@@ -7,9 +7,10 @@ tradeoffs: This is the most safety-critical file in the repo and the split buys 
 
 # The race-resolution logic deserves its own module
 
-`packages/db-p2p/src/cluster/cluster-repo.ts` is **2034 lines**
+`packages/db-p2p/src/cluster/cluster-repo.ts` is **2067 lines**
 (`wc -l packages/db-p2p/src/cluster/cluster-repo.ts`, re-measured after
-`member-must-answer-a-lost-conflict-race` landed), almost all of it one class,
+`commit-and-cancel-records-omit-the-coordinating-block` landed; it was 2034 after
+`member-must-answer-a-lost-conflict-race`), almost all of it one class,
 `ClusterMember`. That one class covers: the two-phase protocol state machine, signature
 signing and verification, membership admission, block storage application, consensus
 certificates, invalidation, persistence and restart recovery, expiration timers — and

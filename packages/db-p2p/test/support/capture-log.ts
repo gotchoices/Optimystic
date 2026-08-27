@@ -2,19 +2,24 @@ import debug from 'debug';
 import { format } from 'node:util';
 
 /**
- * Capture what a `createLogger(<name>)` namespace emits while `fn` runs, restoring the
+ * Capture what one or more `createLogger(<name>)` namespaces emit while `fn` runs, restoring the
  * caller's `debug` configuration afterwards. Returns the raw `debug` argument lists so
  * specs can assert on both the event tag (`args[0]`) and the structured payload (`args[1]`).
  *
+ * Pass an array to watch several namespaces across ONE run of `fn` — a spec that needs both the
+ * coordinator-side and the member-side view of an operation must not run that operation twice, since
+ * the second run starts from the state the first one left.
+ *
  * Not a `.spec.ts` file on purpose — mocha's glob would otherwise load it as a suite.
  */
-export const captureLog = async (namespace: string, fn: () => Promise<void>): Promise<unknown[][]> => {
+export const captureLog = async (namespace: string | string[], fn: () => Promise<void>): Promise<unknown[][]> => {
 	const captured: unknown[][] = [];
 	const previousNamespaces = debug.disable();
 	const previousLog = debug.log;
 	// Matches both the bare namespace (no peer id known) and a peer-id-suffixed one
 	// (`createLogger` appends `:<truncated-peer-id>` when an instance knows its peer id).
-	debug.enable(`optimystic:db-p2p:${namespace},optimystic:db-p2p:${namespace}:*`);
+	const names = Array.isArray(namespace) ? namespace : [namespace];
+	debug.enable(names.map(n => `optimystic:db-p2p:${n},optimystic:db-p2p:${n}:*`).join(','));
 	debug.log = (...args: unknown[]): void => { captured.push(args); };
 	try {
 		await fn();

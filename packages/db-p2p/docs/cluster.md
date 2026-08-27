@@ -702,6 +702,8 @@ Errors are thrown as plain `Error` instances with descriptive messages. Key erro
   - `membership-not-admitted:below-floor (declared=D, floor=F, kEst=K)` — the member has a confident derived view of `K` peers and the declared set of `D` is below `⌈membershipAdmissionFraction · K⌉`
   - `membership-not-admitted:low-confidence-downsize (declared=D, floor=F, assumedClusterSize=A)` — the member has no confident network-size estimate, so the floor falls back to the operator-asserted `assumedClusterSize`. The numbers name the local setting that caused it: if `A` is larger than the cohort you actually run, lower `clusterPolicy.assumedClusterSize`
   - `membership-not-admitted:inconsistent-with-derived-view` — the declared set differs from the member's derived view by more than `clusterSizeTolerance · kEst` peers
+
+  The derived view comes from `record.message.coordinatingBlockIds[0]` — the block the coordinator selected the cohort by. It lives inside `message` (and therefore inside `messageHash`), never as a top-level record field, so a relaying peer cannot rewrite it. `ClusterCoordinator.executeClusterTransaction` stamps it onto a per-transaction copy of the message from the cohort key it is handed, so pend, commit and cancel all carry one. The member additionally requires that id to be a block the record's **own** operations name (`getAffectedBlockIds`); if it is not, the member logs `cluster-member:coordinating-block-unbound` and takes the low-confidence path above rather than deriving a cohort of the coordinator's free choosing.
 - **Expiration**: `Transaction expired` — transaction's `message.expiration` timestamp passed
 - **Hash mismatch**: `Message hash mismatch` — incoming record's message doesn't match its hash (forgery detection)
 - **Signature invalid**: `Invalid promise/commit signature from peerId` — cryptographic signature verification failed
@@ -758,7 +760,6 @@ export interface ClusterRecord {
   message: RepoMessage;
   promises: Record<string, Signature>;
   commits: Record<string, Signature>;
-  coordinatingBlockIds?: BlockId[];    // Block IDs driving cluster selection
   suggestedClusterSize?: number;       // Cluster size observed by coordinator
   minRequiredSize?: number;            // Minimum required (when allowClusterDownsize=false)
   networkSizeHint?: number;            // FRET network size estimate

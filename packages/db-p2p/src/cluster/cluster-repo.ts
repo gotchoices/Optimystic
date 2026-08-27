@@ -1114,8 +1114,10 @@ export class ClusterMember implements ICluster {
 		// coordinator declares a shrunken cohort `D` and names a coordinating block whose real cohort
 		// resembles `D`: every member then derives that block's cohort, finds kEst = |D|, symmetric
 		// difference 0, and admits — the gate fully defeated. Binding the coordinating block to a block the
-		// record's OWN operations touch removes that free choice.
-		if (!ClusterMember.operationBlockIds(record.message).includes(blockId)) {
+		// record's OWN operations touch removes that free choice. `getAffectedBlockIds` is the same block
+		// extraction conflict detection already runs on this message — one definition, so the set a
+		// coordinating id must come from cannot drift from the set the record is judged to touch.
+		if (!this.getAffectedBlockIds(record.message.operations).includes(blockId)) {
 			log('cluster-member:coordinating-block-unbound', {
 				messageHash: record.messageHash,
 				coordinatingBlockId: blockId
@@ -1137,29 +1139,6 @@ export class ClusterMember implements ICluster {
 			log('cluster-member:derive-expected-cluster-error', { messageHash: record.messageHash, error: (err as Error).message });
 			return undefined;
 		}
-	}
-
-	/**
-	 * Every block id the message's own operations name — the set a legitimate coordinating block id must
-	 * come from. `RepoMessage.operations` is a single-element tuple, so this is one operation's blocks in
-	 * practice; the loop keeps it correct if that ever widens.
-	 *
-	 * Every production caller satisfies the binding: `pend`'s coordinating ids are the batch's own
-	 * consolidated blocks (`NetworkTransactor.consolidateCoordinators` builds the payload FROM that list,
-	 * and a `processBatches` retry re-batches without the option so `CoordinatorRepo.pend` falls back to
-	 * the transforms' own ids), and `commit`/`cancel` derive theirs from the request in
-	 * `ClusterCoordinator.executeClusterTransaction`.
-	 */
-	private static operationBlockIds(message: RepoMessage): string[] {
-		const ids: string[] = [];
-		for (const operation of message.operations ?? []) {
-			if ('pend' in operation) ids.push(...blockIdsForTransforms(operation.pend.transforms));
-			else if ('commit' in operation) ids.push(...operation.commit.blockIds);
-			else if ('cancel' in operation) ids.push(...(operation.cancel.actionRef?.blockIds ?? []));
-			else if ('get' in operation) ids.push(...(operation.get.blockIds ?? []));
-			else if ('invalidate' in operation) ids.push(...(operation.invalidate.blockIds ?? []));
-		}
-		return ids;
 	}
 
 	/** |A △ B| over two id lists (order-independent set symmetric difference). */
@@ -1867,6 +1846,13 @@ export class ClusterMember implements ICluster {
 		return undefined;
 	}
 
+	/**
+	 * Every block id the message's own operations name. Two consumers, deliberately sharing one
+	 * definition: conflict detection (which writes must serialize against each other) and the membership
+	 * admission gate's binding check (the set a legitimate `coordinatingBlockIds[0]` must come from —
+	 * {@link ClusterMember.deriveExpectedClusterView}). If the two ever disagreed, a coordinator could
+	 * name a block the record is not judged to touch.
+	 */
 	private getAffectedBlockIds(operations: RepoMessage['operations']): string[] {
 		const blockIds = new Set<string>();
 

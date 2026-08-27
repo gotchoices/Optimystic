@@ -261,8 +261,10 @@ export class ClusterCoordinator {
 		//    N concurrent calls, one per block. In-place mutation would leak one block's id into another
 		//    block's transaction.
 		//  - Preserve an already-present list: `pend` deliberately declares the whole consolidated batch,
-		//    not just its first block, so `??` must not overwrite it.
-		const coordinated: RepoMessage = message.coordinatingBlockIds
+		//    not just its first block, so this must not overwrite it. Tested on `length`, not on the
+		//    field: an empty list carries no id for a member to derive from, so preserving one would be
+		//    the same silent downgrade to the fallback floor this choke point exists to prevent.
+		const coordinated: RepoMessage = message.coordinatingBlockIds?.length
 			? message
 			: { ...message, coordinatingBlockIds: [blockId] };
 

@@ -339,23 +339,23 @@ describe('mesh partition — membership admission gate', () => {
 			});
 			expect(pended.success, 'the two-block pend must succeed').to.equal(true);
 
-			// Coordinator-side log: one `cluster-tx:start` per block, each naming its own block.
-			const coordinatorLog = await captureLog('cluster', async () => {
+			// Both namespaces over ONE cancel: a second cancel would run against an action the first one
+			// already removed, which is a different scenario than the one being asserted.
+			const captured = await captureLog(['cluster', 'cluster-member'], async () => {
 				await target.mesh.nodes[0]!.coordinatorRepo.cancel({ actionId, blockIds: [blockA as BlockId, blockB as BlockId] });
 			});
-			const starts = payloadsOf(coordinatorLog, 'cluster-tx:start');
+
+			// Coordinator-side: one `cluster-tx:start` per block, each naming its own block.
+			const starts = payloadsOf(captured, 'cluster-tx:start');
 			expect(new Set(starts.map(p => String(p.blockId))), 'one transaction per cancelled block')
 				.to.deep.equal(new Set([blockA, blockB]));
 			expect(new Set(starts.map(p => String(p.messageHash))).size,
 				'the two per-block transactions must not collide on one messageHash').to.equal(2);
 
 			// Member-side: each block's members derived from THAT block, not from a single leaked id.
-			const memberLog = await captureLog('cluster-member', async () => {
-				await target.mesh.nodes[0]!.coordinatorRepo.cancel({ actionId, blockIds: [blockA as BlockId, blockB as BlockId] });
-			});
-			expect(new Set(derivedBlockIds(memberLog)), 'each cancel transaction derives from its own block')
+			expect(new Set(derivedBlockIds(captured)), 'each cancel transaction derives from its own block')
 				.to.deep.equal(new Set([blockA, blockB]));
-			expect(admissionRejectReasons(memberLog), 'nothing was refused on the cancel path').to.deep.equal([]);
+			expect(admissionRejectReasons(captured), 'nothing was refused on the cancel path').to.deep.equal([]);
 		});
 	});
 
