@@ -85,14 +85,18 @@ hatch deliberately shut).
 - **Add a comment to `packages/quereus-plugin-optimystic/test/mesh-node-harness.ts`** on
   `startMockMesh`, recording that the membership admission gate is ARMED there and stating the
   arithmetic above in two or three lines, so its specs do not each re-answer the question.
-- **File the commit-path defect** (details below) into `tickets/fix/`.
+- ~~File the commit-path defect into `tickets/fix/`.~~ **ALREADY FILED** as
+  `fix/commit-and-cancel-records-omit-the-coordinating-block` — do NOT file a second copy. It was
+  re-verified independently when filed, and it corrects one number in the section below: the
+  admit-anything case is `assumedClusterSize === undefined`, not 2. Read that ticket before repeating
+  the claim anywhere.
 - **Handoff to `review/`** stating: no mesh opted out of the gate; solo meshes are protected by the
   coordinator short-circuit rather than the gate; the majority-side pend succeeding is by design
   (a confidently-measured majority may proceed — Theorem 2's protection is that the minority cannot
   ALSO commit); the commit-path case is pinned to CURRENT behavior and flips when the filed defect
   lands.
 
-## The defect to file into `tickets/fix/`
+## The defect (now filed — see `fix/commit-and-cancel-records-omit-the-coordinating-block`)
 
 Suggested slug: `commit-records-carry-no-coordinating-block`. `repro: verified` — the case
 `commit path: the gate has no block to derive from (KNOWN GAP)` in the new spec observes it.
