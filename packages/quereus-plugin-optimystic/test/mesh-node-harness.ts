@@ -40,6 +40,16 @@ export interface MockMesh {
  * NOTE: accepted tradeoff — the Databases built on it are likewise left open, which is
  * per-case garbage that grows with the case count; revisit (closing each node in an
  * `afterEach`) if a spec ever slows down or runs the heap up.
+ *
+ * NOTE: membership admission gate is ARMED here (not opted out) — no `assumedClusterSize`
+ * is passed, so it resolves to `minAbsoluteClusterSize` (2) and the gate's fallback floor
+ * is `max(2, ceil(0.75*2)) = 2`. On the pend path every member derives the full
+ * self-including mesh confidently (kEst = size, floor `max(2, ceil(0.75*size))`, declared
+ * = size, symmetric difference 0 -> admit). On the commit/cancel path there is no
+ * coordinating block id yet (tracked by fix ticket
+ * `commit-and-cancel-records-omit-the-coordinating-block`), so it falls back to floor 2,
+ * which any cohort of 2+ clears. `size: 1` never reaches the gate (solo short-circuit in
+ * `CoordinatorRepo`). Specs here don't need to re-derive this arithmetic.
  */
 export async function startMockMesh(size: number): Promise<MockMesh> {
 	const mesh = await createMesh(size, {
