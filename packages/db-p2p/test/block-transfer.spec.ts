@@ -467,6 +467,9 @@ describe('BlockTransferCoordinator', () => {
 			expect(result.released, 'nothing is released off the grown arm').to.deep.equal([]);
 			expect(peerNetwork.connectCalls.length, 'one clean push, no retry churn').to.equal(1);
 			expect(peerNetwork.connectCalls[0]!.peerId.toString()).to.equal(newPeer.toString());
+			// Floor met → the outcome the monitor records as seen: the peer, complete.
+			expect(result.growth.get('block-kept')).to.deep.equal(
+				{ satisfiedPeers: [newPeer.toString()], complete: true });
 		});
 
 		it('reports a grown block underReplicated when the new peer refuses to persist it', async () => {
@@ -488,6 +491,35 @@ describe('BlockTransferCoordinator', () => {
 
 			expect(result.replicated).to.deep.equal([]);
 			expect(result.underReplicated, 'unconfirmed grown block surfaces for the log line').to.deep.equal(['block-kept']);
+			// Incomplete outcome, nothing satisfied → the monitor keeps the peer un-seen and retries.
+			expect(result.growth.get('block-kept')).to.deep.equal(
+				{ satisfiedPeers: [], complete: false });
+		});
+
+		it('a partially confirmed grown block reports only the confirming peers satisfied', async () => {
+			repo.blocks.set('block-kept', makeBlock('block-kept'));
+			const goodPeer = await makePeerId();
+			const badPeer = await makePeerId();
+			peerNetwork.responses.set(goodPeer.toString(), { blocks: { 'block-kept': 'data' }, missing: [] });
+			peerNetwork.responses.set(badPeer.toString(), { blocks: {}, missing: ['block-kept'] });
+
+			const event: RebalanceEvent = {
+				gained: [],
+				lost: [],
+				newOwners: new Map(),
+				grown: new Map([['block-kept', [goodPeer.toString(), badPeer.toString()]]]),
+				floor: 3, // clamps to 2 (the new-peer count) per block
+				triggeredAt: Date.now()
+			};
+
+			const result = await coordinator.handleRebalanceEvent(event);
+
+			expect(result.replicated).to.deep.equal([]);
+			expect(result.underReplicated).to.deep.equal(['block-kept']);
+			const outcome = result.growth.get('block-kept');
+			expect(outcome!.complete, 'floor unmet → incomplete').to.equal(false);
+			expect(outcome!.satisfiedPeers, 'ONLY the confirming peer is satisfied — the refusing one is retried')
+				.to.deep.equal([goodPeer.toString()]);
 		});
 
 		it('a grown block with no local data is reported underReplicated without dialing (gained∩grown case)', async () => {
@@ -510,6 +542,10 @@ describe('BlockTransferCoordinator', () => {
 			expect(result.replicated).to.deep.equal([]);
 			expect(result.underReplicated).to.deep.equal(['block-absent']);
 			expect(peerNetwork.connectCalls.length, 'no dial without local data').to.equal(0);
+			// Nothing to replicate and no dial happened: the reported peers are the pull's own source,
+			// so the outcome is COMPLETE — the monitor must not turn this case into a retry loop.
+			expect(result.growth.get('block-absent')).to.deep.equal(
+				{ satisfiedPeers: [newPeer.toString()], complete: true });
 		});
 	});
 

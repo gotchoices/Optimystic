@@ -37,6 +37,21 @@ export interface RebalanceEvent {
 	triggeredAt: number
 }
 
+/**
+ * What the growth reaction learned about ONE block reported `grown`. Fed back to
+ * {@link RebalanceMonitor.recordGrowthOutcome} so the seen set is confirmation-driven: a peer
+ * enters a block's seen set only once a replica is confirmed on it, or once the block has
+ * otherwise reached its floor. A block the reaction had NO information about (its confirm was
+ * deduped against one already in flight) gets no outcome at all — the monitor's state stays
+ * untouched and the next check re-detects.
+ */
+export interface GrowthOutcome {
+	/** Newly co-responsible peers that may now be recorded as seen for this block. */
+	satisfiedPeers: string[]
+	/** True when nothing about this block is still owed a push. */
+	complete: boolean
+}
+
 export interface RebalanceMonitorConfig {
 	/** Debounce window for topology changes (ms). Default: 5000 */
 	debounceMs?: number
@@ -53,6 +68,24 @@ export interface RebalanceMonitorConfig {
 	 * Default: 64
 	 */
 	growthBlockBudget?: number
+	/**
+	 * How many incomplete growth outcomes ({@link GrowthOutcome} with `complete: false`) a block
+	 * absorbs before its still-unsatisfied peers are moved to a per-block abandoned set and no longer
+	 * pushed to. Without this bound a peer that permanently refuses would be re-pushed on every check
+	 * forever, and its block would re-consume `growthBlockBudget` slots and starve genuinely-new
+	 * growth. An abandoned peer that leaves the cohort and later rejoins is retried from scratch.
+	 * Default: 5
+	 */
+	growthMaxAttempts?: number
+	/**
+	 * Self-arming re-check timer for outstanding growth work (reported-but-unconfirmed peers, or
+	 * blocks deferred by `growthBlockBudget`). Checks otherwise fire only on libp2p connection
+	 * events, so a failed push on a then-quiet network would never be retried. Armed at the end of a
+	 * check only while work is outstanding; fires `maybeRebalance()` so the existing
+	 * `minRebalanceIntervalMs` throttle still bounds the push rate. `0` disables.
+	 * Default: `minRebalanceIntervalMs`
+	 */
+	growthRecheckIntervalMs?: number
 }
 
 export interface RebalanceMonitorDeps {
@@ -73,6 +106,34 @@ export interface RebalanceMonitorDeps {
 
 type RebalanceHandler = (event: RebalanceEvent) => void
 
+/** Per-block rebalance/growth state (the `responsibilitySnapshot` entry). */
+interface BlockGrowthState {
+	responsible: boolean
+	/**
+	 * The growth arm's seen set: peers CONFIRMED to hold a replica of this block (or satisfied
+	 * another way — floor met, or nothing local to push). Peers enter ONLY via
+	 * {@link RebalanceMonitor.recordGrowthOutcome}, never at report time.
+	 */
+	cohortPeers: Set<string>
+	/** Peers reported grown at the last emitting check whose confirmation is still outstanding. */
+	pendingPeers: Set<string>
+	/** Consecutive incomplete growth outcomes — the give-up counter against `growthMaxAttempts`. */
+	growthAttempts: number
+	/**
+	 * Peers given up on after `growthMaxAttempts` incomplete outcomes — excluded from growth reports
+	 * until they leave the cohort and rejoin (each check intersects this with the current cohort).
+	 */
+	abandonedPeers: Set<string>
+}
+
+const emptyGrowthState = (responsible: boolean): BlockGrowthState => ({
+	responsible,
+	cohortPeers: new Set<string>(),
+	pendingPeers: new Set<string>(),
+	growthAttempts: 0,
+	abandonedPeers: new Set<string>()
+})
+
 export class RebalanceMonitor implements Startable {
 	private running = false
 	private readonly trackedBlocks: Set<string>
@@ -82,22 +143,28 @@ export class RebalanceMonitor implements Startable {
 	// block may linger here. That is acceptable: performRebalanceCheck only iterates trackedBlocks, so
 	// a lingering entry is inert; if the block is later re-fed, its responsibility is simply re-derived.
 	//
-	// `cohortPeers` is the growth arm's already-seen-co-responsible memory (non-self cohort at the
-	// last check). A MISSING entry is deliberately treated as "prior cohort = empty", so the first
-	// check after a topology event reports the whole non-self cohort as grown — that is what heals
-	// the founder case (A alone commits; B joins → first check pushes to B) and the restarted-holder
-	// case (snapshot memory is process-local, so a restarted holder re-pushes to everyone once).
-	private readonly responsibilitySnapshot = new Map<string, { responsible: boolean; cohortPeers: Set<string> }>()
+	// `cohortPeers` is the growth arm's CONFIRMED-co-responsible memory. A MISSING entry is
+	// deliberately treated as "prior cohort = empty", so the first check after a topology event
+	// reports the whole non-self cohort as grown — that is what heals the founder case (A alone
+	// commits; B joins → first check pushes to B) and the restarted-holder case (snapshot memory is
+	// process-local, so a restarted holder re-pushes to everyone once). Peers enter the set only
+	// through recordGrowthOutcome — a reported-but-unconfirmed peer stays out, so a failed push is
+	// re-detected on the next check instead of being recorded as done.
+	private readonly responsibilitySnapshot = new Map<string, BlockGrowthState>()
 	private readonly handlers: RebalanceHandler[] = []
 	private debounceTimer: ReturnType<typeof setTimeout> | null = null
+	private recheckTimer: ReturnType<typeof setTimeout> | null = null
 	private lastRebalanceAt = 0
 	private pendingTopologyChange = false
 	private topologyChangeTimestamp = 0
+	private lastGrowthDeferred = 0
 
 	private readonly debounceMs: number
 	private readonly minRebalanceIntervalMs: number
 	private readonly suppressDuringPartition: boolean
 	private readonly growthBlockBudget: number
+	private readonly growthMaxAttempts: number
+	private readonly growthRecheckIntervalMs: number
 
 	private readonly onConnectionOpen: () => void
 	private readonly onConnectionClose: () => void
@@ -114,6 +181,8 @@ export class RebalanceMonitor implements Startable {
 		this.minRebalanceIntervalMs = config.minRebalanceIntervalMs ?? 60000
 		this.suppressDuringPartition = config.suppressDuringPartition ?? true
 		this.growthBlockBudget = config.growthBlockBudget ?? 64
+		this.growthMaxAttempts = config.growthMaxAttempts ?? 5
+		this.growthRecheckIntervalMs = config.growthRecheckIntervalMs ?? this.minRebalanceIntervalMs
 
 		this.onConnectionOpen = () => this.handleTopologyChange()
 		this.onConnectionClose = () => this.handleTopologyChange()
@@ -140,6 +209,10 @@ export class RebalanceMonitor implements Startable {
 			clearTimeout(this.debounceTimer)
 			this.debounceTimer = null
 		}
+		if (this.recheckTimer) {
+			clearTimeout(this.recheckTimer)
+			this.recheckTimer = null
+		}
 
 		this.pendingTopologyChange = false
 		log('stopped')
@@ -164,6 +237,98 @@ export class RebalanceMonitor implements Startable {
 
 	async checkNow(): Promise<RebalanceEvent | null> {
 		return this.performRebalanceCheck(Date.now())
+	}
+
+	/**
+	 * Feedback from the growth reaction for one block reported `grown`. `satisfiedPeers` enter the
+	 * block's seen set; an incomplete outcome counts an attempt against `growthMaxAttempts`, and on
+	 * reaching the bound the block's still-unsatisfied reported peers are abandoned (no longer
+	 * pushed to until they leave the cohort and rejoin). Never called for a block the reaction had
+	 * no information about (a confirm deduped against one already in flight) — a missing outcome
+	 * leaves the block's state untouched so the next check retries.
+	 */
+	recordGrowthOutcome(blockId: string, outcome: GrowthOutcome): void {
+		const state = this.responsibilitySnapshot.get(blockId)
+		// No state (untracked since) or responsibility lost since the report: the growth state was
+		// cleared, and recording into it would survive the clear and suppress the regain re-push.
+		if (!state || !state.responsible) return
+
+		for (const peerId of outcome.satisfiedPeers) {
+			state.cohortPeers.add(peerId)
+			state.pendingPeers.delete(peerId)
+		}
+
+		if (outcome.complete) {
+			state.growthAttempts = 0
+			state.pendingPeers.clear()
+		} else {
+			state.growthAttempts++
+			if (state.growthAttempts >= this.growthMaxAttempts) {
+				for (const peerId of state.pendingPeers) {
+					state.abandonedPeers.add(peerId)
+				}
+				log('growth give-up: block=%s abandoning %d unsatisfied peer(s) after %d attempts',
+					blockId, state.pendingPeers.size, state.growthAttempts)
+				state.pendingPeers.clear()
+				state.growthAttempts = 0
+			}
+		}
+
+		this.updateRecheckTimer()
+	}
+
+	/**
+	 * Growth-arm observability: how many tracked blocks still await confirmation on reported peers,
+	 * how many (block, peer) pairs have been given up on, and whether the re-check timer is armed.
+	 */
+	getGrowthDiagnostics(): { blocksAwaitingConfirmation: number; abandonedPairs: number; recheckArmed: boolean } {
+		let blocksAwaitingConfirmation = 0
+		let abandonedPairs = 0
+		for (const [blockId, state] of this.responsibilitySnapshot) {
+			if (!state.responsible || !this.trackedBlocks.has(blockId)) continue
+			if (state.pendingPeers.size > 0) blocksAwaitingConfirmation++
+			abandonedPairs += state.abandonedPeers.size
+		}
+		return { blocksAwaitingConfirmation, abandonedPairs, recheckArmed: this.recheckTimer !== null }
+	}
+
+	/** Growth work is outstanding while any reported peer is unconfirmed or blocks were budget-deferred. */
+	private hasOutstandingGrowthWork(): boolean {
+		if (this.lastGrowthDeferred > 0) return true
+		for (const [blockId, state] of this.responsibilitySnapshot) {
+			if (state.responsible && state.pendingPeers.size > 0 && this.trackedBlocks.has(blockId)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	/**
+	 * Arm the growth re-check timer while work is outstanding; disarm it when there is none. The
+	 * timer fires maybeRebalance(), so minRebalanceIntervalMs still bounds the push rate, and it
+	 * re-arms itself after firing for as long as work remains. unref'd so it never holds the
+	 * process open; stop() clears it.
+	 */
+	private updateRecheckTimer(): void {
+		if (this.growthRecheckIntervalMs <= 0) return
+
+		if (!this.running || !this.hasOutstandingGrowthWork()) {
+			if (this.recheckTimer) {
+				clearTimeout(this.recheckTimer)
+				this.recheckTimer = null
+			}
+			return
+		}
+
+		if (this.recheckTimer) return // already armed
+
+		this.recheckTimer = setTimeout(() => {
+			this.recheckTimer = null
+			void this.maybeRebalance()
+				.catch(err => { log('recheck error: %O', err) })
+				.finally(() => this.updateRecheckTimer())
+		}, this.growthRecheckIntervalMs)
+		;(this.recheckTimer as unknown as { unref?: () => void }).unref?.()
 	}
 
 	private handleTopologyChange(): void {
@@ -218,6 +383,7 @@ export class RebalanceMonitor implements Startable {
 		const newOwners = new Map<string, string[]>()
 		const grown = new Map<string, string[]>()
 		let growthDeferred = 0
+		const growthCandidates: Array<{ blockId: string; newPeers: string[]; state: BlockGrowthState }> = []
 
 		for (const blockId of this.trackedBlocks) {
 			const key = textEncoder.encode(blockId)
@@ -237,49 +403,71 @@ export class RebalanceMonitor implements Startable {
 				newOwners.set(blockId, cohort.filter(id => id !== selfId))
 			}
 
-			// Growth arm: while this node STAYS responsible, any cohort peer it has not seen
-			// co-responsible before gets the block pushed (up to the floor). Runs on every responsible
+			// Growth arm: while this node STAYS responsible, any cohort peer not yet CONFIRMED to hold
+			// the block (and not abandoned) gets it pushed (up to the floor). Runs on every responsible
 			// check — NOT gated on wasResponsible — so a first observation (no snapshot entry) treats
 			// the whole non-self cohort as new; see the responsibilitySnapshot comment for why that is
 			// load-bearing. Not responsible ⇒ arm skipped, so `lost` ∩ `grown` is impossible.
-			let seenCohortPeers = prior?.cohortPeers ?? new Set<string>()
+			//
+			// Reporting a peer does NOT record it as seen — only recordGrowthOutcome does — so a push
+			// that fails (dial timeout, receiver refused to persist, partition mid-reaction, reaction
+			// threw) leaves the peer un-seen and the next check re-detects it.
+			let state: BlockGrowthState
 			if (isResponsible) {
-				const currentPeers = cohort.filter(id => id !== selfId)
-				const newPeers = currentPeers.filter(id => !seenCohortPeers.has(id))
+				const currentSet = new Set(cohort.filter(id => id !== selfId))
+				// Intersect the prior seen/abandoned sets against the CURRENT cohort: a peer that left
+				// drops out (so its return is re-detected — the departure self-heal, and the abandoned
+				// peer's retry-from-scratch), and unconfirmed peers are never laundered into seen.
+				state = {
+					responsible: true,
+					cohortPeers: new Set([...(prior?.cohortPeers ?? [])].filter(id => currentSet.has(id))),
+					pendingPeers: new Set<string>(),
+					growthAttempts: prior?.growthAttempts ?? 0,
+					abandonedPeers: new Set([...(prior?.abandonedPeers ?? [])].filter(id => currentSet.has(id)))
+				}
+				const newPeers = [...currentSet].filter(id => !state.cohortPeers.has(id) && !state.abandonedPeers.has(id))
 				if (newPeers.length > 0) {
-					if (grown.size < this.growthBlockBudget) {
-						grown.set(blockId, newPeers)
-						seenCohortPeers = new Set(currentPeers)
-					} else {
-						// Budget-dropped: keep the PRIOR seen set so the next check re-detects the same
-						// growth — a deferral, not a loss.
-						growthDeferred++
-					}
-				} else {
-					seenCohortPeers = new Set(currentPeers)
+					growthCandidates.push({ blockId, newPeers, state })
 				}
 			} else {
-				// Not responsible: clear the seen set, so a later regain re-pushes to the whole cohort
-				// (benign when the local data is gone — the push finds nothing and no-ops).
-				seenCohortPeers = new Set<string>()
+				// Not responsible: clear ALL growth state (seen set, attempts, abandoned peers), so a
+				// later regain re-pushes to the whole cohort (benign when the local data is gone — the
+				// push finds nothing and no-ops).
+				state = emptyGrowthState(false)
 			}
 
-			this.responsibilitySnapshot.set(blockId, { responsible: isResponsible, cohortPeers: seenCohortPeers })
+			this.responsibilitySnapshot.set(blockId, state)
 		}
+
+		// Fill the growth budget in two passes: fresh growth (no failed attempts yet) first, retrying
+		// blocks with what remains — otherwise a stuck retry set at the front of the tracked-block
+		// insertion order would starve peers that just joined.
+		for (const candidate of [
+			...growthCandidates.filter(c => c.state.growthAttempts === 0),
+			...growthCandidates.filter(c => c.state.growthAttempts > 0)
+		]) {
+			if (grown.size < this.growthBlockBudget) {
+				grown.set(candidate.blockId, candidate.newPeers)
+				candidate.state.pendingPeers = new Set(candidate.newPeers)
+			} else {
+				// Budget-dropped: the seen set was not touched, so the next check re-detects the same
+				// growth — a deferral, not a loss.
+				growthDeferred++
+			}
+		}
+		this.lastGrowthDeferred = growthDeferred
 
 		this.lastRebalanceAt = Date.now()
 
 		if (growthDeferred > 0) {
-			// NOTE: deferred blocks drain one budget-full per CHECK, and checks fire only on a libp2p
-			// connection event (further throttled by minRebalanceIntervalMs, default 60s) — there is no
-			// timer sweep. So a node whose tracked-block count far exceeds growthBlockBudget drains its
-			// backlog only as fast as topology events arrive, and on a quiet network may not drain at
-			// all. Fine at the sizes this runs at today (cohort size is clamped to 3, so each block
-			// costs at most two pushes); if a deployment ever tracks blocks in the thousands, give the
-			// monitor a periodic re-check rather than raising the budget.
+			// Deferred blocks drain one budget-full per check. Checks fire on libp2p connection events
+			// AND — while growth work is outstanding — on the growthRecheckIntervalMs timer armed
+			// below, so a backlog drains even on a quiet network.
 			log('growth budget reached: %d blocks deferred to the next check (budget=%d)',
 				growthDeferred, this.growthBlockBudget)
 		}
+
+		this.updateRecheckTimer()
 
 		if (gained.length === 0 && lost.length === 0 && grown.size === 0) {
 			return null

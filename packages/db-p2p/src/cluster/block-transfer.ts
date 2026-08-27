@@ -3,7 +3,7 @@ import { peerIdFromString } from '@libp2p/peer-id';
 import type { PartitionDetector } from './partition-detector.js';
 import type { RestorationCoordinator } from '../storage/restoration-coordinator.js';
 import { BlockTransferClient, sourceBlockMeta } from './block-transfer-service.js';
-import type { RebalanceEvent } from './rebalance-monitor.js';
+import type { GrowthOutcome, RebalanceEvent } from './rebalance-monitor.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('block-transfer');
@@ -36,12 +36,19 @@ export interface RebalanceReactionResult {
 	/** Grown blocks confirmed pushed to every newly co-responsible peer (capped by the floor). */
 	replicated: string[];
 	/**
-	 * Grown blocks that could not be confirmed on the new peers this pass. Nothing is released or
-	 * retried off this list here — the monitor's snapshot already recorded these peers as seen, so
-	 * the retry is `confirmReplicated`'s own `maxRetries` within the pass, and after that the block
-	 * stays where it was (the next cohort CHANGE re-detects any peer still missing it).
+	 * Grown blocks that could not be confirmed on the new peers this pass. Nothing is released off
+	 * this list — the node keeps the block either way. The retry lives in the monitor: the caller
+	 * feeds each block's {@link GrowthOutcome} (in `growth`) back via
+	 * `RebalanceMonitor.recordGrowthOutcome`, so an unconfirmed peer stays out of the seen set and
+	 * the next check re-detects it.
 	 */
 	underReplicated: string[];
+	/**
+	 * Per-block feedback for the growth arm, keyed by block id. A block reported `grown` that the
+	 * reaction had NO information about (its confirm was deduped against one already in flight) has
+	 * no entry — the monitor must leave that block's state untouched.
+	 */
+	growth: Map<string, GrowthOutcome>;
 }
 
 /**
@@ -154,45 +161,81 @@ export class BlockTransferCoordinator {
 			released: confirmResult.confirmed,
 			retained: confirmResult.unconfirmed,
 			replicated: growResult.confirmed,
-			underReplicated: growResult.unconfirmed
+			underReplicated: growResult.unconfirmed,
+			growth: growResult.growth
 		};
 	}
 
 	/**
 	 * Push each GROWN block (still owned; new peers became co-responsible) to its newly
-	 * co-responsible peers, reusing {@link confirmReplicated} per block. The per-block floor is
+	 * co-responsible peers, reusing {@link executeConfirm} per block. The per-block floor is
 	 * `min(event floor, new-peer count)`: passing the raw event floor would be wrong when fewer new
 	 * peers exist than the floor — `executeConfirm` could then never reach the floor and would burn
 	 * `maxRetries` re-pushing peers that already accepted. Nothing is released off this path (the
 	 * node KEEPS the block either way); the confirmed/unconfirmed split is reporting only. The
-	 * in-flight `confirm:<id>` key dedups against a concurrent lost-confirm for the same block.
+	 * in-flight `confirm:<id>` key dedups against a concurrent lost-confirm for the same block —
+	 * such a block gets NO `growth` entry (no information), so the monitor leaves it untouched.
 	 * `enablePush` deliberately does not gate this (same rationale as the NOTE in
 	 * {@link confirmReplicated}); the growth arm as a whole is gated by the `rebalance.enabled`
 	 * wiring in `libp2p-node-base`.
+	 *
+	 * Per-block {@link GrowthOutcome} rules:
+	 * - floor met → all reported peers satisfied, complete. Deliberately includes peers
+	 *   `executeConfirm` skipped once the floor was reached — the block is adequately replicated,
+	 *   and re-pushing the remainder on every check forever would be a live loop.
+	 * - no local data → all reported peers satisfied, complete (nothing to replicate; see NOTE).
+	 * - otherwise → only the peers that actually confirmed, incomplete (retried by the monitor).
 	 */
 	private async replicateGrown(
 		grown: Map<string, string[]>,
 		floor: number
-	): Promise<{ confirmed: string[]; unconfirmed: string[] }> {
-		if (grown.size === 0) {
-			return { confirmed: [], unconfirmed: [] };
-		}
-
+	): Promise<{ confirmed: string[]; unconfirmed: string[]; growth: Map<string, GrowthOutcome> }> {
 		const confirmed: string[] = [];
 		const unconfirmed: string[] = [];
+		const growth = new Map<string, GrowthOutcome>();
+		if (grown.size === 0) {
+			return { confirmed, unconfirmed, growth };
+		}
+
+		if (this.partitionDetector.detectPartition()) {
+			// Mirrors confirmReplicated's guard (replicateGrown drives executeConfirm directly). An
+			// incomplete outcome with nothing satisfied keeps every reported peer un-seen AND counts an
+			// attempt, so a partition mid-reaction is retried like any other failed push.
+			log('grow:partition-detected, leaving %d blocks unconfirmed', grown.size);
+			for (const [blockId, newPeers] of grown) {
+				if (newPeers.length === 0) continue;
+				unconfirmed.push(blockId);
+				growth.set(blockId, { satisfiedPeers: [], complete: false });
+			}
+			return { confirmed, unconfirmed, growth };
+		}
 
 		await Promise.all([...grown.entries()].map(async ([blockId, newPeers]) => {
 			if (newPeers.length === 0) return;
-			const result = await this.confirmReplicated(
-				[blockId],
+			const result = await this.executeConfirm(
+				blockId,
 				new Map([[blockId, newPeers]]),
-				Math.min(floor, newPeers.length)
+				Math.max(1, Math.min(floor, newPeers.length))
 			);
-			confirmed.push(...result.confirmed);
-			unconfirmed.push(...result.unconfirmed);
+			if (result === null) return; // confirm already in flight — no information, no entry
+			if (result.confirmed) {
+				confirmed.push(blockId);
+				growth.set(blockId, { satisfiedPeers: [...newPeers], complete: true });
+			} else if (result.noLocalData) {
+				// NOTE: nothing local to replicate (the gained∩grown first-observation case) — the
+				// reported peers are recorded satisfied so this does not become a permanent retry loop
+				// (those cohort peers are the pull's own source). If the node later obtains the block by
+				// another route (a fresh local commit, a spread push), these peers stay recorded and are
+				// never pushed — benign today, since a gained block's data comes from these very peers.
+				unconfirmed.push(blockId);
+				growth.set(blockId, { satisfiedPeers: [...newPeers], complete: true });
+			} else {
+				unconfirmed.push(blockId);
+				growth.set(blockId, { satisfiedPeers: [...result.confirmedPeers], complete: false });
+			}
 		}));
 
-		return { confirmed, unconfirmed };
+		return { confirmed, unconfirmed, growth };
 	}
 
 	/**
@@ -235,7 +278,11 @@ export class BlockTransferCoordinator {
 		const unconfirmed: string[] = [];
 
 		const ids = blockIds.filter(id => !this.inFlight.has(`confirm:${id}`));
-		await Promise.all(ids.map(id => this.executeConfirm(id, owners, floor, confirmed, unconfirmed)));
+		await Promise.all(ids.map(async id => {
+			const result = await this.executeConfirm(id, owners, floor);
+			if (result === null) return; // raced into flight after the filter — no information
+			(result.confirmed ? confirmed : unconfirmed).push(id);
+		}));
 
 		return { confirmed, unconfirmed };
 	}
@@ -357,28 +404,33 @@ export class BlockTransferCoordinator {
 	}
 
 	/**
-	 * Confirm one block replicated to ≥ `floor` distinct qualifying owners. Reads the local block once,
-	 * pushes to each candidate owner (stopping once the floor is reached), and counts distinct owners
-	 * that report holding it (not `missing`). Retries the whole round up to `maxRetries` before giving
-	 * up. Records the block in `confirmed` iff the floor was met, otherwise in `unconfirmed`.
+	 * Confirm one block replicated to ≥ `floor` distinct qualifying owners. Reads the local block once
+	 * per attempt, pushes to each candidate owner (stopping once the floor is reached), and counts
+	 * distinct owners that report holding it (not `missing`). Retries the whole round up to
+	 * `maxRetries` before giving up.
+	 *
+	 * Returns `null` when a confirm for this block is already in flight (no information — the caller
+	 * must not record anything for it). Otherwise: `confirmed` iff the floor was met; `confirmedPeers`
+	 * is the union of owners that confirmed across every attempt (a peer that accepted a push holds a
+	 * replica even if a later round missed it — the floor decision itself stays per-round, unchanged);
+	 * `noLocalData` marks the nothing-local-to-push case. The lost-block release path uses only
+	 * `confirmed`; the growth arm consumes the other two.
 	 */
 	private async executeConfirm(
 		blockId: string,
 		owners: Map<string, string[]>,
-		floor: number,
-		confirmed: string[],
-		unconfirmed: string[]
-	): Promise<void> {
+		floor: number
+	): Promise<{ confirmed: boolean; confirmedPeers: Set<string>; noLocalData: boolean } | null> {
 		const key = `confirm:${blockId}`;
-		if (this.inFlight.has(key)) return;
+		if (this.inFlight.has(key)) return null;
 		this.inFlight.add(key);
 
 		try {
+			const allConfirmedPeers = new Set<string>();
 			const candidateOwners = owners.get(blockId) ?? [];
 			if (candidateOwners.length === 0) {
 				// No qualifying holder to confirm against — cannot release; keep serving.
-				unconfirmed.push(blockId);
-				return;
+				return { confirmed: false, confirmedPeers: allConfirmedPeers, noLocalData: false };
 			}
 
 			for (let attempt = 0; ; attempt++) {
@@ -391,8 +443,7 @@ export class BlockTransferCoordinator {
 					if (!blockResult?.block) {
 						// No local bytes to prove replication with — cannot confirm; keep serving.
 						log('confirm:no-local-data block=%s', blockId);
-						unconfirmed.push(blockId);
-						return;
+						return { confirmed: false, confirmedPeers: allConfirmedPeers, noLocalData: true };
 					}
 
 					const blockData = new TextEncoder().encode(JSON.stringify(blockResult.block));
@@ -411,6 +462,7 @@ export class BlockTransferCoordinator {
 							);
 							if (response && !response.missing.includes(blockId)) {
 								confirmedPeers.add(ownerPeerIdStr);
+								allConfirmedPeers.add(ownerPeerIdStr);
 							}
 						} catch (err) {
 							log('confirm:peer-error block=%s peer=%s err=%s',
@@ -424,8 +476,7 @@ export class BlockTransferCoordinator {
 
 				if (confirmCount >= floor) {
 					log('confirm:ok block=%s holders=%d/%d', blockId, confirmCount, floor);
-					confirmed.push(blockId);
-					return;
+					return { confirmed: true, confirmedPeers: allConfirmedPeers, noLocalData: false };
 				}
 				if (attempt < this.maxRetries) {
 					log('confirm:retry block=%s holders=%d/%d attempt=%d', blockId, confirmCount, floor, attempt + 1);
@@ -433,8 +484,7 @@ export class BlockTransferCoordinator {
 					continue;
 				}
 				log('confirm:unmet block=%s holders=%d/%d', blockId, confirmCount, floor);
-				unconfirmed.push(blockId);
-				return;
+				return { confirmed: false, confirmedPeers: allConfirmedPeers, noLocalData: false };
 			}
 		} finally {
 			this.inFlight.delete(key);

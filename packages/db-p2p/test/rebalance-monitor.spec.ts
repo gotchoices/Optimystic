@@ -260,7 +260,9 @@ describe('RebalanceMonitor', () => {
 
 			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
 			monitor.trackBlock('block-1');
-			await monitor.checkNow(); // baseline: peerId2 recorded as seen
+			await monitor.checkNow(); // baseline reports peerId2 grown…
+			// …and the reaction's feedback is what records it as seen (report time no longer does).
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [peerId2.toString()], complete: true });
 
 			mockFret.setCohort('*', [selfId.toString(), peerId2.toString(), peerId3.toString()]);
 			const event = await monitor.checkNow();
@@ -268,16 +270,17 @@ describe('RebalanceMonitor', () => {
 			expect(event).to.not.be.null;
 			expect(event!.gained, 'still responsible — nothing gained').to.deep.equal([]);
 			expect(event!.lost).to.deep.equal([]);
-			expect(event!.grown.get('block-1'), 'only the joiner, not the already-seen peer').to.deep.equal(
+			expect(event!.grown.get('block-1'), 'only the joiner, not the already-confirmed peer').to.deep.equal(
 				[peerId3.toString()]);
 		});
 
-		it('a stable cohort does not re-emit growth', async () => {
+		it('a CONFIRMED cohort does not re-emit growth', async () => {
 			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
 
 			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
 			monitor.trackBlock('block-1');
 			await monitor.checkNow(); // first observation emits gained+grown
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [peerId2.toString()], complete: true });
 
 			const second = await monitor.checkNow();
 			expect(second, 'no change → no event → no re-push loop').to.be.null;
@@ -315,17 +318,20 @@ describe('RebalanceMonitor', () => {
 			const first = await monitor.checkNow();
 			expect(first).to.not.be.null;
 			expect(first!.grown.size, 'budget admits exactly one block').to.equal(1);
+			const firstBlock = [...first!.grown.keys()][0]!;
+			// Confirm the admitted block, or it competes for the budget again next check.
+			monitor.recordGrowthOutcome(firstBlock, { satisfiedPeers: [peerId2.toString()], complete: true });
 
 			// The dropped block's snapshot was NOT updated, so the same growth is re-detected.
 			const second = await monitor.checkNow();
 			expect(second).to.not.be.null;
 			expect(second!.grown.size, 'the deferred block surfaces next check').to.equal(1);
-			const firstBlock = [...first!.grown.keys()][0];
-			const secondBlock = [...second!.grown.keys()][0];
+			const secondBlock = [...second!.grown.keys()][0]!;
 			expect(secondBlock, 'it is the OTHER block, not a re-emit').to.not.equal(firstBlock);
-			expect(second!.grown.get(secondBlock!)).to.deep.equal([peerId2.toString()]);
+			expect(second!.grown.get(secondBlock)).to.deep.equal([peerId2.toString()]);
+			monitor.recordGrowthOutcome(secondBlock, { satisfiedPeers: [peerId2.toString()], complete: true });
 
-			// Both now recorded — nothing left to defer.
+			// Both now confirmed — nothing left to defer.
 			const third = await monitor.checkNow();
 			expect(third).to.be.null;
 		});
@@ -335,7 +341,8 @@ describe('RebalanceMonitor', () => {
 
 			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
 			monitor.trackBlock('block-1');
-			await monitor.checkNow(); // baseline: responsible, peerId2 seen
+			await monitor.checkNow(); // baseline: responsible, peerId2 reported
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [peerId2.toString()], complete: true });
 
 			mockFret.setCohort('*', [peerId2.toString()]); // self drops out
 			await monitor.checkNow(); // lost
@@ -347,6 +354,196 @@ describe('RebalanceMonitor', () => {
 			expect(event!.gained).to.deep.equal(['block-1']);
 			expect(event!.grown.get('block-1'), 'peerId2 re-reported: the seen set was cleared on loss').to.deep.equal(
 				[peerId2.toString()]);
+		});
+	});
+
+	describe('confirmation-driven growth (a peer is seen only once its outcome confirms)', () => {
+		it('an incomplete outcome re-reports the same peer on the next check — the retry regression', async () => {
+			// The defect this pins: a failed push used to be recorded as seen at report time, so the
+			// peer was never re-detected and the block kept its single copy forever.
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			monitor.trackBlock('block-1');
+			const first = await monitor.checkNow();
+			expect(first!.grown.get('block-1')).to.deep.equal([peerId2.toString()]);
+
+			// The push failed (dial timeout / receiver refused / partition mid-reaction).
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [], complete: false });
+
+			const second = await monitor.checkNow();
+			expect(second, 'the unconfirmed peer is re-detected').to.not.be.null;
+			expect(second!.grown.get('block-1'), 'same peer re-reported for another push').to.deep.equal(
+				[peerId2.toString()]);
+		});
+
+		it('a partial outcome re-reports only the unsatisfied peer', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString(), peerId3.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			monitor.trackBlock('block-1');
+			const first = await monitor.checkNow();
+			expect(first!.grown.get('block-1')).to.have.members([peerId2.toString(), peerId3.toString()]);
+
+			// peerId2 confirmed, peerId3 did not.
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [peerId2.toString()], complete: false });
+
+			const second = await monitor.checkNow();
+			expect(second!.grown.get('block-1'), 'only the unconfirmed peer is re-pushed').to.deep.equal(
+				[peerId3.toString()]);
+		});
+
+		it('NO outcome (reaction had no information) leaves the state untouched and re-reports', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			monitor.trackBlock('block-1');
+			await monitor.checkNow();
+			// The reaction's confirm was deduped against one already in flight → recordGrowthOutcome
+			// is never called for the block.
+
+			const second = await monitor.checkNow();
+			expect(second!.grown.get('block-1'), 'no information → retried, not recorded').to.deep.equal(
+				[peerId2.toString()]);
+		});
+
+		it('gives up on a peer after growthMaxAttempts incomplete outcomes, visibly, and retries it after a leave/rejoin', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0, growthMaxAttempts: 2 });
+			monitor.trackBlock('block-1');
+
+			for (let attempt = 0; attempt < 2; attempt++) {
+				const event = await monitor.checkNow();
+				expect(event!.grown.get('block-1'), `attempt ${attempt + 1} still pushes`).to.deep.equal(
+					[peerId2.toString()]);
+				monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [], complete: false });
+			}
+
+			// The bound tripped: the peer is abandoned — no longer reported — and NOT silently.
+			expect(await monitor.checkNow(), 'abandoned peer no longer generates growth').to.be.null;
+			expect(monitor.getGrowthDiagnostics().abandonedPairs, 'the give-up is observable').to.equal(1);
+
+			// The abandoned set is intersected with the current cohort: leave…
+			mockFret.setCohort('*', [selfId.toString()]);
+			await monitor.checkNow();
+			expect(monitor.getGrowthDiagnostics().abandonedPairs, 'departure clears the abandonment').to.equal(0);
+
+			// …and rejoin → retried from scratch.
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+			const retry = await monitor.checkNow();
+			expect(retry!.grown.get('block-1'), 'the rejoined peer is pushed again').to.deep.equal(
+				[peerId2.toString()]);
+		});
+
+		it('a complete outcome resets the give-up counter', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0, growthMaxAttempts: 2 });
+			monitor.trackBlock('block-1');
+
+			await monitor.checkNow();
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [], complete: false }); // 1 of 2
+
+			await monitor.checkNow();
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [peerId2.toString()], complete: true }); // reset
+
+			// A NEW peer joins: it gets the full growthMaxAttempts budget, not the leftovers.
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString(), peerId3.toString()]);
+			await monitor.checkNow();
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [], complete: false }); // 1 of 2 again
+			const event = await monitor.checkNow();
+			expect(event!.grown.get('block-1'), 'counter was reset — still retrying, not abandoned').to.deep.equal(
+				[peerId3.toString()]);
+			expect(monitor.getGrowthDiagnostics().abandonedPairs).to.equal(0);
+		});
+
+		it('an outcome arriving after responsibility was lost is ignored (the regain re-push survives)', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			monitor.trackBlock('block-1');
+			await monitor.checkNow(); // reports peerId2 grown; reaction in flight…
+
+			mockFret.setCohort('*', [peerId2.toString()]); // …self drops out before the outcome lands
+			await monitor.checkNow(); // lost — growth state cleared
+
+			// The stale outcome must not survive the clear, or a regain would skip the re-push.
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [peerId2.toString()], complete: true });
+
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+			const regain = await monitor.checkNow();
+			expect(regain!.grown.get('block-1'), 'the regain still re-pushes the whole cohort').to.deep.equal(
+				[peerId2.toString()]);
+		});
+	});
+
+	describe('growth re-check timer', () => {
+		it('arms while confirmation is outstanding, fires a re-check, and disarms once confirmed', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const events: RebalanceEvent[] = [];
+			const monitor = new RebalanceMonitor(deps, {
+				debounceMs: 5,
+				minRebalanceIntervalMs: 0,
+				growthRecheckIntervalMs: 60_000 // long — this test asserts arming, not firing
+			});
+			monitor.onRebalance(e => events.push(e));
+			monitor.trackBlock('block-1');
+			await monitor.start();
+
+			await monitor.checkNow(); // reports peerId2 grown — confirmation outstanding
+			expect(monitor.getGrowthDiagnostics().recheckArmed, 'outstanding work arms the timer').to.equal(true);
+			expect(monitor.getGrowthDiagnostics().blocksAwaitingConfirmation).to.equal(1);
+
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [peerId2.toString()], complete: true });
+			expect(monitor.getGrowthDiagnostics().recheckArmed, 'confirmation disarms the timer').to.equal(false);
+			expect(monitor.getGrowthDiagnostics().blocksAwaitingConfirmation).to.equal(0);
+
+			await monitor.stop();
+		});
+
+		it('fires maybeRebalance so an invalidated seen set is retried without a connection event', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const events: RebalanceEvent[] = [];
+			const monitor = new RebalanceMonitor(deps, {
+				debounceMs: 5,
+				minRebalanceIntervalMs: 0,
+				growthRecheckIntervalMs: 25
+			});
+			monitor.onRebalance(e => events.push(e));
+			monitor.trackBlock('block-1');
+			await monitor.start();
+
+			const first = await monitor.checkNow();
+			expect(first!.grown.get('block-1')).to.deep.equal([peerId2.toString()]);
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [], complete: false });
+
+			// NO connection event fires here. The timer alone must re-run the check and re-emit.
+			await waitFor(() => events.length >= 1, {
+				description: 'the re-check timer re-detected the unconfirmed peer with no topology event'
+			});
+			expect(events[0]!.grown.get('block-1')).to.deep.equal([peerId2.toString()]);
+
+			await monitor.stop();
+			expect(monitor.getGrowthDiagnostics().recheckArmed, 'stop() clears the timer').to.equal(false);
+		});
+
+		it('stays disarmed when growthRecheckIntervalMs is 0', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, {
+				minRebalanceIntervalMs: 0,
+				growthRecheckIntervalMs: 0
+			});
+			monitor.trackBlock('block-1');
+			await monitor.start();
+
+			await monitor.checkNow();
+			expect(monitor.getGrowthDiagnostics().recheckArmed, 'disabled timer never arms').to.equal(false);
+
+			await monitor.stop();
 		});
 	});
 

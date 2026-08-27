@@ -1137,10 +1137,16 @@ export async function createLibp2pNodeBase(
 						// document it here rather than add locking.
 						//
 						// The event's `grown` arm (blocks this node KEEPS whose cohort acquired new peers — the
-						// founder/cohort-growth case) is handled entirely inside handleRebalanceEvent: it pushes
-						// each grown block to the newly co-responsible peers. Nothing is released or untracked off
-						// that arm — the node keeps serving the block either way — so the only local effect here is
-						// the log line naming what could not be confirmed this pass.
+						// founder/cohort-growth case): handleRebalanceEvent pushes each grown block to the newly
+						// co-responsible peers and returns a per-block GrowthOutcome in `result.growth`, which is
+						// fed back into the monitor here. The monitor records a peer as seen ONLY off that
+						// feedback (a confirmed replica, or a block that otherwise reached its floor), so a failed
+						// push is re-detected on the next check instead of being silently dropped — bounded by
+						// growthMaxAttempts, after which the monitor abandons the peer for that block (visible in
+						// getGrowthDiagnostics). Nothing is released or untracked off the grown arm — the node
+						// keeps serving the block either way. On the catch path NOTHING is recorded: the monitor's
+						// state stays un-advanced and the next check retries, the correct outcome for a reaction
+						// that threw.
 						rebalanceMonitor.onRebalance((event) => {
 							for (const blockId of event.gained) ownedBlocks.add(blockId);
 							coordinator.handleRebalanceEvent(event).then((result) => {
@@ -1148,9 +1154,15 @@ export async function createLibp2pNodeBase(
 									rebalanceMonitor.untrackBlock(blockId); // also evicts from the shared ownedBlocks set
 									gcEligible.add(blockId);                 // confirmed replicated → safe to sweep
 								}
+								for (const [blockId, outcome] of result.growth) {
+									rebalanceMonitor.recordGrowthOutcome(blockId, outcome);
+								}
 								if (result.underReplicated.length > 0) {
-									log?.('cohort-growth: %d of %d grown blocks not confirmed on new peers this pass',
-										result.underReplicated.length, event.grown.size);
+									const growthDiag = rebalanceMonitor.getGrowthDiagnostics();
+									log?.('cohort-growth: %d of %d grown blocks not confirmed on new peers this pass ' +
+										'(awaiting-confirmation=%d given-up-pairs=%d)',
+										result.underReplicated.length, event.grown.size,
+										growthDiag.blocksAwaitingConfirmation, growthDiag.abandonedPairs);
 								}
 							}).catch((err) => {
 								log?.('rebalance reaction failed: %o', err);

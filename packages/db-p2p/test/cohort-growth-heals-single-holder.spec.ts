@@ -205,12 +205,17 @@ function createLoopbackStream(
 class LoopbackPeerNetwork implements IPeerNetwork {
 	private readonly services = new Map<string, BlockTransferService>();
 	dialed: string[] = [];
+	/** Peer ids whose dial fails (a transiently unreachable machine). */
+	readonly unreachable = new Set<string>();
 
 	register(peerId: PeerId, service: BlockTransferService): void {
 		this.services.set(peerId.toString(), service);
 	}
 
 	async connect(peerId: PeerId, _protocol: string): Promise<any> {
+		if (this.unreachable.has(peerId.toString())) {
+			throw new Error(`loopback: ${peerId.toString()} is unreachable`);
+		}
 		const target = this.services.get(peerId.toString());
 		if (!target) throw new Error(`loopback: no service registered for ${peerId.toString()}`);
 		this.dialed.push(peerId.toString());
@@ -346,6 +351,10 @@ describe('cohort growth replicates the founder block and makes it readable', fun
 		expect(result.replicated, 'the grown block confirmed on the floor of new peers').to.deep.equal([BLOCK_ID]);
 		expect(result.released, 'nothing released — A keeps the block').to.deep.equal([]);
 		expect(network.dialed, 'both joiners were dialed').to.have.members([peerB.toString(), peerC.toString()]);
+
+		// The node-base handler feeds the reaction's outcomes back — that is what records the peers
+		// as seen (the monitor no longer records anything at report time).
+		for (const [blockId, outcome] of result.growth) monitor.recordGrowthOutcome(blockId, outcome);
 
 		// B and C now hold durable replicas at the SOURCE's (rev, actionId) — the blockMeta ride-along
 		// is what makes these replicas able to corroborate A's claim in the quorum vote.
