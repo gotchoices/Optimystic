@@ -104,3 +104,13 @@ Neither is a new defect, and neither changes the shape of the extraction. They a
 argument yet for the acceptance criterion already stated above: the collaborator that owns freshness
 should own the *record* of what an earlier pass concluded too, with each fact named and its lifetime
 stated in one place, rather than lifetimes reconstructed at three call sites.
+
+## Fourth measurement (review pass on `mesh-partition-admission-quereus-validation`)
+
+Re-measured (`wc -l packages/db-p2p/src/repo/coordinator-repo.ts`): **1451 lines**, up from 1341.
+Evidence only — this ticket's shape is unchanged. The growth since the third measurement is not
+freshness state; it is the solo-cohort short-circuit gaining a third copy (`cancel` joined `pend`
+and `commit`, each deciding `peerCount <= 1` for itself with its own explanatory comment). Worth
+noting for whoever does the extraction: "how does this operation decide whether the cluster path
+applies at all" is a second small concern living inline in this file three times over, and it is
+adjacent to, but distinct from, the freshness state this ticket is about.

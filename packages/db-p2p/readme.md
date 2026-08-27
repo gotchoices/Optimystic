@@ -557,8 +557,10 @@ const soloNode = await createLibp2pNode({
 In solo mode:
 
 - The node is its own coordinator. `CoordinatorRepo` short-circuits to local
-  storage when the cluster size is ≤ 1, so `pend`/`commit` do not require
-  cluster consensus and do not attempt to dial self.
+  storage when the cluster size is ≤ 1, so `pend`, `commit` and `cancel` do not
+  require cluster consensus and do not attempt to dial self. `pend` and `commit`
+  decide once (from the coordinating block); `cancel` decides per block id,
+  because a multi-block cancel can span cohorts of different sizes.
 - Block restoration is skipped when the only discovered peer is self.
   `RestorationCoordinator` will return `undefined` immediately rather than
   attempt to dial self (which would hang on a node with no listen addrs).

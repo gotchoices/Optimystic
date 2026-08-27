@@ -32,7 +32,7 @@
  * A member therefore has NO block id to derive its own view from on the commit path, so the gate's
  * confident predicates never run there and every commit falls to the fallback floor. See
  * `commit path: the gate has no block to derive from` below, and ticket
- * `commit-records-carry-no-coordinating-block`.
+ * `commit-and-cancel-records-omit-the-coordinating-block`.
  */
 
 import { expect } from 'chai';
@@ -65,9 +65,13 @@ const pendBlock = (node: MeshNode, blockId: string, actionId: string) =>
 const commitBlock = (node: MeshNode, blockId: string, actionId: string, rev = 1) =>
 	node.coordinatorRepo.commit({ actionId, tailId: blockId as BlockId, rev, blockIds: [blockId as BlockId] });
 
-/** What a node's own storage holds for a block, bypassing any cluster consult. */
+/**
+ * What a node's own storage holds for a block. Reads the node's `StorageRepo` directly rather than
+ * its `CoordinatorRepo`, so no cluster consult can happen and no read-repair can manufacture the
+ * very committed revision these cases assert is absent.
+ */
 const localState = async (node: MeshNode, blockId: string) => {
-	const result = await node.storageRepo.get({ blockIds: [blockId as BlockId] }, { skipClusterFetch: true } as any);
+	const result = await node.storageRepo.get({ blockIds: [blockId as BlockId] });
 	return result[blockId];
 };
 
@@ -247,11 +251,16 @@ describe('mesh partition — membership admission gate', () => {
 			collapseConfidence(target, target.minority);
 
 			const blockId = 'block-majority-pend';
-			const { captured, error } = await runCapturingFailure(
-				() => pendBlock(target.majority[0]!, blockId, 'a-majority')
-			);
+			let result: Awaited<ReturnType<typeof pendBlock>> | undefined;
+			const { captured, error } = await runCapturingFailure(async () => {
+				result = await pendBlock(target.majority[0]!, blockId, 'a-majority');
+			});
 
 			expect(error, 'the majority pend must succeed').to.equal(undefined);
+			// Not merely "did not throw": `pend` also reports a lost race or a stale revision as a
+			// returned `success: false`, which would leave nothing admitted and still pass a
+			// no-throw assertion.
+			expect(result?.success, 'the majority pend must report success').to.equal(true);
 			expect(admissionRejectReasons(captured), 'no majority member refused admission').to.deep.equal([]);
 		});
 
@@ -264,7 +273,7 @@ describe('mesh partition — membership admission gate', () => {
 			//
 			// Pinned as-is deliberately: it is a real defect (a cohort can pass pend and be refused at
 			// commit, stranding the write pended-but-uncommitted), filed as
-			// `commit-records-carry-no-coordinating-block`. When that lands this case flips to
+			// `commit-and-cancel-records-omit-the-coordinating-block`. When that lands this case flips to
 			// asserting a successful commit — the arithmetic above already says the confident majority
 			// should be admitted.
 			const target = await createFiveNodeMesh();

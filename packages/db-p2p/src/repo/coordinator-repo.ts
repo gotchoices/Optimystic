@@ -1355,6 +1355,14 @@ export class CoordinatorRepo implements IRepo {
 			// deployment could pend and commit but never cancel, unless the operator had opened the
 			// `allowUnvalidatedSmallCluster` hatch. Decided per block rather than once for
 			// `blockIds[0]`, because a multi-block cancel can span cohorts of different sizes.
+			//
+			// NOTE: `getClusterSize` is a second `findCluster` for the same key that
+			// `executeClusterTransaction` is about to look up again, so a cancel over N blocks now
+			// costs 2N cohort lookups instead of N. Same shape `pend` and `commit` already pay, but
+			// they pay it once (they only ever consult `blockIds[0]`) where this scales with N. Fine
+			// while cancels span a handful of blocks; if wide multi-block cancels ever show up hot,
+			// have `executeClusterTransaction` return the cohort it already fetched (or own the
+			// short-circuit itself) rather than adding a cache here.
 			const results = await Promise.all(blockIds.map(async blockId => {
 				const peerCount = await this.coordinator.getClusterSize(blockId);
 				if (peerCount <= 1) return false;

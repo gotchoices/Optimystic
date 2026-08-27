@@ -109,3 +109,37 @@ wrong key, which is worse than deriving none.
   so a minority side is refused at both.
 - Multi-block `cancel`: each per-block transaction carries its own block id.
 - Unchanged behavior for `allowUnvalidatedSmallCluster` and for the `peerCount <= 1` short-circuits.
+
+## Second correction, from the review pass on `mesh-partition-admission-quereus-validation`
+
+The "Correction to the originating handoff" section above is itself measured against the wrong
+wiring, and the numbers it hands the implementer are not the ones a real node runs on. Both of its
+claims come from `ClusterMember`'s own constructor fallbacks (`cluster-repo.ts:273-276`:
+`minAbsoluteClusterSize ?? 3`, `assumedClusterSize` left `undefined`), which apply only when a
+member is constructed with no `consensusConfig` at all — a direct-construction path used by unit
+tests, not by node assembly.
+
+A real node is assembled through `resolveClusterPolicy` (`cluster-policy.ts:262-283`), called once
+in `libp2p-node-base.ts:484` and handed to the member as `consensusConfig`. That result **always**
+sets both fields:
+
+- `minAbsoluteClusterSize` = 2 (`cluster-policy.ts:53`), not 3;
+- `assumedClusterSize` = `clusterPolicy.assumedClusterSize ?? minAbsoluteClusterSize` — so it is
+  **never `undefined` on a real node**.
+
+Consequences for this ticket, both of which change what the fix has to be judged against:
+
+- The "admits essentially any declared set containing the member" branch
+  (`cluster-repo.ts:1007-1009`, guarded on `assumedClusterSize === undefined`) is **unreachable**
+  through node assembly. It is a direct-constructor / test-wiring case, not the production
+  commit-path posture. Do not write it into a release note as a live production hole.
+- The live production weakness is quantitatively different and still real: an undeclared deployment
+  resolves `assumedClusterSize` to 2, so the commit/cancel fallback floor is
+  `max(2, ceil(0.75 * 2)) = 2`. Every cohort of two or more clears it, which is *nominal* gating
+  rather than *no* gating. A deployment that declares its real cohort size gets a proportional
+  floor on the fallback path too.
+
+The direction of the defect is unchanged, and so is the preferred fix. What changes is the test
+matrix: assertions about the commit path must be written against a member built from a resolved
+policy (as `mesh-harness.ts` does — it passes `consensusConfig: policy`), because a member built
+from bare constructor defaults exercises floors no deployment ever sees.
