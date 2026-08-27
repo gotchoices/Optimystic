@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 
 /**
  * Structural guard: `src/network/open-protocol-stream.ts` is the ONLY file in this package allowed
@@ -18,6 +19,10 @@ import { fileURLToPath } from 'node:url';
  *
  * Modeled on `testing-entry-runtime-deps.spec.ts` — same package, same shape: walk the source
  * files, assert a structural rule.
+ *
+ * NOTE: the walk covers `packages/db-p2p/src` only, because `db-p2p` is the only package that
+ * depends on libp2p directly today. If a second package ever takes a libp2p dependency, this guard
+ * will not notice its dial sites — widen `srcRoot` to the other package's `src` at that point.
  */
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -26,12 +31,7 @@ const srcRoot = path.join(packageRoot, 'src');
 /** The one file permitted to open a protocol stream directly. Keep this a one-element set. */
 const ALLOWED = new Set(['src/network/open-protocol-stream.ts']);
 
-/**
- * Member-call syntax only, so a *method definition* does not trip the guard —
- * `src/testing/cohort-topic-mesh-harness.ts` defines `dialProtocol(peer, protocols)` on its
- * `MockNode` with no leading dot, and is a legitimate implementation rather than a caller.
- */
-const DIRECT_OPEN_RE = /\.(dialProtocol|newStream)\s*\(/g;
+const GUARDED_METHODS = new Set(['dialProtocol', 'newStream']);
 
 export interface Violation {
 	file: string;
@@ -40,62 +40,34 @@ export interface Violation {
 }
 
 /**
- * Blank out `//` and block comments while preserving every newline, so line numbers survive and
- * prose that merely mentions the method names does not trip the guard (several docblocks in
- * `stream-util.ts` and `libp2p-key-network.ts` legitimately do).
+ * Direct `dialProtocol` / `newStream` member calls in `source`, as 1-indexed lines.
  *
- * String literals are tracked so a `//` inside one is not read as a comment. Regex literals are
- * NOT tracked: a regex containing a lone quote character would put the scanner into string mode
- * and blank out real code after it. That direction is a false negative, never a false positive,
- * and `finds the calls inside the allowlisted file` below pins that the stripper has not started
- * swallowing the tree wholesale.
+ * Parsed with TypeScript's own parser rather than scanned textually, so the guard sees exactly
+ * what the compiler sees: prose in a comment, a name inside a string or template literal, and a
+ * method *definition* (`src/testing/cohort-topic-mesh-harness.ts` implements `dialProtocol` on its
+ * `MockNode`) are all structurally distinct from a call and cannot trip it, while `node?.newStream(…)`
+ * — which a `\.newStream\s*\(` regex misses — cannot slip past it.
+ *
+ * Only member calls on a named property are matched. Dynamic dispatch (`conn['newStream'](…)`, or
+ * the method pulled out into a variable first) is not detected; that direction is a false negative,
+ * and `finds the calls inside the allowlisted file` below pins that the walk still sees real calls.
  */
-export function stripComments(source: string): string {
-	type Mode = 'code' | 'line' | 'block' | 'single' | 'double' | 'template';
-	let mode: Mode = 'code';
-	let out = '';
-	let i = 0;
-	while (i < source.length) {
-		const ch = source[i]!;
-		const next = source[i + 1];
-		if (mode === 'code') {
-			if (ch === '/' && next === '/') { mode = 'line'; out += '  '; i += 2; continue; }
-			if (ch === '/' && next === '*') { mode = 'block'; out += '  '; i += 2; continue; }
-			if (ch === "'") mode = 'single';
-			else if (ch === '"') mode = 'double';
-			else if (ch === '`') mode = 'template';
-			out += ch; i++; continue;
-		}
-		if (mode === 'line') {
-			if (ch === '\n') { mode = 'code'; out += ch; } else out += ' ';
-			i++; continue;
-		}
-		if (mode === 'block') {
-			if (ch === '*' && next === '/') { mode = 'code'; out += '  '; i += 2; continue; }
-			out += ch === '\n' ? '\n' : ' ';
-			i++; continue;
-		}
-		// Inside a string literal: copied through verbatim, escapes consumed in pairs so a
-		// trailing `\'` does not read as the closing quote.
-		if (ch === '\\') { out += ch + (next ?? ''); i += 2; continue; }
-		if ((mode === 'single' && ch === "'") || (mode === 'double' && ch === '"') || (mode === 'template' && ch === '`')) {
-			mode = 'code';
-		}
-		out += ch; i++;
-	}
-	return out;
-}
-
-/** Direct `dialProtocol` / `newStream` member calls in `source`, as 1-indexed lines. */
 export function findDirectStreamOpens(file: string, source: string): Violation[] {
+	const parsed = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, /* setParentNodes */ true, ts.ScriptKind.TS);
 	const found: Violation[] = [];
-	const lines = stripComments(source).split('\n');
-	lines.forEach((text, index) => {
-		DIRECT_OPEN_RE.lastIndex = 0;
-		for (const match of text.matchAll(DIRECT_OPEN_RE)) {
-			found.push({ file, line: index + 1, method: match[1]! });
+
+	const visit = (node: ts.Node): void => {
+		if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+			const method = node.expression.name.text;
+			if (GUARDED_METHODS.has(method)) {
+				const { line } = parsed.getLineAndCharacterOfPosition(node.expression.name.getStart(parsed));
+				found.push({ file, line: line + 1, method });
+			}
 		}
-	});
+		ts.forEachChild(node, visit);
+	};
+	visit(parsed);
+
 	return found;
 }
 
@@ -176,6 +148,29 @@ describe('protocol streams are opened in exactly one place', () => {
 			expect(findDirectStreamOpens('src/x.ts', source)).to.deep.equal([
 				{ file: 'src/x.ts', line: 4, method: 'dialProtocol' },
 			]);
+		});
+
+		it('flags an optionally-chained call, which a `.method(` text scan would miss', () => {
+			expect(findDirectStreamOpens('src/x.ts', 'await node?.dialProtocol(p, [q]);')).to.deep.equal([
+				{ file: 'src/x.ts', line: 1, method: 'dialProtocol' },
+			]);
+		});
+
+		it('is not derailed by a quote character inside a regex literal', () => {
+			// A textual scanner tracking string state would enter string mode at the lone `'` and
+			// blank out the real call that follows it.
+			const source = "const q = /it's/;\nawait node.dialProtocol(p, [q]);\n";
+			expect(findDirectStreamOpens('src/x.ts', source)).to.deep.equal([
+				{ file: 'src/x.ts', line: 2, method: 'dialProtocol' },
+			]);
+		});
+
+		it('flags a call interpolated into a template literal', () => {
+			expect(findDirectStreamOpens('src/x.ts', 'const s = `${await conn.newStream([p])}`;')).to.have.length(1);
+		});
+
+		it('ignores the names inside a string literal', () => {
+			expect(findDirectStreamOpens('src/x.ts', "log('conn.newStream(...) is forbidden here');")).to.deep.equal([]);
 		});
 
 		it('does not treat `//` inside a string literal as the start of a comment', () => {

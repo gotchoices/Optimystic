@@ -47,7 +47,7 @@ export interface OpenProtocolStreamOptions {
  * versions that leave `limits` unpopulated.
  */
 export function isLimitedConnection(c: Connection): boolean {
-	if ((c as { limits?: unknown }).limits != null) return true;
+	if (c.limits != null) return true;
 	return c.remoteAddr?.toString?.().includes("/p2p-circuit") ?? false;
 }
 
