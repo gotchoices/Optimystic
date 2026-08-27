@@ -80,3 +80,14 @@ work was planned on the assumption that flipping a flag was all that stood betwe
 Found while planning `implement/5-mesh-harness-signature-enforcement`, which needed to answer
 "how would a deployment turn signature enforcement on?" and found that it cannot. That ticket leaves
 a `NOTE:` at `QuereusValidatorOptions.requireClientSignature` pointing here.
+
+## Related — two holes in the seam this ticket would switch on
+
+Reviewing `mesh-harness-signature-enforcement` turned up two ways
+`ClusterMember.validatePendOperations` skips the check rather than enforcing it, on a member that
+*does* have a validator: a sender that omits `operationsHash` (or `transaction`) falls through the
+presence guard unchecked, and a validator that throws escapes as an error rather than becoming a
+signed reject vote — so a cohort of failing validators degrades toward not-validating, not toward
+refusing. Filed separately as `debt-pend-validation-is-skipped-instead-of-failing-closed`, because
+they are worth closing *before* this wiring lands: with them open, turning validation on only partly
+turns it on.

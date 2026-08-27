@@ -3,9 +3,10 @@
  * identity driving db-core's signer/verifier PORTS.
  *
  * These are the exact closures the Quereus plugin's collection-factory and `quereus-validator` bind
- * in production — reproduced here from `db-p2p` primitives only, so a spec can exercise enforcement
- * without pulling in Quereus (and without the chicken-and-egg of building a `Database` before a
- * mesh). Two consumers today: `test/client-tx-signature.spec.ts` (the seam, single process) and
+ * in production: the verify side is imported outright (`createPeerClientSignatureVerifier`), the sign
+ * side rebuilt from the same `db-p2p` primitive, so a spec can exercise enforcement without pulling in
+ * Quereus (and without the chicken-and-egg of building a `Database` before a mesh). Two consumers
+ * today: `test/client-tx-signature.spec.ts` (the seam, single process) and
  * `test/mesh-client-signature-enforcement.spec.ts` (the same seam through a live cluster PEND).
  */
 
@@ -20,7 +21,6 @@ import {
 	clientSignaturePayload,
 	hashOperations,
 	bytesToB64url,
-	b64urlToBytes,
 	TransactionValidator,
 	type Transaction,
 	type ReadDependency,
@@ -29,7 +29,8 @@ import {
 	type EngineRegistration,
 	type ValidationCoordinatorFactory,
 } from '@optimystic/db-core';
-import { signPeer, verifyPeerSig } from '../../src/cohort-topic/peer-sig.js';
+import { signPeer } from '../../src/cohort-topic/peer-sig.js';
+import { createPeerClientSignatureVerifier } from '../../src/cluster/client-signature-verifier.js';
 
 /**
  * The schema hash every stamp and every validator built here agrees on. A stamp carrying a different
@@ -44,17 +45,11 @@ export function makeSigner(key: PrivateKey): TransactionSigner {
 }
 
 /**
- * The exact verifier closure `quereus-validator` wires when `requireClientSignature` is on. Total by
- * construction: `verifyPeerSig` returns false (never throws) on a non-Ed25519 or malformed peer-id,
- * and the try/catch additionally covers the base64url decode.
+ * The verifier closure `quereus-validator` wires when `requireClientSignature` is on — the SAME
+ * factory, imported rather than re-typed, so this file's claim to reproduce production cannot drift
+ * out of date without a compile error.
  */
-export const verifier: ClientSignatureVerifier = (peerId, payload, signature) => {
-	try {
-		return verifyPeerSig(peerId, payload, b64urlToBytes(signature));
-	} catch {
-		return false;
-	}
-};
+export const verifier: ClientSignatureVerifier = createPeerClientSignatureVerifier();
 
 /**
  * The operations hash of a transaction that carries NO statements.
@@ -63,6 +58,12 @@ export const verifier: ClientSignatureVerifier = (peerId, payload, signature) =>
  * `hashOperations([])` regardless of what transforms the pend request actually carries — which makes
  * every validator step except the signature check pass trivially. That isolation is the whole point;
  * it evaporates the moment a case adds statements.
+ *
+ * NOTE: this only holds while every consumer stays statement-free. A case that adds statements and
+ * keeps sending `emptyOpsHash()` fails at the validator's step 9 with `Operations hash mismatch` — a
+ * verdict about operations, not signatures, whose message gives no hint that the ops hash is the
+ * stale part. If a spec ever needs real statements, compute the hash from the same transforms the
+ * pend carries instead of reaching for this.
  */
 export const emptyOpsHash = async (): Promise<string> => await hashOperations([]);
 

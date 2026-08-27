@@ -29,6 +29,10 @@
  *   - 4-node mesh → superMajority 3, maxAllowedRejections 1: one rejecting member is absorbed, two
  *     are fatal. That is what makes the per-node case below meaningful rather than arbitrary.
  *
+ * Both budgets are ASSERTED from the exported default in this suite's `before`, not merely asserted
+ * in prose here — a change to `DEFAULT_SUPER_MAJORITY_THRESHOLD` must fail loudly rather than quietly
+ * swap which cases are "absorbed" and which are "fatal".
+ *
  * ## Isolating the signature step
  *
  * Every transaction here carries NO statements, so re-execution yields no actions and the validator
@@ -49,6 +53,7 @@
 
 import { expect } from 'chai';
 import type { BlockId, IBlock, BlockHeader, Transforms, Transaction } from '@optimystic/db-core';
+import { DEFAULT_SUPER_MAJORITY_THRESHOLD } from '@optimystic/db-core';
 import type { PrivateKey } from '@libp2p/interface';
 import { createMesh, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
 import { ValidatorRejectionError } from '../src/repo/cluster-coordinator.js';
@@ -120,6 +125,20 @@ const reasonsOf = (error: Error | undefined): string[] =>
 // ─── mesh construction ───
 
 /**
+ * The member's own arithmetic (`cluster-repo.ts`: `superMajority = ceil(peerCount * threshold)`,
+ * `maxAllowedRejections = peerCount - superMajority`), recomputed here from the SAME exported
+ * default the harness resolves to.
+ *
+ * The per-node cases below are only meaningful at particular rejection budgets: 0 for the three-node
+ * meshes (any one refusal is fatal) and 1 for the four-node ones (one refusal absorbed, two fatal).
+ * Asserting the budget rather than restating it in a comment means a change to
+ * `DEFAULT_SUPER_MAJORITY_THRESHOLD` fails HERE, naming the reason, instead of silently inverting
+ * "absorbed" and "fatal" into two cases that quietly test the opposite of what they say.
+ */
+const maxAllowedRejections = (peerCount: number): number =>
+	peerCount - Math.ceil(peerCount * DEFAULT_SUPER_MAJORITY_THRESHOLD);
+
+/**
  * `nodeCount` nodes, every one responsible for every key, declaring its real cohort size so the
  * membership admission gate has an honest yardstick and admits. `enforcingIndices` names which nodes
  * get a signature-ENFORCING validator (omit it for "all of them"); the rest still get a validator,
@@ -144,6 +163,11 @@ const createEnforcingMesh = async (nodeCount: number, enforcingIndices?: number[
 };
 
 describe('mesh — client transaction signature enforcement at PEND', () => {
+	before(() => {
+		expect(maxAllowedRejections(3), 'a 3-node cohort must tolerate NO rejections for these cases to mean what they say').to.equal(0);
+		expect(maxAllowedRejections(4), 'a 4-node cohort must tolerate exactly ONE rejection for the per-node cases to mean what they say').to.equal(1);
+	});
+
 	let clientKey: PrivateKey;
 	let clientPeerId: string;
 	let strangerKey: PrivateKey;

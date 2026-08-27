@@ -11,10 +11,9 @@ import type {
 	ITransactionValidator,
 	CollectionActions,
 	BlockStateProvider,
-	ClientSignatureVerifier,
 } from '@optimystic/db-core';
-import { TransactionValidator, type EngineRegistration, type ValidationCoordinatorFactory, b64urlToBytes } from '@optimystic/db-core';
-import { verifyPeerSig } from '@optimystic/db-p2p';
+import { TransactionValidator, type EngineRegistration, type ValidationCoordinatorFactory } from '@optimystic/db-core';
+import { createPeerClientSignatureVerifier } from '@optimystic/db-p2p';
 import { QuereusEngine, QUEREUS_ENGINE_ID } from './quereus-engine.js';
 
 /**
@@ -48,23 +47,6 @@ export interface QuereusValidatorOptions {
 	 * when a composition root starts supplying `NodeOptions.validator`.
 	 */
 	requireClientSignature?: boolean;
-}
-
-/**
- * The p2p-backed {@link ClientSignatureVerifier}: derive the signer's Ed25519 public key from the
- * peer-id string embedded in `stamp.peerId` and verify the base64url signature over the canonical
- * payload. `verifyPeerSig` is total (returns `false`, never throws, on a non-Ed25519 / malformed
- * peer-id or bad signature); the try/catch additionally makes the base64url decode total, so the
- * whole verifier honors the "never throws" contract even on adversarial input.
- */
-function createClientSignatureVerifier(): ClientSignatureVerifier {
-	return (peerId: string, payload: Uint8Array, signature: string): boolean => {
-		try {
-			return verifyPeerSig(peerId, payload, b64urlToBytes(signature));
-		} catch {
-			return false;
-		}
-	};
 }
 
 /**
@@ -125,7 +107,7 @@ export function createQuereusValidator(options: QuereusValidatorOptions): ITrans
 	// Wire the client-signature verifier port ONLY when enforcement is requested. Omitting it (the
 	// default) means the validator's signature step accepts both unsigned and signed transactions —
 	// the phased-rollout posture (see requireClientSignature).
-	const verifyClientSignature = options.requireClientSignature ? createClientSignatureVerifier() : undefined;
+	const verifyClientSignature = options.requireClientSignature ? createPeerClientSignatureVerifier() : undefined;
 
 	return new TransactionValidator(engines, createValidationCoordinator, options.blockStateProvider, verifyClientSignature);
 }

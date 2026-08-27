@@ -5,11 +5,12 @@
  * un-backed. This exercises the p2p backing this ticket supplies — the exact closures the Quereus plugin
  * wires:
  *   - signer:   async payload => bytesToB64url(await signPeer(nodeKey, payload))
- *   - verifier: (peerId, payload, sig) => { try { return verifyPeerSig(peerId, payload, b64urlToBytes(sig)); } catch { return false; } }
+ *   - verifier: `createPeerClientSignatureVerifier()` from `db-p2p` — the very factory
+ *     `createQuereusValidator` calls, not a re-typed copy of it
  * driven through db-core's TransactionSession (sign) and TransactionValidator (verify) with a genuine
  * generateKeyPair('Ed25519') identity, so the crypto actually round-trips end to end.
  *
- * Both closures, plus the validator/transaction builders, live in `test/support/client-tx-signature.ts`
+ * Both, plus the validator/transaction builders, are reached through `test/support/client-tx-signature.ts`
  * — shared with `mesh-client-signature-enforcement.spec.ts`, which runs the same seam through a live
  * cluster PEND. This file stays the SINGLE-PROCESS tier: validator constructed directly, no mesh.
  */
