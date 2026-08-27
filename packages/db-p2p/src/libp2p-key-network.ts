@@ -1,4 +1,4 @@
-import type { AbortOptions, Connection, Libp2p, PeerId, Stream } from "@libp2p/interface";
+import type { AbortOptions, Libp2p, PeerId, Stream } from "@libp2p/interface";
 import { toString as u8ToString } from 'uint8arrays'
 import type { ClusterPeers, CoordinatorIntent, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } from "@optimystic/db-core";
 import { peerIdFromString } from '@libp2p/peer-id'
@@ -7,6 +7,7 @@ import { hashKey } from 'p2p-fret'
 import { createLogger, verbose } from './logger.js'
 import { classifySelfDialability, mergePeerAddresses, publishableConnectionAddr, unionPublishableAddrs, type AddressLog } from './peer-address-book.js'
 import type { IPeerReputation } from './reputation/types.js'
+import { openProtocolStream } from './network/open-protocol-stream.js'
 
 interface WithFretService { services?: { fret?: FretService } }
 
@@ -592,61 +593,34 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	}
 
 	/**
-	 * True for a circuit-relay ("limited") connection. libp2p stamps a relayed
-	 * connection with `limits` (per-circuit data/duration caps); we additionally
-	 * sniff the multiaddr for `/p2p-circuit` as a fallback for transports/versions
-	 * that don't populate `limits`.
-	 */
-	private isLimitedConnection(c: Connection): boolean {
-		if ((c as { limits?: unknown }).limits != null) return true
-		const addr = c.remoteAddr?.toString?.()
-		return addr != null && addr.includes('/p2p-circuit')
-	}
-
-	/**
 	 * Open a stream to `peerId` on `protocol` — reusing a live connection when we hold one, and
 	 * otherwise dialing.
+	 *
+	 * Connection selection (prefer a direct connection over a resettable circuit-relay one, skip
+	 * entries libp2p has not yet evicted, opt in to limited connections) lives in
+	 * {@link openProtocolStream}, the single place in this package that opens a protocol stream.
+	 *
+	 * `negotiateFully: false` is safe here and saves a round trip: this is request/response and the
+	 * caller always reads a reply, so an unsupported-protocol failure deferred to the first read is
+	 * still observed. The caller's `AbortSignal` is forwarded so a per-peer dial deadline (enforced
+	 * upstream by `ProtocolClient.processMessage`) can actually cancel a stuck dial — without it,
+	 * libp2p falls back to its built-in connection-manager `dialTimeout` and the caller's tighter
+	 * deadline is decorative.
 	 *
 	 * The cold path pays one `peerStore.get` before dialing, to separate two failures libp2p
 	 * reports identically: "nobody ever taught us an address" and "every address we hold routes
 	 * back through us" (see {@link SelfRelayOnlyAddressesError}). Only the second is diagnosed
 	 * here; the first still dials, so an unknown peer produces libp2p's own `NoValidAddressesError`
-	 * exactly as before. The warm path is deliberately kept clear of that read: it is only reached
-	 * when a connection already exists, which is the case this method exists to make cheap.
+	 * exactly as before. It rides `beforeDial`, which never runs on the reuse path — the warm path
+	 * is deliberately kept clear of that read, since a live connection is the case this method
+	 * exists to make cheap.
 	 */
 	async connect(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<Stream> {
-		const conns = this.libp2p.getConnections?.(peerId) ?? []
-		// Filter to only-open connections so a closing/closed entry that libp2p
-		// hasn't yet evicted from its index doesn't get picked up here.
-		const open = conns.filter(c => c?.status === 'open' && typeof c?.newStream === 'function')
-		// Prefer a DIRECT connection over a limited (circuit-relay) one for the RPC.
-		// A relayed/limited connection can be reset by the relay once a per-circuit
-		// cap or reservation lapses (@libp2p/circuit-relay-v2), surfacing to the
-		// coordinator as a StreamResetError that fails consensus. After DCUtR upgrades
-		// a relayed link to direct, both connections briefly coexist — picking the
-		// direct one avoids riding the soon-to-be-reset circuit. We only fall back to
-		// the limited connection (with runOnLimitedConnection) when it is the only open
-		// path — the steady state for browsers and NATed peers before any upgrade.
-		const chosen = open.find(c => !this.isLimitedConnection(c)) ?? open[0]
-		if (chosen) {
-			// runOnLimitedConnection: true is required to open a stream over a
-			// circuit-relay (limited) connection — the steady-state path for
-			// browsers and NATed peers. Without it, the warm relay connection
-			// from a prior dialProtocol cannot be reused on subsequent RPCs. It is
-			// a harmless no-op on the preferred direct connection.
-			return chosen.newStream([protocol], {
-				signal: options?.signal,
-				runOnLimitedConnection: true,
-				negotiateFully: false
-			})
-		}
-		await this.assertNotSelfRelayOnly(peerId, protocol, options)
-		// Forward the caller's AbortSignal so a per-peer dial deadline (enforced
-		// upstream by ProtocolClient.processMessage) can actually cancel a stuck
-		// dial — without this, libp2p falls back to its built-in dial timeout
-		// (default ~30s) and the caller's tighter deadline is decorative.
-		const dialOptions = { runOnLimitedConnection: true, negotiateFully: false, signal: options?.signal } as const
-		return await this.libp2p.dialProtocol(peerId, [protocol], dialOptions)
+		return await openProtocolStream(this.libp2p, peerId, protocol, {
+			signal: options?.signal,
+			negotiateFully: false,
+			beforeDial: () => this.assertNotSelfRelayOnly(peerId, protocol, options)
+		})
 	}
 
 	/**

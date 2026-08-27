@@ -1065,7 +1065,11 @@ export async function createLibp2pNodeBase(
 				// Setup restoration coordinator with FRET adapter
 				const restorationCoordinatorV2 = new RestorationCoordinator(
 					fretAdapter,
-					{ connect: (pid, protocol) => node.dialProtocol(pid as Parameters<typeof node.dialProtocol>[0], [protocol]) },
+					// The node's own IPeerNetwork, not an inline `dialProtocol` lambda: the lambda opened
+					// streams without `runOnLimitedConnection`, so a block holder reachable only through a
+					// relay looked like a peer that simply did not have the block, and it dropped the
+					// caller's AbortSignal, so `SyncClient`'s per-peer dial deadline never bounded a dial.
+					keyNetwork,
 					`/optimystic/${options.networkName}`,
 					node.peerId.toString()
 				);
