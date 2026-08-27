@@ -25,14 +25,15 @@
  * Theorem 2 (`docs/correctness.md`) needs `2 * 0.75 * 0.75 = 1.125 > 1`: two sides of a split cannot
  * both recruit `fraction * threshold * K` distinct honest members out of one K-peer cluster.
  *
- * ## Known gap this file pins rather than papers over
+ * ## Every path carries the coordinating block
  *
- * Only `CoordinatorRepo.pend` puts `coordinatingBlockIds` on the `RepoMessage`; `commit` and
- * `cancel` do not, and `ClusterCoordinator.makeRecord` copies the field straight off the message.
- * A member therefore has NO block id to derive its own view from on the commit path, so the gate's
- * confident predicates never run there and every commit falls to the fallback floor. See
- * `commit path: the gate has no block to derive from` below, and ticket
- * `commit-and-cancel-records-omit-the-coordinating-block`.
+ * `ClusterCoordinator.executeClusterTransaction` derives `coordinatingBlockIds` onto a copy of the
+ * message from the cohort key it is already handed, so pend, commit and cancel all give a member a
+ * block to derive its own view from and all three run the confident predicates. (They used not to:
+ * only `CoordinatorRepo.pend` set the field, so a cohort admitted at pend could be refused at commit
+ * against the larger fallback floor and the write stranded pended-but-uncommitted.) The commit and
+ * cancel cases below assert the derivation actually happens, not merely that the outcome came out
+ * right — the outcome alone can coincide.
  */
 
 import { expect } from 'chai';
@@ -93,6 +94,21 @@ const payloadsOf = (captured: unknown[][], tag: string): Record<string, unknown>
 
 const admissionRejectReasons = (captured: unknown[][]): string[] =>
 	payloadsOf(captured, 'cluster-member:admission-reject').map(p => String(p.reason));
+
+/**
+ * The coordinating block ids members actually derived a cohort view from. This is the "the confident
+ * predicates ran" witness: an admitted outcome alone can coincide with the fallback floor also
+ * admitting, so every commit/cancel case asserts the derivation happened as well.
+ *
+ * `payloadsOf` matches substrings, and `cluster-member:derive-expected-cluster-error` contains the
+ * success tag — hence the explicit exclusion.
+ */
+const derivedBlockIds = (captured: unknown[][]): string[] =>
+	captured
+		.filter(args => typeof args[0] === 'string'
+			&& (args[0] as string).includes('cluster-member:derive-expected-cluster')
+			&& !(args[0] as string).includes('cluster-member:derive-expected-cluster-error'))
+		.map(args => String((args[1] as Record<string, unknown>).blockId));
 
 /** Run `fn`, returning both the member-side log and whatever it threw (if anything). */
 const runCapturingFailure = async (fn: () => Promise<unknown>): Promise<{ captured: unknown[][]; error?: Error }> => {
@@ -183,7 +199,6 @@ const craftRecord = async (peers: ClusterPeers, blockId: string): Promise<Cluste
 		membershipDigest: digest,
 		message,
 		peers,
-		coordinatingBlockIds: [blockId],
 		promises: {},
 		commits: {}
 	};
@@ -262,20 +277,19 @@ describe('mesh partition — membership admission gate', () => {
 			// no-throw assertion.
 			expect(result?.success, 'the majority pend must report success').to.equal(true);
 			expect(admissionRejectReasons(captured), 'no majority member refused admission').to.deep.equal([]);
+			expect(new Set(derivedBlockIds(captured)), 'members derived from the pended block')
+				.to.deep.equal(new Set([blockId]));
 		});
 
-		it('commit path: the gate has no block to derive from, so it falls back (KNOWN GAP)', async () => {
-			// `CoordinatorRepo.commit` builds its RepoMessage WITHOUT `coordinatingBlockIds`, and
-			// `ClusterCoordinator.makeRecord` copies the field off the message — so the member's
-			// `deriveExpectedClusterView` finds no block id, returns undefined, and the confident
-			// predicates that admitted the pend a moment ago never run. The commit is judged against
-			// the fallback floor 4 instead, which the 3-peer majority cannot meet.
+		it('admits the same majority on the commit path — the write is not stranded', async () => {
+			// The stranding case, both halves. `ClusterCoordinator.executeClusterTransaction` derives
+			// `coordinatingBlockIds` from the cohort key it is handed, so the commit record names a block
+			// and each member re-runs the SAME confident arithmetic that admitted the pend a moment ago:
+			// kEst 3, floor max(2, ceil(0.75 * 3)) = 3, |D| = 3 >= 3, symDiff 0 → approve.
 			//
-			// Pinned as-is deliberately: it is a real defect (a cohort can pass pend and be refused at
-			// commit, stranding the write pended-but-uncommitted), filed as
-			// `commit-and-cancel-records-omit-the-coordinating-block`. When that lands this case flips to
-			// asserting a successful commit — the arithmetic above already says the confident majority
-			// should be admitted.
+			// Before that derivation existed the commit record named no block, the gate fell to the
+			// fallback floor 4, and this 3-peer majority — already holding an admitted pend — was refused,
+			// leaving the write pended-but-never-committed.
 			const target = await createFiveNodeMesh();
 			splitViews(target);
 			collapseConfidence(target, target.minority);
@@ -283,13 +297,123 @@ describe('mesh partition — membership admission gate', () => {
 			const blockId = 'block-majority-commit';
 			expect((await pendBlock(target.majority[0]!, blockId, 'a-majority-commit')).success).to.equal(true);
 
+			let result: Awaited<ReturnType<typeof commitBlock>> | undefined;
+			const { captured, error } = await runCapturingFailure(async () => {
+				result = await commitBlock(target.majority[0]!, blockId, 'a-majority-commit');
+			});
+
+			expect(error, 'the majority commit must succeed').to.equal(undefined);
+			expect(result?.success, 'the majority commit must report success').to.equal(true);
+			expect(admissionRejectReasons(captured), 'no majority member refused the commit').to.deep.equal([]);
+			// The outcome alone can coincide (a fallback floor low enough would also admit); assert the
+			// confident path was the one that ran.
+			expect(new Set(derivedBlockIds(captured)), 'members derived a view on the commit path')
+				.to.deep.equal(new Set([blockId]));
+
+			// And the write actually landed on the majority side.
+			expect((await localState(target.majority[0]!, blockId))?.state?.latest?.rev).to.equal(1);
+		});
+
+		it('derives on the cancel path too, and gives each block of a multi-block cancel its own transaction', async () => {
+			// `CoordinatorRepo.cancel` builds ONE message and runs one cluster transaction per block, so
+			// this is the case that would break if the coordinating block were written into the shared
+			// message object instead of onto a per-transaction copy: one block's id would leak into the
+			// other block's transaction.
+			//
+			// It is also where two blocks with identical cohorts used to produce an identical
+			// `membershipDigest` and therefore an identical `messageHash` — colliding in the coordinator's
+			// `transactions` map and in `wasTransactionExecuted`. Per-block coordinating ids separate them.
+			const target = await createFiveNodeMesh();
+			const blockA = 'block-cancel-a';
+			const blockB = 'block-cancel-b';
+			const actionId = 'a-multi-cancel';
+
+			const pended = await target.mesh.nodes[0]!.coordinatorRepo.pend({
+				actionId,
+				transforms: {
+					inserts: { [blockA]: makeBlock(blockA), [blockB]: makeBlock(blockB) },
+					updates: {},
+					deletes: []
+				},
+				policy: 'c'
+			});
+			expect(pended.success, 'the two-block pend must succeed').to.equal(true);
+
+			// Coordinator-side log: one `cluster-tx:start` per block, each naming its own block.
+			const coordinatorLog = await captureLog('cluster', async () => {
+				await target.mesh.nodes[0]!.coordinatorRepo.cancel({ actionId, blockIds: [blockA as BlockId, blockB as BlockId] });
+			});
+			const starts = payloadsOf(coordinatorLog, 'cluster-tx:start');
+			expect(new Set(starts.map(p => String(p.blockId))), 'one transaction per cancelled block')
+				.to.deep.equal(new Set([blockA, blockB]));
+			expect(new Set(starts.map(p => String(p.messageHash))).size,
+				'the two per-block transactions must not collide on one messageHash').to.equal(2);
+
+			// Member-side: each block's members derived from THAT block, not from a single leaked id.
+			const memberLog = await captureLog('cluster-member', async () => {
+				await target.mesh.nodes[0]!.coordinatorRepo.cancel({ actionId, blockIds: [blockA as BlockId, blockB as BlockId] });
+			});
+			expect(new Set(derivedBlockIds(memberLog)), 'each cancel transaction derives from its own block')
+				.to.deep.equal(new Set([blockA, blockB]));
+			expect(admissionRejectReasons(memberLog), 'nothing was refused on the cancel path').to.deep.equal([]);
+		});
+	});
+
+	describe('a partitioned minority is judged on the commit path as well as the pend path', () => {
+		it('measures a minority commit against the minority members own derived view', async () => {
+			// The minority pends while the mesh is whole, then the split lands before the commit. Each
+			// minority member now derives its own 2-peer side and — because nothing collapsed its size
+			// estimate — derives it CONFIDENTLY: kEst 2, floor max(minAbsoluteClusterSize 2,
+			// ceil(0.75 * 2)) = 2, which |D| = 2 meets, symDiff 0 → admit.
+			//
+			// So a *confident* minority is not something this gate refuses, and it is not meant to be: a
+			// member that genuinely measures a 2-peer cohort cannot tell a partition from a small
+			// deployment. Theorem 2's protection rests on a partition COLLAPSING that confidence (the next
+			// case), which is what `meshConfidence` models here. Nothing diverges either way — both sides
+			// pended the same action and only one side commits it.
+			//
+			// What this case pins is the half that changed: the commit is judged against a view the member
+			// derived for itself, rather than waved past the confident predicates because the record named
+			// no block to derive from.
+			const target = await createFiveNodeMesh();
+			const blockId = 'block-minority-commit';
+			expect((await pendBlock(target.minority[0]!, blockId, 'a-minority-commit')).success).to.equal(true);
+
+			splitViews(target);
+
+			let result: Awaited<ReturnType<typeof commitBlock>> | undefined;
+			const { captured, error } = await runCapturingFailure(async () => {
+				result = await commitBlock(target.minority[0]!, blockId, 'a-minority-commit');
+			});
+
+			expect(error, 'a confident minority commit is admitted').to.equal(undefined);
+			expect(result?.success).to.equal(true);
+			expect(new Set(derivedBlockIds(captured)), 'the commit path derived a view from its own block')
+				.to.deep.equal(new Set([blockId]));
+			expect(admissionRejectReasons(captured), 'confidence, not the coordinating block, is the hinge')
+				.to.deep.equal([]);
+		});
+
+		it('refuses a minority commit at the gate when the minority also lost confidence', async () => {
+			// Same shape, but the partition also collapsed the minority's size estimate, so the members
+			// themselves refuse: fallback floor 4 = ceil(0.75 * assumedClusterSize 5) > |D| = 2. This is
+			// the gate rejecting a commit, which before the coordinating block reached the commit record
+			// happened for the WRONG reason (no block to derive from) on both sides of every partition.
+			const target = await createFiveNodeMesh();
+			const blockId = 'block-minority-commit-unconfident';
+			expect((await pendBlock(target.minority[0]!, blockId, 'a-minority-commit-unconfident')).success).to.equal(true);
+
+			splitViews(target);
+			collapseConfidence(target, target.minority);
+
 			const { captured, error } = await runCapturingFailure(
-				() => commitBlock(target.majority[0]!, blockId, 'a-majority-commit')
+				() => commitBlock(target.minority[0]!, blockId, 'a-minority-commit-unconfident')
 			);
 
-			expect(error, 'commit is refused by the fallback floor').to.be.instanceOf(Error);
+			expect(error, 'the minority commit must fail').to.be.instanceOf(Error);
 			expect(error!.message).to.include(`${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize`);
 			expect(admissionRejectReasons(captured)).to.include('low-confidence-downsize');
+			await expectNowhereCommitted(target.mesh, blockId);
 		});
 	});
 

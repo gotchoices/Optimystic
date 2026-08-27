@@ -66,8 +66,15 @@ export type ClusterRecord = {
 	membershipVersion?: 1 | 2;
 	/** Membership digest of {@link ClusterRecord.peers}; present iff `membershipVersion === 2`. base64url. */
 	membershipDigest?: string;
+	/**
+	 * The transaction's operations and the block the coordinator selected the cohort by
+	 * ({@link RepoMessage.coordinatingBlockIds}). There is deliberately NO top-level copy of the
+	 * coordinating block ids on the record: `messageHash` covers `message` only, so a duplicate at
+	 * this level would be outside every hash and any relaying peer could rewrite it — and the
+	 * membership admission gate derives its own cohort view from exactly that id
+	 * (`ClusterMember.deriveExpectedClusterView`). One source of truth, inside the hash.
+	 */
 	message: RepoMessage;
-	coordinatingBlockIds?: string[];
 	promises: { [peerId: string]: Signature };
 	commits: { [peerId: string]: Signature };
 	/** Sender's recommended cluster size: min(estimated network size, configured cluster size) */

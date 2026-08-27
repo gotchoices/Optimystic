@@ -165,7 +165,12 @@ export class DisputeService {
 
 		// Select the arbitrator set FIRST so the challenge can carry it: each arbitrator folds the set's
 		// digest into the v3 vote it signs, binding every vote to the legitimately-selected set (#1).
-		const blockIds = record.coordinatingBlockIds ?? [];
+		// Read off the hash-covered `record.message`; there is no top-level copy (see `ClusterRecord`).
+		// Every coordinator-built record now carries this field — `ClusterCoordinator` derives it from the
+		// cohort key — so the `record.messageHash` fallback below is reached only by a record built outside
+		// that path. Disputes over a commit/cancel therefore draw arbitrators by the same block key that
+		// selected the cohort, rather than by an opaque message hash, which is the intended draw.
+		const blockIds = record.message.coordinatingBlockIds ?? [];
 		const blockId = blockIds[0] ?? record.messageHash;
 		const originalPeers = Object.keys(record.peers);
 		const arbitratorCount = this.config.arbitratorCount ?? originalPeers.length;
@@ -512,6 +517,11 @@ export class DisputeService {
 	 * Derives the invalidation target — the committed action, its revision, the blocks it wrote, and
 	 * its owning collection — from the disputed record. Prefers the commit operation (the disputed
 	 * transaction is committed); falls back to the pend operation defensively.
+	 *
+	 * The `collectionId` fallbacks read the hash-covered `record.message.coordinatingBlockIds`. On the
+	 * commit arm that field is now always present (the coordinator derives it from `commit.blockIds[0]`,
+	 * the very key it selected the cohort by), so the middle fallback resolves to the same id the final
+	 * `commit.blockIds[0]` fallback used to produce — the branch taken changed, the id did not.
 	 */
 	private static extractInvalidationTarget(record: ClusterRecord): { actionId: string; rev: number; blockIds: string[]; collectionId: CollectionId } | undefined {
 		for (const operation of record.message.operations) {
@@ -521,7 +531,7 @@ export class DisputeService {
 					actionId: commit.actionId,
 					rev: commit.rev,
 					blockIds: commit.blockIds,
-					collectionId: commit.headerId ?? record.coordinatingBlockIds?.[0] ?? commit.blockIds[0]!,
+					collectionId: commit.headerId ?? record.message.coordinatingBlockIds?.[0] ?? commit.blockIds[0]!,
 				};
 			}
 		}
@@ -533,7 +543,7 @@ export class DisputeService {
 					actionId: pend.actionId,
 					rev: pend.rev ?? 0,
 					blockIds,
-					collectionId: record.coordinatingBlockIds?.[0] ?? blockIds[0]!,
+					collectionId: record.message.coordinatingBlockIds?.[0] ?? blockIds[0]!,
 				};
 			}
 		}

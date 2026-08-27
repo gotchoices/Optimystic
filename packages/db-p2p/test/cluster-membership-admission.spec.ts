@@ -8,9 +8,10 @@ import { generateKeyPair } from '@libp2p/crypto/keys';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { base58btc } from 'multiformats/bases/base58';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
+import { captureLog, hasTag } from './support/capture-log.js';
 
-// ─── Helpers (v1/unbound records — the admission gate reads record.peers + coordinatingBlockIds, not the
-// membership-binding version) ───
+// ─── Helpers (v1/unbound records — the admission gate reads record.peers plus the coordinating block
+// id inside record.message, not the membership-binding version) ───
 
 function canonicalJson(value: unknown): string {
 	return JSON.stringify(value, (_, v) =>
@@ -43,11 +44,17 @@ const makeClusterPeers = (keyPairs: KeyPair[]): ClusterPeers => {
 	return peers;
 };
 
-/** A fresh record (no promises/commits) carrying a coordinating block id so the gate can derive a view. */
-const makeRecord = async (peers: ClusterPeers, blockId = 'block-1'): Promise<ClusterRecord> => {
+/**
+ * A fresh record (no promises/commits) carrying a coordinating block id so the gate can derive a view.
+ *
+ * `coordinatingBlockId` defaults to the block the operations name — the bound, legitimate case. Passing
+ * a different id models a coordinator that named a block its own operations never touch, which is the
+ * free choice the binding check exists to remove.
+ */
+const makeRecord = async (peers: ClusterPeers, blockId = 'block-1', coordinatingBlockId = blockId): Promise<ClusterRecord> => {
 	const message: RepoMessage = {
 		operations: [{ get: { blockIds: [blockId] } }],
-		coordinatingBlockIds: [blockId],
+		coordinatingBlockIds: [coordinatingBlockId],
 		expiration: Date.now() + 30000
 	};
 	const messageHash = await computeMessageHash(message);
@@ -55,7 +62,6 @@ const makeRecord = async (peers: ClusterPeers, blockId = 'block-1'): Promise<Clu
 		messageHash,
 		message,
 		peers,
-		coordinatingBlockIds: [blockId],
 		promises: {},
 		commits: {}
 	};
@@ -94,7 +100,8 @@ const voteOn = async (
 	self: KeyPair,
 	declared: KeyPair[],
 	view: ExpectedClusterView | undefined,
-	config?: ClusterConsensusConfig
+	config?: ClusterConsensusConfig,
+	coordinatingBlockId?: string
 ): Promise<{ type: string; rejectReason?: string }> => {
 	const member = clusterMember({
 		storageRepo: new MockRepo(),
@@ -105,7 +112,7 @@ const voteOn = async (
 		deriveExpectedCluster: view ? constantDerive(view) : undefined
 	});
 	try {
-		const record = await makeRecord(makeClusterPeers(declared));
+		const record = await makeRecord(makeClusterPeers(declared), 'block-1', coordinatingBlockId);
 		const result = await member.update(record);
 		const sig = result.promises[self.peerId.toString()];
 		return { type: sig?.type ?? 'none', rejectReason: sig?.type === 'reject' ? sig.rejectReason : undefined };
@@ -339,6 +346,43 @@ describe('ClusterMember — membership admission gate', () => {
 			expect(shrunkVote.rejectReason).to.match(
 				new RegExp(`^${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize \\(declared=3, floor=6, assumedClusterSize=8\\)$`)
 			);
+		});
+	});
+
+	describe('the coordinating block must be bound to the record’s own operations', () => {
+		// Hashing `coordinatingBlockIds` into `messageHash` makes it tamper-evident to a RELAY, but the
+		// coordinator is the party this gate exists to check and it picks the field before it computes the
+		// hash. Unbound, a Byzantine coordinator declares a shrunken cohort D and names a coordinating block
+		// whose real cohort IS D: every member then derives that block, finds kEst = |D|, symmetric
+		// difference 0, and admits — the gate fully defeated. These two cases are the same attack with the
+		// binding on and off, so the binding is what separates them and not some other predicate.
+		const shrunkDeclared = () => cluster(3);
+
+		it('is defeated-shaped when the named block IS one the operations touch (control)', async () => {
+			// D = 3, derived view = the same 3 → kEst 3, floor max(2, ceil(0.75 * 3)) = 3, symDiff 0 → approve.
+			// A legitimate small cohort looks exactly like this, which is why the size predicates alone cannot
+			// tell the two apart and the binding has to.
+			const declared = shrunkDeclared();
+			const vote = await voteOn(self, declared, view(declared, 0.9), baseConfig({ assumedClusterSize: 8 }));
+			expect(vote.type).to.equal('approve');
+		});
+
+		it('falls closed to the fallback floor when the named block is NOT one the operations touch', async () => {
+			// Same record, same derived view, only the coordinating block changed to one the record's `get`
+			// never names. The derivation must not run at all, so the member judges D against the asserted
+			// cohort size instead: floor = ceil(0.75 * 8) = 6 > 3 → reject.
+			const declared = shrunkDeclared();
+			let vote: { type: string; rejectReason?: string } | undefined;
+			const captured = await captureLog('cluster-member', async () => {
+				vote = await voteOn(self, declared, view(declared, 0.9), baseConfig({ assumedClusterSize: 8 }), 'block-the-operations-never-name');
+			});
+
+			expect(vote!.type).to.equal('reject');
+			expect(vote!.rejectReason).to.match(
+				new RegExp(`^${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize \\(declared=3, floor=6, assumedClusterSize=8\\)$`)
+			);
+			expect(hasTag(captured, 'cluster-member:coordinating-block-unbound'),
+				'the mismatch is logged, not silently swallowed').to.equal(true);
 		});
 	});
 

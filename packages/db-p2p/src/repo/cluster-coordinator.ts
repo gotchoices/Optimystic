@@ -219,7 +219,6 @@ export class ClusterCoordinator {
 			membershipVersion: CURRENT_MEMBERSHIP_VERSION,
 			membershipDigest: membershipDigestValue,
 			message,
-			coordinatingBlockIds: message.coordinatingBlockIds,
 			promises: {},
 			commits: {},
 			suggestedClusterSize: peerCount || undefined,
@@ -250,6 +249,23 @@ export class ClusterCoordinator {
 		record: ClusterRecord;
 		localExecuted: boolean;
 	}> {
+		// The coordinating block id is derived HERE, from the key this method is already handed, rather
+		// than being set by each caller's message builder: a member's membership admission gate derives
+		// its own cohort view from this field, and a builder that forgets it silently downgrades the gate
+		// to its fallback floor on that path (which is how `commit` and `cancel` used to strand writes —
+		// admitted at pend, refused at commit). Doing it at the single choke point means a future message
+		// builder cannot reintroduce the gap.
+		//
+		// Two constraints this shape exists to satisfy:
+		//  - COPY, never mutate: `CoordinatorRepo.cancel` builds ONE message and hands the same object to
+		//    N concurrent calls, one per block. In-place mutation would leak one block's id into another
+		//    block's transaction.
+		//  - Preserve an already-present list: `pend` deliberately declares the whole consolidated batch,
+		//    not just its first block, so `??` must not overwrite it.
+		const coordinated: RepoMessage = message.coordinatingBlockIds
+			? message
+			: { ...message, coordinatingBlockIds: [blockId] };
+
 		// Get the cluster peers for this block
 		const peers = await this.getClusterForBlock(blockId);
 
@@ -258,11 +274,14 @@ export class ClusterCoordinator {
 		// than one hash with a silent internal disagreement about who is responsible.
 		const membershipDigestValue = await membershipDigest(peers);
 
-		// Create a unique hash for this transaction (over message + membership digest)
-		const messageHash = await this.createMessageHash(message, membershipDigestValue);
+		// Create a unique hash for this transaction (over message + membership digest). Hashing the
+		// coordinating-block-bearing copy is what makes the field tamper-evident in transit — and it also
+		// makes a multi-block `cancel` produce a distinct hash per block, where before two blocks with
+		// identical cohorts collided on one `messageHash` in `this.transactions` / `wasTransactionExecuted`.
+		const messageHash = await this.createMessageHash(coordinated, membershipDigestValue);
 
 		// Create a cluster record for this transaction
-		const record = this.makeRecord(peers, messageHash, message, membershipDigestValue);
+		const record = this.makeRecord(peers, messageHash, coordinated, membershipDigestValue);
 		log('cluster-tx:start', {
 			messageHash,
 			blockId,

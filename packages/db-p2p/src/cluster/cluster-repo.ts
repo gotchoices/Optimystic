@@ -1092,18 +1092,42 @@ export class ClusterMember implements ICluster {
 
 	/**
 	 * Derive this member's own view of the record's block cluster via the injected capability, or
-	 * `undefined` when it cannot (no capability, no coordinating block id, or a derivation error — all of
-	 * which the gate treats as "not confident"). Derived from the record's coordinating block, the same key
-	 * the coordinator used to select the cluster.
+	 * `undefined` when it cannot (no capability, no coordinating block id, a coordinating block not bound
+	 * to the record's own operations, or a derivation error — all of which the gate treats as "not
+	 * confident"). Derived from the record's coordinating block, the same key the coordinator used to
+	 * select the cluster.
+	 *
+	 * Read off `record.message`, NOT a top-level record field: `messageHash` covers the message only, so
+	 * only the in-message copy is tamper-evident to a relaying peer. (There is no top-level copy any more —
+	 * see {@link ClusterRecord.message}.)
 	 */
 	private async deriveExpectedClusterView(record: ClusterRecord): Promise<ExpectedClusterView | undefined> {
 		if (!this.deriveExpectedCluster) {
 			return undefined;
 		}
-		const blockId = record.coordinatingBlockIds?.[0];
+		const blockId = record.message.coordinatingBlockIds?.[0];
 		if (blockId === undefined) {
 			return undefined;
 		}
+		// Hashing the field makes it tamper-evident to RELAYS, but the coordinator is the party this gate
+		// exists to check and it picks the field before it computes the hash. Unbound, a Byzantine
+		// coordinator declares a shrunken cohort `D` and names a coordinating block whose real cohort
+		// resembles `D`: every member then derives that block's cohort, finds kEst = |D|, symmetric
+		// difference 0, and admits — the gate fully defeated. Binding the coordinating block to a block the
+		// record's OWN operations touch removes that free choice.
+		if (!ClusterMember.operationBlockIds(record.message).includes(blockId)) {
+			log('cluster-member:coordinating-block-unbound', {
+				messageHash: record.messageHash,
+				coordinatingBlockId: blockId
+			});
+			// Fail closed into the branch that already exists rather than throwing: a hard reject would
+			// change `validateRecord`'s failure surface, and "not confident" already refuses any downsize.
+			return undefined;
+		}
+		// Which block a member derived its cohort view from is the single most useful fact when an
+		// admission decision has to be explained after the fact — and the only externally visible sign
+		// that the confident predicates ran at all rather than the fallback floor.
+		log('cluster-member:derive-expected-cluster', { messageHash: record.messageHash, blockId });
 		try {
 			// NOTE: derives (findCluster) once per inbound record on the promise path — one routing lookup
 			// per vote. If this shows up as hot, cache the derived view per (blockId, short TTL): it is a
@@ -1113,6 +1137,29 @@ export class ClusterMember implements ICluster {
 			log('cluster-member:derive-expected-cluster-error', { messageHash: record.messageHash, error: (err as Error).message });
 			return undefined;
 		}
+	}
+
+	/**
+	 * Every block id the message's own operations name — the set a legitimate coordinating block id must
+	 * come from. `RepoMessage.operations` is a single-element tuple, so this is one operation's blocks in
+	 * practice; the loop keeps it correct if that ever widens.
+	 *
+	 * Every production caller satisfies the binding: `pend`'s coordinating ids are the batch's own
+	 * consolidated blocks (`NetworkTransactor.consolidateCoordinators` builds the payload FROM that list,
+	 * and a `processBatches` retry re-batches without the option so `CoordinatorRepo.pend` falls back to
+	 * the transforms' own ids), and `commit`/`cancel` derive theirs from the request in
+	 * `ClusterCoordinator.executeClusterTransaction`.
+	 */
+	private static operationBlockIds(message: RepoMessage): string[] {
+		const ids: string[] = [];
+		for (const operation of message.operations ?? []) {
+			if ('pend' in operation) ids.push(...blockIdsForTransforms(operation.pend.transforms));
+			else if ('commit' in operation) ids.push(...operation.commit.blockIds);
+			else if ('cancel' in operation) ids.push(...(operation.cancel.actionRef?.blockIds ?? []));
+			else if ('get' in operation) ids.push(...(operation.get.blockIds ?? []));
+			else if ('invalidate' in operation) ids.push(...(operation.invalidate.blockIds ?? []));
+		}
+		return ids;
 	}
 
 	/** |A △ B| over two id lists (order-independent set symmetric difference). */

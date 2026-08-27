@@ -109,7 +109,6 @@ async function makeClusterRecord(
 		messageHash,
 		peers: clusterPeers,
 		message: message as any,
-		coordinatingBlockIds: [blockId],
 		promises,
 		commits,
 	};
