@@ -1,5 +1,5 @@
 import type { PeerId, PrivateKey } from '@libp2p/interface';
-import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ActionRev, ITransactor, PeerId as DbPeerId } from '@optimystic/db-core';
+import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ActionRev, ITransactor, ITransactionValidator, PeerId as DbPeerId } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { NetworkTransactor } from '@optimystic/db-core';
@@ -63,6 +63,21 @@ export interface MeshOptions {
 	 * from `meshConfidence` (default 1).
 	 */
 	deriveExpectedCluster?: (node: MeshNode, blockId: BlockId) => Promise<ExpectedClusterView>;
+	/**
+	 * Per-node transaction validator — the harness analogue of `NodeOptions.validator`, which
+	 * `libp2p-node-base` forwards straight into `clusterMember({ … validator })`. Invoked once per
+	 * node (indexed from 0, in the order `Mesh.nodes` ends up in) during assembly.
+	 *
+	 * Omitted → no validator, and `ClusterMember.validatePendOperations` skips the whole validation
+	 * step (signatures, schema hash, operations hash) — today's harness behaviour, preserved as the
+	 * default so existing meshes do not suddenly re-validate transactions they were never built to
+	 * satisfy. That is also production's current posture: no composition root supplies
+	 * `NodeOptions.validator` yet (backlog `feat-no-deployment-validates-transactions-at-pend`).
+	 *
+	 * A FACTORY rather than one shared instance because enforcement is a per-node decision, and a
+	 * mixed mesh — some members enforcing, some not — is exactly the case worth testing.
+	 */
+	validatorFactory?: (index: number, peerId: PeerId) => ITransactionValidator;
 	/**
 	 * Per-node network-size confidence (0..1) fed to the default derivation — the FRET stand-in.
 	 * Default 1 (confident). Evaluated per vote, so a spec may flip it mid-test (e.g. collapse a
@@ -303,10 +318,10 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	// Phase 1: create storage + cluster members
 	let nodeIndex = 0;
 	for (const { peerId, privateKey } of keyPairs) {
+		const index = nodeIndex++;
 		const rawStorage = options.rawStorageFactory
-			? options.rawStorageFactory(nodeIndex)
+			? options.rawStorageFactory(index)
 			: new MemoryRawStorage();
-		nodeIndex++;
 		const storageRepo = new StorageRepo(
 			(blockId: BlockId) => new BlockStorage(blockId, rawStorage)
 		);
@@ -360,7 +375,10 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			privateKey,
 			consensusConfig: policy,
 			reconcileBlock,
-			deriveExpectedCluster
+			deriveExpectedCluster,
+			// Absent by default: `undefined` here is identical to omitting the field, and
+			// `validatePendOperations` then skips the validation step entirely.
+			validator: options.validatorFactory?.(index, peerId)
 		});
 
 		nodes.push(meshNode);

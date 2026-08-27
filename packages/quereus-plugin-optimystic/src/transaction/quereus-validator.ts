@@ -37,6 +37,15 @@ export interface QuereusValidatorOptions {
 	 * Migration order: land this (clients with a node key start signing immediately), observe clients
 	 * signing in the field, THEN flip this to `true` to start rejecting. Flipping it on before clients
 	 * sign rejects every legacy (unsigned) client at pend.
+	 *
+	 * NOTE: accepted tradeoff — this flag is deliberately NOT surfaced as a deployment-configurable
+	 * option, because it would be a switch on a code path no deployment reaches. `createQuereusValidator`
+	 * has no production caller: nothing supplies `NodeOptions.validator`, so every deployed cluster
+	 * member runs `ClusterMember.validatePendOperations` with no validator and re-validates nothing at
+	 * all. A config knob here would read as a working rollout path that does not exist. Tracked as
+	 * backlog `feat-no-deployment-validates-transactions-at-pend`; enforcement itself IS proven end to
+	 * end across a live cluster PEND in db-p2p's `mesh-client-signature-enforcement.spec.ts`. Revisit
+	 * when a composition root starts supplying `NodeOptions.validator`.
 	 */
 	requireClientSignature?: boolean;
 }

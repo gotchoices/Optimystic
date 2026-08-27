@@ -8,6 +8,10 @@
  *   - verifier: (peerId, payload, sig) => { try { return verifyPeerSig(peerId, payload, b64urlToBytes(sig)); } catch { return false; } }
  * driven through db-core's TransactionSession (sign) and TransactionValidator (verify) with a genuine
  * generateKeyPair('Ed25519') identity, so the crypto actually round-trips end to end.
+ *
+ * Both closures, plus the validator/transaction builders, live in `test/support/client-tx-signature.ts`
+ * — shared with `mesh-client-signature-enforcement.spec.ts`, which runs the same seam through a live
+ * cluster PEND. This file stays the SINGLE-PROCESS tier: validator constructed directly, no mesh.
  */
 
 import { expect } from 'chai';
@@ -16,12 +20,8 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PrivateKey } from '@libp2p/interface';
 import {
 	ActionsEngine,
-	ACTIONS_ENGINE_ID,
 	createActionsStatements,
-	createTransactionStamp,
-	createTransactionId,
 	clientSignaturePayload,
-	hashOperations,
 	bytesToB64url,
 	b64urlToBytes,
 	TransactionValidator,
@@ -29,69 +29,18 @@ import {
 	TransactionCoordinator,
 	Tree,
 	type Transaction,
-	type ReadDependency,
-	type TransactionSigner,
-	type ClientSignatureVerifier,
-	type EngineRegistration,
-	type ValidationCoordinatorFactory,
 } from '@optimystic/db-core';
 import { TestTransactor } from '@optimystic/db-core/test';
-import { signPeer, verifyPeerSig } from '../src/cohort-topic/peer-sig.js';
-
-const SCHEMA_HASH = 'schema-hash-123';
-
-/** The exact signer closure the collection-factory binds to a node key. */
-function makeSigner(key: PrivateKey): TransactionSigner {
-	return async (payload: Uint8Array): Promise<string> => bytesToB64url(await signPeer(key, payload));
-}
-
-/** The exact verifier closure quereus-validator wires when requireClientSignature is on. */
-const verifier: ClientSignatureVerifier = (peerId, payload, signature) => {
-	try {
-		return verifyPeerSig(peerId, payload, b64urlToBytes(signature));
-	} catch {
-		return false;
-	}
-};
-
-const emptyOpsHash = async (): Promise<string> => await hashOperations([]);
-
-function makeValidator(verify?: ClientSignatureVerifier): TransactionValidator {
-	const engines = new Map<string, EngineRegistration>();
-	engines.set(ACTIONS_ENGINE_ID, {
-		engine: new ActionsEngine(),
-		getSchemaHash: async () => SCHEMA_HASH,
-	});
-	const createValidationCoordinator: ValidationCoordinatorFactory = () => ({
-		applyActions: async () => { },
-		getTransforms: () => new Map(),
-		dispose: () => { },
-	});
-	return new TransactionValidator(engines, createValidationCoordinator, undefined, verify);
-}
-
-/**
- * Build a transaction stamped for `stampPeerId` and signed with `signKey`. Pass a different key than the
- * stamp identity's to forge an impersonation.
- */
-async function buildSignedTx(
-	stampPeerId: string,
-	signKey: PrivateKey,
-	opts: { statements?: string[]; reads?: ReadDependency[] } = {}
-): Promise<Transaction> {
-	const statements = opts.statements ?? [];
-	const reads = opts.reads ?? [];
-	const stamp = await createTransactionStamp(stampPeerId, Date.now(), SCHEMA_HASH, ACTIONS_ENGINE_ID);
-	const tx: Transaction = {
-		stamp,
-		statements,
-		reads,
-		id: await createTransactionId(stamp.id, statements, reads),
-	};
-	const payload = clientSignaturePayload(stamp.id, statements, reads);
-	tx.signature = await makeSigner(signKey)(payload);
-	return tx;
-}
+import { signPeer } from '../src/cohort-topic/peer-sig.js';
+import {
+	SCHEMA_HASH,
+	makeSigner,
+	makeValidator,
+	verifier,
+	emptyOpsHash,
+	buildSignedTx,
+	buildUnsignedTx,
+} from './support/client-tx-signature.js';
 
 describe('Client transaction signatures — real Ed25519 keys (p2p backing)', () => {
 	let keyA: PrivateKey;
@@ -142,14 +91,8 @@ describe('Client transaction signatures — real Ed25519 keys (p2p backing)', ()
 	it('rejects a malformed (non-Ed25519 peer-id) stamp with enforcement on, without throwing', async () => {
 		// Sign with a real key but stamp a peer-id string that is not a valid libp2p identity.
 		// peerIdFromString throws inside verifyPeerSig; the closure catches → false → clean reject.
-		const stamp = await createTransactionStamp('not-a-real-peer-id', Date.now(), SCHEMA_HASH, ACTIONS_ENGINE_ID);
-		const tx: Transaction = {
-			stamp,
-			statements: [],
-			reads: [],
-			id: await createTransactionId(stamp.id, [], []),
-		};
-		tx.signature = await makeSigner(keyA)(clientSignaturePayload(stamp.id, [], []));
+		const tx = await buildUnsignedTx('not-a-real-peer-id');
+		tx.signature = await makeSigner(keyA)(clientSignaturePayload(tx.stamp.id, [], []));
 		const validator = makeValidator(verifier);
 		let result: Awaited<ReturnType<TransactionValidator['validate']>> | undefined;
 		let threw = false;
@@ -165,14 +108,8 @@ describe('Client transaction signatures — real Ed25519 keys (p2p backing)', ()
 
 	it('rejects a non-base64url signature with enforcement on, without throwing', async () => {
 		// A garbage signature string that b64urlToBytes cannot decode — the closure's try/catch keeps it total.
-		const stamp = await createTransactionStamp(peerA, Date.now(), SCHEMA_HASH, ACTIONS_ENGINE_ID);
-		const tx: Transaction = {
-			stamp,
-			statements: [],
-			reads: [],
-			id: await createTransactionId(stamp.id, [], []),
-			signature: '!!!not base64url!!!',
-		};
+		const tx = await buildUnsignedTx(peerA);
+		tx.signature = '!!!not base64url!!!';
 		const result = await makeValidator(verifier).validate(tx, await emptyOpsHash());
 		expect(result.valid).to.be.false;
 		expect(result.reason).to.equal('Invalid client signature');
@@ -184,24 +121,12 @@ describe('Client transaction signatures — real Ed25519 keys (p2p backing)', ()
 		const signed = await buildSignedTx(peerA, keyA);
 		expect((await validator.validate(signed, await emptyOpsHash())).valid, 'signed accepted').to.be.true;
 
-		const unsignedStamp = await createTransactionStamp(peerA, Date.now(), SCHEMA_HASH, ACTIONS_ENGINE_ID);
-		const unsigned: Transaction = {
-			stamp: unsignedStamp,
-			statements: [],
-			reads: [],
-			id: await createTransactionId(unsignedStamp.id, [], []),
-		};
+		const unsigned = await buildUnsignedTx(peerA);
 		expect((await validator.validate(unsigned, await emptyOpsHash())).valid, 'unsigned accepted').to.be.true;
 	});
 
 	it('with enforcement ON, an unsigned transaction is rejected as missing a signature', async () => {
-		const stamp = await createTransactionStamp(peerA, Date.now(), SCHEMA_HASH, ACTIONS_ENGINE_ID);
-		const tx: Transaction = {
-			stamp,
-			statements: [],
-			reads: [],
-			id: await createTransactionId(stamp.id, [], []),
-		};
+		const tx = await buildUnsignedTx(peerA);
 		const result = await makeValidator(verifier).validate(tx, await emptyOpsHash());
 		expect(result.valid).to.be.false;
 		expect(result.reason).to.equal('Missing client signature');
@@ -227,6 +152,17 @@ describe('Client transaction signatures — real Ed25519 keys (p2p backing)', ()
 		expect(roundTripped.signature).to.equal(tx.signature);
 		const payload = clientSignaturePayload(roundTripped.stamp.id, roundTripped.statements, roundTripped.reads);
 		expect(verifier(roundTripped.stamp.peerId, payload, roundTripped.signature!)).to.be.true;
+	});
+
+	it('a stamp forged onto a different peer id is caught before the signature step', async () => {
+		// `computeStampId` binds every stamp field, so swapping the identity after stamping breaks the
+		// id first. Pinned because the signature cases above are only meaningful while this ordering
+		// holds: a spec that mutates a stamp gets `Tampered transaction stamp`, not a signature verdict.
+		const tx = await buildSignedTx(peerA, keyA);
+		tx.stamp = { ...tx.stamp, peerId: peerIdFromPrivateKey(keyB).toString() };
+		const result = await makeValidator(verifier).validate(tx, await emptyOpsHash());
+		expect(result.valid).to.be.false;
+		expect(result.reason).to.equal('Tampered transaction stamp');
 	});
 
 	it('a TransactionSession created with the real signer stamps a committed transaction that verifies', async () => {

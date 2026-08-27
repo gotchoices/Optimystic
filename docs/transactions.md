@@ -1323,6 +1323,17 @@ export interface ITransactor {
 
 ### 7. Transaction Validator (cluster participants)
 
+> **Deployment status — validation is not wired anywhere in production.** `ClusterMember` takes an
+> optional validator (`NodeOptions.validator` → `clusterMember({ … validator })`), and
+> `validatePendOperations` returns success when none is configured. No composition root supplies one:
+> `createQuereusValidator` is exported from the plugin root but called only by tests, and neither the
+> reference-peer CLI nor the plugin's collection factory constructs a validator. So every deployed
+> cluster member currently re-validates **nothing** at pend — no signature check, no schema-hash
+> check, no operations-hash check. The mechanism below is fully implemented and proven across a live
+> in-process cluster (`db-p2p/test/mesh-client-signature-enforcement.spec.ts`, via
+> `MeshOptions.validatorFactory`); what is missing is a deployment that turns it on. Tracked as
+> backlog `feat-no-deployment-validates-transactions-at-pend`.
+
 Cluster participants validate transactions by re-executing:
 
 ```typescript
