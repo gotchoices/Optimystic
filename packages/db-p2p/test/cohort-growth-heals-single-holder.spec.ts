@@ -372,4 +372,56 @@ describe('cohort growth replicates the founder block and makes it readable', fun
 		// Repeating the check re-emits nothing — the growth was recorded, no re-push loop.
 		expect(await monitor.checkNow(), 'stable cohort → no event').to.equal(null);
 	});
+
+	/**
+	 * The regression this ticket exists for: the FIRST push to a newly co-responsible peer fails
+	 * (B is transiently unreachable), and nothing in the topology changes afterwards — the cohort is
+	 * identical on the next check. Before the fix, the monitor recorded B as seen the moment it
+	 * REPORTED the growth, so the failed push was never retried and the block kept its single copy
+	 * until some unrelated cohort change happened to evict and re-add B. Now the seen set is
+	 * confirmation-driven: B stays out of it until an outcome says a replica landed, so the very next
+	 * check re-reports the same growth and the second pass heals the block.
+	 */
+	it('re-reports a grown peer whose push failed, with no further topology change', async () => {
+		const { bRepo, peerA, peerB, mockFret, monitor, coordinator, network } = await build();
+
+		mockFret.setCohort([peerA.toString()]);
+		monitor.trackBlock(BLOCK_ID);
+		await monitor.checkNow(); // baseline: A alone, responsible, nothing grown
+
+		// B joins the cohort but its machine is unreachable — every dial to it throws.
+		network.unreachable.add(peerB.toString());
+		mockFret.setCohort([peerA.toString(), peerB.toString()]);
+		const first = await monitor.checkNow();
+		expect(first!.grown.get(BLOCK_ID), 'B reported grown').to.deep.equal([peerB.toString()]);
+
+		const firstResult = await coordinator.handleRebalanceEvent(first!);
+		expect(firstResult.underReplicated, 'the push to the unreachable peer could not be confirmed')
+			.to.deep.equal([BLOCK_ID]);
+		expect(firstResult.replicated).to.deep.equal([]);
+		expect(firstResult.growth.get(BLOCK_ID), 'nothing satisfied, block still owed a push')
+			.to.deep.equal({ satisfiedPeers: [], complete: false });
+		expect((await bRepo.get({ blockIds: [BLOCK_ID] }))[BLOCK_ID]?.state?.latest, 'B holds nothing yet')
+			.to.equal(undefined);
+		for (const [blockId, outcome] of firstResult.growth) monitor.recordGrowthOutcome(blockId, outcome);
+
+		// B's machine comes back. NOTHING else changes — same cohort, no join, no departure. The
+		// re-report has to come from the unconfirmed state alone.
+		network.unreachable.delete(peerB.toString());
+		const second = await monitor.checkNow();
+		expect(second, 'the unconfirmed growth is re-detected with no topology change').to.not.be.null;
+		expect(second!.gained).to.deep.equal([]);
+		expect(second!.lost).to.deep.equal([]);
+		expect(second!.grown.get(BLOCK_ID), 'B is reported grown again').to.deep.equal([peerB.toString()]);
+
+		const secondResult = await coordinator.handleRebalanceEvent(second!);
+		expect(secondResult.replicated, 'the retry lands the replica').to.deep.equal([BLOCK_ID]);
+		expect(network.dialed, 'the retry is what finally reached B').to.deep.equal([peerB.toString()]);
+		expect((await bRepo.get({ blockIds: [BLOCK_ID] }))[BLOCK_ID]?.state?.latest,
+			'B holds a durable replica at the source revision').to.deep.equal({ rev: 1, actionId: 'action-1' });
+
+		// With the replica confirmed, the growth is finally recorded and the loop stops.
+		for (const [blockId, outcome] of secondResult.growth) monitor.recordGrowthOutcome(blockId, outcome);
+		expect(await monitor.checkNow(), 'confirmed growth → no further re-report').to.equal(null);
+	});
 });
