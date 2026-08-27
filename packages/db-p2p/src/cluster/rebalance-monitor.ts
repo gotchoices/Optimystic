@@ -134,6 +134,23 @@ const emptyGrowthState = (responsible: boolean): BlockGrowthState => ({
 	abandonedPeers: new Set<string>()
 })
 
+const intersect = (remembered: Set<string> | undefined, current: Set<string>): Set<string> =>
+	new Set([...(remembered ?? [])].filter(id => current.has(id)))
+
+/**
+ * Carry a still-responsible block's growth state into the next check, intersecting both remembered
+ * peer sets against the CURRENT cohort: a peer that left drops out of `cohortPeers` (so its return
+ * is re-detected — the departure self-heal) and out of `abandonedPeers` (so a rejoin is retried from
+ * scratch). `pendingPeers` is always rebuilt from this check's own report, never carried.
+ */
+const carryGrowthState = (prior: BlockGrowthState | undefined, currentPeers: Set<string>): BlockGrowthState => ({
+	responsible: true,
+	cohortPeers: intersect(prior?.cohortPeers, currentPeers),
+	pendingPeers: new Set<string>(),
+	growthAttempts: prior?.growthAttempts ?? 0,
+	abandonedPeers: intersect(prior?.abandonedPeers, currentPeers)
+})
+
 export class RebalanceMonitor implements Startable {
 	private running = false
 	private readonly trackedBlocks: Set<string>
@@ -262,6 +279,15 @@ export class RebalanceMonitor implements Startable {
 			state.growthAttempts = 0
 			state.pendingPeers.clear()
 		} else {
+			// NOTE: growthMaxAttempts is a floor on the retry count, not an exact one. `pendingPeers` is
+			// rebuilt from each check's own report, so two cases blunt the bound: a check that defers
+			// this block on growthBlockBudget clears pendingPeers, and a give-up landing right then
+			// abandons nobody while still resetting the counter; and two checks racing (the second
+			// re-reporting the same peer after the first's confirm left `inFlight` but before its outcome
+			// landed) double-count one attempt. Both are rare, both only change how many pushes a doomed
+			// peer absorbs. If a deployment ever tracks far more blocks than growthBlockBudget, deferral
+			// stops being rare — carry the report's peer list on GrowthOutcome and match it against
+			// pendingPeers instead of trusting the latest report.
 			state.growthAttempts++
 			if (state.growthAttempts >= this.growthMaxAttempts) {
 				for (const peerId of state.pendingPeers) {
@@ -374,6 +400,10 @@ export class RebalanceMonitor implements Startable {
 
 		if (this.trackedBlocks.size === 0) {
 			this.lastRebalanceAt = Date.now()
+			// Nothing left to grow, so any prior deferral is moot — drop it and let the re-check timer
+			// disarm, rather than re-arming forever against blocks that were untracked out from under it.
+			this.lastGrowthDeferred = 0
+			this.updateRecheckTimer()
 			return null
 		}
 
@@ -415,19 +445,16 @@ export class RebalanceMonitor implements Startable {
 			let state: BlockGrowthState
 			if (isResponsible) {
 				const currentSet = new Set(cohort.filter(id => id !== selfId))
-				// Intersect the prior seen/abandoned sets against the CURRENT cohort: a peer that left
-				// drops out (so its return is re-detected — the departure self-heal, and the abandoned
-				// peer's retry-from-scratch), and unconfirmed peers are never laundered into seen.
-				state = {
-					responsible: true,
-					cohortPeers: new Set([...(prior?.cohortPeers ?? [])].filter(id => currentSet.has(id))),
-					pendingPeers: new Set<string>(),
-					growthAttempts: prior?.growthAttempts ?? 0,
-					abandonedPeers: new Set([...(prior?.abandonedPeers ?? [])].filter(id => currentSet.has(id)))
-				}
+				state = carryGrowthState(prior, currentSet)
 				const newPeers = [...currentSet].filter(id => !state.cohortPeers.has(id) && !state.abandonedPeers.has(id))
 				if (newPeers.length > 0) {
 					growthCandidates.push({ blockId, newPeers, state })
+				} else {
+					// Nothing owed for this block. growthAttempts counts CONSECUTIVE incomplete outcomes
+					// against outstanding growth, so it must not carry across a quiet stretch — otherwise a
+					// block that failed a few times, then had that peer leave, would spend the leftovers on
+					// whichever peer joins next and abandon it early.
+					state.growthAttempts = 0
 				}
 			} else {
 				// Not responsible: clear ALL growth state (seen set, attempts, abandoned peers), so a

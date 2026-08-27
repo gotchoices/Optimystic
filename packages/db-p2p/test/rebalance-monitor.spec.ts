@@ -458,6 +458,32 @@ describe('RebalanceMonitor', () => {
 			expect(monitor.getGrowthDiagnostics().abandonedPairs).to.equal(0);
 		});
 
+		it('a quiet stretch with nothing owed resets the give-up counter', async () => {
+			// The counter measures CONSECUTIVE failures against OUTSTANDING growth. If it carried across
+			// a stretch where the block owed nothing, the leftovers would be spent on the next joiner and
+			// abandon it early.
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0, growthMaxAttempts: 2 });
+			monitor.trackBlock('block-1');
+
+			await monitor.checkNow();
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [], complete: false }); // 1 of 2
+
+			// peerId2 leaves before ever confirming: the block now owes nothing at all.
+			mockFret.setCohort('*', [selfId.toString()]);
+			expect(await monitor.checkNow(), 'nothing owed → no event').to.be.null;
+
+			// A DIFFERENT peer joins. It must get the full budget, not peerId2's leftover.
+			mockFret.setCohort('*', [selfId.toString(), peerId3.toString()]);
+			await monitor.checkNow();
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [], complete: false }); // 1 of 2 again
+			const event = await monitor.checkNow();
+			expect(event!.grown.get('block-1'), 'still retrying — not abandoned on its first failure').to.deep.equal(
+				[peerId3.toString()]);
+			expect(monitor.getGrowthDiagnostics().abandonedPairs).to.equal(0);
+		});
+
 		it('an outcome arriving after responsibility was lost is ignored (the regain re-push survives)', async () => {
 			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
 
@@ -542,6 +568,57 @@ describe('RebalanceMonitor', () => {
 
 			await monitor.checkNow();
 			expect(monitor.getGrowthDiagnostics().recheckArmed, 'disabled timer never arms').to.equal(false);
+
+			await monitor.stop();
+		});
+
+		it('disarms once the last unsatisfied peer is given up on', async () => {
+			// Give-up and the timer are the two bounds on retrying; this pins their interaction. Once a
+			// block's peers are abandoned it owes nothing, so the timer must stop waking the node up.
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, {
+				minRebalanceIntervalMs: 0,
+				growthMaxAttempts: 2,
+				growthRecheckIntervalMs: 60_000
+			});
+			monitor.trackBlock('block-1');
+			await monitor.start();
+
+			await monitor.checkNow();
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [], complete: false });
+			expect(monitor.getGrowthDiagnostics().recheckArmed, 'still owed a push → armed').to.equal(true);
+
+			await monitor.checkNow();
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [], complete: false }); // trips the bound
+			const diag = monitor.getGrowthDiagnostics();
+			expect(diag.abandonedPairs, 'the peer was given up on').to.equal(1);
+			expect(diag.blocksAwaitingConfirmation, 'nothing outstanding any more').to.equal(0);
+			expect(diag.recheckArmed, 'give-up disarms the timer').to.equal(false);
+
+			await monitor.stop();
+		});
+
+		it('disarms when every tracked block is untracked out from under a deferral', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, {
+				minRebalanceIntervalMs: 0,
+				growthBlockBudget: 1,
+				growthRecheckIntervalMs: 60_000
+			});
+			monitor.trackBlock('block-1');
+			monitor.trackBlock('block-2');
+			await monitor.start();
+
+			await monitor.checkNow(); // budget 1 admits one block, defers the other
+			expect(monitor.getGrowthDiagnostics().recheckArmed, 'a deferral arms the timer').to.equal(true);
+
+			monitor.untrackBlock('block-1');
+			monitor.untrackBlock('block-2');
+			expect(await monitor.checkNow(), 'nothing tracked → no event').to.be.null;
+			expect(monitor.getGrowthDiagnostics().recheckArmed,
+				'the deferral is moot — no forever-rearming wakeup').to.equal(false);
 
 			await monitor.stop();
 		});

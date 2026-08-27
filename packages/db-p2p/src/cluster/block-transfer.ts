@@ -215,7 +215,7 @@ export class BlockTransferCoordinator {
 			const result = await this.executeConfirm(
 				blockId,
 				new Map([[blockId, newPeers]]),
-				Math.max(1, Math.min(floor, newPeers.length))
+				Math.min(floor, newPeers.length) // both ≥ 1 here: the caller clamps floor, empty newPeers returned above
 			);
 			if (result === null) return; // confirm already in flight — no information, no entry
 			if (result.confirmed) {
@@ -462,6 +462,12 @@ export class BlockTransferCoordinator {
 							);
 							if (response && !response.missing.includes(blockId)) {
 								confirmedPeers.add(ownerPeerIdStr);
+								// NOTE: allConfirmedPeers never un-records a peer. A holder that confirms in one
+								// round and reports `missing` in a later one stays recorded, on the reasoning that
+								// `handlePush` answers non-missing only after persisting. If the receiver ever
+								// gains a path that drops a just-persisted block (an eviction sweep, a rejected
+								// revision), the growth arm would record a peer that no longer holds a replica —
+								// intersect against the LAST round's confirmedPeers instead of unioning.
 								allConfirmedPeers.add(ownerPeerIdStr);
 							}
 						} catch (err) {

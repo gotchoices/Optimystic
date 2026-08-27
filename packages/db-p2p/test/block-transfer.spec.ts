@@ -547,6 +547,37 @@ describe('BlockTransferCoordinator', () => {
 			expect(result.growth.get('block-absent')).to.deep.equal(
 				{ satisfiedPeers: [newPeer.toString()], complete: true });
 		});
+
+		it('leaves every grown block owed a push during a detected partition, without dialing', async () => {
+			// The grown arm has its own partition guard (it drives executeConfirm directly rather than
+			// going through confirmReplicated). A partition must look like any other failed push: nothing
+			// satisfied, incomplete, so the monitor keeps the peer un-seen and retries.
+			for (let i = 0; i < 10; i++) {
+				partitionDetector.recordFailure(`peer-${i}`);
+				partitionDetector.recordFailure(`peer-${i}`);
+				partitionDetector.recordFailure(`peer-${i}`);
+			}
+			repo.blocks.set('block-kept', makeBlock('block-kept'));
+			const newPeer = await makePeerId();
+			peerNetwork.responses.set(newPeer.toString(), { blocks: { 'block-kept': 'data' }, missing: [] });
+
+			const event: RebalanceEvent = {
+				gained: [],
+				lost: [],
+				newOwners: new Map(),
+				grown: new Map([['block-kept', [newPeer.toString()]]]),
+				floor: 3,
+				triggeredAt: Date.now()
+			};
+
+			const result = await coordinator.handleRebalanceEvent(event);
+
+			expect(result.replicated).to.deep.equal([]);
+			expect(result.underReplicated).to.deep.equal(['block-kept']);
+			expect(peerNetwork.connectCalls.length, 'no dial during a partition').to.equal(0);
+			expect(result.growth.get('block-kept')).to.deep.equal(
+				{ satisfiedPeers: [], complete: false });
+		});
 	});
 
 	describe('idempotent block receipt', () => {

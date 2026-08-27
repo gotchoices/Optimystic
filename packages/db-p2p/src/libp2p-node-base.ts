@@ -1165,6 +1165,14 @@ export async function createLibp2pNodeBase(
 										growthDiag.blocksAwaitingConfirmation, growthDiag.abandonedPairs);
 								}
 							}).catch((err) => {
+								// NOTE: accepted tradeoff — recording nothing here means growthMaxAttempts (which
+								// only counts RECORDED incomplete outcomes) never bounds a reaction that throws
+								// every time, so the re-check timer retries it at growthRecheckIntervalMs forever,
+								// logging each failure. Kept deliberately: per-peer errors are already caught
+								// inside the coordinator, so a throw out of handleRebalanceEvent is a coding bug,
+								// and a loud unbounded retry is the right way to surface one — silently abandoning
+								// the block would hide it and leave the block singly held. Revisit if a legitimate
+								// recoverable condition is ever allowed to throw out of the reaction.
 								log?.('rebalance reaction failed: %o', err);
 							});
 						});

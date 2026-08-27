@@ -79,3 +79,27 @@ returns a `stop` or it has nothing to release.
 
 Changing what the node wires, what any service does, or the public `NodeOptions` surface. This is a
 restructuring of how the factory is assembled, not of what it assembles.
+
+## Second arm: the reaction handlers inside the factory are untestable, and one of them is untested
+
+Found during review of `confirm-before-recording-a-cohort-growth-push`. The same monolith blocks a
+second thing besides teardown: the *bodies* of the callbacks registered inside it. The rebalance
+reaction handler (`rebalanceMonitor.onRebalance(...)`, around `libp2p-node-base.ts:1152`) does three
+things with the coordinator's result — untrack the blocks it confirmed released, mark them
+GC-eligible, and feed each block's growth outcome back to `rebalanceMonitor.recordGrowthOutcome` so
+a failed copy is retried rather than recorded as done.
+
+None of those three lines is covered by a test. Every existing test either drives the coordinator
+directly or hand-rolls the same feedback loop itself, so deleting the growth-feedback loop from the
+factory leaves the whole suite green while restoring the exact production defect that ticket was
+filed to fix: a block copied to a machine that never confirmed it keeps its single copy forever.
+The node-wiring spec (`rebalance-monitor-node-wiring.spec.ts`) boots a *solo* node, so no peer ever
+joins a cohort and the growth path never runs there.
+
+Resolving this the point way means a two-node real-libp2p growth test, which is expensive for three
+lines. Resolving it the way this ticket proposes is nearly free: once each wiring step is a small
+named function, the reaction handler is one of them, and a plain unit test can hand it a fake
+monitor plus a canned reaction result and assert all three hops. Treat that assertion as part of
+this ticket's acceptance, not as separate work.
+
+Files this arm adds: `packages/db-p2p/test/rebalance-monitor-node-wiring.spec.ts`.
