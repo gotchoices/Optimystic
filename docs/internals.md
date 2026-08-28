@@ -195,8 +195,55 @@ depends on that placement.
 Residual: a false declaration commits only if the declarer lies AND enough of the cohort is
 simultaneously unable to check (lagging on update-only blocks, missed pends) that no honest
 checker remains — any single caught-up honest member rejects. That is strictly stronger than
-before, when commit signatures bound no content at all. Verifying and persisting a durable
-content proof from these attestations is separate, later work (`persist-block-commit-proof`).
+before, when commit signatures bound no content at all. The durable proof persisted from these
+attestations is described next.
+
+#### Durable commit proof (`BlockCommitProof`)
+
+The in-memory `CommitCert` retained for reactivity (see "Cohort-Topic Origination Bridge" below)
+lives in a bounded store with a 60-second TTL and signs only an opaque commit hash — useless as
+repair evidence once the moment passes. `BlockCommitProof`
+(`packages/db-p2p/src/cluster/commit-proof.ts`) is the durable counterpart: a self-contained
+artifact carrying the commit `RepoMessage` verbatim (including the commit op's `blockDigests`),
+the promise-round and commit-round vote signatures, and the membership-v2 digest with its full
+sorted peer-id list. No public keys ride along — every signer's Ed25519 key is recovered from its
+peer id, the same binding `peerIdBindsPublicKey` relies on. Measured size for a 10-peer cohort on
+a two-block commit: 4578 bytes (`test/commit-proof.spec.ts`), comfortably inside the 1 MiB
+control-message bound.
+
+Verification is pure, throw-free on hostile input, and split to match what the two repair stages
+know:
+
+- `verifyBlockCommitProofClaim(proof, claim, thresholds)` proves "block B at revision R under
+  action A was committed by this cohort" **without the block bytes**: recompute the membership
+  digest from `peerIds`, the message hash, and the promise/commit hashes; verify and count each
+  vote signature (dedup'd, signer must be in `peerIds`); require the promise approvals to reach
+  super-majority AND the commit approvals a simple majority (the commit vote is cast blind — only
+  promise approvals attest to content, only commit approvals prove the record actually committed);
+  finally require the claim's `(blockId, rev, actionId)` to appear in the message's commit op,
+  which is what stops replaying a genuine proof against a different revision or block. On success
+  it surfaces the digest the op declared for the claimed block.
+- `verifyBlockCommitProofContent(...)` adds the last step: the declared digest must exist and
+  equal `canonicalBlockHash` of the received bytes.
+
+Failures return a distinguishable `ProofFailure` reason and are never a reputation signal — a
+malformed or unbound signer means the identity was not proven, mirroring
+`ClusterMember.verifySignature`'s discipline.
+
+**Persistence and retention.** `ClusterMember.applyConsensusOperation` builds the proof from the
+consensus record (membership-v2 records only) and passes it into `StorageRepo.commit`, which
+applies one rule after materializing: **a member persists the proof only when its own
+materialization matches the digest the commit op declared** — otherwise it stores nothing and
+logs `commit:proof-digest-mismatch` (or `commit:proof-undeclared` when the op declared no digest
+for the block). A diverged member therefore never serves its divergent bytes as certified — and
+the mismatch log is the first divergence signal this system has had. Proofs are keyed per
+revision under the reserved `~proof:<rev>` key in the transactions store (`raw-store-codec.ts`),
+so they survive `pruneMaterialization` (which trims superseded materialized copies but retains
+revision records) and live exactly as long as the revision itself; no revision-delete site exists
+today. An idempotent re-commit back-fills a missing proof. `saveReplicatedBlock` writes no proof
+(revisited by `require-proof-on-block-push`). Nothing consumes the stored artifact yet — serving
+it is `serve-block-commit-proof`, honoring it during repair is
+`accept-certified-claims-in-repair`.
 
 ### Change Notification (Reactive Wake)
 
