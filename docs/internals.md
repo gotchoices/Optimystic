@@ -982,6 +982,30 @@ saveMaterializedBlock(block): store(structuredClone(block));
   turns into a loud "not found during restore attempt") — that arm fires only for a repo that does
   not report `materialized` at all (a plain `IRepo` describing its latest) when that latest is newer
   than the pin. A served revision at or below the pin is the block unchanged since the pin.
+- **The asker does not take that on faith.** Honest serving is one end of the rule; the other is
+  that `BlockStorage.ensureRevision` vets every archive off this wire before a byte of it reaches
+  storage (`vetRestoredArchive`), because the wire itself verifies nothing —
+  `RestorationCoordinator.queryPeer` returns the response's archive straight through. An archive is
+  refused whole (logged, and reported to the caller as the same "not found during restore attempt"
+  an absent one produces) unless it names *this* block, every revision key is a revision in its one
+  canonical spelling, each entry carries an action whose own `rev` — when it declares one — matches
+  the key it is filed under, its LOWEST revision is at or below the pin, its declared `range` agrees
+  with the revisions it carries and is not open-ended, and nothing it restates contradicts content
+  this node already holds (`noDivergentRewrite`, comparing by `canonicalJson`; an identical
+  restatement is not a conflict, so a re-restore stays idempotent). The lowest-not-exact rule is
+  deliberate: `ActionContext.rev` is collection-wide, so the honest answer to a pin at 9 for a block
+  last changed at rev 2 *is* rev 2, and demanding the pin's exact number would turn working
+  historical reads into hard failures.
+- **A restore claims coverage only up to the pin.** What lands in `meta.ranges` is
+  `[archive floor, pin + 1)` — never the archive's declared `range`. Extending up to the pin is the
+  one inference in the guard (a peer answering a pinned fetch with revision M ≤ N asserts nothing
+  changed in `(M, N]`); without it `inRanges(N)` stays false and every later read at that pin re-runs
+  the whole restore, never converging. Stopping at the pin is the matching limit: entries above the
+  pin are still written, but claiming them would let a peer widen its own no-re-ask window by padding
+  an archive with fabricated high revisions. Two accepted tradeoffs are recorded at the code site — a
+  lying peer's answer is sticky across the span it was asked about, and the overwrite guard is
+  first-writer-wins, so a poisoned revision becomes unreadable rather than wrong. Both are stated to
+  be revisited if a restore ever gains a way to *verify* an archive.
 
 ### Collection Header Blocks
 - Header blockId = collection name (deterministic)

@@ -27,6 +27,14 @@ const log = createLogger('block-archive');
  * `proof` is optional for the same kind of reason (see `ArchiveRevisions.proof`): a pre-proof
  * revision, a diverged member, or an un-upgraded peer serves none, and every consumer must behave
  * exactly as it did before proofs existed when it is absent.
+ *
+ * NOTE: the `range` emitted here is a COMPATIBILITY CONTRACT with `BlockStorage.vetRestoredArchive`,
+ * which refuses an archive whose declared range does not start at its lowest revision, end past its
+ * highest, or which is open-ended. `[rev, rev + 1]` around a single revision satisfies all three
+ * trivially, and this is currently the ONLY producer of an archive that crosses the restore wire —
+ * which is why no test drives a refusal end to end through `RestorationCoordinator`. If a second
+ * producer ever appears (a multi-revision or sparse archive, say), that contract stops being
+ * trivially true and needs a test pinning the two ends together.
  */
 export function singleRevisionArchive(
 	blockId: BlockId,

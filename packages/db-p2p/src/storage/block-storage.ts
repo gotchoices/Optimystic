@@ -530,8 +530,10 @@ export class BlockStorage implements IBlockStorage {
 	 *
 	 * ## What gets recorded, and the one thing taken on trust
 	 *
-	 * The coverage returned is `[lowest, max(highest + 1, rev + 1))` — the archive's own span,
-	 * extended to include the pin. The extension is an INFERENCE, and the only one here: a peer
+	 * The coverage returned is `[lowest, rev + 1)` — the archive's floor, up to the PIN and no
+	 * further. Both halves of that are deliberate.
+	 *
+	 * Extending UP to the pin is an INFERENCE, and the only one here: a peer
 	 * answering a pinned fetch with revision M ≤ N means "M is my highest committed revision of this
 	 * block at or below N", i.e. nothing changed in (M, N]. This node cannot verify that locally.
 	 *
@@ -542,6 +544,17 @@ export class BlockStorage implements IBlockStorage {
 	 * converging. The inference is also unavoidable rather than merely convenient: having the peer
 	 * state the claim on the wire instead would not make it verifiable, only explicit, while breaking
 	 * repair against every peer running an older build.
+	 *
+	 * Stopping AT the pin, on the other hand, discards coverage for any revision the archive
+	 * volunteered ABOVE it. Those entries are still WRITTEN — an honest peer serves a contiguous
+	 * span, so an archive of `{2, 3, 4}` answering a pin at 3 is normal, not hostile — they are
+	 * merely not CLAIMED. `rev` is the one number in the exchange this node chose, so it is as far as
+	 * its trust in the answer should reach; recording `highest + 1` instead would let the peer set
+	 * the width of its own credibility by padding the archive with fabricated high revisions, and
+	 * reads across that padded span would then be served from local content without ever re-asking.
+	 * The cost is one redundant fetch the first time a revision above the pin is read; that fetch is
+	 * idempotent (identical content is not a conflict, see {@link noDivergentRewrite}) and the
+	 * coverage converges.
 	 *
 	 * NOTE: accepted tradeoff — a lying peer's answer is therefore STICKY across the whole span it
 	 * was asked about: reads between M and N are served locally from M's content and never re-ask, so
@@ -566,7 +579,12 @@ export class BlockStorage implements IBlockStorage {
 		let highest: number | undefined;
 		for (const [key, entry] of Object.entries(archive.revisions ?? {})) {
 			const entryRev = Number(key);
-			if (!Number.isInteger(entryRev) || entryRev < 1) {
+			// `String(entryRev) === key`, not merely "parses as an integer". `saveRestored` re-derives
+			// the number with its own `Number(key)`, so any key with a second spelling (`"02"`, `" 2"`,
+			// `"2e1"`) lets ONE archive file two entries under one revision: the vet checks both, the
+			// write keeps whichever `Object.entries` yields last, and which one that is was never the
+			// question either check answered.
+			if (!Number.isInteger(entryRev) || entryRev < 1 || String(entryRev) !== key) {
 				return refuse('revision key %s is not a revision', key);
 			}
 			const action = entry?.action;
@@ -604,7 +622,7 @@ export class BlockStorage implements IBlockStorage {
 			return undefined;
 		}
 
-		return [lowest, Math.max(highest + 1, rev + 1)];
+		return [lowest, rev + 1];
 	}
 
 	/**
@@ -619,6 +637,15 @@ export class BlockStorage implements IBlockStorage {
 	 *
 	 * Identical content is NOT a conflict — a re-restore of the same archive must stay idempotent,
 	 * which it has to be for the pin-extended coverage above to converge.
+	 *
+	 * NOTE: accepted tradeoff — first writer wins, permanently. Once a revision record is held, no
+	 * later archive can replace it, so a lying peer that answers a gap FIRST makes every honest
+	 * archive restating that revision refuse forever: the revision becomes unreadable rather than
+	 * wrong. That is the deliberate direction — this guard exists precisely so a peer cannot rewrite
+	 * held history, and it cannot tell "the held copy is the lie" from "the incoming copy is". Repair
+	 * from that state is an operator action (drop the block's local records and re-fetch). Revisit
+	 * only alongside a way to verify an archive, which would let the guard prefer the provable copy
+	 * instead of the earlier one.
 	 *
 	 * Comparison is by `canonicalJson`, db-core's one deterministic encoding, so key ORDER across a
 	 * JSON round trip over the wire never reads as divergence.

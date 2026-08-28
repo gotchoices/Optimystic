@@ -733,6 +733,66 @@ describe('BlockStorage restore archive vetting', () => {
 		expect(await raw.getRevision(blockId, 4), 'the revision record landed').to.equal('low4');
 	});
 
+	it('revisions volunteered ABOVE the pin are written but do not widen the recorded coverage', async () => {
+		// A peer may honestly serve a contiguous span that overruns the pin, and those entries are
+		// kept. What it may NOT do is set the width of its own credibility: if coverage followed the
+		// archive's highest revision, padding it with fabricated high revisions would buy a silent
+		// no-re-ask window over the whole padded span, and reads inside it would be answered from the
+		// peer's floor content without ever consulting anyone else.
+		const blockId = 'restore-overshoot' as BlockId;
+		await seedAtRev(blockId, 'u20' as ActionId, 20, makeBlock('restore-overshoot', { items: ['local'] }));
+
+		const low = makeBlock('restore-overshoot', { items: ['rev4'] });
+		const padding = makeBlock('restore-overshoot', { items: ['fabricated'] });
+		const pins: number[] = [];
+		const restoreCallback: RestoreCallback = async (id, rev) => {
+			pins.push(rev ?? -1);
+			return {
+				blockId: id,
+				revisions: {
+					4: { action: { actionId: 'low4' as ActionId, rev: 4, transform: { insert: low } }, block: low },
+					30: { action: { actionId: 'pad30' as ActionId, rev: 30, transform: { insert: padding } }, block: padding }
+				},
+				range: [4, 31]
+			};
+		};
+
+		const storage = new BlockStorage(blockId, raw, restoreCallback);
+		expect(itemsOf((await storage.getBlock(4))!.block), 'the pinned rev is served').to.deep.equal(['rev4']);
+		expect((await raw.getMetadata(blockId))!.ranges, 'coverage stops at the pin, not at the archive tip')
+			.to.deep.equal([[4, 5], [20]]);
+		expect(await raw.getRevision(blockId, 30), 'the overshooting entry is still WRITTEN, just not claimed')
+			.to.equal('pad30');
+
+		// The un-claimed span still costs a fetch rather than being answered locally on the peer's word.
+		expect(itemsOf((await storage.getBlock(10))!.block)).to.deep.equal(['rev4']);
+		expect(pins, 'a read inside the padded span re-asks instead of trusting the padding').to.deep.equal([4, 10]);
+		expect((await raw.getMetadata(blockId))!.ranges, 'and converges on the span actually asked about')
+			.to.deep.equal([[4, 11], [20]]);
+	});
+
+	it('refuses an archive that files two entries under one revision via a second spelling of the key', async () => {
+		// `saveRestored` re-derives each revision number with its own `Number(key)`, so "4" and "04"
+		// collapse to the same revision on the way in. Whichever entry `Object.entries` yields last
+		// wins the write — a choice no check ever made — so the archive is refused outright.
+		const blockId = 'restore-alias' as BlockId;
+		await seedAtRev(blockId, 'u10' as ActionId, 10, makeBlock('restore-alias', { items: ['local'] }));
+
+		const low = makeBlock('restore-alias', { items: ['low'] });
+		const shadow = makeBlock('restore-alias', { items: ['shadow'] });
+		const storage = new BlockStorage(blockId, raw, async (id) => ({
+			blockId: id,
+			revisions: {
+				4: { action: { actionId: 'low4' as ActionId, rev: 4, transform: { insert: low } }, block: low },
+				['04' as unknown as number]: { action: { actionId: 'shadow4' as ActionId, transform: { insert: shadow } }, block: shadow }
+			},
+			range: [4, 5]
+		}));
+
+		await expectRestoreRefused(storage, 4, 'a revision key with two spellings is not a revision key');
+		expect(await raw.getRevision(blockId, 4), 'neither entry landed').to.equal(undefined);
+	});
+
 	it('refuses an archive whose declared range disagrees with the revisions it carries', async () => {
 		const blockId = 'restore-badrange' as BlockId;
 		await seedAtRev(blockId, 'u10' as ActionId, 10, makeBlock('restore-badrange', { items: ['local'] }));
@@ -877,8 +937,11 @@ describe('BlockStorage restore archive vetting', () => {
 			}));
 			expect(itemsOf((await storage.getBlock(3))!.block), 'rev 3 restored').to.deep.equal(['rev3']);
 
-			expect((await raw.getMetadata(blockId))!.ranges, 'the two lower spans merged into one')
-				.to.deep.equal([[3, 6], [10]]);
+			// [3, 4) — the floor up to the PIN, not the archive's declared [3, 6). Rev 5's entry was
+			// accepted and is still held under its own earlier span, but the archive does not get to
+			// widen the claim past the revision that was asked for.
+			expect((await raw.getMetadata(blockId))!.ranges, 'the accepted restatement claims only up to the pin')
+				.to.deep.equal([[3, 4], [5, 6], [10]]);
 			expect(await raw.getRevision(blockId, 5), 'the held revision is unchanged').to.equal('low5');
 		});
 	});
