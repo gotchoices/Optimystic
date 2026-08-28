@@ -1,4 +1,5 @@
 import type { IBlock } from "@optimystic/db-core";
+import type { BlockCommitProof } from "./commit-proof.js";
 
 /**
  * Quorum-corroboration helpers shared by the two block-restoration paths:
@@ -21,6 +22,17 @@ export interface RevClaim {
 	peerId: string;
 	rev: number;
 	actionId: string;
+	/**
+	 * The cohort commit proof the claiming peer attached, when it had one. Carried here so a
+	 * corroboration pass CAN weigh certified evidence; {@link selectQuorumRev} deliberately does
+	 * not read it yet, so today every claim still counts exactly one distinct-peer vote whether it
+	 * arrived with a proof or not.
+	 *
+	 * Presence proves nothing on its own — the peer chose what to attach. Only a caller that
+	 * verifies it (`verifyBlockCommitProofClaim`, plus a cohort corroboration the proof itself
+	 * cannot supply) may treat it as evidence.
+	 */
+	proof?: BlockCommitProof;
 }
 
 /** The (rev, actionId) pair a quorum agreed on, plus the peers that corroborated it. */

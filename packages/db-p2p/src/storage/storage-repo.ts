@@ -967,6 +967,22 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		return { digest, baseRev, baseIndependent };
 	}
 
+	/**
+	 * The {@link BlockCommitProof} this node retained for `blockId` at `rev`, or `undefined` when it
+	 * kept none — a revision committed before proofs were persisted, a member whose materialization
+	 * diverged from the declared digest (see {@link persistProofIfContentMatches}), or simply a
+	 * revision this node never landed.
+	 *
+	 * Public because a peer answering a block-repair fetch serves the proof alongside the revision
+	 * (`serveBlockArchive`), which is the only way a requester can check a lone holder's claim
+	 * without a second holder to corroborate it. Read-only and unlatched: a proof is written once
+	 * and never mutated, so a concurrent commit can only make this return a proof for a revision
+	 * that just became stale — which the caller pairs with the revision it actually read.
+	 */
+	async getBlockProof(blockId: BlockId, rev: number): Promise<BlockCommitProof | undefined> {
+		return await this.createBlockStorage(blockId).getBlockProof(rev);
+	}
+
 	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage, proof?: BlockCommitProof): Promise<CollectionId | undefined> {
 		// Note: This method is called under the per-block commit latch — by commit() (within its
 		// locked critical section) and by the read-driven promotion in get() (which now takes the

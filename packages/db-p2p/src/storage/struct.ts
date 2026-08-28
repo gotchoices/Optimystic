@@ -1,4 +1,5 @@
 import type { BlockId, IBlock, ActionId, ActionRev, ActionTransform, ActionTransforms } from "@optimystic/db-core";
+import type { BlockCommitProof } from "../cluster/commit-proof.js";
 
 export type RevisionRange = [
 	/** Inclusive start */
@@ -14,7 +15,24 @@ export type BlockMetadata = {
 	latest?: ActionRev;
 };
 
-export type ArchiveRevisions = Record<number, { action: ActionTransform, block?: IBlock }>;
+export type ArchiveRevisions = Record<number, {
+	action: ActionTransform;
+	block?: IBlock;
+	/**
+	 * The cohort's commit proof for this revision, when the serving repo retained one.
+	 *
+	 * Absent in three legitimate cases, all of which every consumer must tolerate exactly as it
+	 * tolerated the pre-proof shape: a revision committed before proofs were persisted at all; a
+	 * member whose own materialization diverged from the digest the commit declared (it deliberately
+	 * stores no proof — see `StorageRepo.persistProofIfContentMatches`); and a peer running an
+	 * un-upgraded build.
+	 *
+	 * Keyed INSIDE the revision entry on purpose: the proof and the `(rev, actionId)` it certifies
+	 * travel together, so a serving bug or a hostile peer cannot pair a genuine proof with a
+	 * different revision by construction of the wire shape alone.
+	 */
+	proof?: BlockCommitProof;
+}>;
 
 export type BlockArchive = {
 	blockId: BlockId;

@@ -13,8 +13,8 @@ import { MemoryRawStorage } from '../storage/memory-storage.js';
 import { BlockStorage } from '../storage/block-storage.js';
 import type { IRawStorage } from '../storage/i-raw-storage.js';
 import type { BlockArchive } from '../storage/struct.js';
-import { serveBlockArchive } from '../storage/block-archive.js';
-import { coordinatorRepo, type ClusterLatestCallback } from '../repo/coordinator-repo.js';
+import { serveBlockArchive, servableProof } from '../storage/block-archive.js';
+import { coordinatorRepo, type ClusterLatestCallback, type CertifiedActionRev } from '../repo/coordinator-repo.js';
 import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
 import { sortPeersByDistance, type KnownPeer } from '../routing/responsibility.js';
 import { toString as u8ToString } from 'uint8arrays';
@@ -407,7 +407,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		// provide — masking exactly the defect that ticket `read-repair-cannot-transfer-block-content`
 		// existed to expose. Transfer now happens where it does in production: through
 		// `acquireBlockFromCohort` below, gated on a corroborated revision.
-		const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId, context?): Promise<ActionRev | undefined> => {
+		const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId, context?): Promise<CertifiedActionRev | undefined> => {
 			// Silence: the peer never answers. REJECTS, mirroring what a dial failure does to the
 			// production callback — the coordinator must count this as "did not answer", never as
 			// an absent claim (a resolved `undefined` remains the peer answering "I hold nothing").
@@ -420,7 +420,16 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 				{ blockIds: [blockId], context },
 				{ skipClusterFetch: true } as any
 			);
-			return result[blockId]?.state?.latest;
+			const latest = result[blockId]?.state?.latest;
+			if (!latest) return undefined;
+			// The commit proof rides along exactly as it does in production, and through the SAME
+			// lookup `serveBlockArchive` uses (`servableProof`) rather than a hand-rolled one — a
+			// harness that attached proofs by its own rule would let every mesh-tier test exercise a
+			// certification path real peers do not have, or miss one they do. Production reads the
+			// proof out of the served archive; the harness reads the sibling's repo directly, so
+			// sharing the lookup is what keeps the two answers identical.
+			const proof = await servableProof(target.storageRepo, blockId, latest);
+			return proof ? { ...latest, proof } : latest;
 		};
 		// The node's own self-including (and partition-aware) key-network view, built in phase 1 —
 		// the SAME instance the member's admission derivation reads, matching real

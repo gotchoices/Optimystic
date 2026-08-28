@@ -18,6 +18,7 @@ import { StorageRepo, withBlockCommitLatch } from './storage/storage-repo.js';
 import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
+import { latestClaimFromArchive, servableProof } from './storage/block-archive.js';
 import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
 import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
 import { createReconcileBlock } from './cluster/reconcile-block.js';
@@ -859,12 +860,16 @@ export async function createLibp2pNodeBase(
 		);
 
 		// Create callback for querying cluster peers for their latest block revision. Three-way
-		// contract (see ClusterLatestCallback): an ActionRev is the peer's claim, a resolved
+		// contract (see ClusterLatestCallback): a CertifiedActionRev is the peer's claim, a resolved
 		// `undefined` is the peer answering "I hold nothing", and a REJECTION is silence — the
 		// coordinator counts it as "did not answer" and refuses to report an authoritative absent
 		// over it. Transport errors must therefore propagate, not collapse into `undefined` (that
 		// collapse let a slow two-node cohort report a missing block as authoritatively absent —
 		// ticket cluster-read-consult-cannot-report-unreachable).
+		//
+		// The claim carries the cohort's commit proof for the claimed revision when the answering
+		// peer retained one. It is attached UNVERIFIED — a peer chooses what to send — and nothing
+		// on the read path weighs it yet; verification is `accept-certified-claims-in-repair`.
 		const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId, context?) => {
 			// Self-read short-circuit: dialling self via SyncClient is a round trip
 			// with no remote on the other end, and on nodes without listen addresses
@@ -875,7 +880,13 @@ export async function createLibp2pNodeBase(
 			if (peerId.equals(node.peerId)) {
 				try {
 					const result = await storageRepo.get({ blockIds: [blockId], context });
-					return result[blockId]?.state?.latest;
+					const latest = result[blockId]?.state?.latest;
+					if (!latest) return undefined;
+					// The SAME lookup a peer serving an archive uses, so a self answer and a remote
+					// answer attach proofs by one rule (including the mis-pairing guard). It never
+					// throws — a proof fault degrades to "no proof", never to a lost claim.
+					const proof = await servableProof(storageRepo, blockId, latest);
+					return proof ? { ...latest, proof } : latest;
 				} catch {
 					return undefined;
 				}
@@ -885,14 +896,11 @@ export async function createLibp2pNodeBase(
 			// per-peer deadline also bounds a hung request — slowness needs no race here.
 			const response = await syncClient.requestBlock({ blockId, rev: undefined });
 			if (response.success && response.archive) {
-				const revisions = Object.keys(response.archive.revisions).map(Number);
-				if (revisions.length > 0) {
-					const maxRev = Math.max(...revisions);
-					const revisionData = response.archive.revisions[maxRev];
-					if (revisionData?.action) {
-						return { actionId: revisionData.action.actionId, rev: maxRev };
-					}
-				}
+				// Projection lives with the archive shape (`latestClaimFromArchive`) rather than
+				// re-read inline here — it reads the claim and its proof out of ONE revision entry,
+				// so a serving peer cannot pair a proof with a revision it does not certify.
+				const claim = latestClaimFromArchive(response.archive);
+				if (claim) return claim;
 			}
 			// The peer DID answer, without data: `success:false` is the sync service's "Block not
 			// found in local storage", and an archive with no usable revisions holds nothing either

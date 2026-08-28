@@ -234,6 +234,25 @@ export function proofDeclaredDigest(proof: BlockCommitProof, claim: ProofClaim):
 	return findClaimedCommitOp(proof.message, claim)?.blockDigests?.[claim.blockId]?.digest;
 }
 
+/**
+ * Does `proof`'s message actually carry a commit operation for this exact
+ * `(blockId, rev, actionId)`? The claim step of {@link verifyBlockCommitProofClaim} with NO
+ * cryptography — the same {@link findClaimedCommitOp} resolution, so the cheap structural check and
+ * the full verification can never disagree about which op a claim names.
+ *
+ * This is the pairing guard a SERVER uses: a proof is looked up by revision, so attaching one whose
+ * message names a different revision (or block, or action) would be publishing a mis-paired
+ * artifact. It says nothing about signatures or thresholds — a receiver must still verify. Total on
+ * hostile input like its verifying sibling: never throws, `false` on any malformed shape.
+ */
+export function proofClaimsCommit(proof: BlockCommitProof, claim: ProofClaim): boolean {
+	try {
+		return findClaimedCommitOp(proof.message, claim) !== undefined;
+	} catch {
+		return false;
+	}
+}
+
 /** A plain-object (non-array) map of votes — the shape `promises` / `commits` must have. */
 function isVoteMap(value: unknown): value is Record<string, Signature> {
 	return value !== null && typeof value === 'object' && !Array.isArray(value);

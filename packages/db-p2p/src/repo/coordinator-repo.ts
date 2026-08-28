@@ -13,6 +13,7 @@ import { DEFAULT_CLUSTER_SIZE } from "../cluster/cluster-policy.js";
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
 import { isMissingBaseRevisionFailure, MISSING_BASE_REVISION_REASON } from "../storage/storage-repo.js";
 import type { ReconcileBlockCallback } from "../cluster/cluster-repo.js";
+import type { CertifiedActionRev } from "../storage/block-archive.js";
 
 /**
  * Acquire a block's content for a cohort-corroborated revision, from the cohort, and persist it.
@@ -58,8 +59,13 @@ function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promis
 interface ClusterLatestQuery {
 	/** Highest `(rev, actionId)` corroborated by peers other than this node, if any. */
 	corroborated?: ActionRev;
-	/** This node's own latest for the block, as answered by the callback's self short-circuit. */
-	local?: ActionRev;
+	/**
+	 * This node's own latest for the block, as answered by the callback's self short-circuit.
+	 * Typed as a {@link CertifiedActionRev} because that short-circuit reads the local proof too —
+	 * of no use to this node (it trusts its own storage), but the type stays honest about what the
+	 * value carries rather than silently erasing it.
+	 */
+	local?: CertifiedActionRev;
 	/**
 	 * Cohort peers (self excluded) that never answered the consult — the callback rejected
 	 * (dial failure, protocol error) or blew the per-peer deadline. Silence, not evidence:
@@ -206,8 +212,16 @@ interface LocalClusterWithExecutionTracking extends ICluster {
 }
 
 /**
+ * A cohort peer's answer to the latest-revision consult. Defined with the archive shape it is
+ * projected from (`storage/block-archive.ts`) and re-exported here so it reads next to the callback
+ * that returns it; see {@link CertifiedActionRev} there for what the optional proof does and does
+ * not mean.
+ */
+export type { CertifiedActionRev } from "../storage/block-archive.js";
+
+/**
  * Callback to query a cluster peer for their latest revision of a block. Three-way contract:
- *  - resolves an `ActionRev` — the peer answered and holds the block at that revision;
+ *  - resolves a `CertifiedActionRev` — the peer answered and holds the block at that revision;
  *  - resolves `undefined` — the peer answered and holds NOTHING (an absent claim);
  *  - REJECTS — the peer could not be asked at all (dial failure, protocol error).
  *
@@ -219,7 +233,7 @@ interface LocalClusterWithExecutionTracking extends ICluster {
  * harness's `silentPeers` failure knob). Slowness needs no handling here — the caller deadlines
  * each query and treats expiry as silence.
  */
-export type ClusterLatestCallback = (peerId: PeerId, blockId: BlockId, context?: ActionContext) => Promise<ActionRev | undefined>;
+export type ClusterLatestCallback = (peerId: PeerId, blockId: BlockId, context?: ActionContext) => Promise<CertifiedActionRev | undefined>;
 
 interface CoordinatorRepoComponents {
 	storageRepo: IRepo;
@@ -977,7 +991,7 @@ export class CoordinatorRepo implements IRepo {
 		// reads as `answered === 0` and reports isolation ('cohort-unreachable') rather than a local
 		// fault. Same fix if it ever matters — require `localPeerId`.
 		const selfId = this.localPeerId?.toString();
-		let local: ActionRev | undefined;
+		let local: CertifiedActionRev | undefined;
 		const claims: RevClaim[] = [];
 		const silent: string[] = [];
 		// `allSettled` preserves input order, so results correlate to `peerIds` by index — a
@@ -998,7 +1012,14 @@ export class CoordinatorRepo implements IRepo {
 				continue;
 			}
 			if (!value) continue; // responded, holds nothing — an absent claim, not silence
-			claims.push({ peerId: peerIdStr, rev: value.rev, actionId: value.actionId });
+			// The proof rides along UNVERIFIED and unweighted: `selectQuorumRev` ignores it, so this
+			// pass still corroborates by counting distinct peers exactly as before. Carrying it here
+			// is what lets `accept-certified-claims-in-repair` accept a verified lone holder later
+			// without re-consulting the cohort.
+			claims.push({
+				peerId: peerIdStr, rev: value.rev, actionId: value.actionId,
+				...(value.proof ? { proof: value.proof } : {})
+			});
 		}
 		if (silent.length > 0) {
 			this.log('cluster-fetch:peers-silent', { blockId, silent: silent.length, consulted: peerIds.length });

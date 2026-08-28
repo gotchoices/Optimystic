@@ -11,56 +11,30 @@ import { CachedRawStorage } from '../src/storage/cached-raw-storage.js';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../src/protocol-limits.js';
 import type { IRawStorage } from '../src/storage/i-raw-storage.js';
 import {
-	canonicalBlockHash, clusterVoteSigningPayload, computeClusterCommitHash, computeClusterMessageHash,
-	computeClusterPromiseHash, membershipDigest, membershipDigestFromIds
+	PROOF_THRESHOLDS, makeKeyPair, makeKeyPairs, makeMessage, makeSignedProof, makeSignedRecord,
+	signVote, type KeyPair
+} from './support/commit-proof-fixtures.js';
+import {
+	canonicalBlockHash, computeClusterCommitHash, computeClusterMessageHash,
+	computeClusterPromiseHash, membershipDigestFromIds
 } from '@optimystic/db-core';
 import type {
-	ActionId, BlockContentDigests, BlockId, ClusterPeers, ClusterRecord, CommitRequest, IBlock,
-	IPeerNetwork, RepoMessage, Signature
+	ActionId, BlockContentDigests, BlockId, ClusterRecord, CommitRequest, IBlock,
+	IPeerNetwork, Signature
 } from '@optimystic/db-core';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
-import { peerIdFromPrivateKey } from '@libp2p/peer-id';
-import { generateKeyPair } from '@libp2p/crypto/keys';
-import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 
-// --- Harness (mirrors cluster-commit-digest.spec.ts: real Ed25519 key pairs, fully-signed v2
-// records built with the SAME hash/signing recipe the coordinator and members use) ---
+// --- Harness. The shared builders (real Ed25519 key pairs, fully-signed v2 records built with the
+// SAME hash/signing recipe the coordinator and members use) live in
+// `support/commit-proof-fixtures.ts`, so this spec and the archive-serving spec cannot verify
+// against differently-built proofs. What stays here is failure injection, which is this spec's own
+// subject. ---
 
 const BLOCK = 'block-1' as BlockId;
 const BLOCK2 = 'block-2' as BlockId;
 const ACTION = 'action-1' as ActionId;
 
-/** 0.75 mirrors DEFAULT_SUPER_MAJORITY_THRESHOLD; 0.5 mirrors ClusterMember.hasMajority (> total/2). */
-const THRESHOLDS: ProofThresholds = { superMajorityThreshold: 0.75, simpleMajorityThreshold: 0.5 };
-
-interface KeyPair { peerId: PeerId; privateKey: PrivateKey; }
-
-const makeKeyPair = async (): Promise<KeyPair> => {
-	const privateKey = await generateKeyPair('Ed25519');
-	return { peerId: peerIdFromPrivateKey(privateKey), privateKey };
-};
-
-const makeKeyPairs = (n: number): Promise<KeyPair[]> =>
-	Promise.all(Array.from({ length: n }, makeKeyPair));
-
-const makeClusterPeers = (keyPairs: KeyPair[]): ClusterPeers => {
-	const peers: ClusterPeers = {};
-	for (const { peerId } of keyPairs) {
-		peers[peerId.toString()] = {
-			multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-			publicKey: uint8ArrayToString(peerId.publicKey!.raw, 'base64url')
-		};
-	}
-	return peers;
-};
-
-const signVote = async (
-	privateKey: PrivateKey, hash: string, type: 'approve' | 'reject' = 'approve', reason?: string
-): Promise<Signature> => {
-	const signature = uint8ArrayToString(
-		await privateKey.sign(clusterVoteSigningPayload(hash, type, reason)), 'base64url');
-	return type === 'approve' ? { type, signature } : { type, signature, rejectReason: reason };
-};
+const THRESHOLDS = PROOF_THRESHOLDS;
 
 const makeCommit = (blockDigests?: BlockContentDigests, over: Partial<CommitRequest> = {}): CommitRequest => ({
 	actionId: ACTION,
@@ -70,42 +44,6 @@ const makeCommit = (blockDigests?: BlockContentDigests, over: Partial<CommitRequ
 	...(blockDigests ? { blockDigests } : {}),
 	...over
 });
-
-const makeMessage = (commit: CommitRequest): RepoMessage => ({
-	operations: [{ commit }],
-	coordinatingBlockIds: [commit.blockIds[0] ?? BLOCK],
-	expiration: Date.now() + 30_000
-});
-
-/** Fully-signed v2 record: every key pair approves both rounds -- the recipe validateRecord accepts. */
-const makeSignedRecord = async (keyPairs: KeyPair[], commit: CommitRequest): Promise<ClusterRecord> => {
-	const peers = makeClusterPeers(keyPairs);
-	const digest = await membershipDigest(peers);
-	const message = makeMessage(commit);
-	const messageHash = await computeClusterMessageHash(message, digest);
-	const promiseHash = await computeClusterPromiseHash(messageHash, message, digest);
-	const promises: Record<string, Signature> = {};
-	for (const kp of keyPairs) {
-		promises[kp.peerId.toString()] = await signVote(kp.privateKey, promiseHash);
-	}
-	const commitHash = await computeClusterCommitHash(messageHash, message, promises, digest);
-	const commitVotes: Record<string, Signature> = {};
-	for (const kp of keyPairs) {
-		commitVotes[kp.peerId.toString()] = await signVote(kp.privateKey, commitHash);
-	}
-	return {
-		messageHash, message, peers, promises, commits: commitVotes,
-		membershipVersion: 2, membershipDigest: digest
-	};
-};
-
-const makeSignedProof = async (n: number, commit: CommitRequest) => {
-	const keyPairs = await makeKeyPairs(n);
-	const record = await makeSignedRecord(keyPairs, commit);
-	const proof = buildBlockCommitProof(record);
-	expect(proof, 'a fully-signed v2 record must project to a proof').to.not.equal(undefined);
-	return { keyPairs, record, proof: proof! };
-};
 
 /** How one signer votes in a hand-built proof: sign properly with `key`, or carry `verbatim` as-is. */
 type VoteSpec = { key: PrivateKey; type?: 'approve' | 'reject'; reason?: string } | { verbatim: Signature };
