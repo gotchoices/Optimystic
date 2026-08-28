@@ -172,6 +172,9 @@ function idsContent(ids: Set<ActionId>): number {
  * NOTE: every cache hit still pays one JSON.parse in the kernel; if decode ever shows up hot
  * on large materialized blocks, cache decoded objects plus an explicit clone instead.
  *
+ * **Proofs are a passthrough, not a cached store.** The proofs store is read only on repair
+ * and archive-serving paths; see the NOTE at {@link getProof}.
+ *
  * **Do not wrap `MemoryStoreDriver`.** The memory driver already holds the same byte
  * references in maps; wrapping it duplicates every map entry (the bytes themselves are
  * shared, so no byte copy — but the bookkeeping is pure overhead with nothing to save).
@@ -726,6 +729,24 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 		const s = this.state(blockId);
 		this.cachePoint(blockId, s, 'tx', actionId, value, s.transactions.get(actionId),
 			e => s.transactions.set(actionId, e), () => s.transactions.delete(actionId));
+	}
+
+	// --- proofs (PASSTHROUGH — deliberately not cached) ---
+
+	// Proof reads happen on repair and archive-serving paths, never on the hot read path,
+	// so proofs get no cache namespace of their own: two delegating methods instead of new
+	// cache state, eviction accounting and coherence rules. A namespace that is never
+	// populated also cannot go stale. This IS a small behaviour change from when proofs
+	// rode the transactions store and were cached incidentally.
+	// NOTE: if proof reads ever show up as hot, give proofs their own cache namespace
+	// alongside `transactions` (point entries keyed by rev, same shape as `tx`).
+
+	async getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
+		return this.inner.getProof(blockId, rev);
+	}
+
+	async putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
+		await this.inner.putProof(blockId, rev, value);
 	}
 
 	// --- materialized ---

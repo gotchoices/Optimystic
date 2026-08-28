@@ -88,7 +88,7 @@ export const DEFAULT_DB_VERSION = 1;
 /**
  * Schema for the NativeScript storage backend.
  *
- * Mirrors the IndexedDB object stores 1:1. The five block-storage stores keep
+ * Mirrors the IndexedDB object stores 1:1. The six block-storage stores keep
  * their original columns and keys, but their value columns are now BLOB: the
  * shared `KvRawStorage` kernel (driven by `SqliteStoreDriver`) owns all JSON /
  * UTF-8 (de)serialization, so the driver only ever binds/reads the kernel's raw
@@ -100,6 +100,9 @@ export const DEFAULT_DB_VERSION = 1;
  *   holds the kernel's encoded `ActionId` bytes (BLOB).
  * - `pending` → uncommitted transform bytes keyed by `(block_id, action_id)`.
  * - `transactions` → committed transform bytes keyed by `(block_id, action_id)`.
+ * - `proofs` → `BlockCommitProof` bytes keyed by `(block_id, rev)` — the same key
+ *   shape as `revisions`, deliberately NOT the action keyspace (an action id is
+ *   caller-chosen, so no reserved id could be relied on).
  * - `materialized` → materialized block bytes keyed by `(block_id, action_id)`.
  * - `kv` → generic string keyspace shared by `IKVStore` (`s_val`) and the
  *   identity helper (`b_val`). NOT kernel-backed; unchanged. The two columns
@@ -112,7 +115,7 @@ export const DEFAULT_DB_VERSION = 1;
  * throwing). There is no migration. Safe today because this backend is
  * NativeScript-only with no shipped production data; if a build ever ships to
  * devices that later upgrade, add a `user_version` bump that drops+recreates
- * these five tables (or a real migration) before assuming BLOB rows.
+ * these six tables (or a real migration) before assuming BLOB rows.
  */
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS metadata (
@@ -139,6 +142,13 @@ CREATE TABLE IF NOT EXISTS transactions (
 	action_id TEXT NOT NULL,
 	value     BLOB NOT NULL,
 	PRIMARY KEY (block_id, action_id)
+);
+
+CREATE TABLE IF NOT EXISTS proofs (
+	block_id TEXT    NOT NULL,
+	rev      INTEGER NOT NULL,
+	value    BLOB    NOT NULL,
+	PRIMARY KEY (block_id, rev)
 );
 
 CREATE TABLE IF NOT EXISTS materialized (

@@ -104,10 +104,22 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 	}
 
 	async putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void> {
-		// Block commit proofs also cross here (`~proof:<rev>` keys — see blockProofActionKey): the
-		// decode types a BlockCommitProof as a Transform, which is a harmless JSON passthrough — the
-		// inner storage re-encodes the same object graph byte-identically.
 		await this.inner.saveTransaction(blockId, actionId, decodeJson(value));
+	}
+
+	// --- proofs ---
+
+	// The inner storage owns the proofs keyspace (`IRawStorage.getBlockProof` /
+	// `saveBlockProof`), so this adapter only re-encodes across the byte boundary the
+	// way its sibling methods do. Deliberately no delete — see RawStoreDriver.getProof.
+
+	async getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
+		const proof = await this.inner.getBlockProof(blockId, rev);
+		return proof === undefined ? undefined : encodeJson(proof);
+	}
+
+	async putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
+		await this.inner.saveBlockProof(blockId, rev, decodeJson(value));
 	}
 
 	// --- materialized ---

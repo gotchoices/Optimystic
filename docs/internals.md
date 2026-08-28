@@ -246,9 +246,13 @@ applies one rule after materializing: **a member persists the proof only when it
 materialization matches the digest the commit op declared** — otherwise it stores nothing and
 logs `commit:proof-digest-mismatch` (or `commit:proof-undeclared` when the op declared no digest
 for the block). A diverged member therefore never serves its divergent bytes as certified — and
-the mismatch log is the first divergence signal this system has had. Proofs are keyed per
-revision under the reserved `~proof:<rev>` key in the transactions store (`raw-store-codec.ts`),
-so they survive `pruneMaterialization` (which trims superseded materialized copies but retains
+the mismatch log is the first divergence signal this system has had. Proofs live in their own
+logical store, keyed by `(blockId, rev)` — the same key shape as the revisions store, and
+deliberately NOT the action keyspace: an action id is chosen by whoever originates a write and is
+never re-derived or format-checked by the storing node, so no reserved action-id convention could
+survive a client or peer picking that exact id. Every `RawStoreDriver` backend carries the proofs
+store natively (its own map / subdirectory / table / tag byte / object store). Proofs survive
+`pruneMaterialization` (which trims superseded materialized copies but retains
 revision records) and live exactly as long as the revision itself; no revision-delete site exists
 today. The landing paths that skip `internalCommit` — an idempotent re-commit of the same
 `(actionId, rev)`, a Crash-D3 block whose lost `setLatest` `recover()` redoes, and a certified push

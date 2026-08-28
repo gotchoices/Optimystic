@@ -4,7 +4,7 @@ import type { ActionId, BlockId } from '@optimystic/db-core';
 /**
  * IndexedDB schema for the Optimystic browser storage backend.
  *
- * The five block-storage stores keep their original object stores and compound
+ * The six block-storage stores keep their original object stores and compound
  * array keys, but their values are now opaque `Uint8Array` blobs: the shared
  * `KvRawStorage` kernel owns JSON (de)serialization, so `IndexedDBStoreDriver`
  * only ever hands IndexedDB kernel-encoded bytes. IndexedDB stores a
@@ -17,6 +17,9 @@ import type { ActionId, BlockId } from '@optimystic/db-core';
  * - `pending`: pending transform bytes keyed by `[blockId, actionId]`. Listing pending
  *   transactions for a block uses a key cursor over `[blockId, ...]`.
  * - `transactions`: committed transform bytes keyed by `[blockId, actionId]`.
+ * - `proofs`: `BlockCommitProof` bytes keyed by `[blockId, rev]` — the same key shape
+ *   as `revisions`, deliberately NOT the action keyspace (an action id is caller-chosen,
+ *   so no reserved id could be relied on).
  * - `materialized`: materialized block bytes keyed by `[blockId, actionId]`. Deleting
  *   the row is a driver `delete`, not a stored `undefined`.
  * - `kv`: a generic string keyspace shared by `IndexedDBKVStore` and the
@@ -41,6 +44,10 @@ export interface OptimysticWebDB extends DBSchema {
 		key: [BlockId, ActionId];
 		value: Uint8Array;
 	};
+	proofs: {
+		key: [BlockId, number];
+		value: Uint8Array;
+	};
 	materialized: {
 		key: [BlockId, ActionId];
 		value: Uint8Array;
@@ -52,7 +59,9 @@ export interface OptimysticWebDB extends DBSchema {
 }
 
 export const DEFAULT_DB_NAME = 'optimystic';
-export const DEFAULT_DB_VERSION = 1;
+// Bumped to 2 when the `proofs` object store was added. The `upgrade` hook is guarded
+// by `objectStoreNames.contains`, so an existing v1 database gains only the new store.
+export const DEFAULT_DB_VERSION = 2;
 
 export type OptimysticWebDBHandle = IDBPDatabase<OptimysticWebDB>;
 
@@ -80,6 +89,9 @@ export async function openOptimysticWebDb(
 			}
 			if (!db.objectStoreNames.contains('transactions')) {
 				db.createObjectStore('transactions');
+			}
+			if (!db.objectStoreNames.contains('proofs')) {
+				db.createObjectStore('proofs');
 			}
 			if (!db.objectStoreNames.contains('materialized')) {
 				db.createObjectStore('materialized');

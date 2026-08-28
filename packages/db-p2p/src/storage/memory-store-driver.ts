@@ -2,7 +2,7 @@ import type { BlockId, ActionId } from "@optimystic/db-core";
 import type { RawStoreDriver } from "./raw-store-driver.js";
 
 /**
- * In-memory {@link RawStoreDriver}: the five logical block-storage stores as
+ * In-memory {@link RawStoreDriver}: the six logical block-storage stores as
  * `Map`s of `Uint8Array` values. `KvRawStorage` hands this driver bytes produced
  * by `JSON`-encode and reads them back via `JSON`-decode, so every get yields a
  * fresh object and every save stored an independent byte snapshot BY
@@ -16,6 +16,7 @@ export class MemoryStoreDriver implements RawStoreDriver {
 	private readonly revisions = new Map<string, Uint8Array>(); // `${blockId}:${rev}` -> actionId bytes
 	private readonly pending = new Map<string, Uint8Array>();    // `${blockId}:${actionId}` -> transform bytes
 	private readonly transactions = new Map<string, Uint8Array>();
+	private readonly proofs = new Map<string, Uint8Array>();       // `${blockId}:${rev}` -> proof bytes
 	private readonly materialized = new Map<string, Uint8Array>();
 
 	private revisionKey(blockId: BlockId, rev: number): string {
@@ -104,6 +105,16 @@ export class MemoryStoreDriver implements RawStoreDriver {
 		this.transactions.set(this.actionKey(blockId, actionId), value);
 	}
 
+	// --- proofs (keyed like revisions, NOT like actions — see RawStoreDriver.getProof) ---
+
+	async getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
+		return this.proofs.get(this.revisionKey(blockId, rev));
+	}
+
+	async putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
+		this.proofs.set(this.revisionKey(blockId, rev), value);
+	}
+
 	// --- materialized ---
 
 	async getMaterialized(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined> {
@@ -147,7 +158,7 @@ export class MemoryStoreDriver implements RawStoreDriver {
 		for (const [blockId, value] of this.metadata) {
 			total += blockId.length + value.byteLength;
 		}
-		for (const store of [this.revisions, this.pending, this.transactions, this.materialized]) {
+		for (const store of [this.revisions, this.pending, this.transactions, this.proofs, this.materialized]) {
 			for (const [key, value] of store) {
 				total += key.length + value.byteLength;
 			}

@@ -10,6 +10,7 @@ import {
 	metadataKey,
 	metadataRange,
 	pendingKey,
+	proofKey,
 	revisionFromKey,
 	revisionKey,
 	transactionKey,
@@ -19,7 +20,7 @@ import { createLogger } from './logger.js';
 const log = createLogger('storage:leveldb');
 
 /**
- * LevelDB {@link RawStoreDriver}: the five logical block-storage stores mapped
+ * LevelDB {@link RawStoreDriver}: the six logical block-storage stores mapped
  * into a single ordered byte keyspace, partitioned by a leading tag byte (see
  * `./keys.ts`). LevelDB is already one ordered byte-keyspace, so this driver is
  * mostly key encoding — the tag-prefixed byte scheme in `keys.ts` stays in this
@@ -100,6 +101,16 @@ export class LevelDBStoreDriver implements RawStoreDriver {
 
 	async putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void> {
 		await this.db.put(transactionKey(blockId, actionId), value);
+	}
+
+	// --- proofs (own tag byte; no delete — see RawStoreDriver.getProof) ---
+
+	async getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
+		return this.db.get(proofKey(blockId, rev));
+	}
+
+	async putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
+		await this.db.put(proofKey(blockId, rev), value);
 	}
 
 	// --- materialized ---

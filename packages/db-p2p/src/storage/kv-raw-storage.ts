@@ -3,21 +3,20 @@ import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockMetadata } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
 import type { RawStoreDriver } from "./raw-store-driver.js";
-import { encodeJson, decodeJson, encodeActionId, decodeActionId, blockProofActionKey } from "./raw-store-codec.js";
+import { encodeJson, decodeJson, encodeActionId, decodeActionId } from "./raw-store-codec.js";
 
 /**
  * Shared ordered-KV storage kernel. Implements the full {@link IRawStorage}
  * surface over a {@link RawStoreDriver}, owning all value (de)serialization and
- * call orchestration so each backend only has to expose its five logical stores
+ * call orchestration so each backend only has to expose its six logical stores
  * as bytes-valued maps over its native mechanism.
  *
  * The genuinely-shared logic lives ABOVE the storage primitive: the JSON/string
- * codec for the four value types, `listRevisions`' lo/hi/reverse bound
- * computation, `saveMaterializedBlock`'s put-or-delete branch, and the
- * passthroughs. Key layout / storage topology stays in the driver, because the
- * backends do NOT share one — LevelDB is a single ordered byte keyspace, SQLite
- * five relational tables, IndexedDB five object stores, the filesystem a
- * directory tree.
+ * codec for the value types, `listRevisions`' lo/hi/reverse bound computation,
+ * `saveMaterializedBlock`'s put-or-delete branch, and the passthroughs. Key
+ * layout / storage topology stays in the driver, because the backends do NOT
+ * share one — LevelDB is a single ordered byte keyspace, SQLite six relational
+ * tables, IndexedDB six object stores, the filesystem a directory tree.
  */
 export class KvRawStorage implements IRawStorage {
 	/**
@@ -47,7 +46,7 @@ export class KvRawStorage implements IRawStorage {
 
 	// NOTE: every value write funnels through the driver put/delete calls in the
 	// methods below (saveMetadata / saveRevision / save*Transaction /
-	// saveMaterializedBlock). This is the single choke point where an incremental
+	// saveBlockProof / saveMaterializedBlock). This is the single choke point where an incremental
 	// byte counter would hook in, replacing the per-driver full-scan
 	// getApproximateBytesUsed. The chosen capacity-estimate mechanism is instead a
 	// short-TTL cache over the full scan in StorageMonitor (see storage-monitor.ts
@@ -112,15 +111,22 @@ export class KvRawStorage implements IRawStorage {
 		await this.driver.putTransaction(blockId, actionId, encodeJson(transform));
 	}
 
-	// --- Commit proofs (ride the transactions store under a reserved key — see blockProofActionKey) ---
+	// --- Commit proofs (their OWN (blockId, rev)-keyed store — see RawStoreDriver.getProof) ---
+	//
+	// Proofs deliberately do NOT share the transactions keyspace. Action ids are
+	// chosen by whoever originates a write and are never re-derived or format-checked
+	// by the storing node, so no reserved action-id prefix can be relied on: a client
+	// pending an action literally named `~proof:5`, or a peer's restore archive naming
+	// one, used to land on the same key as revision 5's proof and silently overwrite it
+	// (or be overwritten by it). Separate stores make that collision unrepresentable.
 
 	async getBlockProof(blockId: BlockId, rev: number): Promise<BlockCommitProof | undefined> {
-		const bytes = await this.driver.getTransaction(blockId, blockProofActionKey(rev));
+		const bytes = await this.driver.getProof(blockId, rev);
 		return bytes === undefined ? undefined : decodeJson<BlockCommitProof>(bytes);
 	}
 
 	async saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof): Promise<void> {
-		await this.driver.putTransaction(blockId, blockProofActionKey(rev), encodeJson(proof));
+		await this.driver.putProof(blockId, rev, encodeJson(proof));
 	}
 
 	// --- Materialized blocks ---

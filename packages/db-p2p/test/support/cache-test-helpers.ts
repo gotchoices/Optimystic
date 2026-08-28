@@ -79,6 +79,14 @@ export class CountingStoreDriver implements RawStoreDriver {
 		this.bump('putTransaction');
 		return this.inner.putTransaction(blockId, actionId, value);
 	}
+	async getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
+		this.bump('getProof');
+		return this.inner.getProof(blockId, rev);
+	}
+	async putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
+		this.bump('putProof');
+		return this.inner.putProof(blockId, rev, value);
+	}
 	async getMaterialized(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined> {
 		this.bump('getMaterialized');
 		return this.inner.getMaterialized(blockId, actionId);
@@ -97,6 +105,9 @@ export class CountingStoreDriver implements RawStoreDriver {
 	}
 }
 
+// `getProof`/`putProof` are deliberately absent from both lists: the proofs store is a
+// PASSTHROUGH in CachedStoreDriver (never cached), so counting it would make the cache-hit
+// ratio assertions measure a store the cache does not claim to serve.
 export const READ_METHODS = [
 	'getMetadata', 'getRevision', 'rangeRevisions', 'getPending',
 	'listPendingActionIds', 'getTransaction', 'getMaterialized'

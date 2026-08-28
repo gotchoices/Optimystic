@@ -1146,7 +1146,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 * fault must not turn `commit()` into `success:false` for a landed commit — it is logged and
 	 * the proof simply is not retained (repair falls back to corroboration).
 	 *
-	 * NOTE: one commit of N blocks stores the SAME proof under each block's `~proof:<rev>` key, and
+	 * NOTE: one commit of N blocks stores the SAME proof under each block's `(blockId, rev)` proofs-store key, and
 	 * the proof itself carries the commit op's N `blockIds`/`blockDigests` — so bytes retained per
 	 * commit grow with N². Measured base cost is ~4.6 KB for a 10-peer 2-block commit
 	 * (`test/commit-proof.spec.ts` "size"), and nothing today bounds `CommitRequest.blockIds`. Fine

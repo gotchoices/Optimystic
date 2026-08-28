@@ -66,6 +66,8 @@ class GatedStoreDriver implements RawStoreDriver {
 	deletePending(blockId: BlockId, actionId: ActionId) { return this.inner.deletePending(blockId, actionId); }
 	getTransaction(blockId: BlockId, actionId: ActionId) { return this.inner.getTransaction(blockId, actionId); }
 	putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putTransaction(blockId, actionId, value); }
+	getProof(blockId: BlockId, rev: number) { return this.inner.getProof(blockId, rev); }
+	putProof(blockId: BlockId, rev: number, value: Uint8Array) { return this.inner.putProof(blockId, rev, value); }
 	getMaterialized(blockId: BlockId, actionId: ActionId) { return this.inner.getMaterialized(blockId, actionId); }
 	putMaterialized(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putMaterialized(blockId, actionId, value); }
 	deleteMaterialized(blockId: BlockId, actionId: ActionId) { return this.inner.deleteMaterialized(blockId, actionId); }
@@ -110,6 +112,8 @@ class FaultyStoreDriver implements RawStoreDriver {
 	listPendingActionIds(blockId: BlockId) { return this.inner.listPendingActionIds(blockId); }
 	getTransaction(blockId: BlockId, actionId: ActionId) { return this.inner.getTransaction(blockId, actionId); }
 	putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putTransaction(blockId, actionId, value); }
+	getProof(blockId: BlockId, rev: number) { return this.inner.getProof(blockId, rev); }
+	putProof(blockId: BlockId, rev: number, value: Uint8Array) { return this.inner.putProof(blockId, rev, value); }
 	getMaterialized(blockId: BlockId, actionId: ActionId) { return this.inner.getMaterialized(blockId, actionId); }
 	putMaterialized(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putMaterialized(blockId, actionId, value); }
 	deleteMaterialized(blockId: BlockId, actionId: ActionId) { return this.inner.deleteMaterialized(blockId, actionId); }

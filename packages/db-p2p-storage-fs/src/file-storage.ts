@@ -40,9 +40,9 @@ function isParseableJson(bytes: Uint8Array): boolean {
 }
 
 /**
- * Filesystem {@link RawStoreDriver}: the five logical block-storage stores mapped
- * to five subdirectories under `basePath/<blockId>/`
- * (`{meta.json,revs/,pend/,actions/,blocks/}`). The directory tree is a
+ * Filesystem {@link RawStoreDriver}: the six logical block-storage stores mapped
+ * to six paths under `basePath/<blockId>/`
+ * (`{meta.json,revs/,pend/,actions/,proofs/,blocks/}`). The directory tree is a
  * deliberate, human-inspectable/debuggable layout — it is NOT flattened into
  * encoded-filename KV keys.
  *
@@ -186,6 +186,21 @@ export class FileStoreDriver implements RawStoreDriver {
 		await atomicWriteFile(this.getActionPath(blockId, actionId), value);
 	}
 
+	// --- proofs ---
+
+	// Keyed by (blockId, rev) like the revisions store, but JSON-valued like the action
+	// stores — so it takes the corrupt-content-as-missing guard the revisions store does
+	// not, and the filename carries no colon to encode. Deliberately no delete: a proof
+	// lives and dies with its revision record (see RawStoreDriver.getProof).
+
+	async getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
+		return this.readBytesIfExists(this.getProofPath(blockId, rev), true);
+	}
+
+	async putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
+		await atomicWriteFile(this.getProofPath(blockId, rev), value);
+	}
+
 	// --- materialized ---
 
 	async getMaterialized(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined> {
@@ -234,7 +249,7 @@ export class FileStoreDriver implements RawStoreDriver {
 	// --- optional passthroughs ---
 
 	async *listBlockIds(): AsyncIterable<BlockId> {
-		// The block layout is `basePath/<blockId>/{meta.json,revs/,pend/,actions/,blocks/}`
+		// The block layout is `basePath/<blockId>/{meta.json,revs/,pend/,actions/,proofs/,blocks/}`
 		// (see getBlockPath), so the direct children of basePath are the per-block directories
 		// and each directory NAME is the blockId (used raw, no encoding). Filter to directories
 		// so a stray file can't be mistaken for a block; `*.tmp` atomic-write orphans live inside
@@ -324,6 +339,10 @@ export class FileStoreDriver implements RawStoreDriver {
 
 	private getRevisionPath(blockId: BlockId, rev: number): string {
 		return path.join(this.getBlockPath(blockId), 'revs', `${rev}.json`);
+	}
+
+	private getProofPath(blockId: BlockId, rev: number): string {
+		return path.join(this.getBlockPath(blockId), 'proofs', `${rev}.json`);
 	}
 
 	// `encoded` controls colon handling: writes and canonical reads use the

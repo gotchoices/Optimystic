@@ -2,9 +2,9 @@ import type { BlockId, ActionId } from "@optimystic/db-core";
 
 /**
  * Bytes-valued, per-logical-store driver surface. Each backend implements the
- * five block-storage stores (metadata, revisions, pending, transactions,
- * materialized) over its native mechanism (LevelDB tag-ranges, five SQLite
- * tables, five IndexedDB object stores, five filesystem subdirectories, five
+ * six block-storage stores (metadata, revisions, pending, transactions,
+ * materialized, proofs) over its native mechanism (LevelDB tag-ranges, six SQLite
+ * tables, six IndexedDB object stores, six filesystem subdirectories, six
  * in-memory maps). `KvRawStorage` layers all JSON serialization and call
  * orchestration on top — drivers never (de)serialize values and never see the
  * `BlockMetadata`/`Transform`/`IBlock` types. Drivers speak only
@@ -55,6 +55,23 @@ export interface RawStoreDriver {
 	// transactions store — keyed by (blockId, actionId)
 	getTransaction(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined>;
 	putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void>;
+
+	/**
+	 * proofs store — keyed by (blockId, rev), the same key shape as the revisions
+	 * store. A revision's `BlockCommitProof` lives here and NOWHERE in the
+	 * transactions store: an action id is chosen by whoever originates a write
+	 * (a client's `pend`, a peer's restore archive) and is never re-derived or
+	 * format-checked, so any reserved action-id convention could be collided with
+	 * by an ordinary write. Separate keyspaces make the collision unrepresentable.
+	 *
+	 * There is deliberately NO `deleteProof`: a proof lives and dies with its
+	 * REVISION record, and no revision-delete site exists today (`RawStoreDriver`
+	 * has no revision delete at all — invalidations write compensating FORWARD
+	 * revisions). Whatever ever deletes a revision record must delete its proof;
+	 * until such a site exists this is a contract note, not a wired path.
+	 */
+	getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined>;
+	putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void>;
 
 	// materialized store — keyed by (blockId, actionId)
 	getMaterialized(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined>;

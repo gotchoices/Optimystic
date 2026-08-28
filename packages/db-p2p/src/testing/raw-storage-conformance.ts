@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import type { BlockId, ActionId, IBlock, BlockHeader, Transform, Transforms } from '@optimystic/db-core';
+import type { BlockCommitProof } from '../cluster/commit-proof.js';
 import type { IRawStorage } from '../storage/i-raw-storage.js';
 import type { BlockMetadata } from '../storage/struct.js';
 import { StorageRepo } from '../storage/storage-repo.js';
@@ -30,6 +31,23 @@ const makeInsertTransforms = (blockId: BlockId, block: IBlock): Transforms => ({
 	inserts: { [blockId]: block },
 	updates: {},
 	deletes: []
+});
+
+/**
+ * A structurally-valid {@link BlockCommitProof} carrying a recognizable marker. The
+ * conformance suite never verifies a proof (that is `commit-proof.spec.ts`); it only
+ * asserts the proofs STORE round-trips a proof-shaped object and keeps it in its own
+ * keyspace, so the votes are deliberately empty.
+ */
+const makeProof = (marker: string): BlockCommitProof => ({
+	v: 1,
+	messageHash: `hash-${marker}`,
+	message: { operations: [] } as unknown as BlockCommitProof['message'],
+	promises: {},
+	commits: {},
+	membershipVersion: 2,
+	membershipDigest: `digest-${marker}`,
+	peerIds: ['peer-a', 'peer-b']
 });
 
 async function collect<T>(iter: AsyncIterable<T>): Promise<T[]> {
@@ -239,6 +257,84 @@ export function runRawStorageConformance(
 			const transform: Transform = { updates: [['items', 0, 0, ['y']]] };
 			await storage.saveTransaction(blockId, 'a1' as ActionId, transform);
 			expect(await storage.getTransaction(blockId, 'a1' as ActionId)).to.deep.equal(transform);
+		});
+
+		// --- Commit proofs (their own (blockId, rev)-keyed store) ---
+
+		it('getBlockProof returns undefined on a miss', async () => {
+			expect(await storage.getBlockProof('block' as BlockId, 1)).to.equal(undefined);
+		});
+
+		it('commit proof round-trips', async () => {
+			const blockId = 'proof-block' as BlockId;
+			const proof = makeProof('rt');
+			await storage.saveBlockProof(blockId, 5, proof);
+			expect(await storage.getBlockProof(blockId, 5)).to.deep.equal(proof);
+		});
+
+		it('proofs are per-block and per-revision', async () => {
+			const a = 'proof-a' as BlockId;
+			const b = 'proof-b' as BlockId;
+			await storage.saveBlockProof(a, 1, makeProof('a1'));
+			await storage.saveBlockProof(a, 2, makeProof('a2'));
+			await storage.saveBlockProof(b, 1, makeProof('b1'));
+
+			expect((await storage.getBlockProof(a, 1))!.messageHash).to.equal('hash-a1');
+			expect((await storage.getBlockProof(a, 2))!.messageHash).to.equal('hash-a2');
+			expect((await storage.getBlockProof(b, 1))!.messageHash).to.equal('hash-b1');
+			expect(await storage.getBlockProof(a, 3), 'an unwritten rev on a block that has proofs')
+				.to.equal(undefined);
+		});
+
+		it('a later save replaces the proof for that revision only', async () => {
+			const blockId = 'proof-replace' as BlockId;
+			await storage.saveBlockProof(blockId, 1, makeProof('first'));
+			await storage.saveBlockProof(blockId, 2, makeProof('other-rev'));
+			await storage.saveBlockProof(blockId, 1, makeProof('second'));
+
+			expect((await storage.getBlockProof(blockId, 1))!.messageHash).to.equal('hash-second');
+			expect((await storage.getBlockProof(blockId, 2))!.messageHash).to.equal('hash-other-rev');
+		});
+
+		// The whole point of giving proofs their own store: an action id is chosen by whoever
+		// originates a write (a client's `pend`, a peer's restore archive) and is never
+		// re-derived or format-checked by the storing node, so a transaction may legitimately
+		// be named `~proof:<N>` — the id proofs USED to be filed under in the transactions
+		// store. Neither write may disturb the other, in either arrival order.
+		it('a transaction named `~proof:<N>` and the proof for revision N do not collide', async () => {
+			const blockId = 'proof-collide' as BlockId;
+			const collidingId = '~proof:5' as ActionId;
+			const transform: Transform = { insert: makeBlock('proof-collide', { items: ['committed'] }) };
+
+			// Order A: committed transform first, then the proof.
+			await storage.saveTransaction(blockId, collidingId, transform);
+			await storage.saveBlockProof(blockId, 5, makeProof('A'));
+			expect(await storage.getTransaction(blockId, collidingId), 'the committed transform survives')
+				.to.deep.equal(transform);
+			expect((await storage.getBlockProof(blockId, 5))!.messageHash, 'the proof is stored')
+				.to.equal('hash-A');
+
+			// Order B: proof first, then a transaction under the colliding id.
+			const other = 'proof-collide-b' as BlockId;
+			await storage.saveBlockProof(other, 5, makeProof('B'));
+			await storage.saveTransaction(other, collidingId, transform);
+			expect((await storage.getBlockProof(other, 5))!.messageHash, 'the proof survives')
+				.to.equal('hash-B');
+			expect(await storage.getTransaction(other, collidingId), 'the transform is stored')
+				.to.deep.equal(transform);
+		});
+
+		it('saveBlockProof snapshots — a later caller mutation does not corrupt stored state', async () => {
+			const blockId = 'proof-clone' as BlockId;
+			const proof = makeProof('clone');
+			await storage.saveBlockProof(blockId, 1, proof);
+
+			proof.peerIds.push('peer-c');
+			proof.messageHash = 'hash-mutated';
+
+			const stored = await storage.getBlockProof(blockId, 1);
+			expect(stored!.peerIds).to.deep.equal(['peer-a', 'peer-b']);
+			expect(stored!.messageHash).to.equal('hash-clone');
 		});
 
 		// --- Materialized blocks ---

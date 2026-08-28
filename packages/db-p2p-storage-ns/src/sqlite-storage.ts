@@ -6,10 +6,9 @@ import { createLogger } from './logger.js';
 const log = createLogger('storage:sqlite');
 
 /**
- * SQLite {@link RawStoreDriver}: the five logical block-storage stores mapped to
- * the five relational tables (`metadata`, `revisions`, `pending`, `transactions`,
- * `materialized`) with their original columns and keys. This is a code refactor,
- * not a storage-format change at the SQL level.
+ * SQLite {@link RawStoreDriver}: the six logical block-storage stores mapped to
+ * the six relational tables (`metadata`, `revisions`, `pending`, `transactions`,
+ * `proofs`, `materialized`) with their original columns and keys.
  *
  * `KvRawStorage` now owns all JSON serialization, so this driver only ever
  * reads/writes `Uint8Array` values: the value columns are BLOB and SQLite binds
@@ -38,6 +37,8 @@ export class SqliteStoreDriver implements RawStoreDriver {
 		listBlockIds: SqliteStatement;
 		getTransaction: SqliteStatement;
 		saveTransaction: SqliteStatement;
+		getProof: SqliteStatement;
+		saveProof: SqliteStatement;
 		getMaterialized: SqliteStatement;
 		saveMaterialized: SqliteStatement;
 		deleteMaterialized: SqliteStatement;
@@ -64,6 +65,8 @@ export class SqliteStoreDriver implements RawStoreDriver {
 			listBlockIds: db.prepare('SELECT block_id FROM metadata'),
 			getTransaction: db.prepare('SELECT value FROM transactions WHERE block_id = ? AND action_id = ?'),
 			saveTransaction: db.prepare('INSERT OR REPLACE INTO transactions (block_id, action_id, value) VALUES (?, ?, ?)'),
+			getProof: db.prepare('SELECT value FROM proofs WHERE block_id = ? AND rev = ?'),
+			saveProof: db.prepare('INSERT OR REPLACE INTO proofs (block_id, rev, value) VALUES (?, ?, ?)'),
 			getMaterialized: db.prepare('SELECT value FROM materialized WHERE block_id = ? AND action_id = ?'),
 			saveMaterialized: db.prepare('INSERT OR REPLACE INTO materialized (block_id, action_id, value) VALUES (?, ?, ?)'),
 			deleteMaterialized: db.prepare('DELETE FROM materialized WHERE block_id = ? AND action_id = ?'),
@@ -136,6 +139,17 @@ export class SqliteStoreDriver implements RawStoreDriver {
 
 	async putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void> {
 		await this.stmts.saveTransaction.run(blockId, actionId, value);
+	}
+
+	// --- proofs (keyed (block_id, rev) like revisions; no delete — see RawStoreDriver.getProof) ---
+
+	async getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
+		const row = await this.stmts.getProof.get(blockId, rev);
+		return row ? (row.value as Uint8Array) : undefined;
+	}
+
+	async putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
+		await this.stmts.saveProof.run(blockId, rev, value);
 	}
 
 	// --- materialized ---

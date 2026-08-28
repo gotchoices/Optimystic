@@ -13,6 +13,7 @@
  *   - revisions:    rev (8-byte big-endian unsigned via DataView.setBigUint64)
  *   - pending:      actionId UTF-8 (terminal)
  *   - transactions: actionId UTF-8 (terminal)
+ *   - proofs:       rev (8-byte big-endian unsigned, same as revisions)
  *   - materialized: actionId UTF-8 (terminal)
  *
  * `kv` and `identity` keys are flat — no `blockId` envelope — under their
@@ -28,6 +29,7 @@ export const TAG_REVISIONS = 0x02;
 export const TAG_PENDING = 0x03;
 export const TAG_TRANSACTIONS = 0x04;
 export const TAG_MATERIALIZED = 0x05;
+export const TAG_PROOFS = 0x06;
 export const TAG_KV = 0x10;
 export const TAG_IDENTITY = 0x20;
 
@@ -98,6 +100,19 @@ export function pendingKey(blockId: string, actionId: string): Uint8Array {
 
 export function transactionKey(blockId: string, actionId: string): Uint8Array {
 	return concat(encodeBlockEnvelope(TAG_TRANSACTIONS, blockId), textEncoder.encode(actionId));
+}
+
+/**
+ * Proofs are keyed by `(blockId, rev)` with the SAME 8-byte big-endian rev suffix as
+ * `revisionKey`, under their own tag — deliberately not the action keyspace, since an
+ * action id is chosen by whoever originates a write (see `RawStoreDriver.getProof`).
+ */
+export function proofKey(blockId: string, rev: number): Uint8Array {
+	const envelope = encodeBlockEnvelope(TAG_PROOFS, blockId);
+	const out = new Uint8Array(envelope.length + 8);
+	out.set(envelope, 0);
+	new DataView(out.buffer, out.byteOffset).setBigUint64(envelope.length, BigInt(rev), false);
+	return out;
 }
 
 export function materializedKey(blockId: string, actionId: string): Uint8Array {

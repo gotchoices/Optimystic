@@ -6,10 +6,9 @@ import { createLogger } from './logger.js';
 const log = createLogger('storage:indexeddb');
 
 /**
- * IndexedDB {@link RawStoreDriver}: the five logical block-storage stores mapped
- * to the five IndexedDB object stores (`metadata`, `revisions`, `pending`,
- * `transactions`, `materialized`) with their original compound array keys. This
- * is a code refactor, not a storage-format change at the key level.
+ * IndexedDB {@link RawStoreDriver}: the six logical block-storage stores mapped
+ * to the six IndexedDB object stores (`metadata`, `revisions`, `pending`,
+ * `transactions`, `proofs`, `materialized`) with their compound array keys.
  *
  * `KvRawStorage` now owns all JSON serialization, so this driver only ever
  * reads/writes `Uint8Array` values — IndexedDB stores a typed array natively via
@@ -103,6 +102,16 @@ export class IndexedDBStoreDriver implements RawStoreDriver {
 
 	async putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void> {
 		await this.db.put('transactions', value, [blockId, actionId]);
+	}
+
+	// --- proofs (keyed [blockId, rev] like revisions; no delete — see RawStoreDriver.getProof) ---
+
+	async getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
+		return this.db.get('proofs', [blockId, rev]);
+	}
+
+	async putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
+		await this.db.put('proofs', value, [blockId, rev]);
 	}
 
 	// --- materialized ---
