@@ -11,9 +11,13 @@ import type { BlockCommitProof } from "./commit-proof.js";
  * "max wins" with "highest value corroborated by a quorum of distinct peers".
  *
  * NOTE: the quorum here is corroboration-of-a-claim, NOT Sybil-resistant cohort
- * membership. A peer minting fresh keypairs can still cast a vote — proving a
- * voter is a legitimate cohort member requires commit-cert + membership
- * anchoring, deferred to backlog `debt-read-repair-commit-cert-verification`.
+ * membership. A peer minting fresh keypairs can still cast a vote. Selection now
+ * additionally weighs *certified* claims — those whose cohort commit proof a
+ * caller has already verified (`cluster/certified-claims.ts`) and marked via the
+ * injected `certified` flag — so a lone honest holder with a valid proof is
+ * sufficient where uncertified claims still need distinct-peer corroboration.
+ * Verification itself never happens here: both selectors stay pure and
+ * synchronous; verdicts arrive as booleans.
  */
 
 /** A single peer's self-reported (rev, actionId) for a block. */
@@ -23,24 +27,34 @@ export interface RevClaim {
 	rev: number;
 	actionId: string;
 	/**
-	 * The cohort commit proof the claiming peer attached, when it had one. Carried here so a
-	 * corroboration pass CAN weigh certified evidence; {@link selectQuorumRev} deliberately does
-	 * not read it yet, so today every claim still counts exactly one distinct-peer vote whether it
-	 * arrived with a proof or not.
-	 *
-	 * Presence proves nothing on its own — the peer chose what to attach. Only a caller that
-	 * verifies it (`verifyBlockCommitProofClaim`, plus a cohort corroboration the proof itself
-	 * cannot supply) may treat it as evidence.
+	 * The cohort commit proof the claiming peer attached, when it had one. Selection never reads
+	 * this field: presence proves nothing on its own — the peer chose what to attach. A caller
+	 * that verifies it (`certifyClaim` / `certifyContent` in `cluster/certified-claims.ts`, built
+	 * on `verifyBlockCommitProofClaim`) records the verdict in {@link certified}, which is what
+	 * {@link selectQuorumRev} weighs.
 	 */
 	proof?: BlockCommitProof;
+	/**
+	 * Injected verdict: the caller verified this claim's cohort commit proof and it certifies this
+	 * exact `(rev, actionId)`. A certified claim carries the cohort's signature set as its
+	 * corroboration, so {@link selectQuorumRev} can select it without a second peer vouching.
+	 * Never set this from the mere presence of {@link proof}.
+	 */
+	certified?: boolean;
 }
 
 /** The (rev, actionId) pair a quorum agreed on, plus the peers that corroborated it. */
 export interface QuorumRev {
 	rev: number;
 	actionId: string;
-	/** Distinct peer-ids that voted for this exact (rev, actionId). */
+	/**
+	 * Distinct peer-ids that voted for this exact (rev, actionId). When {@link certified} is set,
+	 * these are the certified claimants at that pair instead — possibly a single peer, whose
+	 * corroboration is the proof's signature set rather than other voters.
+	 */
 	supporters: string[];
+	/** Set when the certified path selected this pair, so callers can log which rule won. */
+	certified?: true;
 }
 
 /**
@@ -119,6 +133,22 @@ export function corroboratorCapacity(cohortPeerCount: number, repairCorroboratio
  *
  * Returns `undefined` when nothing is corroborated — an uncorroborated claim
  * must never drive restoration.
+ *
+ * **Certified claims** (`certified === true`, injected by a caller that verified the claim's
+ * cohort commit proof — see `cluster/certified-claims.ts`) short-circuit the distinct-peer rule,
+ * because the proof's signature set IS the corroboration:
+ *
+ *  - No certified claims → today's corroboration result, unchanged.
+ *  - A corroborated pair at a HIGHER rev than every certified claim wins — corroboration stays a
+ *    legitimate weaker path, so a legacy uncertified tail written after the last proven rev
+ *    remains readable.
+ *  - Otherwise the highest certified rev wins: this covers a certified rev beaten in raw rev only
+ *    by an *uncorroborated* claim (which failed quorum and is no evidence), and the equal-rev
+ *    tie, where the proof outweighs votes.
+ *  - Except: two distinct `actionId`s certified at that top rev is equivocation — the cohort
+ *    provably signed two different actions into one revision — and the whole selection declines
+ *    (`undefined`). Callers distinguish this decline from a plain no-quorum via
+ *    {@link certifiedEquivocation}.
  */
 export function selectQuorumRev(
 	claims: RevClaim[],
@@ -155,9 +185,59 @@ export function selectQuorumRev(
 			best = g;
 		}
 	}
-	return best
+	const corroborated = best
 		? { rev: best.rev, actionId: best.actionId, supporters: [...best.supporters] }
 		: undefined;
+
+	const certified = certifiedGroups(claims);
+	if (!certified) return corroborated;
+	// A corroborated pair strictly above every certified rev wins — a legacy uncertified tail
+	// must stay readable. A merely UNcorroborated higher rev never reaches here (it is not in
+	// `corroborated`), so it cannot outrank a proof.
+	if (corroborated && corroborated.rev > certified.rev) return corroborated;
+	// Two actions provably signed into the same top revision: decline the whole selection rather
+	// than pick a side. Callers log via certifiedEquivocation.
+	if (certified.byAction.size !== 1) return undefined;
+	const [entry] = certified.byAction;
+	const [actionId, supporters] = entry!; // size === 1 checked above
+	return { rev: certified.rev, actionId, supporters: [...supporters], certified: true };
+}
+
+/** Certified claims at the top certified rev, keyed by actionId → distinct certified claimants. */
+function certifiedGroups(claims: RevClaim[]): { rev: number; byAction: Map<string, Set<string>> } | undefined {
+	let top: number | undefined;
+	for (const c of claims) {
+		if (c.certified === true && (top === undefined || c.rev > top)) top = c.rev;
+	}
+	if (top === undefined) return undefined;
+	const byAction = new Map<string, Set<string>>();
+	for (const c of claims) {
+		if (c.certified !== true || c.rev !== top) continue;
+		let s = byAction.get(c.actionId);
+		if (!s) {
+			s = new Set();
+			byAction.set(c.actionId, s);
+		}
+		s.add(c.peerId);
+	}
+	return { rev: top, byAction };
+}
+
+/**
+ * The conflicting certified set at the top certified rev, when there is one: two-plus distinct
+ * `actionId`s each carrying a verified cohort commit proof for the SAME revision. This is the
+ * condition that makes {@link selectQuorumRev} decline outright, and it deserves a distinct log
+ * line from a plain no-quorum — the cohort (or whoever holds its keys) provably signed both
+ * sides. Selection stays pure, so callers do the logging with what this reports.
+ *
+ * `undefined` when no certified claim exists or the top certified rev names a single action —
+ * conflicts at LOWER certified revs are history already superseded, not equivocation worth
+ * declining over.
+ */
+export function certifiedEquivocation(claims: RevClaim[]): { rev: number; actionIds: string[] } | undefined {
+	const groups = certifiedGroups(claims);
+	if (!groups || groups.byAction.size < 2) return undefined;
+	return { rev: groups.rev, actionIds: [...groups.byAction.keys()] };
 }
 
 /** One block candidate paired with its serving peer and canonical hash
@@ -166,6 +246,12 @@ export interface BlockHashCandidate {
 	peerId: string;
 	hash: string;
 	block: IBlock;
+	/**
+	 * Injected verdict: the caller verified a cohort commit proof binding this candidate's CONTENT
+	 * (`certifyContent` in `cluster/certified-claims.ts` — the declared digest matched these
+	 * bytes), so the cohort's signatures stand in for other peers serving the same hash.
+	 */
+	certified?: boolean;
 }
 
 /**
@@ -187,6 +273,12 @@ export interface BlockHashCandidate {
  * size, and a two-member cohort has no honest majority to appeal to. Pass a capacity a shrunken
  * view of the network cannot talk down (see {@link corroboratorCapacity}), so only a cohort that is
  * *genuinely* that small reaches this branch.
+ *
+ * **Certified candidates** (`certified === true` — a caller verified a cohort commit proof whose
+ * declared digest matches these exact bytes) short-circuit the hash quorum: exactly one distinct
+ * certified hash → that block wins outright, however many peers served it. Two-plus distinct
+ * certified hashes is certified content equivocation → decline (`undefined`), mirroring the
+ * existing unique-hash-tie decline. No certified candidate → the hash quorum below, unchanged.
  */
 export function selectQuorumBlock(
 	candidates: BlockHashCandidate[],
@@ -194,6 +286,17 @@ export function selectQuorumBlock(
 	corroboratorCapacity?: number
 ): { block: IBlock; hash: string } | undefined {
 	if (candidates.length === 0) return undefined;
+
+	const certifiedByHash = new Map<string, IBlock>();
+	for (const c of candidates) {
+		if (c.certified === true && !certifiedByHash.has(c.hash)) certifiedByHash.set(c.hash, c.block);
+	}
+	if (certifiedByHash.size === 1) {
+		const [entry] = certifiedByHash;
+		const [hash, block] = entry!;
+		return { block, hash };
+	}
+	if (certifiedByHash.size > 1) return undefined; // certified content equivocation — decline
 
 	// One vote per distinct peer per hash group, matching selectQuorumRev — a peer appearing twice
 	// must not be able to second itself into a content quorum.
