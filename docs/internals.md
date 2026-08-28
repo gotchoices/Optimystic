@@ -340,7 +340,9 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
 |----------|---------|-------|
 | `withOperation(block, op)` | new block | Safe alternative to applyOperation |
 | `CacheSource.tryGet()` | structuredClone | Prevents cache corruption |
+| `CacheSource.peek()` | structuredClone | Recency-neutral read; callers apply ops to the result |
 | `Tracker.tryGet()` for inserts | structuredClone | Inserts are cloned on retrieval |
+| `Tracker.peekMaterialized()` | structuredClone | Clones the staged insert before `applyTransform` mutates it |
 
 ### Storage Clone Requirements
 **Memory storage MUST clone on get/save** to prevent cross-revision contamination:

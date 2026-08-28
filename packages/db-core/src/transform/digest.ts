@@ -9,8 +9,13 @@ import type { Tracker } from "./tracker.js";
  * is the {@link canonicalBlockHash} of what {@link Tracker.peekMaterialized} says the block will
  * contain at the committing revision; `baseRev` rides along except for base-independent (inserted)
  * blocks. */
-export async function computeBlockContentDigests(
-	tracker: Tracker<IBlock>,
+// NOTE: coverage is bounded by the read cache, not by the transaction. A commit whose update-carrying
+// blocks outnumber the CacheSource capacity (default 128) silently digests only the ids still
+// resident — omission degrades to corroboration rather than failing, so this is safe but quieter than
+// it looks. If commits routinely touch more blocks than the cache holds, size the cache to the
+// transaction or carry the base revision alongside the staged updates instead of re-reading it here.
+export async function computeBlockContentDigests<T extends IBlock>(
+	tracker: Tracker<T>,
 	blockIds: BlockId[]
 ): Promise<BlockContentDigests> {
 	const digests: BlockContentDigests = {};

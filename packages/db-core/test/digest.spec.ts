@@ -78,6 +78,24 @@ describe('commit content digests', () => {
 			expect(digests['a' as BlockId]!.digest).to.equal(await canonicalBlockHash(expected!));
 		});
 
+		it('insert with staged updates: updates apply on top, insert stays base-independent', async () => {
+			// update-then-insert is reachable: Tracker.insert clears a staged delete but NOT staged
+			// updates, so both ride on the same id. tryGet serves the bare insert, but COMMIT applies
+			// insert-then-updates (applyTransform) — the digest must describe what commit produces.
+			tracker.update('n' as BlockId, ['items', 0, 0, ['late']]);
+			const inserted = makeBlock('n', 'new', ['q']);
+			tracker.insert(inserted);
+
+			const digests = await computeBlockContentDigests(tracker, ['n' as BlockId]);
+			expect(digests['n' as BlockId]).to.not.have.property('baseRev');
+			expect(digests['n' as BlockId]!.digest).to.equal(
+				await canonicalBlockHash(makeBlock('n', 'new', ['late', 'q']))
+			);
+			// The staged insert must not have the updates baked into it by the peek pass.
+			expect(tracker.transforms.inserts!['n' as BlockId]).to.deep.equal(inserted);
+			expect(tracker.transforms.updates!['n' as BlockId]).to.deep.equal([['items', 0, 0, ['late']]]);
+		});
+
 		it('delete-only: omitted (materializes to nothing), cached or not', async () => {
 			await tracker.tryGet('a' as BlockId);
 			tracker.delete('a' as BlockId);                  // cached base
@@ -102,6 +120,19 @@ describe('commit content digests', () => {
 			const digests = await computeBlockContentDigests(tracker, ['b' as BlockId]);
 			expect(digests).to.deep.equal({});
 			expect(cache.peek('b' as BlockId)).to.be.undefined;         // and nothing got loaded
+		});
+
+		it('LRU-evicted base: omitted even though a stale cached revision lingers', async () => {
+			const smallCache = new CacheSource(makeRevSource(blocks, revs), 1);
+			const smallTracker = new Tracker(smallCache);
+			await smallTracker.tryGet('a' as BlockId);
+			await smallTracker.tryGet('b' as BlockId);         // evicts 'a' from the cache, not from `revisions`
+			expect(smallCache.peek('a' as BlockId)).to.be.undefined;
+			expect(smallCache.getCachedRevision('a' as BlockId)).to.equal(7);
+
+			smallTracker.update('a' as BlockId, ['data', 0, 0, 'updated']);
+			const digests = await computeBlockContentDigests(smallTracker, ['a' as BlockId]);
+			expect(digests).to.deep.equal({});                 // both halves required, so no stale pairing
 		});
 
 		it('id with no staged transform: omitted', async () => {
@@ -133,7 +164,9 @@ describe('commit content digests', () => {
 
 		it('leaves tracker and cache state observably unchanged', async () => {
 			const before = await tracker.tryGet('a' as BlockId);
-			tracker.update('a' as BlockId, ['data', 0, 0, 'updated']);
+			// A splice op, not a scalar set: applying it twice is observable, so a peeked base that
+			// leaked back into the cache would show up below.
+			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);
 			tracker.insert(makeBlock('n', 'new'));
 			const transformsBefore = structuredClone(tracker.transforms);
 			const genBefore = cache.getGeneration('a' as BlockId);
@@ -144,10 +177,11 @@ describe('commit content digests', () => {
 			expect(tracker.transforms).to.deep.equal(transformsBefore);
 			// Cache content generation stable — no reload, no fold
 			expect(cache.getGeneration('a' as BlockId)).to.equal(genBefore);
-			// Reads still see the same materialized content (base + staged op)
+			// The cached BASE is untouched — applyTransform ran over peek's clone, not the cache entry
+			expect(cache.peek('a' as BlockId)!.items).to.deep.equal(before!.items);
+			// Reads still see the same materialized content (base + staged op), applied exactly once
 			const after = await tracker.tryGet('a' as BlockId);
-			expect(after!.data).to.equal('updated');
-			expect(after!.items).to.deep.equal(before!.items);
+			expect(after!.items).to.deep.equal(['z', ...before!.items]);
 		});
 
 		it('mutating a peeked block does not leak into the staged insert', () => {

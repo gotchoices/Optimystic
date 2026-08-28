@@ -3,6 +3,7 @@ import type { ClusterPeers, ClusterRecord, Signature } from "./structs.js";
 import { sha256 } from "multiformats/hashes/sha2";
 import { base58btc } from "multiformats/bases/base58";
 import { toString as uint8ArrayToString } from "uint8arrays/to-string";
+import { canonicalJson } from "../utility/canonical-json.js";
 
 /**
  * Membership-binding version a new coordinator emits. A record at this version folds a
@@ -12,15 +13,6 @@ import { toString as uint8ArrayToString } from "uint8arrays/to-string";
  * this change.
  */
 export const CURRENT_MEMBERSHIP_VERSION = 2 as const;
-
-/** Deterministic JSON: sorts object keys so the hash is independent of key insertion order. */
-function canonicalJson(value: unknown): string {
-	return JSON.stringify(value, (_, v) =>
-		v && typeof v === 'object' && !Array.isArray(v)
-			? Object.keys(v).sort().reduce((o: Record<string, unknown>, k) => { o[k] = v[k]; return o; }, {})
-			: v
-	);
-}
 
 /**
  * Canonical membership digest for a peer set: `base64url(SHA256(canonicalJson(sorted peer-id list)))`.
