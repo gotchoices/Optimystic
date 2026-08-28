@@ -630,17 +630,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 						// Idempotent no-op for this block — already committed with this exact (actionId, rev).
 						// A retry can carry a proof the original commit lacked (or crashed before writing):
 						// back-fill it, strictly additively, under the same digest-match retention rule the
-						// original commit applies. Runs inside the latched critical section. getBlock can
-						// throw on an unmaterializable base — treated as "no local content" (proof withheld).
-						if (proof !== undefined && await storage.getBlockProof(request.rev) === undefined) {
-							let committedBlock: IBlock | undefined;
-							try {
-								committedBlock = (await storage.getBlock(request.rev))?.block;
-							} catch {
-								committedBlock = undefined;
-							}
-							await this.persistProofIfContentMatches(blockId, request.actionId, request.rev, storage, proof, committedBlock);
-						}
+						// original commit applies. Runs inside the latched critical section.
+						await this.backFillProof(blockId, storage, request, proof);
 						continue;
 					}
 					staleAt = highestStaleAt([staleAt, { blockId, rev: latest.rev }]);
@@ -747,6 +738,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 					list.push(blockId);
 					collectionBlocks.set(collectionId, list);
 				}
+				// The recovered block IS committed at request.rev, but it is excluded from the
+				// internalCommit loop below — so without this it would be the one landing path that
+				// never retains the cohort's proof, even though this very call is carrying it.
+				await this.backFillProof(blockId, storage, request, proof);
 			}
 
 			// Commit the action for each block that still needs it.
@@ -870,6 +865,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 * replica's read-modify-write of `latest` is mutually exclusive with a concurrent
 	 * local commit on the same block — otherwise `saveReplica`'s monotonic guard could
 	 * read a stale `latest` and clobber a commit that advanced it in between.
+	 *
+	 * Retains NO {@link BlockCommitProof}: this path carries no consensus record to project one
+	 * from, so a revision landed here is uncertified even though a local commit of the same
+	 * revision would be certified. Requiring the pusher to supply a verified proof is
+	 * `require-proof-on-block-push`.
 	 */
 	async saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev): Promise<void> {
 		log('saveReplicatedBlock blockId=%s rev=%s', blockId, source?.rev);
@@ -1047,9 +1047,33 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	}
 
 	/**
+	 * Retain `proof` for a block this call found ALREADY committed at `request.rev` — the idempotent
+	 * re-commit partition and the Crash-D3 `recover()` partition, the two landing paths that skip
+	 * {@link internalCommit} and would otherwise never retain a proof. Strictly additive: an existing
+	 * proof is left alone, and the same digest-match rule as the fresh-commit site decides retention.
+	 *
+	 * Callers must hold the block's commit latch. `getBlock` can throw on an unmaterializable base —
+	 * treated as "no local content", i.e. the proof is withheld.
+	 */
+	private async backFillProof(
+		blockId: BlockId, storage: IBlockStorage, request: CommitRequest, proof: BlockCommitProof | undefined
+	): Promise<void> {
+		if (proof === undefined || await storage.getBlockProof(request.rev) !== undefined) {
+			return;
+		}
+		let committedBlock: IBlock | undefined;
+		try {
+			committedBlock = (await storage.getBlock(request.rev))?.block;
+		} catch {
+			committedBlock = undefined;
+		}
+		await this.persistProofIfContentMatches(blockId, request.actionId, request.rev, storage, proof, committedBlock);
+	}
+
+	/**
 	 * The single retention rule for {@link BlockCommitProof}s, shared by the fresh-commit site
-	 * ({@link internalCommit}, after `setLatest`) and the idempotent-retry back-fill in
-	 * {@link commit}'s already-done partition:
+	 * ({@link internalCommit}, after `setLatest`) and the already-landed back-fill
+	 * ({@link backFillProof}):
 	 *
 	 * > **A member persists the proof only when its own materialization matches the digest the
 	 * > commit operation declared for this block.**
@@ -1065,6 +1089,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 * Never throws: the commit this proof describes already durably landed, so a proof-persist
 	 * fault must not turn `commit()` into `success:false` for a landed commit — it is logged and
 	 * the proof simply is not retained (repair falls back to corroboration).
+	 *
+	 * NOTE: one commit of N blocks stores the SAME proof under each block's `~proof:<rev>` key, and
+	 * the proof itself carries the commit op's N `blockIds`/`blockDigests` — so bytes retained per
+	 * commit grow with N². Measured base cost is ~4.6 KB for a 10-peer 2-block commit
+	 * (`test/commit-proof.spec.ts` "size"), and nothing today bounds `CommitRequest.blockIds`. Fine
+	 * at the handful-of-blocks batches the transactor produces now; if per-coordinator batches ever
+	 * grow large, store the proof once under its `messageHash` and key each revision to a pointer.
 	 */
 	private async persistProofIfContentMatches(
 		blockId: BlockId,

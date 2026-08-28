@@ -110,6 +110,20 @@ export function buildBlockCommitProof(record: ClusterRecord): BlockCommitProof |
  *
  * The claim step (a `{ commit }` op whose `blockIds`/`actionId`/`rev` all match) is what stops
  * replay: a genuine proof for rev 5 presented for rev 9, or for a different block id, dies there.
+ *
+ * ## What a passing verdict does NOT prove — two caller obligations
+ *
+ * 1. **The signers are not bound to the block.** A verdict says "the cohort in `proof.peerIds`
+ *    agreed", never "that is the cohort responsible for `claim.blockId`". Any attacker who controls
+ *    N keys can stand up their own N-peer cohort, sign a commit for any block id at any revision,
+ *    and produce a proof that verifies here. Nothing offline can close this: a block's cohort is
+ *    chosen by live placement and rotates over history, so `peerIds` cannot be checked against a
+ *    fixed expected set. A caller accepting proofs from untrusted peers MUST corroborate the cohort
+ *    separately (overlap with the block's currently-derived cohort, or a membership anchor — see
+ *    `accept-certified-claims-in-repair` and `feat-cluster-membership-threshold-cert-anchoring`).
+ * 2. **Cost is attacker-chosen.** This performs one Ed25519 verify per approve vote and hashes the
+ *    whole message; nothing here caps `peerIds`, the vote maps, or the message. A caller reading a
+ *    proof off the wire must bound its size and cohort count BEFORE calling.
  */
 export async function verifyBlockCommitProofClaim(
 	proof: BlockCommitProof, claim: ProofClaim, thresholds: ProofThresholds

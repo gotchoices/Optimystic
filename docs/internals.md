@@ -230,6 +230,16 @@ Failures return a distinguishable `ProofFailure` reason and are never a reputati
 malformed or unbound signer means the identity was not proven, mirroring
 `ClusterMember.verifySignature`'s discipline.
 
+**What a passing verdict does not say.** It says *the cohort listed in `peerIds` agreed*, not *that
+is the right cohort for this block* — an attacker holding N keys can stand up their own cohort and
+self-certify any block id at any revision. No offline check can close that: a block's cohort is
+chosen by live placement and rotates over history, so there is no fixed expected set to compare
+against. Any consumer accepting proofs from untrusted peers must corroborate the cohort separately
+(overlap against the block's currently-derived cohort, or a membership anchor — see
+`accept-certified-claims-in-repair` and `feat-cluster-membership-threshold-cert-anchoring`) and must
+bound proof size and cohort count before verifying, since verification cost is one Ed25519 check per
+approve vote.
+
 **Persistence and retention.** `ClusterMember.applyConsensusOperation` builds the proof from the
 consensus record (membership-v2 records only) and passes it into `StorageRepo.commit`, which
 applies one rule after materializing: **a member persists the proof only when its own
@@ -240,7 +250,9 @@ the mismatch log is the first divergence signal this system has had. Proofs are 
 revision under the reserved `~proof:<rev>` key in the transactions store (`raw-store-codec.ts`),
 so they survive `pruneMaterialization` (which trims superseded materialized copies but retains
 revision records) and live exactly as long as the revision itself; no revision-delete site exists
-today. An idempotent re-commit back-fills a missing proof. `saveReplicatedBlock` writes no proof
+today. The two landing paths that skip `internalCommit` — an idempotent re-commit of the same
+`(actionId, rev)`, and a Crash-D3 block whose lost `setLatest` `recover()` redoes — back-fill a
+missing proof under the same rule. `saveReplicatedBlock` writes no proof
 (revisited by `require-proof-on-block-push`). Nothing consumes the stored artifact yet — serving
 it is `serve-block-commit-proof`, honoring it during repair is
 `accept-certified-claims-in-repair`.

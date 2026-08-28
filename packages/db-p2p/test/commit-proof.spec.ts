@@ -326,6 +326,15 @@ describe('BlockCommitProof', () => {
 				proof, { ...claimFor(commit), actionId: 'action-other' as ActionId }, THRESHOLDS), 'claim-not-in-message');
 		});
 
+		it('never certifies an empty cohort (both thresholds are vacuous at zero denominators)', async () => {
+			// `superMajority = ceil(0.75 * 0) = 0`, so the promise gate `approves >= 0` passes on an
+			// empty cohort. Only the strict commit gate (`0 > 0` is false) stops it — pin that, so a
+			// later relaxation of either comparison cannot make a signer-less proof verifiable.
+			const commit = commitWithDigest();
+			const proof = await handProof([], commit, {}, {});
+			await expectFailure(verifyBlockCommitProofClaim(proof, claimFor(commit), THRESHOLDS), 'commit-threshold');
+		});
+
 		it('rejects structurally-invalid input as malformed-proof, never throwing', async () => {
 			const commit = commitWithDigest();
 			const { proof } = await makeSignedProof(2, commit);
@@ -499,6 +508,26 @@ describe('BlockCommitProof', () => {
 			const proof = stubProof(commit);
 			expect((await repo.commit(commit, undefined, proof)).success, 'retry is an idempotent no-op').to.equal(true);
 			expect(await raw.getBlockProof(BLOCK, commit.rev), 'retry back-fills the proof').to.deep.equal(proof);
+		});
+
+		it('back-fills a Crash-D3 block that recover() lands without running internalCommit', async () => {
+			// Crash-D3: the action was durably promoted and its revision saved, but the crash lost
+			// setLatest. commit() self-heals via recover() and then EXCLUDES the block from the
+			// internalCommit loop (its pending is gone) — the one landing path that would otherwise
+			// retain no proof despite this very call carrying one.
+			const block = insertBlock();
+			const { raw, repo } = await seededRepo(block);
+			const storage = new BlockStorage(BLOCK, raw);
+			await storage.saveMaterializedBlock(ACTION, block);
+			await storage.saveRevision(1, ACTION);
+			await storage.promotePendingTransaction(ACTION);
+			expect(await storage.getLatest(), 'the lost setLatest is the D3 signature').to.equal(undefined);
+
+			const commit = makeCommit({ [BLOCK]: { digest: await canonicalBlockHash(block) } });
+			const proof = stubProof(commit);
+			expect((await repo.commit(commit, undefined, proof)).success, 'recover() rolls the block forward').to.equal(true);
+			expect((await storage.getLatest())?.rev, 'latest reconciled to the durable rev').to.equal(1);
+			expect(await raw.getBlockProof(BLOCK, commit.rev), 'recovered block retains the proof').to.deep.equal(proof);
 		});
 	});
 
