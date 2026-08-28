@@ -100,6 +100,26 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 		return structuredClone(block);
 	}
 
+	/** The block currently cached for `id`, without consulting the source. Cloned (callers apply ops
+	 *  to it) and recency-neutral ({@link LruMap.peek}) — an observation pass must neither pay a
+	 *  network read nor reshape eviction order. Records no read dependency: the caller that peeks
+	 *  already read the block through {@link tryGet} (that is how it got cached), so the dependency
+	 *  exists; a digest pass merely re-describes it. */
+	peek(id: BlockId): T | undefined {
+		const block = this.cache.peek(id);
+		return block === undefined ? undefined : structuredClone(block);
+	}
+
+	/** The committed revision of the content currently cached for `id` — the source-reported
+	 *  materialized revision learned on miss-load (see {@link revisions}), NOT the block's own
+	 *  `state.latest.rev`. An LRU-evicted id can leave a stale entry here (see the NOTE on
+	 *  {@link revisions}); callers must therefore require BOTH {@link peek} and this to be present —
+	 *  {@link peek} returns `undefined` for the evicted id, so a stale revision never pairs with a
+	 *  peeked block. */
+	getCachedRevision(id: BlockId): number | undefined {
+		return this.revisions.get(id);
+	}
+
 	/** Upgrade an already-captured read of `id` to a `value` read in the shared collector,
 	 *  retaining it in the conflict set. The B-tree point-lookup descent calls this (through the
 	 *  Tracker, which forwards) to pin the terminal leaf after recording the interior nodes as

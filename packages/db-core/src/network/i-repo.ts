@@ -1,4 +1,4 @@
-import type { ActionBlocks, CommitResult, GetBlockResults, PendResult, PendRequest, BlockGets, BlockId, ActionId } from "../index.js";
+import type { ActionBlocks, BlockContentDigests, CommitResult, GetBlockResults, PendResult, PendRequest, BlockGets, BlockId, ActionId } from "../index.js";
 
 export type MessageOptions = {
 	expiration?: number;
@@ -36,6 +36,14 @@ export type RepoCommitRequest = {
 	 * originate reactivity.
 	 */
 	tailId?: BlockId;
+	/**
+	 * Per-block content declarations for the committing action (see {@link BlockContentDigests}).
+	 * Threaded verbatim from the transactor's {@link CommitRequest} into the per-peer repo commit —
+	 * `RepoClient.commit` wraps this whole request into the `RepoMessage`, and the coordinator places
+	 * the received request into the consensus message, so the digests land inside every cohort
+	 * signature's preimage. Absent when the client could not digest (falls back to corroboration).
+	 */
+	blockDigests?: BlockContentDigests;
 };
 
 export type IRepo = {

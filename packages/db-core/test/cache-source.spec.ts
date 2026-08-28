@@ -284,6 +284,47 @@ describe('CacheSource', () => {
 		});
 	});
 
+	describe('peek / getCachedRevision', () => {
+		it('peek returns undefined before the block is cached, without consulting the source', () => {
+			expect(cache.peek('a' as BlockId)).to.be.undefined;
+		});
+
+		it('peek returns a clone of the cached block after a load', async () => {
+			await cache.tryGet('a' as BlockId);
+			const peeked = cache.peek('a' as BlockId);
+			expect(peeked!.data).to.equal('alpha');
+
+			peeked!.data = 'mutated';
+			peeked!.items.push('z');
+			expect(cache.peek('a' as BlockId)!.data).to.equal('alpha');
+			expect(cache.peek('a' as BlockId)!.items).to.deep.equal(['x', 'y']);
+		});
+
+		it('peek does not refresh LRU recency', async () => {
+			const smallCache = new CacheSource(source, 2);
+			await smallCache.tryGet('a' as BlockId);
+			await smallCache.tryGet('b' as BlockId);
+
+			// Peek 'a' — must not count as a use
+			expect(smallCache.peek('a' as BlockId)).to.not.be.undefined;
+
+			// Add 'c' — 'a' is still oldest, evicted despite the peek
+			blocks.set('c', makeBlock('c', 'gamma'));
+			await smallCache.tryGet('c' as BlockId);
+			expect(smallCache.peek('a' as BlockId)).to.be.undefined;
+			expect(smallCache.peek('b' as BlockId)).to.not.be.undefined;
+		});
+
+		it('getCachedRevision reports the source-learned materialized revision after a load', async () => {
+			const revSource = makeRevSource(blocks, new Map([['a', 7]]));
+			const c = new CacheSource(revSource);
+
+			expect(c.getCachedRevision('a' as BlockId)).to.be.undefined;
+			await c.tryGet('a' as BlockId);
+			expect(c.getCachedRevision('a' as BlockId)).to.equal(7);
+		});
+	});
+
 	describe('delegation', () => {
 		it('should delegate generateId to source', () => {
 			expect(cache.generateId()).to.equal('gen-id');

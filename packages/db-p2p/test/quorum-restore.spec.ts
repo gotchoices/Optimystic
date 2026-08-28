@@ -11,8 +11,9 @@
 
 import { expect } from 'chai';
 import type { IBlock } from '@optimystic/db-core';
+import { canonicalBlockHash } from '@optimystic/db-core';
 import {
-	quorumSize, corroboratorCapacity, selectQuorumRev, selectQuorumBlock, canonicalBlockHash,
+	quorumSize, corroboratorCapacity, selectQuorumRev, selectQuorumBlock,
 	type RevClaim, type BlockHashCandidate
 } from '../src/cluster/quorum-restore.js';
 import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';

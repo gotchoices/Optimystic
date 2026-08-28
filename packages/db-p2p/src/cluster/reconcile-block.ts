@@ -1,10 +1,11 @@
 import type { ActionRev, BlockId, IBlock } from "@optimystic/db-core";
+import { canonicalBlockHash } from "@optimystic/db-core";
 import type { BlockArchive } from "../storage/struct.js";
 import type { ReconcileBlockCallback } from "./cluster-repo.js";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import {
-	selectQuorumRev, selectQuorumBlock, canonicalBlockHash, corroboratorCapacity, quorumSize,
+	selectQuorumRev, selectQuorumBlock, corroboratorCapacity, quorumSize,
 	type RevClaim, type BlockHashCandidate, type QuorumRev
 } from "./quorum-restore.js";
 import { createLogger } from '../logger.js';

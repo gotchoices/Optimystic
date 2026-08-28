@@ -65,6 +65,26 @@ describe('LruMap', () => {
 		expect(map.has('b')).to.be.false;
 	});
 
+	it('should not refresh entry on peek', () => {
+		const map = new LruMap<string, number>(2);
+		map.set('a', 1);
+		map.set('b', 2);
+
+		// Peek 'a' — observation only, must NOT count as a use
+		expect(map.peek('a')).to.equal(1);
+
+		// Add 'c' — 'a' is still the oldest and gets evicted despite the peek
+		map.set('c', 3);
+		expect(map.has('a')).to.be.false;
+		expect(map.has('b')).to.be.true;
+		expect(map.has('c')).to.be.true;
+	});
+
+	it('peek returns undefined for missing keys', () => {
+		const map = new LruMap<string, number>(2);
+		expect(map.peek('missing')).to.be.undefined;
+	});
+
 	it('should delete entries', () => {
 		const map = new LruMap<string, number>(10);
 		map.set('a', 1);

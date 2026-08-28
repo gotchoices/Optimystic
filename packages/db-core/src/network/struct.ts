@@ -97,6 +97,21 @@ export type StaleFailure = {
 
 export type PendResult = PendSuccess | StaleFailure;
 
+/** What one block will materialize to at the committing revision, declared by the client that
+ *  authored the transforms. */
+export type BlockContentDigest = {
+	/** base64url SHA-256 of canonicalJson(block) - see canonicalBlockHash. */
+	digest: string;
+	/** Committed revision of the base the digest was computed from. ABSENT when the block's
+	 *  transform carries an insert, which makes the result base-independent and therefore
+	 *  checkable by every member regardless of how far behind it is. */
+	baseRev?: number;
+};
+
+/** Per-block content declarations riding on a commit. Optional per id: a block the client cannot
+ *  digest without a network read is simply omitted, and falls back to corroboration downstream. */
+export type BlockContentDigests = Record<BlockId, BlockContentDigest>;
+
 export type CommitRequest = ActionBlocks & {
 	/** The header block of the collection, if this is a new collection (commit first) */
 	headerId?: BlockId;
@@ -104,6 +119,10 @@ export type CommitRequest = ActionBlocks & {
 	tailId: BlockId;
 	/** The new revision for the committed action */
 	rev: number;
+	/** Per-block content declarations for the committing action — see {@link BlockContentDigests}.
+	 *  Rides inside the consensus message, so the generic cluster message hash folds it into every
+	 *  cohort signature with no change to the hash helpers. */
+	blockDigests?: BlockContentDigests;
 };
 
 /**

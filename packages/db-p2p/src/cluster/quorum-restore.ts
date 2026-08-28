@@ -1,6 +1,4 @@
 import type { IBlock } from "@optimystic/db-core";
-import { sha256 } from "multiformats/hashes/sha2";
-import { toString as uint8ArrayToString } from 'uint8arrays';
 
 /**
  * Quorum-corroboration helpers shared by the two block-restoration paths:
@@ -150,23 +148,8 @@ export function selectQuorumRev(
 		: undefined;
 }
 
-/** Deterministic JSON: sorts object keys so the hash is order-independent. Mirrors `ClusterMember.canonicalJson`. */
-function canonicalJson(value: unknown): string {
-	return JSON.stringify(value, (_, v) =>
-		v && typeof v === 'object' && !Array.isArray(v)
-			? Object.keys(v).sort().reduce((o: Record<string, unknown>, k) => { o[k] = v[k]; return o; }, {})
-			: v
-	);
-}
-
-/** Canonical sha256 of a block's content, base64url. Same pattern as `ClusterMember.computeCommitHash`. */
-export async function canonicalBlockHash(block: IBlock): Promise<string> {
-	const bytes = new TextEncoder().encode(canonicalJson(block));
-	const digest = await sha256.digest(bytes);
-	return uint8ArrayToString(digest.digest, 'base64url');
-}
-
-/** One block candidate paired with its serving peer and canonical hash. */
+/** One block candidate paired with its serving peer and canonical hash
+ * (`canonicalBlockHash` from `@optimystic/db-core`). */
 export interface BlockHashCandidate {
 	peerId: string;
 	hash: string;
@@ -185,7 +168,7 @@ export interface BlockHashCandidate {
  * Omit it to keep the floor at two.
  *
  * **What relaxing this does and does not cost.** Block ids are random 256-bit strings, not
- * content-addressed, so {@link canonicalBlockHash} is a cross-peer *agreement* hash and never a
+ * content-addressed, so `canonicalBlockHash` (db-core) is a cross-peer *agreement* hash and never a
  * check against the requested id — nothing here re-derives an id from received bytes. At capacity
  * one the sole peer's content is therefore taken on its word. That extends no trust the cohort had
  * not already extended: the same peer's `(rev, actionId)` claim is equally uncorroborable at that

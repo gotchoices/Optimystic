@@ -20,6 +20,11 @@ export class LruMap<K, V> {
 		return value;
 	}
 
+	/** Read without refreshing recency — for observation passes that must not reshape eviction order. */
+	peek(key: K): V | undefined {
+		return this.map.get(key);
+	}
+
 	set(key: K, value: V): this {
 		// If already present, delete first to refresh position
 		if (this.map.has(key)) {

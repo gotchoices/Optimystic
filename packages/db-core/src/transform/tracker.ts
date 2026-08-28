@@ -1,5 +1,5 @@
 import type { IBlock, BlockId, BlockStore as IBlockStore, BlockHeader, BlockOperation, BlockType, BlockSource as IBlockSource, ReadPurpose } from "../index.js";
-import { applyOperation, applyOperations, emptyTransforms, blockIdsForTransforms } from "./helpers.js";
+import { applyOperation, applyOperations, applyTransform, emptyTransforms, blockIdsForTransforms, transformForBlockId } from "./helpers.js";
 import { ensured } from "../utility/ensured.js";
 
 /** A block store that collects transformations, without applying them to the underlying source.
@@ -63,6 +63,47 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 			}
 		}
 		return block;                                    // no-ops path unchanged (source already cloned)
+	}
+
+	/** The block `id` materializes to under the staged transforms, computed WITHOUT loading from the
+	 * source, plus the committed revision of the base used. `undefined` when not computable here —
+	 * nothing staged for the id, the result is a delete, or an update's base is not locally cached
+	 * (a commit must not pay a network round trip to describe itself).
+	 *
+	 * Materializes with the canonical {@link applyTransform} — the exact function the member side
+	 * uses at commit — so client and member can never disagree on semantics (insert replaces the
+	 * block, then updates apply, then delete wins). An insert makes the result base-independent, so
+	 * `baseRev` is absent; updates-only returns the base's cached committed revision, probed from the
+	 * source via `peek`/`getCachedRevision` (duck-typed like {@link sourceGeneration}, because Tracker
+	 * layers over test doubles; `peek` must return a clone — CacheSource's does). Recency-neutral and
+	 * memo-neutral: observably changes no tracker or source state. */
+	peekMaterialized(id: BlockId): { block: IBlock; baseRev?: number } | undefined {
+		const transform = transformForBlockId(this.transforms, id);
+		if (transform.insert === undefined && transform.updates === undefined && transform.delete === undefined) {
+			return undefined;                              // nothing staged for this id
+		}
+		if (transform.delete) {
+			return undefined;                              // delete-last-wins: materializes to nothing
+		}
+		if (transform.insert) {
+			// applyTransform mutates the insert in place when updates ride along; transformForBlockId
+			// clones `updates` but NOT `insert`, so clone here to keep the staged transform pristine.
+			transform.insert = structuredClone(transform.insert);
+			const block = applyTransform(undefined, transform);
+			return block ? { block } : undefined;
+		}
+		const src = this.source as {
+			peek?: (id: BlockId) => T | undefined;
+			getCachedRevision?: (id: BlockId) => number | undefined;
+		};
+		if (typeof src.peek !== 'function' || typeof src.getCachedRevision !== 'function') return undefined;
+		const base = src.peek(id);
+		const baseRev = src.getCachedRevision(id);
+		// Require BOTH: an LRU-evicted id can leave a stale cached revision behind (see the NOTE on
+		// CacheSource's revisions map); peek returning undefined keeps it from pairing with a block.
+		if (base === undefined || baseRev === undefined) return undefined;
+		const block = applyTransform(base, transform);   // base already a clone (peek contract)
+		return block ? { block, baseRev } : undefined;
 	}
 
 	/** Forward a leaf-value upgrade down to the source's read collector (duck-typed: only the
