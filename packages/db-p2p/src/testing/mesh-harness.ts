@@ -335,8 +335,12 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		const reconcileBlock = createReconcileBlock({
 			selfPeerId: peerId.toString(),
 			fetchArchive: makeFetchArchive(nodes, peerId.toString(), failures),
-			saveReplicatedBlock: (blockId, block, source) => storageRepo.saveReplicatedBlock(blockId, block, source),
+			// Production shape: a proof reconcile verified against the agreed bytes is persisted so
+			// the repaired replica serves it onward.
+			saveReplicatedBlock: (blockId, block, source, verifiedProof) =>
+				storageRepo.saveReplicatedBlock(blockId, block, source, verifiedProof),
 			simpleMajorityThreshold: policy.simpleMajorityThreshold,
+			superMajorityThreshold: policy.superMajorityThreshold,
 			repairCorroborationClusterSize: policy.repairCorroborationClusterSize
 		});
 		reconcileByPeer.set(peerId.toString(), reconcileBlock);

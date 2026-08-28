@@ -293,8 +293,10 @@ describe('cohort growth replicates the founder block and makes it readable', fun
 				if (peerIdStr === peerC.toString()) return await serveArchive(cRepo, blockId);
 				return undefined;
 			},
-			saveReplicatedBlock: (blockId, block, source) => bRepo.saveReplicatedBlock(blockId, block, source),
+			saveReplicatedBlock: (blockId, block, source, verifiedProof) =>
+				bRepo.saveReplicatedBlock(blockId, block, source, verifiedProof),
 			simpleMajorityThreshold: 0.51,
+			superMajorityThreshold: 0.75,
 			repairCorroborationClusterSize: 3
 		});
 		const bCoordinator = new CoordinatorRepo(

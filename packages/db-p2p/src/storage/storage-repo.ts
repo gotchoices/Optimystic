@@ -866,12 +866,14 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 * local commit on the same block — otherwise `saveReplica`'s monotonic guard could
 	 * read a stale `latest` and clobber a commit that advanced it in between.
 	 *
-	 * Retains NO {@link BlockCommitProof}: this path carries no consensus record to project one
-	 * from, so a revision landed here is uncertified even though a local commit of the same
-	 * revision would be certified. Requiring the pusher to supply a verified proof is
-	 * `require-proof-on-block-push`.
+	 * `verifiedProof` is retained when supplied: the reconcile path
+	 * (`cluster/reconcile-block.ts`) passes the {@link BlockCommitProof} it verified against these
+	 * exact bytes (`certifyContent`'s digest check), so a repaired replica serves the proof onward
+	 * and certification no longer decays across repair hops. The churn/push path
+	 * (`BlockTransferService`) still passes none — its revisions land uncertified; requiring the
+	 * pusher to supply a verified proof is `require-proof-on-block-push`.
 	 */
-	async saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev): Promise<void> {
+	async saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev, verifiedProof?: BlockCommitProof): Promise<void> {
 		log('saveReplicatedBlock blockId=%s rev=%s', blockId, source?.rev);
 		const storage = this.createBlockStorage(blockId);
 		const release = await Latches.acquire(commitLatchKey(blockId));
@@ -879,7 +881,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		let landed: { collectionId: CollectionId, actionId: ActionId, rev: number } | undefined;
 		try {
 			const priorLatest = await storage.getLatest();
-			const effective = await storage.saveReplica(block, source);
+			const effective = await storage.saveReplica(block, source, verifiedProof);
 			// Advanced iff there was no prior revision or the effective rev moved past it. On the
 			// monotonic no-op, saveReplica returns the held latest unchanged → effective.rev === priorLatest.rev.
 			const advanced = priorLatest === undefined || effective.rev > priorLatest.rev;

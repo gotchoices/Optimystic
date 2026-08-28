@@ -162,8 +162,10 @@ describe('a block only one machine holds', function () {
 			selfPeerId: peerB.toString(),
 			fetchArchive: async (peerIdStr, blockId) =>
 				peerIdStr === peerA.toString() ? await serveArchive(aRepo, blockId) : undefined,
-			saveReplicatedBlock: (blockId, block, source) => bRepo.saveReplicatedBlock(blockId, block, source),
+			saveReplicatedBlock: (blockId, block, source, verifiedProof) =>
+				bRepo.saveReplicatedBlock(blockId, block, source, verifiedProof),
 			simpleMajorityThreshold: 0.51,
+			superMajorityThreshold: 0.75,
 			repairCorroborationClusterSize: clusterSize
 		});
 

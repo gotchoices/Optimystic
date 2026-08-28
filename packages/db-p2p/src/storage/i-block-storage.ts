@@ -88,8 +88,13 @@ export interface IBlockStorage {
      * No-op (still durable) when an equal-or-newer revision is already present: `latest`
      * is never downgraded. Idempotent for a fixed `(rev, actionId)`. Returns the
      * effective latest `ActionRev`.
+     *
+     * `proof` is persisted for `source.rev` and MUST already be verified by the caller against
+     * these exact bytes (`verifyBlockCommitProofContent` — the digest check is what binds a proof
+     * to the block content). An unverified proof passed here would be re-served onward as evidence
+     * this node never checked. The monotonic no-op persists nothing, proof included.
      */
-    saveReplica(block: IBlock, source?: ActionRev): Promise<ActionRev>;
+    saveReplica(block: IBlock, source?: ActionRev, proof?: BlockCommitProof): Promise<ActionRev>;
 
     /**
      * Writes a forward TOMBSTONE revision that reverses a block creation: persists `rev → actionId`,

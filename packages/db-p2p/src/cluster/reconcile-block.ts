@@ -1,4 +1,4 @@
-import type { ActionRev, BlockId, IBlock } from "@optimystic/db-core";
+import type { ActionId, ActionRev, BlockId, IBlock } from "@optimystic/db-core";
 import { canonicalBlockHash } from "@optimystic/db-core";
 import type { BlockArchive } from "../storage/struct.js";
 import { maxArchiveRevision } from "../storage/block-archive.js";
@@ -7,8 +7,13 @@ import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import {
 	selectQuorumRev, selectQuorumBlock, corroboratorCapacity, quorumSize,
+	certifiedEquivocation, certifiedContentEquivocation,
 	type RevClaim, type BlockHashCandidate, type QuorumRev
 } from "./quorum-restore.js";
+import {
+	certifyClaim, certifyContent, isAttributableProofFailure, type ProofAnchoring
+} from "./certified-claims.js";
+import type { BlockCommitProof } from "./commit-proof.js";
 import { createLogger } from '../logger.js';
 
 const log = createLogger('reconcile-block');
@@ -28,6 +33,24 @@ interface ReconcileCandidate {
 	actionId: string;
 	/** Present only when the serving archive carried a materialized block for `rev`. */
 	block?: IBlock;
+	/**
+	 * The cohort commit proof the serving archive attached, when it carried one. The archive keys the
+	 * proof INSIDE the same revision entry as the `(rev, actionId)` it certifies
+	 * (`storage/struct.ts` `ArchiveRevisions`), so a serving peer cannot pair a genuine proof with a
+	 * different revision — mis-pairing is structurally blocked by the wire shape. Presence proves
+	 * nothing; the certification pass below is what turns it into a verdict.
+	 */
+	proof?: BlockCommitProof;
+	/** Injected by the certification pass: the proof verified for this `(rev, actionId)`. Never set from mere proof presence. */
+	revCertified?: boolean;
+	/** Injected by the certification pass: the proof's declared digest matches these exact bytes. */
+	contentCertified?: boolean;
+	/**
+	 * Set on `digest-mismatch` only: the served bytes provably contradict the proof's declared
+	 * digest, so this candidate is dropped from the content quorum (its rev claim still counts —
+	 * that half genuinely verified).
+	 */
+	contentRejected?: boolean;
 }
 
 /** Collaborators {@link createReconcileBlock} needs, injected so the logic stays transport-agnostic. */
@@ -36,10 +59,18 @@ export interface ReconcileBlockDeps {
 	selfPeerId: string;
 	/** Fetch one cohort peer's archive for `blockId` — `undefined` when it is unreachable or holds nothing. */
 	fetchArchive: (peerId: string, blockId: BlockId) => Promise<BlockArchive | undefined>;
-	/** Persist the agreed content through the churn-replication funnel. */
-	saveReplicatedBlock: (blockId: BlockId, block: IBlock, source: ActionRev) => Promise<void>;
+	/**
+	 * Persist the agreed content through the churn-replication funnel. `verifiedProof` is passed
+	 * ONLY when it was verified against these exact bytes (`certifyContent`'s digest check) — the
+	 * receiver persists it as evidence, so an unverified proof must never reach this parameter.
+	 */
+	saveReplicatedBlock: (blockId: BlockId, block: IBlock, source: ActionRev, verifiedProof?: BlockCommitProof) => Promise<void>;
 	/** Proportional corroboration threshold; the cohort's `simpleMajorityThreshold`. */
 	simpleMajorityThreshold: number;
+	/** Promise-round gate for proof verification; the cohort's `superMajorityThreshold`. */
+	superMajorityThreshold: number;
+	/** Optional layer-2 anchoring for accepted proofs — observational only, see `cluster/certified-claims.ts`. */
+	anchoring?: ProofAnchoring;
 	/**
 	 * Yardstick the corroboration floor is measured against — the floor for
 	 * {@link corroboratorCapacity}. Required, not optional: unlike the membership admission gate there
@@ -86,7 +117,10 @@ function toCandidate(peerId: string, archive: BlockArchive, committedRev: number
 	if (maxRev === undefined || maxRev < committedRev) return undefined;
 	const data = archive.revisions[maxRev];
 	if (!data?.action) return undefined;
-	return { peerId, rev: maxRev, actionId: data.action.actionId, block: data.block };
+	return {
+		peerId, rev: maxRev, actionId: data.action.actionId, block: data.block,
+		...(data.proof ? { proof: data.proof } : {})
+	};
 }
 
 /**
@@ -114,16 +148,109 @@ async function fetchAnswer(
 }
 
 /**
- * Hash the block bytes of every candidate that both corroborates `selected` and actually carried content.
+ * Run every proof-carrying candidate through the shared certification layer
+ * (`cluster/certified-claims.ts`) and inject the verdicts, BEFORE selection reads the claim set.
+ * Mirrors the read path's certifyClaim pass (`CoordinatorRepo.queryClusterForLatest`) — same
+ * thresholds, same failure logging, same penalty discipline:
+ *
+ *  - A candidate whose claim half fails stays an ORDINARY uncertified corroborator (its vote is
+ *    never dropped — a peer that could fabricate a bad proof could equally have sent none), and
+ *    only an attributable failure (`isAttributableProofFailure`) penalizes the serving peer.
+ *  - `digest-mismatch` is the one content-side rejection: the served bytes provably contradict
+ *    the proof's declared digest, so the candidate is dropped from the content quorum and the
+ *    server penalized — while its (genuinely verified) rev claim still counts.
+ *  - `no-digest-declared` leaves the content an ordinary uncertified carrier: the cohort declared
+ *    nothing to compare against, which is a verdict, never misbehavior.
+ *
+ * NOTE: cost is one verification pass per proof-carrying answer per reconcile, each bounded by
+ * MAX_PROOF_SIGNERS (256, the shared layer's cap) signature checks × cohort width — fine at
+ * deployment cohort sizes (~10).
+ */
+async function certifyCandidates(deps: ReconcileBlockDeps, blockId: BlockId, candidates: ReconcileCandidate[]): Promise<void> {
+	// simpleMajorityThreshold is hardcoded 0.5, NOT deps.simpleMajorityThreshold (0.51 default):
+	// members enforce `count > total / 2` (ClusterMember.hasMajority), and the ProofThresholds doc
+	// says to mirror that — verifying against the config value would reject proofs real cohorts
+	// produce. Same rule as the read path (coordinator-repo.ts queryClusterForLatest).
+	const thresholds = { superMajorityThreshold: deps.superMajorityThreshold, simpleMajorityThreshold: 0.5 };
+	await Promise.all(candidates.map(async c => {
+		if (!c.proof) return;
+		const claim = { blockId, rev: c.rev, actionId: c.actionId as ActionId };
+		if (c.block) {
+			const verdict = await certifyContent(c.proof, claim, c.block, thresholds, deps.anchoring);
+			if (verdict.revCertified) {
+				c.revCertified = true;
+				if (verdict.contentCertified) {
+					c.contentCertified = true;
+				} else if (verdict.failure === 'digest-mismatch') {
+					// The claim half genuinely passed; the bytes provably lie. Drop them from the
+					// content quorum and penalize the server — repair continues on the other holders.
+					c.contentRejected = true;
+					log('reconcile:content-rejected', { blockId, peerId: c.peerId, rev: c.rev });
+					penalizeProofService(deps.reputation, c.peerId, blockId);
+				}
+				// no-digest-declared: content stays an ordinary uncertified carrier, no penalty.
+				return;
+			}
+			logUncertified(blockId, c, verdict.failure);
+			if (isAttributableProofFailure(verdict.failure)) {
+				penalizeProofService(deps.reputation, c.peerId, blockId);
+			}
+			return;
+		}
+		const verdict = await certifyClaim(c.proof, claim, thresholds, deps.anchoring);
+		if (verdict.certified) {
+			c.revCertified = true;
+			return;
+		}
+		logUncertified(blockId, c, verdict.failure);
+		if (isAttributableProofFailure(verdict.failure)) {
+			penalizeProofService(deps.reputation, c.peerId, blockId);
+		}
+	}));
+}
+
+/** Mirror of `cluster-fetch:proof-uncertified` on the read path — same fields, reconcile-side name. */
+function logUncertified(blockId: BlockId, c: ReconcileCandidate, failure: string): void {
+	log('reconcile:proof-uncertified', { blockId, peerId: c.peerId, rev: c.rev, failure });
+}
+
+/**
+ * Best-effort penalty for a peer whose served proof (or the bytes served under it) provably lies.
+ * Mirrors `CoordinatorRepo.penalizeProofService` — never throws.
+ */
+function penalizeProofService(
+	reputation: Pick<IPeerReputation, 'reportPeer'> | undefined, peerId: string, blockId: BlockId
+): void {
+	if (!reputation) return;
+	try {
+		reputation.reportPeer(peerId, PenaltyReason.InvalidRestoration, `reconcile:${blockId}`);
+	} catch (err) {
+		log('reconcile:penalize-error', { blockId, error: (err as Error).message });
+	}
+}
+
+/**
+ * Hash the block bytes of every candidate that both corroborates `selected` and actually carried
+ * content — minus any whose bytes were rejected against their own proof's digest
+ * (`contentRejected`). A carrier whose content CERTIFIED carries its `certified` flag into the
+ * selector and its proof alongside: that is the only proof safe to persist, because it was
+ * verified against these exact bytes.
  *
  * NOTE: this canonical-JSON-serializes and sha256s every carrier's whole block on every reconcile.
  * Negligible at today's cohort widths and block sizes; if blocks grow large or cohorts wide enough
  * for this to show up on a commit-path profile, hash incrementally at receive time instead.
  */
-async function hashCarriers(candidates: ReconcileCandidate[], selected: QuorumRev): Promise<BlockHashCandidate[]> {
-	const carriers = candidates.filter(c => c.rev === selected.rev && c.actionId === selected.actionId && c.block);
+async function hashCarriers(
+	candidates: ReconcileCandidate[], selected: QuorumRev
+): Promise<(BlockHashCandidate & { proof?: BlockCommitProof })[]> {
+	const carriers = candidates.filter(c =>
+		c.rev === selected.rev && c.actionId === selected.actionId && c.block && !c.contentRejected);
 	return await Promise.all(
-		carriers.map(async c => ({ peerId: c.peerId, hash: await canonicalBlockHash(c.block!), block: c.block! }))
+		carriers.map(async c => ({
+			peerId: c.peerId, hash: await canonicalBlockHash(c.block!), block: c.block!,
+			...(c.contentCertified ? { certified: true } : {}),
+			...(c.contentCertified && c.proof ? { proof: c.proof } : {})
+		}))
 	);
 }
 
@@ -182,9 +309,25 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 		const tally = (kind: PeerAnswer['kind']) => answers.filter(a => a.kind === kind).length;
 		const capacity = corroboratorCapacity(targets.length, deps.repairCorroborationClusterSize);
 
-		const revClaims: RevClaim[] = candidates.map(({ peerId, rev, actionId }) => ({ peerId, rev, actionId }));
+		await certifyCandidates(deps, blockId, candidates);
+
+		const revClaims: RevClaim[] = candidates.map(({ peerId, rev, actionId, revCertified }) => ({
+			peerId, rev, actionId, ...(revCertified ? { certified: true } : {})
+		}));
 		const selected = selectQuorumRev(revClaims, deps.simpleMajorityThreshold, capacity);
 		if (!selected) {
+			// Asked ONLY on a decline: a certified-vs-certified conflict can coexist with a successful
+			// selection (a corroborated pair strictly above the top certified rev wins), so a
+			// non-undefined answer here explains THIS decline, nothing more. Two verified proofs for
+			// distinct actions at one revision means the cohort (or whoever holds its keys) provably
+			// signed both sides — an incident, not a shortage of answers; neither claimant is
+			// penalized, because which side is wrong is exactly what this node cannot know.
+			const equivocation = certifiedEquivocation(revClaims);
+			if (equivocation) {
+				log('reconcile:certified-equivocation', {
+					blockId, rev: equivocation.rev, actionIds: equivocation.actionIds
+				});
+			}
 			// Leave the block behind; churn/rebalance and the next commit retry.
 			log('reconcile:no-rev-quorum', {
 				blockId,
@@ -200,9 +343,26 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 			return;
 		}
 
+		if (selected.certified) {
+			// Which rule won matters when reading a repair log: a certified selection may rest on a
+			// SINGLE claimant whose corroboration is the cohort's signature set, not other voters.
+			log('reconcile:certified-selected', {
+				blockId, rev: selected.rev, claimants: selected.supporters.length
+			});
+		}
+
 		const hashCandidates = await hashCarriers(candidates, selected);
 		const agreed = selectQuorumBlock(hashCandidates, deps.simpleMajorityThreshold, capacity);
 		if (!agreed) {
+			// Two certified hashes at one (rev, actionId) means the cohort's keys signed two digests
+			// into one revision — a provable compromise an operator must be able to tell apart from a
+			// routine carrier shortfall; without this line the two declines log identically.
+			const equivocation = certifiedContentEquivocation(hashCandidates);
+			if (equivocation) {
+				log('reconcile:certified-content-equivocation', {
+					blockId, rev: selected.rev, hashes: equivocation.hashes
+				});
+			}
 			log('reconcile:no-content-quorum', {
 				blockId,
 				rev: selected.rev,
@@ -213,9 +373,24 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 			return;
 		}
 
-		penalizeContradictingContent(deps.reputation, hashCandidates, agreed.hash, blockId);
+		// Detection is sound: selectQuorumBlock's certified branch fires iff exactly one distinct
+		// certified hash exists, so a defined `agreed` with a certified carrier at `agreed.hash` ⇔
+		// the certified rule won.
+		const certifiedCarrier = hashCandidates.find(c => c.certified === true && c.hash === agreed.hash);
 
-		await deps.saveReplicatedBlock(blockId, agreed.block, { actionId: selected.actionId, rev: selected.rev });
+		// Contradicting-content penalties run ONLY on a corroborated win, mirroring the read path's
+		// rule (CoordinatorRepo.penalizeContradictingRevClaims): an unanchored proof must not be able
+		// to convict the honest cohort — anyone holding N keys can mint a proof that verifies, and
+		// penalizing dissenters against it would hand a forged proof a reputation lever. Revisit when
+		// certification is anchored to the block's derived cohort
+		// (`feat-cluster-membership-threshold-cert-anchoring`).
+		if (!certifiedCarrier) {
+			penalizeContradictingContent(deps.reputation, hashCandidates, agreed.hash, blockId);
+		}
+
+		// A corroboration-won heal with no certified carrier persists no proof — today's behavior.
+		await deps.saveReplicatedBlock(
+			blockId, agreed.block, { actionId: selected.actionId, rev: selected.rev }, certifiedCarrier?.proof);
 		log('reconcile:restored', { blockId, rev: selected.rev, actionId: selected.actionId });
 	};
 }

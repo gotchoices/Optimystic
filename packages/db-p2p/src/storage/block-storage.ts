@@ -234,7 +234,7 @@ export class BlockStorage implements IBlockStorage {
 		return { reconciled: false, latest: meta.latest };
 	}
 
-	async saveReplica(block: IBlock, source?: ActionRev): Promise<ActionRev> {
+	async saveReplica(block: IBlock, source?: ActionRev, proof?: BlockCommitProof): Promise<ActionRev> {
 		const rev = source?.rev ?? 1;
 		// Deterministic fallback id when the sender carried no revision metadata, so a
 		// re-push of the same block resolves to the same (rev, actionId) and stays
@@ -247,7 +247,7 @@ export class BlockStorage implements IBlockStorage {
 		return await this.saveForwardRevision(
 			rev,
 			actionId,
-			{ action: { actionId, rev, transform: { insert: block } }, block },
+			{ action: { actionId, rev, transform: { insert: block } }, block, ...(proof ? { proof } : {}) },
 			'replica'
 		);
 	}
@@ -279,7 +279,7 @@ export class BlockStorage implements IBlockStorage {
 	private async saveForwardRevision(
 		rev: number,
 		actionId: ActionId,
-		body: { action: ActionTransform; block?: IBlock },
+		body: { action: ActionTransform; block?: IBlock; proof?: BlockCommitProof },
 		logLabel: 'replica' | 'deletion'
 	): Promise<ActionRev> {
 		// Serialize the read-modify-write on this block's metadata (mirrors ensureRevision). saveReplica
@@ -293,6 +293,10 @@ export class BlockStorage implements IBlockStorage {
 
 			// Monotonic guard: an equal-or-newer revision is already held. The block (or tombstone) is
 			// durably present; do not downgrade `latest` or rewrite the metadata.
+			// NOTE: this skip returns before persisting anything, so an already-held revision keeps
+			// whatever proof state it had — a certified re-heal of a held rev does NOT backfill its
+			// proof. Acceptable: the revision itself is already durable, and the proof is an
+			// availability optimization, not a correctness requirement.
 			if (meta?.latest && meta.latest.rev >= rev) {
 				log('%s:skip blockId=%s rev=%d held=%d', logLabel, this.blockId, rev, meta.latest.rev);
 				return meta.latest;
@@ -453,31 +457,39 @@ export class BlockStorage implements IBlockStorage {
 
 	private async restoreBlock(rev: number): Promise<BlockArchive | undefined> {
 		if (!this.restoreCallback) return undefined;
-		return await this.restoreCallback(this.blockId, rev);
+		const archive = await this.restoreCallback(this.blockId, rev);
+		if (!archive) return undefined;
+		// The archive comes straight from a remote peer (RestorationCoordinator fetches and verifies
+		// NOTHING), so strip any attached proof before saveRestored persists the entries: persisting
+		// an unverified proof would re-serve a hostile peer's artifact as evidence this node retained
+		// itself. Verified proofs enter storage only through saveReplica (reconcile's certified path).
+		for (const entry of Object.values(archive.revisions ?? {})) {
+			if (entry && typeof entry === 'object') delete entry.proof;
+		}
+		return archive;
 	}
 
 	/**
 	 * Persist a fetched archive's revisions locally.
 	 *
-	 * NOTE: a served archive may carry the cohort's `BlockCommitProof` for a revision, and this
-	 * deliberately does NOT store it — nothing on the repair path has verified it yet, and a node
-	 * that persisted an unverified proof would re-serve a hostile peer's artifact as evidence it
-	 * retained itself. The consequence to know: a block obtained by repair (here, or through
-	 * `cluster/reconcile-block.ts`) holds no proof, so that node serves the revision proof-less even
-	 * though the cohort members that committed it do not. Once `accept-certified-claims-in-repair`
-	 * verifies a proof before accepting it, persisting the verified one here is the follow-on that
-	 * closes the asymmetry.
+	 * A revision entry's `proof` IS persisted (`saveBlockProof`), so a repaired node can serve it
+	 * onward — CALLERS must strip any proof they have not verified against the entry's exact bytes.
+	 * The one unverified entry point is {@link restoreBlock} above, which strips; the verified one is
+	 * {@link saveReplica}, whose caller chain (`StorageRepo.saveReplicatedBlock` ←
+	 * `cluster/reconcile-block.ts`) passes a proof only after `certifyContent` bound it to these
+	 * bytes.
 	 */
 	private async saveRestored(archive: BlockArchive) {
 		const revisions = Object.entries(archive.revisions)
 			.map(([rev, data]) => ({ rev: Number(rev), data }));
 
-		// Save all revisions, actions, and materializations
-		for (const { rev, data: { action, block } } of revisions) {
+		// Save all revisions, actions, materializations, and any verified proofs
+		for (const { rev, data: { action, block, proof } } of revisions) {
 			await Promise.all([
 				this.storage.saveRevision(this.blockId, rev, action.actionId),
 				this.storage.saveTransaction(this.blockId, action.actionId, action.transform),
-				block ? this.storage.saveMaterializedBlock(this.blockId, action.actionId, block) : Promise.resolve()
+				block ? this.storage.saveMaterializedBlock(this.blockId, action.actionId, block) : Promise.resolve(),
+				proof ? this.storage.saveBlockProof(this.blockId, rev, proof) : Promise.resolve()
 			]);
 		}
 	}

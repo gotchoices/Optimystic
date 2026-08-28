@@ -766,10 +766,21 @@ export async function createLibp2pNodeBase(
 		const reconcileBlock: ReconcileBlockCallback = createReconcileBlock({
 			selfPeerId: node.peerId.toString(),
 			fetchArchive: fetchArchiveFromPeer,
-			saveReplicatedBlock: (blockId, block, source) => storageRepo.saveReplicatedBlock(blockId, block, source),
+			// The 4th parameter is a proof reconcile verified against these exact bytes; it is
+			// persisted so the repaired replica serves it onward (see StorageRepo.saveReplicatedBlock).
+			saveReplicatedBlock: (blockId, block, source, verifiedProof) =>
+				storageRepo.saveReplicatedBlock(blockId, block, source, verifiedProof),
 			simpleMajorityThreshold: consensusConfig.simpleMajorityThreshold,
+			superMajorityThreshold: consensusConfig.superMajorityThreshold,
 			repairCorroborationClusterSize: consensusConfig.repairCorroborationClusterSize,
 			reputation
+			// `anchoring` (proof layer-2, `ProofAnchoring`) is intentionally NOT wired here yet — nor
+			// is the coordinator's `proofAnchoring` below: a real implementation re-derives the
+			// block's cohort from `keyNetwork.findCluster` (the same source `deriveExpectedCluster`
+			// uses) and needs a churn-tolerance window so historic cohort rotation does not read as an
+			// anomaly flood. Until then certification runs on layer-1 cryptography and LOGS the
+			// unanchored residual. See `feat-cluster-membership-threshold-cert-anchoring`, and the
+			// matching `recomputeArbitratorSet` note at the clusterMember construction below.
 		});
 
 		// Member-side membership derivation for the admission gate: independently re-derive this block's
@@ -852,8 +863,10 @@ export async function createLibp2pNodeBase(
 		// ticket cluster-read-consult-cannot-report-unreachable).
 		//
 		// The claim carries the cohort's commit proof for the claimed revision when the answering
-		// peer retained one. It is attached UNVERIFIED — a peer chooses what to send — and nothing
-		// on the read path weighs it yet; verification is `accept-certified-claims-in-repair`.
+		// peer retained one. It is attached UNVERIFIED — a peer chooses what to send. Both repair
+		// paths verify it before weighing it (the shared layer in `cluster/certified-claims.ts`):
+		// the coordinator's certifyClaim pass in `queryClusterForLatest`, and reconcile's
+		// certification pass in `cluster/reconcile-block.ts`.
 		const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId, context?) => {
 			// Self-read short-circuit: dialling self via SyncClient is a round trip
 			// with no remote on the other end, and on nodes without listen addresses
