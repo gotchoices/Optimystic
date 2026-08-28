@@ -1,6 +1,6 @@
 ----
 description: Keep the group's signed approval of a write on disk next to the record it approved, and add a checker that can confirm, offline, that a copy of the record really is the one the group agreed on.
-prereq: commit-cert-bind-block-content-digest
+prereq: commit-cert-digest-member-check
 files: packages/db-core/src/cluster/membership.ts, packages/db-core/src/cluster/structs.ts, packages/db-p2p/src/cluster/commit-proof.ts, packages/db-p2p/src/cluster/peer-key-binding.ts, packages/db-p2p/src/cluster/cluster-repo.ts, packages/db-p2p/src/storage/i-raw-storage.ts, packages/db-p2p/src/storage/i-block-storage.ts, packages/db-p2p/src/storage/block-storage.ts, packages/db-p2p/src/storage/kv-raw-storage.ts, packages/db-p2p/src/storage/cached-raw-storage.ts, packages/db-p2p/src/storage/raw-store-codec.ts, packages/db-p2p/src/storage/storage-repo.ts
 difficulty: hard
 ----
