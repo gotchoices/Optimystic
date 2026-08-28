@@ -1,15 +1,108 @@
 ----
 description: Let a machine prove that a record really was updated by checking a signature the group produced when it committed, instead of having to reach two other machines that say the same thing. Without that proof, a machine that cannot reach enough peers can never catch up, and small or partly-connected deployments get stuck permanently.
 prereq:
-files: packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/cluster/commit-cert.ts, packages/db-p2p/src/storage/struct.ts (BlockArchive), packages/db-p2p/src/sync/service.ts, packages/db-p2p/src/sync/protocol.ts
+files: packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/cluster/commit-cert.ts, packages/db-p2p/src/cluster/cluster-repo.ts, packages/db-p2p/src/cluster/quorum-restore.ts, packages/db-p2p/src/cluster/reconcile-block.ts, packages/db-p2p/src/cluster/block-transfer-service.ts, packages/db-p2p/src/storage/struct.ts (BlockArchive), packages/db-p2p/src/sync/service.ts, packages/db-p2p/src/sync/protocol.ts, packages/db-p2p/test/block-transfer-push-persist.spec.ts
 difficulty: hard
 severity: wrong-result
 likelihood: normal-use
 repro: verified
-tradeoffs: It is a large piece of work whose own prerequisite (cohort-membership anchoring) is not built, and the availability arm below can be worked around by an operator setting `clusterPolicy.assumedClusterSize` — for two-machine deployments; three-machine ones have no workaround at all.
 ----
 
 # Verify restored blocks against a commit certificate (Sybil-resistant)
+
+## Promoted to plan, 2026-08-27 — read this section first
+
+Two things changed since this was parked, and together they retire the reason it was parked.
+
+**1. The floor this ticket hardens is already bypassable, so "is it worth the cost" is the wrong
+question.** `blocked/repair-floor-defends-a-door-the-push-path-leaves-open` (now absorbed here, and
+deleted) measured it rather than arguing it. `BlockTransferService.handlePush` accepts a pushed block
+from any peer, validates only that the payload parses and has a `header`, and persists it via
+`saveReplicatedBlock` using the **pusher's own** rev and action id — which is exactly what that node
+then reports when a reader asks what it holds:
+
+```
+push accepted: [ 'single-holder-block' ]  missing: []
+push accepted: [ 'single-holder-block' ]  missing: []
+reader served payload: FORGED  rev: 7
+reader now HOLDS payload: FORGED  rev: 7
+```
+
+Run with the strict default (`repairCorroborationClusterSize: 10`, floor of two, no relaxation). A
+peer that can dial two cohort members manufactures two honest-looking corroborators, and the floor is
+satisfied by construction. The reader then becomes a third. The acceptance half is pinned green in
+`test/block-transfer-push-persist.spec.ts:48,65` — working as designed, for the design in
+`docs/internals.md:859` (any peer that can open a connection may issue database operations;
+`authorizeInboundStream` is the embedder's opt-in seam and defaults to `undefined`).
+
+So today we pay permanent unreadability of a deployment's earliest data for a guarantee any peer with
+two connections can walk around. That is not a threat model to choose between; it is one mechanism
+that works and one that does not, and the certificate replaces both.
+
+**2. The decision that was blocked has been made.** Fund this path. Neither the corroboration floor
+nor the push path is the durable answer: once a revision carries proof, origin stops mattering, the
+floor stops doing load-bearing work, and an unauthenticated push becomes harmless because an
+unproven block is simply not accepted. Do not spend this ticket re-litigating Position A vs Position
+B — implement the thing that dissolves the question.
+
+### What was verified in the tree on 2026-08-27, so the planner does not re-derive it
+
+- `BlockArchive` (`storage/struct.ts:19`) is `{ blockId, revisions, range, pending? }` — **no
+  signature or certificate field anywhere in the type**. There is nothing on the restore/sync wire to
+  check, which is why "take the peer's word" is the whole path, not a corner of it.
+- `buildCommitCert` (`cluster/commit-cert.ts`) already assembles the real artifact: the cohort's
+  per-member Ed25519 **commit** votes over the commit hash, concatenated in signer order, plus the
+  exact signed preimage. It is then handed to an in-memory sink with
+  `DEFAULT_COMMIT_CERT_TTL_MS = 60_000` for reactivity. Even the node that witnessed consensus cannot
+  prove it an hour later.
+- Client signatures are real but unenforced in practice: `requireClientSignature` exists,
+  `createQuereusValidator` is exported, and **no shipping entry point constructs one** — the node
+  takes `validator` as an option nothing sets (see `backlog/feat-no-deployment-validates-transactions-at-pend`).
+  They also validate the *transaction at pend*, not the block bytes replicated later.
+
+### The design question this ticket must answer — it is not just wiring
+
+The commit cert signs the commit hash over the record's **message** — the transaction — not over the
+resulting block bytes. A receiver can therefore prove *"the cohort approved action X at revision N"*
+but not *"these bytes are what X produces from N-1"*. Block ids are **not** content hashes (see
+`complete/bug-docs-claim-block-ids-are-content-hashes`), so the id binds nothing either. Closing that
+needs one of:
+
+- **Verify by replay** — replicate signed transforms rather than materialized state, and replay from a
+  base the receiver already trusts. Strongest binding; costs a replay and a trusted base, and
+  interacts with how `BlockArchive` already carries `pending` transforms.
+- **Extend the signed preimage** to cover a digest of the resulting block, so the certificate binds
+  content directly. Cheaper to verify; changes the commit-vote preimage, which is a wire-compatibility
+  event — and note `computeClusterMessageHash` canonicalises the whole message generically, so an
+  older peer recomputes a changed preimage correctly (established while shipping
+  `complete/1-commit-and-cancel-records-omit-the-coordinating-block`).
+
+Pick one, with the reasoning written down. This is the crux of the ticket; everything else is
+plumbing.
+
+### Staging — the default, unless the plan stage finds better
+
+Land at **layer-1 strength now** and log the residual anchoring gap, following the precedent this
+ticket already cites: `verifyInvalidationCertificate` verifies a challenger-bound signer set,
+membership and dedup, and logs what it cannot yet anchor rather than waiting for
+`feat-cluster-membership-threshold-cert-anchoring`. A certified claim verified to that standard is
+strictly stronger than "two peers said the same number", which carries no signatures at all. Waiting
+for the anchor keeps a measured hole open indefinitely; shipping without it is a real improvement that
+the anchor later upgrades in place.
+
+Once a cert can be verified, `handlePush` must require one — that is what closes the forgery above,
+and it should be part of this work rather than a follow-on, because a push path that still accepts
+unproven blocks re-opens everything this ticket buys.
+
+### Sizing — split it
+
+This does not fit one agent run. Emit prereq-chained implement tickets; the natural seams are:
+persist the cert with the revision → carry it in `BlockArchive` and the sync protocol → verify on the
+read-repair/reconcile path → require it on `handlePush` → retention policy (certs must outlive a
+60 s TTL to serve historical restores). Fold `backlog/debt-read-repair-penalty-provable-only` if its
+cheap arm (stop penalising an uncorroborated higher revision) falls out of this work; leave it filed
+if it does not.
+
 
 ## Why this exists
 
@@ -176,6 +269,5 @@ check a lone claim against. It landed two implement tickets instead:
 `replicate-owned-blocks-when-the-cohort-grows` (stop creating singly-held blocks, and heal existing
 ones while their holder is online) and `name-the-single-holder-deadlock` (say what is happening).
 **Neither covers a block whose sole holder is offline or gone — this ticket is still what covers
-that.** A related threat-model question it surfaced is in
-`blocked/repair-floor-defends-a-door-the-push-path-leaves-open`; how that is answered may change this
-ticket's priority.
+that.** The threat-model question it surfaced has been absorbed into the "Promoted to plan" section at the
+top of this ticket, and that blocked ticket deleted.
