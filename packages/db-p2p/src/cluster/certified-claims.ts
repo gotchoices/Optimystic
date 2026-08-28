@@ -158,6 +158,23 @@ export function isAttributableProofFailure(failure: CertifyFailure): boolean {
 }
 
 /**
+ * The {@link ProofThresholds} both repair paths verify against, from the cohort's configured
+ * `superMajorityThreshold`.
+ *
+ * `simpleMajorityThreshold` is hardcoded 0.5 — NOT the deployment's configured value (0.51 by
+ * default): cohort members enforce `count > total / 2` (`ClusterMember.hasMajority`), and
+ * `ProofThresholds` requires a verifier to mirror what the members actually enforced. Verifying
+ * against the configured value would reject proofs real cohorts produce.
+ *
+ * One function so the read path (`CoordinatorRepo.queryClusterForLatest`) and the commit-path
+ * reconcile (`cluster/reconcile-block.ts`) cannot drift on the one number that has to match
+ * `hasMajority`.
+ */
+export function proofThresholds(superMajorityThreshold: number): ProofThresholds {
+	return { superMajorityThreshold, simpleMajorityThreshold: 0.5 };
+}
+
+/**
  * Certification verdict for a claim — a discriminated union, mirroring `ProofVerdict`
  * (`commit-proof.ts`) so "certified" and "why not" cannot disagree: a failure reason is REQUIRED
  * when uncertified and unrepresentable when certified.

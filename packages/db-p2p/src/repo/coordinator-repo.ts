@@ -9,7 +9,7 @@ import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocation, CORROBORATION_FLOOR, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
-import { certifyClaim, isAttributableProofFailure, type ProofAnchoring } from "../cluster/certified-claims.js";
+import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAnchoring } from "../cluster/certified-claims.js";
 import { DEFAULT_CLUSTER_SIZE } from "../cluster/cluster-policy.js";
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
 import { isMissingBaseRevisionFailure, MISSING_BASE_REVISION_REASON } from "../storage/storage-repo.js";
@@ -1062,11 +1062,10 @@ export class CoordinatorRepo implements IRepo {
 			const verdict = await certifyClaim(
 				claim.proof,
 				{ blockId, rev: claim.rev, actionId: claim.actionId },
-				// simpleMajorityThreshold is hardcoded 0.5, NOT this.simpleMajorityThreshold (0.51
-				// default): members enforce `count > total / 2` (ClusterMember.hasMajority), and the
-				// ProofThresholds doc says to mirror that — verifying against the config value would
-				// reject proofs real cohorts produce.
-				{ superMajorityThreshold: this.superMajorityThreshold, simpleMajorityThreshold: 0.5 },
+				// Shared with the reconcile path, so the two cannot drift on what the members actually
+				// enforced — see `proofThresholds` for why the simple-majority term is not
+				// this.simpleMajorityThreshold.
+				proofThresholds(this.superMajorityThreshold),
 				this.proofAnchoring
 			);
 			if (verdict.certified) {

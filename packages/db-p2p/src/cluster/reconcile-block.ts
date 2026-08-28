@@ -11,7 +11,7 @@ import {
 	type RevClaim, type BlockHashCandidate, type QuorumRev
 } from "./quorum-restore.js";
 import {
-	certifyClaim, certifyContent, isAttributableProofFailure, type ProofAnchoring
+	certifyClaim, certifyContent, isAttributableProofFailure, proofThresholds, type ProofAnchoring
 } from "./certified-claims.js";
 import type { BlockCommitProof } from "./commit-proof.js";
 import { createLogger } from '../logger.js';
@@ -167,11 +167,9 @@ async function fetchAnswer(
  * deployment cohort sizes (~10).
  */
 async function certifyCandidates(deps: ReconcileBlockDeps, blockId: BlockId, candidates: ReconcileCandidate[]): Promise<void> {
-	// simpleMajorityThreshold is hardcoded 0.5, NOT deps.simpleMajorityThreshold (0.51 default):
-	// members enforce `count > total / 2` (ClusterMember.hasMajority), and the ProofThresholds doc
-	// says to mirror that — verifying against the config value would reject proofs real cohorts
-	// produce. Same rule as the read path (coordinator-repo.ts queryClusterForLatest).
-	const thresholds = { superMajorityThreshold: deps.superMajorityThreshold, simpleMajorityThreshold: 0.5 };
+	// Shared with the read path, so the two cannot drift on what the members actually enforced —
+	// see `proofThresholds` for why the simple-majority term is not deps.simpleMajorityThreshold.
+	const thresholds = proofThresholds(deps.superMajorityThreshold);
 	await Promise.all(candidates.map(async c => {
 		if (!c.proof) return;
 		const claim = { blockId, rev: c.rev, actionId: c.actionId as ActionId };
@@ -281,9 +279,15 @@ function penalizeContradictingContent(
  * corroboration rather than raw `Math.max` (a lone peer inflating its rev cannot steer
  * reconciliation), verifies the cohort agrees on the *content* at that revision, and persists it.
  *
- * Both quorums are capped by {@link corroboratorCapacity}: demanding two corroborators from a
- * cohort that contains exactly one other peer is a permanent deadlock, not a safety property —
- * the node can never heal and stays unreadable forever.
+ * Peer-attached cohort commit proofs are verified first ({@link certifyCandidates}) and both gates
+ * weigh the verdicts: a claim — and, separately, the bytes — that a verified proof certifies is
+ * accepted with no second peer at any cohort size, and the proof that certified the bytes is
+ * persisted alongside them so the repaired replica serves it onward.
+ *
+ * Both quorums are capped by {@link corroboratorCapacity} for the claims that still need
+ * corroboration: demanding two corroborators from a cohort that contains exactly one other peer is
+ * a permanent deadlock, not a safety property — the node can never heal and stays unreadable
+ * forever.
  *
  * **Exposure at capacity 1 (documented, not accidental).** Block ids are random 256-bit strings
  * (`db-core` `structs.ts`), NOT content-addressed, so nothing on the receive path can re-derive
@@ -291,8 +295,12 @@ function penalizeContradictingContent(
  * against `blockId`. A sole cohort peer's content is therefore believed on its word. That adds no
  * trust the cohort had not already extended — the same peer's `(rev, actionId)` claim is likewise
  * uncorroborable at that size (see `selectQuorumRev`'s capacity note), and a two-member cohort has
- * no honest majority to appeal to in the first place. Closing it needs commit-cert verification,
- * tracked by backlog `debt-read-repair-commit-cert-verification`.
+ * no honest majority to appeal to in the first place. It is closed for a candidate that carries a
+ * verified cohort commit proof — {@link certifyCandidates} binds the proof's declared digest to the
+ * served bytes, which is a check against the *cohort's own signatures* rather than against other
+ * peers, so a certified carrier wins the content gate outright and this exposure never applies to
+ * it. It remains open for a proof-less candidate, and for the residual that layer 1 proves only
+ * that the listed signers signed (`feat-cluster-membership-threshold-cert-anchoring`).
  *
  * Declines are cheap and retryable: nothing is persisted, nothing is marked, and the next commit
  * or churn/rebalance pass tries again.

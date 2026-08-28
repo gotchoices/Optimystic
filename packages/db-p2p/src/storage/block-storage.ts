@@ -247,8 +247,9 @@ export class BlockStorage implements IBlockStorage {
 		return await this.saveForwardRevision(
 			rev,
 			actionId,
-			{ action: { actionId, rev, transform: { insert: block } }, block, ...(proof ? { proof } : {}) },
-			'replica'
+			{ action: { actionId, rev, transform: { insert: block } }, block },
+			'replica',
+			proof
 		);
 	}
 
@@ -275,12 +276,17 @@ export class BlockStorage implements IBlockStorage {
 	 * plus the materialized `block`; a deletion carries `{ delete: true }` and no block. `rev` and
 	 * `actionId` are passed alongside `body` because the guard and the `latest` advance need them
 	 * independently of the archive body.
+	 *
+	 * `verifiedProof` travels OUTSIDE `body` on purpose — see {@link saveRestored}: it is the one
+	 * channel that persists a proof, and only {@link saveReplica} (whose caller verified the proof
+	 * against `body.block`) supplies it.
 	 */
 	private async saveForwardRevision(
 		rev: number,
 		actionId: ActionId,
-		body: { action: ActionTransform; block?: IBlock; proof?: BlockCommitProof },
-		logLabel: 'replica' | 'deletion'
+		body: { action: ActionTransform; block?: IBlock },
+		logLabel: 'replica' | 'deletion',
+		verifiedProof?: BlockCommitProof
 	): Promise<ActionRev> {
 		// Serialize the read-modify-write on this block's metadata (mirrors ensureRevision). saveReplica
 		// and saveDeletion deliberately SHARE this one lock id (keyed `saveReplica`, NOT per-method):
@@ -312,7 +318,7 @@ export class BlockStorage implements IBlockStorage {
 				},
 				range: [rev, rev + 1]
 			};
-			await this.saveRestored(archive);
+			await this.saveRestored(archive, verifiedProof ? { rev, proof: verifiedProof } : undefined);
 
 			// INVARIANT P: a block never holds a pending record AND a committed record for the same
 			// action id. On the commit path `promotePendingTransaction` maintains it by MOVING the
@@ -457,39 +463,33 @@ export class BlockStorage implements IBlockStorage {
 
 	private async restoreBlock(rev: number): Promise<BlockArchive | undefined> {
 		if (!this.restoreCallback) return undefined;
-		const archive = await this.restoreCallback(this.blockId, rev);
-		if (!archive) return undefined;
-		// The archive comes straight from a remote peer (RestorationCoordinator fetches and verifies
-		// NOTHING), so strip any attached proof before saveRestored persists the entries: persisting
-		// an unverified proof would re-serve a hostile peer's artifact as evidence this node retained
-		// itself. Verified proofs enter storage only through saveReplica (reconcile's certified path).
-		for (const entry of Object.values(archive.revisions ?? {})) {
-			if (entry && typeof entry === 'object') delete entry.proof;
-		}
-		return archive;
+		return await this.restoreCallback(this.blockId, rev);
 	}
 
 	/**
 	 * Persist a fetched archive's revisions locally.
 	 *
-	 * A revision entry's `proof` IS persisted (`saveBlockProof`), so a repaired node can serve it
-	 * onward — CALLERS must strip any proof they have not verified against the entry's exact bytes.
-	 * The one unverified entry point is {@link restoreBlock} above, which strips; the verified one is
-	 * {@link saveReplica}, whose caller chain (`StorageRepo.saveReplicatedBlock` ←
-	 * `cluster/reconcile-block.ts`) passes a proof only after `certifyContent` bound it to these
-	 * bytes.
+	 * A revision entry's own `proof` is deliberately IGNORED. An archive is remote wire data —
+	 * {@link restoreBlock}'s `RestorationCoordinator` fetch verifies nothing, and a peer chooses
+	 * what to attach — so persisting a proof read out of the archive body would re-serve a hostile
+	 * peer's artifact as evidence this node retained itself. A proof reaches storage only through
+	 * `verified`, passed out-of-band alongside the archive, which exactly one caller chain supplies:
+	 * `cluster/reconcile-block.ts` → `StorageRepo.saveReplicatedBlock` → {@link saveReplica} →
+	 * {@link saveForwardRevision}, where `certifyContent` had already bound the proof to these exact
+	 * bytes. A separate parameter rather than a caller obligation to strip is what makes "an
+	 * unverified proof reached `saveBlockProof`" unrepresentable instead of merely documented.
 	 */
-	private async saveRestored(archive: BlockArchive) {
+	private async saveRestored(archive: BlockArchive, verified?: { rev: number; proof: BlockCommitProof }) {
 		const revisions = Object.entries(archive.revisions)
 			.map(([rev, data]) => ({ rev: Number(rev), data }));
 
-		// Save all revisions, actions, materializations, and any verified proofs
-		for (const { rev, data: { action, block, proof } } of revisions) {
+		// Save all revisions, actions, materializations, and the caller-verified proof (if any).
+		for (const { rev, data: { action, block } } of revisions) {
 			await Promise.all([
 				this.storage.saveRevision(this.blockId, rev, action.actionId),
 				this.storage.saveTransaction(this.blockId, action.actionId, action.transform),
 				block ? this.storage.saveMaterializedBlock(this.blockId, action.actionId, block) : Promise.resolve(),
-				proof ? this.storage.saveBlockProof(this.blockId, rev, proof) : Promise.resolve()
+				verified?.rev === rev ? this.storage.saveBlockProof(this.blockId, rev, verified.proof) : Promise.resolve()
 			]);
 		}
 	}
