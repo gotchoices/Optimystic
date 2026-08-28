@@ -8,11 +8,39 @@ difficulty: hard
 # Persist a durable, self-verifying commit proof per revision
 
 <!-- resume-note -->
-## Findings from prior implement run (2026-08-27 — investigation complete, NO code written yet)
+## Status after second implement run (2026-08-27 — partial code written, budget-stopped)
 
-A prior run spent its budget on investigation and was stopped before editing any source file.
-The working tree has **zero changes** from that run. Everything below is verified against the
-current code — start implementing directly; do not re-derive these decisions.
+A second run started implementing and was budget-stopped after two files. **DONE (in working
+tree, uncommitted, NOT yet built/typechecked/tested):**
+
+1. `packages/db-core/src/cluster/membership.ts` — `membershipDigestFromIds(ids)` added;
+   `membershipDigest(peers)` now delegates to it. Barrel already `export *`s membership.js, so no
+   barrel edit needed. Complete.
+2. `packages/db-p2p/src/cluster/commit-proof.ts` — NEW file, complete per spec: `BlockCommitProof`,
+   `ProofClaim`, `ProofThresholds`, `ProofFailure` (including the deliberate extra
+   `malformed-proof` value — mention as a spec deviation in the review handoff), `ProofVerdict`,
+   `buildBlockCommitProof`, `verifyBlockCommitProofClaim`, `verifyBlockCommitProofContent`.
+   Counting/threshold semantics exactly as decided below. Two loose ends inside it:
+   - The size comment is a `TODO(2-persist-block-commit-proof)` — measure for real, bake number.
+   - `verifyBlockCommitProofContent` maps a block `canonicalBlockHash` cannot digest to
+     `digest-mismatch` (documented in its doc comment) — a judgement call, flag to reviewer.
+
+   **Editor currently shows** `'@optimystic/db-core' has no exported member named
+   'membershipDigestFromIds'` in commit-proof.ts — that is only because db-core's dist is stale;
+   run `yarn workspace @optimystic/db-core build` (or root `yarn build`) and it resolves. Not a
+   source error.
+
+**NOT done — everything else in the TODO list below**: no exports added to
+`packages/db-p2p/src/index.ts` yet (add `export * from "./cluster/commit-proof.js";` beside the
+commit-cert line), no storage-layer changes, no StorageRepo/ClusterMember wiring, no
+`CrashingRawStorage` passthroughs, no tests, no docs, nothing run. Resume from "### Storage
+decision" below — all decisions there remain verified-current and the two finished files match
+them.
+
+## Findings from prior implement run (2026-08-27 — investigation complete)
+
+Everything below was verified against the current code — implement directly; do not re-derive
+these decisions.
 
 ### Storage decision (the big one): do NOT extend `RawStoreDriver`
 

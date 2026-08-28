@@ -24,8 +24,18 @@ export const CURRENT_MEMBERSHIP_VERSION = 2 as const;
  * it. `membershipDigest({})` (the empty set) is a fixed constant.
  */
 export async function membershipDigest(peers: ClusterPeers): Promise<string> {
-	const ids = Object.keys(peers ?? {}).sort();
-	const bytes = new TextEncoder().encode(canonicalJson(ids));
+	return membershipDigestFromIds(Object.keys(peers ?? {}));
+}
+
+/**
+ * Canonical membership digest for an explicit peer-id list — the same digest {@link membershipDigest}
+ * derives from a peer map's keys. ONE implementation, so a verifier reading a stored `peerIds` list
+ * (e.g. a persisted block commit proof) and a coordinator reading live `ClusterPeers` can never
+ * disagree. Sorts a copy; the caller's array is not mutated.
+ */
+export async function membershipDigestFromIds(ids: readonly string[]): Promise<string> {
+	const sorted = [...ids].sort();
+	const bytes = new TextEncoder().encode(canonicalJson(sorted));
 	const hash = await sha256.digest(bytes);
 	return uint8ArrayToString(hash.digest, 'base64url');
 }
