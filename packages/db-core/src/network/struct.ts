@@ -121,7 +121,8 @@ export type CommitRequest = ActionBlocks & {
 	rev: number;
 	/** Per-block content declarations for the committing action — see {@link BlockContentDigests}.
 	 *  Rides inside the consensus message, so the generic cluster message hash folds it into every
-	 *  cohort signature with no change to the hash helpers. */
+	 *  cohort signature with no change to the hash helpers. Action-wide here; the transactor narrows
+	 *  it to each per-coordinator batch's own block ids before sending (`RepoCommitRequest`). */
 	blockDigests?: BlockContentDigests;
 };
 

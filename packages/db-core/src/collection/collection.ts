@@ -637,6 +637,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// live). Purely local — an id whose base is not already cached is simply omitted and falls
 			// back to corroboration on the member side. Computed AFTER the log append so the log tail
 			// and header transforms this attempt just staged are digested too.
+			// NOTE: recomputed from scratch on every retry attempt (the snapshot tracker is rebuilt each
+			// iteration), so a sync that loses N races pays N full hashing passes over its touched
+			// blocks. Unmeasured and cheap relative to the round trips it is retrying; if a
+			// high-contention sync ever shows digest hashing in a profile, memoize per (id, staged ops).
 			const blockDigests = await computeBlockContentDigests(tracker, tracker.transformedBlockIds());
 
 			// Commit the action to the transactor. Carry the aged retry priority derived from the

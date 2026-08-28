@@ -371,5 +371,34 @@ describe('commit content digest threading', () => {
 					.to.equal(await computeClusterCommitHash(mine, message, promises, membership))
 			}
 		})
+
+		// The round-trip above is only half the property: it stays green even if someone rewrites the
+		// canonicalising helpers to hash an explicit allowlist of known fields, because BOTH sides
+		// would then drop `blockDigests` alike. What actually pins the generic canonicalisation is
+		// that the field CHANGES the hash — a cohort that declares content signs something different
+		// from one that declares nothing, which is the whole basis of part 3's member-side check.
+		it('folds blockDigests into the hash rather than ignoring it as an unknown field', async () => {
+			const commit: CommitRequest = {
+				actionId: 'action-1',
+				blockIds: ['b1' as BlockId, 'b2' as BlockId],
+				tailId: 'b1' as BlockId,
+				rev: 4,
+			}
+			const bare: RepoMessage = { operations: [{ commit }], expiration: 1_700_000_000_000 }
+			const declared: RepoMessage = {
+				operations: [{ commit: { ...commit, blockDigests: { ['b1' as BlockId]: { digest: 'aaa', baseRev: 3 } } } }],
+				expiration: 1_700_000_000_000,
+			}
+			const altered: RepoMessage = {
+				operations: [{ commit: { ...commit, blockDigests: { ['b1' as BlockId]: { digest: 'bbb', baseRev: 3 } } } }],
+				expiration: 1_700_000_000_000,
+			}
+
+			const bareHash = await computeClusterMessageHash(bare)
+			const declaredHash = await computeClusterMessageHash(declared)
+			expect(declaredHash, 'declaring content must not hash like declaring nothing').to.not.equal(bareHash)
+			expect(await computeClusterMessageHash(altered), 'a different declaration must hash differently')
+				.to.not.equal(declaredHash)
+		})
 	})
 })

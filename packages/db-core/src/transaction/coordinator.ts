@@ -7,7 +7,7 @@ import type { SyncOptions } from "../collection/index.js";
 import { isTransactionExpired, clampPriority } from "./transaction.js";
 import { Log } from "../log/log.js";
 import { blockIdsForTransforms } from "../transform/helpers.js";
-import { computeBlockContentDigests } from "../transform/digest.js";
+import { computeBlockContentDigests, blockDigestsField } from "../transform/digest.js";
 import { collectOperations, hashOperations } from "./operations-hash.js";
 import { CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./errors.js";
 import { jitteredBackoffMs, abortableDelay, makeAbortError } from "../utility/backoff.js";
@@ -1056,8 +1056,7 @@ export class TransactionCoordinator {
 			blockIds,
 			tailId: logTailBlockId,
 			rev,
-			// Omit an empty map so a commit that declares nothing serializes exactly as before.
-			...(Object.keys(blockDigests).length > 0 ? { blockDigests } : {})
+			...blockDigestsField(blockDigests)
 		};
 
 		// Retry ONLY transient/thrown failures (unreachable peers, timeout) — forward recovery.

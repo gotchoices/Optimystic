@@ -59,6 +59,7 @@ class InstrumentedTransactor implements ITransactor {
 	committedCollections: string[] = [];
 	cancelledBlockIds: BlockId[] = [];
 	commitAttemptsByCollection = new Map<string, number>();
+	commitRequests: CommitRequest[] = [];
 
 	constructor(
 		private readonly failCollections: Set<string> = new Set(),
@@ -109,6 +110,8 @@ class InstrumentedTransactor implements ITransactor {
 			await Promise.resolve();
 			const collectionId = collectionOfBlockId(request.blockIds[0]!);
 			this.commitAttemptsByCollection.set(collectionId, (this.commitAttemptsByCollection.get(collectionId) ?? 0) + 1);
+			// Snapshot so a later mutation of the caller's object cannot rewrite history.
+			this.commitRequests.push(structuredClone(request));
 			if (this.throwCommitCollections.has(collectionId)) {
 				throw new Error(`forced commit throw: ${collectionId}`);
 			}
@@ -131,7 +134,7 @@ class InstrumentedTransactor implements ITransactor {
  *  per-block content digests riding on the commit) off each collection. The tracker here has no
  *  staged transforms, so it declares nothing — these tests are about phase control flow, and the
  *  digest content itself is covered by commit-digest-threading.spec.ts. */
-function fakeCollections(collectionIds: string[]): Map<CollectionId, unknown> {
+function fakeCollections(collectionIds: string[], stage?: (tracker: Tracker<IBlock>, collectionId: string) => void): Map<CollectionId, unknown> {
 	const map = new Map<CollectionId, unknown>();
 	const emptySource: BlockSource<IBlock> = {
 		createBlockHeader: (type, newId) => ({ type, id: newId ?? 'fake', collectionId: 'fake' }),
@@ -140,7 +143,9 @@ function fakeCollections(collectionIds: string[]): Map<CollectionId, unknown> {
 	};
 	let rev = 1;
 	for (const id of collectionIds) {
-		map.set(id, { getNextRev: () => rev++, tracker: new Tracker(emptySource) });
+		const tracker = new Tracker<IBlock>(emptySource);
+		stage?.(tracker, id);
+		map.set(id, { getNextRev: () => rev++, tracker });
 	}
 	return map;
 }
@@ -357,6 +362,52 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			expect(transactor.commitAttemptsByCollection.get(failing)).to.equal(1);
 			// The successful ones committed on their first attempt.
 			expect(transactor.commitAttemptsByCollection.get('c0')).to.equal(1);
+		});
+
+		// commitCollection declares what each pended block will contain, off the collection's own
+		// tracker. The other phase tests use trackers with nothing staged (so they declare nothing and
+		// the field is absent); these two pin both halves of that.
+		it('declares the digests of the blocks its collection actually staged', async () => {
+			const collectionIds = ['c0', 'c1'];
+			const transactor = new InstrumentedTransactor();
+			const collections = fakeCollections(collectionIds, (tracker, collectionId) => {
+				tracker.insert({ header: { id: `${collectionId}-tail`, type: 'test', collectionId } } as unknown as IBlock);
+			});
+			const coordinator = new TransactionCoordinator(transactor, collections as never);
+
+			const pendedBlockIds = new Map<CollectionId, BlockId[]>(
+				collectionIds.map(id => [id, [`${id}-tail` as BlockId]])
+			);
+			const criticalBlockIds = collectionIds.map(id => `${id}-tail` as BlockId);
+
+			const result = await (coordinator as unknown as {
+				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>) => Promise<{ success: boolean }>;
+			}).commitPhase('txn-1', criticalBlockIds, pendedBlockIds);
+			expect(result.success).to.be.true;
+
+			expect(transactor.commitRequests).to.have.lengthOf(collectionIds.length);
+			for (const request of transactor.commitRequests) {
+				const collectionId = collectionOfBlockId(request.blockIds[0]!);
+				// Exactly its own block — never a sibling collection's, even though both staged one.
+				expect(Object.keys(request.blockDigests ?? {}), `${collectionId} declares only its own block`)
+					.to.deep.equal([`${collectionId}-tail`]);
+				// An insert is base-independent, so it names no base revision.
+				expect(request.blockDigests![`${collectionId}-tail` as BlockId]!.baseRev).to.be.undefined;
+				expect(request.blockDigests![`${collectionId}-tail` as BlockId]!.digest).to.be.a('string');
+			}
+		});
+
+		it('omits the field entirely when its collection staged nothing to declare', async () => {
+			const transactor = new InstrumentedTransactor();
+			const coordinator = new TransactionCoordinator(transactor, fakeCollections(['c0']) as never);
+
+			await (coordinator as unknown as {
+				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>) => Promise<{ success: boolean }>;
+			}).commitPhase('txn-1', ['c0-tail' as BlockId], new Map([['c0', ['c0-tail' as BlockId]]]));
+
+			// Not an empty object: the request is hashed verbatim into every cohort signature, so a
+			// commit that declares nothing must serialize exactly as it did before the field existed.
+			expect(Object.prototype.hasOwnProperty.call(transactor.commitRequests[0]!, 'blockDigests')).to.be.false;
 		});
 
 		it('retries a transient (thrown) commit failure the full 3 attempts before giving up', async () => {

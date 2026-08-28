@@ -457,6 +457,8 @@ The transaction system separates **statement execution** (handled by engines) fr
 │    • Each cluster validates (see below)                     │
 │                                                             │
 │  Phase 3: COMMIT                                            │
+│    • Declare each block's post-commit content digest        │
+│      (blockDigests; see repository.md)                      │
 │    • Send commit to all critical clusters (log tails)       │
 │    • Each critical cluster achieves consensus               │
 │    • All must succeed for transaction to proceed            │

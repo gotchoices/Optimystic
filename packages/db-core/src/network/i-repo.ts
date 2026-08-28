@@ -37,11 +37,13 @@ export type RepoCommitRequest = {
 	 */
 	tailId?: BlockId;
 	/**
-	 * Per-block content declarations for the committing action (see {@link BlockContentDigests}).
-	 * Threaded verbatim from the transactor's {@link CommitRequest} into the per-peer repo commit —
+	 * Per-block content declarations for this batch (see {@link BlockContentDigests}).
+	 * The transactor narrows its action-wide {@link CommitRequest.blockDigests} to this request's own
+	 * `blockIds` before sending, so a cohort only ever declares for the blocks it is driving —
 	 * `RepoClient.commit` wraps this whole request into the `RepoMessage`, and the coordinator places
 	 * the received request into the consensus message, so the digests land inside every cohort
-	 * signature's preimage. Absent when the client could not digest (falls back to corroboration).
+	 * signature's preimage. Absent when no block in this batch could be digested (each undeclared
+	 * block falls back to corroboration).
 	 */
 	blockDigests?: BlockContentDigests;
 };

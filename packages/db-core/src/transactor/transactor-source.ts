@@ -4,6 +4,7 @@ import type { IBlock, BlockId, BlockHeader, ITransactor, ActionId, StaleFailure,
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
+import { blockDigestsField } from "../transform/digest.js";
 
 export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlock> {
 	/** Shared with this collection's CacheSource so cache hits also record dependencies.
@@ -154,9 +155,7 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 				blockIds: pendResult.blockIds,
 				actionId,
 				rev,
-				// Omit an absent OR empty map so a commit that declares nothing serializes exactly as
-				// before — the field rides inside every cohort signature's hash preimage.
-				...(blockDigests && Object.keys(blockDigests).length > 0 ? { blockDigests } : {})
+				...blockDigestsField(blockDigests)
 			});
 			if (!commitResult.success) {
 				await this.transactor.cancel({ actionId, blockIds: pendResult.blockIds });

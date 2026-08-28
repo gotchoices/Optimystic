@@ -6,6 +6,7 @@ import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, Pe
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
 import { Tracker } from "../transform/tracker.js";
+import { blockDigestsField } from "../transform/digest.js";
 import { CacheSource } from "../transform/cache-source.js";
 import { TransactorSource } from "./transactor-source.js";
 import { Log } from "../log/log.js";
@@ -907,18 +908,10 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 }
 
 
-/**
- * The owning collection id for an action ref, read from any fetched block's header. A
- * committed-then-invalidated action still has a materialized (compensating) block whose header carries
- * the collection id; a genuinely-aborted action has no fetched block, so this returns `undefined` and
- * the status stays `aborted`.
- */
-/** The subset of `all` whose ids appear in `batchBlockIds`, wrapped so it spreads to nothing when
- * the batch declares no digests. Called at SEND time, once per attempt, because `processBatches`
- * re-batches failed blocks onto different coordinators — a subset computed up front would follow the
- * wrong batch on retry. The empty case omits the key entirely rather than sending `{}`: the request
- * is hashed verbatim into every cohort signature preimage, so a batch that declares nothing must
- * serialize exactly as it did before this field existed. */
+/** The subset of `all` whose ids appear in `batchBlockIds`, wrapped (via {@link blockDigestsField})
+ * so it spreads to nothing when the batch declares no digests. Called at SEND time, once per attempt,
+ * because `processBatches` re-batches failed blocks onto different coordinators — a subset computed
+ * up front would follow the wrong batch on retry. */
 function digestsFor(all: BlockContentDigests | undefined, batchBlockIds: BlockId[]): { blockDigests?: BlockContentDigests } {
 	if (!all) return {};
 	const subset: BlockContentDigests = {};
@@ -926,9 +919,15 @@ function digestsFor(all: BlockContentDigests | undefined, batchBlockIds: BlockId
 		const digest = all[id];
 		if (digest !== undefined) subset[id] = digest;
 	}
-	return isRecordEmpty(subset) ? {} : { blockDigests: subset };
+	return blockDigestsField(subset);
 }
 
+/**
+ * The owning collection id for an action ref, read from any fetched block's header. A
+ * committed-then-invalidated action still has a materialized (compensating) block whose header carries
+ * the collection id; a genuinely-aborted action has no fetched block, so this returns `undefined` and
+ * the status stays `aborted`.
+ */
 function collectionIdForRef(ref: ActionBlocks, blockStates: GetBlockResults): CollectionId | undefined {
 	for (const blockId of ref.blockIds) {
 		const collectionId = blockStates[blockId]?.block?.header.collectionId;

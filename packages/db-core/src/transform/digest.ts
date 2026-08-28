@@ -1,7 +1,11 @@
 import type { BlockId, IBlock } from "../index.js";
 import type { BlockContentDigests } from "../network/struct.js";
 import { canonicalBlockHash } from "../blocks/helpers.js";
+import { createLogger } from "../logger.js";
+import { isRecordEmpty } from "../utility/is-record-empty.js";
 import type { Tracker } from "./tracker.js";
+
+const log = createLogger('digest');
 
 /** Digests for the blocks the tracker's staged transforms touch, computed WITHOUT loading anything
  * from the source. An id whose base is not already cached is omitted rather than fetched — an
@@ -20,18 +24,7 @@ export async function computeBlockContentDigests<T extends IBlock>(
 ): Promise<BlockContentDigests> {
 	const digests: BlockContentDigests = {};
 	for (const id of blockIds) {
-		// Declaring content must never break committing it. Materializing replays the staged ops
-		// against the LOCALLY CACHED base, which can legitimately fail — e.g. another action's commit
-		// folded into the cache (CacheSource.transformCache) shrank an array a staged splice indexes
-		// into. That transaction is doomed, but it must die as a retryable stale failure from the
-		// pend/commit round trip, not as a TypeError thrown out of sync() before the pend. Skipping
-		// the id degrades to corroboration, exactly like an uncached base.
-		let peeked: { block: IBlock; baseRev?: number } | undefined;
-		try {
-			peeked = tracker.peekMaterialized(id);
-		} catch {
-			continue;
-		}
+		const peeked = peekOrSkip(tracker, id);
 		if (!peeked) continue;
 		digests[id] = {
 			digest: await canonicalBlockHash(peeked.block),
@@ -39,4 +32,29 @@ export async function computeBlockContentDigests<T extends IBlock>(
 		};
 	}
 	return digests;
+}
+
+/** Wraps `blockDigests` so it spreads onto a request only when there is something to declare. The
+ * empty map omits the key entirely rather than sending `{}`: the request is hashed verbatim into
+ * every cohort signature preimage, so a commit that declares nothing must serialize exactly as it
+ * did before this field existed. Every producer of the field goes through here. */
+export function blockDigestsField(digests: BlockContentDigests | undefined): { blockDigests?: BlockContentDigests } {
+	return digests && !isRecordEmpty(digests) ? { blockDigests: digests } : {};
+}
+
+/** {@link Tracker.peekMaterialized}, degraded to "undeclared" when materializing throws.
+ *
+ * Declaring content must never break committing it. Materializing replays the staged ops against the
+ * LOCALLY CACHED base, which can legitimately fail — e.g. another action's commit folded into the
+ * cache (`CacheSource.transformCache`) shrank an array a staged splice indexes into. That transaction
+ * is doomed, but it must die as a retryable stale failure from the pend/commit round trip, not as a
+ * TypeError thrown out of `sync()` before the pend. The failure is logged rather than silently eaten,
+ * because the same swallow would also hide a genuine `applyTransform` bug. */
+function peekOrSkip<T extends IBlock>(tracker: Tracker<T>, id: BlockId): { block: IBlock; baseRev?: number } | undefined {
+	try {
+		return tracker.peekMaterialized(id);
+	} catch (e) {
+		log('block %s left undeclared: materializing against the cached base failed: %o', id, e);
+		return undefined;
+	}
 }
