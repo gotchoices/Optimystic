@@ -142,6 +142,22 @@ describe('commit content digests', () => {
 			expect(Object.keys(digests)).to.deep.equal(['n']);
 		});
 
+		// Declaring content must never break committing it. Materializing replays the staged ops
+		// against the LOCALLY CACHED base, which can fail on its own (an op naming an entity the
+		// cached base does not have — reachable when another action's commit folds a different shape
+		// into the cache between staging and digesting). That must degrade to "undeclared", not
+		// throw out of the caller's sync() before it has even pended.
+		it('an op that cannot replay against the cached base is omitted, not thrown', async () => {
+			await tracker.tryGet('a' as BlockId);
+			await tracker.tryGet('b' as BlockId);
+			tracker.update('a' as BlockId, ['nonexistent-entity', 0, 0, ['z']]);
+			tracker.update('b' as BlockId, ['items', 0, 0, ['z']]);   // valid: makeBlock gives `items`
+
+			const digests = await computeBlockContentDigests(tracker, ['a', 'b'] as BlockId[]);
+			expect(Object.keys(digests), 'the unreplayable id is skipped, the sibling still declares')
+				.to.deep.equal(['b']);
+		});
+
 		it('is deterministic: repeated passes yield identical digests', async () => {
 			await tracker.tryGet('a' as BlockId);
 			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);

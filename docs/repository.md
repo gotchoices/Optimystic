@@ -79,12 +79,44 @@ Here is how a transaction proceeds for a given cluster:
   - `rev` - Revision being committed
   - `tailId` - Optional; the committing collection's chain tail block id, threaded through so the
     committing node can anchor the emitted change event
+  - `blockDigests` - Optional; per-block declarations of what each block will contain once this
+    action commits (see *Declared block content* below)
 - **Output**: `CommitResult` indicating success or missing transactions needed
 - **Behavior**:
   - Verifies expected revision matches current state
   - Updates block metadata and revision
   - Promotes pending transaction to committed state
   - Handles block deletion if specified in transform
+
+#### Declared block content (`blockDigests`)
+
+The client that authored a transaction knows what every block it touches will contain once the
+transaction lands, so it says so: `blockDigests` maps a block id to a hash of that block's
+post-commit content, plus the committed revision of the base the hash was computed from (absent for
+an inserted block, whose content does not depend on any base). Only the client can declare this — a
+coordinator forwards a commit without materializing it, and may not even have seen the pend.
+
+Three properties are load-bearing:
+
+- **It is optional, per block.** The client computes digests from what it already has in memory and
+  never pays a network read to describe itself, so a block whose base is not locally cached is
+  simply left out. An undeclared block is not an error; it falls back to the corroboration the
+  cohort already does. The field is omitted entirely — not sent as an empty object — when a request
+  declares nothing.
+- **It rides *inside* the commit request.** The request is the consensus message, and the cluster
+  hash helpers canonicalise that message generically, so the declarations land inside every cohort
+  signature's preimage with no change to the hashing. A peer built before this field existed still
+  hashes the bytes it received, so upgraded and un-upgraded peers agree on the same hash.
+- **Each cohort sees only its own blocks.** One transaction's blocks are split across coordinators,
+  and each per-coordinator batch becomes its own cluster record. The transactor therefore narrows
+  the map to the batch's own block ids at the moment it sends — not once up front, because a failed
+  batch is re-split across different coordinators on retry. Shipping the whole map would make one
+  cohort sign for blocks it is not responsible for.
+
+Declaring content must never break committing it. Computing a digest replays the staged changes
+against the locally cached base, which can legitimately fail (another action's commit may have
+folded a different shape into the cache); that block is then left undeclared rather than raising an
+error out of the client's sync.
 
 #### Invariant P — a pending record and a committed record never coexist for one action
 

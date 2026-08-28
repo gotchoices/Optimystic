@@ -3,6 +3,7 @@ import { Log } from "../log/log.js";
 import { Atomic } from "../transform/atomic.js";
 import { Tracker } from "../transform/tracker.js";
 import { CacheSource } from "../transform/cache-source.js";
+import { computeBlockContentDigests } from "../transform/digest.js";
 import { copyTransforms, isTransformsEmpty } from "../transform/helpers.js";
 import { TransactorSource } from "../transactor/transactor-source.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
@@ -631,11 +632,18 @@ export class Collection<TAction> implements ICollection<TAction> {
 			const newRev = (this.source.actionContext?.rev ?? 0) + 1;
 			const addResult = await collectionLog.addActions(pending, actionId, newRev, () => tracker.transformedBlockIds());
 
+			// Declare what each touched block will contain once committed, computed from this snapshot
+			// tracker (which layers over `this.sourceCache`, so the peek/getCachedRevision probes are
+			// live). Purely local — an id whose base is not already cached is simply omitted and falls
+			// back to corroboration on the member side. Computed AFTER the log append so the log tail
+			// and header transforms this attempt just staged are digested too.
+			const blockDigests = await computeBlockContentDigests(tracker, tracker.transformedBlockIds());
+
 			// Commit the action to the transactor. Carry the aged retry priority derived from the
 			// consecutive-failure count so a sync that keeps losing concurrent races out-ranks fresh
 			// (priority-0) rivals in the cluster's resolveRace (fairness-only; capped at MaxPriority).
 			// First attempt has consecutiveFailures == 0, so priority 0 — the common pend is unchanged.
-			const staleFailure = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id, clampPriority(consecutiveFailures));
+			const staleFailure = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id, clampPriority(consecutiveFailures), blockDigests);
 			if (staleFailure) {
 				consecutiveFailures++;
 				lastReason = staleFailure.reason ?? lastReason;

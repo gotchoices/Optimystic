@@ -20,7 +20,18 @@ export async function computeBlockContentDigests<T extends IBlock>(
 ): Promise<BlockContentDigests> {
 	const digests: BlockContentDigests = {};
 	for (const id of blockIds) {
-		const peeked = tracker.peekMaterialized(id);
+		// Declaring content must never break committing it. Materializing replays the staged ops
+		// against the LOCALLY CACHED base, which can legitimately fail — e.g. another action's commit
+		// folded into the cache (CacheSource.transformCache) shrank an array a staged splice indexes
+		// into. That transaction is doomed, but it must die as a retryable stale failure from the
+		// pend/commit round trip, not as a TypeError thrown out of sync() before the pend. Skipping
+		// the id degrades to corroboration, exactly like an uncached base.
+		let peeked: { block: IBlock; baseRev?: number } | undefined;
+		try {
+			peeked = tracker.peekMaterialized(id);
+		} catch {
+			continue;
+		}
 		if (!peeked) continue;
 		digests[id] = {
 			digest: await canonicalBlockHash(peeked.block),

@@ -2,7 +2,7 @@ import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
 import { highestStaleAt, isConflictFailure } from "../network/stale-failure.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
-import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, CoordinatorIntent, BlockUnavailableReason } from "../index.js";
+import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
 import { Tracker } from "../transform/tracker.js";
@@ -687,15 +687,18 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// consensus commit op → each committing node's StorageRepo.commit stamps it onto the emitted
 		// CollectionChangeEvent (the reactivity topic anchor). Without this the per-block RepoCommitRequest
 		// drops the collection tail and reactivity origination is gated off (undefined tail → non-member).
+		// `request.blockDigests` (when present) is the FULL per-block declaration map for the action;
+		// it is threaded whole through commitBlock/commitBlocks and subset per batch at send time (see
+		// commitBlocks) so each cohort only signs for the blocks it is actually driving.
 		if (request.headerId && !request.blockIds.includes(request.headerId)) {
-			const headerResult = await this.commitBlock(request.headerId, request.actionId, request.rev, request.tailId);
+			const headerResult = await this.commitBlock(request.headerId, request.actionId, request.rev, request.tailId, request.blockDigests);
 			if (!headerResult.success) {
 				return headerResult;
 			}
 		}
 
 		// Commit the tail block
-		const tailResult = await this.commitBlock(request.tailId, request.actionId, request.rev, request.tailId);
+		const tailResult = await this.commitBlock(request.tailId, request.actionId, request.rev, request.tailId, request.blockDigests);
 		if (!tailResult.success) {
 			return tailResult;
 		}
@@ -706,7 +709,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			!(request.headerId && bid === request.headerId && !request.blockIds.includes(request.headerId))
 		);
 		if (remainingBlocks.length > 0) {
-			const { error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev, tailId: request.tailId });
+			const { error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev, tailId: request.tailId, blockDigests: request.blockDigests });
 			if (error) {
 				// Non-tail block commit failures should not fail the overall action once the tail has committed.
 				// Proceed and rely on reconciliation paths (e.g. reads with context) to finalize state on lagging peers.
@@ -718,8 +721,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		return { success: true };
 	}
 
-	private async commitBlock(blockId: BlockId, actionId: ActionId, rev: number, tailId?: BlockId): Promise<CommitResult> {
-		const { batches: tailBatches, error: tailError } = await this.commitBlocks({ blockIds: [blockId], actionId, rev, tailId });
+	private async commitBlock(blockId: BlockId, actionId: ActionId, rev: number, tailId?: BlockId, blockDigests?: BlockContentDigests): Promise<CommitResult> {
+		const { batches: tailBatches, error: tailError } = await this.commitBlocks({ blockIds: [blockId], actionId, rev, tailId, blockDigests });
 		if (tailError) {
 			// commit is a pure attempt: stale → { success:false }, transient → throw. Cancellation
 			// is the CALLER's responsibility (coordinator cancelPhase; TransactorSource.transact),
@@ -746,8 +749,14 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		return { success: true };
 	}
 
-	/** Attempts to commit a set of blocks, and handles failures and errors */
-	private async commitBlocks({ blockIds, actionId, rev, tailId }: RepoCommitRequest) {
+	/** Attempts to commit a set of blocks, and handles failures and errors.
+	 *
+	 * `blockDigests` arrives as the action's FULL declaration map and is narrowed to each batch's own
+	 * block ids inside the send callback below — never up front. Each batch's message becomes its own
+	 * cluster record, so shipping the whole map would make one cohort sign for blocks it is not
+	 * responsible for; and `processBatches` re-batches failed blocks onto different coordinators, so
+	 * only a send-time subset stays correct across retries. */
+	private async commitBlocks({ blockIds, actionId, rev, tailId, blockDigests }: RepoCommitRequest) {
 		const expiration = Date.now() + this.timeoutMs;
 		// Thread the transaction's actionId so both the initial batch assembly and any
 		// per-block retry re-resolution prefer the coordinator pend already resolved.
@@ -757,7 +766,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		try {
 			await processBatches(
 				batches,
-				(batch) => this.getRepo(batch.peerId).commit({ actionId, blockIds: batch.payload, rev, tailId }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
+				(batch) => this.getRepo(batch.peerId).commit({ actionId, blockIds: batch.payload, rev, tailId, ...digestsFor(blockDigests, batch.payload) }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
 				batch => batch.payload,
 				mergeBlocks,
 				expiration,
@@ -904,6 +913,22 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
  * the collection id; a genuinely-aborted action has no fetched block, so this returns `undefined` and
  * the status stays `aborted`.
  */
+/** The subset of `all` whose ids appear in `batchBlockIds`, wrapped so it spreads to nothing when
+ * the batch declares no digests. Called at SEND time, once per attempt, because `processBatches`
+ * re-batches failed blocks onto different coordinators — a subset computed up front would follow the
+ * wrong batch on retry. The empty case omits the key entirely rather than sending `{}`: the request
+ * is hashed verbatim into every cohort signature preimage, so a batch that declares nothing must
+ * serialize exactly as it did before this field existed. */
+function digestsFor(all: BlockContentDigests | undefined, batchBlockIds: BlockId[]): { blockDigests?: BlockContentDigests } {
+	if (!all) return {};
+	const subset: BlockContentDigests = {};
+	for (const id of batchBlockIds) {
+		const digest = all[id];
+		if (digest !== undefined) subset[id] = digest;
+	}
+	return isRecordEmpty(subset) ? {} : { blockDigests: subset };
+}
+
 function collectionIdForRef(ref: ActionBlocks, blockStates: GetBlockResults): CollectionId | undefined {
 	for (const blockId of ref.blockIds) {
 		const collectionId = blockStates[blockId]?.block?.header.collectionId;

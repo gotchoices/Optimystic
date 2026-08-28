@@ -1,6 +1,8 @@
 import { expect } from 'chai';
 import { TransactionCoordinator, blockIdsForTransforms } from '../src/index.js';
+import { Tracker } from '../src/transform/tracker.js';
 import type {
+	BlockSource,
 	ITransactor,
 	PendRequest,
 	CommitRequest,
@@ -125,12 +127,20 @@ class InstrumentedTransactor implements ITransactor {
 	}
 }
 
-/** Fake collections map: the phases only call `getNextRev()` on each collection. */
+/** Fake collections map: the phases call `getNextRev()` and read `tracker` (to declare the
+ *  per-block content digests riding on the commit) off each collection. The tracker here has no
+ *  staged transforms, so it declares nothing — these tests are about phase control flow, and the
+ *  digest content itself is covered by commit-digest-threading.spec.ts. */
 function fakeCollections(collectionIds: string[]): Map<CollectionId, unknown> {
 	const map = new Map<CollectionId, unknown>();
+	const emptySource: BlockSource<IBlock> = {
+		createBlockHeader: (type, newId) => ({ type, id: newId ?? 'fake', collectionId: 'fake' }),
+		async tryGet() { return undefined; },
+		generateId: () => 'fake',
+	};
 	let rev = 1;
 	for (const id of collectionIds) {
-		map.set(id, { getNextRev: () => rev++ });
+		map.set(id, { getNextRev: () => rev++, tracker: new Tracker(emptySource) });
 	}
 	return map;
 }

@@ -7,6 +7,7 @@ import type { SyncOptions } from "../collection/index.js";
 import { isTransactionExpired, clampPriority } from "./transaction.js";
 import { Log } from "../log/log.js";
 import { blockIdsForTransforms } from "../transform/helpers.js";
+import { computeBlockContentDigests } from "../transform/digest.js";
 import { collectOperations, hashOperations } from "./operations-hash.js";
 import { CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./errors.js";
 import { jitteredBackoffMs, abortableDelay, makeAbortError } from "../utility/backoff.js";
@@ -1042,12 +1043,21 @@ export class TransactionCoordinator {
 			return { collectionId, committed: false, error: `Log tail block not found for collection ${collectionId}` };
 		}
 
+		// Declare what each pended block will contain once committed. The collection's tracker still
+		// holds this transaction's staged transforms (it is reset only after commit succeeds) and
+		// layers over the collection's CacheSource, so this is a purely local computation; an id whose
+		// base is not cached is omitted and falls back to corroboration on the member side. Only the
+		// client can declare this — CoordinatorRepo.commit forwards without materializing.
+		const blockDigests = await computeBlockContentDigests(collection.tracker, blockIds);
+
 		// Create commit request
 		const commitRequest: CommitRequest = {
 			actionId,
 			blockIds,
 			tailId: logTailBlockId,
-			rev
+			rev,
+			// Omit an empty map so a commit that declares nothing serializes exactly as before.
+			...(Object.keys(blockDigests).length > 0 ? { blockDigests } : {})
 		};
 
 		// Retry ONLY transient/thrown failures (unreachable peers, timeout) — forward recovery.

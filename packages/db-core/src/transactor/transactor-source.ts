@@ -1,6 +1,6 @@
 import { randomBytes } from '@noble/hashes/utils.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
-import type { IBlock, BlockId, BlockHeader, ITransactor, ActionId, StaleFailure, ActionContext, BlockType, BlockSource, ReadPurpose, Transforms } from "../index.js";
+import type { IBlock, BlockId, BlockHeader, ITransactor, ActionId, StaleFailure, ActionContext, BlockType, BlockSource, ReadPurpose, Transforms, BlockContentDigests } from "../index.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
@@ -135,9 +135,13 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	 * @param priority - Aged, advisory retry priority (default 0). Rides on the pend so a repeatedly-losing
 	 * single-collection sync out-ranks fresh rivals in a concurrent race (`resolveRace`); fairness-only, never
 	 * affects validity. Omitted from the pend when 0 so the common first-attempt pend serializes exactly as before.
+	 * @param blockDigests - Optional per-block content declarations for this commit (see {@link BlockContentDigests}),
+	 * computed by the caller from the same tracker that produced `transform`. Omitted from the commit request when
+	 * undefined, so a caller that declares nothing produces exactly the request shape as before — the field rides
+	 * inside every cohort signature's hash preimage, so keeping the shape clean keeps those preimages clean.
 	 * @returns A promise that resolves to undefined if the action is successful, or a StaleFailure if the action is stale.
 	 */
-	async transact(transform: Transforms, actionId: ActionId, rev: number, headerId: BlockId, tailId: BlockId, priority = 0): Promise<undefined | StaleFailure> {
+	async transact(transform: Transforms, actionId: ActionId, rev: number, headerId: BlockId, tailId: BlockId, priority = 0, blockDigests?: BlockContentDigests): Promise<undefined | StaleFailure> {
 		const pendResult = await this.transactor.pend({ transforms: transform, actionId, rev, policy: 'r', ...(priority > 0 ? { priority } : {}) });
 		if (!pendResult.success) {
 			return pendResult;
@@ -149,7 +153,10 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 				tailId,
 				blockIds: pendResult.blockIds,
 				actionId,
-				rev
+				rev,
+				// Omit an absent OR empty map so a commit that declares nothing serializes exactly as
+				// before — the field rides inside every cohort signature's hash preimage.
+				...(blockDigests && Object.keys(blockDigests).length > 0 ? { blockDigests } : {})
 			});
 			if (!commitResult.success) {
 				await this.transactor.cancel({ actionId, blockIds: pendResult.blockIds });
