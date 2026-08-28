@@ -20,7 +20,9 @@ export enum PenaltyReason {
 	FalseApproval = 'false-approval',
 	/** Challenger lost a dispute (their rejection was wrong) */
 	DisputeLost = 'dispute-lost',
-	/** Peer reported a block latest (rev/actionId) or served content contradicted by a cluster quorum during restoration */
+	/** Peer served provably-bad restoration evidence: a latest claim naming a different action at the
+	 *  quorum-agreed revision, served content contradicted by a cluster quorum, or a cohort commit
+	 *  proof that provably lies or does not cover the claim it was attached to (replay) */
 	InvalidRestoration = 'invalid-restoration',
 }
 

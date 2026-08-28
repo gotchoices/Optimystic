@@ -8,7 +8,8 @@ import { createLogger } from '../logger.js';
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
-import { quorumSize, corroboratorCapacity, selectQuorumRev, CORROBORATION_FLOOR, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
+import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocation, CORROBORATION_FLOOR, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
+import { certifyClaim, isAttributableProofFailure, type ProofAnchoring } from "../cluster/certified-claims.js";
 import { DEFAULT_CLUSTER_SIZE } from "../cluster/cluster-policy.js";
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
 import { isMissingBaseRevisionFailure, MISSING_BASE_REVISION_REASON } from "../storage/storage-repo.js";
@@ -179,7 +180,10 @@ function soleHolderMessage(cohortPeers: number): string {
 		`what is missing is ANOTHER COHORT PEER HOLDING THE BLOCK. The usual cause is data written while the ` +
 		`deployment (or this block's cohort) was smaller: a block that had one holder then still has one holder ` +
 		`now, because the two paths that would replicate it — read-repair and reconcile — both decline on this ` +
-		`same rule. Committing any new revision of the block writes it to the current cohort and clears this.`;
+		`same rule. Committing any new revision of the block writes it to the current cohort and clears this. ` +
+		`(A lone holder whose answer carries a valid cohort commit proof for its revision IS adopted without a ` +
+		`second voter — reaching this message means the one holder attached no such proof, or one that did not ` +
+		`verify.)`;
 }
 
 /**
@@ -251,6 +255,14 @@ interface CoordinatorRepoComponents {
 	 * holds the corroborated action as a promotable pending. See {@link AcquireBlockCallback}.
 	 */
 	acquireBlockFromCohort?: AcquireBlockCallback;
+	/**
+	 * Optional layer-2 anchoring for the cohort commit proofs the latest-revision consult verifies
+	 * (`cluster/certified-claims.ts`): re-derive the block's cohort and LOG the overlap with the
+	 * proof's signers, plus surface proofs accepted without that comparison. Purely observational —
+	 * never a gate — and absent in production wiring today; `certifyClaim` logs unanchored
+	 * acceptance internally regardless.
+	 */
+	proofAnchoring?: ProofAnchoring;
 }
 
 /**
@@ -284,7 +296,8 @@ export function coordinatorRepo(
 		components.clusterLatestCallback,
 		reputation,
 		stateStore,
-		components.acquireBlockFromCohort
+		components.acquireBlockFromCohort,
+		components.proofAnchoring
 	);
 }
 
@@ -336,7 +349,8 @@ export class CoordinatorRepo implements IRepo {
 		private readonly clusterLatestCallback?: ClusterLatestCallback,
 		reputation?: IPeerReputation,
 		stateStore?: ITransactionStateStore,
-		private readonly acquireBlockFromCohort?: AcquireBlockCallback
+		private readonly acquireBlockFromCohort?: AcquireBlockCallback,
+		private readonly proofAnchoring?: ProofAnchoring
 	) {
 		this.localPeerId = localPeerId;
 		this.log = createLogger('coordinator-repo', localPeerId?.toString());
@@ -954,11 +968,14 @@ export class CoordinatorRepo implements IRepo {
 	 * repair. It is returned separately so the caller can compare, not vote.
 	 *
 	 * NOTE: the quorum is corroboration-of-a-claim, NOT Sybil-resistant cohort
-	 * membership — a peer minting fresh keypairs still casts a vote, and the claims
-	 * themselves are bare assertions (a `BlockArchive` carries no commit certificate, so
-	 * there is nothing here to verify a `(rev, actionId)` against). Commit-cert +
-	 * membership anchoring is deferred to backlog
-	 * `debt-read-repair-commit-cert-verification`.
+	 * membership — a peer minting fresh keypairs still casts a vote. A claim that arrives
+	 * with a cohort commit proof is additionally VERIFIED here (`certifyClaim`,
+	 * `cluster/certified-claims.ts`); when the proof holds, the claim is certified and
+	 * {@link selectQuorumRev} accepts it without a second voter — the cohort's signature set
+	 * is its corroboration. What a passing proof does NOT prove is that its signers are the
+	 * block's responsible cohort (anyone controlling N keys can sign their own N-peer
+	 * proof); anchoring the signer set to topology is the optional, observational-only
+	 * {@link ProofAnchoring} layer, unwired in production today.
 	 */
 	private async queryClusterForLatest(peerIds: string[], blockId: BlockId, context?: ActionContext): Promise<ClusterLatestQuery> {
 		// Query peers in parallel for their latest revision. Each query is DEADLINED (rejects), not
@@ -1012,10 +1029,9 @@ export class CoordinatorRepo implements IRepo {
 				continue;
 			}
 			if (!value) continue; // responded, holds nothing — an absent claim, not silence
-			// The proof rides along UNVERIFIED and unweighted: `selectQuorumRev` ignores it, so this
-			// pass still corroborates by counting distinct peers exactly as before. Carrying it here
-			// is what lets `accept-certified-claims-in-repair` accept a verified lone holder later
-			// without re-consulting the cohort.
+			// The proof rides along here and is verified BELOW (certifyClaim) before selection reads
+			// the claim set: presence proves nothing — the peer chose what to attach — but a proof
+			// that verifies certifies the claim, and a certified claim needs no second voter.
 			claims.push({
 				peerId: peerIdStr, rev: value.rev, actionId: value.actionId,
 				...(value.proof ? { proof: value.proof } : {})
@@ -1025,12 +1041,56 @@ export class CoordinatorRepo implements IRepo {
 			this.log('cluster-fetch:peers-silent', { blockId, silent: silent.length, consulted: peerIds.length });
 		}
 
+		// Verify every attached proof, in parallel, BEFORE selection — and penalize provable proof
+		// misbehavior HERE, at verification time, independent of what selection later does with the
+		// claim. Only attributable failures (isAttributableProofFailure) are penalized: a failure
+		// whose signer identities were never proven — unknown/non-ed25519 signer, malformed
+		// signature or proof, a legacy record, the oversized-cohort cap — could have been authored
+		// by anyone in the chain, and penalizing on it would let an attacker frame a peer (the same
+		// discipline as VerifyOutcome.penalize in cluster-repo.ts). A claim whose proof fails stays
+		// in the claim set UNCERTIFIED: it still corroborates by distinct-peer count exactly as a
+		// proof-less claim does.
+		await Promise.all(claims.map(async claim => {
+			if (!claim.proof) return;
+			const verdict = await certifyClaim(
+				claim.proof,
+				{ blockId, rev: claim.rev, actionId: claim.actionId },
+				// simpleMajorityThreshold is hardcoded 0.5, NOT this.simpleMajorityThreshold (0.51
+				// default): members enforce `count > total / 2` (ClusterMember.hasMajority), and the
+				// ProofThresholds doc says to mirror that — verifying against the config value would
+				// reject proofs real cohorts produce.
+				{ superMajorityThreshold: this.superMajorityThreshold, simpleMajorityThreshold: 0.5 },
+				this.proofAnchoring
+			);
+			if (verdict.certified) {
+				claim.certified = true;
+				return;
+			}
+			this.log('cluster-fetch:proof-uncertified', {
+				blockId, peerId: claim.peerId, rev: claim.rev, failure: verdict.failure
+			});
+			if (isAttributableProofFailure(verdict.failure)) {
+				this.penalizeProofService(claim.peerId, blockId);
+			}
+		}));
+
 		const nonSelfCount = peerIds.filter(id => id !== selfId).length;
 		const answered = nonSelfCount - silent.length;
 		const capacity = corroboratorCapacity(nonSelfCount, this.repairCorroborationClusterSize);
 		const required = quorumSize(claims.length, this.simpleMajorityThreshold, capacity);
 		const selected = selectQuorumRev(claims, this.simpleMajorityThreshold, capacity);
 		if (!selected) {
+			// A decline can be the certified path REFUSING to pick a side: two distinct actions each
+			// carrying a verified cohort proof for the same top revision. Name that apart from the
+			// routine no-quorum — the cohort (or whoever holds its keys) provably signed both sides,
+			// an incident rather than a shortage of answers. Neither claimant is penalized: both
+			// proofs verified, so which side is "wrong" is exactly what this node cannot know.
+			const equivocation = certifiedEquivocation(claims);
+			if (equivocation) {
+				this.log('cluster-fetch:certified-equivocation', {
+					blockId, rev: equivocation.rev, actionIds: equivocation.actionIds
+				});
+			}
 			// The three populations are reported SEPARATELY, never rolled into one "responders" count:
 			// "1 of 2 responded" and "1 holder, 1 confirmed non-holder, 0 silent" call for completely
 			// different operator actions — the first says wait or fix reachability, the second says the
@@ -1052,22 +1112,31 @@ export class CoordinatorRepo implements IRepo {
 			// The claims themselves must not drive restoration — but their existence is
 			// evidence the caller needs: an answer served below the highest claim cannot be
 			// confirmed current (see ClusterLatestQuery.uncorroboratedRev).
-			// NOTE: ONE claim is enough to raise that doubt, and a claim is a bare assertion
-			// (no commit certificate to verify it against). So a single lying cohort peer can
-			// deny unpinned reads of a block by claiming a revision nobody else holds — an
-			// availability lever it did not have while uncorroborated claims were discarded.
-			// Deliberate for now: the alternative is the silent stale serve this marker exists
-			// to end, and the same liar can already force a silent-treated absence by staying
-			// quiet. Revisit if claims become attestable (backlog
-			// `debt-read-repair-commit-cert-verification`) — then gate the stamp on a verified
-			// certificate rather than on the bare claim.
+			// NOTE: ONE claim is enough to raise that doubt, and the claims reaching this branch
+			// are unverified assertions — a certified claim converges above instead of declining
+			// (the only certified shape that lands here is the equivocation decline). So a single
+			// lying cohort peer can deny unpinned reads of a block by claiming a revision nobody
+			// else holds — an availability lever it did not have while uncorroborated claims were
+			// discarded. Deliberate for now: the alternative is the silent stale serve this marker
+			// exists to end, and the same liar can already force a silent-treated absence by
+			// staying quiet. If the lever is ever exercised, gate the stamp on a certified claim
+			// (the verification machinery now exists) rather than on the bare assertion — at the
+			// cost of re-opening the stale-serve window for the proof-less honest majority.
 			const uncorroboratedRev = claims.length > 0 ? Math.max(...claims.map(c => c.rev)) : undefined;
 			return { local, silent, answered, ...(uncorroboratedRev !== undefined ? { uncorroboratedRev } : {}) };
 		}
 
-		// Best-effort: penalize peers whose claim contradicts the corroborated pair
-		// (an inflated rev the quorum outvoted, or conflicting content at the agreed
-		// rev). A lower rev is just lag, never penalized. Never let this throw.
+		if (selected.certified) {
+			// Which rule won matters when reading a repair log: a certified selection may rest on a
+			// SINGLE claimant whose corroboration is the cohort's signature set, not other voters.
+			this.log('cluster-fetch:certified-selected', {
+				blockId, rev: selected.rev, claimants: selected.supporters.length
+			});
+		}
+
+		// Best-effort: penalize peers whose claim PROVABLY contradicts the selected pair —
+		// a different action at the very same revision. A higher rev may be honest leadership
+		// and a lower rev is just lag; neither is penalized. Never let this throw.
 		this.penalizeContradictingRevClaims(claims, selected, blockId);
 
 		return { corroborated: { actionId: selected.actionId, rev: selected.rev }, local, silent, answered };
@@ -1095,7 +1164,10 @@ export class CoordinatorRepo implements IRepo {
 	 * days of log archaeology went into re-deriving the real condition from a thousand identical
 	 * `cluster-fetch:no-quorum` lines; the node knows it at the moment of each decline.
 	 *
-	 * **What makes `sole-holder` provable.** "That peer will hold it later" is an assumption, and for a
+	 * **What makes `sole-holder` provable.** Note it is only reachable for a lone UNCERTIFIED holder:
+	 * a lone holder whose cohort commit proof verified is selected by the certified path and converges
+	 * before any decline — so the wording's "a lone holder cannot second itself" stays accurate for
+	 * every claim that gets here. "That peer will hold it later" is an assumption, and for a
 	 * peer that ANSWERED "I hold nothing" it is false: the only two mechanisms that would turn a
 	 * non-holder into a holder — `queryClusterForLatest` (read-repair) and `createReconcileBlock`
 	 * (reconcile) — consume this very decision, so they decline for exactly the same reason on that
@@ -1208,26 +1280,44 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
-	 * Report peers whose reported latest contradicts the quorum-corroborated pair. Best-effort.
+	 * Report peers whose reported latest PROVABLY contradicts the selected pair: the same revision
+	 * under a different actionId. Two actions cannot both be the commit at one revision, so
+	 * whichever way the selection was won — certified or corroborated — the disagreeing claimant is
+	 * provably wrong. Best-effort.
 	 *
-	 * NOTE: the `rev > selected.rev` branch is NOT provable misbehavior — an honest
-	 * peer legitimately ahead of the sampled quorum (an in-flight commit it durably
-	 * stored, or other honest holders dropped from the sample by the 1s per-peer
-	 * timeout) reports a higher rev and gets penalized (weight 30 → immediate
-	 * deprioritize at threshold 20). Distinguishing a liar from an honest leader
-	 * needs the commit-cert verification tracked in backlog
-	 * `debt-read-repair-penalty-provable-only` / `debt-read-repair-commit-cert-verification`.
+	 * A claim at a HIGHER rev than the selection is deliberately NOT penalized: a peer can honestly
+	 * be ahead of the sampled quorum — an in-flight commit it durably stored before the rest of the
+	 * cohort, or other honest holders dropped from the sample by the 1s per-peer consult deadline —
+	 * and the InvalidRestoration weight (30) sits above the deprioritize threshold (20), so a single
+	 * false hit used to deprioritize an honest, up-to-date peer. Declining to RESTORE from the
+	 * uncorroborated higher claim already happens in selection; the affirmative penalty on that
+	 * ambiguous evidence is what this method no longer applies. Provably-bad proof SERVICE is
+	 * penalized at verification time instead (the certifyClaim pass in
+	 * {@link queryClusterForLatest}).
 	 */
 	private penalizeContradictingRevClaims(claims: RevClaim[], selected: QuorumRev, blockId: BlockId): void {
 		if (!this.reputation) return;
 		try {
 			for (const c of claims) {
-				const contradicts = c.rev > selected.rev
-					|| (c.rev === selected.rev && c.actionId !== selected.actionId);
-				if (contradicts) {
+				if (c.rev === selected.rev && c.actionId !== selected.actionId) {
 					this.reputation.reportPeer(c.peerId, PenaltyReason.InvalidRestoration, `read-repair:${blockId}`);
 				}
 			}
+		} catch (err) {
+			this.log('cluster-fetch:penalize-error', { blockId, error: (err as Error).message });
+		}
+	}
+
+	/**
+	 * Best-effort penalty for a peer whose SERVED PROOF provably lies or provably does not cover the
+	 * claim it was attached to (see the attributability classification in
+	 * `cluster/certified-claims.ts`). Never throws — mirrors
+	 * {@link penalizeContradictingRevClaims}.
+	 */
+	private penalizeProofService(peerId: string, blockId: BlockId): void {
+		if (!this.reputation) return;
+		try {
+			this.reputation.reportPeer(peerId, PenaltyReason.InvalidRestoration, `read-repair:${blockId}`);
 		} catch (err) {
 			this.log('cluster-fetch:penalize-error', { blockId, error: (err as Error).message });
 		}
