@@ -154,6 +154,13 @@ confirmed on a holder when that holder reports it *not* missing (it already had 
 push). Retries and per-block timeouts apply. The phase completes only when **every** block in the
 shed range is confirmed to the floor.
 
+> A receiver refuses a pushed block that carries no verifying cohort commit proof (`handlePush`,
+> `requirePushCertificate` — see [internals.md](internals.md) § *Certified push*). A block committed
+> before proofs existed can never be certified, so it can never confirm, so a shed range containing
+> one aborts this phase every time. That is by design on the receiving side; the deployment remedy
+> is to run receivers with `blockTransfer.requirePushCertificate: false` until those blocks have been
+> rewritten under current code.
+
 If confirmation cannot be reached for any block (holders unreachable, partition detected, floor not
 met within a bound), the shift **aborts** and rolls back to `active` at the *old* ring — the node
 keeps the range.

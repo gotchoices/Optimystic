@@ -42,6 +42,16 @@ class MockRepo implements IRepo {
 	async saveReplicatedBlock(blockId: string, block: IBlock): Promise<void> {
 		this.blocks.set(blockId, block);
 	}
+	/**
+	 * `BlockTransferCoordinator` requires a proof-retaining repo (a repo without the accessor would
+	 * push uncertified and every default-configured receiver would refuse it, silently). This mock
+	 * retains none, so its pushes carry metadata only -- fine here: the receivers in this spec are
+	 * mocks that assert on the coordinator's own bookkeeping, not on certification. The certified
+	 * producer -> wire -> receiver chain is pinned in `block-transfer-roundtrip.spec.ts`.
+	 */
+	async getBlockProof(_blockId: string, _rev: number): Promise<undefined> {
+		return undefined;
+	}
 }
 
 class MockRestorationCoordinator {

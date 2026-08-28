@@ -400,6 +400,21 @@ export class BlockTransferService implements Startable {
 				// `certifyContent` rather than the raw verifier so the wire-facing signer cap
 				// (MAX_PROOF_SIGNERS) the verifier requires of its callers is applied before any
 				// signature work — this input comes from an unauthenticated peer.
+				//
+				// NOTE: no `ProofAnchoring` is threaded here, unlike the other two proof-verifying
+				// paths (`ReconcileBlockDeps.anchoring`, `CoordinatorRepo`'s). Nothing wires anchoring
+				// in production today, so all three behave identically; when
+				// `feat-cluster-membership-threshold-cert-anchoring` lands, this call needs the same
+				// optional dep or the push path becomes the one place the unanchored residual is
+				// neither compared nor surfaced.
+				//
+				// NOTE: verification cost per REQUEST is unbounded in a way per-proof caps do not
+				// cover — one inbound push frame is capped at MAX_BLOCK_MESSAGE_BYTES (8 MiB, not the
+				// 1 MiB control cap `MAX_PROOF_SIGNERS`' note reasons about) and may carry one proof
+				// per block id. Each proof is bounded (≤ 256 signers), but their number is the
+				// sender's choice. Acceptable today because the pre-proof path already did per-block
+				// parse + disk write on the same frame; if inbound push CPU ever shows up in a
+				// profile, bound the per-request proof count (or total proof bytes) here.
 				const verdict = await certifyContent(
 					proof, { blockId, rev: source.rev, actionId: source.actionId }, block, this.proofThresholds);
 				if (!verdict.contentCertified) {

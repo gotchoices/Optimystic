@@ -1,7 +1,8 @@
-import type { IRepo, IPeerNetwork } from '@optimystic/db-core';
+import type { IPeerNetwork } from '@optimystic/db-core';
 import { peerIdFromString } from '@libp2p/peer-id';
 import type { PartitionDetector } from './partition-detector.js';
 import type { RestorationCoordinator } from '../storage/restoration-coordinator.js';
+import type { ProofRetainingRepo } from '../storage/block-archive.js';
 import { BlockTransferClient, sourceBlockCertification } from './block-transfer-service.js';
 import type { GrowthOutcome, RebalanceEvent } from './rebalance-monitor.js';
 import { createLogger } from '../logger.js';
@@ -70,7 +71,14 @@ export class BlockTransferCoordinator {
 	private readonly waitQueue: Array<() => void> = [];
 
 	constructor(
-		private readonly repo: IRepo,
+		/**
+		 * The node's OWN store, proof accessor REQUIRED (not the optional `ArchiveServingRepo`
+		 * shape): every push this class makes is certified out of it, and a repo without the
+		 * accessor would make `sourceBlockCertification` return meta-only for every block — so
+		 * every push would be refused by a receiver running the default `requirePushCertificate`,
+		 * silently and with no type error. Same reasoning as `createServedRepoProxy`'s.
+		 */
+		private readonly repo: ProofRetainingRepo,
 		private readonly peerNetwork: IPeerNetwork,
 		private readonly restorationCoordinator: RestorationCoordinator,
 		private readonly partitionDetector: PartitionDetector,

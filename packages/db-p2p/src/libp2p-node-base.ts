@@ -248,6 +248,21 @@ export type NodeOptions = ClusterPolicyOptions & {
 	/** Dispute protocol configuration */
 	dispute?: Partial<DisputeConfig>;
 
+	/**
+	 * Block-transfer (churn re-replication) receiver tuning.
+	 *
+	 * `requirePushCertificate` (default `true`) refuses a pushed block that carries no verifying
+	 * cohort commit proof — see `BlockTransferServiceInit.requirePushCertificate` for why that is
+	 * the default. It is exposed here because the migration it exists for is a DEPLOYMENT decision
+	 * and the escape hatch lives on the RECEIVER: a node still holding pre-proof blocks cannot
+	 * certify them (the signatures no longer exist), so under the strict default those blocks never
+	 * gain a new holder — which also means `BlockTransferCoordinator.confirmReplicated` never
+	 * confirms them, so a rebalance never releases them and a ring shift's confirm phase aborts on
+	 * them (`docs/arachnode-ring-handoff.md` § Phase B). Clearing the backlog means running the
+	 * receivers with this `false` until every such block has been rewritten under current code.
+	 */
+	blockTransfer?: { requirePushCertificate?: boolean };
+
 	/** Optional persistent store for 2PC transaction state (enables crash recovery) */
 	transactionStateStore?: ITransactionStateStore;
 
@@ -624,6 +639,10 @@ export async function createLibp2pNodeBase(
 			blockTransfer: (components: any) => {
 				const serviceFactory = blockTransferService({
 					protocolPrefix: `/optimystic/${options.networkName}`,
+					// Absent → the strict default inside the service; see `blockTransfer` on the options.
+					...(options.blockTransfer?.requirePushCertificate !== undefined
+						? { requirePushCertificate: options.blockTransfer.requirePushCertificate }
+						: {}),
 					...inboundAuthorization
 				});
 				return serviceFactory({

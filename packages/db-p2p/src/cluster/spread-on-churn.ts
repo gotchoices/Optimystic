@@ -1,9 +1,10 @@
 import type { Startable, Libp2p } from '@libp2p/interface'
-import type { IRepo, IPeerNetwork } from '@optimystic/db-core'
+import type { IPeerNetwork } from '@optimystic/db-core'
 import { hashKey } from 'p2p-fret'
 import type { FretService } from 'p2p-fret'
 import { peerIdFromString } from '@libp2p/peer-id'
 import type { PartitionDetector } from './partition-detector.js'
+import type { ProofRetainingRepo } from '../storage/block-archive.js'
 import { BlockTransferClient, sourceBlockCertification } from './block-transfer-service.js'
 import { createLogger } from '../logger.js'
 
@@ -44,7 +45,12 @@ export interface SpreadOnChurnDeps {
 	libp2p: Libp2p
 	fret: FretService
 	partitionDetector: PartitionDetector
-	repo: IRepo
+	/**
+	 * The node's OWN store, proof accessor REQUIRED — see the same requirement on
+	 * `BlockTransferCoordinator`: a repo without it spreads meta-only pushes that every
+	 * default-configured receiver refuses, with no type error to say so.
+	 */
+	repo: ProofRetainingRepo
 	peerNetwork: IPeerNetwork
 	clusterSize: number
 	protocolPrefix?: string
