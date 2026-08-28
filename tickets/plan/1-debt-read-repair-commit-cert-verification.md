@@ -1,273 +1,304 @@
 ----
-description: Let a machine prove that a record really was updated by checking a signature the group produced when it committed, instead of having to reach two other machines that say the same thing. Without that proof, a machine that cannot reach enough peers can never catch up, and small or partly-connected deployments get stuck permanently.
-prereq:
-files: packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/cluster/commit-cert.ts, packages/db-p2p/src/cluster/cluster-repo.ts, packages/db-p2p/src/cluster/quorum-restore.ts, packages/db-p2p/src/cluster/reconcile-block.ts, packages/db-p2p/src/cluster/block-transfer-service.ts, packages/db-p2p/src/storage/struct.ts (BlockArchive), packages/db-p2p/src/sync/service.ts, packages/db-p2p/src/sync/protocol.ts, packages/db-p2p/test/block-transfer-push-persist.spec.ts
+description: Let a machine prove a record really was updated by checking a signature the group produced when it committed, instead of having to reach two other machines that say the same thing. Without that proof, a machine that cannot reach enough peers can never catch up, and small or partly-connected deployments get stuck permanently.
+files: packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/cluster/cluster-repo.ts, packages/db-p2p/src/cluster/commit-cert.ts, packages/db-p2p/src/cluster/quorum-restore.ts, packages/db-p2p/src/cluster/reconcile-block.ts, packages/db-p2p/src/cluster/block-transfer-service.ts, packages/db-p2p/src/cluster/peer-key-binding.ts, packages/db-p2p/src/storage/struct.ts, packages/db-p2p/src/storage/block-archive.ts, packages/db-p2p/src/storage/storage-repo.ts, packages/db-p2p/src/storage/i-raw-storage.ts, packages/db-p2p/src/sync/service.ts, packages/db-p2p/src/sync/protocol.ts, packages/db-core/src/cluster/membership.ts, packages/db-core/src/cluster/structs.ts, packages/db-core/src/network/repo-protocol.ts, packages/db-core/src/network/struct.ts, packages/db-core/src/network/i-repo.ts, packages/db-core/src/transactor/network-transactor.ts, packages/db-p2p/test/block-transfer-push-persist.spec.ts
 difficulty: hard
 severity: wrong-result
 likelihood: normal-use
 repro: verified
 ----
 
-# Verify restored blocks against a commit certificate (Sybil-resistant)
+# Verify restored blocks against a commit certificate
 
-## Promoted to plan, 2026-08-27 — read this section first
+<!-- resume-note -->
+**A prior plan run (2026-08-27) was cut short by a token budget warning.** It completed the
+architecture research and settled every major design question except ONE (named under *The one open
+question* below). No code was changed. This file replaces the original ticket and carries everything
+that run established, so the next planner does **not** need to re-derive any of it. Read
+*Verified facts* before opening any file; each line there was read out of the tree, not inferred.
 
-Two things changed since this was parked, and together they retire the reason it was parked.
-
-**1. The floor this ticket hardens is already bypassable, so "is it worth the cost" is the wrong
-question.** `blocked/repair-floor-defends-a-door-the-push-path-leaves-open` (now absorbed here, and
-deleted) measured it rather than arguing it. `BlockTransferService.handlePush` accepts a pushed block
-from any peer, validates only that the payload parses and has a `header`, and persists it via
-`saveReplicatedBlock` using the **pusher's own** rev and action id — which is exactly what that node
-then reports when a reader asks what it holds:
-
-```
-push accepted: [ 'single-holder-block' ]  missing: []
-push accepted: [ 'single-holder-block' ]  missing: []
-reader served payload: FORGED  rev: 7
-reader now HOLDS payload: FORGED  rev: 7
-```
-
-Run with the strict default (`repairCorroborationClusterSize: 10`, floor of two, no relaxation). A
-peer that can dial two cohort members manufactures two honest-looking corroborators, and the floor is
-satisfied by construction. The reader then becomes a third. The acceptance half is pinned green in
-`test/block-transfer-push-persist.spec.ts:48,65` — working as designed, for the design in
-`docs/internals.md:859` (any peer that can open a connection may issue database operations;
-`authorizeInboundStream` is the embedder's opt-in seam and defaults to `undefined`).
-
-So today we pay permanent unreadability of a deployment's earliest data for a guarantee any peer with
-two connections can walk around. That is not a threat model to choose between; it is one mechanism
-that works and one that does not, and the certificate replaces both.
-
-**2. The decision that was blocked has been made.** Fund this path. Neither the corroboration floor
-nor the push path is the durable answer: once a revision carries proof, origin stops mattering, the
-floor stops doing load-bearing work, and an unauthenticated push becomes harmless because an
-unproven block is simply not accepted. Do not spend this ticket re-litigating Position A vs Position
-B — implement the thing that dissolves the question.
-
-### What was verified in the tree on 2026-08-27, so the planner does not re-derive it
-
-- `BlockArchive` (`storage/struct.ts:19`) is `{ blockId, revisions, range, pending? }` — **no
-  signature or certificate field anywhere in the type**. There is nothing on the restore/sync wire to
-  check, which is why "take the peer's word" is the whole path, not a corner of it.
-- `buildCommitCert` (`cluster/commit-cert.ts`) already assembles the real artifact: the cohort's
-  per-member Ed25519 **commit** votes over the commit hash, concatenated in signer order, plus the
-  exact signed preimage. It is then handed to an in-memory sink with
-  `DEFAULT_COMMIT_CERT_TTL_MS = 60_000` for reactivity. Even the node that witnessed consensus cannot
-  prove it an hour later.
-- Client signatures are real but unenforced in practice: `requireClientSignature` exists,
-  `createQuereusValidator` is exported, and **no shipping entry point constructs one** — the node
-  takes `validator` as an option nothing sets (see `backlog/feat-no-deployment-validates-transactions-at-pend`).
-  They also validate the *transaction at pend*, not the block bytes replicated later.
-
-### The design question this ticket must answer — it is not just wiring
-
-The commit cert signs the commit hash over the record's **message** — the transaction — not over the
-resulting block bytes. A receiver can therefore prove *"the cohort approved action X at revision N"*
-but not *"these bytes are what X produces from N-1"*. Block ids are **not** content hashes (see
-`complete/bug-docs-claim-block-ids-are-content-hashes`), so the id binds nothing either. Closing that
-needs one of:
-
-- **Verify by replay** — replicate signed transforms rather than materialized state, and replay from a
-  base the receiver already trusts. Strongest binding; costs a replay and a trusted base, and
-  interacts with how `BlockArchive` already carries `pending` transforms.
-- **Extend the signed preimage** to cover a digest of the resulting block, so the certificate binds
-  content directly. Cheaper to verify; changes the commit-vote preimage, which is a wire-compatibility
-  event — and note `computeClusterMessageHash` canonicalises the whole message generically, so an
-  older peer recomputes a changed preimage correctly (established while shipping
-  `complete/1-commit-and-cancel-records-omit-the-coordinating-block`).
-
-Pick one, with the reasoning written down. This is the crux of the ticket; everything else is
-plumbing.
-
-### Staging — the default, unless the plan stage finds better
-
-Land at **layer-1 strength now** and log the residual anchoring gap, following the precedent this
-ticket already cites: `verifyInvalidationCertificate` verifies a challenger-bound signer set,
-membership and dedup, and logs what it cannot yet anchor rather than waiting for
-`feat-cluster-membership-threshold-cert-anchoring`. A certified claim verified to that standard is
-strictly stronger than "two peers said the same number", which carries no signatures at all. Waiting
-for the anchor keeps a measured hole open indefinitely; shipping without it is a real improvement that
-the anchor later upgrades in place.
-
-Once a cert can be verified, `handlePush` must require one — that is what closes the forgery above,
-and it should be part of this work rather than a follow-on, because a push path that still accepts
-unproven blocks re-opens everything this ticket buys.
-
-### Sizing — split it
-
-This does not fit one agent run. Emit prereq-chained implement tickets; the natural seams are:
-persist the cert with the revision → carry it in `BlockArchive` and the sync protocol → verify on the
-read-repair/reconcile path → require it on `handlePush` → retention policy (certs must outlive a
-60 s TTL to serve historical restores). Fold `backlog/debt-read-repair-penalty-provable-only` if its
-cheap arm (stop penalising an uncorroborated higher revision) falls out of this work; leave it filed
-if it does not.
-
-
-## Why this exists
-
-The near-term fix (`p2p-read-repair-verify-peer-claims`, in implement/) makes
-block read-repair and reconcile require a **quorum of peers to agree** on the
-claimed latest revision + its content before accepting it. That defeats a
-*minority* of lying peers. It does **not** defeat a single attacker that spins up
-many fake peer identities (a Sybil attack): those fake identities can manufacture
-a fake "quorum" because the quorum check counts distinct peer-ids, and nothing
-proves those ids are legitimate members of the block's cohort.
-
-The stronger, Sybil-resistant guarantee is to verify the claimed latest against a
-**commit certificate** — the cohort's threshold signature produced when the block
-was actually committed. A forger cannot produce a valid cohort signature it never
-collected.
-
-## What blocks doing this today
-
-Three gaps, all real work:
-
-- **Certs are not stored with blocks.** A commit cert lives only in an in-memory
-  TTL cache (`cluster/commit-cert.ts`) keyed by `actionId`, used for reactivity.
-  Block archives (`storage/struct.ts` `BlockArchive`) carry no cert.
-- **The sync protocol does not serve certs.** `sync/service.ts` builds archives
-  from stored revisions; there is no field or path to return the cert alongside a
-  revision, so a restoring node cannot fetch one to verify.
-- **Cohort-membership anchoring is not wired into these restore paths.**
-  Verifying a threshold signature requires knowing which peer-ids are legitimately
-  in the block's cohort. That machinery exists in part (completed
-  `cohort-topic-trust-anchor-*` work / membership certs) but is not connected to
-  read-repair or reconcile, and the per-vote binding check in `cluster-repo.ts`
-  `verifySignature` explicitly does not establish cohort membership on its own.
-
-## Rough shape of the work
-
-- Persist the commit cert with the committed revision (extend the archive
-  revision record and storage write path).
-- Extend the sync protocol / `BlockArchive` to return the cert for a revision.
-- Add a `verifyCommitCert` step in `queryClusterForLatest` / `reconcileBlock`
-  that reconstructs the signed commit image and checks the threshold signature
-  against the cohort's anchored membership; accept a claimed latest when its cert
-  verifies (stronger than / short-circuits the quorum-agreement path).
-- Decide retention: certs must survive long enough to serve historical restores,
-  which the current TTL cache does not guarantee.
-
-## Sibling ticket at the same seam
-
-`debt-read-repair-penalty-provable-only` covers the *other* half of the same weakness in
-`queryClusterForLatest`: because a peer's claimed latest cannot be proven, read-repair currently
-penalizes the reputation of any peer reporting a higher revision than the sampled quorum — including
-an honest peer that is simply ahead. The two were kept as separate tickets (both slugs are cited from
-`NOTE:` comments in `coordinator-repo.ts`, `quorum-restore.ts`, and `reconcile-block.ts`), but they
-should be triaged together: the penalty ticket's cheap fix (stop penalizing an uncorroborated higher
-revision) is independently shippable now, and this ticket is what makes the penalty *provable* rather
-than merely dropped. A planner may fold them.
-
-This was filed as a future hardening pass on the grounds that it was not an
-active bug — the quorum + content-hash gate already stops the realistic
-minority-liar case. **The second arm below overturns that half of the framing:**
-the same missing proof is also a reproduced availability defect, so the
-promotion question is no longer only about Sybil resistance. The cohort-membership
-anchor is still not ready to consume here, which is what keeps this in backlog.
+The next run's job: answer the one open question, then emit the five prereq-chained implement
+tickets sketched under *Ticket split*. Do not re-open the settled decisions.
 
 ---
 
-## Second arm (appended 2026-08-24): this is an availability defect, not only Sybil hardening
+## What this is for, in one paragraph
 
-Added from `fix/stale-read-returned-as-authoritative-when-repair-cannot-converge`, which reached
-this site as the *only sound* fix for a reproduced non-convergence. The metadata above was raised
-from `likelihood: contrived` / `repro: static` on this evidence; the analysis below is why.
+When a node needs to repair or acquire a block, it asks the block's cohort peers what they hold and
+only believes an answer that at least two *distinct peers* corroborate. That rule has two measured
+failures. (1) **Availability:** a block held by exactly one reachable peer can never be repaired, so
+a deployment's earliest data — written while it was one node — becomes permanently unreadable as the
+deployment grows. (2) **It is bypassable anyway:** a peer that can dial two cohort members can push
+forged content to them and manufacture its own corroborators. Replacing "N peers agree now" with
+"one peer carries a signature the cohort produced at commit time" fixes both: the signature set *is*
+the corroboration, so origin stops mattering and a lone honest holder is sufficient.
 
-### What was measured
+---
 
-Corroboration counts *voters*. A voter count cannot be met when the voters are unreachable, and the
-floor is 2. Sweeping `resolveClusterPolicy` → `corroboratorCapacity` → `quorumSize` over real
-cohort sizes gives one rule: **a cohort of three or more needs two cohort peers besides the reader
-to answer, or the repair declines.** So:
+## Verified facts (read out of the tree 2026-08-27 — do not re-derive)
 
-- A three-machine deployment has **zero** fault tolerance for repair. One peer unreachable *from
-  one reader* — healthy and reachable from everybody else — leaves that reader's copy permanently
-  unrepairable.
-- A two-machine deployment that never declared `clusterPolicy.assumedClusterSize` falls back to
-  `clusterSize` (default 10), so its floor never relaxes and it can repair nothing, ever.
+**Cluster consensus shape**
 
-Reproduced in `packages/db-p2p` against a three-peer cohort with one member unreachable: no quorum,
-no restoration, the reader stays at its old revision across every pass. Matches the field logs
-(`cluster-fetch:no-quorum { responders: 1, required: 2 }`, 1821 times in one boot).
+- A transaction is TWO independent cluster records: a `pend` record and a `commit` record
+  (`ClusterMember.applyConsensusOperation`, `cluster-repo.ts:1349`). Each runs a promise round then a
+  commit round, and each ends with a `commits: Record<peerId, Signature>` map of per-member Ed25519
+  approve votes.
+- The commit record's message is `{ operations: [{ commit: CommitRequest }], expiration }`, built in
+  `CoordinatorRepo.commit` (`coordinator-repo.ts:1395`). `CommitRequest` / `RepoCommitRequest` is
+  `{ blockIds, actionId, rev, tailId? }` (`db-core/src/network/i-repo.ts:26`) — **no transforms and
+  no content**. So today's commit signatures bind `(blockIds, actionId, rev)` and nothing about bytes.
+- `computeClusterMessageHash(message, digest)` hashes `canonicalJson(message) + digest`
+  (`db-core/src/cluster/membership.ts:58`); `computeClusterCommitHash` hashes
+  `messageHash + canonicalJson(message) + digest + canonicalJson(promises)`. Both canonicalise the
+  **whole** message generically, so **adding a field inside the commit op is automatically covered by
+  every hash and every existing signature, and an older peer recomputes the changed preimage
+  correctly.** This property is what makes the chosen design wire-safe.
+- `clusterVoteSigningPayload(hash, type, extra)` (`db-core/src/cluster/structs.ts:35`) is
+  `utf8(hash + ':' + type + [':' + extra])`; `clusterVoteVerificationPayload` reads a variant's extra
+  off the vote. An `approve` carries no extra today.
+- `membershipVersion: 2` folds `membershipDigest` — `base64url(SHA256(canonicalJson(sorted peer-id
+  list)))`, ids only, no multiaddrs or keys (`membership.ts:33`) — into all three hashes, making the
+  declared peer set tamper-evident. A v1 / unversioned record binds no peer set at all.
+- `peerIdBindsPublicKey` (`cluster/peer-key-binding.ts`) proves a key is the one an Ed25519 peer id
+  names, by reading `peerIdFromString(id).publicKey.raw`. **A verifier can therefore recover every
+  signer's public key from its peer id alone — a stored proof never needs to carry public keys.** The
+  same file states plainly that this does NOT establish cohort membership.
+- `buildCommitCert` (`cluster/commit-cert.ts`) already assembles
+  `{ thresholdSig, signers, minSigs, signedPayload }` from `record.commits`, but hands it to an
+  in-memory store with `DEFAULT_COMMIT_CERT_TTL_MS = 60_000`. `signedPayload` is
+  `utf8(commitHash + ":approve")` — an opaque hash, so a receiver holding only a `CommitCert`
+  **cannot tell what claim it certifies**. A durable proof must carry enough of the record to
+  recompute `commitHash` from the claim.
 
-### Why the cost of this ticket changed
+**Repair paths**
 
-The corroboration floor's strict default was chosen as *degraded rather than dead* — an unrepaired
-block was still served, just stale. **That is no longer what happens.**
-`coordinator-serves-stale-data-as-if-confirmed` landed on the same day (2026-08-12) and made an
-unconfirmable read throw `BlockPossiblyStaleError` rather than silently serve. Correct, and the
-right call — but it means an unrepairable block is now **read-dead**, not degraded. The two
-decisions appear to have been made without either seeing the other. The tradeoff that justified the
-strict default was priced against the old cost.
+- `BlockArchive` (`storage/struct.ts:19`) is `{ blockId, revisions, range, pending? }` where
+  `ArchiveRevisions = Record<number, { action: ActionTransform, block?: IBlock }>`. No signature field
+  anywhere.
+- `singleRevisionArchive` (`storage/block-archive.ts:23`) **fabricates** the action as
+  `{ actionId, transform: { insert: block } }`. The repair wire therefore carries *materialized state*
+  with a synthetic transform, never the real transform chain. This is what makes verify-by-replay
+  expensive — see *Rejected*.
+- `clusterLatestCallback` (`libp2p-node-base.ts:864`) fetches the whole archive over the sync
+  protocol and **discards everything except `(actionId, maxRev)`**. Widening its return type is cheap,
+  and is what lets a certificate help at the latest-query stage rather than only at acquisition.
+- `CoordinatorRepo.queryClusterForLatest` → `selectQuorumRev` picks the target revision;
+  `restoreCorroborated` → `acquireBlockFromCohort` (wired to the same `createReconcileBlock` the
+  commit path uses, `libp2p-node-base.ts:909`) fetches archives and runs `selectQuorumBlock` on
+  content. **Both stages must accept a certificate, or the lone-holder case dies at the first stage.**
+- `corroboratorCapacity(cohortPeerCount, repairCorroborationClusterSize)` is deliberately the MAX of
+  the two so a shrunken cohort view cannot talk the floor down (`quorum-restore.ts:88`). Do not touch
+  it; the certificate path goes *around* it, it does not relax it.
+- `BlockTransferService.handlePush` (`block-transfer-service.ts:230`) accepts a pushed block from any
+  peer, checks only that the payload parses and has a `header`, and persists it via
+  `saveReplicatedBlock` using the **pusher's own** `blockMeta` rev/actionId. `saveReplicatedBlock`
+  (`storage-repo.ts:822`) advances `latest` monotonically. Acceptance is pinned green in
+  `test/block-transfer-push-persist.spec.ts:48,65`.
+- `MAX_CONTROL_MESSAGE_BYTES = 1 MiB` bounds sync responses (`protocol-limits.ts`), which already
+  carry whole blocks — a few KB of proof is not a concern there.
 
-### Why no cheaper fix exists
+**Precedent for shipping at partial strength**
 
-Every alternative reduces to "trust fewer voters because the others did not answer", which is the
-attack the floor exists to stop. Specifically rejected during the investigation:
+- `verifyInvalidationCertificate` (`dispute/invalidation.ts`) verifies a challenger-bound signer set +
+  membership + dedup (layer 1), takes an optional injected layer-2 recompute capability, and reports
+  `{ reason: 'no-recompute-capability' | 'recompute-infeasible' }` through an `onUnanchored` callback
+  rather than blocking on the unlanded anchor. `libp2p-node-base.ts:820` documents why layer 2 is
+  deliberately not wired yet. **Mirror this shape exactly.**
 
-- **Use the count of peers that actually answered as the capacity.** A routing-level attacker who
-  shrinks a reader's cohort view to `[reader, attacker]` produces one answerer with nobody silent,
-  and would be believed. This is the `max(cohortPeerCount, …)` in `corroboratorCapacity` doing its
-  job; removing it removes the protection.
-- **Relax when nobody was silent.** Same hole, same reason — silence is not what the attacker
-  needs to induce.
-- **Ask a reachable peer to relay an unreachable peer's answer.** That is a certificate with extra
-  steps and no signature.
+---
 
-A commit certificate breaks the circularity because **one peer carrying a certificate is as strong
-as N peers agreeing** — the signature set *is* the corroboration, so the reader never needs to
-reach a second peer. That property is what this ticket is for, and it is worth as much for
-availability as for Sybil resistance.
+## Settled design
 
-### What still blocks it
+### Bind block content by declaring a digest inside the commit operation
 
-Unchanged, and stated honestly: the three gaps in the section above, plus
-`feat-cluster-membership-threshold-cert-anchoring` (also backlog, also not buildable). Note the
-precedent for landing this at partial strength: `verifyInvalidationCertificate` in
-`cluster-repo.ts` already verifies at layer-1 (challenger-bound signer set, membership, dedup) and
-**logs** the residual anchoring gap rather than waiting for the anchor. A certified repair claim
-verified to that same standard would still be strictly stronger than today's "two peers said the
-same number", which carries no signatures at all. A planner should weigh that staging.
+Add an optional `blockDigests?: Record<BlockId, string>` to the commit request — the canonical
+SHA-256 (base64url) of the block each id will materialize to at this revision. Because
+`canonicalJson(message)` covers it, `messageHash`, `promiseHash` and `commitHash` all bind it with
+**zero changes to the hashing helpers**, and the cohort's existing commit approve signatures become
+signatures over the content digest. No new signature type, no new consensus round.
 
-### Meanwhile
+A signature only *means* something if signers check what they sign, so: before casting its commit
+approve vote, a member that can materialize the block locally recomputes the digest and **rejects on
+mismatch**. A member that cannot materialize (cohort drift — the case `reconcileDivergentCommit`
+exists for) approves as it does today and simply contributes no content attestation.
 
-`implement/repair-deadlock-is-never-named` does not fix any of this. It makes the deadlock legible
-— a named, once-per-block signal when every cohort member answered and there were still too few of
-them, plus a startup advisory that stops implying three machines are enough. That is deliberately
-diagnostics only, because nothing else is sound without this ticket.
+**Residual — state it in the implement ticket and in code:** a false digest requires the declarer to
+lie AND at least a super-majority of the cohort to be simultaneously unable to check. Any single
+current honest member rejects, and the transaction fails. This is strictly stronger than today, where
+the commit signatures bind no content at all.
 
+### The durable artifact: `BlockCommitProof`
 
-## Arm — new evidence, filed 2026-08-25 (gotchoices/Optimystic#15)
+`CommitCert` as it exists cannot be verified against a claim (its `signedPayload` is an opaque hash),
+so persist a self-contained proof per committed `(blockId, rev)`:
 
-An outside reporter measured the availability half of this ticket as a live, permanent data-loss-
-shaped failure, and sharpened *which* quantity is wrong.
+```ts
+export type BlockCommitProof = {
+  v: 1;
+  messageHash: string;
+  /** The commit RepoMessage exactly as hashed — carries the commit op incl. blockDigests. */
+  message: RepoMessage;
+  promises: Record<string, Signature>;   // needed verbatim: commitHash's preimage includes it
+  commits: Record<string, Signature>;    // approve votes only
+  membershipVersion: 2;                  // v1 records bind no peer set → never certifiable
+  membershipDigest: string;
+  /** The record's full sorted peer-id list — the threshold denominator, bound by membershipDigest. */
+  peerIds: string[];
+};
+```
 
-`corroboratorCapacity` relaxes the floor based on **cohort size**. What bounds corroboration is
-**how many peers hold the block**. A block with exactly one holder supplies exactly one claim, so it
-is declined in any cohort of three or more — and both paths that could create a second holder
-(`CoordinatorRepo.queryClusterForLatest`, `createReconcileBlock`) consume the same decision. One
-holder is therefore where it stays, permanently.
+No public keys: every signer's key is recovered from its Ed25519 peer id (`peerIdBindsPublicKey`'s
+mechanism). Rough size at a cohort of 10 is a few KB — two signature maps plus the id list. Measure
+it in the implement ticket rather than quoting a figure from here.
 
-Verified against our own 0.24.2 build: identical evidence (one honest claim, all other members
-answering "I hold nothing") is accepted at a cohort view of two and declined at three, four and
-nine.
+**Verification splits in two, because the two repair stages hold different information:**
 
-Why this strengthens the case for a certificate specifically: the state is produced by **growth**,
-not by misconfiguration. Whatever was committed while the deployment was one node has one holder,
-and the cohort that later derives for that key has three — so a deployment's founding records are
-exactly the data that becomes unreadable, and `clusterPolicy.assumedClusterSize` cannot express "this
-block has one holder". A certificate is the only listed direction that lets a lone claim be trusted
-without handing an attacker the sole-claimant lever.
+- *Claim verification* (no block bytes needed — used at the latest-query stage): recompute
+  `membershipDigest` from `peerIds` and compare; recompute `messageHash` and compare; recompute
+  `commitHash`; verify each approve signature over `clusterVoteVerificationPayload(commitHash, sig)`
+  with the key its peer id names, counting only signers present in `peerIds`, deduped; require
+  `count >= ceil(simpleMajorityThreshold * peerIds.length)`; then confirm the message's commit op
+  names this `blockId` at this `(actionId, rev)`. Result: the claim `(rev, actionId)` is **proven**.
+- *Content verification* (needs the bytes — used at acquisition and on push): additionally require
+  `blockDigests[blockId] === canonicalBlockHash(receivedBlock)`.
 
-That investigation has since concluded (its ticket is gone; successors below). It rejected the two
-cheaper directions on measured grounds — relaxing the floor on an affirmative "I hold nothing" is
-strictly weaker than today's rule and self-amplifying, since an acquiring reader becomes a genuine
-second voter; and structural corroboration against a parent pointer is not buildable, because parents
-name children by bare id only (`BranchNode.nodes: BlockId[]`), with no revision or content hash to
-check a lone claim against. It landed two implement tickets instead:
-`replicate-owned-blocks-when-the-cohort-grows` (stop creating singly-held blocks, and heal existing
-ones while their holder is online) and `name-the-single-holder-deadlock` (say what is happening).
-**Neither covers a block whose sole holder is offline or gone — this ticket is still what covers
-that.** The threat-model question it surfaced has been absorbed into the "Promoted to plan" section at the
-top of this ticket, and that blocked ticket deleted.
+### Anchoring: layer 1 now, log the gap
+
+A proof's signers are proven to be *some* set of Ed25519 identities that jointly signed; nothing yet
+proves they are the block's legitimate cohort. Follow `verifyInvalidationCertificate` exactly: verify
+at layer 1, take an **optional** injected capability that re-derives the block's cohort
+(`keyNetwork.findCluster`, the same source `deriveExpectedCluster` uses at `libp2p-node-base.ts:790`)
+and reports overlap, and when that capability is absent or reports infeasible, **accept and log the
+residual** rather than declining. Historic cohort rotation means overlap can legitimately be zero for
+old data, so overlap must never be a hard gate at this layer — making it one would re-create the
+read-dead defect this ticket exists to fix.
+
+Write this honestly in the ticket: the immediate, complete win is **availability** — one holder's
+proof replaces N reachable corroborators, which is the reproduced defect. Sybil resistance improves
+from "any two ids answering now" to "at least a super-majority of the committing cohort's keys,
+checkable offline", and completes when `feat-cluster-membership-threshold-cert-anchoring` lands.
+
+### `handlePush` requires a proof
+
+A push must carry a `BlockCommitProof` that content-verifies against the pushed bytes and matches the
+declared `blockMeta`; otherwise the block is reported `missing` (the existing failure surface — the
+sender falls back or retries). This is what closes the measured forgery, and per the promotion
+decision it belongs in this work, not a follow-on.
+
+**Migration, decided:** pre-certificate blocks can never be certified — the signatures no longer
+exist. So expose `requirePushCertificate`, default **`true`**, and document that a deployment holding
+pre-certificate data sets it to `false` during migration. Rationale for the strict default: the
+forgery is measured and currently unmitigated; the failure mode of `true` is "legacy blocks stop
+gaining holders via push", which is visible in a `push:reject-uncertified` log and still readable
+while two or more holders remain, whereas the failure mode of `false` is silent acceptance of forged
+content. Mitigation worth stating: any block written again under the new code gets a proof, so only
+cold, never-updated blocks stay uncertified. Do not re-litigate this; record it and move on.
+
+### Fold the sibling penalty ticket
+
+`backlog/debt-read-repair-penalty-provable-only`'s cheap arm falls out of this work: drop the
+`rev > selected.rev` reputation penalty in `penalizeContradictingRevClaims` — an honest peer that is
+ahead on a legacy uncertified revision would otherwise be punished — and replace it with genuinely
+provable misbehavior: a peer serving a proof that fails verification, or content contradicting a
+verified proof's digest. Update `test/coordinator-repo-read-repair-trust.spec.ts` accordingly, and
+delete that backlog ticket when the arm lands.
+
+---
+
+## Rejected, with reasons (do not revisit)
+
+- **Verify by replay** — replicate signed transforms and replay from a trusted base. The repair wire
+  carries materialized state with a *synthetic* `{ insert: block }` transform
+  (`block-archive.ts:23`), and the receiver in the case that matters holds **nothing**, so replay
+  would have to reach genesis over a transform chain no node is guaranteed to retain — and each link
+  would still need its own certificate. That is the digest design plus a chain walk, not an
+  alternative to it.
+- **Per-signer digest folded into the commit vote's `extra`.** Stronger — each signer would attest
+  only what it computed itself — but an upgraded member's `approve` fails verification on an
+  un-upgraded member, because `clusterVoteVerificationPayload`'s `default:` branch rebuilds
+  `hash + ':approve'`, so the whole record is rejected. A hard mixed-version break, for a
+  strengthening the residual above already bounds.
+- **A separate per-member content attestation merged into the record.** Wire-safe and stronger, but
+  roughly triples the surface — new record field, merge rules, a speculative-materialization API on
+  the vote path, digest grouping, a second threshold — for the same practical guarantee. Revisit only
+  if the residual above is ever measured to matter.
+- **Collecting attestations in a new post-commit round.** Costs an extra protocol round per commit to
+  buy what the existing commit round already provides for free.
+
+---
+
+## The one open question the next run must answer
+
+**Who declares `blockDigests`, and can they?** The design needs a declarer that reliably knows the
+block each id will materialize to.
+
+- The **coordinator** cannot: `CoordinatorRepo.commit` forwards the caller's `CommitRequest` without
+  materializing, and the code at `coordinator-repo.ts:1406-1418` explicitly handles a coordinator that
+  was picked for commit after missing the pend phase.
+- The **client / transactor** is the strong candidate — it authored the transforms, so it materialized
+  the result locally to build them — but this was **not finished being verified**. Resume at
+  `NetworkTransactor.commit` (`db-core/src/transactor/network-transactor.ts:681`) and `commitBlocks`
+  (`:750`), which today pass only `{ actionId, blockIds, rev, tailId }` per batch. Establish whether
+  the transactor (or its `TransactorSource` / cache layer) holds the post-transform block for every id
+  in `blockIds` at commit time, including header and tail blocks and the multi-collection path. If
+  some ids cannot be digested, the field stays per-id optional and those blocks fall back to
+  corroboration — acceptable, but the ticket must then say which ids are expected to carry a digest so
+  the implementer is not guessing.
+- If the transactor turns out **not** to hold them, note that a member-side speculative
+  materialization cannot serve as the declarer — the message must be fixed before it is hashed. In
+  that case re-open the per-member-attestation option above rather than inventing a third mechanism.
+
+`StorageRepo.previewCommitDigest(blockId, actionId, rev)` — reusing `readCommitBase` + `applyTransform`
++ `canonicalBlockHash` — is needed **regardless**, for the member-side verify-before-vote check. Only
+the *declarer* is open.
+
+---
+
+## Ticket split to emit (five, prereq-chained, in this order)
+
+Each is sized to one agent run; the chain is strictly linear because each stage consumes the previous
+stage's type.
+
+- **`commit-cert-bind-block-content-digest`** — the open question resolved; `blockDigests` on the
+  commit request threaded from the declarer; `canonicalBlockHash` promoted into db-core (it lives in
+  db-p2p `quorum-restore.ts:162` today and both packages will need it);
+  `StorageRepo.previewCommitDigest`; member-side verify-before-vote with reject-on-mismatch.
+- **`persist-block-commit-proof`** — the `BlockCommitProof` type and a pure `verifyBlockCommitProof`
+  (claim half and content half); `membershipDigestFromIds` in db-core with `membershipDigest`
+  delegating to it; `IRawStorage.getBlockCert` / `saveBlockCert`; write the proof alongside the
+  revision on the commit path. Retention: the proof lives and dies with the revision record it belongs
+  to, which is what makes it outlive the 60-second reactivity TTL.
+- **`serve-block-commit-proof`** — `ArchiveRevisions` gains `proof?`; `singleRevisionArchive` and
+  `serveBlockArchive` carry it; `ClusterLatestCallback` widens from `ActionRev` to a certified rev so
+  the latest-query stage can use a proof.
+- **`accept-certified-claims-in-repair`** — `selectQuorumRev` / `selectQuorumBlock` gain a certified
+  short-circuit: a verifying proof accepts a lone claim outright, highest certified rev wins, and
+  corroboration stays as the fallback for uncertified claims. Plus the optional cohort-overlap
+  capability with its `onUnanchored`-shaped logging, and the folded penalty arm from
+  `debt-read-repair-penalty-provable-only`.
+- **`require-proof-on-block-push`** — `blockCerts` on the push wire; `handlePush` content-verifies;
+  `requirePushCertificate` default `true` with the documented migration flag; flip
+  `test/block-transfer-push-persist.spec.ts` from pinning acceptance to pinning rejection.
+
+## Edge cases the implement tickets must name
+
+- A v1 / unversioned record is never certifiable, because its peer set is unbound — it must fall back
+  cleanly, never half-verify.
+- Duplicate signer ids, a signer absent from `peerIds`, a non-Ed25519 signer id, a malformed
+  base64url signature: reject the proof, and take care never to penalise a peer whose identity was not
+  proven (the `VerifyOutcome.penalize` distinction at `cluster-repo.ts:63`).
+- Replay: a genuine proof for rev 5 presented for rev 9, or presented for a different block id. The
+  commit-op match is what stops both; test it explicitly.
+- A cohort whose membership has fully rotated since commit: overlap zero must still accept and log.
+- Multi-block commits: one proof certifies several block ids, and each id's digest is checked
+  separately.
+- A block whose commit materializes nothing — a tombstone; `internalCommit` allows an absent
+  `newBlock` when a prior `latest` exists. Decide and pin what digest, if any, is declared.
+- Mixed-version cohorts in both directions, and a proof-bearing push to an un-upgraded receiver.
+- `saveReplicatedBlock`'s monotonic no-op: a proof arriving for a revision already held must not
+  regress or duplicate stored state.
+
+## Out of scope, already covered elsewhere
+
+`replicate-owned-blocks-when-the-cohort-grows` and `name-the-single-holder-deadlock`, both landed from
+the earlier single-holder investigation, stop *creating* singly-held blocks and make the deadlock
+legible. Neither covers a block whose sole holder is offline or gone; this ticket is what covers that.
