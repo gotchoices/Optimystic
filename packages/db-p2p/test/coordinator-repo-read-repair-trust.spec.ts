@@ -466,7 +466,37 @@ describe('CoordinatorRepo read-repair CERTIFIED claims (cohort commit proofs)', 
 		expect(reports, 'a malformed proof is never attributable').to.deep.equal([]);
 	});
 
-	it('a same-rev/different-actionId claim against the selection is STILL penalized (the kept branch)', async () => {
+	it('claims contradicting a CERTIFIED selection are never penalized — one proof must not convict the cohort', async () => {
+		// A proof says "the cohort named in it signed this", never "that is the block's cohort", so a
+		// peer holding N keys can mint a passing proof for any (block, rev, action). If a certified
+		// selection carried the contradiction penalty, that one forged proof would report every
+		// honest holder of the real action at that revision for invalid-restoration — weight 30,
+		// above the deprioritize threshold of 20 — on every consult.
+		const localPeer = await makePeerId();
+		const prover = await makePeerId();
+		const honestA = await makePeerId();
+		const honestB = await makePeerId();
+		const honestC = await makePeerId();
+		const answer = await certifiedAnswer(blockId, 5, 'action-proven');
+		const real: ActionRev = { actionId: 'action-real', rev: 5 };
+		const callback: ClusterLatestCallback = async (peerId) =>
+			peerId.equals(prover) ? answer : peerId.equals(localPeer) ? undefined : real;
+		const { rep, reports } = makeReputationStub();
+		const { repo, calls } = makeRepo(
+			[localPeer, prover, honestA, honestB, honestC], localPeer, 5, callback, rep);
+
+		await repo.get({ blockIds: [blockId] });
+
+		// The proof still wins the selection (the accepted cost of the certified path at equal rev)...
+		const restore = calls.find(c => c.context?.rev === 5);
+		expect(restore, 'the certified pair drives restoration').to.not.equal(undefined);
+		expect(restore!.context!.committed).to.deep.equal([{ actionId: 'action-proven', rev: 5 }]);
+		// ...but the three peers it disagrees with keep their reputation.
+		expect(reports, 'an unanchored proof must not deprioritize the peers that contradict it')
+			.to.deep.equal([]);
+	});
+
+	it('a same-rev/different-actionId claim against a CORROBORATED selection is STILL penalized (the kept branch)', async () => {
 		const localPeer = await makePeerId();
 		const honestA = await makePeerId();
 		const honestB = await makePeerId();

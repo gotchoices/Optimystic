@@ -1049,7 +1049,14 @@ export class CoordinatorRepo implements IRepo {
 		// by anyone in the chain, and penalizing on it would let an attacker frame a peer (the same
 		// discipline as VerifyOutcome.penalize in cluster-repo.ts). A claim whose proof fails stays
 		// in the claim set UNCERTIFIED: it still corroborates by distinct-peer count exactly as a
-		// proof-less claim does.
+		// proof-less claim does — a peer that could fabricate a bad proof could equally have sent no
+		// proof, so dropping the vote would buy nothing.
+		// NOTE: cost is one verification pass per proof-carrying answer per consult, each bounded by
+		// MAX_PROOF_SIGNERS (256) signature checks. In `lazy` mode consults are rate-limited by the
+		// read-repair window; in `paranoid` mode every read of every block pays cohort-width
+		// verifications. Fine at deployment cohort sizes (~10) — if paranoid readers ever show CPU
+		// time in `certifyClaim`, cache verdicts per (blockId, rev, actionId, proof hash) rather than
+		// skipping verification.
 		await Promise.all(claims.map(async claim => {
 			if (!claim.proof) return;
 			const verdict = await certifyClaim(
@@ -1134,9 +1141,10 @@ export class CoordinatorRepo implements IRepo {
 			});
 		}
 
-		// Best-effort: penalize peers whose claim PROVABLY contradicts the selected pair —
-		// a different action at the very same revision. A higher rev may be honest leadership
-		// and a lower rev is just lag; neither is penalized. Never let this throw.
+		// Best-effort: penalize peers whose claim contradicts a CORROBORATED selection — a different
+		// action at the very same revision. A higher rev may be honest leadership and a lower rev is
+		// just lag; neither is penalized, nor is anything contradicting a certified-only selection
+		// (an unanchored proof must not be able to convict the honest cohort). Never let this throw.
 		this.penalizeContradictingRevClaims(claims, selected, blockId);
 
 		return { corroborated: { actionId: selected.actionId, rev: selected.rev }, local, silent, answered };
@@ -1280,10 +1288,22 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
-	 * Report peers whose reported latest PROVABLY contradicts the selected pair: the same revision
-	 * under a different actionId. Two actions cannot both be the commit at one revision, so
-	 * whichever way the selection was won — certified or corroborated — the disagreeing claimant is
-	 * provably wrong. Best-effort.
+	 * Report peers whose reported latest PROVABLY contradicts a CORROBORATED selection: the same
+	 * revision under a different actionId. Two actions cannot both be the commit at one revision,
+	 * and the pair a quorum of distinct peers agreed on is the one this node can stand behind, so
+	 * the disagreeing claimant is wrong. Best-effort.
+	 *
+	 * A CERTIFIED selection is deliberately excluded — no claim is penalized against it. A passing
+	 * proof shows the cohort it names signed the commit, never that those signers are the block's
+	 * responsible cohort: anyone holding N keys can mint a proof that verifies (see caller
+	 * obligation #1 in `cluster/commit-proof.ts`, and the unwired {@link ProofAnchoring} layer).
+	 * Penalizing here would therefore hand one forged proof a lever it must not have — every honest
+	 * peer holding the real action at that revision reported for InvalidRestoration (weight 30,
+	 * above the deprioritize threshold of 20), on every consult. Losing the selection to the proof
+	 * is already the accepted cost of the certified path; deprioritizing the honest cohort on top of
+	 * it is not. Revisit when certification is anchored to the block's derived cohort
+	 * (`feat-cluster-membership-threshold-cert-anchoring`): a gated proof makes the contradiction
+	 * provable again.
 	 *
 	 * A claim at a HIGHER rev than the selection is deliberately NOT penalized: a peer can honestly
 	 * be ahead of the sampled quorum — an in-flight commit it durably stored before the rest of the
@@ -1296,7 +1316,7 @@ export class CoordinatorRepo implements IRepo {
 	 * {@link queryClusterForLatest}).
 	 */
 	private penalizeContradictingRevClaims(claims: RevClaim[], selected: QuorumRev, blockId: BlockId): void {
-		if (!this.reputation) return;
+		if (!this.reputation || selected.certified) return;
 		try {
 			for (const c of claims) {
 				if (c.rev === selected.rev && c.actionId !== selected.actionId) {

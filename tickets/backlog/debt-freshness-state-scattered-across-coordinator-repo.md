@@ -114,3 +114,22 @@ and `commit`, each deciding `peerCount <= 1` for itself with its own explanatory
 noting for whoever does the extraction: "how does this operation decide whether the cluster path
 applies at all" is a second small concern living inline in this file three times over, and it is
 adjacent to, but distinct from, the freshness state this ticket is about.
+
+## Fifth measurement (review pass on `certified-claims-read-repair`)
+
+Re-measured (`wc -l packages/db-p2p/src/repo/coordinator-repo.ts`): **1570 lines**, up from 1451.
+Evidence only — this ticket's shape is unchanged. The growth is the cohort-consult gaining a
+verification pass: every peer answer that carries a cohort commit proof is now verified inside
+`queryClusterForLatest` before selection reads the answers, and the two reputation penalties it can
+raise sit as two sibling helpers beside it. That is more of exactly the concern this ticket names —
+the consult now decides existence, currency, permanence-of-decline, *and* per-answer trust, from
+loose values, in one method.
+
+A second, adjacent concern for whoever does the extraction (distinct from freshness state, noted
+here rather than as its own ticket because it is a property of the same class): the constructor now
+takes **twelve positional parameters, eight of them optional**, and 44 test call sites thread
+`undefined` placeholders through the middle to reach the ones they care about. Every ticket that
+adds a collaborator adds a placeholder to all of them. `coordinatorRepo(components)` — the
+options-object factory in the same file — is already the production entry point and the shape the
+constructor should have; the positional signature survives only because the tests use it. Whatever
+seam the extraction creates, give the class one options object rather than a thirteenth slot.
