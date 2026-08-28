@@ -2370,9 +2370,12 @@ describe('StorageRepo', () => {
 			// internalCommit's absent-newBlock-with-prior-latest tombstone branch still commits.
 			const commit = await repo.commit({ actionId: 'a2' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 2 });
 			expect(commit.success).to.equal(true);
+			// `latest` advanced, read from storage: repo.get returns an EMPTY state for a tombstone
+			// (the `!blockRev` branch) — an authoritative absent, deliberately without `latest`.
+			expect((await new BlockStorage(BLOCK, rawStorage).getLatest())?.rev).to.equal(2);
 			const got = await repo.get({ blockIds: [BLOCK] });
-			expect(got[BLOCK]?.state?.latest?.rev).to.equal(2);
 			expect(got[BLOCK]?.block, 'tombstoned').to.equal(undefined);
+			expect('unavailable' in got[BLOCK]!, 'an authoritative absent, not a failed read').to.equal(false);
 		});
 
 		it('previews updates-with-no-base as digest-undefined with no baseRev', async () => {
