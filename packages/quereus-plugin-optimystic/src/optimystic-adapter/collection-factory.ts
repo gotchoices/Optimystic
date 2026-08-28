@@ -9,6 +9,8 @@ import {
 	StorageRepo,
 	BlockStorage,
 	MemoryRawStorage,
+	CachedRawStorage,
+	withReadCache,
 	signPeer,
 	type OptimysticNodeAttachments,
 } from '@optimystic/db-p2p';
@@ -53,6 +55,12 @@ export class CollectionFactory {
   private libp2pNodes = new Map<string, { node: FactoryNode; coordinatedRepo: IRepo; blockChangeNotifier?: IBlockChangeNotifier }>();
   private customTransactorCtors = new Map<string, new (...args: any[]) => ITransactor>();
   private customKeyNetworkCtors = new Map<string, new (...args: any[]) => IKeyNetwork>();
+  /**
+   * Raw-storage read caches this factory put in front of host-supplied storage (one per `local`
+   * transactor over a non-memory backend — see {@link withReadCache}). Tracked only so
+   * {@link dispose} can release their shared-pool registrations.
+   */
+  private readCaches: CachedRawStorage[] = [];
 
   /**
    * Create or get a tree collection, bringing it into existence when nothing has ever
@@ -287,9 +295,20 @@ export class CollectionFactory {
    * Create a local transactor (single-node, no network).
    * Uses `options.rawStorageFactory` when supplied so hosts can plug in a
    * persistent backend; otherwise falls back to in-memory `MemoryRawStorage`.
+   *
+   * A host-supplied backend is wrapped in the write-through read cache here — the one
+   * composition seam for the local transactor. Without it `BlockStorage` re-reads block
+   * metadata on essentially every operation, which over a filesystem backend is hundreds
+   * of reads of the same tiny files per statement. The factory is called once per transactor
+   * (and this factory is built fresh per plugin `register`), so the cache is owned by this
+   * transactor alone and a re-opened `Database` starts cold — coherent by construction.
+   * `MemoryRawStorage` passes through unwrapped (nothing to save).
    */
   private async createLocalTransactor(options: ParsedOptimysticOptions): Promise<ITransactor> {
-    const rawStorage = options.rawStorageFactory?.() ?? new MemoryRawStorage();
+    const rawStorage = withReadCache(options.rawStorageFactory?.() ?? new MemoryRawStorage(), 'quereus:local');
+    if (rawStorage instanceof CachedRawStorage) {
+      this.readCaches.push(rawStorage);
+    }
     const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, rawStorage));
 
     // LocalTransactor implementation (simple wrapper around StorageRepo).
@@ -622,7 +641,32 @@ export class CollectionFactory {
   }
 
   /**
-   * Shutdown all libp2p nodes
+   * Release the raw-storage read caches this factory created — their registrations with the
+   * process-wide `SharedCachePool` (see `withReadCache` in `@optimystic/db-p2p`) — and forget
+   * the transactors built over them.
+   *
+   * Explicit because nothing else reaches this factory when the hosting `Database` closes: the
+   * vtab module's `disconnect` is per-statement and its `destroy` is DROP TABLE. Call it after
+   * `db.close()`. A host that skips it leaks one dead pool store handle per factory, whose
+   * entries stay charged against the shared budget until the pool evicts them as cold —
+   * hygiene, not correctness (the pool always evicts, never refuses).
+   *
+   * Safe to call more than once. A transactor requested afterwards is rebuilt from scratch
+   * (the storage factory is invoked again and gets a fresh, cold cache), so a stray statement
+   * after dispose is coherent — just uncached until then. Does NOT stop libp2p nodes; that is
+   * {@link shutdown}, which calls this as its last step.
+   */
+  async dispose(): Promise<void> {
+    const caches = this.readCaches;
+    this.readCaches = [];
+    this.transactors.clear();
+    for (const cache of caches) {
+      await cache.dispose();
+    }
+  }
+
+  /**
+   * Shutdown all libp2p nodes, then release the read caches ({@link dispose}).
    */
   async shutdown(): Promise<void> {
     for (const [key, { node }] of this.libp2pNodes.entries()) {
@@ -630,5 +674,6 @@ export class CollectionFactory {
       await node.stop();
     }
     this.libp2pNodes.clear();
+    await this.dispose();
   }
 }

@@ -154,7 +154,7 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
  *
  * All caching semantics (write-through coherence, proven-absence negatives, list
  * completeness, promote mirroring) live in {@link CachedStoreDriver}; see its class doc
- * and docs/storage.md "Write-through raw-storage cache" for the invariants this relies
+ * and `packages/db-p2p/docs/storage.md` § "Write-through raw-storage cache" for the invariants this relies
  * on — including the single-process-owner precondition.
  *
  * Prefer wrapping the backend's driver directly — `new KvRawStorage(new

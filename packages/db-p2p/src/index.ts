@@ -22,6 +22,7 @@ export * from "./storage/kv-raw-storage.js";
 export * from "./storage/shared-cache-pool.js";
 export * from "./storage/cached-store-driver.js";
 export * from "./storage/cached-raw-storage.js";
+export * from "./storage/with-read-cache.js";
 export * from "./storage/memory-store-driver.js";
 export * from "./storage/memory-storage.js";
 export * from "./storage/i-block-storage.js";

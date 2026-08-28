@@ -16,7 +16,7 @@ let tempCounter = 0;
  * concurrent reader only ever sees the complete old file or the complete new
  * file — never a torn/half-written one. After the rename we best-effort fsync
  * the containing directory so the rename itself survives power loss on POSIX;
- * that directory fsync is unsupported on win32 and its error is swallowed.
+ * that directory fsync is unsupported on win32 and is skipped there.
  *
  * On any failure the temp file is removed (best-effort) so a crashed write does
  * not leave the canonical path damaged. A crash *between* the temp write and the
@@ -66,16 +66,23 @@ export async function atomicWriteFile(filePath: string, content: string | Uint8A
 
 /**
  * Best-effort fsync of a directory so a completed rename is durable. POSIX needs
- * this; win32 (and platforms that reject opening a directory for fsync) throw,
- * and we ignore that rather than failing the write.
+ * this; platforms that reject opening a directory for fsync throw, and we ignore
+ * that rather than failing the write.
+ *
+ * Skipped outright on win32: there `fs.open(dir, 'r')` SUCCEEDS and only the
+ * following `handle.sync()` fails with EPERM (swallowed), so the open/close pair
+ * was guaranteed wasted work — exactly half of all `fs.open` calls a write
+ * workload makes. Durability is unchanged on win32 (the sync never succeeded
+ * there); the on-disk layout is untouched.
  */
 async function fsyncDir(dir: string): Promise<void> {
+	if (process.platform === 'win32') return;
 	let handle: fs.FileHandle | undefined;
 	try {
 		handle = await fs.open(dir, 'r');
 		await handle.sync();
 	} catch {
-		// Directory fsync unsupported here (e.g. win32) — nothing to do.
+		// Directory fsync unsupported here — nothing to do.
 	} finally {
 		if (handle) await handle.close().catch(() => { /* best-effort */ });
 	}

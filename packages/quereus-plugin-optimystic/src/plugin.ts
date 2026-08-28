@@ -71,6 +71,14 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		 * each one. Idempotent.
 		 */
 		hydrate: (db: Database) => optimysticModule.hydrateCatalog(db, config, config),
+		/**
+		 * Release what the plugin holds outside the `Database` — today the raw-storage
+		 * read caches behind `local` transactors over host-supplied storage (see
+		 * `CollectionFactory.dispose`). Call after `db.close()`. Quereus has no close hook
+		 * that reaches the plugin, so this is explicit; a host that skips it leaks only cold
+		 * cache bookkeeping, bounded by the shared pool's budget.
+		 */
+		dispose: () => collectionFactory.dispose(),
 	};
 }
 

@@ -21,10 +21,10 @@ import type { BlockMetadata } from '../src/storage/struct.js';
  * really arrive. A regression that reordered the gate, passed a fresh `Set` instead of the shared one,
  * or dropped the `void`-dispatch would pass every existing test.
  *
- * The restart is faithful, not simulated: `resolveStorage` returns a supplied `IRawStorage` verbatim
- * and nothing on the node's stop path closes or clears it, so handing ONE `MemoryRawStorage` to two
- * sequential `createLibp2pNode` calls really does bring the second node up over the first node's
- * durable state.
+ * The restart is faithful, not simulated: `resolveStorage` returns a supplied `MemoryRawStorage`
+ * verbatim (`withReadCache` wraps only non-memory storage) and nothing on the node's stop path
+ * closes or clears it, so handing ONE `MemoryRawStorage` to two sequential `createLibp2pNode` calls
+ * really does bring the second node up over the first node's durable state.
  *
  * Deliberately NOT staged here (each is covered where the mechanism actually lives):
  * - **Both monitors disabled → no scan.** The gate holds, but with no monitor wired there is no

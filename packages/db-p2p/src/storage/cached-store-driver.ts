@@ -139,7 +139,7 @@ function idsContent(ids: Set<ActionId>): number {
  * the hot reads exist to observe the writes, so invalidation lands between nearly every read
  * pair (measured: only a 23% cut).
  *
- * **Why this is sound** — the invariants in `docs/storage.md` ("Invariants", 1–5):
+ * **Why this is sound** — the invariants in `packages/db-p2p/docs/storage.md` ("Invariants", 1–5):
  * 1. every backend write funnels through `IRawStorage` (and thus this driver) in-process, so
  *    the cache sees every mutation;
  * 2. every writer of `meta.latest` holds the per-block commit latch, and each cache update is
@@ -150,7 +150,7 @@ function idsContent(ids: Set<ActionId>): number {
  *
  * **Precondition: one process owns the store** (Invariant 5). A second process writing the
  * same backend bypasses this wrapper and makes cached values stale in ways that feed
- * consensus decisions. Not enforced in code — see docs/storage.md.
+ * consensus decisions. Not enforced in code — see `packages/db-p2p/docs/storage.md`.
  *
  * **The cache is always clean, never dirty.** No write is deferred, reordered, or coalesced;
  * the inner driver's durable state never depends on cache contents. Eviction of ANY entry at
