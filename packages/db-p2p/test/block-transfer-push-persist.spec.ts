@@ -480,6 +480,11 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 			await push(service, pushReq(blockId, block, meta, first));
 			// A second, independently-signed proof for the same commit — a different cohort sample.
 			const second = await certify(blockId, block, meta);
+			// Without this the test goes vacuous if `makeSignedProof` ever stops minting fresh keys:
+			// two identical proofs would satisfy the assertion below whether or not anything was
+			// overwritten.
+			expect(second, 'the two proofs must be distinguishable for this test to mean anything')
+				.to.not.deep.equal(first);
 			await push(service, pushReq(blockId, block, meta, second));
 
 			expect(await repo.getBlockProof(blockId as BlockId, meta.rev),

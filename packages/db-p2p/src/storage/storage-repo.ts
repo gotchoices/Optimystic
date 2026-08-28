@@ -912,6 +912,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				// back-fill sites hold, so no new latch interaction. `backFillProof` never throws: the
 				// revision is already durable, and a proof-persist fault must not turn a no-op into a
 				// failure.
+				//
+				// NOTE: once a proof IS retained this costs one key lookup per duplicate push
+				// (`backFillProof` returns before materializing). A holder whose bytes diverge from the
+				// cohort's never retains one, so it re-materializes and re-hashes the block on EVERY
+				// certified push of that revision. Bounded by push frequency and fine at spread-on-churn
+				// rates; if a diverged holder under repeated push ever shows up in a profile, remember the
+				// withheld `(rev, actionId)` and skip the re-check.
 				await this.backFillProof(blockId, storage, effective.rev, effective.actionId, verifiedProof);
 			}
 		} finally {

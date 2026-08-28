@@ -92,7 +92,9 @@ export interface IBlockStorage {
      * `proof` is persisted for `source.rev` and MUST already be verified by the caller against
      * these exact bytes (`verifyBlockCommitProofContent` — the digest check is what binds a proof
      * to the block content). An unverified proof passed here would be re-served onward as evidence
-     * this node never checked. The monotonic no-op persists nothing, proof included.
+     * this node never checked. The monotonic no-op persists nothing, proof included — a proof for an
+     * already-held revision is back-filled one layer up, by `StorageRepo.saveReplicatedBlock`, which
+     * first checks the declared digest against LOCAL content (these bytes may not be the held bytes).
      */
     saveReplica(block: IBlock, source?: ActionRev, proof?: BlockCommitProof): Promise<ActionRev>;
 

@@ -4,8 +4,11 @@ import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockArchive, BlockMetadata, RestoreCallback } from '../src/storage/struct.js';
 import type { BlockCommitProof } from '../src/cluster/commit-proof.js';
-import { hashString } from '@optimystic/db-core';
-import type { BlockId, ActionId, ActionRev, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
+import { makeSignedProof } from './support/commit-proof-fixtures.js';
+import { canonicalBlockHash, hashString } from '@optimystic/db-core';
+import type {
+	BlockId, ActionId, ActionRev, CommitRequest, IBlock, BlockHeader, Transforms
+} from '@optimystic/db-core';
 import { delay } from '@optimystic/db-core/test';
 
 /**
@@ -852,8 +855,10 @@ describe('BlockStorage checkpoint materialization sweep', () => {
  * unverified restore wire (`RestorationCoordinator` → `restoreCallback`) strips any proof a
  * remote archive attached. This layer never verifies — verification happened upstream — so a
  * minimal cast literal stands in for a real proof and keeps the tests fast. That literal declares
- * no digest, so the back-fill's POSITIVE path cannot be shown here; it is covered with real signed
- * proofs in `block-transfer-push-persist.spec.ts`.
+ * no digest, so the tests using it can only show the back-fill WITHHOLDING; the nested
+ * `back-fill (real signed proofs)` block below pays for real fixtures where a digest is needed.
+ * The back-fill driven end to end through a certified push lives in
+ * `block-transfer-push-persist.spec.ts`.
  */
 describe('commit-proof persistence on the replica path', () => {
 	let raw: MemoryRawStorage;
@@ -937,6 +942,96 @@ describe('commit-proof persistence on the replica path', () => {
 		expect(result?.block.header.id, 'the restore itself succeeded').to.equal('block-proof-strip');
 		expect(await storage.getBlockProof(1), 'the unverified proof was stripped, not persisted')
 			.to.equal(undefined);
+	});
+
+	/**
+	 * Ticket: backfill-proof-on-held-revision. `saveReplicatedBlock` is reached by two callers —
+	 * `BlockTransferService.handlePush` and `cluster/reconcile-block.ts` — with the same
+	 * `(block, source, verifiedProof)` shape. The push caller is driven end to end in
+	 * `block-transfer-push-persist.spec.ts`; these call the seam directly, which is the reconcile
+	 * caller's shape, and cover the two branches no push can reach: a save with no declared
+	 * `source`, and a proof-persist fault.
+	 *
+	 * Real signed proofs here because the retention rule compares a DECLARED digest against local
+	 * content, and the suite's stand-in literal declares none.
+	 */
+	describe('back-fill (real signed proofs)', () => {
+		/** The proof a genuine cohort retained for `(blockId, rev, actionId)` over exactly `block`. */
+		const certify = async (
+			blockId: BlockId, block: IBlock, rev: number, actionId: string
+		): Promise<BlockCommitProof> => {
+			const commit: CommitRequest = {
+				actionId: actionId as ActionId,
+				blockIds: [blockId],
+				tailId: blockId,
+				rev,
+				blockDigests: { [blockId]: { digest: await canonicalBlockHash(block) } }
+			};
+			return (await makeSignedProof(4, commit)).proof;
+		};
+
+		it('back-fills onto a revision already held proof-lessly (the reconcile-path caller)', async () => {
+			// The assertion that would have failed before this ticket: the second call is a monotonic
+			// no-op, so nothing is written by `saveReplica` — the proof lands via the back-fill.
+			const blockId = 'block-backfill-reconcile' as BlockId;
+			const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+			const block = makeBlock('block-backfill-reconcile', { items: [] });
+			const source = { rev: 3, actionId: 'a3' as ActionId };
+
+			await repo.saveReplicatedBlock(blockId, block, source);
+			expect(await repo.getBlockProof(blockId, 3), 'precondition: corroboration-only')
+				.to.equal(undefined);
+
+			const real = await certify(blockId, block, 3, 'a3');
+			await repo.saveReplicatedBlock(blockId, block, source, real);
+
+			expect(await repo.getBlockProof(blockId, 3), 'the verified proof is back-filled')
+				.to.deep.equal(real);
+			expect(await repo.get({ blockIds: [blockId] }).then(r => r[blockId]?.state?.latest),
+				'latest is untouched — this was a no-op save').to.deep.equal(source);
+		});
+
+		it('never back-fills a save that declares no source revision', async () => {
+			// With no `source`, `saveReplica` FABRICATES `rev = 1` and a content-derived actionId, so
+			// there is no declared revision the proof could be compared against — back-filling would
+			// key evidence to an identity this node invented. Unreachable from `handlePush` (it
+			// refuses `proof-without-meta`) and from reconcile (its `source` is required), so this
+			// pins the guard rather than a live path.
+			const blockId = 'block-backfill-no-source' as BlockId;
+			const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+			const block = makeBlock('block-backfill-no-source', { items: [] });
+
+			await repo.saveReplicatedBlock(blockId, block);
+			const held = (await repo.get({ blockIds: [blockId] }))[blockId]?.state?.latest;
+			expect(held?.rev, 'precondition: landed at the fabricated rev 1').to.equal(1);
+
+			await repo.saveReplicatedBlock(
+				blockId, block, undefined, await certify(blockId, block, 1, held!.actionId));
+
+			expect(await repo.getBlockProof(blockId, 1), 'no declared source ⇒ no back-fill')
+				.to.equal(undefined);
+		});
+
+		it('a proof-persist fault leaves the no-op successful and the revision durable', async () => {
+			// `persistProofIfContentMatches` swallows and logs: the revision this proof describes is
+			// ALREADY durable, so a proof-write fault must not turn a no-op save into a rejection the
+			// pusher reads as "not replicated".
+			const blockId = 'block-backfill-fault' as BlockId;
+			const faulty = new MemoryRawStorage();
+			faulty.saveBlockProof = async () => { throw new Error('disk write failed'); };
+			const repo = new StorageRepo((id) => new BlockStorage(id, faulty));
+			const block = makeBlock('block-backfill-fault', { items: [] });
+			const source = { rev: 3, actionId: 'a3' as ActionId };
+
+			await repo.saveReplicatedBlock(blockId, block, source);
+			await repo.saveReplicatedBlock(
+				blockId, block, source, await certify(blockId, block, 3, 'a3'));
+
+			expect(await repo.getBlockProof(blockId, 3), 'the proof simply is not retained')
+				.to.equal(undefined);
+			expect((await repo.get({ blockIds: [blockId] }))[blockId]?.state?.latest,
+				'the revision is untouched and still held').to.deep.equal(source);
+		});
 	});
 });
 
