@@ -17,7 +17,7 @@ import { expect } from 'chai';
 import type { IBlock } from '@optimystic/db-core';
 import { canonicalBlockHash } from '@optimystic/db-core';
 import {
-	certifiedEquivocation, selectQuorumBlock, selectQuorumRev,
+	certifiedContentEquivocation, certifiedEquivocation, selectQuorumBlock, selectQuorumRev,
 	type BlockHashCandidate, type RevClaim
 } from '../src/cluster/quorum-restore.js';
 
@@ -132,6 +132,20 @@ describe('certified claim selection (quorum-restore)', () => {
 			expect(sel!.certified).to.equal(true);
 		});
 
+		it('reports equivocation that did NOT decline the selection — ask it only on a decline', () => {
+			// A corroborated pair STRICTLY above the top certified rev wins, so selection succeeds
+			// while `certifiedEquivocation` still reports the conflict beneath it. Callers must key
+			// the distinct log line off the decline, never off this being non-undefined.
+			const claims = [
+				claim('h1', 9, 'z'),
+				claim('h2', 9, 'z'),
+				claim('p1', 5, 'a', true),
+				claim('p2', 5, 'b', true)
+			];
+			expect(selectQuorumRev(claims, THRESHOLD, 9)!.rev).to.equal(9);
+			expect(certifiedEquivocation(claims)).to.deep.equal({ rev: 5, actionIds: ['a', 'b'] });
+		});
+
 		it('a certified: false claim is treated exactly as an uncertified one', () => {
 			// The flag records a verdict, not a vote weight: an explicit failed verification must
 			// not differ from an absent one.
@@ -200,11 +214,30 @@ describe('certified claim selection (quorum-restore)', () => {
 		});
 
 		it('declines on two certified candidates with DIFFERENT hashes (certified content equivocation)', async () => {
-			const cands = await Promise.all([
-				hashed('h1', block('b', { payload: 'A' }), true),
-				hashed('h2', block('b', { payload: 'B' }), true)
-			]);
+			const a = block('b', { payload: 'A' });
+			const b = block('b', { payload: 'B' });
+			const cands = await Promise.all([hashed('h1', a, true), hashed('h2', b, true)]);
 			expect(selectQuorumBlock(cands, THRESHOLD, 9)).to.equal(undefined);
+			// Both declines return undefined, so the reporter is the only thing separating "the
+			// cohort's keys signed two digests into one revision" from "not enough carriers agreed".
+			const conflict = certifiedContentEquivocation(cands);
+			expect(conflict).to.not.equal(undefined);
+			expect(conflict!.hashes.sort())
+				.to.deep.equal([await canonicalBlockHash(a), await canonicalBlockHash(b)].sort());
+		});
+
+		it('reports no content equivocation for an ordinary content-quorum shortfall', async () => {
+			// A plain decline (one uncertified carrier where a second could exist) and a single
+			// certified hash must both read as "no equivocation".
+			const good = block('b', { payload: 'ok' });
+			expect(certifiedContentEquivocation([await hashed('h1', good)])).to.equal(undefined);
+			expect(certifiedContentEquivocation([await hashed('h1', good, true)])).to.equal(undefined);
+			expect(certifiedContentEquivocation([])).to.equal(undefined);
+			// Two DIFFERENT hashes where neither is certified is a content split, not equivocation.
+			expect(certifiedContentEquivocation(await Promise.all([
+				hashed('h1', block('b', { payload: 'A' })),
+				hashed('h2', block('b', { payload: 'B' }))
+			]))).to.equal(undefined);
 		});
 
 		it('with no certified candidate the hash quorum is unchanged', async () => {

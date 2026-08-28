@@ -16,7 +16,8 @@ import { canonicalBlockHash } from '@optimystic/db-core';
 import type { ActionId, BlockContentDigests, BlockId, CommitRequest, IBlock } from '@optimystic/db-core';
 import {
 	MAX_PROOF_SIGNERS, NON_ATTRIBUTABLE_PROOF_FAILURES, certifyClaim, certifyContent,
-	isAttributableProofFailure, type ProofAnchoring, type UnanchoredProofAcceptance
+	isAttributableProofFailure, type CertifyFailure, type CohortRecomputeVerdict,
+	type ProofAnchoring, type UnanchoredProofAcceptance
 } from '../src/cluster/certified-claims.js';
 import type { BlockCommitProof, ProofClaim } from '../src/cluster/commit-proof.js';
 import { PROOF_THRESHOLDS, makeSignedProof } from './support/commit-proof-fixtures.js';
@@ -50,13 +51,56 @@ const recordingAnchoring = (extra: Omit<ProofAnchoring, 'onUnanchored'> = {}): {
 };
 
 describe('certified-claims (shared proof certification)', () => {
+	describe('failure classification', () => {
+		/**
+		 * Every reason, with the answer to the ONE question the two repair paths ask it: may the peer
+		 * that served this proof be penalized for it? Pinned as a table so a reclassification is a
+		 * deliberate edit here, not a silent behavior change at two call sites. (Adding a
+		 * `ProofFailure` variant without classifying it is already a BUILD error — the module's
+		 * classification is `Record<CertifyFailure, boolean>` — so this table guards the values, the
+		 * type guards the coverage.)
+		 */
+		const EXPECTED: ReadonlyArray<readonly [CertifyFailure, boolean]> = [
+			['unknown-signer', false],
+			['non-ed25519-signer', false],
+			['malformed-signature', false],
+			['malformed-proof', false],
+			['legacy-record', false],
+			['oversized-cohort', false],
+			['no-digest-declared', false],
+			['membership-mismatch', true],
+			['message-hash-mismatch', true],
+			['duplicate-signer', true],
+			['promise-threshold', true],
+			['commit-threshold', true],
+			['claim-not-in-message', true],
+			['digest-mismatch', true]
+		];
+
+		for (const [failure, attributable] of EXPECTED) {
+			it(`${failure} is ${attributable ? '' : 'NOT '}attributable`, () => {
+				expect(isAttributableProofFailure(failure)).to.equal(attributable);
+			});
+		}
+
+		it('the exported set is exactly the non-attributable half — one source of truth', () => {
+			expect([...NON_ATTRIBUTABLE_PROOF_FAILURES].sort())
+				.to.deep.equal(EXPECTED.filter(([, a]) => !a).map(([f]) => f).sort());
+		});
+
+		it('an unrecognized reason defaults to NOT attributable — never penalize on an unknown', () => {
+			// The type makes this unreachable from typed callers; the runtime default still has to be
+			// the safe direction, because a penalty is the irreversible half.
+			expect(isAttributableProofFailure('some-future-reason' as CertifyFailure)).to.equal(false);
+		});
+	});
+
 	describe('certifyClaim', () => {
 		it('certifies a genuine fully-signed proof', async () => {
 			const commit = makeCommit();
 			const { proof } = await makeSignedProof(3, commit);
 			const result = await certifyClaim(proof, claimFor(commit), PROOF_THRESHOLDS);
-			expect(result.certified).to.equal(true);
-			expect(result.failure).to.equal(undefined);
+			expect(result).to.deep.equal({ certified: true });
 		});
 
 		it('declines an oversized signer list BEFORE any hash/signature work, non-attributably', async () => {
@@ -69,10 +113,9 @@ describe('certified-claims (shared proof certification)', () => {
 				peerIds: Array.from({ length: MAX_PROOF_SIGNERS + 1 }, (_, i) => `fake-peer-${i}`)
 			};
 			const result = await certifyClaim(oversized, claimFor(commit), PROOF_THRESHOLDS);
-			expect(result.certified).to.equal(false);
-			expect(result.failure).to.equal('oversized-cohort');
-			expect(NON_ATTRIBUTABLE_PROOF_FAILURES.has(result.failure!)).to.equal(true);
-			expect(isAttributableProofFailure(result.failure!)).to.equal(false);
+			expect(result).to.deep.equal({ certified: false, failure: 'oversized-cohort' });
+			expect(NON_ATTRIBUTABLE_PROOF_FAILURES.has('oversized-cohort')).to.equal(true);
+			expect(isAttributableProofFailure('oversized-cohort')).to.equal(false);
 		});
 
 		it('a cohort exactly AT the cap still verifies structurally (cap is >, not >=)', async () => {
@@ -86,7 +129,7 @@ describe('certified-claims (shared proof certification)', () => {
 			// point is only that the failure is NOT 'oversized-cohort'.
 			const result = await certifyClaim(atCap, claimFor(commit), PROOF_THRESHOLDS);
 			expect(result.certified).to.equal(false);
-			expect(result.failure).to.not.equal('oversized-cohort');
+			expect(result).to.not.deep.equal({ certified: false, failure: 'oversized-cohort' });
 		});
 
 		it('classifies a replayed proof (genuine, but for a different claim) as attributable', async () => {
@@ -94,19 +137,29 @@ describe('certified-claims (shared proof certification)', () => {
 			const { proof } = await makeSignedProof(3, commit);
 			const replayed = await certifyClaim(
 				proof, { blockId: BLOCK, rev: 9, actionId: commit.actionId }, PROOF_THRESHOLDS);
-			expect(replayed.certified).to.equal(false);
-			expect(replayed.failure).to.equal('claim-not-in-message');
-			expect(NON_ATTRIBUTABLE_PROOF_FAILURES.has(replayed.failure!)).to.equal(false);
-			expect(isAttributableProofFailure(replayed.failure!)).to.equal(true);
+			expect(replayed).to.deep.equal({ certified: false, failure: 'claim-not-in-message' });
+			expect(NON_ATTRIBUTABLE_PROOF_FAILURES.has('claim-not-in-message')).to.equal(false);
+			expect(isAttributableProofFailure('claim-not-in-message')).to.equal(true);
 		});
 
 		it('classifies structural garbage as non-attributable and never throws', async () => {
 			const commit = makeCommit();
 			const result = await certifyClaim(
 				null as unknown as BlockCommitProof, claimFor(commit), PROOF_THRESHOLDS);
-			expect(result.certified).to.equal(false);
-			expect(result.failure).to.equal('malformed-proof');
-			expect(isAttributableProofFailure(result.failure!)).to.equal(false);
+			expect(result).to.deep.equal({ certified: false, failure: 'malformed-proof' });
+			expect(isAttributableProofFailure('malformed-proof')).to.equal(false);
+		});
+
+		it('stays total on a proof whose peerIds getter throws — the cap check cannot break "never throws"', async () => {
+			const commit = makeCommit();
+			const hostile = {
+				v: 1, membershipVersion: 2, messageHash: 'h', membershipDigest: 'd',
+				message: { operations: [] }, promises: {}, commits: {},
+				get peerIds(): string[] { throw new Error('boom'); }
+			};
+			const result = await certifyClaim(
+				hostile as unknown as BlockCommitProof, claimFor(commit), PROOF_THRESHOLDS);
+			expect(result).to.deep.equal({ certified: false, failure: 'malformed-proof' });
 		});
 	});
 
@@ -160,6 +213,31 @@ describe('certified-claims (shared proof certification)', () => {
 			expect(calls.map(c => c.reason)).to.deep.equal(['recompute-infeasible']);
 		});
 
+		it('an off-contract verdict (null) degrades to recompute-infeasible, not a throw', async () => {
+			const commit = makeCommit();
+			const { proof } = await makeSignedProof(3, commit);
+			const { anchoring, calls } = recordingAnchoring({
+				recomputeBlockCohort: async () => null as unknown as CohortRecomputeVerdict
+			});
+			const result = await certifyClaim(proof, claimFor(commit), PROOF_THRESHOLDS, anchoring);
+			expect(result.certified).to.equal(true);
+			expect(calls.map(c => c.reason)).to.deep.equal(['recompute-infeasible']);
+		});
+
+		it('a feasible verdict with non-iterable cohortPeerIds still certifies — overlap is observational', async () => {
+			const commit = makeCommit();
+			const { proof } = await makeSignedProof(3, commit);
+			const { anchoring, calls } = recordingAnchoring({
+				recomputeBlockCohort: async () =>
+					({ feasible: true, cohortPeerIds: 42 as unknown as string[] })
+			});
+			const result = await certifyClaim(proof, claimFor(commit), PROOF_THRESHOLDS, anchoring);
+			expect(result.certified).to.equal(true);
+			// The comparison was attempted (so this is not an "unanchored acceptance"); it just could
+			// not be computed, and that costs a log line, never the certification.
+			expect(calls).to.deep.equal([]);
+		});
+
 		it('a THROWING onUnanchored is swallowed — certification stands', async () => {
 			const commit = makeCommit();
 			const { proof } = await makeSignedProof(3, commit);
@@ -189,10 +267,10 @@ describe('certified-claims (shared proof certification)', () => {
 			const { proof } = await makeSignedProof(3, commit);
 			const result = await certifyContent(
 				proof, claimFor(commit), testBlock('tampered-content'), PROOF_THRESHOLDS);
-			expect(result.revCertified).to.equal(true);
-			expect(result.contentCertified).to.equal(false);
-			expect(result.failure).to.equal('digest-mismatch');
-			expect(isAttributableProofFailure(result.failure!)).to.equal(true);
+			expect(result).to.deep.equal({
+				revCertified: true, contentCertified: false, failure: 'digest-mismatch'
+			});
+			expect(isAttributableProofFailure('digest-mismatch')).to.equal(true);
 		});
 
 		it('no-digest-declared: rev stays certified, content does not, and NO penalty attaches', async () => {
@@ -200,10 +278,43 @@ describe('certified-claims (shared proof certification)', () => {
 			const { proof } = await makeSignedProof(3, commit);
 			const result = await certifyContent(
 				proof, claimFor(commit), testBlock(), PROOF_THRESHOLDS);
+			expect(result).to.deep.equal({
+				revCertified: true, contentCertified: false, failure: 'no-digest-declared'
+			});
+			expect(isAttributableProofFailure('no-digest-declared')).to.equal(false);
+		});
+
+		it('anchors on digest-mismatch too — the claim half passed, so a proof WAS accepted', async () => {
+			// Beyond the ticket's letter (it specified anchoring on success): the event anchoring
+			// observes is "a proof was accepted as evidence", which the rev half already did.
+			const committed = testBlock('committed-content');
+			const commit = makeCommit({ [BLOCK]: { digest: await canonicalBlockHash(committed) } });
+			const { proof } = await makeSignedProof(3, commit);
+			const { anchoring, calls } = recordingAnchoring();
+			const result = await certifyContent(
+				proof, claimFor(commit), testBlock('tampered-content'), PROOF_THRESHOLDS, anchoring);
 			expect(result.revCertified).to.equal(true);
-			expect(result.contentCertified).to.equal(false);
-			expect(result.failure).to.equal('no-digest-declared');
-			expect(isAttributableProofFailure(result.failure!)).to.equal(false);
+			expect(calls.map(c => c.reason)).to.deep.equal(['no-recompute-capability']);
+		});
+
+		it('anchors on no-digest-declared too, for the same reason', async () => {
+			const commit = makeCommit();
+			const { proof } = await makeSignedProof(3, commit);
+			const { anchoring, calls } = recordingAnchoring();
+			const result = await certifyContent(
+				proof, claimFor(commit), testBlock(), PROOF_THRESHOLDS, anchoring);
+			expect(result.revCertified).to.equal(true);
+			expect(calls.map(c => c.reason)).to.deep.equal(['no-recompute-capability']);
+		});
+
+		it('does NOT anchor when the claim half failed — no proof was accepted as evidence', async () => {
+			const commit = makeCommit();
+			const { proof } = await makeSignedProof(3, commit);
+			const { anchoring, calls } = recordingAnchoring();
+			await certifyContent(
+				proof, { blockId: BLOCK, rev: 9, actionId: commit.actionId }, testBlock(),
+				PROOF_THRESHOLDS, anchoring);
+			expect(calls).to.deep.equal([]);
 		});
 
 		it('a claim-half failure certifies NEITHER half', async () => {

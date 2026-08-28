@@ -225,14 +225,18 @@ function certifiedGroups(claims: RevClaim[]): { rev: number; byAction: Map<strin
 
 /**
  * The conflicting certified set at the top certified rev, when there is one: two-plus distinct
- * `actionId`s each carrying a verified cohort commit proof for the SAME revision. This is the
- * condition that makes {@link selectQuorumRev} decline outright, and it deserves a distinct log
- * line from a plain no-quorum — the cohort (or whoever holds its keys) provably signed both
- * sides. Selection stays pure, so callers do the logging with what this reports.
+ * `actionId`s each carrying a verified cohort commit proof for the SAME revision. It deserves a
+ * distinct log line from a plain no-quorum — the cohort (or whoever holds its keys) provably
+ * signed both sides. Selection stays pure, so callers do the logging with what this reports.
  *
  * `undefined` when no certified claim exists or the top certified rev names a single action —
  * conflicts at LOWER certified revs are history already superseded, not equivocation worth
  * declining over.
+ *
+ * **Ask this only on a decline.** A non-`undefined` result does NOT imply {@link selectQuorumRev}
+ * returned `undefined`: a corroborated pair STRICTLY above the top certified rev still wins, and
+ * the equivocation below it is reported here while selection succeeded. Call it when selection
+ * declined, to say WHY it declined.
  */
 export function certifiedEquivocation(claims: RevClaim[]): { rev: number; actionIds: string[] } | undefined {
 	const groups = certifiedGroups(claims);
@@ -278,7 +282,8 @@ export interface BlockHashCandidate {
  * declared digest matches these exact bytes) short-circuit the hash quorum: exactly one distinct
  * certified hash → that block wins outright, however many peers served it. Two-plus distinct
  * certified hashes is certified content equivocation → decline (`undefined`), mirroring the
- * existing unique-hash-tie decline. No certified candidate → the hash quorum below, unchanged.
+ * existing unique-hash-tie decline; callers name that decline via
+ * {@link certifiedContentEquivocation}. No certified candidate → the hash quorum below, unchanged.
  */
 export function selectQuorumBlock(
 	candidates: BlockHashCandidate[],
@@ -287,10 +292,7 @@ export function selectQuorumBlock(
 ): { block: IBlock; hash: string } | undefined {
 	if (candidates.length === 0) return undefined;
 
-	const certifiedByHash = new Map<string, IBlock>();
-	for (const c of candidates) {
-		if (c.certified === true && !certifiedByHash.has(c.hash)) certifiedByHash.set(c.hash, c.block);
-	}
+	const certifiedByHash = certifiedHashes(candidates);
 	if (certifiedByHash.size === 1) {
 		const [entry] = certifiedByHash;
 		const [hash, block] = entry!;
@@ -318,4 +320,29 @@ export function selectQuorumBlock(
 	if (meeting.length !== 1) return undefined;
 	const [hash, group] = meeting[0]!;
 	return { block: group.block, hash };
+}
+
+/** Distinct hashes carried by certified candidates → the first block instance serving each. */
+function certifiedHashes(candidates: BlockHashCandidate[]): Map<string, IBlock> {
+	const byHash = new Map<string, IBlock>();
+	for (const c of candidates) {
+		if (c.certified === true && !byHash.has(c.hash)) byHash.set(c.hash, c.block);
+	}
+	return byHash;
+}
+
+/**
+ * The conflicting certified hashes when there are two or more — the content-side sibling of
+ * {@link certifiedEquivocation}, and the reason {@link selectQuorumBlock} declines outright.
+ * Candidates reaching that selector all carry the SAME `(rev, actionId)`, so two certified hashes
+ * mean the cohort's keys signed two different digests into one revision: a provable compromise an
+ * operator must be able to tell apart from the routine "not enough carriers agreed" decline. Both
+ * declines return `undefined`, so without this they log identically.
+ *
+ * `undefined` when fewer than two distinct certified hashes exist — including the ordinary
+ * no-certified-candidate case, where a decline really is a plain content-quorum shortfall.
+ */
+export function certifiedContentEquivocation(candidates: BlockHashCandidate[]): { hashes: string[] } | undefined {
+	const byHash = certifiedHashes(candidates);
+	return byHash.size < 2 ? undefined : { hashes: [...byHash.keys()] };
 }

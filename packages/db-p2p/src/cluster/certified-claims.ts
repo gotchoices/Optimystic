@@ -83,57 +83,107 @@ export type CertifyFailure = ProofFailure | 'oversized-cohort';
  * response), which would still admit ~80k signature verifications — so this module enforces the
  * bound `commit-proof.ts` declares as its caller obligation #2. 256 is far above any plausible
  * cohort (deployments run ~10) while keeping the worst-case verification cost trivial.
+ *
+ * NOTE: this cap bounds the SIGNATURE count (at most `MAX_PROOF_SIGNERS` Ed25519 verifies per
+ * round, since `countApprovals` skips signers outside `peerIds` before any crypto). It does NOT
+ * bound the proof's serialized SIZE: `computeClusterMessageHash` / `...PromiseHash` /
+ * `...CommitHash` canonically serialize `message`, `promises` and `commits`, whose entry counts a
+ * peer chooses freely inside the transport byte cap. That cost is linear and today bounded by the
+ * 1 MiB control-message cap; if repair verification ever shows up in a profile, or a deployment
+ * raises those transport caps, add a serialized-size bound here alongside the signer count.
  */
 export const MAX_PROOF_SIGNERS = 256;
 
 /**
- * Failure reasons that must NEVER become a reputation penalty for the serving peer, because the
- * identity behind the artifact was not proven (mirrors `ClusterMember.verifySignature`'s outcome
- * discipline, restated in `commit-proof.ts`): an unparseable or unbound signer, a legacy record,
- * structural garbage — and `oversized-cohort`, since a genuine mega-cohort is conceivable and the
- * cap declines it unexamined.
+ * Every {@link CertifyFailure}, classified: may it be held against the peer that SERVED the proof?
  *
- * Everything else IS attributable: `membership-mismatch`, `message-hash-mismatch`,
- * `duplicate-signer`, `promise-threshold`, `commit-threshold`, `claim-not-in-message` (the replay
- * case — a genuine proof presented for a claim it does not cover), and `digest-mismatch` (the peer
- * served bytes that provably are not the committed content). `no-digest-declared` is neither: it
- * is a verdict-level "content uncertified, rev certified" outcome, not misbehavior — use
- * {@link isAttributableProofFailure} rather than testing this set directly.
+ * Exhaustive by type — `Record<CertifyFailure, boolean>` means adding a {@link ProofFailure}
+ * variant in `commit-proof.ts` fails the build here until it is classified, rather than silently
+ * defaulting to `true` (penalize), which is the wrong direction for an unknown reason.
+ *
+ * `false` — never a penalty, because the identity behind the artifact was not proven (mirrors
+ * `ClusterMember.verifySignature`'s outcome discipline, restated in `commit-proof.ts`) or because
+ * the outcome is not misbehavior at all.
+ *
+ * `true` — the peer's own artifact provably lies, or provably does not cover what it was served
+ * for.
  */
-export const NON_ATTRIBUTABLE_PROOF_FAILURES: ReadonlySet<CertifyFailure> = new Set<CertifyFailure>([
-	'unknown-signer', 'non-ed25519-signer', 'malformed-signature', 'legacy-record', 'malformed-proof',
-	'oversized-cohort'
-]);
+const ATTRIBUTABLE_PROOF_FAILURES: Readonly<Record<CertifyFailure, boolean>> = {
+	// Identity not proven — an unparseable or unbound signer, or structural garbage that could have
+	// been authored by anyone in the chain.
+	'unknown-signer': false,
+	'non-ed25519-signer': false,
+	'malformed-signature': false,
+	'malformed-proof': false,
+	// A v1 / unversioned record is history, not misbehavior: it binds no peer set and never could.
+	'legacy-record': false,
+	// A genuine mega-cohort is conceivable and the cap declines it unexamined — no evidence either way.
+	'oversized-cohort': false,
+	// Not a failure of the proof at all: the cohort declared no digest for this block, so there was
+	// nothing to compare the served bytes against. A verdict ("content uncertified, rev certified"),
+	// never misbehavior.
+	'no-digest-declared': false,
+	// The artifact contradicts itself or the claim it was served for. `buildBlockCommitProof` derives
+	// `peerIds` from `Object.keys(record.peers)`, so honest construction cannot produce a duplicate —
+	// serving one implies authorship, as does a digest or hash that does not recompute.
+	'membership-mismatch': true,
+	'message-hash-mismatch': true,
+	'duplicate-signer': true,
+	'promise-threshold': true,
+	'commit-threshold': true,
+	// The replay case: a genuine proof presented for a claim it does not cover.
+	'claim-not-in-message': true,
+	// The peer served bytes that provably are not the committed content.
+	'digest-mismatch': true
+};
+
+/**
+ * Failure reasons that must NEVER become a reputation penalty for the serving peer — the `false`
+ * half of {@link ATTRIBUTABLE_PROOF_FAILURES}, derived so the set and
+ * {@link isAttributableProofFailure} cannot drift apart. Prefer the predicate; this set is exported
+ * for callers that want to name the whole population (logs, tests).
+ */
+export const NON_ATTRIBUTABLE_PROOF_FAILURES: ReadonlySet<CertifyFailure> = new Set(
+	(Object.keys(ATTRIBUTABLE_PROOF_FAILURES) as CertifyFailure[])
+		.filter(failure => !ATTRIBUTABLE_PROOF_FAILURES[failure])
+);
 
 /**
  * May this failure be held against the peer that served the proof? One predicate so the two repair
- * paths cannot drift on the classification: non-attributable reasons (unproven identity /
- * unexamined artifact) and `no-digest-declared` (a legitimate "cohort declared no digest for this
- * block" outcome) are excluded; everything else is the serving peer's own artifact lying.
+ * paths cannot drift on the classification — see {@link ATTRIBUTABLE_PROOF_FAILURES} for the
+ * per-reason rationale.
  */
 export function isAttributableProofFailure(failure: CertifyFailure): boolean {
-	return !NON_ATTRIBUTABLE_PROOF_FAILURES.has(failure) && failure !== 'no-digest-declared';
+	return ATTRIBUTABLE_PROOF_FAILURES[failure] === true;
 }
 
-export type ClaimCertification = {
+/**
+ * Certification verdict for a claim — a discriminated union, mirroring `ProofVerdict`
+ * (`commit-proof.ts`) so "certified" and "why not" cannot disagree: a failure reason is REQUIRED
+ * when uncertified and unrepresentable when certified.
+ */
+export type ClaimCertification =
 	/** The proof certifies `claim` — cap passed, thresholds of valid cohort signatures met. */
-	certified: boolean;
-	/** Why not, when `certified` is false. Classify via {@link isAttributableProofFailure}. */
-	failure?: CertifyFailure;
-};
+	| { certified: true }
+	/** Classify the reason via {@link isAttributableProofFailure} before penalizing anyone. */
+	| { certified: false; failure: CertifyFailure };
 
-export type ContentCertification = {
-	/** The claim half passed: the proof certifies `(blockId, rev, actionId)`. */
-	revCertified: boolean;
-	/** The content half passed too: the committed digest matches the served bytes. */
-	contentCertified: boolean;
+/**
+ * Certification verdict for a claim AND the block bytes served for it. Three reachable outcomes,
+ * spelled as three arms so an impossible mix (content certified while the rev is not, a failure
+ * alongside full success) cannot be constructed:
+ */
+export type ContentCertification =
+	/** Both halves passed: the proof certifies `(blockId, rev, actionId)` AND these exact bytes. */
+	| { revCertified: true; contentCertified: true }
 	/**
-	 * Set whenever either half failed. With `revCertified` true this is `digest-mismatch`
-	 * (attributable — drop/penalize the served bytes) or `no-digest-declared` (no penalty; the
-	 * cohort declared nothing to compare against).
+	 * The claim half passed, the content half did not: `digest-mismatch` (attributable — drop AND
+	 * penalize the served bytes) or `no-digest-declared` (drop only; the cohort declared nothing to
+	 * compare against). The `(rev, actionId)` is certified either way.
 	 */
-	failure?: CertifyFailure;
-};
+	| { revCertified: true; contentCertified: false; failure: 'digest-mismatch' | 'no-digest-declared' }
+	/** The claim half failed, so nothing is certified. Classify via {@link isAttributableProofFailure}. */
+	| { revCertified: false; contentCertified: false; failure: CertifyFailure };
 
 /**
  * Certify a repair claim by its attached cohort commit proof: cap the cohort, verify offline
@@ -182,12 +232,19 @@ export async function certifyContent(
 }
 
 /**
- * The cap check, structurally safe on hostile shapes: a `peerIds` that is not an array falls
- * through to the verifier, which reports `malformed-proof` without doing signature work either.
+ * The cap check, structurally safe on hostile shapes: a `peerIds` that is not an array — or a
+ * property access that throws, which is why the whole read is guarded — falls through to the
+ * verifier, which reports `malformed-proof` without doing signature work either. This runs before
+ * {@link certifyClaim}'s and {@link certifyContent}'s only other call, so it is the one place their
+ * "never throws" contract could be broken.
  */
 function exceedsSignerCap(proof: BlockCommitProof): boolean {
-	return proof !== null && typeof proof === 'object'
-		&& Array.isArray(proof.peerIds) && proof.peerIds.length > MAX_PROOF_SIGNERS;
+	try {
+		return proof !== null && typeof proof === 'object'
+			&& Array.isArray(proof.peerIds) && proof.peerIds.length > MAX_PROOF_SIGNERS;
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -211,14 +268,22 @@ async function anchorAcceptedProof(proof: BlockCommitProof, claim: ProofClaim, a
 		acceptUnanchored(claim, signerCount, 'recompute-infeasible', anchoring);
 		return;
 	}
-	if (!verdict.feasible) {
+	// A verdict that is null or otherwise off-contract reads as infeasible rather than throwing —
+	// `recomputeBlockCohort` is caller-supplied, so its return shape is as untrusted as its behavior.
+	if (!verdict?.feasible) {
 		acceptUnanchored(claim, signerCount, 'recompute-infeasible', anchoring);
 		return;
 	}
-	const cohort = new Set(verdict.cohortPeerIds);
-	const overlap = proof.peerIds.filter(id => cohort.has(id)).length;
-	log('anchor-overlap block=%s rev=%d action=%s overlap=%d signers=%d cohort=%d',
-		claim.blockId, claim.rev, claim.actionId, overlap, signerCount, cohort.size);
+	try {
+		const cohort = new Set(verdict.cohortPeerIds);
+		const overlap = proof.peerIds.filter(id => cohort.has(id)).length;
+		log('anchor-overlap block=%s rev=%d action=%s overlap=%d signers=%d cohort=%d',
+			claim.blockId, claim.rev, claim.actionId, overlap, signerCount, cohort.size);
+	} catch (err) {
+		// A non-iterable `cohortPeerIds`. The comparison is observational, so losing it costs a log
+		// line, never the certification.
+		log('anchor-overlap-error block=%s error=%o', claim.blockId, err);
+	}
 }
 
 /** Accept-and-surface a proof certified on layer 1 alone — never silent, never throwing. */
