@@ -3,7 +3,7 @@ import { StorageRepo, commitLatchKey, MISSING_BASE_REVISION_REASON } from '../sr
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockId, ActionId, ActionRev, ActionTransforms, CommitResult, PendRequest, StaleFailure, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
-import { isBlockChangeNotifier, Latches } from '@optimystic/db-core';
+import { isBlockChangeNotifier, Latches, canonicalBlockHash } from '@optimystic/db-core';
 import { delay } from '@optimystic/db-core/test';
 
 const makeHeader = (id: string): BlockHeader => ({
@@ -2295,6 +2295,143 @@ describe('StorageRepo', () => {
 			await repo.saveReplicatedBlock('block-1' as BlockId, makeBlock('block-1'),
 				{ actionId: 'a1' as ActionId, rev: 5 });
 			expect(anyEvents.length).to.equal(1);
+		});
+	});
+
+	/**
+	 * Ticket: commit-cert-digest-member-check. `previewCommitDigest` predicts, read-only and
+	 * latch-free, what internalCommit would materialize for a pended action — the member side of the
+	 * commit content-digest check compares it against the digest the transaction author declared.
+	 * The invariant these specs pin: the preview's digest matches what a commit of the same pending
+	 * action ACTUALLY stores, and the preview never disturbs durable state.
+	 */
+	describe('previewCommitDigest', () => {
+		const BLOCK = 'digest-block' as BlockId;
+
+		/** Digest of the block the repo actually stored at `rev` — the ground truth a preview must match. */
+		const storedDigest = async (rev: number): Promise<string> => {
+			const stored = await new BlockStorage(BLOCK, rawStorage).getBlock(rev);
+			expect(stored?.block, `a materialized block must exist at rev ${rev}`).to.not.equal(undefined);
+			return await canonicalBlockHash(stored!.block);
+		};
+
+		it('returns undefined when this node holds no pending transform for the action', async () => {
+			expect(await repo.previewCommitDigest(BLOCK, 'never-pended' as ActionId, 1)).to.equal(undefined);
+		});
+
+		it('previews an insert as base-independent and matches what internalCommit stores', async () => {
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: ['x'] })),
+				policy: 'c'
+			});
+
+			const preview = await repo.previewCommitDigest(BLOCK, 'a1' as ActionId, 1);
+			expect(preview).to.not.equal(undefined);
+			expect(preview!.baseIndependent, 'an insert is base-independent').to.equal(true);
+			expect(preview!.baseRev, 'no base is read for an insert').to.equal(undefined);
+			expect(preview!.digest).to.be.a('string');
+
+			// Read-only: the pending record survives the preview and the commit still lands from it.
+			const commit = await repo.commit({ actionId: 'a1' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 1 });
+			expect(commit.success).to.equal(true);
+			expect(await storedDigest(1), 'preview predicted the committed content').to.equal(preview!.digest);
+		});
+
+		it('previews an update against the local base and matches what internalCommit stores', async () => {
+			await repo.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: ['x'] })), policy: 'c' });
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 1 });
+			await repo.pend({ actionId: 'a2' as ActionId, transforms: makeUpdateTransforms(BLOCK, [['items', 1, 0, ['y']]]), policy: 'c' });
+
+			const preview = await repo.previewCommitDigest(BLOCK, 'a2' as ActionId, 2);
+			expect(preview!.baseIndependent).to.equal(false);
+			expect(preview!.baseRev, 'computed against the local committed base').to.equal(1);
+			expect(preview!.digest).to.be.a('string');
+
+			const commit = await repo.commit({ actionId: 'a2' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 2 });
+			expect(commit.success).to.equal(true);
+			expect(await storedDigest(2)).to.equal(preview!.digest);
+			// Preview cloned before materializing: the base rev 1 must still hold the pre-update content.
+			expect(await storedDigest(1), 'the base materialization was not mutated by the preview')
+				.to.not.equal(preview!.digest);
+		});
+
+		it('previews a delete as digest-undefined, and the tombstone commit still lands', async () => {
+			await repo.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: ['x'] })), policy: 'c' });
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 1 });
+			await repo.pend({ actionId: 'a2' as ActionId, transforms: makeDeleteTransforms(BLOCK), policy: 'c' });
+
+			const preview = await repo.previewCommitDigest(BLOCK, 'a2' as ActionId, 2);
+			expect(preview, 'a pended delete still yields a preview').to.not.equal(undefined);
+			expect(preview!.digest, 'a delete materializes nothing to digest').to.equal(undefined);
+			expect(preview!.baseIndependent).to.equal(false);
+			expect(preview!.baseRev).to.equal(1);
+
+			// internalCommit's absent-newBlock-with-prior-latest tombstone branch still commits.
+			const commit = await repo.commit({ actionId: 'a2' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 2 });
+			expect(commit.success).to.equal(true);
+			const got = await repo.get({ blockIds: [BLOCK] });
+			expect(got[BLOCK]?.state?.latest?.rev).to.equal(2);
+			expect(got[BLOCK]?.block, 'tombstoned').to.equal(undefined);
+		});
+
+		it('previews updates-with-no-base as digest-undefined with no baseRev', async () => {
+			// applyTransform drops updates when there is no block to apply them to; a preview of that
+			// pending must say "nothing to compare", not fabricate content.
+			await repo.pend({ actionId: 'a1' as ActionId, transforms: makeUpdateTransforms(BLOCK, [['items', 0, 0, ['x']]]), policy: 'c' });
+
+			const preview = await repo.previewCommitDigest(BLOCK, 'a1' as ActionId, 2);
+			expect(preview).to.not.equal(undefined);
+			expect(preview!.digest).to.equal(undefined);
+			expect(preview!.baseRev).to.equal(undefined);
+			expect(preview!.baseIndependent).to.equal(false);
+		});
+
+		it('reports digest-undefined plus the baseRev when the base is unmaterializable, without disturbing the pending', async () => {
+			// A wedged block: latest points at a revision with no materialization below it, so
+			// getBlock throws. The commit path refuses AND deletes the pending (refuseMissingBase);
+			// preview must do neither — an unmaterializable base is "cannot check", not a mismatch.
+			await rawStorage.saveMetadata(BLOCK, { latest: { rev: 3, actionId: 'ghost' as ActionId }, ranges: [[3]] });
+			await repo.pend({ actionId: 'a1' as ActionId, transforms: makeUpdateTransforms(BLOCK, [['items', 0, 0, ['x']]]), policy: 'c' });
+
+			const preview = await repo.previewCommitDigest(BLOCK, 'a1' as ActionId, 4);
+			expect(preview).to.not.equal(undefined);
+			expect(preview!.digest).to.equal(undefined);
+			expect(preview!.baseRev, 'the unreachable base rev is still reported').to.equal(3);
+			expect(preview!.baseIndependent).to.equal(false);
+
+			const pending = await new BlockStorage(BLOCK, rawStorage).getPendingTransaction('a1' as ActionId);
+			expect(pending, 'preview must not drop the pending record').to.not.equal(undefined);
+		});
+
+		it('an insert-carrying transform previews cleanly even on a wedged block (no base read at all)', async () => {
+			// Base-independence must not just ignore the base's CONTENT — it must not read the base,
+			// or a locally wedged block would degrade a check every member could otherwise make.
+			await rawStorage.saveMetadata(BLOCK, { latest: { rev: 3, actionId: 'ghost' as ActionId }, ranges: [[3]] });
+			await new BlockStorage(BLOCK, rawStorage).savePendingTransaction('a1' as ActionId,
+				{ insert: makeBlock(BLOCK, { items: ['fresh'] }) });
+
+			const preview = await repo.previewCommitDigest(BLOCK, 'a1' as ActionId, 4);
+			expect(preview!.baseIndependent).to.equal(true);
+			expect(preview!.digest).to.be.a('string');
+			expect(preview!.digest, 'digest is of the insert content')
+				.to.equal(await canonicalBlockHash(makeBlock(BLOCK, { items: ['fresh'] })));
+		});
+
+		it('single-peer fast path: StorageRepo.commit accepts a request carrying blockDigests', async () => {
+			// CoordinatorRepo.commit short-circuits straight to storageRepo.commit when peerCount <= 1
+			// — no consensus, no member check. The extra field must ride through harmlessly.
+			await repo.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: ['x'] })), policy: 'c' });
+			const commit = await repo.commit({
+				actionId: 'a1' as ActionId,
+				blockIds: [BLOCK],
+				tailId: BLOCK,
+				rev: 1,
+				blockDigests: { [BLOCK]: { digest: 'not-even-checked-here' } }
+			});
+			expect(commit.success).to.equal(true);
+			const got = await repo.get({ blockIds: [BLOCK] });
+			expect(got[BLOCK]?.state?.latest?.rev).to.equal(1);
 		});
 	});
 });

@@ -17,7 +17,7 @@ import type { FretService } from "p2p-fret";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
-import { isMissingBaseRevisionFailure } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, type CommitDigestPreview } from "../storage/storage-repo.js";
 import { RECONCILE_TIMEOUT_MS } from "./reconcile-block.js";
 
 const log = createLogger('cluster-member')
@@ -139,6 +139,14 @@ export type DeriveExpectedClusterCallback = (blockId: BlockId) => Promise<Expect
 
 /** Stable reject reason a member emits when a declared peer set fails the membership admission gate. */
 export const MEMBERSHIP_NOT_ADMITTED = 'membership-not-admitted';
+
+/**
+ * Stable reject reason a member emits when its own materialization of a commit's block disagrees
+ * with the content digest the transaction author declared (`CommitRequest.blockDigests`). Rides in
+ * the reject vote's `rejectReason`, which `clusterVoteSigningPayload` folds into the signed bytes —
+ * so the rejection itself is integrity-protected.
+ */
+export const CONTENT_DIGEST_MISMATCH = 'content-digest-mismatch';
 
 interface ClusterMemberComponents {
 	storageRepo: IRepo;
@@ -940,7 +948,11 @@ export class ClusterMember implements ICluster {
 		if (!admission.admit) {
 			return { valid: false, reason: admission.reason ?? MEMBERSHIP_NOT_ADMITTED };
 		}
-		return await this.validatePendOperations(record);
+		const pendValidation = await this.validatePendOperations(record);
+		if (!pendValidation.valid) {
+			return pendValidation;
+		}
+		return await this.validateCommitOperations(record);
 	}
 
 	/**
@@ -1209,6 +1221,103 @@ export class ClusterMember implements ICluster {
 					if (!result.valid) {
 						return { valid: false, reason: result.reason };
 					}
+				}
+			}
+		}
+
+		return { valid: true };
+	}
+
+	/**
+	 * Promise-round check of a commit record's declared content digests
+	 * (`CommitRequest.blockDigests`) against what this member's OWN pended copy of each transform
+	 * would materialize (`StorageRepo.previewCommitDigest`). This is what makes a promise approval on
+	 * a commit record MEAN something about content: before this hook, the promise round validated
+	 * nothing for commits (`validatePendOperations` only inspects pend operations).
+	 *
+	 * MUST run on the promise round, not the commit round: the commit-round vote is cast deliberately
+	 * blind — `getTransactionPhase` signs the commit whenever promise approvals reach super-majority,
+	 * regardless of this member's own promise vote — so promise approvals are the only votes that
+	 * carry "I checked this". Do not move it.
+	 *
+	 * Checkable/abstain rule, keyed on the member's OWN pended transform (the payload the client
+	 * authored, delivered at pend — a hostile declarer cannot force or dodge a check by mis-declaring
+	 * `baseRev`):
+	 *  - transform carries an `insert` → base-independent, ALWAYS check (declared `baseRev` ignored);
+	 *  - `updates` only → check iff this member's local base rev equals the declared `baseRev`
+	 *    (StorageRepo.commit accepts any `latest.rev < request.rev`, so a lagging member applying an
+	 *    update-only transform to an older base legitimately materializes different bytes);
+	 *  - `delete` only / no base / unmaterializable base → materializes nothing to compare, abstain;
+	 *  - no pending transform for the action (this member never saw the pend) → abstain.
+	 * "Abstain" = contribute no content attestation: approve exactly as before this check existed.
+	 *
+	 * Residual: a false digest survives only when the declarer lies AND enough of the cohort is
+	 * simultaneously unable to check (lagging on update-only blocks, missed pends) that no honest
+	 * checker is left — any single caught-up honest member rejects. Strictly stronger than before,
+	 * when commit signatures bound no content at all. Verifying/persisting a durable content proof is
+	 * later work (persist-block-commit-proof).
+	 */
+	private async validateCommitOperations(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
+		// Duck-typed probe: `storageRepo` is typed IRepo, and only the local StorageRepo can preview a
+		// materialization. A repo without the capability abstains everywhere (also keeps mock-repo
+		// harnesses and non-storage compositions on the legacy approve path).
+		const repo = this.storageRepo as IRepo & {
+			previewCommitDigest?: (blockId: BlockId, actionId: ActionId, rev: number) => Promise<CommitDigestPreview | undefined>;
+		};
+		if (typeof repo.previewCommitDigest !== 'function') {
+			return { valid: true };
+		}
+
+		for (const operation of record.message.operations) {
+			if (!('commit' in operation)) {
+				continue;
+			}
+			const commit = operation.commit;
+			// An upgraded member receiving a commit with no declarations abstains everywhere.
+			if (!commit.blockDigests) {
+				continue;
+			}
+			for (const [blockId, declared] of Object.entries(commit.blockDigests)) {
+				// Surplus (or hostile) entry for a block this commit does not even cover: ignore it —
+				// never throw out of the vote path, and never reject on content nobody is committing.
+				if (!commit.blockIds.includes(blockId as BlockId)) {
+					continue;
+				}
+				let preview: CommitDigestPreview | undefined;
+				try {
+					preview = await repo.previewCommitDigest(blockId as BlockId, commit.actionId, commit.rev);
+				} catch (err) {
+					log('cluster-member:content-digest-preview-error', {
+						messageHash: record.messageHash,
+						blockId,
+						error: err instanceof Error ? err.message : String(err)
+					});
+					continue; // a local preview fault is an abstain, never a content judgement
+				}
+				// No pend seen here, or the transform materializes nothing to compare (tombstone,
+				// updates with no base, unmaterializable base) → abstain.
+				if (preview === undefined || preview.digest === undefined) {
+					continue;
+				}
+				const checkable = preview.baseIndependent
+					|| (declared.baseRev !== undefined && preview.baseRev === declared.baseRev);
+				if (!checkable) {
+					continue;
+				}
+				if (preview.digest !== declared.digest) {
+					log('cluster-member:content-digest-mismatch', {
+						messageHash: record.messageHash,
+						blockId,
+						actionId: commit.actionId,
+						rev: commit.rev,
+						declaredDigest: declared.digest,
+						declaredBaseRev: declared.baseRev,
+						previewDigest: preview.digest,
+						previewBaseRev: preview.baseRev,
+						baseIndependent: preview.baseIndependent
+					});
+					// One vote per record: a single mismatching block rejects the whole record.
+					return { valid: false, reason: CONTENT_DIGEST_MISMATCH };
 				}
 			}
 		}

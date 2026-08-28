@@ -156,6 +156,48 @@ Collection.sync()
             → StorageRepo.pend/commit  # Applies to local storage
 ```
 
+#### Commit content-digest check (promise round)
+
+The client that authored a transaction declares, inside the commit request it submits for
+consensus, what each block it could digest will contain once the action commits
+(`CommitRequest.blockDigests` — see `docs/repository.md` "Declared block content"). Each cohort
+member then checks that declaration against its OWN copy of the pending change: on the promise
+round, `ClusterMember.validateCommitOperations` calls `StorageRepo.previewCommitDigest`, which
+re-materializes the block from the member's pended transform (mirroring `internalCommit`'s reads,
+but read-only and without the per-block commit latch — it runs on the vote path, ahead of the
+commit that will take that latch), and votes reject with the signed reason
+`content-digest-mismatch` when the results disagree.
+
+A member cannot always check. `StorageRepo.commit` accepts a commit whenever
+`latest.rev < request.rev` — not only `latest.rev === request.rev - 1` — so a lagging member
+applying an update-only transform to an older base legitimately materializes different bytes.
+The checkable/abstain rule is therefore keyed on the member's own pended transform (the same
+payload the client authored, delivered at pend):
+
+| Member's pended transform for the id | Member behaviour |
+|---|---|
+| carries an `insert` (with or without updates) | base-independent — always check; digest mismatch → reject |
+| `updates` only | check iff local `latest.rev` equals the declared `baseRev`; otherwise abstain |
+| `delete` only | materializes nothing; nothing to check |
+| no pending transform for the action | member never saw the pend — abstain, never reject |
+
+"Abstain" means: contribute no content attestation, vote exactly as before the check existed.
+Base-independence is decided by the member's own transform and never by the declaration, so a
+hostile declarer can neither force nor dodge a check by mis-declaring `baseRev`; a surplus
+declaration for a block the commit does not cover is ignored.
+
+**The check runs on the promise round, not the commit round.** The commit-round vote is cast
+deliberately blind: a member signs the commit whenever the cohort's promise approvals reach
+super-majority, regardless of its own promise vote (`getTransactionPhase`). Promise-round
+approvals are therefore the only votes that carry "I checked this", and downstream verification
+depends on that placement.
+
+Residual: a false declaration commits only if the declarer lies AND enough of the cohort is
+simultaneously unable to check (lagging on update-only blocks, missed pends) that no honest
+checker remains — any single caught-up honest member rejects. That is strictly stronger than
+before, when commit signatures bound no content at all. Verifying and persisting a durable
+content proof from these attestations is separate, later work (`persist-block-commit-proof`).
+
 ### Change Notification (Reactive Wake)
 
 `StorageRepo` implements `IBlockChangeNotifier` (db-core). It is the single commit

@@ -8,7 +8,7 @@ import type {
 } from "@optimystic/db-core";
 import {
 	Latches, transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
-	blockIdsForTransforms, transformsFromTransform, highestStaleAt
+	blockIdsForTransforms, transformsFromTransform, highestStaleAt, canonicalBlockHash
 } from "@optimystic/db-core";
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
@@ -79,6 +79,21 @@ export function isMissingBaseRevisionFailure(result: CommitResult): boolean {
 export type StorageRepoOptions = {
 	/** Optional hook to validate transactions in PendRequests */
 	validatePend?: PendValidationHook;
+};
+
+/**
+ * What {@link StorageRepo.previewCommitDigest} predicts a commit would materialize. `digest` is the
+ * {@link canonicalBlockHash} of the materialized content, or `undefined` when the transform
+ * materializes nothing (a delete/tombstone, updates with no base to apply them to) or the base
+ * exists but cannot be materialized locally. `baseRev` is the local committed revision the preview
+ * was computed against (absent when there is none, or when the transform is base-independent and no
+ * base was read). `baseIndependent` is true when the pended transform carries an `insert`, making
+ * the result identical on every member regardless of what base it holds.
+ */
+export type CommitDigestPreview = {
+	digest?: string;
+	baseRev?: number;
+	baseIndependent: boolean;
 };
 
 export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaStore {
@@ -849,6 +864,70 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				landed.rev,
 			);
 		}
+	}
+
+	/**
+	 * The digest the block WOULD materialize to if `actionId`'s pending transform committed at `rev`,
+	 * plus the base revision it was computed from. Read-only: touches no durable state and takes no
+	 * commit latch.
+	 *
+	 * Mirrors {@link internalCommit}'s reads (pending transform → latest → base → applyTransform) so
+	 * the prediction and the eventual commit cannot drift. Consumed by the cluster member's
+	 * promise-round content-digest check (`ClusterMember.validateCommitOperations`), which compares it
+	 * against the digest the transaction author declared on the commit request.
+	 *
+	 * Deliberately does NOT take the per-block commit latch: this runs on the vote path, ahead of the
+	 * commit that will take it, so taking it here would serialize voting behind commits and risks
+	 * deadlocking against commit's sorted up-front multi-block latch acquisition. The price is that a
+	 * concurrent commit can move `latest` mid-preview; the caller's checkable rule (base-independent,
+	 * or `baseRev` agreement) makes a torn read at worst an abstain, never a false reject of honest
+	 * content.
+	 *
+	 * `rev` is accepted for parity/logging with the commit that would follow; materialization does not
+	 * depend on it (internalCommit only records it).
+	 *
+	 * Returns `undefined` when this node holds no pending transform for the action (it never saw the
+	 * pend) — distinct from a defined preview with `digest: undefined` (see {@link CommitDigestPreview}).
+	 */
+	async previewCommitDigest(blockId: BlockId, actionId: ActionId, rev: number): Promise<CommitDigestPreview | undefined> {
+		const storage = this.createBlockStorage(blockId);
+		const transform = await storage.getPendingTransaction(actionId);
+		if (!transform) {
+			return undefined;
+		}
+
+		// An insert replaces the block wholesale before updates apply, so the result is the same on
+		// every member no matter what base it holds — do not read a base at all (the block may even be
+		// locally wedged/unmaterializable, which must not degrade a base-independent preview).
+		const baseIndependent = transform.insert !== undefined;
+		let base: IBlock | undefined;
+		let baseRev: number | undefined;
+		if (!baseIndependent) {
+			const latest = await storage.getLatest();
+			if (latest) {
+				baseRev = latest.rev;
+				try {
+					base = (await storage.getBlock(latest.rev))?.block;
+				} catch (err) {
+					// This node holds a `latest` it cannot materialize (see readCommitBase). That is a
+					// local deficiency, not a content mismatch — report "cannot check" so the caller
+					// abstains. Unlike the commit path's refuseMissingBase, this must NOT delete the
+					// pending record or throw: preview is read-only and runs before any commit exists.
+					log('previewCommitDigest:unmaterializable-base blockId=%s baseRev=%d rev=%d error=%s',
+						blockId, latest.rev, rev, err instanceof Error ? err.message : String(err));
+					return { baseIndependent: false, baseRev, digest: undefined };
+				}
+			}
+		}
+
+		// Clone both: applyTransform assigns `transform.insert` into the result by reference and
+		// applyOperations mutates the block in place, so materializing on live storage/pending objects
+		// would corrupt them for the real commit that follows.
+		const newBlock = applyTransform(structuredClone(base), structuredClone(transform));
+		// `undefined` covers the tombstone (delete transform) and updates-with-no-base (applyTransform
+		// drops updates when there is no block to apply them to) — both materialize nothing.
+		const digest = newBlock ? await canonicalBlockHash(newBlock) : undefined;
+		return { digest, baseRev, baseIndependent };
 	}
 
 	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage): Promise<CollectionId | undefined> {
