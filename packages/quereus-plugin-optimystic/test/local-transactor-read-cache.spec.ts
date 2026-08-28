@@ -3,10 +3,11 @@
  * (`CollectionFactory.createLocalTransactor` → `withReadCache`).
  *
  * Before the cache was wired, `BlockStorage` re-read block metadata on essentially every
- * operation and nothing beneath it memoized, so a create/insert/update/select workload over a
- * host-supplied backend issued 181 `getMetadata` reads against the driver (314 `fs.readFile`s
- * over `FileRawStorage`). On a host with slow disk reads that was enough to push several plugin
- * specs past their Mocha timeout.
+ * operation and nothing beneath it memoized. Measured A/B on exactly the workload below, with
+ * only the wrap decision changed: 113 `getMetadata` / 207 total driver reads uncached versus
+ * 6 / 14 cached; over `FileRawStorage` the same workload went from 184 `fs.readFile` + 29
+ * `readdir` to 9 + 6. On a host with slow disk reads that amplification was enough to push
+ * several plugin specs past their Mocha timeout.
  *
  * Counts are taken at the `RawStoreDriver` seam — BELOW the cache — because that is the only
  * place the fix is observable: the calls `BlockStorage` makes against `IRawStorage` are
@@ -94,15 +95,16 @@ describe('local transactor read cache (read-amplification regression guard)', fu
 			db.close();
 		}
 
-		// Measured through this seam at the time of writing: 6 getMetadata / 16 total backend
-		// reads cached, against 181 getMetadata uncached (the ticket's baseline). The bounds
-		// leave ~3× headroom for schema-catalog growth without letting the amplification back in.
+		// Measured through this seam: exactly 6 getMetadata / 14 total backend reads cached,
+		// against 113 / 207 uncached on the identical workload. The bounds leave ~3× headroom
+		// for schema-catalog growth without letting the amplification back in — anything near
+		// the uncached figures means the seam stopped wrapping.
 		const meta = first.counts['getMetadata'] ?? 0;
 		const reads = totalReads(first.counts);
 		expect(meta, `getMetadata reached the driver ${meta} times (counts: ${JSON.stringify(first.counts)})`)
 			.to.be.at.most(20);
 		expect(reads, `${reads} backend reads total (counts: ${JSON.stringify(first.counts)})`)
-			.to.be.at.most(60);
+			.to.be.at.most(45);
 
 		// --- Dispose: the cache's shared-pool registration is released. ---
 		const storesBefore = defaultCachePool().stats().stores.length;

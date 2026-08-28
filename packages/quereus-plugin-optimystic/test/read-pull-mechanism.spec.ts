@@ -26,6 +26,7 @@ import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
+import { CachedRawStorage, type IRawStorage } from '@optimystic/db-p2p';
 import register from '../dist/plugin.js';
 import { OptimysticVirtualTable } from '../dist/index.js';
 import { Tree } from '@optimystic/db-core';
@@ -115,13 +116,26 @@ function installReadProbe(): ReadProbe {
 	return probe;
 }
 
-function createDb(dir: string): { db: Database; plugin: ReturnType<typeof register> } {
+/**
+ * @param shared  Storage instance both peers must share, for the multi-peer test. Omit for the
+ *   single-peer tests and each `Database` gets its own `FileRawStorage` over `dir`.
+ *
+ * Two `Database`s in one process that need to see each other's committed writes must be handed
+ * the SAME already-wrapped storage object, not two `FileRawStorage`s over the same directory.
+ * The `local` transactor puts a write-through read cache in front of host-supplied storage
+ * (`withReadCache`), and that wrap happens per `register()` — so two independent instances over
+ * one directory hold two caches that never observe each other's writes. Measured on this
+ * workload: two instances → peer A still sees 1 row after peer B commits 3; one shared
+ * `CachedRawStorage` → peer A sees 3. See `packages/db-p2p/docs/storage.md` § Invariants 5 and
+ * § 6 "Write-through raw-storage cache".
+ */
+function createDb(dir: string, shared?: IRawStorage): { db: Database; plugin: ReturnType<typeof register> } {
 	const db = new Database();
 	const config = {
 		default_transactor: 'local',
 		default_key_network: 'test',
 		enable_cache: false,
-		rawStorageFactory: () => new FileRawStorage(dir),
+		rawStorageFactory: () => shared ?? new FileRawStorage(dir),
 	} as unknown as Record<string, SqlValue>;
 	const plugin = register(db, config);
 	for (const vtable of plugin.vtables) {
@@ -273,21 +287,27 @@ describe('Read-path pull mechanism (single node, harness-independent)', function
 	});
 
 	it('count(*) observes a second writer\'s committed appends (cross-writer convergence)', async () => {
-		// Truest single-process two-peer model: two independent Databases wired to
-		// the SAME on-disk FileRawStorage dir. Peer B's SQL inserts commit to the
-		// shared store; peer A's collection instance is separate, so peer A only
-		// sees them if its read path pulls (collection.update()). This is the
-		// blind-write scenario the originating convergence test exercises, minus
-		// the cross-repo cadre harness.
+		// Single-process two-peer model: two independent Databases over one store. Peer B's SQL
+		// inserts commit to the shared store; peer A's collection instance is separate, so peer A
+		// only sees them if its read path pulls (collection.update()). This is the blind-write
+		// scenario the originating convergence test exercises, minus the cross-repo cadre harness.
+		//
+		// The store is ONE pre-wrapped CachedRawStorage handed to both peers (see createDb).
+		// Two separate FileRawStorage instances over one directory would each get their own read
+		// cache and never converge — that is a property of the storage layer, not of the read
+		// path, and this test is about the read path. Real peers are separate PROCESSES with
+		// separate directories converging over the network; cross-process convergence is covered
+		// by the mesh harness, not here.
 		const uri = 'tree://read-pull/cross';
-		const peerA = createDb(dir);
+		const store: IRawStorage = new CachedRawStorage(new FileRawStorage(dir), undefined, 'read-pull:cross');
+		const peerA = createDb(dir, store);
 		try {
 			await peerA.db.exec(`create table T (id integer primary key, v text) using optimystic('${uri}')`);
 			await peerA.db.exec(`insert into T (id, v) values (1, 'a')`);
 			expect(await evalCount(peerA.db, 'select count(*) as c from T')).to.equal(1);
 
 			// Peer B: a separate Database over the same dir appends two rows.
-			const peerB = createDb(dir);
+			const peerB = createDb(dir, store);
 			try {
 				await peerB.plugin.hydrate(peerB.db);
 				await peerB.db.exec(`insert into T (id, v) values (2, 'b')`);

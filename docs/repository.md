@@ -212,6 +212,14 @@ The system is implemented with these key components:
 - `StorageRepo`: Main implementation of the repository operations
 - `IBlockStorage`: Interface for block storage operations
 - `RestoreCallback`: Optional mechanism for block restoration
+- `withReadCache`: the single seam that puts the write-through read cache in front of a
+  persistent raw storage. `StorageRepo` builds a fresh `BlockStorage` per block per call and
+  `BlockStorage` re-reads block metadata on essentially every operation, so nothing above the
+  raw-storage boundary memoizes — over a filesystem backend that is hundreds of reads of the same
+  small files per statement. Why the cache is safe to read from (and the single-process-owner
+  precondition it depends on) is argued in
+  [`packages/db-p2p/docs/storage.md`](../packages/db-p2p/docs/storage.md) — see **Invariants** 1-5
+  and **Core Components § 6, Write-through raw-storage cache**.
 
 The storage layer maintains separate stores for:
 - Block metadata (e.g. latest revision, deletion status)

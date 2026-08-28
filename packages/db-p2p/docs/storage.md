@@ -340,6 +340,40 @@ Semantics worth knowing:
 
 **Wiring:**
 
+- **Production entry point — `withReadCache(storage, label?, pool?)`**
+  (`src/storage/with-read-cache.ts`). Every seam that resolves an `IRawStorage`
+  for real use goes through this one helper, so the exclusion rules live in one
+  place instead of being re-derived per site. It returns the storage *unchanged*
+  when it is a `MemoryRawStorage` (already in memory — see the "never wrap" bullet
+  below) or already a `CachedRawStorage` (a host that wrapped before handing it
+  over is not wrapped twice); otherwise it returns `new CachedRawStorage(...)`.
+  The two seams that call it:
+  - `CollectionFactory.createLocalTransactor`
+    (`packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts`)
+    — wraps the host's `rawStorageFactory` result, label `quereus:local`.
+  - `resolveStorage` (`src/libp2p-node-base.ts`) — wraps a `RawStorageProvider`'s
+    instance or factory result, label `node:<networkName>`. The no-provider
+    default is a bare `MemoryRawStorage` and stays unwrapped.
+
+  **Dispose obligations.** The seam that wraps owns the wrapper's lifecycle:
+  `CollectionFactory.dispose()` releases its caches and is called by
+  `shutdown()` and surfaced to hosts as `plugin.dispose()` (opt-in — a host that
+  never calls it leaks only cold entries the pool evicts under pressure). A
+  libp2p node releases automatically: a stop wrapper installed at construction
+  calls `dispose()` in a `finally` after the rest of the stop chain.
+
+  **Precondition (Invariant 5, above): exactly one cache fronts a given backing
+  store.** Cache identity is per-*object*, so `new FileRawStorage(dir)` twice
+  over one `dir` yields two caches that never observe each other's writes — and
+  so does passing one unwrapped instance to `withReadCache` twice, since each
+  call wraps it again. Both fail silently: no error, just reads that never
+  converge (measured: peer A still reads 1 row after peer B commits 3). A host
+  that needs several consumers on one store constructs the `CachedRawStorage`
+  itself and hands that same object to each; `withReadCache` returns an
+  already-cached storage unchanged, which is what makes sharing work. Seams that
+  call a per-consumer factory (the plugin's `rawStorageFactory`) get one cache
+  per consumer by construction — fine for the one-`Database`-per-process case
+  they serve, wrong for two `Database`s sharing a directory.
 - Backend exposes its `RawStoreDriver` (all kernel-backed backends):
   `new KvRawStorage(new CachedStoreDriver(driver))`. Optional second/third
   constructor args pick a specific `SharedCachePool` (default: the shared
