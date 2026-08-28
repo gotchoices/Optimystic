@@ -288,6 +288,7 @@ describe('block archive commit proof', () => {
 			expect(pinned.block, 'the pinned read serves rev 1').to.deep.equal(makeBlock(BLOCK, 'one'));
 			expect('unavailable' in pinned, 'a restored revision is a real answer').to.equal(false);
 			expect(pinned.state.latest, 'state.latest keeps meaning the newest held').to.deep.equal({ rev: 2, actionId: ACTION_2 });
+			expect(pinned.materialized, 'the result says which revision its bytes actually are').to.deep.equal({ rev: 1, actionId: ACTION });
 			expect((await askerRaw.getMetadata(BLOCK))!.ranges, 'rev 1 is now recorded as held').to.deep.equal([[1, 3]]);
 			expect(await askerRaw.getMaterializedBlock(BLOCK, ACTION), 'stored under its OWN action id')
 				.to.deep.equal(makeBlock(BLOCK, 'one'));
