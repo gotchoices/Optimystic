@@ -236,7 +236,7 @@ self-certify any block id at any revision. No offline check can close that: a bl
 chosen by live placement and rotates over history, so there is no fixed expected set to compare
 against. Any consumer accepting proofs from untrusted peers must corroborate the cohort separately
 (overlap against the block's currently-derived cohort, or a membership anchor — see
-`accept-certified-claims-in-repair` and `feat-cluster-membership-threshold-cert-anchoring`) and must
+`feat-cluster-membership-threshold-cert-anchoring`) and must
 bound proof size and cohort count before verifying, since verification cost is one Ed25519 check per
 approve vote.
 
@@ -622,11 +622,14 @@ saveMaterializedBlock(block): store(structuredClone(block));
 
   **How many machines repair actually needs** (swept over `resolveClusterPolicy` +
   `corroboratorCapacity` + `quorumSize`, and pinned in `test/quorum-restore.spec.ts` under *how
-  many answering peers a repair needs, by deployment size*). **Every row assumes the block already
-  has at least as many cohort-peer holders as that row's *must answer* column demands** — those peers
-  have to answer *and agree*, which only a peer that holds the block can do. A block with fewer
-  holders than that is a different failure, and machine count does not fix it; see the paragraph
-  below the table:
+  many answering peers a repair needs, by deployment size*). **The whole table is about
+  *uncertified* claims** — an answering peer that serves nothing but its own word for the revision
+  and the bytes. A peer that also serves a verified cohort commit proof is on a different track
+  entirely and none of these rows constrain it; see *The certified exception* below the table.
+  **Every row assumes the block already has at least as many cohort-peer holders as that row's
+  *must answer* column demands** — those peers have to answer *and agree*, which only a peer that
+  holds the block can do. A block with fewer holders than that is a different failure, and machine
+  count does not fix it; see the paragraph below the table:
 
   | machines | cohort size declared? | peers besides the reader | peers that must answer *that reader* | can repair (given that many holders)? |
   | --- | --- | --- | --- | --- |
@@ -643,11 +646,13 @@ saveMaterializedBlock(block): store(structuredClone(block));
   undeclared three. And **the `4+` row's "survives one unreachable peer" is conditional on that row's
   holder assumption — two of them — not a blanket guarantee at that size**: wherever the
   corroboration floor is two (every row but the declared-two-machine one), a block that only one
-  cohort peer holds cannot be repaired at *any* machine count, four-or-more included — more machines
-  never manufactures a second copy of a block that only ever had one. The declared two-machine row is
-  the single exception: its floor relaxes to one, so a lone peer's claim *is* adopted there and a
-  singly-held block repairs like any other. The usual way a block ends up stranded is being written
-  while the deployment (or that block's cohort) was smaller. Growing the deployment afterwards *does*
+  cohort peer holds *and cannot certify* cannot be repaired at *any* machine count, four-or-more
+  included — more machines never manufactures a second copy of a block that only ever had one. Two
+  things escape that. The declared two-machine row escapes it by size: its floor relaxes to one, so a
+  lone peer's claim *is* adopted there and a singly-held block repairs like any other. And a lone
+  holder that still has the cohort's commit proof escapes it at *every* size — see below. The usual
+  way a block ends up stranded is being written while the deployment (or that block's cohort) was
+  smaller. Growing the deployment afterwards *does*
   now copy it — that is the `RebalanceMonitor` `grown` arm below — but the copy is not instantaneous:
   a peer counts as holding the block only once a push to it is CONFIRMED, so a push that fails is
   re-detected and retried on later checks (bounded by `growthMaxAttempts`, default 5, after which
@@ -655,6 +660,34 @@ saveMaterializedBlock(block): store(structuredClone(block));
   still has its single copy and this is reported as `cluster-fetch:repair-deadlock` with
   `reason: 'sole-holder'` (below) — a diagnosis, not a fault of
   the read path, and one an operator at four-plus machines can otherwise easily miss.
+
+  **The certified exception — when one holder is enough at any size.** Everything above measures a
+  claim by how many *other peers* say the same thing. A peer that retained the cohort's commit proof
+  for the revision it is serving does not need them: the proof carries the cohort's own signatures
+  over that `(block, revision, action)` — and, when the commit declared a content digest, over the
+  bytes too — so a verifier checks it offline against the proof's signer list instead of polling for
+  a second opinion. Both restoration paths (`CoordinatorRepo` read-repair and the commit-path
+  reconcile) run peer-attached proofs through `cluster/certified-claims.ts` first, and a claim whose
+  proof verifies is selected with **no corroborating peer, at any cohort size** — the
+  declared-two-machine row's relaxation, available everywhere, and earned rather than assumed. The
+  content gate has the same short-circuit for a proof that declared a digest matching the served
+  bytes. So the *never* in the two-machine undeclared row, and "a block only one cohort peer holds
+  cannot be repaired at any machine count", are both statements about proof-less holders only. A
+  certified lone holder repairs in either case. Three limits worth knowing:
+
+  - **Ordinary corroboration still wins when it is higher.** A pair corroborated by peers at a
+    *strictly higher* revision than the top certified one is selected over the proof, so a legacy
+    uncertified tail written after the last proven revision stays readable. (A merely
+    *uncorroborated* higher claim never outranks a proof — it is not evidence at all.)
+  - **Proof retention is per revision, and not retroactive.** A revision that first landed
+    proof-less keeps no proof even if a later certified heal of that same revision carries one.
+    Blocks written before proofs existed, or by a member whose materialization disagreed with the
+    declared digest, have none — those fall back to the table above. A repaired replica *does*
+    serve the proof onward, so a certified block's coverage grows with each heal.
+  - **A verified proof says the listed signers signed, not that they are this block's cohort.**
+    Anyone holding N keys can stand up their own N-peer cohort and self-certify. Closing that needs
+    a membership anchor (`feat-cluster-membership-threshold-cert-anchoring`, open); until then the
+    residual is logged, never silently accepted. See *What a passing verdict does not say* above.
 
   Two signals name this rather than leaving it to be re-derived from logs:
 
@@ -675,20 +708,29 @@ saveMaterializedBlock(block): store(structuredClone(block));
       where repair says *never*: one peer besides the reader, with the size undeclared. Remedy: more
       machines, or an honest declared `clusterPolicy.assumedClusterSize` / `clusterSize`.
     - **`sole-holder`** — the cohort is big enough (does not trip `cohort-too-small`), but exactly
-      ONE of its peers holds the block and every *other* peer answered that it holds nothing — an
-      answer, not silence. Every row in the table above assumes the block already has as many
-      cohort-peer holders as that row demands; this is the case where it does not, so it holds at any
-      machine count whose corroboration floor is two — that is, everything but a declared two-machine
-      cohort, where the floor is one, a lone holder IS corroborated, and the repair therefore succeeds
-      rather than declining (so this reason cannot arise there).
+      ONE of its peers holds the block, that peer has no cohort commit proof for it, and every
+      *other* peer answered that it holds nothing — an answer, not silence. Every row in the table
+      above assumes the block already has as many cohort-peer holders as that row demands; this is
+      the case where it does not, so it holds at any machine count whose corroboration floor is two —
+      that is, everything but a declared two-machine cohort, where the floor is one, a lone holder IS
+      corroborated, and the repair therefore succeeds rather than declining (so this reason cannot
+      arise there).
       Scope is deliberately narrow: this node's own copy, if it has one, is excluded from the claim
       set (it cannot corroborate the revision it is repairing), so the message says "cohort peer",
       never "machine in the deployment" — a reader that holds the block itself still gets
-      `sole-holder`. Remedy: another cohort peer holding the block, i.e. committing any new revision
-      of the block, which writes it to the current cohort; no machine count or configuration setting
-      helps. The usual cause is data written while the deployment (or that block's cohort) was
-      smaller — growing the deployment afterwards does not copy existing blocks to the new peers, so
-      founding data can stay stranded at one copy indefinitely.
+      `sole-holder`. **Two remedies, not one.** The first is another cohort peer holding the block,
+      i.e. committing any new revision of the block, which writes it to the current cohort. The
+      second is the lone holder retaining the cohort's commit proof for the revision it serves: a
+      certified claim needs no corroborating peer, so it converges inside the selection and never
+      reaches this decline at all (which is also why the "a lone holder cannot second itself"
+      wording stays accurate for every claim that does get here). That second remedy is not something
+      an operator applies to an already-stranded block — the proof either was retained at commit time
+      or was not — but it is why this case should get *rarer* over time rather than staying permanent:
+      a repaired replica now serves the proof onward, so certified coverage spreads with each heal.
+      What does not help either way is machine count or any configuration setting. The usual cause is
+      data written while the deployment (or that block's cohort) was smaller — growing the deployment
+      afterwards does not copy existing blocks to the new peers, so founding data written before
+      proofs were retained can stay stranded at one copy indefinitely.
 
     Deliberately excluded from both: a shortfall where the cohort *could* reach quorum and some peer
     simply does not hold the block yet (that peer's own repair, or the next commit, fixes it); a
@@ -725,6 +767,40 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `StorageRepo.commit:<blockId>` latch, so fetching the base from inside the commit path
   would deadlock against the lock the commit already holds. That constraint is why a member
   with no base *refuses and heals* rather than *fetching then committing*.
+
+  **Certified-claim log lines, and which of them are incidents.** Cohort commit proofs added five
+  lines across the two repair paths — the `reconcile:` prefix is the commit-path reconcile, the
+  `cluster-fetch:` prefix is `CoordinatorRepo` read-repair. Two of them are *incidents* and must not
+  be read as ordinary shortages:
+
+  - **`reconcile:certified-equivocation`** / **`cluster-fetch:certified-equivocation`** — two proofs
+    that both verify certify *different actions into the same revision*. The whole revision selection
+    declines rather than picking a side, so the block stays unrepaired permanently and by design.
+  - **`reconcile:certified-content-equivocation`** — two proofs that both verify certify *different
+    content digests for one revision*. Same outcome on the content gate.
+
+  Both mean whoever holds the cohort's signing keys signed both sides. **This is a key compromise,
+  not a capacity problem: adding machines or lowering a corroboration setting does nothing.** The
+  remedy is investigating the cohort that signed — which keys, and what else they signed. Neither
+  claimant is penalized, because which side is wrong is exactly what a verifying node cannot know.
+  Each equivocation line is accompanied by the routine `reconcile:no-rev-quorum` /
+  `no-content-quorum` decline for the same pass, which on its own reads as a routine shortage; the
+  equivocation line is the one that says *why*, and is what makes the two declines distinguishable
+  in a log search.
+
+  The remaining three are informational:
+
+  - **`reconcile:certified-selected`** / **`cluster-fetch:certified-selected`** — the certified rule,
+    rather than peer corroboration, chose the revision. Carries `claimants`, which may legitimately
+    be `1`: the corroboration is the proof's signature set, not other voters.
+  - **`reconcile:proof-uncertified`** / **`cluster-fetch:proof-uncertified`** — a peer attached a
+    proof that did not verify, with the `failure` reason. Expected in mixed-version deployments
+    (`legacy-record`) and on relayed junk (`malformed-proof`); only the reasons that prove the
+    artifact itself lies penalize the serving peer.
+  - **`reconcile:content-rejected`** — a peer's proof verified but its served bytes contradict the
+    digest that proof declared. Those bytes are dropped from the content quorum and that peer is
+    penalized, while its (genuinely verified) revision claim still counts; repair continues on the
+    other holders.
 - **The coordinator tolerates the same divergence, in both its shapes.** When
   `CoordinatorRepo.commit` finds its own member did not execute during consensus, it falls back
   to a local commit — which can diverge for reasons the caller is not responsible for. A thrown

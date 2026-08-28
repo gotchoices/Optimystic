@@ -23,7 +23,7 @@ import { createReconcileBlock, type ReconcileBlockDeps } from '../src/cluster/re
 import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
 import { PenaltyReason } from '../src/reputation/types.js';
 import type { BlockCommitProof } from '../src/cluster/commit-proof.js';
-import { captureLog } from './support/capture-log.js';
+import { captureLog, hasTag } from './support/capture-log.js';
 import { makeSignedProof } from './support/commit-proof-fixtures.js';
 
 const BLOCK_ID = 'reconcile-target-block' as BlockId;
@@ -524,6 +524,125 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 
 			expect(h.saved.length).to.equal(1);
 			expect(h.saved[0]!.proof, 'no certified carrier ⇒ no proof persisted').to.equal(undefined);
+		});
+
+		it('does not penalize dissenting bytes when the certified rule won the content gate', async () => {
+			// Contradicting-content penalties run ONLY on a corroborated win. An unanchored proof
+			// must not become a reputation lever against the honest cohort: anyone holding N keys
+			// can mint a proof that verifies here, and letting it convict dissenters would be the
+			// worse failure mode. Without that skip the proof-less dissenter below would be
+			// penalized exactly as `evil` is in 'rejects a content liar and persists the majority
+			// content in a larger cohort'. Flip this assertion only alongside
+			// `feat-cluster-membership-threshold-cert-anchoring`, which is what would make a
+			// certified win trustworthy enough to convict on.
+			const certifiedBlock = makeBlock('v2');
+			const { proof } = await makeSignedProof(3, await commitFor(2, 'action-2', certifiedBlock));
+			const h = harness(
+				{
+					carrier: archiveAt(2, 'action-2', certifiedBlock, proof),
+					dissenter: archiveAt(2, 'action-2', makeBlock('other-bytes'))
+				},
+				{ repairCorroborationClusterSize: 10 }
+			);
+
+			await h.reconcile(BLOCK_ID, COMMITTED, ['carrier', 'dissenter']);
+
+			expect(h.saved.length, 'the certified carrier wins the content gate outright').to.equal(1);
+			expect(payloadOf(h.saved[0]!.block), 'the digest-bound bytes win').to.equal('v2');
+			expect(h.saved[0]!.proof).to.equal(proof);
+			expect(h.penalties, 'a certified win must never convict a dissenting peer').to.deep.equal([]);
+		});
+
+		it('certifies only the revision when the proof declares no digest for this block', async () => {
+			// The pre-digest-upgrade shape: a genuine, fully-signed proof whose commit op named no
+			// digest for BLOCK_ID. `no-digest-declared` is a verdict, not misbehavior — the revision
+			// certifies, the content does not, nobody is penalized, and the content gate falls back
+			// to ordinary carrier corroboration.
+			const block = makeBlock('v2');
+			const { proof } = await makeSignedProof(3, await commitFor(2, 'action-2'));
+			const lone = harness(
+				{ [PEER_A]: archiveAt(2, 'action-2', block, proof) },
+				{ repairCorroborationClusterSize: 10 }
+			);
+			const captured = await captureLog('reconcile-block', async () => {
+				await lone.reconcile(BLOCK_ID, COMMITTED, [PEER_A]);
+			});
+
+			expect(lone.saved.length, 'an undeclared digest buys the content gate nothing').to.equal(0);
+			expect(lone.penalties, 'no-digest-declared implicates nobody').to.deep.equal([]);
+			expect(hasTag(captured, 'reconcile:certified-selected'), 'the revision still went certified').to.equal(true);
+			expect(hasTag(captured, 'reconcile:no-content-quorum'), 'the content gate declined for want of carriers').to.equal(true);
+
+			// Same proof, plus an ordinary second carrier: the content gate is satisfied the normal
+			// way, and the proof — which bound no bytes — is still never persisted.
+			const corroborated = harness(
+				{
+					p1: archiveAt(2, 'action-2', block, proof),
+					p2: archiveAt(2, 'action-2', makeBlock('v2'))
+				},
+				{ repairCorroborationClusterSize: 4 }
+			);
+
+			await corroborated.reconcile(BLOCK_ID, COMMITTED, ['p1', 'p2']);
+
+			expect(corroborated.saved.length, 'ordinary corroboration still heals').to.equal(1);
+			expect(corroborated.saved[0]!.proof, 'a proof that certified no bytes is never persisted').to.equal(undefined);
+			expect(corroborated.penalties).to.deep.equal([]);
+		});
+
+		it('certifies a revision from a peer carrying the proof but no block bytes', async () => {
+			// A pruned archive advertises the revision and retains the proof without the materialized
+			// block, so certification routes through `certifyClaim` rather than `certifyContent` — an
+			// arm of `certifyCandidates` no other reconcile test reaches. The revision certifies off
+			// that block-less answer (`reconcile:certified-selected` fires, which plain corroboration
+			// alone would not produce); the bytes still come from ordinary carriers, and nothing is
+			// persisted as proof because nothing bound that proof to these bytes.
+			const { proof } = await makeSignedProof(3, await commitFor(2, 'action-2', makeBlock('v2')));
+			const h = harness(
+				{
+					keeper: archiveAt(2, 'action-2', undefined, proof),
+					c1: archiveAt(2, 'action-2', makeBlock('v2')),
+					c2: archiveAt(2, 'action-2', makeBlock('v2'))
+				},
+				{ repairCorroborationClusterSize: 4 }
+			);
+
+			const captured = await captureLog('reconcile-block', async () => {
+				await h.reconcile(BLOCK_ID, COMMITTED, ['keeper', 'c1', 'c2']);
+			});
+
+			expect(h.saved.length).to.equal(1);
+			expect(payloadOf(h.saved[0]!.block)).to.equal('v2');
+			expect(h.saved[0]!.proof, 'certifyClaim binds no bytes, so no proof is persisted').to.equal(undefined);
+			expect(h.penalties).to.deep.equal([]);
+			expect(
+				hasTag(captured, 'reconcile:certified-selected'),
+				'the block-less proof carried the revision selection'
+			).to.equal(true);
+		});
+
+		it('penalizes a block-less peer presenting a genuine proof for a revision it does not cover', async () => {
+			// The replay case on the same `certifyClaim` arm: the proof is real and fully signed, but
+			// it commits rev 2 while the peer advertises rev 9. `claim-not-in-message` is attributable
+			// — a genuine proof presented for a claim it does not cover implicates whoever served it —
+			// and the inflated claim still never steers the heal.
+			const { proof } = await makeSignedProof(3, await commitFor(2, 'action-2', makeBlock('v2')));
+			const h = harness(
+				{
+					replayer: archiveAt(9, 'action-2', undefined, proof),
+					c1: archiveAt(2, 'action-2', makeBlock('v2')),
+					c2: archiveAt(2, 'action-2', makeBlock('v2'))
+				},
+				{ repairCorroborationClusterSize: 4 }
+			);
+
+			await h.reconcile(BLOCK_ID, COMMITTED, ['replayer', 'c1', 'c2']);
+
+			expect(h.penalties, 'a replayed proof implicates the peer that served it')
+				.to.deep.equal([{ peerId: 'replayer', reason: PenaltyReason.InvalidRestoration }]);
+			expect(h.saved.length, 'the corroborated revision still heals').to.equal(1);
+			expect(h.saved[0]!.source, 'the inflated claim never steers restoration')
+				.to.deep.equal({ actionId: 'action-2', rev: 2 });
 		});
 	});
 });

@@ -120,7 +120,9 @@ export function buildBlockCommitProof(record: ClusterRecord): BlockCommitProof |
  *    chosen by live placement and rotates over history, so `peerIds` cannot be checked against a
  *    fixed expected set. A caller accepting proofs from untrusted peers MUST corroborate the cohort
  *    separately (overlap with the block's currently-derived cohort, or a membership anchor — see
- *    `accept-certified-claims-in-repair` and `feat-cluster-membership-threshold-cert-anchoring`).
+ *    `feat-cluster-membership-threshold-cert-anchoring`). Both repair paths do this via
+ *    `cluster/certified-claims.ts`, whose layer 2 logs the overlap and surfaces the unanchored
+ *    residual; the anchor itself is still open.
  * 2. **Cost is attacker-chosen.** This performs one Ed25519 verify per approve vote and hashes the
  *    whole message; nothing here caps `peerIds`, the vote maps, or the message. A caller reading a
  *    proof off the wire must bound its size and cohort count BEFORE calling.
