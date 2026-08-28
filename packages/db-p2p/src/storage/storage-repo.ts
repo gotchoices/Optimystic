@@ -356,7 +356,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 					// of its own, so the honest answer is the base it was applied to. Absent when there
 					// was no base at all — a pending-only insert served over an absent committed base,
 					// where fabricating a revision would claim content this node never committed.
-					...(blockRev ? { materializedRev: blockRev.actionRev.rev } : {}),
+					...(blockRev ? { materialized: blockRev.actionRev } : {}),
 					// A pending applied to a missing base can materialize nothing (applyTransform drops
 					// updates with no block to apply them to) — that absence is a guess, and is flagged.
 					// A materialized block is a real answer regardless of the earlier refusal. TWO ways
@@ -389,7 +389,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				// content. `state.latest` deliberately stays the node's newest revision for the block
 				// (StorageRepo.get's own promotion pre-scan and CoordinatorRepo's read-repair compare
 				// against it), so the two disagree exactly when a pinned read is serving older content.
-				materializedRev: blockRev.actionRev.rev,
+				materialized: blockRev.actionRev,
 				state: {
 					latest: await blockStorage.getLatest(),
 					pendings

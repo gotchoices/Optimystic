@@ -140,16 +140,18 @@ export type ProofRetainingRepo = IRepo & Required<Pick<ArchiveServingRepo, 'getB
  * The read skips the cluster deliberately: a peer answering a repair fetch reports what IT holds,
  * and one that re-asked its own cohort would launder another peer's claim as its own.
  *
- * NOTE: `rev` DOES NOT currently pin anything. It is packed into a synthetic `ActionContext`, and
- * `StorageRepo.get` reads only that context's `committed` list -- never its `rev` -- so this always
- * serves the repo's own latest and labels the archive with that revision. A caller asking for an
- * older revision (`RestorationCoordinator` is the one that does) silently gets the latest instead.
- * Filed as `fix/block-archive-rev-pin-is-a-no-op`; this doc used to claim the pin worked, which is
- * why it now says so loudly.
+ * `rev` pins the read: `StorageRepo.get` materializes the highest committed revision of the block
+ * at or below it and reports that revision as `GetBlockResult.materialized`, which is what the
+ * archive is labelled with — its revision number, its action id, and its proof all belong to the
+ * bytes actually served. `state.latest` (the repo's NEWEST revision) is never the label: a caller
+ * asking for an older revision (`RestorationCoordinator` is the one that does) is answered with
+ * that revision as itself, or with nothing. Never with old bytes under a newer label — that pairing
+ * is what a receiver keyed by action id writes over its own good copy of the newer revision.
  *
- * The proof served is looked up for the revision ACTUALLY served (`latest.rev`), never for a
- * revision chosen independently -- so whatever the line above resolves to, the archive can never
- * publish a proof paired with a revision it does not certify.
+ * The proof served is looked up for the revision ACTUALLY served, never for one chosen
+ * independently, so the archive can never publish a proof paired with a revision it does not
+ * certify. (A newer revision's proof over older bytes would pass `verifyBlockCommitProofClaim` and
+ * fail `verifyBlockCommitProofContent` — strictly worse than no proof.)
  *
  * NOTE: a single-revision archive's proof is a rounding error against the wire cap. A sync
  * *response* is bounded by `MAX_BLOCK_MESSAGE_BYTES` (8 MiB — `SyncClient.requestBlock` sets the
@@ -168,8 +170,26 @@ export async function serveBlockArchive(repo: ArchiveServingRepo, blockId: Block
 	const entry = result[blockId];
 	const latest = entry?.state?.latest;
 	if (!latest) return undefined;
-	const proof = await servableProof(repo, blockId, latest);
-	return singleRevisionArchive(blockId, latest, entry.block, proof);
+	// The revision the content in hand IS. A repo that reports `materialized` (`StorageRepo`) has
+	// served the highest committed revision at or below the pin, and that — never `state.latest`,
+	// the repo's NEWEST revision — is the archive's label. A repo that does not report it (a plain
+	// `IRepo`) can only be describing its latest.
+	const served = entry.materialized ?? latest;
+	// Fail closed rather than mislabel. A served revision ABOVE the pin is never a right answer:
+	// either the repo could not say what it materialized and its latest is newer than what was
+	// asked for (so the bytes may be pinned or may not — and the only label in hand is wrong for
+	// one of them), or the repo misreported. Labelling old bytes with a newer revision's number and
+	// action id is what the asker's `saveRestored` — keyed by action id — then writes over the good
+	// copy it already holds. Serve nothing instead: every caller already handles "holds nothing",
+	// and `ensureRevision` turns it into a loud "not found during restore attempt". A served
+	// revision AT OR BELOW the pin is the block unchanged since the pin, served exactly as before.
+	if (rev !== undefined && served.rev > rev) {
+		log('serve:skip blockId=%s served=%d requested=%d latest=%d (pinned read — refusing to mislabel content)',
+			blockId, served.rev, rev, latest.rev);
+		return undefined;
+	}
+	const proof = await servableProof(repo, blockId, served);
+	return singleRevisionArchive(blockId, served, entry.block, proof);
 }
 
 /**

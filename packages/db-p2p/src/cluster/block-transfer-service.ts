@@ -62,20 +62,26 @@ export interface BlockTransferRequest {
  * defined in one place alongside {@link BlockTransferRequest.blockMeta}.
  *
  * The caller must read the block UNPINNED (no `BlockGets.context`). `state.latest` is the newest
- * revision the source holds, while `block` is materialized at `materializedRev`; those agree only
+ * revision the source holds, while `block` is the revision `materialized` names; those agree only
  * for an unpinned read. Pairing pinned (older) content with `latest` would label content with a
  * revision it is not — so the pairing is guarded below and drops the meta rather than lying.
+ *
+ * Dropping, rather than labelling the older content with its own (now known) `materialized`
+ * revision, is deliberate: a push is "here is my latest replica" — the receiver lands it as its
+ * replica and the source's `latest` is what the cohort corroborates — and no push path reads
+ * pinned, so a mismatch here is a caller bug, not a historical serve. A repair fetch of an older
+ * revision is a different wire (`serveBlockArchive`), and that one DOES label from `materialized`.
  */
 export function sourceBlockMeta(
 	blockId: BlockId,
-	result: Pick<GetBlockResult, 'state' | 'materializedRev'> | undefined
+	result: Pick<GetBlockResult, 'state' | 'materialized'> | undefined
 ): Record<string, ActionRev> | undefined {
 	const latest = result?.state?.latest;
 	if (!latest) return undefined;
-	const materializedRev = result?.materializedRev;
-	if (materializedRev !== undefined && materializedRev !== latest.rev) {
-		log('meta:skip block=%s materializedRev=%d latest=%d (pinned read — refusing to mislabel content)',
-			blockId, materializedRev, latest.rev);
+	const materialized = result?.materialized;
+	if (materialized !== undefined && materialized.rev !== latest.rev) {
+		log('meta:skip block=%s materialized=%d latest=%d (pinned read — refusing to mislabel content)',
+			blockId, materialized.rev, latest.rev);
 		return undefined;
 	}
 	return { [blockId]: { rev: latest.rev, actionId: latest.actionId } };
@@ -119,7 +125,7 @@ export type PushCertification = {
 export async function sourceBlockCertification(
 	repo: ArchiveServingRepo,
 	blockId: BlockId,
-	result: Pick<GetBlockResult, 'state' | 'materializedRev'> | undefined
+	result: Pick<GetBlockResult, 'state' | 'materialized'> | undefined
 ): Promise<PushCertification> {
 	const blockMeta = sourceBlockMeta(blockId, result);
 	if (!blockMeta) {

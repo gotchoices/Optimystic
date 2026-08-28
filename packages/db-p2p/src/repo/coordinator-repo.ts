@@ -668,7 +668,7 @@ export class CoordinatorRepo implements IRepo {
 	 * from the tail block's `latest.rev`, and `syncInternal` commits every block of an action at
 	 * `context.rev + 1` — so `context.rev >= claimedRev` is a well-defined comparison. `state.latest`
 	 * is this node's newest revision for the block even on a pinned read (StorageRepo reports the
-	 * content's own revision separately as `materializedRev`), which is exactly the number "is this
+	 * content's own revision separately as `materialized`), which is exactly the number "is this
 	 * node behind the claim?" asks about.
 	 */
 	private flagUnconfirmedCurrency(results: GetBlockResults, blockId: BlockId, context?: ActionContext): void {

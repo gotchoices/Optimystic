@@ -44,7 +44,7 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 		// `result[id]` is undefined. Destructuring that would throw a TypeError.
 		const entry = result?.[id];
 		if (entry) {
-			const { block, state, materializedRev, unavailable, unconfirmedAheadRev } = entry;
+			const { block, state, materialized, unavailable, unconfirmedAheadRev } = entry;
 			// An entry flagged `unavailable` with no block is the repo saying "I could not find
 			// out whether this exists" — an answer that must not be read as absent. Throw rather
 			// than return undefined, and record no read dependency (dependencies are recorded
@@ -85,12 +85,12 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 				// read purpose (default `value`) so a purely-structural navigation read can later be
 				// dropped from the conflict set (see ReadDependencyCollector / Theorem 5).
 				// Record the revision the content was MATERIALIZED at, not the newest the repo holds —
-				// see {@link GetBlockResult.materializedRev} for why `state.latest` is the wrong number
+				// see {@link GetBlockResult.materialized} for why `state.latest` is the wrong number
 				// and why the fallback preserves today's behaviour for repos that omit the field.
 				// Both sinks must take the SAME value: CacheSource learns it via getReadRevision on a
 				// miss-load and re-emits it on every later hit, so a split would stamp the cache
 				// differently from the collector.
-				const rev = materializedRev ?? state.latest?.rev ?? 0;
+				const rev = materialized?.rev ?? state.latest?.rev ?? 0;
 				this.collector.record(id, rev, purpose);
 				this.readRevisions.set(id, rev);
 			}

@@ -942,28 +942,46 @@ saveMaterializedBlock(block): store(structuredClone(block));
   reads of a block it falsely claims to be ahead on — cheaper than the silent-staleness it
   replaces, and revisited when commit-certificate verification can make a claim attestable.
 - **"What revision did this read observe?" is a separate field from "what revision does this repo
-  hold?"** `GetBlockResult` carries an optional `materializedRev`
-  ([`network/struct.ts`](../packages/db-core/src/network/struct.ts)): the revision the returned
-  `block` was actually materialized at. It differs from `state.latest.rev` for exactly one case — a
-  read that pins `context.rev` below the revision at which *that block* last committed, so the repo
-  serves older content than it holds. `state.latest` deliberately keeps its own meaning (the newest
+  hold?"** `GetBlockResult` carries an optional `materialized`
+  ([`network/struct.ts`](../packages/db-core/src/network/struct.ts)): the `(rev, actionId)` the
+  returned `block` actually is. It differs from `state.latest` for exactly one case — a read that
+  pins `context.rev` below the revision at which *that block* last committed, so the repo serves
+  older content than it holds. `state.latest` deliberately keeps its own meaning (the newest
   revision the answering repo holds), because other consumers depend on it: `StorageRepo.get`'s
   read-driven promotion pre-scan compares `context.committed` against it, and `CoordinatorRepo.get`
-  drives read-repair off it. Producers: `StorageRepo.get` populates it from the `actionRev` that
-  `IBlockStorage.getBlock(rev)` already returns — on the plain committed read, and on the
-  pending-overlay read as the revision of the *committed base* the pending was applied over (a
-  pending has no revision of its own). A pending-only insert — a block pended but not yet committed,
-  read back by its own writer — genuinely has no committed base, so the field is **absent** on that
-  answer rather than fabricating a revision; `TransactorSource.tryGet`'s
-  `materializedRev ?? state.latest?.rev ?? 0` fallback then records revision `0`, the honest "no
-  committed revision observed". `TestTransactor` mirrors that. `CoordinatorRepo` and `NetworkTransactor` forward peer entries
-  verbatim, and the repo protocol is plain JSON, so the field rides along untouched. The one
-  consumer is `TransactorSource.tryGet`, which records `materializedRev ?? state.latest?.rev ?? 0`
-  as the read dependency and re-emits the same number through `getReadRevision` so a `CacheSource`
-  hit stamps the cache identically. Recording `state.latest` there claimed the reader had observed
-  content it never read, and the validator's stale-read check (exact equality against the block's
-  current revision) then wrongly passed. Being optional with that fallback is what let every
-  producer that cannot report a materialized revision stay unchanged.
+  drives read-repair off it. The revision and its action id are **one field** on purpose: a site
+  that passes content on must label it with both, and two separately-optional fields could
+  disagree — which is exactly how old bytes once went out under a newer revision's number and
+  action id (see the `serveBlockArchive` bullet below). Producers: `StorageRepo.get` populates it
+  from the `actionRev` that `IBlockStorage.getBlock(rev)` already returns — on the plain committed
+  read, and on the pending-overlay read as the revision of the *committed base* the pending was
+  applied over (a pending has no revision of its own). A pending-only insert — a block pended but
+  not yet committed, read back by its own writer — genuinely has no committed base, so the field is
+  **absent** on that answer rather than fabricating a revision; `TransactorSource.tryGet`'s
+  `materialized?.rev ?? state.latest?.rev ?? 0` fallback then records revision `0`, the honest "no
+  committed revision observed". `TestTransactor` mirrors that. `CoordinatorRepo` and
+  `NetworkTransactor` forward peer entries verbatim, and the repo protocol is plain JSON, so the
+  field rides along untouched. Consumers: `TransactorSource.tryGet` records
+  `materialized?.rev ?? state.latest?.rev ?? 0` as the read dependency and re-emits the same number
+  through `getReadRevision` so a `CacheSource` hit stamps the cache identically (recording
+  `state.latest` there claimed the reader had observed content it never read, and the validator's
+  stale-read check — exact equality against the block's current revision — then wrongly passed);
+  `serveBlockArchive` labels the archive it serves with it; and `sourceBlockMeta` drops a push's
+  metadata when it disagrees with `state.latest`. Being optional with that fallback is what let
+  every producer that cannot report a materialized revision stay unchanged.
+- **A peer asked for revision N serves revision N labelled N, or serves nothing.**
+  `serveBlockArchive` ([`storage/block-archive.ts`](../packages/db-p2p/src/storage/block-archive.ts))
+  answers every block-repair fetch, and labels the archive — revision number, action id, and the
+  commit proof it looks up — from `materialized`, never from `state.latest`. The receiving side
+  (`BlockStorage.saveRestored`) stores the archive's bytes under the archive's action id, so an
+  archive that paired rev-1 bytes with rev 2's number and action id (what serving from
+  `state.latest` did) silently overwrote the asker's own good rev 2 with rev 1's content, and left
+  rev 1 unrecorded so every later read repeated the corruption. Two rules make that unrepresentable:
+  the label IS the materialized revision, and a served revision strictly above the pin is refused
+  (`undefined`, the "holds nothing" answer every caller already handles, which `ensureRevision`
+  turns into a loud "not found during restore attempt") — that arm fires only for a repo that does
+  not report `materialized` at all (a plain `IRepo` describing its latest) when that latest is newer
+  than the pin. A served revision at or below the pin is the block unchanged since the pin.
 
 ### Collection Header Blocks
 - Header blockId = collection name (deterministic)

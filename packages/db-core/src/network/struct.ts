@@ -196,19 +196,27 @@ export type GetBlockResult = {
 	block?: IBlock;
 	/** The latest and pending states of the repo that retrieved the block */
 	state: BlockActionState;
-	/** The revision the returned `block` was actually materialized at — the highest committed
-	 *  revision of THIS block at or below the caller's {@link BlockGets.context}`.rev`. Differs
-	 *  from `state.latest.rev` only for a revision-pinned read of a block that has committed
+	/** The revision the returned `block` actually IS — the `(rev, actionId)` of the highest
+	 *  committed revision of THIS block at or below the caller's {@link BlockGets.context}`.rev`.
+	 *  Differs from `state.latest` only for a revision-pinned read of a block that has committed
 	 *  further since the pin; for an unpinned read the two agree.
 	 *
-	 *  This — not `state.latest.rev` — is the revision a read observed, so it is what a read
-	 *  dependency must record (recording `latest` would claim the reader saw content it never
-	 *  read, and the validator's stale-read check would wrongly pass). `state.latest` keeps its
-	 *  own meaning: the newest revision the answering repo holds for the block.
+	 *  This — not `state.latest` — is what a read observed, so it is what a read dependency must
+	 *  record (recording `latest` would claim the reader saw content it never read, and the
+	 *  validator's stale-read check would wrongly pass), and it is the only correct label for the
+	 *  content when it is passed on (a block-repair archive, a replica push). `state.latest` keeps
+	 *  its own meaning: the newest revision the answering repo holds for the block.
 	 *
-	 *  Optional: a producer that does not know the materialized revision leaves it absent
-	 *  rather than guessing, and consumers fall back to `state.latest?.rev ?? 0`. */
-	materializedRev?: number;
+	 *  The revision and its action id are ONE field, deliberately: a site that must label content
+	 *  it is holding needs both, and two independently-optional fields could disagree — which is
+	 *  exactly the mislabel this exists to make unrepresentable (old bytes served under a newer
+	 *  revision's number and action id, which a receiver keyed by action id then writes over its
+	 *  own good copy; see `serveBlockArchive`).
+	 *
+	 *  Optional: a producer that does not know what it materialized leaves it absent rather than
+	 *  guessing, and consumers fall back to `state.latest` (read dependencies record
+	 *  `state.latest?.rev ?? 0`; a labelling site refuses to label a pinned read). */
+	materialized?: ActionRev;
 	/** Set when this repo could not determine whether the block exists — its answer is a
 	 *  guess, not an authoritative absent. Every producer that omits it (including
 	 *  TestTransactor) keeps meaning "authoritative". */

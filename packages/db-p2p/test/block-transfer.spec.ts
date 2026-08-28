@@ -681,9 +681,9 @@ describe('sourceBlockMeta', () => {
 			.to.deep.equal({ 'block-1': { rev: 7, actionId: 'a7' } });
 	});
 
-	it('agreeing materializedRev is still carried', () => {
+	it('an agreeing materialized revision is still carried', () => {
 		expect(sourceBlockMeta('block-1' as BlockId,
-			{ state: { latest: { rev: 7, actionId: 'a7' } }, materializedRev: 7 }))
+			{ state: { latest: { rev: 7, actionId: 'a7' } }, materialized: { rev: 7, actionId: 'a7' } }))
 			.to.deep.equal({ 'block-1': { rev: 7, actionId: 'a7' } });
 	});
 
@@ -691,7 +691,7 @@ describe('sourceBlockMeta', () => {
 		// Labelling rev-3 content as rev 7 would make every holder of it a false corroborator for a
 		// revision it does not hold. Dropping the meta falls the receiver back to a rev-1 replica.
 		expect(sourceBlockMeta('block-1' as BlockId,
-			{ state: { latest: { rev: 7, actionId: 'a7' } }, materializedRev: 3 }))
+			{ state: { latest: { rev: 7, actionId: 'a7' } }, materialized: { rev: 3, actionId: 'a3' } }))
 			.to.equal(undefined);
 	});
 

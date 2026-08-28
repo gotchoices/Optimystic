@@ -26,6 +26,7 @@ import type { ActionId, ActionRev, BlockId, CommitRequest, IBlock } from '@optim
 const BLOCK = 'block-1' as BlockId;
 const OTHER_BLOCK = 'block-2' as BlockId;
 const ACTION = 'action-1' as ActionId;
+const ACTION_2 = 'action-2' as ActionId;
 
 const makeBlock = (id: BlockId = BLOCK, marker = 'x'): IBlock => ({
 	header: { id, type: 'test', collectionId: 'collection-1' as BlockId },
@@ -142,32 +143,32 @@ describe('block archive commit proof', () => {
 			expect(verdict.ok, `proof must still verify after the wire, got ${JSON.stringify(verdict)}`).to.equal(true);
 		});
 
-		it('serves the proof for the revision it ACTUALLY serves, never one chosen independently', async () => {
+		it('serves the requested revision labelled as itself, with that revision\'s own proof', async () => {
 			const { repo } = makeRepo();
 			const proof1 = await landRevision(repo, { rev: 1, actionId: ACTION, block: makeBlock(BLOCK, 'one'), certified: true });
-			const proof2 = await landRevision(repo, {
-				rev: 2, actionId: 'action-2' as ActionId, block: makeBlock(BLOCK, 'two'), certified: true
-			});
+			const proof2 = await landRevision(repo, { rev: 2, actionId: ACTION_2, block: makeBlock(BLOCK, 'two'), certified: true });
 			expect(proof1).to.not.deep.equal(proof2);
 			expect(await repo.getBlockProof(BLOCK, 1), 'rev 1 keeps its own proof').to.deep.equal(proof1);
 
-			// KNOWN GAP, pinned deliberately rather than asserted away: serveBlockArchive's `rev`
-			// argument does NOT pin the read. It packs `rev` into a synthetic ActionContext, and
-			// StorageRepo.get reads only that context's `committed` list -- so a rev-1 request is
-			// answered with the repo's latest (rev 2). Pre-existing and untouched by this ticket;
-			// filed as `fix/block-archive-rev-pin-is-a-no-op`. What this ticket guarantees, and what
-			// this asserts, is that the proof always matches the revision ACTUALLY served -- so the
-			// archive can never publish a proof paired with a revision it does not certify, whichever
-			// revision the un-honoured pin ends up producing.
-			for (const requested of [undefined, 1, 2]) {
+			// A pinned request is answered with the PINNED revision — its bytes, its action id, its
+			// revision number, its proof — and an unpinned request with the latest. The proof is
+			// verified against the served CONTENT, not just the claim: rev 2's proof over rev 1's bytes
+			// would pass the claim check and fail this one, which is exactly the mislabel this pins out.
+			const expected = {
+				1: { rev: 1, actionId: ACTION, marker: 'one', proof: proof1 },
+				2: { rev: 2, actionId: ACTION_2, marker: 'two', proof: proof2 }
+			};
+			for (const requested of [undefined, 1, 2] as const) {
+				const want = expected[requested ?? 2];
 				const archive = (await serveBlockArchive(repo, BLOCK, requested))!;
 				const entry = soleEntry(archive);
-				const servedRev = archive.range[0];
-				expect(entry.proof, `rev ${servedRev} must carry its own proof`)
-					.to.deep.equal(servedRev === 1 ? proof1 : proof2);
-				const verdict = await verifyBlockCommitProofClaim(
-					entry.proof!, { blockId: BLOCK, rev: servedRev, actionId: entry.action.actionId }, PROOF_THRESHOLDS);
-				expect(verdict.ok, `served proof must certify the served revision: ${JSON.stringify(verdict)}`).to.equal(true);
+				expect(archive.range, `requested ${requested}: served revision`).to.deep.equal([want.rev, want.rev + 1]);
+				expect(entry.action.actionId, `requested ${requested}: served action`).to.equal(want.actionId);
+				expect(entry.block, `requested ${requested}: served bytes`).to.deep.equal(makeBlock(BLOCK, want.marker));
+				expect(entry.proof, `requested ${requested}: served proof`).to.deep.equal(want.proof);
+				const verdict = await verifyBlockCommitProofContent(
+					entry.proof!, { blockId: BLOCK, rev: want.rev, actionId: want.actionId }, entry.block!, PROOF_THRESHOLDS);
+				expect(verdict.ok, `served proof must certify the served content: ${JSON.stringify(verdict)}`).to.equal(true);
 			}
 		});
 
@@ -231,6 +232,82 @@ describe('block archive commit proof', () => {
 			// SyncClient.requestBlock puts on a sync RESPONSE). If a future proof shape breaks this,
 			// the per-peer cost has grown by ~100x and the NOTE needs rewriting, not the assertion.
 			expect(sizes[20]!).to.be.lessThan(MAX_BLOCK_MESSAGE_BYTES / 100);
+		});
+	});
+
+	describe('serveBlockArchive pinned to an older revision (a historical restore)', () => {
+		/**
+		 * Two repos that both landed rev 1 (`one`, ACTION) and rev 2 (`two`, ACTION_2). The asker's
+		 * `BlockStorage` restores through the server's `serveBlockArchive` — the production wiring,
+		 * minus the transport — and has been made to FORGET rev 1 (`meta.ranges` trimmed to
+		 * `[[2, 3]]`), which is exactly the state a historical read of rev 1 restores from.
+		 */
+		const askerForgettingRev1 = async () => {
+			const server = makeRepo();
+			const askerRaw = new MemoryRawStorage();
+			const asker = new StorageRepo((blockId) => new BlockStorage(
+				blockId, askerRaw, (id, rev) => serveBlockArchive(server.repo, id, rev)));
+			for (const repo of [server.repo, asker]) {
+				await landRevision(repo, { rev: 1, actionId: ACTION, block: makeBlock(BLOCK, 'one'), certified: true });
+				await landRevision(repo, { rev: 2, actionId: ACTION_2, block: makeBlock(BLOCK, 'two'), certified: true });
+			}
+			const meta = (await askerRaw.getMetadata(BLOCK))!;
+			expect(meta.latest).to.deep.equal({ rev: 2, actionId: ACTION_2 });
+			meta.ranges = [[2, 3]];
+			await askerRaw.saveMetadata(BLOCK, meta);
+			return { server: server.repo, asker, askerRaw };
+		};
+
+		it('never overwrites a revision the asker already holds (the ticket\'s corruption)', async () => {
+			// Before the fix the server answered a rev-1 request with rev 1's bytes under rev 2's
+			// number and action id, and the asker's `saveRestored` — keyed by action id — wrote those
+			// bytes over its own good rev 2. Whatever the pinned read does (serve rev 1, or fail
+			// loudly), rev 2 must be untouched afterwards.
+			const { asker, askerRaw } = await askerForgettingRev1();
+
+			await asker.get({ blockIds: [BLOCK], context: { rev: 1, committed: [] } });
+
+			expect(await askerRaw.getMaterializedBlock(BLOCK, ACTION_2), 'rev 2\'s stored bytes are still rev 2\'s')
+				.to.deep.equal(makeBlock(BLOCK, 'two'));
+			const latest = (await asker.get({ blockIds: [BLOCK] }))[BLOCK]!;
+			expect(latest.block, 'and rev 2 still reads back as rev 2').to.deep.equal(makeBlock(BLOCK, 'two'));
+			expect(latest.state.latest).to.deep.equal({ rev: 2, actionId: ACTION_2 });
+		});
+
+		it('lands the requested revision, labelled as itself, beside the one already held', async () => {
+			const { server, asker, askerRaw } = await askerForgettingRev1();
+
+			// What goes over the wire: rev 1, as rev 1.
+			const archive = (await serveBlockArchive(server, BLOCK, 1))!;
+			expect(archive.range).to.deep.equal([1, 2]);
+			expect(soleEntry(archive).action.actionId).to.equal(ACTION);
+			expect(soleEntry(archive).block).to.deep.equal(makeBlock(BLOCK, 'one'));
+
+			// What the asker ends up with: rev 1's content on a rev-1 read, rev 1 recorded as held.
+			const pinned = (await asker.get({ blockIds: [BLOCK], context: { rev: 1, committed: [] } }))[BLOCK]!;
+			expect(pinned.block, 'the pinned read serves rev 1').to.deep.equal(makeBlock(BLOCK, 'one'));
+			expect('unavailable' in pinned, 'a restored revision is a real answer').to.equal(false);
+			expect(pinned.state.latest, 'state.latest keeps meaning the newest held').to.deep.equal({ rev: 2, actionId: ACTION_2 });
+			expect((await askerRaw.getMetadata(BLOCK))!.ranges, 'rev 1 is now recorded as held').to.deep.equal([[1, 3]]);
+			expect(await askerRaw.getMaterializedBlock(BLOCK, ACTION), 'stored under its OWN action id')
+				.to.deep.equal(makeBlock(BLOCK, 'one'));
+		});
+
+		it('serves nothing rather than a mislabel when the repo cannot say what it materialized', async () => {
+			// A plain `IRepo` that reports no materialized revision can only be describing its latest.
+			// Asked for a revision BELOW that latest, the honest answer is "cannot serve" — the content
+			// may be pinned or may not, and either way the only label available would be wrong for
+			// one of them. Asked for its latest or anything above it, the latest IS the highest
+			// committed revision at or below the pin, so it is served exactly as before.
+			const latest: ActionRev = { actionId: ACTION, rev: 4 };
+			const plain = { get: async () => ({ [BLOCK]: { block: makeBlock(), state: { latest } } }) } as unknown as ArchiveServingRepo;
+
+			expect(await serveBlockArchive(plain, BLOCK, 2), 'below latest: refused').to.equal(undefined);
+			for (const requested of [undefined, 4, 7]) {
+				const archive = (await serveBlockArchive(plain, BLOCK, requested))!;
+				expect(archive.range, `requested ${requested}: latest is at or below the pin`).to.deep.equal([4, 5]);
+				expect(soleEntry(archive).action.actionId).to.equal(ACTION);
+			}
 		});
 	});
 

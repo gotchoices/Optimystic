@@ -86,14 +86,14 @@ describe('sourceBlockCertification (what a pushing node attaches)', () => {
 		const source = { rev: 4, actionId: 'a4' as ActionId };
 		await repo.saveReplicatedBlock(BLOCK, block, source, await certify(block, 4, 'a4'));
 
-		const pinned = { state: { latest: source }, materializedRev: 3 } as GetBlockResult;
+		const pinned = { state: { latest: source }, materialized: { rev: 3, actionId: 'a3' as ActionId } } as GetBlockResult;
 
 		expect(await sourceBlockCertification(repo, BLOCK, pinned),
 			'a pinned read is never labelled with latest').to.deep.equal({});
 	});
 
 	it('attaches metadata for an unpinned read that happens to sit at latest', async () => {
-		// The benign counterpart of the test above: `materializedRev` IS `latest.rev`, so the read is
+		// The benign counterpart of the test above: `materialized` IS `latest`, so the read is
 		// describing the revision it claims and both halves travel.
 		const repo = makeRepo();
 		const block = makeBlock();
@@ -101,7 +101,7 @@ describe('sourceBlockCertification (what a pushing node attaches)', () => {
 		const proof = await certify(block, 4, 'a4');
 		await repo.saveReplicatedBlock(BLOCK, block, source, proof);
 
-		const atLatest = { state: { latest: source }, materializedRev: 4 } as GetBlockResult;
+		const atLatest = { state: { latest: source }, materialized: source } as GetBlockResult;
 		const certification = await sourceBlockCertification(repo, BLOCK, atLatest);
 
 		expect(certification.blockMeta).to.deep.equal({ [BLOCK]: source });

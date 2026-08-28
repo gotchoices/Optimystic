@@ -65,8 +65,8 @@ export class TestTransactor implements ITransactor {
 
 				// Get the appropriate materialized block based on context
 				let block: IBlock | undefined;
-				// The revision `block` was actually materialized at, reported as
-				// GetBlockResult.materializedRev. Equals `latestRev` on every unpinned path; only a
+				// The revision `block` was actually materialized at, reported (with its action id) as
+				// GetBlockResult.materialized. Equals `latestRev` on every unpinned path; only a
 				// revision-pinned read of a block committed further since the pin makes them differ,
 				// and there the pinned value is what the reader observed (see the field's doc).
 				let materializedRev: number | undefined;
@@ -123,9 +123,14 @@ export class TestTransactor implements ITransactor {
 
 
 				const actionId = blockState.revisionActions.get(blockState.latestRev);
+				// The materialized revision travels WITH its action id (one field, so the pair can
+				// never disagree) — the same `(rev, actionId)` the commit recorded for it.
+				const materializedActionId = materializedRev !== undefined
+					? blockState.revisionActions.get(materializedRev) : undefined;
 				results[blockId] = {
 					block,
-					...(materializedRev !== undefined ? { materializedRev } : {}),
+					...(materializedRev !== undefined && materializedActionId !== undefined
+						? { materialized: { rev: materializedRev, actionId: materializedActionId } } : {}),
 					state: {
 						latest: actionId !== undefined ? {
 							rev: blockState.latestRev,
@@ -612,7 +617,7 @@ function newBlockState(): BlockState {
 }
 
 /** Returns the materialized block at the highest revision ≤ the given revision, together with
- *  that revision — the caller reports it as {@link GetBlockResult.materializedRev}. */
+ *  that revision — the caller reports it as {@link GetBlockResult.materialized}. */
 function latestMaterializedAt(blockState: BlockState, maxRev: number): { block: IBlock, rev: number } | undefined {
 	for (let rev = maxRev; rev >= 0; rev--) {
 		const block = blockState.materializedBlocks.get(rev);
@@ -627,7 +632,7 @@ function latestMaterializedAt(blockState: BlockState, maxRev: number): { block: 
  * An absent base is NOT a short circuit: an insert needs no base — `applyTransform` adopts it as
  * the block. Bailing out on `!block` made this double silently drop a pending-only insert read
  * through the pending overlay, the one shape `StorageRepo.get` serves with content but no
- * `materializedRev` (see docs/internals.md § the `unavailable`/`materializedRev` bullets). A
+ * `materialized` (see docs/internals.md § the `unavailable`/`materialized` bullets). A
  * pending UPDATE over an absent base still resolves to undefined, matching the real repo.
  */
 function applyTransformSafe(block: IBlock | undefined, transform: Transform): IBlock | undefined {

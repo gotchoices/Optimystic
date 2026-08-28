@@ -672,7 +672,7 @@ describe('TransactorSource', () => {
 		it('records revision 0 for content served over an absent committed base', async () => {
 			// A block pended but not yet committed, read back through its pending overlay: real
 			// content, but no committed revision under it, so the repo reports NEITHER
-			// `materializedRev` NOR `state.latest` (see GetBlockResult.materializedRev and
+			// `materialized` NOR `state.latest` (see GetBlockResult.materialized and
 			// docs/internals.md). Both sinks then fall through to 0 — the honest "no committed
 			// revision observed" — rather than fabricating a revision the node never committed.
 			// Pinned here because the fallback is what makes the absent field safe to emit; the
@@ -688,7 +688,7 @@ describe('TransactorSource', () => {
 
 			const raw = await transactor.get({ blockIds: [blockId], context: { committed: [], rev: 1, actionId: 'p1' as ActionId } });
 			expect(raw[blockId]?.block, 'the overlay serves the uncommitted content').to.not.equal(undefined);
-			expect(raw[blockId]?.materializedRev, 'no committed base ⇒ no materialized revision').to.equal(undefined);
+			expect(raw[blockId]?.materialized, 'no committed base ⇒ no materialized revision').to.equal(undefined);
 			expect(raw[blockId]?.state.latest, 'and nothing committed').to.equal(undefined);
 
 			const source = new TransactorSource<IBlock>('c', transactor, { committed: [], rev: 1, actionId: 'p1' as ActionId });

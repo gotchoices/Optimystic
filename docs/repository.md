@@ -41,10 +41,12 @@ Here is how a transaction proceeds for a given cluster:
   - `state` - Current block state including latest revision or deletion status. `state.latest` is
     the newest revision the *answering repo* holds for the block — not necessarily the revision of
     the `block` it just returned
-  - `materializedRev` - Optional; the revision the returned `block` was actually materialized at.
-    Equals `state.latest.rev` for an unpinned read; lower when a revision-pinned read serves older
+  - `materialized` - Optional; the `(rev, actionId)` the returned `block` actually is. Equals
+    `state.latest` for an unpinned read; an older revision when a revision-pinned read serves older
     content. Consumers that need "what revision did this read observe?" (read-dependency recording)
-    must use this, falling back to `state.latest.rev` only for producers that omit it
+    or must label the content when passing it on (a block-repair archive) use this, falling back to
+    `state.latest` only for producers that omit it. One field carrying both halves, so a label can
+    never pair one revision's number with another's action id
 - **Behavior**: 
   - If no context is provided, returns the latest version
   - If a revision is specified, returns the block at the highest committed revision at or below it

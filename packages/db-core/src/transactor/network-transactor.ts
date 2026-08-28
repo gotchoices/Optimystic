@@ -238,13 +238,13 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// — and only strictly-greater rank replaces, so first-arrival (the stale one)
 		// would win the very merge the retry exists to fix. Non-object junk ranks below
 		// everything so any real entry replaces it.
-		// NOTE: `materializedRev` is not part of the ranking, so two peers answering the same
+		// NOTE: `materialized` (the revision the content actually is) is not part of the ranking, so two peers answering the same
 		// pinned get with block-carrying entries at DIFFERENT materialized revisions resolve
 		// to whichever arrived first. Not a concern today — cohort peers share the block's
 		// revision log, so they agree on the highest committed rev at or below a pin — and the
 		// failure direction is safe (a lower recorded revision spuriously stale-rejects rather
 		// than wrongly accepting). If peers are ever seen to disagree here, break the tie on
-		// the HIGHEST materializedRev among top-rank entries.
+		// the HIGHEST `materialized.rev` among top-rank entries.
 		// `unavailable` answers rank among THEMSELVES by how much they establish, so the merged
 		// entry never presents a weaker doubt than some peer actually returned. This matters
 		// because the reason travels out verbatim on `BlockUnavailableError` and callers act on

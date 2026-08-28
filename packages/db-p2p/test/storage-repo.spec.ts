@@ -445,19 +445,19 @@ describe('StorageRepo', () => {
 			const latest = (await repo.get({ blockIds: [blockId] }))[blockId]!;
 			expect((latest.block as unknown as { items: string[] }).items).to.deep.equal(['v1', 'v2']);
 			expect(latest.state.latest?.rev).to.equal(2);
-			expect(latest.materializedRev, 'unpinned: materialized rev agrees with latest').to.equal(2);
+			expect(latest.materialized?.rev, 'unpinned: materialized rev agrees with latest').to.equal(2);
 
 			// Pinned read at rev 1: rev-1 content, reported as rev 1 — while `state.latest` keeps
 			// its own meaning (the newest revision this node holds), which callers rely on.
 			const pinned = (await repo.get({ blockIds: [blockId], context: { rev: 1, committed: [] } }))[blockId]!;
 			expect((pinned.block as unknown as { items: string[] }).items, 'pinned content is rev 1\'s').to.deep.equal(['v1']);
-			expect(pinned.materializedRev, 'and is reported as rev 1').to.equal(1);
+			expect(pinned.materialized?.rev, 'and is reported as rev 1').to.equal(1);
 			expect(pinned.state.latest?.rev, 'state.latest still the newest revision held').to.equal(2);
 		});
 
 		it('a pinned get of a block unchanged since the pin reports that block\'s own revision', async () => {
 			// The pin is a COLLECTION-wide revision, so it routinely sits above a given block's last
-			// change. `materializedRev` must be the block's own revision (what the descending walk
+			// change. `materialized` must be the block's own revision (what the descending walk
 			// actually served), not the pin — otherwise every unchanged block would record a
 			// dependency at a revision it was never committed at and stale-reject spuriously.
 			const aId = 'blk-A' as BlockId;
@@ -482,7 +482,7 @@ describe('StorageRepo', () => {
 			expect((await repo.commit({ actionId: 'a2' as ActionId, blockIds: [aId], tailId: aId, rev: 2 })).success).to.equal(true);
 
 			const result = await repo.get({ blockIds: [bId], context: { rev: 2, committed: [] } });
-			expect(result[bId]!.materializedRev, 'B is served from its own rev 1, not the rev-2 pin').to.equal(1);
+			expect(result[bId]!.materialized?.rev, 'B is served from its own rev 1, not the rev-2 pin').to.equal(1);
 			expect(result[bId]!.state.latest?.rev, 'and its latest is rev 1 too — the two agree here').to.equal(1);
 		});
 
@@ -518,7 +518,7 @@ describe('StorageRepo', () => {
 
 			expect((entry.block as unknown as { items: string[] }).items, 'rev-1 base with the pending applied')
 				.to.deep.equal(['v1', 'v3']);
-			expect(entry.materializedRev, 'reports the base revision, not the newest held').to.equal(1);
+			expect(entry.materialized?.rev, 'reports the base revision, not the newest held').to.equal(1);
 			expect(entry.state.latest?.rev, 'state.latest still the newest revision held').to.equal(2);
 		});
 
@@ -542,7 +542,7 @@ describe('StorageRepo', () => {
 				expect(entry.block?.header.id, `rev ${rev}: the pending insert is served`).to.equal(blockId);
 				expect((entry.block as unknown as { items: string[] }).items, `rev ${rev}: with its content`)
 					.to.deep.equal(['fresh']);
-				expect(entry.materializedRev, `rev ${rev}: no committed base ⇒ no materialized revision`)
+				expect(entry.materialized?.rev, `rev ${rev}: no committed base ⇒ no materialized revision`)
 					.to.equal(undefined);
 				expect('unavailable' in entry, `rev ${rev}: a real answer is never flagged`).to.equal(false);
 				expect(entry.state.latest, `rev ${rev}: nothing committed yet`).to.equal(undefined);
@@ -601,7 +601,7 @@ describe('StorageRepo', () => {
 
 			expect(entry.block, 'nothing to apply the update to').to.equal(undefined);
 			expect(entry.unavailable, 'an empty overlay over no base is a guess').to.equal('unmaterializable');
-			expect(entry.materializedRev, 'no base ⇒ no materialized revision').to.equal(undefined);
+			expect(entry.materialized?.rev, 'no base ⇒ no materialized revision').to.equal(undefined);
 		});
 
 		it('a promotion refusal on the context\'s OWN actionId returns a flagged entry, never a throw', async () => {
@@ -650,7 +650,7 @@ describe('StorageRepo', () => {
 
 			expect(entry.block, 'the pending delete removes the base').to.equal(undefined);
 			expect('unavailable' in entry, 'an intended tombstone is an authoritative absent').to.equal(false);
-			expect(entry.materializedRev, 'the base it was applied over is still reported').to.equal(1);
+			expect(entry.materialized?.rev, 'the base it was applied over is still reported').to.equal(1);
 		});
 
 		it('a context naming a pending this repo NEVER had still throws', async () => {
