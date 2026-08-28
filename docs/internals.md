@@ -252,8 +252,10 @@ so they survive `pruneMaterialization` (which trims superseded materialized copi
 revision records) and live exactly as long as the revision itself; no revision-delete site exists
 today. The two landing paths that skip `internalCommit` — an idempotent re-commit of the same
 `(actionId, rev)`, and a Crash-D3 block whose lost `setLatest` `recover()` redoes — back-fill a
-missing proof under the same rule. `saveReplicatedBlock` writes no proof
-(revisited by `require-proof-on-block-push`).
+missing proof under the same rule. `saveReplicatedBlock` persists a proof only when its caller
+verified it against the exact bytes being saved — the reconcile path is that caller; the
+churn/push path (`BlockTransferService`) still passes none, revisited by
+`require-proof-on-block-push`.
 
 **On the repair wires.** Both block-repair wires now carry the stored proof, so a requester can
 check a lone holder's claim with no second holder to corroborate against:
@@ -271,13 +273,26 @@ check a lone holder's claim with no second holder to corroborate against:
   it into `RevClaim.proof`.
 
 Absence stays legitimate and every consumer must behave exactly as it did before proofs existed:
-a pre-proof revision, a member whose materialization diverged, an un-upgraded peer, and **a replica
-obtained by repair** all serve none — a repaired node deliberately does not persist the proof it
-was served, because nothing has verified it and re-serving it would launder another peer's artifact
-as its own (`BlockStorage.saveRestored`).
+a pre-proof revision, a member whose materialization diverged, and an un-upgraded peer all serve
+none. A replica obtained by repair now DOES carry the proof onward — when the heal was *certified*:
+the reconcile path verified the proof against the exact bytes it persisted
+(`verifyBlockCommitProofContent` binds the declared digest to the served content), so the proof is
+retained through `saveReplicatedBlock` → `saveReplica` → `saveRestored` and certification no longer
+decays across repair hops. A corroboration-only heal persists none, and the
+`RestorationCoordinator` restore wire — which verifies nothing — strips any proof a remote archive
+attached before persistence (`BlockStorage.restoreBlock`): an unverified proof re-served as this
+node's own would launder another peer's artifact as retained evidence.
 
-Nothing DECIDES with a proof yet: `selectQuorumRev` ignores `RevClaim.proof`, so corroboration still
-counts distinct peers exactly as before. Honoring it is `accept-certified-claims-in-repair`.
+Both repair paths now DECIDE with a proof. Each runs peer-attached proofs through the shared
+certification layer (`cluster/certified-claims.ts`) — the read path in
+`CoordinatorRepo.queryClusterForLatest`, the commit-path reconcile in
+`cluster/reconcile-block.ts` — and `selectQuorumRev` / `selectQuorumBlock` weigh the resulting
+`certified` verdicts: a lone holder whose claim (and, for content, whose exact bytes) a verified
+cohort commit proof certifies is accepted where uncertified claims still need distinct-peer
+corroboration. What layer 1 proves is that the listed signers signed — NOT that they are the
+block's legitimate cohort; anchoring the signer set to the block's derived cohort is
+`feat-cluster-membership-threshold-cert-anchoring` (the `ProofAnchoring` hook is observational
+until then).
 
 ### Change Notification (Reactive Wake)
 

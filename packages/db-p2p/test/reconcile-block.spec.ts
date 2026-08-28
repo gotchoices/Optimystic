@@ -15,13 +15,16 @@
  */
 
 import { expect } from 'chai';
-import type { ActionId, ActionRev, BlockHeader, BlockId, IBlock } from '@optimystic/db-core';
+import { canonicalBlockHash } from '@optimystic/db-core';
+import type { ActionId, ActionRev, BlockHeader, BlockId, CommitRequest, IBlock } from '@optimystic/db-core';
 import type { BlockArchive } from '../src/storage/struct.js';
 import { singleRevisionArchive } from '../src/storage/block-archive.js';
 import { createReconcileBlock, type ReconcileBlockDeps } from '../src/cluster/reconcile-block.js';
 import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
 import { PenaltyReason } from '../src/reputation/types.js';
+import type { BlockCommitProof } from '../src/cluster/commit-proof.js';
 import { captureLog } from './support/capture-log.js';
+import { makeSignedProof } from './support/commit-proof-fixtures.js';
 
 const BLOCK_ID = 'reconcile-target-block' as BlockId;
 const COLLECTION_ID = 'reconcile-collection' as BlockId;
@@ -37,12 +40,12 @@ const payloadOf = (block: IBlock | undefined): string | undefined =>
 
 /** The archive a peer serves for its own latest revision — the SAME builder `SyncService` and the
  *  mesh harness serve real fetches with, so a stand-in here cannot drift from the real shape. */
-const archiveAt = (rev: number, actionId: string, block: IBlock | undefined): BlockArchive =>
-	singleRevisionArchive(BLOCK_ID, { rev, actionId: actionId as ActionId }, block);
+const archiveAt = (rev: number, actionId: string, block: IBlock | undefined, proof?: BlockCommitProof): BlockArchive =>
+	singleRevisionArchive(BLOCK_ID, { rev, actionId: actionId as ActionId }, block, proof);
 
 interface Harness {
 	reconcile: ReturnType<typeof createReconcileBlock>;
-	saved: { blockId: BlockId; block: IBlock; source: ActionRev }[];
+	saved: { blockId: BlockId; block: IBlock; source: ActionRev; proof?: BlockCommitProof }[];
 	fetches: string[];
 	penalties: { peerId: string; reason: PenaltyReason }[];
 }
@@ -57,13 +60,16 @@ const harness = (
 	const reconcile = createReconcileBlock({
 		selfPeerId: SELF,
 		simpleMajorityThreshold: THRESHOLD,
+		// Mirrors PROOF_THRESHOLDS in support/commit-proof-fixtures.ts — the fixtures sign full
+		// cohorts, so any threshold ≤ 1 passes; 0.75 is the production default.
+		superMajorityThreshold: 0.75,
 		repairCorroborationClusterSize: 2,
 		async fetchArchive(peerId) {
 			fetches.push(peerId);
 			return archives[peerId];
 		},
-		async saveReplicatedBlock(blockId, block, source) {
-			saved.push({ blockId, block, source });
+		async saveReplicatedBlock(blockId, block, source, proof) {
+			saved.push({ blockId, block, source, proof });
 		},
 		reputation: { reportPeer: (peerId, reason) => { penalties.push({ peerId, reason }); } },
 		...overrides
@@ -313,6 +319,7 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 		const reconcile = createReconcileBlock({
 			selfPeerId: SELF,
 			simpleMajorityThreshold: THRESHOLD,
+			superMajorityThreshold: 0.75,
 			repairCorroborationClusterSize: 4,
 			async fetchArchive(peerId) {
 				if (peerId === 'broken') throw new Error('stream reset');
@@ -355,5 +362,168 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 		await h.reconcile(BLOCK_ID, COMMITTED, ['p1', 'p2', 'evil']);
 
 		expect(h.saved.length, 'a reputation failure must never block restoration').to.equal(1);
+	});
+
+	/**
+	 * Ticket: certified-claims-reconcile-and-persist. The commit-path reconcile runs each
+	 * proof-carrying answer through the shared certification layer (`cluster/certified-claims.ts`)
+	 * before selection, mirroring the read path: a verified cohort commit proof stands in for
+	 * distinct-peer corroboration, and only a proof verified against the exact served bytes is
+	 * handed onward to `saveReplicatedBlock` for persistence.
+	 */
+	describe('certified claims (cohort commit proofs)', () => {
+		/** A commit for BLOCK_ID at `rev` declaring the digest of `block` (omit `block` for no digest). */
+		const commitFor = async (rev: number, actionId: string, block?: IBlock): Promise<CommitRequest> => ({
+			actionId: actionId as ActionId,
+			blockIds: [BLOCK_ID],
+			tailId: BLOCK_ID,
+			rev,
+			...(block ? { blockDigests: { [BLOCK_ID]: { digest: await canonicalBlockHash(block) } } } : {})
+		});
+
+		it('a single certified holder heals where corroboration declines, and the proof is persisted', async () => {
+			// Same shape as 'still demands two corroborators when the cohort only LOOKS two-node',
+			// except the lone holder now attaches a verified proof binding these exact bytes — the
+			// cohort's signature set IS the corroboration, so the heal lands at capacity 9.
+			const block = makeBlock('v2');
+			const { proof } = await makeSignedProof(3, await commitFor(2, 'action-2', block));
+			const h = harness(
+				{ [PEER_A]: archiveAt(2, 'action-2', block, proof) },
+				{ repairCorroborationClusterSize: 10 }
+			);
+
+			await h.reconcile(BLOCK_ID, COMMITTED, [PEER_A]);
+
+			expect(h.saved.length, 'the certified lone claim heals').to.equal(1);
+			expect(payloadOf(h.saved[0]!.block)).to.equal('v2');
+			expect(h.saved[0]!.source).to.deep.equal({ actionId: 'action-2', rev: 2 });
+			expect(h.saved[0]!.proof, 'the verified proof is persisted alongside the bytes').to.equal(proof);
+			expect(h.penalties).to.deep.equal([]);
+		});
+
+		it('rejects digest-contradicting content, penalizes the server, and still heals certified', async () => {
+			// Both peers serve the SAME valid proof (digest = the honest bytes); one serves tampered
+			// bytes under it. The liar's rev claim genuinely verified, but its bytes provably
+			// contradict the declared digest: dropped from the content quorum, penalized once, and
+			// the honest carrier's certified content wins without a second carrier.
+			const honestBlock = makeBlock('v2');
+			const { proof } = await makeSignedProof(3, await commitFor(2, 'action-2', honestBlock));
+			const h = harness(
+				{
+					honest: archiveAt(2, 'action-2', honestBlock, proof),
+					evil: archiveAt(2, 'action-2', makeBlock('tampered'), proof)
+				},
+				{ repairCorroborationClusterSize: 10 }
+			);
+
+			await h.reconcile(BLOCK_ID, COMMITTED, ['honest', 'evil']);
+
+			expect(h.saved.length, 'repair continues on the honest holder').to.equal(1);
+			expect(payloadOf(h.saved[0]!.block), 'the digest-bound content wins').to.equal('v2');
+			expect(h.saved[0]!.proof).to.equal(proof);
+			expect(h.penalties, 'the contradicting server is penalized exactly once')
+				.to.deep.equal([{ peerId: 'evil', reason: PenaltyReason.InvalidRestoration }]);
+		});
+
+		it('treats an unparseable proof as an ordinary uncertified corroborator, without penalty', async () => {
+			// `malformed-proof` is non-attributable: relayed junk, not provable misbehavior by the
+			// server. The claims still corroborate each other, so the heal lands the plain way —
+			// and no proof reaches persistence.
+			const block = makeBlock('v2');
+			const bogus = { v: 1, bogus: true } as unknown as BlockCommitProof;
+			const h = harness(
+				{
+					p1: archiveAt(2, 'action-2', block, bogus),
+					p2: archiveAt(2, 'action-2', block, bogus)
+				},
+				{ repairCorroborationClusterSize: 4 }
+			);
+
+			await h.reconcile(BLOCK_ID, COMMITTED, ['p1', 'p2']);
+
+			expect(h.saved.length, 'plain corroboration still heals').to.equal(1);
+			expect(h.penalties, 'a non-attributable proof failure penalizes nobody').to.deep.equal([]);
+			expect(h.saved[0]!.proof, 'an unverified proof is never persisted').to.equal(undefined);
+		});
+
+		it('declines on certified rev equivocation and logs the distinct incident line', async () => {
+			// Two verified proofs certify DIFFERENT actions into the same revision: the cohort (or
+			// whoever holds its keys) provably signed both sides. Neither claimant is penalized —
+			// which side is wrong is exactly what this node cannot know — and the decline logs
+			// distinctly from a routine no-quorum. Both peers serve the same bytes and each commit
+			// declares that digest, so no digest penalties muddy the assertion.
+			const block = makeBlock('v2');
+			const { proof: proofA } = await makeSignedProof(3, await commitFor(2, 'action-a', block));
+			const { proof: proofB } = await makeSignedProof(3, await commitFor(2, 'action-b', block));
+			const h = harness(
+				{
+					pa: archiveAt(2, 'action-a', block, proofA),
+					pb: archiveAt(2, 'action-b', block, proofB)
+				},
+				{ repairCorroborationClusterSize: 4 }
+			);
+
+			const captured = await captureLog('reconcile-block', async () => {
+				await h.reconcile(BLOCK_ID, COMMITTED, ['pa', 'pb']);
+			});
+
+			expect(h.saved.length, 'the whole selection declines rather than picking a side').to.equal(0);
+			expect(h.penalties, 'equivocation convicts the cohort keys, not a serving peer').to.deep.equal([]);
+			const payload = captured.find(args =>
+				typeof args[0] === 'string' && args[0].includes('reconcile:certified-equivocation'))?.[1] as
+				{ rev?: number; actionIds?: string[] } | undefined;
+			expect(payload, 'expected reconcile:certified-equivocation').to.not.equal(undefined);
+			expect(payload?.rev).to.equal(2);
+			expect(payload?.actionIds).to.have.members(['action-a', 'action-b']);
+		});
+
+		it('declines on certified content equivocation and logs both hashes', async () => {
+			// Same (rev, actionId) certified over two DIFFERENT digests, each peer serving the bytes
+			// its own proof binds: the cohort's keys signed two digests into one revision. The rev
+			// converges (both claims certified, same pair), the content declines, and the incident
+			// line names both hashes so an operator can tell it from a carrier shortfall.
+			const blockA = makeBlock('content-A');
+			const blockB = makeBlock('content-B');
+			const { proof: proofA } = await makeSignedProof(3, await commitFor(2, 'action-2', blockA));
+			const { proof: proofB } = await makeSignedProof(3, await commitFor(2, 'action-2', blockB));
+			const h = harness(
+				{
+					pa: archiveAt(2, 'action-2', blockA, proofA),
+					pb: archiveAt(2, 'action-2', blockB, proofB)
+				},
+				{ repairCorroborationClusterSize: 4 }
+			);
+
+			const captured = await captureLog('reconcile-block', async () => {
+				await h.reconcile(BLOCK_ID, COMMITTED, ['pa', 'pb']);
+			});
+
+			expect(h.saved.length, 'certified content equivocation must not resolve by luck').to.equal(0);
+			const payload = captured.find(args =>
+				typeof args[0] === 'string' && args[0].includes('reconcile:certified-content-equivocation'))?.[1] as
+				{ rev?: number; hashes?: string[] } | undefined;
+			expect(payload, 'expected reconcile:certified-content-equivocation').to.not.equal(undefined);
+			expect(payload?.rev).to.equal(2);
+			expect(payload?.hashes).to.have.members([
+				await canonicalBlockHash(blockA), await canonicalBlockHash(blockB)
+			]);
+		});
+
+		it('a corroboration-only heal persists no proof', async () => {
+			// The pre-proof shape: two proof-less peers agreeing. The heal lands exactly as before
+			// and the persistence parameter stays empty — nothing unverified may reach storage.
+			const h = harness(
+				{
+					p1: archiveAt(2, 'action-2', makeBlock('v2')),
+					p2: archiveAt(2, 'action-2', makeBlock('v2'))
+				},
+				{ repairCorroborationClusterSize: 4 }
+			);
+
+			await h.reconcile(BLOCK_ID, COMMITTED, ['p1', 'p2']);
+
+			expect(h.saved.length).to.equal(1);
+			expect(h.saved[0]!.proof, 'no certified carrier ⇒ no proof persisted').to.equal(undefined);
+		});
 	});
 });

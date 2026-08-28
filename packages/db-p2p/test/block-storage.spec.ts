@@ -3,6 +3,7 @@ import { StorageRepo } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockArchive, BlockMetadata, RestoreCallback } from '../src/storage/struct.js';
+import type { BlockCommitProof } from '../src/cluster/commit-proof.js';
 import { hashString } from '@optimystic/db-core';
 import type { BlockId, ActionId, ActionRev, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
 import { delay } from '@optimystic/db-core/test';
@@ -840,6 +841,96 @@ describe('BlockStorage checkpoint materialization sweep', () => {
 		expect(await raw.getMaterializedBlock(blockId, low3!), 'swept restored rev NOT re-cached').to.equal(undefined);
 		const low2 = await raw.getRevision(blockId, 2);
 		expect(await raw.getMaterializedBlock(blockId, low2!), 'restored floor retained').to.not.equal(undefined);
+	});
+});
+
+/**
+ * Ticket: certified-claims-reconcile-and-persist. The persistence contract for commit proofs on
+ * the replica path: `StorageRepo.saveReplicatedBlock` retains a proof its caller VERIFIED against
+ * the exact bytes (the reconcile path is that caller), a proof-less save retains none, the
+ * monotonic guard's early return keeps a held revision's proof state untouched, and the
+ * unverified restore wire (`RestorationCoordinator` → `restoreCallback`) strips any proof a
+ * remote archive attached. This layer never verifies — verification happened upstream — so a
+ * minimal cast literal stands in for a real proof and keeps the tests fast.
+ */
+describe('commit-proof persistence on the replica path', () => {
+	let raw: MemoryRawStorage;
+
+	beforeEach(() => {
+		raw = new MemoryRawStorage();
+	});
+
+	const proof = { v: 1 } as unknown as BlockCommitProof;
+
+	it('saveReplicatedBlock persists a supplied proof, retrievable by (blockId, rev)', async () => {
+		const blockId = 'block-proof-kept' as BlockId;
+		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+
+		await repo.saveReplicatedBlock(
+			blockId, makeBlock('block-proof-kept', { items: [] }),
+			{ rev: 2, actionId: 'r2' as ActionId }, proof);
+
+		// JSON round-trips through the raw store, so compare structurally, not by reference.
+		expect(await repo.getBlockProof(blockId, 2), 'the verified proof reads back for its revision')
+			.to.deep.equal(proof);
+	});
+
+	it('saveReplicatedBlock without a proof persists none', async () => {
+		const blockId = 'block-proof-none' as BlockId;
+		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+
+		await repo.saveReplicatedBlock(
+			blockId, makeBlock('block-proof-none', { items: [] }),
+			{ rev: 2, actionId: 'r2' as ActionId });
+
+		expect(await repo.getBlockProof(blockId, 2), 'a corroboration-only heal stays proof-less')
+			.to.equal(undefined);
+	});
+
+	it('monotonic-skip: a certified re-heal of a held revision does NOT backfill its proof', async () => {
+		// Pins the documented gap at saveForwardRevision's guard: the skip returns before
+		// persisting anything, so a revision that first landed proof-less keeps no proof even when
+		// a later certified heal of the SAME revision carries one. Deliberate (the revision itself
+		// is already durable; the proof is an availability optimization) — if backfill is ever
+		// added, this is the assertion to flip.
+		const blockId = 'block-proof-skip' as BlockId;
+		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const block = makeBlock('block-proof-skip', { items: [] });
+
+		await repo.saveReplicatedBlock(blockId, block, { rev: 2, actionId: 'r2' as ActionId });
+		await repo.saveReplicatedBlock(blockId, block, { rev: 2, actionId: 'r2' as ActionId }, proof);
+
+		expect(await repo.getBlockProof(blockId, 2), 'the held revision keeps its proof state')
+			.to.equal(undefined);
+	});
+
+	it('restore strips a proof the remote archive attached (unverified wire)', async () => {
+		// The RestorationCoordinator wire verifies nothing, so a proof arriving on it must never be
+		// persisted — persisting it would re-serve a hostile peer's artifact as evidence this node
+		// retained itself. Verified proofs enter storage only through saveReplica.
+		const blockId = 'block-proof-strip' as BlockId;
+		const restoredBlock = makeBlock('block-proof-strip', { items: ['restored'] });
+		const restoreCallback: RestoreCallback = async (id) => ({
+			blockId: id,
+			revisions: {
+				1: {
+					action: { actionId: 'restored-action' as ActionId, rev: 1, transform: { insert: restoredBlock } },
+					block: restoredBlock,
+					proof
+				}
+			},
+			range: [1, 2]
+		});
+
+		const storage = new BlockStorage(blockId, raw, restoreCallback);
+		// Seed pending-only metadata (ranges: []) so getBlock(1) misses coverage and restores.
+		await storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-proof-strip') });
+
+		const result = await storage.getBlock(1);
+
+		expect(result?.block.header.id, 'the restore itself succeeded').to.equal('block-proof-strip');
+		expect(await storage.getBlockProof(1), 'the unverified proof was stripped, not persisted')
+			.to.equal(undefined);
 	});
 });
 
