@@ -1,5 +1,6 @@
 import type { BlockId, IBlock, Transform, ActionId, ActionRev, ActionTransform } from "@optimystic/db-core";
 import { Latches, applyTransform, hashString } from "@optimystic/db-core";
+import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
 import { mergeRanges } from "./helpers.js";
@@ -94,6 +95,14 @@ export class BlockStorage implements IBlockStorage {
 
 	async getTransaction(actionId: ActionId): Promise<Transform | undefined> {
 		return await this.storage.getTransaction(this.blockId, actionId);
+	}
+
+	async getBlockProof(rev: number): Promise<BlockCommitProof | undefined> {
+		return await this.storage.getBlockProof(this.blockId, rev);
+	}
+
+	async saveBlockProof(rev: number, proof: BlockCommitProof): Promise<void> {
+		await this.storage.saveBlockProof(this.blockId, rev, proof);
 	}
 
 	async getPendingTransaction(actionId: ActionId): Promise<Transform | undefined> {

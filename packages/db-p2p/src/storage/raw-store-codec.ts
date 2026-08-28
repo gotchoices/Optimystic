@@ -36,6 +36,20 @@ export function encodeActionId(actionId: ActionId): Uint8Array {
 	return encoder.encode(actionId);
 }
 
+/**
+ * Synthetic action-id key under which a revision's `BlockCommitProof` is stored in the
+ * TRANSACTIONS store. `~proof:` is a RESERVED action-id namespace: real action ids are hashes /
+ * prefixed forms (`tx:<hash>`, `stamp:<hash>`, `inv:<...>`) and never start with `~`, and nothing
+ * enumerates the transactions store (there is no `listTransactions`; `recover()` and
+ * `materializeBlock` only probe action ids read from the REVISIONS store), so the synthetic key can
+ * never leak into real flows. Riding the transactions store means every existing `RawStoreDriver`
+ * backend persists proofs with zero driver changes — the FS driver already percent-encodes `:` in
+ * action-id filenames, so the key round-trips on every backend.
+ */
+export function blockProofActionKey(rev: number): ActionId {
+	return `~proof:${rev}` as ActionId;
+}
+
 /** Decode UTF-8 bytes back into an `ActionId` string. */
 export function decodeActionId(bytes: Uint8Array): ActionId {
 	return decoder.decode(bytes) as ActionId;

@@ -1,4 +1,5 @@
 import type { BlockId, ActionId, ActionRev, Transform, IBlock } from "@optimystic/db-core";
+import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockMetadata } from "./struct.js";
 
 export interface IRawStorage {
@@ -20,6 +21,17 @@ export interface IRawStorage {
 
 	getTransaction(blockId: BlockId, actionId: ActionId): Promise<Transform | undefined>;
 	saveTransaction(blockId: BlockId, actionId: ActionId, transform: Transform): Promise<void>;
+
+	/**
+	 * The commit proof stored for a revision, if one was retained. Keyed by revision: the proof lives
+	 * and dies with the REVISION record, not the materialization, so the checkpoint sweep
+	 * (`pruneSupersededMaterialization`) never touches it — that is what lets it outlive the
+	 * 60-second in-memory commit-cert TTL. Whatever deletes a revision record must delete its proof;
+	 * no such site exists today (`RawStoreDriver` has no revision delete at all — invalidations write
+	 * compensating FORWARD revisions), so this is a contract note, not a wired path.
+	 */
+	getBlockProof(blockId: BlockId, rev: number): Promise<BlockCommitProof | undefined>;
+	saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof): Promise<void>;
 
 	// Block materialization operations
 	getMaterializedBlock(blockId: BlockId, actionId: ActionId): Promise<IBlock | undefined>;

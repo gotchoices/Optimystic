@@ -1,4 +1,5 @@
 import type { IBlock, Transform, ActionId, ActionRev } from "@optimystic/db-core";
+import type { BlockCommitProof } from "../cluster/commit-proof.js";
 
 /** Interface for block-level storage operations */
 export interface IBlockStorage {
@@ -16,6 +17,12 @@ export interface IBlockStorage {
 
     /** Gets an action by ID */
     getTransaction(actionId: ActionId): Promise<Transform | undefined>;
+
+    /** The commit proof stored for a revision, if one was retained (see IRawStorage.getBlockProof). */
+    getBlockProof(rev: number): Promise<BlockCommitProof | undefined>;
+
+    /** Persists the commit proof for a revision (see IRawStorage.saveBlockProof). */
+    saveBlockProof(rev: number, proof: BlockCommitProof): Promise<void>;
 
     /** Gets a pending action by ID */
     getPendingTransaction(actionId: ActionId): Promise<Transform | undefined>;

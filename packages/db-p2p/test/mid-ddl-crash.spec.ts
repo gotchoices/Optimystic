@@ -4,6 +4,7 @@ import { createMesh, buildNetworkTransactor, type Mesh, type MeshOptions } from 
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { IRawStorage } from '../src/storage/i-raw-storage.js';
 import type { BlockMetadata } from '../src/storage/struct.js';
+import type { BlockCommitProof } from '../src/cluster/commit-proof.js';
 
 /**
  * Fault-injection tests for mid-DDL / mid-transaction crash recovery.
@@ -119,6 +120,12 @@ class CrashingRawStorage implements IRawStorage {
 	}
 	getTransaction(blockId: BlockId, actionId: ActionId) {
 		return this.invoke('getTransaction', [blockId, actionId], blockId, actionId, () => this.inner.getTransaction(blockId, actionId));
+	}
+	getBlockProof(blockId: BlockId, rev: number) {
+		return this.invoke('getBlockProof', [blockId, rev], blockId, undefined, () => this.inner.getBlockProof(blockId, rev));
+	}
+	saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof) {
+		return this.invoke('saveBlockProof', [blockId, rev, proof], blockId, undefined, () => this.inner.saveBlockProof(blockId, rev, proof));
 	}
 	saveTransaction(blockId: BlockId, actionId: ActionId, transform: Transform) {
 		return this.invoke('saveTransaction', [blockId, actionId, transform], blockId, actionId, () => this.inner.saveTransaction(blockId, actionId, transform));

@@ -433,7 +433,11 @@ export async function createLibp2pNodeBase(
 			return await target.cancel(trxRef, options);
 		},
 		async commit(request, options) {
-			const target = coordinatedRepo ?? storageRepo;
+			// Widen to IRepo: `coordinatedRepo ?? storageRepo` is `IRepo | StorageRepo`, and
+			// StorageRepo.commit's extra optional proof parameter (ICommitProofPersister) makes the
+			// union's synthesized call signature reject the plain repo-level request. This proxy is
+			// the plain IRepo seam — no proof flows through it.
+			const target: IRepo = coordinatedRepo ?? storageRepo;
 			return await target.commit(request, options);
 		}
 	};

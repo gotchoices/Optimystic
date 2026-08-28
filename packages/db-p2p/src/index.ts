@@ -3,6 +3,7 @@ export * from "./cluster/client-signature-verifier.js";
 export * from "./cluster/cluster-repo.js";
 export * from "./cluster/cluster-policy.js";
 export * from "./cluster/commit-cert.js";
+export * from "./cluster/commit-proof.js";
 export * from "./cluster/service.js";
 export * from "./cluster/rebalance-monitor.js";
 export * from "./cluster/spread-on-churn.js";

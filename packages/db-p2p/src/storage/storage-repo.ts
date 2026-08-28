@@ -13,6 +13,7 @@ import {
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
 import type { IBlockReplicaStore } from "../cluster/block-transfer-service.js";
+import { proofDeclaredDigest, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('storage-repo');
@@ -106,7 +107,20 @@ export interface ICommitDigestPreviewer {
 	previewCommitDigest(blockId: BlockId, actionId: ActionId, rev: number): Promise<CommitDigestPreview | undefined>;
 }
 
-export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaStore, ICommitDigestPreviewer {
+/**
+ * The capability `ClusterMember.applyConsensusOperation` casts its `storageRepo` to when handing a
+ * {@link BlockCommitProof} down the commit path. Named for the same reason as
+ * {@link ICommitDigestPreviewer}: one definition of the widened contract, and something a repo
+ * decorator can `implements` and forward. `IRepo.commit` takes two arguments; the third is
+ * harmless at runtime for a plain `IRepo` implementation (the extra argument is ignored), so
+ * callers cast rather than structurally probe — but a decorator that narrows back to `IRepo`
+ * silently stops persisting proofs on that node.
+ */
+export interface ICommitProofPersister {
+	commit(request: CommitRequest, options?: MessageOptions, proof?: BlockCommitProof): Promise<CommitResult>;
+}
+
+export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ICommitProofPersister {
 	private readonly validatePend?: PendValidationHook;
 	/** Per-collection change listeners; empty sets are pruned on unsubscribe. */
 	private readonly changeListeners = new Map<CollectionId, Set<CollectionChangeListener>>();
@@ -567,7 +581,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 * its `cancel` therefore still strands the record; that is pre-existing and orthogonal to the
 	 * divergence split above.
 	 */
-	async commit(request: CommitRequest, _options?: MessageOptions): Promise<CommitResult> {
+	async commit(request: CommitRequest, _options?: MessageOptions, proof?: BlockCommitProof): Promise<CommitResult> {
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
 		const uniqueBlockIds = Array.from(new Set(request.blockIds)).sort();
 		const releases: (() => void)[] = [];
@@ -614,6 +628,19 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				if (latest && latest.rev >= request.rev) {
 					if (latest.rev === request.rev && latest.actionId === request.actionId) {
 						// Idempotent no-op for this block — already committed with this exact (actionId, rev).
+						// A retry can carry a proof the original commit lacked (or crashed before writing):
+						// back-fill it, strictly additively, under the same digest-match retention rule the
+						// original commit applies. Runs inside the latched critical section. getBlock can
+						// throw on an unmaterializable base — treated as "no local content" (proof withheld).
+						if (proof !== undefined && await storage.getBlockProof(request.rev) === undefined) {
+							let committedBlock: IBlock | undefined;
+							try {
+								committedBlock = (await storage.getBlock(request.rev))?.block;
+							} catch {
+								committedBlock = undefined;
+							}
+							await this.persistProofIfContentMatches(blockId, request.actionId, request.rev, storage, proof, committedBlock);
+						}
 						continue;
 					}
 					staleAt = highestStaleAt([staleAt, { blockId, rev: latest.rev }]);
@@ -736,7 +763,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				}
 				try {
 					// internalCommit will throw if it encounters an issue
-					const collectionId = await this.internalCommit(blockId, request.actionId, request.rev, storage);
+					const collectionId = await this.internalCommit(blockId, request.actionId, request.rev, storage, proof);
 					if (collectionId !== undefined) {
 						const list = collectionBlocks.get(collectionId) ?? [];
 						list.push(blockId);
@@ -940,7 +967,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		return { digest, baseRev, baseIndependent };
 	}
 
-	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage): Promise<CollectionId | undefined> {
+	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage, proof?: BlockCommitProof): Promise<CollectionId | undefined> {
 		// Note: This method is called under the per-block commit latch — by commit() (within its
 		// locked critical section) and by the read-driven promotion in get() (which now takes the
 		// same latch). So, operations like getPendingTransaction, getLatest, getBlock,
@@ -987,6 +1014,15 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// Update latest revision *last*
 		await storage.setLatest({ actionId, rev });
 
+		// Persist the cohort's commit proof AFTER the commit is durably latest — the proof is
+		// evidence about a landed revision, never a precondition of landing it. The retention rule
+		// (persist only when the LOCAL materialization matches the digest the commit op declared)
+		// and its failure logging live in the shared helper; a proof-persist fault must not fail a
+		// commit that already landed, so the helper never throws.
+		if (proof !== undefined) {
+			await this.persistProofIfContentMatches(blockId, actionId, rev, storage, proof, newBlock);
+		}
+
 		// Prune the now-superseded prior materialization (checkpoint retention). Runs LAST — after the
 		// new rev's materialization + revision + transform + setLatest are all durable — so no crash
 		// point can leave a rev unrecoverable: a crash BEFORE this leaves a redundant (harmless)
@@ -1008,6 +1044,55 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// Either may be absent only for a malformed/headerless block — return
 		// undefined so the caller skips it rather than emitting a bogus event.
 		return newBlock?.header.collectionId ?? priorBlock?.header.collectionId;
+	}
+
+	/**
+	 * The single retention rule for {@link BlockCommitProof}s, shared by the fresh-commit site
+	 * ({@link internalCommit}, after `setLatest`) and the idempotent-retry back-fill in
+	 * {@link commit}'s already-done partition:
+	 *
+	 * > **A member persists the proof only when its own materialization matches the digest the
+	 * > commit operation declared for this block.**
+	 *
+	 * One rule covers every awkward case without a second flag: a DIVERGED member (committed onto a
+	 * lagging base) computes a different hash, stores no proof, and falls back to corroboration
+	 * exactly as today — the `commit:proof-digest-mismatch` log line is also the first signal this
+	 * system has ever had that a member diverged. A member that abstained at vote time still checks
+	 * here (by commit time it HAS materialized) and legitimately keeps the proof on agreement. A
+	 * tombstone (no `block`) and a commit with no `blockDigests` (pre-upgrade client) declare no
+	 * digest and store no proof (`commit:proof-undeclared`).
+	 *
+	 * Never throws: the commit this proof describes already durably landed, so a proof-persist
+	 * fault must not turn `commit()` into `success:false` for a landed commit — it is logged and
+	 * the proof simply is not retained (repair falls back to corroboration).
+	 */
+	private async persistProofIfContentMatches(
+		blockId: BlockId,
+		actionId: ActionId,
+		rev: number,
+		storage: IBlockStorage,
+		proof: BlockCommitProof,
+		block: IBlock | undefined
+	): Promise<void> {
+		try {
+			const declaredDigest = proofDeclaredDigest(proof, { blockId, rev, actionId });
+			if (declaredDigest === undefined) {
+				log('commit:proof-undeclared blockId=%s rev=%d actionId=%s', blockId, rev, actionId);
+				return;
+			}
+			// A digest was declared but this node materialized nothing (tombstone / unmaterializable
+			// read on the back-fill path): the local content provably is not the declared content.
+			const localDigest = block === undefined ? undefined : await canonicalBlockHash(block);
+			if (localDigest !== declaredDigest) {
+				log('commit:proof-digest-mismatch blockId=%s rev=%d actionId=%s declared=%s local=%s',
+					blockId, rev, actionId, declaredDigest, localDigest);
+				return;
+			}
+			await storage.saveBlockProof(rev, proof);
+		} catch (err) {
+			log('commit:proof-persist-failed blockId=%s rev=%d actionId=%s error=%s', blockId, rev, actionId,
+				err instanceof Error ? err.message : String(err));
+		}
 	}
 
 	/**

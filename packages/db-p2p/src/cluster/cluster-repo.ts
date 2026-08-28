@@ -17,7 +17,8 @@ import type { FretService } from "p2p-fret";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
-import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister } from "../storage/storage-repo.js";
+import { buildBlockCommitProof } from "./commit-proof.js";
 import { RECONCILE_TIMEOUT_MS } from "./reconcile-block.js";
 
 const log = createLogger('cluster-member')
@@ -1521,9 +1522,23 @@ export class ClusterMember implements ICluster {
 				const commitSignedPayload = clusterVoteSigningPayload(await this.computeCommitHash(record), 'approve');
 				this.captureCommitCert(record, commit.actionId, commitSignedPayload);
 			}
+			// Project the consensus record into a durable BlockCommitProof and hand it down the commit
+			// path — StorageRepo persists it only where the local materialization matches the declared
+			// digest (see persistProofIfContentMatches). A cheap projection (no hashing/signing).
+			// `undefined` for a v1 / unversioned record: its hashes bind no peer set, so it is never
+			// certifiable — logged so an operator can see why a cohort retains no proofs. The cast is the
+			// named ICommitProofPersister contract; a plain IRepo mock ignores the extra argument.
+			const proof = buildBlockCommitProof(record);
+			if (proof === undefined) {
+				log('cluster-member:commit-proof-skipped', {
+					messageHash,
+					actionId: commit.actionId,
+					membershipVersion: record.membershipVersion
+				});
+			}
 			let result: CommitResult;
 			try {
-				result = await this.storageRepo.commit(commit);
+				result = await (this.storageRepo as IRepo & ICommitProofPersister).commit(commit, undefined, proof);
 			} catch (err) {
 				// `StorageRepo.commit` throws (rather than returning success:false) when
 				// the pending action is missing — the canonical "behind" signal: this

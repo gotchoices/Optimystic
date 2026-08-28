@@ -209,6 +209,17 @@ export async function verifyBlockCommitProofContent(
 	return verdict;
 }
 
+/**
+ * The digest `proof.message`'s commit operation declares for the claimed block, or `undefined`
+ * when the claim resolves no commit op or the op carries no digest for that block id. This is the
+ * SAME op resolution {@link verifyBlockCommitProofClaim}'s claim step uses, so the digest the
+ * storage layer's retention rule compares against (persist only when the local materialization
+ * matches) can never drift from the digest a later verifier extracts.
+ */
+export function proofDeclaredDigest(proof: BlockCommitProof, claim: ProofClaim): string | undefined {
+	return findClaimedCommitOp(proof.message, claim)?.blockDigests?.[claim.blockId]?.digest;
+}
+
 /** A plain-object (non-array) map of votes — the shape `promises` / `commits` must have. */
 function isVoteMap(value: unknown): value is Record<string, Signature> {
 	return value !== null && typeof value === 'object' && !Array.isArray(value);

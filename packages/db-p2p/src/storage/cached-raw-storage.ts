@@ -104,6 +104,9 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 	}
 
 	async putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void> {
+		// Block commit proofs also cross here (`~proof:<rev>` keys — see blockProofActionKey): the
+		// decode types a BlockCommitProof as a Transform, which is a harmless JSON passthrough — the
+		// inner storage re-encodes the same object graph byte-identically.
 		await this.inner.saveTransaction(blockId, actionId, decodeJson(value));
 	}
 

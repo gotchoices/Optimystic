@@ -1,8 +1,9 @@
 import type { BlockId, ActionId, ActionRev, Transform, IBlock } from "@optimystic/db-core";
+import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockMetadata } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
 import type { RawStoreDriver } from "./raw-store-driver.js";
-import { encodeJson, decodeJson, encodeActionId, decodeActionId } from "./raw-store-codec.js";
+import { encodeJson, decodeJson, encodeActionId, decodeActionId, blockProofActionKey } from "./raw-store-codec.js";
 
 /**
  * Shared ordered-KV storage kernel. Implements the full {@link IRawStorage}
@@ -109,6 +110,17 @@ export class KvRawStorage implements IRawStorage {
 
 	async saveTransaction(blockId: BlockId, actionId: ActionId, transform: Transform): Promise<void> {
 		await this.driver.putTransaction(blockId, actionId, encodeJson(transform));
+	}
+
+	// --- Commit proofs (ride the transactions store under a reserved key — see blockProofActionKey) ---
+
+	async getBlockProof(blockId: BlockId, rev: number): Promise<BlockCommitProof | undefined> {
+		const bytes = await this.driver.getTransaction(blockId, blockProofActionKey(rev));
+		return bytes === undefined ? undefined : decodeJson<BlockCommitProof>(bytes);
+	}
+
+	async saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof): Promise<void> {
+		await this.driver.putTransaction(blockId, blockProofActionKey(rev), encodeJson(proof));
 	}
 
 	// --- Materialized blocks ---
