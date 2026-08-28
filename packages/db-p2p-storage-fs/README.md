@@ -3,7 +3,8 @@
 Node.js filesystem storage backend for Optimystic peers. Provides:
 
 - **`FileRawStorage`** — implements `IRawStorage` so a Node peer persists block
-  metadata, revisions, pending transactions, committed transactions, and
+  metadata, revisions, pending transactions, committed transactions, commit
+  proofs, and
   materialized blocks durably across restarts.
 - **`FileKVStore`** — implements `IKVStore` for the persistent transaction state
   used to recover crashed two-phase commits.
@@ -56,6 +57,7 @@ give them separate `basePath`s if you cannot guarantee that.
     revs/<rev>.json          — ActionId for that revision number
     pend/<id>.json           — pending Transform (two-phase commit, before promotion)
     actions/<id>.json        — committed Transform
+    proofs/<rev>.json        — BlockCommitProof retained for that revision
     blocks/<id>.json         — materialized IBlock snapshot
   <key-segment>/
     <key-segment>.json       — FileKVStore value; key "/" separators become subdirectories

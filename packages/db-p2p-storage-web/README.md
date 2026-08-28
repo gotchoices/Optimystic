@@ -3,7 +3,8 @@
 IndexedDB-backed storage backend for Optimystic browser peers. Provides:
 
 - **`IndexedDBRawStorage`** — implements `IRawStorage` so a browser node persists
-  block metadata, revisions, pending transactions, committed transactions, and
+  block metadata, revisions, pending transactions, committed transactions,
+  commit proofs, and
   materialized blocks across page reloads.
 - **`IndexedDBKVStore`** — implements `IKVStore` for the persistent transaction
   state used to recover crashed two-phase commits.
@@ -59,9 +60,9 @@ layer parallelises naturally.
 ## Persistence semantics
 
 The package opens a single IndexedDB database (`optimystic` by default) with
-six object stores. `IndexedDBRawStorage` is a thin shell over the shared
+seven object stores. `IndexedDBRawStorage` is a thin shell over the shared
 `KvRawStorage` kernel driven by an `IndexedDBStoreDriver`: the kernel owns all
-JSON/UTF-8 serialization, so the five block-storage stores now hold opaque
+JSON/UTF-8 serialization, so the six block-storage stores now hold opaque
 kernel-encoded `Uint8Array` bytes rather than live objects. The keys and the
 logical types the kernel decodes them back into are unchanged:
 
@@ -71,6 +72,7 @@ logical types the kernel decodes them back into are unchanged:
 | `revisions`    | `[blockId, rev]`     | `Uint8Array` | `ActionId`             |
 | `pending`      | `[blockId, actionId]`| `Uint8Array` | `Transform`            |
 | `transactions` | `[blockId, actionId]`| `Uint8Array` | `Transform`            |
+| `proofs`       | `[blockId, rev]`     | `Uint8Array` | `BlockCommitProof`     |
 | `materialized` | `[blockId, actionId]`| `Uint8Array` | `IBlock`               |
 | `kv`           | `key`                | `string` or `Uint8Array` | — (not kernel-backed) |
 

@@ -80,12 +80,21 @@ export function blockIdFromMetadataKey(key: Uint8Array): string {
 	return textDecoder.decode(key.subarray(5, 5 + blockIdLen));
 }
 
-export function revisionKey(blockId: string, rev: number): Uint8Array {
-	const envelope = encodeBlockEnvelope(TAG_REVISIONS, blockId);
+/**
+ * `tag || len(blockId) || blockId || rev (8 BE)`. The fixed-width big-endian suffix is
+ * what makes a rev-keyed store scan in numeric order; `revisionFromKey` decodes it back.
+ * Shared by every rev-keyed store so their encodings cannot drift apart.
+ */
+function revScopedKey(tag: number, blockId: string, rev: number): Uint8Array {
+	const envelope = encodeBlockEnvelope(tag, blockId);
 	const out = new Uint8Array(envelope.length + 8);
 	out.set(envelope, 0);
 	new DataView(out.buffer, out.byteOffset).setBigUint64(envelope.length, BigInt(rev), false);
 	return out;
+}
+
+export function revisionKey(blockId: string, rev: number): Uint8Array {
+	return revScopedKey(TAG_REVISIONS, blockId, rev);
 }
 
 /** Decode the trailing 8-byte big-endian rev from a `revisionKey`-encoded key. */
@@ -108,11 +117,7 @@ export function transactionKey(blockId: string, actionId: string): Uint8Array {
  * action id is chosen by whoever originates a write (see `RawStoreDriver.getProof`).
  */
 export function proofKey(blockId: string, rev: number): Uint8Array {
-	const envelope = encodeBlockEnvelope(TAG_PROOFS, blockId);
-	const out = new Uint8Array(envelope.length + 8);
-	out.set(envelope, 0);
-	new DataView(out.buffer, out.byteOffset).setBigUint64(envelope.length, BigInt(rev), false);
-	return out;
+	return revScopedKey(TAG_PROOFS, blockId, rev);
 }
 
 export function materializedKey(blockId: string, actionId: string): Uint8Array {

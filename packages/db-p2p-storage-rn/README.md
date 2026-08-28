@@ -6,7 +6,7 @@ on-device LevelDB. Provides:
 
 - **`LevelDBRawStorage`** — implements `IRawStorage` so an RN node persists
   block metadata, revisions, pending transactions, committed transactions,
-  and materialized blocks.
+  commit proofs, and materialized blocks.
 - **`LevelDBKVStore`** — implements `IKVStore` for the persistent
   transaction state used to recover crashed two-phase commits.
 - **`loadOrCreateRNPeerKey`** — generates an Ed25519 libp2p private key on

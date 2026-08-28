@@ -5,10 +5,10 @@ Android, native — not React Native). Provides:
 
 - **`SqliteRawStorage`** — the `IRawStorage` a NativeScript node uses to
   persist block metadata, revisions, pending transactions, committed
-  transactions, and materialized blocks across app restarts. It is a thin
-  shell over the shared `KvRawStorage` kernel driven by `SqliteStoreDriver`:
-  the kernel owns all JSON serialization, the driver maps the five logical
-  stores onto the five SQLite tables.
+  transactions, commit proofs, and materialized blocks across app restarts.
+  It is a thin shell over the shared `KvRawStorage` kernel driven by
+  `SqliteStoreDriver`: the kernel owns all JSON serialization, the driver
+  maps the six logical stores onto the six SQLite tables.
 - **`SqliteKVStore`** — implements `IKVStore` for the persistent transaction
   state used to recover crashed two-phase commits.
 - **`loadOrCreateNSPeerKey`** — generates an Ed25519 libp2p private key on
@@ -75,7 +75,7 @@ the mutex to preserve read concurrency.
 ## Persistence model
 
 The package opens a single SQLite database (`optimystic.sqlite` by default
-in the NativeScript app's documents directory) with six tables. The five
+in the NativeScript app's documents directory) with seven tables. The six
 block-storage tables keep their original columns and keys, but their value
 columns are now **BLOB**: `SqliteStoreDriver` binds/reads the kernel's raw
 `Uint8Array` bytes and the shared `KvRawStorage` kernel owns the JSON/UTF-8
@@ -90,6 +90,7 @@ into; keys stay TEXT/INTEGER.
 | `revisions`    | `(block_id, rev)`                | `BLOB` (`action_id` col) | `ActionId`     |
 | `pending`      | `(block_id, action_id)`          | `BLOB`       | `Transform`            |
 | `transactions` | `(block_id, action_id)`          | `BLOB`       | `Transform`            |
+| `proofs`       | `(block_id, rev)`                | `BLOB`       | `BlockCommitProof`     |
 | `materialized` | `(block_id, action_id)`          | `BLOB`       | `IBlock`               |
 | `kv`           | `key`                            | `s_val` (TEXT) or `b_val` (BLOB) | — (not kernel-backed) |
 

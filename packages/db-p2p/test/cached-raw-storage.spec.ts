@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import type { BlockId, ActionId, IBlock, Transform } from '@optimystic/db-core';
-import { runRawStorageConformance } from '../src/testing/raw-storage-conformance.js';
+import { makeProof, runRawStorageConformance } from '../src/testing/raw-storage-conformance.js';
 import type { RawStoreDriver } from '../src/storage/raw-store-driver.js';
 import { KvRawStorage } from '../src/storage/kv-raw-storage.js';
 import { MemoryStoreDriver } from '../src/storage/memory-store-driver.js';
@@ -209,6 +209,25 @@ describe('CachedStoreDriver coherence', () => {
 		expect(await storage.getMaterializedBlock(blockId, 'a1' as ActionId)).to.equal(undefined);
 		expect(await storage.getMaterializedBlock(blockId, 'a1' as ActionId)).to.equal(undefined);
 		expect(counting.count('getMaterialized'), 'funnelled delete = proven absence, no fall-through').to.equal(0);
+	});
+
+	// Proofs are a deliberate PASSTHROUGH (see the NOTE at CachedStoreDriver.getProof): they get no
+	// cache namespace, so every read must reach the inner driver. Pinned so that adding a proofs
+	// namespace without coherence rules — the way the transactions store incidentally cached proofs
+	// before they got their own keyspace — fails here rather than going unnoticed.
+	it('proofs are never cached: every read reaches the inner driver', async () => {
+		const { counting, storage } = makeCounted();
+		await storage.saveBlockProof(blockId, 1, makeProof('pass'));
+		expect(counting.count('putProof'), 'the write goes straight through').to.equal(1);
+
+		expect((await storage.getBlockProof(blockId, 1))!.messageHash).to.equal('hash-pass');
+		expect((await storage.getBlockProof(blockId, 1))!.messageHash).to.equal('hash-pass');
+		expect(counting.count('getProof'), 'a write-through cache would have served these').to.equal(2);
+
+		// Absence is not cached either — a repeated miss still costs an inner read each time.
+		expect(await storage.getBlockProof(blockId, 2)).to.equal(undefined);
+		expect(await storage.getBlockProof(blockId, 2)).to.equal(undefined);
+		expect(counting.count('getProof')).to.equal(4);
 	});
 
 	it('pending list: one enumeration seeds completeness; funnelled writes maintain it', async () => {

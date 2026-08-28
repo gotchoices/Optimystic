@@ -34,12 +34,12 @@ const makeInsertTransforms = (blockId: BlockId, block: IBlock): Transforms => ({
 });
 
 /**
- * A structurally-valid {@link BlockCommitProof} carrying a recognizable marker. The
- * conformance suite never verifies a proof (that is `commit-proof.spec.ts`); it only
- * asserts the proofs STORE round-trips a proof-shaped object and keeps it in its own
- * keyspace, so the votes are deliberately empty.
+ * A structurally-valid {@link BlockCommitProof} carrying a recognizable marker. Storage-level
+ * suites never VERIFY a proof (that is `commit-proof.spec.ts`); they only assert the proofs
+ * store round-trips a proof-shaped object and keeps it in its own keyspace, so the votes are
+ * deliberately empty. Exported so every proofs-store suite shares one shape.
  */
-const makeProof = (marker: string): BlockCommitProof => ({
+export const makeProof = (marker: string): BlockCommitProof => ({
 	v: 1,
 	messageHash: `hash-${marker}`,
 	message: { operations: [] } as unknown as BlockCommitProof['message'],

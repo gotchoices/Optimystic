@@ -285,6 +285,7 @@ class BlockStorage implements IBlockStorage {
 │   ├── revs/{rev}.json          # Revision → ActionId mappings
 │   ├── pend/{actionId}.json     # Pending actions
 │   ├── actions/{actionId}.json  # Committed actions
+│   ├── proofs/{rev}.json        # Retained BlockCommitProof per revision
 │   └── blocks/{actionId}.json   # Materialized blocks
 ```
 

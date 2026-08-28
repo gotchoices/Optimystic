@@ -3,7 +3,7 @@ import type { ActionId, BlockId, IBlock, Transforms } from '@optimystic/db-core'
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
-import type { BlockCommitProof } from '../src/cluster/commit-proof.js';
+import { makeProof } from '../src/testing/raw-storage-conformance.js';
 
 /**
  * Regression guard for `reserved-proof-key-collides-with-client-action-ids`.
@@ -30,18 +30,6 @@ const insertTransforms = (blockId: BlockId, block: IBlock): Transforms => ({
 	inserts: { [blockId]: block },
 	updates: {},
 	deletes: []
-});
-
-/** Proof-shaped, never verified here — these cases assert the KEYSPACE, not proof validity. */
-const makeProof = (marker: string): BlockCommitProof => ({
-	v: 1,
-	messageHash: `hash-${marker}`,
-	message: { operations: [] } as unknown as BlockCommitProof['message'],
-	promises: {},
-	commits: {},
-	membershipVersion: 2,
-	membershipDigest: `digest-${marker}`,
-	peerIds: ['peer-a', 'peer-b']
 });
 
 describe('commit proofs do not share the transactions keyspace', () => {

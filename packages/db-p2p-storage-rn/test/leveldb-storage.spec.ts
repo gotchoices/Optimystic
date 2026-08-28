@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { LevelDBRawStorage } from '../src/leveldb-storage.js';
 import { openTestDb, type TestDbHandle } from './classic-level-driver.js';
-import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing/conformance';
+import { makeProof, runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing/conformance';
 import type { ActionId, BlockHeader, BlockId, IBlock, Transform } from '@optimystic/db-core';
 
 const blockId = 'block-1' as BlockId;
@@ -55,13 +55,14 @@ describe('LevelDB driver specifics', () => {
 	});
 
 	it('listBlockIds enumerates only TAG_METADATA keys — higher-tag keys are not decoded as block ids', async () => {
-		// Rows in every OTHER store (pending / revision / transaction / materialized) but NO
-		// metadata. These keys sort above the metadata range (tags 0x02..0x05 vs 0x01), so the
+		// Rows in every OTHER store (pending / revision / transaction / materialized / proofs) but
+		// NO metadata. These keys sort above the metadata range (tags 0x02..0x06 vs 0x01), so the
 		// metadataRange upper bound (0x02) must exclude them — none may surface as a block id.
 		await storage.savePendingTransaction('only-pending' as BlockId, actionId, makeTransform());
 		await storage.saveRevision('only-rev' as BlockId, 1, actionId);
 		await storage.saveTransaction('only-tx' as BlockId, actionId, makeTransform());
 		await storage.saveMaterializedBlock('only-mat' as BlockId, actionId, makeBlock('only-mat'));
+		await storage.saveBlockProof('only-proof' as BlockId, 1, makeProof('only-proof'));
 		// One genuinely committed block for contrast.
 		await storage.saveMetadata('committed' as BlockId, { ranges: [[1, 1]], latest: { rev: 1, actionId } });
 
