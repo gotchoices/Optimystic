@@ -96,7 +96,17 @@ export type CommitDigestPreview = {
 	baseIndependent: boolean;
 };
 
-export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaStore {
+/**
+ * The capability {@link ClusterMember.validateCommitOperations} probes its `storageRepo` for. Named
+ * (rather than written inline at the probe) so there is ONE definition of the contract and so a repo
+ * decorator wrapping the member's storage seam has something to `implements` and forward — a wrapper
+ * that drops the method silently disables the commit content-digest check on that node.
+ */
+export interface ICommitDigestPreviewer {
+	previewCommitDigest(blockId: BlockId, actionId: ActionId, rev: number): Promise<CommitDigestPreview | undefined>;
+}
+
+export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaStore, ICommitDigestPreviewer {
 	private readonly validatePend?: PendValidationHook;
 	/** Per-collection change listeners; empty sets are pruned on unsubscribe. */
 	private readonly changeListeners = new Map<CollectionId, Set<CollectionChangeListener>>();

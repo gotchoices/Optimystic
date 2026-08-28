@@ -17,7 +17,7 @@ import type { FretService } from "p2p-fret";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
-import { isMissingBaseRevisionFailure, type CommitDigestPreview } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer } from "../storage/storage-repo.js";
 import { RECONCILE_TIMEOUT_MS } from "./reconcile-block.js";
 
 const log = createLogger('cluster-member')
@@ -938,10 +938,12 @@ export class ClusterMember implements ICluster {
 
 	/**
 	 * The full promise-phase decision for a record: admit the declared membership FIRST, then (only if
-	 * admitted) validate its pend operations. Failing either yields a `{ valid:false, reason }` the caller
-	 * turns into a `reject` vote. Splitting membership from pend validation keeps the reason strings
-	 * distinct — a `membership-not-admitted` reject is a different signal (feeds the dispute path) than a
-	 * stale-revision / custom-validator reject.
+	 * admitted) validate its pend operations, then its commit operations. Failing any yields a
+	 * `{ valid:false, reason }` the caller turns into a `reject` vote. Keeping the three separate keeps
+	 * the reason strings distinct — a `membership-not-admitted` reject is a different signal (feeds the
+	 * dispute path) than a stale-revision / custom-validator reject, which is different again from a
+	 * `content-digest-mismatch` (see {@link validateCommitOperations}). A record carries pend OR commit
+	 * operations, so in practice exactly one of the latter two has anything to inspect.
 	 */
 	private async evaluatePromise(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
 		const admission = await this.admitMembership(record);
@@ -1258,12 +1260,14 @@ export class ClusterMember implements ICluster {
 	 * later work (persist-block-commit-proof).
 	 */
 	private async validateCommitOperations(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
-		// Duck-typed probe: `storageRepo` is typed IRepo, and only the local StorageRepo can preview a
-		// materialization. A repo without the capability abstains everywhere (also keeps mock-repo
-		// harnesses and non-storage compositions on the legacy approve path).
-		const repo = this.storageRepo as IRepo & {
-			previewCommitDigest?: (blockId: BlockId, actionId: ActionId, rev: number) => Promise<CommitDigestPreview | undefined>;
-		};
+		// Capability probe: `storageRepo` is typed IRepo, and only a repo that owns the local
+		// materialization can preview one. A repo without the capability abstains everywhere (also
+		// keeps mock-repo harnesses and non-storage compositions on the legacy approve path).
+		// NOTE: probing structurally means a decorating/caching repo later inserted at this seam
+		// silently disables the whole check with no signal. `ICommitDigestPreviewer` exists so such a
+		// decorator has a named contract to forward; if a non-forwarding wrapper is ever wired here,
+		// promote this to a typed component field rather than widening the probe.
+		const repo = this.storageRepo as IRepo & Partial<ICommitDigestPreviewer>;
 		if (typeof repo.previewCommitDigest !== 'function') {
 			return { valid: true };
 		}
@@ -1277,10 +1281,27 @@ export class ClusterMember implements ICluster {
 			if (!commit.blockDigests) {
 				continue;
 			}
+			// One Set per commit operation: the surplus-entry filter below is a membership test per
+			// declared id, and `blockIds` is a per-coordinator batch that can be wide.
+			const committedIds = new Set<string>(commit.blockIds);
+			// NOTE: previews run one block at a time, so a commit declaring N blocks adds N sequential
+			// preview round-trips (each 1-3 block-storage reads plus a structuredClone of the base and
+			// the transform) to this member's promise-round latency. Unmeasured, and sequencing buys the
+			// short-circuit on the first mismatch. If wide commits ever show up as promise latency,
+			// fan the previews out with Promise.all and reduce the results, rather than sampling a
+			// subset of the declared ids — a skipped id is an unchecked id.
 			for (const [blockId, declared] of Object.entries(commit.blockDigests)) {
 				// Surplus (or hostile) entry for a block this commit does not even cover: ignore it —
 				// never throw out of the vote path, and never reject on content nobody is committing.
-				if (!commit.blockIds.includes(blockId as BlockId)) {
+				if (!committedIds.has(blockId)) {
+					continue;
+				}
+				// `blockDigests` is untrusted wire data with no ingress schema behind it, so the entry
+				// need not be the shape the type promises. A malformed entry is treated as an omitted
+				// one (abstain) rather than a mismatch: rejecting on it would let a garbled request
+				// look like forged content, and reading through it would throw a TypeError out of the
+				// vote path — this member would then fail to vote at all instead of voting reject.
+				if (typeof declared?.digest !== 'string') {
 					continue;
 				}
 				let preview: CommitDigestPreview | undefined;
@@ -1299,8 +1320,11 @@ export class ClusterMember implements ICluster {
 				if (preview === undefined || preview.digest === undefined) {
 					continue;
 				}
+				// `typeof === 'number'` rather than `!== undefined` for the same untrusted-shape reason
+				// as the digest guard above: a non-numeric declared baseRev can never equal a local
+				// one, so it degrades to an abstain instead of comparing junk.
 				const checkable = preview.baseIndependent
-					|| (declared.baseRev !== undefined && preview.baseRev === declared.baseRev);
+					|| (typeof declared.baseRev === 'number' && preview.baseRev === declared.baseRev);
 				if (!checkable) {
 					continue;
 				}

@@ -5,7 +5,7 @@ import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { IRepo, ClusterRecord, RepoMessage, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, BlockId, ActionId, BlockContentDigests, IBlock } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
-import { canonicalBlockHash } from '@optimystic/db-core';
+import { canonicalBlockHash, computeBlockContentDigests, Tracker } from '@optimystic/db-core';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
@@ -186,6 +186,31 @@ describe('ClusterMember — commit content-digest check (promise round)', () => 
 			const vote = await voteOnCommit(new ThrowingPreviewRepo(), makeCommit({ [BLOCK]: { digest: 'declared-digest' } }));
 			expect(vote.type).to.equal('approve');
 		});
+
+		// `blockDigests` is untrusted wire data and nothing validates its shape on ingress, so a
+		// checkable member must survive an entry that is not the shape the type promises. Reading
+		// through one would throw out of the vote path — the member would then fail to vote at all,
+		// which is worse than either verdict.
+		for (const [label, entry] of [
+			['null', null],
+			['undefined', undefined],
+			['a non-object', 'just-a-string'],
+			['an object with no digest', {}],
+			['an object with a non-string digest', { digest: 42 }]
+		] as const) {
+			it(`a malformed declaration (${label}) abstains instead of throwing out of the vote path`, async () => {
+				const repo = new PreviewRepo({ [BLOCK]: { digest: 'local-digest', baseIndependent: true } });
+				const vote = await voteOnCommit(repo, makeCommit({ [BLOCK]: entry } as unknown as BlockContentDigests));
+				expect(vote.type).to.equal('approve');
+			});
+		}
+
+		it('a non-numeric declared baseRev is not checkable on an update-only block', async () => {
+			const repo = new PreviewRepo({ [BLOCK]: { digest: 'local-digest', baseRev: 4, baseIndependent: false } });
+			const vote = await voteOnCommit(repo, makeCommit(
+				{ [BLOCK]: { digest: 'declared-digest', baseRev: '4' } } as unknown as BlockContentDigests));
+			expect(vote.type).to.equal('approve');
+		});
 	});
 
 	describe('checkable paths', () => {
@@ -221,6 +246,35 @@ describe('ClusterMember — commit content-digest check (promise round)', () => 
 			const vote = await voteOnCommit(repo, makeCommit({ [BLOCK]: { digest: 'same-digest', baseRev: 999 } }));
 			expect(vote.type).to.equal('approve');
 		});
+
+		it('rejects the whole record when any one block of a multi-block commit mismatches', async () => {
+			// The vote is per-record, not per-block: a mismatch anywhere past the first declared id
+			// must still be reached and must still sink the record.
+			const other = 'block-2' as BlockId;
+			const repo = new PreviewRepo({
+				[BLOCK]: { digest: 'same-digest', baseIndependent: true },
+				[other]: { digest: 'local-digest', baseIndependent: true }
+			});
+			const vote = await voteOnCommit(repo, makeCommit(
+				{ [BLOCK]: { digest: 'same-digest' }, [other]: { digest: 'declared-digest' } },
+				{ blockIds: [BLOCK, other] }
+			));
+			expect(vote.type).to.equal('reject');
+			expect(vote.rejectReason).to.equal(CONTENT_DIGEST_MISMATCH);
+		});
+
+		it('approves a multi-block commit when every declared block matches', async () => {
+			const other = 'block-2' as BlockId;
+			const repo = new PreviewRepo({
+				[BLOCK]: { digest: 'digest-a', baseIndependent: true },
+				[other]: { digest: 'digest-b', baseIndependent: true }
+			});
+			const vote = await voteOnCommit(repo, makeCommit(
+				{ [BLOCK]: { digest: 'digest-a' }, [other]: { digest: 'digest-b' } },
+				{ blockIds: [BLOCK, other] }
+			));
+			expect(vote.type).to.equal('approve');
+		});
 	});
 
 	describe('against a real StorageRepo seeded via pend', () => {
@@ -253,6 +307,71 @@ describe('ClusterMember — commit content-digest check (promise round)', () => 
 			const vote = await voteOnCommit(repo, makeCommit({ [BLOCK]: { digest: 'tampered-declaration' } }, { rev: 1 }));
 			expect(vote.type).to.equal('reject');
 			expect(vote.rejectReason).to.equal(CONTENT_DIGEST_MISMATCH);
+		});
+
+		/**
+		 * The update-only path end to end: the declaration is produced by the REAL client-side helper
+		 * (`computeBlockContentDigests` over a `Tracker`, exactly as `Collection.sync` and the
+		 * coordinator's commit phase call it) and checked by the REAL member-side preview. This is the
+		 * pairing a false reject would come from — the two sides materialize the same block through
+		 * different code (a cached base + staged ops on the client, stored base + pended transform on
+		 * the member), and only a test that runs both catches them drifting apart.
+		 */
+		const declareLikeAClient = async (base: IBlock, baseRev: number, updates: unknown[]) => {
+			const source = {
+				peek: (id: BlockId) => id === BLOCK ? structuredClone(base) : undefined,
+				getCachedRevision: (id: BlockId) => id === BLOCK ? baseRev : undefined
+			};
+			const tracker = new Tracker(source as never, { inserts: {}, updates: { [BLOCK]: updates as never }, deletes: [] });
+			return await computeBlockContentDigests(tracker, [BLOCK]);
+		};
+
+		/** Repo holding BLOCK committed at rev 1, with an update to it pended under `update-action`. */
+		const seededWithCommittedBase = async (updates: unknown[]) => {
+			const repo = await seededRepo();
+			expect((await repo.commit({ actionId: ACTION, blockIds: [BLOCK], tailId: BLOCK, rev: 1 })).success).to.equal(true);
+			const pended = await repo.pend({
+				actionId: 'update-action' as ActionId,
+				transforms: { inserts: {}, updates: { [BLOCK]: updates as never }, deletes: [] },
+				rev: 2,
+				policy: 'c'
+			});
+			expect(pended.success, 'update pend must land').to.equal(true);
+			const committedBase = (await repo.get({ blockIds: [BLOCK] }))[BLOCK]?.block;
+			expect(committedBase, 'the committed base must be readable').to.not.equal(undefined);
+			return { repo, committedBase: committedBase! };
+		};
+
+		it('approves an update declared by the real client helper against the same base revision', async () => {
+			const updates = [['items', 1, 0, ['y']]];
+			const { repo, committedBase } = await seededWithCommittedBase(updates);
+			const blockDigests = await declareLikeAClient(committedBase, 1, updates);
+			expect(blockDigests[BLOCK]?.baseRev, 'the client declares the base it computed from').to.equal(1);
+
+			const vote = await voteOnCommit(repo, makeCommit(blockDigests, { actionId: 'update-action' as ActionId, rev: 2 }));
+			expect(vote.type, 'client and member must materialize identically').to.equal('approve');
+		});
+
+		it('rejects when the client declares a base revision it agrees on but content it does not', async () => {
+			const { repo, committedBase } = await seededWithCommittedBase([['items', 1, 0, ['y']]]);
+			// Same declared baseRev (so the member considers itself checkable) but a digest computed
+			// from DIFFERENT staged ops than the ones actually pended.
+			const blockDigests = await declareLikeAClient(committedBase, 1, [['items', 1, 0, ['z']]]);
+
+			const vote = await voteOnCommit(repo, makeCommit(blockDigests, { actionId: 'update-action' as ActionId, rev: 2 }));
+			expect(vote.type).to.equal('reject');
+			expect(vote.rejectReason).to.equal(CONTENT_DIGEST_MISMATCH);
+		});
+
+		it('abstains when the client declares a base revision this member does not hold', async () => {
+			const updates = [['items', 1, 0, ['y']]];
+			const { repo, committedBase } = await seededWithCommittedBase(updates);
+			// A digest computed from a base the client believes is rev 7 while this member holds rev 1:
+			// legitimately different bytes, so the member must cast no content judgement at all.
+			const blockDigests = await declareLikeAClient(committedBase, 7, updates);
+
+			const vote = await voteOnCommit(repo, makeCommit(blockDigests, { actionId: 'update-action' as ActionId, rev: 2 }));
+			expect(vote.type).to.equal('approve');
 		});
 	});
 });

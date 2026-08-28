@@ -24,18 +24,19 @@ loaded gun, and nothing in the type says which.
 
 ## Evidence this is a class, not an instance
 
-Three separate places have independently hand-written the same guard:
+Four separate places have independently hand-written the same guard:
 
 - `packages/db-core/src/testing/test-transactor.ts` — a private `applyTransformSafe` wrapper that
   clones the block *and* re-clones `transform.insert`.
 - `packages/db-core/src/transform/tracker.ts` — `peekMaterialized` reassigns
   `transform.insert = structuredClone(transform.insert)` with a three-line comment explaining that
   `transformForBlockId` clones updates but not inserts.
-- `tickets/implement/1.4-commit-cert-digest-member-check.md` — the not-yet-written member-side check
-  is *specified* to clone both, for the same reason.
+- `packages/db-p2p/src/storage/storage-repo.ts` — `previewCommitDigest` (landed by
+  `commit-cert-digest-member-check`) clones BOTH the base and the transform before `applyTransform`,
+  with its own comment re-deriving the same reason. That is the fourth hand-written guard.
 
-Each guard is correct. The point is that there are three of them and they were each derived from
-scratch. The fourth caller that skips it is a silent data-corruption bug with no test to catch it.
+Each guard is correct. The point is that there are now four of them and they were each derived from
+scratch. The fifth caller that skips it is a silent data-corruption bug with no test to catch it.
 
 ## Not a live defect today
 

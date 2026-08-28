@@ -118,6 +118,15 @@ against the locally cached base, which can legitimately fail (another action's c
 folded a different shape into the cache); that block is then left undeclared rather than raising an
 error out of the client's sync.
 
+**Who checks it.** A declaration is worth nothing until someone independently reproduces it. Each
+cohort member does that on the commit's *promise* round: it re-materializes the block from the
+transform it was handed at pend and votes reject (reason `content-digest-mismatch`) when the result
+disagrees. A member that cannot reproduce the answer — it never saw the pend, or it holds a
+different base for an update-only block — abstains rather than guessing. See
+[internals.md](internals.md) "Commit content-digest check (promise round)" for the full
+checkable/abstain rule, and `docs/correctness.md` §2 **Content digest declaration** for what an
+approval does and does not attest.
+
 #### Invariant P — a pending record and a committed record never coexist for one action
 
 A block never holds a pending record and a committed record for the same action id at the same

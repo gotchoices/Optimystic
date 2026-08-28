@@ -178,7 +178,7 @@ payload the client authored, delivered at pend):
 |---|---|
 | carries an `insert` (with or without updates) | base-independent — always check; digest mismatch → reject |
 | `updates` only | check iff local `latest.rev` equals the declared `baseRev`; otherwise abstain |
-| `delete` only | materializes nothing; nothing to check |
+| `delete` only, or a base this node cannot materialize | materializes nothing to compare — abstain |
 | no pending transform for the action | member never saw the pend — abstain, never reject |
 
 "Abstain" means: contribute no content attestation, vote exactly as before the check existed.
