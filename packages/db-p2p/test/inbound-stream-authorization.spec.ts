@@ -191,7 +191,7 @@ const SERVICE_CASES: ServiceCase[] = [
 			const repo = { calls: 0, async get() { repo.calls++; return {}; }, async saveReplicatedBlock() { repo.calls++; } } as unknown as IBlockReplicaStore & { calls: number };
 			const { logger, errors } = makeLogger();
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new BlockTransferService({ registrar, repo, logger }, { protocolPrefix: PREFIX, ...init });
+			const service = new BlockTransferService({ registrar, repo, logger, superMajorityThreshold: 0.75 }, { protocolPrefix: PREFIX, ...init });
 			await service.start();
 			const mock = makeMockStream(await encodeMessages({ type: 'pull', blockIds: ['block-1'], reason: 'rebalance' }));
 			return {
@@ -365,7 +365,7 @@ describe('inbound stream authorization — what the dialing client observes', ()
 
 		const { logger } = makeLogger();
 		const { registrar, getHandler } = capturingRegistrar();
-		const service = new BlockTransferService({ registrar, repo, logger }, { protocolPrefix: PREFIX, ...init });
+		const service = new BlockTransferService({ registrar, repo, logger, superMajorityThreshold: 0.75 }, { protocolPrefix: PREFIX, ...init });
 		await service.start();
 
 		const peerNetwork = {

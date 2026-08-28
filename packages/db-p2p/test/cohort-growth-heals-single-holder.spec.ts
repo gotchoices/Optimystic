@@ -249,8 +249,14 @@ describe('cohort growth replicates the founder block and makes it readable', fun
 
 		// B and C run the REAL receiving service over their real repos.
 		const registrarStub = { handle: async () => {}, unhandle: async () => {} };
-		const bService = new BlockTransferService({ registrar: registrarStub, repo: bRepo });
-		const cService = new BlockTransferService({ registrar: registrarStub, repo: cRepo });
+		// `writeRevision` commits without a cohort proof (this spec's subject is growth + heal, not
+		// certification), so the pushes it drives are uncertified and the receivers run the migration
+		// flag. Certified-push coverage lives in `block-transfer-push-persist.spec.ts`.
+		const uncertifiedPush = { requirePushCertificate: false };
+		const bService = new BlockTransferService(
+			{ registrar: registrarStub, repo: bRepo, superMajorityThreshold: 0.75 }, uncertifiedPush);
+		const cService = new BlockTransferService(
+			{ registrar: registrarStub, repo: cRepo, superMajorityThreshold: 0.75 }, uncertifiedPush);
 
 		const network = new LoopbackPeerNetwork();
 		network.register(peerB, bService);

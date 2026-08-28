@@ -286,7 +286,7 @@ describe('inbound message caps', () => {
 				async saveReplicatedBlock() { },
 			} as any;
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new BlockTransferService({ registrar, repo }, {});
+			const service = new BlockTransferService({ registrar, repo, superMajorityThreshold: 0.75 }, {});
 			await service.start();
 
 			const mock = makeMockStream([oversizedFrame(MAX_BLOCK_MESSAGE_BYTES + 1)]);
@@ -303,7 +303,7 @@ describe('inbound message caps', () => {
 				async saveReplicatedBlock() { },
 			} as any;
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new BlockTransferService({ registrar, repo }, {});
+			const service = new BlockTransferService({ registrar, repo, superMajorityThreshold: 0.75 }, {});
 			await service.start();
 
 			const mock = makeMockStream([oversizedFrame(MAX_CONTROL_MESSAGE_BYTES + 1)]);
@@ -321,7 +321,7 @@ describe('inbound message caps', () => {
 				async saveReplicatedBlock() { },
 			} as any;
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new BlockTransferService({ registrar, repo }, {});
+			const service = new BlockTransferService({ registrar, repo, superMajorityThreshold: 0.75 }, {});
 			await service.start();
 
 			const mock = makeMockStream([oversizedFrame(LIBRARY_DEFAULT_MAX_BYTES + 1)]);

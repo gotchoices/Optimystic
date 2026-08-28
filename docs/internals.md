@@ -253,9 +253,8 @@ revision records) and live exactly as long as the revision itself; no revision-d
 today. The two landing paths that skip `internalCommit` — an idempotent re-commit of the same
 `(actionId, rev)`, and a Crash-D3 block whose lost `setLatest` `recover()` redoes — back-fill a
 missing proof under the same rule. `saveReplicatedBlock` persists a proof only when its caller
-verified it against the exact bytes being saved — the reconcile path is that caller; the
-churn/push path (`BlockTransferService`) still passes none, revisited by
-`require-proof-on-block-push`.
+verified it against the exact bytes being saved — the reconcile path is one such caller, and
+`BlockTransferService.handlePush` is the other (see **Certified push** below).
 
 **On the repair wires.** Both block-repair wires now carry the stored proof, so a requester can
 check a lone holder's claim with no second holder to corroborate against:
@@ -1202,7 +1201,7 @@ Tracks whether the local node's responsibility for blocks has changed after topo
 
 **Gated release (confirm-before-untrack).** A `lost` block is no longer untracked synchronously. `BlockTransferCoordinator.handleRebalanceEvent` returns `{ pulled, released, retained, replicated, underReplicated, growth }`: `released` holds only blocks it **confirmed** replicated to ≥ `floor` new owners (via `confirmReplicated`, which pushes and counts holders reporting the block *not* `missing`). The node-base handler untracks + marks GC-eligible ONLY those; a block whose push failed / was partition-skipped stays in `retained` — still tracked and served — and is retried next rebalance. This closes the release-before-confirm hole (`docs/arachnode-ring-handoff.md` § Part 2).
 
-**Push payload.** Both `executePush` and `executeConfirm` carry the source's `state.latest` as `blockMeta` (built by the shared `sourceBlockMeta()` in `block-transfer-service.ts`, which spread-on-churn uses too), so a pushed replica lands at the source's `(rev, actionId)` rather than a fabricated rev-1. That match is load-bearing: a replica at a fabricated action id can never corroborate the source's claim in a read-repair quorum vote, so the vote would still see one claimant and decline.
+**Push payload.** Both `executePush` and `executeConfirm` carry the source's `state.latest` as `blockMeta` (built by the shared `sourceBlockMeta()` in `block-transfer-service.ts`, which spread-on-churn uses too), so a pushed replica lands at the source's `(rev, actionId)` rather than a fabricated rev-1. That match is load-bearing: a replica at a fabricated action id can never corroborate the source's claim in a read-repair quorum vote, so the vote would still see one claimant and decline. Both also carry the cohort's commit proof for that same revision, built together with the metadata by `sourceBlockCertification()` from ONE unpinned read — see **Certified push** below.
 
 ### RingShiftCoordinator (advertise → confirm → release)
 
@@ -1215,9 +1214,18 @@ Tracks whether the local node's responsibility for blocks has changed after topo
 
 ### SpreadOnChurnMonitor (Middle-Out)
 
-Proactively pushes tracked blocks to expansion targets on peer departure. Only "middle" peers (FRET `neighborDistance` rank < d) spread, bounding fan-out to 2d across the cluster. Uses `BlockTransferClient.pushBlocks()` with reason `'replication'`, carrying the source block's `state.latest` as `blockMeta` so the replica's revision mirrors the source.
+Proactively pushes tracked blocks to expansion targets on peer departure. Only "middle" peers (FRET `neighborDistance` rank < d) spread, bounding fan-out to 2d across the cluster. Uses `BlockTransferClient.pushBlocks()` with reason `'replication'`, carrying the source block's `state.latest` as `blockMeta` (so the replica's revision mirrors the source) and the retained commit proof for that revision.
 
 On the receiver, `BlockTransferService.handlePush` persists each pushed block into **local** storage via `IBlockReplicaStore.saveReplicatedBlock()` → `BlockStorage.saveReplica()`, which seeds metadata, advances `latest` monotonically (never downgrades on a stale push), deletes any pending record this node still holds for the landing revision's action id (Invariant P — see [repository.md](repository.md#invariant-p--a-pending-record-and-a-committed-record-never-coexist-for-one-action)), and makes the block durably servable. The monotonic no-op path deletes nothing: it wrote no committed record, so it owes no deletion. A block is reported `accepted` only when it was both parseable and persisted; a parse/validation/persist failure surfaces it in `missing`. The sender only records a target as `succeeded` when the response does not list the block in `missing`, so a non-throwing round-trip that failed to persist is correctly counted as a failed push.
+
+**Certified push.** A pushed block is content the receiver will serve — and, because `saveReplicatedBlock` advances `latest` monotonically, content it will later *corroborate* in a read-repair vote. Accepting a push on the pusher's word alone is therefore how a peer manufactures its own corroborators. So `handlePush` requires, per block, the cohort's `BlockCommitProof` for the revision the push declares:
+
+- The wire carries `blockProofs` alongside `blockMeta` (`BlockTransferRequest`). Producers build the two together with `sourceBlockCertification()` from a single unpinned read, so a proof is never paired with metadata for a different revision. The proof itself comes from `servableProof()` — the same accessor that decides what a peer attaches to a served repair archive — which fails closed on a missing accessor, a throwing lookup, or a stored proof whose message names a different `(blockId, rev, actionId)`.
+- The receiver runs one `certifyContent()` call, which covers the signer cap, the vote signatures and thresholds, the claim matching the declared `(rev, actionId)`, and the declared digest matching the pushed bytes. A failure reports the block in `missing` (the existing failure surface, which senders already handle by falling back or retrying) and logs `push:reject-uncertified` with the `ProofFailure` reason. Thresholds come from `proofThresholds(components.superMajorityThreshold)`, threaded from the node's single resolved `consensusConfig` — the same value `assertSuperMajorityCoupling` already binds the member and coordinator to.
+- Decisions are strictly **per block**: in a multi-block push the verifying block is accepted beside one that is refused. `handlePull` is untouched — it serves this node's own storage.
+- A block accepted on a proof **stores** that proof (`saveReplicatedBlock`'s 4th argument), so the receiver can re-prove onward what it verified instead of becoming a corroboration-only holder.
+- **`requirePushCertificate`** (`BlockTransferServiceInit`, default `true`) is the migration escape hatch. Pre-proof blocks can never be certified — the signatures no longer exist — so a deployment holding pre-proof data sets it `false` during migration, which restores the pre-proof acceptance path and logs `push:accept-uncertified`. The failure mode of `true` is that legacy blocks stop gaining new holders via push, visible in a log line, while staying readable as long as two or more holders remain; the failure mode of `false` is silent acceptance of forged content. Any block written again under current code gets a proof, so only cold, never-updated blocks stay uncertified. A push carrying a proof that *fails* verification is rejected regardless of the flag — that is not a legacy block, it is a bad one.
+- **Mixed versions.** An upgraded sender pushing to an un-upgraded receiver: the extra field is ignored and the push behaves as before. An un-upgraded sender pushing to an upgraded receiver: rejected under the strict default, diagnosable from `push:reject-uncertified ... reason=no-proof`.
 
 **Dynamic d**: Under rapid churn (3+ departures in sliding window) or low cluster health (FRET estimate/clusterSize < threshold), `effectiveD` scales up, capped at `clusterSize / 2`.
 

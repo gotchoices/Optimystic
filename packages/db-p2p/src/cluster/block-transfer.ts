@@ -2,7 +2,7 @@ import type { IRepo, IPeerNetwork } from '@optimystic/db-core';
 import { peerIdFromString } from '@libp2p/peer-id';
 import type { PartitionDetector } from './partition-detector.js';
 import type { RestorationCoordinator } from '../storage/restoration-coordinator.js';
-import { BlockTransferClient, sourceBlockMeta } from './block-transfer-service.js';
+import { BlockTransferClient, sourceBlockCertification } from './block-transfer-service.js';
 import type { GrowthOutcome, RebalanceEvent } from './rebalance-monitor.js';
 import { createLogger } from '../logger.js';
 
@@ -359,7 +359,11 @@ export class BlockTransferCoordinator {
 					}
 
 					const blockData = new TextEncoder().encode(JSON.stringify(blockResult.block));
-					const blockMeta = sourceBlockMeta(blockId, blockResult);
+					// Revision metadata AND the cohort proof for that revision, from this one unpinned
+					// read. A receiver running the default `requirePushCertificate` rejects a push with
+					// no proof, so a block whose proof this node never retained (pre-proof history, a
+					// diverged commit) simply fails to place here and is retried/kept as today.
+					const certification = await sourceBlockCertification(this.repo, blockId, blockResult);
 
 					// Push to at least one new owner
 					for (const ownerPeerIdStr of owners) {
@@ -367,7 +371,7 @@ export class BlockTransferCoordinator {
 							const peerId = peerIdFromString(ownerPeerIdStr);
 							const client = new BlockTransferClient(peerId, this.peerNetwork, this.protocolPrefix);
 							const response = await this.withTimeout(
-								client.pushBlocks([blockId], [blockData], 'rebalance', blockMeta),
+								client.pushBlocks([blockId], [blockData], 'rebalance', certification),
 								this.transferTimeoutMs
 							);
 
@@ -447,7 +451,9 @@ export class BlockTransferCoordinator {
 					}
 
 					const blockData = new TextEncoder().encode(JSON.stringify(blockResult.block));
-					const blockMeta = sourceBlockMeta(blockId, blockResult);
+					// See executePush: meta + proof are built together from this one unpinned read, so a
+					// confirming holder either takes a certified replica or reports the block missing.
+					const certification = await sourceBlockCertification(this.repo, blockId, blockResult);
 
 					// Count DISTINCT owners that hold a current replica; stop once the floor is reached.
 					const confirmedPeers = new Set<string>();
@@ -457,7 +463,7 @@ export class BlockTransferCoordinator {
 							const peerId = peerIdFromString(ownerPeerIdStr);
 							const client = new BlockTransferClient(peerId, this.peerNetwork, this.protocolPrefix);
 							const response = await this.withTimeout(
-								client.pushBlocks([blockId], [blockData], 'rebalance', blockMeta),
+								client.pushBlocks([blockId], [blockData], 'rebalance', certification),
 								this.transferTimeoutMs
 							);
 							if (response && !response.missing.includes(blockId)) {

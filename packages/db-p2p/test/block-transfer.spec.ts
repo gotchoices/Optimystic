@@ -633,7 +633,8 @@ describe('BlockTransferService', () => {
 					handle: async (protocol: string) => { handled.push(protocol); },
 					unhandle: async (protocol: string) => { unhandled.push(protocol); }
 				},
-				repo: new MockRepo()
+				repo: new MockRepo(),
+				superMajorityThreshold: 0.75
 			});
 
 			await service.start();
@@ -650,7 +651,8 @@ describe('BlockTransferService', () => {
 					handle: async () => { handleCount++; },
 					unhandle: async () => {}
 				},
-				repo: new MockRepo()
+				repo: new MockRepo(),
+				superMajorityThreshold: 0.75
 			});
 
 			await service.start();

@@ -8,6 +8,9 @@ import { ProtocolClient } from '../protocol-client.js';
 import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js';
 import { createLogger } from '../logger.js';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
+import { certifyContent, proofThresholds } from './certified-claims.js';
+import type { BlockCommitProof, ProofThresholds } from './commit-proof.js';
+import { servableProof, type ArchiveServingRepo } from '../storage/block-archive.js';
 
 const log = createLogger('block-transfer-service');
 
@@ -34,6 +37,16 @@ export interface BlockTransferRequest {
 	 * deterministic rev-1 replica (see {@link IBlockStorage.saveReplica}).
 	 */
 	blockMeta?: Record<string, { rev: number; actionId: ActionId }>;
+	/**
+	 * For push: the cohort's commit proof for each block's revision. Verified against the pushed
+	 * bytes AND against the declared {@link blockMeta} before anything is persisted — one
+	 * `certifyContent` call covers the signatures and thresholds, the claim matching the declared
+	 * `(rev, actionId)`, and the declared digest matching the pushed bytes.
+	 *
+	 * Optional on the wire so an un-upgraded sender still parses; whether a proof-less push is
+	 * ACCEPTED is the receiver's `requirePushCertificate` decision (default: reject).
+	 */
+	blockProofs?: Record<string, BlockCommitProof>;
 }
 
 /**
@@ -68,6 +81,59 @@ export function sourceBlockMeta(
 	return { [blockId]: { rev: latest.rev, actionId: latest.actionId } };
 }
 
+/**
+ * Everything a push carries ABOUT the blocks it pushes, as one value: the source's revision
+ * metadata and the cohort commit proof for that same revision. One parameter rather than two so a
+ * caller cannot attach a proof for one revision beside metadata for another — the two are built
+ * together by {@link sourceBlockCertification} from a single unpinned read, or not at all.
+ */
+export type PushCertification = {
+	blockMeta?: Record<string, ActionRev>;
+	blockProofs?: Record<string, BlockCommitProof>;
+};
+
+/**
+ * Build a push's {@link PushCertification} for ONE block from a single unpinned read: the
+ * {@link sourceBlockMeta} for the source's `state.latest`, plus the locally-retained
+ * {@link BlockCommitProof} for exactly that revision.
+ *
+ * The proof comes from {@link servableProof} — the same accessor that decides what a peer attaches
+ * to a served repair archive — so a push and a repair fetch can never disagree about which proof
+ * pairs with which revision. It fails closed on every unhappy path (repo with no proof accessor, a
+ * throwing lookup, a stored proof whose message names a different `(blockId, rev, actionId)`), so a
+ * mis-paired artifact is never pushed.
+ *
+ * **A proof is never attached without its meta.** Without the declared `(rev, actionId)` a receiver
+ * has no claim to verify the proof against, and it rejects the block (see
+ * `BlockTransferService.handlePush`).
+ *
+ * **Meta IS still attached when no proof exists.** That is the pre-proof push, unchanged: a
+ * receiver running the default `requirePushCertificate: true` rejects it either way, and one
+ * migrating with the flag `false` needs the meta to land the replica at the source's revision
+ * instead of a fabricated rev 1. Dropping the meta alongside the missing proof would regress the
+ * legacy path without making the strict path any stricter.
+ *
+ * Like `sourceBlockMeta`, the caller must have read the block UNPINNED, so `block`, the meta and
+ * the proof all describe the same revision.
+ */
+export async function sourceBlockCertification(
+	repo: ArchiveServingRepo,
+	blockId: BlockId,
+	result: Pick<GetBlockResult, 'state' | 'materializedRev'> | undefined
+): Promise<PushCertification> {
+	const blockMeta = sourceBlockMeta(blockId, result);
+	if (!blockMeta) {
+		return {};
+	}
+	const latest = result!.state!.latest!;
+	const proof = await servableProof(repo, blockId, latest);
+	if (!proof) {
+		log('cert:no-local-proof block=%s rev=%d (pushing uncertified)', blockId, latest.rev);
+		return { blockMeta };
+	}
+	return { blockMeta, blockProofs: { [blockId]: proof } };
+}
+
 /** Response with block data */
 export interface BlockTransferResponse {
 	/** Blocks successfully transferred: blockId → base64-encoded data */
@@ -90,17 +156,56 @@ export interface IBlockReplicaStore extends IRepo {
 	 * Seeds metadata if absent, advances `latest` monotonically, and makes the block
 	 * durably servable via `get`. Idempotent for a fixed `(rev, actionId)`; a no-op
 	 * (still durable) when an equal-or-newer revision is already present.
+	 *
+	 * `verifiedProof` MUST already have been verified against these exact bytes and this exact
+	 * `source` (`certifyContent` — the digest check is what binds a proof to the content). It is
+	 * retained so the receiver can re-prove onward what it just verified, instead of becoming a
+	 * holder that can only corroborate.
 	 */
-	saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev): Promise<void>;
+	saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev, verifiedProof?: BlockCommitProof): Promise<void>;
 }
 
 export interface BlockTransferServiceInit extends InboundStreamAuthorizationInit {
 	protocolPrefix?: string;
+	/**
+	 * Reject a pushed block that carries no verifying commit proof. Default `true`.
+	 * A deployment holding pre-proof data sets this `false` during migration.
+	 *
+	 * **Why the strict default.** `handlePush` persists what a peer hands it, and
+	 * `saveReplicatedBlock` advances `latest` monotonically — so an uncertified push makes the
+	 * pusher's bytes this node's authoritative revision, after which this node *corroborates* the
+	 * pusher in a later read-repair vote. That is how a peer manufactures its own corroborators.
+	 *
+	 * The failure mode of `true` is that legacy blocks stop gaining new holders via push — visible
+	 * in a `push:reject-uncertified` log line, and those blocks stay readable while two or more
+	 * holders remain. The failure mode of `false` is silent acceptance of forged content. Pre-proof
+	 * blocks can never be certified (the signatures no longer exist), but any block written again
+	 * under the current code gets a proof, so only cold, never-updated blocks stay uncertified.
+	 *
+	 * With the flag `false` an uncertified push falls back to the pre-proof behaviour, logged as
+	 * `push:accept-uncertified`. A push carrying a proof that FAILS verification is rejected
+	 * regardless of the flag — that is not a legacy block, it is a bad one.
+	 */
+	requirePushCertificate?: boolean;
 }
 
 export interface BlockTransferServiceComponents {
 	registrar: { handle: (...args: any[]) => Promise<void>; unhandle: (...args: any[]) => Promise<void> };
 	repo: IBlockReplicaStore;
+	/**
+	 * The cohort's configured super-majority fraction, used to verify a pushed block's commit proof.
+	 *
+	 * REQUIRED rather than defaulted: the node factory must hand this down from the single resolved
+	 * `consensusConfig` every other consensus consumer reads (`libp2p-node-base.ts`, which already
+	 * fail-fast asserts member/coordinator coupling on exactly this value). A local default here
+	 * would be a third copy that silently disagrees with a deployment that tuned the threshold.
+	 *
+	 * The simple-majority half of {@link ProofThresholds} is deliberately NOT threaded: it must
+	 * mirror what members actually enforce (`count > total / 2`), not the configured 0.51 — see
+	 * `proofThresholds` in `certified-claims.ts`, the one helper every proof-verifying path builds
+	 * its thresholds with.
+	 */
+	superMajorityThreshold: number;
 	/**
 	 * Optional libp2p component logger. Supplied by the node factory so authorization denials
 	 * land on the same `logger.forComponent(...).error` sink as the repo/cluster/sync services;
@@ -122,6 +227,10 @@ export class BlockTransferService implements Startable {
 	private readonly registrar: BlockTransferServiceComponents['registrar'];
 	/** Optional embedder authorization gate; `undefined` (the default) means no check runs. */
 	private readonly authorization: InboundStreamAuthorization | undefined;
+	/** Built once from the node's configured super-majority — see {@link BlockTransferServiceComponents.superMajorityThreshold}. */
+	private readonly proofThresholds: ProofThresholds;
+	/** See {@link BlockTransferServiceInit.requirePushCertificate}. */
+	private readonly requirePushCertificate: boolean;
 
 	constructor(
 		components: BlockTransferServiceComponents,
@@ -130,6 +239,8 @@ export class BlockTransferService implements Startable {
 		this.protocol = buildBlockTransferProtocol(init.protocolPrefix ?? '');
 		this.repo = components.repo;
 		this.registrar = components.registrar;
+		this.proofThresholds = proofThresholds(components.superMajorityThreshold);
+		this.requirePushCertificate = init.requirePushCertificate ?? true;
 		const componentLog = components.logger?.forComponent('db-p2p:block-transfer');
 		this.authorization = createInboundStreamAuthorization(init, this.protocol,
 			componentLog ? (msg, ...args) => componentLog.error(msg, ...args) : (msg, ...args) => log(msg, ...args));
@@ -225,8 +336,18 @@ export class BlockTransferService implements Startable {
 	/**
 	 * Persist pushed blocks into local storage so the new owner holds a durable
 	 * replica after churn. A block is reported `accepted` only if it was both
-	 * received (parseable) AND successfully persisted; a parse or persist failure
+	 * received (parseable) AND successfully persisted; a parse, certification or persist failure
 	 * surfaces it as `missing` so the sender does not falsely treat it as replicated.
+	 *
+	 * **Certification.** A pushed block is content this node will serve — and, because
+	 * `saveReplicatedBlock` advances `latest`, content it will later CORROBORATE in a read-repair
+	 * vote. So by default the pusher must show the cohort's commit proof for the revision it
+	 * declares, verified here against both the declared `(rev, actionId)` and the pushed bytes. See
+	 * {@link BlockTransferServiceInit.requirePushCertificate} for the migration flag and its
+	 * rationale.
+	 *
+	 * Decisions are strictly PER BLOCK: in a multi-block push a block that verifies is accepted
+	 * beside one that does not. `handlePull` is unaffected — it serves this node's own storage.
 	 */
 	private async handlePush(request: BlockTransferRequest): Promise<BlockTransferResponse> {
 		const blocks: Record<string, string> = {};
@@ -261,10 +382,45 @@ export class BlockTransferService implements Startable {
 				continue;
 			}
 
+			// Certify BEFORE persisting: `saveReplicatedBlock` advances `latest`, so anything that
+			// reaches it becomes this node's authoritative revision.
+			const source = request.blockMeta?.[blockId];
+			const proof = request.blockProofs?.[blockId];
+			let verifiedProof: BlockCommitProof | undefined;
+			if (proof !== undefined) {
+				if (!source) {
+					// No declared `(rev, actionId)` means no claim to verify the proof against, and
+					// `saveReplica` would fabricate a rev-1 replica the proof does not cover.
+					log('push:reject-uncertified block=%s reason=proof-without-meta', blockId);
+					missing.push(blockId);
+					continue;
+				}
+				// One call covers the signatures and thresholds, the claim matching the declared
+				// `(rev, actionId)`, and the declared digest matching these exact bytes. Routed through
+				// `certifyContent` rather than the raw verifier so the wire-facing signer cap
+				// (MAX_PROOF_SIGNERS) the verifier requires of its callers is applied before any
+				// signature work — this input comes from an unauthenticated peer.
+				const verdict = await certifyContent(
+					proof, { blockId, rev: source.rev, actionId: source.actionId }, block, this.proofThresholds);
+				if (!verdict.contentCertified) {
+					log('push:reject-uncertified block=%s rev=%d reason=%s', blockId, source.rev, verdict.failure);
+					missing.push(blockId);
+					continue;
+				}
+				verifiedProof = proof;
+			} else if (this.requirePushCertificate) {
+				// The documented migration case: an un-upgraded sender, or a block committed before
+				// proofs existed. Diagnosable by this line alone.
+				log('push:reject-uncertified block=%s rev=%s reason=no-proof', blockId, source?.rev);
+				missing.push(blockId);
+				continue;
+			} else {
+				log('push:accept-uncertified block=%s rev=%s (requirePushCertificate disabled)', blockId, source?.rev);
+			}
+
 			// Persist locally. Only a received-AND-persisted block is reported accepted.
 			try {
-				const source = request.blockMeta?.[blockId];
-				await this.repo.saveReplicatedBlock(blockId, block, source);
+				await this.repo.saveReplicatedBlock(blockId, block, source, verifiedProof);
 				blocks[blockId] = data;
 			} catch (error) {
 				log('persist:fail block=%s err=%s', blockId, (error as Error).message);
@@ -317,9 +473,11 @@ export class BlockTransferClient extends ProtocolClient {
 	/**
 	 * Push blocks to the remote peer.
 	 *
-	 * @param blockMeta Optional per-block source revision metadata (the sender's
-	 *   `state.latest`). When provided, the receiver replicates at the source's
-	 *   `(rev, actionId)`; when omitted, it falls back to a deterministic rev-1 replica.
+	 * @param certification What this push claims about the blocks — the source's revision metadata
+	 *   and the cohort commit proof for that same revision, built as one unit by
+	 *   {@link sourceBlockCertification}. Without a proof the receiver rejects the block under its
+	 *   default `requirePushCertificate: true`; without metadata it replicates at a deterministic
+	 *   rev-1 (and rejects any proof, which then covers nothing).
 	 * @param options Optional per-call deadlines/cancellation forwarded to the
 	 *   underlying request. `dialTimeoutMs` bounds connecting; `responseTimeoutMs`
 	 *   bounds waiting for the reply once connected (so a peer that connects but goes
@@ -331,14 +489,18 @@ export class BlockTransferClient extends ProtocolClient {
 		blockIds: string[],
 		blockDataBuffers: Uint8Array[],
 		reason: BlockTransferRequest['reason'] = 'rebalance',
-		blockMeta?: Record<string, { rev: number; actionId: ActionId }>,
+		certification?: PushCertification,
 		options?: { signal?: AbortSignal; dialTimeoutMs?: number; responseTimeoutMs?: number }
 	): Promise<BlockTransferResponse> {
 		const blockData: Record<string, string> = {};
 		for (let i = 0; i < blockIds.length; i++) {
 			blockData[blockIds[i]!] = Buffer.from(blockDataBuffers[i]!).toString('base64');
 		}
-		const request: BlockTransferRequest = { type: 'push', blockIds, reason, blockData, ...(blockMeta ? { blockMeta } : {}) };
+		const request: BlockTransferRequest = {
+			type: 'push', blockIds, reason, blockData,
+			...(certification?.blockMeta ? { blockMeta: certification.blockMeta } : {}),
+			...(certification?.blockProofs ? { blockProofs: certification.blockProofs } : {})
+		};
 		return await this.processMessage<BlockTransferResponse>(request, this.protocol, { ...options, maxDataLength: MAX_BLOCK_MESSAGE_BYTES });
 	}
 }

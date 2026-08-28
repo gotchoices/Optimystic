@@ -4,7 +4,7 @@ import { hashKey } from 'p2p-fret'
 import type { FretService } from 'p2p-fret'
 import { peerIdFromString } from '@libp2p/peer-id'
 import type { PartitionDetector } from './partition-detector.js'
-import { BlockTransferClient, sourceBlockMeta } from './block-transfer-service.js'
+import { BlockTransferClient, sourceBlockCertification } from './block-transfer-service.js'
 import { createLogger } from '../logger.js'
 
 const log = createLogger('spread-on-churn')
@@ -242,8 +242,11 @@ export class SpreadOnChurnMonitor implements Startable {
 			const blockData = textEncoder.encode(JSON.stringify(blockResult.block))
 
 			// Carry the source's revision metadata so the replica's `latest` matches the
-			// source instead of being fabricated as rev 1 on the receiver.
-			const blockMeta = sourceBlockMeta(blockId, blockResult)
+			// source instead of being fabricated as rev 1 on the receiver, plus the cohort commit
+			// proof for that same revision — a receiver running the default `requirePushCertificate`
+			// rejects an uncertified push, so a block this node holds no proof for simply fails to
+			// spread (logged by the receiver as `push:reject-uncertified`) rather than being planted.
+			const certification = await sourceBlockCertification(this.deps.repo, blockId, blockResult)
 
 			// Push to each target
 			const succeeded: string[] = []
@@ -261,7 +264,7 @@ export class SpreadOnChurnMonitor implements Startable {
 					// never replies would otherwise hang this sequential loop forever during
 					// churn (exactly when slow/dying peers are common); the deadline makes the
 					// push throw, which the catch below records as `failed` so the pass advances.
-					const response = await client.pushBlocks([blockId], [blockData], 'replication', blockMeta, {
+					const response = await client.pushBlocks([blockId], [blockData], 'replication', certification, {
 						dialTimeoutMs: this.config.pushDialTimeoutMs,
 						responseTimeoutMs: this.config.pushResponseTimeoutMs,
 					})

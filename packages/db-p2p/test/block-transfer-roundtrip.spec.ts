@@ -79,7 +79,12 @@ function makeWiredNetwork(repo: IBlockReplicaStore) {
 		handle: async (_proto: string, h: (stream: any) => void | Promise<void>) => { handler = h; },
 		unhandle: async () => { handler = undefined; },
 	};
-	const service = new BlockTransferService({ registrar: registrar as any, repo });
+	// This spec pins the STREAM path (handler wiring, framing, deadlines), not certification, and its
+	// pushes carry no commit proof — so it runs the migration flag. Certified-push coverage lives in
+	// `block-transfer-push-persist.spec.ts`.
+	const service = new BlockTransferService(
+		{ registrar: registrar as any, repo, superMajorityThreshold: 0.75 },
+		{ requirePushCertificate: false });
 	const peerNetwork = {
 		async connect(_peerId: PeerId, _protocol: string, _options?: any) {
 			const { clientStream, serverStream } = makeLinkedPair();

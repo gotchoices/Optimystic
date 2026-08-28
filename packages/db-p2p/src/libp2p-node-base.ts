@@ -629,6 +629,11 @@ export async function createLibp2pNodeBase(
 				return serviceFactory({
 					registrar: components.registrar,
 					repo: storageRepo,
+					// Verifying a pushed block's commit proof needs the cohort's super-majority fraction.
+					// Read from the SAME resolved `consensusConfig` the member and coordinator read (whose
+					// coupling `assertSuperMajorityCoupling` below already asserts) — a third copy resolving
+					// its own default would defeat that.
+					superMajorityThreshold: consensusConfig.superMajorityThreshold,
 					// So this service's authorization denials reach the same error sink as the other three.
 					logger: components.logger
 				});
