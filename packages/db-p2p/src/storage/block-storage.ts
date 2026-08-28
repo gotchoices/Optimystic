@@ -1,5 +1,5 @@
 import type { BlockId, IBlock, Transform, ActionId, ActionRev, ActionTransform } from "@optimystic/db-core";
-import { Latches, applyTransform, hashString } from "@optimystic/db-core";
+import { Latches, applyTransform, canonicalJson, hashString } from "@optimystic/db-core";
 import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
@@ -15,6 +15,14 @@ const log = createLogger('block-storage');
  * to at most `CHECKPOINT_INTERVAL` forward transforms. See {@link BlockStorage.pruneSupersededMaterialization}.
  */
 const CHECKPOINT_INTERVAL = 32;
+
+/**
+ * One revision entry of a fetched archive, after {@link BlockStorage.vetRestoredArchive} has
+ * established that its key really is a revision number and that it carries an action. The `rev` here
+ * is the KEY the entry was filed under — the number `saveRestored` writes it as — not
+ * `action.rev`, which is optional and is only cross-checked against this.
+ */
+type RestoredRevision = { rev: number; action: ActionTransform; block?: IBlock };
 
 export class BlockStorage implements IBlockStorage {
 	constructor(
@@ -391,12 +399,22 @@ export class BlockStorage implements IBlockStorage {
 			}
 
 			const restored = await this.restoreBlock(rev);
-			if (!restored) {
+			// An archive off this wire is a peer's UNVERIFIED answer (see {@link saveRestored}), so it
+			// is vetted before a byte of it reaches storage. A rejected archive is indistinguishable to
+			// the caller from an absent one — same throw — because both mean the same thing: this node
+			// still cannot serve `rev`. The specific reason is logged rather than thrown so that
+			// `StorageRepo.readCommitBase`'s deliberately-unnarrowed catch keeps behaving as it does
+			// for every other BlockStorage fault.
+			const coverage = restored ? await this.vetRestoredArchive(restored, rev) : undefined;
+			if (!restored || !coverage) {
 				throw new Error(`Block ${this.blockId} revision ${rev} not found during restore attempt.`);
 			}
 			await this.saveRestored(restored);
 
-			currentMeta.ranges.unshift(restored.range);
+			// The vetted coverage, NOT `restored.range`. The declared range is checked for internal
+			// consistency above but is not what gets recorded — see {@link vetRestoredArchive} for why
+			// the pin has to be folded in, or the same restore repeats on every read forever.
+			currentMeta.ranges.unshift(coverage);
 			currentMeta.ranges = mergeRanges(currentMeta.ranges);
 			await this.storage.saveMetadata(this.blockId, currentMeta);
 
@@ -476,6 +494,173 @@ export class BlockStorage implements IBlockStorage {
 	}
 
 	/**
+	 * Vet an archive fetched for a PINNED restore of `rev`, returning the revision coverage to record
+	 * for it — or `undefined` when the archive must be refused, in which case nothing is written at
+	 * all and the reason is logged.
+	 *
+	 * This is the whole trust boundary for the restore wire. `restoreBlock`'s
+	 * `RestorationCoordinator` verifies nothing about a response (`queryPeer` returns
+	 * `response.archive` straight through), so every field below is a remote peer's assertion, and
+	 * `saveRestored` writes keyed by REVISION and by ACTION ID — meaning an archive naming a
+	 * revision or action id this node already holds would otherwise overwrite content that was never
+	 * in question. The checks, in order:
+	 *
+	 *  - **The archive is about this block.** `saveRestored` writes under `this.blockId` and ignores
+	 *    `archive.blockId`, so an answer about a different block would land as this block's history.
+	 *  - **Every revision key is a real revision.** Keys arrive as JSON strings; a non-numeric key
+	 *    coerces to `NaN` and would be stored as a garbage revision number. Min/max are folded rather
+	 *    than spread through `Math.min`/`Math.max`, which throws `RangeError` past ~125k arguments —
+	 *    reachable inside the 8 MiB sync-response cap (see `maxArchiveRevision`, same hazard).
+	 *  - **Each entry's own `rev`, when it declares one, agrees with the key it is filed under.**
+	 *    That disagreement IS the mislabel this ticket's family of bugs is about, in miniature.
+	 *  - **The archive answers the pin.** NOT "carries revision `rev`" — `ActionContext.rev` is a
+	 *    COLLECTION-wide revision, so it routinely sits above the revision at which this particular
+	 *    block last changed. A peer answering a pin at 9 for a block whose last commit was rev 2
+	 *    correctly serves rev 2, labelled as rev 2 (pinned in `test/block-archive-proof.spec.ts`).
+	 *    So the rule is that the archive's LOWEST revision is at or below the pin: `materializeBlock`
+	 *    descends from `rev`, so an archive entirely above the pin answers a different question and
+	 *    is exactly the "old bytes under a newer label" shape that overwrites good local data.
+	 *  - **The declared `range` agrees with the revisions actually carried** — it starts at the
+	 *    lowest (the floor must be present, or the descending walk has nothing to land on) and ends
+	 *    past the highest. An OPEN-ENDED range is refused outright: it would claim infinite coverage
+	 *    and permanently disable restore for this block on one unverified peer's say-so.
+	 *    (`RestoreCallback` allows open-ended for the UNPINNED call; `ensureRevision` never makes one.)
+	 *  - **Nothing already held is overwritten with different content** — see
+	 *    {@link noDivergentRewrite}.
+	 *
+	 * ## What gets recorded, and the one thing taken on trust
+	 *
+	 * The coverage returned is `[lowest, max(highest + 1, rev + 1))` — the archive's own span,
+	 * extended to include the pin. The extension is an INFERENCE, and the only one here: a peer
+	 * answering a pinned fetch with revision M ≤ N means "M is my highest committed revision of this
+	 * block at or below N", i.e. nothing changed in (M, N]. This node cannot verify that locally.
+	 *
+	 * It is recorded anyway because the alternative is worse. `meta.ranges` is what
+	 * {@link ensureRevision} consults to decide whether to fetch at all, so recording only the
+	 * archive's literal `[M, M+1)` leaves `inRanges(N)` false and re-runs the ENTIRE restore — network
+	 * round trip plus a full `saveRestored` write — on every later read at that pin, forever, never
+	 * converging. The inference is also unavoidable rather than merely convenient: having the peer
+	 * state the claim on the wire instead would not make it verifiable, only explicit, while breaking
+	 * repair against every peer running an older build.
+	 *
+	 * NOTE: accepted tradeoff — a lying peer's answer is therefore STICKY across the whole span it
+	 * was asked about: reads between M and N are served locally from M's content and never re-ask, so
+	 * a later honest peer is never consulted for them. Weighed against an unbounded re-fetch loop and
+	 * kept; that is the same "ranges records what this node can locally reconstruct, freshness is a
+	 * separate concern" position `setLatest` and `saveForwardRevision` already take. Revisit if a
+	 * restore ever gains a way to verify an archive (a commit proof chain over the served revision
+	 * would do it) — at that point record only what verifies.
+	 */
+	private async vetRestoredArchive(archive: BlockArchive, rev: number): Promise<RevisionRange | undefined> {
+		const refuse = (why: string, ...args: unknown[]): undefined => {
+			log(`restore:refused blockId=%s rev=%d ${why}`, this.blockId, rev, ...args);
+			return undefined;
+		};
+
+		if (archive.blockId !== this.blockId) {
+			return refuse('archive is for blockId=%s', archive.blockId);
+		}
+
+		const entries: RestoredRevision[] = [];
+		let lowest: number | undefined;
+		let highest: number | undefined;
+		for (const [key, entry] of Object.entries(archive.revisions ?? {})) {
+			const entryRev = Number(key);
+			if (!Number.isInteger(entryRev) || entryRev < 1) {
+				return refuse('revision key %s is not a revision', key);
+			}
+			const action = entry?.action;
+			if (!action?.actionId) {
+				return refuse('revision %d carries no action', entryRev);
+			}
+			if (action.rev !== undefined && action.rev !== entryRev) {
+				return refuse('revision %d is filed under an action declaring rev=%d', entryRev, action.rev);
+			}
+			entries.push({ rev: entryRev, action, block: entry.block });
+			if (lowest === undefined || entryRev < lowest) lowest = entryRev;
+			if (highest === undefined || entryRev > highest) highest = entryRev;
+		}
+		if (lowest === undefined || highest === undefined) {
+			return refuse('carries no revisions');
+		}
+
+		if (lowest > rev) {
+			return refuse('lowest revision %d is above the pin', lowest);
+		}
+
+		const range = archive.range;
+		if (!Array.isArray(range)) {
+			return refuse('declares no range');
+		}
+		const [start, end] = range;
+		if (start !== lowest) {
+			return refuse('range starts at %o but revisions start at %d', start, lowest);
+		}
+		if (end === undefined || !Number.isInteger(end) || end <= highest) {
+			return refuse('range ends at %o but revisions end at %d', end, highest);
+		}
+
+		if (!await this.noDivergentRewrite(entries, refuse)) {
+			return undefined;
+		}
+
+		return [lowest, Math.max(highest + 1, rev + 1)];
+	}
+
+	/**
+	 * True when none of `entries` would overwrite content this node ALREADY holds with different
+	 * content. False (having logged which entry, via `refuse`) when any would.
+	 *
+	 * The refusal is all-or-nothing: one divergent entry rejects the WHOLE archive rather than
+	 * landing the entries this node happens to lack. Two reasons. An archive that contradicts locally
+	 * held content is evidence the peer is wrong or hostile about this block, which makes the rest of
+	 * it no more trustworthy than the part that was caught; and a partial apply would leave
+	 * {@link vetRestoredArchive}'s coverage claiming a span the applied subset may not support.
+	 *
+	 * Identical content is NOT a conflict — a re-restore of the same archive must stay idempotent,
+	 * which it has to be for the pin-extended coverage above to converge.
+	 *
+	 * Comparison is by `canonicalJson`, db-core's one deterministic encoding, so key ORDER across a
+	 * JSON round trip over the wire never reads as divergence.
+	 *
+	 * The three keys mirror {@link saveRestored}'s three writes exactly; an entry that carries no
+	 * `block` writes no materialization, so it cannot clobber one and is not checked for it.
+	 *
+	 * NOTE: costs up to three raw-storage reads per revision entry, on the restore path only — which
+	 * has already paid for a network round trip, so it is not the term that matters. If a restore
+	 * ever carries thousands of revisions and this shows up, check `getRevision` first and skip the
+	 * other two for a revision this node does not hold at all.
+	 */
+	private async noDivergentRewrite(
+		entries: RestoredRevision[],
+		refuse: (why: string, ...args: unknown[]) => undefined
+	): Promise<boolean> {
+		for (const { rev, action, block } of entries) {
+			const heldActionId = await this.storage.getRevision(this.blockId, rev);
+			if (heldActionId !== undefined && heldActionId !== action.actionId) {
+				refuse('revision %d is already held as action %s, archive names %s',
+					rev, heldActionId, action.actionId);
+				return false;
+			}
+
+			const heldTransform = await this.storage.getTransaction(this.blockId, action.actionId);
+			if (heldTransform !== undefined && canonicalJson(heldTransform) !== canonicalJson(action.transform)) {
+				refuse('action %s (revision %d) is already held with a different transform', action.actionId, rev);
+				return false;
+			}
+
+			if (block) {
+				const heldBlock = await this.storage.getMaterializedBlock(this.blockId, action.actionId);
+				if (heldBlock !== undefined && canonicalJson(heldBlock) !== canonicalJson(block)) {
+					refuse('action %s (revision %d) is already materialized with different content', action.actionId, rev);
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	/**
 	 * Persist a fetched archive's revisions locally.
 	 *
 	 * A revision entry's own `proof` is deliberately IGNORED. An archive is remote wire data —
@@ -487,6 +672,23 @@ export class BlockStorage implements IBlockStorage {
 	 * {@link saveForwardRevision}, where `certifyContent` had already bound the proof to these exact
 	 * bytes. A separate parameter rather than a caller obligation to strip is what makes "an
 	 * unverified proof reached `saveBlockProof`" unrepresentable instead of merely documented.
+	 *
+	 * This is a WRITER, not a gate: it trusts what it is handed, and each of its two callers is
+	 * responsible for having earned that on its own terms.
+	 *
+	 *  - {@link ensureRevision} — the unverified restore wire — runs {@link vetRestoredArchive}
+	 *    first. Those checks are ABOUT the pinned request (does the archive answer the revision that
+	 *    was asked for?), and this function has no pin to check against, so they cannot live here.
+	 *  - {@link saveForwardRevision} — reached by `saveReplica`/`saveDeletion` through
+	 *    `StorageRepo.saveReplicatedBlock` — builds the archive it passes from local arguments, and
+	 *    on the replica path `cluster/reconcile-block.ts` has already bound those bytes to a verified
+	 *    proof. It writes strictly ABOVE its own `latest` (the monotonic guard returns first
+	 *    otherwise), so it cannot rewrite held history, and it deliberately pays nothing for the
+	 *    restore wire's checks.
+	 *
+	 * A THIRD caller would not inherit either argument. Any future one that takes an archive off a
+	 * network must route through `vetRestoredArchive` (or an equivalent for its own trust model)
+	 * before reaching here.
 	 */
 	private async saveRestored(archive: BlockArchive, verified?: { rev: number; proof: BlockCommitProof }) {
 		const revisions = Object.entries(archive.revisions)

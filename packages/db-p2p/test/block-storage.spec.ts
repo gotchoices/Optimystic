@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import type { BlockArchive, BlockMetadata, RestoreCallback } from '../src/storage/struct.js';
+import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from '../src/storage/struct.js';
 import type { BlockCommitProof } from '../src/cluster/commit-proof.js';
 import { makeSignedProof } from './support/commit-proof-fixtures.js';
 import { canonicalBlockHash, hashString } from '@optimystic/db-core';
@@ -595,6 +595,292 @@ describe('BlockStorage meta.ranges honesty', () => {
 		const after = await raw.getMetadata(blockId);
 		expect(after!.latest?.rev).to.equal(1);
 		expect(after!.ranges, 'recovered revision opens coverage from E=1').to.deep.equal([[1]]);
+	});
+});
+
+/**
+ * Coverage for the restore TRUST BOUNDARY. `ensureRevision` fills a gap in local revision history
+ * by asking a peer, over a wire that verifies nothing — `RestorationCoordinator.queryPeer` returns
+ * the response's archive straight through — and `saveRestored` writes keyed by revision number and
+ * by action id. So an archive naming a revision or action id this node already holds would
+ * otherwise overwrite content that was never in question. Every archive off that wire is vetted
+ * before a byte of it is written; a refused archive is indistinguishable from an absent one (same
+ * "not found during restore attempt" throw), because both mean this node still cannot serve the rev.
+ *
+ * The two directions that must BOTH hold:
+ *   - reject the wrong answer — an archive entirely above the pin, a range that contradicts the
+ *     revisions carried, or content that disagrees with what is already held;
+ *   - accept the RIGHT answer, which is routinely a LOWER revision than the pin. `ActionContext.rev`
+ *     is a collection-wide revision, so a pin at 9 for a block whose last commit was rev 2 is
+ *     correctly answered with rev 2 labelled as rev 2 (see `block-archive-proof.spec.ts`). A guard
+ *     that demanded the pin's exact revision would turn working historical reads into hard failures.
+ */
+describe('BlockStorage restore archive vetting', () => {
+	let raw: MemoryRawStorage;
+
+	beforeEach(() => {
+		raw = new MemoryRawStorage();
+	});
+
+	/**
+	 * Commit `block` as this block's FIRST revision, at global rev `rev`. Coverage then opens at
+	 * E = rev, so every read BELOW it is a genuine gap — which is what fires the restore path.
+	 */
+	const seedAtRev = async (blockId: BlockId, actionId: ActionId, rev: number, block: IBlock) => {
+		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		await repo.pend({ actionId, transforms: makeInsertTransforms(blockId, block), policy: 'c' });
+		expect((await repo.commit({ actionId, blockIds: [blockId], tailId: blockId, rev })).success).to.equal(true);
+	};
+
+	const itemsOf = (block: IBlock) => (block as unknown as { items: unknown[] }).items;
+
+	const expectRestoreRefused = async (storage: BlockStorage, rev: number, why: string) => {
+		let error: unknown;
+		try {
+			await storage.getBlock(rev);
+		} catch (err) {
+			error = err;
+		}
+		expect((error as Error)?.message, why).to.contain('not found during restore attempt');
+	};
+
+	it('refuses an archive whose revisions all sit ABOVE the pin (the mislabel that overwrote good data)', async () => {
+		// The ticket's reproduction, minus the producer `serve-pinned-revision-honestly` removed: a
+		// peer asked for rev 1 while holding rev 2 answers with rev 1's bytes filed under rev 2's
+		// number and action id. Keyed by action id, `saveRestored` used to write that over the
+		// asker's own good rev 2 — and rev 1, the thing actually requested, was still not recorded
+		// as held, so every later read repeated the fetch and the overwrite.
+		const blockId = 'restore-mislabel' as BlockId;
+		await seedAtRev(blockId, 'a2' as ActionId, 2, makeBlock('restore-mislabel', { items: ['TWO'] }));
+
+		const older = makeBlock('restore-mislabel', { items: ['ONE'] });
+		let restores = 0;
+		const restoreCallback: RestoreCallback = async (id) => {
+			restores++;
+			return {
+				blockId: id,
+				revisions: {
+					2: { action: { actionId: 'a2' as ActionId, rev: 2, transform: { insert: older } }, block: older }
+				},
+				range: [2, 3]
+			};
+		};
+
+		const before = structuredClone((await raw.getMetadata(blockId))!);
+		const storage = new BlockStorage(blockId, raw, restoreCallback);
+
+		await expectRestoreRefused(storage, 1, 'the wrong answer fails loudly, exactly as an absent one does');
+		expect(restores, 'the fetch WAS made — the refusal is on the answer, not on asking').to.equal(1);
+		expect(await raw.getMetadata(blockId), 'metadata untouched by the refusal').to.deep.equal(before);
+
+		const held = await storage.getBlock(2);
+		expect(itemsOf(held!.block), 'the held rev 2 still reads back its OWN content').to.deep.equal(['TWO']);
+		expect(held!.actionRev, 'the held rev 2 still names its own action').to.deep.equal({ rev: 2, actionId: 'a2' });
+	});
+
+	it('accepts a LOWER revision for a collection-wide pin, and records coverage that stops the re-fetch', async () => {
+		// The everyday shape: the collection is at rev 9, this block last changed at rev 2, and the
+		// peer correctly serves rev 2 labelled as itself in a range of [2, 3). Two claims here —
+		// that the answer is accepted at all, and that the coverage recorded for it includes the PIN,
+		// without which `inRanges(9, ...)` stays false and every later read at rev 9 re-runs the
+		// whole restore: another round trip and another write, forever.
+		const blockId = 'restore-lowpin' as BlockId;
+		await seedAtRev(blockId, 'u20' as ActionId, 20, makeBlock('restore-lowpin', { items: ['local'] }));
+
+		const low = makeBlock('restore-lowpin', { items: ['rev2'] });
+		const pins: number[] = [];
+		const restoreCallback: RestoreCallback = async (id, rev) => {
+			pins.push(rev ?? -1);
+			return {
+				blockId: id,
+				revisions: {
+					2: { action: { actionId: 'low2' as ActionId, rev: 2, transform: { insert: low } }, block: low }
+				},
+				range: [2, 3]
+			};
+		};
+
+		const storage = new BlockStorage(blockId, raw, restoreCallback);
+		const got = await storage.getBlock(9);
+		expect(itemsOf(got!.block), "rev 9 served from the block's own rev 2").to.deep.equal(['rev2']);
+		expect(got!.actionRev, 'served as the revision it actually is').to.deep.equal({ rev: 2, actionId: 'low2' });
+
+		// [2, 3) extended to the pin — NOT the declared range verbatim, and not open-ended either.
+		const meta = await raw.getMetadata(blockId);
+		expect(meta!.ranges, 'coverage spans the archive floor up to the pin').to.deep.equal([[2, 10], [20]]);
+
+		await storage.getBlock(9);
+		expect(pins, 'the restore converged: it ran once, not once per read').to.deep.equal([9]);
+	});
+
+	it('a correct restore at the pin itself still succeeds and still merges its range', async () => {
+		const blockId = 'restore-exact' as BlockId;
+		await seedAtRev(blockId, 'u10' as ActionId, 10, makeBlock('restore-exact', { items: ['local'] }));
+
+		const low = makeBlock('restore-exact', { items: ['rev4'] });
+		const restoreCallback: RestoreCallback = async (id) => ({
+			blockId: id,
+			revisions: {
+				4: { action: { actionId: 'low4' as ActionId, rev: 4, transform: { insert: low } }, block: low }
+			},
+			range: [4, 5]
+		});
+
+		const storage = new BlockStorage(blockId, raw, restoreCallback);
+		expect(itemsOf((await storage.getBlock(4))!.block)).to.deep.equal(['rev4']);
+		expect((await raw.getMetadata(blockId))!.ranges, 'restored span merged alongside the local one')
+			.to.deep.equal([[4, 5], [10]]);
+		expect(await raw.getRevision(blockId, 4), 'the revision record landed').to.equal('low4');
+	});
+
+	it('refuses an archive whose declared range disagrees with the revisions it carries', async () => {
+		const blockId = 'restore-badrange' as BlockId;
+		await seedAtRev(blockId, 'u10' as ActionId, 10, makeBlock('restore-badrange', { items: ['local'] }));
+
+		const low = makeBlock('restore-badrange', { items: ['low'] });
+		const servingRange = (range: RevisionRange): RestoreCallback => async (id) => ({
+			blockId: id,
+			revisions: {
+				4: { action: { actionId: 'low4' as ActionId, rev: 4, transform: { insert: low } }, block: low }
+			},
+			range
+		});
+
+		const before = structuredClone((await raw.getMetadata(blockId))!);
+		const cases: [RevisionRange, string][] = [
+			[[3, 5], 'a floor below the revisions carried — nothing to descend to at rev 3'],
+			[[4, 4], 'a range that ends at or below its own highest revision'],
+			[[4], 'an open-ended range, which would claim infinite coverage on one unverified say-so']
+		];
+		for (const [range, why] of cases) {
+			await expectRestoreRefused(new BlockStorage(blockId, raw, servingRange(range)), 4, why);
+		}
+
+		expect(await raw.getMetadata(blockId), 'nothing written by any of the refusals').to.deep.equal(before);
+		expect(await raw.getRevision(blockId, 4), 'no revision record landed').to.equal(undefined);
+		expect(await raw.getTransaction(blockId, 'low4' as ActionId), 'no transform landed').to.equal(undefined);
+	});
+
+	it('refuses a malformed archive: a non-revision key, a missing action, a self-contradicting entry, or another block', async () => {
+		const blockId = 'restore-malformed' as BlockId;
+		await seedAtRev(blockId, 'u10' as ActionId, 10, makeBlock('restore-malformed', { items: ['local'] }));
+
+		const low = makeBlock('restore-malformed', { items: ['low'] });
+		const goodEntry = { action: { actionId: 'low4' as ActionId, rev: 4, transform: { insert: low } }, block: low };
+		const before = structuredClone((await raw.getMetadata(blockId))!);
+
+		const cases: [BlockArchive, string][] = [
+			[{
+				blockId: 'some-other-block' as BlockId,
+				revisions: { 4: goodEntry },
+				range: [4, 5]
+			}, "an answer about a different block, which would land as THIS block's history"],
+			[{
+				blockId,
+				// A JSON key that is not a number coerces to NaN and would be stored as a garbage rev.
+				revisions: { ['not-a-rev' as unknown as number]: goodEntry },
+				range: [4, 5]
+			}, 'a revision key that is not a revision'],
+			[{
+				blockId,
+				revisions: { 4: {} as unknown as BlockArchive['revisions'][number] },
+				range: [4, 5]
+			}, 'an entry carrying no action'],
+			[{
+				blockId,
+				// The entry's own rev contradicts the key it is filed under — the mislabel, in miniature.
+				revisions: { 4: { ...goodEntry, action: { ...goodEntry.action, rev: 7 } } },
+				range: [4, 5]
+			}, 'an entry whose declared rev disagrees with its key'],
+			[{ blockId, revisions: {}, range: [4, 5] }, 'an archive carrying no revisions at all']
+		];
+
+		for (const [archive, why] of cases) {
+			const storage = new BlockStorage(blockId, raw, async () => archive);
+			await expectRestoreRefused(storage, 4, why);
+		}
+
+		expect(await raw.getMetadata(blockId), 'nothing written by any of the refusals').to.deep.equal(before);
+		expect(await raw.getRevision(blockId, 4), 'no revision record landed').to.equal(undefined);
+	});
+
+	describe('never overwrites content this node already holds', () => {
+		const blockId = 'restore-collide' as BlockId;
+		const low5 = makeBlock('restore-collide', { items: ['rev5'] });
+		const low3 = makeBlock('restore-collide', { items: ['rev3'] });
+
+		/** Seed an upper range at E=10 and restore rev 5 into a lower range, so rev 5 IS held. */
+		const seedHoldingRev5 = async () => {
+			await seedAtRev(blockId, 'u10' as ActionId, 10, makeBlock('restore-collide', { items: ['local'] }));
+			const first: RestoreCallback = async (id) => ({
+				blockId: id,
+				revisions: {
+					5: { action: { actionId: 'low5' as ActionId, rev: 5, transform: { insert: low5 } }, block: low5 }
+				},
+				range: [5, 6]
+			});
+			expect(itemsOf((await new BlockStorage(blockId, raw, first).getBlock(5))!.block)).to.deep.equal(['rev5']);
+		};
+
+		/** An archive answering a rev-3 pin that ALSO re-states rev 5, with `rev5Entry`'s content. */
+		const alsoRestating5 = (rev5Entry: BlockArchive['revisions'][number]): RestoreCallback => async (id) => ({
+			blockId: id,
+			revisions: {
+				3: { action: { actionId: 'low3' as ActionId, rev: 3, transform: { insert: low3 } }, block: low3 },
+				5: rev5Entry
+			},
+			range: [3, 6]
+		});
+
+		it('refuses the WHOLE archive when it renames a held revision to another action id', async () => {
+			await seedHoldingRev5();
+			const before = structuredClone((await raw.getMetadata(blockId))!);
+
+			const storage = new BlockStorage(blockId, raw, alsoRestating5({
+				action: { actionId: 'imposter' as ActionId, rev: 5, transform: { insert: low3 } }, block: low3
+			}));
+			await expectRestoreRefused(storage, 3, 'rev 5 is already held under a different action id');
+
+			// All-or-nothing: the entry this node LACKED (rev 3) is not landed either.
+			expect(await raw.getMetadata(blockId), 'metadata untouched').to.deep.equal(before);
+			expect(await raw.getRevision(blockId, 3), 'the innocent-looking entry is refused with the rest').to.equal(undefined);
+			expect(await raw.getRevision(blockId, 5), 'the held revision keeps its own action').to.equal('low5');
+		});
+
+		it('refuses the WHOLE archive when it re-materializes a held action with different content', async () => {
+			await seedHoldingRev5();
+			const before = structuredClone((await raw.getMetadata(blockId))!);
+
+			// Same (rev, actionId) as what is held — only the bytes differ. This is the pairing that
+			// `saveMaterializedBlock`, keyed by action id, would silently write over.
+			const rewritten = makeBlock('restore-collide', { items: ['REWRITTEN'] });
+			const storage = new BlockStorage(blockId, raw, alsoRestating5({
+				action: { actionId: 'low5' as ActionId, rev: 5, transform: { insert: rewritten } }, block: rewritten
+			}));
+			await expectRestoreRefused(storage, 3, 'action low5 is already held with different content');
+
+			expect(await raw.getMetadata(blockId), 'metadata untouched').to.deep.equal(before);
+			expect(await raw.getRevision(blockId, 3), 'nothing from the archive landed').to.equal(undefined);
+			const reader = new BlockStorage(blockId, raw);
+			expect(itemsOf((await reader.getBlock(5))!.block), 'the held rev 5 still reads its own content')
+				.to.deep.equal(['rev5']);
+		});
+
+		it('accepts an archive that RE-STATES a held revision identically (a re-restore stays idempotent)', async () => {
+			await seedHoldingRev5();
+
+			// Byte-identical restatement of rev 5 — not a conflict, or the pin-extended coverage
+			// above could never converge across overlapping restores.
+			const storage = new BlockStorage(blockId, raw, alsoRestating5({
+				action: { actionId: 'low5' as ActionId, rev: 5, transform: { insert: makeBlock('restore-collide', { items: ['rev5'] }) } },
+				block: makeBlock('restore-collide', { items: ['rev5'] })
+			}));
+			expect(itemsOf((await storage.getBlock(3))!.block), 'rev 3 restored').to.deep.equal(['rev3']);
+
+			expect((await raw.getMetadata(blockId))!.ranges, 'the two lower spans merged into one')
+				.to.deep.equal([[3, 6], [10]]);
+			expect(await raw.getRevision(blockId, 5), 'the held revision is unchanged').to.equal('low5');
+		});
 	});
 });
 

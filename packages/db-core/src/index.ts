@@ -12,6 +12,7 @@ export * from "./reactivity/index.js";
 export * from "./transaction/index.js";
 export * from "./transactor/index.js";
 export * from "./transform/index.js";
+export * from "./utility/canonical-json.js";
 export * from "./utility/groupby.js";
 export * from "./utility/hash-string.js";
 export * from "./utility/latches.js";
