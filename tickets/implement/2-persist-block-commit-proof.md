@@ -1,213 +1,100 @@
 ----
 description: Keep the group's signed approval of a write on disk next to the record it approved, and add a checker that can confirm, offline, that a copy of the record really is the one the group agreed on.
 prereq: commit-cert-digest-member-check
-files: packages/db-core/src/cluster/membership.ts, packages/db-core/src/cluster/structs.ts, packages/db-p2p/src/cluster/commit-proof.ts, packages/db-p2p/src/cluster/peer-key-binding.ts, packages/db-p2p/src/cluster/cluster-repo.ts, packages/db-p2p/src/storage/i-raw-storage.ts, packages/db-p2p/src/storage/i-block-storage.ts, packages/db-p2p/src/storage/block-storage.ts, packages/db-p2p/src/storage/kv-raw-storage.ts, packages/db-p2p/src/storage/cached-raw-storage.ts, packages/db-p2p/src/storage/raw-store-codec.ts, packages/db-p2p/src/storage/storage-repo.ts
+files: packages/db-core/src/cluster/membership.ts, packages/db-core/src/cluster/structs.ts, packages/db-p2p/src/cluster/commit-proof.ts, packages/db-p2p/src/cluster/peer-key-binding.ts, packages/db-p2p/src/cluster/cluster-repo.ts, packages/db-p2p/src/storage/i-raw-storage.ts, packages/db-p2p/src/storage/i-block-storage.ts, packages/db-p2p/src/storage/block-storage.ts, packages/db-p2p/src/storage/kv-raw-storage.ts, packages/db-p2p/src/storage/cached-raw-storage.ts, packages/db-p2p/src/storage/raw-store-codec.ts, packages/db-p2p/src/storage/storage-repo.ts, packages/db-p2p/test/commit-proof.spec.ts
 difficulty: hard
 ----
 
 # Persist a durable, self-verifying commit proof per revision
 
 <!-- resume-note -->
-## Status after third implement run (2026-08-27 — ALL production code done + built, budget-stopped
-before tests/docs)
+## Status after fourth implement run (2026-08-27 — tests written and passed once; budget-stopped before docs + final validation)
 
-**Every source change is DONE and both `yarn workspace @optimystic/db-core build` and
-`yarn workspace @optimystic/db-p2p build` pass.** Do not re-derive or re-edit production code —
-resume at "Remaining work" below (tests, size measurement, docs, full validation only).
+**All production code AND the test suite are done.** Do not re-derive or re-edit production code or
+test logic — resume at "Remaining work" below.
 
-Done (in working tree; runs 1–2 already committed membership.ts + commit-proof.ts):
+This run:
 
-1. `db-core/src/cluster/membership.ts` — `membershipDigestFromIds` (committed, prior run).
-2. `db-p2p/src/cluster/commit-proof.ts` — full verify/build module (committed, prior run), PLUS
-   this run added exported `proofDeclaredDigest(proof, claim)` — resolves the claimed commit op's
-   declared digest via the SAME op-resolution the verifier uses, consumed by StorageRepo's
-   retention rule so the two can never drift.
-3. `db-p2p/src/storage/raw-store-codec.ts` — `blockProofActionKey(rev)` = `` `~proof:${rev}` ``,
-   documented reserved action-id namespace (proofs ride the transactions store; zero driver fanout).
-4. `db-p2p/src/storage/i-raw-storage.ts` — `getBlockProof`/`saveBlockProof` + contract note that no
-   revision-delete site exists today (the "whatever deletes a revision" clause resolved to a comment).
-5. `db-p2p/src/storage/kv-raw-storage.ts` — implements both via `driver.get/putTransaction` with
-   the proof key + `encodeJson/decodeJson`. `MemoryRawStorage`/`CachedRawStorage` inherit free.
-6. `db-p2p/src/storage/i-block-storage.ts` + `block-storage.ts` — rev-only pair, forwards.
-7. `db-p2p/src/storage/cached-raw-storage.ts` — comment on `putTransaction` noting the harmless
-   Transform-cast JSON passthrough for proof bytes.
-8. `db-p2p/src/storage/storage-repo.ts` — `ICommitProofPersister` (beside `ICommitDigestPreviewer`;
-   StorageRepo implements it); `commit(request, _options?, proof?)` threads to
-   `internalCommit(..., proof?)`; persist site AFTER `setLatest`; idempotent-retry **back-fill** at
-   the alreadyDone `continue` (guards `getBlockProof === undefined`, `getBlock` in try/catch);
-   shared helper `persistProofIfContentMatches` — digest-match retention rule, logs
-   `commit:proof-undeclared` / `commit:proof-digest-mismatch` / `commit:proof-persist-failed`,
-   never throws (a proof fault must not fail a landed commit).
-9. `db-p2p/src/cluster/cluster-repo.ts` — `buildBlockCommitProof(record)` in the commit branch of
-   `applyConsensusOperation` (beside `captureCommitCert`), `cluster-member:commit-proof-skipped`
-   log for v1 records, commit called via `(storageRepo as IRepo & ICommitProofPersister)`.
-10. `db-p2p/src/index.ts` — exports `./cluster/commit-proof.js`.
-11. `db-p2p/test/mid-ddl-crash.spec.ts` — `CrashingRawStorage` got the two passthroughs.
-12. `db-p2p/test/storage-monitor.spec.ts` — stub got `getBlockProof/saveBlockProof: reject` entries.
-13. `db-p2p/src/libp2p-node-base.ts` — **necessary side-fix, flag to reviewer**: `repoProxy.commit`
-    now annotates `const target: IRepo = coordinatedRepo ?? storageRepo`. The un-annotated union
-    `IRepo | StorageRepo` stopped compiling once StorageRepo.commit gained the 3rd optional param
-    (TS synthesizes a different composite call signature on arity mismatch and rejected
-    `RepoCommitRequest`'s optional `tailId`). The proxy is the plain-IRepo seam; no proof flows there.
+1. **NEW `packages/db-p2p/test/commit-proof.spec.ts`** — the ticket's full test matrix:
+   - `buildBlockCommitProof`: v2 → proof with sorted `peerIds`; v1 / unversioned → `undefined`.
+   - `verifyBlockCommitProofClaim`: happy path (declared digest surfaced; also the
+     no-digests-declared variant); properly-signed reject votes ignored silently (4 peers, 3
+     approve + 1 reject per round, still passes); every `ProofFailure` reached — `legacy-record`
+     (wrong `v` and wrong `membershipVersion`), `membership-mismatch` (added + removed peer id),
+     `message-hash-mismatch` (tampered expiration), `unknown-signer` (outsider promise + only 2/3
+     cohort promises), `duplicate-signer` (duplicated id in `peerIds`), `non-ed25519-signer`
+     (garbage id baked into `peerIds`+digest from the start), `malformed-signature` (non-base64url
+     AND real-key-wrong-payload), `promise-threshold` (2/3 at 0.75), `commit-threshold` (1/3),
+     `claim-not-in-message` replay ×3 (rev / blockId / actionId), `malformed-proof` (9 hostile
+     shapes incl. null and a string).
+   - `verifyBlockCommitProofContent`: match; `no-digest-declared`; `digest-mismatch` (tampered
+     bytes); undigestable (circular) block → `digest-mismatch` not throw; multi-block proof — one
+     id intact passes, sibling tampered fails.
+   - Storage round trip through `MemoryRawStorage` AND `CachedRawStorage(new MemoryRawStorage())`:
+     deep-equal restore, claim still verifies.
+   - Retention rule via direct `StorageRepo.commit(commit, undefined, proof)` with a stub proof
+     (rule reads only `proofDeclaredDigest` — no sig verify needed): persisted on match; withheld
+     on mismatch / undeclared / tombstone (delete pend); back-fill on idempotent re-commit.
+   - End-to-end: FULLY-SIGNED v2 record (2 peers, both sign both rounds; recipe = `membershipDigest`
+     → `computeClusterMessageHash(message, digest)` → promise/commit hashes → each peer signs
+     `clusterVoteSigningPayload(hash, type)` base64url) driven through
+     `clusterMember(...).update(record)` against a pend-seeded `StorageRepo`: proof lands in raw
+     storage on digest match (and the stored artifact passes content verification offline);
+     withheld on mismatch.
+   - Size: 10-peer, two-block fully-signed proof measured **4578 bytes**, asserted `<
+     MAX_CONTROL_MESSAGE_BYTES`.
+2. **Full `yarn workspace @optimystic/db-p2p test` ran GREEN with this spec included** — 2081
+   passing, 44 pending (`tickets/.logs/2-persist-block-commit-proof.test.log`).
+3. **AFTER that green run** the spec file was refactored mechanically and rewritten: TS flagged
+   that `RepoMessage.operations` is a 1-element TUPLE type, so the helpers changed from
+   `commits: CommitRequest[]` to a single `commit: CommitRequest` (`operations: [{ commit }]`) —
+   and the file was fully re-Written because an intermediate PowerShell regex pass had corrupted
+   UTF-8 punctuation. **The rewritten file has NOT been re-executed.** Only mechanical changes
+   since the green run; expect green.
+4. `src/cluster/commit-proof.ts` — the `TODO(2-persist-block-commit-proof)` size comment replaced
+   with the measured number (4578 bytes), pointing at the spec's "size" test.
+
+Production-code inventory (runs 1–3, all committed — do NOT re-edit):
+`membershipDigestFromIds` in db-core `membership.ts`; full `commit-proof.ts` module incl.
+`proofDeclaredDigest` (shared op-resolution with the retention rule); `blockProofActionKey(rev)` =
+`` `~proof:${rev}` `` reserved key in `raw-store-codec.ts` (proofs ride the transactions store,
+zero driver fanout); `getBlockProof`/`saveBlockProof` on `IRawStorage`/`KvRawStorage` (+ contract
+note that no revision-delete site exists today) and rev-only pair on
+`IBlockStorage`/`BlockStorage`; `cached-raw-storage.ts` passthrough comment;
+`ICommitProofPersister` + `commit(request, _options?, proof?)` + post-`setLatest` persist site +
+alreadyDone back-fill + shared never-throwing `persistProofIfContentMatches` (logs
+`commit:proof-undeclared` / `commit:proof-digest-mismatch` / `commit:proof-persist-failed`) in
+`storage-repo.ts`; `buildBlockCommitProof` call + `cluster-member:commit-proof-skipped` log in
+`cluster-repo.ts` `applyConsensusOperation`; `commit-proof.js` export from `db-p2p/src/index.ts`;
+test-stub passthroughs in `mid-ddl-crash.spec.ts` / `storage-monitor.spec.ts`; and a necessary
+type-annotation side-fix in `libp2p-node-base.ts` (`const target: IRepo = coordinatedRepo ??
+storageRepo` — the un-annotated union stopped compiling when `StorageRepo.commit` gained the third
+optional param). All design decisions are documented in code comments at their sites.
 
 ## Remaining work (in order)
 
-- **Tests** — new `packages/db-p2p/test/commit-proof.spec.ts`. Copy the harness from
-  `test/cluster-commit-digest.spec.ts` (`makeKeyPair`, `makeClusterPeers`, seeded StorageRepo via
-  `pend`, `clusterMember({storageRepo, peerNetwork, peerId, privateKey})`) and the v2 signing
-  recipe in "### Test harness" below. `Signature` = `{type:'approve'|'reject'|'conflict';
-  signature: string; ...}` (db-core `cluster/structs.ts:11`); sign
-  `clusterVoteSigningPayload(hash,'approve')` with `privateKey.sign`, base64url encode.
-  Matrix (from the TODO list, all still open):
-  - Pure verify: happy claim+content; every `ProofFailure` reachable — `legacy-record` (v/mv),
-    `membership-mismatch` (tampered peerIds), `message-hash-mismatch` (tampered message),
-    `unknown-signer` (extra signer outside peerIds causing threshold shortfall — build the record's
-    digest WITH only the real ids), `duplicate-signer` (hand-built duplicated id in `peerIds`),
-    `non-ed25519-signer` (garbage id included in peerIds+digest from the start, with a votes entry),
-    `malformed-signature` (bad base64url / wrong bytes), `promise-threshold` (2-of-3 approves at
-    0.75 ⇒ ceil(2.25)=3), `commit-threshold` (full promises, 1-of-3 commits at 0.5),
-    `claim-not-in-message` replay ×3 (wrong rev / wrong blockId / wrong actionId),
-    `no-digest-declared`, `digest-mismatch` (tampered bytes), `malformed-proof` (null/garbage).
-    Non-approve votes ignored silently. Multi-block: one proof, two ids, one verifies + one tampered.
-  - `buildBlockCommitProof`: v2 ⇒ proof with sorted peerIds; v1/unversioned ⇒ undefined.
-  - Storage round trip: proof saved+read deep-equal through `MemoryRawStorage` AND
-    `new CachedRawStorage(new MemoryRawStorage())`; verify claim still passes after the round trip.
-  - Retention rule, direct `StorageRepo.commit(commit, undefined, proof)` calls (no consensus
-    needed — `persistProofIfContentMatches` only reads `proofDeclaredDigest`, no sig verify):
-    persisted on digest match; withheld on mismatch; withheld when no `blockDigests`
-    (undeclared); withheld on tombstone (pend a `{delete}`); back-fill on idempotent re-commit
-    (commit without proof, re-commit same `(actionId, rev)` with proof ⇒ stored).
-  - End-to-end via `member.update` with a FULLY-SIGNED v2 record (recipe in "### Test harness"
-    below, 2 peers ⇒ both must sign both rounds): proof lands in raw storage on match.
-  - Size: 10-peer cohort, two-block fully-signed commit — assert
-    `JSON.stringify(proof).length < MAX_CONTROL_MESSAGE_BYTES` (`src/protocol-limits.ts:19`), print
-    the number, then **bake the measured number into the `TODO(2-persist-block-commit-proof)` size
-    comment in commit-proof.ts** (and remove the TODO marker).
-- **Docs** — `docs/internals.md`: the artifact, the reserved `~proof:` key, the digest-match
-  retention rule + its two log lines, and that `saveReplicatedBlock` writes no proof (revisited by
-  `require-proof-on-block-push`).
-- **Validate** — root `yarn build && yarn typecheck && yarn test` (foreground, optionally
+- **Re-run `yarn workspace @optimystic/db-p2p test`** (foreground) to confirm the rewritten spec.
+  Also confirm no TS diagnostics remain in `test/commit-proof.spec.ts` (the tuple-type errors were
+  fixed by the rewrite; nothing else was flagged).
+- **Docs** — `docs/internals.md`: document the `BlockCommitProof` artifact (contrast with the
+  60-second-TTL in-memory `CommitCert`, which is documented in the "Cohort-Topic Origination
+  Bridge" subsection around lines 286–345), the reserved `~proof:` transactions-store key
+  (`raw-store-codec.ts`), the digest-match retention rule with its
+  `commit:proof-undeclared` / `commit:proof-digest-mismatch` log lines, and that
+  `saveReplicatedBlock` writes no proof (revisited by `require-proof-on-block-push`). Best
+  insertion point: a short subsection under "### Commit Path (Distributed Consensus)" (line ~147)
+  or immediately after the origination-bridge bullets.
+- **Validate** — root `yarn build && yarn typecheck && yarn test` (foreground; optionally
   `2>&1 | tee tickets/.logs/2-persist-block-commit-proof.test.log`).
-- Then write the review/ handoff (spec deviations to flag: the extra `malformed-proof` enum value;
-  content-verify mapping an undigestable block to `digest-mismatch`; the libp2p-node-base
-  annotation fix) and delete this ticket.
-
-## Findings from prior implement run (2026-08-27 — investigation complete)
-
-Everything below was verified against the current code — implement directly; do not re-derive
-these decisions.
-
-### Storage decision (the big one): do NOT extend `RawStoreDriver`
-
-`KvRawStorage` delegates every operation to a `RawStoreDriver` (`raw-store-driver.ts`), and that
-interface has **five production implementations across four other packages** (`db-p2p-storage-fs`,
-`-web`, `-ns`, `-rn`, plus `MemoryStoreDriver`) and several test drivers. Adding a proofs store to
-the driver would fan out far beyond this ticket's `files:` list. Instead, ride the **existing
-transactions store** with a synthetic action-id key:
-
-- Add `blockProofActionKey(rev: number): ActionId` (returns `` `~proof:${rev}` ``) to
-  `raw-store-codec.ts`, documented as a reserved key namespace.
-- `KvRawStorage.getBlockProof/saveBlockProof` call `driver.getTransaction/putTransaction` with that
-  key and `encodeJson/decodeJson`.
-- Why this is safe: nothing enumerates the transactions store (no `listTransactions` exists;
-  `recover()` and `materializeBlock` only probe action-ids read from the *revisions* store, so the
-  synthetic key can never leak into real flows). The FS driver already percent-encodes `:` in
-  action-id filenames (real ids look like `tx:<hash>`, `stamp:<hash>`, `inv:<...>` — see
-  `file-storage.ts:12-20`), so `~proof:2` round-trips on every backend.
-- **Free forwarding**: `MemoryRawStorage` and `CachedRawStorage` both `extends KvRawStorage`, and
-  the proof rides `CachedStoreDriver.getTransaction/putTransaction`
-  (`cached-store-driver.ts:701-721`) → `RawStorageDriverAdapter.getTransaction/putTransaction` →
-  inner `IRawStorage.getTransaction/saveTransaction` with **zero new wrapper code**. (The adapter
-  decodes the proof as a `Transform` cast — harmless JSON passthrough; note it in a comment.)
-- `canonicalJson` sorts object keys, so a codec that reorders keys does NOT actually break hash
-  recomputation — the ticket's worry is softer than stated. Still pin the round-trip test.
-
-`mid-ddl-crash.spec.ts` has a `CrashingRawStorage implements IRawStorage` — adding the two methods
-to the interface requires adding passthroughs there too.
-
-### Threading the proof into the commit
-
-- `ClusterMember.storageRepo` is typed `IRepo` (`cluster-repo.ts:262`); the commit call is at
-  `cluster-repo.ts:1526` inside `applyConsensusOperation` (commit branch starts ~1505, beside the
-  existing `captureCommitCert` at :1520-1523). `IRepo.commit` takes 2 args, so a 3-arg call needs a
-  named contract: add `ICommitProofPersister { commit(request, options?, proof?) }` to
-  `storage-repo.ts` (same pattern as `ICommitDigestPreviewer` at `storage-repo.ts:105`), have
-  `StorageRepo` implement it, and in the member cast
-  `this.storageRepo as IRepo & ICommitProofPersister` — the extra arg is harmless at runtime for
-  plain `IRepo` mocks, so no structural probe is needed.
-- `buildBlockCommitProof(record)` is a **cheap projection, no hashing**: copy
-  `messageHash/message/promises/commits/membershipDigest`, set
-  `peerIds = Object.keys(record.peers).sort()`; return `undefined` unless
-  `membershipVersion === 2 && typeof membershipDigest === 'string'` (member logs the skip).
-- `internalCommit` is at `storage-repo.ts:943` (ticket said :901; `pruneSupersededMaterialization`
-  actually lives in `block-storage.ts:135` and is *called* at `storage-repo.ts:1002`). Persist the
-  proof **after `setLatest`**, and wrap `saveBlockProof` in try/catch+log — a proof-persist fault
-  must NOT fail a commit that already durably landed (`commit()` would report `success:false` for a
-  landed commit).
-- **Back-fill site** for idempotent re-commit: the `alreadyDone` `continue` at
-  `storage-repo.ts:615-617`. Guard on `getBlockProof(request.rev) === undefined`, read
-  `storage.getBlock(request.rev)` in try/catch (can throw on unmaterializable), apply the same
-  digest-match rule. Runs inside the latched critical section — fine.
-- Factor one shared helper (blockId, rev, actionId, storage, proof, block|undefined) used by both
-  sites: tombstone/undeclared → log `commit:proof-undeclared`; hash mismatch → log
-  `commit:proof-digest-mismatch`; match → `saveBlockProof`.
-- **No site deletes revision records today** — `RawStoreDriver` has no revision delete at all, and
-  invalidations write compensating *forward* revisions. The "whatever deletes a revision must
-  delete its proof" clause resolves to a code comment on `saveBlockProof`.
-
-### Verification semantics (decisions already weighed — implement as stated)
-
-- Promise threshold: `approves >= Math.ceil(superMajorityThreshold * peerIds.length)` (mirrors
-  `getTransactionPhase`, `cluster-repo.ts:809`).
-- Commit threshold: `approves > peerIds.length * simpleMajorityThreshold`, and document that
-  callers pass **0.5** to mirror `ClusterMember.hasMajority` (`cluster-repo.ts:876` hardcodes
-  `> total/2`; the config's 0.51 default is NOT what members actually enforce).
-- Per-entry counting rules: non-`approve` vote → ignore silently; signer not in `peerIds` → skip
-  and note (if a threshold then fails, return `unknown-signer` rather than the bare threshold
-  reason — that is the "record" in the spec); signer in `peerIds` but not Ed25519 → immediate
-  `non-ed25519-signer`; signature that fails base64url decode OR cryptographic verify → immediate
-  `malformed-signature`; duplicate ids **in the `peerIds` array itself** (Set size ≠ length) →
-  `duplicate-signer` (JSON-parsed vote maps cannot carry duplicate keys, so the array is the
-  reachable site — pin with a hand-built object).
-- Add one extra failure value **`malformed-proof`** to `ProofFailure` for structurally-invalid
-  input (wrong types, missing fields, throwing shapes): the spec's enum has no honest fit and
-  "pure and total on hostile input" needs a catch-all. Deviation from spec, deliberate — mention in
-  the review handoff.
-- Membership digest recompute: `membershipDigestFromIds(proof.peerIds)` — the db-core helper this
-  ticket extracts; `membership.ts:26` `membershipDigest` delegates to it (`Object.keys(peers ?? {})`,
-  helper sorts a copy). The cluster barrel (`db-core/src/cluster/index.ts`) already `export *`s
-  membership.ts, so no barrel edit needed there. Export `commit-proof.js` from
-  `db-p2p/src/index.ts` beside the existing `./cluster/commit-cert.js` line (:5).
-
-### Test harness (proven pattern to copy)
-
-`packages/db-p2p/test/cluster-commit-digest.spec.ts` has everything: `makeKeyPair` (Ed25519 via
-`generateKeyPair`/`peerIdFromPrivateKey`), `makeClusterPeers`, a real
-`StorageRepo(new BlockStorage(id, new MemoryRawStorage()))` seeded via `pend`, and driving
-`clusterMember(...).update(record)`. To build a fully-signed **v2** record for proof tests:
-
-1. `digest = await membershipDigest(peers)`; message with one `{ commit }` op carrying
-   `blockDigests`; `messageHash = computeClusterMessageHash(message, digest)`; set
-   `membershipVersion: 2, membershipDigest: digest` on the record.
-2. `promiseHash = computeClusterPromiseHash(messageHash, message, digest)`; each peer signs
-   `clusterVoteSigningPayload(promiseHash, 'approve')` with `privateKey.sign`, base64url via
-   `uint8ArrayToString`.
-3. `commitHash = computeClusterCommitHash(messageHash, message, promises, digest)`; sign commits
-   the same way. (`canonicalJson` sorts keys, so promise-map insertion order is irrelevant.)
-4. A record fully signed this way passes `validateRecord` and drives `member.update` straight to
-   Consensus → `applyConsensusOperation` → `StorageRepo.commit` — use this for the end-to-end
-   "proof persisted on match / withheld on mismatch" test against a pend-seeded repo.
-
-Framework is mocha+chai (`expect(...).to.equal`); run `yarn workspace @optimystic/db-p2p test`
-(and `yarn workspace @optimystic/db-core test` for the membership helper), then root
-`yarn build && yarn typecheck && yarn test`. Long runs: stream to foreground, optionally
-`2>&1 | tee tickets/.logs/2-persist-block-commit-proof.test.log`.
-
-### Remaining work = the ticket's TODO list, unchanged
-
-Nothing from the TODO list is done. Measure the real proof size (10-peer cohort, two-block commit,
-`JSON.stringify(proof).length`) in a test, then bake the measured number into the commit-proof.ts
-comment — do not estimate.
+- **Handoff** — write the review/ ticket and delete this one. Spec deviations to flag to the
+  reviewer:
+  - extra `ProofFailure` value **`malformed-proof`** (deliberate catch-all for structurally
+    hostile input; the spec's enum had no honest fit);
+  - `verifyBlockCommitProofContent` maps an *undigestable* block to `digest-mismatch` (the bytes
+    provably are not the declared content);
+  - the `libp2p-node-base.ts` type-annotation side-fix above;
+  - thresholds doc: callers pass `simpleMajorityThreshold = 0.5` to mirror
+    `ClusterMember.hasMajority` (`> total/2`), NOT the config's 0.51 default.
 <!-- /resume-note -->
 
 ## The gap this closes
@@ -256,6 +143,7 @@ add bytes and a second thing to disagree with the id.
 **Measure the size** during implementation (a cohort of 10, a two-block commit) and record the real
 number in a code comment — do not quote an estimate. It rides inside sync responses bounded by
 `MAX_CONTROL_MESSAGE_BYTES = 1 MiB` (`protocol-limits.ts`), which already carry whole blocks.
+*(Done: measured 4578 bytes, recorded in the commit-proof.ts header comment.)*
 
 ## Verification, in two halves
 
@@ -426,21 +314,22 @@ Build the proof only for `membershipVersion === 2` records; skip and log otherwi
 
 ## TODO
 
-- Add `membershipDigestFromIds` to `db-core/src/cluster/membership.ts`; make `membershipDigest`
-  delegate; export from the barrel.
-- Add `packages/db-p2p/src/cluster/commit-proof.ts`: `BlockCommitProof`, `ProofClaim`,
+- ~~Add `membershipDigestFromIds` to `db-core/src/cluster/membership.ts`; make `membershipDigest`
+  delegate; export from the barrel.~~ DONE
+- ~~Add `packages/db-p2p/src/cluster/commit-proof.ts`: `BlockCommitProof`, `ProofClaim`,
   `ProofThresholds`, `ProofFailure`, `ProofVerdict`, `verifyBlockCommitProofClaim`,
-  `verifyBlockCommitProofContent`, and a `buildBlockCommitProof(record)` builder.
-- Add `getBlockProof` / `saveBlockProof` to `IRawStorage`, `IBlockStorage`, `BlockStorage`,
-  `KvRawStorage`, and the `cached-raw-storage.ts` wrappers; follow `raw-store-codec.ts` conventions.
-- Add the optional `proof` parameter to `StorageRepo.commit` → `internalCommit`; implement the
-  digest-match retention rule with its two log lines.
-- Build and pass the proof from `ClusterMember.applyConsensusOperation`, beside the existing
-  `captureCommitCert` call.
-- Tests: happy-path verify (claim and content); each `ProofFailure` reason reachable and returned;
+  `verifyBlockCommitProofContent`, and a `buildBlockCommitProof(record)` builder.~~ DONE
+- ~~Add `getBlockProof` / `saveBlockProof` to `IRawStorage`, `IBlockStorage`, `BlockStorage`,
+  `KvRawStorage`, and the `cached-raw-storage.ts` wrappers; follow `raw-store-codec.ts` conventions.~~ DONE
+- ~~Add the optional `proof` parameter to `StorageRepo.commit` → `internalCommit`; implement the
+  digest-match retention rule with its two log lines.~~ DONE
+- ~~Build and pass the proof from `ClusterMember.applyConsensusOperation`, beside the existing
+  `captureCommitCert` call.~~ DONE
+- ~~Tests: happy-path verify (claim and content); each `ProofFailure` reason reachable and returned;
   replay in its three shapes; tampered message / peerIds; duplicate and unknown signers; multi-block;
   storage round trip through both backends; proof written on match, withheld on mismatch, withheld on
-  tombstone, withheld on a commit with no digests.
-- Add a code comment recording the **measured** proof size for a 10-peer cohort.
+  tombstone, withheld on a commit with no digests.~~ DONE (written + one green run; re-run after the
+  mechanical rewrite — see resume note)
+- ~~Add a code comment recording the **measured** proof size for a 10-peer cohort.~~ DONE (4578 bytes)
 - Document the artifact and the retention rule in `docs/internals.md`.
 - Run `yarn build && yarn typecheck && yarn test` from the root.
