@@ -847,11 +847,13 @@ describe('BlockStorage checkpoint materialization sweep', () => {
 /**
  * Ticket: certified-claims-reconcile-and-persist. The persistence contract for commit proofs on
  * the replica path: `StorageRepo.saveReplicatedBlock` retains a proof its caller VERIFIED against
- * the exact bytes (the reconcile path is that caller), a proof-less save retains none, the
- * monotonic guard's early return keeps a held revision's proof state untouched, and the
+ * the exact bytes (the reconcile path is that caller), a proof-less save retains none, a re-heal
+ * of an already-held revision back-fills only under the digest-match retention rule, and the
  * unverified restore wire (`RestorationCoordinator` → `restoreCallback`) strips any proof a
  * remote archive attached. This layer never verifies — verification happened upstream — so a
- * minimal cast literal stands in for a real proof and keeps the tests fast.
+ * minimal cast literal stands in for a real proof and keeps the tests fast. That literal declares
+ * no digest, so the back-fill's POSITIVE path cannot be shown here; it is covered with real signed
+ * proofs in `block-transfer-push-persist.spec.ts`.
  */
 describe('commit-proof persistence on the replica path', () => {
 	let raw: MemoryRawStorage;
@@ -887,12 +889,16 @@ describe('commit-proof persistence on the replica path', () => {
 			.to.equal(undefined);
 	});
 
-	it('monotonic-skip: a certified re-heal of a held revision does NOT backfill its proof', async () => {
-		// Pins the documented gap at saveForwardRevision's guard: the skip returns before
-		// persisting anything, so a revision that first landed proof-less keeps no proof even when
-		// a later certified heal of the SAME revision carries one. Deliberate (the revision itself
-		// is already durable; the proof is an availability optimization) — if backfill is ever
-		// added, this is the assertion to flip.
+	it('monotonic-skip: a re-heal whose proof declares no digest back-fills nothing', async () => {
+		// `saveReplicatedBlock` DOES back-fill a proof onto an already-held revision (ticket:
+		// backfill-proof-on-held-revision) — but only through the digest-match retention rule, which
+		// stores nothing when the proof declares no digest for this `(blockId, rev, actionId)`. The
+		// stand-in `{ v: 1 }` proof used throughout this suite declares none, so it is withheld
+		// (`commit:proof-undeclared`). That is the claim pinned here.
+		//
+		// The back-fill's POSITIVE path needs real signed proofs and lives in
+		// `block-transfer-push-persist.spec.ts`, alongside the diverged-holder and stale-revision
+		// cases that make the retention rule matter.
 		const blockId = 'block-proof-skip' as BlockId;
 		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
 		const block = makeBlock('block-proof-skip', { items: [] });
@@ -900,7 +906,7 @@ describe('commit-proof persistence on the replica path', () => {
 		await repo.saveReplicatedBlock(blockId, block, { rev: 2, actionId: 'r2' as ActionId });
 		await repo.saveReplicatedBlock(blockId, block, { rev: 2, actionId: 'r2' as ActionId }, proof);
 
-		expect(await repo.getBlockProof(blockId, 2), 'the held revision keeps its proof state')
+		expect(await repo.getBlockProof(blockId, 2), 'a proof declaring no digest is withheld')
 			.to.equal(undefined);
 	});
 

@@ -631,7 +631,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 						// A retry can carry a proof the original commit lacked (or crashed before writing):
 						// back-fill it, strictly additively, under the same digest-match retention rule the
 						// original commit applies. Runs inside the latched critical section.
-						await this.backFillProof(blockId, storage, request, proof);
+						await this.backFillProof(blockId, storage, request.rev, request.actionId, proof);
 						continue;
 					}
 					staleAt = highestStaleAt([staleAt, { blockId, rev: latest.rev }]);
@@ -741,7 +741,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				// The recovered block IS committed at request.rev, but it is excluded from the
 				// internalCommit loop below — so without this it would be the one landing path that
 				// never retains the cohort's proof, even though this very call is carrying it.
-				await this.backFillProof(blockId, storage, request, proof);
+				await this.backFillProof(blockId, storage, request.rev, request.actionId, proof);
 			}
 
 			// Commit the action for each block that still needs it.
@@ -866,12 +866,20 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 * local commit on the same block — otherwise `saveReplica`'s monotonic guard could
 	 * read a stale `latest` and clobber a commit that advanced it in between.
 	 *
-	 * `verifiedProof` is retained when supplied: the reconcile path
-	 * (`cluster/reconcile-block.ts`) passes the {@link BlockCommitProof} it verified against these
-	 * exact bytes (`certifyContent`'s digest check), so a repaired replica serves the proof onward
-	 * and certification no longer decays across repair hops. The churn/push path
-	 * (`BlockTransferService`) still passes none — its revisions land uncertified; requiring the
-	 * pusher to supply a verified proof is `require-proof-on-block-push`.
+	 * `verifiedProof` is retained when supplied: both the reconcile path
+	 * (`cluster/reconcile-block.ts`) and the certified push path (`BlockTransferService.handlePush`)
+	 * pass the {@link BlockCommitProof} they verified against these exact bytes (`certifyContent`'s
+	 * digest check), so a repaired replica serves the proof onward and certification no longer decays
+	 * across repair hops.
+	 *
+	 * When the push does NOT advance `latest` (this node already holds that revision), `saveReplica`
+	 * is a no-op and persists nothing — so the proof is back-filled here instead, through
+	 * {@link backFillProof}'s digest-match rule. It is deliberately NOT persisted inside
+	 * `saveReplica`: the proof was verified against the PUSHED bytes, while a back-fill attaches it to
+	 * this node's HELD materialization, and a diverged holder's bytes at the same `(rev, actionId)`
+	 * may differ. Storing a proof whose declared digest contradicts local content would make this node
+	 * serve content that fails its own proof — `digest-mismatch` is an ATTRIBUTABLE fault in
+	 * `certified-claims.ts`, so every receiver would penalize it.
 	 */
 	async saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev, verifiedProof?: BlockCommitProof): Promise<void> {
 		log('saveReplicatedBlock blockId=%s rev=%s', blockId, source?.rev);
@@ -888,6 +896,23 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			const collectionId = block.header?.collectionId;
 			if (advanced && collectionId !== undefined) {
 				landed = { collectionId, actionId: effective.actionId, rev: effective.rev };
+			}
+			if (!advanced && verifiedProof !== undefined && source !== undefined
+				&& effective.rev === source.rev && effective.actionId === source.actionId) {
+				// The push named exactly the revision this node already holds, and carried a verified
+				// proof for it. Back-fill so a proof-lessly-landed revision stops being corroboration-only
+				// the moment valid evidence for it arrives. Requires agreement on BOTH rev and actionId:
+				// same rev under a different action is a divergence, not the same revision.
+				//
+				// A held revision NEWER than the pushed one is deliberately not back-filled: `servableProof`
+				// only ever serves the proof for `latest.rev`, so the proof would be keyed to a revision
+				// this node will never serve, for content it may not even materialize.
+				//
+				// Runs under the commit latch already held here — the same latch the commit-path
+				// back-fill sites hold, so no new latch interaction. `backFillProof` never throws: the
+				// revision is already durable, and a proof-persist fault must not turn a no-op into a
+				// failure.
+				await this.backFillProof(blockId, storage, effective.rev, effective.actionId, verifiedProof);
 			}
 		} finally {
 			release();
@@ -1065,27 +1090,33 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	}
 
 	/**
-	 * Retain `proof` for a block this call found ALREADY committed at `request.rev` — the idempotent
-	 * re-commit partition and the Crash-D3 `recover()` partition, the two landing paths that skip
-	 * {@link internalCommit} and would otherwise never retain a proof. Strictly additive: an existing
-	 * proof is left alone, and the same digest-match rule as the fresh-commit site decides retention.
+	 * Retain `proof` for a block this call found ALREADY committed at `(rev, actionId)` — the paths
+	 * that land (or find already landed) a revision without running {@link internalCommit}, and would
+	 * otherwise never retain a proof: the idempotent re-commit partition, the Crash-D3 `recover()`
+	 * partition, and {@link saveReplicatedBlock}'s monotonic no-op on a certified push. Strictly
+	 * additive: an existing proof is left alone, and the same digest-match rule as the fresh-commit
+	 * site decides retention.
+	 *
+	 * `rev`/`actionId` are passed separately rather than as a `CommitRequest` because the replica
+	 * caller has no commit request — it has the `(rev, actionId)` the push and the held revision
+	 * agree on.
 	 *
 	 * Callers must hold the block's commit latch. `getBlock` can throw on an unmaterializable base —
 	 * treated as "no local content", i.e. the proof is withheld.
 	 */
 	private async backFillProof(
-		blockId: BlockId, storage: IBlockStorage, request: CommitRequest, proof: BlockCommitProof | undefined
+		blockId: BlockId, storage: IBlockStorage, rev: number, actionId: ActionId, proof: BlockCommitProof | undefined
 	): Promise<void> {
-		if (proof === undefined || await storage.getBlockProof(request.rev) !== undefined) {
+		if (proof === undefined || await storage.getBlockProof(rev) !== undefined) {
 			return;
 		}
 		let committedBlock: IBlock | undefined;
 		try {
-			committedBlock = (await storage.getBlock(request.rev))?.block;
+			committedBlock = (await storage.getBlock(rev))?.block;
 		} catch {
 			committedBlock = undefined;
 		}
-		await this.persistProofIfContentMatches(blockId, request.actionId, request.rev, storage, proof, committedBlock);
+		await this.persistProofIfContentMatches(blockId, actionId, rev, storage, proof, committedBlock);
 	}
 
 	/**

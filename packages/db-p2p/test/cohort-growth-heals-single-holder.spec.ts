@@ -29,9 +29,11 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import type { PeerId } from '@libp2p/interface';
 import type {
-	ActionId, BlockHeader, BlockId, ClusterPeers, IBlock, IKeyNetwork, IRepo, Transforms, ActionRev,
-	FindCoordinatorOptions, IPeerNetwork
+	ActionId, BlockHeader, BlockId, ClusterPeers, CommitRequest, IBlock, IKeyNetwork, IRepo, Transforms,
+	ActionRev, FindCoordinatorOptions, IPeerNetwork
 } from '@optimystic/db-core';
+import { canonicalBlockHash } from '@optimystic/db-core';
+import { makeSignedProof } from './support/commit-proof-fixtures.js';
 import { toString as u8ToString } from 'uint8arrays';
 import { pipe } from 'it-pipe';
 import { encode as lpEncode, decode as lpDecode } from 'it-length-prefixed';
@@ -63,13 +65,32 @@ const makeBlock = (payload: string): IBlock => ({
 const payloadOf = (block: IBlock | undefined): string | undefined =>
 	(block as unknown as { payload?: string } | undefined)?.payload;
 
-/** Pend + commit one whole-block write at `rev`, asserting both halves succeeded. */
-const writeRevision = async (repo: IRepo, actionId: ActionId, rev: number, payload: string): Promise<void> => {
-	const transforms: Transforms = { inserts: { [BLOCK_ID]: makeBlock(payload) }, updates: {}, deletes: [] };
+/**
+ * Pend + CERTIFIED-commit one whole-block write at `rev`, asserting both halves succeeded and the
+ * cohort proof was retained.
+ *
+ * Certified rather than bare so this spec runs the PRODUCTION receiving posture: the commit declares
+ * the block's `canonicalBlockHash` in `blockDigests` and carries a fully-signed cohort proof, which
+ * `StorageRepo` retains, `sourceBlockCertification` reads back out, and the pushes below therefore
+ * carry — so B and C can keep `requirePushCertificate` at its default `true`. That makes the whole
+ * producer → wire → receiver certification chain part of what this end-to-end heal exercises.
+ */
+const writeRevision = async (repo: StorageRepo, actionId: ActionId, rev: number, payload: string): Promise<void> => {
+	const block = makeBlock(payload);
+	const transforms: Transforms = { inserts: { [BLOCK_ID]: block }, updates: {}, deletes: [] };
 	const pended = await repo.pend({ actionId, rev, transforms, policy: 'c' });
 	expect(pended.success, `pend of ${actionId} must succeed`).to.equal(true);
-	const committed = await repo.commit({ actionId, blockIds: [BLOCK_ID], tailId: BLOCK_ID, rev });
+	const commit: CommitRequest = {
+		actionId, blockIds: [BLOCK_ID], tailId: BLOCK_ID, rev,
+		blockDigests: { [BLOCK_ID]: { digest: await canonicalBlockHash(block) } }
+	};
+	// 4 approving peers against the 0.75 super-majority the receiving services below run.
+	const { proof } = await makeSignedProof(4, commit);
+	const committed = await repo.commit(commit, undefined, proof);
 	expect(committed.success, `commit of ${actionId} must succeed`).to.equal(true);
+	expect(await repo.getBlockProof(BLOCK_ID, rev),
+		`the cohort proof for rev ${rev} must be retained, or the push it drives cannot be certified`)
+		.to.not.equal(undefined);
 };
 
 /** The archive a peer serves for its own latest revision. Mirrors `SyncService.buildArchive`. */
@@ -249,14 +270,14 @@ describe('cohort growth replicates the founder block and makes it readable', fun
 
 		// B and C run the REAL receiving service over their real repos.
 		const registrarStub = { handle: async () => {}, unhandle: async () => {} };
-		// `writeRevision` commits without a cohort proof (this spec's subject is growth + heal, not
-		// certification), so the pushes it drives are uncertified and the receivers run the migration
-		// flag. Certified-push coverage lives in `block-transfer-push-persist.spec.ts`.
-		const uncertifiedPush = { requirePushCertificate: false };
+		// No migration flag: B and C run the PRODUCTION posture (`requirePushCertificate: true`), so
+		// the heal only completes if A's certified commit produced a proof, `sourceBlockCertification`
+		// attached it, it survived the wire framing, and each receiver verified it against both the
+		// declared `(rev, actionId)` and the pushed bytes.
 		const bService = new BlockTransferService(
-			{ registrar: registrarStub, repo: bRepo, superMajorityThreshold: 0.75 }, uncertifiedPush);
+			{ registrar: registrarStub, repo: bRepo, superMajorityThreshold: 0.75 });
 		const cService = new BlockTransferService(
-			{ registrar: registrarStub, repo: cRepo, superMajorityThreshold: 0.75 }, uncertifiedPush);
+			{ registrar: registrarStub, repo: cRepo, superMajorityThreshold: 0.75 });
 
 		const network = new LoopbackPeerNetwork();
 		network.register(peerB, bService);

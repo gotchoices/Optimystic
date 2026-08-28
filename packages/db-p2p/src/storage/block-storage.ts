@@ -299,10 +299,19 @@ export class BlockStorage implements IBlockStorage {
 
 			// Monotonic guard: an equal-or-newer revision is already held. The block (or tombstone) is
 			// durably present; do not downgrade `latest` or rewrite the metadata.
-			// NOTE: this skip returns before persisting anything, so an already-held revision keeps
-			// whatever proof state it had — a certified re-heal of a held rev does NOT backfill its
-			// proof. Acceptable: the revision itself is already durable, and the proof is an
-			// availability optimization, not a correctness requirement.
+			//
+			// This skip returns before persisting anything, INCLUDING `verifiedProof` — deliberately.
+			// The proof was verified against the PUSHED bytes; persisting it here would attach it to
+			// this node's HELD materialization, whose bytes at the same `(rev, actionId)` may differ if
+			// this holder diverged. A stored proof whose declared digest contradicts local content makes
+			// this node serve content that fails its own proof, and `digest-mismatch` is ATTRIBUTABLE in
+			// `cluster/certified-claims.ts` — every receiver would penalize it.
+			//
+			// Back-filling a proof onto an already-held revision therefore happens one layer up, in
+			// `StorageRepo.saveReplicatedBlock`'s non-advancing branch, which routes it through
+			// `backFillProof` → `persistProofIfContentMatches` — the rule that persists only when the
+			// LOCAL materialization matches the digest the commit op declared. Keep this guard a true
+			// no-op; the digest check is what makes the back-fill safe, and it does not belong here.
 			if (meta?.latest && meta.latest.rev >= rev) {
 				log('%s:skip blockId=%s rev=%d held=%d', logLabel, this.blockId, rev, meta.latest.rev);
 				return meta.latest;

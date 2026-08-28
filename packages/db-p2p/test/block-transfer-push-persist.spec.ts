@@ -373,4 +373,117 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 			expect(await repo.getBlockProof(blockId as BlockId, meta.rev)).to.deep.equal(proof);
 		});
 	});
+
+	/**
+	 * Ticket: backfill-proof-on-held-revision. A node that landed a revision proof-lessly (a legacy
+	 * uncertified push, a corroboration-only heal, a commit whose proof never reached it) is a
+	 * corroboration-only holder for it: it cannot re-prove to anyone what it holds. When a CERTIFIED
+	 * push for that same revision arrives, `BlockStorage.saveForwardRevision`'s monotonic guard makes
+	 * the save a no-op — so `StorageRepo.saveReplicatedBlock` back-fills the proof itself, through the
+	 * same digest-match retention rule the commit path uses.
+	 *
+	 * The rule is what makes this safe, and the negative cases below are the reason it lives one layer
+	 * up from the guard: the proof was verified against the PUSHED bytes, and a diverged holder's bytes
+	 * at the same `(rev, actionId)` may differ.
+	 */
+	describe('back-filling a proof onto an already-held revision', () => {
+		it('back-fills the proof when a certified push names the revision already held', async () => {
+			const blockId = 'block-backfill';
+			const block = makeBlock(blockId);
+			const meta = { rev: 4, actionId: 'a4' };
+
+			// Land the revision proof-lessly (the legacy/uncertified route).
+			await push(legacyService, pushReq(blockId, block, meta));
+			expect(await repo.getBlockProof(blockId as BlockId, meta.rev),
+				'precondition: the holder starts corroboration-only').to.equal(undefined);
+
+			// The same revision arrives again, this time certified.
+			const proof = await certify(blockId, block, meta);
+			const response = await push(service, pushReq(blockId, block, meta, proof));
+
+			expect(response.blocks, 'the certified re-push is accepted').to.have.property(blockId);
+			expect(response.missing).to.deep.equal([]);
+			expect(await repo.getBlockProof(blockId as BlockId, meta.rev),
+				'the verified proof is now retained for the held revision').to.deep.equal(proof);
+
+			const result = await repo.get({ blockIds: [blockId as BlockId] });
+			expect(result[blockId]?.state?.latest, 'latest is untouched — this was a no-op save')
+				.to.deep.equal(meta);
+		});
+
+		it('withholds the proof when the held bytes differ from the pushed bytes (diverged holder)', async () => {
+			// The trap the retention rule exists for. Both sides claim rev 4 / a4, but this node
+			// materialized different content. Storing the pushed proof would make this node serve
+			// content that fails its own proof — `digest-mismatch`, which is ATTRIBUTABLE in
+			// `cluster/certified-claims.ts`, so every receiver would penalize it.
+			const blockId = 'block-backfill-diverged';
+			const meta = { rev: 4, actionId: 'a4' };
+
+			await push(legacyService, pushReq(blockId, makeBlock(blockId, 'held'), meta));
+
+			const pushedBlock = makeBlock(blockId, 'pushed');
+			const proof = await certify(blockId, pushedBlock, meta);
+			const response = await push(service, pushReq(blockId, pushedBlock, meta, proof));
+
+			// The push itself verifies (the proof covers the bytes it carried) and is accepted...
+			expect(response.blocks).to.have.property(blockId);
+			// ...but nothing is retained for a revision this node materialized differently.
+			expect(await repo.getBlockProof(blockId as BlockId, meta.rev),
+				'a proof contradicting local content is never stored').to.equal(undefined);
+
+			const result = await repo.get({ blockIds: [blockId as BlockId] });
+			const held = result[blockId]?.block as unknown as { marker: string } | undefined;
+			expect(held?.marker, 'the held content is unchanged').to.equal('held');
+		});
+
+		it('withholds the proof when the same revision is held under a different action', async () => {
+			// Same rev, different actionId is a DIVERGENCE, not the same revision — the proof claims a
+			// commit this node did not land.
+			const blockId = 'block-backfill-other-action';
+			const block = makeBlock(blockId);
+
+			await push(legacyService, pushReq(blockId, block, { rev: 4, actionId: 'held-4' }));
+
+			const pushedMeta = { rev: 4, actionId: 'pushed-4' };
+			const proof = await certify(blockId, block, pushedMeta);
+			await push(service, pushReq(blockId, block, pushedMeta, proof));
+
+			expect(await repo.getBlockProof(blockId as BlockId, 4),
+				'agreement on rev alone is not enough').to.equal(undefined);
+			const result = await repo.get({ blockIds: [blockId as BlockId] });
+			expect(result[blockId]?.state?.latest).to.deep.equal({ rev: 4, actionId: 'held-4' });
+		});
+
+		it('does not back-fill for a revision older than the one held', async () => {
+			// `servableProof` only ever serves the proof for `latest.rev`, so a proof keyed to a
+			// superseded revision is dead weight for content this node may not even materialize.
+			const blockId = 'block-backfill-stale';
+			const block = makeBlock(blockId);
+
+			await push(legacyService, pushReq(blockId, block, { rev: 5, actionId: 'a5' }));
+
+			const staleMeta = { rev: 1, actionId: 'a1' };
+			await push(service, pushReq(blockId, block, staleMeta, await certify(blockId, block, staleMeta)));
+
+			expect(await repo.getBlockProof(blockId as BlockId, 1),
+				'no proof is stored for the superseded revision').to.equal(undefined);
+			const result = await repo.get({ blockIds: [blockId as BlockId] });
+			expect(result[blockId]?.state?.latest).to.deep.equal({ rev: 5, actionId: 'a5' });
+		});
+
+		it('leaves an existing proof alone (back-fill is strictly additive)', async () => {
+			const blockId = 'block-backfill-additive';
+			const block = makeBlock(blockId);
+			const meta = { rev: 2, actionId: 'a2' };
+			const first = await certify(blockId, block, meta);
+
+			await push(service, pushReq(blockId, block, meta, first));
+			// A second, independently-signed proof for the same commit — a different cohort sample.
+			const second = await certify(blockId, block, meta);
+			await push(service, pushReq(blockId, block, meta, second));
+
+			expect(await repo.getBlockProof(blockId as BlockId, meta.rev),
+				'the first retained proof is not overwritten').to.deep.equal(first);
+		});
+	});
 });

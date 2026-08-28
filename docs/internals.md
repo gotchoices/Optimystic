@@ -250,11 +250,28 @@ the mismatch log is the first divergence signal this system has had. Proofs are 
 revision under the reserved `~proof:<rev>` key in the transactions store (`raw-store-codec.ts`),
 so they survive `pruneMaterialization` (which trims superseded materialized copies but retains
 revision records) and live exactly as long as the revision itself; no revision-delete site exists
-today. The two landing paths that skip `internalCommit` — an idempotent re-commit of the same
-`(actionId, rev)`, and a Crash-D3 block whose lost `setLatest` `recover()` redoes — back-fill a
-missing proof under the same rule. `saveReplicatedBlock` persists a proof only when its caller
-verified it against the exact bytes being saved — the reconcile path is one such caller, and
-`BlockTransferService.handlePush` is the other (see **Certified push** below).
+today. The landing paths that skip `internalCommit` — an idempotent re-commit of the same
+`(actionId, rev)`, a Crash-D3 block whose lost `setLatest` `recover()` redoes, and a certified push
+of a revision this node already holds — back-fill a missing proof under the same rule.
+`saveReplicatedBlock` persists a proof only when its caller verified it against the exact bytes
+being saved — the reconcile path is one such caller, and `BlockTransferService.handlePush` is the
+other (see **Certified push** below).
+
+**Back-filling onto an already-held revision.** When a certified push names a revision this node
+already holds, `BlockStorage.saveForwardRevision`'s monotonic guard makes the save a no-op, so
+nothing — including the proof — is written there. `StorageRepo.saveReplicatedBlock` back-fills it
+instead, on its non-advancing branch, when the push and the held revision agree on **both** `rev`
+and `actionId`. This is deliberately one layer above the guard: the proof was verified against the
+*pushed* bytes, while a back-fill attaches it to this node's *held* materialization, and a diverged
+holder's bytes at the same `(rev, actionId)` may differ. Routing it through
+`persistProofIfContentMatches` is what withholds the proof in that case; storing it would make this
+node serve content that fails its own proof, and `digest-mismatch` is **attributable** in
+`certified-claims.ts`, so every receiver would penalize it. A held revision *newer* than the pushed
+one is never back-filled — `servableProof` only serves the proof for `latest.rev`, so it would be
+keyed to a revision this node will never serve. Without this, a node that landed a revision
+proof-lessly (a legacy uncertified push, a corroboration-only heal) stayed a corroboration-only
+holder for it even after valid evidence arrived — exactly the certification decay the certified-push
+work exists to stop.
 
 **On the repair wires.** Both block-repair wires now carry the stored proof, so a requester can
 check a lone holder's claim with no second holder to corroborate against:

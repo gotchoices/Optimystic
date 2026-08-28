@@ -79,6 +79,14 @@ function makeLinkedPair() {
  * linked pair, kicks off the captured handler with the server stream concurrently
  * (NOT awaited — mirrors how libp2p invokes a stream handler), and hands the client
  * stream back to the BlockTransferClient.
+ *
+ * The DEFAULT here is the migration posture (`requirePushCertificate: false`), and that is a
+ * deliberate, reviewed choice — not inertia (ticket: backfill-proof-on-held-revision). This spec's
+ * subject is the stream path: handler registration, length-prefixed framing, and the response
+ * deadline. Those tests must fail for a framing reason and nothing else, so they push a bare block
+ * with no certification to build. The production posture is NOT skipped here — the two
+ * `certified push:` tests below pass `{}` explicitly and run the strict default end to end, with a
+ * real signed proof crossing the real wire and an uncertified control that must be refused.
  */
 function makeWiredNetwork(repo: IBlockReplicaStore, init: BlockTransferServiceInit = { requirePushCertificate: false }) {
 	let handler: ((stream: any) => void | Promise<void>) | undefined;
