@@ -1,6 +1,7 @@
 import type { ActionRev, BlockId, IBlock } from "@optimystic/db-core";
 import { canonicalBlockHash } from "@optimystic/db-core";
 import type { BlockArchive } from "../storage/struct.js";
+import { maxArchiveRevision } from "../storage/block-archive.js";
 import type { ReconcileBlockCallback } from "./cluster-repo.js";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
@@ -54,20 +55,6 @@ export interface ReconcileBlockDeps {
 }
 
 /**
- * Highest revision an archive covers. Keys arrive as strings off the wire from an untrusted peer,
- * so a non-numeric one is skipped rather than poisoning the maximum with `NaN`; folding instead of
- * `Math.max(...keys)` also keeps a wide archive off the argument-count limit.
- */
-function maxRevision(revisions: BlockArchive['revisions']): number | undefined {
-	let max: number | undefined;
-	for (const key of Object.keys(revisions)) {
-		const rev = Number(key);
-		if (Number.isFinite(rev) && (max === undefined || rev > max)) max = rev;
-	}
-	return max;
-}
-
-/**
  * What one cohort peer's fetch produced. Kept as separate outcomes rather than collapsed to
  * `ReconcileCandidate | undefined` so a decline can report WHICH populations it was short of: "1 of 3
  * responded" and "1 holder, 2 confirmed non-holders" call for completely different operator actions.
@@ -95,7 +82,7 @@ type PeerAnswer =
  * healing, or no usable action at its highest.
  */
 function toCandidate(peerId: string, archive: BlockArchive, committedRev: number): ReconcileCandidate | undefined {
-	const maxRev = maxRevision(archive.revisions);
+	const maxRev = maxArchiveRevision(archive.revisions);
 	if (maxRev === undefined || maxRev < committedRev) return undefined;
 	const data = archive.revisions[maxRev];
 	if (!data?.action) return undefined;

@@ -290,6 +290,25 @@ describe('block archive commit proof', () => {
 			expect(latestClaimFromArchive({ blockId: BLOCK, range: [0, 0] } as unknown as BlockArchive)).to.equal(undefined);
 		});
 
+		it('folds a hostilely WIDE archive instead of spreading it into Math.max', async function () {
+			// A remote peer chooses this archive's width. `Math.max(...keys)` passes one ARGUMENT per
+			// revision and throws `RangeError: Maximum call stack size exceeded` past ~125k of them, so
+			// a peer could otherwise decide to make the projection throw -- which the read path counts
+			// as SILENCE from that peer rather than an answer. 130k entries is chosen because it is
+			// over that limit and, as the assertion below measures, still inside the 8 MiB a sync
+			// response may carry, i.e. reachable without breaking any other protocol rule.
+			this.timeout(20_000);
+			const revisions: BlockArchive['revisions'] = {};
+			for (let rev = 0; rev < 130_000; rev++) {
+				revisions[rev] = { action: { actionId: `a-${rev}` as ActionId, transform: {} } };
+			}
+			const wide: BlockArchive = { blockId: BLOCK, revisions, range: [0, 130_000] };
+			expect(JSON.stringify(wide).length, 'the width must be reachable within the response cap')
+				.to.be.lessThan(MAX_BLOCK_MESSAGE_BYTES);
+
+			expect(latestClaimFromArchive(wide)).to.deep.equal({ actionId: 'a-129999' as ActionId, rev: 129_999 });
+		});
+
 		it('survives a JSON round trip and ignores unknown fields from a newer peer', async () => {
 			// Both compatibility directions in one: an unknown key on the archive (what an upgraded
 			// peer's extra field looks like to any reader) is carried through JSON and simply not read,

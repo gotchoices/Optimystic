@@ -1,5 +1,4 @@
 import type { ComponentLogger, Connection, Startable } from '@libp2p/interface';
-import type { IRepo } from '@optimystic/db-core';
 import { buildSyncProtocol, type SyncRequest, type SyncResponse } from './protocol.js';
 import { pipe } from 'it-pipe';
 import { toString as u8ToString } from 'uint8arrays/to-string';
@@ -7,7 +6,7 @@ import * as lp from 'it-length-prefixed';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
-import { serveBlockArchive } from '../storage/block-archive.js';
+import { serveBlockArchive, type ArchiveServingRepo } from '../storage/block-archive.js';
 import type { BlockArchive } from '../storage/struct.js';
 
 export interface SyncServiceInit extends InboundStreamAuthorizationInit {
@@ -17,7 +16,15 @@ export interface SyncServiceInit extends InboundStreamAuthorizationInit {
 export interface SyncServiceComponents {
 	logger: ComponentLogger;
 	registrar: { handle: (...args: any[]) => Promise<void>, unhandle: (...args: any[]) => Promise<void> };
-	repo: IRepo;
+	/**
+	 * The local store this node answers repair fetches out of. Declared as `ArchiveServingRepo`
+	 * rather than bare `IRepo` so the seam SAYS that the served archive's commit proof is read off
+	 * this object: a wiring that hands over a delegating proxy without the accessor serves every
+	 * archive proof-less, which is invisible to any test that reads a real `StorageRepo` directly.
+	 * The accessor stays optional — a plain `IRepo` embedder serves the pre-proof archive, which
+	 * every consumer still handles.
+	 */
+	repo: ArchiveServingRepo;
 }
 
 type Logger = ReturnType<ComponentLogger['forComponent']>;
@@ -36,7 +43,7 @@ export class SyncService implements Startable {
 	private running = false;
 	private readonly log: Logger;
 	private readonly protocol: string;
-	private readonly repo: IRepo;
+	private readonly repo: ArchiveServingRepo;
 	private readonly registrar: { handle: (...args: any[]) => Promise<void>, unhandle: (...args: any[]) => Promise<void> };
 	/** Optional embedder authorization gate; `undefined` (the default) means no check runs. */
 	private readonly authorization: InboundStreamAuthorization | undefined;

@@ -64,6 +64,30 @@ export function singleRevisionArchive(
 export type CertifiedActionRev = ActionRev & { proof?: BlockCommitProof };
 
 /**
+ * Highest revision an archive covers, or `undefined` when it covers none.
+ *
+ * ONE implementation for every site that asks an untrusted archive this question — the two repair
+ * wires ({@link latestClaimFromArchive}) and the reconcile pass (`cluster/reconcile-block.ts`) — for
+ * the same reason {@link singleRevisionArchive} is one function: two copies is how one of them ends
+ * up without the guards below.
+ *
+ * Both guards matter on input a remote peer chose. `Object.keys` on a JSON-parsed archive yields
+ * strings, so a non-numeric key coerces to `NaN` and is skipped rather than poisoning the maximum.
+ * And the fold is deliberate rather than `Math.max(...keys)`: the spread passes one ARGUMENT per
+ * revision, which throws `RangeError: Maximum call stack size exceeded` past ~125k arguments —
+ * comfortably inside the 8 MiB `MAX_BLOCK_MESSAGE_BYTES` a sync response may carry (130k minimal
+ * revision entries serialize to ~6.3 MiB), so a peer could otherwise choose to make this throw.
+ */
+export function maxArchiveRevision(revisions: BlockArchive['revisions'] | undefined): number | undefined {
+	let max: number | undefined;
+	for (const key of Object.keys(revisions ?? {})) {
+		const rev = Number(key);
+		if (Number.isFinite(rev) && (max === undefined || rev > max)) max = rev;
+	}
+	return max;
+}
+
+/**
  * The highest-revision claim an archive carries, or `undefined` when it holds no usable revision.
  * `undefined` is the peer having ANSWERED without data — an absent claim, never silence (see
  * `ClusterLatestCallback`'s three-way contract).
@@ -71,14 +95,10 @@ export type CertifiedActionRev = ActionRev & { proof?: BlockCommitProof };
  * The proof is read from the SAME revision entry as the `(rev, actionId)`, so a serving peer cannot
  * pair a genuine proof with a revision it does not certify by choosing a different layout. Nothing
  * here verifies anything: the result is the peer's unverified assertion until a caller checks it.
- *
- * `Object.keys` on a JSON-parsed archive yields strings; a key that is not a number coerces to `NaN`
- * and is dropped rather than poisoning `Math.max`.
  */
 export function latestClaimFromArchive(archive: BlockArchive): CertifiedActionRev | undefined {
-	const revisions = Object.keys(archive.revisions ?? {}).map(Number).filter(rev => Number.isFinite(rev));
-	if (revisions.length === 0) return undefined;
-	const maxRev = Math.max(...revisions);
+	const maxRev = maxArchiveRevision(archive.revisions);
+	if (maxRev === undefined) return undefined;
 	const entry = archive.revisions[maxRev];
 	if (!entry?.action) return undefined;
 	return {
@@ -99,6 +119,17 @@ export function latestClaimFromArchive(archive: BlockArchive): CertifiedActionRe
 export type ArchiveServingRepo = IRepo & {
 	getBlockProof?(blockId: BlockId, rev: number): Promise<BlockCommitProof | undefined>;
 };
+
+/**
+ * An {@link ArchiveServingRepo} that definitely CAN serve proofs — the accessor required rather
+ * than optional.
+ *
+ * The optionality above exists for a serving repo that legitimately has no proofs (a test double, a
+ * plain-`IRepo` embedder). It is the wrong default for a node's OWN store: forgetting the accessor
+ * there degrades every archive it serves to proof-less, silently and without a type error. Naming
+ * the stronger shape lets a composition root demand it (`createServedRepoProxy`).
+ */
+export type ProofRetainingRepo = IRepo & Required<Pick<ArchiveServingRepo, 'getBlockProof'>>;
 
 /**
  * Serve `blockId` out of a local repo as a {@link singleRevisionArchive} — what a peer answers a

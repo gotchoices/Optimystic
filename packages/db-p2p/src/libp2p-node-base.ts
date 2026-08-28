@@ -18,7 +18,8 @@ import { StorageRepo, withBlockCommitLatch } from './storage/storage-repo.js';
 import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
-import { latestClaimFromArchive, servableProof } from './storage/block-archive.js';
+import { latestClaimFromArchive, servableProof, type ArchiveServingRepo } from './storage/block-archive.js';
+import { createServedRepoProxy } from './repo/served-repo-proxy.js';
 import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
 import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
 import { createReconcileBlock } from './cluster/reconcile-block.js';
@@ -420,28 +421,11 @@ export async function createLibp2pNodeBase(
 		}
 	};
 
-	const repoProxy: IRepo = {
-		async get(blockGets, options) {
-			const target = coordinatedRepo ?? storageRepo;
-			return await target.get(blockGets, options);
-		},
-		async pend(request, options) {
-			const target = coordinatedRepo ?? storageRepo;
-			return await target.pend(request, options);
-		},
-		async cancel(trxRef, options) {
-			const target = coordinatedRepo ?? storageRepo;
-			return await target.cancel(trxRef, options);
-		},
-		async commit(request, options) {
-			// Widen to IRepo: `coordinatedRepo ?? storageRepo` is `IRepo | StorageRepo`, and
-			// StorageRepo.commit's extra optional proof parameter (ICommitProofPersister) makes the
-			// union's synthesized call signature reject the plain repo-level request. This proxy is
-			// the plain IRepo seam — no proof flows through it.
-			const target: IRepo = coordinatedRepo ?? storageRepo;
-			return await target.commit(request, options);
-		}
-	};
+	// Built by a named factory, not an inline literal: see `createServedRepoProxy` for why (an
+	// inline object here is unreachable from every test that does not boot a libp2p node, which is
+	// how it served every repair archive without its commit proof). `coordinatedRepo` is read per
+	// call because it is assigned further down, after the cluster is assembled.
+	const repoProxy: ArchiveServingRepo = createServedRepoProxy(storageRepo, () => coordinatedRepo);
 
 	// The ONE authorization slice, spread verbatim into all four database-protocol service inits
 	// below. Building it once (rather than repeating two option reads per service) is what makes

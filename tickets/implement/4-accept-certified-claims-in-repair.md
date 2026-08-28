@@ -118,6 +118,26 @@ Update `packages/db-p2p/test/coordinator-repo-read-repair-trust.spec.ts` accordi
 - **Mixed cohort.** Some peers serve proofs, some do not: certified claims short-circuit, the rest
   still corroborate among themselves.
 
+## Two arms appended by the `serve-block-commit-proof` review
+
+Both are places the proof now *arrives* and is dropped. Neither is a defect today — nothing decides
+with a proof yet — but both become this ticket's work the moment verification exists.
+
+**The reconcile path never lifts the proof off the archive it fetched.** `CoordinatorRepo`
+populates `RevClaim.proof`; `createReconcileBlock` does not. Its `toCandidate`
+(`cluster/reconcile-block.ts`) reads `rev`, `actionId`, and `block` out of the served entry and
+discards `entry.proof`, so a certified short-circuit added to `selectQuorumRev` would fire on the
+read path and never on the commit-time reconcile path — the two paths would silently heal by
+different rules, which is exactly what the shared `quorum-restore.ts` primitives exist to prevent.
+Carry the proof into `ReconcileCandidate` alongside `block`.
+
+**A repaired replica retains no proof, so it re-serves the revision proof-less.** Today that is
+correct and deliberate — `BlockStorage.saveRestored` carries a `NOTE:` saying so: nothing has
+verified the served proof, and persisting an unverified one would let this node re-serve a hostile
+peer's artifact as evidence it retained itself. Once this ticket verifies a proof before accepting
+it, the verified proof is safe to persist, and persisting it is what stops certification from
+decaying across every repair hop. Same at the push site, which `require-proof-on-block-push` owns.
+
 ## TODO
 
 - Add an optional `certified` flag to `RevClaim` and `BlockHashCandidate`; add the certified
@@ -135,6 +155,10 @@ Update `packages/db-p2p/test/coordinator-repo-read-repair-trust.spec.ts` accordi
   uncorroborated; competing certified claims decline; zero overlap accepts and logs; replayed proof
   rejected; digest-contradicting content rejected and penalized; unparseable proof rejected and NOT
   penalized; every pre-existing corroboration test still passes untouched.
-- Update `docs/internals.md` (and `docs/correctness.md` where it states the repair trust rule) with
+- Carry the proof into `ReconcileCandidate` and verify it in `createReconcileBlock`, per the first
+  appended arm; persist the VERIFIED proof where a repair lands a revision (`BlockStorage.saveRestored`,
+  replacing the `NOTE:` there), per the second.
+- Update `docs/internals.md` (its **On the repair wires** subsection states today's "nothing decides"
+  position and the repaired-replica asymmetry) and `docs/correctness.md` (Theorem 14 states the same) with
   the certified short-circuit and the honest statement of what layer 1 does and does not prove.
 - Run `yarn build && yarn typecheck && yarn test` from the root.

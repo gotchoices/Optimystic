@@ -456,6 +456,18 @@ export class BlockStorage implements IBlockStorage {
 		return await this.restoreCallback(this.blockId, rev);
 	}
 
+	/**
+	 * Persist a fetched archive's revisions locally.
+	 *
+	 * NOTE: a served archive may carry the cohort's `BlockCommitProof` for a revision, and this
+	 * deliberately does NOT store it — nothing on the repair path has verified it yet, and a node
+	 * that persisted an unverified proof would re-serve a hostile peer's artifact as evidence it
+	 * retained itself. The consequence to know: a block obtained by repair (here, or through
+	 * `cluster/reconcile-block.ts`) holds no proof, so that node serves the revision proof-less even
+	 * though the cohort members that committed it do not. Once `accept-certified-claims-in-repair`
+	 * verifies a proof before accepting it, persisting the verified one here is the follow-on that
+	 * closes the asymmetry.
+	 */
 	private async saveRestored(archive: BlockArchive) {
 		const revisions = Object.entries(archive.revisions)
 			.map(([rev, data]) => ({ rev: Number(rev), data }));
