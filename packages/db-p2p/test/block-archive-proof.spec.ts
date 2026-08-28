@@ -294,6 +294,25 @@ describe('block archive commit proof', () => {
 				.to.deep.equal(makeBlock(BLOCK, 'one'));
 		});
 
+		it('a pin ABOVE the block\'s own latest serves that block\'s revision, labelled as itself', async () => {
+			// The everyday pin shape: `context.rev` is a COLLECTION revision, so it routinely sits
+			// above the revision at which this particular block last changed. The block is unchanged
+			// since the pin, so serving it is right — but the label is still the block's OWN revision,
+			// never the pin and never a revision the repo does not hold. The guard must not fire here:
+			// `served.rev <= rev` is the whole condition, not `served.rev === rev`.
+			const { repo } = makeRepo();
+			await landRevision(repo, { rev: 1, actionId: ACTION, block: makeBlock(BLOCK, 'one'), certified: true });
+			const proof2 = await landRevision(repo, { rev: 2, actionId: ACTION_2, block: makeBlock(BLOCK, 'two'), certified: true });
+
+			for (const requested of [2, 3, 9]) {
+				const archive = (await serveBlockArchive(repo, BLOCK, requested))!;
+				expect(archive.range, `requested ${requested}: the block's own revision`).to.deep.equal([2, 3]);
+				expect(soleEntry(archive).action.actionId, `requested ${requested}: its action`).to.equal(ACTION_2);
+				expect(soleEntry(archive).block, `requested ${requested}: its bytes`).to.deep.equal(makeBlock(BLOCK, 'two'));
+				expect(soleEntry(archive).proof, `requested ${requested}: its proof`).to.deep.equal(proof2);
+			}
+		});
+
 		it('serves nothing rather than a mislabel when the repo cannot say what it materialized', async () => {
 			// A plain `IRepo` that reports no materialized revision can only be describing its latest.
 			// Asked for a revision BELOW that latest, the honest answer is "cannot serve" — the content

@@ -1,4 +1,4 @@
-import type { ActionRev, BlockId, IBlock, IRepo } from "@optimystic/db-core";
+import type { ActionContext, ActionRev, BlockId, IBlock, IRepo } from "@optimystic/db-core";
 import type { BlockArchive } from "./struct.js";
 import { proofClaimsCommit, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { createLogger } from "../logger.js";
@@ -165,7 +165,10 @@ export type ProofRetainingRepo = IRepo & Required<Pick<ArchiveServingRepo, 'getB
  * signatures.
  */
 export async function serveBlockArchive(repo: ArchiveServingRepo, blockId: BlockId, rev?: number): Promise<BlockArchive | undefined> {
-	const context = rev !== undefined ? { rev, committed: [], pending: [] } : undefined;
+	// `ActionContext` is `{ committed, rev, actionId? }` — nothing else. `committed: []` claims no
+	// uncommitted-but-known action, and omitting `actionId` is what keeps this off `StorageRepo`'s
+	// pending-overlay path, so the read is purely "the highest COMMITTED revision at or below `rev`".
+	const context: ActionContext | undefined = rev !== undefined ? { rev, committed: [] } : undefined;
 	const result = await repo.get({ blockIds: [blockId], context }, { skipClusterFetch: true } as any);
 	const entry = result[blockId];
 	const latest = entry?.state?.latest;
