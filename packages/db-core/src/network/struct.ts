@@ -123,6 +123,21 @@ export type CommitRequest = ActionBlocks & {
 	 *  Rides inside the consensus message, so the generic cluster message hash folds it into every
 	 *  cohort signature with no change to the hash helpers. Action-wide here; the transactor narrows
 	 *  it to each per-coordinator batch's own block ids before sending (`RepoCommitRequest`). */
+	// NOTE: accepted tradeoff — this field stays OPTIONAL even though an omitted declaration has a real
+	// cost: `StorageRepo.persistProofIfContentMatches` retains no `BlockCommitProof` for a block that
+	// declared no digest (`commit:proof-undeclared`), and a block with no proof is refused by any
+	// receiver running the default `requirePushCertificate: true` (`push:reject-uncertified
+	// reason=no-proof`). Such a block stays readable and pullable (`handlePull` is not certificate-gated)
+	// and still repairs by corroboration while two or more holders remain, but it can never GAIN a
+	// holder by push — so spread-on-churn and cohort-growth healing silently stop maintaining its
+	// replication factor. Kept optional anyway because: (a) required-but-nullable is the strongest form
+	// available and still permits `undefined`, so it does not make the bad state unrepresentable, only
+	// typed out loud; (b) some commits legitimately declare nothing — delete-only/tombstone commits
+	// materialize no content, and a member on a lagging base abstains; (c) measured migration cost of
+	// required-but-nullable here and on `RepoCommitRequest` is >=194 `tsc --noEmit` errors across >=39
+	// files (39/9 in db-core, 155/30 in db-p2p, quereus-plugin-optimystic unmeasured), nearly all fixed
+	// by literally writing `undefined`. Revisit if undeclared commits ever become common enough to show
+	// up as replication-factor decay.
 	blockDigests?: BlockContentDigests;
 };
 

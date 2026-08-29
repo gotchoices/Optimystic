@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
-import type { BlockId, IBlock, BlockHeader, Transforms, IRepo } from '@optimystic/db-core';
+import type { BlockId, IBlock, BlockHeader, Transforms, IRepo, BlockContentDigests } from '@optimystic/db-core';
+import { canonicalBlockHash } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { multiaddr } from '@multiformats/multiaddr';
@@ -38,6 +39,23 @@ const makeTransforms = (blockId: string): Transforms => ({
 	deletes: []
 });
 
+/** The content declaration a production commit of {@link makeTransforms} would carry.
+ *
+ * Every commit in this file must declare, not because the field is required — it is optional, and an
+ * omitted declaration still commits — but because a revision committed with no declaration retains no
+ * `BlockCommitProof`, and a block with no proof is refused by any receiver running the default
+ * `requirePushCertificate: true`. Undeclared commits therefore cannot gain holders by push, which
+ * silently disables the spread-on-churn and cohort-growth paths these tests exist to cover.
+ *
+ * `makeTransforms` only inserts, so the digest is the canonical hash of `makeBlock(blockId)` and no
+ * `baseRev` rides along — exactly what `computeBlockContentDigests` produces for an inserted block.
+ * A WRONG digest is not a weaker test but a failing one: cohort members run
+ * `ClusterMember.validateCommitOperations` on the promise round and vote reject with
+ * `content-digest-mismatch` when a declaration disagrees with what they materialize. */
+const makeBlockDigests = async (blockId: string): Promise<BlockContentDigests> => ({
+	[blockId]: { digest: await canonicalBlockHash(makeBlock(blockId)) }
+});
+
 async function pendCommitGet(
 	repo: IRepo,
 	blockId: string,
@@ -55,8 +73,9 @@ async function pendCommitGet(
 		actionId,
 		tailId: blockId as BlockId,
 		rev,
-		blockIds: [blockId as BlockId]
-	} as any);
+		blockIds: [blockId as BlockId],
+		blockDigests: await makeBlockDigests(blockId)
+	});
 	expect(commitResult.success, `commit(${blockId})`).to.equal(true);
 
 	const getResult = await repo.get({ blockIds: [blockId as BlockId] });
@@ -220,8 +239,9 @@ describe('Real libp2p integration', function () {
 			actionId: 'two-a1',
 			tailId: blockId as BlockId,
 			rev: 1,
-			blockIds: [blockId as BlockId]
-		} as any);
+			blockIds: [blockId as BlockId],
+			blockDigests: await makeBlockDigests(blockId)
+		});
 		expect(commitResult.success, 'A.commit').to.equal(true);
 
 		const bResult = await bRepo.get({ blockIds: [blockId as BlockId] });
@@ -286,8 +306,9 @@ describe('Real libp2p integration', function () {
 			actionId: 'drop-a1',
 			tailId: blockId as BlockId,
 			rev: 1,
-			blockIds: [blockId as BlockId]
-		} as any);
+			blockIds: [blockId as BlockId],
+			blockDigests: await makeBlockDigests(blockId)
+		});
 		expect(commitResult.success, 'A.commit with C dropped').to.equal(true);
 
 		const bResult = await bRepo.get({ blockIds: [blockId as BlockId] });
@@ -317,8 +338,9 @@ describe('Real libp2p integration', function () {
 			actionId: 'cold-a1',
 			tailId: blockId as BlockId,
 			rev: 1,
-			blockIds: [blockId as BlockId]
-		} as any);
+			blockIds: [blockId as BlockId],
+			blockDigests: await makeBlockDigests(blockId)
+		});
 		expect(commit.success, 'pre-restart commit').to.equal(true);
 
 		await node1.stop();
@@ -404,7 +426,7 @@ describe('Real libp2p integration', function () {
 		const rRepo = (responsible as any).coordinatedRepo as IRepo;
 		const pend = await rRepo.pend({ actionId: 'rt-a1', transforms: makeTransforms(blockId), policy: 'c' });
 		expect(pend.success, 'responsible-node pend').to.equal(true);
-		const commit = await rRepo.commit({ actionId: 'rt-a1', tailId: blockId as BlockId, rev: 1, blockIds: [blockId as BlockId] } as any);
+		const commit = await rRepo.commit({ actionId: 'rt-a1', tailId: blockId as BlockId, rev: 1, blockIds: [blockId as BlockId], blockDigests: await makeBlockDigests(blockId) });
 		expect(commit.success, 'responsible-node commit').to.equal(true);
 
 		// Precondition: the entry node does NOT hold the block locally, so a successful client
@@ -429,7 +451,7 @@ describe('Real libp2p integration', function () {
 		const protocolPrefix = `/optimystic/${NETWORK_NAME}`;
 		const driverKeyNetwork = (driver as any).keyNetwork;
 		const client = RepoClient.create(entry.peerId as any, driverKeyNetwork, protocolPrefix);
-		const res = await client.get({ blockIds: [blockId as BlockId] }, { expiration: Date.now() + 20_000 } as any);
+		const res = await client.get({ blockIds: [blockId as BlockId] }, { expiration: Date.now() + 20_000 });
 
 		expect(res[blockId]?.block?.header.id, 'redirected get reached the responsible peer and returned the committed block').to.equal(blockId);
 	});
@@ -526,7 +548,7 @@ describe('Real libp2p integration', function () {
 		const rRepo = (responsible as any).coordinatedRepo as IRepo;
 		const pend = await rRepo.pend({ actionId: 'mm-a1', transforms: makeTransforms(blockId), policy: 'c' });
 		expect(pend.success, 'responsible-member pend').to.equal(true);
-		const commit = await rRepo.commit({ actionId: 'mm-a1', tailId: blockId as BlockId, rev: 1, blockIds: [blockId as BlockId] } as any);
+		const commit = await rRepo.commit({ actionId: 'mm-a1', tailId: blockId as BlockId, rev: 1, blockIds: [blockId as BlockId], blockDigests: await makeBlockDigests(blockId) });
 		expect(commit.success, 'responsible-member commit (2-member consensus)').to.equal(true);
 
 		// Precondition: neither the entry nor the driver holds the block locally (both are
@@ -558,7 +580,7 @@ describe('Real libp2p integration', function () {
 		const protocolPrefix = `/optimystic/${NETWORK_NAME}`;
 		const driverKeyNetwork = (driver as any).keyNetwork;
 		const client = RepoClient.create(entry.peerId as any, driverKeyNetwork, protocolPrefix);
-		const res = await client.get({ blockIds: [blockId as BlockId] }, { expiration: Date.now() + 20_000 } as any);
+		const res = await client.get({ blockIds: [blockId as BlockId] }, { expiration: Date.now() + 20_000 });
 		expect(res[blockId]?.block?.header.id, 'redirected get resolved to a multi-peer cohort member and returned the committed block').to.equal(blockId);
 
 		// --- Assertion 2: every cohort member handles locally (no spurious redirect) ---
@@ -648,7 +670,7 @@ describe('Real libp2p integration', function () {
 		const ownerRepo = (owner as any).coordinatedRepo as IRepo;
 		const pend = await ownerRepo.pend({ actionId: 'spread-churn-a1', transforms: makeTransforms(blockId), policy: 'c' });
 		expect(pend.success, 'owner pend').to.equal(true);
-		const commit = await ownerRepo.commit({ actionId: 'spread-churn-a1', tailId: blockId as BlockId, rev: 1, blockIds: [blockId as BlockId] } as any);
+		const commit = await ownerRepo.commit({ actionId: 'spread-churn-a1', tailId: blockId as BlockId, rev: 1, blockIds: [blockId as BlockId], blockDigests: await makeBlockDigests(blockId) });
 		expect(commit.success, 'owner commit (2-member consensus)').to.equal(true);
 
 		for (const nm of nonMembers) {

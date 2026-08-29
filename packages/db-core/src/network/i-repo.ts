@@ -45,6 +45,9 @@ export type RepoCommitRequest = {
 	 * signature's preimage. Absent when no block in this batch could be digested (each undeclared
 	 * block falls back to corroboration).
 	 */
+	// NOTE: accepted tradeoff — optional by necessity, and NOT free: an undeclared block retains no
+	// durable commit proof and so cannot gain holders by push. Full rationale and the measured cost of
+	// making it required live at {@link CommitRequest.blockDigests} in `struct.ts`; keep the two in sync.
 	blockDigests?: BlockContentDigests;
 };
 

@@ -9,15 +9,30 @@ const log = createLogger('digest');
 
 /** Digests for the blocks the tracker's staged transforms touch, computed WITHOUT loading anything
  * from the source. An id whose base is not already cached is omitted rather than fetched — an
- * omitted id simply falls back to corroboration downstream, so omission is always safe. Each digest
- * is the {@link canonicalBlockHash} of what {@link Tracker.peekMaterialized} says the block will
- * contain at the committing revision; `baseRev` rides along except for base-independent (inserted)
- * blocks. */
+ * omitted id never fails the commit, it only forfeits what a declaration buys (see the NOTE below).
+ * Each digest is the {@link canonicalBlockHash} of what {@link Tracker.peekMaterialized} says the
+ * block will contain at the committing revision; `baseRev` rides along except for base-independent
+ * (inserted) blocks. */
 // NOTE: coverage is bounded by the read cache, not by the transaction. A commit whose update-carrying
 // blocks outnumber the CacheSource capacity (default 128) silently digests only the ids still
-// resident — omission degrades to corroboration rather than failing, so this is safe but quieter than
-// it looks. If commits routinely touch more blocks than the cache holds, size the cache to the
-// transaction or carry the base revision alongside the staged updates instead of re-reading it here.
+// resident, and the declared count does not merely thin out — it CAPS. Measured through the
+// production path (`Collection.act`/`sync`) in `test/digest-cache-coverage.spec.ts`: with N
+// update-carrying blocks the declared count is 32/32 at N=32, then 126 at N=128, 200, 256 AND 512
+// (126 = the 128 slots less the collection header and log tail), i.e. 100%, 98.4%, 63.0%, 49.2%,
+// 24.6%. Coverage therefore decays as 1/N and an arbitrarily large commit declares an arbitrarily
+// small fraction of itself. The survivors are the newest contiguous run, exactly as LRU eviction
+// predicts.
+// Omission also costs MORE than it used to: on the read path it still degrades gracefully to
+// corroboration, but since `requirePushCertificate: true` became the default receiver posture, an
+// undeclared block also retains no durable `BlockCommitProof` (`StorageRepo.persistProofIfContentMatches`
+// logs `commit:proof-undeclared`) and is therefore refused by every push receiver
+// (`push:reject-uncertified reason=no-proof`). It stays readable and pullable and still repairs by
+// corroboration while two or more holders remain, but it can never GAIN a holder by push — so
+// spread-on-churn and cohort-growth healing quietly stop maintaining its replication factor.
+// Still accepted here rather than fixed in place: both remedies are larger than this function —
+// size the cache to the transaction, or carry the base revision alongside the staged updates instead
+// of re-reading it here. Tracked as `debt-digest-coverage-capped-by-read-cache`. Revisit when a
+// workload legitimately commits more update-carrying blocks than the cache holds.
 export async function computeBlockContentDigests<T extends IBlock>(
 	tracker: Tracker<T>,
 	blockIds: BlockId[]
