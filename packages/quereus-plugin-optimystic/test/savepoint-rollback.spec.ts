@@ -65,7 +65,14 @@ async function expectThrows(fn: () => Promise<unknown>): Promise<void> {
 	throw new Error('expected operation to throw, but it resolved');
 }
 
-/** Reopen the storage dir in a fresh Database and return the row count of `sql`. */
+/**
+ * Reopen the storage dir in a fresh Database and return the row count of `sql`.
+ *
+ * Every `Database` in this file releases its read-cache lease (`plugin.dispose()`) when it closes.
+ * The cache is shared per directory for as long as any lease is held, so a skipped release would
+ * make this reopen read the previous `Database`'s still-warm cache instead of the on-disk bytes
+ * these tests exist to check.
+ */
 async function reopenCount(dir: string, countSql: string): Promise<number> {
 	const { db, plugin } = createDb(dir);
 	try {
@@ -73,6 +80,7 @@ async function reopenCount(dir: string, countSql: string): Promise<number> {
 		return await selectCount(db, countSql);
 	} finally {
 		db.close();
+		await plugin.dispose();
 	}
 }
 
@@ -92,7 +100,7 @@ describe('Savepoint rollback (local/bootstrap transactor)', function () {
 
 	it('statement-level ABORT unwinds partial rows but the transaction survives (primary repro)', async () => {
 		const uri = 'tree://savepoint/abort';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(`create table T (id integer primary key) using optimystic('${uri}')`);
 			await db.exec('begin');
@@ -111,6 +119,7 @@ describe('Savepoint rollback (local/bootstrap transactor)', function () {
 			expect(await selectCount(db, 'select count(*) as c from T where id = 2')).to.equal(0);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		// Reopen: the discarded row never reached storage.
@@ -120,7 +129,7 @@ describe('Savepoint rollback (local/bootstrap transactor)', function () {
 
 	it('statement-level ABORT in autocommit (no explicit transaction) leaves nothing partial', async () => {
 		const uri = 'tree://savepoint/autoabort';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(`create table A (id integer primary key) using optimystic('${uri}')`);
 			await db.exec(`insert into A (id) values (1)`);
@@ -133,6 +142,7 @@ describe('Savepoint rollback (local/bootstrap transactor)', function () {
 			expect(await selectCount(db, 'select count(*) as c from A where id = 2')).to.equal(0);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenCount(dir, 'select count(*) as c from A where id = 2')).to.equal(0);
@@ -140,7 +150,7 @@ describe('Savepoint rollback (local/bootstrap transactor)', function () {
 
 	it('INSERT OR FAIL keeps earlier rows and does not clobber them when a later row fails', async () => {
 		const uri = 'tree://savepoint/orfail';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(`create table F (id integer primary key) using optimystic('${uri}')`);
 			await db.exec(`insert into F (id) values (1)`);
@@ -158,6 +168,7 @@ describe('Savepoint rollback (local/bootstrap transactor)', function () {
 			expect(await selectCount(db, 'select count(*) as c from F where id = 3')).to.equal(0);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenCount(dir, 'select count(*) as c from F')).to.equal(2);
@@ -166,7 +177,7 @@ describe('Savepoint rollback (local/bootstrap transactor)', function () {
 
 	it('nested user SAVEPOINT / ROLLBACK TO drops the inner and post-savepoint changes', async () => {
 		const uri = 'tree://savepoint/nested';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(`create table S (id integer primary key) using optimystic('${uri}')`);
 			await db.exec('begin');
@@ -187,6 +198,7 @@ describe('Savepoint rollback (local/bootstrap transactor)', function () {
 			expect(await selectCount(db, 'select count(*) as c from S where id in (2, 3)')).to.equal(0);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenCount(dir, 'select count(*) as c from S')).to.equal(2);
@@ -195,7 +207,7 @@ describe('Savepoint rollback (local/bootstrap transactor)', function () {
 
 	it('user RELEASE SAVEPOINT absorbs the inner changes into the enclosing transaction', async () => {
 		const uri = 'tree://savepoint/release';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(`create table R (id integer primary key) using optimystic('${uri}')`);
 			await db.exec('begin');
@@ -209,6 +221,7 @@ describe('Savepoint rollback (local/bootstrap transactor)', function () {
 			expect(await selectCount(db, 'select count(*) as c from R')).to.equal(2);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenCount(dir, 'select count(*) as c from R')).to.equal(2);
@@ -216,7 +229,7 @@ describe('Savepoint rollback (local/bootstrap transactor)', function () {
 
 	it('ROLLBACK TO a savepoint twice is idempotent (savepoint preserved)', async () => {
 		const uri = 'tree://savepoint/twice';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(`create table W (id integer primary key) using optimystic('${uri}')`);
 			await db.exec('begin');
@@ -235,6 +248,7 @@ describe('Savepoint rollback (local/bootstrap transactor)', function () {
 			expect(await selectCount(db, 'select count(*) as c from W where id = 2')).to.equal(0);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 	});
 
@@ -257,8 +271,8 @@ describe('Savepoint rollback (local/bootstrap transactor)', function () {
 			expect(await selectCount(db, `select count(*) as c from I where cat = 'b'`)).to.equal(0);
 			expect(await selectCount(db, `select count(*) as c from I where cat = 'a'`)).to.equal(1);
 		} finally {
-			void plugin;
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenCount(dir, `select count(*) as c from I where cat = 'b'`)).to.equal(0);

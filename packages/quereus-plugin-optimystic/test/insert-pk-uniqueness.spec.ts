@@ -76,6 +76,14 @@ async function captureThrowMessage(fn: () => Promise<unknown>): Promise<string> 
 	throw new Error('expected operation to throw, but it resolved');
 }
 
+/**
+ * Reopen the storage dir in a fresh Database and return the scalar `sql` yields.
+ *
+ * Every `Database` in this file releases its read-cache lease (`plugin.dispose()`) when it closes.
+ * The cache is shared per directory for as long as any lease is held, so a skipped release would
+ * make this reopen read the previous `Database`'s still-warm cache instead of the on-disk bytes
+ * these tests exist to check.
+ */
 async function reopenScalar(dir: string, sql: string): Promise<SqlValue> {
 	const { db, plugin } = createDb(dir);
 	try {
@@ -83,6 +91,7 @@ async function reopenScalar(dir: string, sql: string): Promise<SqlValue> {
 		return await selectScalar(db, sql);
 	} finally {
 		db.close();
+		await plugin.dispose();
 	}
 }
 
@@ -102,7 +111,7 @@ describe('INSERT primary-key uniqueness (local/bootstrap transactor)', function 
 
 	it('rejects a duplicate-key INSERT in a separate transaction and leaves the original row intact (in-session + reopen)', async () => {
 		const uri = 'tree://pkuniq/consumed';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table ConsumedInvite (invite text primary key, member text)
@@ -122,6 +131,7 @@ describe('INSERT primary-key uniqueness (local/bootstrap transactor)', function 
 			expect(await selectScalar(db, `select member from ConsumedInvite where invite = 'I'`)).to.equal('B');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		// Reopen: the overwrite never reached storage.
@@ -130,7 +140,7 @@ describe('INSERT primary-key uniqueness (local/bootstrap transactor)', function 
 
 	it('rejects a duplicate-key INSERT staged earlier in the SAME transaction without overwriting it', async () => {
 		const uri = 'tree://pkuniq/sametxn';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
@@ -150,6 +160,7 @@ describe('INSERT primary-key uniqueness (local/bootstrap transactor)', function 
 			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('a');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, 'select v from T where id = 1')).to.equal('a');
@@ -157,7 +168,7 @@ describe('INSERT primary-key uniqueness (local/bootstrap transactor)', function 
 
 	it('rejects a duplicate key within a single multi-row INSERT', async () => {
 		const uri = 'tree://pkuniq/multirow';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table M (id integer primary key, v text) using optimystic('${uri}')`,
@@ -169,6 +180,7 @@ describe('INSERT primary-key uniqueness (local/bootstrap transactor)', function 
 			expect(await selectCount(db, 'select count(*) as c from M')).to.equal(0);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 	});
 });
@@ -201,7 +213,7 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 
 	it('INSERT OR IGNORE on a duplicate key skips the row and preserves the original', async () => {
 		const uri = 'tree://onconflict/ignore';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
@@ -215,6 +227,7 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('a');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, 'select v from T where id = 1')).to.equal('a');
@@ -222,7 +235,7 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 
 	it('INSERT OR REPLACE on a duplicate key overwrites the row and persists across reopen', async () => {
 		const uri = 'tree://onconflict/replace';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
@@ -236,6 +249,7 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('b');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		// The overwrite reached storage.
@@ -244,7 +258,7 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 
 	it('ON CONFLICT (pk) DO NOTHING preserves the original row without throwing', async () => {
 		const uri = 'tree://onconflict/donothing';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
@@ -259,6 +273,7 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('a');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, 'select v from T where id = 1')).to.equal('a');
@@ -266,7 +281,7 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 
 	it('ON CONFLICT (pk) DO UPDATE applies the update clause to the existing row', async () => {
 		const uri = 'tree://onconflict/doupdate';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
@@ -281,6 +296,7 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('updated');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, 'select v from T where id = 1')).to.equal('updated');
@@ -288,7 +304,7 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 
 	it('ON CONFLICT (pk) DO UPDATE can reference the proposed row via excluded.*', async () => {
 		const uri = 'tree://onconflict/excluded';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
@@ -306,6 +322,7 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('b');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, 'select v from T where id = 1')).to.equal('b');
@@ -313,7 +330,7 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 
 	it('surfaces a SQLite-style "UNIQUE constraint failed: <table>.<pkCol>" message on a default-ABORT duplicate', async () => {
 		const uri = 'tree://onconflict/message';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
@@ -328,12 +345,13 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 			expect(message).to.contain('UNIQUE constraint failed: T.id');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 	});
 
 	it('INSERT OR REPLACE keeps a secondary index consistent (indexed lookup returns the new value)', async () => {
 		const uri = 'tree://onconflict/replace-index';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, cat text, v text) using optimystic('${uri}')`,
@@ -350,6 +368,7 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 			expect(await selectScalar(db, `select v from T where cat = 'y'`)).to.equal('b');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, `select v from T where cat = 'y'`)).to.equal('b');
@@ -400,7 +419,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 
 	it('default UPDATE moving a PK onto an occupied key is rejected with a SQLite-style message and leaves both rows intact', async () => {
 		const uri = 'tree://update-pkmove/abort';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
@@ -424,6 +443,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 			expect(await selectScalar(db, 'select v from T where id = 2')).to.equal('b');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		// Nothing reached storage; both rows survive a reopen.
@@ -436,7 +456,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 		// through to the shared delete-old/insert-new + updateIndexEntries
 		// staging exactly as before the fix.
 		const uri = 'tree://update-pkmove/no-collision';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
@@ -451,6 +471,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 			expect(await selectScalar(db, 'select v from T where id = 2')).to.equal('a');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, 'select v from T where id = 2')).to.equal('a');
@@ -458,7 +479,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 
 	it('UPDATE moving a PK onto an occupied key under a declared `on conflict ignore` is swallowed (both rows intact)', async () => {
 		const uri = 'tree://update-pkmove/declared-ignore';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key on conflict ignore, v text) using optimystic('${uri}')`,
@@ -476,6 +497,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 			expect(await selectScalar(db, 'select v from T where id = 2')).to.equal('b');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, 'select v from T where id = 1')).to.equal('a');
@@ -483,7 +505,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 
 	it('UPDATE moving a PK onto an occupied key under a declared `on conflict replace` displaces the occupying row', async () => {
 		const uri = 'tree://update-pkmove/declared-replace';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key on conflict replace, v text) using optimystic('${uri}')`,
@@ -499,6 +521,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 			expect(await selectScalar(db, 'select v from T where id = 2')).to.equal('a');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, 'select v from T where id = 2')).to.equal('a');
@@ -509,7 +532,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 		// row's index entry must still resolve and no entry should appear at the
 		// would-be-moved value.
 		const uri = 'tree://update-pkmove/abort-index';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, cat text) using optimystic('${uri}')`,
@@ -526,6 +549,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 			expect(await selectScalar(db, `select id from T where cat = 'y'`)).to.equal(2);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, `select id from T where cat = 'x'`)).to.equal(1);
@@ -541,7 +565,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 
 	it('UPDATE PK-move REPLACE is not blocked by a secondary UNIQUE collision with the row it displaces', async () => {
 		const uri = 'tree://update-pkmove/displaced-not-a-collision';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key on conflict replace, s text not null unique) using optimystic('${uri}')`,
@@ -558,6 +582,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 			expect(await selectScalar(db, `select id from T where s = 'b'`)).to.equal(2);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, `select id from T where s = 'b'`)).to.equal(2);
@@ -565,7 +590,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 
 	it('UPDATE PK-move REPLACE is not swallowed by a declared-IGNORE secondary UNIQUE on the row it displaces', async () => {
 		const uri = 'tree://update-pkmove/displaced-not-swallowed';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key on conflict replace, s text not null unique on conflict ignore) `
@@ -582,6 +607,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 			expect(await selectCount(db, 'select count(*) as c from T where id = 1')).to.equal(0);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, `select id from T where s = 'b'`)).to.equal(2);
@@ -589,7 +615,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 
 	it('a swallowed UPDATE PK-move (declared IGNORE) is not preempted by a secondary UNIQUE violation', async () => {
 		const uri = 'tree://update-pkmove/ignore-wins-over-secondary';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key on conflict ignore, s text not null unique) using optimystic('${uri}')`,
@@ -606,6 +632,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 			expect(await selectScalar(db, 'select s from T where id = 1')).to.equal('a');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, 'select s from T where id = 1')).to.equal('a');
@@ -613,7 +640,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 
 	it('an UPDATE that both displaces at the target PK and evicts a third row on a declared-REPLACE UNIQUE keeps the table unique', async () => {
 		const uri = 'tree://update-pkmove/displace-plus-evict';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key on conflict replace, s text not null unique on conflict replace) `
@@ -631,6 +658,7 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 			expect(await selectScalar(db, `select id from T where s = 'c'`)).to.equal(2);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, `select id from T where s = 'c'`)).to.equal(2);
@@ -674,7 +702,7 @@ describe('Declared PK conflict actions (local/bootstrap transactor)', function (
 		for (const [action, outcome] of Object.entries(outcomes)) {
 			it(`${spelling} primary key on conflict ${action}: duplicate-PK insert is ${outcome}`, async () => {
 				const uri = `tree://pkdeclared/${spelling}-${action}`;
-				const { db } = createDb(dir);
+				const { db, plugin } = createDb(dir);
 				try {
 					const ddl = spelling === 'table-level'
 						? `create table T (id integer, v text, primary key (id) on conflict ${action}) using optimystic('${uri}')`
@@ -695,6 +723,7 @@ describe('Declared PK conflict actions (local/bootstrap transactor)', function (
 					expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
 				} finally {
 					db.close();
+					await plugin.dispose();
 				}
 			});
 		}
@@ -702,7 +731,7 @@ describe('Declared PK conflict actions (local/bootstrap transactor)', function (
 
 	it('statement-level OR wins over the declared PK action (or ignore beats declared replace)', async () => {
 		const uri = 'tree://pkdeclared/precedence';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key on conflict replace, v text) using optimystic('${uri}')`,
@@ -716,12 +745,13 @@ describe('Declared PK conflict actions (local/bootstrap transactor)', function (
 			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('a');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 	});
 
 	it('statement-level or fail / or rollback on a duplicate PK reject and preserve the row', async () => {
 		const uri = 'tree://pkdeclared/stmt-fail-rollback';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
@@ -735,6 +765,7 @@ describe('Declared PK conflict actions (local/bootstrap transactor)', function (
 			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('a');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 	});
 });

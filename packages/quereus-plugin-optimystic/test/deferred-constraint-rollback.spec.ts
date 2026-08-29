@@ -99,7 +99,14 @@ async function countTreeEntries(
 	return n;
 }
 
-/** Reopen the storage dir in a fresh Database and return the row count of `sql`. */
+/**
+ * Reopen the storage dir in a fresh Database and return the row count of `sql`.
+ *
+ * Every `Database` in this file releases its read-cache lease (`plugin.dispose()`) when it closes.
+ * The cache is shared per directory for as long as any lease is held, so a skipped release would
+ * make this reopen read the previous `Database`'s still-warm cache instead of the on-disk bytes
+ * these tests exist to check.
+ */
 async function reopenCount(dir: string, countSql: string): Promise<number> {
 	const { db, plugin } = createDb(dir);
 	try {
@@ -107,6 +114,7 @@ async function reopenCount(dir: string, countSql: string): Promise<number> {
 		return await selectCount(db, countSql);
 	} finally {
 		db.close();
+		await plugin.dispose();
 	}
 }
 
@@ -126,7 +134,7 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 
 	it('rejected INSERT under a deferred CHECK leaves the table unchanged (in-session + reopen)', async () => {
 		const uri = 'tree://deferred/widget';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table Widget (id integer primary key, v text,
@@ -143,6 +151,7 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 			expect(await selectCount(db, 'select count(*) as c from Widget')).to.equal(1);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		// Reopen: the rejected row never reached storage.
@@ -151,7 +160,7 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 
 	it('rejected UPDATE under a deferred CHECK reverts the row (in-session + reopen)', async () => {
 		const uri = 'tree://deferred/flagrow';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table FlagRow (id integer primary key, flag integer,
@@ -168,6 +177,7 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 			expect(await selectCount(db, 'select count(*) as c from FlagRow where flag = 0')).to.equal(1);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenCount(dir, 'select count(*) as c from FlagRow where flag = 0')).to.equal(1);
@@ -175,7 +185,7 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 
 	it('rejected PK-changing UPDATE discards both index halves (in-session + reopen)', async () => {
 		const uri = 'tree://deferred/pkrow';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table PkRow (id integer primary key, v text,
@@ -193,6 +203,7 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 			expect(await selectCount(db, 'select count(*) as c from PkRow where id = 200')).to.equal(0);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenCount(dir, 'select count(*) as c from PkRow where id = 1')).to.equal(1);
@@ -201,7 +212,7 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 
 	it('a deferred-constraint failure also discards a staged DELETE in the same transaction (in-session + reopen)', async () => {
 		const uri = 'tree://deferred/delrow';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table DelRow (id integer primary key, v text,
@@ -222,6 +233,7 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 			expect(await selectCount(db, 'select count(*) as c from DelRow where id = 1')).to.equal(1);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenCount(dir, 'select count(*) as c from DelRow where id = 1')).to.equal(1);
@@ -247,12 +259,13 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 			expect(await countTreeEntries(plugin, dir, `${uri}/index/idx_item_cat`)).to.equal(1);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 	});
 
 	it('regression: an immediate (no-subquery) CHECK rejection still leaves no row', async () => {
 		const uri = 'tree://deferred/imm';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table Imm (id integer primary key, v text,
@@ -267,6 +280,7 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 			expect(await selectCount(db, 'select count(*) as c from Imm')).to.equal(1);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenCount(dir, 'select count(*) as c from Imm')).to.equal(1);
@@ -274,7 +288,7 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 
 	it('btree split during staging is reverted cleanly on a deferred-constraint rollback (in-session + reopen)', async () => {
 		const uri = 'tree://deferred/bulk';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table Bulk (id integer primary key, v text,
@@ -296,6 +310,7 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 			expect(await selectCount(db, 'select count(*) as c from Bulk')).to.equal(0);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenCount(dir, 'select count(*) as c from Bulk')).to.equal(0);
@@ -303,7 +318,7 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 
 	it('multi-row single INSERT fully rolls back when one row trips a deferred CHECK (in-session + reopen)', async () => {
 		const uri = 'tree://deferred/multi';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table Multi (id integer primary key, v text,
@@ -323,6 +338,7 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 			expect(await selectCount(db, 'select count(*) as c from Multi where id = 1')).to.equal(1);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenCount(dir, 'select count(*) as c from Multi')).to.equal(1);

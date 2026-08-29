@@ -65,6 +65,14 @@ async function expectThrows(fn: () => Promise<unknown>): Promise<void> {
 	throw new Error('expected operation to throw, but it resolved');
 }
 
+/**
+ * Reopen the storage dir in a fresh Database and return the scalar `sql` yields.
+ *
+ * Every `Database` in this file releases its read-cache lease (`plugin.dispose()`) when it closes.
+ * The cache is shared per directory for as long as any lease is held, so a skipped release would
+ * make this reopen read the previous `Database`'s still-warm cache instead of the on-disk bytes
+ * these tests exist to check.
+ */
 async function reopenScalar(dir: string, sql: string): Promise<SqlValue> {
 	const { db, plugin } = createDb(dir);
 	try {
@@ -72,6 +80,7 @@ async function reopenScalar(dir: string, sql: string): Promise<SqlValue> {
 		return await selectScalar(db, sql);
 	} finally {
 		db.close();
+		await plugin.dispose();
 	}
 }
 
@@ -91,7 +100,7 @@ describe('UPDATE primary-key move uniqueness (local/bootstrap transactor)', func
 
 	it('rejects an UPDATE that moves a row onto an existing PK and leaves both rows intact (in-session + reopen)', async () => {
 		const uri = 'tree://pkmove/collide';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
@@ -108,6 +117,7 @@ describe('UPDATE primary-key move uniqueness (local/bootstrap transactor)', func
 			expect(await selectScalar(db, 'select v from T where id = 2')).to.equal('b');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		// Reopen: the overwrite never reached storage.
@@ -117,7 +127,7 @@ describe('UPDATE primary-key move uniqueness (local/bootstrap transactor)', func
 
 	it('aborts the offending PK-move statement inside a transaction but lets the txn commit, both rows surviving', async () => {
 		const uri = 'tree://pkmove/txn';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
@@ -136,6 +146,7 @@ describe('UPDATE primary-key move uniqueness (local/bootstrap transactor)', func
 			expect(await selectScalar(db, 'select v from T where id = 2')).to.equal('b');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, 'select v from T where id = 2')).to.equal('b');
@@ -144,7 +155,7 @@ describe('UPDATE primary-key move uniqueness (local/bootstrap transactor)', func
 
 	it('allows a PK-move to a genuinely unused key (regression guard)', async () => {
 		const uri = 'tree://pkmove/free';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
@@ -159,6 +170,7 @@ describe('UPDATE primary-key move uniqueness (local/bootstrap transactor)', func
 			expect(await selectScalar(db, 'select v from T where id = 99')).to.equal('a');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, 'select v from T where id = 99')).to.equal('a');
