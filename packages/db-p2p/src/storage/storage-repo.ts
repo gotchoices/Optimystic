@@ -14,7 +14,7 @@ import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
 import type { IBlockReplicaStore } from "../cluster/block-transfer-service.js";
 import { proofDeclaredDigest, type BlockCommitProof } from "../cluster/commit-proof.js";
-import { RevisionNotCoveredError } from "./block-storage.js";
+import { RevisionNotCoveredError } from "./i-block-storage.js";
 import { acquireBlockWriteLatch, withBlockWriteLatch, type BlockWriteLatch } from "./block-latch.js";
 import { createLogger } from "../logger.js";
 
@@ -609,7 +609,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 */
 	async commit(request: CommitRequest, _options?: MessageOptions, proof?: BlockCommitProof): Promise<CommitResult> {
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
-		const uniqueBlockIds = Array.from(new Set(request.blockIds)).sort();
+		// Deduped ONCE, in request order; the sorted copy below is the latch-acquisition order. Both
+		// views must name exactly the same set — `latches.get(blockId)!` below relies on it.
+		const blockIds = Array.from(new Set(request.blockIds));
+		const latchOrder = [...blockIds].sort();
 		const releases: (() => void)[] = [];
 		// Collects the blocks newly committed in this call, grouped by collection,
 		// so we can emit change events once locks are released. Blocks that land before
@@ -624,7 +627,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			// Acquire the block write latches sequentially in sorted id order to prevent deadlocks.
 			// Each block's token is kept so every write below can prove it runs inside the latch.
 			const latches = new Map<BlockId, BlockWriteLatch>();
-			for (const id of uniqueBlockIds) {
+			for (const id of latchOrder) {
 				const { latch, release } = await acquireBlockWriteLatch(id);
 				releases.push(release);
 				latches.set(id, latch);
@@ -634,7 +637,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 
 			// Request order, deduped (NOT the sorted acquisition order): the order here is the order
 			// blocks are committed and reported in change events, which callers may observe.
-			const blockStorages = Array.from(new Set(request.blockIds)).map(blockId => ({
+			const blockStorages = blockIds.map(blockId => ({
 				blockId,
 				storage: this.createBlockStorage(blockId),
 				latch: latches.get(blockId)!
@@ -1250,6 +1253,14 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		if (!latest) {
 			return undefined;
 		}
+		// NOTE: `latest.rev` is always inside `meta.ranges` today — every writer of `latest`
+		// (`setLatest`, `saveForwardRevision`, `recover`) merges an open-ended range anchored at or
+		// below the new latest in the same `saveMetadata` — so the RevisionNotCoveredError arm below
+		// is unreachable from here and only truncated-history corruption lands in the catch. If a
+		// future change can leave `latest` uncovered, the ordering in `get` becomes load-bearing: the
+		// read-driven promotion runs BEFORE `readBlockHealing`, so a coverage gap under `latest` would
+		// make `refuseMissingBase` delete the pending record moments before the healing read would
+		// have restored it. Heal before refusing if that day comes.
 		try {
 			return (await storage.getBlock(latest.rev))?.block;
 		} catch (err) {

@@ -1,6 +1,24 @@
-import type { IBlock, Transform, ActionId, ActionRev } from "@optimystic/db-core";
+import type { BlockId, IBlock, Transform, ActionId, ActionRev } from "@optimystic/db-core";
 import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockWriteLatch } from "./block-latch.js";
+
+/**
+ * Thrown by {@link IBlockStorage.getBlock} when the block has metadata here but the target revision
+ * lies outside the locally held revision ranges — this node holds no local records that can serve
+ * it. Not a fault: it is the signal a caller that is allowed to heal (only `StorageRepo.get`, under
+ * the block's write latch) turns into a {@link IBlockStorage.restoreRevision}; every other caller
+ * treats it like any other unreadable-base condition.
+ *
+ * It lives beside the interface rather than beside `BlockStorage` because it is part of the
+ * `getBlock` contract: an alternate `IBlockStorage` implementation must be able to throw it, and
+ * `StorageRepo` must be able to catch it, without either depending on the concrete implementation.
+ */
+export class RevisionNotCoveredError extends Error {
+	constructor(readonly blockId: BlockId, readonly rev: number) {
+		super(`Block ${blockId} revision ${rev} is not covered by local records`);
+		this.name = 'RevisionNotCoveredError';
+	}
+}
 
 /**
  * Interface for block-level storage operations.
@@ -21,7 +39,7 @@ export interface IBlockStorage {
      * Gets a materialized block at the given revision, from LOCAL records only — this never fetches
      * from a peer. Returns `undefined` when this node has never seen the block (no metadata) or when
      * it is pending-only (metadata seeded by a pending transaction, nothing committed) and no `rev`
-     * was named. Throws `RevisionNotCoveredError` when the target revision (`rev`, or `latest.rev`)
+     * was named. Throws {@link RevisionNotCoveredError} when the target revision (`rev`, or `latest.rev`)
      * lies outside `meta.ranges` — the caller decides whether to heal that gap with
      * {@link restoreRevision} under the block's write latch (`StorageRepo.get` does; the commit path
      * deliberately does not). Throws a plain `Error` when the revision is covered but cannot be

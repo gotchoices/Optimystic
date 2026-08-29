@@ -4,25 +4,11 @@ import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
 import { mergeRanges } from "./helpers.js";
-import type { IBlockStorage } from "./i-block-storage.js";
+import { RevisionNotCoveredError, type IBlockStorage } from "./i-block-storage.js";
 import type { BlockWriteLatch } from "./block-latch.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('block-storage');
-
-/**
- * Thrown by {@link BlockStorage.getBlock} when the block has metadata here but the target revision
- * lies outside `meta.ranges` — this node holds no local records that can serve it. Not a fault: it
- * is the signal a caller that is allowed to heal (only `StorageRepo.get`, under the block's write
- * latch) turns into a {@link BlockStorage.restoreRevision}; every other caller treats it like any
- * other unreadable-base condition.
- */
-export class RevisionNotCoveredError extends Error {
-	constructor(readonly blockId: BlockId, readonly rev: number) {
-		super(`Block ${blockId} revision ${rev} is not covered by local records`);
-		this.name = 'RevisionNotCoveredError';
-	}
-}
 
 /**
  * Default checkpoint cadence: a full materialization is retained at every `CHECKPOINT_INTERVAL`th
@@ -58,13 +44,17 @@ export class BlockStorage implements IBlockStorage {
 	}
 
 	/**
-	 * Guard every write: the token must have been minted for THIS block. The type already proves the
-	 * caller went through `acquireBlockWriteLatch`; this catches a token for block A presented to
-	 * block B's storage, which the type cannot.
+	 * Guard every write: the token must have been minted for THIS block and must still be live. The
+	 * type already proves the caller went through `acquireBlockWriteLatch`; this catches the two
+	 * things the type cannot — a token for block A presented to block B's storage, and a token
+	 * stashed by a callback and used after its scope released the latch.
 	 */
 	private assertLatch(latch: BlockWriteLatch): void {
 		if (latch.blockId !== this.blockId) {
 			throw new Error(`Block ${this.blockId}: write latch was acquired for block ${latch.blockId}`);
+		}
+		if (!latch.live) {
+			throw new Error(`Block ${this.blockId}: write latch has already been released`);
 		}
 	}
 

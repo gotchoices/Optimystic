@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { StorageRepo } from '../src/storage/storage-repo.js';
-import { BlockStorage, RevisionNotCoveredError } from '../src/storage/block-storage.js';
+import { BlockStorage } from '../src/storage/block-storage.js';
+import { RevisionNotCoveredError } from '../src/storage/i-block-storage.js';
 import { withBlockWriteLatch, type BlockWriteLatch } from '../src/storage/block-latch.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from '../src/storage/struct.js';
@@ -136,6 +137,28 @@ describe('BlockStorage meta.ranges honesty', () => {
 			expect((thrown as Error).message).to.match(/write latch was acquired for block block-token-a/);
 		});
 		expect(await raw.getMetadata(b), 'nothing was written under the wrong token').to.equal(undefined);
+	});
+
+	it('a write latch token stashed past its scope is refused, writing nothing', async () => {
+		// The token is proof the latch is HELD, not proof it once was. Without the liveness check a
+		// callback could keep its token and write after release — outside the latch, which is exactly
+		// the unserialized read-modify-write of the metadata blob the latch exists to prevent.
+		const raw = new MemoryRawStorage();
+		const id = 'block-stale-token' as BlockId;
+		const storage = new BlockStorage(id, raw);
+		let stashed!: BlockWriteLatch;
+		await withBlockWriteLatch(id, async l => { stashed = l; });
+
+		expect(stashed.live, 'the token is dead once its scope released the latch').to.equal(false);
+		let thrown: unknown;
+		try {
+			await storage.savePendingTransaction('p' as ActionId, { insert: makeBlock('block-stale-token') }, stashed);
+		} catch (err) {
+			thrown = err;
+		}
+		expect(thrown).to.be.instanceOf(Error);
+		expect((thrown as Error).message).to.match(/write latch has already been released/);
+		expect(await raw.getMetadata(id), 'nothing was written under the released token').to.equal(undefined);
 	});
 
 	it('getBlock is local-only: absent, absent, or a coverage gap — never a fetch', async () => {

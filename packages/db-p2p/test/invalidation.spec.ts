@@ -751,7 +751,9 @@ describe('applyInvalidation', () => {
 			}
 		});
 
-		// (No "WITHOUT the latch, a concurrent commit clobbers the invalidation" repro any more: every compensating write demands a BlockWriteLatch token, so the unlatched write that lost update documented is unrepresentable.)
+		// The old "WITHOUT the latch, a concurrent commit clobbers the invalidation" repro is gone: every
+		// compensating write now demands a BlockWriteLatch token, so the unlatched write that lost update
+		// documented cannot be expressed.
 
 		it('a commit queues behind the invalidation on the one write latch and latest stays monotonic', async () => {
 			const raw = new MemoryRawStorage();
