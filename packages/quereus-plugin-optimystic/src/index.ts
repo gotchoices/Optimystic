@@ -32,7 +32,11 @@ export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } 
 // (RowCodec.asPrimaryKeyTuple / IndexManager.asIndexColumnTuple) — exported so callers
 // can name them in their own signatures.
 export type { PrimaryKeyTuple, IndexColumnTuple, UnbrandedValues } from './schema/key-tuples.js';
-export type { StoredTableSchema, StoredColumnSchema, StoredPrimaryKeyColumn, StoredIndexSchema, StoredUniqueConstraint } from './schema/schema-manager.js';
+export type { StoredTableSchema, StoredColumnSchema, StoredPrimaryKeyColumn, StoredIndexSchema, StoredIndexColumn, StoredUniqueConstraint } from './schema/schema-manager.js';
+// The catalog's on-disk shape (index columns by NAME) and its runtime counterpart's
+// conversions — see PersistedTableSchema for why the two differ.
+export type { PersistedTableSchema, PersistedIndexSchema, PersistedIndexColumn } from './schema/schema-manager.js';
+export { toPersistedSchema, toStoredSchema, uniqueEnforcementTreeName } from './schema/schema-manager.js';
 
 // Export the order-preserving, injective key-framing primitives (shared by the
 // primary-key and secondary-index encoders).

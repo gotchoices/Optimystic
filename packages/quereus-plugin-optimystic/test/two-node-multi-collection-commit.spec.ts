@@ -15,6 +15,10 @@
  *   default/Member/index/_uniq_1      at rev 2, requested rev 1
  *   default/CadrePeer                 at rev 3, requested rev 1
  *
+ * (`_uniq_1` is the enforcement tree's name under the positional scheme the downstream
+ * build ran; it is now named by column — `_uniq_5.token` — see uniqueEnforcementTreeName.
+ * The signature is quoted as it was reported.)
+ *
  * Two Databases share one 2-node mock mesh (each bound to its own node's transactor),
  * both declare the SAME table, and the second node writes after the first has already
  * advanced every one of those collections. A node whose revision context cannot advance

@@ -64,3 +64,30 @@ The current change is correct and complete for new data; this only concerns back
 compatibility with data from before the change. It does not block any active work.
 Recorded so the format-change risk is not lost — the reviewer flagged it rather than
 silently accepting it.
+
+## Two more on-disk changes to cover (added by `bug-persisted-index-outlives-the-columns-it-points-at`)
+
+Whatever migration answer this ticket settles on must cover two further format changes
+that landed with that fix, both in `packages/quereus-plugin-optimystic`:
+
+- **The schema catalog record's index columns changed shape.** Each entry in the
+  plugin-global catalog (`tree://optimystic/schema`) used to store an index column as
+  `{ index: <position> }`; it now stores `{ name: <column name> }`
+  (`PersistedIndexColumn` in `src/schema/schema-manager.ts`). A catalog written by an
+  older build has no `name` on any index column, so reading it fails loudly on the first
+  table with an index (`Persisted catalog record for table '…' is unresolvable`). There is
+  deliberately no read-side fallback for the positional form — it was the ambiguous state
+  the fix removes. A migration would rewrite each record's index columns from positions
+  to names using that record's own `columns` list (they agree in any record the old build
+  wrote without a column-reordering re-declare).
+
+- **The synthesized UNIQUE-enforcement trees moved to new URIs.** A column-level or
+  table-level UNIQUE with no declared index is enforced through a tree at
+  `<collectionUri>/index/_uniq_<…>`. The suffix was the sorted column positions
+  (`_uniq_1`, `_uniq_1_2`); it is now the sorted, lowercased, length-prefixed column
+  names (`_uniq_5.stamp`, `_uniq_1.a_1.b`) — `uniqueEnforcementTreeName` in
+  `src/schema/schema-manager.ts`. This one self-heals: the vtab's one-time backfill
+  (`ensureUniquePopulated`) rebuilds an empty enforcement tree from the table on first
+  probe, so no data is lost. The old `_uniq_<positions>` trees are simply never read
+  again and stay in storage as unreferenced collections; a migration or a cleanup pass
+  could delete them.

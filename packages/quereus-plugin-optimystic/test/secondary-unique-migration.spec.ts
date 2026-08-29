@@ -3,7 +3,7 @@
  * (see ticket `optimystic-unique-probe-index-backed`).
  *
  * The probe enforces a plain secondary UNIQUE by point-probing a synthesized
- * `_uniq_<cols>` index tree. A table CREATED under this build maintains that tree from
+ * `_uniq_<column names>` index tree. A table CREATED under this build maintains that tree from
  * the first insert, so it is always in sync. The danger is a table whose rows were
  * written by an OLDER build that never maintained such a tree: the tree is EMPTY while
  * the main table is populated, so a naive probe would find no collision and silently
@@ -99,8 +99,9 @@ describe('Secondary-UNIQUE migration: backfill an empty unique tree over pre-exi
 			}
 		}
 
-		// Build 2: SAME collection URI, now WITH the UNIQUE constraint. The `_uniq_1`
-		// tree is empty while the main table already holds 3 rows. The one-time backfill
+		// Build 2: SAME collection URI, now WITH the UNIQUE constraint. The `_uniq_5.stamp`
+		// tree (named by column, see uniqueEnforcementTreeName) is empty while the main
+		// table already holds 3 rows. The one-time backfill
 		// must populate it before the first probe, so a duplicate of a pre-existing value
 		// is rejected.
 		{

@@ -193,9 +193,11 @@ describe('Optimystic schema catalog index durability', function () {
 	});
 
 	describe('mergeIndexLists', () => {
+		// Persisted (on-disk) shape: index columns are NAMES, never positions — see
+		// PersistedTableSchema in schema-manager.ts.
 		const idx = (name: string, unique?: boolean, predicate?: unknown) => ({
 			name,
-			columns: [{ index: 0 }],
+			columns: [{ name: 'id' }],
 			...(unique ? { unique: true as const } : {}),
 			...(predicate !== undefined ? { predicate } : {}),
 		});

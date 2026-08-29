@@ -886,7 +886,7 @@ describe('Secondary UNIQUE enforcement across the hydrate warm-restart path', fu
 		}
 
 		// Session 2: hydrate-only. The one-time backfill must populate the empty
-		// `_uniq_1` tree from the existing rows before the first probe trusts it.
+		// `_uniq_5.stamp` tree from the existing rows before the first probe trusts it.
 		const dbB = new Database();
 		const pluginB = registerWithSharedTransactor(dbB, shared);
 		try {

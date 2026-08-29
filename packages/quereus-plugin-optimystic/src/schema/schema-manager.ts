@@ -14,13 +14,39 @@ import type { ITransactor } from '@optimystic/db-core';
 type IndexSchema = NonNullable<TableSchema['indexes']>[number];
 
 /**
- * Order-insensitive identity for a set of column indices — sorted and joined by `_`.
+ * Order-insensitive identity for a set of column POSITIONS — sorted and joined by `_`.
  * Uniqueness of `(a, b)` and `(b, a)` is the same rule, so constraint/index matching
- * compares sets. Also names the vtab's synthesized enforcement trees (`_uniq_<key>`),
- * which must stay stable across restarts so the same tree URI resolves.
+ * compares sets. IN-MEMORY ONLY: every comparison is between two descriptors resolved
+ * against the same {@link StoredTableSchema}, where positions mean one thing. It must
+ * never name anything persistent — a position outlives nothing, but a tree URI or a
+ * catalog record does, and a later `CREATE TABLE` can renumber the columns underneath
+ * it. Persistent identity is by column NAME: {@link uniqueEnforcementTreeName} for the
+ * synthesized enforcement trees, {@link PersistedIndexColumn} for the catalog.
  */
 export function columnSetKey(columns: readonly number[]): string {
 	return [...columns].sort((a, b) => a - b).join('_');
+}
+
+/**
+ * Name of the vtab's synthesized UNIQUE-enforcement tree for a set of column NAMES —
+ * the `<indexName>` in `<collectionUri>/index/<indexName>`, so it is persistent storage
+ * identity and must stay stable across restarts AND across re-declares that reorder
+ * the table's columns (which is why it is not built from positions).
+ *
+ * Names are lowercased and sorted so `(a, b)` and `(b, a)` name one tree, matching the
+ * positional set semantics of {@link columnSetKey}. The join is length-prefixed
+ * (`_uniq_3.foo_3.bar`) because SQL identifiers can contain `_`: a bare `_`-join would
+ * make `(a_b, c)` and `(a, b_c)` collide on `_uniq_a_b_c`. Length prefixes keep it
+ * injective while staying readable in a URI or a log line.
+ *
+ * Trees named by the retired positional scheme (`_uniq_1`, `_uniq_1_2`) are never read
+ * again; they are left in storage as unreferenced collections, and the newly-named
+ * tree is rebuilt from the table on first probe by the vtab's one-time backfill
+ * (`ensureUniquePopulated`).
+ */
+export function uniqueEnforcementTreeName(columnNames: readonly string[]): string {
+	const parts = columnNames.map(name => name.toLowerCase()).sort();
+	return `_uniq_${parts.map(name => `${name.length}.${name}`).join('_')}`;
 }
 
 /** The subset of a UNIQUE constraint that {@link uniqueConstraintKey} identifies it by. */
@@ -47,7 +73,13 @@ export function uniqueConstraintKey(uc: ConstraintIdentity): string {
 }
 
 /**
- * Serializable schema storage format
+ * A table's schema as every consumer in this plugin sees it — the RESOLVED, in-memory
+ * shape. Index columns are POSITIONS into `columns` (the row is a positional array and
+ * every hot path indexes into it). Positions are valid only because this value is
+ * produced by resolving a {@link PersistedTableSchema} against ITS OWN `columns` list
+ * (or built straight from a Quereus `TableSchema`, whose columns and indexes come from
+ * one declaration); it is never what gets written to the catalog — see
+ * {@link PersistedTableSchema} for why.
  */
 export interface StoredTableSchema {
 	name: string;
@@ -121,6 +153,7 @@ export interface StoredPrimaryKeyColumn {
 	collation?: string;
 }
 
+/** Resolved (in-memory) index descriptor: columns addressed by POSITION. */
 export interface StoredIndexSchema {
 	name: string;
 	columns: StoredIndexColumn[];
@@ -131,6 +164,7 @@ export interface StoredIndexSchema {
 	predicate?: unknown;
 }
 
+/** Resolved index column: `index` is a position into the owning schema's `columns`. */
 export interface StoredIndexColumn {
 	index: number;
 	desc?: boolean;
@@ -138,8 +172,50 @@ export interface StoredIndexColumn {
 }
 
 /**
+ * The catalog record as WRITTEN — identical to {@link StoredTableSchema} except that
+ * index columns carry the column's NAME rather than its position.
+ *
+ * A position only means something relative to the column list it was computed
+ * against, and the catalog does not preserve that list: a later `CREATE TABLE` on the
+ * same name (no DROP) replaces `columns` with the new declaration while the persisted
+ * `indexes` survive the write ({@link mergeIndexLists}). A positional index column
+ * would then silently point at whichever column now sits in its old slot — rows
+ * vanish from indexed seeks, and a uniqueness probe reads the wrong key space. A name
+ * cannot drift; it either resolves against the current column list or it fails
+ * loudly. {@link SchemaManager} owns the ONLY conversions between the two shapes:
+ * {@link toStoredSchema} on every read, {@link toPersistedSchema} on every write.
+ *
+ * `primaryKeyDefinition` and `uniqueConstraints` stay positional: both are re-written
+ * from the local declaration on every write, always alongside the column list from
+ * the same declaration, so they cannot drift — and {@link assertPositionsInRange}
+ * checks that invariant at every write so the day one of them is preserved across
+ * writes the way `indexes` is, the drift is caught instead of persisted.
+ */
+export interface PersistedTableSchema extends Omit<StoredTableSchema, 'indexes'> {
+	indexes: PersistedIndexSchema[];
+}
+
+/** Persisted index descriptor: columns addressed by NAME. */
+export interface PersistedIndexSchema {
+	name: string;
+	columns: PersistedIndexColumn[];
+	unique?: boolean;
+	predicate?: unknown;
+}
+
+/** Persisted index column: `name` is the column's declared name, matched case-insensitively. */
+export interface PersistedIndexColumn {
+	name: string;
+	desc?: boolean;
+	collation?: string;
+}
+
+/**
  * Name-keyed union of two persisted index lists — the non-destructive merge every
- * schema write goes through (see {@link SchemaManager.storeStoredSchema}).
+ * schema write goes through (see {@link SchemaManager.storeStoredSchema}). Operates on
+ * the PERSISTED (name-keyed) shape: unioning positional descriptors resolved against
+ * two different column lists is exactly the drift this file's two-shape split exists
+ * to prevent.
  *
  * Rules:
  * - An index present on either side survives. `incoming` keeps its order;
@@ -153,9 +229,9 @@ export interface StoredIndexColumn {
  *   ever adds the flag.
  */
 export function mergeIndexLists(
-	incoming: readonly StoredIndexSchema[],
-	persisted: readonly StoredIndexSchema[]
-): StoredIndexSchema[] {
+	incoming: readonly PersistedIndexSchema[],
+	persisted: readonly PersistedIndexSchema[]
+): PersistedIndexSchema[] {
 	const merged = [...incoming];
 	const position = new Map(incoming.map((idx, i) => [idx.name, i]));
 	for (const idx of persisted) {
@@ -166,6 +242,142 @@ export function mergeIndexLists(
 			merged[at] = { ...merged[at]!, unique: true, predicate: merged[at]!.predicate ?? idx.predicate };
 		}
 	}
+	return merged;
+}
+
+/** Column-name → position map over a record's own column list (names compare case-insensitively). */
+function columnPositions(columns: readonly StoredColumnSchema[]): Map<string, number> {
+	return new Map(columns.map((col, index) => [col.name.toLowerCase(), index]));
+}
+
+/** Render a column list for an error message: `[id, a, b]`. */
+function describeColumns(columns: readonly StoredColumnSchema[]): string {
+	return `[${columns.map(col => col.name).join(', ')}]`;
+}
+
+/**
+ * Every index column on `record` that does not resolve against the record's own column
+ * list, as (index name, column name) pairs. Empty when the record is resolvable.
+ */
+function unresolvedIndexColumns(record: PersistedTableSchema): { index: string; column: string }[] {
+	const positions = columnPositions(record.columns);
+	const misses: { index: string; column: string }[] = [];
+	for (const idx of record.indexes) {
+		for (const col of idx.columns) {
+			if (!positions.has(col.name.toLowerCase())) {
+				misses.push({ index: idx.name, column: col.name });
+			}
+		}
+	}
+	return misses;
+}
+
+/**
+ * The write-time boundary check for the fields that stay POSITIONAL on disk: every
+ * primary-key position and every UNIQUE-constraint position must be in range for the
+ * record's own column list. Both are consistent by construction today (see
+ * {@link PersistedTableSchema}); this is what turns that unstated invariant into a
+ * loud failure the day a write preserves one of them across a re-declare.
+ */
+function assertPositionsInRange(record: PersistedTableSchema): void {
+	const width = record.columns.length;
+	const check = (position: number, what: string) => {
+		if (!Number.isInteger(position) || position < 0 || position >= width) {
+			throw new Error(
+				`Cannot persist table '${record.name}': ${what} position ${position} is out of range ` +
+				`for its column list ${describeColumns(record.columns)}`
+			);
+		}
+	};
+	for (const pk of record.primaryKeyDefinition) check(pk.index, 'primary key');
+	for (const uc of record.uniqueConstraints ?? []) {
+		for (const position of uc.columns) check(position, `unique constraint ${uc.name ? `'${uc.name}' ` : ''}column`);
+	}
+}
+
+/**
+ * De-resolve a runtime schema to its on-disk shape: index positions become the names
+ * of the columns they address in `stored`'s OWN column list. A position outside that
+ * list is a corrupt input (the resolved shape guarantees the two agree), so it throws
+ * rather than persisting a dangling reference.
+ */
+export function toPersistedSchema(stored: StoredTableSchema): PersistedTableSchema {
+	const indexes: PersistedIndexSchema[] = stored.indexes.map(idx => ({
+		...idx,
+		columns: idx.columns.map(col => {
+			const column = stored.columns[col.index];
+			if (column === undefined) {
+				throw new Error(
+					`Cannot persist table '${stored.name}': index '${idx.name}' addresses column position ` +
+					`${col.index}, which is out of range for its column list ${describeColumns(stored.columns)}`
+				);
+			}
+			const { index: _position, ...rest } = col;
+			return { ...rest, name: column.name };
+		}),
+	}));
+	return { ...stored, indexes };
+}
+
+/**
+ * Resolve an on-disk record to the runtime shape: each index column name becomes its
+ * position in the record's OWN column list. A name with no match is an unresolvable
+ * record and throws, naming the table, the index and the column — the read-side half of
+ * the guarantee that a resolved schema's positions always describe its own columns.
+ *
+ * NOTE: `hydrateCatalog` treats a listTables error matching /not found|missing|empty/
+ * as "no catalog yet" and swallows it; this message deliberately uses none of those
+ * words so an unresolvable record surfaces instead of reading as a cold start.
+ */
+export function toStoredSchema(record: PersistedTableSchema): StoredTableSchema {
+	const misses = unresolvedIndexColumns(record);
+	if (misses.length > 0) {
+		const [first] = misses;
+		throw new Error(
+			`Persisted catalog record for table '${record.name}' is unresolvable: index '${first!.index}' ` +
+			`names column '${first!.column}', which is absent from its column list ${describeColumns(record.columns)}`
+		);
+	}
+	assertPositionsInRange(record);
+	const positions = columnPositions(record.columns);
+	const indexes: StoredIndexSchema[] = record.indexes.map(idx => ({
+		...idx,
+		columns: idx.columns.map(col => {
+			const { name, ...rest } = col;
+			return { ...rest, index: positions.get(name.toLowerCase())! };
+		}),
+	}));
+	return { ...record, indexes };
+}
+
+/**
+ * The record a schema write produces: `incoming` (the caller's declaration, already in
+ * persisted form) with its index list unioned against what the catalog holds
+ * ({@link mergeIndexLists}), validated so that every surviving index column exists in
+ * the MERGED record's column list — which is `incoming`'s.
+ *
+ * The one way that validation fails is a re-declare that drops a column a persisted
+ * index still covers (the incoming indexes were de-resolved from the incoming columns,
+ * so they always resolve). Before index columns were persisted by name, that write
+ * went through silently and every later row was indexed under the NULL key; now it is
+ * refused at the write with the way out spelled out. `DROP TABLE` tombstones the
+ * entry ({@link SchemaManager.deleteSchema}), so drop-then-recreate is unaffected.
+ */
+export function mergePersistedSchemas(
+	incoming: PersistedTableSchema,
+	persisted: PersistedTableSchema | undefined
+): PersistedTableSchema {
+	const merged: PersistedTableSchema = persisted
+		? { ...incoming, indexes: mergeIndexLists(incoming.indexes, persisted.indexes) }
+		: incoming;
+	const [miss] = unresolvedIndexColumns(merged);
+	if (miss) {
+		throw new Error(
+			`Cannot re-declare table '${merged.name}' without column '${miss.column}': persisted index ` +
+			`'${miss.index}' covers it. Drop the index or the table first.`
+		);
+	}
+	assertPositionsInRange(merged);
 	return merged;
 }
 
@@ -228,9 +440,15 @@ export class SchemaManager {
 	 * count responders (see the coordinator-repo tripwire recorded in
 	 * tickets/complete/4.5-repo-reports-unavailable-vs-absent.md).
 	 *
-	 * Returns the schema actually written (input + any unioned-in indexes); callers
-	 * that keep using the schema after the write must use the returned value, not
-	 * their input.
+	 * Returns the schema actually written (input + any unioned-in indexes, resolved
+	 * against the input's column list); callers that keep using the schema after the
+	 * write must use the returned value, not their input.
+	 *
+	 * This is the WRITE half of the catalog's shape boundary: the positional input is
+	 * de-resolved to the name-keyed {@link PersistedTableSchema} against its own
+	 * columns, unioned, validated and written ({@link mergePersistedSchemas}) — so a
+	 * re-declare that reorders columns re-points every persisted index at the column
+	 * it was declared on, and one that drops an indexed column is refused here.
 	 */
 	async storeStoredSchema(stored: StoredTableSchema, transactor?: ITransactor): Promise<StoredTableSchema> {
 		const tree = await this.requireSchemaTree(transactor);
@@ -239,19 +457,12 @@ export class SchemaManager {
 		// look up this table's entry. Skip tombstones (entry[1] === undefined).
 		await tree.update();
 		const path = await tree.find(stored.name);
-		let persisted: StoredTableSchema | undefined;
-		if (tree.isValid(path)) {
-			const entry = tree.at(path) as [string, StoredTableSchema] | undefined;
-			if (entry && entry.length >= 2 && entry[1]) {
-				persisted = entry[1];
-			}
-		}
-		const merged: StoredTableSchema = persisted
-			? { ...stored, indexes: mergeIndexLists(stored.indexes, persisted.indexes) }
-			: stored;
+		const persisted = tree.isValid(path) ? this.livePersistedEntry(tree.at(path)) : undefined;
+		const merged = mergePersistedSchemas(toPersistedSchema(stored), persisted);
+		const resolved = toStoredSchema(merged);
 
 		// The schema tree's keyExtractor (in collection-factory) treats entries
-		// as `[name, StoredTableSchema]` tuples — keying on `entry[0]`. The
+		// as `[name, PersistedTableSchema]` tuples — keying on `entry[0]`. The
 		// per-table cache and read paths (getSchema, listTables) also expect
 		// the tuple shape. Storing the bare `stored` object made `entry[0]`
 		// undefined inside the btree, so cross-instance reads (and listTables)
@@ -260,8 +471,46 @@ export class SchemaManager {
 
 		// Cache what was ACTUALLY written, and only after the write succeeded — a
 		// failed replace must not leave the cache claiming the new value landed.
-		this.schemaCache.set(merged.name, merged);
-		return merged;
+		this.schemaCache.set(merged.name, resolved);
+		return resolved;
+	}
+
+	/**
+	 * What a schema write to the catalog WOULD produce for `candidate` given the
+	 * `persisted` schema this instance has read, without writing: the same
+	 * de-resolve → union → validate → resolve sequence as {@link storeStoredSchema},
+	 * so a caller comparing the two to skip a byte-identical write compares against
+	 * exactly what a write would land. Throws what the write would throw (a
+	 * re-declare that drops an indexed column).
+	 */
+	mergeWithPersisted(candidate: StoredTableSchema, persisted: StoredTableSchema): StoredTableSchema {
+		return toStoredSchema(mergePersistedSchemas(toPersistedSchema(candidate), toPersistedSchema(persisted)));
+	}
+
+	/**
+	 * The persisted record inside a catalog entry, or undefined for a tombstone — a
+	 * deleted entry surfaces as `entry[1] === undefined` and must never be merged
+	 * with, cached, or returned as a live schema.
+	 */
+	private livePersistedEntry(entry: unknown): PersistedTableSchema | undefined {
+		const tuple = entry as [string, PersistedTableSchema | undefined] | undefined;
+		return tuple && tuple.length >= 2 && tuple[1] ? tuple[1] : undefined;
+	}
+
+	/**
+	 * The READ half of the catalog's shape boundary: resolve a live entry's record to
+	 * the positional {@link StoredTableSchema} every consumer expects, against the
+	 * record's own column list, and cache it under its table name. Undefined for a
+	 * tombstone. The one place a persisted record becomes a runtime schema.
+	 */
+	private resolveAndCache(entry: unknown): StoredTableSchema | undefined {
+		const record = this.livePersistedEntry(entry);
+		if (!record) {
+			return undefined;
+		}
+		const resolved = toStoredSchema(record);
+		this.schemaCache.set(resolved.name, resolved);
+		return resolved;
 	}
 
 	/**
@@ -341,16 +590,7 @@ export class SchemaManager {
 			return undefined;
 		}
 
-		const entry = tree.at(path) as [string, StoredTableSchema];
-		// Skip tombstones — a deleted entry surfaces as `entry[1] === undefined`
-		// and must not be cached or returned as a live schema.
-		if (entry && entry.length >= 2 && entry[1]) {
-			const stored = entry[1];
-			this.schemaCache.set(tableName, stored);
-			return stored;
-		}
-
-		return undefined;
+		return this.resolveAndCache(tree.at(path));
 	}
 
 	/**
@@ -396,18 +636,15 @@ export class SchemaManager {
 				continue;
 			}
 
-			const entry = tree.at(path) as [string, StoredTableSchema];
+			const entry = tree.at(path) as [string, PersistedTableSchema | undefined] | undefined;
 			// Seed the per-instance cache from this single traversal so the
 			// follow-up `getSchema(name)` calls (hydrateCatalog walks one
 			// listTables + one getSchema per table) hit memory instead of
 			// re-walking the schema btree from the root. The seeded value is
-			// the same `entry[1]` shape getSchema itself caches and returns
-			// (`[name, StoredTableSchema]`). Skip tombstones — a deleted entry
-			// can surface as `entry[1] === undefined` and must not register as
-			// a cache hit.
-			if (entry && entry.length >= 2 && entry[1]) {
-				this.schemaCache.set(entry[0], entry[1]);
-			}
+			// the same resolved shape getSchema itself caches and returns.
+			// Skip tombstones — a deleted entry can surface as
+			// `entry[1] === undefined` and must not register as a cache hit.
+			this.resolveAndCache(entry);
 			if (entry && entry.length >= 1) {
 				tables.push(entry[0]);
 			}

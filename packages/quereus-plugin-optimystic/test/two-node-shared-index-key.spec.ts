@@ -218,7 +218,9 @@ describe('Two nodes writing one shared secondary-index value', function () {
 
 	/*
 	 * A UNIQUE index across two nodes. The downstream stack's other failing signature names a
-	 * `_uniq_1` index collection and nothing covered a unique index across machines.
+	 * `_uniq_1` index collection (the enforcement tree under its old positional name; it is
+	 * now named by column, e.g. `_uniq_5.token`) and nothing covered a unique index across
+	 * machines.
 	 *
 	 * The values here are DISTINCT, so this case is purely about maintenance: a unique index
 	 * written by two machines still ends up holding both of their entries. The SAME-value

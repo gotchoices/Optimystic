@@ -16,7 +16,7 @@ import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, 
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import type { CollectionChangeEvent, ITransactor, TreeReadView } from '@optimystic/db-core';
-import { SchemaManager, columnSetKey, mergeIndexLists, uniqueConstraintKey } from './schema/schema-manager.js';
+import { SchemaManager, columnSetKey, uniqueConstraintKey, uniqueEnforcementTreeName } from './schema/schema-manager.js';
 import type { StoredTableSchema, StoredIndexSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { SqlDataType, PhysicalType } from '@quereus/quereus';
@@ -430,13 +430,21 @@ export class OptimysticVirtualTable extends VirtualTable {
         // the table HAS; it only says which ones this DDL statement mentioned.
         // The candidate therefore unions its index list with the persisted one
         // — the SAME rule storeStoredSchema applies at write time
-        // (mergeIndexLists), so what we compare against is what a write would
+        // (mergeWithPersisted), so what we compare against is what a write would
         // actually produce. Two things fall out: an index-free re-declare can
         // never write `indexes: []` over a real list (which would force every
         // later `addIndex()` to fail its dedupe and rebuild from scratch), and
         // a candidate that carries SOME indexes while the catalog carries more
         // still short-circuits once, instead of missing the compare and
         // re-writing a byte-identical record on every single open.
+        //
+        // Persisted indexes are identified by column NAME on disk and resolved
+        // against whichever column list they are merged into, so a re-declare
+        // that REORDERS columns re-points each surviving index at the column it
+        // was declared on (its tree contents were always keyed on that column's
+        // values, so nothing has to be rebuilt). A re-declare that DROPS a column
+        // a persisted index still covers cannot be expressed and throws here —
+        // the persisted index has to be dropped first, or the table.
         //
         // A schema persisted before uniqueness metadata was wired through misses
         // this short-circuit exactly once for a table that HAS unique
@@ -446,7 +454,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         // key on both sides (see tableSchemaToStored) and never miss.
         const candidateStored = this.schemaManager.tableSchemaToStored(this.tableSchema);
         const mergedCandidate: StoredTableSchema = persistedSchema
-          ? { ...candidateStored, indexes: mergeIndexLists(candidateStored.indexes, persistedSchema.indexes) }
+          ? this.schemaManager.mergeWithPersisted(candidateStored, persistedSchema)
           : candidateStored;
 
         if (persistedSchema && schemasEqual(mergedCandidate, persistedSchema)) {
@@ -1382,6 +1390,14 @@ export class OptimysticVirtualTable extends VirtualTable {
    * is reserved for enforcement trees and must not collide with a user index) and the
    * constraint's columns in declared order. Two constraints over the same column set
    * collapse to one descriptor.
+   *
+   * Set matching within this one resolved schema is positional ({@link columnSetKey});
+   * the descriptor's NAME is not, because it becomes the tree's URI and so outlives this
+   * schema's column numbering — it is derived from the columns' names
+   * ({@link uniqueEnforcementTreeName}), so a re-declare that reorders the table's
+   * columns resolves to the same tree. Trees under the retired positional names
+   * (`_uniq_1`) are left unreferenced in storage; a renamed tree starts empty and is
+   * rebuilt from the table by {@link ensureUniquePopulated} on its first probe.
    */
   private buildUniqueEnforcementIndexes(storedSchema: StoredTableSchema): StoredIndexSchema[] {
     const constraints = this.tableSchema.uniqueConstraints;
@@ -1402,11 +1418,23 @@ export class OptimysticVirtualTable extends VirtualTable {
       if (seen.has(setKey)) continue;
       seen.add(setKey);
       synthesized.push({
-        name: `_uniq_${setKey}`,
+        name: uniqueEnforcementTreeName(uc.columns.map(index => this.columnNameAt(storedSchema, index))),
         columns: uc.columns.map(index => ({ index })),
       });
     }
     return synthesized;
+  }
+
+  /** The declared name of the column at `index` in `storedSchema`; a constraint that addresses a position the schema lacks is corrupt, not NULL-keyed. */
+  private columnNameAt(storedSchema: StoredTableSchema, index: number): string {
+    const column = storedSchema.columns[index];
+    if (column === undefined) {
+      throw new Error(
+        `Table '${this.tableName}': unique constraint addresses column position ${index}, ` +
+        `which is out of range for its ${storedSchema.columns.length} columns`
+      );
+    }
+    return column.name;
   }
 
   /**

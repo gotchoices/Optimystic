@@ -16,11 +16,12 @@
  */
 
 import { expect } from 'chai';
-import { SchemaManager } from '../src/schema/schema-manager.js';
-import type { StoredTableSchema } from '../src/schema/schema-manager.js';
+import { SchemaManager, toPersistedSchema } from '../src/schema/schema-manager.js';
+import type { PersistedTableSchema, StoredTableSchema } from '../src/schema/schema-manager.js';
 import type { Tree } from '@optimystic/db-core';
 
-type CatalogEntry = [string, StoredTableSchema | undefined];
+/** The catalog holds the PERSISTED shape (index columns by name), never the resolved one. */
+type CatalogEntry = [string, PersistedTableSchema | undefined];
 
 /** Minimal stand-in for the catalog tree: just the surface SchemaManager touches. */
 class FakeCatalogTree {
@@ -58,8 +59,8 @@ class FakeCatalogTree {
 		}
 	}
 
-	/** The schema last written under `name`, or undefined if it was tombstoned. */
-	stored(name: string): StoredTableSchema | undefined {
+	/** The record last written under `name`, or undefined if it was tombstoned. */
+	stored(name: string): PersistedTableSchema | undefined {
 		return this.entries.get(name)?.[1];
 	}
 }
@@ -78,6 +79,36 @@ function makeStored(name: string, indexNames: string[]): StoredTableSchema {
 	};
 }
 
+/**
+ * A resolved schema over `columnNames` (first column is the PK) with one single-column
+ * index per `[indexName, columnName]` pair, positions resolved against THIS column list.
+ */
+function makeStoredWide(
+	name: string,
+	columnNames: string[],
+	indexes: [indexName: string, columnName: string][],
+	uniqueColumns?: number[],
+): StoredTableSchema {
+	return {
+		name,
+		schemaName: 'main',
+		columns: columnNames.map((colName, i) => ({
+			name: colName, affinity: i === 0 ? 'INTEGER' : 'TEXT', notNull: i === 0, primaryKey: i === 0,
+			pkOrder: i === 0 ? 0 : -1, collation: 'BINARY', generated: false,
+		})),
+		primaryKeyDefinition: [{ index: 0 }],
+		indexes: indexes.map(([idxName, colName]) => ({
+			name: idxName,
+			columns: [{ index: columnNames.indexOf(colName) }],
+		})),
+		vtabModuleName: 'optimystic',
+		uniqueConstraints: uniqueColumns ? [{ columns: uniqueColumns }] : undefined,
+	};
+}
+
+/** What the catalog would hold for `stored`: seed helper for the fake tree. */
+const persistedOf = (stored: StoredTableSchema): PersistedTableSchema => toPersistedSchema(stored);
+
 /** A SchemaManager over `tree`, plus the (transactor, create) calls it made. */
 function managerOver(tree: FakeCatalogTree | undefined) {
 	const opens: { create: boolean }[] = [];
@@ -94,7 +125,7 @@ describe('SchemaManager write path', () => {
 			// The caller never read the catalog — the guard is the write path's own
 			// re-read, which is what makes an index-free candidate non-destructive.
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', makeStored('t', ['idx_persisted'])]);
+			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_persisted']))]);
 			const { manager } = managerOver(tree);
 
 			const written = await manager.storeStoredSchema(makeStored('t', []));
@@ -131,7 +162,7 @@ describe('SchemaManager write path', () => {
 			// Caching before the replace would let a later read report a value that
 			// never reached storage.
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', makeStored('t', ['idx_persisted'])]);
+			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_persisted']))]);
 			const { manager } = managerOver(tree);
 			tree.failNextReplace = true;
 
@@ -157,15 +188,135 @@ describe('SchemaManager write path', () => {
 		});
 	});
 
+	describe('column identity across the catalog boundary', () => {
+		// The catalog record identifies an index's columns by NAME; the runtime schema by
+		// POSITION. The two are converted only here, each against the record's own column
+		// list — so a persisted index can never point at "whatever now sits in slot 2".
+
+		it('writes index columns by name and reads them back resolved against the record', async () => {
+			const tree = new FakeCatalogTree();
+			const { manager } = managerOver(tree);
+
+			await manager.storeStoredSchema(makeStoredWide('t', ['id', 'a', 'b'], [['idx_b', 'b']]));
+
+			expect(tree.stored('t')!.indexes[0]!.columns, 'on disk: a name, no position').to.deep.equal([{ name: 'b' }]);
+
+			manager.clearCache();
+			const read = await manager.getSchema('t');
+			expect(read!.indexes[0]!.columns, 'in memory: a position, no name').to.deep.equal([{ index: 2 }]);
+		});
+
+		it('re-points a persisted index at its column when a re-declare reorders the columns', async () => {
+			// The pre-fix defect: `idx_b` persisted as position 2; a re-declare with `a`
+			// and `b` swapped kept "position 2", which is now `a`.
+			const tree = new FakeCatalogTree();
+			tree.entries.set('t', ['t', persistedOf(makeStoredWide('t', ['id', 'a', 'b'], [['idx_b', 'b']]))]);
+			const { manager } = managerOver(tree);
+
+			const written = await manager.storeStoredSchema(makeStoredWide('t', ['id', 'b', 'a'], []));
+
+			expect(written.indexes.map(i => [i.name, i.columns[0]!.index])).to.deep.equal([['idx_b', 1]]);
+			expect(tree.stored('t')!.indexes[0]!.columns).to.deep.equal([{ name: 'b' }]);
+		});
+
+		it('matches persisted column names case-insensitively, as the SQL layer does', async () => {
+			const tree = new FakeCatalogTree();
+			tree.entries.set('t', ['t', persistedOf(makeStoredWide('t', ['id', 'Stamp'], [['idx_stamp', 'Stamp']]))]);
+			const { manager } = managerOver(tree);
+
+			const written = await manager.storeStoredSchema(makeStoredWide('t', ['id', 'stamp'], []));
+
+			expect(written.indexes.map(i => [i.name, i.columns[0]!.index])).to.deep.equal([['idx_stamp', 1]]);
+		});
+
+		it('refuses a re-declare that drops a column a persisted index covers', async () => {
+			// Pre-fix this wrote through silently and every later row was indexed under
+			// the NULL key (`row[2]` on a two-column row is undefined).
+			const tree = new FakeCatalogTree();
+			tree.entries.set('t', ['t', persistedOf(makeStoredWide('t', ['id', 'a', 'b'], [['idx_b', 'b']]))]);
+			const { manager } = managerOver(tree);
+
+			let thrown: Error | undefined;
+			try {
+				await manager.storeStoredSchema(makeStoredWide('t', ['id', 'a'], []));
+			} catch (error) {
+				thrown = error as Error;
+			}
+			expect(thrown?.message).to.equal(
+				"Cannot re-declare table 't' without column 'b': persisted index 'idx_b' covers it. " +
+				'Drop the index or the table first.',
+			);
+			expect(tree.writes, 'nothing may reach the catalog').to.have.lengthOf(0);
+		});
+
+		it('mergeWithPersisted previews exactly what the write would land, including its refusal', () => {
+			const { manager } = managerOver(new FakeCatalogTree());
+			const persisted = makeStoredWide('t', ['id', 'a', 'b'], [['idx_b', 'b']]);
+
+			const merged = manager.mergeWithPersisted(makeStoredWide('t', ['id', 'b', 'a'], []), persisted);
+			expect(merged.indexes.map(i => [i.name, i.columns[0]!.index])).to.deep.equal([['idx_b', 1]]);
+
+			expect(() => manager.mergeWithPersisted(makeStoredWide('t', ['id', 'a'], []), persisted))
+				.to.throw(/without column 'b': persisted index 'idx_b' covers it/);
+		});
+
+		it('fails loudly on read when a persisted record names a column it does not have', async () => {
+			// Cannot be produced by the write path any more; pins the read-side half of
+			// the invariant against a hand-corrupted (or future-format) record.
+			const tree = new FakeCatalogTree();
+			const corrupt = persistedOf(makeStoredWide('t', ['id', 'a', 'b'], [['idx_b', 'b']]));
+			tree.entries.set('t', ['t', { ...corrupt, columns: corrupt.columns.slice(0, 2) }]);
+			const { manager } = managerOver(tree);
+
+			let thrown: Error | undefined;
+			try {
+				await manager.getSchema('t');
+			} catch (error) {
+				thrown = error as Error;
+			}
+			expect(thrown?.message).to.equal(
+				"Persisted catalog record for table 't' is unresolvable: index 'idx_b' names column 'b', " +
+				'which is absent from its column list [id, a]',
+			);
+		});
+
+		it('refuses to write a primary key or unique constraint position outside the column list', async () => {
+			// These stay positional on disk because every write re-derives them alongside
+			// the column list; this is the check that makes that an enforced invariant.
+			const { manager } = managerOver(new FakeCatalogTree());
+
+			const badPk: StoredTableSchema = { ...makeStoredWide('t', ['id', 'a'], []), primaryKeyDefinition: [{ index: 2 }] };
+			let thrown: Error | undefined;
+			try {
+				await manager.storeStoredSchema(badPk);
+			} catch (error) {
+				thrown = error as Error;
+			}
+			expect(thrown?.message).to.equal(
+				"Cannot persist table 't': primary key position 2 is out of range for its column list [id, a]",
+			);
+
+			thrown = undefined;
+			try {
+				await manager.storeStoredSchema(makeStoredWide('t', ['id', 'a'], [], [5]));
+			} catch (error) {
+				thrown = error as Error;
+			}
+			expect(thrown?.message).to.equal(
+				"Cannot persist table 't': unique constraint column position 5 is out of range for its column list [id, a]",
+			);
+		});
+	});
+
 	describe('getSchemaFresh', () => {
 		it('prefers the catalog over a stale cached copy', async () => {
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', makeStored('t', [])]);
+			tree.entries.set('t', ['t', persistedOf(makeStored('t', []))]);
 			const { manager } = managerOver(tree);
 			expect((await manager.getSchema('t'))!.indexes).to.deep.equal([]);
 
 			// A sibling instance persists an index behind this manager's back.
-			tree.entries.set('t', ['t', makeStored('t', ['idx_sibling'])]);
+			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_sibling']))]);
 
 			expect((await manager.getSchema('t'))!.indexes, 'the cached read must stay stale by design').to.deep.equal([]);
 			const fresh = await manager.getSchemaFresh('t');
@@ -177,7 +328,7 @@ describe('SchemaManager write path', () => {
 			// entry is proof the schema existed, so reporting the table gone would be
 			// inventing certainty.
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', makeStored('t', ['idx_a'])]);
+			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_a']))]);
 			const { manager } = managerOver(tree);
 			await manager.getSchema('t');
 
@@ -202,7 +353,7 @@ describe('SchemaManager write path', () => {
 
 		it('tombstones the entry when the catalog exists', async () => {
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', makeStored('t', ['idx_a'])]);
+			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_a']))]);
 			const { manager } = managerOver(tree);
 			await manager.getSchema('t');
 
