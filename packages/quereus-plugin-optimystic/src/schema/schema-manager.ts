@@ -35,7 +35,7 @@ export function columnSetKey(columns: readonly number[]): string {
  *
  * Names are lowercased and sorted so `(a, b)` and `(b, a)` name one tree, matching the
  * positional set semantics of {@link columnSetKey}. The join is length-prefixed
- * (`_uniq_3.foo_3.bar`) because SQL identifiers can contain `_`: a bare `_`-join would
+ * (`_uniq_3.bar_3.foo`) because SQL identifiers can contain `_`: a bare `_`-join would
  * make `(a_b, c)` and `(a, b_c)` collide on `_uniq_a_b_c`. Length prefixes keep it
  * injective while staying readable in a URI or a log line.
  *
@@ -190,6 +190,12 @@ export interface StoredIndexColumn {
  * the same declaration, so they cannot drift — and {@link assertPositionsInRange}
  * checks that invariant at every write so the day one of them is preserved across
  * writes the way `indexes` is, the drift is caught instead of persisted.
+ *
+ * The partial-index / partial-constraint `predicate` ASTs are persisted verbatim and
+ * need no conversion: they are Quereus parser `Expression` trees, whose every column
+ * reference (`ColumnExpr`, `IdentifierExpr`) carries a column NAME — the union has no
+ * positional column node at all — so a predicate cannot outlive its column list the
+ * way a positional index descriptor could. Audited against Quereus 4.17.
  */
 export interface PersistedTableSchema extends Omit<StoredTableSchema, 'indexes'> {
 	indexes: PersistedIndexSchema[];
@@ -273,11 +279,14 @@ function unresolvedIndexColumns(record: PersistedTableSchema): { index: string; 
 }
 
 /**
- * The write-time boundary check for the fields that stay POSITIONAL on disk: every
- * primary-key position and every UNIQUE-constraint position must be in range for the
- * record's own column list. Both are consistent by construction today (see
+ * The boundary check for the fields that stay POSITIONAL on disk: every primary-key
+ * position and every UNIQUE-constraint position must be in range for the record's own
+ * column list. Both are consistent by construction today (see
  * {@link PersistedTableSchema}); this is what turns that unstated invariant into a
- * loud failure the day a write preserves one of them across a re-declare.
+ * loud failure the day a write preserves one of them across a re-declare. Runs on
+ * both sides of the boundary — every write ({@link mergePersistedSchemas}) and every
+ * read ({@link toStoredSchema}) — so a record corrupted by any route is caught before
+ * a consumer indexes a row with it.
  */
 function assertPositionsInRange(record: PersistedTableSchema): void {
 	const width = record.columns.length;
@@ -327,7 +336,13 @@ export function toPersistedSchema(stored: StoredTableSchema): PersistedTableSche
  *
  * NOTE: `hydrateCatalog` treats a listTables error matching /not found|missing|empty/
  * as "no catalog yet" and swallows it; this message deliberately uses none of those
- * words so an unresolvable record surfaces instead of reading as a cold start.
+ * words so an unresolvable record surfaces instead of reading as a cold start. That
+ * only covers the message's FIXED words — the table, index and column names it
+ * interpolates are user identifiers, so a corrupt record on a table with a column
+ * literally named `missing` would still be swallowed as a cold start (hydrate reports
+ * zero tables instead of failing). Conditional on an already-corrupt catalog, so left
+ * as is; if it ever bites, give the cold-start case a typed signal from
+ * `requireSchemaTree` and drop the regex rather than widening this wording.
  */
 export function toStoredSchema(record: PersistedTableSchema): StoredTableSchema {
 	const misses = unresolvedIndexColumns(record);
@@ -502,6 +517,16 @@ export class SchemaManager {
 	 * the positional {@link StoredTableSchema} every consumer expects, against the
 	 * record's own column list, and cache it under its table name. Undefined for a
 	 * tombstone. The one place a persisted record becomes a runtime schema.
+	 *
+	 * NOTE: {@link toStoredSchema} throws on an unresolvable record, and
+	 * {@link listTables} calls this once per catalog entry — so ONE corrupt record
+	 * makes the whole catalog unlistable and hydrate finds no tables at all, rather
+	 * than the other tables hydrating and the bad one failing when it is opened.
+	 * Deliberate while the only producer of such a record is a build older than the
+	 * name-keyed format (see tickets/backlog/debt-optimystic-key-format-migration.md),
+	 * where a partial hydrate would be the more confusing answer. If the catalog ever
+	 * gains records this build legitimately cannot resolve, make the listTables walk
+	 * collect per-table failures instead of propagating the first.
 	 */
 	private resolveAndCache(entry: unknown): StoredTableSchema | undefined {
 		const record = this.livePersistedEntry(entry);

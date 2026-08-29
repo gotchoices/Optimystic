@@ -16,7 +16,7 @@
  */
 
 import { expect } from 'chai';
-import { SchemaManager, toPersistedSchema } from '../src/schema/schema-manager.js';
+import { SchemaManager, toPersistedSchema, toStoredSchema, uniqueEnforcementTreeName } from '../src/schema/schema-manager.js';
 import type { PersistedTableSchema, StoredTableSchema } from '../src/schema/schema-manager.js';
 import type { Tree } from '@optimystic/db-core';
 
@@ -305,6 +305,71 @@ describe('SchemaManager write path', () => {
 			expect(thrown?.message).to.equal(
 				"Cannot persist table 't': unique constraint column position 5 is out of range for its column list [id, a]",
 			);
+		});
+
+		it('round-trips every index-column attribute across a column reorder', () => {
+			// The conversions rewrite only the column ADDRESS. Anything else on an index
+			// or an index column that they drop or mangle is silently lost on the next
+			// write — a general check, so a field added later is covered without a test
+			// per field.
+			const declared: StoredTableSchema = {
+				...makeStoredWide('t', ['id', 'a', 'b'], []),
+				indexes: [{
+					name: 'idx_ba',
+					columns: [
+						{ index: 2, desc: true, collation: 'NOCASE' },
+						{ index: 1 },
+					],
+					unique: true,
+					predicate: { op: 'notnull', column: 'b' },
+				}],
+			};
+
+			const persisted = toPersistedSchema(declared);
+			expect(persisted.indexes[0]!.columns, 'positions become names, attributes ride along').to.deep.equal([
+				{ name: 'b', desc: true, collation: 'NOCASE' },
+				{ name: 'a' },
+			]);
+			expect(toStoredSchema(persisted), 'resolving against the same columns is the identity')
+				.to.deep.equal(declared);
+
+			// The same record resolved against a REORDERED column list: addresses move,
+			// nothing else does, and column order within the index is preserved.
+			const reordered = toStoredSchema({ ...persisted, columns: makeStoredWide('t', ['id', 'b', 'a'], []).columns });
+			expect(reordered.indexes[0]).to.deep.equal({
+				name: 'idx_ba',
+				columns: [
+					{ index: 1, desc: true, collation: 'NOCASE' },
+					{ index: 2 },
+				],
+				unique: true,
+				predicate: { op: 'notnull', column: 'b' },
+			});
+		});
+	});
+
+	describe('uniqueEnforcementTreeName', () => {
+		// The synthesized UNIQUE-enforcement tree's name IS its storage URI, so it must
+		// be a function of the column NAMES (stable across a re-declare that renumbers
+		// them) and it must be injective — two different column sets sharing a name would
+		// have them enforce over each other's key space.
+
+		it('is order- and case-insensitive over the column set', () => {
+			expect(uniqueEnforcementTreeName(['a', 'b'])).to.equal(uniqueEnforcementTreeName(['b', 'a']));
+			expect(uniqueEnforcementTreeName(['Stamp'])).to.equal(uniqueEnforcementTreeName(['stamp']));
+			expect(uniqueEnforcementTreeName(['stamp'])).to.equal('_uniq_5.stamp');
+			expect(uniqueEnforcementTreeName(['a', 'b'])).to.equal('_uniq_1.a_1.b');
+		});
+
+		it('keeps `_`-bearing identifiers from colliding', () => {
+			// The reason the join is length-prefixed: a bare `_` join makes both of these
+			// `_uniq_a_b_c`, and the two constraints then share one enforcement tree.
+			expect(uniqueEnforcementTreeName(['a_b', 'c'])).to.not.equal(uniqueEnforcementTreeName(['a', 'b_c']));
+			expect(uniqueEnforcementTreeName(['a_b', 'c'])).to.equal('_uniq_3.a_b_1.c');
+		});
+
+		it('carries the reserved prefix that keeps it out of the user index namespace', () => {
+			expect(uniqueEnforcementTreeName(['x'])).to.match(/^_uniq_/);
 		});
 	});
 
