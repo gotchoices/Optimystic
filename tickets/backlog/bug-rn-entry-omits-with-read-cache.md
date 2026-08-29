@@ -57,13 +57,41 @@ for.
 Downstream is currently **red at `yarn build`** because of it — not a test failure, a link failure,
 so nothing downstream can be measured against this HEAD until it is fixed.
 
+## Update: it is THREE missing exports, and one of them is required to implement an interface `/rn` DOES export
+
+Found while accommodating the same release downstream. `packages/db-p2p/src/index.ts` re-exports
+these and `rn.ts` re-exports none of them:
+
+| module | why `/rn` needs it |
+| --- | --- |
+| `./storage/with-read-cache.js` | the plugin's `/rn` build imports `withReadCache` — the original build break |
+| `./cluster/commit-proof.js` | defines `BlockCommitProof`, which **`IRawStorage` requires**, and `/rn` exports `IRawStorage` |
+| `./cluster/block-transfer-service.js` | defines `PushCertification`, the new 4th argument to `pushBlocks` |
+
+The `commit-proof` one is the sharpest: `/rn` exports an interface whose members
+(`getBlockProof`/`saveBlockProof`) cannot be *named* by a consumer resolving that entry. And this
+is not a niche path — `package.json`'s `exports` map sends the **`react-native` condition on `.`**
+to `rn.d.ts`, so a React-Native consumer importing plain `@optimystic/db-p2p` lands there without
+asking for `/rn` at all. A downstream NativeScript app hit exactly this implementing the two new
+members, and had to derive the type
+(`Parameters<IRawStorage['saveBlockProof']>[2]`) because it could not import it.
+
+That derivation is a workaround, not a fix — it is in
+`packages/reference-app-ns/src/ns-storage.ts` downstream with a pointer to this ticket, and should
+go back to a plain import once the entry exports the type.
+
 ## The fix
 
 Add the missing re-export to `packages/db-p2p/src/rn.ts`:
 
 ```ts
 export * from './storage/with-read-cache.js';
+export * from './cluster/commit-proof.js';
+export * from './cluster/block-transfer-service.js';
 ```
+
+Check the rest of `index.ts` against `rn.ts` while doing it rather than adding these three — the
+drift is clearly not a one-off.
 
 Worth also asking the wider question while it is open: **nothing enforces that the two entries stay
 in step.** This one drifted silently and was caught only by a downstream build. A gate comparing the
