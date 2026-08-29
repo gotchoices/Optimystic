@@ -83,3 +83,39 @@ taken with it temporarily restored.
 **Every `unique` constraint in a Quereus schema is enforced through such an index**, so this is not
 confined to explicitly declared secondary indexes; a forked uniqueness index would let two machines
 each admit a row the other considers a duplicate.
+
+## Steer for this fix pass (added on promotion)
+
+**Do not spend this run on a seventh two-node reproduction attempt.** Six have already been made and
+all reproduced nothing; that dead end is recorded on
+`tickets/blocked/secondary-index-repro-exhausted-upstream.md`, which asks a human whether black-box
+repro attempts should continue here at all. That question is still open and this ticket does not
+depend on its answer.
+
+What changed since those attempts is that the mechanism is now named rather than guessed: two
+machines commit from one shared base (`1@-UzaWOQiXI12s6PU5PE5lA`) into the index sub-collection and
+never converge, while the **main** collection of the same table converges byte-identically in the
+same instant under the same writes. That control is the whole value of the measurement — it turns
+"two machines disagree" into "one reconciliation path works and its sibling does not", which is a
+question about this repo's code and answerable here without a distributed harness.
+
+So work it white-box, in this order:
+
+1. **Find what differs between the two paths.** The main collection and the index sub-collection
+   both go through `Collection.update()` / `Log.getFrom`. Establish what is different about the
+   index sub-collection's tail, header, or commit path such that the same walk closes the gap for
+   one and not the other. A single-process test that drives two `Collection` handles over one
+   transactor against one collection id may well be enough to exhibit it — that is not the
+   two-machine harness that failed, and is worth trying before anything heavier.
+2. **Check the diagnostic fires.** `a-refresh-that-fails-to-close-a-known-gap-says-nothing`
+   (complete) added a signal for a refresh that returns without closing a known gap. It should fire
+   on every one of the 111 reads described above. If that code path cannot fire for a forked
+   collection, say so — that is a finding about the diagnostic, and it is the reason this went
+   unseen.
+3. **Only then consider a reproduction.** If steps 1-2 land a hypothesis, write the narrowest test
+   that pins *it*, not the end-to-end scenario.
+
+If the mechanism turns out not to be reachable from this repo's own code — i.e. the divergence
+requires the downstream wiring — that is a real outcome: say it explicitly and route the ticket to
+`blocked/` referencing `secondary-index-repro-exhausted-upstream`, rather than filing an implement
+ticket on a hypothesis nothing here can test.
