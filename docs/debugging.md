@@ -302,6 +302,41 @@ worth enabling together:
 DEBUG='optimystic:db-core:collection' node your-app.js
 ```
 
+The third line on this namespace covers the case the two above structurally cannot: **lineage
+divergence**. Both shortfall numbers come from one chain — a forked replica is internally
+self-consistent, its tail claiming exactly what its own walk reaches — so two copies of one
+collection id holding the same revision under different actions keep `context-short-of-tail`
+silent forever. The refresh instead compares the action id it *holds* at its current revision
+against the action id the freshly-read log *names* at that same revision, and a mismatch means the
+local copy and the stored log are provably different lineages (see *Comparing action ids* below —
+this is that comparison, run by db-core itself on every refresh, without needing a second node's
+lines):
+
+```
+optimystic:db-core:collection collection:lineage-divergence id=default/Usage/index/by_token rev=2 held=fR1TfGRxHLN_Icl0ZK-XIw read=vR5WcYtFvwoW2nYPa8BqCg
+```
+
+- `id=` — the collection id, joining to `index:seek`'s `collection=`/`main=` and to
+  `commit:collections`.
+- `rev=` — the revision both sides occupy; the disagreement is *at* this revision, not about it.
+- `held=` — the action id this collection's own context carried into the refresh (its lineage
+  marker); `read=` — the action id the stored log names at that same revision.
+
+Three things to know when reading it:
+
+- **It fires once per discovery, not once per refresh.** After reporting, the refresh adopts the
+  log's context as usual (`update()` returns normally; nothing throws), so the held lineage marker
+  now matches the log and later refreshes of that instance stay silent — even though content the
+  instance materialized under its old lineage may still be cached. Seeing the line once is the
+  finding; do not wait for it to repeat.
+- **Silence is weaker evidence than for the shortfall line.** The comparison needs an action entry
+  at the held revision on *both* sides; an invented collection, or a revision whose log slot went
+  to a checkpoint or invalidation entry, has nothing to compare and stays quiet. Cross-node
+  comparison per *Comparing action ids* below remains the ground truth.
+- The line only fires on a refresh (`update()`), and only on an instance that carried the other
+  lineage in — a handle freshly opened from storage adopts the stored lineage and has nothing to
+  disagree with.
+
 #### Comparing action ids
 
 A revision number is counted **per collection**, so it means nothing on its own. Two nodes

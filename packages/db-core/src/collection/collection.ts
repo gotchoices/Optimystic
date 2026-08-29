@@ -193,11 +193,45 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * repeats the same doomed request because each retry re-runs the same losing read.
 	 *
 	 * Equal revisions still adopt `next`: the rev is unchanged but its `committed` list may be
-	 * more complete than what we hold. */
+	 * more complete than what we hold.
+	 *
+	 * This is also the one seam where lineage divergence is observable: the action id this
+	 * collection holds at its CURRENT revision must equal the action id the freshly-read log
+	 * names at that same revision. Revision numbers are per-collection counters, so two
+	 * separately-built copies under one id can each occupy the same revision with DIFFERENT
+	 * actions while each stays internally self-consistent — {@link reportShortfall} structurally
+	 * cannot see that (its two numbers come from one chain), and this comparison is the only
+	 * place both lineages' `committed` lists meet. Where they name different actions at the same
+	 * revision, the local copy and the stored log are provably different lineages
+	 * (`collection:lineage-divergence`; see docs/debugging.md § "Did the refresh itself fail to
+	 * close the gap?").
+	 *
+	 * Logs, does not throw — same reasoning as {@link reportShortfall}: `update()` runs
+	 * blanket-style over every registered collection between commit retries, and aborting here
+	 * would promote a diagnosis to production behaviour before the line has ever been seen to
+	 * fire in the wild. Adoption then proceeds unchanged, which means the line is a PER-DISCOVERY
+	 * report, not a per-refresh one: adopting `next` overwrites the held lineage marker with the
+	 * log's, so the next refresh of this instance compares log-to-log and stays silent — even
+	 * though block content materialized under the old lineage may still be in caches. The line
+	 * marks the refresh that first observed the disagreement.
+	 *
+	 * Gated on `log.enabled` (like every {@link committedActionId} caller): the two `find`s are
+	 * linear in the uncheckpointed `committed` list and buy nothing when the line has no sink.
+	 * Deliberately the entry at ONE revision — the current one — not a full list diff: the
+	 * committed lists grow per commit, and this runs on every refresh. Silent when either list
+	 * holds no entry at that revision (an invented collection, or a revision slot the log gave
+	 * to a checkpoint or invalidation entry) — absence proves nothing either way. */
 	private static advanceContext(source: TransactorSource<IBlock>, id: CollectionId, next: ActionContext | undefined): void {
 		const current = source.actionContext;
 		if (next === undefined) {
 			return;	// The read learned nothing — keep what we already know.
+		}
+		if (current !== undefined && log.enabled) {
+			const held = current.committed.find(entry => entry.rev === current.rev)?.actionId;
+			const read = next.committed.find(entry => entry.rev === current.rev)?.actionId;
+			if (held !== undefined && read !== undefined && held !== read) {
+				log('collection:lineage-divergence id=%s rev=%d held=%s read=%s', id, current.rev, held, read);
+			}
 		}
 		if (current !== undefined && next.rev < current.rev) {
 			log('collection:context-not-lowered id=%s held=%d read=%d', id, current.rev, next.rev);
@@ -214,6 +248,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * where a SEPARATE read path (the chain walk) actually landed. Landing below the claim means
 	 * this refresh closed nothing, which from outside the class is otherwise indistinguishable
 	 * from "there was nothing newer to adopt".
+	 *
+	 * This detects LAG, and only lag. It CANNOT see lineage divergence: both of its numbers
+	 * come from the same chain — `tailRev` off the tail block this collection's own header
+	 * names, `after` from a walk of that same chain — and a forked replica is internally
+	 * self-consistent, its tail claiming exactly what its own walk reaches. Two copies of one
+	 * collection id holding the same revision under different actions therefore keep this line
+	 * silent forever. That case is `collection:lineage-divergence`, reported from
+	 * {@link advanceContext}, which compares action ids — the one value comparable across
+	 * copies — rather than revision counters.
 	 *
 	 * Logs, does not throw: `update()` is called blanket-style over every registered collection
 	 * between commit retries, and a shortfall is not yet known to be illegitimate — an abort here

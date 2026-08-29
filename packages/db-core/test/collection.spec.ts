@@ -1501,4 +1501,173 @@ describe('Collection', () => {
       expect(values, 'a collection that fell short still serves what it does hold').to.deep.equal(['one'])
     })
   })
+
+  // Ticket make-a-refresh-able-to-say-the-two-copies-disagree: revision numbers are counted per
+  // collection, so two separately-built copies under one id can each hold the SAME revision under
+  // DIFFERENT actions while each stays internally self-consistent — the shortfall line above
+  // structurally cannot fire on that (both of its numbers come from one chain). The lineage check
+  // in advanceContext compares the action id held at the collection's current revision against
+  // the action id the freshly-read log names at that same revision; a mismatch means the local
+  // copy and the stored log are provably different lineages.
+  describe('a refresh whose log names a different action at the held revision', () => {
+    const divergenceTag = 'collection:lineage-divergence'
+
+    /** Capture what the `db-core:collection` namespace emits while `fn` runs, fully substituted
+     *  (`debug` leaves `%s`/`%d` for the downstream sink, so the raw args are not the text). */
+    const captureCollectionLog = async (fn: () => Promise<void>): Promise<string[]> => {
+      const lines: string[] = []
+      const previousNamespaces = debug.disable()
+      const previousLog = debug.log
+      debug.enable('optimystic:db-core:collection')
+      debug.log = (...args: unknown[]): void => { lines.push(format(...args)) }
+      try {
+        await fn()
+      } finally {
+        debug.log = previousLog
+        debug.disable()
+        if (previousNamespaces) debug.enable(previousNamespaces)
+      }
+      return lines
+    }
+
+    /** The tail block id the synced header points at, and the action id its state claims produced
+     *  the latest committed revision — the collection's lineage marker in storage. */
+    const syncedTail = async (): Promise<{ tailId: string, actionId: string }> => {
+      const headerEntry = (await transactor.get({ blockIds: [collectionId] }))[collectionId]
+      const tailId = (headerEntry?.block as { tailId?: string } | undefined)?.tailId
+      expect(tailId, 'a synced header names its log tail block').to.be.a('string')
+      const tailEntry = (await transactor.get({ blockIds: [tailId!] }))[tailId!]
+      const actionId = tailEntry?.state.latest?.actionId
+      expect(actionId, 'a committed tail block carries the action id of the latest revision').to.be.a('string')
+      return { tailId: tailId!, actionId: actionId! }
+    }
+
+    /** While armed, rewrites every read of the tail block so the whole stored lineage appears to
+     *  have been produced by `fakeId`: `state.latest.actionId` (what bootstrapContext adopts) and
+     *  every log entry's `action.actionId` (what the chain walk adopts). Opening a collection
+     *  through this while armed yields a handle that HOLDS revision N under `fakeId` — exactly
+     *  the state of a replica built from a different lineage. Disarming then makes the next
+     *  refresh read the honest lineage, so held and read disagree at the same revision. */
+    const rewrittenLineageTransactor = (inner: TestTransactor, tailId: string, fakeId: string) => {
+      let armed = false
+      const rewrite = (entry: GetBlockResults[string]): GetBlockResults[string] => {
+        let out = entry
+        if (out.state.latest) {
+          out = { ...out, state: { ...out.state, latest: { ...out.state.latest, actionId: fakeId } } }
+        }
+        const block = out.block as (IBlock & { entries?: { action?: { actionId: string } }[] }) | undefined
+        if (block?.entries) {
+          out = {
+            ...out,
+            block: {
+              ...block,
+              entries: block.entries.map(e => e.action ? { ...e, action: { ...e.action, actionId: fakeId } } : e),
+            } as IBlock,
+          }
+        }
+        return out
+      }
+      const transactor: ITransactor = {
+        async get(gets: BlockGets): Promise<GetBlockResults> {
+          const res = await inner.get(gets)
+          const entry = res[tailId]
+          if (armed && entry) {
+            res[tailId] = rewrite(entry)
+          }
+          return res
+        },
+        getStatus: (refs: ActionBlocks[]) => inner.getStatus(refs),
+        pend: (req: PendRequest) => inner.pend(req),
+        cancel: (ref: ActionBlocks) => inner.cancel(ref),
+        commit: (req: CommitRequest) => inner.commit(req),
+      }
+      return { transactor, arm: () => { armed = true }, disarm: () => { armed = false } }
+    }
+
+    /** A committed collection plus a second handle opened while the tail reads were rewritten to
+     *  `fakeId` — a handle holding the stored revision under a different lineage marker. */
+    const openDivergedHandle = async (fakeId: string) => {
+      const writer = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await writer.act({ type: 'set', data: { value: 'one', timestamp: 1 } })
+      await writer.updateAndSync()
+      const { tailId, actionId } = await syncedTail()
+
+      const rewritten = rewrittenLineageTransactor(transactor, tailId, fakeId)
+      rewritten.arm()
+      const diverged = await Collection.open<TestAction>(rewritten.transactor, collectionId, initOptions)
+      expect(diverged, 'the collection opens against the rewritten lineage').to.not.equal(undefined)
+      rewritten.disarm()
+      return { diverged: diverged!, storedActionId: actionId }
+    }
+
+    // The healthy paths are the assertions that matter most: a divergence line on an ordinary
+    // refresh would be noise in every log this diagnostic is meant to be read in.
+    it('an ordinary refresh of an already-current collection says nothing', async () => {
+      const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await collection.act({ type: 'set', data: { value: 'one', timestamp: 1 } })
+      await collection.updateAndSync()
+
+      const lines = await captureCollectionLog(() => collection.update())
+      expect(lines.filter(l => l.includes(divergenceTag)), 'a current collection reports no divergence').to.deep.equal([])
+    })
+
+    it('a refresh that catches up on a same-lineage commit says nothing', async () => {
+      // Exercises the overlap when the log has moved PAST the held revision: the walk's committed
+      // list still names the held revision's action, and it is the same action — one lineage.
+      const writer = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await writer.act({ type: 'set', data: { value: 'one', timestamp: 1 } })
+      await writer.updateAndSync()
+
+      const reader = await Collection.open<TestAction>(transactor, collectionId, initOptions)
+      expect(reader, 'the committed collection reopens').to.not.equal(undefined)
+
+      await writer.act({ type: 'set', data: { value: 'two', timestamp: 2 } })
+      await writer.updateAndSync()
+
+      const lines = await captureCollectionLog(() => reader!.update())
+      expect(lines.filter(l => l.includes(divergenceTag)), 'a lagging same-lineage reader reports no divergence').to.deep.equal([])
+    })
+
+    it('a refresh that finds a different action at its held revision logs both ids and still returns normally', async () => {
+      const fakeId = 'divergent-lineage-action-id'
+      const { diverged, storedActionId } = await openDivergedHandle(fakeId)
+      expect(storedActionId, 'the rewritten id really differs from the stored one').to.not.equal(fakeId)
+
+      const lines = await captureCollectionLog(() => diverged.update())   // must NOT throw
+      const divergence = lines.filter(l => l.includes(divergenceTag))
+      expect(divergence.length, `exactly one divergence line, got: ${lines.join(' | ')}`).to.equal(1)
+      const parsed = /id=(\S+) rev=(\d+) held=(\S+) read=(\S+)/.exec(divergence[0]!)
+      expect(parsed, `the line names id, rev, held and read: ${divergence[0]}`).to.not.equal(null)
+      const [, id, rev, held, read] = parsed!
+      expect(id, 'the line names the collection').to.equal(collectionId)
+      expect(Number(rev), 'the disagreement is at the held revision').to.equal(1)
+      expect(held, 'held is the lineage marker this handle carried in').to.equal(fakeId)
+      expect(read, 'read is the action the stored log actually names').to.equal(storedActionId)
+      // The shortfall line must stay silent here: a forked copy is internally self-consistent,
+      // which is exactly why that diagnostic could never catch this case.
+      expect(lines.filter(l => l.includes('collection:context-short-of-tail')), 'no shortfall on a fork').to.deep.equal([])
+
+      const values: string[] = []
+      for await (const a of diverged.selectLog()) { values.push(a.data.value) }
+      expect(values, 'a diverged collection still serves reads after the report').to.deep.equal(['one'])
+    })
+
+    it('reports once per discovery, not once per refresh — adoption heals the held context', async () => {
+      // advanceContext adopts the log's context after reporting (equal revisions adopt; see its
+      // doc comment), so the held lineage marker now matches the log and a second refresh
+      // compares log-to-log. The line marks the refresh that DISCOVERED the divergence. This is
+      // deliberately weaker than the shortfall line's per-call reporting: the context disagreement
+      // genuinely is resolved by adoption, even though block content materialized under the old
+      // lineage may still be cached.
+      const { diverged } = await openDivergedHandle('divergent-lineage-action-id')
+
+      const lines = await captureCollectionLog(async () => {
+        await diverged.update()
+        await diverged.update()
+        await diverged.update()
+      })
+      expect(lines.filter(l => l.includes(divergenceTag)).length,
+        `only the discovering refresh reports, got: ${lines.join(' | ')}`).to.equal(1)
+    })
+  })
 })
