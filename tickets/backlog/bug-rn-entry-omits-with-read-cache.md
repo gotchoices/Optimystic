@@ -1,3 +1,9 @@
+RESOLVED — the one-line export was added directly (`packages/db-p2p/src/rn.ts`, next to the other
+storage re-exports). The wider class it exposed — nothing keeps the two entries in step, and 19
+modules currently differ, `cluster/commit-proof` among them — is tracked as
+`plan/entry-points-drift-without-a-guard`. Kept here only until the next tending pass files it to
+complete/.
+
 ----
 description: The React-Native/browser entry point of db-p2p is missing an export that this repo's own Quereus plugin imports from it, so anything built against that entry fails to link. It breaks the downstream build outright and would ship broken if released as-is.
 prereq:
