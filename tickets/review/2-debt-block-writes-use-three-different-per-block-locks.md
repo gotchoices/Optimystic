@@ -1,136 +1,133 @@
-description: Four different parts of the storage layer each wrote a block's bookkeeping record under different locks (one under none), so two could run at once on the same block and silently undo each other's work. Now every write to a block's records requires a token that can only be obtained by holding the one write lock for that block, so an unlocked write no longer compiles.
-files: packages/db-p2p/src/storage/block-latch.ts (new), packages/db-p2p/src/storage/i-block-storage.ts, packages/db-p2p/src/storage/block-storage.ts, packages/db-p2p/src/storage/storage-repo.ts, packages/db-p2p/src/dispute/invalidation.ts, packages/db-p2p/src/dispute/cascade.ts, packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/index.ts, packages/db-p2p/src/rn.ts, packages/db-p2p/src/testing/raw-storage-conformance.ts, packages/db-p2p/test/block-storage.spec.ts, packages/db-p2p/test/storage-repo.spec.ts, packages/db-p2p/test/invalidation.spec.ts, packages/db-p2p/test/commit-proof.spec.ts, packages/db-p2p/test/proof-keyspace-isolation.spec.ts, packages/db-p2p-storage-fs/test/file-storage.spec.ts
-difficulty: hard
+description: Review pass over the one-block-one-write-lock change. Most of the adversarial reading is done and recorded below; three small fixes and the validation run are still outstanding.
+files: packages/db-p2p/src/storage/block-latch.ts, packages/db-p2p/src/storage/i-block-storage.ts, packages/db-p2p/src/storage/block-storage.ts, packages/db-p2p/src/storage/storage-repo.ts, packages/db-p2p/test/block-storage.spec.ts, packages/db-p2p/test/storage-repo.spec.ts, packages/db-p2p/test/invalidation.spec.ts
+difficulty: medium
 ----
 
-# One block, one write lock — review handoff
+<!-- resume-note -->
+A prior review run read the whole implement diff (commits `701e8d12`, `5150997b`, `6355e1b7`) and
+crossed its token budget before applying fixes or running validation. **No source edits were made —
+the working tree is exactly the implement output.** Everything already checked is recorded below so
+this run does not repeat it. Start at "Remaining work".
 
-## What landed
+# Review of: one block, one write lock
 
-A block's metadata is stored as **one blob** `{ latest, ranges }`, read and written whole, so any
-read-modify-write of it overwrites `latest` whether it meant to or not. The invariant is now stated
-over the whole blob and enforced by the type system:
+## What the prior run verified (do not redo)
 
-> A block's metadata, revision records, action transforms, pending records, and stored proofs are
-> only ever written while holding **one** named lock for that block: `Block.write:<blockId>`.
+- **Every `IBlockStorage` writing method takes and asserts a latch.** All 12 latch-taking methods on
+  `BlockStorage` call `assertLatch` first (`restoreRevision`, `saveBlockProof`,
+  `savePendingTransaction`, `deletePendingTransaction`, `saveMaterializedBlock`,
+  `pruneSupersededMaterialization`, `saveRevision`, `promotePendingTransaction`, `setLatest`,
+  `recover`, `saveReplica`, `saveDeletion`). None missed.
+- **Single acquirer.** `grep -rn "Latches.acquire" packages/db-p2p/src` returns exactly one hit
+  (`block-latch.ts:51`). No stale `commitLatchKey` / `withBlockCommitLatch` / `ensureRevision`
+  anywhere in `.ts`; the only remaining hits are `packages/db-p2p/docs/storage.md` and
+  `packages/db-p2p/README.md`, which ticket `block-write-latch-docs-and-commit-path-test`
+  (`tickets/implement/2.5-...`) owns in full — confirmed by reading that ticket. **Do not touch the
+  docs in this pass.**
+- **Every writer call site outside `block-storage.ts` is latched.** Swept the whole repo for
+  `saveReplica|saveDeletion|savePendingTransaction|deletePendingTransaction|setLatest|
+  promotePendingTransaction|saveRevision|saveMaterializedBlock|saveBlockProof|restoreRevision|
+  .recover(`; every non-raw-storage hit routes through `withBlockWriteLatch` or a token threaded
+  from `commit`'s multi-latch acquisition. The dispute path no longer has an injection point for an
+  unlatched write (`InvalidationContext.withBlockCommitLatch` / `CollectionEnv.withBlockCommitLatch`
+  are gone), which retires the whole class rather than the instance — the right shape.
+- **Deadlock audit.** `Latches` (`packages/db-core/src/utility/latches.ts`) is a **process-global
+  static** map keyed only by string, and `blockWriteLatchKey` carries no node identity — so
+  in-process multi-node setups share one latch per block id. That was already true of the old
+  `commitLatchKey`, but this change newly puts a network fetch (`restoreRevision`) *inside* the
+  latch, which would self-deadlock if a restore could ever be served from the same process for the
+  same block. It cannot today, on two independent grounds, both checked:
+  `RestorationCoordinator.restore` filters `selfPeerId` out of both ring loops, and
+  `testing/mesh-harness.ts` constructs `new BlockStorage(blockId, rawStorage)` with **no**
+  `restoreCallback` at all (its `makeFetchArchive` feeds `reconcileBlock`, not the restore wire).
+  Every scoped caller holds at most one block latch; `commit` is the only multi-latch holder and
+  acquires in sorted id order.
+- **`readCommitBase`'s new `RevisionNotCoveredError` path is effectively unreachable**, which
+  matches the handoff's own claim from the other direction. Every writer of `meta.latest`
+  (`setLatest`, `saveForwardRevision`, `recover`) merges an open-ended range anchored at or below the
+  new latest in the same `saveMetadata`, so `latest.rev` is always inside `meta.ranges`. The real
+  restore trigger is a read pinned *below* the block's earliest held rev. Corollary worth keeping:
+  the read-driven promotion in `get` runs BEFORE `readBlockHealing`, so if a coverage gap under
+  `latest` were ever reachable, `refuseMissingBase` would delete the pending record moments before
+  the healing read would have restored it. Not reachable today; noted so a future change that can
+  make `latest` uncovered knows the ordering is load-bearing.
+- **Tests read and judged sound.** The two repro tests (`block-storage.spec.ts` →
+  `describe('one block, one write lock')`) are deterministic gated-raw-storage tests, not timing
+  races. The scope-overlap test keeps the old `LatchProbeStorage` probe as an independent witness.
+  The injected-`setLatest` interleave test survives in `storage-repo.spec.ts`. The three
+  `delay(25)` / `delay(10)` negative assertions are, as the handoff says, false-**pass**-only.
+  `commit`'s block-id dedup already has coverage (`storage-repo.spec.ts:346`,
+  "deduplicates block IDs").
+- **No test was skipped, deleted-without-replacement, or weakened.** The one deleted test
+  (`invalidation.spec.ts`, "WITHOUT the latch, a concurrent commit clobbers the invalidation") is
+  deleted because the state it documented is now untypeable; a comment marks the spot. Everything
+  else removed from the diff is mechanical latch-threading in test setup.
 
-- **`src/storage/block-latch.ts`** (new): `blockWriteLatchKey`, `BlockWriteLatch` (opaque token,
-  private constructor, minted only inside this module), `acquireBlockWriteLatch` (multi-latch form
-  for `commit`), `withBlockWriteLatch` (scoped form for everyone else). It is the **single acquirer**
-  of the key: `grep -rn "Latches.acquire" packages/db-p2p/src/storage` → exactly one code hit.
-- **`IBlockStorage`**: every writing method takes `latch: BlockWriteLatch` as its LAST parameter.
-  `saveReplica(block, source | undefined, proof | undefined, latch)` — two positional optionals now
-  need an explicit `undefined`. `BlockStorage.assertLatch` rejects a token minted for another block.
-- **`getBlock(rev?)` is local-only** (never calls `restoreCallback`): no metadata → `undefined`;
-  pending-only + no `rev` → `undefined`; target rev outside `meta.ranges` → throws
-  `RevisionNotCoveredError` (exported from `block-storage.ts`, carries `.blockId`/`.rev`); covered →
-  materialize as before. The old implicit restore (`ensureRevision`) is gone; restore is the
-  explicit latched call **`restoreRevision(rev, latch)`**.
-- **Healing lives in one place**: `StorageRepo.get` → private `readBlockHealing`: `getBlock` → on
-  `RevisionNotCoveredError` → `withBlockWriteLatch(id, l => restoreRevision(err.rev, l))` → re-read.
-  A failed restore on a **pending-only** block (no `latest`) reads as absent (`undefined`); on a
-  block that has a `latest` it rethrows → `{ state: {}, unavailable: 'unmaterializable' }`.
-- **`StorageRepo`**: `commit` acquires per unique sorted id via `acquireBlockWriteLatch`, keeps a
-  `Map<BlockId, BlockWriteLatch>`, builds `blockStorages` in request order **deduped**, and threads
-  the token through `internalCommit` (param sits before the optional `proof`), `backFillProof`,
-  `persistProofIfContentMatches`, `readCommitBase`, `refuseMissingBase`, `dropUnpromotablePendings`,
-  `storage.recover(latch)`. `pend` / `cancel` take one latch per block branch (never nested).
-  `saveReplicatedBlock` and `recoverBlock` use one `withBlockWriteLatch` scope.
-  `commitLatchKey` / `withBlockCommitLatch` are **deleted**.
-- **Dispute**: `InvalidationContext.withBlockCommitLatch` and `CollectionEnv.withBlockCommitLatch`
-  are deleted; `applyInvalidation` always wraps each compensating `saveDeletion` / `saveReplica` in
-  `withBlockWriteLatch`. There is no injection point for an unlatched write any more.
-- `libp2p-node-base.ts`: dead `blockCommitLatch` alias removed. `index.ts` **and `rn.ts`** export
-  `block-latch.js` (the `entry-parity` test caught the missing `rn.ts` line).
-- Stale prose naming the "commit latch" / `ensureRevision` in `src/` and spec comments was updated.
-  `docs/storage.md` and `README.md` were deliberately **not** touched — the follow-up ticket
-  `block-write-latch-docs-and-commit-path-test` (sequence 2.5) owns the docs rewrite, the
-  `materializeBlock` / `readCommitBase` `NOTE:`s, and the commit-never-fetches test.
+## Remaining work
 
-## Use cases to exercise (all have tests; names given so the reviewer can run them)
+### Findings to fix inline (all minor, all analysed — just apply)
 
-1. **Repro A — restore cross-writes a revision and regresses `latest`.**
-   `test/block-storage.spec.ts` → `describe('one block, one write lock')`, first test. Byte-identical
-   to the failing version filed with the ticket; now passes because the restore and the replica share
-   one latch.
-2. **Repro B — a pend erases a committed `latest`.** Same describe, second test. `pend` now seeds
-   metadata under the block's latch.
-3. **External hold parks every writer.** `storage-repo.spec.ts`: "does not promote while another
-   writer holds the block write latch", "recoverBlock does not reconcile meta.latest while another
-   writer holds the block write latch". `invalidation.spec.ts`: "contends on the per-block write
-   latch", "a commit queues behind the invalidation on the one write latch and latest stays
-   monotonic". Pattern: test-side `Latches.acquire(blockWriteLatchKey(id))`, start the operation,
-   assert not completed, release, assert landed.
-4. **Two scopes never overlap.** `block-storage.spec.ts` "two write-latch scopes on one block never
-   overlap" (replaces the old "saveReplica and saveDeletion are mutually exclusive (shared latch)").
-5. **Token is block-bound.** `block-storage.spec.ts` "a write latch minted for one block is refused
-   by another block's storage, writing nothing".
-6. **`getBlock` local-only contract.** `block-storage.spec.ts` "getBlock is local-only: absent,
-   absent, or a coverage gap — never a fetch" (asserts `restoreCallback` call count 0).
-7. **Healing through the real path.** The restore-behaviour tests moved from direct `getBlock` to
-   `StorageRepo.get({ blockIds, context: { rev, committed: [] } })`: "a healing read for an absent
-   revision fires restoreCallback", "a named rev on a pending-only block with NO restoreCallback
-   reads absent, not a fault", "…whose restore comes back empty reads absent", "…supplies revisions
-   but no materialization is a fault". Restore-mechanics tests (vetting, coverage merge, refusal)
-   call `restoreRevision` directly under `withBlockWriteLatch`.
-8. **Deleted test** — `invalidation.spec.ts` 'WITHOUT the latch, a concurrent commit clobbers the
-   invalidation (documents the lost update)' and its `GatedRawStorage` helper: the unlatched
-   compensating write it documented is now unrepresentable. A one-line comment marks the spot.
+- **A released latch token still passes `assertLatch`.** `withBlockWriteLatch` hands the token to
+  its callback; nothing stops a callback from stashing it and writing after the scope closed, which
+  silently defeats the whole invariant at runtime. Make it unrepresentable the same way the private
+  constructor does: give `BlockWriteLatch` a private `#live` field, add a module-scoped `expire`
+  assigned from the same `static {}` block that assigns `mint`, have `acquireBlockWriteLatch`'s
+  returned `release` expire the token before releasing, and have `BlockStorage.assertLatch` reject a
+  non-live token. Audited: no current caller uses a token after its scope (`commit` releases in
+  `finally` after every write; every `withBlockWriteLatch` body awaits its writes), so this is
+  additive. Add a test beside "a write latch minted for one block is refused by another block's
+  storage": a token used after its scope closed throws and writes nothing.
+- **`storage-repo.ts` now has a runtime dependency on the concrete `block-storage.ts`.**
+  `import { RevisionNotCoveredError } from "./block-storage.js"` is a *value* import; before this
+  change `StorageRepo` referenced only the interface module (`import type { IBlockStorage }`).
+  `StorageRepo` is generic over an injected `createBlockStorage`, so an alternate `IBlockStorage`
+  implementation must now import `BlockStorage` (and `applyTransform` / `canonicalJson` /
+  `hashString` / `mergeRanges` with it) purely to throw the error its `getBlock` contract requires.
+  Move `RevisionNotCoveredError` into `i-block-storage.ts`, next to the `getBlock` doc comment that
+  already specifies it, and update the three importers (`block-storage.ts`, `storage-repo.ts`,
+  `test/block-storage.spec.ts`). No cycle (`i-block-storage.ts` imports nothing from
+  `block-storage.ts`) and the public surface is unchanged — `index.ts` and `rn.ts` both
+  `export *` from each module already.
+- **`commit` computes `Array.from(new Set(request.blockIds))` twice** (once at
+  `storage-repo.ts:617` for the sorted `uniqueBlockIds`, once at ~`:635` for `blockStorages` in
+  request order). Derive both from one deduped array so a reader cannot wonder whether the two sets
+  can disagree — `latches.get(blockId)!` at `:638` depends on them being identical.
 
-## Validation run
+### Still to check
 
-- `yarn workspace @optimystic/db-p2p typecheck` → clean. `yarn workspace @optimystic/db-p2p test`
-  → **2299 passing, 44 pending, 0 failing**.
-- Root `yarn build && yarn typecheck` → clean.
-- `yarn workspace @optimystic/quereus-plugin-optimystic test` → 658 passing, 13 pending (+ smoke ok).
-- `yarn workspace @optimystic/db-p2p-storage-fs test` → 60 passing, 1 pending (the pre-existing
-  POSIX-only raw-colon skip on win32).
-- `grep -rn "commitLatchKey\|withBlockCommitLatch\|ensureRevision" packages --include=*.ts --exclude-dir=dist --exclude-dir=node_modules`
-  → no code hits (only `docs/storage.md` / `README.md`, owned by the 2.5 follow-up).
+- `packages/db-p2p/test/invalidation.spec.ts` beyond the latch describe, and
+  `commit-proof.spec.ts` / `proof-keyspace-isolation.spec.ts` / `db-p2p-storage-fs` test diffs were
+  only skimmed via removed-line grep (mechanical latch threading, nothing weakened). A quick read is
+  enough.
+- One thing deliberately parked, decide whether it is this ticket's or a separate one:
+  `applyInvalidation` computes the compensating content OUTSIDE the latch and takes the latch only
+  around the write, so a commit landing in between makes `saveReplica`/`saveDeletion` hit their
+  monotonic no-op — yet the discarded return value means `reverted` still reports a restore that did
+  not happen, and that feeds the dispute cascade. **This is pre-existing** (the old
+  `runLatched(() => storage.saveDeletion(...))` discarded the same value) and is not the lock bug,
+  so it is evidence for a separate ticket at most. Before filing anything, run the site-claim grep
+  over `tickets/{backlog,fix,plan,implement,review}` for `invalidation.ts` / `applyInvalidation`.
 
-## Behaviour changes the reviewer should weigh (deliberate, but worth a second opinion)
+### Validation (not yet run this pass)
 
-- **The commit path never fetches from a peer.** `readCommitBase` → `getBlock` is local-only; a
-  `latest` outside `meta.ranges` now raises `RevisionNotCoveredError` → caught → `refuseMissingBase`
-  → `MissingBaseRevisionError` (pending dropped, cohort reconcile heals). Before, it restored in line
-  while holding every block latch of the batch. The pinning test is in the 2.5 follow-up.
-- **The vote path abstains instead of fetching.** `previewCommitDigest` catches the same error and
-  returns `digest: undefined`. Previously an uncovered base triggered an inline restore on the vote
-  path; now the member abstains on that block. Check `ClusterMember.validateCommitOperations`'s
-  abstain handling is what we want under a cold member.
-- **`commit` dedups `request.blockIds`.** `blockStorages` is `Array.from(new Set(request.blockIds))`
-  in request order. A request with a duplicated id used to process the block twice (second pass as
-  alreadyDone); now once. Change-event ordering for unique ids is unchanged.
-- **`cancel` is now latched** per block (previously unlatched).
-- **`commit`'s recovered-block collection lookup** (`storage.getBlock(request.rev)` /
-  `getBlock(request.rev - 1)` after `recover()`) is still unwrapped, per the resolved design. A
-  `RevisionNotCoveredError` there would fail the batch; judged unreachable because `recover()` only
-  advances `latest` within recorded revisions, but nothing pins that.
+- `yarn workspace @optimystic/db-p2p typecheck`
+- `yarn workspace @optimystic/db-p2p test`
+- `yarn lint` (root)
+- `yarn build && yarn typecheck` (root)
 
-## Known gaps / where the reviewer should push
+Note `BlockWriteLatch` relies on an ES2022 `static {}` initialization block; the typecheck run is
+what confirms the target allows it.
 
-- **Timing-based negative assertions.** The two rewritten invalidation "parked" tests use a 25 ms
-  real-timer window (`delay(25)`), and the scope-overlap test a 10 ms window, to assert "has NOT
-  completed". They can only false-**pass** under load (a slow unlatched write would look parked),
-  never false-fail. The old versions had an injected probe; there is no injection point now. If a
-  deterministic signal is wanted, a `LatchProbeStorage`-style raw-storage gate on the first write is
-  the way, not a runner hook.
-- **No deadlock test against `commit`'s multi-latch acquisition.** Every scoped caller holds at most
-  one block latch and never calls into `StorageRepo` from inside a scope (audited by hand across
-  `src/` and the specs). A reviewer should re-check the two scoped sites that call *out*:
-  `readBlockHealing` (restore under latch — see tripwire below) and `applyInvalidation`
-  (compute happens before the latch; only the write is inside).
-- **Restore runs under the latch** (tripwire `NOTE:` at `readBlockHealing` in `storage-repo.ts`): a
-  slow peer fetch queues every commit/pend/replica on that block behind one round-trip. Fine at
-  today's rates; revisit condition is stated at the site.
-- **`materializeBlock`'s read-path re-cache** is the one named write outside the latch. The `NOTE:`
-  explaining why that is safe (same key, deterministic bytes) is in the 2.5 follow-up, not here.
-- The `saveReplica` signature change (`source`, `proof` both positional-optional → explicit
-  `undefined`) is the API-surface item most likely to bite an external caller; every in-repo call
-  site was converted and typechecks, but `quereus-plugin-optimystic` / harnesses only *construct*
-  `BlockStorage`, so nothing outside `db-p2p` exercises the new positional shape.
+## Tripwires already recorded by the implement stage (leave alone)
 
-## Tripwires recorded
+- `storage-repo.ts` `readBlockHealing`: restore fetches under the block write latch; revisit if
+  restore latency shows up delaying commits.
+- `block-storage.ts` `vetRestoredArchive` / `noDivergentRewrite`: two accepted-tradeoff `NOTE:`s
+  (sticky lying-peer coverage, first-writer-wins on held revisions). Both carry revisit conditions;
+  neither has tripped.
 
-- `storage-repo.ts` `readBlockHealing`: `NOTE:` — restore fetches under the block write latch;
-  revisit if restore latency ever shows up delaying commits.
+## Output
+
+Finish the three fixes, run the validation, then write `tickets/complete/` with a
+`## Review findings` section — carrying forward the "what the prior run verified" list above as the
+checked-and-clean record, and stating explicitly (with reasons) which categories came back empty.
