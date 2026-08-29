@@ -17,8 +17,7 @@ import { repoService } from './repo/service.js';
 import { StorageRepo, withBlockCommitLatch } from './storage/storage-repo.js';
 import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
-import { withReadCache } from './storage/with-read-cache.js';
-import { CachedRawStorage } from './storage/cached-raw-storage.js';
+import { withReadCache, type ResolvedReadCache } from './storage/with-read-cache.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
 import { latestClaimFromArchive, servableProof, type ArchiveServingRepo } from './storage/block-archive.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
@@ -140,12 +139,15 @@ const reactivityWiringLog = createLogger('reactivity-node-wiring');
 const wiringLog = createLogger('node-wiring');
 
 /**
- * Factory function or instance for creating raw storage. Either way the node takes OWNERSHIP of
- * the resolved instance: it is wrapped in the write-through read cache (`withReadCache`, unless it
- * is a `MemoryRawStorage`) and the cache is released when the node stops. Do not hand one instance
- * to two concurrently running nodes — each would cache independently and never see the other's
- * writes (Invariant 5 in `packages/db-p2p/docs/storage.md`). Sequential reuse (a restart over the
- * same instance) is fine: the first node's cache is disposed at stop and the second starts cold.
+ * Factory function or instance for creating raw storage. The node wraps the resolved instance in
+ * the write-through read cache (`withReadCache`, unless it is a `MemoryRawStorage` or already
+ * cached) and disposes THAT WRAPPER when it stops; the instance you supplied is never disposed.
+ * Do not hand one uncached instance to two concurrently running nodes — each would wrap it
+ * separately and never see the other's writes (Invariant 5 in
+ * `packages/db-p2p/docs/storage.md`); to share a store across concurrent in-process nodes, build
+ * one `CachedRawStorage` yourself and give every node that same object. Sequential reuse (a
+ * restart over the same instance) is fine: the first node's cache is disposed at stop and the
+ * second starts cold.
  */
 export type RawStorageProvider = IRawStorage | (() => IRawStorage);
 
@@ -363,12 +365,21 @@ export type NodeOptions = ClusterPolicyOptions & {
  * cache is wired (`withReadCache` states the exclusions: memory storage and already-cached
  * storage pass through unchanged). The default is a bare `MemoryRawStorage`, deliberately not
  * routed through the helper — nothing to cache.
+ *
+ * `ownedCache` is the cache this node built, and the ONLY thing its stop path may dispose — a
+ * host that supplied its own `CachedRawStorage` keeps owning it (see {@link ResolvedReadCache}).
  */
-function resolveStorage(provider: RawStorageProvider | undefined, networkName: string): IRawStorage {
+function resolveStorage(provider: RawStorageProvider | undefined, networkName: string): ResolvedReadCache {
 	if (!provider) {
-		return new MemoryRawStorage();
+		return { storage: new MemoryRawStorage(), ownedCache: undefined };
 	}
 	const storage = typeof provider === 'function' ? provider() : provider;
+	// NOTE: the label is the network name, so N nodes on one network in one process produce N
+	// identically-labelled rows in `SharedCachePool.stats()` (they are still distinct stores — the
+	// pool keys on a monotonic store id, not the label). Harmless while the label is only read by
+	// a human eyeballing occupancy; if pool stats ever need to attribute bytes to a SPECIFIC node,
+	// fold the peer id in — it is not known here, so that would mean labelling after node
+	// construction rather than at resolve time.
 	return withReadCache(storage, `node:${networkName}`);
 }
 
@@ -412,7 +423,7 @@ export async function createLibp2pNodeBase(
 		transports: Libp2pTransports;
 	}
 ): Promise<OptimysticNode> {
-	const rawStorage = resolveStorage(options.storage, options.networkName);
+	const { storage: rawStorage, ownedCache } = resolveStorage(options.storage, options.networkName);
 
 	// Create placeholder restore callback (will be replaced after node starts)
 	let restoreCallback: RestoreCallback = async (_blockId, _rev?) => {
@@ -727,16 +738,18 @@ export async function createLibp2pNodeBase(
 	// Release the raw-storage read cache's shared-pool registration when the node stops. Installed
 	// FIRST — before start() and before every other stop wrapper — so it runs LAST in the wrapper
 	// chain, after every monitor and service that may still read storage during its own stop. Only
-	// wired when resolveStorage actually cached (a MemoryRawStorage passes through unwrapped). A
-	// skipped release leaks only cold entries the pool evicts under pressure; the point of the
-	// polite release is honest pool occupancy on a long-lived provider node.
-	if (rawStorage instanceof CachedRawStorage) {
+	// wired for a cache THIS node built: a MemoryRawStorage passes through unwrapped, and a
+	// host-supplied `CachedRawStorage` stays the host's to dispose (stopping one node must not
+	// clear a cache its other consumers are still reading through). A skipped release leaks only
+	// cold entries the pool evicts under pressure; the point of the polite release is honest pool
+	// occupancy on a long-lived provider node.
+	if (ownedCache) {
 		const previousStop = node.stop.bind(node);
 		node.stop = async () => {
 			try {
 				await previousStop();
 			} finally {
-				await rawStorage.dispose();
+				await ownedCache.dispose();
 			}
 		};
 	}

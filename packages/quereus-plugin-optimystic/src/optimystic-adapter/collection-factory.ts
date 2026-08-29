@@ -9,7 +9,7 @@ import {
 	StorageRepo,
 	BlockStorage,
 	MemoryRawStorage,
-	CachedRawStorage,
+	type CachedRawStorage,
 	withReadCache,
 	signPeer,
 	type OptimysticNodeAttachments,
@@ -305,9 +305,13 @@ export class CollectionFactory {
    * `MemoryRawStorage` passes through unwrapped (nothing to save).
    */
   private async createLocalTransactor(options: ParsedOptimysticOptions): Promise<ITransactor> {
-    const rawStorage = withReadCache(options.rawStorageFactory?.() ?? new MemoryRawStorage(), 'quereus:local');
-    if (rawStorage instanceof CachedRawStorage) {
-      this.readCaches.push(rawStorage);
+    const { storage: rawStorage, ownedCache } = withReadCache(
+      options.rawStorageFactory?.() ?? new MemoryRawStorage(), 'quereus:local');
+    // Only a cache THIS call constructed is ours to release. A host that hands the same
+    // pre-built `CachedRawStorage` to several `register()` calls (the documented way to share
+    // one store across in-process consumers) gets it back unchanged and keeps owning it.
+    if (ownedCache) {
+      this.readCaches.push(ownedCache);
     }
     const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, rawStorage));
 

@@ -1,5 +1,5 @@
 description: When two parts of a program open the same storage folder separately, each quietly gets its own private copy of recently-read data, so neither ever sees what the other saved — with no error to tell anyone it happened.
-files: packages/db-p2p/src/storage/with-read-cache.ts, packages/db-p2p/src/storage/cached-raw-storage.ts, packages/db-p2p/src/storage/i-raw-storage.ts, packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts, packages/quereus-plugin-optimystic/test/read-pull-mechanism.spec.ts
+files: packages/db-p2p/src/storage/with-read-cache.ts, packages/db-p2p/src/storage/cached-raw-storage.ts, packages/db-p2p/src/storage/i-raw-storage.ts, packages/db-p2p/src/storage/shared-cache-pool.ts, packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts, packages/db-p2p/test/with-read-cache.spec.ts, packages/quereus-plugin-optimystic/test/read-pull-mechanism.spec.ts
 severity: wrong-result
 likelihood: unusual
 tradeoffs: The configuration is already documented as unsupported (a store is meant to have one owner), so a maintainer could reasonably say the doc note added alongside this ticket is enough and decline to spend type-system or runtime-guard work on preventing it.
@@ -73,6 +73,29 @@ not documented:
 
 Wiring two consumers onto one backing store either works correctly (they share one cache) or
 fails loudly at construction. It never silently produces two views that diverge.
+
+## Already landed (review pass) — do not re-derive
+
+The review of the originating ticket found and fixed a *different* defect at the same seam, and
+it changed this file's shape, so start from the current code rather than the snippet above:
+
+- `withReadCache` now returns `{ storage, ownedCache }` instead of a bare `IRawStorage`.
+  `ownedCache` is the wrapper THAT CALL constructed, and `undefined` when the argument passed
+  through unchanged. Both seams dispose `ownedCache` and never `storage`.
+- The bug that motivated it: both seams previously disposed whatever they got back if it was a
+  `CachedRawStorage` — including a cache the *host* built and handed them. So the sanctioned
+  workaround for this ticket (build one `CachedRawStorage`, give the same object to every
+  consumer) broke as soon as the first consumer departed: the shared store was cleared and
+  unregistered from the pool while other consumers kept reading through it and charging entries
+  against a handle `stats()` no longer listed.
+- Regression guards for both halves are in `packages/db-p2p/test/with-read-cache.spec.ts`
+  ("a shared wrapper survives one consumer departing", "two wraps of ONE unwrapped instance are
+  two independent caches that never converge") and
+  `packages/db-p2p/test/node-read-cache-wiring.spec.ts`.
+
+None of that fixes THIS ticket: two `FileRawStorage(dir)` objects over one directory still get
+two caches that never converge. It only means the documented workaround now actually works, so
+option 3 below (a supported opt-out) is a little less urgent than it read when this was filed.
 
 ## How to confirm any fix
 

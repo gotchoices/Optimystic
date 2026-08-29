@@ -4,19 +4,37 @@ import { CachedRawStorage } from "./cached-raw-storage.js";
 import type { SharedCachePool } from "./shared-cache-pool.js";
 
 /**
+ * What {@link withReadCache} resolved: the storage to use, and the cache THIS call created —
+ * `undefined` when it returned the argument unchanged.
+ *
+ * The split exists because "the result is a `CachedRawStorage`" and "the result is mine to
+ * dispose" are different questions, and answering the second with the first is a bug: the
+ * pass-through branch hands back a cache the CALLER built and may still be sharing with other
+ * consumers. Dispose `ownedCache`, never `storage`.
+ */
+export type ResolvedReadCache = {
+	/** The storage to build on — wrapped, or the argument unchanged. */
+	storage: IRawStorage;
+	/** The wrapper this call constructed, and therefore the only thing this caller may dispose. */
+	ownedCache: CachedRawStorage | undefined;
+};
+
+/**
  * Wrap a raw storage in the write-through read cache ({@link CachedRawStorage}) at a
  * composition seam — the ONE helper every production seam that resolves an `IRawStorage`
  * goes through, so the exclusion rules below are stated once rather than re-derived per site.
  *
- * Returns the storage **unchanged** when caching would not pay:
+ * Returns the storage **unchanged**, with no `ownedCache`, when caching would not pay:
  * - `MemoryRawStorage` is already in memory; the cache would duplicate every map entry's
  *   bookkeeping with nothing to save (see `CachedStoreDriver`'s class doc).
  * - An already-cached storage (a host that wrapped before handing it over) is not wrapped twice.
  *
  * Why this is needed at all: `BlockStorage` re-reads block metadata on essentially every
  * operation and `StorageRepo` builds a fresh `BlockStorage` per block per call, so nothing above
- * this seam memoizes. Over a filesystem backend that is hundreds of `readFile`s of the same tiny
- * files per statement (measured 314 → 32 on a two-statement workload once cached).
+ * this seam memoizes. Over a filesystem backend that is hundreds of reads of the same tiny files
+ * per statement. Measured A/B on a create/insert/update/select workload with only the wrap
+ * decision changed: 113 → 6 `getMetadata` and 207 → 14 total reads at the `RawStoreDriver` seam;
+ * over `FileRawStorage` the same workload went from 184 `readFile` + 29 `readdir` to 9 + 6.
  *
  * **Precondition: exactly one cache fronts a given backing store** (Invariant 5 in
  * `packages/db-p2p/docs/storage.md`). Two forms of violation, both silently non-convergent —
@@ -37,17 +55,23 @@ import type { SharedCachePool } from "./shared-cache-pool.js";
  * what makes sharing work. (Seams that call a per-consumer factory, such as the plugin's
  * `rawStorageFactory`, get one cache per consumer by construction.)
  *
- * The caller owns the returned wrapper's lifecycle: when the result is a {@link CachedRawStorage},
- * call `dispose()` on departure so the shared pool's occupancy stays honest (a skipped dispose
- * leaks only cold entries the pool evicts under pressure — hygiene, not correctness).
+ * **Lifecycle: dispose {@link ResolvedReadCache.ownedCache} and nothing else.** A seam that
+ * disposed `storage` whenever it happened to be a `CachedRawStorage` would clear and unregister
+ * the host's shared wrapper the moment its FIRST consumer departed — the pool would keep
+ * charging that store's entries while dropping its row from `stats()`, so occupancy becomes
+ * unattributable for the rest of the process, and the other consumers keep reading through a
+ * cache nobody can account for. That is precisely the recipe recommended above, so the helper
+ * reports ownership rather than leaving each site to infer it. A skipped dispose of a cache you
+ * DO own leaks only cold entries the pool evicts under pressure — hygiene, not correctness.
  *
  * @param label  Shown in `SharedCachePool.stats()` so this store is recognizable.
  * @param pool   Pool to join; defaults to the process-wide `defaultCachePool()`. Pass one only
  *               for isolation (tests) or host-specific sizing.
  */
-export function withReadCache(storage: IRawStorage, label?: string, pool?: SharedCachePool): IRawStorage {
+export function withReadCache(storage: IRawStorage, label?: string, pool?: SharedCachePool): ResolvedReadCache {
 	if (storage instanceof MemoryRawStorage || storage instanceof CachedRawStorage) {
-		return storage;
+		return { storage, ownedCache: undefined };
 	}
-	return new CachedRawStorage(storage, pool, label);
+	const ownedCache = new CachedRawStorage(storage, pool, label);
+	return { storage: ownedCache, ownedCache };
 }

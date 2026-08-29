@@ -299,7 +299,9 @@ describe('Read-path pull mechanism (single node, harness-independent)', function
 		// separate directories converging over the network; cross-process convergence is covered
 		// by the mesh harness, not here.
 		const uri = 'tree://read-pull/cross';
-		const store: IRawStorage = new CachedRawStorage(new FileRawStorage(dir), undefined, 'read-pull:cross');
+		// THIS test owns the cache, not either peer: `withReadCache` hands an already-cached
+		// storage back unchanged and reports no ownership, so neither plugin's dispose retires it.
+		const store = new CachedRawStorage(new FileRawStorage(dir), undefined, 'read-pull:cross');
 		const peerA = createDb(dir, store);
 		try {
 			await peerA.db.exec(`create table T (id integer primary key, v text) using optimystic('${uri}')`);
@@ -336,6 +338,7 @@ describe('Read-path pull mechanism (single node, harness-independent)', function
 			expect(countAfter, 'count(*) sees both writers\' rows').to.equal(3);
 		} finally {
 			peerA.db.close();
+			await store.dispose();
 		}
 	});
 

@@ -343,11 +343,13 @@ Semantics worth knowing:
 - **Production entry point — `withReadCache(storage, label?, pool?)`**
   (`src/storage/with-read-cache.ts`). Every seam that resolves an `IRawStorage`
   for real use goes through this one helper, so the exclusion rules live in one
-  place instead of being re-derived per site. It returns the storage *unchanged*
-  when it is a `MemoryRawStorage` (already in memory — see the "never wrap" bullet
-  below) or already a `CachedRawStorage` (a host that wrapped before handing it
-  over is not wrapped twice); otherwise it returns `new CachedRawStorage(...)`.
-  The two seams that call it:
+  place instead of being re-derived per site. It returns
+  `{ storage, ownedCache }`: `storage` is the argument *unchanged* when it is a
+  `MemoryRawStorage` (already in memory — see the "never wrap" bullet below) or
+  already a `CachedRawStorage` (a host that wrapped before handing it over is not
+  wrapped twice), and a `new CachedRawStorage(...)` otherwise. `ownedCache` is set
+  only in that last case — see **Dispose obligations** below for why the two are
+  separate answers. The two seams that call it:
   - `CollectionFactory.createLocalTransactor`
     (`packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts`)
     — wraps the host's `rawStorageFactory` result, label `quereus:local`.
@@ -355,12 +357,21 @@ Semantics worth knowing:
     instance or factory result, label `node:<networkName>`. The no-provider
     default is a bare `MemoryRawStorage` and stays unwrapped.
 
-  **Dispose obligations.** The seam that wraps owns the wrapper's lifecycle:
-  `CollectionFactory.dispose()` releases its caches and is called by
-  `shutdown()` and surfaced to hosts as `plugin.dispose()` (opt-in — a host that
-  never calls it leaks only cold entries the pool evicts under pressure). A
-  libp2p node releases automatically: a stop wrapper installed at construction
-  calls `dispose()` in a `finally` after the rest of the stop chain.
+  **Dispose obligations — a seam disposes `ownedCache`, never `storage`.** "The
+  result is a `CachedRawStorage`" and "the result is mine to release" are
+  different questions: the pass-through branch returns a cache the HOST built and
+  may still be sharing with other consumers, so a seam that disposed on
+  `instanceof` alone would clear and unregister the shared store the moment its
+  first consumer departed — the pool keeps charging that store's entries while
+  dropping its row from `stats()`, leaving live occupancy unattributable for the
+  rest of the process. That is exactly the sharing recipe the precondition below
+  recommends, which is why the helper reports ownership instead of leaving each
+  site to infer it. With that in hand: `CollectionFactory.dispose()` releases the
+  caches it built and is called by `shutdown()` and surfaced to hosts as
+  `plugin.dispose()` (opt-in — a host that never calls it leaks only cold entries
+  the pool evicts under pressure); a libp2p node releases automatically, via a
+  stop wrapper installed at construction that disposes in a `finally` after the
+  rest of the stop chain.
 
   **Precondition (Invariant 5, above): exactly one cache fronts a given backing
   store.** Cache identity is per-*object*, so `new FileRawStorage(dir)` twice
