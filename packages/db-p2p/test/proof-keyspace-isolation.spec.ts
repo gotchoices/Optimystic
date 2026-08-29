@@ -3,6 +3,7 @@ import type { ActionId, BlockId, IBlock, Transforms } from '@optimystic/db-core'
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
+import { withBlockWriteLatch } from '../src/storage/block-latch.js';
 import { makeProof } from '../src/testing/raw-storage-conformance.js';
 
 /**
@@ -112,7 +113,7 @@ describe('commit proofs do not share the transactions keyspace', () => {
 
 		// `saveReplica` reaches `saveRestored`, which writes a PEER-supplied action id verbatim
 		// into both the revisions and transactions stores.
-		await bs.saveReplica(block, { rev: 1, actionId: COLLIDING_ACTION });
+		await withBlockWriteLatch(blockId, l => bs.saveReplica(block, { rev: 1, actionId: COLLIDING_ACTION }, undefined, l));
 
 		const proof = await storage.getBlockProof(blockId, 5);
 		expect(proof, 'a peer cannot overwrite a retained proof by naming its old reserved id').to.not.equal(undefined);
@@ -129,8 +130,10 @@ describe('commit proofs do not share the transactions keyspace', () => {
 		const v2 = makeBlock('order-d', { items: ['v1', 'v2'] });
 		const bs = new BlockStorage(blockId, storage);
 
-		await bs.saveReplica(v1, { rev: 1, actionId: 'tx:1' as ActionId });
-		await bs.saveReplica(v2, { rev: 2, actionId: COLLIDING_ACTION });
+		await withBlockWriteLatch(blockId, async l => {
+			await bs.saveReplica(v1, { rev: 1, actionId: 'tx:1' as ActionId }, undefined, l);
+			await bs.saveReplica(v2, { rev: 2, actionId: COLLIDING_ACTION }, undefined, l);
+		});
 		await storage.saveBlockProof(blockId, 5, makeProof('D'));
 
 		// Drop rev 2's materialization so the read must replay rev 2's transform onto rev 1's

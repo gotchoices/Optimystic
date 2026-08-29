@@ -250,7 +250,7 @@ export class BlockStorage implements IBlockStorage {
 		// the un-held revs below E). Claim open-ended from the prior latest (>= E via merge); the first
 		// commit (prevRev undefined) anchors the span at E = L. mergeRanges folds it into the existing
 		// [E, +inf). Only revs BELOW E miss inRanges, which is exactly the genuine-gap/restore case.
-		// Range + latest advance in one saveMetadata write (atomic under the commit latch), so a crash
+		// Range + latest advance in one saveMetadata write (atomic under the block write latch), so a crash
 		// before this call advances neither.
 		meta.ranges.unshift([prevRev ?? latest.rev]);
 		meta.ranges = mergeRanges(meta.ranges);
@@ -357,81 +357,79 @@ export class BlockStorage implements IBlockStorage {
 		// caller already holds (asserted in saveReplica / saveDeletion) — the same latch every other
 		// writer of this block holds, so a concurrent replica, deletion, restore, commit, or pend
 		// cannot land inside the window between the read and the saveMetadata.
-		{
-			let meta = await this.storage.getMetadata(this.blockId);
+		let meta = await this.storage.getMetadata(this.blockId);
 
-			// Monotonic guard: an equal-or-newer revision is already held. The block (or tombstone) is
-			// durably present; do not downgrade `latest` or rewrite the metadata.
-			//
-			// This skip returns before persisting anything, INCLUDING `verifiedProof` — deliberately.
-			// The proof was verified against the PUSHED bytes; persisting it here would attach it to
-			// this node's HELD materialization, whose bytes at the same `(rev, actionId)` may differ if
-			// this holder diverged. A stored proof whose declared digest contradicts local content makes
-			// this node serve content that fails its own proof, and `digest-mismatch` is ATTRIBUTABLE in
-			// `cluster/certified-claims.ts` — every receiver would penalize it.
-			//
-			// Back-filling a proof onto an already-held revision therefore happens one layer up, in
-			// `StorageRepo.saveReplicatedBlock`'s non-advancing branch, which routes it through
-			// `backFillProof` → `persistProofIfContentMatches` — the rule that persists only when the
-			// LOCAL materialization matches the digest the commit op declared. Keep this guard a true
-			// no-op; the digest check is what makes the back-fill safe, and it does not belong here.
-			if (meta?.latest && meta.latest.rev >= rev) {
-				log('%s:skip blockId=%s rev=%d held=%d', logLabel, this.blockId, rev, meta.latest.rev);
-				return meta.latest;
-			}
-
-			// One-revision archive. A replica's body carries the materialized block; a deletion's body
-			// omits it (forward tombstone). saveRestored skips materialization when `block` is absent,
-			// so a tombstone reverse-applies to an absent block (read back as undefined).
-			const archive: BlockArchive = {
-				blockId: this.blockId,
-				revisions: {
-					[rev]: body
-				},
-				range: [rev, rev + 1]
-			};
-			await this.saveRestored(archive, verifiedProof ? { rev, proof: verifiedProof } : undefined);
-
-			// INVARIANT P: a block never holds a pending record AND a committed record for the same
-			// action id. On the commit path `promotePendingTransaction` maintains it by MOVING the
-			// record atomically; this forward path writes the committed transform directly (via
-			// saveRestored above), so it owes the deletion itself. Without it, a node that pended the
-			// action but diverged before committing keeps a record nothing can ever promote — reported
-			// as a phantom conflicting action by every later `pend` on the block, which under
-			// `policy: 'f'` refuses that node's participation in the block's writes permanently.
-			//
-			// Deliberately on the WRITE path only: the monotonic guard above returns before here, and
-			// that early return must stay a true no-op (the earlier call that wrote the revision is the
-			// one that owed the deletion). Deliberately here rather than in `saveRestored`, which is
-			// also reached from restoreRevision's historical restore, where a held revision's pending
-			// record is not this writer's to delete. Both paths run under the block's write latch, so
-			// this deletion is already mutually exclusive with a live commit.
-			//
-			// NOTE: deletes only this revision's actionId, not every pending whose action is already
-			// committed. A broader sweep would repair records orphaned by routes that do not carry the
-			// committing actionId; if orphaned pendings ever show up in the field on blocks whose
-			// committing action id differs, widen to a sweep over listPendingTransactions filtered by
-			// getTransaction.
-			await this.storage.deletePendingTransaction(this.blockId, actionId);
-
-			// Seed metadata when absent, advance latest, and merge the covered range.
-			const prevRev = meta?.latest?.rev;
-			if (!meta) {
-				meta = { latest: undefined, ranges: [] };
-			}
-			meta.latest = { rev, actionId };
-			// Open-ended coverage from the earliest held rev (see setLatest): the descending walk serves
-			// any rev >= the anchor. A prior latest at prevRev (< rev per the monotonic guard) is a
-			// materialized point, so anchor at prevRev; the first write (prevRev undefined) anchors at
-			// rev. Freshness of a stale replica is a separate (replication-lag) concern from what this
-			// node can locally reconstruct, which is exactly what ranges records.
-			meta.ranges.unshift([prevRev ?? rev]);
-			meta.ranges = mergeRanges(meta.ranges);
-			await this.storage.saveMetadata(this.blockId, meta);
-
-			log('%s:save blockId=%s rev=%d actionId=%s', logLabel, this.blockId, rev, actionId);
+		// Monotonic guard: an equal-or-newer revision is already held. The block (or tombstone) is
+		// durably present; do not downgrade `latest` or rewrite the metadata.
+		//
+		// This skip returns before persisting anything, INCLUDING `verifiedProof` — deliberately.
+		// The proof was verified against the PUSHED bytes; persisting it here would attach it to
+		// this node's HELD materialization, whose bytes at the same `(rev, actionId)` may differ if
+		// this holder diverged. A stored proof whose declared digest contradicts local content makes
+		// this node serve content that fails its own proof, and `digest-mismatch` is ATTRIBUTABLE in
+		// `cluster/certified-claims.ts` — every receiver would penalize it.
+		//
+		// Back-filling a proof onto an already-held revision therefore happens one layer up, in
+		// `StorageRepo.saveReplicatedBlock`'s non-advancing branch, which routes it through
+		// `backFillProof` → `persistProofIfContentMatches` — the rule that persists only when the
+		// LOCAL materialization matches the digest the commit op declared. Keep this guard a true
+		// no-op; the digest check is what makes the back-fill safe, and it does not belong here.
+		if (meta?.latest && meta.latest.rev >= rev) {
+			log('%s:skip blockId=%s rev=%d held=%d', logLabel, this.blockId, rev, meta.latest.rev);
 			return meta.latest;
 		}
+
+		// One-revision archive. A replica's body carries the materialized block; a deletion's body
+		// omits it (forward tombstone). saveRestored skips materialization when `block` is absent,
+		// so a tombstone reverse-applies to an absent block (read back as undefined).
+		const archive: BlockArchive = {
+			blockId: this.blockId,
+			revisions: {
+				[rev]: body
+			},
+			range: [rev, rev + 1]
+		};
+		await this.saveRestored(archive, verifiedProof ? { rev, proof: verifiedProof } : undefined);
+
+		// INVARIANT P: a block never holds a pending record AND a committed record for the same
+		// action id. On the commit path `promotePendingTransaction` maintains it by MOVING the
+		// record atomically; this forward path writes the committed transform directly (via
+		// saveRestored above), so it owes the deletion itself. Without it, a node that pended the
+		// action but diverged before committing keeps a record nothing can ever promote — reported
+		// as a phantom conflicting action by every later `pend` on the block, which under
+		// `policy: 'f'` refuses that node's participation in the block's writes permanently.
+		//
+		// Deliberately on the WRITE path only: the monotonic guard above returns before here, and
+		// that early return must stay a true no-op (the earlier call that wrote the revision is the
+		// one that owed the deletion). Deliberately here rather than in `saveRestored`, which is
+		// also reached from restoreRevision's historical restore, where a held revision's pending
+		// record is not this writer's to delete. Both paths run under the block's write latch, so
+		// this deletion is already mutually exclusive with a live commit.
+		//
+		// NOTE: deletes only this revision's actionId, not every pending whose action is already
+		// committed. A broader sweep would repair records orphaned by routes that do not carry the
+		// committing actionId; if orphaned pendings ever show up in the field on blocks whose
+		// committing action id differs, widen to a sweep over listPendingTransactions filtered by
+		// getTransaction.
+		await this.storage.deletePendingTransaction(this.blockId, actionId);
+
+		// Seed metadata when absent, advance latest, and merge the covered range.
+		const prevRev = meta?.latest?.rev;
+		if (!meta) {
+			meta = { latest: undefined, ranges: [] };
+		}
+		meta.latest = { rev, actionId };
+		// Open-ended coverage from the earliest held rev (see setLatest): the descending walk serves
+		// any rev >= the anchor. A prior latest at prevRev (< rev per the monotonic guard) is a
+		// materialized point, so anchor at prevRev; the first write (prevRev undefined) anchors at
+		// rev. Freshness of a stale replica is a separate (replication-lag) concern from what this
+		// node can locally reconstruct, which is exactly what ranges records.
+		meta.ranges.unshift([prevRev ?? rev]);
+		meta.ranges = mergeRanges(meta.ranges);
+		await this.storage.saveMetadata(this.blockId, meta);
+
+		log('%s:save blockId=%s rev=%d actionId=%s', logLabel, this.blockId, rev, actionId);
+		return meta.latest;
 	}
 
 	private async materializeBlock(meta: BlockMetadata, targetRev: number): Promise<{ block: IBlock, actionRev: ActionRev } | undefined> {

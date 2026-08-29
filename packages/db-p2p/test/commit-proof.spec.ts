@@ -6,6 +6,7 @@ import {
 import { clusterMember } from '../src/cluster/cluster-repo.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
+import { withBlockWriteLatch } from '../src/storage/block-latch.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { CachedRawStorage } from '../src/storage/cached-raw-storage.js';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../src/protocol-limits.js';
@@ -456,9 +457,11 @@ describe('BlockCommitProof', () => {
 			const block = insertBlock();
 			const { raw, repo } = await seededRepo(block);
 			const storage = new BlockStorage(BLOCK, raw);
-			await storage.saveMaterializedBlock(ACTION, block);
-			await storage.saveRevision(1, ACTION);
-			await storage.promotePendingTransaction(ACTION);
+			await withBlockWriteLatch(BLOCK, async l => {
+				await storage.saveMaterializedBlock(ACTION, block, l);
+				await storage.saveRevision(1, ACTION, l);
+				await storage.promotePendingTransaction(ACTION, l);
+			});
 			expect(await storage.getLatest(), 'the lost setLatest is the D3 signature').to.equal(undefined);
 
 			const commit = makeCommit({ [BLOCK]: { digest: await canonicalBlockHash(block) } });

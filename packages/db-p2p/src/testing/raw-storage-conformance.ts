@@ -5,6 +5,7 @@ import type { IRawStorage } from '../storage/i-raw-storage.js';
 import type { BlockMetadata } from '../storage/struct.js';
 import { StorageRepo } from '../storage/storage-repo.js';
 import { BlockStorage } from '../storage/block-storage.js';
+import { withBlockWriteLatch } from '../storage/block-latch.js';
 
 /**
  * What `makeStorage` hands each conformance case: a fresh `IRawStorage` and a
@@ -532,12 +533,13 @@ export function runRawStorageConformance(
 			const blockId = 'parity-tombstone' as BlockId;
 			const bs = new BlockStorage(blockId, storage);
 
-			await bs.saveReplica(makeBlock('parity-tombstone', { items: ['live'] }), { rev: 1, actionId: 'r1' as ActionId });
+			await withBlockWriteLatch(blockId, l =>
+				bs.saveReplica(makeBlock('parity-tombstone', { items: ['live'] }), { rev: 1, actionId: 'r1' as ActionId }, undefined, l));
 			const meta = await storage.getMetadata(blockId);
 			// saveReplica seeds open-ended coverage anchored at the replica rev, never [[0]].
 			expect(meta!.ranges, 'replica seeds open-ended [[1]]').to.deep.equal([[1]]);
 
-			const latest = await bs.saveDeletion({ rev: 2, actionId: 'd2' as ActionId });
+			const latest = await withBlockWriteLatch(blockId, l => bs.saveDeletion({ rev: 2, actionId: 'd2' as ActionId }, l));
 			expect(latest.rev).to.equal(2);
 
 			// getBlock at the tombstone rev reverse-applies { delete: true } → absent block.

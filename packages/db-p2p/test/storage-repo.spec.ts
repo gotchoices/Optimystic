@@ -1,5 +1,6 @@
 import { expect } from 'chai';
-import { StorageRepo, commitLatchKey, MISSING_BASE_REVISION_REASON } from '../src/storage/storage-repo.js';
+import { StorageRepo, MISSING_BASE_REVISION_REASON } from '../src/storage/storage-repo.js';
+import { blockWriteLatchKey, withBlockWriteLatch, type BlockWriteLatch } from '../src/storage/block-latch.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockId, ActionId, ActionRev, ActionTransforms, CommitResult, PendRequest, StaleFailure, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
@@ -141,11 +142,13 @@ describe('StorageRepo', () => {
 			// Setup: create a block with committed data
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const initialBlock = makeBlock('block-1');
-			await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock });
-			await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock);
-			await blockStorage.saveRevision(1, 'initial-action' as ActionId);
-			await blockStorage.promotePendingTransaction('initial-action' as ActionId);
-			await blockStorage.setLatest({ actionId: 'initial-action' as ActionId, rev: 1 });
+			await withBlockWriteLatch('block-1' as BlockId, async l => {
+				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, l);
+				await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock, l);
+				await blockStorage.saveRevision(1, 'initial-action' as ActionId, l);
+				await blockStorage.promotePendingTransaction('initial-action' as ActionId, l);
+				await blockStorage.setLatest({ actionId: 'initial-action' as ActionId, rev: 1 }, l);
+			});
 
 			// Now try to pend at revision 0 - should conflict
 			const result = await repo.pend({
@@ -166,11 +169,13 @@ describe('StorageRepo', () => {
 		it('reports staleAt with the revision this node holds when the requested rev is taken', async () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const initialBlock = makeBlock('block-1');
-			await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock });
-			await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock);
-			await blockStorage.saveRevision(1, 'initial-action' as ActionId);
-			await blockStorage.promotePendingTransaction('initial-action' as ActionId);
-			await blockStorage.setLatest({ actionId: 'initial-action' as ActionId, rev: 1 });
+			await withBlockWriteLatch('block-1' as BlockId, async l => {
+				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, l);
+				await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock, l);
+				await blockStorage.saveRevision(1, 'initial-action' as ActionId, l);
+				await blockStorage.promotePendingTransaction('initial-action' as ActionId, l);
+				await blockStorage.setLatest({ actionId: 'initial-action' as ActionId, rev: 1 }, l);
+			});
 
 			const result = await repo.pend({
 				actionId: 'new-action' as ActionId,
@@ -190,11 +195,13 @@ describe('StorageRepo', () => {
 			// revision race, so the held revision would be a number answering no question.
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const initialBlock = makeBlock('block-1');
-			await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock });
-			await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock);
-			await blockStorage.saveRevision(1, 'initial-action' as ActionId);
-			await blockStorage.promotePendingTransaction('initial-action' as ActionId);
-			await blockStorage.setLatest({ actionId: 'initial-action' as ActionId, rev: 1 });
+			await withBlockWriteLatch('block-1' as BlockId, async l => {
+				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, l);
+				await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock, l);
+				await blockStorage.saveRevision(1, 'initial-action' as ActionId, l);
+				await blockStorage.promotePendingTransaction('initial-action' as ActionId, l);
+				await blockStorage.setLatest({ actionId: 'initial-action' as ActionId, rev: 1 }, l);
+			});
 
 			const result = await repo.pend({
 				actionId: 'colliding-insert' as ActionId,
@@ -289,11 +296,13 @@ describe('StorageRepo', () => {
 			// Create block first so it exists
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const existingBlock = makeBlock('block-1');
-			await blockStorage.savePendingTransaction('setup' as ActionId, { insert: existingBlock });
-			await blockStorage.saveMaterializedBlock('setup' as ActionId, existingBlock);
-			await blockStorage.saveRevision(1, 'setup' as ActionId);
-			await blockStorage.promotePendingTransaction('setup' as ActionId);
-			await blockStorage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+			await withBlockWriteLatch('block-1' as BlockId, async l => {
+				await blockStorage.savePendingTransaction('setup' as ActionId, { insert: existingBlock }, l);
+				await blockStorage.saveMaterializedBlock('setup' as ActionId, existingBlock, l);
+				await blockStorage.saveRevision(1, 'setup' as ActionId, l);
+				await blockStorage.promotePendingTransaction('setup' as ActionId, l);
+				await blockStorage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+			});
 
 			// Now pend a new action
 			await repo.pend({
@@ -338,11 +347,13 @@ describe('StorageRepo', () => {
 			// Create a block first
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const testBlock = makeBlock('block-1');
-			await blockStorage.savePendingTransaction('create' as ActionId, { insert: testBlock });
-			await blockStorage.saveMaterializedBlock('create' as ActionId, testBlock);
-			await blockStorage.saveRevision(1, 'create' as ActionId);
-			await blockStorage.promotePendingTransaction('create' as ActionId);
-			await blockStorage.setLatest({ actionId: 'create' as ActionId, rev: 1 });
+			await withBlockWriteLatch('block-1' as BlockId, async l => {
+				await blockStorage.savePendingTransaction('create' as ActionId, { insert: testBlock }, l);
+				await blockStorage.saveMaterializedBlock('create' as ActionId, testBlock, l);
+				await blockStorage.saveRevision(1, 'create' as ActionId, l);
+				await blockStorage.promotePendingTransaction('create' as ActionId, l);
+				await blockStorage.setLatest({ actionId: 'create' as ActionId, rev: 1 }, l);
+			});
 
 			// Request same block multiple times
 			const result = await repo.get({
@@ -401,11 +412,13 @@ describe('StorageRepo', () => {
 			// Create block first
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const testBlock = makeBlock('block-1');
-			await blockStorage.savePendingTransaction('create' as ActionId, { insert: testBlock });
-			await blockStorage.saveMaterializedBlock('create' as ActionId, testBlock);
-			await blockStorage.saveRevision(1, 'create' as ActionId);
-			await blockStorage.promotePendingTransaction('create' as ActionId);
-			await blockStorage.setLatest({ actionId: 'create' as ActionId, rev: 1 });
+			await withBlockWriteLatch('block-1' as BlockId, async l => {
+				await blockStorage.savePendingTransaction('create' as ActionId, { insert: testBlock }, l);
+				await blockStorage.saveMaterializedBlock('create' as ActionId, testBlock, l);
+				await blockStorage.saveRevision(1, 'create' as ActionId, l);
+				await blockStorage.promotePendingTransaction('create' as ActionId, l);
+				await blockStorage.setLatest({ actionId: 'create' as ActionId, rev: 1 }, l);
+			});
 
 			// Add a pending transaction
 			await repo.pend({
@@ -926,11 +939,13 @@ describe('StorageRepo', () => {
 			// Setup: create block and two pending actions
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const testBlock = makeBlock('block-1', { items: [] });
-			await blockStorage.savePendingTransaction('setup' as ActionId, { insert: testBlock });
-			await blockStorage.saveMaterializedBlock('setup' as ActionId, testBlock);
-			await blockStorage.saveRevision(1, 'setup' as ActionId);
-			await blockStorage.promotePendingTransaction('setup' as ActionId);
-			await blockStorage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+			await withBlockWriteLatch('block-1' as BlockId, async l => {
+				await blockStorage.savePendingTransaction('setup' as ActionId, { insert: testBlock }, l);
+				await blockStorage.saveMaterializedBlock('setup' as ActionId, testBlock, l);
+				await blockStorage.saveRevision(1, 'setup' as ActionId, l);
+				await blockStorage.promotePendingTransaction('setup' as ActionId, l);
+				await blockStorage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+			});
 
 			await repo.pend({
 				actionId: 'a1' as ActionId,
@@ -960,11 +975,13 @@ describe('StorageRepo', () => {
 			for (const blockId of ['block-a', 'block-b']) {
 				const storage = new BlockStorage(blockId as BlockId, rawStorage);
 				const block = makeBlock(blockId, { items: [] });
-				await storage.savePendingTransaction('setup' as ActionId, { insert: block });
-				await storage.saveMaterializedBlock('setup' as ActionId, block);
-				await storage.saveRevision(1, 'setup' as ActionId);
-				await storage.promotePendingTransaction('setup' as ActionId);
-				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+				await withBlockWriteLatch(blockId as BlockId, async l => {
+					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, l);
+					await storage.saveMaterializedBlock('setup' as ActionId, block, l);
+					await storage.saveRevision(1, 'setup' as ActionId, l);
+					await storage.promotePendingTransaction('setup' as ActionId, l);
+					await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+				});
 			}
 
 			const transforms: Transforms = {
@@ -1010,17 +1027,19 @@ describe('StorageRepo', () => {
 		});
 	});
 
-	describe('read-driven promotion under the commit latch (st-storage-repo-promotion-latch-bypass)', () => {
+	describe('read-driven promotion under the write latch (st-storage-repo-promotion-latch-bypass)', () => {
 		// Commit block-1 at rev 1 directly, then pend a2 at rev 2 without ever driving it
 		// through commit() — so a context-proving get() is what promotes it.
 		const seedRev1AndPendA2 = async () => {
 			const storage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const block = makeBlock('block-1', { items: [] });
-			await storage.savePendingTransaction('setup' as ActionId, { insert: block });
-			await storage.saveMaterializedBlock('setup' as ActionId, block);
-			await storage.saveRevision(1, 'setup' as ActionId);
-			await storage.promotePendingTransaction('setup' as ActionId);
-			await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+			await withBlockWriteLatch('block-1' as BlockId, async l => {
+				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, l);
+				await storage.saveMaterializedBlock('setup' as ActionId, block, l);
+				await storage.saveRevision(1, 'setup' as ActionId, l);
+				await storage.promotePendingTransaction('setup' as ActionId, l);
+				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+			});
 			await repo.pend({
 				actionId: 'a2' as ActionId,
 				transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['a2']]]),
@@ -1029,13 +1048,13 @@ describe('StorageRepo', () => {
 			return storage;
 		};
 
-		it('does not promote while another writer holds the block commit latch', async () => {
+		it('does not promote while another writer holds the block write latch', async () => {
 			// The core of the bug: get()'s read-driven promotion ran internalCommit with NO latch.
-			// Hold the block's commit latch (simulating a concurrent commit sitting in its critical
+			// Hold the block's write latch (simulating a concurrent commit sitting in its critical
 			// section); a correctly-latched promotion must BLOCK on it, a bypassing one promotes anyway.
 			const storage = await seedRev1AndPendA2();
 
-			const release = await Latches.acquire(commitLatchKey('block-1' as BlockId));
+			const release = await Latches.acquire(blockWriteLatchKey('block-1' as BlockId));
 
 			let resolved = false;
 			const getPromise = repo.get({
@@ -1043,7 +1062,7 @@ describe('StorageRepo', () => {
 				context: { committed: [{ actionId: 'a2' as ActionId, rev: 2 }], rev: 2 }
 			}).then((r) => { resolved = true; return r; });
 
-			// Release even if an assertion throws: the commit latch is a process-global mutex, so a
+			// Release even if an assertion throws: the write latch is a process-global mutex, so a
 			// leaked hold would wedge every later test that commits block-1.
 			try {
 				// Ample event-loop turns: with the fix the get parks on the held latch; pre-fix it has
@@ -1085,13 +1104,13 @@ describe('StorageRepo', () => {
 				const storage = new BlockStorage(blockId as BlockId, rawStorage);
 				if (blockId === 'block-1') {
 					const originalSetLatest = storage.setLatest.bind(storage);
-					storage.setLatest = async (latest: ActionRev) => {
+					storage.setLatest = async (latest: ActionRev, l: BlockWriteLatch) => {
 						// Gate only the read-driven promotion's write (a2), not the commit's (a3).
 						if (latest.actionId === 'a2') {
 							reachedResolve();
 							await gate;
 						}
-						return originalSetLatest(latest);
+						return originalSetLatest(latest, l);
 					};
 				}
 				return storage;
@@ -1100,11 +1119,13 @@ describe('StorageRepo', () => {
 			// block-1 committed at rev 1, with a2 and a3 both pending (neither committed yet).
 			const storage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const block = makeBlock('block-1', { items: [] });
-			await storage.savePendingTransaction('setup' as ActionId, { insert: block });
-			await storage.saveMaterializedBlock('setup' as ActionId, block);
-			await storage.saveRevision(1, 'setup' as ActionId);
-			await storage.promotePendingTransaction('setup' as ActionId);
-			await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+			await withBlockWriteLatch('block-1' as BlockId, async l => {
+				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, l);
+				await storage.saveMaterializedBlock('setup' as ActionId, block, l);
+				await storage.saveRevision(1, 'setup' as ActionId, l);
+				await storage.promotePendingTransaction('setup' as ActionId, l);
+				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+			});
 			await gatedRepo.pend({
 				actionId: 'a2' as ActionId,
 				transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['a2']]]),
@@ -1147,31 +1168,33 @@ describe('StorageRepo', () => {
 			expect(rev2 === undefined || rev2 === 'a2').to.equal(true);
 		});
 
-		it('recoverBlock does not reconcile meta.latest while another writer holds the block commit latch', async () => {
+		it('recoverBlock does not reconcile meta.latest while another writer holds the block write latch', async () => {
 			// recoverBlock() is a read-modify-write of meta.latest (redoes a lost setLatest), same class
-			// as get()'s read-driven promotion — it must hold the commit latch too, or a concurrent commit
+			// as get()'s read-driven promotion — it must hold the write latch too, or a concurrent commit
 			// advancing latest in between gets clobbered. Build a Crash-D3 state: rev 1 is latest, but rev 2
 			// is durable (revision + promoted action) with meta.latest never advanced. recover() should lift
 			// latest to 2 — but not while the latch is held.
 			const storage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const block = makeBlock('block-1', { items: [] });
-			await storage.savePendingTransaction('setup' as ActionId, { insert: block });
-			await storage.saveMaterializedBlock('setup' as ActionId, block);
-			await storage.saveRevision(1, 'setup' as ActionId);
-			await storage.promotePendingTransaction('setup' as ActionId);
-			await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
-			// rev 2 durable but latest deliberately NOT advanced (the lost-setLatest / Crash-D3 signature).
-			await storage.savePendingTransaction('a2' as ActionId, { insert: makeBlock('block-1', { items: ['a2'] }) });
-			await storage.saveMaterializedBlock('a2' as ActionId, makeBlock('block-1', { items: ['a2'] }));
-			await storage.saveRevision(2, 'a2' as ActionId);
-			await storage.promotePendingTransaction('a2' as ActionId);
+			await withBlockWriteLatch('block-1' as BlockId, async l => {
+				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, l);
+				await storage.saveMaterializedBlock('setup' as ActionId, block, l);
+				await storage.saveRevision(1, 'setup' as ActionId, l);
+				await storage.promotePendingTransaction('setup' as ActionId, l);
+				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+				// rev 2 durable but latest deliberately NOT advanced (the lost-setLatest / Crash-D3 signature).
+				await storage.savePendingTransaction('a2' as ActionId, { insert: makeBlock('block-1', { items: ['a2'] }) }, l);
+				await storage.saveMaterializedBlock('a2' as ActionId, makeBlock('block-1', { items: ['a2'] }), l);
+				await storage.saveRevision(2, 'a2' as ActionId, l);
+				await storage.promotePendingTransaction('a2' as ActionId, l);
+			});
 
-			const release = await Latches.acquire(commitLatchKey('block-1' as BlockId));
+			const release = await Latches.acquire(blockWriteLatchKey('block-1' as BlockId));
 
 			let resolved = false;
 			const recoverPromise = repo.recoverBlock('block-1' as BlockId).then(() => { resolved = true; });
 
-			// Release in finally: the commit latch is a process-global mutex; a leaked hold would wedge
+			// Release in finally: the write latch is a process-global mutex; a leaked hold would wedge
 			// every later test that commits block-1.
 			try {
 				// A held mutex never self-releases, so a correctly-latched recover cannot complete in this
@@ -1195,20 +1218,24 @@ describe('StorageRepo', () => {
 			// Setup block-1 with a committed block
 			const storage1 = new BlockStorage('block-1' as BlockId, rawStorage);
 			const block1 = makeBlock('block-1', { items: [] });
-			await storage1.savePendingTransaction('setup' as ActionId, { insert: block1 });
-			await storage1.saveMaterializedBlock('setup' as ActionId, block1);
-			await storage1.saveRevision(1, 'setup' as ActionId);
-			await storage1.promotePendingTransaction('setup' as ActionId);
-			await storage1.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+			await withBlockWriteLatch('block-1' as BlockId, async l => {
+				await storage1.savePendingTransaction('setup' as ActionId, { insert: block1 }, l);
+				await storage1.saveMaterializedBlock('setup' as ActionId, block1, l);
+				await storage1.saveRevision(1, 'setup' as ActionId, l);
+				await storage1.promotePendingTransaction('setup' as ActionId, l);
+				await storage1.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+			});
 
 			// Setup block-2 with a committed block
 			const storage2 = new BlockStorage('block-2' as BlockId, rawStorage);
 			const block2 = makeBlock('block-2', { items: [] });
-			await storage2.savePendingTransaction('setup' as ActionId, { insert: block2 });
-			await storage2.saveMaterializedBlock('setup' as ActionId, block2);
-			await storage2.saveRevision(1, 'setup' as ActionId);
-			await storage2.promotePendingTransaction('setup' as ActionId);
-			await storage2.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+			await withBlockWriteLatch('block-2' as BlockId, async l => {
+				await storage2.savePendingTransaction('setup' as ActionId, { insert: block2 }, l);
+				await storage2.saveMaterializedBlock('setup' as ActionId, block2, l);
+				await storage2.saveRevision(1, 'setup' as ActionId, l);
+				await storage2.promotePendingTransaction('setup' as ActionId, l);
+				await storage2.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+			});
 
 			// Pend action on both blocks
 			const transforms: Transforms = {
@@ -1496,12 +1523,12 @@ describe('StorageRepo', () => {
 				const storage = new BlockStorage(blockId as BlockId, rawStorage);
 				if (blockId === 'block-2') {
 					const originalSaveRevision = storage.saveRevision.bind(storage);
-					storage.saveRevision = async (rev: number, actionId: ActionId) => {
+					storage.saveRevision = async (rev: number, actionId: ActionId, l: BlockWriteLatch) => {
 						if (!block2SaveRevisionThrown) {
 							block2SaveRevisionThrown = true;
 							throw new Error('Simulated saveRevision failure on block-2');
 						}
-						return originalSaveRevision(rev, actionId);
+						return originalSaveRevision(rev, actionId, l);
 					};
 				}
 				return storage;
@@ -1511,11 +1538,13 @@ describe('StorageRepo', () => {
 			for (const id of ['block-1', 'block-2']) {
 				const storage = new BlockStorage(id as BlockId, rawStorage);
 				const block = makeBlock(id, { items: [] });
-				await storage.savePendingTransaction('setup' as ActionId, { insert: block });
-				await storage.saveMaterializedBlock('setup' as ActionId, block);
-				await storage.saveRevision(1, 'setup' as ActionId);
-				await storage.promotePendingTransaction('setup' as ActionId);
-				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+				await withBlockWriteLatch(id as BlockId, async l => {
+					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, l);
+					await storage.saveMaterializedBlock('setup' as ActionId, block, l);
+					await storage.saveRevision(1, 'setup' as ActionId, l);
+					await storage.promotePendingTransaction('setup' as ActionId, l);
+					await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+				});
 			}
 
 			const events: CollectionChangeEvent[] = [];
@@ -1573,12 +1602,12 @@ describe('StorageRepo', () => {
 				const storage = new BlockStorage(blockId as BlockId, rawStorage);
 				if (blockId === 'block-b') {
 					const originalSaveRevision = storage.saveRevision.bind(storage);
-					storage.saveRevision = async (rev: number, actionId: ActionId) => {
+					storage.saveRevision = async (rev: number, actionId: ActionId, l: BlockWriteLatch) => {
 						if (!blockBSaveRevisionThrown) {
 							blockBSaveRevisionThrown = true;
 							throw new Error('Simulated saveRevision failure on block-b');
 						}
-						return originalSaveRevision(rev, actionId);
+						return originalSaveRevision(rev, actionId, l);
 					};
 				}
 				return storage;
@@ -1587,11 +1616,13 @@ describe('StorageRepo', () => {
 			const setup = async (id: string, collectionId: string) => {
 				const storage = new BlockStorage(id as BlockId, rawStorage);
 				const block = makeBlockInCollection(id, collectionId, { items: [] });
-				await storage.savePendingTransaction('setup' as ActionId, { insert: block });
-				await storage.saveMaterializedBlock('setup' as ActionId, block);
-				await storage.saveRevision(1, 'setup' as ActionId);
-				await storage.promotePendingTransaction('setup' as ActionId);
-				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+				await withBlockWriteLatch(id as BlockId, async l => {
+					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, l);
+					await storage.saveMaterializedBlock('setup' as ActionId, block, l);
+					await storage.saveRevision(1, 'setup' as ActionId, l);
+					await storage.promotePendingTransaction('setup' as ActionId, l);
+					await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+				});
 			};
 			await setup('block-a', 'collection-A');
 			await setup('block-b', 'collection-B');
@@ -2411,8 +2442,10 @@ describe('StorageRepo', () => {
 			// Base-independence must not just ignore the base's CONTENT — it must not read the base,
 			// or a locally wedged block would degrade a check every member could otherwise make.
 			await rawStorage.saveMetadata(BLOCK, { latest: { rev: 3, actionId: 'ghost' as ActionId }, ranges: [[3]] });
-			await new BlockStorage(BLOCK, rawStorage).savePendingTransaction('a1' as ActionId,
-				{ insert: makeBlock(BLOCK, { items: ['fresh'] }) });
+			await withBlockWriteLatch(BLOCK, async l => {
+				await new BlockStorage(BLOCK, rawStorage).savePendingTransaction('a1' as ActionId,
+					{ insert: makeBlock(BLOCK, { items: ['fresh'] }) }, l);
+			});
 
 			const preview = await repo.previewCommitDigest(BLOCK, 'a1' as ActionId, 4);
 			expect(preview!.baseIndependent).to.equal(true);

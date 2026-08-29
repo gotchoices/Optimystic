@@ -5,11 +5,11 @@ import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import type { BlockStore, IBlock, BlockOperation, BlockId } from '@optimystic/db-core';
 import { Log, applyOperation, Latches } from '@optimystic/db-core';
-import { StorageRepo, commitLatchKey, withBlockCommitLatch } from '../src/storage/storage-repo.js';
+import { StorageRepo } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import type { BlockMetadata } from '../src/storage/struct.js';
-import { waitFor, delay } from '@optimystic/db-core/test';
+import { withBlockWriteLatch, blockWriteLatchKey } from '../src/storage/block-latch.js';
+import { delay } from '@optimystic/db-core/test';
 import {
 	buildDisputeResolutionProof,
 	verifyInvalidationCertificate,
@@ -77,24 +77,6 @@ class MemLogStore implements BlockStore<IBlock> {
 	update(id: string, op: BlockOperation): void { const b = this.blocks.get(id); if (!b) throw new Error(`Block ${id} not found`); applyOperation(b, op); }
 	delete(id: string): void { this.blocks.delete(id); }
 	generateId(): string { return `log-${this.nextId++}`; }
-}
-
-// ─── Gated raw storage (deterministic interleaving for the lost-update tests) ───
-
-/**
- * A {@link MemoryRawStorage} that can pause inside `saveMetadata` at an injected barrier, so a test can
- * park a commit precisely between its staleness check and its `setLatest` write and interleave an
- * invalidation in that window. `beforeSaveMetadata` sees the metadata about to be persisted (its
- * `latest.rev` identifies which write it is) and may await before the store mutates.
- */
-class GatedRawStorage extends MemoryRawStorage {
-	beforeSaveMetadata?: (blockId: BlockId, meta: BlockMetadata) => Promise<void> | void;
-	override async saveMetadata(blockId: BlockId, metadata: BlockMetadata): Promise<void> {
-		if (this.beforeSaveMetadata) {
-			await this.beforeSaveMetadata(blockId, metadata);
-		}
-		await super.saveMetadata(blockId, metadata);
-	}
 }
 
 // ─── Block content helpers ───
@@ -722,12 +704,12 @@ describe('applyInvalidation', () => {
 		expect(m1.reverted[0]?.restoredContentHash).to.be.a('string').and.not.equal(DELETED_BLOCK_RESTORE);
 	});
 
-	// ─── Per-block commit latch: the invalidation-apply RMW of meta.latest must serialize against commit ───
-	describe('per-block commit latch (lost-update guard)', () => {
+	// ─── The ONE per-block write latch: the invalidation-apply RMW of meta.latest must serialize against commit ───
+	describe('per-block write latch (lost-update guard)', () => {
 		const updateOp = (blockId: BlockId, value: string) =>
 			({ updates: { [blockId]: [['value', 0, 0, value] as BlockOperation] } });
 
-		it('contends on the per-block commit latch: the compensating write blocks until the latch is free', async () => {
+		it('contends on the per-block write latch: the compensating write blocks until the latch is free', async () => {
 			const raw = new MemoryRawStorage();
 			const blockId = 'lat-contend';
 			const { createBlockStorage } = await seedBlock(raw, blockId, [
@@ -737,32 +719,25 @@ describe('applyInvalidation', () => {
 			const log = await Log.create<unknown>(new MemLogStore());
 			const proof = await challengerWinsProof('d1', 'msg-1', { invalidatedActionId: 'a2', blockIds: [blockId] });
 
-			// Externally hold the SAME latch a concurrent commit would hold for this block.
-			const release = await Latches.acquire(commitLatchKey(blockId));
+			// Externally hold the block's ONE write latch — exactly the key a concurrent commit holds.
+			// There is no runner to inject any more: `applyInvalidation` always takes this key itself, and
+			// an unlatched compensating write cannot even be expressed (every write demands the token).
+			const release = await Latches.acquire(blockWriteLatchKey(blockId));
 			let released = false;
 			const releaseOnce = () => { if (!released) { released = true; release(); } };
-
-			// Wrap the real runner so the test deterministically knows when apply has reached the latched write.
-			let reachedWrite = false;
-			const probe = <T,>(id: string, fn: () => Promise<T>): Promise<T> => {
-				reachedWrite = true;
-				return withBlockCommitLatch(id, fn);
-			};
 
 			try {
 				let applied = false;
 				const p = applyInvalidation(
-					{ log, createBlockStorage, withBlockCommitLatch: probe },
+					{ log, createBlockStorage },
 					{ invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: [blockId], proof, rev: 3 }
 				).then(r => { applied = true; return r; });
 
-				// Drive apply forward (dedup → cert verify → compute) until it reaches and blocks on the latch.
-				await waitFor(() => reachedWrite, { description: 'apply reached and blocked on the held commit latch' });
-				// A couple more event-loop turns confirm it is parked inside acquire (latch held) and has
-				// NOT written. Residual micro-yields: proving apply does NOT proceed is a negative assertion
-				// a condition poll cannot express, so give the (buggy) unlatched path turns to run first.
+				// Apply runs its whole prefix (dedup → cert verify → compute) freely, then parks acquiring
+				// the held latch. Proving it does NOT proceed is a negative assertion a condition poll cannot
+				// express, so give that prefix real event-loop time and then assert nothing landed.
 				await delay(0);
-				await delay(0);
+				await delay(25);
 				expect(applied).to.equal(false);
 				expect((await createBlockStorage(blockId).getLatest())!.rev).to.equal(2);
 
@@ -776,52 +751,9 @@ describe('applyInvalidation', () => {
 			}
 		});
 
-		it('WITHOUT the latch, a concurrent commit clobbers the invalidation (documents the lost update)', async () => {
-			const raw = new GatedRawStorage();
-			const blockId = 'lat-bug';
-			const { repo, createBlockStorage } = await seedBlock(raw, blockId, [
-				{ actionId: 'a1', value: 'original', rev: 1 },
-				{ actionId: 'a2', value: 'tinv', rev: 2 },
-				{ actionId: 'a3', value: 'r3', rev: 3 },
-				{ actionId: 'a4', value: 'r4', rev: 4 },
-			]);
-			const log = await Log.create<unknown>(new MemLogStore());
-			const proof = await challengerWinsProof('d1', 'msg-1', { invalidatedActionId: 'a2', blockIds: [blockId] });
+		// (No "WITHOUT the latch, a concurrent commit clobbers the invalidation" repro any more: every compensating write demands a BlockWriteLatch token, so the unlatched write that lost update documented is unrepresentable.)
 
-			// Park the commit right before it persists latest=5 (internalCommit.setLatest) so the unlatched
-			// invalidation can advance latest to 6 in the window between commit's staleness check and write.
-			let signalParked: () => void = () => { };
-			const parked = new Promise<void>(res => { signalParked = res; });
-			let releaseCommit: () => void = () => { };
-			const commitGate = new Promise<void>(res => { releaseCommit = res; });
-			let gatedOnce = false;
-			raw.beforeSaveMetadata = async (_id, meta) => {
-				if (!gatedOnce && meta.latest?.rev === 5) {
-					gatedOnce = true;
-					signalParked();
-					await commitGate;
-				}
-			};
-
-			await repo.pend({ actionId: 'c5', transforms: updateOp(blockId, 'c5'), rev: 5 } as Parameters<StorageRepo['pend']>[0]);
-			const commitP = repo.commit({ actionId: 'c5', rev: 5, blockIds: [blockId], tailId: 'log' });
-			await parked; // commit holds StorageRepo.commit:<id> and is paused just before writing latest=5
-
-			// Unlatched invalidation (no withBlockCommitLatch) advances latest to 6 under a DISJOINT latch.
-			const invResult = await applyInvalidation({ log, createBlockStorage }, {
-				invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: [blockId], proof, rev: 6,
-			});
-			expect(invResult.applied).to.equal(true);
-			expect((await createBlockStorage(blockId).getLatest())!.rev).to.equal(6);
-
-			releaseCommit(); // commit resumes; setLatest(5) overwrites the invalidation's 6
-			await commitP;
-
-			// The bug: latest regressed 6 → 5 (non-monotonic), losing the invalidation's advance.
-			expect((await createBlockStorage(blockId).getLatest())!.rev).to.equal(5);
-		});
-
-		it('WITH the latch, the invalidation and commit serialize and latest stays monotonic', async () => {
+		it('a commit queues behind the invalidation on the one write latch and latest stays monotonic', async () => {
 			const raw = new MemoryRawStorage();
 			const blockId = 'lat-fix';
 			const { repo, createBlockStorage } = await seedBlock(raw, blockId, [
@@ -833,43 +765,45 @@ describe('applyInvalidation', () => {
 			const log = await Log.create<unknown>(new MemLogStore());
 			const proof = await challengerWinsProof('d1', 'msg-1', { invalidatedActionId: 'a2', blockIds: [blockId] });
 
-			// Gated runner: acquire the REAL commit latch, write rev 6, then hold the latch open so a commit
-			// started next must queue behind it — forcing invalidation-first order and proving exclusion.
-			let signalHeld: () => void = () => { };
-			const held = new Promise<void>(res => { signalHeld = res; });
-			let releaseHold: () => void = () => { };
-			const holdGate = new Promise<void>(res => { releaseHold = res; });
-			const gatedLatch = async <T,>(id: string, fn: () => Promise<T>): Promise<T> => {
-				const release = await Latches.acquire(commitLatchKey(id));
-				try {
-					const result = await fn(); // writes rev 6 under the latch
-					signalHeld();
-					await holdGate;            // keep the latch held while the commit tries to acquire it
-					return result;
-				} finally {
-					release();
-				}
-			};
-
-			const invP = applyInvalidation({ log, createBlockStorage, withBlockCommitLatch: gatedLatch }, {
+			// The invalidation writes rev 6 under the block write latch it takes itself.
+			const invResult = await applyInvalidation({ log, createBlockStorage }, {
 				invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: [blockId], proof, rev: 6,
 			});
-			await held; // invalidation has written rev 6 and is holding StorageRepo.commit:<id>
-			expect((await createBlockStorage(blockId).getLatest())!.rev).to.equal(6);
-
-			// Start the commit; it must block acquiring the same latch (cannot run its staleness check yet).
-			await repo.pend({ actionId: 'c5', transforms: updateOp(blockId, 'c5'), rev: 5 } as Parameters<StorageRepo['pend']>[0]);
-			const commitP = repo.commit({ actionId: 'c5', rev: 5, blockIds: [blockId], tailId: 'log' });
-
-			releaseHold(); // invalidation releases the latch → commit acquires it next
-			const invResult = await invP;
-			const commitResult = await commitP;
-
 			expect(invResult.applied).to.equal(true);
-			// The commit now sees latest=6 ≥ its rev 5 (different action) → rejected as stale, never clobbers.
-			expect(commitResult.success).to.equal(false);
-			// latest stayed monotonic at 6 — the invalidation's advance survived.
 			expect((await createBlockStorage(blockId).getLatest())!.rev).to.equal(6);
+
+			// Pend BEFORE holding the key: pend writes the pending record under the same latch.
+			await repo.pend({ actionId: 'c5', transforms: updateOp(blockId, 'c5'), rev: 5 } as Parameters<StorageRepo['pend']>[0]);
+
+			// Hold the very key the invalidation just used. A commit of the older rev 5 must now queue
+			// behind it — it cannot even run its staleness check, let alone write latest.
+			const release = await Latches.acquire(blockWriteLatchKey(blockId));
+			let released = false;
+			const releaseOnce = () => { if (!released) { released = true; release(); } };
+
+			try {
+				let commitDone = false;
+				const commitP = repo.commit({ actionId: 'c5', rev: 5, blockIds: [blockId], tailId: 'log' })
+					.then(r => { commitDone = true; return r; });
+
+				// Same negative assertion as above: give the commit real event-loop time, then prove it is
+				// parked and that latest is untouched at the invalidation's 6.
+				await delay(0);
+				await delay(25);
+				expect(commitDone).to.equal(false);
+				expect((await createBlockStorage(blockId).getLatest())!.rev).to.equal(6);
+
+				releaseOnce(); // the commit acquires the latch next
+				const commitResult = await commitP;
+
+				// Serialized after the invalidation, the commit sees latest=6 ≥ its rev 5 (different action)
+				// → rejected as stale, never clobbers.
+				expect(commitResult.success).to.equal(false);
+				// latest stayed monotonic at 6 — the invalidation's advance survived.
+				expect((await createBlockStorage(blockId).getLatest())!.rev).to.equal(6);
+			} finally {
+				releaseOnce();
+			}
 		});
 	});
 });
@@ -884,8 +818,8 @@ describe('BlockStorage.saveDeletion (tombstone write path)', () => {
 		]);
 		const storage = createBlockStorage('B');
 
-		// Tombstone the block at rev 3.
-		const latest = await storage.saveDeletion({ rev: 3, actionId: 'tomb' });
+		// Tombstone the block at rev 3 (writes demand the block's write-latch token).
+		const latest = await withBlockWriteLatch('B', latch => storage.saveDeletion({ rev: 3, actionId: 'tomb' }, latch));
 		expect(latest).to.deep.equal({ rev: 3, actionId: 'tomb' });
 
 		// getBlock() (latest) and getBlock(tombstoneRev) both read as absent — no throw, no placeholder.
@@ -897,8 +831,8 @@ describe('BlockStorage.saveDeletion (tombstone write path)', () => {
 		expect(((await storage.getBlock(2))!.block as ValueBlock).value).to.equal('updated');
 
 		// Idempotent for a fixed (rev, actionId); monotonic — a stale lower-rev tombstone is a no-op.
-		expect(await storage.saveDeletion({ rev: 3, actionId: 'tomb' })).to.deep.equal({ rev: 3, actionId: 'tomb' });
-		expect(await storage.saveDeletion({ rev: 2, actionId: 'stale' })).to.deep.equal({ rev: 3, actionId: 'tomb' });
+		expect(await withBlockWriteLatch('B', latch => storage.saveDeletion({ rev: 3, actionId: 'tomb' }, latch))).to.deep.equal({ rev: 3, actionId: 'tomb' });
+		expect(await withBlockWriteLatch('B', latch => storage.saveDeletion({ rev: 2, actionId: 'stale' }, latch))).to.deep.equal({ rev: 3, actionId: 'tomb' });
 		expect((await storage.getLatest())!.rev).to.equal(3);
 	});
 });

@@ -892,7 +892,7 @@ export class CoordinatorRepo implements IRepo {
 		}
 		try {
 			// Bounded: a stalled cohort peer must not hold up the caller's read. Persisting happens
-			// inside the callback via `saveReplicatedBlock`, which takes the per-block commit latch —
+			// inside the callback via `saveReplicatedBlock`, which takes the block write latch —
 			// safe to call from here because the read path holds no latch of its own (`StorageRepo.get`
 			// acquires and releases it around the promotion above, and nothing wraps this method).
 			// NOTE: `get` walks its block ids sequentially, so the bound is per block, not per call — a
@@ -920,7 +920,8 @@ export class CoordinatorRepo implements IRepo {
 	 * the repair. Returns the local revision afterwards.
 	 *
 	 * A pending-only block (metadata seeded by `savePendingTransaction`, no committed revision) asked
-	 * for a forward revision no promotion can reach used to throw out of `BlockStorage.ensureRevision`.
+	 * for a forward revision no promotion can reach used to throw out of the restore step (now
+	 * `BlockStorage.restoreRevision`, driven by `StorageRepo.get`'s healing helper).
 	 * It no longer does: "no committed base here" is an absence, so that read comes back as a plain
 	 * unflagged `{ state: {} }` and this method simply returns `undefined` — acquisition then supplies
 	 * the revision. The `unavailable` arm below still fires for the shapes that ARE a guess (a `latest`

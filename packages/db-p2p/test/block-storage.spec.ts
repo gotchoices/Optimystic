@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { StorageRepo } from '../src/storage/storage-repo.js';
-import { BlockStorage } from '../src/storage/block-storage.js';
+import { BlockStorage, RevisionNotCoveredError } from '../src/storage/block-storage.js';
+import { withBlockWriteLatch, type BlockWriteLatch } from '../src/storage/block-latch.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from '../src/storage/struct.js';
 import type { BlockCommitProof } from '../src/cluster/commit-proof.js';
@@ -25,7 +26,7 @@ import { delay } from '@optimystic/db-core/test';
  *
  * Regression guard for two opposite bugs:
  *   - over-claim: `savePendingTransaction` seeded open-ended `[[0]]`, claiming coverage of
- *     every revision and short-circuiting the `ensureRevision` restore path.
+ *     every revision and short-circuiting the `restoreRevision` restore path.
  *   - under-claim: each commit claimed only its own point `[rev, rev+1)`, so `inRanges` went
  *     false for any global rev between/above a block's modified revs — a normal read of a
  *     block not touched by the latest commit then hit restore and threw.
@@ -65,7 +66,8 @@ describe('BlockStorage meta.ranges honesty', () => {
 		const blockId = 'block-pend' as BlockId;
 		const storage = new BlockStorage(blockId, raw);
 
-		await storage.savePendingTransaction('a1' as ActionId, { insert: makeBlock('block-pend') });
+		await withBlockWriteLatch(blockId, l =>
+			storage.savePendingTransaction('a1' as ActionId, { insert: makeBlock('block-pend') }, l));
 
 		const meta = await raw.getMetadata(blockId);
 		expect(meta, 'metadata seeded').to.not.equal(undefined);
@@ -73,7 +75,12 @@ describe('BlockStorage meta.ranges honesty', () => {
 		expect(meta!.latest, 'no committed revision yet').to.equal(undefined);
 	});
 
-	it('getBlock for an absent revision fires restoreCallback (restore not short-circuited)', async () => {
+	it('a healing read for an absent revision fires restoreCallback (restore not short-circuited)', async () => {
+		// `getBlock` is LOCAL-ONLY now: it reports the coverage gap and `StorageRepo.get`'s healing
+		// helper is what turns that into a latched `restoreRevision` and a re-read. The claim under
+		// test is unchanged — a pending-only block claims NO coverage, so the read really does reach
+		// the peer instead of being short-circuited by an over-claimed range — but it is asserted
+		// where the behaviour now lives, through the public read.
 		const blockId = 'block-restore' as BlockId;
 		const restoreCalls: { blockId: BlockId; rev?: number }[] = [];
 
@@ -96,39 +103,110 @@ describe('BlockStorage meta.ranges honesty', () => {
 
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
 		// Seed pending-only metadata (ranges: []), but never commit rev 1 locally.
-		await storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore') });
+		await withBlockWriteLatch(blockId, l =>
+			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore') }, l));
 
-		const result = await storage.getBlock(1);
+		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback));
+		const result = (await repo.get({ blockIds: [blockId], context: { rev: 1, committed: [] } }))[blockId];
 
 		expect(restoreCalls.length, 'restoreCallback invoked for the absent revision').to.equal(1);
 		expect(restoreCalls[0]!.rev).to.equal(1);
-		expect(result?.block.header.id).to.equal('block-restore');
+		expect(result?.block?.header.id).to.equal('block-restore');
+		expect(result?.unavailable, 'a healed read is an authoritative answer').to.equal(undefined);
 
 		// The restored range is now claimed.
 		const meta = await raw.getMetadata(blockId);
 		expect(meta!.ranges).to.deep.equal([[1, 2]]);
 	});
 
-	it('getBlock at a named rev on a pending-only block with NO restoreCallback reads absent, not a fault', async () => {
+	it('a write latch minted for one block is refused by another block\'s storage, writing nothing', async () => {
+		const raw = new MemoryRawStorage();
+		const a = 'block-token-a' as BlockId;
+		const b = 'block-token-b' as BlockId;
+		const storageB = new BlockStorage(b, raw);
+		await withBlockWriteLatch(a, async l => {
+			expect(l.blockId).to.equal(a);
+			let thrown: unknown;
+			try {
+				await storageB.savePendingTransaction('p' as ActionId, { insert: makeBlock('block-token-b') }, l);
+			} catch (err) {
+				thrown = err;
+			}
+			expect(thrown).to.be.instanceOf(Error);
+			expect((thrown as Error).message).to.match(/write latch was acquired for block block-token-a/);
+		});
+		expect(await raw.getMetadata(b), 'nothing was written under the wrong token').to.equal(undefined);
+	});
+
+	it('getBlock is local-only: absent, absent, or a coverage gap — never a fetch', async () => {
+		// The contract the healing helper is written against. `getBlock` answers only from local
+		// records: a block this node never saw is absent, a pending-only block with no rev named is
+		// absent, and a named rev outside `meta.ranges` is reported as a gap for the caller to heal.
+		// None of the three consults `restoreCallback` — the fetch moved to `restoreRevision`.
+		let restores = 0;
+		const restoreCallback: RestoreCallback = async () => { restores++; return undefined; };
+
+		const unseen = new BlockStorage('block-unseen' as BlockId, raw, restoreCallback);
+		expect(await unseen.getBlock(), 'a never-seen block reads absent').to.equal(undefined);
+		expect(await unseen.getBlock(1), 'a never-seen block reads absent at a named rev too').to.equal(undefined);
+
+		const blockId = 'block-local-only' as BlockId;
+		const storage = new BlockStorage(blockId, raw, restoreCallback);
+		await withBlockWriteLatch(blockId, l =>
+			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-local-only') }, l));
+		expect(await storage.getBlock(), 'pending-only with no rev named reads absent').to.equal(undefined);
+
+		let gap: unknown;
+		try {
+			await storage.getBlock(7);
+		} catch (err) {
+			gap = err;
+		}
+		expect(gap, 'an uncovered rev is REPORTED, not healed here').to.be.instanceOf(RevisionNotCoveredError);
+		expect((gap as RevisionNotCoveredError).rev, 'the gap names the rev to restore').to.equal(7);
+		expect((gap as RevisionNotCoveredError).blockId, 'and the block it is about').to.equal(blockId);
+
+		expect(restores, 'getBlock never consults the restore wire').to.equal(0);
+	});
+
+	it('a named rev on a pending-only block with NO restoreCallback reads absent, not a fault', async () => {
 		// A brand-new block between pend and commit holds a pending record and no committed
 		// revision. Asking for it at a named revision is what a writer reading back its own
 		// uncommitted insert does (ActionContext.rev is required). There is no committed base to
-		// reconstruct, so the honest answer is "absent" — it used to throw, and StorageRepo.get
-		// turned that throw into `unavailable: 'unmaterializable'`, telling the writer its own
-		// pending content was unreadable.
+		// reconstruct, so the honest answer through the public read is "absent" — it used to be a
+		// fault, and StorageRepo.get turned that into `unavailable: 'unmaterializable'`, telling the
+		// writer its own pending content was unreadable.
 		const blockId = 'block-no-restore' as BlockId;
 		const storage = new BlockStorage(blockId, raw);	// no restoreCallback wired
-		await storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-no-restore') });
+		await withBlockWriteLatch(blockId, l =>
+			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-no-restore') }, l));
 
-		expect(await storage.getBlock(1), 'named rev with no committed base ⇒ absent').to.equal(undefined);
+		// The local-only contract underneath: the named rev is outside the (empty) ranges, so the
+		// direct read reports the gap rather than answering it.
+		let direct: unknown;
+		try {
+			await storage.getBlock(1);
+		} catch (err) {
+			direct = err;
+		}
+		expect(direct, 'the direct read reports a coverage gap').to.be.instanceOf(RevisionNotCoveredError);
+		expect((direct as RevisionNotCoveredError).rev).to.equal(1);
+
+		// Through the healing read, the restore cannot even be attempted (no callback wired), and a
+		// failed restore on a pending-only block reads as ABSENT rather than as a fault.
+		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const got = (await repo.get({ blockIds: [blockId], context: { rev: 1, committed: [] } }))[blockId];
+		expect(got!.block, 'named rev with no committed base ⇒ absent').to.equal(undefined);
+		expect(got!.unavailable, 'absent, not unavailable').to.equal(undefined);
+
 		expect(await storage.getBlock(), 'contextless read unchanged').to.equal(undefined);
 		expect((await raw.getMetadata(blockId))!.latest, 'still no committed revision').to.equal(undefined);
 	});
 
-	it('getBlock at a named rev on a pending-only block whose restore comes back empty reads absent', async () => {
+	it('a named rev on a pending-only block whose restore comes back empty reads absent', async () => {
 		// The restore IS attempted (see the 'restore not short-circuited' test above) — it simply
-		// cannot supply the revision. That failure means only "no committed base here", so it is
-		// swallowed into an absent answer rather than propagating as a fault.
+		// cannot supply the revision. That failure means only "no committed base here", so
+		// StorageRepo.get's healing helper turns it into an absent answer rather than a fault.
 		const blockId = 'block-restore-empty' as BlockId;
 		const restoreCalls: number[] = [];
 		const restoreCallback: RestoreCallback = async (_id, rev) => {
@@ -137,9 +215,13 @@ describe('BlockStorage meta.ranges honesty', () => {
 		};
 
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
-		await storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore-empty') });
+		await withBlockWriteLatch(blockId, l =>
+			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore-empty') }, l));
 
-		expect(await storage.getBlock(1), 'restore supplied nothing ⇒ absent').to.equal(undefined);
+		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback));
+		const got = (await repo.get({ blockIds: [blockId], context: { rev: 1, committed: [] } }))[blockId];
+		expect(got!.block, 'restore supplied nothing ⇒ absent').to.equal(undefined);
+		expect(got!.unavailable, 'and authoritatively absent, not a fault').to.equal(undefined);
 		expect(restoreCalls, 'the restore was still attempted').to.deep.equal([1]);
 	});
 
@@ -171,11 +253,12 @@ describe('BlockStorage meta.ranges honesty', () => {
 			.to.contain('Failed to find materialized block');
 	});
 
-	it('a pending-only block whose restore supplies revisions but no materialization still throws', async () => {
-		// The narrow seam inside the new pending-only arm: only `ensureRevision`'s failure means
-		// "no committed base here". Once restore SUCCEEDS, revision records exist — and if nothing
-		// under them is materialized, that is genuine corruption and materializeBlock's throw must
-		// propagate rather than being flattened into an absent answer.
+	it('a pending-only block whose restore supplies revisions but no materialization is a fault', async () => {
+		// The narrow seam inside the healing helper's pending-only arm: only a FAILED
+		// `restoreRevision` means "no committed base here". Once the restore SUCCEEDS, revision
+		// records exist — and if nothing under them is materialized, that is genuine corruption, so
+		// the re-read's throw must propagate as `unavailable` rather than being flattened into an
+		// absent answer.
 		const blockId = 'block-restore-hollow' as BlockId;
 		const restoreCallback: RestoreCallback = async (id) => ({
 			blockId: id,
@@ -187,16 +270,19 @@ describe('BlockStorage meta.ranges honesty', () => {
 		});
 
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
-		await storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore-hollow') });
+		await withBlockWriteLatch(blockId, l =>
+			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore-hollow') }, l));
 
-		let error: unknown;
-		try {
-			await storage.getBlock(1);
-		} catch (err) {
-			error = err;
-		}
-		expect((error as Error)?.message, 'restored records with no materialization is a fault')
-			.to.contain('Failed to find materialized block');
+		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback));
+		const got = (await repo.get({ blockIds: [blockId], context: { rev: 1, committed: [] } }))[blockId];
+		expect(got!.block, 'nothing served').to.equal(undefined);
+		expect(got!.unavailable, 'restored records with no materialization is a fault, not an absence')
+			.to.equal('unmaterializable');
+
+		// The restore itself landed its coverage — the fault is strictly downstream of it, which is
+		// what separates this case from the empty-restore one above.
+		expect((await raw.getMetadata(blockId))!.ranges, 'the successful restore recorded its span')
+			.to.deep.equal([[1, 2]]);
 	});
 
 	it('commit opens coverage from the earliest committed rev', async () => {
@@ -337,9 +423,18 @@ describe('BlockStorage meta.ranges honesty', () => {
 		const meta = await raw.getMetadata(blockId);
 		expect(meta!.ranges, 'span opens at the earliest committed rev (5), not below').to.deep.equal([[5]]);
 
-		// Reading rev 4 (below E=5) must miss inRanges → restore fires.
+		// Reading rev 4 (below E=5) must miss inRanges → the read reports the gap, and the restore
+		// a healing caller then runs fetches exactly that rev.
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
-		await storage.getBlock(4);
+		let gap: unknown;
+		try {
+			await storage.getBlock(4);
+		} catch (err) {
+			gap = err;
+		}
+		expect(gap, 'the sub-E read is a coverage gap').to.be.instanceOf(RevisionNotCoveredError);
+		expect((gap as RevisionNotCoveredError).rev).to.equal(4);
+		await withBlockWriteLatch(blockId, l => storage.restoreRevision(4, l));
 		expect(restoreCalls, 'restore invoked for the genuine sub-E gap').to.deep.equal([4]);
 	});
 
@@ -347,7 +442,8 @@ describe('BlockStorage meta.ranges honesty', () => {
 		const blockId = 'block-replica-fresh' as BlockId;
 		const storage = new BlockStorage(blockId, raw);
 
-		const latest = await storage.saveReplica(makeBlock('block-replica-fresh', { items: [] }), { rev: 1, actionId: 'r1' as ActionId });
+		const latest = await withBlockWriteLatch(blockId, l =>
+			storage.saveReplica(makeBlock('block-replica-fresh', { items: [] }), { rev: 1, actionId: 'r1' as ActionId }, undefined, l));
 		expect(latest.rev).to.equal(1);
 		expect(latest.actionId).to.equal('r1');
 
@@ -362,8 +458,11 @@ describe('BlockStorage meta.ranges honesty', () => {
 		const storage = new BlockStorage(blockId, raw);
 		const block = makeBlock('block-replica-idem', { items: ['x'] });
 
-		const first = await storage.saveReplica(block);
-		const second = await storage.saveReplica(block);
+		const [first, second] = await withBlockWriteLatch(blockId, async (l) => {
+			const a = await storage.saveReplica(block, undefined, undefined, l);
+			const b = await storage.saveReplica(block, undefined, undefined, l);
+			return [a, b] as const;
+		});
 
 		// Re-pushing the same block resolves to the same (rev, actionId) — never a fresh id per retry.
 		expect(first.rev).to.equal(1);
@@ -384,11 +483,13 @@ describe('BlockStorage meta.ranges honesty', () => {
 		const storage = new BlockStorage(blockId, raw);
 
 		// Pre-seed latest at rev 5.
-		await storage.saveReplica(makeBlock('block-guard-replica', { items: [] }), { rev: 5, actionId: 'r5' as ActionId });
+		await withBlockWriteLatch(blockId, l =>
+			storage.saveReplica(makeBlock('block-guard-replica', { items: [] }), { rev: 5, actionId: 'r5' as ActionId }, undefined, l));
 		const before = await raw.getMetadata(blockId);
 
 		// A stale replica at rev 3: equal-or-newer already held ⇒ return held latest, no rewrite.
-		const result = await storage.saveReplica(makeBlock('block-guard-replica', { items: ['stale'] }), { rev: 3, actionId: 'r3' as ActionId });
+		const result = await withBlockWriteLatch(blockId, l =>
+			storage.saveReplica(makeBlock('block-guard-replica', { items: ['stale'] }), { rev: 3, actionId: 'r3' as ActionId }, undefined, l));
 		expect(result.rev, 'held rev-5 latest returned, no downgrade').to.equal(5);
 		expect(result.actionId).to.equal('r5');
 
@@ -401,11 +502,13 @@ describe('BlockStorage meta.ranges honesty', () => {
 		const storage = new BlockStorage(blockId, raw);
 
 		// Pre-seed latest at rev 5.
-		await storage.saveReplica(makeBlock('block-guard-deletion', { items: [] }), { rev: 5, actionId: 'r5' as ActionId });
+		await withBlockWriteLatch(blockId, l =>
+			storage.saveReplica(makeBlock('block-guard-deletion', { items: [] }), { rev: 5, actionId: 'r5' as ActionId }, undefined, l));
 		const before = await raw.getMetadata(blockId);
 
 		// A stale deletion at rev 3: same guard as replica ⇒ return held latest, no rewrite.
-		const result = await storage.saveDeletion({ rev: 3, actionId: 'd3' as ActionId });
+		const result = await withBlockWriteLatch(blockId, l =>
+			storage.saveDeletion({ rev: 3, actionId: 'd3' as ActionId }, l));
 		expect(result.rev, 'held rev-5 latest returned, no downgrade').to.equal(5);
 		expect(result.actionId).to.equal('r5');
 
@@ -418,8 +521,10 @@ describe('BlockStorage meta.ranges honesty', () => {
 		const storage = new BlockStorage(blockId, raw);
 
 		// A block present at rev 1, then a forward tombstone at rev 2.
-		await storage.saveReplica(makeBlock('block-tombstone', { items: ['live'] }), { rev: 1, actionId: 'r1' as ActionId });
-		const latest = await storage.saveDeletion({ rev: 2, actionId: 'd2' as ActionId });
+		const latest = await withBlockWriteLatch(blockId, async (l) => {
+			await storage.saveReplica(makeBlock('block-tombstone', { items: ['live'] }), { rev: 1, actionId: 'r1' as ActionId }, undefined, l);
+			return await storage.saveDeletion({ rev: 2, actionId: 'd2' as ActionId }, l);
+		});
 		expect(latest.rev).to.equal(2);
 
 		// getBlock() at the tombstone rev reverse-applies { delete: true } → absent block.
@@ -431,13 +536,17 @@ describe('BlockStorage meta.ranges honesty', () => {
 		expect(atRev1?.block.header.id, 'rev 1 still serves the live block').to.equal('block-tombstone');
 	});
 
-	it('saveReplica and saveDeletion are mutually exclusive on one block (shared latch)', async () => {
-		// A non-shared (per-method) latch would let the two read-modify-write critical sections
-		// interleave, risking a `latest` downgrade. Each save reads metadata exactly once while
-		// holding the latch, so under a SHARED latch no two getMetadata reads are ever in flight at
-		// once. The probe widens the read window and flags any concurrent entry. The counter is
-		// self-balanced within getMetadata, so the guard-skip path (which never calls saveMetadata)
-		// cannot leak it.
+	it('two write-latch scopes on one block never overlap', async () => {
+		// "One block, one write lock." Writers no longer take a latch each — they are handed a token
+		// by the ONE scope their caller opened, so mutual exclusion is a property of the scope, not
+		// of any pair of methods. What must hold is that a second scope on the same block cannot
+		// enter while the first still holds it, however long the first takes: that window is exactly
+		// where a read-modify-write of the metadata blob would be silently undone.
+		//
+		// The probe from the per-method-latch era is kept as a second, independent witness: it
+		// widens every metadata read and flags any concurrent entry, so a leaked overlap shows up
+		// even if the ordering assertions happened to line up. The counter is self-balanced within
+		// getMetadata, so the monotonic guard-skip path (which never calls saveMetadata) cannot leak it.
 		class LatchProbeStorage extends MemoryRawStorage {
 			private inFlight = 0;
 			overlaps = 0;
@@ -445,9 +554,9 @@ describe('BlockStorage meta.ranges honesty', () => {
 				this.inFlight++;
 				if (this.inFlight > 1) this.overlaps++;
 				try {
-					// Real async gap: yields the event loop so a non-shared latch's second read overlaps.
+					// Real async gap: yields the event loop so an unserialized second read would overlap.
 					// NOTE: deliberate concurrency-window widener, NOT a settle wait — it manufactures the
-					// overlap that exposes an unshared latch; there is no observable state to condition-poll on.
+					// overlap that exposes a missing latch; there is no observable state to condition-poll on.
 					await delay(5);
 					return await super.getMetadata(id);
 				} finally {
@@ -460,15 +569,42 @@ describe('BlockStorage meta.ranges honesty', () => {
 		const blockId = 'block-shared-latch' as BlockId;
 		const storage = new BlockStorage(blockId, probe);
 
-		// Fire a replica at rev 2 and a deletion at rev 3 concurrently on the SAME block.
-		const [a, b] = await Promise.all([
-			storage.saveReplica(makeBlock('block-shared-latch', { items: [] }), { rev: 2, actionId: 'r2' as ActionId }),
-			storage.saveDeletion({ rev: 3, actionId: 'd3' as ActionId })
-		]) as [ActionRev, ActionRev];
+		const order: string[] = [];
+		let entered2 = false;
+		let release!: () => void;
+		const held = new Promise<void>(r => { release = r; });
+		let signalEntered1!: () => void;
+		const entered1 = new Promise<void>(r => { signalEntered1 = r; });
 
-		expect(probe.overlaps, 'critical sections never overlapped (latch is shared)').to.equal(0);
-		// Regardless of interleave, the monotonic guard converges latest to the higher rev (3).
-		expect(Math.max(a.rev, b.rev)).to.equal(3);
+		// Scope 1 enters and then PAUSES while still holding the latch.
+		const first = withBlockWriteLatch(blockId, async (l) => {
+			order.push('enter-1');
+			signalEntered1();
+			await held;
+			await storage.saveReplica(makeBlock('block-shared-latch', { items: [] }), { rev: 2, actionId: 'r2' as ActionId }, undefined, l);
+			order.push('exit-1');
+		});
+		await entered1;
+
+		// Scope 2 is requested on the SAME block while scope 1 is parked inside.
+		const second = withBlockWriteLatch(blockId, async (l) => {
+			order.push('enter-2');
+			entered2 = true;
+			await storage.saveDeletion({ rev: 3, actionId: 'd3' as ActionId }, l);
+			order.push('exit-2');
+		});
+		// NOTE: the only way to observe "did NOT enter" is to give it a real chance to; there is no
+		// state that flips on non-entry to condition-poll on.
+		await delay(10);
+		expect(entered2, 'the second scope must queue behind the first, not enter it').to.equal(false);
+
+		release();
+		await Promise.all([first, second]);
+
+		expect(order, 'the scopes ran strictly one after the other')
+			.to.deep.equal(['enter-1', 'exit-1', 'enter-2', 'exit-2']);
+		expect(probe.overlaps, 'no two metadata read-modify-writes were ever in flight at once').to.equal(0);
+
 		const meta = await probe.getMetadata(blockId);
 		expect(meta!.latest?.rev, 'final latest is the higher rev, no downgrade').to.equal(3);
 		expect(meta!.latest?.actionId).to.equal('d3');
@@ -490,11 +626,11 @@ describe('BlockStorage meta.ranges honesty', () => {
 			const block = makeBlock('block-invariant-p-replica', { items: [] });
 
 			// This node pended the action but diverged before committing it.
-			await storage.savePendingTransaction(actionId, { insert: block });
+			await withBlockWriteLatch(blockId, l => storage.savePendingTransaction(actionId, { insert: block }, l));
 			expect(await storage.getPendingTransaction(actionId), 'pended here').to.not.equal(undefined);
 
 			// The reconcile path supplies the committed revision for the SAME action.
-			await storage.saveReplica(block, { rev: 2, actionId });
+			await withBlockWriteLatch(blockId, l => storage.saveReplica(block, { rev: 2, actionId }, undefined, l));
 
 			expect(await storage.getLatest(), 'revision landed').to.deep.equal({ rev: 2, actionId });
 			expect(await storage.getPendingTransaction(actionId), 'pending twin removed').to.equal(undefined);
@@ -524,11 +660,13 @@ describe('BlockStorage meta.ranges honesty', () => {
 			const storage = new BlockStorage(blockId, raw);
 			const actionId = 'a-del' as ActionId;
 
-			await storage.saveReplica(makeBlock('block-invariant-p-deletion', { items: ['live'] }), { rev: 1, actionId: 'r1' as ActionId });
-			await storage.savePendingTransaction(actionId, { delete: true });
+			await withBlockWriteLatch(blockId, async (l) => {
+				await storage.saveReplica(makeBlock('block-invariant-p-deletion', { items: ['live'] }), { rev: 1, actionId: 'r1' as ActionId }, undefined, l);
+				await storage.savePendingTransaction(actionId, { delete: true }, l);
+			});
 			expect(await storage.getPendingTransaction(actionId), 'delete pended here').to.not.equal(undefined);
 
-			await storage.saveDeletion({ rev: 2, actionId });
+			await withBlockWriteLatch(blockId, l => storage.saveDeletion({ rev: 2, actionId }, l));
 
 			expect((await storage.getLatest())?.rev, 'tombstone landed').to.equal(2);
 			expect(await storage.getPendingTransaction(actionId), 'pending twin removed').to.equal(undefined);
@@ -541,8 +679,10 @@ describe('BlockStorage meta.ranges honesty', () => {
 			const blockId = 'block-invariant-p-scoped' as BlockId;
 			const storage = new BlockStorage(blockId, raw);
 
-			await storage.savePendingTransaction('a-inflight' as ActionId, { updates: [['items', 0, 0, ['x']]] });
-			await storage.saveReplica(makeBlock('block-invariant-p-scoped', { items: [] }), { rev: 2, actionId: 'a-land' as ActionId });
+			await withBlockWriteLatch(blockId, async (l) => {
+				await storage.savePendingTransaction('a-inflight' as ActionId, { updates: [['items', 0, 0, ['x']]] }, l);
+				await storage.saveReplica(makeBlock('block-invariant-p-scoped', { items: [] }), { rev: 2, actionId: 'a-land' as ActionId }, undefined, l);
+			});
 
 			expect((await storage.getLatest())?.rev, 'the replica landed').to.equal(2);
 			expect(await storage.getPendingTransaction('a-inflight' as ActionId),
@@ -557,12 +697,15 @@ describe('BlockStorage meta.ranges honesty', () => {
 			const storage = new BlockStorage(blockId, raw);
 			const actionId = 'a-inflight' as ActionId;
 
-			await storage.saveReplica(makeBlock('block-invariant-p-noop', { items: [] }), { rev: 5, actionId: 'r5' as ActionId });
-			await storage.savePendingTransaction(actionId, { updates: [['items', 0, 0, ['x']]] });
+			await withBlockWriteLatch(blockId, async (l) => {
+				await storage.saveReplica(makeBlock('block-invariant-p-noop', { items: [] }), { rev: 5, actionId: 'r5' as ActionId }, undefined, l);
+				await storage.savePendingTransaction(actionId, { updates: [['items', 0, 0, ['x']]] }, l);
+			});
 			const before = await raw.getMetadata(blockId);
 
 			// rev 3 <= held rev 5 ⇒ monotonic guard fires, nothing is written.
-			const result = await storage.saveReplica(makeBlock('block-invariant-p-noop', { items: ['stale'] }), { rev: 3, actionId });
+			const result = await withBlockWriteLatch(blockId, l =>
+				storage.saveReplica(makeBlock('block-invariant-p-noop', { items: ['stale'] }), { rev: 3, actionId }, undefined, l));
 			expect(result.rev, 'held latest returned').to.equal(5);
 
 			expect(await storage.getPendingTransaction(actionId), 'guarded call must not delete').to.not.equal(undefined);
@@ -578,17 +721,19 @@ describe('BlockStorage meta.ranges honesty', () => {
 		// Reproduce a Crash-D3 raw state: revision durable + action in committed log,
 		// but setLatest (and its range merge) was lost — latest undefined, ranges [].
 		const block = makeBlock('block-recover', { items: [] });
-		await storage.savePendingTransaction(actionId, { insert: block });
-		await storage.saveMaterializedBlock(actionId, block);
-		await storage.saveRevision(1, actionId);
-		await storage.promotePendingTransaction(actionId);
-		// NOTE: setLatest deliberately skipped — the lost write recover() exists to redo.
+		await withBlockWriteLatch(blockId, async (l) => {
+			await storage.savePendingTransaction(actionId, { insert: block }, l);
+			await storage.saveMaterializedBlock(actionId, block, l);
+			await storage.saveRevision(1, actionId, l);
+			await storage.promotePendingTransaction(actionId, l);
+			// NOTE: setLatest deliberately skipped — the lost write recover() exists to redo.
+		});
 
 		const before = await raw.getMetadata(blockId);
 		expect(before!.latest, 'latest lost pre-recovery').to.equal(undefined);
 		expect(before!.ranges, 'no coverage claimed pre-recovery').to.deep.equal([]);
 
-		const result = await storage.recover();
+		const result = await withBlockWriteLatch(blockId, l => storage.recover(l));
 		expect(result.reconciled).to.equal(true);
 		expect(result.latest?.rev).to.equal(1);
 
@@ -599,7 +744,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 });
 
 /**
- * Coverage for the restore TRUST BOUNDARY. `ensureRevision` fills a gap in local revision history
+ * Coverage for the restore TRUST BOUNDARY. `restoreRevision` fills a gap in local revision history
  * by asking a peer, over a wire that verifies nothing — `RestorationCoordinator.queryPeer` returns
  * the response's archive straight through — and `saveRestored` writes keyed by revision number and
  * by action id. So an archive naming a revision or action id this node already holds would
@@ -634,10 +779,15 @@ describe('BlockStorage restore archive vetting', () => {
 
 	const itemsOf = (block: IBlock) => (block as unknown as { items: unknown[] }).items;
 
-	const expectRestoreRefused = async (storage: BlockStorage, rev: number, why: string) => {
+	/**
+	 * The refusal now surfaces from `restoreRevision` (called under the block's write latch), not from
+	 * `getBlock` — which is local-only and would only report the coverage gap that PROMPTS the
+	 * restore. Same throw, same message, one layer down.
+	 */
+	const expectRestoreRefused = async (blockId: BlockId, storage: BlockStorage, rev: number, why: string) => {
 		let error: unknown;
 		try {
-			await storage.getBlock(rev);
+			await withBlockWriteLatch(blockId, l => storage.restoreRevision(rev, l));
 		} catch (err) {
 			error = err;
 		}
@@ -669,7 +819,7 @@ describe('BlockStorage restore archive vetting', () => {
 		const before = structuredClone((await raw.getMetadata(blockId))!);
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
 
-		await expectRestoreRefused(storage, 1, 'the wrong answer fails loudly, exactly as an absent one does');
+		await expectRestoreRefused(blockId, storage, 1, 'the wrong answer fails loudly, exactly as an absent one does');
 		expect(restores, 'the fetch WAS made — the refusal is on the answer, not on asking').to.equal(1);
 		expect(await raw.getMetadata(blockId), 'metadata untouched by the refusal').to.deep.equal(before);
 
@@ -701,6 +851,7 @@ describe('BlockStorage restore archive vetting', () => {
 		};
 
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
+		await withBlockWriteLatch(blockId, l => storage.restoreRevision(9, l));
 		const got = await storage.getBlock(9);
 		expect(itemsOf(got!.block), "rev 9 served from the block's own rev 2").to.deep.equal(['rev2']);
 		expect(got!.actionRev, 'served as the revision it actually is').to.deep.equal({ rev: 2, actionId: 'low2' });
@@ -709,7 +860,11 @@ describe('BlockStorage restore archive vetting', () => {
 		const meta = await raw.getMetadata(blockId);
 		expect(meta!.ranges, 'coverage spans the archive floor up to the pin').to.deep.equal([[2, 10], [20]]);
 
+		// Convergence, stated against the two halves the local-only split created: a later read at the
+		// same pin is served locally (no coverage gap to report, so no healing caller is woken), and a
+		// restore attempted anyway short-circuits on the recorded coverage without re-asking a peer.
 		await storage.getBlock(9);
+		await withBlockWriteLatch(blockId, l => storage.restoreRevision(9, l));
 		expect(pins, 'the restore converged: it ran once, not once per read').to.deep.equal([9]);
 	});
 
@@ -727,6 +882,7 @@ describe('BlockStorage restore archive vetting', () => {
 		});
 
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
+		await withBlockWriteLatch(blockId, l => storage.restoreRevision(4, l));
 		expect(itemsOf((await storage.getBlock(4))!.block)).to.deep.equal(['rev4']);
 		expect((await raw.getMetadata(blockId))!.ranges, 'restored span merged alongside the local one')
 			.to.deep.equal([[4, 5], [10]]);
@@ -758,13 +914,24 @@ describe('BlockStorage restore archive vetting', () => {
 		};
 
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
+		await withBlockWriteLatch(blockId, l => storage.restoreRevision(4, l));
 		expect(itemsOf((await storage.getBlock(4))!.block), 'the pinned rev is served').to.deep.equal(['rev4']);
 		expect((await raw.getMetadata(blockId))!.ranges, 'coverage stops at the pin, not at the archive tip')
 			.to.deep.equal([[4, 5], [20]]);
 		expect(await raw.getRevision(blockId, 30), 'the overshooting entry is still WRITTEN, just not claimed')
 			.to.equal('pad30');
 
-		// The un-claimed span still costs a fetch rather than being answered locally on the peer's word.
+		// The un-claimed span still costs a fetch rather than being answered locally on the peer's word:
+		// a read at rev 10 reports a coverage gap (not served from the padding), and the restore that
+		// heals it goes back to the peer instead of short-circuiting.
+		let padded: unknown;
+		try {
+			await storage.getBlock(10);
+		} catch (err) {
+			padded = err;
+		}
+		expect(padded, 'the padded span is NOT claimed as coverage').to.be.instanceOf(RevisionNotCoveredError);
+		await withBlockWriteLatch(blockId, l => storage.restoreRevision(10, l));
 		expect(itemsOf((await storage.getBlock(10))!.block)).to.deep.equal(['rev4']);
 		expect(pins, 'a read inside the padded span re-asks instead of trusting the padding').to.deep.equal([4, 10]);
 		expect((await raw.getMetadata(blockId))!.ranges, 'and converges on the span actually asked about')
@@ -789,7 +956,7 @@ describe('BlockStorage restore archive vetting', () => {
 			range: [4, 5]
 		}));
 
-		await expectRestoreRefused(storage, 4, 'a revision key with two spellings is not a revision key');
+		await expectRestoreRefused(blockId, storage, 4, 'a revision key with two spellings is not a revision key');
 		expect(await raw.getRevision(blockId, 4), 'neither entry landed').to.equal(undefined);
 	});
 
@@ -813,7 +980,7 @@ describe('BlockStorage restore archive vetting', () => {
 			[[4], 'an open-ended range, which would claim infinite coverage on one unverified say-so']
 		];
 		for (const [range, why] of cases) {
-			await expectRestoreRefused(new BlockStorage(blockId, raw, servingRange(range)), 4, why);
+			await expectRestoreRefused(blockId, new BlockStorage(blockId, raw, servingRange(range)), 4, why);
 		}
 
 		expect(await raw.getMetadata(blockId), 'nothing written by any of the refusals').to.deep.equal(before);
@@ -857,7 +1024,7 @@ describe('BlockStorage restore archive vetting', () => {
 
 		for (const [archive, why] of cases) {
 			const storage = new BlockStorage(blockId, raw, async () => archive);
-			await expectRestoreRefused(storage, 4, why);
+			await expectRestoreRefused(blockId, storage, 4, why);
 		}
 
 		expect(await raw.getMetadata(blockId), 'nothing written by any of the refusals').to.deep.equal(before);
@@ -879,7 +1046,9 @@ describe('BlockStorage restore archive vetting', () => {
 				},
 				range: [5, 6]
 			});
-			expect(itemsOf((await new BlockStorage(blockId, raw, first).getBlock(5))!.block)).to.deep.equal(['rev5']);
+			const seeder = new BlockStorage(blockId, raw, first);
+			await withBlockWriteLatch(blockId, l => seeder.restoreRevision(5, l));
+			expect(itemsOf((await seeder.getBlock(5))!.block)).to.deep.equal(['rev5']);
 		};
 
 		/** An archive answering a rev-3 pin that ALSO re-states rev 5, with `rev5Entry`'s content. */
@@ -899,7 +1068,7 @@ describe('BlockStorage restore archive vetting', () => {
 			const storage = new BlockStorage(blockId, raw, alsoRestating5({
 				action: { actionId: 'imposter' as ActionId, rev: 5, transform: { insert: low3 } }, block: low3
 			}));
-			await expectRestoreRefused(storage, 3, 'rev 5 is already held under a different action id');
+			await expectRestoreRefused(blockId, storage, 3, 'rev 5 is already held under a different action id');
 
 			// All-or-nothing: the entry this node LACKED (rev 3) is not landed either.
 			expect(await raw.getMetadata(blockId), 'metadata untouched').to.deep.equal(before);
@@ -917,7 +1086,7 @@ describe('BlockStorage restore archive vetting', () => {
 			const storage = new BlockStorage(blockId, raw, alsoRestating5({
 				action: { actionId: 'low5' as ActionId, rev: 5, transform: { insert: rewritten } }, block: rewritten
 			}));
-			await expectRestoreRefused(storage, 3, 'action low5 is already held with different content');
+			await expectRestoreRefused(blockId, storage, 3, 'action low5 is already held with different content');
 
 			expect(await raw.getMetadata(blockId), 'metadata untouched').to.deep.equal(before);
 			expect(await raw.getRevision(blockId, 3), 'nothing from the archive landed').to.equal(undefined);
@@ -935,6 +1104,7 @@ describe('BlockStorage restore archive vetting', () => {
 				action: { actionId: 'low5' as ActionId, rev: 5, transform: { insert: makeBlock('restore-collide', { items: ['rev5'] }) } },
 				block: makeBlock('restore-collide', { items: ['rev5'] })
 			}));
+			await withBlockWriteLatch(blockId, l => storage.restoreRevision(3, l));
 			expect(itemsOf((await storage.getBlock(3))!.block), 'rev 3 restored').to.deep.equal(['rev3']);
 
 			// [3, 4) — the floor up to the PIN, not the archive's declared [3, 6). Rev 5's entry was
@@ -1083,8 +1253,10 @@ describe('BlockStorage checkpoint materialization sweep', () => {
 		expect((await repo.commit({ actionId: 'u10' as ActionId, blockIds: [blockId], tailId: blockId, rev: 10 })).success).to.equal(true);
 		for (let r = 11; r <= 10 + CK; r++) await updateRev(repo, blockId, r); // through 14
 
-		// Restore the lower range by reading rev 2 (below E=10 ⇒ ensureRevision restores [2,3]).
+		// Restore the lower range: rev 2 is below E=10, so it is a genuine gap ⇒ restoreRevision
+		// brings in [2,3] and the read then serves it locally.
 		const storage = new BlockStorage(blockId, raw, restoreCallback, CK);
+		await withBlockWriteLatch(blockId, l => storage.restoreRevision(2, l));
 		expect((await storage.getBlock(2))!.block.header.id).to.equal('ck-multirange');
 		const meta = await raw.getMetadata(blockId);
 		expect(meta!.ranges, 'two disjoint ranges after restore').to.deep.equal([[2, 3], [10]]);
@@ -1124,9 +1296,9 @@ describe('BlockStorage checkpoint materialization sweep', () => {
 		// full reconstructibility — and that a later commit's prune still functions.
 		let suppressPrune = true;
 		class SkipPruneStorage extends BlockStorage {
-			override async pruneSupersededMaterialization(prior: ActionRev): Promise<void> {
+			override async pruneSupersededMaterialization(prior: ActionRev, latch: BlockWriteLatch): Promise<void> {
 				if (suppressPrune) return; // simulate crash before the prune ran
-				return super.pruneSupersededMaterialization(prior);
+				return super.pruneSupersededMaterialization(prior, latch);
 			}
 		}
 		const blockId = 'ck-crash' as BlockId;
@@ -1155,13 +1327,17 @@ describe('BlockStorage checkpoint materialization sweep', () => {
 		expect((await scanStores(blockId, 6)).materialized).to.deep.equal([1, 2, 3, 4, 6]);
 	});
 
-	it('restore-then-replay read does NOT re-cache a swept rev (retention uses fresh metadata, not the pre-restore snapshot)', async () => {
-		// Regression: getBlock captures `meta` BEFORE ensureRevision. When a read restores its range in
-		// the same call, that snapshot's `ranges` is stale. If materializeBlock's re-cache gate trusted
-		// the stale snapshot, rangeFloorOf would fall back to treating the target as its own floor and
-		// wrongly RETAIN it — re-caching a materialization the sweep means to prune, regrowing storage via
-		// reads of restored ranges (the exact floor+transforms shape a swept peer serves). The gate must
-		// read metadata fresh so the just-restored range is visible.
+	it('restore-then-replay read does NOT re-cache a swept rev (retention sees the just-restored range)', async () => {
+		// Regression: a read that healed its own gap used to materialize against `meta` captured
+		// BEFORE the restore, so the re-cache gate saw stale `ranges`; rangeFloorOf then fell back to
+		// treating the target as its own floor and wrongly RETAINED it — re-caching a materialization
+		// the sweep means to prune, regrowing storage via reads of restored ranges (the exact
+		// floor+transforms shape a swept peer serves).
+		//
+		// The heal is now a separate step (`StorageRepo.get` → `restoreRevision` → re-read), so the
+		// second `getBlock` reads metadata fresh by construction and the gate's own fresh read is
+		// belt-and-braces. The claim is unchanged and is asserted through the public healing read,
+		// which is the only way to reach this shape in one call.
 		const blockId = 'ck-staleread' as BlockId;
 		const prependOp: [string, number, number, unknown[]][] = [['items', 0, 0, ['more']]];
 		const lowFloor = makeBlock('ck-staleread', { items: ['a'] });
@@ -1183,10 +1359,11 @@ describe('BlockStorage checkpoint materialization sweep', () => {
 		expect((await repo.commit({ actionId: 'u10' as ActionId, blockIds: [blockId], tailId: blockId, rev: 10 })).success).to.equal(true);
 		for (let r = 11; r <= 10 + CK; r++) await updateRev(repo, blockId, r); // through 14
 
-		const storage = new BlockStorage(blockId, raw, restoreCallback, CK);
-		// rev 3: below E=10 ⇒ restores [2,5], then replays from the floor (rev 2). Not floor/checkpoint/tip.
-		const got = await storage.getBlock(3);
-		expect(got, 'restored & replayed rev served').to.not.equal(undefined);
+		// rev 3: below E=10 ⇒ the read reports the gap, the healing helper restores [2,4), and the
+		// re-read replays from the floor (rev 2). Not floor/checkpoint/tip, so it must not be cached.
+		const got = (await repo.get({ blockIds: [blockId], context: { rev: 3, committed: [] } }))[blockId];
+		expect(got!.block, 'restored & replayed rev served').to.not.equal(undefined);
+		expect(got!.unavailable, 'and served authoritatively').to.equal(undefined);
 		expect((got!.block as unknown as { items: unknown[] }).items.length, 'rev 3 content = floor + 1 prepend').to.equal(2);
 
 		const low3 = await raw.getRevision(blockId, 3);
@@ -1283,9 +1460,11 @@ describe('commit-proof persistence on the replica path', () => {
 		});
 
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
-		// Seed pending-only metadata (ranges: []) so getBlock(1) misses coverage and restores.
-		await storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-proof-strip') });
+		// Seed pending-only metadata (ranges: []) so rev 1 is a genuine gap and the restore fires.
+		await withBlockWriteLatch(blockId, l =>
+			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-proof-strip') }, l));
 
+		await withBlockWriteLatch(blockId, l => storage.restoreRevision(1, l));
 		const result = await storage.getBlock(1);
 
 		expect(result?.block.header.id, 'the restore itself succeeded').to.equal('block-proof-strip');

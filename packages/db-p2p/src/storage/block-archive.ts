@@ -192,7 +192,7 @@ export async function serveBlockArchive(repo: ArchiveServingRepo, blockId: Block
 	// one of them), or the repo misreported. Labelling old bytes with a newer revision's number and
 	// action id is what the asker's `saveRestored` — keyed by action id — then writes over the good
 	// copy it already holds. Serve nothing instead: every caller already handles "holds nothing",
-	// and `ensureRevision` turns it into a loud "not found during restore attempt". A served
+	// and `restoreRevision` turns it into a loud "not found during restore attempt". A served
 	// revision AT OR BELOW the pin is the block unchanged since the pin, served exactly as before.
 	if (rev !== undefined && served.rev > rev) {
 		log('serve:skip blockId=%s served=%d requested=%d latest=%d (pinned read — refusing to mislabel content)',

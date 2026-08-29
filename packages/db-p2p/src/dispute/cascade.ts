@@ -40,13 +40,6 @@ export type CollectionEnv = {
 	readonly collectionId: CollectionId;
 	readonly log: Log<unknown>;
 	readonly createBlockStorage: (blockId: BlockId) => IBlockStorage;
-	/**
-	 * Optional per-block commit-latch runner threaded into each cascade child's {@link applyInvalidation}
-	 * so the child's compensating write serializes against a concurrent commit on the same block — the
-	 * same mutual-exclusion the root apply gets (see `InvalidationContext.withBlockCommitLatch`). Omitted
-	 * → child writes run unlatched (today's behavior).
-	 */
-	readonly withBlockCommitLatch?: <T>(blockId: BlockId, fn: () => Promise<T>) => Promise<T>;
 };
 
 // ─── Invalidated (blockId, revision) pairs ───
@@ -354,7 +347,7 @@ export async function cascadeInvalidate(input: CascadeInput): Promise<CascadeRes
 
 			const env = cand.env;
 			const result = await applyInvalidation(
-				{ log: env.log, createBlockStorage: env.createBlockStorage, withBlockCommitLatch: env.withBlockCommitLatch },
+				{ log: env.log, createBlockStorage: env.createBlockStorage },
 				{
 					invalidatedActionId: cand.actionId,
 					invalidatedRev: cand.rev,

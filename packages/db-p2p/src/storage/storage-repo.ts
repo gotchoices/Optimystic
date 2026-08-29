@@ -7,44 +7,18 @@ import type {
 	StaleFailure
 } from "@optimystic/db-core";
 import {
-	Latches, transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
+	transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
 	blockIdsForTransforms, transformsFromTransform, highestStaleAt, canonicalBlockHash
 } from "@optimystic/db-core";
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
 import type { IBlockReplicaStore } from "../cluster/block-transfer-service.js";
 import { proofDeclaredDigest, type BlockCommitProof } from "../cluster/commit-proof.js";
+import { RevisionNotCoveredError } from "./block-storage.js";
+import { acquireBlockWriteLatch, withBlockWriteLatch, type BlockWriteLatch } from "./block-latch.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('storage-repo');
-
-/**
- * Single source of truth for the per-block commit latch key. Held by {@link StorageRepo.commit} and
- * {@link StorageRepo.saveReplicatedBlock}, and — through an injected runner ({@link withBlockCommitLatch})
- * — by the invalidation-apply path. Every out-of-band writer of a block's `meta.latest` must serialize
- * on this key against a concurrent local commit on the same block; keeping all call sites on this helper
- * is what prevents the key from drifting between them.
- */
-export const commitLatchKey = (blockId: BlockId): string => `StorageRepo.commit:${blockId}`;
-
-/**
- * Runs `fn` while holding the per-block commit latch {@link commitLatchKey}. This is the capability the
- * dispute module's `applyInvalidation` is handed (through its context) so its compensating
- * `saveReplica`/`saveDeletion` read-modify-write of `meta.latest` is mutually exclusive with a concurrent
- * {@link StorageRepo.commit} on the same block — otherwise an invalidation advancing `latest` outside
- * that latch is invisible to commit's staleness guard and can be clobbered (a non-monotonic regression).
- *
- * Acquire/release is per call, so a caller holds at most one block latch at any instant and cannot
- * deadlock against commit's sorted, up-front multi-latch acquisition.
- */
-export async function withBlockCommitLatch<T>(blockId: BlockId, fn: () => Promise<T>): Promise<T> {
-	const release = await Latches.acquire(commitLatchKey(blockId));
-	try {
-		return await fn();
-	} finally {
-		release();
-	}
-}
 
 /**
  * Stable, greppable prefix on the failure reason a commit carries when this node cannot materialize
@@ -233,9 +207,9 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			let unavailable: BlockUnavailableReason | undefined;
 
 			// Ensure that all outstanding transactions in the context are committed.
-			// This promotes a landed-elsewhere pending via internalCommit, which mutates
-			// meta.latest — the same read-modify-write commit()/saveReplicatedBlock guard
-			// with the per-block commit latch. It MUST hold that latch too, or a promotion
+			// This promotes a landed-elsewhere pending via internalCommit, which writes the
+			// block's metadata — the same read-modify-write commit()/saveReplicatedBlock guard
+			// with the per-block write latch. It MUST hold that latch too, or a promotion
 			// racing a concurrent commit on the block regresses latest non-monotonically /
 			// cross-writes a revision. Cheap unlatched pre-scan first so the common
 			// contextless read and no-pending read never pay for latch acquisition; the
@@ -246,7 +220,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 					? context.committed.filter(c => c.rev > preLatest.rev)
 					: context.committed;
 				if (preMissing.length > 0) {
-					await withBlockCommitLatch(blockId, async () => {
+					await withBlockWriteLatch(blockId, async (latch) => {
 						// Re-read authoritative state under the latch: a concurrent commit may have
 						// promoted or superseded a pending between the unlatched pre-scan and here.
 						// Recompute which committed entries are still ahead of `latest` (drops the
@@ -265,7 +239,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 							for (const { actionId, rev } of [...missing].sort((a, b) => a.rev - b.rev)) {
 								const pending = await blockStorage.getPendingTransaction(actionId);
 								if (pending) {
-									const collectionId = await this.internalCommit(blockId, actionId, rev, blockStorage);
+									const collectionId = await this.internalCommit(blockId, actionId, rev, blockStorage, latch);
 									if (collectionId !== undefined) {
 										promotions.push({ collectionId, blockId, actionId, rev });
 									}
@@ -295,17 +269,17 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			// context-driven get skips promotion (pending gone) and a default getBlock() sees the
 			// stale latest. It is soft-wedged (stale), not hard-wedged: the next commit-retry for
 			// (actionId, rev) self-heals it via storage.recover() in commit(). Not repaired lazily on
-			// the read path because get() holds no commit latch; if stale reads on unwritten blocks
-			// ever become a problem, add a latched lazy recover() here.
+			// the read path because the plain read below holds no write latch; if stale reads on
+			// unwritten blocks ever become a problem, add a latched lazy recover() here.
 			//
-			// getBlock() THROWS when this node holds a `latest` it cannot materialize (truncated
-			// history: "Failed to find materialized block", or a failed restore). Caught PER BLOCK so
-			// one broken block cannot fail the whole batch's Promise.all and take healthy siblings
-			// down with it. The read still fails for THIS block — TransactorSource throws
+			// readBlockHealing() THROWS when this node holds a `latest` it cannot materialize
+			// (truncated history: "Failed to find materialized block", or a failed restore). Caught
+			// PER BLOCK so one broken block cannot fail the whole batch's Promise.all and take healthy
+			// siblings down with it. The read still fails for THIS block — TransactorSource throws
 			// BlockUnavailableError on the flagged entry — so nothing is swallowed.
 			let blockRev: Awaited<ReturnType<IBlockStorage['getBlock']>>;
 			try {
-				blockRev = await blockStorage.getBlock(context?.rev);
+				blockRev = await this.readBlockHealing(blockId, blockStorage, context?.rev);
 			} catch (err) {
 				// NOTE: the entry drops `state.latest`, which this node does know (getLatest() does not
 				// materialize, so it does not throw). Empty state is what makes CoordinatorRepo treat the
@@ -403,6 +377,52 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		this.emitPromotions(promotions);
 
 		return Object.fromEntries(results);
+	}
+
+	/**
+	 * The one place a local coverage gap is healed from a peer. `getBlock` is local-only; when it
+	 * reports the target revision as not covered ({@link RevisionNotCoveredError}) this fetches it
+	 * through `restoreRevision` under the block's write latch — the restore writes revision records
+	 * and merges coverage into the metadata blob, so it must serialize against every other writer of
+	 * the block — and re-reads. Only the restore is latched; the reads on either side are not, and
+	 * the latch is never held across the two.
+	 *
+	 * A restore that fails on a **pending-only** block (metadata seeded by a pend, no committed
+	 * revision) reads as ABSENT, not as a fault: the named revision was a guess about content this
+	 * node never held, and the caller's insert-probe / pending-overlay logic already treats an absent
+	 * base as "nothing committed here". A failed restore on a block that DOES hold a `latest` is a
+	 * real fault (a `latest` this node cannot serve) and propagates, so the caller reports the block
+	 * as unavailable. Any throw from the second read (records restored but nothing materializable
+	 * under them) propagates the same way.
+	 */
+	private async readBlockHealing(
+		blockId: BlockId,
+		storage: IBlockStorage,
+		rev: number | undefined
+	): Promise<{ block: IBlock, actionRev: ActionRev } | undefined> {
+		try {
+			return await storage.getBlock(rev);
+		} catch (err) {
+			if (!(err instanceof RevisionNotCoveredError)) {
+				throw err;
+			}
+			try {
+				// NOTE: the peer fetch inside restoreRevision runs UNDER the block's write latch, so a
+				// slow restore queues every commit/pend/replica on this block behind one network
+				// round-trip. Fine at today's restore rates (a gap is healed once, then served
+				// locally); if restore latency ever shows up delaying commits, fetch + vet OUTSIDE the
+				// latch and take it only to write, re-checking coverage inside.
+				await withBlockWriteLatch(blockId, latch => storage.restoreRevision(err.rev, latch));
+			} catch (restoreErr) {
+				if (await storage.getLatest() === undefined) {
+					log('get:restore-failed-pending-only blockId=%s rev=%d error=%s', blockId, err.rev,
+						restoreErr instanceof Error ? restoreErr.message : String(restoreErr));
+					return undefined;
+				}
+				throw restoreErr;
+			}
+			return await storage.getBlock(rev);
+		}
 	}
 
 	/**
@@ -532,10 +552,16 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// Note: that this is not atomic, after we checked for conflicts and pending actions
 		// new pending or committed actions may have been added.  This is okay, because
 		// this check during pend is conservative.
+		//
+		// Each block's pending write runs under THAT block's write latch, one latch per branch and
+		// never nested: savePendingTransaction seeds the block's metadata blob when it has none, and
+		// an unlatched seed racing a concurrent commit/replica on a fresh block erases the `latest`
+		// the other writer just landed. Never more than one block latch is held by a branch, so this
+		// cannot deadlock against commit's sorted multi-latch acquisition.
 		await Promise.all(blockIds.map(blockId => {
 			const blockStorage = this.createBlockStorage(blockId);
 			const blockTransform = transformForBlockId(request.transforms, blockId);
-			return blockStorage.savePendingTransaction(request.actionId, blockTransform);
+			return withBlockWriteLatch(blockId, latch => blockStorage.savePendingTransaction(request.actionId, blockTransform, latch));
 		}));
 
 		return {
@@ -549,12 +575,12 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		log('cancel actionId=%s blockIds=%d', actionRef.actionId, actionRef.blockIds.length);
 		await Promise.all(actionRef.blockIds.map(blockId => {
 			const blockStorage = this.createBlockStorage(blockId);
-			return blockStorage.deletePendingTransaction(actionRef.actionId);
+			return withBlockWriteLatch(blockId, latch => blockStorage.deletePendingTransaction(actionRef.actionId, latch));
 		}));
 	}
 
 	/**
-	 * Commit a previously-pended action across its blocks, under the per-block commit latches.
+	 * Commit a previously-pended action across its blocks, under the block write latches.
 	 *
 	 * **Divergence vs genuine fault.** When the batch cannot be completed, the reason decides what
 	 * happens to the pending records the pend left behind. `ClusterMember.applyConsensusOperation`
@@ -595,18 +621,23 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		let failure: { reason: string } | undefined;
 
 		try {
-			// Acquire locks sequentially based on sorted IDs to prevent deadlocks
+			// Acquire the block write latches sequentially in sorted id order to prevent deadlocks.
+			// Each block's token is kept so every write below can prove it runs inside the latch.
+			const latches = new Map<BlockId, BlockWriteLatch>();
 			for (const id of uniqueBlockIds) {
-				const lockId = commitLatchKey(id);
-				const release = await Latches.acquire(lockId);
+				const { latch, release } = await acquireBlockWriteLatch(id);
 				releases.push(release);
+				latches.set(id, latch);
 			}
 
 			// --- Start of Critical Section ---
 
-			const blockStorages = request.blockIds.map(blockId => ({
+			// Request order, deduped (NOT the sorted acquisition order): the order here is the order
+			// blocks are committed and reported in change events, which callers may observe.
+			const blockStorages = Array.from(new Set(request.blockIds)).map(blockId => ({
 				blockId,
-				storage: this.createBlockStorage(blockId)
+				storage: this.createBlockStorage(blockId),
+				latch: latches.get(blockId)!
 			}));
 
 			// Partition blocks into:
@@ -616,14 +647,14 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			//     after a mid-batch crash committed some but not all blocks.)
 			//   - missedCommits: latest.rev >= request.rev but not the same actionId → real stale conflict.
 			//   - toCommit: latest.rev < request.rev or no latest yet → run internalCommit.
-			const toCommit: { blockId: BlockId, storage: IBlockStorage }[] = [];
+			const toCommit: { blockId: BlockId, storage: IBlockStorage, latch: BlockWriteLatch }[] = [];
 			const missedCommits: { blockId: BlockId, transforms: ActionTransform[] }[] = [];
 			// Highest revision among the blocks confirmed lost to a newer one — reported as
 			// StaleFailure.staleAt. The idempotent-retry `continue` below is a no-op, not a loss,
 			// so it never seeds this.
 			let staleAt: StaleFailure['staleAt'];
 			for (const entry of blockStorages) {
-				const { blockId, storage } = entry;
+				const { blockId, storage, latch } = entry;
 				const latest = await storage.getLatest();
 				if (latest && latest.rev >= request.rev) {
 					if (latest.rev === request.rev && latest.actionId === request.actionId) {
@@ -631,7 +662,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 						// A retry can carry a proof the original commit lacked (or crashed before writing):
 						// back-fill it, strictly additively, under the same digest-match retention rule the
 						// original commit applies. Runs inside the latched critical section.
-						await this.backFillProof(blockId, storage, request.rev, request.actionId, proof);
+						await this.backFillProof(blockId, storage, request.rev, request.actionId, proof, latch);
 						continue;
 					}
 					staleAt = highestStaleAt([staleAt, { blockId, rev: latest.rev }]);
@@ -672,7 +703,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			//     is gone. getTransaction(actionId) returns the promoted transform. Self-heal here
 			//     via storage.recover() (redoes the lost setLatest, advancing latest to the highest
 			//     contiguous promoted rev, >= request.rev). recover() is idempotent + monotonic, so
-			//     calling it under the already-held commit latch is safe. Recovered blocks are then
+			//     calling it under the already-held block write latch is safe. Recovered blocks are then
 			//     excluded from the internalCommit loop below — their pending is gone, so
 			//     internalCommit would throw.
 			//   - Genuine missing pend: the action was never promoted (getTransaction → undefined),
@@ -680,7 +711,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			// Crash-D2 never reaches this branch: its pending record is still present.
 			const missingPends: { blockId: BlockId, actionId: ActionId }[] = [];
 			const recovered = new Set<BlockId>();
-			for (const { blockId, storage } of toCommit) {
+			for (const { blockId, storage, latch } of toCommit) {
 				const pendingAction = await storage.getPendingTransaction(request.actionId);
 				if (pendingAction) {
 					continue;
@@ -691,7 +722,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 					continue;
 				}
 				// Crash-D3 signature (pending absent + action durably promoted). Redo the lost setLatest.
-				const result = await storage.recover();
+				const result = await storage.recover(latch);
 				if (result.latest !== undefined && result.latest.rev >= request.rev) {
 					recovered.add(blockId);
 				} else {
@@ -727,7 +758,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			// internalCommit does — otherwise a recovered delete would silently fail to wake watchers.
 			// Only when neither resolves (a delete-only block with no prior materialization) is the
 			// emit skipped, the same terminal fallback internalCommit uses.
-			for (const { blockId, storage } of toCommit) {
+			for (const { blockId, storage, latch } of toCommit) {
 				if (!recovered.has(blockId)) {
 					continue;
 				}
@@ -741,7 +772,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				// The recovered block IS committed at request.rev, but it is excluded from the
 				// internalCommit loop below — so without this it would be the one landing path that
 				// never retains the cohort's proof, even though this very call is carrying it.
-				await this.backFillProof(blockId, storage, request.rev, request.actionId, proof);
+				await this.backFillProof(blockId, storage, request.rev, request.actionId, proof, latch);
 			}
 
 			// Commit the action for each block that still needs it.
@@ -752,13 +783,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			// Set when the mid-loop failure was a divergence rather than a genuine fault — the split
 			// documented on commit() above, which decides the fate of the batch's pending records.
 			let divergentFailure = false;
-			for (const { blockId, storage } of toCommit) {
+			for (const { blockId, storage, latch } of toCommit) {
 				if (recovered.has(blockId)) {
 					continue;
 				}
 				try {
 					// internalCommit will throw if it encounters an issue
-					const collectionId = await this.internalCommit(blockId, request.actionId, request.rev, storage, proof);
+					const collectionId = await this.internalCommit(blockId, request.actionId, request.rev, storage, latch, proof);
 					if (collectionId !== undefined) {
 						const list = collectionBlocks.get(collectionId) ?? [];
 						list.push(blockId);
@@ -819,16 +850,16 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 * consensus. A leftover record only degrades this node's participation in that one block.
 	 */
 	private async dropUnpromotablePendings(
-		blocks: { blockId: BlockId, storage: IBlockStorage }[],
+		blocks: { blockId: BlockId, storage: IBlockStorage, latch: BlockWriteLatch }[],
 		actionId: ActionId
 	): Promise<void> {
 		if (blocks.length === 0) {
 			return;
 		}
 		log('commit:drop-unpromotable-pendings actionId=%s blockIds=%d', actionId, blocks.length);
-		await Promise.all(blocks.map(async ({ blockId, storage }) => {
+		await Promise.all(blocks.map(async ({ blockId, storage, latch }) => {
 			try {
-				await storage.deletePendingTransaction(actionId);
+				await storage.deletePendingTransaction(actionId, latch);
 			} catch (err) {
 				log('commit:drop-unpromotable-pending-failed blockId=%s actionId=%s error=%s', blockId, actionId,
 					err instanceof Error ? err.message : String(err));
@@ -846,13 +877,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	async recoverBlock(blockId: BlockId): Promise<void> {
 		log('recoverBlock blockId=%s', blockId);
 		const storage = this.createBlockStorage(blockId);
-		// Hold the per-block commit latch: recover() is a read-modify-write of meta.latest that
-		// blindly writes back the metadata object it read, so its "advance only" guard is TOCTOU —
-		// racing a concurrent commit()/saveReplicatedBlock that advanced latest in between would
-		// clobber it (a non-monotonic regression). Same latching invariant as every other
-		// latest-mutating site. commit() calls storage.recover() directly under its own held latch,
-		// so it never routes through here — no double-acquire / deadlock.
-		await withBlockCommitLatch(blockId, () => storage.recover());
+		// Hold the block write latch: recover() is a read-modify-write of the metadata blob that
+		// blindly writes back the object it read, so its "advance only" guard is TOCTOU — racing a
+		// concurrent commit()/saveReplicatedBlock that advanced latest in between would clobber it
+		// (a non-monotonic regression). Same latching invariant as every other metadata writer.
+		// commit() calls storage.recover(latch) directly under its own held latch, so it never
+		// routes through here — no double-acquire / deadlock.
+		await withBlockWriteLatch(blockId, latch => storage.recover(latch));
 	}
 
 	/**
@@ -861,8 +892,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 * already materialized from a departing owner, not as a pend/commit. See
 	 * {@link IBlockStorage.saveReplica} for the durability/monotonicity contract.
 	 *
-	 * Held under the same `StorageRepo.commit:<id>` latch as {@link commit} so the
-	 * replica's read-modify-write of `latest` is mutually exclusive with a concurrent
+	 * Held under the same block write latch as {@link commit} so the replica's
+	 * read-modify-write of the metadata blob is mutually exclusive with a concurrent
 	 * local commit on the same block — otherwise `saveReplica`'s monotonic guard could
 	 * read a stale `latest` and clobber a commit that advanced it in between.
 	 *
@@ -884,12 +915,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	async saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev, verifiedProof?: BlockCommitProof): Promise<void> {
 		log('saveReplicatedBlock blockId=%s rev=%s', blockId, source?.rev);
 		const storage = this.createBlockStorage(blockId);
-		const release = await Latches.acquire(commitLatchKey(blockId));
 		// Captured under the latch; emitted after release to match commit's ordering.
 		let landed: { collectionId: CollectionId, actionId: ActionId, rev: number } | undefined;
-		try {
+		await withBlockWriteLatch(blockId, async (latch) => {
 			const priorLatest = await storage.getLatest();
-			const effective = await storage.saveReplica(block, source, verifiedProof);
+			const effective = await storage.saveReplica(block, source, verifiedProof, latch);
 			// Advanced iff there was no prior revision or the effective rev moved past it. On the
 			// monotonic no-op, saveReplica returns the held latest unchanged → effective.rev === priorLatest.rev.
 			const advanced = priorLatest === undefined || effective.rev > priorLatest.rev;
@@ -908,7 +938,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				// only ever serves the proof for `latest.rev`, so the proof would be keyed to a revision
 				// this node will never serve, for content it may not even materialize.
 				//
-				// Runs under the commit latch already held here — the same latch the commit-path
+				// Runs under the block write latch already held here — the same latch the commit-path
 				// back-fill sites hold, so no new latch interaction. `backFillProof` never throws: the
 				// revision is already durable, and a proof-persist fault must not turn a no-op into a
 				// failure.
@@ -919,11 +949,9 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				// certified push of that revision. Bounded by push frequency and fine at spread-on-churn
 				// rates; if a diverged holder under repeated push ever shows up in a profile, remember the
 				// withheld `(rev, actionId)` and skip the re-check.
-				await this.backFillProof(blockId, storage, effective.rev, effective.actionId, verifiedProof);
+				await this.backFillProof(blockId, storage, effective.rev, effective.actionId, verifiedProof, latch);
 			}
-		} finally {
-			release();
-		}
+		});
 		// Replica-persist has no CommitRequest, hence no tailId — like a read-driven promotion,
 		// this wakes local onCollectionChange watchers but is cert-gated out of cohort-topic
 		// re-origination downstream (change-bridge selfIsCohortMember treats a tail-less event as
@@ -940,14 +968,14 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	/**
 	 * The digest the block WOULD materialize to if `actionId`'s pending transform committed at `rev`,
 	 * plus the base revision it was computed from. Read-only: touches no durable state and takes no
-	 * commit latch.
+	 * block write latch.
 	 *
 	 * Mirrors {@link internalCommit}'s reads (pending transform → latest → base → applyTransform) so
 	 * the prediction and the eventual commit cannot drift. Consumed by the cluster member's
 	 * promise-round content-digest check (`ClusterMember.validateCommitOperations`), which compares it
 	 * against the digest the transaction author declared on the commit request.
 	 *
-	 * Deliberately does NOT take the per-block commit latch: this runs on the vote path, ahead of the
+	 * Deliberately does NOT take the block write latch: this runs on the vote path, ahead of the
 	 * commit that will take it, so taking it here would serialize voting behind commits and risks
 	 * deadlocking against commit's sorted up-front multi-block latch acquisition. The price is that a
 	 * concurrent commit can move `latest` mid-preview; the caller's checkable rule (base-independent,
@@ -1017,12 +1045,16 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		return await this.createBlockStorage(blockId).getBlockProof(rev);
 	}
 
-	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage, proof?: BlockCommitProof): Promise<CollectionId | undefined> {
-		// Note: This method is called under the per-block commit latch — by commit() (within its
-		// locked critical section) and by the read-driven promotion in get() (which now takes the
-		// same latch). So, operations like getPendingTransaction, getLatest, getBlock,
-		// saveMaterializedBlock, saveRevision, promotePendingTransaction, setLatest are protected
-		// against concurrent commits for the *same blockId*.
+	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage, latch: BlockWriteLatch, proof?: BlockCommitProof): Promise<CollectionId | undefined> {
+		// Note: This method is called under the block write latch — by commit() (within its locked
+		// critical section) and by the read-driven promotion in get() (which takes the same latch);
+		// `latch` is the proof of that. So, operations like getPendingTransaction, getLatest,
+		// getBlock, saveMaterializedBlock, saveRevision, promotePendingTransaction, setLatest are
+		// protected against concurrent writers for the *same blockId*.
+		//
+		// `getBlock` here (via readCommitBase) is LOCAL-ONLY: the commit path never fetches from a
+		// peer while holding N block latches. A coverage gap reads as a missing base, which the
+		// healing path repairs by replication instead.
 
 		const transform = await storage.getPendingTransaction(actionId);
 		// No need to check if !transform here, as the caller (commit) already verified this.
@@ -1033,7 +1065,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 
 		// Get prior materialized block if it exists
 		const latest = await storage.getLatest();
-		const priorBlock = await this.readCommitBase(blockId, actionId, rev, storage, latest);
+		const priorBlock = await this.readCommitBase(blockId, actionId, rev, storage, latest, latch);
 
 		// Apply transform and save materialized block
 		// applyTransform handles undefined priorBlock correctly for inserts
@@ -1047,22 +1079,22 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// target, and with no prior revision there is none. With a prior `latest` an absent newBlock is
 		// a legitimate tombstone (the walk resolves to an earlier materialization), so it stays allowed.
 		if (!newBlock && latest === undefined) {
-			return await this.refuseMissingBase(blockId, actionId, rev, storage,
+			return await this.refuseMissingBase(blockId, actionId, rev, storage, latch,
 				'no committed revision to apply the transform to');
 		}
 
 		if (newBlock) {
-			await storage.saveMaterializedBlock(actionId, newBlock);
+			await storage.saveMaterializedBlock(actionId, newBlock, latch);
 		}
 
 		// Save revision and promote action *before* updating latest
 		// This ensures that if the process crashes between these steps,
 		// the 'latest' pointer doesn't point to a revision that hasn't been fully recorded.
-		await storage.saveRevision(rev, actionId);
-		await storage.promotePendingTransaction(actionId);
+		await storage.saveRevision(rev, actionId, latch);
+		await storage.promotePendingTransaction(actionId, latch);
 
 		// Update latest revision *last*
-		await storage.setLatest({ actionId, rev });
+		await storage.setLatest({ actionId, rev }, latch);
 
 		// Persist the cohort's commit proof AFTER the commit is durably latest — the proof is
 		// evidence about a landed revision, never a precondition of landing it. The retention rule
@@ -1070,7 +1102,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// and its failure logging live in the shared helper; a proof-persist fault must not fail a
 		// commit that already landed, so the helper never throws.
 		if (proof !== undefined) {
-			await this.persistProofIfContentMatches(blockId, actionId, rev, storage, proof, newBlock);
+			await this.persistProofIfContentMatches(blockId, actionId, rev, storage, proof, newBlock, latch);
 		}
 
 		// Prune the now-superseded prior materialization (checkpoint retention). Runs LAST — after the
@@ -1078,7 +1110,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// point can leave a rev unrecoverable: a crash BEFORE this leaves a redundant (harmless)
 		// materialization the next commit's prune reclaims; a crash AFTER is fully consistent. The prune
 		// only ever deletes a materialization reconstructible from the retained floor + transforms. Runs
-		// under the per-block commit latch already held here, so it serializes against concurrent commits.
+		// under the block write latch already held here, so it serializes against concurrent commits.
 		// NOTE: prune targets ONLY the immediate prior. A crash between setLatest and this call leaves that
 		// one prior materialization un-pruned; since a later commit prunes ITS OWN prior (never the earlier
 		// leaked rev), that copy is NOT auto-reclaimed — a bounded (≤1 block-copy per crash), harmless leak
@@ -1086,7 +1118,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// add a bounded look-back (prune non-retained mats in [rev-checkpointInterval, rev)) here, or a
 		// periodic reconciliation sweep — do NOT reintroduce a per-read re-cache.
 		if (latest !== undefined) {
-			await storage.pruneSupersededMaterialization(latest);
+			await storage.pruneSupersededMaterialization(latest, latch);
 		}
 
 		// Report the affected collection for change-event routing. For a delete the
@@ -1108,11 +1140,12 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 * caller has no commit request — it has the `(rev, actionId)` the push and the held revision
 	 * agree on.
 	 *
-	 * Callers must hold the block's commit latch. `getBlock` can throw on an unmaterializable base —
-	 * treated as "no local content", i.e. the proof is withheld.
+	 * Callers must hold the block's write latch (`latch`). `getBlock` is local-only and can throw on
+	 * an unmaterializable or uncovered base — treated as "no local content", i.e. the proof is withheld.
 	 */
 	private async backFillProof(
-		blockId: BlockId, storage: IBlockStorage, rev: number, actionId: ActionId, proof: BlockCommitProof | undefined
+		blockId: BlockId, storage: IBlockStorage, rev: number, actionId: ActionId, proof: BlockCommitProof | undefined,
+		latch: BlockWriteLatch
 	): Promise<void> {
 		if (proof === undefined || await storage.getBlockProof(rev) !== undefined) {
 			return;
@@ -1123,7 +1156,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		} catch {
 			committedBlock = undefined;
 		}
-		await this.persistProofIfContentMatches(blockId, actionId, rev, storage, proof, committedBlock);
+		await this.persistProofIfContentMatches(blockId, actionId, rev, storage, proof, committedBlock, latch);
 	}
 
 	/**
@@ -1159,7 +1192,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		rev: number,
 		storage: IBlockStorage,
 		proof: BlockCommitProof,
-		block: IBlock | undefined
+		block: IBlock | undefined,
+		latch: BlockWriteLatch
 	): Promise<void> {
 		try {
 			const declaredDigest = proofDeclaredDigest(proof, { blockId, rev, actionId });
@@ -1175,7 +1209,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 					blockId, rev, actionId, declaredDigest, localDigest);
 				return;
 			}
-			await storage.saveBlockProof(rev, proof);
+			await storage.saveBlockProof(rev, proof, latch);
 		} catch (err) {
 			log('commit:proof-persist-failed blockId=%s rev=%d actionId=%s error=%s', blockId, rev, actionId,
 				err instanceof Error ? err.message : String(err));
@@ -1210,7 +1244,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		actionId: ActionId,
 		rev: number,
 		storage: IBlockStorage,
-		latest: ActionRev | undefined
+		latest: ActionRev | undefined,
+		latch: BlockWriteLatch
 	): Promise<IBlock | undefined> {
 		if (!latest) {
 			return undefined;
@@ -1220,7 +1255,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		} catch (err) {
 			log('commit:unmaterializable-base blockId=%s baseRev=%d error=%s', blockId, latest.rev,
 				err instanceof Error ? err.message : String(err));
-			return await this.refuseMissingBase(blockId, actionId, rev, storage,
+			return await this.refuseMissingBase(blockId, actionId, rev, storage, latch,
 				`local rev ${latest.rev} is not materializable here`);
 		}
 	}
@@ -1240,9 +1275,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		actionId: ActionId,
 		rev: number,
 		storage: IBlockStorage,
+		latch: BlockWriteLatch,
 		detail: string
 	): Promise<never> {
-		await storage.deletePendingTransaction(actionId);
+		await storage.deletePendingTransaction(actionId, latch);
 		log('commit:missing-base blockId=%s rev=%d actionId=%s detail=%s', blockId, rev, actionId, detail);
 		throw new MissingBaseRevisionError(blockId, rev, detail);
 	}

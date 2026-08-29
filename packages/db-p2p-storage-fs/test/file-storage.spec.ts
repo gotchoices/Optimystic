@@ -3,7 +3,7 @@ import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { FileRawStorage, FileKVStore } from '../src/index.js';
-import { BlockStorage } from '@optimystic/db-p2p';
+import { BlockStorage, withBlockWriteLatch } from '@optimystic/db-p2p';
 import type { BlockMetadata } from '@optimystic/db-p2p';
 import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing/conformance';
 import type { BlockId, ActionId, Transform, IBlock } from '@optimystic/db-core';
@@ -105,7 +105,7 @@ describe('FileRawStorage atomic writes + corruption tolerance', () => {
 		await fs.writeFile(metaPath, 'not json at all');
 
 		const blockStorage = new BlockStorage(blockId, storage);
-		const result = await blockStorage.recover();
+		const result = await withBlockWriteLatch(blockId, l => blockStorage.recover(l));
 		assert.deepStrictEqual(result, { reconciled: false });
 	});
 

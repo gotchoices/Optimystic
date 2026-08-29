@@ -246,7 +246,7 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 	 * `fetchBlockFromCluster` used to perform (`storageRepo.get({ context: { committed, rev } })`)
 	 * only promotes a pending this node ALREADY holds, and B never pended `action-2`. The follow-up
 	 * `getBlock(2)` cannot rescue it either — `BlockStorage` records coverage as the open-ended span
-	 * `[E, +inf)`, so `ensureRevision` treats rev 2 as covered and the descending walk resolves it
+	 * `[E, +inf)`, so `getBlock`'s coverage check treats rev 2 as covered and the descending walk resolves it
 	 * down to B's own rev-1 materialization. B stayed at `v1` forever.
 	 *
 	 * The read path now falls through to `acquireBlockFromCohort` — the same
@@ -268,7 +268,7 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 	/**
 	 * The downstream blocker: a collection's header block committed solo on the writer during a
 	 * cohort-formation race, so the reader has NO local metadata for it. `BlockStorage.getBlock`
-	 * returns `undefined` before `ensureRevision` runs, so the restore callback is unreachable — the
+	 * returns `undefined` before it could report a coverage gap, so the healing restore (`restoreRevision`) is unreachable — the
 	 * reader could establish `clusterRev` and still never obtain the block, logging
 	 * `cluster-fetch:not-restored { localRev: undefined, clusterRev: 1 }` on every read.
 	 */
@@ -294,7 +294,7 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 	 *
 	 * B holds metadata for the block (seeded by a pend of some unrelated action) but no committed
 	 * revision, so `StorageRepo.get` with the corroborated commit context finds no pending to promote
-	 * and no committed base underneath. That read used to throw out of `BlockStorage.ensureRevision`
+	 * and no committed base underneath. That read used to throw out of the restore step (now `BlockStorage.restoreRevision`)
 	 * — rev 2 is outside B's (empty) coverage ranges and B has no storage-layer restore to supply it
 	 * — and the throw escaped `fetchBlockFromCluster` as `cluster-fetch:error`, ending the pass
 	 * before the one mechanism that CAN supply the revision ever ran.

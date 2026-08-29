@@ -142,7 +142,7 @@ function idsContent(ids: Set<ActionId>): number {
  * **Why this is sound** — the invariants in `packages/db-p2p/docs/storage.md` ("Invariants", 1–5):
  * 1. every backend write funnels through `IRawStorage` (and thus this driver) in-process, so
  *    the cache sees every mutation;
- * 2. every writer of `meta.latest` holds the per-block commit latch, and each cache update is
+ * 2. every writer of the metadata blob holds the block write latch, and each cache update is
  *    synchronous with its inner write (no `await` between the inner call resolving and the
  *    cache mutation), so latch-protected read-after-write sees the new value exactly as a
  *    driver read would;
