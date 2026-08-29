@@ -1,5 +1,5 @@
 import type { ActionId, BlockId } from '@optimystic/db-core';
-import { KvRawStorage, type RawStoreDriver } from '@optimystic/db-p2p';
+import { KvRawStorage, identityForHandle, type RawStoreDriver, type StoreIdentity } from '@optimystic/db-p2p';
 import type { SqliteDb, SqliteStatement } from './db.js';
 import { createLogger } from './logger.js';
 
@@ -46,7 +46,14 @@ export class SqliteStoreDriver implements RawStoreDriver {
 		pageSize: SqliteStatement;
 	};
 
+	// NOTE: identity is the HANDLE object, so two handles opened over the same SQLite FILE read
+	// as two identities. Resolving that would mean naming the underlying database file, which
+	// `SqliteDb` does not expose. The package opener (`ns-opener.ts`) hands out one handle per
+	// file in practice, so this is the reachable case, not the complete one.
+	private readonly identity: StoreIdentity;
+
 	constructor(private readonly db: SqliteDb) {
+		this.identity = identityForHandle('sqlite-handle', db);
 		this.stmts = {
 			getMetadata: db.prepare('SELECT value FROM metadata WHERE block_id = ?'),
 			saveMetadata: db.prepare('INSERT OR REPLACE INTO metadata (block_id, value) VALUES (?, ?)'),
@@ -73,6 +80,10 @@ export class SqliteStoreDriver implements RawStoreDriver {
 			pageCount: db.prepare('PRAGMA page_count'),
 			pageSize: db.prepare('PRAGMA page_size'),
 		};
+	}
+
+	storeIdentity(): StoreIdentity {
+		return this.identity;
 	}
 
 	// --- metadata ---
@@ -224,6 +235,7 @@ export class SqliteStoreDriver implements RawStoreDriver {
 export class SqliteRawStorage extends KvRawStorage {
 	declare listBlockIds: () => AsyncIterable<BlockId>;
 	declare getApproximateBytesUsed: () => Promise<number>;
+	declare getStoreIdentity: () => StoreIdentity;
 
 	constructor(db: SqliteDb) {
 		super(new SqliteStoreDriver(db));

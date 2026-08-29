@@ -1,6 +1,7 @@
 import type { BlockId, ActionId, ActionRev, Transform, IBlock } from "@optimystic/db-core";
 import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockMetadata } from "./struct.js";
+import type { StoreIdentity } from "./store-identity.js";
 
 export interface IRawStorage {
 	// Metadata operations
@@ -39,6 +40,27 @@ export interface IRawStorage {
 
 	// Promote a pending action to a committed action
 	promotePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void>;
+
+	/**
+	 * A stable, process-scoped string naming what this storage is ultimately backed by (a
+	 * resolved directory, an open database handle). Wrappers pass it through from whatever they
+	 * wrap, so a cache and the storage it fronts name the same store — e.g.
+	 * `new CachedRawStorage(new FileRawStorage(dir)).getStoreIdentity()` is `'file:<resolved dir>'`.
+	 *
+	 * Contract:
+	 * - Two storages over the SAME underlying location MUST return equal strings; two over
+	 *   different locations MUST NOT.
+	 * - Every string is scheme-prefixed so backends cannot collide: `file:`, `sqlite-handle:`,
+	 *   `idb-handle:`, `leveldb-handle:`. Compared for equality only — never parsed.
+	 * - Stable for the storage object's whole life; fixed at construction.
+	 * - OPTIONAL BY DESIGN. A backend that cannot honour the contract omits the method entirely
+	 *   and callers fall back to per-object behavior. Never install a stub that returns
+	 *   `undefined` — feature-detection (`typeof storage.getStoreIdentity === 'function'`) must
+	 *   see the backend's true capability, the same trap `KvRawStorage`'s class doc calls out
+	 *   for `listBlockIds`.
+	 * - It identifies the STORE, not its contents.
+	 */
+	getStoreIdentity?(): StoreIdentity;
 
 	/**
 	 * Approximate bytes currently stored by this backend.

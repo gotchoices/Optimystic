@@ -1,5 +1,5 @@
 import type { ActionId, BlockId } from '@optimystic/db-core';
-import { KvRawStorage, type RawStoreDriver } from '@optimystic/db-p2p';
+import { KvRawStorage, identityForHandle, type RawStoreDriver, type StoreIdentity } from '@optimystic/db-p2p';
 import { drain, type LevelDBLike } from './leveldb-like.js';
 import {
 	TAG_PENDING,
@@ -34,7 +34,19 @@ const log = createLogger('storage:leveldb');
  * consumer's `await`), and the single `WriteBatch` that makes `promote` atomic.
  */
 export class LevelDBStoreDriver implements RawStoreDriver {
-	constructor(private readonly db: LevelDBLike) {}
+	// NOTE: identity is the HANDLE object, so two handles opened over the same LevelDB PATH read
+	// as two identities. Resolving that would mean naming the underlying on-disk path, which
+	// `LevelDBLike` does not expose. The package opener (`rn-opener.ts`) hands out one handle per
+	// path in practice, so this is the reachable case, not the complete one.
+	private readonly identity: StoreIdentity;
+
+	constructor(private readonly db: LevelDBLike) {
+		this.identity = identityForHandle('leveldb-handle', db);
+	}
+
+	storeIdentity(): StoreIdentity {
+		return this.identity;
+	}
 
 	// --- metadata ---
 
@@ -207,6 +219,7 @@ export class LevelDBStoreDriver implements RawStoreDriver {
 export class LevelDBRawStorage extends KvRawStorage {
 	declare listBlockIds: () => AsyncIterable<BlockId>;
 	declare getApproximateBytesUsed: () => Promise<number>;
+	declare getStoreIdentity: () => StoreIdentity;
 
 	constructor(db: LevelDBLike) {
 		super(new LevelDBStoreDriver(db));

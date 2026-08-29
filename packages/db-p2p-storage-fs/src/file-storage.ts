@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import type { BlockId, ActionId } from "@optimystic/db-core";
-import { KvRawStorage, type RawStoreDriver } from "@optimystic/db-p2p";
+import { KvRawStorage, type RawStoreDriver, type StoreIdentity } from "@optimystic/db-p2p";
 import { createLogger } from './logger.js';
 import { atomicWriteFile } from './atomic-write.js';
 
@@ -53,8 +53,30 @@ function isParseableJson(bytes: Uint8Array): boolean {
  * the legacy raw-colon read fallback + win32 guards, and rename-based promote.
  */
 export class FileStoreDriver implements RawStoreDriver {
+	private readonly identity: StoreIdentity;
+
 	constructor(private readonly basePath: string) {
 		// TODO: use https://www.npmjs.com/package/proper-lockfile to take a lock on the basePath, also introduce explicit dispose pattern
+		// The directory this driver is backed by, resolved once here: `path.resolve` is
+		// cwd-dependent, and capturing it at construction is the correct reading — two drivers
+		// built from the same RELATIVE path under different cwds genuinely address different
+		// directories and must not compare equal. An empty/whitespace basePath resolves to the
+		// cwd; nothing special-cases it.
+		// Lowercased on win32 because Windows paths are case-insensitive: `C:\Foo` and `C:\foo`
+		// are one directory and must produce one identity.
+		// NOTE: aliases of one directory that this does NOT collapse, and so read as two
+		// identities: symlinks, junctions, UNC-versus-mapped-drive spellings, and case-differing
+		// spellings on a case-INSENSITIVE non-Windows volume (the default on macOS) — platform is
+		// the only signal available synchronously, and case-folding every darwin path would be
+		// wrong on a case-sensitive volume. `fs.realpath` resolves all of these, but it is async
+		// (this constructor is not) and requires the directory to already exist. Revisit if an
+		// alias ever bites.
+		const resolved = path.resolve(basePath);
+		this.identity = `file:${process.platform === 'win32' ? resolved.toLowerCase() : resolved}`;
+	}
+
+	storeIdentity(): StoreIdentity {
+		return this.identity;
 	}
 
 	// --- metadata ---
@@ -427,13 +449,14 @@ export class FileStoreDriver implements RawStoreDriver {
  * imports keep resolving; the kernel supplies the `IRawStorage` surface and the
  * driver supplies fs behavior.
  *
- * `listBlockIds`/`getApproximateBytesUsed` are re-declared here as always-present
- * (the fs driver always implements them, so the kernel constructor always wires
- * them) — the base declares them optional, but every fs consumer relies on them.
+ * `listBlockIds`/`getApproximateBytesUsed`/`getStoreIdentity` are re-declared here as
+ * always-present (the fs driver always implements them, so the kernel constructor always
+ * wires them) — the base declares them optional, but every fs consumer relies on them.
  */
 export class FileRawStorage extends KvRawStorage {
 	declare listBlockIds: () => AsyncIterable<BlockId>;
 	declare getApproximateBytesUsed: () => Promise<number>;
+	declare getStoreIdentity: () => StoreIdentity;
 
 	constructor(basePath: string) {
 		super(new FileStoreDriver(basePath));

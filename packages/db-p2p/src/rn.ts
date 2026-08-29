@@ -28,6 +28,7 @@ export * from './repo/served-repo-proxy.js';
 export * from './repo/service.js';
 export * from './storage/block-storage.js';
 export * from './storage/block-latch.js';
+export * from './storage/store-identity.js';
 export * from './storage/raw-store-driver.js';
 export * from './storage/kv-raw-storage.js';
 export * from './storage/shared-cache-pool.js';

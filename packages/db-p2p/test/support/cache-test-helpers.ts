@@ -17,7 +17,12 @@ export async function collect<T>(iter: AsyncIterable<T>): Promise<T[]> {
 }
 
 /** Counts every driver call by method name, then delegates. Placed UNDER the cache to
- * measure what actually reaches the backend, or alone to measure an uncached baseline. */
+ * measure what actually reaches the backend, or alone to measure an uncached baseline.
+ *
+ * Deliberately does NOT pass `storeIdentity` through, and must not start: tests build several
+ * of these over one shared inner driver precisely so each wrapper stays INDEPENDENT. Passing
+ * identity through would let identity-keyed consumers collapse them into one, silently voiding
+ * the isolation the counts depend on. Same reason it passes no `close`. */
 export class CountingStoreDriver implements RawStoreDriver {
 	readonly counts: Record<string, number> = {};
 

@@ -3,6 +3,7 @@ import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockMetadata } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
 import type { RawStoreDriver } from "./raw-store-driver.js";
+import type { StoreIdentity } from "./store-identity.js";
 import { encodeJson, decodeJson, encodeActionId, decodeActionId } from "./raw-store-codec.js";
 
 /**
@@ -23,12 +24,18 @@ export class KvRawStorage implements IRawStorage {
 	 * Optional passthroughs are wired in the constructor ONLY when the driver
 	 * provides them, so a `StorageMonitor` / owned-block seed that feature-detects
 	 * (`typeof storage.listBlockIds === 'function'`) sees the driver's true
-	 * capability instead of a stub that silently reports 0 / no seed.
+	 * capability instead of a stub that silently reports 0 / no seed. The same rule
+	 * governs `getStoreIdentity`: a stub returning `undefined` would make every store
+	 * look identity-less to consumers that dedupe on it.
 	 */
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	getApproximateBytesUsed?: () => Promise<number>;
+	getStoreIdentity?: () => StoreIdentity;
 
 	constructor(private readonly driver: RawStoreDriver) {
+		if (driver.storeIdentity) {
+			this.getStoreIdentity = () => driver.storeIdentity!();
+		}
 		if (driver.listBlockIds) {
 			this.listBlockIds = () => driver.listBlockIds!();
 		}

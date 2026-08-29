@@ -1,4 +1,5 @@
 import type { BlockId, ActionId } from "@optimystic/db-core";
+import type { StoreIdentity } from "./store-identity.js";
 
 /**
  * Bytes-valued, per-logical-store driver surface. Each backend implements the
@@ -88,6 +89,24 @@ export interface RawStoreDriver {
 	 */
 	promote(blockId: BlockId, actionId: ActionId): Promise<void>;
 
+	/**
+	 * Optional — a stable, process-scoped string naming what this driver is backed by (a
+	 * resolved directory, an open database handle). Passed through by the kernel and by every
+	 * wrapper, so a cache and the storage it fronts name the same store.
+	 *
+	 * Contract:
+	 * - Two drivers over the SAME underlying location MUST return equal strings; two over
+	 *   different locations MUST NOT.
+	 * - Every string is scheme-prefixed so backends cannot collide: `file:`, `sqlite-handle:`,
+	 *   `idb-handle:`, `leveldb-handle:`. Compared for equality only — never parsed.
+	 * - Stable for the driver object's whole life; fixed at construction.
+	 * - OPTIONAL BY DESIGN. A driver that cannot honour the contract omits the method entirely
+	 *   and callers fall back to per-object behavior. Never install a stub that returns
+	 *   `undefined` — feature-detection (`typeof driver.storeIdentity === 'function'`) must see
+	 *   the driver's true capability.
+	 * - It identifies the STORE, not its contents.
+	 */
+	storeIdentity?(): StoreIdentity;
 	/** Optional — enumerate block ids with durable metadata (startup seed). Passed through by the kernel. */
 	listBlockIds?(): AsyncIterable<BlockId>;
 	/** Optional — best cheap byte estimate. Passed through by the kernel. */

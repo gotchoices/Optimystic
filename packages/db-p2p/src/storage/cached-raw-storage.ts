@@ -4,6 +4,7 @@ import type { RawStoreDriver } from "./raw-store-driver.js";
 import { KvRawStorage } from "./kv-raw-storage.js";
 import { CachedStoreDriver } from "./cached-store-driver.js";
 import type { SharedCachePool } from "./shared-cache-pool.js";
+import type { StoreIdentity } from "./store-identity.js";
 import { encodeJson, decodeJson, encodeActionId, decodeActionId } from "./raw-store-codec.js";
 
 /**
@@ -27,8 +28,12 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 	 */
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	approximateBytesUsed?: () => Promise<number>;
+	storeIdentity?: () => StoreIdentity;
 
 	constructor(private readonly inner: IRawStorage) {
+		if (inner.getStoreIdentity) {
+			this.storeIdentity = () => inner.getStoreIdentity!();
+		}
 		if (inner.listBlockIds) {
 			this.listBlockIds = () => inner.listBlockIds!();
 		}

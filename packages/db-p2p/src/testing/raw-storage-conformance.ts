@@ -445,6 +445,20 @@ export function runRawStorageConformance(
 			expect(reread.items, 'fresh read unaffected by mutation of a prior read').to.deep.equal(['original']);
 		});
 
+		// --- getStoreIdentity (optional; only when the backend implements it) ---
+
+		it('getStoreIdentity is a stable, scheme-prefixed, non-empty string', async function () {
+			const getStoreIdentity = storage.getStoreIdentity;
+			if (typeof getStoreIdentity !== 'function') {
+				this.skip();
+			} else {
+				const first = getStoreIdentity.call(storage);
+				expect(first, 'identity is a non-empty string').to.be.a('string').and.not.equal('');
+				expect(first, 'identity is scheme-prefixed').to.include(':');
+				expect(getStoreIdentity.call(storage), 'identity is stable across calls').to.equal(first);
+			}
+		});
+
 		// --- listBlockIds (optional; only when the driver implements it) ---
 
 		it('listBlockIds yields exactly the blocks with metadata', async function () {

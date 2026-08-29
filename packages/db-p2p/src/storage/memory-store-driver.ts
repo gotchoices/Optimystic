@@ -143,6 +143,11 @@ export class MemoryStoreDriver implements RawStoreDriver {
 
 	// --- optional passthroughs ---
 
+	// Deliberately NO storeIdentity(): two MemoryStoreDrivers hold two independent Maps and are
+	// genuinely two different stores, so there is no shared "location" for them to name. The
+	// case that DOES matter — one driver object shared by two wrappers — is already covered by
+	// object identity, so an identity string would add nothing.
+
 	async *listBlockIds(): AsyncIterable<BlockId> {
 		// Snapshot the keys before yielding so a concurrent putMetadata during the scan
 		// doesn't invalidate a live map iterator. Fresh in-memory storage is empty, so at

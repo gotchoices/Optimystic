@@ -1,5 +1,6 @@
 import type { BlockId, ActionId } from "@optimystic/db-core";
 import type { RawStoreDriver } from "./raw-store-driver.js";
+import type { StoreIdentity } from "./store-identity.js";
 import {
 	defaultCachePool,
 	SharedCachePool,
@@ -190,10 +191,12 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 	 * enumerates the inner metadata keyspace, which funnelled writes keep authoritative.
 	 * `close` is the deliberate exception (a real method below): releasing the store's pool
 	 * registration is THIS wrapper's own capability, needed whether or not the inner driver
-	 * has anything to close.
+	 * has anything to close. `storeIdentity` passes through unchanged — a cache names the SAME
+	 * store as the driver it fronts; it is not a store of its own.
 	 */
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	approximateBytesUsed?: () => Promise<number>;
+	storeIdentity?: () => StoreIdentity;
 
 	constructor(
 		private readonly inner: RawStoreDriver,
@@ -201,6 +204,9 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 		label?: string,
 	) {
 		this.store = pool.registerStore(label);
+		if (inner.storeIdentity) {
+			this.storeIdentity = () => inner.storeIdentity!();
+		}
 		if (inner.listBlockIds) {
 			this.listBlockIds = () => inner.listBlockIds!();
 		}

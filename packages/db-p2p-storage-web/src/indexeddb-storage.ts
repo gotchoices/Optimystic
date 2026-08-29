@@ -1,5 +1,5 @@
 import type { ActionId, BlockId } from '@optimystic/db-core';
-import { KvRawStorage, type RawStoreDriver } from '@optimystic/db-p2p';
+import { KvRawStorage, identityForHandle, type RawStoreDriver, type StoreIdentity } from '@optimystic/db-p2p';
 import type { OptimysticWebDBHandle } from './db.js';
 import { createLogger } from './logger.js';
 
@@ -17,7 +17,19 @@ const log = createLogger('storage:indexeddb');
  * yielding), and the single `readwrite` transaction that makes `promote` atomic.
  */
 export class IndexedDBStoreDriver implements RawStoreDriver {
-	constructor(private readonly db: OptimysticWebDBHandle) {}
+	// NOTE: identity is the HANDLE object, so two handles opened over the same IndexedDB database
+	// NAME read as two identities. Resolving that would mean naming the underlying database,
+	// which `OptimysticWebDBHandle` does not expose. The package opener (`db.ts`) hands out one
+	// handle per database name in practice, so this is the reachable case, not the complete one.
+	private readonly identity: StoreIdentity;
+
+	constructor(private readonly db: OptimysticWebDBHandle) {
+		this.identity = identityForHandle('idb-handle', db);
+	}
+
+	storeIdentity(): StoreIdentity {
+		return this.identity;
+	}
 
 	// --- metadata ---
 
@@ -190,6 +202,7 @@ export class IndexedDBStoreDriver implements RawStoreDriver {
 export class IndexedDBRawStorage extends KvRawStorage {
 	declare listBlockIds: () => AsyncIterable<BlockId>;
 	declare getApproximateBytesUsed: () => Promise<number>;
+	declare getStoreIdentity: () => StoreIdentity;
 
 	constructor(db: OptimysticWebDBHandle) {
 		super(new IndexedDBStoreDriver(db));

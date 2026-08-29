@@ -45,6 +45,10 @@ class InjectedCrash extends Error {
 	}
 }
 
+// Deliberately does NOT pass `getStoreIdentity` through, and must not start: this proxy is a
+// distinct storage object by design (a crashed node's mesh is rebuilt over the SAME preserved
+// inner storage but a FRESH proxy), and identity-keyed consumers must keep treating each proxy
+// as its own object rather than collapsing them onto the inner store's identity.
 class CrashingRawStorage implements IRawStorage {
 	private matchCount = 0;
 	private hasFired = false;
