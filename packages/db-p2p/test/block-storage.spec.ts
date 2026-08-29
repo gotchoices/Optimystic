@@ -1400,3 +1400,131 @@ async function insertRev1AfterDelete(repo: StorageRepo, blockId: BlockId, rev: n
 	const result = await repo.commit({ actionId, blockIds: [blockId], tailId: blockId, rev });
 	if (!result.success) throw new Error(`re-create commit failed at rev ${rev}`);
 }
+
+/**
+ * Regression coverage for "one block, one write lock": every writer of a block's metadata blob
+ * (`{ latest, ranges }`) serializes on the SAME per-block latch. Before the fix, the restore path,
+ * the replica path, and the pend path each took a different lock (or none), so two of them could
+ * interleave inside one read-modify-write window and silently undo each other.
+ *
+ * Both tests force the interleaving by subclassing `MemoryRawStorage` and pausing AFTER an
+ * underlying read returns — the racing writer then lands in the window the first writer's check has
+ * already looked past. Only `StorageRepo.get` / `pend` / `saveReplicatedBlock` are used, whose
+ * signatures do not change with the fix, so the tests run (and fail) on the unfixed tree.
+ */
+describe('one block, one write lock', () => {
+	/** A one-shot gate: `parked` resolves when the gated read pauses; `release()` lets it continue. */
+	function makeGate() {
+		let release!: () => void;
+		let signalParked!: () => void;
+		const gate = new Promise<void>(r => { release = r; });
+		const parked = new Promise<void>(r => { signalParked = r; });
+		return { gate, parked, release, signalParked };
+	}
+
+	it('a peer restore and a replica push on the same block never cross-write a revision (A)', async () => {
+		const B = 'block-race-a' as BlockId;
+		const g = makeGate();
+		let tripped = false;
+		class GatedRaw extends MemoryRawStorage {
+			override async getRevision(id: BlockId, rev: number): Promise<ActionId | undefined> {
+				const r = await super.getRevision(id, rev);
+				// Pause inside the restore's `noDivergentRewrite` scan, right after it has observed
+				// that rev 6 is NOT held — the check it is about to act on is now stale.
+				if (id === B && rev === 6 && !tripped) {
+					tripped = true;
+					g.signalParked();
+					await g.gate;
+				}
+				return r;
+			}
+		}
+		const raw = new GatedRaw();
+
+		const two = makeBlock(B, { items: ['two'] });
+		const six = makeBlock(B, { items: ['six'] });
+		// The peer answers the pin at rev 2 with rev 2 AND volunteers rev 6 (action x6).
+		const restoreCallback: RestoreCallback = async (id) => ({
+			blockId: id,
+			revisions: {
+				2: { action: { actionId: 'a2' as ActionId, rev: 2, transform: { insert: two } }, block: two },
+				6: { action: { actionId: 'x6' as ActionId, rev: 6, transform: { insert: six } }, block: six }
+			},
+			range: [2, 7]
+		});
+		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback));
+
+		// Seed the block at rev 5 (coverage [[5]]), so rev 2 is a genuine gap that triggers a restore.
+		await repo.pend({
+			actionId: 'a5' as ActionId,
+			transforms: makeInsertTransforms(B, makeBlock(B, { items: ['five'] })),
+			policy: 'c'
+		});
+		const seeded = await repo.commit({ actionId: 'a5' as ActionId, blockIds: [B], tailId: B, rev: 5 });
+		expect(seeded.success).to.equal(true);
+		expect((await raw.getMetadata(B))!.ranges).to.deep.equal([[5]]);
+
+		// Read at rev 2 → restore → parks inside the divergence scan.
+		const readP = repo.get({ blockIds: [B], context: { rev: 2, committed: [] } });
+		await g.parked;
+
+		// A replica of rev 6 arrives while the restore is mid-flight.
+		const replicaP = repo.saveReplicatedBlock(B, six, { rev: 6, actionId: 'r6' as ActionId });
+		await delay(10);
+		expect(await raw.getRevision(B, 6), 'the replica must QUEUE behind the in-flight restore, not land inside it')
+			.to.equal(undefined);
+
+		g.release();
+		await Promise.all([readP, replicaP]);
+
+		// Either serialization order converges here: restore-then-replica overwrites the volunteered
+		// x6 with r6 above its own latest; replica-then-restore refuses the archive on divergence.
+		expect(await raw.getRevision(B, 6), 'rev 6 is the replica, never the peer-volunteered x6')
+			.to.equal('r6');
+		expect((await raw.getMetadata(B))!.latest, 'latest never regresses below the replica')
+			.to.deep.equal({ rev: 6, actionId: 'r6' });
+	});
+
+	it('a pend seeding metadata and a replica push on a fresh block never erase latest (B)', async () => {
+		const B = 'block-race-b' as BlockId;
+		const g = makeGate();
+		let tripped = false;
+		class GatedRaw extends MemoryRawStorage {
+			override async getMetadata(id: BlockId): Promise<BlockMetadata | undefined> {
+				const m = await super.getMetadata(id);
+				// Pause inside `savePendingTransaction`, right after it has read "no metadata" and
+				// decided to seed an empty blob.
+				if (id === B && !tripped) {
+					tripped = true;
+					g.signalParked();
+					await g.gate;
+				}
+				return m;
+			}
+		}
+		const raw = new GatedRaw();
+		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+
+		// An updates-only pend with no `rev` makes no getLatest() call of its own, so the FIRST
+		// metadata read for this block is the one inside savePendingTransaction.
+		const pendP = repo.pend({
+			actionId: 'p1' as ActionId,
+			transforms: makeUpdateTransforms(B, [['items', 0, 0, ['x']]]),
+			policy: 'c'
+		});
+		await g.parked;
+
+		const one = makeBlock(B, { items: ['one'] });
+		const replicaP = repo.saveReplicatedBlock(B, one, { rev: 1, actionId: 'r1' as ActionId });
+		await delay(10);
+
+		g.release();
+		const [pended] = await Promise.all([pendP, replicaP]);
+		expect(pended.success).to.equal(true);
+
+		expect((await raw.getMetadata(B))!.latest, 'the committed replica latest survives the pend')
+			.to.deep.equal({ rev: 1, actionId: 'r1' });
+		expect(await raw.getPendingTransaction(B, 'p1' as ActionId), 'the pending record is present')
+			.to.not.equal(undefined);
+	});
+});

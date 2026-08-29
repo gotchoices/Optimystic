@@ -1,13 +1,28 @@
 import type { BlockId, IBlock, Transform, ActionId, ActionRev, ActionTransform } from "@optimystic/db-core";
-import { Latches, applyTransform, canonicalJson, hashString } from "@optimystic/db-core";
+import { applyTransform, canonicalJson, hashString } from "@optimystic/db-core";
 import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
 import { mergeRanges } from "./helpers.js";
 import type { IBlockStorage } from "./i-block-storage.js";
+import type { BlockWriteLatch } from "./block-latch.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('block-storage');
+
+/**
+ * Thrown by {@link BlockStorage.getBlock} when the block has metadata here but the target revision
+ * lies outside `meta.ranges` — this node holds no local records that can serve it. Not a fault: it
+ * is the signal a caller that is allowed to heal (only `StorageRepo.get`, under the block's write
+ * latch) turns into a {@link BlockStorage.restoreRevision}; every other caller treats it like any
+ * other unreadable-base condition.
+ */
+export class RevisionNotCoveredError extends Error {
+	constructor(readonly blockId: BlockId, readonly rev: number) {
+		super(`Block ${blockId} revision ${rev} is not covered by local records`);
+		this.name = 'RevisionNotCoveredError';
+	}
+}
 
 /**
  * Default checkpoint cadence: a full materialization is retained at every `CHECKPOINT_INTERVAL`th
@@ -42,13 +57,31 @@ export class BlockStorage implements IBlockStorage {
 		return meta?.latest;
 	}
 
+	/**
+	 * Guard every write: the token must have been minted for THIS block. The type already proves the
+	 * caller went through `acquireBlockWriteLatch`; this catches a token for block A presented to
+	 * block B's storage, which the type cannot.
+	 */
+	private assertLatch(latch: BlockWriteLatch): void {
+		if (latch.blockId !== this.blockId) {
+			throw new Error(`Block ${this.blockId}: write latch was acquired for block ${latch.blockId}`);
+		}
+	}
+
+	/**
+	 * LOCAL-ONLY read — never fetches from a peer. A revision outside `meta.ranges` throws
+	 * {@link RevisionNotCoveredError}; the one caller allowed to heal that (`StorageRepo.get`) does so
+	 * with {@link restoreRevision} under the block's write latch and re-reads. Keeping the fetch out of
+	 * here is what lets the commit path hold N block latches with no network I/O inside them.
+	 */
 	async getBlock(rev?: number): Promise<{ block: IBlock, actionRev: ActionRev } | undefined> {
 		const meta = await this.storage.getMetadata(this.blockId);
 		if (!meta) {
 			// No metadata at all ⇒ this node has never seen the block, and reads report it absent
 			// WITHOUT consulting `restoreCallback`. That is deliberate, not an oversight: `restoreCallback`
-			// is reachable only from ensureRevision below, so a never-seen block is never fetched HERE.
-			// Attempting a fetch at this layer would turn every read of a genuinely non-existent block —
+			// is reachable only from restoreRevision, which a caller invokes only after THIS method has
+			// reported a coverage gap on a block that has metadata — so a never-seen block is never fetched.
+			// Attempting a fetch for it would turn every read of a genuinely non-existent block —
 			// the common case for an insert probing for a collision — into a network round trip, because
 			// storage cannot tell "nobody has this" from "I don't have this".
 			//
@@ -59,46 +92,56 @@ export class BlockStorage implements IBlockStorage {
 			return undefined;
 		}
 
-		// Pending-only state: metadata was seeded by savePendingTransaction but no revision has been
-		// committed yet. "No committed base here" is an ABSENCE, not a fault — nothing is being
-		// FAILED to reconstruct — so both arms below answer `undefined` rather than throwing, whether
-		// or not the caller named a revision. StorageRepo.get then applies any pending overlay over
-		// that absent base; a throw here would instead be caught into `unavailable: 'unmaterializable'`
-		// and a writer reading back its own not-yet-committed insert would be told it is unreadable.
-		// `unmaterializable` must keep its one meaning: records prove the block exists and this node
-		// cannot reconstruct it.
-		if (meta.latest === undefined) {
-			if (rev === undefined) {
-				return undefined;
-			}
-			// A named rev still ATTEMPTS the restore: `restoreCallback` may be able to supply that
-			// revision even though nothing is committed locally, and a successful restore serves real
-			// content with `latest` still undefined. That capability is pinned by the 'getBlock for an
-			// absent revision fires restoreCallback (restore not short-circuited)' test in
-			// test/block-storage.spec.ts — do not short-circuit it away.
-			//
-			// Only ensureRevision's FAILURE is swallowed (no callback wired, or restore could not
-			// supply the rev): that is precisely the "no committed base here" absence. materializeBlock
-			// below is deliberately OUTSIDE the try — a throw from there means revision records exist
-			// with no materialization anywhere under them, which is genuine corruption and must keep
-			// reading as `unmaterializable`.
-			//
-			// NOTE: a contextful read of a pending-only block still attempts a network restore before
-			// falling back to absent (same cost as the pre-fix throw path); if pending-only read-backs
-			// ever show as hot, short-circuit when ranges are empty.
-			try {
-				await this.ensureRevision(meta, rev);
-			} catch (err) {
-				log('getBlock:no-committed-base blockId=%s rev=%d error=%s', this.blockId, rev,
-					err instanceof Error ? err.message : String(err));
-				return undefined;
-			}
-			return await this.materializeBlock(meta, rev);
+		// Pending-only state (metadata seeded by savePendingTransaction, nothing committed) with no
+		// revision named: "no committed base here" is an ABSENCE, not a fault — answer `undefined`.
+		// StorageRepo.get then applies any pending overlay over that absent base. A NAMED rev on a
+		// pending-only block falls through: it is covered only if an earlier restore brought it in
+		// (a restore can serve real content with `latest` still undefined), otherwise it reports the
+		// gap below and StorageRepo.get decides whether the failed restore reads as absent.
+		if (meta.latest === undefined && rev === undefined) {
+			return undefined;
 		}
 
-		const targetRev = rev ?? meta.latest.rev;
-		await this.ensureRevision(meta, targetRev);
+		const targetRev = rev ?? meta.latest!.rev;
+		if (!this.inRanges(targetRev, meta.ranges)) {
+			throw new RevisionNotCoveredError(this.blockId, targetRev);
+		}
+		// A throw from here means revision records exist with no materialization anywhere under them —
+		// genuine corruption, which StorageRepo.get reports as `unmaterializable`.
 		return await this.materializeBlock(meta, targetRev);
+	}
+
+	async restoreRevision(rev: number, latch: BlockWriteLatch): Promise<void> {
+		this.assertLatch(latch);
+		// One metadata read, under the held latch: the caller's earlier `getBlock` observed a gap, but
+		// a queued-ahead restore or replica may have filled it before this latch was granted.
+		const meta = await this.storage.getMetadata(this.blockId);
+		if (!meta) {
+			// Same reasoning as getBlock's early return: a never-seen block is not restored here.
+			throw new Error(`Block ${this.blockId} has no metadata; a never-seen block is not restored here.`);
+		}
+		if (this.inRanges(rev, meta.ranges)) {
+			return;
+		}
+
+		const restored = await this.restoreBlock(rev);
+		// An archive off this wire is a peer's UNVERIFIED answer (see {@link saveRestored}), so it
+		// is vetted before a byte of it reaches storage. A rejected archive is indistinguishable to
+		// the caller from an absent one — same throw — because both mean the same thing: this node
+		// still cannot serve `rev`. The specific reason is logged rather than thrown so that
+		// `StorageRepo.get`'s healing helper keeps one rule for every restore failure.
+		const coverage = restored ? await this.vetRestoredArchive(restored, rev) : undefined;
+		if (!restored || !coverage) {
+			throw new Error(`Block ${this.blockId} revision ${rev} not found during restore attempt.`);
+		}
+		await this.saveRestored(restored);
+
+		// The vetted coverage, NOT `restored.range`. The declared range is checked for internal
+		// consistency above but is not what gets recorded — see {@link vetRestoredArchive} for why
+		// the pin has to be folded in, or the same restore repeats on every read forever.
+		meta.ranges.unshift(coverage);
+		meta.ranges = mergeRanges(meta.ranges);
+		await this.storage.saveMetadata(this.blockId, meta);
 	}
 
 	async getTransaction(actionId: ActionId): Promise<Transform | undefined> {
@@ -109,7 +152,8 @@ export class BlockStorage implements IBlockStorage {
 		return await this.storage.getBlockProof(this.blockId, rev);
 	}
 
-	async saveBlockProof(rev: number, proof: BlockCommitProof): Promise<void> {
+	async saveBlockProof(rev: number, proof: BlockCommitProof, latch: BlockWriteLatch): Promise<void> {
+		this.assertLatch(latch);
 		await this.storage.saveBlockProof(this.blockId, rev, proof);
 	}
 
@@ -121,7 +165,8 @@ export class BlockStorage implements IBlockStorage {
 		yield* this.storage.listPendingTransactions(this.blockId);
 	}
 
-	async savePendingTransaction(actionId: ActionId, transform: Transform): Promise<void> {
+	async savePendingTransaction(actionId: ActionId, transform: Transform, latch: BlockWriteLatch): Promise<void> {
+		this.assertLatch(latch);
 		log('pend blockId=%s actionId=%s', this.blockId, actionId);
 		let meta = await this.storage.getMetadata(this.blockId);
 		if (!meta) {
@@ -129,14 +174,18 @@ export class BlockStorage implements IBlockStorage {
 			// nothing yet: seed empty ranges. The first commit anchors an OPEN-ENDED span at
 			// the earliest held rev E ([E, +inf)); later commits/recover merge into it via
 			// setLatest/recover. Seeding open-ended `[[0]]` would falsely claim coverage of the
-			// un-held revs below E and disable ensureRevision's restore path.
+			// un-held revs below E and disable restoreRevision's restore path.
+			//
+			// This read-then-seed is exactly the window a concurrent replica used to land in (the
+			// seed then erased its `latest`); the latch the caller holds is what closes it.
 			meta = { latest: undefined, ranges: [] };
 			await this.storage.saveMetadata(this.blockId, meta);
 		}
 		await this.storage.savePendingTransaction(this.blockId, actionId, transform);
 	}
 
-	async deletePendingTransaction(actionId: ActionId): Promise<void> {
+	async deletePendingTransaction(actionId: ActionId, latch: BlockWriteLatch): Promise<void> {
+		this.assertLatch(latch);
 		log('cancel blockId=%s actionId=%s', this.blockId, actionId);
 		await this.storage.deletePendingTransaction(this.blockId, actionId);
 	}
@@ -145,11 +194,13 @@ export class BlockStorage implements IBlockStorage {
 		yield* this.storage.listRevisions(this.blockId, startRev, endRev);
 	}
 
-	async saveMaterializedBlock(actionId: ActionId, block: IBlock | undefined): Promise<void> {
+	async saveMaterializedBlock(actionId: ActionId, block: IBlock | undefined, latch: BlockWriteLatch): Promise<void> {
+		this.assertLatch(latch);
 		await this.storage.saveMaterializedBlock(this.blockId, actionId, block);
 	}
 
-	async pruneSupersededMaterialization(prior: ActionRev): Promise<void> {
+	async pruneSupersededMaterialization(prior: ActionRev, latch: BlockWriteLatch): Promise<void> {
+		this.assertLatch(latch);
 		const meta = await this.storage.getMetadata(this.blockId);
 		// No metadata / no committed tip yet ⇒ nothing has superseded `prior`; leave it.
 		if (!meta || meta.latest === undefined) {
@@ -168,16 +219,19 @@ export class BlockStorage implements IBlockStorage {
 		log('prune blockId=%s rev=%d actionId=%s', this.blockId, prior.rev, prior.actionId);
 	}
 
-	async saveRevision(rev: number, actionId: ActionId): Promise<void> {
+	async saveRevision(rev: number, actionId: ActionId, latch: BlockWriteLatch): Promise<void> {
+		this.assertLatch(latch);
 		await this.storage.saveRevision(this.blockId, rev, actionId);
 	}
 
-	async promotePendingTransaction(actionId: ActionId): Promise<void> {
+	async promotePendingTransaction(actionId: ActionId, latch: BlockWriteLatch): Promise<void> {
+		this.assertLatch(latch);
 		log('commit blockId=%s actionId=%s', this.blockId, actionId);
 		await this.storage.promotePendingTransaction(this.blockId, actionId);
 	}
 
-	async setLatest(latest: ActionRev): Promise<void> {
+	async setLatest(latest: ActionRev, latch: BlockWriteLatch): Promise<void> {
+		this.assertLatch(latch);
 		const meta = await this.storage.getMetadata(this.blockId);
 		if (!meta) {
 			throw new Error(`Block ${this.blockId} not found`);
@@ -203,7 +257,8 @@ export class BlockStorage implements IBlockStorage {
 		await this.storage.saveMetadata(this.blockId, meta);
 	}
 
-	async recover(): Promise<{ reconciled: boolean; latest?: ActionRev }> {
+	async recover(latch: BlockWriteLatch): Promise<{ reconciled: boolean; latest?: ActionRev }> {
+		this.assertLatch(latch);
 		const meta = await this.storage.getMetadata(this.blockId);
 		if (!meta) {
 			return { reconciled: false };
@@ -242,7 +297,8 @@ export class BlockStorage implements IBlockStorage {
 		return { reconciled: false, latest: meta.latest };
 	}
 
-	async saveReplica(block: IBlock, source?: ActionRev, proof?: BlockCommitProof): Promise<ActionRev> {
+	async saveReplica(block: IBlock, source: ActionRev | undefined, proof: BlockCommitProof | undefined, latch: BlockWriteLatch): Promise<ActionRev> {
+		this.assertLatch(latch);
 		const rev = source?.rev ?? 1;
 		// Deterministic fallback id when the sender carried no revision metadata, so a
 		// re-push of the same block resolves to the same (rev, actionId) and stays
@@ -261,7 +317,8 @@ export class BlockStorage implements IBlockStorage {
 		);
 	}
 
-	async saveDeletion(source: ActionRev): Promise<ActionRev> {
+	async saveDeletion(source: ActionRev, latch: BlockWriteLatch): Promise<ActionRev> {
+		this.assertLatch(latch);
 		const { rev, actionId } = source;
 
 		// Forward tombstone: a `{ delete: true }` transform and NO materialized block. saveRestored
@@ -296,13 +353,11 @@ export class BlockStorage implements IBlockStorage {
 		logLabel: 'replica' | 'deletion',
 		verifiedProof?: BlockCommitProof
 	): Promise<ActionRev> {
-		// Serialize the read-modify-write on this block's metadata (mirrors ensureRevision). saveReplica
-		// and saveDeletion deliberately SHARE this one lock id (keyed `saveReplica`, NOT per-method):
-		// both do a read-modify-write of `meta.latest`, so they must be mutually exclusive on this block
-		// to keep the monotonic guard sound against a concurrent replica+deletion.
-		const lockId = `BlockStorage.saveReplica:${this.blockId}`;
-		const release = await Latches.acquire(lockId);
-		try {
+		// The read-modify-write of this block's metadata below is serialized by the write latch the
+		// caller already holds (asserted in saveReplica / saveDeletion) — the same latch every other
+		// writer of this block holds, so a concurrent replica, deletion, restore, commit, or pend
+		// cannot land inside the window between the read and the saveMetadata.
+		{
 			let meta = await this.storage.getMetadata(this.blockId);
 
 			// Monotonic guard: an equal-or-newer revision is already held. The block (or tombstone) is
@@ -348,10 +403,9 @@ export class BlockStorage implements IBlockStorage {
 			// Deliberately on the WRITE path only: the monotonic guard above returns before here, and
 			// that early return must stay a true no-op (the earlier call that wrote the revision is the
 			// one that owed the deletion). Deliberately here rather than in `saveRestored`, which is
-			// also reached from ensureRevision's historical restore under a different latch, where a
-			// deletion could race a concurrent promotePendingTransaction; this path holds
-			// `BlockStorage.saveReplica:<id>` and (via StorageRepo.saveReplicatedBlock) the per-block
-			// commit latch, so it is already mutually exclusive with a live commit.
+			// also reached from restoreRevision's historical restore, where a held revision's pending
+			// record is not this writer's to delete. Both paths run under the block's write latch, so
+			// this deletion is already mutually exclusive with a live commit.
 			//
 			// NOTE: deletes only this revision's actionId, not every pending whose action is already
 			// committed. A broader sweep would repair records orphaned by routes that do not carry the
@@ -377,49 +431,6 @@ export class BlockStorage implements IBlockStorage {
 
 			log('%s:save blockId=%s rev=%d actionId=%s', logLabel, this.blockId, rev, actionId);
 			return meta.latest;
-		} finally {
-			release();
-		}
-	}
-
-	private async ensureRevision(meta: BlockMetadata, rev: number): Promise<void> {
-		if (this.inRanges(rev, meta.ranges)) {
-			return;
-		}
-
-		const lockId = `BlockStorage.ensureRevision:${this.blockId}`;
-		const release = await Latches.acquire(lockId);
-		try {
-			const currentMeta = await this.storage.getMetadata(this.blockId);
-			if (!currentMeta) {
-				throw new Error(`Block ${this.blockId} metadata disappeared unexpectedly.`);
-			}
-			if (this.inRanges(rev, currentMeta.ranges)) {
-				return;
-			}
-
-			const restored = await this.restoreBlock(rev);
-			// An archive off this wire is a peer's UNVERIFIED answer (see {@link saveRestored}), so it
-			// is vetted before a byte of it reaches storage. A rejected archive is indistinguishable to
-			// the caller from an absent one — same throw — because both mean the same thing: this node
-			// still cannot serve `rev`. The specific reason is logged rather than thrown so that
-			// `StorageRepo.readCommitBase`'s deliberately-unnarrowed catch keeps behaving as it does
-			// for every other BlockStorage fault.
-			const coverage = restored ? await this.vetRestoredArchive(restored, rev) : undefined;
-			if (!restored || !coverage) {
-				throw new Error(`Block ${this.blockId} revision ${rev} not found during restore attempt.`);
-			}
-			await this.saveRestored(restored);
-
-			// The vetted coverage, NOT `restored.range`. The declared range is checked for internal
-			// consistency above but is not what gets recorded — see {@link vetRestoredArchive} for why
-			// the pin has to be folded in, or the same restore repeats on every read forever.
-			currentMeta.ranges.unshift(coverage);
-			currentMeta.ranges = mergeRanges(currentMeta.ranges);
-			await this.storage.saveMetadata(this.blockId, currentMeta);
-
-		} finally {
-			release();
 		}
 	}
 
@@ -471,11 +482,12 @@ export class BlockStorage implements IBlockStorage {
 			// NOTE: cold non-checkpoint historical reads re-replay every time (up to `checkpointInterval`
 			// forward transforms). Acceptable — historical reads are rare and replay is depth-bounded. If
 			// they ever show as hot, cache at the nearest checkpoint below the target instead of skipping.
-			// Read metadata FRESH for the retention decision: the `meta` passed in was captured by getBlock
-			// BEFORE ensureRevision, which may have restored the containing range during this same read
-			// (ensureRevision mutates its own re-read, not this snapshot). A stale `meta.ranges` would send
-			// rangeFloorOf into its fallback (treats the target as its own floor ⇒ wrongly "retained"),
-			// re-caching a rev the sweep means to prune — regrowing storage via reads of restored ranges.
+			// Read metadata FRESH for the retention decision: this re-cache runs on the READ path, outside
+			// the block's write latch (the one named exclusion from "every write holds the latch" — see
+			// block-latch.ts; the follow-up ticket records the NOTE explaining why that is safe), so a
+			// concurrent restore or commit may have moved `ranges` since `meta` was captured. A stale
+			// `meta.ranges` would send rangeFloorOf into its fallback (treats the target as its own floor
+			// ⇒ wrongly "retained"), re-caching a rev the sweep means to prune — regrowing storage via reads.
 			const retentionMeta = (await this.storage.getMetadata(this.blockId)) ?? meta;
 			const cacheRev = actions[0]!.rev;
 			const latestRev = retentionMeta.latest?.rev ?? cacheRev;
@@ -524,7 +536,7 @@ export class BlockStorage implements IBlockStorage {
 	 *    lowest (the floor must be present, or the descending walk has nothing to land on) and ends
 	 *    past the highest. An OPEN-ENDED range is refused outright: it would claim infinite coverage
 	 *    and permanently disable restore for this block on one unverified peer's say-so.
-	 *    (`RestoreCallback` allows open-ended for the UNPINNED call; `ensureRevision` never makes one.)
+	 *    (`RestoreCallback` allows open-ended for the UNPINNED call; `restoreRevision` never makes one.)
 	 *  - **Nothing already held is overwritten with different content** — see
 	 *    {@link noDivergentRewrite}.
 	 *
@@ -538,7 +550,7 @@ export class BlockStorage implements IBlockStorage {
 	 * block at or below N", i.e. nothing changed in (M, N]. This node cannot verify that locally.
 	 *
 	 * It is recorded anyway because the alternative is worse. `meta.ranges` is what
-	 * {@link ensureRevision} consults to decide whether to fetch at all, so recording only the
+	 * {@link restoreRevision} consults to decide whether to fetch at all, so recording only the
 	 * archive's literal `[M, M+1)` leaves `inRanges(N)` false and re-runs the ENTIRE restore — network
 	 * round trip plus a full `saveRestored` write — on every later read at that pin, forever, never
 	 * converging. The inference is also unavoidable rather than merely convenient: having the peer
@@ -703,7 +715,7 @@ export class BlockStorage implements IBlockStorage {
 	 * This is a WRITER, not a gate: it trusts what it is handed, and each of its two callers is
 	 * responsible for having earned that on its own terms.
 	 *
-	 *  - {@link ensureRevision} — the unverified restore wire — runs {@link vetRestoredArchive}
+	 *  - {@link restoreRevision} — the unverified restore wire — runs {@link vetRestoredArchive}
 	 *    first. Those checks are ABOUT the pinned request (does the archive answer the revision that
 	 *    was asked for?), and this function has no pin to check against, so they cannot live here.
 	 *  - {@link saveForwardRevision} — reached by `saveReplica`/`saveDeletion` through

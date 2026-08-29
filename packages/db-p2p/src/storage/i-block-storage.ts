@@ -1,19 +1,41 @@
 import type { IBlock, Transform, ActionId, ActionRev } from "@optimystic/db-core";
 import type { BlockCommitProof } from "../cluster/commit-proof.js";
+import type { BlockWriteLatch } from "./block-latch.js";
 
-/** Interface for block-level storage operations */
+/**
+ * Interface for block-level storage operations.
+ *
+ * **One block, one write lock.** Every method that writes — metadata, revision records, action
+ * transforms, pending records, materializations, proofs — takes a {@link BlockWriteLatch} token as
+ * its LAST parameter. The token is proof the caller holds this block's write latch
+ * (`blockWriteLatchKey(blockId)`, see `block-latch.ts`), which is the only thing that keeps two
+ * writers' read-modify-writes of the metadata blob from silently undoing each other. Only
+ * `acquireBlockWriteLatch` / `withBlockWriteLatch` can mint a token, and an implementation must
+ * reject a token minted for a different block.
+ */
 export interface IBlockStorage {
     /** Gets the latest revision information for this block */
     getLatest(): Promise<ActionRev | undefined>;
 
     /**
-     * Gets a materialized block at the given revision.
-     * Returns undefined when the block has no materialized content yet — either
-     * no metadata exists, or metadata exists (seeded by a pending transaction)
-     * but no revision has been committed. Throws only when a specific `rev` was
-     * requested but cannot be located.
+     * Gets a materialized block at the given revision, from LOCAL records only — this never fetches
+     * from a peer. Returns `undefined` when this node has never seen the block (no metadata) or when
+     * it is pending-only (metadata seeded by a pending transaction, nothing committed) and no `rev`
+     * was named. Throws `RevisionNotCoveredError` when the target revision (`rev`, or `latest.rev`)
+     * lies outside `meta.ranges` — the caller decides whether to heal that gap with
+     * {@link restoreRevision} under the block's write latch (`StorageRepo.get` does; the commit path
+     * deliberately does not). Throws a plain `Error` when the revision is covered but cannot be
+     * materialized from the records held (truncated history — genuine corruption).
      */
     getBlock(rev?: number): Promise<{ block: IBlock, actionRev: ActionRev } | undefined>;
+
+    /**
+     * Fill a gap in local revision history by fetching `rev` from a peer (the restore wire) and
+     * recording the vetted coverage. No-op when `rev` is already covered. Throws when the block has
+     * no metadata here (a never-seen block is not restored at this layer — see the note in
+     * `BlockStorage.getBlock`) or when no peer could supply an acceptable archive.
+     */
+    restoreRevision(rev: number, latch: BlockWriteLatch): Promise<void>;
 
     /** Gets an action by ID */
     getTransaction(actionId: ActionId): Promise<Transform | undefined>;
@@ -22,7 +44,7 @@ export interface IBlockStorage {
     getBlockProof(rev: number): Promise<BlockCommitProof | undefined>;
 
     /** Persists the commit proof for a revision (see IRawStorage.saveBlockProof). */
-    saveBlockProof(rev: number, proof: BlockCommitProof): Promise<void>;
+    saveBlockProof(rev: number, proof: BlockCommitProof, latch: BlockWriteLatch): Promise<void>;
 
     /** Gets a pending action by ID */
     getPendingTransaction(actionId: ActionId): Promise<Transform | undefined>;
@@ -30,29 +52,28 @@ export interface IBlockStorage {
     /** Lists all pending action IDs */
     listPendingTransactions(): AsyncIterable<ActionId>;
 
-    /** Saves a pending action */
-    savePendingTransaction(actionId: ActionId, transform: Transform): Promise<void>;
+    /** Saves a pending action (seeding this block's metadata when it has none). */
+    savePendingTransaction(actionId: ActionId, transform: Transform, latch: BlockWriteLatch): Promise<void>;
 
     /** Deletes a pending action */
-    deletePendingTransaction(actionId: ActionId): Promise<void>;
+    deletePendingTransaction(actionId: ActionId, latch: BlockWriteLatch): Promise<void>;
 
     /** Lists revisions in ascending or descending order between startRev and endRev (inclusive) */
     listRevisions(startRev: number, endRev: number): AsyncIterable<ActionRev>;
 
     /** Saves a materialized block */
-    saveMaterializedBlock(actionId: ActionId, block: IBlock | undefined): Promise<void>;
+    saveMaterializedBlock(actionId: ActionId, block: IBlock | undefined, latch: BlockWriteLatch): Promise<void>;
 
     /**
      * Delete the materialized copy at `prior` if it is now redundant under the checkpoint
      * retention policy (not the tip, not its range floor, not a checkpoint rev). The forward
      * transform for `prior.rev` is retained, so the rev stays reconstructible by replay.
      * No-op if `prior.rev` must be retained or has no materialization (e.g. a tombstone rev).
-     * Must be called under the per-block commit latch (serialized against concurrent commit).
      */
-    pruneSupersededMaterialization(prior: ActionRev): Promise<void>;
+    pruneSupersededMaterialization(prior: ActionRev, latch: BlockWriteLatch): Promise<void>;
 
     /** Saves a revision */
-    saveRevision(rev: number, actionId: ActionId): Promise<void>;
+    saveRevision(rev: number, actionId: ActionId, latch: BlockWriteLatch): Promise<void>;
 
     /**
      * Promotes a pending action to committed, MOVING the record from the pending namespace to the
@@ -66,10 +87,10 @@ export interface IBlockStorage {
      * and is reported as a phantom conflicting action by `StorageRepo.pend` on every later write to
      * the block.
      */
-    promotePendingTransaction(actionId: ActionId): Promise<void>;
+    promotePendingTransaction(actionId: ActionId, latch: BlockWriteLatch): Promise<void>;
 
     /** Sets the latest revision information */
-    setLatest(latest: ActionRev): Promise<void>;
+    setLatest(latest: ActionRev, latch: BlockWriteLatch): Promise<void>;
 
     /**
      * Persist a replica of a block received out-of-band (churn re-replication).
@@ -95,8 +116,11 @@ export interface IBlockStorage {
      * this node never checked. The monotonic no-op persists nothing, proof included — a proof for an
      * already-held revision is back-filled one layer up, by `StorageRepo.saveReplicatedBlock`, which
      * first checks the declared digest against LOCAL content (these bytes may not be the held bytes).
+     *
+     * `source` and `proof` are positional-but-optional (pass `undefined` when absent) so the latch
+     * token can stay in the last position like every other writer.
      */
-    saveReplica(block: IBlock, source?: ActionRev, proof?: BlockCommitProof): Promise<ActionRev>;
+    saveReplica(block: IBlock, source: ActionRev | undefined, proof: BlockCommitProof | undefined, latch: BlockWriteLatch): Promise<ActionRev>;
 
     /**
      * Writes a forward TOMBSTONE revision that reverses a block creation: persists `rev → actionId`,
@@ -111,7 +135,7 @@ export interface IBlockStorage {
      * Idempotent for a fixed `(rev, actionId)`; never downgrades `latest` (a no-op — still durable —
      * when an equal-or-newer revision is already present). Returns the effective latest `ActionRev`.
      */
-    saveDeletion(source: ActionRev): Promise<ActionRev>;
+    saveDeletion(source: ActionRev, latch: BlockWriteLatch): Promise<ActionRev>;
 
     /**
      * Reconciles `metadata.latest` with the highest contiguous fully-promoted revision in
@@ -126,5 +150,5 @@ export interface IBlockStorage {
      *
      * Idempotent and monotonic (latest only advances forward).
      */
-    recover(): Promise<{ reconciled: boolean; latest?: ActionRev }>;
+    recover(latch: BlockWriteLatch): Promise<{ reconciled: boolean; latest?: ActionRev }>;
 }
