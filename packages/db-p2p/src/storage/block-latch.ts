@@ -11,8 +11,14 @@ import { Latches } from "@optimystic/db-core";
  * > A block's metadata, revision records, action transforms, pending records, and stored proofs are
  * > only ever written while holding {@link blockWriteLatchKey}`(blockId)`.
  *
- * This module is the single acquirer of that key (`grep -rn "Latches.acquire" src/storage` must
- * return exactly one hit — the one below). Every writing method on `IBlockStorage` demands a
+ * This module is the single acquirer of that key. The check, which deliberately matches the call
+ * shape (the escapes keep this very comment from matching):
+ *
+ * >     grep -rnE "Latches\.acquire\(" packages/db-p2p/src
+ *
+ * That must return exactly one line — the call in `acquireBlockWriteLatch` below. A second hit
+ * anywhere means a caller has started taking the key directly and the token discipline has a hole.
+ * Every writing method on `IBlockStorage` demands a
  * {@link BlockWriteLatch} token, which only this module can mint, so an unlatched write does not
  * type-check rather than merely being documented as forbidden.
  *

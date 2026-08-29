@@ -51,38 +51,73 @@ a cache, or the byte-counter this seam was deliberately left open for — silent
 serves stale data, because a write that bypassed `IRawStorage` never touched the
 seam.
 
-### 2. Every out-of-band writer of a block's `meta.latest` serializes on the per-block commit latch
+### 2. Every write to a block holds that block's single write latch
 
-`StorageRepo.commit` is not the only path that read-modify-writes a block's
-`meta.latest`. Replica persistence (`saveReplicatedBlock`, e.g. churn
-re-replication) and the dispute module's compensating writes
-(`applyInvalidation`'s `saveReplica`/`saveDeletion`) do too, and all three must
-hold the same key (`packages/db-p2p/src/storage/storage-repo.ts:21-27`,
-`commitLatchKey`):
+A block's metadata is one blob — `{ latest, ranges }` — read and written whole.
+There is no field-level write, so *any* read-modify-write of that blob rewrites
+`latest` whether it meant to or not. The invariant is therefore stated over the
+whole blob and over every record filed under the block, not over `latest` alone:
 
-> Every out-of-band writer of a block's `meta.latest` must serialize on this key
-> against a concurrent local commit on the same block; keeping all call sites on
-> this helper is what prevents the key from drifting between them.
+> A block's metadata, revision records, action transforms, pending records, and
+> stored commit proofs are only ever written while holding the block's write
+> latch — the key `Block.write:<blockId>`
+> (`packages/db-p2p/src/storage/block-latch.ts`, `blockWriteLatchKey`).
 
-Skipping the latch is invisible to the check it protects
-(`storage-repo.ts:29-46`, `withBlockCommitLatch`):
+That is ONE key per block, and it is the only one. `StorageRepo.commit` is not
+the only writer: `pend` and `cancel`, the read-driven promotion in
+`StorageRepo.get`, coverage restores (`restoreRevision`), replica persistence
+(`saveReplicatedBlock`, e.g. churn re-replication), crash recovery (`recover`),
+and the dispute module's compensating writes (`applyInvalidation`'s
+`saveReplica`/`saveDeletion`) all take the same key. Sorting matters only for `commit`, which is the one caller
+that holds several block latches at once: it acquires them in sorted block-id
+order so two concurrent commits over overlapping batches cannot deadlock. Every
+other caller holds at most one at a time.
 
-> otherwise an invalidation advancing `latest` outside that latch is invisible
-> to commit's staleness guard and can be clobbered (a non-monotonic regression)
+**Two things enforce it, one static and one checkable:**
 
-**Known deliberate exception:** the invalidation-apply path
-(`packages/db-p2p/src/dispute/invalidation.ts:481-490`,
-`InvalidationContext.withBlockCommitLatch`) and its cascade-child counterpart
-(`packages/db-p2p/src/dispute/cascade.ts:43-49`,
-`CollectionEnv.withBlockCommitLatch`) both take the latch runner as *optional*.
-When a host doesn't supply one — unit tests, or a non-`StorageRepo` host — the
-compensating write runs unlatched. That's accepted specifically because such a
-host has no concurrent `StorageRepo.commit` to race against; a `StorageRepo`-
-backed host always supplies the runner.
+*Statically:* every writing method on `IBlockStorage`
+(`packages/db-p2p/src/storage/i-block-storage.ts`) takes a `BlockWriteLatch`
+token as a required parameter — `savePendingTransaction`,
+`deletePendingTransaction`, `promotePendingTransaction`, `saveRevision`,
+`setLatest`, `saveMaterializedBlock`, `pruneSupersededMaterialization`,
+`saveBlockProof`, `restoreRevision`, `saveReplica`, `saveDeletion`, `recover`.
+The token's constructor is private to `block-latch.ts` and only
+`acquireBlockWriteLatch` can mint one, so an unlatched write does not type-check
+rather than merely being documented as forbidden. `BlockStorage` also checks at
+runtime what the type cannot: that the token was minted for *this* block, and
+that its latch has not been released yet (a callback that stashes its token and
+writes after its scope closed is rejected).
+
+*By inspection:* `block-latch.ts` is the single place that acquires the key, so
+
+```bash
+grep -rnE "Latches\.acquire\(" packages/db-p2p/src
+```
+
+must return exactly one line — the call inside `acquireBlockWriteLatch`. (The
+pattern matches the call shape including its open paren, and the escapes are
+what keep the prose describing the check — here and in `block-latch.ts` — from
+matching itself.) A second hit anywhere means a caller has started taking the key directly and the
+token discipline has a hole.
+
+**The one named exclusion:** `BlockStorage.materializeBlock` re-caches a replayed
+materialization at a retained revision (the `saveMaterializedBlock` after the
+retention check in `packages/db-p2p/src/storage/block-storage.ts`). That runs on
+the READ path, outside the latch. It is safe because it is not a
+read-modify-write of anything: the key is `(blockId, actionId)` and the value is
+a deterministic replay of transforms this node already retained, so a concurrent
+writer racing on the same key writes identical bytes. It touches neither the
+metadata blob nor any revision record, so it cannot clobber `latest`. Taking the
+latch there would put a lock acquisition on every cold historical read and would
+self-deadlock the commit path, which reaches `materializeBlock` through
+`getBlock` while already holding the latch. The `NOTE:` at that call site says
+the same, and dropping the re-cache entirely stays out of scope until someone
+measures the cold historical-read cost of doing without it.
 
 **Violate it and:** a commit's staleness guard can read `latest` before a
-concurrent out-of-band writer advances it, then write its own value back on top —
-a non-monotonic regression that silently discards the out-of-band write.
+concurrent out-of-band writer advances it, then write the whole metadata blob
+back on top — a non-monotonic regression that silently discards the out-of-band
+write.
 
 ### 3. Committed revisions are append-only; `latest` never advances past a materializable revision
 
@@ -154,14 +189,22 @@ The `BlockStorage` class manages individual block operations, providing versioni
 - **Version Management**: Tracks block revisions and ensures availability
 - **Block Materialization**: Reconstructs blocks by applying transforms
 - **Transaction Lifecycle**: Manages pending → committed transaction flow
-- **Restoration Support**: Integrates with external restoration callbacks
-- **Concurrency Control**: Uses latches for thread-safe operations
+- **Restoration Support**: Integrates with external restoration callbacks, but only
+  from the one explicit entry point below — reads never fetch implicitly
+- **Concurrency Control**: The caller holds the block's write latch and passes the
+  token; every writing method demands one (Invariant 2 above)
 
 **Core Operations:**
-- `getBlock()`: Retrieves and materializes blocks at specific revisions
-- `savePendingTransaction()`: Stores uncommitted transactions
-- `promotePendingTransaction()`: Converts pending to committed transactions
-- `ensureRevision()`: Ensures revision availability through restoration
+- `getBlock(rev?)`: Materializes the block at a revision from LOCAL data only — it
+  never consults `restoreCallback`. A revision outside `meta.ranges` raises
+  `RevisionNotCoveredError` and the caller decides whether to heal.
+- `restoreRevision(rev, latch)`: The one place a coverage gap is filled from a peer.
+  Called by `StorageRepo.get`'s healing helper after `getBlock` reported the gap,
+  under the block's write latch, which then re-reads. The commit path deliberately
+  never calls it: `readCommitBase` refuses with `MissingBaseRevisionError` instead,
+  because `commit` holds N block latches and must do no network I/O inside them.
+- `savePendingTransaction(actionId, transform, latch)`: Stores uncommitted transactions
+- `promotePendingTransaction(actionId, latch)`: Converts pending to committed transactions
 
 ### 3. Raw Storage Interface (`IRawStorage`)
 
@@ -240,7 +283,8 @@ Its soundness rests entirely on the five **Invariants** above:
 
 1. every backend write funnels through `IRawStorage` in-process, so the cache
    sees every mutation (Invariant 1);
-2. every writer of `meta.latest` holds the per-block commit latch, and each
+2. every writer of a block's metadata blob holds that block's single write
+   latch (`Block.write:<blockId>`), and each
    cache update is synchronous with its inner write (no `await` between the
    inner call resolving and the cache mutation), so a latch-protected
    read-after-write sees the new value exactly as a driver read would
@@ -470,11 +514,17 @@ Supports external restoration for missing data:
 
 ### 5. Concurrency Control
 
-Implements proper locking mechanisms:
+One write latch per block, described in full under Invariant 2 above:
 
-- **Block-level Locking**: Prevents concurrent modifications to the same block
-- **Ordered Locking**: Prevents deadlocks through consistent lock ordering
-- **Atomic Operations**: Ensures consistency during complex operations
+- **Block-level Locking**: `Block.write:<blockId>` — the single key guarding every
+  write to a block, minted and acquired only by `block-latch.ts`
+- **Token-passing**: Writing methods take a `BlockWriteLatch`, so an unlatched write
+  does not type-check
+- **Ordered Locking**: `StorageRepo.commit` is the only caller holding several block
+  latches at once and acquires them in sorted block-id order, so two commits over
+  overlapping batches cannot deadlock
+- **No I/O under the latch on the commit path**: a base the node cannot materialize
+  locally is refused, not fetched
 
 ## Usage Examples
 

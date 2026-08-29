@@ -164,7 +164,7 @@ consensus, what each block it could digest will contain once the action commits
 member then checks that declaration against its OWN copy of the pending change: on the promise
 round, `ClusterMember.validateCommitOperations` calls `StorageRepo.previewCommitDigest`, which
 re-materializes the block from the member's pended transform (mirroring `internalCommit`'s reads,
-but read-only and without the per-block commit latch — it runs on the vote path, ahead of the
+but read-only and without the block's write latch — it runs on the vote path, ahead of the
 commit that will take that latch), and votes reject with the signed reason
 `content-digest-mismatch` when the results disagree.
 
@@ -784,7 +784,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   is the only line that means bytes actually landed. An *ahead* member already holds ≥ the rev, so it does not reconcile
   downward. Reconciliation deliberately runs **after** `StorageRepo.commit` returns, once
   its per-block latches are released: `saveReplicatedBlock` takes the same
-  `StorageRepo.commit:<blockId>` latch, so fetching the base from inside the commit path
+  `Block.write:<blockId>` write latch, so fetching the base from inside the commit path
   would deadlock against the lock the commit already holds. That constraint is why a member
   with no base *refuses and heals* rather than *fetching then committing*.
 
@@ -978,12 +978,12 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `state.latest` did) silently overwrote the asker's own good rev 2 with rev 1's content, and left
   rev 1 unrecorded so every later read repeated the corruption. Two rules make that unrepresentable:
   the label IS the materialized revision, and a served revision strictly above the pin is refused
-  (`undefined`, the "holds nothing" answer every caller already handles, which `ensureRevision`
+  (`undefined`, the "holds nothing" answer every caller already handles, which `restoreRevision`
   turns into a loud "not found during restore attempt") — that arm fires only for a repo that does
   not report `materialized` at all (a plain `IRepo` describing its latest) when that latest is newer
   than the pin. A served revision at or below the pin is the block unchanged since the pin.
 - **The asker does not take that on faith.** Honest serving is one end of the rule; the other is
-  that `BlockStorage.ensureRevision` vets every archive off this wire before a byte of it reaches
+  that `BlockStorage.restoreRevision` vets every archive off this wire before a byte of it reaches
   storage (`vetRestoredArchive`), because the wire itself verifies nothing —
   `RestorationCoordinator.queryPeer` returns the response's archive straight through. An archive is
   refused whole (logged, and reported to the caller as the same "not found during restore attempt"

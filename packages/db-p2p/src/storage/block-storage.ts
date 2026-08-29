@@ -470,10 +470,19 @@ export class BlockStorage implements IBlockStorage {
 			// NOTE: cold non-checkpoint historical reads re-replay every time (up to `checkpointInterval`
 			// forward transforms). Acceptable — historical reads are rare and replay is depth-bounded. If
 			// they ever show as hot, cache at the nearest checkpoint below the target instead of skipping.
-			// Read metadata FRESH for the retention decision: this re-cache runs on the READ path, outside
-			// the block's write latch (the one named exclusion from "every write holds the latch" — see
-			// block-latch.ts; the follow-up ticket records the NOTE explaining why that is safe), so a
-			// concurrent restore or commit may have moved `ranges` since `meta` was captured. A stale
+			// NOTE: this `saveMaterializedBlock` is the ONE named exclusion from the storage invariant that
+			// every write to a block holds `blockWriteLatchKey(blockId)` (see block-latch.ts). It runs on the
+			// READ path, unlatched, and that is safe because it is not a read-modify-write of anything: the
+			// key is `(blockId, actionId)` and the value is a deterministic replay of transforms this node
+			// has already retained, so a concurrent writer racing on the same key writes the same bytes. It
+			// touches neither the metadata blob nor any revision record, so it cannot clobber `latest`.
+			// Taking the latch here would put a lock acquisition on every cold historical read and would
+			// deadlock the callers that already hold it. Dropping the re-cache entirely is the other way to
+			// close the exclusion, and is out of scope until someone measures the cold historical-read cost
+			// of doing without it.
+			//
+			// Read metadata FRESH for the retention decision: because this runs outside the block's write
+			// latch, a concurrent restore or commit may have moved `ranges` since `meta` was captured. A stale
 			// `meta.ranges` would send rangeFloorOf into its fallback (treats the target as its own floor
 			// ⇒ wrongly "retained"), re-caching a rev the sweep means to prune — regrowing storage via reads.
 			const retentionMeta = (await this.storage.getMetadata(this.blockId)) ?? meta;

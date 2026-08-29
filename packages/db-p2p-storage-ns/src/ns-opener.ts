@@ -142,7 +142,7 @@ class NSPluginStatement implements SqliteStatement {
 		// concurrency. A read issued while a write transaction is open on this same
 		// connection observes that transaction's UNCOMMITTED rows (read-your-connection
 		// semantics). Fine today: the only transaction writer is same-block promote
-		// under the commit latch, and cross-block reads are independent. If a future
+		// under the block's write latch, and cross-block reads are independent. If a future
 		// caller reads a block on this connection while another op's transaction on the
 		// same rows is mid-flight, it may see uncommitted state — serialize reads too if
 		// that ever matters.

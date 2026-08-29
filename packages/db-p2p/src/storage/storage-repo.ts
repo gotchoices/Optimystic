@@ -1253,6 +1253,19 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		if (!latest) {
 			return undefined;
 		}
+		// NOTE: this read is deliberately LOCAL-ONLY and does not heal. `getBlock` no longer restores
+		// from a peer (that moved to the explicit `restoreRevision`, which `StorageRepo.get` calls), so a
+		// base this node cannot materialize locally raises {@link MissingBaseRevisionError} here instead
+		// of being fetched in line. The reason is the calling context, not the cost of a fetch: `commit`
+		// holds the write latch of EVERY block in the batch across this call, and network I/O inside that
+		// critical section makes one unreachable peer stall every writer of every block in the batch for
+		// the length of a round trip. Healing is out-of-band instead — cohort reconcile supplies the
+		// revision (`ClusterMember` → `saveReplicatedBlock`) and the action is retried, by which point
+		// this read succeeds locally. Pinned by `test/storage-repo.spec.ts` "commit reads its base
+		// locally", which wires a restore callback that would have answered and asserts it is never
+		// called. Do not reintroduce a restore on this path; if a commit ever genuinely needs one, fetch
+		// BEFORE taking the latches, not underneath them.
+		//
 		// NOTE: `latest.rev` is always inside `meta.ranges` today — every writer of `latest`
 		// (`setLatest`, `saveForwardRevision`, `recover`) merges an open-ended range anchored at or
 		// below the new latest in the same `saveMetadata` — so the RevisionNotCoveredError arm below

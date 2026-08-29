@@ -250,26 +250,39 @@ class StorageRepo implements IRepo {
 - Concrete implementation of core database abstractions
 - Orchestrates transactions across multiple blocks
 - Handles revision conflicts and missing transaction detection
-- Provides atomic commit operations with proper locking
+- Provides atomic commit operations under one write latch per block, acquired in sorted block-id order so two commits over overlapping batches cannot deadlock
 
 #### `BlockStorage`
 Provides versioned block storage with conflict resolution, reading and writing through an injected `IRawStorage` backend:
 
 ```typescript
 class BlockStorage implements IBlockStorage {
-  constructor(blockId: BlockId, storage: IRawStorage, /* … */)
-  async getBlock(rev?: number): Promise<{ block: IBlock, actionRev: ActionRev }>
-  async savePendingAction(actionId: ActionId, transform: Transform): Promise<void>
-  async promotePendingAction(actionId: ActionId): Promise<void>
-  async ensureRevision(rev: number): Promise<void>
+  constructor(blockId: BlockId, storage: IRawStorage, restoreCallback?: RestoreCallback, /* … */)
+
+  // Reads take no latch.
+  async getBlock(rev?: number): Promise<{ block: IBlock, actionRev: ActionRev } | undefined>
+
+  // Every write takes a BlockWriteLatch token, minted only by acquiring the
+  // block's write latch — so an unlatched write does not compile.
+  async savePendingTransaction(actionId: ActionId, transform: Transform, latch: BlockWriteLatch): Promise<void>
+  async promotePendingTransaction(actionId: ActionId, latch: BlockWriteLatch): Promise<void>
+  async restoreRevision(rev: number, latch: BlockWriteLatch): Promise<void>
 }
 ```
 
 **Key Features:**
 - Maintains complete revision history for each block
 - Reconstructs blocks by applying transforms to base versions
-- Integrates with restoration callbacks for missing data
-- Uses latches for thread-safe concurrent access
+- `getBlock` is **local-only** — it never fetches from a peer. A revision outside the
+  block's recorded coverage raises `RevisionNotCoveredError`; `StorageRepo.get` is the
+  one caller that heals that, by calling `restoreRevision` (which does consult the
+  restoration callback) under the block's write latch and re-reading. The commit path
+  never restores in line: it holds every batch block's latch and must do no network I/O
+  there, so an unreachable base is refused with `MissingBaseRevisionError` and healed
+  out-of-band by cohort reconcile plus a retry.
+- Concurrency is one write latch per block (`Block.write:<blockId>`). The caller acquires
+  it and passes the resulting token into each write; `BlockStorage` rejects a token minted
+  for a different block, or one whose latch has already been released.
 
 #### `IRawStorage` backends
 `BlockStorage` persists through the `IRawStorage` interface, so the backing store is pluggable:

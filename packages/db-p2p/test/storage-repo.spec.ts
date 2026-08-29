@@ -3,6 +3,7 @@ import { StorageRepo, MISSING_BASE_REVISION_REASON } from '../src/storage/storag
 import { blockWriteLatchKey, withBlockWriteLatch, type BlockWriteLatch } from '../src/storage/block-latch.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
+import type { BlockArchive, RestoreCallback, RevisionRange } from '../src/storage/struct.js';
 import type { BlockId, ActionId, ActionRev, ActionTransforms, CommitResult, PendRequest, StaleFailure, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
 import { isBlockChangeNotifier, Latches, canonicalBlockHash } from '@optimystic/db-core';
 import { delay } from '@optimystic/db-core/test';
@@ -2187,6 +2188,147 @@ describe('StorageRepo', () => {
 				expect((await repo.get({ blockIds: [OK] }))[OK]?.state?.latest?.rev, 'already-done block untouched').to.equal(2);
 				expect(await laterExclusiveWriteAccepted(), 'and still writable').to.equal(true);
 			});
+		});
+	});
+
+	/**
+	 * `StorageRepo.commit` holds the write latch of EVERY block in its batch at once, which makes that
+	 * critical section the wrong place for network I/O — one slow peer would stall every writer of
+	 * every block in the batch. So the commit path reads its base LOCALLY (`BlockStorage.getBlock`
+	 * never consults `restoreCallback`), and a base this node cannot materialize locally is refused
+	 * with `MISSING_BASE_REVISION_REASON` rather than fetched in line. Healing is out-of-band: cohort
+	 * reconcile supplies the revision (`saveReplicatedBlock`) and the action is retried.
+	 *
+	 * This is a deliberate behaviour CHANGE. Previously `readCommitBase` -> `getBlock` ->
+	 * `ensureRevision` fetched the missing base from a peer with all of those latches held. These
+	 * tests pin the new behaviour: a restore callback that WOULD have answered is never invoked from
+	 * the commit path.
+	 */
+	describe('commit reads its base locally (no peer fetch inside the latched critical section)', () => {
+		const BLOCK = 'gap-block' as BlockId;
+		const GHOST = 'ghost' as ActionId;
+
+		let restoreCalls: { blockId: BlockId; rev?: number }[];
+		let restoringRepo: StorageRepo;
+
+		beforeEach(() => {
+			restoreCalls = [];
+			// A peer that can answer for rev 3, and records every time it is asked.
+			const restoreCallback: RestoreCallback = async (blockId, rev) => {
+				restoreCalls.push({ blockId, rev });
+				const block = makeBlock(BLOCK, { items: ['from-peer'] });
+				const archive: BlockArchive = {
+					blockId,
+					revisions: { 3: { action: { actionId: GHOST, rev: 3, transform: { insert: block } }, block } },
+					range: [3, 4]
+				};
+				return archive;
+			};
+			restoringRepo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage, restoreCallback));
+		});
+
+		/**
+		 * `latest` at rev 3 that this node cannot serve — the shape the old code healed in line.
+		 *
+		 * Written straight to raw storage on purpose: no code path produces this state today (every
+		 * writer of `latest` merges coverage for it in the same `saveMetadata` — see the NOTE in
+		 * `readCommitBase`), so it stands in for the states that DO reach it — a block wedged by an
+		 * older build, or truncated history — which are exactly the ones the old code answered by
+		 * fetching from a peer mid-commit.
+		 */
+		const seedUnservableLatest = async (ranges: RevisionRange[]): Promise<void> => {
+			await rawStorage.saveMetadata(BLOCK, { latest: { rev: 3, actionId: GHOST }, ranges });
+		};
+
+		const pendUpdate = async (actionId: string): Promise<void> => {
+			const pended = await restoringRepo.pend({
+				actionId: actionId as ActionId,
+				transforms: makeUpdateTransforms(BLOCK, [['items', 0, 0, ['x']]]),
+				policy: 'c'
+			});
+			expect(pended.success, 'the pend itself must succeed — the refusal under test is the commit').to.equal(true);
+		};
+
+		const expectMissingBase = (result: CommitResult): void => {
+			expect(result.success, 'commit must be refused').to.equal(false);
+			const reason = (result as { reason?: string }).reason;
+			expect(reason, 'refusal must carry a reason').to.be.a('string');
+			expect(reason!.startsWith(MISSING_BASE_REVISION_REASON),
+				`reason must be greppable as ${MISSING_BASE_REVISION_REASON}, got: ${reason}`).to.equal(true);
+		};
+
+		it('control: the READ path DOES fetch this same base from the peer', async () => {
+			// Without this, "the commit path made 0 restore calls" would pass just as well against a
+			// callback that could never have answered in the first place. Same metadata, same wiring,
+			// different entry point — the read heals (StorageRepo.get -> restoreRevision -> re-read).
+			await seedUnservableLatest([]);
+
+			const got = await restoringRepo.get({ blockIds: [BLOCK] });
+
+			expect(restoreCalls.length, 'the read path heals through restoreRevision').to.equal(1);
+			expect(restoreCalls[0]!.rev, 'pinned at the uncovered revision').to.equal(3);
+			expect((got[BLOCK]?.block as unknown as { items: unknown[] } | undefined)?.items,
+				'the content a peer would have supplied really is servable').to.deep.equal(['from-peer']);
+		});
+
+		it('refuses a commit whose base is not locally covered, without calling the restore callback', async () => {
+			// `ranges: []` under `latest.rev = 3`: getBlock reports the coverage gap
+			// (RevisionNotCoveredError). Pre-change, that gap was healed in line by ensureRevision — from
+			// a peer, while this commit held the block's write latch.
+			await seedUnservableLatest([]);
+			await pendUpdate('a-gap');
+
+			expectMissingBase(await restoringRepo.commit({
+				actionId: 'a-gap' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 4
+			}));
+
+			expect(restoreCalls, 'the commit path must not reach the network while holding block latches')
+				.to.deep.equal([]);
+			expect(await new BlockStorage(BLOCK, rawStorage).getPendingTransaction('a-gap' as ActionId),
+				'refuseMissingBase drops the pending it can never promote here').to.equal(undefined);
+			expect((await new BlockStorage(BLOCK, rawStorage).getLatest())?.rev,
+				'the refusal writes nothing else — latest is exactly as it was').to.equal(3);
+		});
+
+		it('refuses the same way, and still without a fetch, when history under a claimed range is truncated', async () => {
+			// `ranges: [[3]]` with no revision records: getBlock passes the coverage check and then finds
+			// nothing materializable. Different throw, same refusal path, same no-network rule.
+			await seedUnservableLatest([[3]]);
+			await pendUpdate('a-truncated');
+
+			expectMissingBase(await restoringRepo.commit({
+				actionId: 'a-truncated' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 4
+			}));
+
+			expect(restoreCalls, 'no peer fetch on this arm either').to.deep.equal([]);
+			expect(await new BlockStorage(BLOCK, rawStorage).getPendingTransaction('a-truncated' as ActionId),
+				'the unpromotable pending is dropped').to.equal(undefined);
+		});
+
+		it('a multi-block batch refuses without a fetch, with every block in the batch latched', async () => {
+			// The concrete cost the change removes: the old in-line restore happened with the latches of
+			// EVERY block in `blockIds` held, so one unreachable base stalled writers of every sibling for
+			// the length of a round trip. (Which block the loop reaches first is `commit`'s sorted-id
+			// business and is covered by the 'mixed batch' tests above; all this one claims is that no
+			// fetch happens on any ordering.)
+			const SIBLING = 'gap-sibling' as BlockId;
+			await seedUnservableLatest([]);
+			const pended = await restoringRepo.pend({
+				actionId: 'a-batch' as ActionId,
+				transforms: {
+					inserts: { [SIBLING]: makeBlock(SIBLING, { items: [] }) },
+					updates: { [BLOCK]: [['items', 0, 0, ['x']]] },
+					deletes: []
+				},
+				policy: 'c'
+			});
+			expect(pended.success).to.equal(true);
+
+			expectMissingBase(await restoringRepo.commit({
+				actionId: 'a-batch' as ActionId, blockIds: [SIBLING, BLOCK], tailId: SIBLING, rev: 4
+			}));
+
+			expect(restoreCalls, 'no network I/O with N block latches held').to.deep.equal([]);
 		});
 	});
 
