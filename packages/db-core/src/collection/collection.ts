@@ -683,6 +683,16 @@ export class Collection<TAction> implements ICollection<TAction> {
 				this.pending = this.pending.slice(pending.length);
 				// Reset cache and replay any actions that were added during the action
 				const transforms = tracker.reset();
+				// NOTE: this replay runs BEFORE the cache fold and the context bump below — the
+				// inverse of the order `updateInternal` and `TransactionCoordinator.commitOnce`
+				// both document as required, where the newly committed state must be visible
+				// before anything re-reads. Dormant today: `act()` and `syncInternal` take the
+				// same collection latch, so `this.pending` cannot grow during the transact above
+				// and the slice always leaves it empty, making this replay a no-op reset. If a
+				// path ever stages outside that latch, move the transformCache + actionContext
+				// lines above this replay — otherwise the replay re-reads at the superseded
+				// revision over a cache that has not yet seen the commit, and re-stages onto a
+				// root the commit already replaced.
 				await this.replayActions();
 				this.sourceCache.transformCache(transforms, newRev);
 				this.source.actionContext = this.source.actionContext
