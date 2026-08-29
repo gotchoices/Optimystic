@@ -42,6 +42,7 @@
   "scripts": {
     "clean": "rimraf dist",
     "build": "tsc",
+    "typecheck": "tsc --noEmit",
     "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min",
     "test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec"
   },

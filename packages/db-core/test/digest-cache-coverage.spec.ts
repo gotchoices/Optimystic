@@ -17,10 +17,8 @@ import type {
  * ids still resident.
  *
  * That matters more than the omission-is-safe framing suggests: an undeclared block retains no
- * durable `BlockCommitProof`, and a block with no proof is refused by every push receiver running
- * the default `requirePushCertificate: true`. It stays readable, pullable, and repairable by
- * corroboration, but it can never GAIN a holder by push — churn-driven re-replication silently stops
- * maintaining its replication factor.
+ * durable commit proof and so can never GAIN a holder by push. The consequence is stated in full at
+ * `CommitRequest.blockDigests` in `src/network/struct.ts`.
  *
  * These tests measure that, through the production path (`Collection.act` → `Collection.sync` →
  * `computeBlockContentDigests`), rather than by poking the digest function directly — the unit-level
@@ -31,7 +29,14 @@ import type {
  * cites.
  */
 
-/** Must match `CacheSource`'s `DefaultMaxSize`, which is what `Collection` constructs with. */
+/** Must match `CacheSource`'s `DefaultMaxSize`, which is what `Collection` constructs with.
+ *
+ * NOTE: the assertions below pin the SHAPE of the gap (bounded by the cache; identical at 2x and 4x),
+ * not the exact declared count — deliberately, so they do not break on an off-by-one in how many
+ * slots the collection's own header and log tail occupy. The consequence is that the concrete table
+ * quoted in `src/transform/digest.ts` and in `debt-digest-coverage-capped-by-read-cache` (126
+ * declared at N>=128) is NOT pinned by anything and will rot silently if `DefaultMaxSize` changes.
+ * Re-measure it there if you change the cache default; last confirmed 2026-08-28. */
 const CacheCapacity = 128
 
 interface TestAction { id?: string; op?: BlockOperation }

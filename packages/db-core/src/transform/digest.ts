@@ -22,13 +22,10 @@ const log = createLogger('digest');
 // 24.6%. Coverage therefore decays as 1/N and an arbitrarily large commit declares an arbitrarily
 // small fraction of itself. The survivors are the newest contiguous run, exactly as LRU eviction
 // predicts.
-// Omission also costs MORE than it used to: on the read path it still degrades gracefully to
-// corroboration, but since `requirePushCertificate: true` became the default receiver posture, an
-// undeclared block also retains no durable `BlockCommitProof` (`StorageRepo.persistProofIfContentMatches`
-// logs `commit:proof-undeclared`) and is therefore refused by every push receiver
-// (`push:reject-uncertified reason=no-proof`). It stays readable and pullable and still repairs by
-// corroboration while two or more holders remain, but it can never GAIN a holder by push — so
-// spread-on-churn and cohort-growth healing quietly stop maintaining its replication factor.
+// Omission also costs MORE than it used to: it still degrades gracefully on the read path, but an
+// undeclared block retains no durable `BlockCommitProof` and so can never GAIN a holder by push.
+// That consequence is stated once, canonically, at {@link CommitRequest.blockDigests} in
+// `network/struct.ts`; do not restate it here.
 // Still accepted here rather than fixed in place: both remedies are larger than this function —
 // size the cache to the transaction, or carry the base revision alongside the staged updates instead
 // of re-reading it here. Tracked as `debt-digest-coverage-capped-by-read-cache`. Revisit when a

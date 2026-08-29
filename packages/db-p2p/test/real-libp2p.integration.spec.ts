@@ -41,11 +41,10 @@ const makeTransforms = (blockId: string): Transforms => ({
 
 /** The content declaration a production commit of {@link makeTransforms} would carry.
  *
- * Every commit in this file must declare, not because the field is required — it is optional, and an
- * omitted declaration still commits — but because a revision committed with no declaration retains no
- * `BlockCommitProof`, and a block with no proof is refused by any receiver running the default
- * `requirePushCertificate: true`. Undeclared commits therefore cannot gain holders by push, which
- * silently disables the spread-on-churn and cohort-growth paths these tests exist to cover.
+ * Every commit in this file must declare, not because the field is required — it is optional — but
+ * because a commit with no declaration retains no `BlockCommitProof`, and an unproven block is
+ * refused by any receiver running the default `requirePushCertificate: true`. That silently disables
+ * the spread-on-churn and cohort-growth paths these tests exist to cover.
  *
  * `makeTransforms` only inserts, so the digest is the canonical hash of `makeBlock(blockId)` and no
  * `baseRev` rides along — exactly what `computeBlockContentDigests` produces for an inserted block.
