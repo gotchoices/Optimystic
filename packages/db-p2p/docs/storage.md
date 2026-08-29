@@ -68,10 +68,11 @@ the only writer: `pend` and `cancel`, the read-driven promotion in
 `StorageRepo.get`, coverage restores (`restoreRevision`), replica persistence
 (`saveReplicatedBlock`, e.g. churn re-replication), crash recovery (`recover`),
 and the dispute module's compensating writes (`applyInvalidation`'s
-`saveReplica`/`saveDeletion`) all take the same key. Sorting matters only for `commit`, which is the one caller
-that holds several block latches at once: it acquires them in sorted block-id
-order so two concurrent commits over overlapping batches cannot deadlock. Every
-other caller holds at most one at a time.
+`saveReplica`/`saveDeletion`) all take the same key. Sorting matters only for
+`commit`, which is the one caller that holds several block latches at once: it
+acquires them in sorted block-id order so two concurrent commits over
+overlapping batches cannot deadlock. Every other caller holds at most one at a
+time.
 
 **Two things enforce it, one static and one checkable:**
 
@@ -97,22 +98,30 @@ grep -rnE "Latches\.acquire\(" packages/db-p2p/src
 must return exactly one line — the call inside `acquireBlockWriteLatch`. (The
 pattern matches the call shape including its open paren, and the escapes are
 what keep the prose describing the check — here and in `block-latch.ts` — from
-matching itself.) A second hit anywhere means a caller has started taking the key directly and the
-token discipline has a hole.
+matching itself.) A second hit means a caller has started taking the key
+directly and the token discipline has a hole. The scope is `src` on purpose:
+tests do acquire the key directly, to hold it against the code under test.
 
 **The one named exclusion:** `BlockStorage.materializeBlock` re-caches a replayed
 materialization at a retained revision (the `saveMaterializedBlock` after the
 retention check in `packages/db-p2p/src/storage/block-storage.ts`). That runs on
-the READ path, outside the latch. It is safe because it is not a
+the READ path, outside the latch. Content is safe because it is not a
 read-modify-write of anything: the key is `(blockId, actionId)` and the value is
 a deterministic replay of transforms this node already retained, so a concurrent
-writer racing on the same key writes identical bytes. It touches neither the
-metadata blob nor any revision record, so it cannot clobber `latest`. Taking the
-latch there would put a lock acquisition on every cold historical read and would
+*save* of the same key writes identical bytes. It touches neither the metadata
+blob nor any revision record, so it cannot clobber `latest`. Taking the latch
+there would put a lock acquisition on every cold historical read and would
 self-deadlock the commit path, which reaches `materializeBlock` through
-`getBlock` while already holding the latch. The `NOTE:` at that call site says
-the same, and dropping the re-cache entirely stays out of scope until someone
-measures the cold historical-read cost of doing without it.
+`getBlock` while already holding the latch. Dropping the re-cache entirely stays
+out of scope until someone measures the cold historical-read cost of doing
+without it.
+
+The exclusion is not free of races, only of *corrupting* ones: the racer that
+does not write identical bytes is `pruneSupersededMaterialization`, which
+deletes that key. Losing to it resurrects a materialization the checkpoint sweep
+just removed — a bounded storage leak, never wrong content. The `NOTE:` at the
+call site records that and what to do if materialization storage is ever seen to
+grow under read load.
 
 **Violate it and:** a commit's staleness guard can read `latest` before a
 concurrent out-of-band writer advances it, then write the whole metadata blob
@@ -509,8 +518,12 @@ The system provides sophisticated conflict detection and resolution:
 Supports external restoration for missing data:
 
 - **Restore Callbacks**: Pluggable restoration mechanism
-- **Range-based Restoration**: Restores entire revision ranges
-- **Lazy Loading**: Restores data only when needed
+- **Range-based Restoration**: An archive arrives with the revision range it
+  covers, so one fetch can close more than the revision it was pinned to
+- **Explicitly triggered, never implicit**: reads do not fetch. `getBlock`
+  reports a coverage gap and returns; a caller that wants it healed calls
+  `restoreRevision` under the block's write latch. `StorageRepo.get` is the only
+  caller that does — the commit path refuses instead (Invariant 2)
 
 ### 5. Concurrency Control
 

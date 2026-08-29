@@ -472,14 +472,23 @@ export class BlockStorage implements IBlockStorage {
 			// they ever show as hot, cache at the nearest checkpoint below the target instead of skipping.
 			// NOTE: this `saveMaterializedBlock` is the ONE named exclusion from the storage invariant that
 			// every write to a block holds `blockWriteLatchKey(blockId)` (see block-latch.ts). It runs on the
-			// READ path, unlatched, and that is safe because it is not a read-modify-write of anything: the
-			// key is `(blockId, actionId)` and the value is a deterministic replay of transforms this node
-			// has already retained, so a concurrent writer racing on the same key writes the same bytes. It
-			// touches neither the metadata blob nor any revision record, so it cannot clobber `latest`.
-			// Taking the latch here would put a lock acquisition on every cold historical read and would
-			// deadlock the callers that already hold it. Dropping the re-cache entirely is the other way to
-			// close the exclusion, and is out of scope until someone measures the cold historical-read cost
-			// of doing without it.
+			// READ path, unlatched, and that is safe for CONTENT because it is not a read-modify-write of
+			// anything: the key is `(blockId, actionId)` and the value is a deterministic replay of
+			// transforms this node has already retained, so a concurrent SAVE of the same key writes the
+			// same bytes. It touches neither the metadata blob nor any revision record, so it cannot
+			// clobber `latest`. Taking the latch here would put a lock acquisition on every cold historical
+			// read and would deadlock the callers that already hold it. Dropping the re-cache entirely is
+			// the other way to close the exclusion, and is out of scope until someone measures the cold
+			// historical-read cost of doing without it.
+			//
+			// NOTE: the one racer that does NOT write the same bytes at this key is
+			// `pruneSupersededMaterialization`, which DELETES it (saveMaterializedBlock(..., undefined)).
+			// Losing that race resurrects a materialization the sweep just removed — a bounded storage
+			// leak, never wrong content, since the resurrected bytes are a correct materialization of that
+			// rev. The fresh `retentionMeta` read below narrows the window but cannot close it: a commit
+			// can land and prune between that read and this save. If materialization storage is ever seen
+			// to grow under read load, close it by having the prune win — e.g. re-check retention inside
+			// the raw driver's save, or have the sweep re-run after the read.
 			//
 			// Read metadata FRESH for the retention decision: because this runs outside the block's write
 			// latch, a concurrent restore or commit may have moved `ranges` since `meta` was captured. A stale

@@ -2290,6 +2290,38 @@ describe('StorageRepo', () => {
 				'the refusal writes nothing else — latest is exactly as it was').to.equal(3);
 		});
 
+		it('the refusal really is gated on the block write latch', async () => {
+			// The tests above prove no fetch happens; on their own they would also pass if `commit` took
+			// no latch at all, which would make the whole "no network I/O in the critical section"
+			// argument vacuous. Hold the block's write latch and the commit must PARK — it cannot reach
+			// readCommitBase, let alone refuse, until the latch is free.
+			await seedUnservableLatest([]);
+			await pendUpdate('a-latched');	// pend needs the latch too, so it must run before we take it
+
+			const release = await Latches.acquire(blockWriteLatchKey(BLOCK));
+
+			let result: CommitResult | undefined;
+			const commitPromise = restoringRepo.commit({
+				actionId: 'a-latched' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 4
+			}).then((r) => { result = r; return r; });
+
+			// Release even if an assertion throws: the write latch is a process-global mutex, so a leaked
+			// hold would wedge every later test that writes this block.
+			try {
+				// A held mutex never self-releases, so this is a stable negative assertion, not a race:
+				// an unlatched commit would already have run the refusal within these turns.
+				await delay(25);
+				expect(result, 'commit must not reach its refusal while the latch is held').to.equal(undefined);
+				expect((await new BlockStorage(BLOCK, rawStorage).getPendingTransaction('a-latched' as ActionId)),
+					'and must not have dropped the pending yet either').to.not.equal(undefined);
+			} finally {
+				release();
+			}
+
+			expectMissingBase(await commitPromise);
+			expect(restoreCalls, 'still no fetch once it does run').to.deep.equal([]);
+		});
+
 		it('refuses the same way, and still without a fetch, when history under a claimed range is truncated', async () => {
 			// `ranges: [[3]]` with no revision records: getBlock passes the coverage check and then finds
 			// nothing materializable. Different throw, same refusal path, same no-network rule.
