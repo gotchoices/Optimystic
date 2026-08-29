@@ -2,6 +2,7 @@ import assert from 'node:assert';
 import * as os from 'os';
 import * as path from 'path';
 import { FileRawStorage } from '../src/index.js';
+import { CachedRawStorage, SharedCachePool } from '@optimystic/db-p2p';
 
 // FileStoreDriver names the RESOLVED directory it is backed by, so two storages over one
 // directory — however spelled — compare equal, and two over different directories do not.
@@ -57,5 +58,34 @@ describe('FileRawStorage store identity', () => {
 	it('does not crash on an empty basePath (resolves to the cwd)', () => {
 		const empty = new FileRawStorage('').getStoreIdentity();
 		assert.strictEqual(empty, new FileRawStorage(process.cwd()).getStoreIdentity());
+	});
+
+	// The composition the whole passthrough chain exists for, and the one the `IRawStorage`
+	// doc comment promises by name. Each half is covered elsewhere (fs identity above; the
+	// wrapper chain over a synthetic driver in db-p2p's store-identity.spec.ts), but the
+	// end-to-end join across the two packages was asserted nowhere.
+	describe('through CachedRawStorage', () => {
+		it('a cache over a FileRawStorage reports the file identity unchanged', () => {
+			const inner = new FileRawStorage(base);
+			const cached = new CachedRawStorage(inner, new SharedCachePool());
+			assert.strictEqual(cached.getStoreIdentity?.(), inner.getStoreIdentity());
+			assert.strictEqual(cached.getStoreIdentity?.(), `file:${process.platform === 'win32' ? path.resolve(base).toLowerCase() : path.resolve(base)}`);
+		});
+
+		it('two independent caches over ONE directory report equal identities', () => {
+			// The exact fact an identity-keyed dedupe keys on: two caches built separately over
+			// the same directory are two objects naming one store.
+			const pool = new SharedCachePool();
+			const a = new CachedRawStorage(new FileRawStorage(base), pool);
+			const b = new CachedRawStorage(new FileRawStorage(base), pool);
+			assert.strictEqual(a.getStoreIdentity?.(), b.getStoreIdentity?.());
+		});
+
+		it('caches over DIFFERENT directories report different identities', () => {
+			const pool = new SharedCachePool();
+			const a = new CachedRawStorage(new FileRawStorage(path.join(base, 'a')), pool);
+			const b = new CachedRawStorage(new FileRawStorage(path.join(base, 'b')), pool);
+			assert.notStrictEqual(a.getStoreIdentity?.(), b.getStoreIdentity?.());
+		});
 	});
 });

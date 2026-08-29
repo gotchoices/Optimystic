@@ -6,6 +6,7 @@ import { KvRawStorage } from '../src/storage/kv-raw-storage.js';
 import { MemoryStoreDriver } from '../src/storage/memory-store-driver.js';
 import { CachedRawStorage } from '../src/storage/cached-raw-storage.js';
 import { SharedCachePool } from '../src/storage/shared-cache-pool.js';
+import { CountingStoreDriver } from './support/cache-test-helpers.js';
 
 // A driver that DOES report an identity: MemoryStoreDriver deliberately does not (two memory
 // drivers are two genuinely different stores), so identity-carrying cases wrap one in this.
@@ -76,6 +77,24 @@ describe('store identity', () => {
 		it('MemoryStoreDriver reports no identity (two memory stores are genuinely two stores)', () => {
 			const driver: RawStoreDriver = new MemoryStoreDriver();
 			expect(driver.storeIdentity).to.equal(undefined);
+		});
+
+		it('an identity-less storage fails `typeof === function` detection, which is the specified probe', () => {
+			// The optional members are declared as class fields, so after construction the
+			// property EXISTS with value `undefined` rather than being absent — `'x' in storage`
+			// is true either way. `typeof === 'function'` is therefore the only probe the
+			// interface docs sanction, and the only one consumers may use.
+			const storage = new KvRawStorage(new MemoryStoreDriver());
+			expect(typeof storage.getStoreIdentity).to.not.equal('function');
+		});
+
+		it('CountingStoreDriver does NOT pass identity through (test isolation depends on it)', () => {
+			// Pins the class comment on CountingStoreDriver: tests build several of these over
+			// one shared inner driver so each wrapper stays independent. A passthrough added
+			// later would let identity-keyed consumers collapse them, and the call-count
+			// assertions would silently measure the wrong thing instead of going red.
+			const counting: RawStoreDriver = new CountingStoreDriver(new IdentifiedDriver('test:inner' as StoreIdentity));
+			expect(counting.storeIdentity).to.equal(undefined);
 		});
 	});
 });

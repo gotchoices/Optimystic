@@ -60,8 +60,9 @@ export class FileStoreDriver implements RawStoreDriver {
 		// The directory this driver is backed by, resolved once here: `path.resolve` is
 		// cwd-dependent, and capturing it at construction is the correct reading — two drivers
 		// built from the same RELATIVE path under different cwds genuinely address different
-		// directories and must not compare equal. An empty/whitespace basePath resolves to the
-		// cwd; nothing special-cases it.
+		// directories and must not compare equal. An empty basePath resolves to the cwd;
+		// nothing special-cases it. (A whitespace-only basePath is NOT the cwd — `path.resolve`
+		// is pure string work, so `' '` names a child directory called `' '`.)
 		// Lowercased on win32 because Windows paths are case-insensitive: `C:\Foo` and `C:\foo`
 		// are one directory and must produce one identity.
 		// NOTE: aliases of one directory that this does NOT collapse, and so read as two
@@ -70,7 +71,16 @@ export class FileStoreDriver implements RawStoreDriver {
 		// the only signal available synchronously, and case-folding every darwin path would be
 		// wrong on a case-sensitive volume. `fs.realpath` resolves all of these, but it is async
 		// (this constructor is not) and requires the directory to already exist. Revisit if an
-		// alias ever bites.
+		// alias ever bites. All of these fail in the SAFE direction: a missed alias reports two
+		// identities for one directory, so an identity-keyed consumer declines to merge and gets
+		// today's behavior.
+		// NOTE: the win32 fold is the one branch that can err in the UNSAFE direction — Windows
+		// 10+ supports per-directory case sensitivity (`fsutil file setCaseSensitiveInfo`), and
+		// on such a directory `X:\p\Foo` and `X:\p\foo` are two directories folded onto ONE
+		// identity. A consumer that merges on equality would then merge two distinct stores.
+		// Not addressable synchronously either (the flag is a per-directory filesystem query).
+		// Revisit if Optimystic ever targets a case-sensitive-enabled Windows directory; until
+		// then the fold is right for every ordinary Windows volume.
 		const resolved = path.resolve(basePath);
 		this.identity = `file:${process.platform === 'win32' ? resolved.toLowerCase() : resolved}`;
 	}

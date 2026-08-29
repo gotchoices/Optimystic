@@ -94,9 +94,15 @@ export interface RawStoreDriver {
 	 * resolved directory, an open database handle). Passed through by the kernel and by every
 	 * wrapper, so a cache and the storage it fronts name the same store.
 	 *
-	 * Contract:
-	 * - Two drivers over the SAME underlying location MUST return equal strings; two over
-	 *   different locations MUST NOT.
+	 * Contract — note it is ONE-DIRECTIONAL; read both halves before consuming it:
+	 * - Two drivers over DIFFERENT locations MUST NOT return equal strings. So **equality
+	 *   proves sameness**, and a consumer may merge on it. (The fs driver documents one exotic
+	 *   Windows exception at its own site.)
+	 * - Two drivers over the SAME location SHOULD return equal strings, but this is
+	 *   best-effort and several backends knowingly under-approximate: two handles opened over
+	 *   one database, or two spellings of one directory that cannot be collapsed synchronously,
+	 *   read as two identities. So **inequality proves nothing** — never treat it as evidence
+	 *   that two drivers are distinct stores. Each backend's `NOTE:` states its own gaps.
 	 * - Every string is scheme-prefixed so backends cannot collide: `file:`, `sqlite-handle:`,
 	 *   `idb-handle:`, `leveldb-handle:`. Compared for equality only — never parsed.
 	 * - Stable for the driver object's whole life; fixed at construction.

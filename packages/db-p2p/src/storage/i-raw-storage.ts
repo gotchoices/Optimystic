@@ -47,9 +47,15 @@ export interface IRawStorage {
 	 * wrap, so a cache and the storage it fronts name the same store — e.g.
 	 * `new CachedRawStorage(new FileRawStorage(dir)).getStoreIdentity()` is `'file:<resolved dir>'`.
 	 *
-	 * Contract:
-	 * - Two storages over the SAME underlying location MUST return equal strings; two over
-	 *   different locations MUST NOT.
+	 * Contract — note it is ONE-DIRECTIONAL; read both halves before consuming it:
+	 * - Two storages over DIFFERENT locations MUST NOT return equal strings. So **equality
+	 *   proves sameness**, and a consumer may merge on it. (The fs backend documents one exotic
+	 *   Windows exception at its own site.)
+	 * - Two storages over the SAME location SHOULD return equal strings, but this is
+	 *   best-effort and several backends knowingly under-approximate: two handles opened over
+	 *   one database, or two spellings of one directory that cannot be collapsed synchronously,
+	 *   read as two identities. So **inequality proves nothing** — never treat it as evidence
+	 *   that two storages are distinct stores. Each backend's `NOTE:` states its own gaps.
 	 * - Every string is scheme-prefixed so backends cannot collide: `file:`, `sqlite-handle:`,
 	 *   `idb-handle:`, `leveldb-handle:`. Compared for equality only — never parsed.
 	 * - Stable for the storage object's whole life; fixed at construction.

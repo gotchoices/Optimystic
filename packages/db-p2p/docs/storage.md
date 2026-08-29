@@ -172,6 +172,23 @@ path/keyspace) per process. Two nodes hosted in the same process must each point
 at a distinct path/keyspace; never construct two stores over the same underlying
 location, even transiently.
 
+**Detecting a violation (partial, and not yet wired to anything).** A backend may
+optionally report `getStoreIdentity()` — a scheme-prefixed string naming *what it is
+backed by*, compared for equality only
+(`packages/db-p2p/src/storage/store-identity.ts`). Wrappers pass it through, so a cache
+and the storage it fronts name the same store. Two storages over one location therefore
+compare equal and are, in principle, detectable. Two caveats bound how much this can
+carry:
+
+- **Nothing reads it yet.** No dedupe and no duplicate-store guard is wired; the
+  invariant is still unenforced in code exactly as stated above.
+- **It only ever under-approximates.** Filesystem aliases (symlinks, junctions,
+  UNC-versus-mapped-drive, case-differing spellings on a case-insensitive non-Windows
+  volume) and two handles opened over one database read as *two* identities, not one.
+  So equality proves sameness; inequality proves nothing. A consumer may merge on
+  equality, but must never treat inequality as proof that two stores are distinct.
+  Each backend's `NOTE:` states its own gaps.
+
 ## Core Components
 
 ### 1. Storage Repository (`StorageRepo`)
@@ -227,16 +244,16 @@ The `IRawStorage` interface defines low-level storage operations, abstracting th
 
 ### 4. File-based Storage (`FileRawStorage`)
 
-`FileRawStorage` (`packages/db-p2p-storage-fs/src/file-storage.ts:411`) is a thin
+`FileRawStorage` (`packages/db-p2p-storage-fs/src/file-storage.ts:466`) is a thin
 shell over the shared `KvRawStorage` kernel: it supplies a `FileStoreDriver` that
-lays out the five logical stores as filesystem subdirectories, and the kernel
+lays out the six logical stores as filesystem subdirectories, and the kernel
 owns JSON (de)serialization on top. See "Shared KV Kernel" below.
 
 ### 5. Shared KV Kernel (`KvRawStorage` + `RawStoreDriver`)
 
 `KvRawStorage` implements the full `IRawStorage` surface once, on top of a
-`RawStoreDriver`. The driver exposes each backend's five logical stores
-(metadata, revisions, pending, transactions, materialized) as bytes-valued maps
+`RawStoreDriver`. The driver exposes each backend's six logical stores
+(metadata, revisions, pending, transactions, materialized, proofs) as bytes-valued maps
 over its native mechanism; the kernel owns all value (de)serialization (JSON via
 `raw-store-codec.ts`) and call orchestration. Backends therefore never
 (de)serialize values — they only lay out keys and move bytes.

@@ -208,6 +208,15 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 	// complete well inside a production-style timeout; if they hang, that's the bug.
 	this.timeout(5_000);
 
+	// Pins the class comment on CrashingRawStorage. A crashed node's mesh is rebuilt over the
+	// SAME preserved inner storage but a FRESH proxy, so each proxy must stay its own object to
+	// identity-keyed consumers. A passthrough added later would collapse the rebuilt proxy onto
+	// the pre-crash one, and these tests would quietly stop exercising a rebuild.
+	it('the crash proxy reports no store identity', () => {
+		const proxy: IRawStorage = new CrashingRawStorage(new MemoryRawStorage(), { method: 'saveMetadata', when: 'before' });
+		expect(proxy.getStoreIdentity).to.equal(undefined);
+	});
+
 	// ------------------------------------------------------------------------
 	// Crash-A1: metadata seeded, pending not yet persisted (`when: 'before'`)
 	// ------------------------------------------------------------------------
