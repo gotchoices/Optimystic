@@ -20,6 +20,12 @@
  * the flag exists, and `test/dial-options-single-site.spec.ts` fails the build if a second source
  * file calls `.handle(...)` directly.
  *
+ * Accepting the stream is necessary but not sufficient. A stock relay also caps the *whole* relayed
+ * connection — `applyDefaultLimit: true` stamps `Limit { data: 128 KiB, duration: 2 min }` on every
+ * reservation — so a relay-only peer now answers, but the circuit is reset once either cap is hit,
+ * which one cohort frame (`DEFAULT_STREAM_MAX_BYTES`, 512 KiB) can do on its own. Lifting that is
+ * the relay operator's knob, not this one: see `NodeOptions.relayServerInit` in `libp2p-node-base.ts`.
+ *
  * Imports here are type-only on purpose: this module is reachable from the react-native entry
  * (`src/rn.ts`), which must not pull node-specific code.
  */
