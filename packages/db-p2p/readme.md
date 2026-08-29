@@ -613,6 +613,10 @@ const node = await createLibp2pNode({
 });
 ```
 
+Apart from that transport wiring, `/rn` exports exactly the same API as the root entrypoint,
+so anything importable from `@optimystic/db-p2p` is importable from `@optimystic/db-p2p/rn`.
+`test/entry-parity.spec.ts` fails if the two ever diverge.
+
 RN environments (Hermes) need polyfills for globals that libp2p and its
 dependencies expect. Install these early (e.g. in your app's entry file
 before any other imports).

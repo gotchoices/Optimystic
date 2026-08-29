@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { walkRuntimeGraph } from './support/source-graph.js';
 
 // Regression guard for entry-point drift between the two published entries.
 //
@@ -21,10 +22,17 @@ const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 const NODE_ENTRY = 'src/index.ts';
 const RN_ENTRY = 'src/rn.ts';
 
+// NOTE: this spec compares the two entry *files*; it takes on faith that `package.json` still routes
+// the `react-native` condition (and the `./rn` subpath) at `rn.ts`. Repoint or drop that condition
+// and React Native silently gets the Node entry while everything here stays green. Not guarded
+// because the exports map is stable, hand-edited config; if it starts changing, assert the routing
+// here too — `testing-entry-runtime-deps.spec.ts` already parses the same manifest.
+
 /** Modules deliberately present on only one entry, mapped to the reason. Empty by design: every
  *  module in db-p2p is browser-safe except the libp2p transport wiring, and that asymmetry is
  *  handled by ENTRY_SUBSTITUTIONS below rather than by exclusion. This is the seam a genuinely
- *  Node-only module would get added to — its emptiness is the point. */
+ *  Node-only module would get added to — its emptiness is the point, and the builtin-reachability
+ *  test at the bottom of this file is what keeps that emptiness honest. */
 const NODE_ONLY: ReadonlyMap<string, string> = new Map();
 
 /** The one intended asymmetry: the Node entry wires TCP/WebSocket transports, the RN entry does
@@ -61,6 +69,45 @@ function readEntry(relative: string): Entry {
 	return { file: relative, specifiers, stray };
 }
 
+const EXPORT_LIST_RE = /export\s+(?:type\s+)?\{([^}]*)\}/g;
+const EXPORT_DECL_RE =
+	/export\s+(?:declare\s+)?(?:async\s+)?(?:function\s*\*?|const|let|var|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)/g;
+const EXPORT_OPAQUE_RE = /export\s+(?:\*|default)[^\n]*/g;
+
+/** Comments removed, so a commented-out `export` cannot be mistaken for a real one. */
+function stripComments(source: string): string {
+	return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+}
+
+/** The names a single module declares as its own exports. Handles the two shapes the substituted
+ *  modules use — `export { … }` / `export type { … }` lists, and `export <declaration> Name` — and
+ *  reports anything it cannot attribute to a name (`export *`, `export default`) as unparsed, so a
+ *  shape this cannot compare fails the spec rather than silently shrinking the compared set. */
+function readExportedNames(absoluteFile: string): {
+	readonly names: readonly string[];
+	readonly unparsed: readonly string[];
+} {
+	const source = stripComments(fs.readFileSync(absoluteFile, 'utf8'));
+	const names: string[] = [];
+
+	for (const match of source.matchAll(EXPORT_LIST_RE)) {
+		for (const item of (match[1] ?? '').split(',')) {
+			// `x`, `type x`, and `x as y` all export the *last* identifier in the clause.
+			const name = item.trim().replace(/^type\s+/, '').split(/\s+as\s+/).pop()?.trim();
+			if (name !== undefined && name !== '') names.push(name);
+		}
+	}
+	for (const match of source.matchAll(EXPORT_DECL_RE)) {
+		const name = match[1];
+		if (name !== undefined) names.push(name);
+	}
+
+	return {
+		names: [...new Set(names)].sort(),
+		unparsed: [...source.matchAll(EXPORT_OPAQUE_RE)].map(match => match[0].trim())
+	};
+}
+
 /** `./cluster/client.js` in `src/rn.ts` → the source file it actually resolves to, or undefined. */
 function resolveSpecifier(entryFile: string, specifier: string): string | undefined {
 	const base = path.resolve(packageRoot, path.dirname(entryFile), specifier);
@@ -83,8 +130,70 @@ describe('entry point parity', () => {
 					'— otherwise specifier equality stops implying export-name equality.'
 			).to.deep.equal([]);
 			expect(entry.specifiers.length).to.be.greaterThan(0);
+			// A repeated line is legal ESM but makes the set comparison below narrower than the
+			// file it is comparing, which is how a stale duplicate hides a real edit.
+			const duplicates = entry.specifiers.filter(
+				(specifier, index) => entry.specifiers.indexOf(specifier) !== index
+			);
+			expect(
+				[...new Set(duplicates)].sort(),
+				`${entry.file} re-exports the same module more than once`
+			).to.deep.equal([]);
 		});
 	}
+
+	// The substitution is the one seam where specifier equality stops implying export-name
+	// equality — the spec deliberately treats two *different* modules as interchangeable. Nothing
+	// else checks they still export the same names, so an export added to `libp2p-node.ts` and not
+	// to `libp2p-node-rn.ts` would reintroduce exactly the drift this file exists to catch, with
+	// every other assertion here still green.
+	for (const [nodeSpecifier, rnSpecifier] of ENTRY_SUBSTITUTIONS) {
+		it(`${nodeSpecifier} and ${rnSpecifier} export the same names`, () => {
+			const nodeFile = resolveSpecifier(NODE_ENTRY, nodeSpecifier);
+			const rnFile = resolveSpecifier(RN_ENTRY, rnSpecifier);
+			if (nodeFile === undefined || rnFile === undefined) {
+				throw new Error(
+					`ENTRY_SUBSTITUTIONS maps "${nodeSpecifier}" -> "${rnSpecifier}" but one of them does ` +
+						'not resolve to a file on disk'
+				);
+			}
+
+			const nodeExports = readExportedNames(nodeFile);
+			const rnExports = readExportedNames(rnFile);
+			expect(
+				[...nodeExports.unparsed, ...rnExports.unparsed],
+				'a substituted module uses an export shape this spec cannot compare by name. Extend ' +
+					'readExportedNames — otherwise the substitution stops being name-invisible without ' +
+					'anything going red.'
+			).to.deep.equal([]);
+			expect(nodeExports.names.length).to.be.greaterThan(0);
+			expect(
+				rnExports.names,
+				`"${rnSpecifier}" is substituted for "${nodeSpecifier}", so the two must export the same ` +
+					'names. They no longer do — React Native or Node consumers lose whichever names are ' +
+					'missing from their side.'
+			).to.deep.equal([...nodeExports.names]);
+		});
+	}
+
+	// The assertions above prove the two entries expose the same *modules*. They say nothing about
+	// whether those modules run under React Native, and `NODE_ONLY` being empty is the claim that
+	// they do. This checks the half of that claim a test can actually settle: no first-party module
+	// reachable from the RN entry imports a Node builtin. Node-only third-party *packages* stay
+	// uncovered on purpose — `@libp2p/tcp` ships a browser stub that resolves and bundles cleanly
+	// and throws only on construction, so no bundle- or manifest-based check can see them.
+	it('reaches no Node builtin from the React Native entry', () => {
+		const { builtins } = walkRuntimeGraph(path.join(packageRoot, RN_ENTRY));
+		const offenders = [...builtins].map(
+			([specifier, importers]) =>
+				`${specifier} <- ${importers.map(file => path.relative(packageRoot, file)).join(', ')}`
+		);
+		expect(
+			offenders.sort(),
+			`${RN_ENTRY} transitively imports Node builtin(s), which React Native and browsers do not ` +
+				'provide. Keep the importing module behind the Node entry and declare it in NODE_ONLY.'
+		).to.deep.equal([]);
+	});
 
 	it('declares substitutions that both entries actually use', () => {
 		const nodeSet = new Set(node.specifiers);
