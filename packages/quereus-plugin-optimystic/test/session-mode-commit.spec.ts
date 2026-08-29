@@ -432,6 +432,9 @@ describe('Session-mode commit reopen durability (local/FileRawStorage, all platf
 		} finally {
 			dispose?.();
 			db.close();
+			// Release the read-cache lease: the cache is shared per directory while any lease is
+			// held, so without this the reopen below would read the still-warm cache, not disk.
+			await plugin.dispose();
 		}
 
 		// Reopen a brand-new Database over the same dir — reads on-disk blocks.
@@ -441,6 +444,7 @@ describe('Session-mode commit reopen durability (local/FileRawStorage, all platf
 			expect(await selectCount(db2, 'select count(*) as c from Disk')).to.equal(2);
 		} finally {
 			db2.close();
+			await plugin2.dispose();
 		}
 	});
 });

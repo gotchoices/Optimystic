@@ -26,7 +26,6 @@ import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
-import { CachedRawStorage, type IRawStorage } from '@optimystic/db-p2p';
 import register from '../dist/plugin.js';
 import { OptimysticVirtualTable } from '../dist/index.js';
 import { Tree } from '@optimystic/db-core';
@@ -117,25 +116,22 @@ function installReadProbe(): ReadProbe {
 }
 
 /**
- * @param shared  Storage instance both peers must share, for the multi-peer test. Omit for the
- *   single-peer tests and each `Database` gets its own `FileRawStorage` over `dir`.
- *
- * Two `Database`s in one process that need to see each other's committed writes must be handed
- * the SAME already-wrapped storage object, not two `FileRawStorage`s over the same directory.
- * The `local` transactor puts a write-through read cache in front of host-supplied storage
- * (`withReadCache`), and that wrap happens per `register()` — so two independent instances over
- * one directory hold two caches that never observe each other's writes. Measured on this
- * workload: two instances → peer A still sees 1 row after peer B commits 3; one shared
- * `CachedRawStorage` → peer A sees 3. See `packages/db-p2p/docs/storage.md` § Invariants 5 and
- * § 6 "Write-through raw-storage cache".
+ * Every `Database` gets its own `FileRawStorage` over `dir` — including the two peers of the
+ * cross-writer test. The `local` transactor puts a write-through read cache in front of
+ * host-supplied storage (`withReadCache`), and that cache is ONE PER BACKING STORE in the
+ * process: two `FileRawStorage` over one directory report the same `getStoreIdentity()`, so the
+ * second `register()` joins the first one's cache under its own lease and sees its writes. (Before
+ * dedupe, each `register()` got a private cache and peer A still read 1 row after peer B committed
+ * 3; the only working recipe was to hand both peers one hand-built `CachedRawStorage`.) See
+ * `packages/db-p2p/docs/storage.md` § Invariant 5 and § 6 "Write-through raw-storage cache".
  */
-function createDb(dir: string, shared?: IRawStorage): { db: Database; plugin: ReturnType<typeof register> } {
+function createDb(dir: string): { db: Database; plugin: ReturnType<typeof register> } {
 	const db = new Database();
 	const config = {
 		default_transactor: 'local',
 		default_key_network: 'test',
 		enable_cache: false,
-		rawStorageFactory: () => shared ?? new FileRawStorage(dir),
+		rawStorageFactory: () => new FileRawStorage(dir),
 	} as unknown as Record<string, SqlValue>;
 	const plugin = register(db, config);
 	for (const vtable of plugin.vtables) {
@@ -287,29 +283,27 @@ describe('Read-path pull mechanism (single node, harness-independent)', function
 	});
 
 	it('count(*) observes a second writer\'s committed appends (cross-writer convergence)', async () => {
-		// Single-process two-peer model: two independent Databases over one store. Peer B's SQL
-		// inserts commit to the shared store; peer A's collection instance is separate, so peer A
-		// only sees them if its read path pulls (collection.update()). This is the blind-write
-		// scenario the originating convergence test exercises, minus the cross-repo cadre harness.
+		// Single-process two-peer model: two independent Databases, each with its own plain
+		// `FileRawStorage` over one directory. Peer B's SQL inserts commit to the shared store; peer
+		// A's collection instance is separate, so peer A only sees them if its read path pulls
+		// (collection.update()). This is the blind-write scenario the originating convergence test
+		// exercises, minus the cross-repo cadre harness.
 		//
-		// The store is ONE pre-wrapped CachedRawStorage handed to both peers (see createDb).
-		// Two separate FileRawStorage instances over one directory would each get their own read
-		// cache and never converge — that is a property of the storage layer, not of the read
-		// path, and this test is about the read path. Real peers are separate PROCESSES with
-		// separate directories converging over the network; cross-process convergence is covered
-		// by the mesh harness, not here.
+		// Two plain instances over one directory is exactly the wiring that used to fail (peer A
+		// stuck at 1 row) because each `register()` got a private read cache. The storage layer now
+		// dedupes the cache per backing store, so this test doubles as the end-to-end confirmation
+		// of that: it must pass with NO hand-built shared storage. Real peers are separate
+		// PROCESSES with separate directories converging over the network; cross-process
+		// convergence is covered by the mesh harness, not here.
 		const uri = 'tree://read-pull/cross';
-		// THIS test owns the cache, not either peer: `withReadCache` hands an already-cached
-		// storage back unchanged and reports no ownership, so neither plugin's dispose retires it.
-		const store = new CachedRawStorage(new FileRawStorage(dir), undefined, 'read-pull:cross');
-		const peerA = createDb(dir, store);
+		const peerA = createDb(dir);
 		try {
 			await peerA.db.exec(`create table T (id integer primary key, v text) using optimystic('${uri}')`);
 			await peerA.db.exec(`insert into T (id, v) values (1, 'a')`);
 			expect(await evalCount(peerA.db, 'select count(*) as c from T')).to.equal(1);
 
 			// Peer B: a separate Database over the same dir appends two rows.
-			const peerB = createDb(dir, store);
+			const peerB = createDb(dir);
 			try {
 				await peerB.plugin.hydrate(peerB.db);
 				await peerB.db.exec(`insert into T (id, v) values (2, 'b')`);
@@ -317,6 +311,8 @@ describe('Read-path pull mechanism (single node, harness-independent)', function
 				expect(await evalCount(peerB.db, 'select count(*) as c from T')).to.equal(3);
 			} finally {
 				peerB.db.close();
+				// Releases B's lease only; A still holds one, so the shared cache stays live.
+				await peerB.plugin.dispose();
 			}
 
 			// Peer A re-reads. If count(*) reconciles to the committed store it sees 3.
@@ -338,7 +334,7 @@ describe('Read-path pull mechanism (single node, harness-independent)', function
 			expect(countAfter, 'count(*) sees both writers\' rows').to.equal(3);
 		} finally {
 			peerA.db.close();
-			await store.dispose();
+			await peerA.plugin.dispose();
 		}
 	});
 

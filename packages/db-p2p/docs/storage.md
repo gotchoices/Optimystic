@@ -172,16 +172,18 @@ path/keyspace) per process. Two nodes hosted in the same process must each point
 at a distinct path/keyspace; never construct two stores over the same underlying
 location, even transiently.
 
-**Detecting a violation (partial, and not yet wired to anything).** A backend may
-optionally report `getStoreIdentity()` — a scheme-prefixed string naming *what it is
-backed by*, compared for equality only
-(`packages/db-p2p/src/storage/store-identity.ts`). Wrappers pass it through, so a cache
-and the storage it fronts name the same store. Two storages over one location therefore
-compare equal and are, in principle, detectable. Two caveats bound how much this can
+**Detecting a violation (partial).** A backend may optionally report
+`getStoreIdentity()` — a scheme-prefixed string naming *what it is backed by*, compared
+for equality only (`packages/db-p2p/src/storage/store-identity.ts`). Wrappers pass it
+through, so a cache and the storage it fronts name the same store. Two storages over one
+location therefore compare equal and are detectable. Two caveats bound how much this can
 carry:
 
-- **Nothing reads it yet.** No dedupe and no duplicate-store guard is wired; the
-  invariant is still unenforced in code exactly as stated above.
+- **The one consumer today is the read cache's dedupe** (`withReadCache`, § 6 below):
+  two storages in one process that report one identity share one cache, which closes the
+  *in-process* half of this invariant for the cache. No duplicate-store guard is wired,
+  and nothing addresses the cross-process half — that is still unenforced exactly as
+  stated above.
 - **It only ever under-approximates.** Filesystem aliases (symlinks, junctions,
   UNC-versus-mapped-drive, case-differing spellings on a case-insensitive non-Windows
   volume) and two handles opened over one database read as *two* identities, not one.
@@ -414,12 +416,14 @@ Semantics worth knowing:
   (`src/storage/with-read-cache.ts`). Every seam that resolves an `IRawStorage`
   for real use goes through this one helper, so the exclusion rules live in one
   place instead of being re-derived per site. It returns
-  `{ storage, ownedCache }`: `storage` is the argument *unchanged* when it is a
+  `{ storage, lease }`: `storage` is the argument *unchanged* when it is a
   `MemoryRawStorage` (already in memory — see the "never wrap" bullet below) or
   already a `CachedRawStorage` (a host that wrapped before handing it over is not
-  wrapped twice), and a `new CachedRawStorage(...)` otherwise. `ownedCache` is set
-  only in that last case — see **Dispose obligations** below for why the two are
-  separate answers. The two seams that call it:
+  wrapped twice), and otherwise **the one `CachedRawStorage` for that backing
+  store** — constructed on the first call, and handed back again to every later
+  call over the same store while any earlier caller still holds it. `lease` is
+  set only in that last case — see **Lease obligations** below for why the two
+  are separate answers. The two seams that call it:
   - `CollectionFactory.createLocalTransactor`
     (`packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts`)
     — wraps the host's `rawStorageFactory` result, label `quereus:local`.
@@ -427,34 +431,62 @@ Semantics worth knowing:
     instance or factory result, label `node:<networkName>`. The no-provider
     default is a bare `MemoryRawStorage` and stays unwrapped.
 
-  **Dispose obligations — a seam disposes `ownedCache`, never `storage`.** "The
-  result is a `CachedRawStorage`" and "the result is mine to release" are
-  different questions: the pass-through branch returns a cache the HOST built and
-  may still be sharing with other consumers, so a seam that disposed on
-  `instanceof` alone would clear and unregister the shared store the moment its
-  first consumer departed — the pool keeps charging that store's entries while
-  dropping its row from `stats()`, leaving live occupancy unattributable for the
-  rest of the process. That is exactly the sharing recipe the precondition below
-  recommends, which is why the helper reports ownership instead of leaving each
-  site to infer it. With that in hand: `CollectionFactory.dispose()` releases the
-  caches it built and is called by `shutdown()` and surfaced to hosts as
-  `plugin.dispose()` (opt-in — a host that never calls it leaks only cold entries
-  the pool evicts under pressure); a libp2p node releases automatically, via a
-  stop wrapper installed at construction that disposes in a `finally` after the
-  rest of the stop chain.
+  **One cache per backing store, shared under leases.** A write-through cache
+  is coherent only while every in-process writer to a store goes through the
+  SAME cache; two caches over one store each serve their own stale view forever
+  (measured before dedupe: peer A still read 1 row after peer B committed 3). So
+  the helper keeps a module-level registry of live caches and dedupes on it. The
+  registry is keyed two ways, because the two keys close different holes: by
+  `getStoreIdentity()` when the backend reports one (two `FileRawStorage` over
+  one directory are two objects with one identity), else by the storage object
+  itself (one unwrapped instance handed to two consumers). A hit returns the
+  registered cache under a fresh lease; a miss constructs and registers. On a hit
+  the FIRST caller's `label` and `pool` stick — `pool.stats()` shows whoever
+  wrapped first (`node:<network>` or `quereus:local`), and a second caller's
+  different pool is ignored, since a same-store-different-pool pair is the very
+  divergence being removed. Distinct identities, and identity-less distinct
+  objects, keep independent caches. The helper is synchronous with no `await`
+  between lookup and insert, so two seams resolving concurrently cannot both
+  construct.
 
-  **Precondition (Invariant 5, above): exactly one cache fronts a given backing
-  store.** Cache identity is per-*object*, so `new FileRawStorage(dir)` twice
-  over one `dir` yields two caches that never observe each other's writes — and
-  so does passing one unwrapped instance to `withReadCache` twice, since each
-  call wraps it again. Both fail silently: no error, just reads that never
-  converge (measured: peer A still reads 1 row after peer B commits 3). A host
-  that needs several consumers on one store constructs the `CachedRawStorage`
-  itself and hands that same object to each; `withReadCache` returns an
-  already-cached storage unchanged, which is what makes sharing work. Seams that
-  call a per-consumer factory (the plugin's `rawStorageFactory`) get one cache
-  per consumer by construction — fine for the one-`Database`-per-process case
-  they serve, wrong for two `Database`s sharing a directory.
+  **Lease obligations — a seam releases `lease`, never disposes `storage`.**
+  "The result is a `CachedRawStorage`" and "the result is mine to tear down" are
+  different questions: the returned cache may be serving other consumers, and
+  the pass-through branch returns a cache the HOST built. A seam that disposed
+  on `instanceof` alone would clear and unregister the shared store the moment
+  its first consumer departed — the pool keeps charging that store's entries
+  while dropping its row from `stats()`, leaving live occupancy unattributable
+  for the rest of the process. So each caller gets a `ReadCacheLease` and
+  releases it (idempotently) when it departs; the cache is cleared, unregistered,
+  and forgotten only when the LAST lease over the store releases, and a later
+  wrap over that store starts cold. `CollectionFactory.dispose()` releases the
+  leases it holds and is called by `shutdown()` and surfaced to hosts as
+  `plugin.dispose()`; a libp2p node releases automatically, via a stop wrapper
+  installed at construction that runs in a `finally` after the rest of the stop
+  chain. A host-built `CachedRawStorage` never enters the registry and is never
+  released by a seam.
+
+  *Lifetime now spans consumers.* `plugin.dispose()` is opt-in, and `db.close()`
+  does not reach it, so a host that never releases keeps the store's cache
+  registered for the process — the same retention an undisposed cache already
+  had, and still hygiene rather than correctness — with one visible consequence:
+  a LATER `Database` over the same directory joins a **warm** cache where it
+  used to start cold. That is coherent as long as every write went through the
+  cache; anything that mutates the directory behind the storage's back between
+  two `Database`s (a test that hand-writes files, or a transactor that writes
+  through a bare `FileRawStorage`) must release every lease in between, or the
+  second `Database` reads pre-tamper values.
+
+  **What remains of Invariant 5 for the cache.** Dedupe closes the in-process
+  case only as far as identity reaches. Still open: the *cross-process* case (the
+  filesystem driver takes no lock — the proper-lockfile TODO in
+  `db-p2p-storage-fs/src/file-storage.ts` — and a second process's writes bypass
+  this cache entirely); the identity residuals (path aliases, two handles over
+  one database — each backend's `NOTE:` lists its own), where two storages over
+  one location report two identities and get two caches; and a host that builds
+  its own `CachedRawStorage` while a second consumer wraps a fresh instance over
+  the same store, which never meets the registry. Each of those still fails
+  silently, the way the in-process case used to.
 - Backend exposes its `RawStoreDriver` (all kernel-backed backends):
   `new KvRawStorage(new CachedStoreDriver(driver))`. Optional second/third
   constructor args pick a specific `SharedCachePool` (default: the shared

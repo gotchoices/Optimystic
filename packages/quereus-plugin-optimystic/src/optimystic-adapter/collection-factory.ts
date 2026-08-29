@@ -9,7 +9,7 @@ import {
 	StorageRepo,
 	BlockStorage,
 	MemoryRawStorage,
-	type CachedRawStorage,
+	type ReadCacheLease,
 	withReadCache,
 	signPeer,
 	type OptimysticNodeAttachments,
@@ -56,11 +56,13 @@ export class CollectionFactory {
   private customTransactorCtors = new Map<string, new (...args: any[]) => ITransactor>();
   private customKeyNetworkCtors = new Map<string, new (...args: any[]) => IKeyNetwork>();
   /**
-   * Raw-storage read caches this factory put in front of host-supplied storage (one per `local`
-   * transactor over a non-memory backend — see {@link withReadCache}). Tracked only so
-   * {@link dispose} can release their shared-pool registrations.
+   * This factory's leases on the raw-storage read caches in front of host-supplied storage (one
+   * per `local` transactor over a non-memory backend — see {@link withReadCache}). The cache
+   * behind a lease is shared with every other consumer of the same backing store in this
+   * process, so these are claims, not owned objects. Tracked only so {@link dispose} can
+   * release them.
    */
-  private readCaches: CachedRawStorage[] = [];
+  private readCacheLeases: ReadCacheLease[] = [];
 
   /**
    * Create or get a tree collection, bringing it into existence when nothing has ever
@@ -296,22 +298,26 @@ export class CollectionFactory {
    * Uses `options.rawStorageFactory` when supplied so hosts can plug in a
    * persistent backend; otherwise falls back to in-memory `MemoryRawStorage`.
    *
-   * A host-supplied backend is wrapped in the write-through read cache here — the one
-   * composition seam for the local transactor. Without it `BlockStorage` re-reads block
-   * metadata on essentially every operation, which over a filesystem backend is hundreds
-   * of reads of the same tiny files per statement. The factory is called once per transactor
-   * (and this factory is built fresh per plugin `register`), so the cache is owned by this
-   * transactor alone and a re-opened `Database` starts cold — coherent by construction.
-   * `MemoryRawStorage` passes through unwrapped (nothing to save).
+   * A host-supplied backend gets the write-through read cache here — the one composition
+   * seam for the local transactor. Without it `BlockStorage` re-reads block metadata on
+   * essentially every operation, which over a filesystem backend is hundreds of reads of the
+   * same tiny files per statement. The cache is ONE PER BACKING STORE in this process, not one
+   * per transactor: `withReadCache` recognises a store it already fronts (by
+   * `getStoreIdentity()`, e.g. two `FileRawStorage` over one directory, or by object) and
+   * hands back the same cache under a fresh lease, so two `Database`s registered over one
+   * directory see each other's commits. A re-opened `Database` therefore starts cold only if
+   * every earlier lease over that store was released (`plugin.dispose()`); otherwise it joins
+   * the still-warm shared cache, which is coherent because every in-process write went
+   * through it. `MemoryRawStorage` passes through unwrapped (nothing to save).
    */
   private async createLocalTransactor(options: ParsedOptimysticOptions): Promise<ITransactor> {
-    const { storage: rawStorage, ownedCache } = withReadCache(
+    const { storage: rawStorage, lease } = withReadCache(
       options.rawStorageFactory?.() ?? new MemoryRawStorage(), 'quereus:local');
-    // Only a cache THIS call constructed is ours to release. A host that hands the same
-    // pre-built `CachedRawStorage` to several `register()` calls (the documented way to share
-    // one store across in-process consumers) gets it back unchanged and keeps owning it.
-    if (ownedCache) {
-      this.readCaches.push(ownedCache);
+    // Only a lease THIS call was handed is ours to release. A host that hands a pre-built
+    // `CachedRawStorage` to `register()` gets it back unchanged, with no lease, and keeps
+    // owning it.
+    if (lease) {
+      this.readCacheLeases.push(lease);
     }
     const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, rawStorage));
 
@@ -645,27 +651,31 @@ export class CollectionFactory {
   }
 
   /**
-   * Release the raw-storage read caches this factory created — their registrations with the
-   * process-wide `SharedCachePool` (see `withReadCache` in `@optimystic/db-p2p`) — and forget
-   * the transactors built over them.
+   * Release this factory's leases on the raw-storage read caches (see `withReadCache` in
+   * `@optimystic/db-p2p`) and forget the transactors built over them. A cache is cleared and
+   * its registration with the process-wide `SharedCachePool` retired only when the LAST lease
+   * over its backing store releases — another `Database` in this process still reading through
+   * it keeps it alive and warm.
    *
    * Explicit because nothing else reaches this factory when the hosting `Database` closes: the
    * vtab module's `disconnect` is per-statement and its `destroy` is DROP TABLE. Call it after
-   * `db.close()`. A host that skips it leaks one dead pool store handle per factory, whose
-   * entries stay charged against the shared budget until the pool evicts them as cold —
-   * hygiene, not correctness (the pool always evicts, never refuses).
+   * `db.close()`. A host that skips it keeps its lease for the life of the process, so the
+   * store's cache stays registered (and a later `Database` over the same store starts warm
+   * rather than cold) and its entries stay charged against the shared budget until the pool
+   * evicts them as cold — hygiene, not correctness (the pool always evicts, never refuses, and
+   * the warm cache is coherent with every in-process write).
    *
    * Safe to call more than once. A transactor requested afterwards is rebuilt from scratch
-   * (the storage factory is invoked again and gets a fresh, cold cache), so a stray statement
-   * after dispose is coherent — just uncached until then. Does NOT stop libp2p nodes; that is
-   * {@link shutdown}, which calls this as its last step.
+   * (the storage factory is invoked again and takes a fresh lease — on a cold cache if nobody
+   * else holds one over that store), so a stray statement after dispose is coherent. Does NOT
+   * stop libp2p nodes; that is {@link shutdown}, which calls this as its last step.
    */
   async dispose(): Promise<void> {
-    const caches = this.readCaches;
-    this.readCaches = [];
+    const leases = this.readCacheLeases;
+    this.readCacheLeases = [];
     this.transactors.clear();
-    for (const cache of caches) {
-      await cache.dispose();
+    for (const lease of leases) {
+      await lease.release();
     }
   }
 

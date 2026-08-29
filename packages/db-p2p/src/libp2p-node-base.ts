@@ -139,15 +139,16 @@ const reactivityWiringLog = createLogger('reactivity-node-wiring');
 const wiringLog = createLogger('node-wiring');
 
 /**
- * Factory function or instance for creating raw storage. The node wraps the resolved instance in
- * the write-through read cache (`withReadCache`, unless it is a `MemoryRawStorage` or already
- * cached) and disposes THAT WRAPPER when it stops; the instance you supplied is never disposed.
- * Do not hand one uncached instance to two concurrently running nodes — each would wrap it
- * separately and never see the other's writes (Invariant 5 in
- * `packages/db-p2p/docs/storage.md`); to share a store across concurrent in-process nodes, build
- * one `CachedRawStorage` yourself and give every node that same object. Sequential reuse (a
- * restart over the same instance) is fine: the first node's cache is disposed at stop and the
- * second starts cold.
+ * Factory function or instance for creating raw storage. The node puts the write-through read
+ * cache in front of the resolved instance (`withReadCache`, unless it is a `MemoryRawStorage` or
+ * already cached) under a lease, and releases THAT LEASE when it stops; the instance you supplied
+ * is never disposed. The cache is shared per backing store: two concurrently running nodes handed
+ * one uncached instance — or two instances that report the same `getStoreIdentity()`, such as two
+ * `FileRawStorage` over one directory — read and write through ONE cache, which is cleared and
+ * unregistered only when the last of them stops. Sequential reuse (a restart over the same
+ * instance) starts cold once the previous node's lease has released. What remains unguarded is
+ * the cross-process case (Invariant 5 in `packages/db-p2p/docs/storage.md`). A host that builds
+ * its own `CachedRawStorage` and hands it in keeps owning it; the node never releases it.
  */
 export type RawStorageProvider = IRawStorage | (() => IRawStorage);
 
@@ -366,20 +367,22 @@ export type NodeOptions = ClusterPolicyOptions & {
  * storage pass through unchanged). The default is a bare `MemoryRawStorage`, deliberately not
  * routed through the helper — nothing to cache.
  *
- * `ownedCache` is the cache this node built, and the ONLY thing its stop path may dispose — a
- * host that supplied its own `CachedRawStorage` keeps owning it (see {@link ResolvedReadCache}).
+ * `lease` is this node's claim on the (possibly shared) cache, and the ONLY thing its stop path
+ * may release — a host that supplied its own `CachedRawStorage` keeps owning it (see
+ * {@link ResolvedReadCache}).
  */
 function resolveStorage(provider: RawStorageProvider | undefined, networkName: string): ResolvedReadCache {
 	if (!provider) {
-		return { storage: new MemoryRawStorage(), ownedCache: undefined };
+		return { storage: new MemoryRawStorage(), lease: undefined };
 	}
 	const storage = typeof provider === 'function' ? provider() : provider;
-	// NOTE: the label is the network name, so N nodes on one network in one process produce N
-	// identically-labelled rows in `SharedCachePool.stats()` (they are still distinct stores — the
-	// pool keys on a monotonic store id, not the label). Harmless while the label is only read by
-	// a human eyeballing occupancy; if pool stats ever need to attribute bytes to a SPECIFIC node,
-	// fold the peer id in — it is not known here, so that would mean labelling after node
-	// construction rather than at resolve time.
+	// NOTE: the label is the network name, so N nodes on one network in one process over N DISTINCT
+	// stores produce N identically-labelled rows in `SharedCachePool.stats()` (the pool keys on a
+	// monotonic store id, not the label); N nodes over ONE store share a single row, labelled by
+	// whichever node wrapped first. Harmless while the label is only read by a human eyeballing
+	// occupancy; if pool stats ever need to attribute bytes to a SPECIFIC node, fold the peer id
+	// in — it is not known here, so that would mean labelling after node construction rather than
+	// at resolve time.
 	return withReadCache(storage, `node:${networkName}`);
 }
 
@@ -423,7 +426,7 @@ export async function createLibp2pNodeBase(
 		transports: Libp2pTransports;
 	}
 ): Promise<OptimysticNode> {
-	const { storage: rawStorage, ownedCache } = resolveStorage(options.storage, options.networkName);
+	const { storage: rawStorage, lease } = resolveStorage(options.storage, options.networkName);
 
 	// Create placeholder restore callback (will be replaced after node starts)
 	let restoreCallback: RestoreCallback = async (_blockId, _rev?) => {
@@ -726,21 +729,22 @@ export async function createLibp2pNodeBase(
 	// soon as the protocol handler goes live in start().
 	liveNode = node;
 
-	// Release the raw-storage read cache's shared-pool registration when the node stops. Installed
-	// FIRST — before start() and before every other stop wrapper — so it runs LAST in the wrapper
-	// chain, after every monitor and service that may still read storage during its own stop. Only
-	// wired for a cache THIS node built: a MemoryRawStorage passes through unwrapped, and a
-	// host-supplied `CachedRawStorage` stays the host's to dispose (stopping one node must not
-	// clear a cache its other consumers are still reading through). A skipped release leaks only
-	// cold entries the pool evicts under pressure; the point of the polite release is honest pool
+	// Release this node's lease on the raw-storage read cache when the node stops. Installed FIRST
+	// — before start() and before every other stop wrapper — so it runs LAST in the wrapper chain,
+	// after every monitor and service that may still read storage during its own stop. Only wired
+	// when the seam handed out a lease: a MemoryRawStorage passes through unwrapped, and a
+	// host-supplied `CachedRawStorage` stays the host's to dispose. Releasing a lease is safe even
+	// when other nodes share the cache — it is cleared and unregistered only when the last lease
+	// goes, so stopping one node never blinds the others. A skipped release leaks only cold
+	// entries the pool evicts under pressure; the point of the polite release is honest pool
 	// occupancy on a long-lived provider node.
-	if (ownedCache) {
+	if (lease) {
 		const previousStop = node.stop.bind(node);
 		node.stop = async () => {
 			try {
 				await previousStop();
 			} finally {
-				await ownedCache.dispose();
+				await lease.release();
 			}
 		};
 	}

@@ -87,4 +87,32 @@ describe('libp2p node read-cache wiring (resolveStorage / stop release)', functi
 		}
 		expect(labels()).to.not.include('host-owned-node-store');
 	});
+
+	it('two nodes over one uncached instance share one cache; the first stop keeps it, the last retires it', async () => {
+		// The seam dedupes per backing store (`withReadCache`), so two concurrently running nodes
+		// handed the same storage read and write through ONE cache under two leases. Stopping the
+		// first releases its lease only — the second must keep reading through a registered cache
+		// — and stopping the second retires the registration.
+		const first = 'read-cache-wiring-shared-a';
+		const second = 'read-cache-wiring-shared-b';
+		const storage = new KvRawStorage(new MemoryStoreDriver());
+		const before = defaultCachePool().stats().stores.length;
+
+		const nodeA: any = await spawn(first, storage);
+		let nodeB: any;
+		try {
+			nodeB = await spawn(second, storage);
+			expect(defaultCachePool().stats().stores.length, 'one registration for both nodes').to.equal(before + 1);
+			expect(labels(), 'labelled by whichever node wrapped first').to.include(`node:${first}`);
+			expect(labels()).to.not.include(`node:${second}`);
+
+			await nodeA.stop();
+			expect(labels(), 'the first node stopping does not retire the cache the second still reads through')
+				.to.include(`node:${first}`);
+		} finally {
+			await nodeB?.stop();
+		}
+		expect(defaultCachePool().stats().stores.length, 'the last lease releasing retired the registration').to.equal(before);
+		expect(labels()).to.not.include(`node:${first}`);
+	});
 });

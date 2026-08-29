@@ -160,6 +160,12 @@ async function expectMissingPreWriteRowThrow(
 	}
 }
 
+/**
+ * Every `Database` here releases its read-cache lease (`plugin.dispose()`) when it closes. The
+ * cache is shared per directory for as long as any lease is held, so a skipped release would make
+ * the "reopen" below read the previous `Database`'s still-warm cache instead of the on-disk bytes
+ * these tests exist to check.
+ */
 async function reopenScalar(dir: string, sql: string): Promise<SqlValue> {
 	const { db, plugin } = createDb(dir);
 	try {
@@ -167,6 +173,7 @@ async function reopenScalar(dir: string, sql: string): Promise<SqlValue> {
 		return await selectScalar(db, sql);
 	} finally {
 		db.close();
+		await plugin.dispose();
 	}
 }
 
@@ -186,7 +193,7 @@ describe('UpdateArgs.oldKeyValues compact-tuple shape (local/bootstrap transacto
 
 	it('UPDATE of a non-key column on a composite PK whose columns are NOT leading updates in place', async () => {
 		const uri = 'tree://oldkeyshape/revocation';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			// Revocation's real shape: PK columns sit at schema indices 0 and 2, so
 			// the compact key tuple [TableName, StampId] and the full-row addressing
@@ -222,6 +229,7 @@ describe('UpdateArgs.oldKeyValues compact-tuple shape (local/bootstrap transacto
 			)).to.equal('K1');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(Number(await reopenScalar(dir,
@@ -231,7 +239,7 @@ describe('UpdateArgs.oldKeyValues compact-tuple shape (local/bootstrap transacto
 
 	it('DELETE addressed by a non-leading composite PK removes the row', async () => {
 		const uri = 'tree://oldkeyshape/delete';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table D (
@@ -248,6 +256,7 @@ describe('UpdateArgs.oldKeyValues compact-tuple shape (local/bootstrap transacto
 			expect(await selectCount(db, 'select count(*) as c from D')).to.equal(0);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(Number(await reopenScalar(dir, 'select count(*) as c from D'))).to.equal(0);
@@ -255,7 +264,7 @@ describe('UpdateArgs.oldKeyValues compact-tuple shape (local/bootstrap transacto
 
 	it('UPDATE that MOVES a non-leading composite PK leaves no stale row at the old key', async () => {
 		const uri = 'tree://oldkeyshape/move';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table M (
@@ -276,6 +285,7 @@ describe('UpdateArgs.oldKeyValues compact-tuple shape (local/bootstrap transacto
 			expect(await selectCount(db, `select count(*) as c from M where b = 'y'`)).to.equal(0);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(Number(await reopenScalar(dir, 'select count(*) as c from M'))).to.equal(1);
@@ -283,7 +293,7 @@ describe('UpdateArgs.oldKeyValues compact-tuple shape (local/bootstrap transacto
 
 	it('UPDATE of a non-key column on a single-column PK that is NOT the first column updates in place', async () => {
 		const uri = 'tree://oldkeyshape/single';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table S (
@@ -299,6 +309,7 @@ describe('UpdateArgs.oldKeyValues compact-tuple shape (local/bootstrap transacto
 			expect(await selectScalar(db, 'select payload from S where id = 7')).to.equal('q');
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		expect(await reopenScalar(dir, 'select payload from S where id = 7')).to.equal('q');
@@ -321,7 +332,7 @@ describe('UpdateArgs.oldKeyValues compact-tuple shape (local/bootstrap transacto
 	 */
 	it('UPDATE and DELETE stay correct when EVERY column is in the PK and PK order is rotated', async () => {
 		const uri = 'tree://oldkeyshape/rotated';
-		const { db } = createDb(dir);
+		const { db, plugin } = createDb(dir);
 		try {
 			await db.exec(
 				`create table R (
@@ -342,6 +353,7 @@ describe('UpdateArgs.oldKeyValues compact-tuple shape (local/bootstrap transacto
 			expect(await selectCount(db, `select count(*) as c from R where a = 'a1'`)).to.equal(0);
 		} finally {
 			db.close();
+			await plugin.dispose();
 		}
 
 		// Exactly one row survives the reopen, at the NEW key — the strongest signal
@@ -352,13 +364,14 @@ describe('UpdateArgs.oldKeyValues compact-tuple shape (local/bootstrap transacto
 		))).to.equal(1);
 
 		// And the DELETE half, addressed by the same rotated tuple.
-		const { db: db2, plugin } = createDb(dir);
+		const { db: db2, plugin: plugin2 } = createDb(dir);
 		try {
-			await plugin.hydrate(db2);
+			await plugin2.hydrate(db2);
 			await db2.exec(`delete from R where a = 'a2' and b = 'b1'`);
 			expect(await selectCount(db2, 'select count(*) as c from R')).to.equal(0);
 		} finally {
 			db2.close();
+			await plugin2.dispose();
 		}
 
 		expect(Number(await reopenScalar(dir, 'select count(*) as c from R'))).to.equal(0);

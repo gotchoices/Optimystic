@@ -4,6 +4,9 @@ import { withReadCache } from '../src/storage/with-read-cache.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { KvRawStorage } from '../src/storage/kv-raw-storage.js';
 import { MemoryStoreDriver } from '../src/storage/memory-store-driver.js';
+import type { RawStoreDriver } from '../src/storage/raw-store-driver.js';
+import type { StoreIdentity } from '../src/storage/store-identity.js';
+import type { IRawStorage } from '../src/storage/i-raw-storage.js';
 import { CachedRawStorage } from '../src/storage/cached-raw-storage.js';
 import { SharedCachePool } from '../src/storage/shared-cache-pool.js';
 import { CountingStoreDriver, READ_METHODS, runColdStartWorkload } from './support/cache-test-helpers.js';
@@ -12,44 +15,62 @@ import { CountingStoreDriver, READ_METHODS, runColdStartWorkload } from './suppo
  * `withReadCache` is the ONE helper both production composition seams go through
  * (`CollectionFactory.createLocalTransactor` in the Quereus plugin, `resolveStorage` in
  * `libp2p-node-base`). The cache's semantics are pinned in `cached-raw-storage.spec.ts`; this
- * spec pins the helper's own contract — what it wraps, what it leaves alone, WHICH RESULT THE
- * CALLER MAY DISPOSE, that the wrapped storage really cuts backend reads, and that the lifecycle
- * it hands the caller works.
+ * spec pins the helper's own contract — what it wraps, what it leaves alone, that two callers
+ * over ONE backing store get ONE cache (by store identity, or by object when the backend reports
+ * none), that the lease lifecycle it hands the caller tears the cache down exactly when the last
+ * consumer departs, and that the wrapped storage really cuts backend reads.
  *
  * Counts are taken at the `RawStoreDriver` seam, BELOW the cache. Counting `IRawStorage` calls
  * would measure nothing: the callers above the cache issue exactly the same calls cached or not.
  */
 describe('withReadCache (composition-seam helper)', () => {
 	const blockId = 'blk' as BlockId;
+	const meta = (rev: number): Parameters<IRawStorage['saveMetadata']>[1] =>
+		({ ranges: [[1]], latest: { rev, actionId: `a${rev}` as ActionId } });
 
-	it('returns a MemoryRawStorage unchanged, owning nothing (already in memory — nothing to save)', () => {
+	/**
+	 * A driver that reports a fixed store identity — the shape `FileRawStorage` presents (two
+	 * instances over one directory report one identity) without touching a disk. Every other
+	 * call forwards to `inner`, so several identified drivers over one memory driver ARE one
+	 * backing store.
+	 */
+	function identified(inner: RawStoreDriver, identity: StoreIdentity): RawStoreDriver {
+		return new Proxy(inner, {
+			get(target, prop, _receiver) {
+				if (prop === 'storeIdentity') return () => identity;
+				const value = Reflect.get(target, prop, target);
+				return typeof value === 'function' ? value.bind(target) : value;
+			},
+		});
+	}
+
+	it('returns a MemoryRawStorage unchanged, with no lease (already in memory — nothing to save)', () => {
 		const memory = new MemoryRawStorage();
 		const resolved = withReadCache(memory, 'spec', new SharedCachePool());
 		expect(resolved.storage).to.equal(memory);
-		expect(resolved.ownedCache, 'nothing was constructed, so nothing is ours to dispose').to.equal(undefined);
+		expect(resolved.lease, 'nothing was constructed, so there is nothing to claim').to.equal(undefined);
 	});
 
-	it('returns an already-cached storage unchanged, owning nothing (never double-wraps)', async () => {
+	it('returns an already-cached storage unchanged, with no lease (never double-wraps)', async () => {
 		const pool = new SharedCachePool();
 		const once = withReadCache(new KvRawStorage(new MemoryStoreDriver()), 'spec', pool);
 		expect(once.storage).to.be.instanceOf(CachedRawStorage);
-		expect(once.ownedCache, 'the wrapper this call built IS the storage it returned').to.equal(once.storage);
+		expect(once.lease!.cache, 'the lease is a claim on the cache this call returned').to.equal(once.storage);
 
 		const again = withReadCache(once.storage, 'spec-again', pool);
 		expect(again.storage, 'passed straight through').to.equal(once.storage);
-		expect(again.ownedCache, 'the second caller owns nothing — disposing here would retire a cache the host still owns')
+		expect(again.lease, 'the second caller holds no claim — the host that built the cache still owns it')
 			.to.equal(undefined);
 		expect(pool.stats().stores, 'one registration, not two').to.have.length(1);
-		await once.ownedCache!.dispose();
+		await once.lease!.release();
 	});
 
-	it('a shared wrapper survives one consumer departing (the documented multi-consumer recipe)', async () => {
-		// The recipe this helper's doc prescribes for several in-process consumers over one store:
-		// the HOST builds the cache and hands that same object to each seam. Each seam calls
-		// withReadCache, gets it back unchanged, and — because ownedCache is undefined — has
-		// nothing to dispose. Before ownership was reported, both seams saw `instanceof
-		// CachedRawStorage` and the first to depart unregistered the store from the pool while the
-		// other kept reading and charging entries against a handle stats() no longer listed.
+	it('a host-built wrapper survives one consumer departing (host-owned caches never enter the registry)', async () => {
+		// A host that builds the cache itself and hands that same object to each seam: each seam
+		// gets it back unchanged with no lease, so nothing a seam does can retire it. Before
+		// ownership was reported, both seams saw `instanceof CachedRawStorage` and the first to
+		// depart unregistered the store from the pool while the other kept reading and charging
+		// entries against a handle stats() no longer listed.
 		const pool = new SharedCachePool();
 		const shared = new CachedRawStorage(new KvRawStorage(new MemoryStoreDriver()), pool, 'host-owned');
 		await shared.saveMetadata(blockId, { ranges: [], latest: undefined });
@@ -59,10 +80,10 @@ describe('withReadCache (composition-seam helper)', () => {
 		const consumerB = withReadCache(shared, 'consumer-b', pool);
 		expect(consumerA.storage).to.equal(shared);
 		expect(consumerB.storage).to.equal(shared);
-		expect(consumerA.ownedCache).to.equal(undefined);
-		expect(consumerB.ownedCache).to.equal(undefined);
+		expect(consumerA.lease).to.equal(undefined);
+		expect(consumerB.lease).to.equal(undefined);
 
-		// Consumer A departs. It owns nothing, so there is nothing for it to release.
+		// Consumer A departs. It holds nothing, so there is nothing for it to release.
 		expect(pool.stats().stores.map(s => s.label), 'the host store is still registered').to.deep.equal(['host-owned']);
 		await consumerB.storage.getMetadata(blockId);
 		expect(pool.stats().stores, 'and its occupancy is still attributable to it').to.have.length(1);
@@ -73,26 +94,150 @@ describe('withReadCache (composition-seam helper)', () => {
 		expect(pool.stats().entries).to.equal(0);
 	});
 
-	it('two wraps of ONE unwrapped instance are two independent caches that never converge', async () => {
-		// The silent-non-convergence footgun the helper's doc warns about, pinned so the warning
-		// stays true: sharing the INNER storage is not sharing the cache. This is why the plugin's
-		// cross-writer spec hands both peers one pre-built CachedRawStorage instead.
+	it('two wraps of ONE unwrapped instance converge on one cache (keyed by object when there is no identity)', async () => {
+		// The footgun this helper used to pin as a warning: sharing the INNER storage was not
+		// sharing the cache, so each call wrapped it again and the reader's own cache answered
+		// forever. Now the second call finds the first call's cache.
 		const pool = new SharedCachePool();
 		const inner = new KvRawStorage(new MemoryStoreDriver());
-		const first = withReadCache(inner, 'writer', pool);
-		const second = withReadCache(inner, 'reader', pool);
-		expect(first.storage, 'each call wrapped again').to.not.equal(second.storage);
-		expect(pool.stats().stores, 'two registrations over one backing store').to.have.length(2);
+		expect(inner.getStoreIdentity, 'the memory driver reports no identity — this is the object-key path').to.equal(undefined);
+		const writer = withReadCache(inner, 'writer', pool);
+		const reader = withReadCache(inner, 'reader', pool);
+		expect(reader.storage, 'the same wrapper came back').to.equal(writer.storage);
+		expect(reader.lease, 'under a distinct lease').to.not.equal(writer.lease);
+		expect(pool.stats().stores, 'one registration over one backing store').to.have.length(1);
 
-		await first.storage.saveMetadata(blockId, { ranges: [[1]], latest: { rev: 1, actionId: 'a1' as ActionId } });
-		expect((await second.storage.getMetadata(blockId))!.latest!.rev, 'reader sees the first write (cold)').to.equal(1);
+		await writer.storage.saveMetadata(blockId, meta(1));
+		expect((await reader.storage.getMetadata(blockId))!.latest!.rev, 'reader sees the first write').to.equal(1);
+		await writer.storage.saveMetadata(blockId, meta(2));
+		expect((await reader.storage.getMetadata(blockId))!.latest!.rev, 'AND the second — one cache, write-through')
+			.to.equal(2);
 
-		await first.storage.saveMetadata(blockId, { ranges: [[1]], latest: { rev: 2, actionId: 'a2' as ActionId } });
-		expect((await second.storage.getMetadata(blockId))!.latest!.rev, 'but never the second: its own cache answers')
-			.to.equal(1);
+		await writer.lease!.release();
+		await reader.lease!.release();
+	});
 
-		await first.ownedCache!.dispose();
-		await second.ownedCache!.dispose();
+	it('two storages reporting the same store identity dedupe to one cache and one pool registration', async () => {
+		// Two `FileRawStorage(dir)` over one `dir`, modelled: two DISTINCT storage objects whose
+		// drivers report one identity over one backing driver.
+		const pool = new SharedCachePool();
+		const backing = new MemoryStoreDriver();
+		const storageA = new KvRawStorage(identified(backing, 'spec:same-store'));
+		const storageB = new KvRawStorage(identified(backing, 'spec:same-store'));
+		expect(storageA, 'distinct objects').to.not.equal(storageB);
+		expect(storageA.getStoreIdentity!()).to.equal(storageB.getStoreIdentity!());
+
+		const a = withReadCache(storageA, 'a', pool);
+		const b = withReadCache(storageB, 'b', pool);
+		expect(b.storage, 'one wrapper for both').to.equal(a.storage);
+		expect(pool.stats().stores, 'one registration').to.have.length(1);
+
+		await a.storage.saveMetadata(blockId, meta(1));
+		await a.storage.saveMetadata(blockId, meta(2));
+		expect((await b.storage.getMetadata(blockId))!.latest!.rev, 'a write through one is visible through the other')
+			.to.equal(2);
+
+		await a.lease!.release();
+		await b.lease!.release();
+		expect(pool.stats().stores).to.have.length(0);
+	});
+
+	it('distinct identities, and identity-less distinct objects, keep independent caches', async () => {
+		// The dedupe must not over-merge: several db-p2p specs build two caches over two memory
+		// drivers and compare them, and two stores that merely LOOK alike must stay apart.
+		const pool = new SharedCachePool();
+		const byIdentityA = withReadCache(new KvRawStorage(identified(new MemoryStoreDriver(), 'spec:x')), 'x', pool);
+		const byIdentityB = withReadCache(new KvRawStorage(identified(new MemoryStoreDriver(), 'spec:y')), 'y', pool);
+		expect(byIdentityA.storage).to.not.equal(byIdentityB.storage);
+
+		const objectA = withReadCache(new KvRawStorage(new MemoryStoreDriver()), 'obj-a', pool);
+		const objectB = withReadCache(new KvRawStorage(new MemoryStoreDriver()), 'obj-b', pool);
+		expect(objectA.storage).to.not.equal(objectB.storage);
+		expect(pool.stats().stores, 'four stores, four registrations').to.have.length(4);
+
+		for (const resolved of [byIdentityA, byIdentityB, objectA, objectB]) await resolved.lease!.release();
+		expect(pool.stats().stores).to.have.length(0);
+	});
+
+	it('refcount lifecycle: the cache outlives the first departure and dies with the last; a re-wrap starts cold', async () => {
+		const pool = new SharedCachePool();
+		const counting = new CountingStoreDriver(new MemoryStoreDriver());
+		const inner = new KvRawStorage(counting);
+
+		const a = withReadCache(inner, 'a', pool);
+		const b = withReadCache(inner, 'b', pool);
+		await a.storage.saveMetadata(blockId, meta(1));
+		await b.storage.getMetadata(blockId);
+		const readsAfterWarm = counting.count('getMetadata');
+
+		// A departs: B still reads through a live, pool-registered cache.
+		await a.lease!.release();
+		expect(pool.stats().stores, 'still registered').to.have.length(1);
+		expect(pool.stats().entries, 'entries intact').to.be.greaterThan(0);
+		expect((await b.storage.getMetadata(blockId))!.latest!.rev).to.equal(1);
+		expect(counting.count('getMetadata'), 'served from the surviving cache, no backend read').to.equal(readsAfterWarm);
+
+		// B departs: cleared, unregistered, forgotten.
+		await b.lease!.release();
+		expect(pool.stats().stores, 'registration retired').to.have.length(0);
+		expect(pool.stats().entries, 'entries released').to.equal(0);
+
+		// A later wrap over the same store builds a fresh cold cache.
+		const c = withReadCache(inner, 'c', pool);
+		expect(c.storage, 'a new wrapper, not the dead one').to.not.equal(a.storage);
+		expect((await c.storage.getMetadata(blockId))!.latest!.rev).to.equal(1);
+		expect(counting.count('getMetadata'), 'cold: one real backend read').to.equal(readsAfterWarm + 1);
+		await c.lease!.release();
+	});
+
+	it('release() twice on one lease retires the store exactly once, and concurrent releases land one disposal', async () => {
+		const pool = new SharedCachePool();
+		const inner = new KvRawStorage(new MemoryStoreDriver());
+
+		const solo = withReadCache(inner, 'solo', pool);
+		await solo.storage.saveMetadata(blockId, meta(1));
+		await solo.lease!.release();
+		expect(pool.stats().stores).to.have.length(0);
+		await solo.lease!.release();
+		expect(pool.stats().stores, 'a double release does not decrement twice or throw').to.have.length(0);
+
+		// A second lease over the same (now re-wrapped) store must not be retired by the stale one.
+		const a = withReadCache(inner, 'a', pool);
+		const b = withReadCache(inner, 'b', pool);
+		expect(pool.stats().stores).to.have.length(1);
+		await solo.lease!.release();
+		expect(pool.stats().stores, 'the already-released lease is inert').to.have.length(1);
+		await Promise.all([a.lease!.release(), b.lease!.release()]);
+		expect(pool.stats().stores, 'both released concurrently: exactly one disposal, nothing left').to.have.length(0);
+	});
+
+	it('a different pool on the second wrap is ignored — identity beats sizing', async () => {
+		// A same-store-different-pool pair would be two caches over one store, which is the thing
+		// dedupe removes. So the first wrap fixes the pool; the second caller joins that cache.
+		const firstPool = new SharedCachePool();
+		const secondPool = new SharedCachePool();
+		const inner = new KvRawStorage(new MemoryStoreDriver());
+		const first = withReadCache(inner, 'first', firstPool);
+		const second = withReadCache(inner, 'second', secondPool);
+		expect(second.storage).to.equal(first.storage);
+		await second.storage.saveMetadata(blockId, meta(1));
+		expect(firstPool.stats().stores, 'the first pool keeps the registration').to.have.length(1);
+		expect(secondPool.stats().stores, 'the second pool never saw it').to.have.length(0);
+		await first.lease!.release();
+		await second.lease!.release();
+		expect(firstPool.stats().stores).to.have.length(0);
+	});
+
+	it('the first caller\'s label is the one pool.stats() shows for a shared cache', async () => {
+		const pool = new SharedCachePool();
+		const inner = new KvRawStorage(new MemoryStoreDriver());
+		const first = withReadCache(inner, 'node:alpha', pool);
+		const second = withReadCache(inner, 'quereus:local', pool);
+		expect(pool.stats().stores.map(s => s.label), 'first label wins; the second caller\'s is not recorded anywhere')
+			.to.deep.equal(['node:alpha']);
+		await first.lease!.release();
+		expect(pool.stats().stores.map(s => s.label), 'and it stays after the first caller departs').to.deep.equal(['node:alpha']);
+		await second.lease!.release();
 	});
 
 	it('wraps a non-memory storage and cuts backend reads on the cold-start workload', async () => {
@@ -114,46 +259,47 @@ describe('withReadCache (composition-seam helper)', () => {
 			.to.be.below(uncachedReads / 4);
 		expect(counting.count('getMetadata'), 'metadata re-reads are the amplification being fixed')
 			.to.be.below(baseline.count('getMetadata') / 4);
-		await cached.ownedCache!.dispose();
+		await cached.lease!.release();
 	});
 
 	it('a reopen over the same backing store starts cold and observes the last write', async () => {
-		// The property the plugin specs turn on: close a Database, re-open the same directory,
-		// read the post-write value. Modelled here as dispose-then-rewrap over one inner driver.
+		// The property the plugin specs turn on: close a Database (releasing its lease), re-open
+		// the same directory, read the post-write value. Modelled here as release-then-rewrap
+		// over one inner driver.
 		const inner = new MemoryStoreDriver();
 		const pool = new SharedCachePool();
 
-		const first = withReadCache(new KvRawStorage(inner), 'first', pool).ownedCache!;
-		await first.saveMetadata(blockId, { ranges: [[1]], latest: { rev: 1, actionId: 'a1' as ActionId } });
-		await first.saveMetadata(blockId, { ranges: [[1]], latest: { rev: 2, actionId: 'a2' as ActionId } });
-		expect((await first.getMetadata(blockId))!.latest!.rev).to.equal(2);
-		await first.dispose();
+		const first = withReadCache(new KvRawStorage(inner), 'first', pool);
+		await first.storage.saveMetadata(blockId, meta(1));
+		await first.storage.saveMetadata(blockId, meta(2));
+		expect((await first.storage.getMetadata(blockId))!.latest!.rev).to.equal(2);
+		await first.lease!.release();
 
 		const counting = new CountingStoreDriver(inner);
-		const second = withReadCache(new KvRawStorage(counting), 'second', pool).ownedCache!;
-		expect((await second.getMetadata(blockId))!.latest!.rev, 'post-write value visible after reopen').to.equal(2);
+		const second = withReadCache(new KvRawStorage(counting), 'second', pool);
+		expect((await second.storage.getMetadata(blockId))!.latest!.rev, 'post-write value visible after reopen').to.equal(2);
 		expect(counting.count('getMetadata'), 'the reopened cache is cold: one real read').to.equal(1);
-		expect((await second.getMetadata(blockId))!.latest!.rev).to.equal(2);
+		expect((await second.storage.getMetadata(blockId))!.latest!.rev).to.equal(2);
 		expect(counting.count('getMetadata'), 'then served from cache').to.equal(1);
-		await second.dispose();
+		await second.lease!.release();
 	});
 
-	it('dispose releases the store registration from the pool', async () => {
+	it('releasing the only lease retires the store registration from the pool', async () => {
 		const pool = new SharedCachePool();
-		const cached = withReadCache(new KvRawStorage(new MemoryStoreDriver()), 'spec-dispose', pool).ownedCache!;
-		await cached.saveMetadata(blockId, { ranges: [], latest: undefined });
-		await cached.getMetadata(blockId);
+		const cached = withReadCache(new KvRawStorage(new MemoryStoreDriver()), 'spec-dispose', pool);
+		await cached.storage.saveMetadata(blockId, { ranges: [], latest: undefined });
+		await cached.storage.getMetadata(blockId);
 
 		const registered = pool.stats().stores;
 		expect(registered.map(s => s.label)).to.deep.equal(['spec-dispose']);
 		expect(pool.stats().entries, 'the save populated the cache').to.be.greaterThan(0);
 
-		await cached.dispose();
+		await cached.lease!.release();
 		expect(pool.stats().stores, 'store handle retired').to.have.length(0);
 		expect(pool.stats().entries, 'and its entries released').to.equal(0);
 
 		// Idempotent.
-		await cached.dispose();
+		await cached.lease!.release();
 		expect(pool.stats().stores).to.have.length(0);
 	});
 });

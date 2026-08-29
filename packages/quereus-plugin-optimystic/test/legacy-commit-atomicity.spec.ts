@@ -167,7 +167,10 @@ async function countTreeEntries(
 	return n;
 }
 
-/** Reopen the storage dir in a fresh (plain) Database and return the count of `sql`. */
+/** Reopen the storage dir in a fresh (plain) Database and return the count of `sql`.
+ * The injected transactor writes through a bare `FileRawStorage`, BEHIND the plugin's read
+ * cache, so this reopen must not inherit a warm cache from an earlier one: the read cache is
+ * shared per directory for as long as any lease is held, so release ours before returning. */
 async function reopenCount(dir: string, countSql: string): Promise<number> {
 	const { db, plugin } = createDbPlain(dir);
 	try {
@@ -175,6 +178,7 @@ async function reopenCount(dir: string, countSql: string): Promise<number> {
 		return await selectCount(db, countSql);
 	} finally {
 		db.close();
+		await plugin.dispose();
 	}
 }
 
