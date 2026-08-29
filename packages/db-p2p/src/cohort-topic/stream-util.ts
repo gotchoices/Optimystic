@@ -26,6 +26,7 @@ import type { Libp2p } from "libp2p";
 import type { Connection, PeerId, Stream } from "@libp2p/interface";
 import { readFramed, sendFramed } from "p2p-fret";
 import { openProtocolStream } from "../network/open-protocol-stream.js";
+import { registerProtocolHandler } from "../network/register-protocol-handler.js";
 
 /** Default per-frame ceiling — matches FRET's 512 KiB maybe-act bound. */
 export const DEFAULT_STREAM_MAX_BYTES = 512 * 1024;
@@ -98,7 +99,7 @@ export function handleRequestResponse(
 	handle: (frame: Uint8Array, from: PeerId) => Promise<Uint8Array | undefined>,
 	maxBytes = DEFAULT_STREAM_MAX_BYTES,
 ): void {
-	void node.handle(protocol, (stream: Stream, connection: Connection) => {
+	void registerProtocolHandler(node, protocol, (stream: Stream, connection: Connection) => {
 		void (async (): Promise<void> => {
 			try {
 				const frame = await readFramed(stream, maxBytes);

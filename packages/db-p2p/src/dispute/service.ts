@@ -5,6 +5,7 @@ import type { Uint8ArrayList } from 'uint8arraylist';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { DisputeMessage } from './types.js';
 import type { DisputeService } from './dispute-service.js';
+import { registerProtocolHandler } from '../network/register-protocol-handler.js';
 
 interface BaseComponents {
 	logger: { forComponent: (name: string) => Logger };
@@ -57,7 +58,7 @@ export class DisputeProtocolService implements Startable {
 	async start(): Promise<void> {
 		if (this.running) return;
 
-		await this.components.registrar.handle(this.protocol, this.handleIncomingStream.bind(this), {
+		await registerProtocolHandler(this.components.registrar, this.protocol, this.handleIncomingStream.bind(this), {
 			maxInboundStreams: this.maxInboundStreams,
 			maxOutboundStreams: this.maxOutboundStreams,
 		});

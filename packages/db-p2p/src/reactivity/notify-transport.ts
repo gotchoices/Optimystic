@@ -27,6 +27,7 @@ import { readFramed } from "p2p-fret";
 import { peerIdToBytes } from "../cohort-topic/peer-codec.js";
 import { sendOneWay, DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic/stream-util.js";
 import { PROTOCOL_REACTIVITY_NOTIFY } from "./protocols.js";
+import { registerProtocolHandler } from "../network/register-protocol-handler.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("reactivity-notify");
@@ -126,7 +127,7 @@ export function registerNotifyHandler(
 	transport: ReactivityNotifyTransport,
 	maxBytes = DEFAULT_STREAM_MAX_BYTES,
 ): void {
-	void node.handle(protocol, (stream: Stream, connection: Connection) => {
+	void registerProtocolHandler(node, protocol, (stream: Stream, connection: Connection) => {
 		void (async (): Promise<void> => {
 			try {
 				const frame = await readFramed(stream, maxBytes);

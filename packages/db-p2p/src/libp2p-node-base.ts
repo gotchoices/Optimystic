@@ -1617,13 +1617,13 @@ export async function createLibp2pNodeBase(
 
 			// Inbound notify frames → forwarder host (subscriber role delivers in-process; forwarder role fans out).
 			// NOTE: the four `register*Handler` helpers below (notify / pushStateGossip / recover /
-			// matchmaking query) all call `node.handle(...)` fire-and-forget (`void`), so a rejected
+			// matchmaking query) all call `registerProtocolHandler(...)` fire-and-forget (`void`), so a rejected
 			// registration escapes the post-start rollback `catch` as an UNHANDLED rejection instead of
 			// failing node creation. Harmless today — every protocol id here is a fixed constant registered
 			// exactly once, so the only realistic rejection is a duplicate, and that needs a caller to pass
 			// overlapping custom `cohortTopic.host.protocols`. If any of these ids ever becomes
 			// caller-configurable, or a helper grows a registration that can genuinely fail, make them await
-			// their `node.handle` so the failure reaches the rollback.
+			// their `registerProtocolHandler` so the failure reaches the rollback.
 			registerNotifyHandler(node, reactivityProtocols.notify, notify);
 			offInboundNotify = notify.onNotification((from, n): void => { void forwarderHost.onInbound(from, n); });
 

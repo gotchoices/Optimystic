@@ -161,6 +161,7 @@ import { FretCohortThresholdCrypto, createVerifyOnlyThresholdCrypto } from "./th
 import { FretTrustAnchor } from "./fret-trust-anchor.js";
 import { FretSizeEstimator } from "./size-estimator.js";
 import { peerIdToBytes, bytesToPeerIdString } from "./peer-codec.js";
+import { registerProtocolHandler } from "../network/register-protocol-handler.js";
 import { signPeer, verifyPeerSig } from "./peer-sig.js";
 import { createPoWVerifier, createReputationVerifier, type BootstrapReputationView } from "./bootstrap-evidence-verifiers.js";
 import { createParentReferenceVerifier, createDefaultParentTopicView, type BootstrapParentTopicView } from "./bootstrap-parent-reference.js";
@@ -1037,7 +1038,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// --- protocol handlers + activity callback ---
 	// Await registration so the host is not returned (and dialed) before the five handlers are live —
 	// and, crucially, before the gossip driver below starts ticking (no tick may run on a half-wired node).
-	await registerProtocolHandlers(node, protocols, registry, dispatchRegister, childLinkDeps, minSigs, signEndorse, verifier, promoteGate, gossipTransport, maybeInstantiateColdSibling, publishSink, membershipSource, selfCoord, maxBytes);
+	await registerCohortTopicProtocols(node, protocols, registry, dispatchRegister, childLinkDeps, minSigs, signEndorse, verifier, promoteGate, gossipTransport, maybeInstantiateColdSibling, publishSink, membershipSource, selfCoord, maxBytes);
 	fret.setActivityHandler(async (activity: string, cohort: string[]): Promise<{ commitCertificate: string }> => {
 		const decoded = decodeCohortMessage(b64urlToBytes(activity), maxBytes);
 		// Decode-and-branch: a `ChildLinkV1` (a child cohort registering with this parent) runs the child-link
@@ -2788,7 +2789,7 @@ function tierOfTopic(store: ReturnType<typeof createRegistrationStore>, topicId:
 	return (recs.length > 0 ? recs[0]!.tier : 0) as Tier;
 }
 
-async function registerProtocolHandlers(
+async function registerCohortTopicProtocols(
 	node: Libp2p,
 	protocols: CohortTopicProtocols,
 	registry: CoordRegistry,
@@ -2810,7 +2811,7 @@ async function registerProtocolHandlers(
 	await Promise.all([
 		// register: a direct dial carries a RenewV1 (ping), a ChildLinkV1 (a child cohort registering with this
 		// parent), or a RegisterV1 (re-attach walk fallback). The three shapes are disjoint, so try each in turn.
-		node.handle(protocols.register, makeRequestHandler(async (frame): Promise<Uint8Array> => {
+		registerProtocolHandler(node, protocols.register, makeRequestHandler(async (frame): Promise<Uint8Array> => {
 			const decoded = decodeCohortMessage(frame, maxBytes);
 			const renew = tryValidate(() => validateRenewV1(decoded));
 			if (renew !== undefined) {
@@ -2830,7 +2831,7 @@ async function registerProtocolHandlers(
 		// every coord engine's bus; per-bus epoch matching governs which engine merges the record deltas.
 		// First, if this is a verified co-member frame for a coord we hold no engine for, instantiate that
 		// engine (§Cold-start instantiation) so its freshly-subscribed bus merges this very frame on `deliver`.
-		node.handle(protocols.gossip, makeOneWayHandler(async (frame, from): Promise<void> => {
+		registerProtocolHandler(node, protocols.gossip, makeOneWayHandler(async (frame, from): Promise<void> => {
 			maybeInstantiateColdSibling(frame);
 			gossipTransport.deliver(from.toString(), frame);
 		}, maxBytes)),
@@ -2839,12 +2840,12 @@ async function registerProtocolHandlers(
 		// peer arrives as `from`, so the handler can gate per-(peer, topic) before any expensive work. The
 		// full pipeline (rate limit → findServing → effectiveAt high-water → verify+apply, bounded
 		// refetch) lives in the exported `handleInboundNotice`; it logs and never throws on the stream.
-		node.handle(protocols.promote, makeOneWayHandler(async (frame, from): Promise<void> => {
+		registerProtocolHandler(node, protocols.promote, makeOneWayHandler(async (frame, from): Promise<void> => {
 			await handleInboundNotice(frame, peerIdToBytes(from), registry, verifier, promoteGate, Date.now(), maxBytes);
 		}, maxBytes)),
 
 		// membership: serve this node's latest published cert; cache any cert the requester returns.
-		node.handle(protocols.membership, makeRequestHandler(async (frame): Promise<Uint8Array> => {
+		registerProtocolHandler(node, protocols.membership, makeRequestHandler(async (frame): Promise<Uint8Array> => {
 			void frame; // request frame is the raw coord; this node serves its own cohort cert
 			const latest = publishSink.latest();
 			if (latest !== undefined) {
@@ -2856,7 +2857,7 @@ async function registerProtocolHandlers(
 		// sign: per-member endorsement for threshold-signature assembly. Validate the request, run the
 		// endorsement policy, and reply with this node's peer-key signature over the request payload (or a
 		// refusal). One Ed25519 sign and nothing more — the cohort + epoch gate bounds who we sign for.
-		node.handle(protocols.sign, makeRequestHandler(async (frame, from): Promise<Uint8Array> => {
+		registerProtocolHandler(node, protocols.sign, makeRequestHandler(async (frame, from): Promise<Uint8Array> => {
 			const request = validateSignRequestV1(decodeCohortMessage(frame, maxBytes));
 			const reply = await signEndorse(request, from.toString());
 			return encodeCohortMessage(reply, maxBytes);

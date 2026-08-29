@@ -45,6 +45,7 @@ import type { FretCohortGossipTransport } from "../cohort-topic/cohort-gossip-tr
 import { DEFAULT_GOSSIP_INTERVAL_MS } from "../cohort-topic/cohort-gossip-driver.js";
 import { DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic/stream-util.js";
 import { PROTOCOL_REACTIVITY_PUSH_STATE_GOSSIP } from "./protocols.js";
+import { registerProtocolHandler } from "../network/register-protocol-handler.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("reactivity-push-state-gossip");
@@ -273,7 +274,7 @@ export function registerPushStateGossipHandler(
 	driver: Pick<ReactivityPushStateGossipDriver, "deliver">,
 	maxBytes = DEFAULT_STREAM_MAX_BYTES,
 ): void {
-	void node.handle(protocol, (stream: Stream, connection: Connection) => {
+	void registerProtocolHandler(node, protocol, (stream: Stream, connection: Connection) => {
 		void (async (): Promise<void> => {
 			try {
 				const frame = await readFramed(stream, maxBytes);

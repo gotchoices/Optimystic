@@ -11,6 +11,7 @@ import { createInboundStreamAuthorization, type InboundStreamAuthorization, type
 import { certifyContent, proofThresholds } from './certified-claims.js';
 import type { BlockCommitProof, ProofThresholds } from './commit-proof.js';
 import { servableProof, type ArchiveServingRepo } from '../storage/block-archive.js';
+import { registerProtocolHandler } from '../network/register-protocol-handler.js';
 
 const log = createLogger('block-transfer-service');
 
@@ -254,7 +255,7 @@ export class BlockTransferService implements Startable {
 
 	async start(): Promise<void> {
 		if (this.running) return;
-		await this.registrar.handle(this.protocol, async (data: any, connection?: Connection) => {
+		await registerProtocolHandler(this.registrar, this.protocol, async (data: any, connection?: Connection) => {
 			// libp2p invokes the stream handler with the Stream as the FIRST positional argument
 			// (see cluster/repo/dispute services, which all use `(stream, connection)`). The block-
 			// transfer handler previously read `data.stream`, which is `undefined` for the positional

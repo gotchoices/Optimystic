@@ -15,6 +15,14 @@
  * WITHOUT the flag must be refused. If libp2p ever stopped enforcing that, the primary case would
  * pass for the wrong reason and this file would be worthless.
  *
+ * The last two cases cover the ANSWERING half, which needs the same topology: libp2p checks
+ * `runOnLimitedConnection` a second time on the receiving side, against the options that peer
+ * passed when it registered the handler. A protocol registered through `registerProtocolHandler`
+ * is reached; one registered with a bare `node.handle(...)` is not — the dialer's stream open
+ * still succeeds (multistream-select has already acknowledged the protocol by then) and the stream
+ * is silently reset, which is precisely why the defect reads as "that peer had nothing" rather
+ * than as an error.
+ *
  * **Runtime.** Four real libp2p boots plus a relay reservation. The four cases report ~0.4 s of
  * test time on loopback, and adding the whole file to the default suite was not measurable above
  * run-to-run variance (53 s with it, 60 s without, across two full `yarn workspace
@@ -30,11 +38,16 @@ import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
 import type { Multiaddr } from '@multiformats/multiaddr';
 import { createLibp2pNode, type Libp2pTransports } from '../src/libp2p-node.js';
 import { openProtocolStream, isLimitedConnection } from '../src/network/open-protocol-stream.js';
+import { registerProtocolHandler } from '../src/network/register-protocol-handler.js';
 import { spawnRelayNode, pickRelayWsAddr, waitForCircuitListen } from './util/relay-topology.js';
 
 /** Distinct per-spec: identify protocol ids are network-scoped, so a shared name lets specs cross-talk. */
 const NETWORK = 'open-protocol-stream-relay';
 const TEST_PROTOCOL = '/optimystic-test/limited-stream/1.0.0';
+/** Registered on the relay-only peer through the shared helper — the answering half done right. */
+const SERVED_PROTOCOL = '/optimystic-test/limited-inbound-served/1.0.0';
+/** Registered on the relay-only peer with a bare `node.handle(...)` — the answering half as it was. */
+const UNSERVED_PROTOCOL = '/optimystic-test/limited-inbound-unserved/1.0.0';
 
 /** Budget for the relay to grant `C` its reservation and for `C` to publish the circuit address. */
 const RESERVATION_TIMEOUT_MS = 15_000;
@@ -78,6 +91,35 @@ async function registerHandler(node: Libp2p): Promise<void> {
 	}, { runOnLimitedConnection: true });
 }
 
+/** How many times each inbound-side protocol's handler actually ran on the relay-only peer. */
+const reached: Record<string, number> = { [SERVED_PROTOCOL]: 0, [UNSERVED_PROTOCOL]: 0 };
+
+function countingHandler(protocol: string) {
+	return (stream: Stream, _connection: Connection): void => {
+		reached[protocol] = (reached[protocol] ?? 0) + 1;
+		void stream.close().catch(() => { /* dialer may have closed first */ });
+	};
+}
+
+/** Poll `predicate` until true or `ms` elapses; returns its final value. */
+async function waitUntil(predicate: () => boolean, ms: number): Promise<boolean> {
+	const deadline = Date.now() + ms;
+	while (!predicate() && Date.now() < deadline) {
+		await new Promise(resolve => setTimeout(resolve, 20));
+	}
+	return predicate();
+}
+
+/** Open `protocol` and close the stream, swallowing a refusal — the assertion is on the handler. */
+async function touch(from: Libp2p, to: Libp2p, protocol: string): Promise<void> {
+	try {
+		const stream = await openProtocolStream(from, to.peerId, protocol);
+		await stream.close().catch(() => { /* remote may have reset it */ });
+	} catch {
+		/* a refusal at open time is also a legitimate outcome; the handler count is what is asserted */
+	}
+}
+
 describe('openProtocolStream over a real circuit relay', function () {
 	this.timeout(60_000);
 
@@ -100,6 +142,10 @@ describe('openProtocolStream over a real circuit relay', function () {
 
 		client = await spawnBrowserShaped(relayWs);
 		await registerHandler(client);
+		// The answering half, both ways round, on the peer that is only reachable through the relay.
+		await registerProtocolHandler(client, SERVED_PROTOCOL, countingHandler(SERVED_PROTOCOL));
+		// Deliberately bare — this is what all thirteen registration sites looked like before the fix.
+		await client.handle(UNSERVED_PROTOCOL, countingHandler(UNSERVED_PROTOCOL));
 		circuitAddr = await waitForCircuitListen(client, RESERVATION_TIMEOUT_MS);
 
 		service = await spawnServicePeer();
@@ -140,6 +186,31 @@ describe('openProtocolStream over a real circuit relay', function () {
 		} finally {
 			await stream.close().catch(() => { /* remote may have closed first */ });
 		}
+	});
+
+	it('a handler registered through registerProtocolHandler is reached over the limited connection', async () => {
+		await touch(service!, client!, SERVED_PROTOCOL);
+		expect(
+			await waitUntil(() => reached[SERVED_PROTOCOL]! > 0, 10_000),
+			'the served protocol handler must run — if it does not, the rest of this describe proves nothing'
+		).to.equal(true);
+	});
+
+	it('control: a handler registered with a bare node.handle() is NEVER reached — the bug this helper prevents', async () => {
+		const before = reached[SERVED_PROTOCOL]!;
+		await touch(service!, client!, UNSERVED_PROTOCOL);
+
+		// Fence on observed liveness rather than on a bare sleep: drive the SERVED protocol (known
+		// good on this very connection) and wait for its handler. Once that has run, a working inbound
+		// path has had at least as much wall-clock as the unserved one, plus a settle for slop.
+		await touch(service!, client!, SERVED_PROTOCOL);
+		expect(await waitUntil(() => reached[SERVED_PROTOCOL]! > before, 10_000), 'fence protocol must run').to.equal(true);
+		await new Promise(resolve => setTimeout(resolve, 500));
+
+		expect(
+			reached[UNSERVED_PROTOCOL],
+			'libp2p must refuse to deliver the stream to a handler registered without runOnLimitedConnection'
+		).to.equal(0);
 	});
 
 	it('opens a stream on a cold dial, from a peer that has only been taught the circuit address', async function () {

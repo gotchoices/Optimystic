@@ -10,6 +10,7 @@ import type { Uint8ArrayList } from 'uint8arraylist'
 import { createLogger } from '../logger.js'
 import { publishableAddrsForPeer, type AddressLog, type DirectionalConnection } from '../peer-address-book.js'
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js'
+import { registerProtocolHandler } from '../network/register-protocol-handler.js'
 
 const debugLog = createLogger('repo-service')
 
@@ -135,7 +136,7 @@ export class RepoService implements Startable {
 			return
 		}
 
-		await this.components.registrar.handle(this.protocol, this.handleIncomingStream.bind(this), {
+		await registerProtocolHandler(this.components.registrar, this.protocol, this.handleIncomingStream.bind(this), {
 			maxInboundStreams: this.maxInboundStreams,
 			maxOutboundStreams: this.maxOutboundStreams
 		})

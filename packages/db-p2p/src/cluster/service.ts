@@ -10,6 +10,7 @@ import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { createLogger } from '../logger.js';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
+import { registerProtocolHandler } from '../network/register-protocol-handler.js';
 
 interface BaseComponents {
 	logger: { forComponent: (name: string) => Logger },
@@ -187,7 +188,7 @@ export class ClusterService implements Startable {
 			return;
 		}
 
-		await this.components.registrar.handle(this.protocol, this.handleIncomingStream.bind(this), {
+		await registerProtocolHandler(this.components.registrar, this.protocol, this.handleIncomingStream.bind(this), {
 			maxInboundStreams: this.maxInboundStreams,
 			maxOutboundStreams: this.maxOutboundStreams
 		});

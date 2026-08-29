@@ -7,6 +7,7 @@ import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
 import { serveBlockArchive, type ArchiveServingRepo } from '../storage/block-archive.js';
+import { registerProtocolHandler } from '../network/register-protocol-handler.js';
 import type { BlockArchive } from '../storage/struct.js';
 
 export interface SyncServiceInit extends InboundStreamAuthorizationInit {
@@ -62,7 +63,7 @@ export class SyncService implements Startable {
 	async start(): Promise<void> {
 		if (this.running) return;
 
-		await this.registrar.handle(this.protocol, this.handleSyncRequest.bind(this));
+		await registerProtocolHandler(this.registrar, this.protocol, this.handleSyncRequest.bind(this));
 
 		this.running = true;
 		this.log('Sync service started on protocol %s', this.protocol);
