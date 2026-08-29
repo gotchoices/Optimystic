@@ -37,15 +37,26 @@ Every registration in `packages/db-p2p/src` omits it:
 
 | Protocol | Registered at |
 | --- | --- |
-| sync (block restoration) | `sync/service.ts:58` |
+| sync (block restoration) | `sync/service.ts:65` |
 | cluster | `cluster/service.ts:190` |
 | repo | `repo/service.ts:138` |
 | dispute | `dispute/service.ts:60` |
-| block transfer | `cluster/block-transfer-service.ts:140` |
+| block transfer | `cluster/block-transfer-service.ts:257` |
 | cohort-topic request/response | `cohort-topic/stream-util.ts:101` |
 | cohort-topic register / gossip / promote / membership / sign | `cohort-topic/host.ts:2813, 2833, 2842, 2847, 2859` |
 | reactivity notify | `reactivity/notify-transport.ts:129` |
 | reactivity push-state gossip | `reactivity/push-state-gossip.ts:276` |
+
+**Re-verified at promotion (HEAD `4e650cf7`).** Line numbers above are current — several had drifted
+from the original filing (`sync/service.ts` 58 → 65, `block-transfer-service.ts` 140 → 257). The
+count is **13** registration sites, not the 12 the original table implied; enumerate with
+`grep -rn "\.handle(" packages/db-p2p/src --include=*.ts` rather than trusting this table, and make
+the AST guard the authority afterwards.
+
+Also re-verified: `grep -rn "runOnLimitedConnection" packages/db-p2p/src` returns exactly three hits,
+of which **one is a real use** — `network/open-protocol-stream.ts:79`, the dial-side helper. The
+other two are prose in comments. So the answering side genuinely carries the opt-in nowhere, and
+this ticket's premise is intact rather than partially closed by intervening work.
 
 The one place in the tree that *does* pass it is a test helper
 (`test/open-protocol-stream-relay.spec.ts`), which is why the new relay spec passes while production
