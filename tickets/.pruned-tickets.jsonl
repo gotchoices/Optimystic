@@ -6,3 +6,5 @@
 {"slug":"bug-reconcile-cannot-heal-two-node-cohort","file":"1-bug-reconcile-cannot-heal-two-node-cohort.md","completedAt":"2026-07-29","commit":"6d605061752c7ac00f4f1b3660cd1e3ef65efbf1","prunedAt":"2026-08-28T17:49:01.143Z"}
 {"slug":"read-repair-cannot-transfer-block-content","file":"1-read-repair-cannot-transfer-block-content.md","completedAt":"2026-07-29","commit":"5571181f340c2a10c9e54ce6fde353de99fae3fa","prunedAt":"2026-08-28T17:49:01.143Z"}
 {"slug":"feat-inbound-stream-authorization-hook","file":"2-feat-inbound-stream-authorization-hook.md","completedAt":"2026-07-29","commit":"b7268142f64e830675037cbd6d9cd025edfde6f2","prunedAt":"2026-08-28T17:49:01.143Z"}
+{"slug":"split-admission-floor-from-replication-factor","file":"3-split-admission-floor-from-replication-factor.md","completedAt":"2026-07-29","commit":"f45dc1465c3ca5bc8c241a6858c811ff5b2ae485","prunedAt":"2026-08-29T04:25:01.757Z"}
+{"slug":"corroboration-floor-uses-assumed-cluster-size","file":"corroboration-floor-uses-assumed-cluster-size.md","completedAt":"2026-07-29","commit":"879e4cee8224b4b706b8f96426814652c0d5c84d","prunedAt":"2026-08-29T04:25:01.757Z"}
