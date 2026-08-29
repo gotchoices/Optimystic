@@ -330,12 +330,19 @@ Three things to know when reading it:
   instance materialized under its old lineage may still be cached. Seeing the line once is the
   finding; do not wait for it to repeat.
 - **Silence is weaker evidence than for the shortfall line.** The comparison needs an action entry
-  at the held revision on *both* sides; an invented collection, or a revision whose log slot went
-  to a checkpoint or invalidation entry, has nothing to compare and stays quiet. Cross-node
+  at the held revision on *both* sides, and three ordinary situations leave one side empty: an
+  invented collection (no context at all); a revision whose log slot went to a checkpoint or
+  invalidation entry rather than an action; and a held revision older than the read log's most
+  recent **checkpoint**, since a freshly-read context only lists actions back to that checkpoint —
+  so the further a copy has fallen behind, the more likely a real fork goes unreported. Cross-node
   comparison per *Comparing action ids* below remains the ground truth.
-- The line only fires on a refresh (`update()`), and only on an instance that carried the other
-  lineage in — a handle freshly opened from storage adopts the stored lineage and has nothing to
-  disagree with.
+- **Opening a collection can fire it too, and means something different.** The comparison also
+  runs on the open path, where the two sides are not one node's copy versus storage but two parts
+  of *storage itself*: the tail block's state metadata (which names the action that produced the
+  latest committed revision) versus the log entries under that tail. A line at open therefore says
+  storage is internally inconsistent about one revision, not that some replica forked — check the
+  `id=`/`rev=` against the node's other lines to tell which situation you are looking at. The open
+  still succeeds either way.
 
 #### Comparing action ids
 

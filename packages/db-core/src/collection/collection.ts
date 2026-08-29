@@ -10,6 +10,7 @@ import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struc
 import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions } from "./index.js";
 import { CollectionHeaderVanishedError, SyncRetryExhaustedError } from "./struct.js";
 import type { ActionContext } from "./action.js";
+import { actionIdAt } from "./action.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { clampPriority } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
@@ -195,16 +196,18 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * Equal revisions still adopt `next`: the rev is unchanged but its `committed` list may be
 	 * more complete than what we hold.
 	 *
-	 * This is also the one seam where lineage divergence is observable: the action id this
-	 * collection holds at its CURRENT revision must equal the action id the freshly-read log
-	 * names at that same revision. Revision numbers are per-collection counters, so two
-	 * separately-built copies under one id can each occupy the same revision with DIFFERENT
-	 * actions while each stays internally self-consistent — {@link reportShortfall} structurally
-	 * cannot see that (its two numbers come from one chain), and this comparison is the only
-	 * place both lineages' `committed` lists meet. Where they name different actions at the same
-	 * revision, the local copy and the stored log are provably different lineages
-	 * (`collection:lineage-divergence`; see docs/debugging.md § "Did the refresh itself fail to
-	 * close the gap?").
+	 * This is also the one seam where lineage divergence is observable: the action id held at the
+	 * CURRENT revision must equal the action id `next` names at that same revision. Revision
+	 * numbers are per-collection counters, so two separately-built copies under one id can each
+	 * occupy the same revision with DIFFERENT actions while each stays internally self-consistent
+	 * — {@link reportShortfall} structurally cannot see that (its two numbers come from one
+	 * chain), and this is the only place two `committed` lists meet. Naming different actions at
+	 * one revision proves the two sides are different lineages (`collection:lineage-divergence`;
+	 * see docs/debugging.md § "Did the refresh itself fail to close the gap?"). WHICH two sides
+	 * depends on the caller: from {@link updateInternal} it is this instance's copy against the
+	 * stored log — a forked replica; from {@link attachToLog} it is the tail block's
+	 * `state.latest.actionId` ({@link bootstrapContext} adopts it on trust) against a walk of
+	 * that tail's own chain, so a line there indicts STORAGE rather than a replica.
 	 *
 	 * Logs, does not throw — same reasoning as {@link reportShortfall}: `update()` runs
 	 * blanket-style over every registered collection between commit retries, and aborting here
@@ -215,20 +218,29 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * though block content materialized under the old lineage may still be in caches. The line
 	 * marks the refresh that first observed the disagreement.
 	 *
-	 * Gated on `log.enabled` (like every {@link committedActionId} caller): the two `find`s are
-	 * linear in the uncheckpointed `committed` list and buy nothing when the line has no sink.
-	 * Deliberately the entry at ONE revision — the current one — not a full list diff: the
-	 * committed lists grow per commit, and this runs on every refresh. Silent when either list
-	 * holds no entry at that revision (an invented collection, or a revision slot the log gave
-	 * to a checkpoint or invalidation entry) — absence proves nothing either way. */
+	 * NOTE: adoption resolves the CONTEXT disagreement, not the content one — the read caches on
+	 * this instance still hold blocks materialized under the old lineage, and since the revision
+	 * did not change nothing re-reads them. Conditional today: no fork has been reproduced (see
+	 * the still-open upstream reproducer), so this instrument exists to find out whether one
+	 * happens at all. If the line is ever seen firing in the field, decide then whether a
+	 * divergence should also drop the read cache (and whether to keep re-reporting per refresh)
+	 * — that is a behaviour change, and this seam deliberately makes none.
+	 *
+	 * Gated on `log.enabled`, like every {@link actionIdAt} caller: the lookups buy nothing when
+	 * the line has no sink. Deliberately the entry at ONE revision — the current one — not a
+	 * full list diff: the committed lists grow per commit, and this runs on every refresh.
+	 * Silence proves nothing either way, because {@link actionIdAt} legitimately resolves
+	 * `undefined` on either side — an invented collection, a revision slot the log gave to a
+	 * checkpoint or invalidation entry, or a held revision that predates the read log's most
+	 * recent checkpoint (which is as far back as `committed` reaches). */
 	private static advanceContext(source: TransactorSource<IBlock>, id: CollectionId, next: ActionContext | undefined): void {
 		const current = source.actionContext;
 		if (next === undefined) {
 			return;	// The read learned nothing — keep what we already know.
 		}
 		if (current !== undefined && log.enabled) {
-			const held = current.committed.find(entry => entry.rev === current.rev)?.actionId;
-			const read = next.committed.find(entry => entry.rev === current.rev)?.actionId;
+			const held = actionIdAt(current, current.rev);
+			const read = actionIdAt(next, current.rev);
 			if (held !== undefined && read !== undefined && held !== read) {
 				log('collection:lineage-divergence id=%s rev=%d held=%s read=%s', id, current.rev, held, read);
 			}
@@ -559,19 +571,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * this collection's lineage marker at that revision — or `undefined` when the action
 	 * context holds no entry at the current revision.
 	 *
-	 * `undefined` is legitimate, not an error, and has exactly two causes. An INVENTED
-	 * collection has no context at all. Otherwise the current revision's slot in the log
-	 * belongs to an entry that carries no action — a CHECKPOINT or an INVALIDATION entry
-	 * takes a revision of its own — so a context freshly read off such a log
-	 * ({@link Log.getActionContext}, {@link Log.getFrom}) holds no `ActionRev` at its own
-	 * `rev`. A caller printing this must therefore carry a placeholder rather than invent
-	 * an id. The contexts this class writes itself ({@link recordCommitted}, the inline
-	 * bump in `syncInternal`, {@link bootstrapContext}) always do hold one.
-	 *
-	 * NOTE: linear in `committed`, which grows one entry per commit between context reads;
-	 * fine now — every caller is a `debug`-gated diagnostic behind `log.enabled`, so this
-	 * does not run on a normal path at all. If a non-diagnostic caller ever appears, index
-	 * the lookup or search from the end (the entry at `rev` is normally the last one).
+	 * `undefined` is legitimate, not an error: an INVENTED collection has no context at
+	 * all, and otherwise {@link actionIdAt} resolves nothing at the current revision for
+	 * the reasons listed there. A caller printing this must therefore carry a placeholder
+	 * rather than invent an id. The contexts this class writes itself
+	 * ({@link recordCommitted}, the inline bump in `syncInternal`,
+	 * {@link bootstrapContext}) always do hold one.
 	 *
 	 * DIAGNOSTIC ONLY — do not branch on this. Its value is the one thing about a revision
 	 * that IS comparable across collections and across nodes: a revision number is
@@ -583,8 +588,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * operator reads the pair. */
 	committedActionId(): ActionId | undefined {
 		const context = this.source.actionContext;
-		if (context === undefined) return undefined;
-		return context.committed.find(entry => entry.rev === context.rev)?.actionId;
+		return context === undefined ? undefined : actionIdAt(context, context.rev);
 	}
 
 	/** Fold a just-committed set of transforms into this collection's read cache

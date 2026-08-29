@@ -14,6 +14,24 @@ interface TestAction {
   timestamp: number
 }
 
+/** Capture what the `db-core:collection` namespace emits while `fn` runs, fully substituted
+ *  (`debug` leaves `%s`/`%d` for the downstream sink, so the raw args are not the text). */
+const captureCollectionLog = async (fn: () => Promise<void>): Promise<string[]> => {
+  const lines: string[] = []
+  const previousNamespaces = debug.disable()
+  const previousLog = debug.log
+  debug.enable('optimystic:db-core:collection')
+  debug.log = (...args: unknown[]): void => { lines.push(format(...args)) }
+  try {
+    await fn()
+  } finally {
+    debug.log = previousLog
+    debug.disable()
+    if (previousNamespaces) debug.enable(previousNamespaces)
+  }
+  return lines
+}
+
 describe('Collection', () => {
   let transactor: TestTransactor
   const collectionId = 'test-collection'
@@ -1351,24 +1369,6 @@ describe('Collection', () => {
   describe('a refresh that lands short of the tail it just read', () => {
     const shortfallTag = 'collection:context-short-of-tail'
 
-    /** Capture what the `db-core:collection` namespace emits while `fn` runs, fully substituted
-     *  (`debug` leaves `%s`/`%d` for the downstream sink, so the raw args are not the text). */
-    const captureCollectionLog = async (fn: () => Promise<void>): Promise<string[]> => {
-      const lines: string[] = []
-      const previousNamespaces = debug.disable()
-      const previousLog = debug.log
-      debug.enable('optimystic:db-core:collection')
-      debug.log = (...args: unknown[]): void => { lines.push(format(...args)) }
-      try {
-        await fn()
-      } finally {
-        debug.log = previousLog
-        debug.disable()
-        if (previousNamespaces) debug.enable(previousNamespaces)
-      }
-      return lines
-    }
-
     /** The tail block id the synced header points at, and the revision its state claims —
      *  exactly the block and field `bootstrapContext` reads. */
     const syncedTail = async (): Promise<{ tailId: string, rev: number }> => {
@@ -1512,24 +1512,6 @@ describe('Collection', () => {
   describe('a refresh whose log names a different action at the held revision', () => {
     const divergenceTag = 'collection:lineage-divergence'
 
-    /** Capture what the `db-core:collection` namespace emits while `fn` runs, fully substituted
-     *  (`debug` leaves `%s`/`%d` for the downstream sink, so the raw args are not the text). */
-    const captureCollectionLog = async (fn: () => Promise<void>): Promise<string[]> => {
-      const lines: string[] = []
-      const previousNamespaces = debug.disable()
-      const previousLog = debug.log
-      debug.enable('optimystic:db-core:collection')
-      debug.log = (...args: unknown[]): void => { lines.push(format(...args)) }
-      try {
-        await fn()
-      } finally {
-        debug.log = previousLog
-        debug.disable()
-        if (previousNamespaces) debug.enable(previousNamespaces)
-      }
-      return lines
-    }
-
     /** The tail block id the synced header points at, and the action id its state claims produced
      *  the latest committed revision — the collection's lineage marker in storage. */
     const syncedTail = async (): Promise<{ tailId: string, actionId: string }> => {
@@ -1542,13 +1524,25 @@ describe('Collection', () => {
       return { tailId: tailId!, actionId: actionId! }
     }
 
-    /** While armed, rewrites every read of the tail block so the whole stored lineage appears to
-     *  have been produced by `fakeId`: `state.latest.actionId` (what bootstrapContext adopts) and
-     *  every log entry's `action.actionId` (what the chain walk adopts). Opening a collection
-     *  through this while armed yields a handle that HOLDS revision N under `fakeId` — exactly
-     *  the state of a replica built from a different lineage. Disarming then makes the next
-     *  refresh read the honest lineage, so held and read disagree at the same revision. */
-    const rewrittenLineageTransactor = (inner: TestTransactor, tailId: string, fakeId: string) => {
+    /** While armed, rewrites reads of the tail block so the stored lineage appears to have been
+     *  produced by `fakeId`. Two independently rewritable sides, because the two `advanceContext`
+     *  call sites read different ones: `state.latest.actionId` is what `bootstrapContext` adopts,
+     *  and each log entry's `action.actionId` is what the chain walk adopts.
+     *
+     *  Rewriting BOTH (`entries: true`, the default) makes storage look internally consistent
+     *  under a foreign lineage: opening through it while armed yields a handle that HOLDS
+     *  revision N under `fakeId` — exactly the state of a replica built from a different lineage.
+     *  Disarming then makes the next refresh read the honest lineage, so held and read disagree.
+     *
+     *  Rewriting only the state side (`entries: false`) makes storage self-inconsistent instead:
+     *  the tail's metadata and the log entries under it name different actions for one revision,
+     *  which `attachToLog` compares during open. */
+    const rewrittenLineageTransactor = (
+      inner: TestTransactor,
+      tailId: string,
+      fakeId: string,
+      { entries = true }: { entries?: boolean } = {},
+    ) => {
       let armed = false
       const rewrite = (entry: GetBlockResults[string]): GetBlockResults[string] => {
         let out = entry
@@ -1556,7 +1550,7 @@ describe('Collection', () => {
           out = { ...out, state: { ...out.state, latest: { ...out.state.latest, actionId: fakeId } } }
         }
         const block = out.block as (IBlock & { entries?: { action?: { actionId: string } }[] }) | undefined
-        if (block?.entries) {
+        if (entries && block?.entries) {
           out = {
             ...out,
             block: {
@@ -1668,6 +1662,37 @@ describe('Collection', () => {
       })
       expect(lines.filter(l => l.includes(divergenceTag)).length,
         `only the discovering refresh reports, got: ${lines.join(' | ')}`).to.equal(1)
+    })
+
+    it('an OPEN whose tail state and log entries name different actions reports too', async () => {
+      // attachToLog calls the same advanceContext, and there the two sides come from different
+      // places: bootstrapContext adopts the tail block's state.latest.actionId on trust, while
+      // the read side is a walk of that tail's own chain. So open is not exempt — a line here
+      // means STORAGE is self-inconsistent about which action produced the revision, which is a
+      // different (and more alarming) finding than a forked replica. Open must still succeed.
+      const writer = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await writer.act({ type: 'set', data: { value: 'one', timestamp: 1 } })
+      await writer.updateAndSync()
+      const { tailId, actionId } = await syncedTail()
+
+      const fakeId = 'tail-state-names-another-action'
+      const rewritten = rewrittenLineageTransactor(transactor, tailId, fakeId, { entries: false })
+      rewritten.arm()
+
+      let opened: Collection<TestAction> | undefined
+      const lines = await captureCollectionLog(async () => {
+        opened = await Collection.open<TestAction>(rewritten.transactor, collectionId, initOptions)
+      })
+      expect(opened, 'the collection still opens').to.not.equal(undefined)
+
+      const divergence = lines.filter(l => l.includes(divergenceTag))
+      expect(divergence.length, `exactly one divergence line, got: ${lines.join(' | ')}`).to.equal(1)
+      const parsed = /rev=(\d+) held=(\S+) read=(\S+)/.exec(divergence[0]!)
+      expect(parsed, `the line names rev, held and read: ${divergence[0]}`).to.not.equal(null)
+      const [, rev, held, read] = parsed!
+      expect(Number(rev), 'the disagreement is at the bootstrapped revision').to.equal(1)
+      expect(held, "held is the tail state's claim").to.equal(fakeId)
+      expect(read, 'read is what the log entry at that revision actually names').to.equal(actionId)
     })
   })
 })

@@ -1059,6 +1059,18 @@ saveMaterializedBlock(block): store(structuredClone(block));
   the higher one erases the disagreement). The comparison is local to one node's own reads, so
   silence is not proof the collection is current — see `docs/debugging.md` § "Did the refresh
   itself fail to close the gap?" for how an operator reads presence and absence.
+- Adoption is also the one seam where **lineage divergence** is observable, and that is a
+  different failure from lagging. Revision numbers are per-collection counters, so two
+  separately-built copies under one id can each sit at the same revision under different actions
+  while each stays internally self-consistent — which is exactly why `context-short-of-tail`
+  cannot see it (both of its numbers come from one chain). `advanceContext` therefore compares the
+  action id held at the current revision against the action id the freshly-read context names at
+  that same revision, and reports `collection:lineage-divergence id=… rev=… held=… read=…` when
+  they differ. Like the shortfall line it only logs — adoption proceeds unchanged, which makes it
+  a per-discovery report rather than a per-refresh one. Both adoption sites run it: on
+  `updateInternal` it contrasts this node's copy with the stored log, while on `attachToLog` it
+  contrasts the tail block's `state.latest` (adopted on trust by `bootstrapContext`) with a walk
+  of that tail's own chain, so a line there indicts storage rather than a replica.
 - A header that reads *authoritatively absent* while the collection holds a committed revision is
   a contradiction, not an absence: the client has proof something was committed under this id.
   `updateInternal` throws `CollectionHeaderVanishedError` (naming the collection and the held
