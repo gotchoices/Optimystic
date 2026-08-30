@@ -752,7 +752,20 @@ export class SchemaManager {
 	}
 
 	/**
-	 * List all table names
+	 * List every name the catalog holds an entry for — INCLUDING dropped ones. A
+	 * gravestone is a real entry under the table's key, so a dropped table's name still
+	 * comes back here; the record behind it does not, and callers that want live tables
+	 * filter on the follow-up `getSchema`, which returns undefined for a gravestone
+	 * (`hydrateCatalog` does exactly that and skips them).
+	 *
+	 * NOTE: gravestones are immortal by design — they are what keeps the leftover
+	 * storage described — so this walk, and the one `getSchema` per name that
+	 * `hydrateCatalog` runs after it, grow with a catalog's whole DROP history rather
+	 * than with its live table count. Immaterial at the handful of drops a schema sees
+	 * today; if a workload ever creates and drops tables at the same URI in a loop,
+	 * hydrate is where it will show up first, and the fix is a live-only variant of this
+	 * walk (the filter already exists — {@link livePersistedEntry}) rather than pruning
+	 * gravestones, which would re-open the hole they close.
 	 */
 	async listTables(transactor?: ITransactor): Promise<string[]> {
 		const tables: string[] = [];
@@ -782,6 +795,16 @@ export class SchemaManager {
 	 * without an explicit URI still match. Live records win over gravestones when
 	 * both claim the URI — a live table's description of shared storage is the
 	 * current one, not a dropped predecessor's.
+	 *
+	 * NOTE: the URI match is a raw string compare, but the collection factory strips a
+	 * leading `tree://` before using the URI as the collection id, so `tree://db/t` and
+	 * `db/t` name the SAME storage and are not matched here — a table declared under one
+	 * spelling is not checked against a record written under the other, and the
+	 * declaration falls back to the pre-guard silent adoption. Nobody spells one URI two
+	 * ways today, and the same unnormalized string is already the identity used for the
+	 * factory's per-transaction collection cache key, so normalizing only here would be
+	 * half a fix; if the two spellings ever show up in one database, normalize the URI
+	 * once at parse time and let both sites read the normalized form.
 	 */
 	async findRecordForUri(
 		collectionUri: string,

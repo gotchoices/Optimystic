@@ -236,6 +236,17 @@ function describeColumnList(columns: readonly StoredColumnSchema[]): string {
  * the storage-adoption guard's identity compare and its refusal messages: `(id, b desc)`.
  * Works on both the resolved and the persisted record shape (`columns` and
  * `primaryKeyDefinition` are positional in both).
+ *
+ * NOTE: names and direction only, not per-column COLLATION. Correct today because the
+ * collation-aware key comparator is dead code — the tree is opened with a raw
+ * lexicographic string comparator, so a PK column's collation does not decide where a
+ * row sits. Once debt-optimystic-true-key-ordering wires that comparator up, a
+ * re-declare that changes a PK column's collation relocates every stored row and must
+ * be refused here too; fold `pk.collation` into this rendering then. Direction is
+ * rendered and compared for the same reason and is, today, stricter than storage
+ * requires — a direction-only change is refused although nothing has moved. Erring
+ * strict is the safe side of that trade and becomes exactly right once the comparator
+ * is live, so it stays.
  */
 function describePrimaryKey(schema: Pick<StoredTableSchema, 'columns' | 'primaryKeyDefinition'>): string {
   const parts = schema.primaryKeyDefinition.map(pk => {
@@ -681,7 +692,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     // Clause (a): a declared column the record does not have. The surviving rows
     // carry no value for it, so decoding would invent NULL — including where this
     // declaration says NOT NULL.
-    const recordColumns = new Set(record.columns.map(col => col.name.toLowerCase()));
+    const recordColumns = new Map(record.columns.map(col => [col.name.toLowerCase(), col]));
     const invented = candidate.columns.filter(col => !recordColumns.has(col.name.toLowerCase()));
     if (invented.length > 0) {
       const columnWord = invented.length === 1 ? 'column' : 'columns';
@@ -691,6 +702,33 @@ export class OptimysticVirtualTable extends VirtualTable {
         `still holds rows from ${held} declared as ${describeColumnList(record.columns)}, and this ` +
         `declaration adds ${columnWord} ${names}, which those rows cannot supply. Use a different ` +
         `collection URI, or re-declare the columns the stored rows were written under.`
+      );
+    }
+
+    // Clause (a2): a column the record HAS, re-declared under a different affinity.
+    // A row is stored as a name-keyed JSON object with no type tag, so affinity is
+    // the only thing that says what a stored value MEANS on the way out: RowCodec
+    // base64-decodes a stored string into bytes for a BLOB-affinity column and
+    // returns it verbatim for any other, so `a text` re-declared as `a blob` (or the
+    // reverse) hands back a value that is neither what was written nor an error.
+    // Same failure the clauses around it exist to stop — silently serving rows the
+    // declaration cannot account for — so it is refused the same way.
+    const retyped = candidate.columns.filter(col => {
+      const stored = recordColumns.get(col.name.toLowerCase());
+      return stored !== undefined && stored.affinity !== col.affinity;
+    });
+    if (retyped.length > 0) {
+      const columnWord = retyped.length === 1 ? 'column' : 'columns';
+      const changes = retyped.map(col => {
+        const stored = recordColumns.get(col.name.toLowerCase())!;
+        return `'${col.name}' as ${col.affinity} where the stored rows were written as ${stored.affinity}`;
+      }).join(', ');
+      throw new Error(
+        `Cannot create table '${candidate.name}' over '${this.options.collectionUri}': that collection ` +
+        `still holds rows from ${held}, and this declaration re-types ${columnWord} ${changes} — ` +
+        `stored values are untagged, so they would be decoded as something other than what was ` +
+        `written. Use a different collection URI, or re-declare the column types the stored rows ` +
+        `were written under.`
       );
     }
 
@@ -3616,8 +3654,16 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       table.teardownChangeSubscription();
       try {
         await table.deleteOwnSchema(tableName);
-      } catch {
-        // Best-effort: a schema-tree write failure shouldn't stop teardown.
+      } catch (error) {
+        // Best-effort: a schema-tree write failure shouldn't stop teardown. But it
+        // does leave the record LIVE past its own DROP, which blinds the
+        // storage-adoption guards for this table's URI, so say so rather than
+        // dropping in silence.
+        log(
+          'destroy(%s.%s): gravestone write failed; the catalog record outlives its DROP ' +
+          'and a later CREATE over the same URI will not be checked against it: %s',
+          schemaName, tableName, error
+        );
       }
     }
     this.tables.delete(tableKey);

@@ -17,6 +17,12 @@ Re-measured 2026-08-24 while reviewing `name-the-collections-a-write-carries` (w
 line inside the big class): the same command now reports **3213**. The file is still growing, so the
 churn argument in `tradeoffs:` gets worse, not better, with delay.
 
+Re-measured 2026-08-30 while reviewing `drop-leaves-storage-the-catalog-no-longer-describes` (which
+added the two storage-adoption guards and their doc comments): the same command now reports
+**3691** — up 478 lines in six days. That ticket also added a third distinct concern to the same
+class (declaration-time storage adoption, which has to read the schema catalog *and* probe the data
+collection *and* probe index trees), so it is evidence for the split, not an argument against it.
+
 Top-level shape (`grep -n "^export class\|^class\|^function" …`):
 
 | lines | what |

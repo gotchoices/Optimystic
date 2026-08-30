@@ -12,7 +12,8 @@
  * storage holds, while the deliberately-supported adoptions keep working:
  *
  *   REFUSED: a re-declare that ADDS a column the stored rows cannot supply; one that
- *   changes the PRIMARY KEY the stored rows are keyed under; a second live table
+ *   RE-TYPES a column they do carry; one that changes the PRIMARY KEY the stored rows
+ *   are keyed under; a second live table
  *   declared over the same URI with a contradicting shape; a CREATE INDEX that would
  *   adopt a leftover non-empty index tree under a different column list.
  *
@@ -116,6 +117,35 @@ describe('Storage must not outlive the catalog record that describes it', () => 
 			// were written under — must work on the very next statement (a refused
 			// CREATE leaves no half-registered table behind).
 			await db.exec(`create table t (id integer primary key, a text, b text) using optimystic('tree://scratch/shape')`);
+			expect(await queryAll(db, `select * from t`)).to.deep.equal([{ id: 1, a: 'aa', b: 'bb' }]);
+		} finally {
+			db.close();
+		}
+	});
+
+	it('refuses a re-create at the same URI that RE-TYPES a column the stored rows carry', async () => {
+		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
+		await seed(shared, 'tree://scratch/affinity');
+
+		const db = new Database();
+		const plugin = registerWithSharedTransactor(db, shared);
+		try {
+			await plugin.hydrate(db);
+			await db.exec(`drop table t`);
+			// Same column names and same primary key, but `a` was written as TEXT. A row
+			// is stored as untagged name-keyed JSON, so re-declaring `a` as BLOB makes
+			// RowCodec base64-decode the stored string into bytes — neither what was
+			// written nor an error.
+			const failure = await captureFailure(
+				() => db.exec(`create table t (id integer primary key, a blob, b text) using optimystic('tree://scratch/affinity')`),
+				'a re-declare re-typing a column the stored rows carry must be refused',
+			);
+			expect(failure.message).to.include(`Cannot create table 't' over 'tree://scratch/affinity'`);
+			expect(failure.message).to.include(`re-types column 'a' as BLOB where the stored rows were written as TEXT`);
+
+			// The way out the message names works on the very next statement, and the
+			// stored value comes back as the TEXT it was written as.
+			await db.exec(`create table t (id integer primary key, a text, b text) using optimystic('tree://scratch/affinity')`);
 			expect(await queryAll(db, `select * from t`)).to.deep.equal([{ id: 1, a: 'aa', b: 'bb' }]);
 		} finally {
 			db.close();
