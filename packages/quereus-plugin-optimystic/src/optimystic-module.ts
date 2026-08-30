@@ -16,8 +16,8 @@ import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, 
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import type { CollectionChangeEvent, ITransactor, TreeReadView } from '@optimystic/db-core';
-import { SchemaManager, columnSetKey, uniqueConstraintKey, uniqueEnforcementTreeName } from './schema/schema-manager.js';
-import type { StoredTableSchema, StoredIndexSchema } from './schema/schema-manager.js';
+import { SchemaManager, columnSetKey, mergeIndexLists, uniqueConstraintKey, uniqueEnforcementTreeName } from './schema/schema-manager.js';
+import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { SqlDataType, PhysicalType } from '@quereus/quereus';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
@@ -222,6 +222,25 @@ function formatKeyValues(values: readonly SqlValue[]): string {
     if (typeof v === 'string') return JSON.stringify(v);
     if (v instanceof Uint8Array) return `<blob ${v.length} bytes>`;
     return String(v);
+  });
+  return `(${parts.join(', ')})`;
+}
+
+/** Render a schema's column list for a storage-adoption refusal: `(id, a, b)`. */
+function describeColumnList(columns: readonly StoredColumnSchema[]): string {
+  return `(${columns.map(col => col.name).join(', ')})`;
+}
+
+/**
+ * Render a schema's primary key — column names in key order, with direction — for
+ * the storage-adoption guard's identity compare and its refusal messages: `(id, b desc)`.
+ * Works on both the resolved and the persisted record shape (`columns` and
+ * `primaryKeyDefinition` are positional in both).
+ */
+function describePrimaryKey(schema: Pick<StoredTableSchema, 'columns' | 'primaryKeyDefinition'>): string {
+  const parts = schema.primaryKeyDefinition.map(pk => {
+    const name = schema.columns[pk.index]?.name ?? `#${pk.index}`;
+    return pk.desc ? `${name} desc` : name;
   });
   return `(${parts.join(', ')})`;
 }
@@ -453,9 +472,25 @@ export class OptimysticVirtualTable extends VirtualTable {
         // the second open short-circuits again. Constraint-free tables OMIT the
         // key on both sides (see tableSchemaToStored) and never miss.
         const candidateStored = this.schemaManager.tableSchemaToStored(this.tableSchema);
-        const mergedCandidate: StoredTableSchema = persistedSchema
+        let mergedCandidate: StoredTableSchema = persistedSchema
           ? this.schemaManager.mergeWithPersisted(candidateStored, persistedSchema)
           : candidateStored;
+
+        if (!persistedSchema) {
+          // No live catalog record under this name, so this declaration is about to
+          // ADOPT whatever the collection at its URI already holds. Storage must not
+          // outlive the catalog record that describes it: check the declaration
+          // against the record (gravestone, or a URI-sharing table) that still
+          // describes that storage and refuse loudly rather than silently serving
+          // rows the declaration cannot account for. Runs only on this arm — the
+          // warm, hydrated and live-record paths never pay the catalog walk inside.
+          // Returns the record's index-tree descriptions so addIndex can hold the
+          // same rule over `<uri>/index/<name>` later (see that guard).
+          const orphanedIndexes = await this.guardStorageAdoption(candidateStored, txnState?.transactor);
+          if (orphanedIndexes) {
+            mergedCandidate = { ...mergedCandidate, orphanedIndexes };
+          }
+        }
 
         if (persistedSchema && schemasEqual(mergedCandidate, persistedSchema)) {
           storedSchema = persistedSchema;
@@ -582,6 +617,110 @@ export class OptimysticVirtualTable extends VirtualTable {
       this.setErrorMessage(message);
       throw new Error(message);
     }
+  }
+
+  /**
+   * The declaration-time half of the rule "storage must not outlive the catalog
+   * record that describes it": a `CREATE TABLE` (or a connect carrying columns) with
+   * no live catalog record under its name is adopting whatever already sits at its
+   * collection URI, and must be refused when the record that still describes that
+   * storage contradicts it. Covers every shape of the problem with one rule — drop
+   * then re-create under a different column list, two live tables declared over one
+   * URI with no DROP anywhere, a URI reused across unrelated tables.
+   *
+   * Returns the record's index-tree descriptions (record.indexes ∪ its own
+   * orphanedIndexes) for the caller to stash on the new live record as
+   * `orphanedIndexes` — readable by addIndex's guard, never merged into `indexes`
+   * (a DROP still sheds the catalog's index list; that shedding is what makes the
+   * narrower-re-declare escape hatch work). Undefined when nothing describes the
+   * storage or the record lists no indexes.
+   *
+   * HONEST LIMITS, not to be overclaimed: both lookups read the catalog, so a cohort
+   * that silently answers "nothing" for the catalog while the data collection reads
+   * fine leaves this guard blind — the same residual SchemaManager.getSchema
+   * documents at length. And the guard compares against the RECORD, not the rows: a
+   * record that has diverged from the rows it describes makes the answer wrong in
+   * whichever direction the record is wrong. (Sampling rows instead cannot work: a
+   * legitimately-supported re-declare that adds a column produces rows of mixed
+   * shape, so "this row lacks a declared column" cannot distinguish supported from
+   * corrupting.) The guard closes the local, reproducible corruption and invents no
+   * certainty beyond that.
+   */
+  private async guardStorageAdoption(
+    candidate: StoredTableSchema,
+    transactor?: ITransactor
+  ): Promise<PersistedIndexSchema[] | undefined> {
+    // The record that still describes the storage this declaration adopts: the
+    // gravestone under this table's own name (DROP TABLE writes one — see
+    // SchemaManager.deleteSchema), else any catalog record — live or gravestone —
+    // declared over the same collection URI.
+    const record = await this.schemaManager.getDroppedSchemaRecord(this.tableName, transactor)
+      ?? await this.schemaManager.findRecordForUri(this.options.collectionUri, transactor);
+    // "No record" also covers the bare tombstones written by builds before
+    // gravestones existed: a database dropped before this landed sails through
+    // exactly as it used to. That degradation is intended — not a hole.
+    if (!record) {
+      return undefined;
+    }
+
+    // What the record says may still sit at `<uri>/index/<name>`. Collected BEFORE
+    // the emptiness early-return below: each index tree is probed for emptiness
+    // individually at CREATE INDEX time (an empty leftover tree adopts harmlessly),
+    // so the descriptions must survive even when the main collection is empty today.
+    const described = mergeIndexLists(record.indexes, record.orphanedIndexes ?? []);
+    const orphanedIndexes = described.length > 0 ? described : undefined;
+
+    // An EMPTY data collection cannot mangle anything — a table created, never
+    // written, then dropped re-declares freely under any shape.
+    if (await this.hasNoRowsToBackfill()) {
+      return orphanedIndexes;
+    }
+
+    const held = record.droppedAt ? 'a dropped table' : `live table '${record.name}'`;
+
+    // Clause (a): a declared column the record does not have. The surviving rows
+    // carry no value for it, so decoding would invent NULL — including where this
+    // declaration says NOT NULL.
+    const recordColumns = new Set(record.columns.map(col => col.name.toLowerCase()));
+    const invented = candidate.columns.filter(col => !recordColumns.has(col.name.toLowerCase()));
+    if (invented.length > 0) {
+      const columnWord = invented.length === 1 ? 'column' : 'columns';
+      const names = invented.map(col => `'${col.name}'`).join(', ');
+      throw new Error(
+        `Cannot create table '${candidate.name}' over '${this.options.collectionUri}': that collection ` +
+        `still holds rows from ${held} declared as ${describeColumnList(record.columns)}, and this ` +
+        `declaration adds ${columnWord} ${names}, which those rows cannot supply. Use a different ` +
+        `collection URI, or re-declare the columns the stored rows were written under.`
+      );
+    }
+
+    // Clause (b): a declared primary key that differs from the record's — column
+    // names, order and direction. Every surviving row sits under a tree key computed
+    // from the OLD primary key, so this declaration would never compute a key that
+    // reaches them: point lookups miss, and the first re-write of such a row
+    // relocates it.
+    const declaredKey = describePrimaryKey(candidate);
+    const recordKey = describePrimaryKey(record);
+    if (declaredKey.toLowerCase() !== recordKey.toLowerCase()) {
+      throw new Error(
+        `Cannot create table '${candidate.name}' over '${this.options.collectionUri}': that collection ` +
+        `still holds rows from ${held} keyed on ${recordKey}, and this declaration keys on ` +
+        `${declaredKey} — rows written under the old key can never be reached through the new one. ` +
+        `Use a different collection URI, or re-declare the primary key the stored rows were written under.`
+      );
+    }
+
+    // Deliberately ALLOWED past this point:
+    //  - a declaration that DROPS a column the record had: every declared column is
+    //    still backed by real stored values, nothing is invented — and this is the
+    //    documented way out of "cannot re-declare without column X: persisted index
+    //    Y covers it" (README § Limitations);
+    //  - an identical re-declare: declaring the same shape over the same URI is how
+    //    a node states its view of a table, so the dropped rows come back (the
+    //    README warns about this);
+    //  - a live record under this table's OWN name never reaches this guard at all —
+    //    that path goes through mergeWithPersisted, which already validates it.
+    return orphanedIndexes;
   }
 
   /**
@@ -2202,14 +2341,24 @@ export class OptimysticVirtualTable extends VirtualTable {
       throw new Error('Schema not found');
     }
 
+    const txnState = this.txnBridge.getCurrentTransaction();
+    const existing = storedSchema.indexes.find(idx => idx.name === indexSchema.name);
+
+    if (!existing) {
+      // Build path: `<uri>/index/<name>` is adopted create-on-missing, so a tree a
+      // DROPPED table (or a URI-sharing declaration) left behind under this name is
+      // silently reused. Refuse when the record that described that storage says the
+      // tree was built over DIFFERENT columns — before anything is written or
+      // mirrored, so a refusal leaves no trace.
+      await this.guardIndexAdoption(indexSchema, storedSchema, txnState?.transactor);
+    }
+
     // Mirror the derived UNIQUE constraint BEFORE the already-persisted dedupe
     // below: a re-declared CREATE UNIQUE INDEX on a warm start hits that dedupe
     // and returns early, but this cached vtab still needs the constraint in
     // memory for the uniqueness probe (see mirrorDerivedUniqueConstraint).
     this.mirrorDerivedUniqueConstraint(indexSchema);
 
-    const txnState = this.txnBridge.getCurrentTransaction();
-    const existing = storedSchema.indexes.find(idx => idx.name === indexSchema.name);
     if (existing) {
       // Upgrade path: a schema persisted before `unique`/`predicate` were wired
       // through has the index but not its uniqueness metadata. Re-declaring the
@@ -2306,6 +2455,56 @@ export class OptimysticVirtualTable extends VirtualTable {
     // inside reconcile), so this ONE call serves both the build path and the
     // re-attach path above — there is no second populate loop to keep in step.
     await this.backfillIndexTrees(attached);
+  }
+
+  /**
+   * The CREATE INDEX half of the rule "storage must not outlive the catalog record
+   * that describes it" (the table half: {@link guardStorageAdoption}). On the build
+   * path, `openIndexTree` is create-on-missing, so a leftover tree at
+   * `<uri>/index/<name>` — from a dropped table's index, or a URI-sharing table's —
+   * would be adopted silently; adopted under a CONTRADICTING column list, such a
+   * tree answers every seek empty, including for rows written after the adoption
+   * (measured in test/drop-table-orphan-rows.spec.ts).
+   *
+   * The comparison is against the `orphanedIndexes` descriptions the table's own
+   * record carries (stashed by guardStorageAdoption when the declaration adopted
+   * described storage — a snapshot as of that declare, which is this guard's honest
+   * limit: an index a URI-sharing LIVE table creates later is not in it). Refusal is
+   * column-mismatch only, deliberately: a peer that built the same index over the
+   * same columns produces a matching description and is adopted exactly as before,
+   * so the multi-node re-attach and heal paths are untouched. A mismatched but
+   * EMPTY leftover tree adopts harmlessly (the build's populate pass fills it), so
+   * emptiness is probed before refusing — the index-tree analogue of the table
+   * guard's empty-collection early-return.
+   */
+  private async guardIndexAdoption(
+    indexSchema: IndexSchema,
+    storedSchema: StoredTableSchema,
+    transactor?: ITransactor
+  ): Promise<void> {
+    const orphan = (storedSchema.orphanedIndexes ?? []).find(idx => idx.name === indexSchema.name);
+    if (!orphan) {
+      return;
+    }
+    const declaredColumns = indexSchema.columns.map(
+      col => this.tableSchema.columns[col.index]?.name ?? `#${col.index}`
+    );
+    const orphanColumns = orphan.columns.map(col => col.name);
+    const sameColumns = declaredColumns.length === orphanColumns.length
+      && declaredColumns.every((name, i) => name.toLowerCase() === orphanColumns[i]!.toLowerCase());
+    if (sameColumns) {
+      return;
+    }
+    const tree = await this.openIndexTree(indexSchema.name, transactor);
+    if (tree.at(await tree.first()) === undefined) {
+      return;
+    }
+    throw new Error(
+      `Cannot create index '${indexSchema.name}' over '${this.options.collectionUri}/index/${indexSchema.name}': ` +
+      `that collection still holds entries from a dropped index of the same name declared on ` +
+      `(${orphanColumns.join(', ')}), not (${declaredColumns.join(', ')}). Use a different index name, ` +
+      `or a different collection URI for the table.`
+    );
   }
 
   /**
@@ -2903,8 +3102,19 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
 
     // Initialize table and register connection before returning
     // This ensures the table is fully ready for queries and transactions
-    await table.initialize();
-    await table.ensureConnectionRegistered();
+    try {
+      await table.initialize();
+      await table.ensureConnectionRegistered();
+    } catch (error) {
+      // A refused CREATE must leave no cached instance behind. The storage-adoption
+      // guard's message tells the user to re-declare (different columns, or a
+      // different URI) — that retry arrives as another create() for the same key,
+      // which the has-check above would reject as "already exists" if the failed
+      // instance stayed cached. Nothing was registered with Quereus yet.
+      this.tables.delete(tableKey);
+      table.teardownChangeSubscription();
+      throw error;
+    }
 
     return table;
   }

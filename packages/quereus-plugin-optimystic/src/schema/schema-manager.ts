@@ -108,6 +108,20 @@ export interface StoredTableSchema {
 	 * candidate and `schemasEqual` keeps its short-circuit without a rewrite.
 	 */
 	uniqueConstraints?: StoredUniqueConstraint[];
+	/**
+	 * Descriptions of index TREES that may still exist in storage at
+	 * `<collectionUri>/index/<name>` but are NOT part of this table's schema — carried
+	 * forward from the gravestone (or URI-sharing record) that described the storage
+	 * this declaration adopted (see the guard in `doInitialize`). Read ONLY by the
+	 * `addIndex` guard, which refuses to adopt a leftover tree under a contradicting
+	 * column list; never merged into `indexes`, never maintained, never planned against.
+	 *
+	 * Stays NAME-keyed even in this resolved shape (unlike `indexes`): these
+	 * descriptors reference the DROPPED table's column list, which may name columns
+	 * absent from the live one, so resolving them to positions is exactly the drift
+	 * this file's two-shape split exists to prevent. OMITTED when empty.
+	 */
+	orphanedIndexes?: PersistedIndexSchema[];
 }
 
 /**
@@ -199,6 +213,23 @@ export interface StoredIndexColumn {
  */
 export interface PersistedTableSchema extends Omit<StoredTableSchema, 'indexes'> {
 	indexes: PersistedIndexSchema[];
+	/**
+	 * Present ⇔ this record is a GRAVESTONE, not a live schema: `DROP TABLE` replaces
+	 * the live record with a copy carrying this timestamp ({@link SchemaManager.deleteSchema}),
+	 * so what the leftover storage at the table's URI still holds stays written down.
+	 * Storage must not outlive the catalog record that describes it — a later
+	 * declaration over that storage is checked against the gravestone and refused when
+	 * it contradicts it (the guards in `doInitialize` / `addIndex`), instead of
+	 * silently adopting rows and index entries it cannot describe.
+	 *
+	 * A gravestone is invisible to every read/merge path ({@link SchemaManager.livePersistedEntry}
+	 * returns undefined for it) and is read ONLY by the guards. Cross-version hazard,
+	 * accepted for now (AGENTS.md: no backwards-compatibility promises yet): a build
+	 * OLDER than this field reads a gravestone as a live record and resurrects the
+	 * dropped table. If a persisted-format version stamp ever lands
+	 * (tickets/backlog/debt-optimystic-key-format-migration.md), gate this there.
+	 */
+	droppedAt?: string;
 }
 
 /** Persisted index descriptor: columns addressed by NAME. */
@@ -382,9 +413,19 @@ export function mergePersistedSchemas(
 	incoming: PersistedTableSchema,
 	persisted: PersistedTableSchema | undefined
 ): PersistedTableSchema {
-	const merged: PersistedTableSchema = persisted
+	let merged: PersistedTableSchema = persisted
 		? { ...incoming, indexes: mergeIndexLists(incoming.indexes, persisted.indexes) }
 		: incoming;
+	// `orphanedIndexes` describe leftover STORAGE, not schema: they are never unioned
+	// into `indexes` (that would resurrect a dropped table's index list), but they must
+	// survive every write — a re-declare candidate built from local DDL never carries
+	// them, and losing them here would blind the addIndex guard after the first
+	// post-adoption schema write. Union keyed by name, omitted when empty so records
+	// without the field stay byte-identical.
+	const orphaned = mergeIndexLists(incoming.orphanedIndexes ?? [], persisted?.orphanedIndexes ?? []);
+	if (orphaned.length > 0) {
+		merged = { ...merged, orphanedIndexes: orphaned };
+	}
 	const [miss] = unresolvedIndexColumns(merged);
 	if (miss) {
 		throw new Error(
@@ -503,13 +544,36 @@ export class SchemaManager {
 	}
 
 	/**
-	 * The persisted record inside a catalog entry, or undefined for a tombstone — a
-	 * deleted entry surfaces as `entry[1] === undefined` and must never be merged
-	 * with, cached, or returned as a live schema.
+	 * The record inside a catalog entry whether live OR gravestone, or undefined for a
+	 * bare tombstone (`entry[1] === undefined`, written by builds before gravestones
+	 * or as {@link deleteSchema}'s degraded fallback). Internal building block for the
+	 * two public-facing filters below — callers pick a side; nothing merges, caches,
+	 * or plans against this unfiltered value directly.
 	 */
-	private livePersistedEntry(entry: unknown): PersistedTableSchema | undefined {
+	private anyPersistedEntry(entry: unknown): PersistedTableSchema | undefined {
 		const tuple = entry as [string, PersistedTableSchema | undefined] | undefined;
 		return tuple && tuple.length >= 2 && tuple[1] ? tuple[1] : undefined;
+	}
+
+	/**
+	 * The LIVE persisted record inside a catalog entry — undefined for a bare tombstone
+	 * AND for a gravestone (`droppedAt` set). Every read/merge/hydrate path routes
+	 * through this, so a dropped table stays invisible to the planner exactly as a
+	 * bare tombstone always did; only the storage-adoption guards read gravestones,
+	 * via {@link droppedPersistedEntry} / {@link findRecordForUri}.
+	 */
+	private livePersistedEntry(entry: unknown): PersistedTableSchema | undefined {
+		const record = this.anyPersistedEntry(entry);
+		return record && !record.droppedAt ? record : undefined;
+	}
+
+	/**
+	 * The GRAVESTONE record inside a catalog entry — the record only when `droppedAt`
+	 * is present. Read by the storage-adoption guards and by nothing else.
+	 */
+	private droppedPersistedEntry(entry: unknown): PersistedTableSchema | undefined {
+		const record = this.anyPersistedEntry(entry);
+		return record && record.droppedAt ? record : undefined;
 	}
 
 	/**
@@ -637,45 +701,125 @@ export class SchemaManager {
 		if (!tree) {
 			return;
 		}
-		await tree.replace([[tableName, undefined]]);
+		// Write a GRAVESTONE, not a bare tombstone: the record being deleted, stamped
+		// `droppedAt`, so the storage the drop leaves behind (rows at the table's URI,
+		// index trees at `<uri>/index/<name>`) stays described and a later declaration
+		// over it can be checked instead of silently adopting it. When the current
+		// record cannot be read here, degrade to the bare `undefined` tombstone exactly
+		// as before gravestones existed — a missing gravestone only means the guards
+		// find nothing and let the declaration through, which is the old behaviour and
+		// the right failure direction (never let a failed read block the drop).
+		// An entry already carrying `droppedAt` keeps its original timestamp.
+		let gravestone: PersistedTableSchema | undefined;
+		try {
+			await tree.update();
+			const path = await tree.find(tableName);
+			const record = tree.isValid(path) ? this.anyPersistedEntry(tree.at(path)) : undefined;
+			if (record) {
+				gravestone = { ...record, droppedAt: record.droppedAt ?? new Date().toISOString() };
+			}
+		} catch {
+			gravestone = undefined;
+		}
+		await tree.replace([[tableName, gravestone ? [tableName, gravestone] : undefined]]);
+	}
+
+	/**
+	 * ONE pass over every catalog entry, in key order — the shared walk behind
+	 * {@link listTables} and {@link findRecordForUri}, so the two cannot drift.
+	 * Open-only: a fresh install has no catalog at all and yields nothing rather
+	 * than inventing an empty catalog to iterate. Pulls the latest tree state
+	 * first; a fresh SchemaManager otherwise iterates an empty in-memory btree
+	 * even when storage already holds the persisted schemas.
+	 */
+	private async *catalogEntries(
+		transactor?: ITransactor
+	): AsyncGenerator<[string, PersistedTableSchema | undefined]> {
+		const tree = await this.getSchemaTree(transactor);
+		if (!tree) {
+			return;
+		}
+		await tree.update();
+		for await (const path of tree.range({ isAscending: true } as any)) {
+			if (!tree.isValid(path)) {
+				continue;
+			}
+			const entry = tree.at(path) as [string, PersistedTableSchema | undefined] | undefined;
+			if (entry && entry.length >= 1) {
+				yield entry;
+			}
+		}
 	}
 
 	/**
 	 * List all table names
 	 */
 	async listTables(transactor?: ITransactor): Promise<string[]> {
-		// Open-only: a fresh install has no catalog at all, and must list zero tables
-		// rather than invent an empty catalog to iterate.
-		const tree = await this.getSchemaTree(transactor);
-		if (!tree) {
-			return [];
-		}
-		// Pull the latest tree state from storage; a fresh SchemaManager
-		// otherwise iterates an empty in-memory btree even when the underlying
-		// storage already contains the persisted schemas.
-		await tree.update();
 		const tables: string[] = [];
-
-		for await (const path of tree.range({ isAscending: true } as any)) {
-			if (!tree.isValid(path)) {
-				continue;
-			}
-
-			const entry = tree.at(path) as [string, PersistedTableSchema | undefined] | undefined;
+		for await (const entry of this.catalogEntries(transactor)) {
 			// Seed the per-instance cache from this single traversal so the
 			// follow-up `getSchema(name)` calls (hydrateCatalog walks one
 			// listTables + one getSchema per table) hit memory instead of
 			// re-walking the schema btree from the root. The seeded value is
 			// the same resolved shape getSchema itself caches and returns.
-			// Skip tombstones — a deleted entry can surface as
-			// `entry[1] === undefined` and must not register as a cache hit.
+			// Skip tombstones and gravestones — a dropped entry must not
+			// register as a cache hit (resolveAndCache filters both).
 			this.resolveAndCache(entry);
-			if (entry && entry.length >= 1) {
-				tables.push(entry[0]);
-			}
+			tables.push(entry[0]);
 		}
-
 		return tables;
+	}
+
+	/**
+	 * The record — live OR gravestone — describing the storage at `collectionUri`,
+	 * or undefined when no catalog entry claims that URI. One pass over the catalog
+	 * ({@link catalogEntries} — the same walk listTables runs, one entry per table),
+	 * so callers on hot paths must not call this per-open; the doInitialize guard
+	 * runs it only on the genuinely-new-table arm.
+	 *
+	 * A record's URI is its first `USING optimystic(...)` argument, defaulted the
+	 * way parseTableSchema defaults it (`tree://default/<name>`) so tables declared
+	 * without an explicit URI still match. Live records win over gravestones when
+	 * both claim the URI — a live table's description of shared storage is the
+	 * current one, not a dropped predecessor's.
+	 */
+	async findRecordForUri(
+		collectionUri: string,
+		transactor?: ITransactor
+	): Promise<PersistedTableSchema | undefined> {
+		let dropped: PersistedTableSchema | undefined;
+		for await (const entry of this.catalogEntries(transactor)) {
+			const record = this.anyPersistedEntry(entry);
+			if (!record) {
+				continue;
+			}
+			const recordUri = (record.vtabArgs?.['0'] as string | undefined) || `tree://default/${record.name}`;
+			if (recordUri !== collectionUri) {
+				continue;
+			}
+			if (!record.droppedAt) {
+				return record;
+			}
+			dropped = dropped ?? record;
+		}
+		return dropped;
+	}
+
+	/**
+	 * The gravestone under `tableName`, or undefined when the entry is absent, live,
+	 * or a bare (pre-gravestone) tombstone. Read by the storage-adoption guards only.
+	 */
+	async getDroppedSchemaRecord(
+		tableName: string,
+		transactor?: ITransactor
+	): Promise<PersistedTableSchema | undefined> {
+		const tree = await this.getSchemaTree(transactor);
+		if (!tree) {
+			return undefined;
+		}
+		await tree.update();
+		const path = await tree.find(tableName);
+		return tree.isValid(path) ? this.droppedPersistedEntry(tree.at(path)) : undefined;
 	}
 
 	/**

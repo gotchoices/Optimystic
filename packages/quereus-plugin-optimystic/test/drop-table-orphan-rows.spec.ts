@@ -1,16 +1,25 @@
 /**
- * CHARACTERIZATION of a known defect — ticket slug
- * `drop-leaves-storage-the-catalog-no-longer-describes`.
+ * The rule under test (ticket slug `drop-leaves-storage-the-catalog-no-longer-describes`):
  *
- * `DROP TABLE` tombstones the table's catalog entry and leaves the data collection at
- * the table's URI — and the secondary-index trees at `<uri>/index/<name>` — untouched.
- * Nothing then describes that storage, so the next `CREATE TABLE` over the same URI
- * adopts it silently.
+ * > Storage must not outlive the catalog record that describes it. A table or index
+ * > declared over storage whose describing record is gone must fail loudly rather
+ * > than silently adopt that storage.
  *
- * EVERY assertion below pins CURRENT, WRONG behaviour so the fix has a before/after.
- * When the declaration guard lands, these cases become refusals and this file's
- * assertions must be replaced with the refusal messages (that replacement is a TODO on
- * the implement ticket). Do not read a passing run here as "this works".
+ * `DROP TABLE` is definition-only — it gravestones the table's catalog entry and leaves
+ * the data collection at the table's URI (and the secondary-index trees at
+ * `<uri>/index/<name>`) untouched. The guards checked here make the NEXT declaration
+ * over that leftover storage refuse when it contradicts what the gravestone says the
+ * storage holds, while the deliberately-supported adoptions keep working:
+ *
+ *   REFUSED: a re-declare that ADDS a column the stored rows cannot supply; one that
+ *   changes the PRIMARY KEY the stored rows are keyed under; a second live table
+ *   declared over the same URI with a contradicting shape; a CREATE INDEX that would
+ *   adopt a leftover non-empty index tree under a different column list.
+ *
+ *   STILL ALLOWED: an identical re-declare (the dropped rows come back — documented in
+ *   the README); a NARROWER re-declare (every declared column is still backed by real
+ *   stored values); a fresh index name; re-adopting an index tree on the same column it
+ *   was built on; any re-declare over an EMPTY collection.
  *
  * Single-process, in-memory (`MemoryRawStorage` shared across plugin instances, one
  * Database per "session") — the same harness as schema-redeclare-column-identity.spec.ts.
@@ -50,11 +59,23 @@ function registerWithSharedTransactor(db: Database, transactor: ITransactor) {
 	return plugin;
 }
 
-/** Session A: create `t` at `uri`, optionally index one column, and write one row. */
+/** Run `body` and return what it threw, failing the test if it resolved instead. */
+async function captureFailure(body: () => Promise<unknown>, why: string): Promise<Error> {
+	let caught: Error | undefined;
+	try {
+		await body();
+	} catch (error) {
+		caught = error as Error;
+	}
+	expect(caught, why).to.not.equal(undefined);
+	return caught!;
+}
+
+/** Session A: create `t` at `uri`, optionally index one column, optionally write one row. */
 async function seed(
 	shared: ITransactor,
 	uri: string,
-	options: { indexOn?: string } = {},
+	options: { indexOn?: string; row?: boolean } = {},
 ): Promise<void> {
 	const db = new Database();
 	registerWithSharedTransactor(db, shared);
@@ -63,14 +84,16 @@ async function seed(
 		if (options.indexOn) {
 			await db.exec(`create index ix on t (${options.indexOn})`);
 		}
-		await db.exec(`insert into t (id, a, b) values (1, 'aa', 'bb')`);
+		if (options.row !== false) {
+			await db.exec(`insert into t (id, a, b) values (1, 'aa', 'bb')`);
+		}
 	} finally {
 		db.close();
 	}
 }
 
-describe('DROP TABLE leaves storage the catalog no longer describes', () => {
-	it('re-creating at the same URI under a DIFFERENT column list serves rows the declaration says are impossible', async () => {
+describe('Storage must not outlive the catalog record that describes it', () => {
+	it('refuses a re-create at the same URI that ADDS a column the stored rows cannot supply', async () => {
 		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
 		await seed(shared, 'tree://scratch/shape');
 
@@ -79,16 +102,72 @@ describe('DROP TABLE leaves storage the catalog no longer describes', () => {
 		try {
 			await plugin.hydrate(db);
 			await db.exec(`drop table t`);
-			// `z` was never written by anyone. Quereus defaults a column to NOT NULL, so a
-			// NULL `z` is a value this table's own declaration forbids.
-			await db.exec(`create table t (id integer primary key, z integer) using optimystic('tree://scratch/shape')`);
-			expect(await queryAll(db, `select * from t`)).to.deep.equal([{ id: 1, z: null }]);
+			// `z` was never written by anyone; pre-guard, the surviving rows decoded it
+			// as NULL even though Quereus defaults every column to NOT NULL.
+			const failure = await captureFailure(
+				() => db.exec(`create table t (id integer primary key, z integer) using optimystic('tree://scratch/shape')`),
+				'a re-declare adding a column the stored rows cannot supply must be refused',
+			);
+			expect(failure.message).to.include(`Cannot create table 't' over 'tree://scratch/shape'`);
+			expect(failure.message).to.include(`adds column 'z'`);
+			expect(failure.message).to.include('a dropped table declared as (id, a, b)');
+
+			// The way out the message names — re-declaring the columns the stored rows
+			// were written under — must work on the very next statement (a refused
+			// CREATE leaves no half-registered table behind).
+			await db.exec(`create table t (id integer primary key, a text, b text) using optimystic('tree://scratch/shape')`);
+			expect(await queryAll(db, `select * from t`)).to.deep.equal([{ id: 1, a: 'aa', b: 'bb' }]);
 		} finally {
 			db.close();
 		}
 	});
 
-	it('re-creating at the same URI under the SAME column list brings every dropped row back', async () => {
+	it('refuses a re-create at the same URI under a DIFFERENT primary key', async () => {
+		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
+		await seed(shared, 'tree://scratch/pk');
+
+		const db = new Database();
+		const plugin = registerWithSharedTransactor(db, shared);
+		try {
+			await plugin.hydrate(db);
+			await db.exec(`drop table t`);
+			// Same column set, but every stored row sits under a tree key computed from
+			// `id` — a table keyed on `a` would never compute a key that reaches them.
+			const failure = await captureFailure(
+				() => db.exec(`create table t (id integer, a text primary key, b text) using optimystic('tree://scratch/pk')`),
+				'a re-declare changing the primary key the stored rows are keyed under must be refused',
+			);
+			expect(failure.message).to.include(`Cannot create table 't' over 'tree://scratch/pk'`);
+			expect(failure.message).to.include('keyed on (id)');
+			expect(failure.message).to.include('keys on (a)');
+		} finally {
+			db.close();
+		}
+	});
+
+	it('refuses a SECOND live table declared over the same URI with a contradicting shape', async () => {
+		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
+
+		const db = new Database();
+		registerWithSharedTransactor(db, shared);
+		try {
+			await db.exec(`create table t (id integer primary key, a text, b text) using optimystic('tree://scratch/shared-uri')`);
+			await db.exec(`insert into t (id, a, b) values (1, 'aa', 'bb')`);
+			// No DROP anywhere: the describing record is t's LIVE catalog entry.
+			const failure = await captureFailure(
+				() => db.exec(`create table t2 (id integer primary key, z integer) using optimystic('tree://scratch/shared-uri')`),
+				'a second table over the same URI with a contradicting shape must be refused',
+			);
+			expect(failure.message).to.include(`Cannot create table 't2' over 'tree://scratch/shared-uri'`);
+			expect(failure.message).to.include(`live table 't'`);
+			// The refusal touches nothing: the first table keeps working.
+			expect(await queryAll(db, `select * from t`)).to.deep.equal([{ id: 1, a: 'aa', b: 'bb' }]);
+		} finally {
+			db.close();
+		}
+	});
+
+	it('still allows an identical re-declare — the dropped rows come back (README-documented)', async () => {
 		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
 		await seed(shared, 'tree://scratch/same');
 
@@ -104,7 +183,26 @@ describe('DROP TABLE leaves storage the catalog no longer describes', () => {
 		}
 	});
 
-	it('a secondary-index tree survives DROP and, re-adopted under the same name on a DIFFERENT column, answers every seek empty', async () => {
+	it('still allows any re-declare over an EMPTY collection (created, never written, dropped)', async () => {
+		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
+		await seed(shared, 'tree://scratch/empty', { row: false });
+
+		const db = new Database();
+		const plugin = registerWithSharedTransactor(db, shared);
+		try {
+			await plugin.hydrate(db);
+			await db.exec(`drop table t`);
+			// A different shape AND a different primary key: an empty collection cannot
+			// mangle anything, so the guard lets it through.
+			await db.exec(`create table t (id integer, z text primary key) using optimystic('tree://scratch/empty')`);
+			await db.exec(`insert into t (id, z) values (7, 'zz')`);
+			expect(await queryAll(db, `select * from t`)).to.deep.equal([{ id: 7, z: 'zz' }]);
+		} finally {
+			db.close();
+		}
+	});
+
+	it('refuses to re-adopt a leftover index tree under the same name on a DIFFERENT column', async () => {
 		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
 		await seed(shared, 'tree://scratch/idx', { indexOn: 'b' });
 
@@ -115,26 +213,26 @@ describe('DROP TABLE leaves storage the catalog no longer describes', () => {
 			await db.exec(`drop table t`);
 			await db.exec(`create table t (id integer primary key, a text, b text) using optimystic('tree://scratch/idx')`);
 			// The tree at tree://scratch/idx/index/ix still holds the dropped table's
-			// entries, keyed on `b` values. `ix` is absent from the (tombstoned) catalog
-			// entry, so this takes addIndex's build path and adopts that tree.
-			await db.exec(`create index ix on t (a)`);
-			await db.exec(`insert into t (id, a, b) values (2, 'zz', 'yy')`);
-
-			// A full scan sees both rows...
-			expect(await queryAll(db, `select * from t`)).to.deep.equal([
+			// entries, keyed on `b` values. Pre-guard this adopted that tree and every
+			// seek through it answered empty — including for rows inserted AFTER the
+			// adoption.
+			const failure = await captureFailure(
+				() => db.exec(`create index ix on t (a)`),
+				'adopting a non-empty leftover index tree under a different column must be refused',
+			);
+			expect(failure.message).to.include(`Cannot create index 'ix' over 'tree://scratch/idx/index/ix'`);
+			expect(failure.message).to.include('declared on (b), not (a)');
+			// The way out the message names: a different index name works immediately.
+			await db.exec(`create index ix2 on t (a)`);
+			expect(await queryAll(db, `select * from t where a = 'aa'`)).to.deep.equal([
 				{ id: 1, a: 'aa', b: 'bb' },
-				{ id: 2, a: 'zz', b: 'yy' },
 			]);
-			// ...while every seek routed through the adopted tree answers empty — including
-			// for the row inserted AFTER the adoption, so this is not merely stale entries.
-			expect(await queryAll(db, `select * from t where a = 'aa'`)).to.deep.equal([]);
-			expect(await queryAll(db, `select * from t where a = 'zz'`)).to.deep.equal([]);
 		} finally {
 			db.close();
 		}
 	});
 
-	it('control: the same sequence under an index name storage has never seen answers correctly', async () => {
+	it('still allows an index name storage has never seen', async () => {
 		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
 		await seed(shared, 'tree://scratch/fresh-ix', { indexOn: 'b' });
 
@@ -153,7 +251,7 @@ describe('DROP TABLE leaves storage the catalog no longer describes', () => {
 		}
 	});
 
-	it('control: re-adopting an index tree on the SAME column it was built on answers correctly', async () => {
+	it('still allows re-adopting an index tree on the SAME column it was built on', async () => {
 		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
 		await seed(shared, 'tree://scratch/same-ix', { indexOn: 'b' });
 
@@ -163,6 +261,9 @@ describe('DROP TABLE leaves storage the catalog no longer describes', () => {
 			await plugin.hydrate(db);
 			await db.exec(`drop table t`);
 			await db.exec(`create table t (id integer primary key, a text, b text) using optimystic('tree://scratch/same-ix')`);
+			// A peer that built the same index over the same columns produces a matching
+			// record and is adopted exactly as before the guard — the multi-node
+			// re-attach path depends on this.
 			await db.exec(`create index ix on t (b)`);
 			expect(await queryAll(db, `select * from t where b = 'bb'`)).to.deep.equal([
 				{ id: 1, a: 'aa', b: 'bb' },
