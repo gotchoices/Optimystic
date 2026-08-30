@@ -8,6 +8,7 @@ import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { CachedStoreDriver } from '../src/storage/cached-store-driver.js';
 import { CachedRawStorage } from '../src/storage/cached-raw-storage.js';
 import { SharedCachePool } from '../src/storage/shared-cache-pool.js';
+import { withReadCache } from '../src/storage/with-read-cache.js';
 import type { StoreIdentity } from '../src/storage/store-identity.js';
 import {
 	CountingStoreDriver, READ_METHODS, WRITE_METHODS,
@@ -426,6 +427,50 @@ describe('CachedRawStorage over an already-cached backing store', () => {
 		const second = new CachedRawStorage(storageOver('test:one-store'), pool, 'second-consumer');
 		expect(pool.stats().stores.map(s => s.label)).to.deep.equal(['second-consumer']);
 		await second.dispose();
+	});
+
+	it('the seam refuses to build a second cache over a store a host already cached', async () => {
+		// The scenario the guard exists for, end to end through the production seam: a host
+		// hand-builds its cache (so `withReadCache`'s registry never sees it), then a consumer's
+		// storage factory hands the SAME store to `withReadCache`, which has nothing to dedupe
+		// against and constructs. Registration is what catches it.
+		//
+		// NOTE: `withReadCache`'s dedupe registry is module-global and outlives every test in this
+		// process, so each case here uses an identity of its own; two files reusing one identity
+		// would couple through that registry and fail on file order. The same hazard applies to the
+		// pool: these cases pass an explicit `SharedCachePool`, and a spec that instead registers an
+		// identity-bearing store on `defaultCachePool()` could collide with another file's.
+		const pool = new SharedCachePool();
+		const hostBuilt = new CachedRawStorage(storageOver('test:seam-store'), pool, 'host-built');
+
+		expect(() => withReadCache(storageOver('test:seam-store'), 'seam', pool))
+			.to.throw(/never converge/);
+		expect(pool.stats().stores.map(s => s.label), 'the refused wrap registered nothing')
+			.to.deep.equal(['host-built']);
+
+		// A refused wrap must also leave the dedupe registry clean: it throws before inserting, so
+		// once the host's cache departs the seam builds a live cache, not a stale registry hit.
+		await hostBuilt.dispose();
+		const { storage, lease } = withReadCache(storageOver('test:seam-store'), 'seam', pool);
+		expect(storage).to.be.instanceOf(CachedRawStorage);
+		expect(pool.stats().stores.map(s => s.label)).to.deep.equal(['seam']);
+		await lease?.release();
+	});
+
+	it('releasing the last lease frees the store, so the seam can wrap it again', async () => {
+		// Pins the ordering `CachedStoreDriver.close()`'s NOTE depends on: the last release retires
+		// the registry entry and unregisters the pool claim in ONE synchronous block, so a re-wrap
+		// after it never meets a freed registry with a still-held claim.
+		const pool = new SharedCachePool();
+		const first = withReadCache(storageOver('test:relet-store'), 'first', pool);
+		expect(first.lease).to.not.equal(undefined);
+		await first.lease?.release();
+
+		const second = withReadCache(storageOver('test:relet-store'), 'second', pool);
+		expect(second.storage, 'a cold cache, not the released one').to.not.equal(first.storage);
+		expect(pool.stats().stores.map(s => s.label)).to.deep.equal(['second']);
+		await second.lease?.release();
+		expect(pool.stats().stores, 'the store is free again').to.deep.equal([]);
 	});
 
 	it('leaves identity-less backings alone: two caches over two memory storages coexist', async () => {

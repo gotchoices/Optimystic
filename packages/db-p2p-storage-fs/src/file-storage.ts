@@ -79,7 +79,9 @@ export class FileStoreDriver implements RawStoreDriver {
 		// on such a directory `X:\p\Foo` and `X:\p\foo` are two directories folded onto ONE
 		// identity. That merging consumer now exists — `withReadCache` (db-p2p) shares ONE read
 		// cache per identity — so on such a directory the two stores would read through one cache
-		// and see each other's blocks. Not addressable synchronously either (the flag is a
+		// and see each other's blocks, and if the second cache is built directly rather than
+		// through that helper, `SharedCachePool.registerStore` refuses it outright (one cache per
+		// backing store) and construction throws. Not addressable synchronously either (the flag is a
 		// per-directory filesystem query). Revisit if Optimystic ever targets a
 		// case-sensitive-enabled Windows directory; until then the fold is right for every
 		// ordinary Windows volume.
