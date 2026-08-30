@@ -497,6 +497,23 @@ Minimal. Timestamps are used only for:
 - **Network size N:** Dispute escalation cost is O(K log N) in the worst case. Normal operation (no disputes) is O(K) regardless of N.
 - **Contention:** High contention on a single block serializes transactions through that block's cluster. Throughput is bounded by consensus round-trip time.
 
+### 7.6 Storage Outliving Its Catalog Record
+
+Dropping a SQL table in the Quereus plugin is definition-only: it removes the table's
+definition but leaves the rows (and the secondary-index trees beside them) in their
+collections. So the plugin holds one rule above the protocol layer — **storage must not
+outlive the catalog record that describes it**. `DROP TABLE` keeps the dropped record as
+a *gravestone* (the record, stamped with a drop timestamp) instead of erasing it, and the
+next declaration over that storage is checked against the gravestone — or against a live
+table already declared over the same collection — at declaration time. A declaration the
+surviving data cannot support is **refused**; nothing is deleted, and no data is
+rewritten to fit. The rule spans the schema catalog and the data collections rather than
+living at any single call site, which is why it is recorded here as well as at the guards
+themselves (`packages/quereus-plugin-optimystic/src/optimystic-module.ts`) and in that
+package's README § Limitations. Deleting the leftover collections is deliberately out of
+scope: nothing above the protocol layer is entitled to decide that another node's
+replicas of those blocks should go away.
+
 ---
 
 ## 8. Composition of Guarantees

@@ -225,10 +225,19 @@ describe('Schema re-declare keeps index and UNIQUE column identity', function ()
 			await pluginC.hydrate(dbC);
 			expect(await queryAll(dbC, `select * from s where b = 'bbb'`)).to.deep.equal([{ id: 1, a: 'aaa', b: 'bbb' }]);
 
-			// The way out the message names: drop the table (tombstoning its catalog
-			// entry), then declare the narrower shape. DROP TABLE tombstones the CATALOG
+			// The way out the message names: drop the table (gravestoning its catalog
+			// entry), then declare the narrower shape. DROP TABLE gravestones the CATALOG
 			// entry only — the data tree at the URI keeps its rows — so the new row takes a
 			// fresh primary key rather than colliding with the old row 1.
+			//
+			// This re-declare also has to clear the storage-adoption guard the drop arms
+			// (see drop-table-orphan-rows.spec.ts): declaring over storage a gravestone
+			// still describes is refused when it ADDS a column the stored rows cannot
+			// supply, or changes the primary key those rows are keyed under. Neither
+			// applies here — this shape only DROPS column `b` and keeps `id` as the key,
+			// so every column it declares is still backed by real stored values and the
+			// guard lets it through. Adding a column here, or re-keying on `a`, would now
+			// be refused instead.
 			await dbC.exec(`drop table s`);
 			await dbC.exec(`create table s (id integer primary key, a text) using optimystic('tree://redeclare/s')`);
 			await dbC.exec(`insert into s (id, a) values (2, 'fresh')`);

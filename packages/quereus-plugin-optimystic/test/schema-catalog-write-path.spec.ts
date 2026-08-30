@@ -29,12 +29,18 @@ class FakeCatalogTree {
 	readonly writes: CatalogEntry[][] = [];
 	updateCount = 0;
 	failNextReplace = false;
+	/** Make the NEXT `find` throw, to exercise a read failure mid-write. */
+	failNextFind = false;
 
 	async update(): Promise<void> {
 		this.updateCount++;
 	}
 
 	async find(key: string): Promise<unknown> {
+		if (this.failNextFind) {
+			this.failNextFind = false;
+			throw new Error('find failed');
+		}
 		return { key };
 	}
 
@@ -416,7 +422,12 @@ describe('SchemaManager write path', () => {
 			expect(opens.map(o => o.create), 'the drop must open the catalog read-only').to.deep.equal([false]);
 		});
 
-		it('tombstones the entry when the catalog exists', async () => {
+		it('gravestones the entry when the catalog exists — kept on disk, absent to readers', async () => {
+			// The drop leaves the table's rows (and its index trees) in storage, so the
+			// entry is KEPT and stamped `droppedAt` rather than erased: that gravestone is
+			// what still describes the leftover storage for the declaration-time guards
+			// (see optimystic-module.ts guardStorageAdoption / guardIndexAdoption). Every
+			// read/merge/hydrate path must nonetheless see the table as gone.
 			const tree = new FakeCatalogTree();
 			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_a']))]);
 			const { manager } = managerOver(tree);
@@ -424,8 +435,47 @@ describe('SchemaManager write path', () => {
 
 			await manager.deleteSchema('t');
 
-			expect(tree.stored('t'), 'the entry must read as absent after the drop').to.equal(undefined);
-			expect(await manager.getSchemaFresh('t'), 'the cached copy must go with it').to.equal(undefined);
+			const gravestone = tree.stored('t');
+			expect(gravestone, 'the record itself must survive the drop, to describe the leftover storage')
+				.to.not.equal(undefined);
+			expect(gravestone!.droppedAt, 'a gravestone is a record stamped with its drop time')
+				.to.be.a('string');
+			expect(gravestone!.indexes.map(i => i.name), 'the index trees it describes must survive with it')
+				.to.deep.equal(['idx_a']);
+			expect(await manager.getSchemaFresh('t'), 'a gravestone must read as absent, and the cached copy must go with it')
+				.to.equal(undefined);
+			expect(await manager.getDroppedSchemaRecord('t'), 'the guards read it through the dropped-record accessor')
+				.to.not.equal(undefined);
+		});
+
+		it('keeps the ORIGINAL drop time when an already-dropped table is dropped again', async () => {
+			const tree = new FakeCatalogTree();
+			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_a']))]);
+			const { manager } = managerOver(tree);
+
+			await manager.deleteSchema('t');
+			const first = tree.stored('t')!.droppedAt;
+			await manager.deleteSchema('t');
+
+			expect(tree.stored('t')!.droppedAt, 'a re-drop must not restamp the gravestone').to.equal(first);
+		});
+
+		it('degrades to a bare tombstone when the record cannot be read, rather than failing the drop', async () => {
+			// Deliberate failure direction: a gravestone that cannot be built must not
+			// block the DROP. Without a gravestone the declaration-time guards simply
+			// find nothing and let the next declaration through — exactly the behaviour
+			// of builds from before gravestones existed.
+			const tree = new FakeCatalogTree();
+			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_a']))]);
+			const { manager } = managerOver(tree);
+			tree.failNextFind = true;
+
+			await manager.deleteSchema('t');
+
+			expect(tree.stored('t'), 'a failed read degrades to the bare tombstone').to.equal(undefined);
+			expect(await manager.getSchemaFresh('t'), 'the table is still gone').to.equal(undefined);
+			expect(await manager.getDroppedSchemaRecord('t'), 'and there is no gravestone for the guards to read')
+				.to.equal(undefined);
 		});
 	});
 });

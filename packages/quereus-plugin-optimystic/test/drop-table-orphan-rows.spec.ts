@@ -202,6 +202,36 @@ describe('Storage must not outlive the catalog record that describes it', () => 
 		}
 	});
 
+	it('gravestones the catalog record even when the drop never touches the table', async () => {
+		// The refusal tests above all drop straight after `hydrate()` without querying,
+		// so the module holds no instance for the table when `destroy()` runs. The
+		// catalog write has to happen anyway: otherwise the record outlives its own
+		// DROP as a LIVE entry, and this is the half that shows it — a later session
+		// hydrating the same storage must not see the table come back.
+		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
+		await seed(shared, 'tree://scratch/untouched');
+
+		const dbDrop = new Database();
+		const pluginDrop = registerWithSharedTransactor(dbDrop, shared);
+		try {
+			expect((await pluginDrop.hydrate(dbDrop)).tables).to.equal(1);
+			await dbDrop.exec(`drop table t`);
+		} finally {
+			dbDrop.close();
+		}
+
+		const dbAfter = new Database();
+		const pluginAfter = registerWithSharedTransactor(dbAfter, shared);
+		try {
+			expect(
+				(await pluginAfter.hydrate(dbAfter)).tables,
+				'a dropped table must not be resurrected by the next hydrate',
+			).to.equal(0);
+		} finally {
+			dbAfter.close();
+		}
+	});
+
 	it('refuses to re-adopt a leftover index tree under the same name on a DIFFERENT column', async () => {
 		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
 		await seed(shared, 'tree://scratch/idx', { indexOn: 'b' });

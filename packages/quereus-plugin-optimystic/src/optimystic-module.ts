@@ -3583,18 +3583,33 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   /**
    * Destroys the underlying persistent representation of the virtual table.
    * Removes the table from the internal registry so the name can be re-used,
-   * and deletes the persisted schema entry so a subsequent CREATE TABLE with
-   * the same name picks up the new shape rather than the old one.
+   * and gravestones the persisted schema entry so a subsequent CREATE TABLE with
+   * the same name picks up the new shape rather than the old one, and so the
+   * storage the drop leaves behind stays described (see
+   * {@link SchemaManager.deleteSchema} and the storage-adoption guards).
+   *
+   * The catalog write must happen whether or not this session ever TOUCHED the
+   * table: a table hydrated into Quereus's catalog and dropped without being
+   * queried has no cached instance here, and skipping the write in that case
+   * leaves the record LIVE past its own DROP — the next `hydrate()` resurrects
+   * the table, and a later CREATE at the same URI reads a live persisted schema
+   * and so never reaches {@link OptimysticVirtualTable.guardStorageAdoption}.
+   * So the uncached path instantiates from the catalog entry Quereus still holds
+   * at destroy time. That instance is deliberately NOT initialized: deleting its
+   * own schema needs only its SchemaManager and the bridge's current transactor,
+   * and initializing a table on its way out would re-persist the record being
+   * deleted.
    */
   async destroy(
-    _db: Database,
+    db: Database,
     _pAux: unknown,
     _moduleName: string,
     schemaName: string,
     tableName: string
   ): Promise<void> {
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-    const table = this.tables.get(tableKey);
+    const table = this.tables.get(tableKey)
+      ?? await this.instantiateForTeardown(db, schemaName, tableName);
     if (table) {
       // Release the collection-change → watch bridge before forgetting the table
       // so the storage listener doesn't leak past the table's lifetime.
@@ -3606,5 +3621,29 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       }
     }
     this.tables.delete(tableKey);
+  }
+
+  /**
+   * Build an UNINITIALIZED table instance for {@link destroy}'s benefit when the
+   * drop is the first thing this session does to the table. Returns undefined when
+   * the catalog no longer describes it (nothing to delete) or when the schema
+   * cannot be parsed into options — a drop must never fail on teardown bookkeeping,
+   * and the pre-existing behaviour for an unresolvable table was to skip the
+   * catalog write entirely.
+   */
+  private async instantiateForTeardown(
+    db: Database,
+    schemaName: string,
+    tableName: string
+  ): Promise<OptimysticVirtualTable | undefined> {
+    const resolvedSchema = db.schemaManager.findTable(tableName, schemaName);
+    if (!resolvedSchema) {
+      return undefined;
+    }
+    try {
+      return await this.instantiateTable(db, resolvedSchema);
+    } catch {
+      return undefined;
+    }
   }
 }
