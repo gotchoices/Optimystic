@@ -2946,9 +2946,13 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    *   - every scan's mutable state (read views, iterators, retry bookkeeping,
    *     `yieldedKeys`) is local to the generator invocation;
    *   - a committed scan reads a per-scan pinned view that never touches live state;
-   *   - a live scan's `collection.update()` serializes behind the collection's own
-   *     per-collection latch, and mid-scan tree mutation is already tolerated via
-   *     path-invalidation retry (replicated external commits impose the same
+   *   - a live scan's `collection.update()` serializes behind the collection
+   *     INSTANCE's latch (the key is scoped per Collection instance; one connected
+   *     table = one instance, so this is the same serialization as before) — and
+   *     `TransactionCoordinator.commitOnce`/`execute` now hold that same latch for
+   *     the whole commit span, so a refresh cannot interleave with a mid-flight
+   *     commit on the instance either; mid-scan tree mutation is already tolerated
+   *     via path-invalidation retry (replicated external commits impose the same
    *     interleaving with or without concurrent reads);
    *   - the one shared field a FAILING scan writes is `setErrorMessage(...)` —
    *     diagnostics only, last writer wins; accepted as-is.

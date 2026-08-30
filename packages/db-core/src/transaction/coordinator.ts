@@ -243,6 +243,43 @@ export class TransactionCoordinator {
 			return; // Nothing to commit
 		}
 
+		// Hold every participating collection's instance latch for the WHOLE commit span —
+		// snapshot, log append, the pend/commit round trips, and the local fold — so a
+		// reader-driven update()/sync() on the same instance cannot interleave: without this, a
+		// refresh could adopt the newly committed revision mid-flight and recordCommitted would
+		// land the action at a revision storage never assigned it. Acquisition is in sorted
+		// collection-id order, mirroring StorageRepo.commit's sorted block-id latch discipline
+		// (db-p2p/src/storage/block-latch.ts), so two concurrent commits over overlapping
+		// participant sets cannot deadlock. `Latches` is non-reentrant, so nothing inside the
+		// held span may call a latched Collection method (act/update/sync/updateAndSync) on a
+		// participant — the retry loop's blanket collection.update() in commit() runs OUTSIDE
+		// this span, after release.
+		const latchReleases: (() => void)[] = [];
+		try {
+			const latchOrder = [...collectionData].sort((a, b) =>
+				a.collectionId < b.collectionId ? -1 : a.collectionId > b.collectionId ? 1 : 0);
+			for (const { collection } of latchOrder) {
+				latchReleases.push(await collection.acquireLatch());
+			}
+			await this.commitOnceLatched(transaction, collectionData);
+		} finally {
+			for (const release of latchReleases.reverse()) {
+				release();
+			}
+		}
+	}
+
+	/**
+	 * The body of {@link commitOnce}, run with every participating collection's instance latch
+	 * held by the caller (see the acquisition comment there). Nothing in here may re-acquire a
+	 * participant's latch — every Collection member it touches (snapshotPending, getPendingActions,
+	 * recordCommitted, applyCommittedToCache, restorePending, clearPendingActions, tracker.reset)
+	 * is latch-free by contract.
+	 */
+	private async commitOnceLatched(
+		transaction: Transaction,
+		collectionData: { collectionId: CollectionId; collection: Collection<any>; transforms: Transforms }[]
+	): Promise<void> {
 		// Append each collection's staged actions to its log, then collect the
 		// resulting transforms + critical (log-tail) block for consensus.
 		//
@@ -258,6 +295,10 @@ export class TransactionCoordinator {
 		const allCollectionIds = collectionData.map(({ collectionId }) => collectionId);
 		const collectionTransforms = new Map<CollectionId, Transforms>();
 		const criticalBlocks = new Map<CollectionId, BlockId>();
+		// The revision each collection's log entry was stamped with. Captured ONCE — at the log
+		// append in applyActionsToCollection, the single legitimate capture point — and threaded
+		// through pend, commit, and the local recordCommitted, so all four name the same number.
+		const pendedRevs = new Map<CollectionId, number>();
 
 		// Snapshot EVERY participating collection's staged state (transforms + pending
 		// queue) BEFORE the append loop mutates any tracker. The loop appends log
@@ -291,6 +332,7 @@ export class TransactionCoordinator {
 				}
 				collectionTransforms.set(collectionId, applyResult.transforms!);
 				criticalBlocks.set(collectionId, applyResult.logTailBlockId!);
+				pendedRevs.set(collectionId, applyResult.rev!);
 			}
 
 			// Compute hash of ALL operations across ALL collections (post-log-append).
@@ -304,7 +346,8 @@ export class TransactionCoordinator {
 				transaction,
 				operationsHash,
 				collectionTransforms,
-				criticalBlocks
+				criticalBlocks,
+				pendedRevs
 			);
 		} catch (err) {
 			// A throw here means the failure happened BEFORE any collection could
@@ -336,7 +379,7 @@ export class TransactionCoordinator {
 						// collection kept its pending queue, a subsequent commit() would re-append and
 						// re-log its already-durable actions — a duplicate log entry on the winner. The
 						// no-double-apply-on-retry test in transaction.spec.ts locks this.
-						const rev = collection.recordCommitted(transaction.id);
+						const rev = collection.recordCommitted(transaction.id, pendedRevs.get(collectionId)!);
 						collection.applyCommittedToCache(collectionTransforms.get(collectionId)!, rev);
 						collection.tracker.reset();
 						collection.clearPendingActions();
@@ -380,8 +423,10 @@ export class TransactionCoordinator {
 		// with prior committed state (a pre-synced index, or any second commit)
 		// serves the new revision instead of the stale cached one. Clearing
 		// pending keeps a subsequent commit from re-logging these actions.
+		// NOTE: this fold loop must stay await-free — session-mode publish relies on it being
+		// event-loop-atomic across collections (see OptimysticModule's readCommittedSnapshot audit).
 		for (const { collectionId, collection } of collectionData) {
-			const rev = collection.recordCommitted(transaction.id);
+			const rev = collection.recordCommitted(transaction.id, pendedRevs.get(collectionId)!);
 			collection.applyCommittedToCache(collectionTransforms.get(collectionId)!, rev);
 			collection.tracker.reset();
 			collection.clearPendingActions();
@@ -572,82 +617,107 @@ export class TransactionCoordinator {
 		const criticalBlocks = new Map<CollectionId, BlockId>();
 		const actionResults = new Map<CollectionId, any[]>();
 		const allCollectionIds = result.actions.map(ca => ca.collectionId);
+		// Same single-capture rev threading as commitOnce: stamped at the log append below,
+		// named again at pend, commit, and recordCommitted.
+		const pendedRevs = new Map<CollectionId, number>();
 
-		for (const collectionActions of result.actions) {
-			const applyResult = await this.applyActionsToCollection(
-				collectionActions,
-				transaction,
-				allCollectionIds
-			);
-
-			if (!applyResult.success) {
-				return { success: false, error: applyResult.error };
-			}
-
-			collectionTransforms.set(collectionActions.collectionId, applyResult.transforms!);
-			criticalBlocks.set(collectionActions.collectionId, applyResult.logTailBlockId!);
-			actionResults.set(collectionActions.collectionId, applyResult.results!);
-		}
-
-		// 3. Compute operations hash for validation (order-independent; see commit()).
-		const operationsHash = await hashOperations(collectOperations(collectionTransforms));
-
-		const applyMs = Date.now() - tApply;
-
-		// 4. Coordinate (GATHER if multi-collection)
-		const tCoord = Date.now();
-		const coordResult = await this.coordinateTransaction(
-			transaction,
-			operationsHash,
-			collectionTransforms,
-			criticalBlocks
-		);
-
-		const coordMs = Date.now() - tCoord;
-		if (!coordResult.success) {
-			log('execute:done trxId=%s engine=%dms apply=%dms coordinate=%dms success=false total=%dms', trxId, engineMs, applyMs, coordMs, Date.now() - t0);
-			// Stop lying to the caller about a partial commit: if some collections durably
-			// committed, surface that set. execute() is not snapshot/restore-wrapped (see the
-			// note above), but the committed subset must still get the success-path local
-			// treatment (recordCommitted + tracker.reset, as on the success path below) so its
-			// trackers aren't left mis-tracking already-durable state.
-			const committed = coordResult.committedCollections ?? new Set<CollectionId>();
-			if (committed.size > 0) {
-				for (const collectionActions of result.actions) {
-					const collection = this.collections.get(collectionActions.collectionId);
-					if (collection && committed.has(collectionActions.collectionId)) {
-						collection.recordCommitted(transaction.id);
-						collection.tracker.reset();
-					}
+		// Hold each participating collection's instance latch for the commit span, same
+		// discipline as commitOnce (sorted acquisition; see the comment there). Acquired only
+		// AFTER applyActions above: collection.act takes the same non-reentrant instance latch
+		// itself, so latching earlier would deadlock. Deduped before acquiring — taking one
+		// instance's latch twice would also deadlock. Released in the finally: execute has
+		// early failure returns.
+		const latchReleases: (() => void)[] = [];
+		try {
+			for (const collectionId of [...new Set(allCollectionIds)].sort()) {
+				const collection = this.collections.get(collectionId);
+				if (collection) {
+					latchReleases.push(await collection.acquireLatch());
 				}
 			}
-			return {
-				success: false,
-				error: coordResult.error,
-				committedCollections: committed.size > 0 ? [...committed] : undefined,
-				failedCollections: coordResult.failedCollections ? [...coordResult.failedCollections] : undefined,
-			};
-		}
 
-		// 5. Update actionContext and reset trackers after successful commit
-		for (const collectionActions of result.actions) {
-			const collection = this.collections.get(collectionActions.collectionId);
-			if (collection) {
-				collection.recordCommitted(transaction.id);
-				collection.tracker.reset();
+			for (const collectionActions of result.actions) {
+				const applyResult = await this.applyActionsToCollection(
+					collectionActions,
+					transaction,
+					allCollectionIds
+				);
+
+				if (!applyResult.success) {
+					return { success: false, error: applyResult.error };
+				}
+
+				collectionTransforms.set(collectionActions.collectionId, applyResult.transforms!);
+				criticalBlocks.set(collectionActions.collectionId, applyResult.logTailBlockId!);
+				actionResults.set(collectionActions.collectionId, applyResult.results!);
+				pendedRevs.set(collectionActions.collectionId, applyResult.rev!);
+			}
+
+			// 3. Compute operations hash for validation (order-independent; see commit()).
+			const operationsHash = await hashOperations(collectOperations(collectionTransforms));
+
+			const applyMs = Date.now() - tApply;
+
+			// 4. Coordinate (GATHER if multi-collection)
+			const tCoord = Date.now();
+			const coordResult = await this.coordinateTransaction(
+				transaction,
+				operationsHash,
+				collectionTransforms,
+				criticalBlocks,
+				pendedRevs
+			);
+
+			const coordMs = Date.now() - tCoord;
+			if (!coordResult.success) {
+				log('execute:done trxId=%s engine=%dms apply=%dms coordinate=%dms success=false total=%dms', trxId, engineMs, applyMs, coordMs, Date.now() - t0);
+				// Stop lying to the caller about a partial commit: if some collections durably
+				// committed, surface that set. execute() is not snapshot/restore-wrapped (see the
+				// note above), but the committed subset must still get the success-path local
+				// treatment (recordCommitted + tracker.reset, as on the success path below) so its
+				// trackers aren't left mis-tracking already-durable state.
+				const committed = coordResult.committedCollections ?? new Set<CollectionId>();
+				if (committed.size > 0) {
+					for (const collectionActions of result.actions) {
+						const collection = this.collections.get(collectionActions.collectionId);
+						if (collection && committed.has(collectionActions.collectionId)) {
+							collection.recordCommitted(transaction.id, pendedRevs.get(collectionActions.collectionId)!);
+							collection.tracker.reset();
+						}
+					}
+				}
+				return {
+					success: false,
+					error: coordResult.error,
+					committedCollections: committed.size > 0 ? [...committed] : undefined,
+					failedCollections: coordResult.failedCollections ? [...coordResult.failedCollections] : undefined,
+				};
+			}
+
+			// 5. Update actionContext and reset trackers after successful commit
+			for (const collectionActions of result.actions) {
+				const collection = this.collections.get(collectionActions.collectionId);
+				if (collection) {
+					collection.recordCommitted(transaction.id, pendedRevs.get(collectionActions.collectionId)!);
+					collection.tracker.reset();
+				}
+			}
+
+			// Clean up stamp tracking data
+			this.stampData.delete(transaction.stamp.id);
+
+			// 6. Return results from actions
+			log('execute:done trxId=%s engine=%dms apply=%dms coordinate=%dms total=%dms', trxId, engineMs, applyMs, coordMs, Date.now() - t0);
+			return {
+				success: true,
+				actions: result.actions,
+				results: actionResults
+			};
+		} finally {
+			for (const release of latchReleases.reverse()) {
+				release();
 			}
 		}
-
-		// Clean up stamp tracking data
-		this.stampData.delete(transaction.stamp.id);
-
-		// 6. Return results from actions
-		log('execute:done trxId=%s engine=%dms apply=%dms coordinate=%dms total=%dms', trxId, engineMs, applyMs, coordMs, Date.now() - t0);
-		return {
-			success: true,
-			actions: result.actions,
-			results: actionResults
-		};
 	}
 
 	/**
@@ -663,6 +733,9 @@ export class TransactionCoordinator {
 		success: boolean;
 		transforms?: Transforms;
 		logTailBlockId?: BlockId;
+		/** The revision the log entry was stamped with — the ONE number the pend, the commit,
+		 * and the local recordCommitted must all repeat (see the pendedRevs maps upstream). */
+		rev?: number;
 		results?: any[];
 		error?: string;
 	}> {
@@ -714,6 +787,7 @@ export class TransactionCoordinator {
 			success: true,
 			transforms,
 			logTailBlockId: addResult.tailPath.block.header.id,
+			rev: newRev,
 			results: [] // TODO: Collect results from action handlers when we support read operations
 		};
 	}
@@ -725,12 +799,16 @@ export class TransactionCoordinator {
 	 * @param operationsHash - Hash of all operations for validation
 	 * @param collectionTransforms - Map of collectionId to its transforms
 	 * @param criticalBlocks - Map of collectionId to its log tail blockId
+	 * @param pendedRevs - Per collection, the revision its log entry was stamped with (from
+	 * applyActionsToCollection) — repeated verbatim on the pend and commit requests so storage
+	 * and the local record name the same number.
 	 */
 	private async coordinateTransaction(
 		transaction: Transaction,
 		operationsHash: string,
 		collectionTransforms: Map<CollectionId, Transforms>,
-		criticalBlocks: Map<CollectionId, BlockId>
+		criticalBlocks: Map<CollectionId, BlockId>,
+		pendedRevs: ReadonlyMap<CollectionId, number>
 	): Promise<{
 		success: boolean;
 		error?: string;
@@ -755,6 +833,7 @@ export class TransactionCoordinator {
 			transaction,
 			operationsHash,
 			collectionTransforms,
+			pendedRevs,
 			superclusterNominees
 		);
 		const pendMs = Date.now() - tPend;
@@ -768,7 +847,8 @@ export class TransactionCoordinator {
 		const commitResult = await this.commitPhase(
 			transaction.id as ActionId,
 			criticalBlockIds,
-			pendResult.pendedBlockIds!
+			pendResult.pendedBlockIds!,
+			pendedRevs
 		);
 		const commitMs = Date.now() - tCommit;
 		if (!commitResult.success) {
@@ -847,12 +927,16 @@ export class TransactionCoordinator {
 	 * @param transaction - The full transaction for replay/validation
 	 * @param operationsHash - Hash of all operations for validation
 	 * @param collectionTransforms - Map of collectionId to its transforms
+	 * @param pendedRevs - Per collection, the revision its log entry was stamped with — the pend
+	 * request repeats it verbatim rather than recomputing from the collection (a recompute after
+	 * the append could name a different number if the collection refreshed in between).
 	 * @param superclusterNominees - Nominees for multi-collection consensus (null for single-collection)
 	 */
 	private async pendPhase(
 		transaction: Transaction,
 		operationsHash: string,
 		collectionTransforms: ReadonlyMap<CollectionId, Transforms>,
+		pendedRevs: ReadonlyMap<CollectionId, number>,
 		superclusterNominees: ReadonlySet<PeerId> | null
 	): Promise<{ success: boolean; error?: string; pendedBlockIds?: Map<CollectionId, BlockId[]>; staleLoss?: boolean }> {
 		if (collectionTransforms.size === 0) {
@@ -869,7 +953,7 @@ export class TransactionCoordinator {
 		// with a concurrency limiter so peak in-flight round-trips stays sane. Same for commitPhase.
 		const outcomes = await Promise.allSettled(
 			Array.from(collectionTransforms.entries()).map(([collectionId, transforms]) =>
-				this.pendCollection(transaction, operationsHash, collectionId, transforms, actionId, nominees)
+				this.pendCollection(transaction, operationsHash, collectionId, transforms, pendedRevs.get(collectionId)!, actionId, nominees)
 			)
 		);
 
@@ -918,6 +1002,10 @@ export class TransactionCoordinator {
 		operationsHash: string,
 		collectionId: CollectionId,
 		transforms: Transforms,
+		/** The revision the log entry was stamped with (threaded from applyActionsToCollection),
+		 * NOT recomputed here: a `getNextRev()` after the append round trips could name a number
+		 * a concurrent refresh already moved past. */
+		rev: number,
 		actionId: ActionId,
 		nominees: PeerId[] | undefined
 	): Promise<{ collectionId: CollectionId; blockIds: BlockId[] }> {
@@ -925,9 +1013,6 @@ export class TransactionCoordinator {
 		if (!collection) {
 			throw new Error(`Collection not found: ${collectionId}`);
 		}
-
-		// Get revision from the collection's source
-		const rev = collection.getNextRev();
 
 		// Create pend request with transaction and operations hash for validation
 		const pendRequest: PendRequest = {
@@ -962,7 +1047,8 @@ export class TransactionCoordinator {
 	private async commitPhase(
 		actionId: ActionId,
 		criticalBlockIds: BlockId[],
-		pendedBlockIds: Map<CollectionId, BlockId[]>
+		pendedBlockIds: Map<CollectionId, BlockId[]>,
+		pendedRevs: ReadonlyMap<CollectionId, number>
 	): Promise<{
 		success: boolean;
 		error?: string;
@@ -974,7 +1060,7 @@ export class TransactionCoordinator {
 		// aggregate the committed/failed partition from the settled results.
 		const outcomes = await Promise.allSettled(
 			Array.from(pendedBlockIds.entries()).map(([collectionId, blockIds]) =>
-				this.commitCollection(actionId, criticalBlockIds, collectionId, blockIds)
+				this.commitCollection(actionId, criticalBlockIds, collectionId, blockIds, pendedRevs.get(collectionId)!)
 			)
 		);
 
@@ -1027,15 +1113,16 @@ export class TransactionCoordinator {
 		actionId: ActionId,
 		criticalBlockIds: BlockId[],
 		collectionId: CollectionId,
-		blockIds: BlockId[]
+		blockIds: BlockId[],
+		/** The revision this collection PENDED at, threaded from the log append — the same bug
+		 * family as pendCollection's: recomputing `getNextRev()` here, after the pend round
+		 * trips, could stamp the CommitRequest with a different number than the pend named. */
+		rev: number
 	): Promise<{ collectionId: CollectionId; committed: boolean; error?: string; stale?: boolean }> {
 		const collection = this.collections.get(collectionId);
 		if (!collection) {
 			return { collectionId, committed: false, error: `Collection not found: ${collectionId}` };
 		}
-
-		// Get revision
-		const rev = collection.getNextRev();
 
 		// Find the critical block (log tail) for this collection
 		const logTailBlockId = criticalBlockIds.find(blockId => blockIds.includes(blockId));

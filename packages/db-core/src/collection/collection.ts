@@ -93,8 +93,30 @@ export class Collection<TAction> implements ICollection<TAction> {
 		/** Tracked Changes */
 		public readonly tracker: Tracker<IBlock>,
 		private readonly filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined,
+		/** Short random tag naming THIS instance (see {@link newInstanceTag}). Open paths generate
+		 * it BEFORE construction (so pre-construction diagnostics such as attachToLog can carry it);
+		 * the default covers direct construction in tests. */
+		public readonly instanceTag: string = Collection.newInstanceTag(),
 	) {
-		this.latchId = `Collection:${this.id}`;
+		// Instance-scoped, deliberately NOT shared across instances of one collection id. The
+		// latch protects per-instance state only — the tracker, the pending queue, and
+		// source.actionContext, none of which two instances over the same id share — while
+		// cross-instance races are resolved by the transactor's optimistic concurrency (that is
+		// the design; the old process-global `Collection:${id}` key serialized instances by
+		// accident). Instance scope is also what lets TransactionCoordinator hold this latch
+		// across its whole commit span: `Latches` is a non-reentrant FIFO mutex, and a rival
+		// writer driving a SECOND instance of the same id from inside transactor.pend (see
+		// CompetingWriterTransactor) would otherwise wait on the very latch the parked commit
+		// holds — a deadlock, not contention.
+		this.latchId = `Collection:${this.id}#${this.instanceTag}`;
+	}
+
+	/** A fresh instance tag: four random bytes rendered base64url — six characters, enough that
+	 * two instances over one collection id do not collide by accident, short enough to ride on
+	 * every trace line (same shape as the node tag in quereus-plugin-optimystic's
+	 * collection-factory). Scopes {@link latchId} per instance and labels diagnostics. */
+	private static newInstanceTag(): string {
+		return uint8ArrayToString(randomBytes(4), 'base64url');
 	}
 
 	/** Open an EXISTING collection.
@@ -116,8 +138,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// that ignores the undefined cannot later sync a phantom collection into existence.
 			return undefined;
 		}
+		// Generated BEFORE attachToLog so log-attach-time diagnostics can name the instance
+		// the same way post-construction ones do.
+		const instanceTag = Collection.newInstanceTag();
 		await Collection.attachToLog<TAction>(source, transactor, tracker, id, header);
-		return new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict);
+		return new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict, instanceTag);
 	}
 
 	/** Open an existing collection, or stage a fresh empty one in the local tracker when the
@@ -129,6 +154,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 	static async createOrOpen<TAction>(transactor: ITransactor, id: CollectionId, init: CollectionInitOptions<TAction>): Promise<Collection<TAction>> {
 		const { source, sourceCache, tracker, header } = await Collection.probeHeader(transactor, id);
 
+		// Pre-construction for the same reason as in open(): see the comment there.
+		const instanceTag = Collection.newInstanceTag();
 		if (header) {	// Collection already exists
 			await Collection.attachToLog<TAction>(source, transactor, tracker, id, header);
 		} else {	// Collection does not exist
@@ -139,7 +166,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			await Log.open<Action<TAction>>(tracker, id);
 		}
 
-		return new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict);
+		return new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict, instanceTag);
 	}
 
 	/** The per-instance read wiring every open path needs, plus the header probe result.
@@ -615,14 +642,38 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** Record a just-committed action: append its ActionRev to the committed list
 	 *  and advance the revision. Returns the new revision. Mirrors the inline bump
-	 *  in {@link syncInternal}. */
-	recordCommitted(actionId: ActionId): number {
-		const rev = this.getNextRev();
+	 *  in {@link syncInternal} — which needs no such rev check because it computes and
+	 *  uses its `newRev` inside one latched span.
+	 *
+	 *  @param rev - the revision this action was PENDED at, captured once (at the log
+	 *  append in `TransactionCoordinator.applyActionsToCollection`) and threaded through
+	 *  the pend/commit round trips. Storage assigned the action THAT number; recording it
+	 *  at any other would fork this instance's revision counter from storage permanently
+	 *  (context adoption is one-way — see {@link advanceContext}). With the coordinator
+	 *  holding this instance's latch across the whole commit span the mismatch cannot
+	 *  happen; the throw is the tripwire for any path that still bypasses the latch. */
+	recordCommitted(actionId: ActionId, rev: number): number {
+		const expected = this.getNextRev();
+		if (rev !== expected) {
+			throw new Error(`Collection ${this.id}: action ${actionId} was pended at rev ${rev} ` +
+				`but the collection now expects rev ${expected} — the collection was refreshed mid-commit`);
+		}
 		this.source.actionContext = {
 			committed: [...(this.source.actionContext?.committed ?? []), { actionId, rev }],
 			rev,
 		};
 		return rev;
+	}
+
+	/** Acquire this instance's latch — the same mutex {@link act}, {@link update},
+	 * {@link sync}, and {@link updateAndSync} serialize behind — returning its release.
+	 * Exists so a TransactionCoordinator can hold the latch across its WHOLE commit span
+	 * (log append → pend → commit → local fold), keeping any refresh of this instance from
+	 * interleaving with a mid-flight commit. `Latches` is non-reentrant: while holding this,
+	 * the holder must not call any of those latched methods on this instance. The caller
+	 * MUST call the release exactly once, in a `finally`. */
+	acquireLatch(): Promise<() => void> {
+		return Latches.acquire(this.latchId);
 	}
 
 	/** Push our pending actions to the transactor */

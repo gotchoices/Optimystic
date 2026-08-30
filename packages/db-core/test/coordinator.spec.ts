@@ -130,10 +130,12 @@ class InstrumentedTransactor implements ITransactor {
 	}
 }
 
-/** Fake collections map: the phases call `getNextRev()` and read `tracker` (to declare the
- *  per-block content digests riding on the commit) off each collection. The tracker here has no
- *  staged transforms, so it declares nothing — these tests are about phase control flow, and the
- *  digest content itself is covered by commit-digest-threading.spec.ts. */
+/** Fake collections map: the phases read `tracker` (to declare the per-block content digests
+ *  riding on the commit) off each collection; the revision each phase names now arrives as an
+ *  explicit `pendedRevs` argument (see {@link revsFor}) rather than a `getNextRev()` call on the
+ *  collection. The tracker here has no staged transforms, so it declares nothing — these tests
+ *  are about phase control flow, and the digest content itself is covered by
+ *  commit-digest-threading.spec.ts. */
 function fakeCollections(collectionIds: string[], stage?: (tracker: Tracker<IBlock>, collectionId: string) => void): Map<CollectionId, unknown> {
 	const map = new Map<CollectionId, unknown>();
 	const emptySource: BlockSource<IBlock> = {
@@ -141,13 +143,19 @@ function fakeCollections(collectionIds: string[], stage?: (tracker: Tracker<IBlo
 		async tryGet() { return undefined; },
 		generateId: () => 'fake',
 	};
-	let rev = 1;
 	for (const id of collectionIds) {
 		const tracker = new Tracker<IBlock>(emptySource);
 		stage?.(tracker, id);
-		map.set(id, { getNextRev: () => rev++, tracker });
+		map.set(id, { tracker });
 	}
 	return map;
+}
+
+/** The pended-revision map the phases now take: in production it is captured once at the log
+ *  append (applyActionsToCollection) and threaded through; here any fixed number per collection
+ *  will do — these tests assert control flow, not revision arithmetic. */
+function revsFor(collectionIds: string[]): Map<CollectionId, number> {
+	return new Map<CollectionId, number>(collectionIds.map(id => [id, 1]));
 }
 
 const transaction = { id: 'txn-1' } as unknown as Transaction;
@@ -164,8 +172,8 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			);
 
 			const result = await (coordinator as unknown as {
-				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, n: null) => Promise<{ success: boolean; pendedBlockIds?: Map<CollectionId, BlockId[]> }>;
-			}).pendPhase(transaction, 'ops:hash', collectionTransforms, null);
+				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, r: Map<CollectionId, number>, n: null) => Promise<{ success: boolean; pendedBlockIds?: Map<CollectionId, BlockId[]> }>;
+			}).pendPhase(transaction, 'ops:hash', collectionTransforms, revsFor([...collectionTransforms.keys()]), null);
 
 			expect(result.success).to.be.true;
 			// All four pends were in flight at once — the fan-out ran them concurrently, not serially.
@@ -189,8 +197,8 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			);
 
 			const result = await (coordinator as unknown as {
-				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, n: null) => Promise<{ success: boolean; error?: string }>;
-			}).pendPhase(transaction, 'ops:hash', collectionTransforms, null);
+				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, r: Map<CollectionId, number>, n: null) => Promise<{ success: boolean; error?: string }>;
+			}).pendPhase(transaction, 'ops:hash', collectionTransforms, revsFor([...collectionTransforms.keys()]), null);
 
 			expect(result.success).to.be.false;
 			expect(result.error).to.contain(failing);
@@ -213,8 +221,8 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			);
 
 			const result = await (coordinator as unknown as {
-				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, n: null) => Promise<{ success: boolean; error?: string }>;
-			}).pendPhase(transaction, 'ops:hash', collectionTransforms, null);
+				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, r: Map<CollectionId, number>, n: null) => Promise<{ success: boolean; error?: string }>;
+			}).pendPhase(transaction, 'ops:hash', collectionTransforms, revsFor([...collectionTransforms.keys()]), null);
 
 			expect(result.success).to.be.false;
 			expect(result.error).to.contain(throwing);
@@ -241,8 +249,8 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			);
 
 			const result = await (coordinator as unknown as {
-				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, n: null) => Promise<{ success: boolean; error?: string; staleLoss?: boolean }>;
-			}).pendPhase(transaction, 'ops:hash', collectionTransforms, null);
+				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, r: Map<CollectionId, number>, n: null) => Promise<{ success: boolean; error?: string; staleLoss?: boolean }>;
+			}).pendPhase(transaction, 'ops:hash', collectionTransforms, revsFor([...collectionTransforms.keys()]), null);
 
 			expect(result.success).to.be.false;
 			expect(result.error).to.match(/stale revision/);
@@ -262,8 +270,8 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			);
 
 			const result = await (coordinator as unknown as {
-				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, n: null) => Promise<{ success: boolean; error?: string; staleLoss?: boolean }>;
-			}).pendPhase(transaction, 'ops:hash', collectionTransforms, null);
+				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, r: Map<CollectionId, number>, n: null) => Promise<{ success: boolean; error?: string; staleLoss?: boolean }>;
+			}).pendPhase(transaction, 'ops:hash', collectionTransforms, revsFor([...collectionTransforms.keys()]), null);
 
 			expect(result.success).to.be.false;
 			// Genuine hard rejections (storage fault, validator policy) also arrive reason-only;
@@ -287,8 +295,8 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			const coordinator = new TransactionCoordinator(transactor, fakeCollections(collectionIds) as never);
 
 			const result = await (coordinator as unknown as {
-				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, n: null) => Promise<{ success: boolean; staleLoss?: boolean }>;
-			}).pendPhase(transaction, 'ops:hash', new Map([['c0', transformsForCollection('c0')]]), null);
+				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, r: Map<CollectionId, number>, n: null) => Promise<{ success: boolean; staleLoss?: boolean }>;
+			}).pendPhase(transaction, 'ops:hash', new Map([['c0', transformsForCollection('c0')]]), revsFor(['c0']), null);
 
 			expect(result.success).to.be.false;
 			expect(result.staleLoss).to.be.true;
@@ -306,8 +314,8 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			]);
 
 			const result = await (coordinator as unknown as {
-				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, n: null) => Promise<{ success: boolean; error?: string }>;
-			}).pendPhase(transaction, 'ops:hash', collectionTransforms, null);
+				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, r: Map<CollectionId, number>, n: null) => Promise<{ success: boolean; error?: string }>;
+			}).pendPhase(transaction, 'ops:hash', collectionTransforms, revsFor([...collectionTransforms.keys()]), null);
 
 			expect(result.success).to.be.false;
 			expect(result.error).to.contain('ghost');
@@ -328,8 +336,8 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			const criticalBlockIds = collectionIds.map(id => `${id}-tail` as BlockId);
 
 			const result = await (coordinator as unknown as {
-				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>) => Promise<{ success: boolean; committedCollections: Set<CollectionId>; failedCollections: Set<CollectionId> }>;
-			}).commitPhase('txn-1', criticalBlockIds, pendedBlockIds);
+				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>, r: Map<CollectionId, number>) => Promise<{ success: boolean; committedCollections: Set<CollectionId>; failedCollections: Set<CollectionId> }>;
+			}).commitPhase('txn-1', criticalBlockIds, pendedBlockIds, revsFor(collectionIds));
 
 			expect(result.success).to.be.true;
 			expect(transactor.commitMaxInFlight).to.equal(collectionIds.length);
@@ -351,8 +359,8 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			const criticalBlockIds = collectionIds.map(id => `${id}-tail` as BlockId);
 
 			const result = await (coordinator as unknown as {
-				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>) => Promise<{ success: boolean; error?: string; committedCollections: Set<CollectionId>; failedCollections: Set<CollectionId> }>;
-			}).commitPhase('txn-1', criticalBlockIds, pendedBlockIds);
+				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>, r: Map<CollectionId, number>) => Promise<{ success: boolean; error?: string; committedCollections: Set<CollectionId>; failedCollections: Set<CollectionId> }>;
+			}).commitPhase('txn-1', criticalBlockIds, pendedBlockIds, revsFor(collectionIds));
 
 			expect(result.success).to.be.false;
 			expect(result.error).to.contain(failing);
@@ -381,8 +389,8 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			const criticalBlockIds = collectionIds.map(id => `${id}-tail` as BlockId);
 
 			const result = await (coordinator as unknown as {
-				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>) => Promise<{ success: boolean }>;
-			}).commitPhase('txn-1', criticalBlockIds, pendedBlockIds);
+				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>, r: Map<CollectionId, number>) => Promise<{ success: boolean }>;
+			}).commitPhase('txn-1', criticalBlockIds, pendedBlockIds, revsFor(collectionIds));
 			expect(result.success).to.be.true;
 
 			expect(transactor.commitRequests).to.have.lengthOf(collectionIds.length);
@@ -402,8 +410,8 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			const coordinator = new TransactionCoordinator(transactor, fakeCollections(['c0']) as never);
 
 			await (coordinator as unknown as {
-				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>) => Promise<{ success: boolean }>;
-			}).commitPhase('txn-1', ['c0-tail' as BlockId], new Map([['c0', ['c0-tail' as BlockId]]]));
+				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>, r: Map<CollectionId, number>) => Promise<{ success: boolean }>;
+			}).commitPhase('txn-1', ['c0-tail' as BlockId], new Map([['c0', ['c0-tail' as BlockId]]]), revsFor(['c0']));
 
 			// Not an empty object: the request is hashed verbatim into every cohort signature, so a
 			// commit that declares nothing must serialize exactly as it did before the field existed.
@@ -423,8 +431,8 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			const criticalBlockIds = collectionIds.map(id => `${id}-tail` as BlockId);
 
 			const result = await (coordinator as unknown as {
-				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>) => Promise<{ success: boolean; error?: string; committedCollections: Set<CollectionId>; failedCollections: Set<CollectionId> }>;
-			}).commitPhase('txn-1', criticalBlockIds, pendedBlockIds);
+				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>, r: Map<CollectionId, number>) => Promise<{ success: boolean; error?: string; committedCollections: Set<CollectionId>; failedCollections: Set<CollectionId> }>;
+			}).commitPhase('txn-1', criticalBlockIds, pendedBlockIds, revsFor(collectionIds));
 
 			expect(result.success).to.be.false;
 			expect(result.error).to.contain(failing);
