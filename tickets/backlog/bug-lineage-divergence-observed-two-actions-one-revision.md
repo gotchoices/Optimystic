@@ -23,6 +23,26 @@ collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByTo
 collection:context-not-lowered id=default/FormationUsage/index/FormationUsageByToken held=4 read=3
 ```
 
+## RE-MEASURED after `read-cache-dedupe-by-store-identity` — NOT closed by it
+
+Re-ran the same reproducer against HEAD with that work landed (and
+`store-identity-plumbing` / `duplicate-store-identity-guard` alongside it). The fork is unchanged:
+
+```
+collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken rev=1 held=7dYxrbrubG8Vu_iWLwm7Hw read=CawkObrpMIdukvK1GIvN7w
+collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken rev=2 held=lqqTpGD5JdJHBEMPy1jD0A read=UPVDy94VBVHD1o30U3uihQ
+collection:context-not-lowered id=default/FormationUsage/index/FormationUsageByToken held=4 read=3
+```
+
+Same collection, same two revision slots, same `held=4 read=3` seal — fresh action ids, so it is a
+new occurrence rather than a cached artifact of the earlier run. All three scenario cases still
+fail. **So "two caches over one store" is not the mechanism here**, or not the only one; whatever
+splits the lineage survives deduping the caches by store identity.
+
+Worth stating because the plan for that work reads as though it would cover this: it does not, and
+assuming otherwise would close this ticket on a passing sibling test rather than on the workload
+that actually diverges.
+
 ## What it says
 
 **At the same revision number, the held action id and the stored action id differ** — twice, at
