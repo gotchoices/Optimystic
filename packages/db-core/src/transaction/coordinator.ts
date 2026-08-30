@@ -242,6 +242,11 @@ export class TransactionCoordinator {
 		if (collectionData.length === 0) {
 			return; // Nothing to commit
 		}
+		// NOTE: this selection reads each tracker BEFORE the latches below are held, so a stage
+		// that lands between the filter and the acquisition is simply not part of this commit.
+		// Harmless today — a session stages and commits on one call path, so nothing races its
+		// own commit. If a caller ever stages a collection concurrently with committing it,
+		// re-derive the participant set inside the held span instead of filtering out here.
 
 		// Hold every participating collection's instance latch for the WHOLE commit span —
 		// snapshot, log append, the pend/commit round trips, and the local fold — so a
@@ -254,6 +259,11 @@ export class TransactionCoordinator {
 		// held span may call a latched Collection method (act/update/sync/updateAndSync) on a
 		// participant — the retry loop's blanket collection.update() in commit() runs OUTSIDE
 		// this span, after release.
+		// NOTE: the span covers the pend/commit consensus round trips, so every latched method on
+		// a participant instance (act/update/sync) queues for as long as the transactor takes.
+		// Accepted: correctness needs the whole span, and the transactor's own timeouts bound it.
+		// If a stalled peer is ever observed wedging unrelated readers, bound the hold instead —
+		// e.g. acquire with a deadline and fail the commit rather than queueing indefinitely.
 		const latchReleases: (() => void)[] = [];
 		try {
 			const latchOrder = [...collectionData].sort((a, b) =>
@@ -278,7 +288,7 @@ export class TransactionCoordinator {
 	 */
 	private async commitOnceLatched(
 		transaction: Transaction,
-		collectionData: { collectionId: CollectionId; collection: Collection<any>; transforms: Transforms }[]
+		collectionData: { collectionId: CollectionId; collection: Collection<any> }[]
 	): Promise<void> {
 		// Append each collection's staged actions to its log, then collect the
 		// resulting transforms + critical (log-tail) block for consensus.
@@ -446,6 +456,11 @@ export class TransactionCoordinator {
 	 * @param stampId - The transaction stamp ID to rollback
 	 */
 	async rollback(stampId: string): Promise<void> {
+		// NOTE: unlike the commit path, this resets and replays into participant trackers WITHOUT
+		// holding their instance latches. Safe today because a session drives abort and commit from
+		// one call path, so a rollback cannot overlap a commit span on the same collections. If
+		// rollback ever becomes reachable concurrently with a commit (a background abort, a second
+		// session sharing collection instances), latch the participants here the way commitOnce does.
 		const data = this.stampData.get(stampId);
 		if (!data) return;
 

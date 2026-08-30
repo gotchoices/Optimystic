@@ -2947,13 +2947,17 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    *     `yieldedKeys`) is local to the generator invocation;
    *   - a committed scan reads a per-scan pinned view that never touches live state;
    *   - a live scan's `collection.update()` serializes behind the collection
-   *     INSTANCE's latch (the key is scoped per Collection instance; one connected
-   *     table = one instance, so this is the same serialization as before) — and
-   *     `TransactionCoordinator.commitOnce`/`execute` now hold that same latch for
-   *     the whole commit span, so a refresh cannot interleave with a mid-flight
-   *     commit on the instance either; mid-scan tree mutation is already tolerated
-   *     via path-invalidation retry (replicated external commits impose the same
-   *     interleaving with or without concurrent reads);
+   *     INSTANCE's latch (the latch key is scoped per `Collection` instance, not per
+   *     collection id). Inside a transaction every scan on a table shares the one
+   *     instance cached on the TransactionState, so that latch serializes them — and
+   *     `TransactionCoordinator.commitOnce`/`execute` hold the same latch for the whole
+   *     commit span, so a refresh cannot interleave with a mid-flight commit either.
+   *     Outside a transaction `OptimysticCollectionFactory` caches nothing, so each scan
+   *     resolves its OWN instance with its own tracker and source and there is no shared
+   *     collection state left to serialize (the read cache beneath the instances is
+   *     separately synchronized). Mid-scan tree mutation is tolerated regardless, via
+   *     path-invalidation retry (replicated external commits impose the same interleaving
+   *     with or without concurrent reads);
    *   - the one shared field a FAILING scan writes is `setErrorMessage(...)` —
    *     diagnostics only, last writer wins; accepted as-is.
    * Writes still serialize (this mode's contract); the bridge's single-writer

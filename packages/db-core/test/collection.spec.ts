@@ -1695,4 +1695,73 @@ describe('Collection', () => {
       expect(read, 'read is what the log entry at that revision actually names').to.equal(actionId)
     })
   })
+  // Ticket coordinator-commit-latch-and-rev-threading. The coordinator now captures the
+  // revision ONCE at the log append and threads it through pend/commit back into
+  // recordCommitted, holding the collection INSTANCE's latch for that whole span. Two
+  // properties carry that design; neither had direct coverage when it landed.
+  describe('commit-span latch and pended-revision guard', () => {
+    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+    /** Resolves to 'acquired' if `pending` settles promptly, 'blocked' if it is still waiting. */
+    const settledPromptly = (pending: Promise<unknown>) =>
+      Promise.race([pending.then(() => 'acquired'), delay(50).then(() => 'blocked')])
+
+    it('should record a committed action at the revision it was pended at', async () => {
+      const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      const pendedRev = collection.getNextRev()
+
+      expect(collection.recordCommitted('action-1', pendedRev)).to.equal(pendedRev)
+      expect(collection.committedRevision()).to.equal(pendedRev)
+      expect(collection.committedActionId()).to.equal('action-1')
+      expect(collection.getNextRev(), 'the next write lands one revision later').to.equal(pendedRev + 1)
+    })
+
+    it('should throw when the collection advanced between the pend and the record', async () => {
+      const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      // Capture the revision the way applyActionsToCollection does...
+      const pendedRev = collection.getNextRev()
+      // ...then let something else advance the instance's context, as a refresh mid-commit would.
+      collection.recordCommitted('interloper', pendedRev)
+
+      // Recording the original action at its now-stale revision would fork this instance's
+      // revision counter from storage permanently, so it must fail loudly instead.
+      expect(() => collection.recordCommitted('action-1', pendedRev))
+        .to.throw(/was pended at rev 1 but the collection now expects rev 2/)
+      expect(collection.committedRevision(), 'and the failed record changed nothing').to.equal(pendedRev)
+      expect(collection.committedActionId()).to.equal('interloper')
+    })
+
+    it('should scope the latch per instance, so two handles on one id do not block each other', async () => {
+      // A process-global `Collection:${id}` key would deadlock the coordinator's whole-span hold
+      // against a rival writer driving a second handle on the same id.
+      const first = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await first.act({ type: 'set', data: { value: 'a', timestamp: 1 } })
+      await first.updateAndSync()
+      const second = (await Collection.open<TestAction>(transactor, collectionId, initOptions))!
+
+      expect(second.instanceTag, 'each handle gets its own tag').to.not.equal(first.instanceTag)
+
+      const releaseFirst = await first.acquireLatch()
+      try {
+        const secondLatch = second.acquireLatch()
+        expect(await settledPromptly(secondLatch)).to.equal('acquired')
+        ;(await secondLatch)()
+      } finally {
+        releaseFirst()
+      }
+    })
+
+    it('should hold latched methods off the same instance until the commit-span latch releases', async () => {
+      const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+
+      const release = await collection.acquireLatch()
+      const staging = collection.act({ type: 'set', data: { value: 'a', timestamp: 1 } })
+      expect(await settledPromptly(staging), 'act() waits on the held latch').to.equal('blocked')
+
+      release()
+      await staging
+      expect(collection.hasUnsyncedChanges(), 'and runs once the span releases').to.be.true
+    })
+  })
+
 })
