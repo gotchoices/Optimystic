@@ -1,4 +1,5 @@
 import type { BlockId, ActionId } from "@optimystic/db-core";
+import type { StoreIdentity } from "./store-identity.js";
 
 /**
  * Which of the cache's entry classes a pool entry belongs to. Mirrors the sub-states of
@@ -57,6 +58,12 @@ export class CacheStoreHandle {
 	constructor(
 		readonly id: string,
 		readonly label: string | undefined,
+		/**
+		 * The backing store this cache fronts, when the backend names one. Held so
+		 * {@link SharedCachePool.unregisterStore} can free the pool's live-identity claim; never
+		 * used as, or mixed into, an entry key (that is {@link SharedCachePool.keyFor}'s `id`).
+		 */
+		readonly identity: StoreIdentity | undefined = undefined,
 	) {}
 }
 
@@ -129,6 +136,23 @@ const SEP = '\u0000';
  * throws. Absurdly small values are accepted as-is: they cannot break coherence (the owning
  * cache is correct at any residency, including zero), they just degrade toward read-through.
  *
+ * **One cache per backing store, enforced here.** Every cache — however constructed — registers
+ * with a pool, so registration is the one choke point all construction paths share, and
+ * {@link registerStore} refuses a second live registration for a backing store identity that
+ * already has one (see its doc for why a throw, not a warning). Two deliberate escapes remain,
+ * both documented rather than closed:
+ *
+ * - **Two different pools.** The claim map lives on the pool, so two caches over one store
+ *   registered with two DIFFERENT `SharedCachePool` instances both succeed and both diverge.
+ *   Closing that would take a process-global identity registry outliving every pool — more
+ *   machinery than the case deserves, since passing a non-default pool is an explicit act (tests
+ *   do it for isolation, hosts for sizing). Pinned by a test so it reads as a decision.
+ * - **Backends that report no identity** (memory drivers, test doubles) are not covered at all,
+ *   which is correct: two memory drivers are two genuinely different stores.
+ *
+ * The cross-process case — two OS processes over one directory — is out of scope entirely; it is
+ * the unenforced precondition of Invariant 5 in `packages/db-p2p/docs/storage.md`.
+ *
  * Not safe for use from multiple threads; like the caches it serves, it relies on JS
  * single-threaded execution — every mutation completes synchronously.
  */
@@ -150,6 +174,12 @@ export class SharedCachePool {
 	private entriesTotal = 0;
 	private storeCounter = 0;
 	private readonly stores = new Map<string, CacheStoreHandle>();
+	/**
+	 * Live backing-store claims: one entry per registered store that named an identity, freed by
+	 * {@link unregisterStore}. Registration bookkeeping only — it holds no values and never
+	 * enters the byte or entry budget.
+	 */
+	private readonly claims = new Map<StoreIdentity, CacheStoreHandle>();
 
 	private hits = 0;
 	private admissions = 0;
@@ -186,10 +216,35 @@ export class SharedCachePool {
 		this.trimGhost();
 	}
 
-	/** Register a store. The returned handle's `id` is unique for the pool's lifetime — never reused. */
-	registerStore(label?: string): CacheStoreHandle {
-		const handle = new CacheStoreHandle(`s${++this.storeCounter}`, label);
+	/**
+	 * Register a store. The returned handle's `id` is unique for the pool's lifetime — never reused.
+	 *
+	 * `identity` is the backing store the caller's cache fronts ({@link StoreIdentity}), when the
+	 * backend names one. A second registration for an identity this pool already has live
+	 * **throws**: the two caches are write-through views that never see each other's writes, so
+	 * each serves its own half of the process a permanently stale picture. Throwing is the point —
+	 * the failure it replaces is silent wrong data returned to a caller with no way to notice, and
+	 * a log line is not a way to notice. A registration with no identity is unaffected: it
+	 * registers exactly as it always did.
+	 *
+	 * The check runs BEFORE any mutation, so a refused registration leaves the pool exactly as it
+	 * was — no store row, no consumed id, no claim.
+	 *
+	 * @throws Error when `identity` already has a live registration on this pool.
+	 */
+	registerStore(label?: string, identity?: StoreIdentity): CacheStoreHandle {
+		const claimed = identity === undefined ? undefined : this.claims.get(identity);
+		if (claimed !== undefined) {
+			throw new Error(
+				`two caches over one backing store never converge: ${JSON.stringify(identity)} is already `
+				+ `cached (label ${JSON.stringify(claimed.label ?? null)}); this registration `
+				+ `(label ${JSON.stringify(label ?? null)}) would be a second, independent view. Share one `
+				+ `CachedRawStorage — withReadCache does this for you — or dispose the first.`
+			);
+		}
+		const handle = new CacheStoreHandle(`s${++this.storeCounter}`, label, identity);
 		this.stores.set(handle.id, handle);
+		if (identity !== undefined) this.claims.set(identity, handle);
 		return handle;
 	}
 
@@ -200,6 +255,12 @@ export class SharedCachePool {
 	 * would de-account entries the owner still references, leaving it serving values the pool
 	 * no longer counts. It does NOT ghost (the ghosts are being purged anyway) and does NOT
 	 * count as a budget eviction: it is a lifecycle release, not memory pressure.
+	 *
+	 * Also frees the handle's backing-store claim, so sequential reuse of one store (stop a node,
+	 * start another over the same directory) registers cleanly instead of tripping
+	 * {@link registerStore}'s guard. The claim is released only when the map still points at THIS
+	 * handle — a second, late unregister of a departed handle must not strip the claim out from
+	 * under the successor that legitimately took the identity in between.
 	 */
 	unregisterStore(handle: CacheStoreHandle): void {
 		for (const queue of [this.a1in, this.am]) {
@@ -211,6 +272,9 @@ export class SharedCachePool {
 		}
 		this.purgeGhosts(handle);
 		this.stores.delete(handle.id);
+		if (handle.identity !== undefined && this.claims.get(handle.identity) === handle) {
+			this.claims.delete(handle.identity);
+		}
 	}
 
 	/** Drop every ghost key belonging to `handle` (used by store clear/close — pre-clear recency must not survive the clear). */

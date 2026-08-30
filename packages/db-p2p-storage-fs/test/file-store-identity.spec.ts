@@ -75,10 +75,26 @@ describe('FileRawStorage store identity', () => {
 		it('two independent caches over ONE directory report equal identities', () => {
 			// The exact fact an identity-keyed dedupe keys on: two caches built separately over
 			// the same directory are two objects naming one store.
-			const pool = new SharedCachePool();
-			const a = new CachedRawStorage(new FileRawStorage(base), pool);
-			const b = new CachedRawStorage(new FileRawStorage(base), pool);
+			//
+			// Separate pools deliberately: on ONE pool the second construction is now REFUSED
+			// (`SharedCachePool.registerStore` — two caches over one store never converge), and
+			// the per-pool scope of that guard is its documented escape. Two pools is therefore
+			// the only way left to hold both objects at once and compare what they report.
+			const a = new CachedRawStorage(new FileRawStorage(base), new SharedCachePool());
+			const b = new CachedRawStorage(new FileRawStorage(base), new SharedCachePool());
 			assert.strictEqual(a.getStoreIdentity?.(), b.getStoreIdentity?.());
+		});
+
+		it('a second cache over ONE directory on ONE pool is refused', () => {
+			// The end-to-end join the guard exists for: a real filesystem identity, through
+			// `CachedRawStorage`'s real construction path, on one pool.
+			const pool = new SharedCachePool();
+			const first = new CachedRawStorage(new FileRawStorage(base), pool, 'host-built');
+			assert.ok(first.getStoreIdentity?.());
+			assert.throws(
+				() => new CachedRawStorage(new FileRawStorage(base), pool, 'second-consumer'),
+				/never converge/
+			);
 		});
 
 		it('caches over DIFFERENT directories report different identities', () => {

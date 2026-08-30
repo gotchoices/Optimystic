@@ -267,6 +267,83 @@ describe('SharedCachePool mechanics', () => {
 		expect(pool.stats().evictions, 'a lifecycle release is not budget pressure').to.equal(0);
 	});
 
+	// --- The one-cache-per-backing-store guard ---
+
+	it('refuses a second live registration for one backing store identity', () => {
+		const pool = new SharedCachePool({ maxBytes: 1000, maxEntries: 100 });
+		pool.registerStore('quereus:local', 'file:/tmp/xyz');
+		let message = '';
+		try {
+			pool.registerStore('node:test', 'file:/tmp/xyz');
+		} catch (err) {
+			message = (err as Error).message;
+		}
+		// The message has to be actionable on its own: WHICH store, WHO already holds it, who is
+		// arriving, and what to do instead. A bare "duplicate store" would send the reader digging.
+		expect(message, 'names the failure mode').to.match(/never converge/);
+		expect(message, 'names the backing store').to.include('file:/tmp/xyz');
+		expect(message, 'names the incumbent label').to.include('quereus:local');
+		expect(message, 'names the arriving label').to.include('node:test');
+		expect(message, 'names the fix').to.include('withReadCache');
+	});
+
+	it('a refused registration leaves the pool exactly as it was, and other stores still register', () => {
+		// The guard must validate BEFORE mutating: a caught throw that had already consumed a
+		// store id or inserted a row would leave the pool describing a store that never existed.
+		const pool = new SharedCachePool({ maxBytes: 1000, maxEntries: 100 });
+		const owner = new RecordingOwner();
+		const first = pool.registerStore('first', 'test:same');
+		pool.admit(entryFor(pool, first, owner, 'b1', 100));
+		const before = pool.stats();
+
+		expect(() => pool.registerStore('second', 'test:same')).to.throw();
+
+		const after = pool.stats();
+		expect(after.stores, 'no half-registered store row').to.deep.equal(before.stores);
+		expect([after.bytes, after.entries]).to.deep.equal([before.bytes, before.entries]);
+
+		const other = pool.registerStore('other', 'test:different');
+		expect(other.id, 'a different identity still registers').to.not.equal(first.id);
+		expect(pool.stats().stores.map(s => s.label)).to.deep.equal(['first', 'other']);
+	});
+
+	it('unregisterStore frees the identity, so sequential reuse of one store registers cleanly', () => {
+		// Stop a node and start another over the same directory: the second start must not trip
+		// the guard. This is the single line of `unregisterStore` this whole change turns on.
+		const pool = new SharedCachePool({ maxBytes: 1000, maxEntries: 100 });
+		const first = pool.registerStore('first', 'test:reused');
+		pool.unregisterStore(first);
+		const second = pool.registerStore('second', 'test:reused');
+		expect(second.id).to.not.equal(first.id);
+		expect(pool.stats().stores.map(s => s.label)).to.deep.equal(['second']);
+
+		// Idempotent: a late second unregister of the DEPARTED handle must not strip the claim
+		// out from under the successor that legitimately took the identity in between.
+		pool.unregisterStore(first);
+		expect(() => pool.registerStore('third', 'test:reused')).to.throw(/never converge/);
+	});
+
+	it('registrations with no identity coexist freely (two memory drivers are two stores)', () => {
+		const pool = new SharedCachePool({ maxBytes: 1000, maxEntries: 100 });
+		const a = pool.registerStore('mem-a');
+		const b = pool.registerStore('mem-b');
+		const c = pool.registerStore();
+		expect(new Set([a.id, b.id, c.id]).size, 'three distinct registrations').to.equal(3);
+		expect(pool.stats().stores).to.have.lengthOf(3);
+	});
+
+	it('the guard is per-pool: one identity on two pools is the documented escape, not an error', () => {
+		// Deliberate, not an oversight — see SharedCachePool's class doc. Closing it would take a
+		// process-global registry outliving every pool; passing a non-default pool is an explicit
+		// act (tests for isolation, hosts for sizing). Pinned so a future reader reads a decision.
+		const poolA = new SharedCachePool({ maxBytes: 1000, maxEntries: 100 });
+		const poolB = new SharedCachePool({ maxBytes: 1000, maxEntries: 100 });
+		expect(() => {
+			poolA.registerStore('a', 'test:escape');
+			poolB.registerStore('b', 'test:escape');
+		}).to.not.throw();
+	});
+
 	it("in 'lru' mode everything goes to Am, evictions never ghost, and touches drive the order", () => {
 		const pool = new SharedCachePool({ maxBytes: 1000, maxEntries: 100, admission: 'lru' });
 		const owner = new RecordingOwner();

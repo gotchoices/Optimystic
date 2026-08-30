@@ -192,7 +192,9 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 	 * `close` is the deliberate exception (a real method below): releasing the store's pool
 	 * registration is THIS wrapper's own capability, needed whether or not the inner driver
 	 * has anything to close. `storeIdentity` passes through unchanged — a cache names the SAME
-	 * store as the driver it fronts; it is not a store of its own.
+	 * store as the driver it fronts; it is not a store of its own — and it is also what the
+	 * constructor hands the pool, so a second cache over an already-cached store is refused
+	 * there (see {@link SharedCachePool.registerStore}).
 	 */
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	approximateBytesUsed?: () => Promise<number>;
@@ -203,7 +205,11 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 		private readonly pool: SharedCachePool = defaultCachePool(),
 		label?: string,
 	) {
-		this.store = pool.registerStore(label);
+		// Registration is the choke point every construction path shares (this constructor, the
+		// `CachedRawStorage` wrapper, `withReadCache`), so naming the backing store here is what
+		// lets the pool refuse a second, permanently divergent view of it. Throws before anything else is
+		// wired; the half-built driver is never returned and holds nothing to clean up.
+		this.store = pool.registerStore(label, inner.storeIdentity?.());
 		if (inner.storeIdentity) {
 			this.storeIdentity = () => inner.storeIdentity!();
 		}
@@ -242,6 +248,12 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 	 * it; on a long-lived provider node the polite release is what keeps occupancy honest.
 	 */
 	async close(): Promise<void> {
+		// NOTE: `unregisterStore` must stay in this method's SYNCHRONOUS prefix — before any
+		// `await`. `withReadCache`'s last release retires its registry entry and calls
+		// `dispose()` in one synchronous block, so today the pool's identity claim is freed in
+		// that same block. Put an await ahead of this line and a re-wrap of the same store
+		// between the retire and the unregister would find the registry empty, construct a new
+		// cache, and hit `registerStore`'s guard on a claim that is merely late to be released.
 		this.clear();
 		this.pool.unregisterStore(this.store);
 		await this.inner.close?.();

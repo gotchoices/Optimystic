@@ -7,6 +7,8 @@ import { MemoryStoreDriver } from '../src/storage/memory-store-driver.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { CachedStoreDriver } from '../src/storage/cached-store-driver.js';
 import { CachedRawStorage } from '../src/storage/cached-raw-storage.js';
+import { SharedCachePool } from '../src/storage/shared-cache-pool.js';
+import type { StoreIdentity } from '../src/storage/store-identity.js';
 import {
 	CountingStoreDriver, READ_METHODS, WRITE_METHODS,
 	makeBlock, collect, runColdStartWorkload,
@@ -382,6 +384,57 @@ describe('CachedStoreDriver coherence', () => {
 		expect((await cached.getMaterializedBlock(blockId, 'a1' as ActionId) as IBlock & { items: string[] }).items).to.deep.equal(['x']);
 		expect((await collect(cached.listRevisions(blockId, 1, 1))).map(r => r.rev)).to.deep.equal([1]);
 		expect(await collect(cached.listPendingTransactions(blockId))).to.deep.equal([]);
+	});
+});
+
+// --- The one-cache-per-backing-store guard, through the real construction path ---
+
+describe('CachedRawStorage over an already-cached backing store', () => {
+	/**
+	 * A driver reporting a fixed store identity — the shape `FileRawStorage` presents (two
+	 * instances over one directory report ONE identity) without touching a disk. Each call
+	 * forwards to its own memory driver, so the two storages below are genuinely two objects
+	 * that merely CLAIM to be one store, which is exactly the bad wiring under test.
+	 */
+	function identified(inner: RawStoreDriver, identity: StoreIdentity): RawStoreDriver {
+		return new Proxy(inner, {
+			get(target, prop, _receiver) {
+				if (prop === 'storeIdentity') return () => identity;
+				const value = Reflect.get(target, prop, target);
+				return typeof value === 'function' ? value.bind(target) : value;
+			},
+		});
+	}
+
+	const storageOver = (identity: StoreIdentity) =>
+		new KvRawStorage(identified(new MemoryStoreDriver(), identity));
+
+	it('refuses the second construction, and accepts it once the first is disposed', async () => {
+		// The hole `withReadCache`'s dedupe cannot close: a host hand-builds a cache over a store,
+		// and something else hand-builds a second one over the same store. Both are supported
+		// constructions, so registration — the choke point they share — is where it is caught.
+		const pool = new SharedCachePool();
+		const first = new CachedRawStorage(storageOver('test:one-store'), pool, 'host-built');
+
+		expect(() => new CachedRawStorage(storageOver('test:one-store'), pool, 'second-consumer'))
+			.to.throw(/never converge/);
+		expect(pool.stats().stores.map(s => s.label), 'the refused construction registered nothing')
+			.to.deep.equal(['host-built']);
+
+		// Sequential reuse: the store is free again once its cache departs.
+		await first.dispose();
+		const second = new CachedRawStorage(storageOver('test:one-store'), pool, 'second-consumer');
+		expect(pool.stats().stores.map(s => s.label)).to.deep.equal(['second-consumer']);
+		await second.dispose();
+	});
+
+	it('leaves identity-less backings alone: two caches over two memory storages coexist', async () => {
+		const pool = new SharedCachePool();
+		const a = new CachedRawStorage(new MemoryRawStorage(), pool, 'mem-a');
+		const b = new CachedRawStorage(new MemoryRawStorage(), pool, 'mem-b');
+		expect(pool.stats().stores.map(s => s.label)).to.deep.equal(['mem-a', 'mem-b']);
+		await a.dispose();
+		await b.dispose();
 	});
 });
 

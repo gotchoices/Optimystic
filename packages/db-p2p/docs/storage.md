@@ -327,6 +327,14 @@ Its soundness rests entirely on the five **Invariants** above:
    funnel and makes cached values stale in ways that feed consensus decisions.
    It is not enforced in code (see Invariant 5's embedder note).
 
+   Its *in-process* twin — two caches over one store, which diverge the same way
+   two processes do — **is** enforced: `SharedCachePool.registerStore` refuses a
+   second live registration for a backing store identity that already has one, so
+   the bad wiring throws at construction instead of silently serving each half of
+   the process its own stale view. Two escapes stay open by design (registering
+   with two different pools, and backends that report no identity), and the
+   cross-process case above is untouched by it; § 6 lists all of them.
+
 Semantics worth knowing:
 
 - **Never write-behind.** No write is deferred, reordered, or coalesced; the
@@ -477,16 +485,46 @@ Semantics worth knowing:
   through a bare `FileRawStorage`) must release every lease in between, or the
   second `Database` reads pre-tamper values.
 
-  **What remains of Invariant 5 for the cache.** Dedupe closes the in-process
-  case only as far as identity reaches. Still open: the *cross-process* case (the
-  filesystem driver takes no lock — the proper-lockfile TODO in
-  `db-p2p-storage-fs/src/file-storage.ts` — and a second process's writes bypass
-  this cache entirely); the identity residuals (path aliases, two handles over
-  one database — each backend's `NOTE:` lists its own), where two storages over
-  one location report two identities and get two caches; and a host that builds
-  its own `CachedRawStorage` while a second consumer wraps a fresh instance over
-  the same store, which never meets the registry. Each of those still fails
-  silently, the way the in-process case used to.
+  **The construction guard behind the dedupe.** Deduping in this helper only
+  covers caches this helper built. A cache can also be constructed directly —
+  `new CachedRawStorage(inner)` and `new KvRawStorage(new
+  CachedStoreDriver(driver))` are both supported — so a host that hand-builds a
+  cache over a directory, while a second consumer's `rawStorageFactory` returns
+  a fresh storage over that same directory, still ends up with two caches: the
+  helper never saw the first one. Every cache however constructed registers a
+  store with a `SharedCachePool`, and that registration is the one choke point
+  all construction paths share, so it is where the conflict is caught:
+  `SharedCachePool.registerStore` takes the backing store's identity (passed by
+  `CachedStoreDriver`'s constructor) and **throws** when that identity already
+  has a live registration on the pool, naming both labels and the fix. Throwing
+  rather than logging is the point — the failure it replaces is silent wrong
+  data returned to a caller with no way to notice. The check runs before any
+  mutation, so a refused registration leaves the pool untouched, and
+  `unregisterStore` frees the identity, so sequential reuse of one store (stop a
+  node, start another over the same directory) registers cleanly.
+
+  **What remains of Invariant 5 for the cache.** Dedupe plus the guard close the
+  in-process case only as far as identity reaches, and only within one pool.
+  Still open:
+  - the *cross-process* case (the filesystem driver takes no lock — the
+    proper-lockfile TODO in `db-p2p-storage-fs/src/file-storage.ts` — and a
+    second process's writes bypass this cache entirely). Out of scope for any
+    in-process check;
+  - **two different pools.** The guard's claim map lives on the pool, so two
+    caches over one store registered with two different `SharedCachePool`
+    instances both succeed and both diverge. Left open deliberately: closing it
+    would take a process-global identity registry outliving every pool, more
+    machinery than the case deserves, since passing a non-default pool is an
+    explicit act (tests do it for isolation, hosts for sizing). Pinned by a test
+    in `test/shared-cache-pool.spec.ts` so it reads as a decision;
+  - the identity residuals (path aliases, two handles over one database — each
+    backend's `NOTE:` lists its own), where two storages over one location report
+    two identities, so neither the dedupe nor the guard sees a match;
+  - backends that report no identity at all (memory drivers, test doubles), which
+    are correctly uncovered — two memory drivers are two genuinely different
+    stores.
+
+  The first three still fail silently, the way the in-process case used to.
 - Backend exposes its `RawStoreDriver` (all kernel-backed backends):
   `new KvRawStorage(new CachedStoreDriver(driver))`. Optional second/third
   constructor args pick a specific `SharedCachePool` (default: the shared
