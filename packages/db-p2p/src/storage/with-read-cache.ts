@@ -155,6 +155,12 @@ export function withReadCache(storage: IRawStorage, label?: string, pool?: Share
 	const identity = storage.getStoreIdentity?.();
 	const existing = identity === undefined ? byObject.get(storage) : byIdentity.get(identity);
 	if (existing) {
+		// NOTE: on a hit the `storage` argument is dropped unused — the FIRST caller's instance is
+		// the one the shared cache fronts, and the only one the last release closes. Free today:
+		// `IRawStorage` has no close, and the only backend whose identity can make two DISTINCT
+		// objects collide is the filesystem one, which holds nothing open. If a backend ever pairs
+		// a location-derived identity with an open handle, the discarded instance would leak that
+		// handle — close it here, or key such backends by handle (`identityForHandle`) instead.
 		existing.refs += 1;
 		return { storage: existing.cache, lease: new Lease(existing) };
 	}

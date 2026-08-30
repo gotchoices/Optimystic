@@ -77,10 +77,12 @@ export class FileStoreDriver implements RawStoreDriver {
 		// NOTE: the win32 fold is the one branch that can err in the UNSAFE direction — Windows
 		// 10+ supports per-directory case sensitivity (`fsutil file setCaseSensitiveInfo`), and
 		// on such a directory `X:\p\Foo` and `X:\p\foo` are two directories folded onto ONE
-		// identity. A consumer that merges on equality would then merge two distinct stores.
-		// Not addressable synchronously either (the flag is a per-directory filesystem query).
-		// Revisit if Optimystic ever targets a case-sensitive-enabled Windows directory; until
-		// then the fold is right for every ordinary Windows volume.
+		// identity. That merging consumer now exists — `withReadCache` (db-p2p) shares ONE read
+		// cache per identity — so on such a directory the two stores would read through one cache
+		// and see each other's blocks. Not addressable synchronously either (the flag is a
+		// per-directory filesystem query). Revisit if Optimystic ever targets a
+		// case-sensitive-enabled Windows directory; until then the fold is right for every
+		// ordinary Windows volume.
 		const resolved = path.resolve(basePath);
 		this.identity = `file:${process.platform === 'win32' ? resolved.toLowerCase() : resolved}`;
 	}

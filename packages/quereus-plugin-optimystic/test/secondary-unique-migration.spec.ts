@@ -27,7 +27,14 @@ import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 
-function createDb(dir: string): { db: Database } {
+/**
+ * A `Database` over `dir` plus its plugin handle. The handle is needed at every close site:
+ * the `local` transactor's read cache is shared per directory for as long as any lease on it
+ * is held, so a `Database` that closes WITHOUT `plugin.dispose()` keeps the cache warm and the
+ * next `Database` over the same `dir` reads it instead of the on-disk bytes. This file's whole
+ * point is that build 2 must start from what build 1 left on disk, so every close releases.
+ */
+function createDb(dir: string): { db: Database; plugin: ReturnType<typeof register> } {
 	const db = new Database();
 	const config = {
 		default_transactor: 'local',
@@ -42,7 +49,7 @@ function createDb(dir: string): { db: Database } {
 	for (const func of plugin.functions) {
 		db.registerFunction(func.schema);
 	}
-	return { db };
+	return { db, plugin };
 }
 
 async function scalar(db: Database, sql: string): Promise<SqlValue> {
@@ -86,7 +93,7 @@ describe('Secondary-UNIQUE migration: backfill an empty unique tree over pre-exi
 		// Build 1: NO unique constraint — rows land in the main collection with no unique
 		// tree ever created. This is the "older build" state.
 		{
-			const { db } = createDb(dir);
+			const { db, plugin } = createDb(dir);
 			try {
 				await db.exec(
 					`create table T (Id integer primary key, Stamp text not null) using optimystic('${uri}')`,
@@ -96,6 +103,7 @@ describe('Secondary-UNIQUE migration: backfill an empty unique tree over pre-exi
 				await db.exec(`insert into T (Id, Stamp) values (3, 'c')`);
 			} finally {
 				db.close();
+				await plugin.dispose();
 			}
 		}
 
@@ -105,7 +113,7 @@ describe('Secondary-UNIQUE migration: backfill an empty unique tree over pre-exi
 		// must populate it before the first probe, so a duplicate of a pre-existing value
 		// is rejected.
 		{
-			const { db } = createDb(dir);
+			const { db, plugin } = createDb(dir);
 			try {
 				await db.exec(
 					`create table T (Id integer primary key, Stamp text not null unique) using optimystic('${uri}')`,
@@ -121,6 +129,7 @@ describe('Secondary-UNIQUE migration: backfill an empty unique tree over pre-exi
 				expect(Number(await scalar(db, `select count(*) as v from T where Stamp = 'a'`))).to.equal(1);
 			} finally {
 				db.close();
+				await plugin.dispose();
 			}
 		}
 	});

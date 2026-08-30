@@ -142,6 +142,38 @@ describe('withReadCache (composition-seam helper)', () => {
 		expect(pool.stats().stores).to.have.length(0);
 	});
 
+	it('the identity key is retired on the last release: a re-wrap is cold and the stale lease is inert', async () => {
+		// The refcount test below walks this lifecycle on the OBJECT key; production walks it on
+		// the IDENTITY key (two `FileRawStorage` over one dir), where retirement is a `Map.delete`
+		// rather than a `WeakMap.delete` and the key outlives every storage object that used it. A
+		// leftover entry here would hand a re-opened store a dead cache; a successor entry retired
+		// by the departed lease would blind the store that just re-opened it.
+		const pool = new SharedCachePool();
+		const backing = new MemoryStoreDriver();
+		const identity = 'spec:retired-identity';
+		const counting = new CountingStoreDriver(backing);
+
+		const first = withReadCache(new KvRawStorage(identified(counting, identity)), 'first', pool);
+		await first.storage.saveMetadata(blockId, meta(1));
+		await first.lease!.release();
+		expect(pool.stats().stores, 'the identity entry was retired, not just emptied').to.have.length(0);
+
+		// A DIFFERENT storage object under the same identity: a stale byIdentity entry would hand
+		// back the dead cache instead of building one.
+		const reopened = withReadCache(new KvRawStorage(identified(counting, identity)), 'reopened', pool);
+		expect(reopened.storage, 'a fresh cache, not the retired one').to.not.equal(first.storage);
+		expect(pool.stats().stores.map(s => s.label)).to.deep.equal(['reopened']);
+		const readsBefore = counting.count('getMetadata');
+		expect((await reopened.storage.getMetadata(blockId))!.latest!.rev, 'reads the store, not a stale cache').to.equal(1);
+		expect(counting.count('getMetadata'), 'cold: one real backend read').to.equal(readsBefore + 1);
+
+		// The departed lease must not retire the successor registered under the same identity.
+		await first.lease!.release();
+		expect(pool.stats().stores, 'the stale lease is inert against its successor').to.have.length(1);
+		await reopened.lease!.release();
+		expect(pool.stats().stores).to.have.length(0);
+	});
+
 	it('distinct identities, and identity-less distinct objects, keep independent caches', async () => {
 		// The dedupe must not over-merge: several db-p2p specs build two caches over two memory
 		// drivers and compare them, and two stores that merely LOOK alike must stay apart.

@@ -206,6 +206,34 @@ register(db, {
 });
 ```
 
+### Closing down: call `plugin.dispose()` after `db.close()`
+
+`register()` returns a plugin handle with an async `dispose()`. `db.close()` does not reach it,
+so call it yourself when you are done with a `Database`:
+
+```typescript
+const plugin = register(db, { default_transactor: 'local', rawStorageFactory: () => new FileRawStorage(dir) });
+// ...
+db.close();
+await plugin.dispose();
+```
+
+`dispose()` releases the plugin's claim on the read cache that sits in front of your
+`rawStorageFactory` storage. That cache is **one per backing store per process**, shared by
+every `Database` registered over the same store — which is what lets two `Database`s over one
+directory see each other's committed writes — and it is only cleared once the last claim on it
+is released.
+
+So a skipped `dispose()` is not a correctness problem (the cache is write-through, and every
+in-process write went through it), but it has one visible consequence: the store's cache stays
+warm for the life of the process, so a **later** `Database` over the same store reads it
+instead of re-reading the backend. If something outside Optimystic mutates that store between
+two `Database`s — a test that writes files into the directory itself, say — dispose in between
+or the second `Database` will serve the pre-mutation values.
+
+When the plugin owns libp2p nodes, `plugin.collectionFactory.shutdown()` stops them and calls
+`dispose()` as its last step; use that instead.
+
 ## Custom Networks and Transactors
 
 Register custom implementations before creating tables that reference them:

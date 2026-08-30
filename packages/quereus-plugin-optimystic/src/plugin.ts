@@ -72,11 +72,17 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		 */
 		hydrate: (db: Database) => optimysticModule.hydrateCatalog(db, config, config),
 		/**
-		 * Release what the plugin holds outside the `Database` — today the raw-storage
-		 * read caches behind `local` transactors over host-supplied storage (see
+		 * Release what the plugin holds outside the `Database` — today its LEASES on the
+		 * raw-storage read caches behind `local` transactors over host-supplied storage (see
 		 * `CollectionFactory.dispose`). Call after `db.close()`. Quereus has no close hook
-		 * that reaches the plugin, so this is explicit; a host that skips it leaks only cold
-		 * cache bookkeeping, bounded by the shared pool's budget.
+		 * that reaches the plugin, so this is explicit.
+		 *
+		 * A cache is shared by every consumer of one backing store and is cleared only when the
+		 * LAST lease on it releases, so skipping this is not a correctness problem — but it keeps
+		 * that store's cache warm for the process, and a later `Database` over the same store then
+		 * reads it instead of the backend. Anything that mutates the store behind Optimystic's
+		 * back between two `Database`s must dispose in between. See `withReadCache` in
+		 * `@optimystic/db-p2p`.
 		 */
 		dispose: () => collectionFactory.dispose(),
 	};

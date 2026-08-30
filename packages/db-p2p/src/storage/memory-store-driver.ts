@@ -144,9 +144,17 @@ export class MemoryStoreDriver implements RawStoreDriver {
 	// --- optional passthroughs ---
 
 	// Deliberately NO storeIdentity(): two MemoryStoreDrivers hold two independent Maps and are
-	// genuinely two different stores, so there is no shared "location" for them to name. The
-	// case that DOES matter — one driver object shared by two wrappers — is already covered by
-	// object identity, so an identity string would add nothing.
+	// genuinely two different stores, so there is no shared "location" for them to name.
+	//
+	// NOTE: one driver object shared by two `KvRawStorage` wrappers is NOT covered. `withReadCache`
+	// falls back to keying on the STORAGE object, not the driver, so those two wrappers are two
+	// keys and get two read caches over one Map — the divergence dedupe exists to remove. Harmless
+	// today: this driver is a test fixture and every shipping backend's driver reports an identity,
+	// so the identity-less path only ever sees genuinely distinct stores. If a host ever wires
+	// `rawStorageFactory: () => new KvRawStorage(oneSharedDriver)` for two consumers, give this
+	// driver `identityForHandle('memory', this)` (store-identity.ts) — that makes the two wrappers
+	// name one store — and re-premise `local-transactor-read-cache.spec.ts`, which currently
+	// asserts the non-dedupe.
 
 	async *listBlockIds(): AsyncIterable<BlockId> {
 		// Snapshot the keys before yielding so a concurrent putMetadata during the scan
