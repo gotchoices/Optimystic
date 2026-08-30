@@ -80,3 +80,34 @@ re-creating at the same URI inherits them, and that the workaround is to use a f
 collection URI. `test/schema-redeclare-column-identity.spec.ts` also has to work around
 it — its drop-then-recreate case uses a fresh primary key so the new row does not collide
 with the dropped table's row 1 — and says so in a comment.
+
+## Steer for this fix pass (added on promotion)
+
+**Do not build collection deletion to close this.** The tradeoffs line is right that deleting a
+distributed collection is not cheap or obviously safe — another node may still be reading it, and no
+"delete a whole collection" primitive exists. Building one is a feature, it needs its own design, and
+it is not what makes this a corruption ticket.
+
+What makes it corruption is narrower and fixable without that: **rows that survive a DROP are decoded
+against a column list they were never written under, and surface as rows the new table's own
+declaration says cannot exist.** Silence is the defect. A `CREATE TABLE` that inherits foreign rows
+should fail loudly at the declaration rather than serve mangled ones.
+
+Climb to the invariant rather than patching the observed sequence: the rule wanted is roughly *a
+table may not be declared over a URI already holding rows whose shape contradicts the declaration* —
+which also covers the cases nobody has typed yet (two nodes declaring incompatible shapes over one
+URI; a URI reused across unrelated tables) rather than only DROP-then-CREATE. Prefer that to a check
+keyed on "did a DROP happen recently", which cannot see any of those.
+
+Points worth settling in the pass, with defensible defaults if research does not overturn them:
+
+- **Compatible re-create should still work.** Re-declaring the same shape over the same URI is the
+  supported way a node states its view of a table (`bug-persisted-index-outlives-the-columns-it-points-at`
+  leans on it). Only a contradicting shape should be refused.
+- **Say what to do about it.** A refusal that names the URI, the shape found, and the shape declared
+  is actionable; a bare error sends someone to the source.
+- **Secondary-index trees at `<uri>/index/<name>` have the same problem** and are named in the
+  ticket — cover them or state explicitly why not.
+- If the honest conclusion is that a sound check needs a primitive that does not exist, say so and
+  route to `blocked/` with the options laid out. Do not leave the corrupting path silent because the
+  complete fix is out of reach — a loud, conservative refusal beats mangled rows.
