@@ -130,8 +130,10 @@ its generator; committed scans read per-scan pinned views; a live scan's
 `collection.update()` serializes behind db-core's per-`Collection`-INSTANCE latch — inside a
 transaction the scans on a table share one instance and so that latch, and
 `TransactionCoordinator` holds the same latch for its whole commit span so a refresh cannot
-interleave with a mid-flight commit; outside a transaction each scan resolves its own instance
-with its own tracker, so there is no shared collection state to serialize). Writes still
+interleave with a mid-flight commit — regression anchor:
+`packages/db-core/test/coordinator-latch-interleaving.spec.ts`, which parks a commit mid-flight
+and releases an `update()` into the parked instant; outside a transaction each scan resolves its
+own instance with its own tracker, so there is no shared collection state to serialize). Writes still
 serialize, which is what keeps the bridge's single-writer state (below) unexposed.
 `readCommittedSnapshot` is **also declared** (the stronger promise that a committed
 read survives another connection's commit mid-scan), proven under a stalled commit in

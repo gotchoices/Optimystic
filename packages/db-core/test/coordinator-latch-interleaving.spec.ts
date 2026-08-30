@@ -106,10 +106,21 @@ async function drainMacrotasks(turns = 10): Promise<void> {
  *  completion harmlessly, so on its own neither case proves the latch is what protected them.
  *  This does: checked after {@link drainMacrotasks} but before the gate opens, a still-pending
  *  refresh is a refresh queued behind the coordinator's held latch. */
-function releaseRefresh(collection: Collection<SpecAction>): { promise: Promise<void>; blocked: () => boolean } {
+function releaseRefresh(collection: Collection<SpecAction>): { settle: () => Promise<void>; blocked: () => boolean } {
 	let done = false;
-	const promise = collection.update().then(() => { done = true; });
-	return { promise, blocked: () => !done };
+	let failure: unknown;
+	// Both handlers attach SYNCHRONOUSLY, and the rethrowing promise is built only when the caller
+	// asks for it. The refresh sits unawaited across drainMacrotasks below, so a rejection reaching
+	// the end of a turn with no handler would be a fatal unhandled rejection — killing the process
+	// instead of failing the case. Captured here, rethrown at `settle()`.
+	const captured = collection.update().then(
+		() => { done = true; },
+		(e: unknown) => { done = true; failure = e; },
+	);
+	return {
+		settle: () => captured.then(() => { if (failure !== undefined) throw failure; }),
+		blocked: () => !done,
+	};
 }
 
 /** Every action recorded in a collection's committed log, oldest first. One entry per landed
@@ -243,13 +254,18 @@ describe('coordinator commit / collection refresh interleaving', () => {
 
 		// Release a refresh into exactly that window and give it every chance to interleave.
 		const refresh = releaseRefresh(collection);
-		await drainMacrotasks();
-		expect(refresh.blocked(), 'the refresh is queued behind the commit span, not running inside it')
-			.to.be.true;
-
-		transactor.openGate();
+		// The gate opens in the `finally` so a FAILING assertion still lets the parked commit run to
+		// completion. Without it a failure leaves `commitPromise` pending forever and the
+		// collection's latch held, so the case reports its real failure buried under leaked state.
+		try {
+			await drainMacrotasks();
+			expect(refresh.blocked(), 'the refresh is queued behind the commit span, not running inside it')
+				.to.be.true;
+		} finally {
+			transactor.openGate();
+		}
 		await commitPromise;
-		await refresh.promise;	// also the no-deadlock assertion (the mocha timeout catches a hang)
+		await refresh.settle();	// also the no-deadlock assertion (the mocha timeout catches a hang)
 
 		expect(transactor.pendRevs, 'exactly one pend, one revision').to.have.lengthOf(1);
 		const pendedRev = transactor.pendRevs[0];
@@ -293,13 +309,15 @@ describe('coordinator commit / collection refresh interleaving', () => {
 
 		// Release a refresh on the LOSER's instance while its own pend is still parked.
 		const refresh = releaseRefresh(collection);
-		await drainMacrotasks();
-		expect(refresh.blocked(), 'the refresh is queued behind the commit span, not replaying inside it')
-			.to.be.true;
-
-		transactor.openGate();
+		try {	// gate opens even on a failing assertion — see case 1
+			await drainMacrotasks();
+			expect(refresh.blocked(), 'the refresh is queued behind the commit span, not replaying inside it')
+				.to.be.true;
+		} finally {
+			transactor.openGate();
+		}
 		await commitPromise;
-		await refresh.promise;	// no-deadlock assertion, as in case 1
+		await refresh.settle();	// no-deadlock assertion, as in case 1
 
 		// Attempt 1 loses the revision to the rival; the retry re-reads and attempt 2 wins.
 		expect(transactor.snapshots.length, 'the parked pend and at least one retry delegated')
@@ -310,6 +328,11 @@ describe('coordinator commit / collection refresh interleaving', () => {
 		});
 
 		// Both writers are durable, once each — the retry did not re-append the loser's entry.
+		// NOTE: the ORDER here is a TestTransactor property (the rival commits to completion before
+		// the parked pend is released), not a guarantee of the code under test. What this case is
+		// actually asserting is the multiset — one entry per writer, no duplicate from the retry. If
+		// a transactor change ever makes commit ordering non-deterministic, compare sorted values
+		// rather than relaxing this into a length check, which would stop catching a duplicate.
 		expect((await logActions(collection)).map(a => a.data.value), 'both writes landed, once each')
 			.to.deep.equal(['rival', 'local']);
 		const fresh = await Collection.open<SpecAction>(inner, collectionId, init());
@@ -318,5 +341,17 @@ describe('coordinator commit / collection refresh interleaving', () => {
 			.to.deep.equal(['rival', 'local']);
 		expect(inner.getCommittedActions().has(transaction.id), "the loser's action committed")
 			.to.be.true;
+
+		// Same (revision, lineage) agreement case 1 asserts, but reached through the RETRY: the
+		// retry loop's blanket collection.update() runs outside the latch, between attempts, so
+		// this is where a rev captured on attempt 1 and recorded after attempt 2 would show up.
+		// Explicitly a number, so the equality below cannot pass with both sides `undefined`.
+		expect(collection.committedRevision(), 'the winning attempt recorded a revision').to.be.a('number');
+		expect(collection.committedRevision(), 'local record and storage agree on the revision')
+			.to.equal(fresh!.committedRevision());
+		expect(collection.committedActionId(), "under the winning attempt's own action id")
+			.to.equal(transaction.id);
+		expect(fresh!.committedActionId(), 'and storage attributes that revision to it')
+			.to.equal(transaction.id);
 	});
 });
