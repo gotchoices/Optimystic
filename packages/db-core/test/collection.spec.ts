@@ -1411,6 +1411,29 @@ describe('Collection', () => {
       return { transactor, arm: () => { armed = true } }
     }
 
+    /** While armed, hides every tail-block log entry above `maxRev` from readers, so a chain walk
+     *  reaches a LOWER revision than the handle already holds — an ordinary lagging read, with
+     *  both sides on one honest lineage. The tail's `state` is left alone: only the walk lags. */
+    const truncatedTailTransactor = (inner: TestTransactor, tailId: string, maxRev: number) => {
+      let armed = false
+      const transactor: ITransactor = {
+        async get(gets: BlockGets): Promise<GetBlockResults> {
+          const res = await inner.get(gets)
+          const entry = res[tailId]
+          const block = entry?.block as (IBlock & { entries?: { rev: number }[] }) | undefined
+          if (armed && block?.entries) {
+            res[tailId] = { ...entry!, block: { ...block, entries: block.entries.filter(e => e.rev <= maxRev) } as IBlock }
+          }
+          return res
+        },
+        getStatus: (refs: ActionBlocks[]) => inner.getStatus(refs),
+        pend: (req: PendRequest) => inner.pend(req),
+        cancel: (ref: ActionBlocks) => inner.cancel(ref),
+        commit: (req: CommitRequest) => inner.commit(req),
+      }
+      return { transactor, arm: () => { armed = true } }
+    }
+
     // The healthy path is the assertion that matters most: a shortfall line on an ordinary
     // refresh would be noise in every log this diagnostic is meant to be read in.
     it('an ordinary refresh of an already-current collection says nothing', async () => {
@@ -1503,10 +1526,12 @@ describe('Collection', () => {
     })
 
     // The sibling guard: a collection refusing to move BACKWARDS. Its two revision numbers say
-    // only that this handle sits above what it just read; the ACTION ids say why. The same action
-    // on both sides means the handle is merely pinned high over one lineage, while different
-    // actions would mean a fork had been sealed underneath it — the distinction an operator
-    // cannot make from the revision numbers alone.
+    // only that this handle sits above what it just read; the ACTION ids — both taken at the
+    // READ's revision, the only one the two sides can be compared at — say why. The same action
+    // on both sides means the handle is merely lagging over one lineage; different actions would
+    // mean a fork had been sealed underneath it; `none` on the held side means this handle's own
+    // list does not reach back that far, which is what a context bootstrapped from an
+    // over-claiming tail looks like — as here.
     it('a refusal to move backwards names the action on each side, and its call site', async () => {
       const notLoweredTag = 'collection:context-not-lowered'
       const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
@@ -1533,19 +1558,81 @@ describe('Collection', () => {
       const lines = await captureCollectionLog(() => pinned!.update())
       const notLowered = lines.filter(l => l.includes(notLoweredTag))
       expect(notLowered.length, `exactly one refusal line, got: ${lines.join(' | ')}`).to.equal(1)
-      const parsed = /id=(\S+) tag=(\S+) site=(\S+) held=(\d+) read=(\d+) heldAction=(\S+) readAction=(\S+)/
+      const parsed = /id=(\S+) tag=(\S+) site=(\S+) heldRev=(\d+) readRev=(\d+) heldAction=(\S+) readAction=(\S+)/
         .exec(notLowered[0]!)
       expect(parsed, `the line names id, tag, site, both revisions and both actions: ${notLowered[0]}`)
         .to.not.equal(null)
-      const [, id, tag, site, held, read, heldAction, readAction] = parsed!
+      const [, id, tag, site, heldRev, readRev, heldAction, readAction] = parsed!
       expect(id, 'the line names the collection').to.equal(collectionId)
       expect(tag, 'and the handle that reported it').to.equal(pinned!.instanceTag)
       expect(site, 'this one came from a refresh, not the open').to.equal('refresh')
-      expect(Number(held), 'the handle is pinned at the inflated revision').to.equal(rev + 5)
-      expect(Number(read), 'while the log walk reaches only the real one').to.equal(rev)
-      expect(heldAction, 'one action on both sides: pinned high over one lineage, not forked')
+      expect(Number(heldRev), 'the handle is pinned at the inflated revision').to.equal(rev + 5)
+      expect(Number(readRev), 'while the log walk reaches only the real one').to.equal(rev)
+      expect(heldAction, 'the pinned context names nothing at the read revision — its whole list is the tail claim')
+        .to.equal('none')
+      expect(readAction, 'while the log names the action that really produced that revision')
         .to.equal(storedActionId)
-      expect(readAction).to.equal(storedActionId)
+    })
+
+    // The regression the field pair exists to avoid: on an ordinary lagging read the two sides
+    // are ONE lineage, and the line must say so. Looking each side up at its OWN revision would
+    // print two different ids here — the reader's action at revision 2 against the log's at
+    // revision 1 — which reads exactly like the fork this line is meant to distinguish from lag.
+    it('a refusal on an ordinary lagging read names one action on both sides', async () => {
+      const notLoweredTag = 'collection:context-not-lowered'
+      const writer = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await writer.act({ type: 'set', data: { value: 'one', timestamp: 1 } })
+      await writer.updateAndSync()
+      await writer.act({ type: 'set', data: { value: 'two', timestamp: 2 } })
+      await writer.updateAndSync()
+      const { tailId, rev } = await syncedTail()
+
+      // Opened against the honest tail, so the reader holds a list covering BOTH revisions;
+      // the truncation is armed only afterwards, so its refresh walks back to revision 1.
+      const truncated = truncatedTailTransactor(transactor, tailId, rev - 1)
+      const reader = await Collection.open<TestAction>(truncated.transactor, collectionId, initOptions)
+      expect(reader?.committedRevision(), 'the reader opens at the real latest revision').to.equal(rev)
+      truncated.arm()
+
+      const lines = await captureCollectionLog(() => reader!.update())
+      const notLowered = lines.filter(l => l.includes(notLoweredTag))
+      expect(notLowered.length, `exactly one refusal line, got: ${lines.join(' | ')}`).to.equal(1)
+      const parsed = /heldRev=(\d+) readRev=(\d+) heldAction=(\S+) readAction=(\S+)/.exec(notLowered[0]!)
+      expect(parsed, `the line names both revisions and both actions: ${notLowered[0]}`).to.not.equal(null)
+      const [, heldRev, readRev, heldAction, readAction] = parsed!
+      expect(Number(heldRev), 'the reader still holds what it earned').to.equal(rev)
+      expect(Number(readRev), 'while the truncated walk reaches only the revision below it').to.equal(rev - 1)
+      expect(heldAction, 'the held side names an action at the read revision — no fork to report')
+        .to.not.equal('none')
+      expect(readAction, 'and it is the same action the log names there: one lineage, merely lagging')
+        .to.equal(heldAction)
+      expect(lines.filter(l => l.includes('collection:lineage-divergence')),
+        'and nothing claims a divergence').to.deep.equal([])
+      expect(reader!.committedRevision(), 'the refusal kept the higher revision').to.equal(rev)
+    })
+
+    // The refusal is the guard; the fields only explain it. Every other test here runs with the
+    // namespace ON, so a future edit that moved the `return` inside the `log.enabled` block would
+    // pass all of them while letting revisions silently go backwards on a normal run.
+    it('refuses to move backwards with the debug namespace off', async () => {
+      const writer = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await writer.act({ type: 'set', data: { value: 'one', timestamp: 1 } })
+      await writer.updateAndSync()
+      await writer.act({ type: 'set', data: { value: 'two', timestamp: 2 } })
+      await writer.updateAndSync()
+      const { tailId, rev } = await syncedTail()
+
+      const truncated = truncatedTailTransactor(transactor, tailId, rev - 1)
+      const reader = await Collection.open<TestAction>(truncated.transactor, collectionId, initOptions)
+      truncated.arm()
+
+      const previousNamespaces = debug.disable()
+      try {
+        await reader!.update()
+      } finally {
+        if (previousNamespaces) debug.enable(previousNamespaces)
+      }
+      expect(reader!.committedRevision(), 'the guard holds without a logger to explain it').to.equal(rev)
     })
   })
 
@@ -1695,7 +1782,7 @@ describe('Collection', () => {
       const lines = await captureCollectionLog(() => diverged.update())   // must NOT throw
       const divergence = lines.filter(l => l.includes(divergenceTag))
       expect(divergence.length, `exactly one divergence line, got: ${lines.join(' | ')}`).to.equal(1)
-      const parsed = /id=(\S+) tag=(\S+) site=(\S+) forkRev=(\d+) held=(\S+) read=(\S+) heldRev=(\d+) readRev=(\d+)/
+      const parsed = /id=(\S+) tag=(\S+) site=(\S+) forkRev=(\d+) heldAction=(\S+) readAction=(\S+) heldRev=(\d+) readRev=(\d+)/
         .exec(divergence[0]!)
       expect(parsed, `the line names id, tag, site, forkRev, held, read and both revs: ${divergence[0]}`).to.not.equal(null)
       const [, id, tag, site, forkRev, held, read, heldRev, readRev] = parsed!
@@ -1757,7 +1844,7 @@ describe('Collection', () => {
 
       const divergence = lines.filter(l => l.includes(divergenceTag))
       expect(divergence.length, `exactly one divergence line, got: ${lines.join(' | ')}`).to.equal(1)
-      const parsed = /tag=(\S+) site=(\S+) forkRev=(\d+) held=(\S+) read=(\S+)/.exec(divergence[0]!)
+      const parsed = /tag=(\S+) site=(\S+) forkRev=(\d+) heldAction=(\S+) readAction=(\S+)/.exec(divergence[0]!)
       expect(parsed, `the line names tag, site, forkRev, held and read: ${divergence[0]}`).to.not.equal(null)
       const [, tag, site, rev, held, read] = parsed!
       expect(tag, 'the tag is the one the handle being opened will carry').to.equal(opened!.instanceTag)
@@ -1797,7 +1884,7 @@ describe('Collection', () => {
       const lines = await captureCollectionLog(() => diverged!.update())
       const divergence = lines.filter(l => l.includes(divergenceTag))
       expect(divergence.length, `exactly one divergence line, got: ${lines.join(' | ')}`).to.equal(1)
-      const parsed = /site=(\S+) forkRev=(\d+) held=(\S+) read=(\S+) heldRev=(\d+) readRev=(\d+)/
+      const parsed = /site=(\S+) forkRev=(\d+) heldAction=(\S+) readAction=(\S+) heldRev=(\d+) readRev=(\d+)/
         .exec(divergence[0]!)
       expect(parsed, `the line names site, forkRev, held, read and both revs: ${divergence[0]}`).to.not.equal(null)
       const [, site, forkRev, held, read, heldRev, readRev] = parsed!

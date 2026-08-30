@@ -303,18 +303,24 @@ Its sibling `collection:context-not-lowered` reports the opposite guard — a co
 move *backwards* because a read returned an older view than the revision it already holds:
 
 ```
-optimystic:db-core:collection collection:context-not-lowered id=default/Usage/index/by_token tag=k3Vq_A site=refresh held=4 read=3 heldAction=fR1TfGRxHLN_Icl0ZK-XIw readAction=fR1TfGRxHLN_Icl0ZK-XIw
+optimystic:db-core:collection collection:context-not-lowered id=default/Usage/index/by_token tag=k3Vq_A site=refresh heldRev=4 readRev=3 heldAction=fR1TfGRxHLN_Icl0ZK-XIw readAction=fR1TfGRxHLN_Icl0ZK-XIw
 ```
 
-- `held=` / `read=` — the revision this handle already holds, and the lower one the read returned.
-  The read is discarded; the handle keeps `held=`.
-- `heldAction=` / `readAction=` — the action ids at those two revisions, or `none` where the side
-  names no action there (see *Silence is weaker evidence* below for when that legitimately happens).
-  **These are the field that makes the line diagnosable.** The same id on both sides — as above —
-  means one lineage that this handle simply sits ahead of: it is pinned above what the read could
-  see, nothing has forked. Two *different* ids mean the read came from a different lineage
-  altogether, which is a fork being sealed underneath this handle rather than ordinary lag, and
-  should be read alongside `lineage-divergence` below.
+- `heldRev=` / `readRev=` — the revision this handle already holds, and the lower one the read
+  returned. The read is discarded; the handle keeps `heldRev=`.
+- `heldAction=` / `readAction=` — what each side names as the action at `readRev=`. **Both are taken
+  at the same revision — the read's — because that is the only one the two can be compared at**, and
+  that comparison is the field that makes the line diagnosable:
+  - **Same id** (as above) — the read is an older view of *this* handle's own lineage. Ordinary lag,
+    correctly refused; nothing has forked.
+  - **Different ids** — the read came from a different lineage altogether: a fork being sealed
+    underneath this handle rather than lag. A `lineage-divergence` line reporting the same split
+    normally accompanies it.
+  - **`heldAction=none`** — this handle's own context names no action that far back, so the line
+    cannot say which. That is the signature of a context bootstrapped from a tail block claiming a
+    revision its own log never reaches: the handle's whole list *is* that one claim, which is also
+    why `lineage-divergence` stays silent (it has no revision the two sides share). `readAction=none`
+    means the same on the read's side — see *Silence is weaker evidence* below.
 - `site=` — which call path reported; see the description of the field under `lineage-divergence`.
 
 All three lines are worth enabling together:
@@ -334,7 +340,7 @@ mismatch anywhere means the local copy and the stored log are provably different
 without needing a second node's lines):
 
 ```
-optimystic:db-core:collection collection:lineage-divergence id=default/Usage/index/by_token tag=k3Vq_A site=refresh forkRev=1 held=fR1TfGRxHLN_Icl0ZK-XIw read=vR5WcYtFvwoW2nYPa8BqCg heldRev=2 readRev=2
+optimystic:db-core:collection collection:lineage-divergence id=default/Usage/index/by_token tag=k3Vq_A site=refresh forkRev=1 heldAction=fR1TfGRxHLN_Icl0ZK-XIw readAction=vR5WcYtFvwoW2nYPa8BqCg heldRev=2 readRev=2
 ```
 
 - `id=` — the collection id, joining to `index:seek`'s `collection=`/`main=` and to
@@ -352,9 +358,13 @@ optimystic:db-core:collection collection:lineage-divergence id=default/Usage/ind
 - `forkRev=` — the **lowest** revision the two sides both name an action for and disagree about:
   where the lineages provably parted. It is not necessarily the revision either side currently sits
   at — a copy that forked and kept writing agrees with storage at the revisions above the split, so
-  the split point is usually *below* the current revision.
-- `held=` / `read=` — the two action ids **at `forkRev=`**: `held` is what this handle's own context
-  carries there (its lineage marker), `read` is what the freshly-read log names there.
+  the split point is usually *below* the current revision. Read it as an **upper bound**: only
+  revisions *both* sides still list are comparable, so a split older than the read log's most
+  recent checkpoint is reported at the lowest surviving disagreement instead of at the true split.
+- `heldAction=` / `readAction=` — the two action ids **at `forkRev=`**: `heldAction` is what this
+  handle's own context carries there (its lineage marker), `readAction` is what the freshly-read log
+  names there. Across all three lines on this namespace a `*Rev=` field is always a revision number
+  and a `*Action=` field is always an action id.
 - `heldRev=` / `readRev=` — the two contexts' own current revisions. Together with `forkRev=` these
   say how far each side has travelled since the split: `forkRev=1 heldRev=8 readRev=8` is a fork
   that has been diverging for seven commits on both sides; `forkRev=8 heldRev=8 readRev=8` is one
@@ -412,17 +422,17 @@ one changes where you look:
 The same three events on today's build carry the answers in the lines themselves:
 
 ```
-collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken tag=k3Vq_A site=refresh forkRev=1 held=63cJ... read=vPYE... heldRev=1 readRev=1
-collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken tag=k3Vq_A site=refresh forkRev=1 held=63cJ... read=vPYE... heldRev=2 readRev=2
-collection:context-not-lowered  id=default/FormationUsage/index/FormationUsageByToken tag=7pQ1_B site=refresh held=4 read=3 heldAction=W0vd... readAction=NEJ5...
+collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken tag=k3Vq_A site=refresh forkRev=1 heldAction=63cJ... readAction=vPYE... heldRev=1 readRev=1
+collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken tag=k3Vq_A site=refresh forkRev=1 heldAction=63cJ... readAction=vPYE... heldRev=2 readRev=2
+collection:context-not-lowered  id=default/FormationUsage/index/FormationUsageByToken tag=7pQ1_B site=refresh heldRev=4 readRev=3 heldAction=W0vd... readAction=NEJ5...
 ```
 
 Read straight off: both forks are `site=refresh`, so a **replica** forked and storage is not
 implicated. Both name `forkRev=1` with the same pair of ids, so it is **one** split at revision 1
-that the second line re-reports from revision 2 — not two independent forks. And the two `tag=`
-values say the refusal came from a **different handle** than the forks did, with two different
-actions at its own two revisions — a second, separately-lineaged copy in the same process, which
-is the finding.
+that the second line re-reports from revision 2 — not two independent forks. And the refusal comes
+from a **different** `tag=`, naming two different actions **at one revision** (revision 3, the
+read's) — so that handle is not merely lagging: it is a second, separately-lineaged copy in the
+same process, which is the finding.
 
 (The tags and ids above are illustrative; the point is which questions the fields answer, not the
 particular values.)

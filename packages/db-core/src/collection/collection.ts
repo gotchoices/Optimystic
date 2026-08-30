@@ -38,6 +38,11 @@ const log = createLogger('collection');
  * completely different places. */
 type DivergenceSite = 'refresh' | 'attach';
 
+/** The lowest revision two {@link ActionContext}s provably disagree at, and the action each names
+ * there — what {@link Collection.earliestFork} reports and `collection:lineage-divergence` prints
+ * as `forkRev=` / `heldAction=` / `readAction=`. */
+type LineageFork = { rev: number, heldAction: ActionId, readAction: ActionId };
+
 /** Default base backoff (and historical fixed delay) between sync retries, in ms. */
 const PendingRetryDelayMs = 100;
 /** Default max consecutive no-progress stale-failure retries before {@link Collection.sync} gives up. */
@@ -242,8 +247,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * Equal revisions still adopt `next`: the rev is unchanged but its `committed` list may be
 	 * more complete than what we hold.
 	 *
-	 * This is also the one seam where lineage divergence is observable: the action id held at the
-	 * CURRENT revision must equal the action id `next` names at that same revision. Revision
+	 * This is also the one seam where lineage divergence is observable: at every revision BOTH
+	 * sides name an action for, the two ids must agree. Revision
 	 * numbers are per-collection counters, so two separately-built copies under one id can each
 	 * occupy the same revision with DIFFERENT actions while each stays internally self-consistent
 	 * — {@link reportShortfall} structurally cannot see that (its two numbers come from one
@@ -277,9 +282,19 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * The comparison is {@link earliestFork}, not a single lookup at the current revision: the
 	 * two `committed` lists overlap across several revisions, and the LOWEST one they disagree at
 	 * is where the lineages actually parted — a fork below the current revision was previously
-	 * silent. `forkRev=` names it, `held=`/`read=` are the two ids AT it, and `heldRev=`/`readRev=`
-	 * are the two contexts' own revisions, so the line says both where the split began and how far
-	 * each side has since travelled.
+	 * silent. `forkRev=` names it, `heldAction=`/`readAction=` are the two ids AT it, and
+	 * `heldRev=`/`readRev=` are the two contexts' own revisions, so the line says both where the
+	 * split began and how far each side has since travelled.
+	 *
+	 * The refusal line reports its two action ids at `readRev=` — the read's revision — on BOTH
+	 * sides, because that is the only revision the two can be compared at: `next` never names an
+	 * action above its own revision, so looking each side up at its own revision would compare
+	 * different revisions and print two different ids for one honest lineage. Equal ids there mean
+	 * the read is an older view of THIS lineage (ordinary lag, correctly refused); different ids
+	 * mean a fork; `none` on the held side means this handle's own list does not reach back to the
+	 * read's revision — the signature of a context bootstrapped from an over-claiming tail (see
+	 * the NOTE in {@link bootstrapContext}), which is exactly the case {@link earliestFork} has no
+	 * shared revision to report on.
 	 *
 	 * Gated on `log.enabled`, like every {@link actionIdAt} caller: the comparison buys nothing
 	 * when the line has no sink, and the lists — one entry per commit between context reads,
@@ -302,16 +317,16 @@ export class Collection<TAction> implements ICollection<TAction> {
 		if (current !== undefined && log.enabled) {
 			const fork = Collection.earliestFork(current, next);
 			if (fork !== undefined) {
-				log('collection:lineage-divergence id=%s tag=%s site=%s forkRev=%d held=%s read=%s heldRev=%d readRev=%d',
-					id, instanceTag, site, fork.rev, fork.held, fork.read, current.rev, next.rev);
+				log('collection:lineage-divergence id=%s tag=%s site=%s forkRev=%d heldAction=%s readAction=%s heldRev=%d readRev=%d',
+					id, instanceTag, site, fork.rev, fork.heldAction, fork.readAction, current.rev, next.rev);
 			}
 		}
 		if (current !== undefined && next.rev < current.rev) {
 			// The refusal itself is unconditional; only the id lookups that explain it are gated.
 			if (log.enabled) {
-				log('collection:context-not-lowered id=%s tag=%s site=%s held=%d read=%d heldAction=%s readAction=%s',
+				log('collection:context-not-lowered id=%s tag=%s site=%s heldRev=%d readRev=%d heldAction=%s readAction=%s',
 					id, instanceTag, site, current.rev, next.rev,
-					actionIdAt(current, current.rev) ?? 'none', actionIdAt(next, next.rev) ?? 'none');
+					actionIdAt(current, next.rev) ?? 'none', actionIdAt(next, next.rev) ?? 'none');
 			}
 			return;
 		}
@@ -334,20 +349,20 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * NOTE: linear in the two lists, which hold one entry per commit between context reads and
 	 * truncate at each checkpoint. Every caller is `log.enabled`-gated, so this does not run at
 	 * all on a normal run; if a non-diagnostic caller ever appears, index by revision instead. */
-	private static earliestFork(held: ActionContext, read: ActionContext): { rev: number, held: ActionId, read: ActionId } | undefined {
+	private static earliestFork(held: ActionContext, read: ActionContext): LineageFork | undefined {
 		// NOTE: a `committed` list carrying TWO entries at one revision would be a defect in its own
 		// right, and this keeps the last of them arbitrarily. Harmless while every caller is a
 		// diagnostic; if such a list is ever seen, report the duplicate rather than silently
 		// picking one.
 		const readIds = new Map(read.committed.map(entry => [entry.rev, entry.actionId]));
-		let earliest: { rev: number, held: ActionId, read: ActionId } | undefined;
+		let earliest: LineageFork | undefined;
 		for (const entry of held.committed) {
-			const readId = readIds.get(entry.rev);
-			if (readId === undefined || readId === entry.actionId) {
+			const readAction = readIds.get(entry.rev);
+			if (readAction === undefined || readAction === entry.actionId) {
 				continue;
 			}
 			if (earliest === undefined || entry.rev < earliest.rev) {
-				earliest = { rev: entry.rev, held: entry.actionId, read: readId };
+				earliest = { rev: entry.rev, heldAction: entry.actionId, readAction };
 			}
 		}
 		return earliest;

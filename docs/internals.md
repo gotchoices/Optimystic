@@ -1073,7 +1073,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   two contexts' action ids across every revision they both name one for, and reports the LOWEST
   one they disagree at — the point the lineages actually parted, which is usually below either
   side's current revision once a forked copy has kept writing. The line is
-  `collection:lineage-divergence id=… tag=… site=… forkRev=… held=… read=… heldRev=… readRev=…`.
+  `collection:lineage-divergence id=… tag=… site=… forkRev=… heldAction=… readAction=… heldRev=… readRev=…`.
   Like the shortfall line it only logs — adoption proceeds unchanged, which makes it a
   per-discovery report rather than a per-refresh one. Both adoption sites run it and `site=` says
   which: on `updateInternal` (`site=refresh`) it contrasts this node's copy with the stored log,
