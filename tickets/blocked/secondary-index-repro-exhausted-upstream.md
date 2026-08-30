@@ -84,3 +84,47 @@ attempt is not commissioned from stale information.
 That edit was **not** made: it is a different repository and a different ticket board, and writing
 into it would leave an uncommitted change in someone else's working tree that this project's commit
 process would never pick up. Whoever picks this ticket up should make that edit there.
+
+---
+
+## Update 2026-08-30 — the "move it downstream" arm was taken, and it worked
+
+The first of the three choices above has since happened, and the human deciding this ticket should
+know before choosing again. `db-core` grew a diagnostic (`collection:lineage-divergence`) that a
+collection emits when its own record of which action produced revision N disagrees with what storage
+says. `sereus` re-enabled its reproducer and ran it. The line fired:
+
+```
+collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken rev=1 held=63cJ50MoBCietBFJBvxWeQ read=vPYEKDif1s1ItefiE-5DQw
+collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken rev=2 held=W0vdcSKMif20MB6UYylCjQ read=NEJ50gSY7mr9KGV5QUKQDw
+collection:context-not-lowered id=default/FormationUsage/index/FormationUsageByToken held=4 read=3
+```
+
+That settles the question the table of six negatives could not: the two machines are **not** on one
+collection with one lagging. Two different actions occupy revisions 1 and 2 of the index collection,
+and the machine that is a revision ahead then refuses the lower revision storage offers, so the split
+never closes. The same-name-different-collection theory listed above is the right one, in the
+specific form "one collection id, two lineages".
+
+The capture was re-taken after `read-cache-dedupe-by-store-identity` landed and was unchanged, so the
+"two caches over one store" explanation is ruled out.
+
+What this means for the decision being asked:
+
+- **Do not close it as not-our-defect.** The divergence is in this library's own bookkeeping, and it
+  is reported by this library's own instrument.
+- **Do not commission a seventh two-machine reproduction attempt here.** Six negatives plus a
+  positive downstream is enough; more scenarios of the same shape are unlikely to add anything.
+- The active work moved to `implement/coordinator-mutates-collections-outside-their-latch`, which
+  names an in-repo cause that produces this exact fingerprint without needing two machines at all —
+  the transaction commit path mutates a collection's revision bookkeeping without holding that
+  collection's own latch, so a concurrent refresh can make a commit record a revision the storage
+  layer assigned to somebody else. That ticket carries a local reproduction as its first task, so it
+  will confirm or refute the cause without another downstream run.
+- The architectural half — what the system should *do* once two lineages exist — was appended as an
+  arm to `backlog/more-design/6.5-partition-healing`, which already owns the "Forked (conflict)"
+  case.
+
+The edit this ticket asked for in `sereus`'s own ticket (recording the sixth negative and the refuted
+shared-slot hypothesis) still has not been made here, for the same reason as before: it is another
+repository's board. It should now also record the positive capture above.
