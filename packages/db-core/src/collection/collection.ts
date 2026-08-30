@@ -22,6 +22,22 @@ import { createLogger } from "../logger.js";
 
 const log = createLogger('collection');
 
+/** Which of {@link Collection.advanceContext}'s two callers is reporting — printed as `site=` on
+ * every line it emits, because the two compare DIFFERENT pairs of things and a divergence means
+ * something different in each:
+ *
+ * - `refresh` ({@link Collection.updateInternal}) — this instance's own copy against the stored
+ *   log. A divergence here indicts a forked REPLICA: two copies of one collection id built
+ *   separately, each internally consistent.
+ * - `attach` ({@link Collection.attachToLog}, during open) — the log tail block's claim about
+ *   which action produced the latest revision, against a walk of that same tail's own chain. Both
+ *   sides come from storage, so a divergence here indicts STORAGE being self-inconsistent about
+ *   one revision, not a replica.
+ *
+ * Without this field the two are indistinguishable in a log, and they lead an operator to
+ * completely different places. */
+type DivergenceSite = 'refresh' | 'attach';
+
 /** Default base backoff (and historical fixed delay) between sync retries, in ms. */
 const PendingRetryDelayMs = 100;
 /** Default max consecutive no-progress stale-failure retries before {@link Collection.sync} gives up. */
@@ -141,7 +157,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// Generated BEFORE attachToLog so log-attach-time diagnostics can name the instance
 		// the same way post-construction ones do.
 		const instanceTag = Collection.newInstanceTag();
-		await Collection.attachToLog<TAction>(source, transactor, tracker, id, header);
+		await Collection.attachToLog<TAction>(source, transactor, tracker, id, instanceTag, header);
 		return new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict, instanceTag);
 	}
 
@@ -157,7 +173,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// Pre-construction for the same reason as in open(): see the comment there.
 		const instanceTag = Collection.newInstanceTag();
 		if (header) {	// Collection already exists
-			await Collection.attachToLog<TAction>(source, transactor, tracker, id, header);
+			await Collection.attachToLog<TAction>(source, transactor, tracker, id, instanceTag, header);
 		} else {	// Collection does not exist
 			log('collection:invented id=%s — no committed header found; staging a fresh empty collection', id);
 			const headerBlock = init.createHeaderBlock(id, tracker);
@@ -197,6 +213,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 		transactor: ITransactor,
 		tracker: Tracker<IBlock>,
 		id: CollectionId,
+		/** The tag the calling open path minted for the Collection it is ABOUT to construct, so a
+		 * diagnostic emitted here carries the same instance name as every post-construction one. */
+		instanceTag: string,
 		header: CollectionHeaderBlock,
 	): Promise<void> {
 		// Bootstrap ActionContext from the committed tail before walking the chain.
@@ -210,7 +229,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// Monotonic, not an overwrite: getActionContext resolves undefined when the chain has no
 		// tail or the tail block carries zero entries, and that must not erase the revision
 		// bootstrapContext just read off the committed tail.
-		Collection.advanceContext(source, id, await collectionLog.getActionContext());
+		Collection.advanceContext(source, id, instanceTag, 'attach', await collectionLog.getActionContext());
 	}
 
 	/** Adopt a freshly-read action context WITHOUT ever lowering the revision already held.
@@ -231,10 +250,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * chain), and this is the only place two `committed` lists meet. Naming different actions at
 	 * one revision proves the two sides are different lineages (`collection:lineage-divergence`;
 	 * see docs/debugging.md § "Did the refresh itself fail to close the gap?"). WHICH two sides
-	 * depends on the caller: from {@link updateInternal} it is this instance's copy against the
-	 * stored log — a forked replica; from {@link attachToLog} it is the tail block's
-	 * `state.latest.actionId` ({@link bootstrapContext} adopts it on trust) against a walk of
-	 * that tail's own chain, so a line there indicts STORAGE rather than a replica.
+	 * depends on the caller, and the line says so in `site=` — see {@link DivergenceSite}, which
+	 * defines the two values and what each one indicts.
+	 *
+	 * Every line from here also carries `tag=`, the {@link Collection.instanceTag} of the handle
+	 * reporting. One process routinely holds several handles on one collection id; without the
+	 * tag, two handles' lines interleave into what reads like one handle contradicting itself.
 	 *
 	 * Logs, does not throw — same reasoning as {@link reportShortfall}: `update()` runs
 	 * blanket-style over every registered collection between commit retries, and aborting here
@@ -253,30 +274,83 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * divergence should also drop the read cache (and whether to keep re-reporting per refresh)
 	 * — that is a behaviour change, and this seam deliberately makes none.
 	 *
-	 * Gated on `log.enabled`, like every {@link actionIdAt} caller: the lookups buy nothing when
-	 * the line has no sink. Deliberately the entry at ONE revision — the current one — not a
-	 * full list diff: the committed lists grow per commit, and this runs on every refresh.
-	 * Silence proves nothing either way, because {@link actionIdAt} legitimately resolves
-	 * `undefined` on either side — an invented collection, a revision slot the log gave to a
-	 * checkpoint or invalidation entry, or a held revision that predates the read log's most
-	 * recent checkpoint (which is as far back as `committed` reaches). */
-	private static advanceContext(source: TransactorSource<IBlock>, id: CollectionId, next: ActionContext | undefined): void {
+	 * The comparison is {@link earliestFork}, not a single lookup at the current revision: the
+	 * two `committed` lists overlap across several revisions, and the LOWEST one they disagree at
+	 * is where the lineages actually parted — a fork below the current revision was previously
+	 * silent. `forkRev=` names it, `held=`/`read=` are the two ids AT it, and `heldRev=`/`readRev=`
+	 * are the two contexts' own revisions, so the line says both where the split began and how far
+	 * each side has since travelled.
+	 *
+	 * Gated on `log.enabled`, like every {@link actionIdAt} caller: the comparison buys nothing
+	 * when the line has no sink, and the lists — one entry per commit between context reads,
+	 * truncated at each checkpoint — are only walked on a run that has the namespace turned on.
+	 * Silence proves nothing either way, because a revision is only comparable when BOTH sides
+	 * name an action for it: an invented collection has no context at all, a revision slot the log
+	 * gave to a checkpoint or invalidation entry names none, and a revision older than the read
+	 * log's most recent checkpoint has already fallen off the read side's list. */
+	private static advanceContext(
+		source: TransactorSource<IBlock>,
+		id: CollectionId,
+		instanceTag: string,
+		site: DivergenceSite,
+		next: ActionContext | undefined,
+	): void {
 		const current = source.actionContext;
 		if (next === undefined) {
 			return;	// The read learned nothing — keep what we already know.
 		}
 		if (current !== undefined && log.enabled) {
-			const held = actionIdAt(current, current.rev);
-			const read = actionIdAt(next, current.rev);
-			if (held !== undefined && read !== undefined && held !== read) {
-				log('collection:lineage-divergence id=%s rev=%d held=%s read=%s', id, current.rev, held, read);
+			const fork = Collection.earliestFork(current, next);
+			if (fork !== undefined) {
+				log('collection:lineage-divergence id=%s tag=%s site=%s forkRev=%d held=%s read=%s heldRev=%d readRev=%d',
+					id, instanceTag, site, fork.rev, fork.held, fork.read, current.rev, next.rev);
 			}
 		}
 		if (current !== undefined && next.rev < current.rev) {
-			log('collection:context-not-lowered id=%s held=%d read=%d', id, current.rev, next.rev);
+			// The refusal itself is unconditional; only the id lookups that explain it are gated.
+			if (log.enabled) {
+				log('collection:context-not-lowered id=%s tag=%s site=%s held=%d read=%d heldAction=%s readAction=%s',
+					id, instanceTag, site, current.rev, next.rev,
+					actionIdAt(current, current.rev) ?? 'none', actionIdAt(next, next.rev) ?? 'none');
+			}
 			return;
 		}
 		source.actionContext = next;
+	}
+
+	/** The EARLIEST revision the two contexts provably disagree about: the lowest revision both
+	 * `committed` lists name an action for, where the two ids differ.
+	 *
+	 * Comparing only at the holder's current revision — what this used to do — misses a fork that
+	 * began earlier and has since been overtaken by same-numbered commits on both sides, which is
+	 * the shape a replica that forked and kept writing actually has. Taking the lowest disagreeing
+	 * revision instead names the split point rather than an arbitrary later symptom of it.
+	 *
+	 * Revisions only one side names are skipped, not treated as disagreement: {@link actionIdAt}'s
+	 * `undefined` is legitimate (checkpoint/invalidation slots, and revisions that predate the
+	 * other side's most recent checkpoint), so a one-sided entry is missing evidence, not evidence
+	 * of a fork.
+	 *
+	 * NOTE: linear in the two lists, which hold one entry per commit between context reads and
+	 * truncate at each checkpoint. Every caller is `log.enabled`-gated, so this does not run at
+	 * all on a normal run; if a non-diagnostic caller ever appears, index by revision instead. */
+	private static earliestFork(held: ActionContext, read: ActionContext): { rev: number, held: ActionId, read: ActionId } | undefined {
+		// NOTE: a `committed` list carrying TWO entries at one revision would be a defect in its own
+		// right, and this keeps the last of them arbitrarily. Harmless while every caller is a
+		// diagnostic; if such a list is ever seen, report the duplicate rather than silently
+		// picking one.
+		const readIds = new Map(read.committed.map(entry => [entry.rev, entry.actionId]));
+		let earliest: { rev: number, held: ActionId, read: ActionId } | undefined;
+		for (const entry of held.committed) {
+			const readId = readIds.get(entry.rev);
+			if (readId === undefined || readId === entry.actionId) {
+				continue;
+			}
+			if (earliest === undefined || entry.rev < earliest.rev) {
+				earliest = { rev: entry.rev, held: entry.actionId, read: readId };
+			}
+		}
+		return earliest;
 	}
 
 	/** Report a refresh that failed to move FORWARDS past a revision it had already read for
@@ -297,17 +371,20 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * {@link advanceContext}, which compares action ids — the one value comparable across
 	 * copies — rather than revision counters.
 	 *
+	 * Carries the same `tag=` as {@link advanceContext}'s lines, and for the same reason: several
+	 * handles on one collection id otherwise read as one self-contradicting handle.
+	 *
 	 * Logs, does not throw: `update()` is called blanket-style over every registered collection
 	 * between commit retries, and a shortfall is not yet known to be illegitimate — an abort here
 	 * would promote an unproven diagnosis to production behaviour. Deliberately does NOT adopt
 	 * `tailRev` either: the two numbers come from different read paths, and papering over the
 	 * disagreement destroys the evidence this line exists to produce. */
-	private static reportShortfall(id: CollectionId, tailRev: number | undefined, before: number | undefined, after: number | undefined): void {
+	private static reportShortfall(id: CollectionId, instanceTag: string, tailRev: number | undefined, before: number | undefined, after: number | undefined): void {
 		if (tailRev === undefined || (after !== undefined && after >= tailRev)) {
 			return;
 		}
-		log('collection:context-short-of-tail id=%s before=%s after=%s tail=%d',
-			id, before ?? 'none', after ?? 'none', tailRev);
+		log('collection:context-short-of-tail id=%s tag=%s before=%s after=%s tail=%d',
+			id, instanceTag, before ?? 'none', after ?? 'none', tailRev);
 	}
 
 	async act(...actions: Action<TAction>[]) {
@@ -433,9 +510,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// content at this.actionContext.rev — if the cursor hasn't advanced yet, replay re-reads
 		// at the revision we're leaving and refills the cache with stale content that nothing
 		// will invalidate again (the log entry that would have cleared it was already consumed).
-		Collection.advanceContext(this.source, this.id, latest?.context);
+		Collection.advanceContext(this.source, this.id, this.instanceTag, 'refresh', latest?.context);
 
-		Collection.reportShortfall(this.id, tailRev, actionContext?.rev, this.source.actionContext?.rev);
+		Collection.reportShortfall(this.id, this.instanceTag, tailRev, actionContext?.rev, this.source.actionContext?.rev);
 
 		// On conflicts, re-stage the pending actions against the adopted revision. The affected
 		// blocks were already dropped from sourceCache above (per log entry / per invalidation),

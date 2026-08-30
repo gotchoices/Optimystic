@@ -257,7 +257,7 @@ ran just before it *tried and failed* to advance or simply found nothing newer. 
 answers that from the inside, on the `optimystic:db-core:collection` namespace:
 
 ```
-optimystic:db-core:collection collection:context-short-of-tail id=default/Usage/index/by_token before=1 after=1 tail=6
+optimystic:db-core:collection collection:context-short-of-tail id=default/Usage/index/by_token tag=k3Vq_A before=1 after=1 tail=6
 ```
 
 A refresh reads the collection's **log tail block**, whose stored state names the most recent
@@ -267,6 +267,11 @@ the refresh provably closed nothing, and the collection is still behind a revisi
 been told about. Fields:
 
 - `id=` — the collection id, the same value `index:seek` prints as `collection=` / `main=`.
+- `tag=` — a short random tag naming the collection **handle** that reported, minted once when that
+  handle is opened. One process routinely holds several handles on one collection id (a reader and
+  a writer, or one per open); without this field their lines interleave into what reads like a
+  single handle contradicting itself. Two different tags on one `id=` means two handles — same
+  process or not, this field alone cannot say which. All three lines on this namespace carry it.
 - `before=` / `after=` — the revision the collection held going into the refresh and coming out of
   it. `before` equal to `after` means the refresh moved it nowhere at all. `none` in either position
   means the collection held no committed revision at that point.
@@ -295,8 +300,24 @@ line below fires and names it; when it lags while the collection holds nothing y
 and the gap has to be found by comparing revisions across nodes instead.
 
 Its sibling `collection:context-not-lowered` reports the opposite guard — a collection declining to
-move *backwards* because a read returned an older view than the revision it already holds. Both are
-worth enabling together:
+move *backwards* because a read returned an older view than the revision it already holds:
+
+```
+optimystic:db-core:collection collection:context-not-lowered id=default/Usage/index/by_token tag=k3Vq_A site=refresh held=4 read=3 heldAction=fR1TfGRxHLN_Icl0ZK-XIw readAction=fR1TfGRxHLN_Icl0ZK-XIw
+```
+
+- `held=` / `read=` — the revision this handle already holds, and the lower one the read returned.
+  The read is discarded; the handle keeps `held=`.
+- `heldAction=` / `readAction=` — the action ids at those two revisions, or `none` where the side
+  names no action there (see *Silence is weaker evidence* below for when that legitimately happens).
+  **These are the field that makes the line diagnosable.** The same id on both sides — as above —
+  means one lineage that this handle simply sits ahead of: it is pinned above what the read could
+  see, nothing has forked. Two *different* ids mean the read came from a different lineage
+  altogether, which is a fork being sealed underneath this handle rather than ordinary lag, and
+  should be read alongside `lineage-divergence` below.
+- `site=` — which call path reported; see the description of the field under `lineage-divergence`.
+
+All three lines are worth enabling together:
 
 ```bash
 DEBUG='optimystic:db-core:collection' node your-app.js
@@ -306,21 +327,38 @@ The third line on this namespace covers the case the two above structurally cann
 divergence**. Both shortfall numbers come from one chain — a forked replica is internally
 self-consistent, its tail claiming exactly what its own walk reaches — so two copies of one
 collection id holding the same revision under different actions keep `context-short-of-tail`
-silent forever. The refresh instead compares the action id it *holds* at its current revision
-against the action id the freshly-read log *names* at that same revision, and a mismatch means the
-local copy and the stored log are provably different lineages (see *Comparing action ids* below —
-this is that comparison, run by db-core itself on every refresh, without needing a second node's
-lines):
+silent forever. The refresh instead compares the action ids the two sides name, revision by
+revision across the range they both cover, and reports the LOWEST revision they disagree at — a
+mismatch anywhere means the local copy and the stored log are provably different lineages (see
+*Comparing action ids* below — this is that comparison, run by db-core itself on every refresh,
+without needing a second node's lines):
 
 ```
-optimystic:db-core:collection collection:lineage-divergence id=default/Usage/index/by_token rev=2 held=fR1TfGRxHLN_Icl0ZK-XIw read=vR5WcYtFvwoW2nYPa8BqCg
+optimystic:db-core:collection collection:lineage-divergence id=default/Usage/index/by_token tag=k3Vq_A site=refresh forkRev=1 held=fR1TfGRxHLN_Icl0ZK-XIw read=vR5WcYtFvwoW2nYPa8BqCg heldRev=2 readRev=2
 ```
 
 - `id=` — the collection id, joining to `index:seek`'s `collection=`/`main=` and to
   `commit:collections`.
-- `rev=` — the revision both sides occupy; the disagreement is *at* this revision, not about it.
-- `held=` — the action id this collection's own context carried into the refresh (its lineage
-  marker); `read=` — the action id the stored log names at that same revision.
+- `tag=` — the reporting handle, as described for the shortfall line above.
+- `site=` — which of the two call paths ran the comparison. **The two mean entirely different
+  things and lead to different places**, so read this field before anything else:
+  - `site=refresh` — a live `update()`: this handle's own copy against the stored log. A divergence
+    here indicts a forked **replica** — two copies of one collection id built separately, each
+    internally consistent.
+  - `site=attach` — the open path: the log tail block's claim about which action produced the
+    latest revision, against a walk of that same tail's own chain. Both sides came out of
+    **storage**, so a divergence here says storage is internally inconsistent about one revision.
+    No replica is implicated. The open still succeeds.
+- `forkRev=` — the **lowest** revision the two sides both name an action for and disagree about:
+  where the lineages provably parted. It is not necessarily the revision either side currently sits
+  at — a copy that forked and kept writing agrees with storage at the revisions above the split, so
+  the split point is usually *below* the current revision.
+- `held=` / `read=` — the two action ids **at `forkRev=`**: `held` is what this handle's own context
+  carries there (its lineage marker), `read` is what the freshly-read log names there.
+- `heldRev=` / `readRev=` — the two contexts' own current revisions. Together with `forkRev=` these
+  say how far each side has travelled since the split: `forkRev=1 heldRev=8 readRev=8` is a fork
+  that has been diverging for seven commits on both sides; `forkRev=8 heldRev=8 readRev=8` is one
+  that has just happened.
 
 Three things to know when reading it:
 
@@ -329,20 +367,65 @@ Three things to know when reading it:
   now matches the log and later refreshes of that instance stay silent — even though content the
   instance materialized under its old lineage may still be cached. Seeing the line once is the
   finding; do not wait for it to repeat.
-- **Silence is weaker evidence than for the shortfall line.** The comparison needs an action entry
-  at the held revision on *both* sides, and three ordinary situations leave one side empty: an
+- **Silence is weaker evidence than for the shortfall line.** A revision is only comparable when
+  *both* sides name an action for it, and three ordinary situations leave one side empty: an
   invented collection (no context at all); a revision whose log slot went to a checkpoint or
-  invalidation entry rather than an action; and a held revision older than the read log's most
-  recent **checkpoint**, since a freshly-read context only lists actions back to that checkpoint —
-  so the further a copy has fallen behind, the more likely a real fork goes unreported. Cross-node
-  comparison per *Comparing action ids* below remains the ground truth.
-- **Opening a collection can fire it too, and means something different.** The comparison also
-  runs on the open path, where the two sides are not one node's copy versus storage but two parts
-  of *storage itself*: the tail block's state metadata (which names the action that produced the
-  latest committed revision) versus the log entries under that tail. A line at open therefore says
-  storage is internally inconsistent about one revision, not that some replica forked — check the
-  `id=`/`rev=` against the node's other lines to tell which situation you are looking at. The open
-  still succeeds either way.
+  invalidation entry rather than an action; and revisions older than the read log's most recent
+  **checkpoint**, since a freshly-read context only lists actions back to that checkpoint. If the
+  two sides' lists have no revision in common at all — which is what happens once a copy has fallen
+  far enough behind — a real fork goes entirely unreported. Cross-node comparison per *Comparing
+  action ids* below remains the ground truth.
+- **Opening a collection can fire it too, and means something different** — that is what `site=`
+  is for. `site=attach` is the open path, where the two sides are not one node's copy versus
+  storage but two parts of *storage itself*: the tail block's state metadata (which names the
+  action that produced the latest committed revision) versus the log entries under that tail. It
+  says storage is internally inconsistent about one revision, not that some replica forked. The
+  open still succeeds either way.
+
+##### Worked example: what these fields buy you
+
+A two-machine run in August 2026 produced exactly three lines on this namespace, and they are the
+reason the extra fields exist. As captured then:
+
+```
+collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken rev=1 held=63cJ... read=vPYE...
+collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken rev=2 held=W0vd... read=NEJ5...
+collection:context-not-lowered  id=default/FormationUsage/index/FormationUsageByToken held=4 read=3
+```
+
+Something was clearly wrong — one collection id, four distinct action ids across two revisions —
+but nothing in those lines answers the three questions an operator has to answer next, and each
+one changes where you look:
+
+1. **Was the fork in a replica, or in storage?** Both divergence lines could have come from
+   `update()` (a replica forked) or from an open (storage self-inconsistent). Nothing
+   distinguishes them, and the two lead to completely different investigations.
+2. **Where did the split start?** Lines at revision 1 *and* revision 2 look like two separate
+   forks. They are more likely one fork at revision 1 that the old single-revision comparison
+   re-reported at revision 2 as both sides kept committing — but the lines cannot say so, because
+   each only ever compared at the reporter's then-current revision.
+3. **Was this one process disagreeing with itself, or two?** A `context-not-lowered` at `held=4
+   read=3` from the *same* handle that reported the forks means something quite different from one
+   arriving from a second handle in the same process; the revisions do not overlap with the
+   divergence lines either way, so even the ordering is a guess.
+
+The same three events on today's build carry the answers in the lines themselves:
+
+```
+collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken tag=k3Vq_A site=refresh forkRev=1 held=63cJ... read=vPYE... heldRev=1 readRev=1
+collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken tag=k3Vq_A site=refresh forkRev=1 held=63cJ... read=vPYE... heldRev=2 readRev=2
+collection:context-not-lowered  id=default/FormationUsage/index/FormationUsageByToken tag=7pQ1_B site=refresh held=4 read=3 heldAction=W0vd... readAction=NEJ5...
+```
+
+Read straight off: both forks are `site=refresh`, so a **replica** forked and storage is not
+implicated. Both name `forkRev=1` with the same pair of ids, so it is **one** split at revision 1
+that the second line re-reports from revision 2 — not two independent forks. And the two `tag=`
+values say the refusal came from a **different handle** than the forks did, with two different
+actions at its own two revisions — a second, separately-lineaged copy in the same process, which
+is the finding.
+
+(The tags and ids above are illustrative; the point is which questions the fields answer, not the
+particular values.)
 
 #### Comparing action ids
 

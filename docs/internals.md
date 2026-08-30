@@ -1059,7 +1059,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   the committed tail's revision (the authoritative "latest committed under this id") before the
   walk, and compares it against where the walk left the collection; landing short means the refresh
   demonstrably closed nothing. That is reported — `collection:context-short-of-tail
-  id=… before=… after=… tail=…` on the same namespace — and nothing more: it does not throw (this
+  id=… tag=… before=… after=… tail=…` on the same namespace — and nothing more: it does not throw (this
   same `update()` runs blanket-style over every registered collection between commit retries) and
   it does not adopt the tail's number (the two numbers come from different read paths, and adopting
   the higher one erases the disagreement). The comparison is local to one node's own reads, so
@@ -1070,13 +1070,18 @@ saveMaterializedBlock(block): store(structuredClone(block));
   separately-built copies under one id can each sit at the same revision under different actions
   while each stays internally self-consistent — which is exactly why `context-short-of-tail`
   cannot see it (both of its numbers come from one chain). `advanceContext` therefore compares the
-  action id held at the current revision against the action id the freshly-read context names at
-  that same revision, and reports `collection:lineage-divergence id=… rev=… held=… read=…` when
-  they differ. Like the shortfall line it only logs — adoption proceeds unchanged, which makes it
-  a per-discovery report rather than a per-refresh one. Both adoption sites run it: on
-  `updateInternal` it contrasts this node's copy with the stored log, while on `attachToLog` it
-  contrasts the tail block's `state.latest` (adopted on trust by `bootstrapContext`) with a walk
-  of that tail's own chain, so a line there indicts storage rather than a replica.
+  two contexts' action ids across every revision they both name one for, and reports the LOWEST
+  one they disagree at — the point the lineages actually parted, which is usually below either
+  side's current revision once a forked copy has kept writing. The line is
+  `collection:lineage-divergence id=… tag=… site=… forkRev=… held=… read=… heldRev=… readRev=…`.
+  Like the shortfall line it only logs — adoption proceeds unchanged, which makes it a
+  per-discovery report rather than a per-refresh one. Both adoption sites run it and `site=` says
+  which: on `updateInternal` (`site=refresh`) it contrasts this node's copy with the stored log,
+  while on `attachToLog` (`site=attach`) it contrasts the tail block's `state.latest` (adopted on
+  trust by `bootstrapContext`) with a walk of that tail's own chain, so a line there indicts
+  storage rather than a replica. `tag=` on all three lines names the reporting *handle*
+  (`Collection.instanceTag`), since one process routinely holds several over one collection id and
+  their lines otherwise read as one handle contradicting itself.
 - A header that reads *authoritatively absent* while the collection holds a committed revision is
   a contradiction, not an absence: the client has proof something was committed under this id.
   `updateInternal` throws `CollectionHeaderVanishedError` (naming the collection and the held
