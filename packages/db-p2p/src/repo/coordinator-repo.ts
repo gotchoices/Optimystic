@@ -1,4 +1,4 @@
-import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason } from "@optimystic/db-core";
+import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
 import { LruMap, blockIdsForTransforms, highestStaleAt, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
 import { ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
@@ -213,6 +213,8 @@ type AbsenceVerdict =
  */
 interface LocalClusterWithExecutionTracking extends ICluster {
 	wasTransactionExecuted?(messageHash: string): boolean;
+	/** Local storage's verdict for a pend applied during consensus; see ClusterMember.getExecutedPendResult. */
+	getExecutedPendResult?(messageHash: string): PendResult | undefined;
 }
 
 /**
@@ -397,7 +399,8 @@ export class CoordinatorRepo implements IRepo {
 		const localClusterRef = localCluster && localPeerId ? {
 			update: localCluster.update.bind(localCluster),
 			peerId: localPeerId,
-			wasTransactionExecuted: localCluster.wasTransactionExecuted?.bind(localCluster)
+			wasTransactionExecuted: localCluster.wasTransactionExecuted?.bind(localCluster),
+			getExecutedPendResult: localCluster.getExecutedPendResult?.bind(localCluster)
 		} : undefined;
 		this.coordinator = new ClusterCoordinator(keyNetwork, createClusterClient, policy, localClusterRef, fretService, reputation, stateStore);
 	}
@@ -1422,7 +1425,8 @@ export class CoordinatorRepo implements IRepo {
 			if (error instanceof ConflictRaceLostError) {
 				return { success: false, conflict: true, reason: error.message };
 			}
-			const stale = await this.classifyStaleRejection(error, request, allBlockIds);
+			const stale = await this.classifyStaleRejection(error, request, allBlockIds)
+				?? await this.classifyPendingConflictRejection(error, request, allBlockIds);
 			if (stale) return stale;
 			throw error;
 		}
@@ -1491,6 +1495,53 @@ export class CoordinatorRepo implements IRepo {
 		// `staleAt` is absent on this path for the same reason, and deliberately so — there is no
 		// confirmed number to report, and the field's contract forbids inferring one from that text.
 		return undefined;
+	}
+
+	/**
+	 * Sibling of {@link classifyStaleRejection} for the OTHER optimistic-concurrency refusal shape:
+	 * the promise-phase pending-conflict vote (`validatePendOperations` rejecting a pend whose
+	 * blocks are held by a different unresolved pending action). That vote surfaces here as a
+	 * {@link ValidatorRejectionError}, and without classification it would escape as a throw —
+	 * splitting multi-tree pends mid-batch instead of taking the retry path a lost race deserves.
+	 *
+	 * Same confirmation discipline as the stale classifier: purely local. Re-read the affected
+	 * blocks from our own storage and require some block's `state.pendings` to carry a rival
+	 * actionId; the signed reject text is never consulted. A confirmed rival returns a
+	 * {@link StaleFailure} with `conflict: true` and the rivals as `pending` (`ActionPending`
+	 * without `transform` — the type allows it, and no consumer rebases from it). Unconfirmed —
+	 * including read errors during confirmation — stays a throw, preserving fail-fast for genuine
+	 * validation faults. Checked after `classifyStaleRejection` so a confirmed committed loss
+	 * (which carries the sharper `staleAt`) wins when both hold.
+	 */
+	private async classifyPendingConflictRejection(error: unknown, request: PendRequest, blockIds: BlockId[]): Promise<StaleFailure | undefined> {
+		if (!(error instanceof ValidatorRejectionError)) return undefined;
+		let results: GetBlockResults;
+		try {
+			results = await this.storageRepo.get({ blockIds });
+		} catch (readError) {
+			this.log('coordinator-repo:pend-conflict-classify-read-error', {
+				actionId: request.actionId,
+				error: (readError as Error).message
+			});
+			return undefined;
+		}
+		const pending: ActionPending[] = [];
+		for (const blockId of blockIds) {
+			for (const actionId of results[blockId]?.state?.pendings ?? []) {
+				if (actionId !== request.actionId) pending.push({ blockId, actionId });
+			}
+		}
+		if (pending.length === 0) return undefined;
+		this.log('coordinator-repo:pend-conflict-classified', {
+			actionId: request.actionId,
+			rivals: pending.map(p => `${p.blockId}:${p.actionId}`)
+		});
+		return {
+			success: false,
+			conflict: true,
+			pending,
+			reason: `pending conflict: block(s) held by unresolved rival action(s) ${[...new Set(pending.map(p => p.actionId))].join(', ')}`
+		};
 	}
 
 	async cancel(actionRef: ActionBlocks, options?: MessageOptions): Promise<void> {
