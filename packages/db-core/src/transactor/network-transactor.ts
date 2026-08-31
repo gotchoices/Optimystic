@@ -710,11 +710,22 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// `!blockIds.includes(headerId)` against a `bid` drawn from `blockIds` — unsatisfiable
 		// whenever `bid === headerId`, so it never excluded anything.)
 		//
-		// The header -> tail -> sweep ORDER is deliberate and load-bearing; do not reorder it to put
-		// the contested blocks first. `Collection.bootstrapContext` documents the guarantee it rests
-		// on: "The tail is always committed first (commit protocol guarantee), so it's readable with
+		// NOTE: measured, not assumed — the header-first branch above is currently UNREACHABLE from
+		// the only production producer of `headerId`. `TransactorSource.transact` sets it solely when
+		// the header is a fresh insert, and an inserted id is by construction in the pend's
+		// `blockIds`, so `!blockIds.includes(headerId)` is never true there. Instrumenting the branch
+		// and running both suites: 0 hits across every db-p2p mesh test, 2 hits in db-core, both from
+		// `commit-digest-threading.spec.ts` requests hand-built with the header held out of
+		// `blockIds`. So the order that actually runs in production is tail -> sweep, with the header
+		// (when the action touches it) inside the sweep — i.e. after the tail. Whether to wire the
+		// branch up or delete it, along with the three contracts that still describe it as live, is
+		// `tickets/backlog/debt-commit-header-first-branch-is-unreachable`.
+		//
+		// The tail -> sweep half of that order IS load-bearing; do not reorder it to put the
+		// contested blocks first. `Collection.bootstrapContext` documents the guarantee it rests on:
+		// "The tail is always committed first (commit protocol guarantee), so it's readable with
 		// context=undefined" — that bootstrap is what makes pending non-tail blocks visible to a
-		// chain walk. Committing the tail last would let a committed header point at a
+		// chain walk. Sweeping before the tail would also let a committed header point at a
 		// never-committed tail: a dangling pointer, strictly worse than an orphaned block.
 		const remainingBlocks = request.blockIds.filter(bid => bid !== request.tailId);
 		if (remainingBlocks.length > 0) {

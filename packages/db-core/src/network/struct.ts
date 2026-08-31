@@ -113,9 +113,13 @@ export type BlockContentDigest = {
 export type BlockContentDigests = Record<BlockId, BlockContentDigest>;
 
 export type CommitRequest = ActionBlocks & {
-	/** The header block of the collection, if this is a new collection (commit first) */
+	/** The header block of the collection, if this is a new collection. Nominally "commit first" —
+	 *  but see the NOTE in `NetworkTransactor.commit`: the header-first step is unreachable from the
+	 *  only production producer of this field, so today it only affects hand-built requests. */
 	headerId?: BlockId;
-	/** The tail block of the log (commit next) */
+	/** The tail block of the log.  Nominally "commit next"; since the header-first step above never
+	 *  fires in production, this is in practice the FIRST block committed, which is the ordering
+	 *  `Collection.bootstrapContext` relies on. */
 	tailId: BlockId;
 	/** The new revision for the committed action */
 	rev: number;

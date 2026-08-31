@@ -43,9 +43,13 @@ const entriesOf = async (diary: Diary<DiaryEntry>): Promise<string[]> => {
 
 /**
  * Wraps a transactor so its FIRST commit tears: the collection header and log tail commit for
- * real, every other block of the action is dropped, and the caller is answered with the same
- * retryable-conflict shape a genuine later-block loss produces
- * (`NetworkTransactor.commit`'s non-tail sweep returning its stale failure).
+ * real, every other block of the action is dropped, and the caller is answered with the stale
+ * failure a genuine later-block loss produces — `NetworkTransactor.commit`'s non-tail sweep
+ * returning `staleFromBatches`' result, which is `{ success: false, missing, staleAt? }` and
+ * deliberately carries NO `conflict` flag (that field is set only by producers that classified
+ * the loss themselves). `missing: []` is the weakest shape that path can return, so the recovery
+ * asserted below is being pinned against the LEAST informative failure production can hand it —
+ * `Collection.syncInternal` retries on any stale failure at all, never on `isConflictFailure`.
  *
  * That is the torn action in its exact production shape. `NetworkTransactor.commit` commits the
  * header (when it is not itself in `blockIds`), then the tail, then sweeps the rest — so by the
@@ -56,7 +60,10 @@ const entriesOf = async (diary: Diary<DiaryEntry>): Promise<string[]> => {
  * duplicate.
  *
  * Explicit delegation rather than a spread of `inner`: `NetworkTransactor` is a class, so its
- * methods live on the prototype and a spread would copy none of them.
+ * methods live on the prototype and a spread would copy none of them. The literal is annotated
+ * `ITransactor`, so a new REQUIRED method on that type breaks this file at compile time; only a
+ * new OPTIONAL one could go unforwarded silently, the way `queryClusterNominees` is forwarded
+ * by hand below.
  *
  * Returns the recorded tears alongside the transactor so a test can assert the injection actually
  * fired — without that, a refactor that stopped committing here would leave the test passing
@@ -84,7 +91,7 @@ const tearFirstCommit = (inner: ITransactor): { transactor: ITransactor; tears: 
 			if (!truncated.success) return truncated;
 			return {
 				success: false,
-				conflict: true,
+				missing: [],
 				reason: 'stale commit: injected later-block conflict after tail commit'
 			};
 		}
