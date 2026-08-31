@@ -1,5 +1,5 @@
 import { peerIdFromString } from "@libp2p/peer-id";
-import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster } from "@optimystic/db-core";
+import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult } from "@optimystic/db-core";
 import { CURRENT_MEMBERSHIP_VERSION, computeClusterMessageHash, membershipDigest } from "@optimystic/db-core";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
@@ -123,6 +123,8 @@ export class ClusterCoordinator {
 			update: (record: ClusterRecord) => Promise<ClusterRecord>;
 			peerId: PeerId;
 			wasTransactionExecuted?: (messageHash: string) => boolean;
+			/** Local storage's verdict for a pend applied during consensus; see ClusterMember.getExecutedPendResult. */
+			getExecutedPendResult?: (messageHash: string) => PendResult | undefined;
 		},
 		private readonly fretService?: FretService,
 		private readonly reputation?: IPeerReputation,
@@ -248,6 +250,13 @@ export class ClusterCoordinator {
 	async executeClusterTransaction(blockId: BlockId, message: RepoMessage, _options?: MessageOptions): Promise<{
 		record: ClusterRecord;
 		localExecuted: boolean;
+		/**
+		 * Local storage's verdict for a pend operation this node's own cluster member applied during
+		 * consensus, when the member retained one. Meaningful only when `localExecuted` is true;
+		 * absent for non-pend messages, for a member that predates the retention, or after the
+		 * retention TTL. `CoordinatorRepo.pend` returns this instead of fabricating a success.
+		 */
+		localPendResult?: PendResult;
 	}> {
 		// The coordinating block id is derived HERE, from the key this method is already handed, rather
 		// than being set by each caller's message builder: a member's membership admission gate derives
@@ -317,7 +326,8 @@ export class ClusterCoordinator {
 			const result = await pending.result();
 			// Check if the local cluster already executed the operations during consensus
 			const localExecuted = this.localCluster?.wasTransactionExecuted?.(messageHash) ?? false;
-			return { record: result, localExecuted };
+			const localPendResult = localExecuted ? this.localCluster?.getExecutedPendResult?.(messageHash) : undefined;
+			return { record: result, localExecuted, ...(localPendResult === undefined ? {} : { localPendResult }) };
 		} finally {
 			const stored = this.transactions.get(messageHash);
 			const retrySnapshot = stored?.retry ? {

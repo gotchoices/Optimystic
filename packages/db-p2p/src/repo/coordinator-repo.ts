@@ -1,5 +1,5 @@
 import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason } from "@optimystic/db-core";
-import { LruMap, blockIdsForTransforms, highestStaleAt, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
+import { LruMap, blockIdsForTransforms, highestStaleAt, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
 import { ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -1360,10 +1360,13 @@ export class CoordinatorRepo implements IRepo {
 		};
 
 		try {
-			const { localExecuted } = await this.coordinator.executeClusterTransaction(coordinatingBlockIds[0]!, message, options);
+			const { localExecuted, localPendResult } = await this.coordinator.executeClusterTransaction(coordinatingBlockIds[0]!, message, options);
 			this.log('coordinator-repo:pend-cluster-complete', {
 				actionId: request.actionId,
-				localExecuted
+				localExecuted,
+				localVerdict: localPendResult === undefined ? 'none'
+					: localPendResult.success ? 'success'
+						: isConflictFailure(localPendResult) ? 'conflict' : 'fault'
 			});
 			// Only call storageRepo if local cluster didn't already execute during consensus
 			if (!localExecuted) {
@@ -1376,7 +1379,29 @@ export class CoordinatorRepo implements IRepo {
 				});
 				return result;
 			}
-			// Local cluster already executed - return success
+			// Local cluster already executed during consensus — return storage's own verdict rather
+			// than fabricating a success (the peerCount <= 1 path above returns storage's real result
+			// verbatim; the cluster path must never answer differently). Pend-consensus confers no
+			// durability: a refusal carrying `pending` (a rival's unresolved action holds the blocks)
+			// or `missing` (the requested revision is already committed) is the optimistic-concurrency
+			// verdict — the same scan every member runs, not a local fault — and must reach the writer
+			// as a retryable conflict so NetworkTransactor.pendPhase cancels the partial pend and the
+			// writer rebases. This deliberately differs from `commit`'s divergence split below: a
+			// commit that reached commit-consensus IS the authoritative commit (Theorem 9), whereas a
+			// pend that reached pend-consensus may still have been stored by nobody.
+			if (localPendResult !== undefined) {
+				if (localPendResult.success || isConflictFailure(localPendResult)) {
+					return localPendResult;
+				}
+				// A bare-reason refusal (no pending/missing — e.g. a local validation-hook fault)
+				// stays tolerated local divergence: consensus is authoritative and the pend may well
+				// have landed on the rest of the cohort.
+				this.log('coordinator-repo:pend-local-fault-tolerated', {
+					actionId: request.actionId,
+					reason: localPendResult.reason
+				});
+			}
+			// No verdict retained (member predates retention, restart, or TTL): the prior shape.
 			return {
 				success: true,
 				pending: [],

@@ -1,4 +1,4 @@
-import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, CommitResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, CommitResult, PendResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
@@ -223,6 +223,11 @@ export class ClusterMember implements ICluster {
 	private activeTransactions: Map<string, TransactionState> = new Map();
 	// Track executed consensus transactions to prevent duplicate execution (messageHash -> executedAt timestamp)
 	private executedTransactions: Map<string, number> = new Map();
+	// Local storage's verdict for a pend operation applied during consensus (messageHash -> PendResult).
+	// Retained so the coordinator can return storage's real answer instead of fabricating success —
+	// a pend that every member refused (rival pending action, or the revision already taken) must
+	// reach the writer as a conflict, not a win. Pruned alongside executedTransactions (same TTL).
+	private executedPendResults: Map<string, PendResult> = new Map();
 	// Fast in-memory dedup for applied invalidations, keyed `${invalidatedActionId}:${disputeId}`.
 	// The durable source of truth is the invalidation log entry (Log.findInvalidation, re-checked
 	// inside the sink); this map only spares redundant work when the same invalidation reaches
@@ -324,6 +329,7 @@ export class ClusterMember implements ICluster {
 		}
 		this.activeTransactions.clear();
 		this.cleanupQueue.length = 0;
+		this.executedPendResults.clear();
 	}
 
 	/**
@@ -332,6 +338,20 @@ export class ClusterMember implements ICluster {
 	 */
 	wasTransactionExecuted(messageHash: string): boolean {
 		return this.executedTransactions.has(messageHash);
+	}
+
+	/**
+	 * Local storage's verdict for the pend operation this member applied at consensus for
+	 * `messageHash`, when one was retained. The coordinator reads this so the answer a writer gets
+	 * is the answer storage gave — the cluster path must not fabricate a success the single-node
+	 * path (`CoordinatorRepo.pend`'s `peerCount <= 1` short-circuit) would never produce. Absent for
+	 * transactions carrying no pend operation, for transactions applied before this member restarted
+	 * (the map is in-memory only; the coordinator then falls back to its fabricated-success shape,
+	 * with the promise-phase pending check in {@link validatePendOperations} narrowing that window),
+	 * and after the executed-transaction TTL prunes it.
+	 */
+	getExecutedPendResult(messageHash: string): PendResult | undefined {
+		return this.executedPendResults.get(messageHash);
 	}
 
 	/**
@@ -852,9 +872,19 @@ export class ClusterMember implements ICluster {
 		// the FIRST delivery when the record already arrives at super-majority, rather than a
 		// round-trip later. The safety argument is quorum intersection (Theorem 9: no rival can
 		// assemble its own super-majority once this one has), NOT the reservation — the reservation
-		// only orders *concurrently-pending* rivals. If a lost-update between commit-signing and
-		// consensus-apply ever shows up, hold the reservation until `handleConsensus` instead of
-		// releasing it here.
+		// only orders *concurrently-pending* rivals.
+		//
+		// The lost update this predicted WAS observed (a pend admitted between a rival's
+		// pend-consensus and commit-consensus, then refused by every member's storage at apply and
+		// still reported to the writer as a success). Holding the reservation until `handleConsensus`
+		// would not have closed it — the loser was approved before the winner's apply had even
+		// reached most members — so the cure went elsewhere: `validatePendOperations` now rejects a
+		// pend whose blocks are held by a different unresolved STORAGE pending record (the durable
+		// reservation that spans pend-apply → commit/cancel), and the coordinator returns storage's
+		// retained apply verdict instead of fabricating success (`getExecutedPendResult`). Residual:
+		// a member that has not yet applied the rival's pend abstains from that vote, and only the
+		// coordinating node's own verdict is threaded back — see the handoff notes on
+		// `CoordinatorRepo.pend`.
 		const approvedPromises = Object.values(record.promises).filter(s => s.type === 'approve');
 		if (approvedPromises.length >= superMajority && !record.commits[ourId]) {
 			return { phase: TransactionPhase.OurCommitNeeded };
@@ -1168,7 +1198,8 @@ export class ClusterMember implements ICluster {
 
 	/**
 	 * Validates pend operations in a cluster record using the transaction validator.
-	 * Also checks for stale revisions to prevent consensus on operations that would fail.
+	 * Also checks for stale revisions, and for blocks held by a different unresolved pending
+	 * action, to prevent consensus on operations that storage would refuse at apply.
 	 * Returns success if no validator is configured (backwards compatibility).
 	 */
 	private async validatePendOperations(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
@@ -1176,12 +1207,13 @@ export class ClusterMember implements ICluster {
 		for (const operation of record.message.operations) {
 			if ('pend' in operation) {
 				const pendRequest = operation.pend;
+				const blockIds = blockIdsForTransforms(pendRequest.transforms);
+				// One state read serves both checks below: `latest` for staleness, `pendings` for the
+				// unresolved-rival check.
+				const blockResults = await this.storageRepo.get({ blockIds });
 
 				// Check for stale revisions before allowing consensus
 				if (pendRequest.rev !== undefined) {
-					const blockIds = blockIdsForTransforms(pendRequest.transforms);
-					// Get block states to check latest revisions
-					const blockResults = await this.storageRepo.get({ blockIds });
 					for (const blockId of blockIds) {
 						const blockResult = blockResults[blockId];
 						if (blockResult?.unavailable !== undefined) {
@@ -1215,6 +1247,35 @@ export class ClusterMember implements ICluster {
 							// supplies that number when it can confirm the revision itself.
 							return { valid: false, reason: `stale revision: block ${blockId} at rev ${latestRev}, requested rev ${pendRequest.rev}` };
 						}
+					}
+				}
+
+				// Reject a pend whose blocks are held by a DIFFERENT unresolved pending action. This is
+				// the durable reservation the in-memory table (`findConflict` / `activeTransactions`)
+				// cannot provide: that table clears the moment the rival's PEND record reaches
+				// consensus, but the rival's storage pending record — written at pend-apply, removed at
+				// commit or cancel — spans exactly the pend→commit window in which `latest.rev` has not
+				// yet advanced. Storage's own pend would refuse this request at consensus-apply for the
+				// same reason (`StorageRepo.pend`'s listPendingTransactions scan); voting reject here
+				// moves that verdict into the phase where the cohort aggregates it, so the loser is
+				// refused with a real answer instead of burning a consensus round it cannot win. A
+				// member that has not yet applied the rival's pend has no record and simply abstains
+				// from this reason; the coordinator returning the retained apply verdict
+				// (getExecutedPendResult) catches that residual. Self is excluded so a redelivered pend
+				// for this same action stays approvable. An unavailable block carries no `pendings` and
+				// abstains (the rev branch above already fail-closes when a revision claim is at stake).
+				// Reason stays plain prose: it is fed to computeSigningPayload and carried as
+				// Signature.rejectReason, exactly like the stale-revision reason above.
+				for (const blockId of blockIds) {
+					const rivals = (blockResults[blockId]?.state?.pendings ?? []).filter(actionId => actionId !== pendRequest.actionId);
+					if (rivals.length > 0) {
+						log('cluster-member:validation-pending-conflict', {
+							messageHash: record.messageHash,
+							blockId,
+							actionId: pendRequest.actionId,
+							rivals
+						});
+						return { valid: false, reason: `pending conflict: block ${blockId} held by unresolved action(s) ${rivals.join(', ')}` };
 					}
 				}
 
@@ -1420,7 +1481,10 @@ export class ClusterMember implements ICluster {
 			// the real cause. The durable marker was never written (it lands only after
 			// apply succeeds, below), so there is nothing to roll back. Recoverable local
 			// divergence is absorbed inside applyConsensusOperation and never reaches here.
+			// A retained pend verdict rolls back with the marker: it belongs to an apply
+			// that is now considered not-executed, and a re-run will retain a fresh one.
 			this.executedTransactions.delete(record.messageHash);
+			this.executedPendResults.delete(record.messageHash);
 			throw err;
 		}
 
@@ -1492,6 +1556,13 @@ export class ClusterMember implements ICluster {
 		}
 		if ('pend' in operation) {
 			const result = await this.storageRepo.pend(operation.pend);
+			// Retain the verdict either way so the coordinator can hand the writer storage's real
+			// answer (see getExecutedPendResult). A refusal here is NOT local divergence the way a
+			// commit refusal is: pend-consensus confers no durability — a refusal carrying `pending`
+			// (a rival's unresolved action holds the blocks) or `missing` (the requested revision is
+			// already committed) is the optimistic-concurrency verdict, and swallowing it acknowledged
+			// writes that no member stored.
+			this.executedPendResults.set(messageHash, result);
 			if (!result.success) {
 				log('cluster-member:consensus-pend-diverged', {
 					messageHash,
@@ -2088,6 +2159,7 @@ export class ClusterMember implements ICluster {
 		for (const [messageHash, executedAt] of Array.from(this.executedTransactions.entries())) {
 			if (executedAt < expirationThreshold) {
 				this.executedTransactions.delete(messageHash);
+				this.executedPendResults.delete(messageHash);
 			}
 		}
 		// Prune old applied-invalidation dedup markers on the same TTL.
