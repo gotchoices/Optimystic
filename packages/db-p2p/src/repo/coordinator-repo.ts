@@ -1425,6 +1425,17 @@ export class CoordinatorRepo implements IRepo {
 			// has no field for it and the retry loop only needs "retryable". If a caller ever needs to
 			// know WHICH transaction won (e.g. to wait on it rather than re-race it), add a typed field
 			// for it; never recover it by parsing `reason`.
+			//
+			// NOTE: with three or more contenders the members' votes can split so that EVERY
+			// contender is told it lost the race — an all-lose round where nobody wins and each
+			// writer retries. Fine as it stands: since the torn-action fixes that costs one retry
+			// cycle rather than wedging, and convergence rests on two things separating the
+			// contenders next round — the aged retry priority carried on the re-pend
+			// (`clampPriority(consecutiveFailures)` in `Collection.syncInternal`, which makes a
+			// repeatedly-losing writer out-rank fresh priority-0 rivals in `resolveRace`) and the
+			// jittered backoff before it. If a high-contention workload ever shows syncs exhausting
+			// `maxAttempts` on repeated all-lose rounds, make the winner deterministic (e.g. decide
+			// by a total order over the contending message hashes) rather than raising maxAttempts.
 			if (error instanceof ConflictRaceLostError) {
 				return { success: false, conflict: true, reason: error.message };
 			}

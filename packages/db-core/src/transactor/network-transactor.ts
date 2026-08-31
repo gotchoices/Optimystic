@@ -704,11 +704,19 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			return tailResult;
 		}
 
-		// Commit all remaining block ids (excluding tail and header if it was already handled)
-		const remainingBlocks = request.blockIds.filter(bid =>
-			bid !== request.tailId &&
-			!(request.headerId && bid === request.headerId && !request.blockIds.includes(request.headerId))
-		);
+		// Sweep every non-tail block. The tail is the ONLY exclusion needed: the header-first commit
+		// above fires only when the header is NOT in `blockIds`, so a header that IS in `blockIds`
+		// belongs here, in this sweep. (The removed second filter clause tested
+		// `!blockIds.includes(headerId)` against a `bid` drawn from `blockIds` — unsatisfiable
+		// whenever `bid === headerId`, so it never excluded anything.)
+		//
+		// The header -> tail -> sweep ORDER is deliberate and load-bearing; do not reorder it to put
+		// the contested blocks first. `Collection.bootstrapContext` documents the guarantee it rests
+		// on: "The tail is always committed first (commit protocol guarantee), so it's readable with
+		// context=undefined" — that bootstrap is what makes pending non-tail blocks visible to a
+		// chain walk. Committing the tail last would let a committed header point at a
+		// never-committed tail: a dangling pointer, strictly worse than an orphaned block.
+		const remainingBlocks = request.blockIds.filter(bid => bid !== request.tailId);
 		if (remainingBlocks.length > 0) {
 			const { batches, error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev, tailId: request.tailId, blockDigests: request.blockDigests });
 			if (error) {
@@ -723,14 +731,26 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				if (stale) {
 					return stale;
 				}
-				// NOTE: the tail (and header) already committed durably when this returns — the writer
-				// cancels and re-drives, and its re-executed action can re-append content that the
-				// committed tail already carries (a duplicate entry) or meet its own orphan revision on
-				// re-pend (a wedge). Refusing is still right — acknowledging a torn action is worse —
-				// but the durable-orphan class is the subject of
-				// tickets/fix/2-all-lose-conflict-race-wedges-concurrent-first-appends (commit ordering
-				// / own-action carve-out / durable invalidation); fix it there, not by restoring the
-				// blanket tolerance here.
+				// The tail (and header) already committed durably when this returns — a torn action.
+				// Refusing is still right, and must NOT be softened back into a blanket tolerance:
+				// acknowledging a torn action would report a write as durable while one of its blocks
+				// permanently points somewhere else. The two consequences that used to make the refusal
+				// itself harmful are now handled upstream, so the writer recovers on its own:
+				//   - its re-pend no longer meets its OWN durable revision as if a rival held it. All
+				//     three pend-tier checks carve out `latest.rev === request.rev &&
+				//     latest.actionId === request.actionId` (StorageRepo.pend, which also skips saving
+				//     a pending record for such a block; ClusterMember.validatePendOperations; and
+				//     CoordinatorRepo's stale classification). The retry no longer wedges.
+				//   - its retry consumes its own already-committed log entry instead of replaying it
+				//     (Collection.updateInternal's `inFlightActionId` arm, threaded by syncInternal,
+				//     which reuses one actionId across all of a sync's attempts). It no longer appends
+				//     a duplicate entry.
+				// NOTE: that second half covers the single-collection path only. The multi-collection
+				// path (TransactionCoordinator's retry loop) still refreshes without telling the
+				// collection which of its own actions is in flight, so a torn multi-collection commit
+				// can still record its entry twice — tracked as
+				// tickets/fix/refresh-must-always-know-its-own-in-flight-action, and to be fixed there
+				// rather than by tolerating the failure here.
 				//
 				// Transport-shaped failures (throws, no returned refusal) keep the tolerance: the commit
 				// consensus for these blocks exists, so lagging peers converge via reconciliation paths
