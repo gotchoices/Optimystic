@@ -440,7 +440,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 	}
 
-	private async updateInternal() {
+	/** @param inFlightActionId - The action id {@link syncInternal} is currently retrying, when this
+	 * refresh runs between a failed transact and its retry. If the committed log now carries an entry
+	 * under this id, that action's work is already durable despite the failure answer, so the entry is
+	 * CONSUMED rather than replayed (see the entry loop below). Omitted by every other caller —
+	 * {@link update} and {@link updateAndSync} pass nothing and the loop behaves exactly as before. */
+	private async updateInternal(inFlightActionId?: ActionId) {
 		// Start with a context that can see to the end of the log
 		const source = new TransactorSource(this.id, this.transactor, undefined);
 		const tracker = new Tracker(source);
@@ -485,19 +490,45 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// Process the entries and track the blocks they affect
 		let anyConflicts = false;
 		for (const entry of latest?.entries ?? []) {
-			// Filter any pending actions that conflict with the remote actions. Each pending
-			// action maps to its effective form: the original, a replacement, or dropped.
 			const before = this.pending;
-			const after = before
-				.map(p => this.doFilterConflict(p, entry.actions))
-				.filter((a): a is Action<TAction> => a !== undefined);
-			// A replacement or a discard changes the pending set; the tracker still holds the
-			// pre-filter transforms, so force a replay to re-stage against the effective actions.
-			// Identity comparison per the contract: keep => same instance, replace => new instance.
-			// NOTE: a filterConflict hook that always allocates a fresh (but equal) instance instead
-			// of returning the same one forces a replay on every update — if that ever shows up as a
-			// hot path, compare by value/id here instead of by reference.
-			const mutated = after.length !== before.length || after.some((a, i) => a !== before[i]);
+			let after: Action<TAction>[];
+			let mutated: boolean;
+			if (inFlightActionId !== undefined && entry.actionId === inFlightActionId) {
+				// This sync's OWN action is already durably committed — the failure it is retrying was
+				// stale. `NetworkTransactor.commit` commits the collection header and log tail before
+				// the sweep of the remaining blocks, so a later sweep block confirming a conflict
+				// reports failure over an action whose log entry already landed. Consume the entry
+				// instead of replaying it: replaying re-appends content the committed tail already
+				// carries, producing a duplicate entry.
+				// `addActions` wrote exactly the snapshot pending list under this id, and `act()`
+				// shares the collection latch with `syncInternal`, so `this.pending` cannot have grown
+				// mid-sync — the entry's actions are the leading `entry.actions.length` items of
+				// `this.pending`. `slice` is the defensive shape (never negative, never throws).
+				// NOTE: that correspondence rests on the shared latch, and the slice fails SILENTLY if it
+				// ever breaks — an entry longer than `pending` would drop actions that were never
+				// committed. If a path is ever added that stages actions outside the collection latch,
+				// assert `entry.actions.length <= before.length` here (and see the sibling note on
+				// syncInternal's post-commit replay, which relies on the same invariant).
+				after = before.slice(entry.actions.length);
+				// Unconditional, even for a zero-action entry: the tracker still holds this action's
+				// staged transforms, and only the replay below — which resets the tracker and re-stages
+				// just what remains — drops them. That reset is what turns `hasUnsyncedChanges()` false
+				// so the sync loop exits reporting the success the writer is owed (the action IS durable).
+				mutated = true;
+			} else {
+				// Filter any pending actions that conflict with the remote actions. Each pending
+				// action maps to its effective form: the original, a replacement, or dropped.
+				after = before
+					.map(p => this.doFilterConflict(p, entry.actions))
+					.filter((a): a is Action<TAction> => a !== undefined);
+				// A replacement or a discard changes the pending set; the tracker still holds the
+				// pre-filter transforms, so force a replay to re-stage against the effective actions.
+				// Identity comparison per the contract: keep => same instance, replace => new instance.
+				// NOTE: a filterConflict hook that always allocates a fresh (but equal) instance instead
+				// of returning the same one forces a replay on every update — if that ever shows up as a
+				// hot path, compare by value/id here instead of by reference.
+				mutated = after.length !== before.length || after.some((a, i) => a !== before[i]);
+			}
 			this.pending = after;
 			this.sourceCache.clear(entry.blockIds);
 			anyConflicts = anyConflicts || mutated || this.tracker.conflicts(new Set(entry.blockIds)).length > 0;
@@ -862,8 +893,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 				// baseBackoffMs for that caller rather than reintroducing the zero-delay retry.
 				const delay = jitteredBackoffMs(consecutiveFailures - 1, { baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
 				await abortableDelay(delay, signal);
-				// Fetch latest state - updateInternal() will call replayActions() if there are conflicts
-				await this.updateInternal();
+				// Fetch latest state - updateInternal() will call replayActions() if there are conflicts.
+				// Thread this attempt's actionId so the refresh can recognize a log entry written by
+				// THIS action (a commit that landed durably but answered stale — see updateInternal's
+				// entry loop) and consume it rather than replaying it into a duplicate entry.
+				await this.updateInternal(actionId);
 			} else {
 				// Forward progress: reset the no-progress budget.
 				consecutiveFailures = 0;
