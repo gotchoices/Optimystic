@@ -723,6 +723,15 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				if (stale) {
 					return stale;
 				}
+				// NOTE: the tail (and header) already committed durably when this returns — the writer
+				// cancels and re-drives, and its re-executed action can re-append content that the
+				// committed tail already carries (a duplicate entry) or meet its own orphan revision on
+				// re-pend (a wedge). Refusing is still right — acknowledging a torn action is worse —
+				// but the durable-orphan class is the subject of
+				// tickets/fix/2-all-lose-conflict-race-wedges-concurrent-first-appends (commit ordering
+				// / own-action carve-out / durable invalidation); fix it there, not by restoring the
+				// blanket tolerance here.
+				//
 				// Transport-shaped failures (throws, no returned refusal) keep the tolerance: the commit
 				// consensus for these blocks exists, so lagging peers converge via reconciliation paths
 				// (e.g. reads with context).

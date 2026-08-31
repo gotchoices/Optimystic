@@ -213,8 +213,22 @@ payload (`clusterVoteSigningPayload` in db-core), so neither can be rewritten in
 
 The coordinator counts the three kinds separately and reports a promise-phase shortfall as whichever
 it actually was: `ValidatorRejectionError` (invalid — permanent), `ConflictRaceLostError` (lost race
-— surfaced by `CoordinatorRepo.pend` as a retryable `StaleFailure` with `conflict: true`), or the
-legacy super-majority error reserved for a genuinely silent cohort.
+— surfaced by BOTH `CoordinatorRepo.pend` and `CoordinatorRepo.commit` as a retryable `StaleFailure`
+with `conflict: true`, never as a throw: db-core retries a thrown commit verbatim, and a re-driven
+dead commit can assemble a consensus no member will durably store), or the legacy super-majority
+error reserved for a genuinely silent cohort.
+
+**What `evaluatePromise` checks for a commit operation.** Two independent checks, both promise-round
+only (the commit-round vote is deliberately blind, so a promise vote is the only one that carries "I
+checked this"):
+
+1. `validateCommitRevisions` — is the requested revision already committed HERE under a *different*
+   action? Reject if so (a rival took the slot; the commit can never be durable). Abstain when this
+   member is behind the requested revision, when the same action already holds it (idempotent
+   redelivery), or when the member is past it and its revision index cannot name who took it
+   (`IRevisionActionReader.getRevisionAction` absent, truncated, or faulting).
+2. `validateCommitOperations` — does the declared per-block content digest reproduce locally? (See
+   `docs/correctness.md` § Content digest declaration.)
 
 **Super-Majority Validation** (in ClusterCoordinator):
 ```typescript

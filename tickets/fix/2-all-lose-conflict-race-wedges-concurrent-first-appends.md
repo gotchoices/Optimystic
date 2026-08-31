@@ -103,3 +103,25 @@ full retry cycle for every writer.
 - Acknowledged-means-durable is settled behavior — whatever unwedges retries must not
   re-introduce acknowledging a torn action (see the non-tail sweep comment in
   `network-transactor.ts:714-729`).
+
+## Second arm (added by review of `1-consensus-pend-refusal-commit-tier`, static)
+
+The same durable-orphan class has a second producer, in the same function: `NetworkTransactor.commit`
+commits the header, then the tail, then sweeps the remaining blocks — and that sweep now RETURNS a
+stale failure when a non-tail block's commit comes back as a confirmed conflict
+(`network-transactor.ts:714-737`, the `staleFromBatches` arm added by the commit-tier chain).
+Refusing is the right call — acknowledging a torn action is worse — but at that point the header and
+tail are already durably committed under this action, so the writer cancels and re-drives with the
+tail's content already in the collection. Two outcomes, both this ticket's subject:
+
+- the re-executed action re-appends content the committed tail already carries — a **duplicate
+  entry** (the mesh spec `concurrent-diary-append-acknowledgement.spec.ts` asserts no duplicates, but
+  never exercises tail-committed-then-non-tail-conflict);
+- or the re-pend meets this action's own orphan revision and wedges, exactly as described above.
+
+Consequence for the fix: an own-action carve-out in `validatePendOperations` alone unwedges the
+retry but does not stop the duplicate — the re-driven action must reconcile against what its own
+earlier attempt already committed, or the commit ordering must leave nothing durable behind when a
+later block loses. Whichever direction is chosen should cover both producers; a `NOTE:` at the
+non-tail sweep points here. `repro: static` for this arm — read from the code and the returned-stale
+path, not observed in a run.

@@ -1623,6 +1623,16 @@ export class CoordinatorRepo implements IRepo {
 				// it re-drives at a fresh revision. Own-action or unconfirmed refusals keep the
 				// prior fabricated-success shape: consensus is authoritative and this member converges
 				// via replication.
+				//
+				// NOTE: a CONFIRMED rival is trusted over the consensus outcome here. That is right in
+				// the window this closes (the cohort refused the loser too), but it inverts if the two
+				// ever disagree — a local rival at the requested revision while a super-majority
+				// approved OUR commit means this node is on a forked lineage, and refusing then tells a
+				// writer whose write did land to re-drive it (a duplicate entry). Members holding the
+				// rival reject at the promise round, so consensus and a local rival can only disagree
+				// after a fork; that is partition-healing scope (docs/partition-healing.md). If forks
+				// are ever observed here, weigh the retained verdict against the cohort's votes instead
+				// of trusting the local re-read alone.
 				if (localCommitResult !== undefined && !localCommitResult.success) {
 					const rival = await this.confirmCommitRivalAgainstLocal(request);
 					if (typeof rival === 'object') return rival;

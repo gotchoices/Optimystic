@@ -784,6 +784,47 @@ describe('NetworkTransactor', () => {
       expect(nonTailRepo.commits, 'the non-tail commit was attempted').to.be.greaterThan(0)
       expect(result.success).to.be.true
     })
+
+    it('surfaces the conflict, not the throw, when one non-tail block conflicts and another faults', async () => {
+      // Mixed batch: the returned refusal is the confirmed fact (a rival owns that revision) and
+      // must win over the transport fault, which says nothing about durability. staleFromBatches
+      // runs before the throw is re-surfaced, so the writer sees a retryable stale loss.
+      const faultingId = 'block-faulting' as BlockId
+      const peerF = 'peer-F'
+      const net = new RoutedKeyNetwork()
+      await net.setCluster(tailId, [peerT])
+      await net.setCluster(nonTailId, [peerN])
+      await net.setCluster(faultingId, [peerF])
+      const tailRepo = makeCommitOnlyRepo(async () => ({ success: true as const }))
+      const conflictRepo = makeCommitOnlyRepo(async () => ({
+        success: false as const,
+        conflict: true,
+        reason: `stale commit: block ${nonTailId} at rev 3, requested rev 3`,
+        staleAt: { blockId: nonTailId, rev: 3 },
+      }))
+      const faultingRepo = makeCommitOnlyRepo(async () => { throw new Error('The stream has been reset') })
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => {
+          const id = peerId.toString()
+          return id === peerT ? tailRepo : id === peerN ? conflictRepo : faultingRepo
+        },
+      })
+
+      const result = await networkTransactor.commit({
+        actionId: generateRandomActionId(),
+        rev: 3,
+        blockIds: [tailId, nonTailId, faultingId],
+        tailId,
+      })
+
+      expect(result.success).to.be.false
+      if (!result.success) {
+        expect(result.staleAt, 'the confirmed conflict wins over the transport fault').to.deep.equal({ blockId: nonTailId, rev: 3 })
+      }
+    })
   })
 
   describe('cancel', () => {
