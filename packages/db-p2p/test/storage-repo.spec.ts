@@ -4,7 +4,7 @@ import { blockWriteLatchKey, withBlockWriteLatch, type BlockWriteLatch } from '.
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockArchive, RestoreCallback, RevisionRange } from '../src/storage/struct.js';
-import type { BlockId, ActionId, ActionRev, ActionTransforms, CommitResult, PendRequest, StaleFailure, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
+import type { BlockId, ActionId, ActionRev, ActionTransforms, CommitResult, PendRequest, PendSuccess, StaleFailure, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
 import { isBlockChangeNotifier, Latches, canonicalBlockHash } from '@optimystic/db-core';
 import { delay } from '@optimystic/db-core/test';
 
@@ -289,6 +289,63 @@ describe('StorageRepo', () => {
 			if (!result.success && 'reason' in result) {
 				expect(result.reason).to.equal('Test rejection');
 			}
+		});
+	});
+
+	// A write transaction touching several blocks is committed one group at a time, so it can end
+	// up with SOME blocks durably committed and the rest refused (a "torn action"). The retry reuses
+	// the SAME actionId, so its pend meets its own already-committed half. Comparing revision
+	// numbers alone refuses the writer with its own durable work, forever.
+	describe('pend — own already-committed block (torn-action retry)', () => {
+		const listPendings = async (blockId: BlockId): Promise<ActionId[]> => {
+			const found: ActionId[] = [];
+			for await (const actionId of new BlockStorage(blockId, rawStorage).listPendingTransactions()) found.push(actionId);
+			return found;
+		};
+
+		const commitBlockOne = async () => {
+			const pended = await repo.pend({
+				actionId: 'a1' as ActionId,
+				rev: 1,
+				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1')),
+				policy: 'c'
+			});
+			expect(pended.success, 'setup: first pend must succeed').to.equal(true);
+			const committed = await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+			expect(committed.success, 'setup: commit must land at rev 1').to.equal(true);
+		};
+
+		it('accepts a re-pend of the SAME action at the revision it already committed, recording no pending', async () => {
+			await commitBlockOne();
+
+			const result = await repo.pend({
+				actionId: 'a1' as ActionId,
+				rev: 1,
+				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1')),
+				policy: 'c'
+			});
+
+			expect(result.success, 'our own durable work must not refuse us').to.equal(true);
+			// Still reported, so `cancel` covers the block (deleting an absent pending is a no-op).
+			expect((result as PendSuccess).blockIds).to.deep.equal(['block-1']);
+			// And NO pending record: commit's alreadyDone arm skips internalCommit, the only thing that
+			// promotes (and removes) a pending — one saved here would be a permanent durable
+			// reservation that the rival-pending checks refuse every future writer against.
+			expect(await listPendings('block-1' as BlockId), 'no permanent reservation').to.deep.equal([]);
+		});
+
+		it('still refuses a RIVAL action at a revision this node already holds', async () => {
+			await commitBlockOne();
+
+			const result = await repo.pend({
+				actionId: 'rival' as ActionId,
+				rev: 1,
+				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1')),
+				policy: 'c'
+			});
+
+			expect(result.success).to.equal(false);
+			expect((result as StaleFailure).missing?.length ?? 0, 'rival behavior unchanged').to.be.greaterThan(0);
 		});
 	});
 

@@ -1260,8 +1260,21 @@ export class ClusterMember implements ICluster {
 							});
 							return { valid: false, reason: `block ${blockId} unavailable (${blockResult.unavailable}): cannot verify revision` };
 						}
-						const latestRev = blockResult?.state?.latest?.rev;
-						if (latestRev !== undefined && latestRev >= pendRequest.rev) {
+						const latest = blockResult?.state?.latest;
+						if (latest !== undefined && latest.rev >= pendRequest.rev) {
+							if (latest.rev === pendRequest.rev && latest.actionId === pendRequest.actionId) {
+								// Self is excluded so a redelivered pend for this same action stays
+								// approvable — the same exclusion the pending-rival check below
+								// documents. A write touching several blocks commits them a group at a
+								// time, so it can end up with some blocks durable and the rest refused;
+								// its retry reuses the actionId and meets its own commit here.
+								// Rejecting would refuse the writer with its own durable work forever.
+								// Only `===` is carved out: past the requested revision the follow-on
+								// commit is refused by storage anyway, so approving would only defer
+								// the refusal a round trip.
+								continue;
+							}
+							const latestRev = latest.rev;
 							log('cluster-member:validation-stale-revision', {
 								messageHash: record.messageHash,
 								blockId,

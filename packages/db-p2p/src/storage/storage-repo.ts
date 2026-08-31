@@ -494,6 +494,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// requested one — reported as StaleFailure.staleAt so a losing writer learns the number
 		// instead of parsing prose. Confirmed-local only: we read it from our own storage below.
 		let staleAt: StaleFailure['staleAt'];
+		// Blocks this action ALREADY committed at exactly the requested revision — the durable half
+		// of a torn action whose retry reuses the same actionId. Sibling of the `alreadyDone`
+		// partition in `commit` below: satisfied, not merely non-stale, so no pending is recorded
+		// for them (see the fan-out at the end of this method).
+		const satisfied = new Set<BlockId>();
 
 		// Potential race condition: A concurrent commit operation could complete
 		// between the conflict checks (latest.rev, listPendingTransactions) and the
@@ -506,13 +511,20 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			const blockStorage = this.createBlockStorage(blockId);
 			const transforms = transformForBlockId(request.transforms, blockId);
 
-			// First handle any pending actions
-			const pending = await asyncIteratorToArray(blockStorage.listPendingTransactions());
-			pendings.push(...pending.map(actionId => ({ blockId, actionId })));
-
-			// Handle any conflicting revisions
+			// Handle any conflicting revisions FIRST: a block this same action already committed at
+			// exactly the requested revision is satisfied, and skips both this check and the
+			// pending-action listing below.
 			if (request.rev !== undefined || transforms.insert) {
 				const latest = await blockStorage.getLatest();
+				if (latest && request.rev !== undefined && latest.rev === request.rev && latest.actionId === request.actionId) {
+					// Our own already-durable work, met again by a retry that reuses the actionId
+					// (a torn action: some blocks committed, the rest refused). Treating it as a
+					// stale rival would refuse the writer with its own commit, permanently. Only
+					// `===` is carved out — never `latest.rev > request.rev`, where the follow-on
+					// commit takes the `missedCommits` branch and refuses anyway.
+					satisfied.add(blockId);
+					continue;
+				}
 				if (latest && latest.rev >= (request.rev ?? 0)) {
 					// Only a real revision race yields a meaningful `staleAt`. When `request.rev` is
 					// undefined this same branch fires for an insert collision (the comparison degrades
@@ -535,6 +547,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 					}
 				}
 			}
+
+			// Then handle any pending actions
+			const pending = await asyncIteratorToArray(blockStorage.listPendingTransactions());
+			pendings.push(...pending.map(actionId => ({ blockId, actionId })));
 		}
 
 		if (missing.length) {
@@ -578,7 +594,16 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// an unlatched seed racing a concurrent commit/replica on a fresh block erases the `latest`
 		// the other writer just landed. Never more than one block latch is held by a branch, so this
 		// cannot deadlock against commit's sorted multi-latch acquisition.
-		await Promise.all(blockIds.map(blockId => {
+		//
+		// `satisfied` blocks are skipped: this action's commit for them already landed, and
+		// `commit`'s `alreadyDone` arm `continue`s past `internalCommit` — the only thing that
+		// promotes (and thereby removes) a pending record. A pending saved here would never be
+		// cleared and would sit as a permanent durable reservation that the rival-pending checks
+		// (this method's own listPendingTransactions scan, and
+		// `ClusterMember.validatePendOperations`) refuse every future writer against — a worse
+		// wedge than the one this carve-out fixes. They still ride in the returned `blockIds` so
+		// `cancel` covers them; `deletePendingTransaction` on an absent record is a no-op.
+		await Promise.all(blockIds.filter(blockId => !satisfied.has(blockId)).map(blockId => {
 			const blockStorage = this.createBlockStorage(blockId);
 			const blockTransform = transformForBlockId(request.transforms, blockId);
 			return withBlockWriteLatch(blockId, latch => blockStorage.savePendingTransaction(request.actionId, blockTransform, latch));

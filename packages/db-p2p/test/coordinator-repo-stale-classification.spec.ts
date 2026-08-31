@@ -66,6 +66,10 @@ class MockClusterClient implements ICluster {
 class MockStorageRepo implements IRepo {
 	latestRev: number | undefined;
 	revByBlock: Record<BlockId, number> | undefined;
+	/** Who holds `latest` — defaults to a rival; set to the request's own actionId to exercise the
+	 * torn-action self-exclusion. `actionIdByBlock` overrides it per block. */
+	latestActionId = 'prior-action';
+	actionIdByBlock: Record<BlockId, string> | undefined;
 	getError: Error | undefined;
 	getCalls = 0;
 	pendCalls = 0;
@@ -75,7 +79,8 @@ class MockStorageRepo implements IRepo {
 		if (this.getError) throw this.getError;
 		return Object.fromEntries(blockGets.blockIds.map(id => {
 			const rev = this.revByBlock?.[id] ?? this.latestRev;
-			return [id, { state: rev === undefined ? {} : { latest: { actionId: 'prior-action', rev } } }];
+			const actionId = this.actionIdByBlock?.[id] ?? this.latestActionId;
+			return [id, { state: rev === undefined ? {} : { latest: { actionId, rev } } }];
 		}));
 	}
 
@@ -208,6 +213,38 @@ describe('CoordinatorRepo stale-revision classification (pend)', function () {
 		// The prose names the same block, so the two can never disagree.
 		expect((result as StaleFailure).reason)
 			.to.equal(`stale revision: block ${BLOCK_ID_2} at rev 7, requested rev 3`);
+	});
+
+	// A write touching several blocks commits them a group at a time, so it can end up with some
+	// blocks durable and the rest refused (a "torn action"); the retry reuses the same actionId and
+	// meets its own committed half. That is not a loss to a rival, so it must not be classified as
+	// one. Mirrors the same carve-out in StorageRepo.pend and ClusterMember.validatePendOperations.
+	it(`does not confirm a loss against THIS action's own already-committed revision`, async () => {
+		setVerdicts({ type: 'approve' }, { type: 'reject', reason: 'stale revision: block block-1 at rev 1, requested rev 1' });
+		storage.latestRev = 1;
+		storage.latestActionId = 'action-rev-1';	// == makePendRequest(1).actionId
+
+		let caught: unknown;
+		try {
+			await repo.pend(makePendRequest(1));
+		} catch (err) {
+			caught = err;
+		}
+		// Nothing confirmed, so the rejection keeps its throw, exactly as before this carve-out.
+		expect(caught, 'our own durable revision is not a confirmed loss').to.be.instanceOf(ValidatorRejectionError);
+		expect(caught).to.not.have.property('staleAt');
+	});
+
+	it('still confirms a rival on ANOTHER block while excluding our own committed one', async () => {
+		// The exclusion is per block, deliberately NOT a bail-out for the whole request.
+		setVerdicts({ type: 'approve' }, { type: 'reject', reason: 'stale revision: block block-2 at rev 5, requested rev 3' });
+		storage.revByBlock = { [BLOCK_ID]: 3, [BLOCK_ID_2]: 5 };
+		storage.actionIdByBlock = { [BLOCK_ID]: 'action-rev-3' };	// ours; block-2 stays a rival
+
+		const result = await repo.pend(makePendRequest(3, [BLOCK_ID, BLOCK_ID_2]));
+		expect(result.success).to.equal(false);
+		expect((result as StaleFailure).staleAt, 'the rival block, not our own')
+			.to.deep.equal({ blockId: BLOCK_ID_2, rev: 5 });
 	});
 
 	it('rethrows ValidatorRejectionError when local storage cannot confirm staleness', async () => {

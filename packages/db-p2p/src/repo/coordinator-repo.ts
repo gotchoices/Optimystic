@@ -1473,7 +1473,18 @@ export class CoordinatorRepo implements IRepo {
 		// number and the reason prose name that block, so they never disagree.
 		const staleAt = highestStaleAt(blockIds.map(blockId => {
 			const latest = results[blockId]?.state.latest;
-			return latest && latest.rev >= requestedRev ? { blockId, rev: latest.rev } : undefined;
+			if (!latest || latest.rev < requestedRev) return undefined;
+			// Per-block self-exclusion: a block THIS action already committed at exactly the
+			// requested revision is our own durable half of a torn action (some blocks committed,
+			// the rest refused; the retry reuses the actionId), not a confirmed loss to a rival.
+			// Deliberately per-block, NOT the bail-entirely 'own-durable' shape of
+			// confirmCommitRivalAgainstLocal — a confirmed rival on ANOTHER block still confirms,
+			// and when none is confirmed anywhere the rejection stays a throw exactly as before.
+			// With the two pend-tier sites upstream fixed (StorageRepo.pend and
+			// ClusterMember.validatePendOperations) this shape should not reach here; mirrored so
+			// all three pend-tier checks agree.
+			if (latest.rev === requestedRev && latest.actionId === request.actionId) return undefined;
+			return { blockId, rev: latest.rev };
 		}));
 		if (staleAt) {
 			this.log('coordinator-repo:pend-stale-classified', {
