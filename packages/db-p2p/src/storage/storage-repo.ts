@@ -15,7 +15,7 @@ import type { IBlockStorage } from "./i-block-storage.js";
 import type { IBlockReplicaStore } from "../cluster/block-transfer-service.js";
 import { proofDeclaredDigest, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { RevisionNotCoveredError } from "./i-block-storage.js";
-import { acquireBlockWriteLatch, withBlockWriteLatch, type BlockWriteLatch } from "./block-latch.js";
+import { acquireBlockWriteLatches, withBlockWriteLatch, type BlockWriteLatch } from "./block-latch.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('storage-repo');
@@ -609,11 +609,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 */
 	async commit(request: CommitRequest, _options?: MessageOptions, proof?: BlockCommitProof): Promise<CommitResult> {
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
-		// Deduped ONCE, in request order; the sorted copy below is the latch-acquisition order. Both
-		// views must name exactly the same set — `latches.get(blockId)!` below relies on it.
+		// Deduped ONCE, in request order — the order blocks are committed and reported in. The latches
+		// are acquired in sorted order by `acquireBlockWriteLatches` over this same set, so every
+		// `latches.get(blockId)!` below resolves.
 		const blockIds = Array.from(new Set(request.blockIds));
-		const latchOrder = [...blockIds].sort();
-		const releases: (() => void)[] = [];
 		// Collects the blocks newly committed in this call, grouped by collection,
 		// so we can emit change events once locks are released. Blocks that land before
 		// a mid-loop failure stay here and are still emitted (Option A — emit eagerly):
@@ -623,16 +622,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// so locks release and accumulated landings still emit before we report failure.
 		let failure: { reason: string } | undefined;
 
-		try {
-			// Acquire the block write latches sequentially in sorted id order to prevent deadlocks.
-			// Each block's token is kept so every write below can prove it runs inside the latch.
-			const latches = new Map<BlockId, BlockWriteLatch>();
-			for (const id of latchOrder) {
-				const { latch, release } = await acquireBlockWriteLatch(id);
-				releases.push(release);
-				latches.set(id, latch);
-			}
+		// Every block's token is kept so each write below can prove it runs inside that block's latch.
+		const { latches, release } = await acquireBlockWriteLatches(blockIds);
 
+		try {
 			// --- Start of Critical Section ---
 
 			// Request order, deduped (NOT the sorted acquisition order): the order here is the order
@@ -820,8 +813,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			}
 		}
 		finally {
-			// Release locks in reverse order of acquisition
-			releases.reverse().forEach(release => release());
+			// Releases every block latch, in reverse acquisition order.
+			release();
 		}
 
 		// Notify after the critical section, for every block newly committed here —

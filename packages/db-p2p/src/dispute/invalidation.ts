@@ -6,7 +6,7 @@ import type {
 } from '@optimystic/db-core';
 import { applyTransform, hashString } from '@optimystic/db-core';
 import type { IBlockStorage } from '../storage/i-block-storage.js';
-import { acquireBlockWriteLatch, type BlockWriteLatch } from '../storage/block-latch.js';
+import { acquireBlockWriteLatches } from '../storage/block-latch.js';
 import type { DisputeResolution, ArbitrationVote } from './types.js';
 import { createLogger } from '../logger.js';
 
@@ -586,6 +586,14 @@ export async function applyInvalidation(ctx: InvalidationContext, params: ApplyI
 	const { invalidatedActionId, invalidatedRev, blockIds, proof } = params;
 
 	// 1. Idempotent re-receipt — keyed on (invalidatedActionId, disputeId).
+	// NOTE: this read is outside the block latches taken in step 3, so two OVERLAPPING applies of the
+	// same invalidation would both pass here and both write a compensating revision (the second at a
+	// slot one past the first), appending two entries for one invalidation. Not reachable today: the
+	// network path serializes through consensus and dedups in memory first
+	// (`ClusterRepo.applyConsensusInvalidation`), and the cascade applies its children sequentially.
+	// If a caller ever applies the same invalidation concurrently, this dedup has to move inside the
+	// critical section — which means keying it on something the block latches actually cover, since
+	// `ctx.log` is not latched by them.
 	const existing = await ctx.log.findInvalidation(invalidatedActionId);
 	if (existing && existing.resolution.disputeId === proof.disputeId) {
 		log('apply-skip-duplicate actionId=%s disputeId=%s', invalidatedActionId, proof.disputeId);
@@ -606,39 +614,38 @@ export async function applyInvalidation(ctx: InvalidationContext, params: ApplyI
 
 	// 3. Compensating revisions — ONE critical section spanning every affected block.
 	//
-	// Latch discipline: acquire ALL affected blocks' write latches up front, sequentially, in sorted
-	// block-id order, and hold them across compute → revision slot → precheck → writes. That is the
-	// same discipline `StorageRepo.commit` follows, so the two cannot deadlock against each other:
-	// every multi-latch holder in this package takes its keys in the one global (sorted) order, so
-	// there is no acquisition cycle. (The previous code took each block's latch around only its own
-	// write, which left the tips it computed from — and the revision slot derived from them — read
-	// outside any latch: a concurrent commit could land a newer revision in the gap, the monotonic
-	// guard in saveReplica/saveDeletion would correctly refuse the compensating write, and the log
-	// entry appended in step 4 would then assert a restore that never happened.)
+	// Latch discipline: hold ALL affected blocks' write latches across compute → revision slot →
+	// precheck → writes. `acquireBlockWriteLatches` is the package's single multi-latch entry point
+	// (it dedups and acquires in the one global sorted order), so this cannot deadlock against the
+	// other multi-latch holder, `StorageRepo.commit`. (The previous code took each block's latch
+	// around only its own write, which left the tips it computed from — and the revision slot derived
+	// from them — read outside any latch: a concurrent commit could land a newer revision in the gap,
+	// the monotonic guard in saveReplica/saveDeletion would correctly refuse the compensating write,
+	// and the log entry appended in step 4 would then assert a restore that never happened.)
 	//
-	// Duplicate ids are collapsed before acquisition: `Latches` is a plain FIFO mutex with no
-	// re-entrancy, so acquiring the same key twice in this loop would deadlock against ourselves.
-	// The certificate target above deliberately still uses the caller's `blockIds` verbatim — the
-	// arbitrators signed over that list.
+	// Collapsing duplicate ids is why `uniqueBlockIds` drives the writes and `reverted` too: one
+	// latched block yields one compensating write and one entry. The certificate target above
+	// deliberately still uses the caller's `blockIds` verbatim — the arbitrators signed over that list.
 	const uniqueBlockIds = Array.from(new Set(blockIds));
-	const latchOrder = [...uniqueBlockIds].sort();
-	const releases: (() => void)[] = [];
+	const { latches, release } = await acquireBlockWriteLatches(uniqueBlockIds);
 	let reverted: RevertedBlock[];
 	let rev: number;
 	try {
-		const latches = new Map<BlockId, BlockWriteLatch>();
-		for (const id of latchOrder) {
-			const { latch, release } = await acquireBlockWriteLatch(id);
-			releases.push(release);
-			latches.set(id, latch);
-		}
-
 		// --- Start of critical section ---
 
 		// Compute compensating content from tips read UNDER the latches. `computeRevertedBlock` reads
-		// only through getLatest/listRevisions/getBlock/getTransaction — none of which acquire a latch,
-		// so it is safe to call while holding them. Keep it that way: routing it through a healing read
-		// path (`StorageRepo.get` heals under the block latch) would self-deadlock here.
+		// only through getLatest/listRevisions/getBlock/getTransaction — none of which acquire a latch
+		// or touch the network (`BlockStorage.getBlock` throws `RevisionNotCoveredError` rather than
+		// restoring; the healing re-read lives one layer up in `StorageRepo.get`), so it is safe to
+		// call while holding them. Keep it that way: routing it through the healing path, which
+		// restores under the block latch, would self-deadlock here.
+		//
+		// NOTE: this compute now runs inside the critical section, so every commit and pend on these
+		// blocks queues behind it, and its cost grows with the number of revisions between T_inv and
+		// the tip (`listRevisions` + a transform apply each). Fine at invalidation's rate — a reversal
+		// is rare and its blocks are few. If invalidations ever become frequent, or reversals of very
+		// old transactions show up delaying commits, compute optimistically outside the latches and
+		// re-verify the tips inside (recomputing only the blocks that moved).
 		const computations = await Promise.all(
 			uniqueBlockIds.map(async (blockId) => {
 				const storage = ctx.createBlockStorage(blockId);
@@ -696,10 +703,8 @@ export async function applyInvalidation(ctx: InvalidationContext, params: ApplyI
 
 		// --- End of critical section ---
 	} finally {
-		// Release in reverse acquisition order; every acquired latch is released even if a write threw.
-		for (let i = releases.length - 1; i >= 0; i--) {
-			releases[i]!();
-		}
+		// Every acquired latch is released even if a compute or a write threw.
+		release();
 	}
 
 	// 4. Durable, append-only invalidation entry (the source of truth for committed-invalidated).
@@ -707,6 +712,13 @@ export async function applyInvalidation(ctx: InvalidationContext, params: ApplyI
 	//    itself be repo-backed, and `Latches` has no re-entrancy — appending under a block latch could
 	//    self-deadlock.
 	//    `cascadeRoot` is set when this is a cascade step (a reverted read-dependent), undefined for a root.
+	//
+	// NOTE: the gap between the writes landing and this append is a crash window — a crash inside it
+	// leaves compensating revisions with no entry naming them. Deliberate, and the recoverable
+	// direction of the invariant this function establishes: an entry never over-claims, it can only
+	// under-claim, and re-delivery re-applies (step 1 dedups on the entry, which is not there). The
+	// asymmetry only stops being acceptable if a consumer starts treating "revision present, entry
+	// absent" as authoritative rather than as a state to re-sync.
 	await ctx.log.addInvalidation(invalidatedActionId, invalidatedRev, proof, reverted, rev, params.cascadeRoot, params.timestamp);
 	log('apply-complete actionId=%s disputeId=%s rev=%d blocks=%d', invalidatedActionId, proof.disputeId, rev, reverted.length);
 

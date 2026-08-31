@@ -956,6 +956,78 @@ describe('applyInvalidation', () => {
 			}
 			expect(commitResult.success).to.equal(true);
 		});
+
+		it('collapses a repeated block id: one latch, one compensating write, one reported block', async () => {
+			const raw = new MemoryRawStorage();
+			const { createBlockStorage } = await seedBlock(raw, 'B', [
+				{ actionId: 'a1', value: 'original', rev: 1 },
+				{ actionId: 'a2', value: 'tinv', rev: 2 },
+			]);
+			const log = await Log.create<unknown>(new MemLogStore());
+			// The arbitrators signed over the caller's list verbatim, duplicate and all — so the
+			// certificate target must still be built from the un-deduped ids for verification to pass.
+			const proof = await challengerWinsProof('d1', 'msg-1', { invalidatedActionId: 'a2', blockIds: ['B', 'B'] });
+
+			// `Latches` is a plain FIFO mutex with no re-entrancy: acquiring 'B' twice would park the
+			// apply against itself forever, so a hang here (mocha's 10s timeout) IS the failure.
+			const result = await applyInvalidation({ log, createBlockStorage }, {
+				invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['B', 'B'], proof,
+			});
+
+			expect(result.applied).to.equal(true);
+			expect(result.rev).to.equal(3);
+			// One latched block ⇒ one compensating write ⇒ one reported block, not two.
+			expect(result.reverted.map(r => r.blockId)).to.deep.equal(['B']);
+			expect((await log.findInvalidation('a2'))?.reverted.length).to.equal(1);
+			const current = await createBlockStorage('B').getBlock();
+			expect((current!.block as ValueBlock).value).to.equal('original');
+			expect(current!.actionRev.rev).to.equal(3);
+		});
+
+		it('throws rather than reporting a reversal when a write path refuses for a reason the precheck does not model', async () => {
+			const raw = new MemoryRawStorage();
+			const { createBlockStorage } = await seedBlock(raw, 'B', [
+				{ actionId: 'a1', value: 'original', rev: 1 },
+				{ actionId: 'a2', value: 'tinv', rev: 2 },
+			]);
+			const log = await Log.create<unknown>(new MemLogStore());
+			const proof = await challengerWinsProof('d1', 'msg-1');
+
+			// The boundary invariant is unreachable through the real write paths — the precheck covers
+			// every refusal `saveForwardRevision` can produce — so the only way to exercise it is a
+			// storage whose forward write reports an effective revision other than the intended one.
+			// That is exactly the future write path the assertion exists to catch.
+			const lyingStorage = (id: BlockId) => {
+				const real = createBlockStorage(id);
+				return new Proxy(real, {
+					get(target, prop, receiver) {
+						if (prop === 'saveReplica') {
+							return async () => ({ rev: 99, actionId: 'someone-else' });
+						}
+						return Reflect.get(target, prop, receiver);
+					}
+				});
+			};
+
+			let thrown: Error | undefined;
+			try {
+				await applyInvalidation({ log, createBlockStorage: lyingStorage }, {
+					invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['B'], proof,
+				});
+			} catch (err) {
+				thrown = err as Error;
+			}
+
+			expect(thrown, 'a refused write must not be reported as a reversal').to.be.instanceOf(Error);
+			expect(thrown!.message).to.contain('did not land for block B');
+			expect(thrown!.message).to.contain('rev: 99');
+			// Nothing appended: the caller (ClusterRepo) rolls back its dedup marker and re-delivery retries.
+			expect(await log.findInvalidation('a2')).to.equal(undefined);
+			// And the latch is released on the throw path, so the block is still writable.
+			expect(await withBlockWriteLatch('B', latch =>
+				createBlockStorage('B').saveDeletion({ rev: 3, actionId: 'after' }, latch)))
+				.to.deep.equal({ rev: 3, actionId: 'after' });
+		});
 	});
 });
 

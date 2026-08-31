@@ -61,11 +61,12 @@ export class BlockWriteLatch {
 }
 
 /**
- * Acquire the write latch for `blockId`. The non-scoped form exists for `StorageRepo.commit`, which
- * holds N block latches at once (acquired in sorted id order so two commits cannot deadlock); every
- * other caller should prefer {@link withBlockWriteLatch}. The caller MUST call `release` exactly
- * once, in a `finally`. Releasing expires the token, so a write attempted with it afterwards is
- * rejected rather than running outside the latch.
+ * Acquire the write latch for `blockId`. The non-scoped single-block form is the building block for
+ * {@link acquireBlockWriteLatches} and for a caller that must hold one latch across control flow a
+ * callback cannot express; everything else should prefer {@link withBlockWriteLatch}. A caller that
+ * wants N latches must go through {@link acquireBlockWriteLatches}, not loop over this. The caller
+ * MUST call `release` exactly once, in a `finally`. Releasing expires the token, so a write attempted
+ * with it afterwards is rejected rather than running outside the latch.
  */
 export async function acquireBlockWriteLatch(blockId: BlockId): Promise<{ latch: BlockWriteLatch; release: () => void }> {
 	const releaseLatch = await Latches.acquire(blockWriteLatchKey(blockId));
@@ -79,11 +80,59 @@ export async function acquireBlockWriteLatch(blockId: BlockId): Promise<{ latch:
 	};
 }
 
+/** The N-latch hold {@link acquireBlockWriteLatches} returns: a token per block, and one release. */
+export type BlockWriteLatches = {
+	/** Token per requested block id, so each write can prove it runs inside that block's latch. */
+	readonly latches: ReadonlyMap<BlockId, BlockWriteLatch>;
+	/** Releases every latch, in reverse acquisition order. Call exactly once, in a `finally`. */
+	readonly release: () => void;
+};
+
+/**
+ * Acquire the write latches for a whole set of blocks at once — the only sanctioned way to hold more
+ * than one. Two callers need it (`StorageRepo.commit` and `applyInvalidation`), and the property that
+ * keeps them from deadlocking against each other is not local to either: it is that EVERY multi-latch
+ * holder acquires in the one global order. Owning that here makes it a property of the module that
+ * owns the key rather than a rule each call site restates and a third one could get wrong.
+ *
+ * Three things this does that a hand-rolled loop keeps getting wrong:
+ *  - **Dedups** the ids. `Latches` is a plain FIFO mutex with no re-entrancy, so a repeated id in the
+ *    request would deadlock the acquirer against itself.
+ *  - **Sorts** them, so any two multi-latch holders acquire in the same order and no cycle exists.
+ *  - **Releases what it already took** if an acquisition partway through the set throws, rather than
+ *    stranding those latches forever.
+ *
+ * The returned map is keyed by the ids actually held, so a caller that wants its own (e.g. request)
+ * ordering can iterate its own list and look each token up.
+ */
+export async function acquireBlockWriteLatches(blockIds: Iterable<BlockId>): Promise<BlockWriteLatches> {
+	const ordered = Array.from(new Set(blockIds)).sort();
+	const releases: (() => void)[] = [];
+	const release = () => {
+		for (let i = releases.length - 1; i >= 0; i--) {
+			releases[i]!();
+		}
+		releases.length = 0;
+	};
+	const latches = new Map<BlockId, BlockWriteLatch>();
+	try {
+		for (const id of ordered) {
+			const acquired = await acquireBlockWriteLatch(id);
+			releases.push(acquired.release);
+			latches.set(id, acquired.latch);
+		}
+	} catch (err) {
+		release();
+		throw err;
+	}
+	return { latches, release };
+}
+
 /**
  * Run `fn` while holding the write latch for `blockId`, handing it the token to pass down to the
  * storage writes it makes. Acquire/release is per call, so a caller holds at most one block latch at
- * a time and cannot deadlock against `StorageRepo.commit`'s sorted, up-front multi-latch acquisition
- * — as long as `fn` does not itself acquire another block's latch (nothing in this package does).
+ * a time and cannot deadlock against a sorted, up-front {@link acquireBlockWriteLatches} hold — as
+ * long as `fn` does not itself acquire another block's latch (nothing in this package does).
  */
 export async function withBlockWriteLatch<T>(blockId: BlockId, fn: (latch: BlockWriteLatch) => Promise<T>): Promise<T> {
 	const { latch, release } = await acquireBlockWriteLatch(blockId);

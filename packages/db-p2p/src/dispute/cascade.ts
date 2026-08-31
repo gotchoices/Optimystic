@@ -208,9 +208,10 @@ export type CascadeEscalation = {
 	readonly remainder: ReadonlyArray<CascadeStanding>;
 	/**
 	 * Candidates whose fate could not be decided — a legacy entry with no persisted read set (no engine
-	 * to re-execute it), or one the cascade decided to invalidate but whose compensating write was
-	 * refused wholesale (`applyInvalidation` reason `stale-revision`), so the reversal did not happen
-	 * and the dependent must not be dropped from the frontier as if it were fine.
+	 * to re-execute it), or one the cascade decided to invalidate but whose `applyInvalidation` did not
+	 * apply (a wholesale-refused compensating write, reason `stale-revision`; any other non-applied
+	 * reason lands here too), so the reversal did not happen and the dependent must not be dropped from
+	 * the frontier as if it were fine.
 	 */
 	readonly unevaluable: ReadonlyArray<CascadeStanding>;
 };
@@ -288,6 +289,18 @@ export async function cascadeInvalidate(input: CascadeInput): Promise<CascadeRes
 	const children: CascadeChild[] = [];
 	const affectedCollections = new Set<CollectionId>(input.seed.map(s => s.collectionId));
 	const unevaluable: CascadeStanding[] = [];
+	/**
+	 * Park a candidate whose fate the cascade could not decide, at most once. Both callers below mean
+	 * the same thing — this dependent is neither retained nor reverted, so it must not leave the
+	 * frontier as if it were fine — and both must mark its collection affected, or the `unevaluable`
+	 * escalation would not name the collection that needs the re-sync.
+	 */
+	const markUnevaluable = (cand: CascadeCandidate) => {
+		if (!unevaluable.some(u => u.collectionId === cand.collectionId && u.actionId === cand.actionId)) {
+			unevaluable.push(standing(cand));
+		}
+		affectedCollections.add(cand.collectionId);
+	};
 	let retained: CascadeStanding[] = [];
 	let rounds = 0;
 	let escalation: CascadeEscalation | undefined;
@@ -333,10 +346,7 @@ export async function cascadeInvalidate(input: CascadeInput): Promise<CascadeRes
 				continue;
 			}
 			if (verdict === 'unevaluable') {
-				if (!unevaluable.some(u => u.collectionId === cand.collectionId && u.actionId === cand.actionId)) {
-					unevaluable.push(standing(cand));
-				}
-				affectedCollections.add(cand.collectionId);
+				markUnevaluable(cand);
 				continue;
 			}
 
@@ -368,19 +378,17 @@ export async function cascadeInvalidate(input: CascadeInput): Promise<CascadeRes
 			// exists (prior cascade run / restart). Treat it as invalidated and reuse its reverted blocks
 			// so the frontier still grows and the cascade reconverges without a second entry.
 			if (!result.applied && result.reason !== 'already-applied') {
-				// invalid-certificate should be impossible: the child verifies the root proof against the
-				// root's target (rootCertificateTarget), and the root proof is a valid challenger-wins cert.
-				// `stale-revision` means the child's compensating write was refused wholesale (nothing
-				// written, nothing appended) — we do NOT know whether this dependent still holds, so it
-				// must NOT be silently dropped from the frontier as if it were fine. Record it as
-				// unevaluable: that already produces an `unevaluable` escalation telling the caller the
-				// affected collections need a full re-sync, which is exactly what "could not decide this
-				// dependent's fate" means here.
+				// The child was decided-to-invalidate but the reversal did not happen, so we do NOT know
+				// whether this dependent still holds — it must not be dropped from the frontier as if it
+				// were fine. Deliberately keyed on "not applied", not on a specific reason, so a reason
+				// added later cannot re-open the silent-drop hole:
+				//  - `stale-revision` — the compensating write was refused wholesale (nothing written,
+				//    nothing appended). The reachable case.
+				//  - `invalid-certificate` — should be impossible here (the child verifies the ROOT proof
+				//    against the root's target, and that proof is a valid challenger-wins cert), but if it
+				//    ever fires, an undecided dependent is the honest report.
 				log('child-apply-rejected actionId=%s reason=%s', cand.actionId, result.reason);
-				if (!unevaluable.some(u => u.collectionId === cand.collectionId && u.actionId === cand.actionId)) {
-					unevaluable.push(standing(cand));
-				}
-				affectedCollections.add(cand.collectionId);
+				markUnevaluable(cand);
 				continue;
 			}
 
