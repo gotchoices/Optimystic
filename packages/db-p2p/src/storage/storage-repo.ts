@@ -8,7 +8,7 @@ import type {
 } from "@optimystic/db-core";
 import {
 	transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
-	blockIdsForTransforms, transformsFromTransform, highestStaleAt, canonicalBlockHash
+	blockIdsForTransforms, transformsFromTransform, highestStaleAt, isOwnRevision, canonicalBlockHash
 } from "@optimystic/db-core";
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
@@ -516,12 +516,14 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			// pending-action listing below.
 			if (request.rev !== undefined || transforms.insert) {
 				const latest = await blockStorage.getLatest();
-				if (latest && request.rev !== undefined && latest.rev === request.rev && latest.actionId === request.actionId) {
-					// Our own already-durable work, met again by a retry that reuses the actionId
-					// (a torn action: some blocks committed, the rest refused). Treating it as a
-					// stale rival would refuse the writer with its own commit, permanently. Only
-					// `===` is carved out — never `latest.rev > request.rev`, where the follow-on
-					// commit takes the `missedCommits` branch and refuses anyway.
+				// Our own already-durable work, met again by a retry (see {@link isOwnRevision}):
+				// treating it as a stale rival would refuse the writer with its own commit.
+				// NOTE: a rev-less pend (`request.rev === undefined`, an insert-only claim) can
+				// never match, so a torn action retried WITHOUT a revision is still refused by its
+				// own insert. No production caller sends one — `TransactorSource.transact` and the
+				// multi-collection coordinator both require a rev — so this is unreachable today;
+				// if a rev-less write path ever appears, match on `latest.actionId` alone here.
+				if (isOwnRevision(latest, request.rev, request.actionId)) {
 					satisfied.add(blockId);
 					continue;
 				}
@@ -595,14 +597,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// the other writer just landed. Never more than one block latch is held by a branch, so this
 		// cannot deadlock against commit's sorted multi-latch acquisition.
 		//
-		// `satisfied` blocks are skipped: this action's commit for them already landed, and
-		// `commit`'s `alreadyDone` arm `continue`s past `internalCommit` — the only thing that
-		// promotes (and thereby removes) a pending record. A pending saved here would never be
-		// cleared and would sit as a permanent durable reservation that the rival-pending checks
-		// (this method's own listPendingTransactions scan, and
-		// `ClusterMember.validatePendOperations`) refuse every future writer against — a worse
-		// wedge than the one this carve-out fixes. They still ride in the returned `blockIds` so
-		// `cancel` covers them; `deletePendingTransaction` on an absent record is a no-op.
+		// `satisfied` blocks are skipped: `commit`'s `alreadyDone` arm skips `internalCommit`, the
+		// only thing that promotes (and thereby removes) a pending record, so a pending saved here
+		// would never clear — a permanent durable reservation that the rival-pending checks (this
+		// method's listPendingTransactions scan, and `ClusterMember.validatePendOperations`) refuse
+		// every future writer against, a worse wedge than the one this carve-out fixes. They still
+		// ride in the returned `blockIds` so `cancel` covers them (deleting an absent pending is a
+		// no-op that writes no metadata).
 		await Promise.all(blockIds.filter(blockId => !satisfied.has(blockId)).map(blockId => {
 			const blockStorage = this.createBlockStorage(blockId);
 			const blockTransform = transformForBlockId(request.transforms, blockId);
@@ -698,7 +699,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				const { blockId, storage, latch } = entry;
 				const latest = await storage.getLatest();
 				if (latest && latest.rev >= request.rev) {
-					if (latest.rev === request.rev && latest.actionId === request.actionId) {
+					if (isOwnRevision(latest, request.rev, request.actionId)) {
 						// Idempotent no-op for this block — already committed with this exact (actionId, rev).
 						// A retry can carry a proof the original commit lacked (or crashed before writing):
 						// back-fill it, strictly additively, under the same digest-match retention rule the

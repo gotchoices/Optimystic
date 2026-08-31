@@ -1,7 +1,7 @@
 import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, CommitResult, PendResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
-import { blockIdsForTransforms, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
+import { blockIdsForTransforms, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
 import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest, clampPriority, clusterVoteSigningPayload, clusterVoteVerificationPayload } from "@optimystic/db-core";
 import { verifyInvalidationCertificate, type ArbitratorSetRecompute } from "../dispute/invalidation.js";
 import { buildCommitCert, invalidationActionId } from "./commit-cert.js";
@@ -1262,24 +1262,17 @@ export class ClusterMember implements ICluster {
 						}
 						const latest = blockResult?.state?.latest;
 						if (latest !== undefined && latest.rev >= pendRequest.rev) {
-							if (latest.rev === pendRequest.rev && latest.actionId === pendRequest.actionId) {
-								// Self is excluded so a redelivered pend for this same action stays
-								// approvable — the same exclusion the pending-rival check below
-								// documents. A write touching several blocks commits them a group at a
-								// time, so it can end up with some blocks durable and the rest refused;
-								// its retry reuses the actionId and meets its own commit here.
-								// Rejecting would refuse the writer with its own durable work forever.
-								// Only `===` is carved out: past the requested revision the follow-on
-								// commit is refused by storage anyway, so approving would only defer
-								// the refusal a round trip.
+							// Self is excluded so a redelivered pend for this same action stays
+							// approvable — the same exclusion the pending-rival check below documents,
+							// and the same rule storage applies (see {@link isOwnRevision}).
+							if (isOwnRevision(latest, pendRequest.rev, pendRequest.actionId)) {
 								continue;
 							}
-							const latestRev = latest.rev;
 							log('cluster-member:validation-stale-revision', {
 								messageHash: record.messageHash,
 								blockId,
 								requestedRev: pendRequest.rev,
-								latestRev
+								latestRev: latest.rev
 							});
 							// Deliberately prose-only: this reason is fed to computeSigningPayload, signed,
 							// and carried as Signature.rejectReason, so adding a structured revision here
@@ -1288,7 +1281,7 @@ export class ClusterMember implements ICluster {
 							// is NOT a StaleFailure producer, so StaleFailure.staleAt does not apply; the
 							// coordinator's own local re-read (CoordinatorRepo.classifyStaleRejection)
 							// supplies that number when it can confirm the revision itself.
-							return { valid: false, reason: `stale revision: block ${blockId} at rev ${latestRev}, requested rev ${pendRequest.rev}` };
+							return { valid: false, reason: `stale revision: block ${blockId} at rev ${latest.rev}, requested rev ${pendRequest.rev}` };
 						}
 					}
 				}
@@ -1402,10 +1395,10 @@ export class ClusterMember implements ICluster {
 				if (!latest || latest.rev < commit.rev) {
 					continue; // behind (or block never seen): cannot judge — abstain
 				}
+				if (isOwnRevision(latest, commit.rev, commit.actionId)) {
+					continue; // idempotent redelivery of an already-durable commit — MUST NOT reject
+				}
 				if (latest.rev === commit.rev) {
-					if (latest.actionId === commit.actionId) {
-						continue; // idempotent redelivery of an already-durable commit — MUST NOT reject
-					}
 					log('cluster-member:validation-stale-commit', {
 						messageHash: record.messageHash,
 						blockId,

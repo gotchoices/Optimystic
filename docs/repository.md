@@ -143,6 +143,13 @@ divergence reconcile) and `BlockStorage.saveDeletion` (forward tombstone); both 
 `saveForwardRevision`, which performs the deletion. Any forward path added later inherits the
 obligation.
 
+`StorageRepo.pend` carries the mirror-image obligation: it must not *create* the coexistence in the
+first place. A re-pend of a block this same action already committed at the requested revision (the
+retry of a *torn action* — a write whose blocks committed one group at a time, some landing and the
+rest refused) is waved through as **satisfied** and no pending record is written for it. Writing one
+would strand it exactly as the paragraph below describes: `commit` partitions that block as
+already-done and never promotes the record.
+
 The invariant matters because a pending record left beside a committed one can never be promoted:
 once the block's `latest` has advanced past the revision the record was pended at, a commit retry
 partitions the block as already-done or stale and never revisits it. `pend` then reports that

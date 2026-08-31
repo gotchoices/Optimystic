@@ -563,6 +563,19 @@ saveMaterializedBlock(block): store(structuredClone(block));
   still **throws** — including one whose confirmation read failed, and one only remote members
   could see (local storage behind). The reject-reason text is never parsed; confirmation is
   purely the local revision comparison.
+- **…except against the writer's own durable work.** A write touching several blocks commits them
+  a group at a time, so it can end up with some blocks durable and the rest refused — a *torn
+  action* — and its retry reuses the same action id. Every revision comparison above therefore
+  excludes the case where the holder of the requested revision *is this action*: `isOwnRevision`
+  ([`network/stale-failure.ts`](../packages/db-core/src/network/stale-failure.ts)) is the single
+  rule, and all five revision-vs-action checks call it — `StorageRepo.pend` and `.commit`'s
+  `alreadyDone` partition, `ClusterMember.validatePendOperations` and `.validateCommitRevisions`,
+  and `CoordinatorRepo.classifyStaleRejection`'s per-block confirmation. Without it the retry is
+  refused by its own committed half on every attempt until the retry budget runs out and nothing
+  lands. The carve-out is `latest.rev === request.rev` **only**: past the requested revision the
+  follow-on commit is refused as stale anyway, so approving would defer the refusal by a round
+  trip, and `latest` alone can no longer name who holds the requested revision. Rival behavior,
+  and the signed reject prose that carries it, are untouched.
 - **A lost conflict race is returned too — and needs no confirmation.** A member holding the
   transaction that won a race against this one answers with a signed `conflict` vote naming the
   winner, and the coordinator raises `ConflictRaceLostError` (never `ValidatorRejectionError`:

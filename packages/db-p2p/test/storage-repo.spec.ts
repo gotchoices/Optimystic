@@ -334,6 +334,35 @@ describe('StorageRepo', () => {
 			expect(await listPendings('block-1' as BlockId), 'no permanent reservation').to.deep.equal([]);
 		});
 
+		// The shape the fix actually exists for: the retry pends BOTH halves at once. The committed
+		// half must be waved through without a pending record while the refused half still gets one,
+		// and the follow-on commit must then carry the whole action to success.
+		it('re-pends a partially-committed action: committed half satisfied, refused half still pended', async () => {
+			await commitBlockOne();
+
+			const transforms: Transforms = {
+				inserts: { 'block-1': makeBlock('block-1'), 'block-2': makeBlock('block-2') },
+				updates: {},
+				deletes: []
+			};
+			const result = await repo.pend({ actionId: 'a1' as ActionId, rev: 1, transforms, policy: 'c' });
+
+			expect(result.success).to.equal(true);
+			expect((result as PendSuccess).blockIds).to.have.members(['block-1', 'block-2']);
+			expect(await listPendings('block-1' as BlockId), 'committed half: no reservation').to.deep.equal([]);
+			expect(await listPendings('block-2' as BlockId), 'refused half: pended as usual').to.deep.equal(['a1']);
+
+			const committed = await repo.commit({
+				actionId: 'a1' as ActionId,
+				blockIds: ['block-1' as BlockId, 'block-2' as BlockId],
+				tailId: 'block-1' as BlockId,
+				rev: 1
+			});
+			expect(committed.success, 'the torn action converges').to.equal(true);
+			expect((await new BlockStorage('block-2' as BlockId, rawStorage).getLatest())?.rev).to.equal(1);
+			expect(await listPendings('block-2' as BlockId), 'promoted, so cleared').to.deep.equal([]);
+		});
+
 		it('still refuses a RIVAL action at a revision this node already holds', async () => {
 			await commitBlockOne();
 
