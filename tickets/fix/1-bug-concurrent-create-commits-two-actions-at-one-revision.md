@@ -220,3 +220,97 @@ the causes are independent, and this failure is in the default suite today.
 - **A regression from the recent coordinator-latch commits.** `packages/reference-peer` has no
   diff across `52d0509c..HEAD`; the mechanism here is cross-machine and does not involve the
   interleaving those commits addressed.
+
+---
+
+# CORRECTION on promotion — triage classification was wrong, and the obvious fix is the wrong fix
+
+## This is NOT a pre-existing failure
+
+It was recorded in `tickets/.pre-existing-known.md` at commit `714f1e57` as pre-existing. It is not.
+Bisected to a first-bad commit with deterministic endpoints and no flaky results:
+
+**`210ebffd` — "ticket(implement): coordinator-commit-latch-and-rev-threading"**. Parent `52d0509c`
+passes 2/2; `210ebffd` fails 2/2. The entry has been removed from the allowlist — a regression sitting
+on a known-failures list is worse than a red test, because it stops being counted.
+
+The responsible change is one line, `packages/db-core/src/collection/collection.ts:132`:
+
+```ts
+- this.latchId = `Collection:${this.id}`;
++ this.latchId = `Collection:${this.id}#${this.instanceTag}`;
+```
+
+Reverting **only** that line makes the test pass 3/3 in 4s. Nothing else in `210ebffd` (rev-threading
+through `pendedRevs`, the coordinator's whole-span latch hold, the `recordCommitted` tripwire) is
+required for the failure: the diary path runs through `updateAndSync`, not `coordinator.commitOnce`.
+
+FRET was explicitly controlled out with a 2x2 against a pinned beta.3 worktree — the Optimystic commit
+is the sole determinant.
+
+## Do NOT fix this by reverting that line
+
+`Latches.lockQueues` is a **static, per-process** Map (`packages/db-core/src/utility/latches.ts:4`,
+whose own doc comment warns the key scope is process-global). The test runs all three "nodes" in one
+process, so the old key made three unrelated `Collection` instances share one queue and serialize by
+accident. `210ebffd`'s own comment concedes this.
+
+**In production each node is a separate OS process, so that global key never serialized anything
+across nodes.** Therefore:
+
+- The per-instance latch key is *correct*. Serializing distinct instances was the accident.
+- **The concurrent-create race is a real production defect and always has been.** It was never
+  masked in production — only in this single-process test.
+- Reverting line 132 restores a green test while leaving the production bug exactly where it is, and
+  removes the only reproduction we have. That is strictly worse than the red test.
+
+Keep the per-instance key. Fix the race.
+
+## This is very likely the reported index fork
+
+`bug-lineage-divergence-observed-two-actions-one-revision` (backlog) records two machines diverging on
+an index sub-collection, both departing from a shared base, both landing at the same revision under
+different action ids, never merging. The trace at the bad commit here is that exact shape:
+
+```
+collection:invented x3
+pend iTgk26 / pend yqcpVQ / pend 0g6tZK      (within 220ms)
+commit iTgk26 rev=1 ; commit yqcpVQ rev=1 ; commit 0g6tZK rev=1
+collection:lineage-divergence forkRev=1 heldAction=0g6tZK readAction=iTgk26
+```
+
+Index sub-collections are created on demand, so two nodes writing one index key concurrently both
+"invent" and both commit rev 1 — which is why the fork was only ever observed on the index
+sub-collection and never on the main table, whose collection already exists. **If that link holds,
+fixing this race closes the headline downstream bug reported in issues #12/#15.** Verify the link
+rather than assuming it, and say either way.
+
+## What the fix has to do
+
+The window is a create that commits a first revision without any committed base to compare against.
+`Diary.createOrOpen` only *stages* a header, never commits one, so every concurrent writer starts
+from "no committed header" and each believes it is creating revision 1.
+
+The invariant wanted: **a commit that creates a collection's first revision must succeed for exactly
+one writer; every other concurrent writer must be told it lost and rebase onto the winner.** The
+existing stale-retry machinery in `Collection.syncInternal` already does the right thing once the
+collection exists — the gap is that it has nothing to detect against when the base is absent.
+
+Sites named by the original analysis, all still current:
+`StorageRepo.pend` (conflicting-pending detection, `readCommitBase` / `refuseMissingBase` when a block
+has no committed base), `ClusterMember` pend validation (emits
+`cluster-member:validation-stale-revision`), `collection.ts:154-169` (`createOrOpen`'s
+`collection:invented` branch), `collection.ts:236-253` (`advanceContext`'s no-lower guard, which makes
+the split permanent once it happens).
+
+Prefer the boundary invariant over a patch at the diary path — every collection type creates this way,
+not just diaries.
+
+## Acceptance
+
+- `packages/reference-peer/test/distributed-diary.spec.ts` "should handle concurrent writes from
+  multiple nodes" passes, **with the per-instance latch key retained**.
+- All three concurrent appends are durable — the losing writers rebase and their entries survive.
+  A fix that merely serializes, or that drops a loser's write while reporting success, is not a fix:
+  the acknowledged-write-that-vanished is the whole defect.
+- Full `yarn check` green, integration tier included.
