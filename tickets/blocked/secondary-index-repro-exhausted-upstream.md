@@ -128,3 +128,23 @@ What this means for the decision being asked:
 The edit this ticket asked for in `sereus`'s own ticket (recording the sixth negative and the refuted
 shared-slot hypothesis) still has not been made here, for the same reason as before: it is another
 repository's board. It should now also record the positive capture above.
+
+---
+
+## Update 2026-08-31 — an in-repo reproducer now exists, so "do not reproduce here" is out of date
+
+`packages/reference-peer/test/distributed-diary.spec.ts` → "should handle concurrent writes from
+multiple nodes" fails on every run of the default suite and is the two-machine case this ticket
+concluded could not be built here. Diagnosis and the full trace are in
+`implement/1-consensus-pend-refusal-is-reported-to-the-writer-as-success`.
+
+What it shows: two writers can both be admitted at one revision because a block's reservation is
+released when the *pend* reaches consensus while the block's committed revision only advances when
+the separate *commit* reaches consensus. In the captured run the symptom was the losing write being
+acknowledged and then vanishing rather than a visible fork, so the link to the divergence this
+ticket is about is **plausible but not yet proven** — the fix ticket names what would confirm it.
+
+The bullet above about `implement/coordinator-mutates-collections-outside-their-latch` is also
+stale: that line of work completed (`complete/2-coordinator-commit-latch-and-rev-threading` and its
+siblings) and did not explain the fingerprint. Whoever picks this up next should read the fix ticket
+first. Nothing else about the human decision this ticket is parked on has changed.
