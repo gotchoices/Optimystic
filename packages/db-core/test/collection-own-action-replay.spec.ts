@@ -4,8 +4,8 @@ import { TestTransactor, DelegatingTransactor } from '../src/testing/test-transa
 import type { Action, ActionHandler, BlockStore, IBlock, CommitRequest, CommitResult } from '../src/index.js'
 
 interface TestAction {
-  value: string
-  timestamp: number
+	value: string
+	timestamp: number
 }
 
 /**
@@ -20,121 +20,161 @@ interface TestAction {
  * the real commit already promoted them, so the cancel is a no-op.
  */
 class CommitLandsButReportsStale extends DelegatingTransactor {
-  /** Remaining number of successful commits to mask as stale failures. */
-  private injections: number
-  /** Commits that actually landed on the inner transactor (masked or not). */
-  landedCommits = 0
+	/** Remaining number of successful commits to mask as stale failures. */
+	private injections: number
+	/** Commits that actually landed on the inner transactor (masked or not). */
+	landedCommits = 0
 
-  constructor(inner: TestTransactor, injections = 1) {
-    super(inner)
-    this.injections = injections
-  }
+	constructor(inner: TestTransactor, injections = 1) {
+		super(inner)
+		this.injections = injections
+	}
 
-  override async commit(request: CommitRequest): Promise<CommitResult> {
-    const result = await this.inner.commit(request)
-    if (result.success) {
-      this.landedCommits++
-      if (this.injections-- > 0) {
-        return { success: false, conflict: true, reason: 'stale commit: injected torn-action conflict' }
-      }
-    }
-    return result
-  }
+	override async commit(request: CommitRequest): Promise<CommitResult> {
+		const result = await this.inner.commit(request)
+		if (result.success) {
+			this.landedCommits++
+			if (this.injections-- > 0) {
+				return { success: false, conflict: true, reason: 'stale commit: injected torn-action conflict' }
+			}
+		}
+		return result
+	}
 }
 
 describe('Collection: own committed action on retry', () => {
-  const collectionId = 'own-action-collection'
+	const collectionId = 'own-action-collection'
 
-  const handlers: Record<string, ActionHandler<TestAction>> = {
-    'set': async (_action, store) => {
-      const blockId = store.generateId()
-      store.insert({
-        header: store.createBlockHeader('TEST', blockId)
-      })
-    }
-  }
+	const handlers: Record<string, ActionHandler<TestAction>> = {
+		'set': async (_action, store) => {
+			const blockId = store.generateId()
+			store.insert({
+				header: store.createBlockHeader('TEST', blockId)
+			})
+		}
+	}
 
-  const initOptions = {
-    modules: handlers,
-    createHeaderBlock: (id: string, store: BlockStore<IBlock>) => ({
-      header: store.createBlockHeader('TEST', id)
-    })
-  }
+	const initOptions = {
+		modules: handlers,
+		createHeaderBlock: (id: string, store: BlockStore<IBlock>) => ({
+			header: store.createBlockHeader('TEST', id)
+		})
+	}
 
-  it('consumes its own durably committed entry instead of replaying it', async () => {
-    const inner = new TestTransactor()
-    const transactor = new CommitLandsButReportsStale(inner)
-    const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+	const retryFast = { maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 }
 
-    const action: Action<TestAction> = {
-      type: 'set',
-      data: { value: 'torn', timestamp: 1 }
-    }
-    await collection.act(action)
+	async function readLog(collection: Collection<TestAction>) {
+		const logged: Action<TestAction>[] = []
+		for await (const logAction of collection.selectLog()) {
+			logged.push(logAction)
+		}
+		return logged
+	}
 
-    // Must RESOLVE, not exhaust: the action IS durable, so the writer is owed a success.
-    await collection.sync({ maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 })
+	it('consumes its own durably committed entry instead of replaying it', async () => {
+		const inner = new TestTransactor()
+		const transactor = new CommitLandsButReportsStale(inner)
+		const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
 
-    const logged: Action<TestAction>[] = []
-    for await (const logAction of collection.selectLog()) {
-      logged.push(logAction)
-    }
+		const action: Action<TestAction> = {
+			type: 'set',
+			data: { value: 'torn', timestamp: 1 }
+		}
+		await collection.act(action)
 
-    // Pre-fix the retry replays the pending action, re-pends at the next revision and commits a
-    // second copy (the injection is spent), so the log holds the action twice.
-    expect(logged).to.have.lengthOf(1)
-    expect(logged[0]).to.deep.equal(action)
+		// Must RESOLVE, not exhaust: the action IS durable, so the writer is owed a success.
+		await collection.sync(retryFast)
 
-    // Exactly one commit ever landed on the inner transactor — the masked one.
-    expect(transactor.landedCommits).to.equal(1)
-    expect(collection.hasUnsyncedChanges()).to.equal(false)
+		const logged = await readLog(collection)
 
-    // A second reader sees the same single entry (the durable log, not this instance's view).
-    const reader = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
-    const readerLog: Action<TestAction>[] = []
-    for await (const logAction of reader.selectLog()) {
-      readerLog.push(logAction)
-    }
-    expect(readerLog).to.have.lengthOf(1)
-  })
+		// Pre-fix the retry replays the pending action, re-pends at the next revision and commits a
+		// second copy (the injection is spent), so the log holds the action twice.
+		expect(logged).to.have.lengthOf(1)
+		expect(logged[0]).to.deep.equal(action)
 
-  it('still replays when the committed entry belongs to someone else', async () => {
-    // Guard against the consumption branch firing on a foreign entry: a rival's committed action
-    // must NOT be treated as this sync's own work, so the local action still lands.
-    const inner = new TestTransactor()
-    const rival = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
-    await rival.act({ type: 'set', data: { value: 'rival', timestamp: 1 } })
-    await rival.updateAndSync()
+		// Exactly one commit ever landed on the inner transactor — the masked one.
+		expect(transactor.landedCommits).to.equal(1)
+		expect(collection.hasUnsyncedChanges()).to.equal(false)
 
-    const local = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
-    await local.act({ type: 'set', data: { value: 'local', timestamp: 2 } })
-    await local.sync({ maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 })
+		// A second reader sees the same single entry (the durable log, not this instance's view).
+		const reader = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
+		expect(await readLog(reader)).to.have.lengthOf(1)
+	})
 
-    const logged: Action<TestAction>[] = []
-    for await (const logAction of local.selectLog()) {
-      logged.push(logAction)
-    }
-    expect(logged.map(a => a.data.value)).to.deep.equal(['rival', 'local'])
-  })
+	it('consumes a multi-action entry without dropping or duplicating any action', async () => {
+		// The consume branch slices `entry.actions.length` off the head of `pending`, so a batch of
+		// more than one action is where an off-by-one would show: too small a slice re-commits a
+		// duplicate, too large a slice silently loses an action that never landed.
+		const inner = new TestTransactor()
+		const transactor = new CommitLandsButReportsStale(inner)
+		const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
 
-  it('update() with no in-flight action is unaffected', async () => {
-    // The entry loop must behave exactly as before when no in-flight id is threaded: a plain
-    // update() over a log entry this instance did not write keeps its pending action.
-    const inner = new TestTransactor()
-    const writer = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
-    await writer.act({ type: 'set', data: { value: 'committed', timestamp: 1 } })
-    await writer.updateAndSync()
+		const actions: Action<TestAction>[] = [
+			{ type: 'set', data: { value: 'a', timestamp: 1 } },
+			{ type: 'set', data: { value: 'b', timestamp: 2 } },
+			{ type: 'set', data: { value: 'c', timestamp: 3 } }
+		]
+		for (const action of actions) {
+			await collection.act(action)
+		}
 
-    const other = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
-    await other.act({ type: 'set', data: { value: 'staged', timestamp: 2 } })
-    await other.update()
-    expect(other.hasUnsyncedChanges()).to.equal(true)
+		await collection.sync(retryFast)
 
-    await other.sync({ maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 })
-    const logged: Action<TestAction>[] = []
-    for await (const logAction of other.selectLog()) {
-      logged.push(logAction)
-    }
-    expect(logged.map(a => a.data.value)).to.deep.equal(['committed', 'staged'])
-  })
+		expect((await readLog(collection)).map(a => a.data.value)).to.deep.equal(['a', 'b', 'c'])
+		expect(transactor.landedCommits).to.equal(1)
+		expect(collection.hasUnsyncedChanges()).to.equal(false)
+
+		const reader = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
+		expect((await readLog(reader)).map(a => a.data.value)).to.deep.equal(['a', 'b', 'c'])
+	})
+
+	it('consumes a zero-action entry (the invented collection first sync)', async () => {
+		// A brand-new collection's header/root blocks live in the tracker with NO pending action to
+		// name them, so its first sync commits an entry whose `actions` array is empty. That entry
+		// still has to be consumed on the torn retry: only the consume branch's unconditional
+		// `mutated` resets the tracker, which is what makes `hasUnsyncedChanges()` false and lets
+		// the sync loop exit reporting the success the (durable) commit earned.
+		const inner = new TestTransactor()
+		const transactor = new CommitLandsButReportsStale(inner)
+		const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+
+		expect(collection.hasUnsyncedChanges()).to.equal(true)
+		await collection.sync(retryFast)
+
+		expect(await readLog(collection)).to.have.lengthOf(0)
+		expect(transactor.landedCommits).to.equal(1)
+		expect(collection.hasUnsyncedChanges()).to.equal(false)
+	})
+
+	it('still replays when the committed entry belongs to someone else', async () => {
+		// Guard against the consumption branch firing on a foreign entry: a rival's committed action
+		// must NOT be treated as this sync's own work, so the local action still lands.
+		const inner = new TestTransactor()
+		const rival = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
+		await rival.act({ type: 'set', data: { value: 'rival', timestamp: 1 } })
+		await rival.updateAndSync()
+
+		const local = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
+		await local.act({ type: 'set', data: { value: 'local', timestamp: 2 } })
+		await local.sync(retryFast)
+
+		expect((await readLog(local)).map(a => a.data.value)).to.deep.equal(['rival', 'local'])
+	})
+
+	it('update() with no in-flight action is unaffected', async () => {
+		// The entry loop must behave exactly as before when no in-flight id is threaded: a plain
+		// update() over a log entry this instance did not write keeps its pending action.
+		const inner = new TestTransactor()
+		const writer = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
+		await writer.act({ type: 'set', data: { value: 'committed', timestamp: 1 } })
+		await writer.updateAndSync()
+
+		const other = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
+		await other.act({ type: 'set', data: { value: 'staged', timestamp: 2 } })
+		await other.update()
+		expect(other.hasUnsyncedChanges()).to.equal(true)
+
+		await other.sync(retryFast)
+		expect((await readLog(other)).map(a => a.data.value)).to.deep.equal(['committed', 'staged'])
+	})
 })

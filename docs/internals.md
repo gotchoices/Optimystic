@@ -576,6 +576,22 @@ saveMaterializedBlock(block): store(structuredClone(block));
   follow-on commit is refused as stale anyway, so approving would defer the refusal by a round
   trip, and `latest` alone can no longer name who holds the requested revision. Rival behavior,
   and the signed reject prose that carries it, are untouched.
+- **The writer's retry consumes its own committed log entry.** The carve-out above only stops the
+  *storage* side refusing the retry; the client half is that a torn action's log entry is already
+  durable when the failure is reported, because `NetworkTransactor.commit` commits the collection
+  header and log tail BEFORE sweeping the remaining blocks. `Collection.syncInternal` therefore
+  threads the attempt's action id into its between-retries refresh
+  (`updateInternal(inFlightActionId)`), and an entry carrying that id is **consumed**
+  (`Collection.consumeOwnEntry`) instead of run through the conflict filter and replayed —
+  replaying re-appends content the committed tail already holds, leaving the same action recorded
+  twice in the log. Consuming drops the entry's actions off the head of `pending` and forces the
+  replay that resets the tracker, so `hasUnsyncedChanges()` turns false and the sync loop exits
+  reporting the success the writer is owed. This is the only caller that passes an id: `update()`
+  and `updateAndSync()` pass none and the entry loop behaves exactly as it always did.
+  `packages/db-core/test/collection-own-action-replay.spec.ts` is the regression test.
+  **Not yet true of the coordinator path.** `TransactionCoordinator.commit`'s retry loop refreshes
+  participants with a plain `collection.update()`, with no in-flight id, so a torn action committed
+  through the coordinator still replays into a duplicate entry — tracked separately.
 - **A lost conflict race is returned too — and needs no confirmation.** A member holding the
   transaction that won a race against this one answers with a signed `conflict` vote naming the
   winner, and the coordinator raises `ConflictRaceLostError` (never `ValidatorRejectionError`:
