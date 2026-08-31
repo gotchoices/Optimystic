@@ -94,7 +94,27 @@ export interface ICommitProofPersister {
 	commit(request: CommitRequest, options?: MessageOptions, proof?: BlockCommitProof): Promise<CommitResult>;
 }
 
-export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ICommitProofPersister {
+/**
+ * The capability that answers "which action committed revision N of this block?" — the question the
+ * commit-tier stale checks need when local `latest` has already advanced PAST a contested revision,
+ * so `latest.actionId` alone can no longer distinguish "my commit landed and history moved on"
+ * (abstain / not a conflict) from "a rival took my revision" (reject / retryable conflict).
+ * Consumed by the cluster member's promise-round stale-commit check
+ * (`ClusterMember.validateCommitRevisions`) and by `CoordinatorRepo`'s commit rejection classifier.
+ * Named (rather than probed inline) for the same reason as {@link ICommitDigestPreviewer}: one
+ * definition of the contract, and something a repo decorator can `implements` and forward — a
+ * wrapper that drops the method silently degrades both checks to an abstain on that node.
+ */
+export interface IRevisionActionReader {
+	/**
+	 * The action id recorded for `rev` of `blockId`, or `undefined` when this node holds no revision
+	 * record for it (never seen, or history truncated below `rev`). Read-only; never takes the block
+	 * write latch (callers are on vote/classification paths and must treat a throw as "unknown").
+	 */
+	getRevisionAction(blockId: BlockId, rev: number): Promise<ActionId | undefined>;
+}
+
+export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ICommitProofPersister, IRevisionActionReader {
 	private readonly validatePend?: PendValidationHook;
 	/** Per-collection change listeners; empty sets are pruned on unsubscribe. */
 	private readonly changeListeners = new Map<CollectionId, Set<CollectionChangeListener>>();
@@ -1023,6 +1043,19 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// drops updates when there is no block to apply them to) — both materialize nothing.
 		const digest = newBlock ? await canonicalBlockHash(newBlock) : undefined;
 		return { digest, baseRev, baseIndependent };
+	}
+
+	/**
+	 * See {@link IRevisionActionReader}. Reads the block's revision index directly
+	 * (`listRevisions(rev, rev)` — both bounds inclusive per the `IBlockStorage` contract); an empty
+	 * range means this node holds no record for that revision.
+	 */
+	async getRevisionAction(blockId: BlockId, rev: number): Promise<ActionId | undefined> {
+		const storage = this.createBlockStorage(blockId);
+		for await (const actionRev of storage.listRevisions(rev, rev)) {
+			return actionRev.actionId;
+		}
+		return undefined;
 	}
 
 	/**

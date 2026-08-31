@@ -1177,9 +1177,14 @@ export class TransactionCoordinator {
 				// mark it retryable at the coordinator level (after a re-read advances the rev).
 				// NOTE: deliberately does NOT consult `isConflictFailure` / `StaleFailure.conflict`
 				// like the pend path does. Once the pend succeeded, a returned commit failure means
-				// the revision slot moved, and no commit producer sets `conflict` today. If a commit
-				// producer ever starts distinguishing hard commit rejections (validator policy,
-				// storage fault) from lost races, gate `stale` on isConflictFailure here.
+				// the revision slot moved. One commit producer DOES set `conflict` now —
+				// db-p2p's CoordinatorRepo.commit returns lost commit-consensus races and classified
+				// stale-commit rejections as `{ success:false, conflict:true }` (returning, not
+				// throwing, is what keeps them out of the verbatim retry above) — but every returned
+				// failure still maps to `stale: true` here, and `isConflictFailure` covers that new
+				// shape, so no behavior change is needed. If a commit producer ever starts returning
+				// hard commit rejections (validator policy, storage fault) as results too, gate
+				// `stale` on isConflictFailure here.
 				return {
 					collectionId,
 					committed: false,

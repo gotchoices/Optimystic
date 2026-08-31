@@ -17,7 +17,7 @@ import type { FretService } from "p2p-fret";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
-import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister, type IRevisionActionReader } from "../storage/storage-repo.js";
 import { buildBlockCommitProof } from "./commit-proof.js";
 import { RECONCILE_TIMEOUT_MS } from "./reconcile-block.js";
 
@@ -985,6 +985,14 @@ export class ClusterMember implements ICluster {
 		if (!pendValidation.valid) {
 			return pendValidation;
 		}
+		// Revision staleness before content digests: a commit whose revision a rival already took can
+		// never win, and the sharper stale reject also skips the per-block digest previews (the digest
+		// check would abstain on such a block anyway — its local base rev no longer matches the
+		// declared one).
+		const commitRevValidation = await this.validateCommitRevisions(record);
+		if (!commitRevValidation.valid) {
+			return commitRevValidation;
+		}
 		return await this.validateCommitOperations(record);
 	}
 
@@ -1289,6 +1297,119 @@ export class ClusterMember implements ICluster {
 			}
 		}
 
+		return { valid: true };
+	}
+
+	/**
+	 * Promise-round check that a commit record's requested revision is not already committed HERE
+	 * under a different action. This is the member-side arm that keeps a DEAD rival's re-broadcast
+	 * commit from assembling consensus: after a race winner commits and members clear its record
+	 * from the reservation table, a loser's re-driven commit meets no conflict votes — without this
+	 * check every caught-up member would abstain (the content-digest check below abstains for
+	 * update-only transforms whose base moved) and the loser could reach commit-consensus for a
+	 * write no member will ever durably store (its apply is refused stale and tolerated as 'ahead'
+	 * divergence — see `applyConsensusOperation`).
+	 *
+	 * Same "must run on the promise round" rule as {@link validateCommitOperations}: the
+	 * commit-round vote is deliberately blind, so promise votes are the only ones that carry
+	 * "I checked this". The four-way rule, per committed block:
+	 *  - no local `latest`, or `latest.rev < commit.rev` → abstain (approve). Preserves the
+	 *    lagging-member tolerance (`coordinator-repo-commit-divergence.spec.ts`): a member behind
+	 *    the commit cannot judge it.
+	 *  - `latest.rev === commit.rev` with the SAME action → abstain (approve). Idempotent
+	 *    redelivery of an already-durable commit; rejecting would make the writer rebase and
+	 *    re-append an action that already landed — a duplicate entry. (Storage's `alreadyDone`
+	 *    partition returns success for this shape at apply.)
+	 *  - `latest.rev === commit.rev` with a DIFFERENT action → reject: a rival took the revision.
+	 *  - `latest.rev > commit.rev` → consult the {@link IRevisionActionReader} capability for who
+	 *    holds `commit.rev`: a different action → reject; the same action → abstain (already
+	 *    durable, history simply moved on); no record / capability absent / read fault → abstain.
+	 *
+	 * Never throws out of the vote path: any read fault is an abstain (mirroring the digest check's
+	 * preview-error arm), because a member that fails to vote at all is worse than one that
+	 * abstains. Reason stays plain prose — it is fed to computeSigningPayload and carried as
+	 * Signature.rejectReason, exactly like the stale-revision pend reject.
+	 *
+	 * Residual (see the commit-tier handoff): a member that signed the winner's commit but has not
+	 * yet APPLIED it sits in a window where it holds neither the winner's record (reservation
+	 * dropped at commit-sign, `shouldPersist = false`) nor the winner's revision (storage still
+	 * behind) — it abstains here. A capability-less member, or one with history truncated below
+	 * `latest`, abstains at `latest.rev > commit.rev` too. A dead rival's re-commit can therefore
+	 * still pass the promise round if EVERY member is simultaneously in one of those states; the
+	 * coordinator-side arms (`CoordinatorRepo.commit` returning `ConflictRaceLostError` and
+	 * classified rejections as retryable conflicts) close the observed re-drive route.
+	 */
+	private async validateCommitRevisions(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
+		for (const operation of record.message.operations) {
+			if (!('commit' in operation)) {
+				continue;
+			}
+			const commit = operation.commit;
+			let blockResults: Awaited<ReturnType<IRepo['get']>>;
+			try {
+				// The member's raw storage repo (no cluster recursion) — the same seam
+				// validatePendOperations reads on every pend vote.
+				blockResults = await this.storageRepo.get({ blockIds: commit.blockIds });
+			} catch (err) {
+				log('cluster-member:commit-staleness-read-error', {
+					messageHash: record.messageHash,
+					actionId: commit.actionId,
+					error: err instanceof Error ? err.message : String(err)
+				});
+				continue; // a local read fault is an abstain, never an escape out of the vote path
+			}
+			for (const blockId of commit.blockIds) {
+				const latest = blockResults[blockId]?.state?.latest;
+				if (!latest || latest.rev < commit.rev) {
+					continue; // behind (or block never seen): cannot judge — abstain
+				}
+				if (latest.rev === commit.rev) {
+					if (latest.actionId === commit.actionId) {
+						continue; // idempotent redelivery of an already-durable commit — MUST NOT reject
+					}
+					log('cluster-member:validation-stale-commit', {
+						messageHash: record.messageHash,
+						blockId,
+						actionId: commit.actionId,
+						rev: commit.rev,
+						committedBy: latest.actionId
+					});
+					return { valid: false, reason: `stale commit: block ${blockId} rev ${commit.rev} committed by a different action` };
+				}
+				// latest.rev > commit.rev: latest can no longer name who took commit.rev — ask the
+				// revision index. Structural probe, same pattern as previewCommitDigest below: a repo
+				// without the capability abstains.
+				const reader = this.storageRepo as IRepo & Partial<IRevisionActionReader>;
+				if (typeof reader.getRevisionAction !== 'function') {
+					continue;
+				}
+				let takenBy: ActionId | undefined;
+				try {
+					takenBy = await reader.getRevisionAction(blockId, commit.rev);
+				} catch (err) {
+					log('cluster-member:commit-staleness-revision-read-error', {
+						messageHash: record.messageHash,
+						blockId,
+						rev: commit.rev,
+						error: err instanceof Error ? err.message : String(err)
+					});
+					continue; // read fault → abstain
+				}
+				if (takenBy !== undefined && takenBy !== commit.actionId) {
+					log('cluster-member:validation-stale-commit', {
+						messageHash: record.messageHash,
+						blockId,
+						actionId: commit.actionId,
+						rev: commit.rev,
+						committedBy: takenBy,
+						latestRev: latest.rev
+					});
+					return { valid: false, reason: `stale commit: block ${blockId} rev ${commit.rev} committed by a different action` };
+				}
+				// takenBy === commit.actionId (already durable, history moved on) or undefined
+				// (truncated history — unknown): abstain either way.
+			}
+		}
 		return { valid: true };
 	}
 
@@ -1635,6 +1756,15 @@ export class ClusterMember implements ICluster {
 				// missing-base reason ⇒ behind divergence, reconcile (below). Any other bare
 				// `reason` with no `missing` ⇒ a genuine internalCommit fault: propagate so
 				// handleConsensus rolls back the executed marker and rethrows.
+				//
+				// NOTE: this 'ahead' tolerance is what turns a DEAD rival's commit that somehow
+				// reaches consensus into a reported success no member durably stored (consensus
+				// without durability — the commit-tier acknowledgement hole). It must stay: a
+				// member genuinely ahead of a redelivered/lagging commit is the common, correct
+				// case. The guards live UPSTREAM: `validateCommitRevisions` rejects the rival at
+				// the promise round, and `CoordinatorRepo.commit` returns lost races as retryable
+				// conflicts instead of re-driving them. If consensus-without-durability is ever
+				// observed again, look at those guards' abstain residuals, not at this branch.
 				if (result.missing?.length) {
 					log('cluster-member:consensus-commit-diverged', {
 						messageHash,

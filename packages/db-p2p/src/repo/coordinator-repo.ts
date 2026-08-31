@@ -1,4 +1,4 @@
-import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
+import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
 import { LruMap, blockIdsForTransforms, highestStaleAt, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
 import { ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
@@ -12,7 +12,7 @@ import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocatio
 import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAnchoring } from "../cluster/certified-claims.js";
 import { DEFAULT_CLUSTER_SIZE } from "../cluster/cluster-policy.js";
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
-import { isMissingBaseRevisionFailure, MISSING_BASE_REVISION_REASON } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, MISSING_BASE_REVISION_REASON, type IRevisionActionReader } from "../storage/storage-repo.js";
 import type { ReconcileBlockCallback } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
 
@@ -1641,8 +1641,116 @@ export class CoordinatorRepo implements IRepo {
 			}
 		} catch (error) {
 			this.log('coordinator-repo:commit-error', { actionId: request.actionId, error: (error as Error).message });
+			// A lost commit-consensus race is an optimistic-concurrency loss, not a fault — mirror
+			// `pend`'s conversion above. At the moment this is thrown, zero members approved and the
+			// members hold the winner: nothing of the loser landed, so a retryable-conflict answer is
+			// truthful. Returning it (rather than rethrowing) matters more here than on the pend path:
+			// db-core's `commitCollection` retries a THROWN commit error verbatim up to 3 times, and by
+			// the retry the members have applied the winner and cleared its reservation — the re-driven
+			// commit can then assemble a consensus no member will durably store (the writer's append
+			// fulfills, the entry exists on no node). A RETURNED `success:false` is instead surfaced
+			// immediately as a stale loss; the writer cancels the pend, re-reads, and re-drives the
+			// whole pend+commit at a fresh revision. `staleAt` stays absent for the same reason as
+			// pend's: it is confirmed-only, and a lost race is a rival commit racing the same revision,
+			// not a locally-confirmed revision claim.
+			if (error instanceof ConflictRaceLostError) {
+				return { success: false, conflict: true, reason: error.message };
+			}
+			// A promise-phase stale-commit reject (`ClusterMember.validateCommitRevisions` — a member
+			// holds the requested revision under a different action) surfaces here as a
+			// ValidatorRejectionError; classify it against local storage the way `pend` does, so the
+			// writer gets a clean retryable conflict instead of three verbatim re-drives and a hard
+			// failure.
+			const stale = await this.classifyCommitStaleRejection(error, request);
+			if (stale) return stale;
 			throw error;
 		}
+	}
+
+	/**
+	 * Commit-shaped sibling of {@link classifyStaleRejection}: decide whether a cluster validator
+	 * rejection of a COMMIT was an optimistic-concurrency loss — the requested revision is already
+	 * committed under a different action — rather than a genuine validation fault. A confirmed loss
+	 * returns a {@link StaleFailure} with `conflict: true` so db-core's `commitCollection` surfaces
+	 * it immediately as a stale loss (no verbatim retry) and the writer re-drives at a fresh
+	 * revision.
+	 *
+	 * Same confirmation discipline as the pend classifiers: purely local re-read; the signed reject
+	 * text is never consulted. One commit-specific delta — confirmation must EXCLUDE the
+	 * own-action-at-rev case: a block whose requested revision is held by THIS action is already
+	 * durable, and answering `conflict` for it would make the writer rebase and re-append an
+	 * already-committed action at a new revision — a duplicate entry. So:
+	 *  - `latest.rev === request.rev` → compare `latest.actionId`: ours ⇒ bail (stays a throw),
+	 *    a rival's ⇒ confirmed loss;
+	 *  - `latest.rev > request.rev` → ask the {@link IRevisionActionReader} capability who holds
+	 *    `request.rev`: ours ⇒ bail, a rival's ⇒ confirmed loss, unknown/absent/fault ⇒ unconfirmed;
+	 *  - anything unconfirmed (including read errors) stays a throw — fail-fast for genuine faults.
+	 */
+	private async classifyCommitStaleRejection(error: unknown, request: CommitRequest): Promise<StaleFailure | undefined> {
+		if (!(error instanceof ValidatorRejectionError)) return undefined;
+		const blockIds = request.blockIds;
+		let results: GetBlockResults;
+		try {
+			results = await this.storageRepo.get({ blockIds });
+		} catch (readError) {
+			this.log('coordinator-repo:commit-stale-classify-read-error', {
+				actionId: request.actionId,
+				error: (readError as Error).message
+			});
+			return undefined;
+		}
+		const reader = this.storageRepo as IRepo & Partial<IRevisionActionReader>;
+		// Scan EVERY block (same rule as the pend classifier): report the highest confirmed rival
+		// revision, but bail the moment any block shows OUR action durable at the requested revision.
+		const rivalStales: ({ blockId: BlockId; rev: number } | undefined)[] = [];
+		for (const blockId of blockIds) {
+			const latest = results[blockId]?.state?.latest;
+			if (!latest || latest.rev < request.rev) continue;
+			if (latest.rev === request.rev) {
+				if (latest.actionId === request.actionId) {
+					this.log('coordinator-repo:commit-stale-classify-own-action', {
+						actionId: request.actionId, blockId, rev: request.rev
+					});
+					return undefined;
+				}
+				rivalStales.push({ blockId, rev: latest.rev });
+				continue;
+			}
+			// latest.rev > request.rev — latest can no longer name who took request.rev.
+			if (typeof reader.getRevisionAction !== 'function') continue;
+			let takenBy: ActionId | undefined;
+			try {
+				takenBy = await reader.getRevisionAction(blockId, request.rev);
+			} catch (readError) {
+				this.log('coordinator-repo:commit-stale-classify-revision-read-error', {
+					actionId: request.actionId, blockId, rev: request.rev,
+					error: (readError as Error).message
+				});
+				continue;
+			}
+			if (takenBy === request.actionId) {
+				this.log('coordinator-repo:commit-stale-classify-own-action', {
+					actionId: request.actionId, blockId, rev: request.rev, latestRev: latest.rev
+				});
+				return undefined;
+			}
+			if (takenBy !== undefined) rivalStales.push({ blockId, rev: latest.rev });
+			// takenBy undefined (truncated history): unconfirmed for this block.
+		}
+		const staleAt = highestStaleAt(rivalStales);
+		if (!staleAt) return undefined;
+		this.log('coordinator-repo:commit-stale-classified', {
+			actionId: request.actionId,
+			blockId: staleAt.blockId,
+			latestRev: staleAt.rev,
+			requestedRev: request.rev
+		});
+		return {
+			success: false,
+			conflict: true,
+			reason: `stale commit: block ${staleAt.blockId} at rev ${staleAt.rev}, requested rev ${request.rev}`,
+			staleAt
+		};
 	}
 
 	/**

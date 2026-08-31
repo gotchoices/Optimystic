@@ -37,10 +37,17 @@ export class ValidatorRejectionError extends Error {
  * vote (they hold a rival transaction that won the deterministic race on the same blocks) and
  * approvals fell short of super-majority. Distinct from {@link ValidatorRejectionError} — nobody
  * judged this write invalid; it lost an optimistic-concurrency race and a fresh retry can win.
- * `CoordinatorRepo.pend` converts this into a `StaleFailure` with `conflict: true` so the normal
- * retry machinery (`isConflictFailure`) absorbs it; it should escape as a thrown error only from
- * paths other than pend. The conflicting peers and the winning hashes ride as structured data
- * (from the signed `conflictWith` fields), never parsed out of prose.
+ * `CoordinatorRepo.pend` AND `CoordinatorRepo.commit` both convert this into a `StaleFailure` with
+ * `conflict: true` so the normal retry machinery (`isConflictFailure`) absorbs it; it should escape
+ * as a thrown error only from other paths. The commit conversion matters as much as the pend one:
+ * at the moment this is thrown zero members approved and the members hold the winner — nothing of
+ * the loser landed — yet a THROWN commit error is retried verbatim by db-core's `commitCollection`
+ * (it treats throws as transport faults), and that re-driven commit races into the window after
+ * members apply the winner and clear its reservation, where it can assemble a consensus no member
+ * will durably store. A returned conflict is instead surfaced immediately as a stale loss, and the
+ * writer re-reads and re-drives the whole pend+commit at a fresh revision. The conflicting peers
+ * and the winning hashes ride as structured data (from the signed `conflictWith` fields), never
+ * parsed out of prose.
  */
 export class ConflictRaceLostError extends Error {
 	constructor(
