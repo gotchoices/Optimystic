@@ -26,7 +26,7 @@ import { expect } from 'chai';
 import type {
 	IRepo, IKeyNetwork, ClusterPeers, BlockGets, GetBlockResults, PendRequest, PendResult,
 	CommitRequest, CommitResult, ActionBlocks, MessageOptions, BlockId, ActionId, ActionRev,
-	ClusterRecord, StaleFailure
+	ClusterRecord, StaleFailure, RepoMessage
 } from '@optimystic/db-core';
 import { isConflictFailure } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
@@ -196,5 +196,114 @@ describe('CoordinatorRepo commit — lost races return as retryable conflicts', 
 	it('rethrows a non-validator, non-race error untouched (transport faults keep the verbatim retry)', async () => {
 		const error = new Error('dial failure');
 		await expectThrows(makeRepo(makeStorageRepo({ rev: 2, actionId: RIVAL_ACTION }), error), error);
+	});
+});
+
+/**
+ * Ticket: consensus-pend-refusal-commit-tier-verify2 (retained commit-verdict threading).
+ *
+ * The signed-but-not-yet-applied window: members drop a commit's reservation when they SIGN it,
+ * which can precede applying it by a full propagation round — so a rival's commit racing the same
+ * revision can assemble FULL consensus, and every member's storage then refuses the loser at apply
+ * as stale. The member retains that verdict (`ClusterMember.getExecutedCommitResult`), the
+ * coordinator threads it out of `executeClusterTransaction` as `localCommitResult`, and
+ * `CoordinatorRepo.commit`'s locally-executed branch confirms the refusal against LOCAL storage:
+ * a confirmed rival at the requested revision becomes a retryable conflict; an own-action-durable
+ * or unconfirmed refusal keeps the prior fabricated-success shape (consensus is authoritative and
+ * this member converges via replication).
+ */
+describe('CoordinatorRepo commit — locally-executed consensus consults the retained member verdict', () => {
+	const RECORD: ClusterRecord = { messageHash: 'mh', peers: {}, message: {} as RepoMessage, promises: {}, commits: {} };
+	/** The ahead-shaped refusal `ClusterMember` retains when apply found the revision already taken. */
+	const refusal: CommitResult = { success: false, missing: [], reason: 'commit:stale missed=1' };
+
+	/** A repo whose stubbed consensus resolves locally-executed, optionally carrying a retained verdict. */
+	const makeLocalExecutedRepo = (storageRepo: IRepo, localCommitResult?: CommitResult): CoordinatorRepo => {
+		const repo = new CoordinatorRepo(
+			keyNetwork,
+			((_p: PeerId) => ({} as unknown as ClusterClient)),
+			storageRepo,
+			{ clusterSize: 3 }
+		);
+		(repo as unknown as { coordinator: unknown }).coordinator = {
+			async getClusterSize(): Promise<number> { return 3; },
+			async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, localCommitResult?: CommitResult }> {
+				return { record: RECORD, localExecuted: true, ...(localCommitResult !== undefined ? { localCommitResult } : {}) };
+			}
+		};
+		return repo;
+	};
+
+	/** Wrap a storage repo so the test can assert whether the confirmation re-read ran at all. */
+	const countingGets = (storageRepo: IRepo): { repo: IRepo, gets: () => number } => {
+		let gets = 0;
+		return {
+			repo: {
+				...storageRepo,
+				async get(g: BlockGets, o?: MessageOptions): Promise<GetBlockResults> {
+					gets++;
+					return storageRepo.get(g, o);
+				}
+			},
+			gets: () => gets
+		};
+	};
+
+	it('returns a conflict with staleAt when the retained refusal confirms as a rival at the requested revision', async () => {
+		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 2, actionId: RIVAL_ACTION }), refusal);
+
+		const result = await repo.commit(REQUEST);
+
+		expect(result.success).to.equal(false);
+		expect(isConflictFailure(result as StaleFailure), 'the confirmed loss must be retryable').to.equal(true);
+		expect((result as StaleFailure).staleAt).to.deep.equal({ blockId: BLOCK, rev: 2 });
+	});
+
+	it('confirms the rival via the revision→actionId capability when latest is past the requested rev', async () => {
+		const storageRepo = makeStorageRepo(
+			{ rev: 5, actionId: 'a-later' as ActionId },
+			async (_b, rev) => rev === 2 ? RIVAL_ACTION : undefined
+		);
+		const result = await makeLocalExecutedRepo(storageRepo, refusal).commit(REQUEST);
+
+		expect(result.success).to.equal(false);
+		expect(isConflictFailure(result as StaleFailure)).to.equal(true);
+		expect((result as StaleFailure).staleAt).to.deep.equal({ blockId: BLOCK, rev: 5 });
+	});
+
+	it('keeps the fabricated success when the refusal is our own action durable at the requested revision', async () => {
+		// Already durable under this action: a conflict answer would make the writer rebase and
+		// re-append a landed action — a duplicate entry. The mesh spec's membership/uniqueness
+		// assertions are the end-to-end guard for this arm.
+		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 2, actionId: OUR_ACTION }), refusal);
+		expect((await repo.commit(REQUEST)).success).to.equal(true);
+	});
+
+	it('keeps the fabricated success when local storage is behind the requested revision (unconfirmed)', async () => {
+		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 1, actionId: RIVAL_ACTION }), refusal);
+		expect((await repo.commit(REQUEST)).success).to.equal(true);
+	});
+
+	it('keeps the fabricated success when latest is past the rev and the capability is absent (unconfirmed)', async () => {
+		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 5, actionId: 'a-later' as ActionId }), refusal);
+		expect((await repo.commit(REQUEST)).success).to.equal(true);
+	});
+
+	it('returns success without a confirmation re-read when the retained verdict is a success', async () => {
+		const { repo: storageRepo, gets } = countingGets(makeStorageRepo({ rev: 2, actionId: OUR_ACTION }));
+		const repo = makeLocalExecutedRepo(storageRepo, { success: true });
+
+		expect((await repo.commit(REQUEST)).success).to.equal(true);
+		expect(gets(), 'a retained success needs no classification read').to.equal(0);
+	});
+
+	it('keeps the prior fabricated-success shape when no verdict was retained', async () => {
+		// A mock/legacy coordinator resolving localExecuted with no localCommitResult (e.g. the
+		// member restarted, or the TTL pruned the verdict) keeps the old behavior exactly.
+		const { repo: storageRepo, gets } = countingGets(makeStorageRepo({ rev: 2, actionId: RIVAL_ACTION }));
+		const repo = makeLocalExecutedRepo(storageRepo);
+
+		expect((await repo.commit(REQUEST)).success).to.equal(true);
+		expect(gets(), 'no verdict, no classification read').to.equal(0);
 	});
 });

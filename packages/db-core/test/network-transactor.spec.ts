@@ -672,6 +672,120 @@ describe('NetworkTransactor', () => {
     })
   })
 
+  // Ticket consensus-pend-refusal-commit-tier-verify2: the non-tail sweep in commit() used to
+  // tolerate EVERY failure after the tail landed, on the theory that reconciliation finishes
+  // lagging peers. That holds for transport faults (the commit consensus exists; peers converge)
+  // but is wrong for a RETURNED conflict: a rival owns that block's revision, no reconcile will
+  // ever apply our transform there, and proceeding acknowledges a torn action. The sweep now runs
+  // the same returned-refusal extraction commitBlock uses for the tail (staleFromBatches) and
+  // keeps the tolerance only for transport-shaped (thrown) failures.
+  describe('commit non-tail conflict surfacing', () => {
+    // Routes each block to its own coordinator; findCoordinator honors exclusions and throws
+    // once a block's candidates are exhausted (what a real one does), so a transport retry
+    // terminates instead of re-dialing the same dead peer.
+    class RoutedKeyNetwork implements IKeyNetwork {
+      private clusterMap = new Map<string, string[]>();
+
+      async setCluster(blockId: BlockId, peerIds: string[]) {
+        const keyBytes = await blockIdToBytes(blockId);
+        this.clusterMap.set(uint8ArrayToString(keyBytes, 'base64url'), peerIds);
+      }
+
+      async findCoordinator(key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+        const candidates = this.clusterMap.get(uint8ArrayToString(key, 'base64url')) ?? [];
+        const excluded = new Set((options?.excludedPeers ?? []).map(p => p.toString()));
+        const pick = candidates.find(p => !excluded.has(p));
+        if (!pick) throw new Error('no alternative coordinator');
+        return peerIdFromString(pick);
+      }
+
+      async findCluster(key: Uint8Array): Promise<ClusterPeers> {
+        const peers: ClusterPeers = {};
+        for (const pid of this.clusterMap.get(uint8ArrayToString(key, 'base64url')) ?? []) {
+          peers[pid] = { multiaddrs: [], publicKey: '' };
+        }
+        return peers;
+      }
+    }
+
+    const makeCommitOnlyRepo = (commitImpl: () => Promise<CommitResult>): IRepo & { commits: number } => {
+      const repo = {
+        commits: 0,
+        async get(): Promise<GetBlockResults> { return {} },
+        async pend(): Promise<PendResult> { throw new Error('unused on this path') },
+        async cancel(): Promise<void> { },
+        async commit(): Promise<CommitResult> {
+          repo.commits++;
+          return commitImpl();
+        },
+      };
+      return repo;
+    }
+
+    const tailId = 'block-tail' as BlockId
+    const nonTailId = 'block-nontail' as BlockId
+    const peerT = 'peer-T'
+    const peerN = 'peer-N'
+
+    const setup = async (nonTailCommit: () => Promise<CommitResult>) => {
+      const net = new RoutedKeyNetwork()
+      await net.setCluster(tailId, [peerT])
+      await net.setCluster(nonTailId, [peerN])
+      const tailRepo = makeCommitOnlyRepo(async () => ({ success: true as const }))
+      const nonTailRepo = makeCommitOnlyRepo(nonTailCommit)
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => (peerId.toString() === peerT ? tailRepo : nonTailRepo),
+      })
+      return { networkTransactor, tailRepo, nonTailRepo }
+    }
+
+    it('surfaces a returned non-tail conflict as a stale failure instead of acknowledging a torn action', async () => {
+      const { networkTransactor, tailRepo } = await setup(async () => ({
+        success: false as const,
+        conflict: true,
+        reason: `stale commit: block ${nonTailId} at rev 3, requested rev 3`,
+        staleAt: { blockId: nonTailId, rev: 3 },
+      }))
+
+      const result = await networkTransactor.commit({
+        actionId: generateRandomActionId(),
+        rev: 3,
+        blockIds: [tailId, nonTailId],
+        tailId,
+      })
+
+      // The tail committed first (that ordering is unchanged), but the returned conflict on the
+      // non-tail block must fail the commit so the writer cancels, re-reads, and re-drives.
+      expect(tailRepo.commits).to.equal(1)
+      expect(result.success).to.be.false
+      if (!result.success) {
+        expect(result.staleAt).to.deep.equal({ blockId: nonTailId, rev: 3 })
+        expect(result.missing ?? []).to.deep.equal([])
+      }
+    })
+
+    it('still tolerates a thrown (transport-shaped) non-tail failure after the tail commit', async () => {
+      const { networkTransactor, nonTailRepo } = await setup(async () => {
+        throw new Error('The stream has been reset')
+      })
+
+      const result = await networkTransactor.commit({
+        actionId: generateRandomActionId(),
+        rev: 3,
+        blockIds: [tailId, nonTailId],
+        tailId,
+      })
+
+      // The commit consensus for the non-tail block may still exist server-side; a transport
+      // fault keeps the tolerance and the lagging peer converges via reconciliation.
+      expect(nonTailRepo.commits, 'the non-tail commit was attempted').to.be.greaterThan(0)
+      expect(result.success).to.be.true
+    })
+  })
+
   describe('cancel', () => {
     it('should cancel a pending transaction', async () => {
       const { networkTransactor } = await setupNetworkTest()

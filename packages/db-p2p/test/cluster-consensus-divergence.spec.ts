@@ -483,6 +483,102 @@ describe('ClusterMember consensus-execution divergence (stream-reset root cause)
 	});
 });
 
+/**
+ * Ticket: consensus-pend-refusal-commit-tier-verify2 (member-side commit-verdict retention).
+ *
+ * `ClusterMember.applyConsensusOperation` retains local storage's CommitResult per messageHash
+ * (`getExecutedCommitResult`) so the coordinator can detect when the 'ahead' tolerance above
+ * swallowed a refusal whose real cause was a rival action holding the requested revision. The
+ * missing-pend behind path deliberately retains NOTHING (no CommitResult exists there), and a
+ * propagated apply fault rolls the retained verdict back alongside the executed marker.
+ */
+describe('ClusterMember commit-verdict retention (getExecutedCommitResult)', () => {
+	let mockNetwork: MockPeerNetwork;
+	let self: KeyPair;
+	let other: KeyPair;
+	let member: ClusterMember;
+
+	beforeEach(async () => {
+		mockNetwork = new MockPeerNetwork();
+		self = await makeKeyPair();
+		other = await makeKeyPair();
+	});
+
+	afterEach(() => {
+		member?.dispose();
+	});
+
+	it('retains storage\'s success verdict for a commit applied at consensus', async () => {
+		const storage = realStorageRepo();
+		await storage.pend({ actionId: 'a1', transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] }, policy: 'c' });
+		member = clusterMember({ storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey });
+
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a1', 'block-1', 1));
+		await member.update(record);
+
+		const verdict = member.getExecutedCommitResult(record.messageHash);
+		expect(verdict, 'a verdict must be retained for an applied commit').to.not.equal(undefined);
+		expect(verdict!.success).to.equal(true);
+	});
+
+	it('retains the ahead-shaped refusal the divergence tolerance swallows', async () => {
+		const storage = realStorageRepo();
+		// Member already holds rev 2; a consensus commit at rev 1 is refused as stale by storage,
+		// tolerated by the apply path — and the refusal is exactly what must stay visible.
+		await storage.pend({ actionId: 'a-old', transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] }, policy: 'c' });
+		expect((await storage.commit({ actionId: 'a-old', blockIds: ['block-1'], tailId: 'block-1' as BlockId, rev: 2 })).success).to.equal(true);
+		member = clusterMember({ storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey });
+
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-stale', 'block-1', 1));
+		await member.update(record);
+
+		expect(member.wasTransactionExecuted(record.messageHash), 'the refusal is tolerated, not propagated').to.equal(true);
+		const verdict = member.getExecutedCommitResult(record.messageHash);
+		expect(verdict, 'the swallowed refusal must be retained').to.not.equal(undefined);
+		expect(verdict!.success).to.equal(false);
+		expect(verdict!.success === false && !!verdict!.missing?.length, 'the retained refusal carries the ahead shape').to.equal(true);
+	});
+
+	it('retains nothing for the missing-pend behind path (fabricated success + reconcile stays)', async () => {
+		const storage = realStorageRepo();
+		member = clusterMember({ storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey });
+
+		// Never pended locally: storage.commit THROWS "Pending action … not found" — no
+		// CommitResult exists, so nothing is retained and the coordinator keeps its
+		// fabricated-success + cohort-reconcile shape for a member genuinely behind.
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-missing', 'block-1', 1));
+		await member.update(record);
+
+		expect(member.wasTransactionExecuted(record.messageHash)).to.equal(true);
+		expect(member.getExecutedCommitResult(record.messageHash)).to.equal(undefined);
+	});
+
+	it('drops the retained verdict when the apply rolls back (propagated fault)', async () => {
+		// A bare-reason returned failure is a genuine fault: it propagates, handleConsensus rolls
+		// back the executed marker — and the verdict retained just before the propagation check
+		// must roll back with it, or a corrected retry would consult a verdict of an apply that
+		// officially never ran.
+		class ReturnFailRepo implements IRepo {
+			async get(_b: BlockGets): Promise<GetBlockResults> { return {}; }
+			async pend(_r: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [] }; }
+			async commit(_r: CommitRequest): Promise<CommitResult> { return { success: false, reason: 'internal commit fault' }; }
+			async cancel(_a: ActionBlocks): Promise<void> { /* no-op */ }
+		}
+		member = clusterMember({ storageRepo: new ReturnFailRepo(), peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey });
+
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-fault', 'block-1', 1));
+		let threw: Error | undefined;
+		try {
+			await member.update(record);
+		} catch (err) {
+			threw = err as Error;
+		}
+		expect(threw, 'the bare-reason fault must still propagate').to.not.equal(undefined);
+		expect(member.wasTransactionExecuted(record.messageHash)).to.equal(false);
+		expect(member.getExecutedCommitResult(record.messageHash), 'the verdict rolls back with the marker').to.equal(undefined);
+	});
+});
+
 describe('ClusterMember commit-certificate capture (reactivity origination feed)', () => {
 	let mockNetwork: MockPeerNetwork;
 	let self: KeyPair;
