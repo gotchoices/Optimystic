@@ -155,51 +155,66 @@ export class TransactionCoordinator {
 		// re-drive a losing transaction before surfacing a terminal error.
 		let staleLosses = 0;
 		let lastLoss: CoordinatorStaleLossError | undefined;
-		for (;;) {
-			if (signal?.aborted) {
-				throw makeAbortError(signal);
-			}
-			// Progress-agnostic ceiling: once we've taken at least one loss, give up if the
-			// wall-clock deadline passed (independent of the attempt cap).
-			if (deadlineMs !== undefined && lastLoss && Date.now() - startedAt >= deadlineMs) {
-				throw lastLoss;
-			}
 
-			// Age the transaction's advisory priority by the number of losses taken so far, so a
-			// repeatedly-losing transaction out-ranks fresh (priority-0) rivals in the cluster's
-			// resolveRace. Fairness-only and capped at MaxPriority; excluded from the tx id / client
-			// signature, so bumping it here does not churn identity. Left untouched on the first
-			// attempt (staleLosses == 0) so the initial pend serializes exactly as before.
-			if (staleLosses > 0) {
-				transaction.priority = clampPriority(staleLosses);
-			}
+		// Disposers for the in-flight marks {@link commitOnce} sets on each participant it latches.
+		// They must outlive the individual attempt: the inter-attempt refresh below is the ONLY
+		// reader of the mark, and it deliberately runs after the commit span released its latches
+		// (`Latches` is non-reentrant), so a clear tied to the latch would already have run. Hence
+		// the finally spans the WHOLE retry loop — every exit clears: return, stale-loss exhaustion,
+		// a partial landing, a hard error, an abort. Each disposer is id-guarded, so re-marking on a
+		// later attempt is harmless and a stale disposer cannot wipe a newer mark.
+		const inFlightDisposers: (() => void)[] = [];
+		try {
+			for (;;) {
+				if (signal?.aborted) {
+					throw makeAbortError(signal);
+				}
+				// Progress-agnostic ceiling: once we've taken at least one loss, give up if the
+				// wall-clock deadline passed (independent of the attempt cap).
+				if (deadlineMs !== undefined && lastLoss && Date.now() - startedAt >= deadlineMs) {
+					throw lastLoss;
+				}
 
-			try {
-				await this.commitOnce(transaction);
-				return;
-			} catch (err) {
-				// Only a CLEAN stale loss is retryable. A partial landing, an expired transaction, an
-				// unavailable transactor, etc. all propagate unchanged.
-				if (!(err instanceof CoordinatorStaleLossError)) {
-					throw err;
+				// Age the transaction's advisory priority by the number of losses taken so far, so a
+				// repeatedly-losing transaction out-ranks fresh (priority-0) rivals in the cluster's
+				// resolveRace. Fairness-only and capped at MaxPriority; excluded from the tx id / client
+				// signature, so bumping it here does not churn identity. Left untouched on the first
+				// attempt (staleLosses == 0) so the initial pend serializes exactly as before.
+				if (staleLosses > 0) {
+					transaction.priority = clampPriority(staleLosses);
 				}
-				lastLoss = err;
-				staleLosses++;
-				if (staleLosses >= maxAttempts) {
-					throw err;
+
+				try {
+					await this.commitOnce(transaction, inFlightDisposers);
+					return;
+				} catch (err) {
+					// Only a CLEAN stale loss is retryable. A partial landing, an expired transaction, an
+					// unavailable transactor, etc. all propagate unchanged.
+					if (!(err instanceof CoordinatorStaleLossError)) {
+						throw err;
+					}
+					lastLoss = err;
+					staleLosses++;
+					if (staleLosses >= maxAttempts) {
+						throw err;
+					}
+					const delay = jitteredBackoffMs(staleLosses - 1, { baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
+					await abortableDelay(delay, signal);
+					// Re-read fresh state before re-attempting so the next commit pends against current
+					// revisions (mirrors how Collection.sync calls updateInternal() before retrying).
+					// NOTE: refreshes EVERY registered collection, not only the participants of this
+					// transaction. Not free: a non-participant's update() throws CollectionHeaderVanishedError
+					// if its header momentarily reads absent while it holds a committed revision, aborting
+					// this retry. The registered set is small today; if that (or retry latency) ever bites,
+					// narrow this to the transaction's participating collections.
+					for (const collection of this.collections.values()) {
+						await collection.update();
+					}
 				}
-				const delay = jitteredBackoffMs(staleLosses - 1, { baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
-				await abortableDelay(delay, signal);
-				// Re-read fresh state before re-attempting so the next commit pends against current
-				// revisions (mirrors how Collection.sync calls updateInternal() before retrying).
-				// NOTE: refreshes EVERY registered collection, not only the participants of this
-				// transaction. Not free: a non-participant's update() throws CollectionHeaderVanishedError
-				// if its header momentarily reads absent while it holds a committed revision, aborting
-				// this retry. The registered set is small today; if that (or retry latency) ever bites,
-				// narrow this to the transaction's participating collections.
-				for (const collection of this.collections.values()) {
-					await collection.update();
-				}
+			}
+		} finally {
+			for (const dispose of inFlightDisposers) {
+				dispose();
 			}
 		}
 	}
@@ -220,8 +235,13 @@ export class TransactionCoordinator {
 	 * {@link CoordinatorPartialCommitError} (not retryable).
 	 *
 	 * @param transaction - The transaction to commit
+	 * @param inFlightDisposers - Collects one disposer per participant marked in flight under this
+	 * transaction's id (see {@link Collection.beginInFlightAction}). The caller owns clearing them,
+	 * because the mark has to survive past this attempt — see the array's declaration in
+	 * {@link commit}. Omitted only by a caller that drives a single attempt and never refreshes
+	 * between attempts, which today is nobody.
 	 */
-	private async commitOnce(transaction: Transaction): Promise<void> {
+	private async commitOnce(transaction: Transaction, inFlightDisposers?: (() => void)[]): Promise<void> {
 		if (isTransactionExpired(transaction.stamp)) {
 			throw new Error(`Transaction expired at ${transaction.stamp.expiration}`);
 		}
@@ -270,6 +290,14 @@ export class TransactionCoordinator {
 				a.collectionId < b.collectionId ? -1 : a.collectionId > b.collectionId ? 1 : 0);
 			for (const { collection } of latchOrder) {
 				latchReleases.push(await collection.acquireLatch());
+				// Mark THIS attempt's action id on each participant while its latch is held, so the
+				// inter-attempt refresh in commit() recognises a log entry this transaction itself
+				// made durable (a torn commit: header and log tail committed, a later sweep block
+				// reported the conflict) and consumes it instead of replaying it into a second entry
+				// under the same id. `transaction.id` is stable across retries, so re-marking on a
+				// later attempt re-states the same fact. Only participants are marked; a registered
+				// non-participant is left unmarked and its refresh behaves exactly as a reader's.
+				inFlightDisposers?.push(collection.beginInFlightAction(transaction.id));
 			}
 			await this.commitOnceLatched(transaction, collectionData);
 		} finally {
@@ -788,6 +816,17 @@ export class TransactionCoordinator {
 		// reads are recorded on every collection's entry: a read may target a block in another
 		// collection, and the cascade matches read-dependents by (blockId, revision) regardless of
 		// which collection's log the dependent landed in.
+		// NOTE: `allCollectionIds` names the participants of THIS attempt, and a retry's participant
+		// set can be SMALLER than the first attempt's. After a torn commit, the participant whose
+		// entry landed durably consumes that entry on the inter-attempt refresh
+		// (Collection.inFlightActionId), empties its pending queue and resets its tracker, so
+		// commitOnce's non-empty-transforms filter drops it from the next attempt. The retry's
+		// entries therefore list only the REMAINING participants, while the torn participant's
+		// already-durable entry lists them all — one transaction id, two different
+		// `allCollectionIds` values across its entries. Nothing today keys off that list for
+		// correctness; a cross-collection invalidation cascade that treats it as "the definitive
+		// participant set of this transaction" must union it across the transaction's entries
+		// rather than trusting any single one.
 		const addResult = await log.addActions(
 			collectionActions.actions,
 			actionId,

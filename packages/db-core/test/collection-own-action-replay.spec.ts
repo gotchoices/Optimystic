@@ -1,45 +1,11 @@
 import { expect } from 'chai'
 import { Collection } from '../src/collection/index.js'
-import { TestTransactor, DelegatingTransactor } from '../src/testing/test-transactor.js'
-import type { Action, ActionHandler, BlockStore, IBlock, CommitRequest, CommitResult } from '../src/index.js'
+import { TestTransactor, CommitLandsButReportsStale } from '../src/testing/test-transactor.js'
+import type { Action, ActionHandler, BlockStore, IBlock } from '../src/index.js'
 
 interface TestAction {
 	value: string
 	timestamp: number
-}
-
-/**
- * Commits durably on the inner {@link TestTransactor}, then reports a stale failure anyway —
- * the exact observable shape of `NetworkTransactor.commit`'s torn action: the collection header
- * and log tail are committed BEFORE the sweep of the remaining blocks, so a later sweep block
- * coming back as a confirmed conflict returns a stale failure over an action whose log entry is
- * already durable.
- *
- * Safe against the inner transactor's bookkeeping because `TransactorSource.transact` cancels
- * the pend on the reported failure and `TestTransactor.cancel` only deletes PENDING records —
- * the real commit already promoted them, so the cancel is a no-op.
- */
-class CommitLandsButReportsStale extends DelegatingTransactor {
-	/** Remaining number of successful commits to mask as stale failures. */
-	private injections: number
-	/** Commits that actually landed on the inner transactor (masked or not). */
-	landedCommits = 0
-
-	constructor(inner: TestTransactor, injections = 1) {
-		super(inner)
-		this.injections = injections
-	}
-
-	override async commit(request: CommitRequest): Promise<CommitResult> {
-		const result = await this.inner.commit(request)
-		if (result.success) {
-			this.landedCommits++
-			if (this.injections-- > 0) {
-				return { success: false, conflict: true, reason: 'stale commit: injected torn-action conflict' }
-			}
-		}
-		return result
-	}
 }
 
 describe('Collection: own committed action on retry', () => {

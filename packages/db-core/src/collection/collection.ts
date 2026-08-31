@@ -105,6 +105,34 @@ export class Collection<TAction> implements ICollection<TAction> {
 	private pending: Action<TAction>[] = [];
 	private readonly latchId: string;
 
+	/** The action id of a write currently in flight ON THIS INSTANCE'S BEHALF, or `undefined`
+	 * outside a write. Read by {@link updateInternal}: if the committed log now carries an entry
+	 * under this id, that action's work is already durable despite the failure answer that sent us
+	 * back here — `NetworkTransactor.commit` commits the collection header and log tail BEFORE
+	 * sweeping the remaining blocks, so a later sweep block confirming a conflict reports failure
+	 * over an action whose log entry already landed. Such an entry is CONSUMED
+	 * ({@link consumeOwnEntry}) rather than replayed, because replaying re-appends content the
+	 * committed tail already carries, producing a duplicate entry under one action id at two
+	 * revisions.
+	 *
+	 * The collection owns this fact rather than taking it as a `updateInternal` argument so that no
+	 * refresh path can forget to supply it — {@link update} and {@link updateAndSync} are refreshes
+	 * on behalf of a READER, the field is unset for them, and the consume branch cannot fire. Before
+	 * this was a field, `TransactionCoordinator.commit`'s inter-attempt refresh went through
+	 * `update()` and was therefore indistinguishable from a reader refresh even though the
+	 * coordinator held the very id it was retrying.
+	 *
+	 * LIFETIME is the whole attempt CYCLE, not the latched span: it must survive the refresh
+	 * BETWEEN a failed attempt and its retry, which is the only moment it is ever read. In
+	 * {@link syncInternal} that cycle is contained inside the collection latch `sync()` holds; in
+	 * `TransactionCoordinator.commit` the inter-attempt `update()` runs OUTSIDE the commit latch
+	 * span by design (`Latches` is non-reentrant), so the coordinator's clear necessarily runs
+	 * latch-free. That is safe: this is a single field write, {@link beginInFlightAction}'s
+	 * disposer only clears an id it still owns, and the only reader runs under the latch — so the
+	 * worst a foreign concurrent refresh can see is a cleared field (it stops consuming), never a
+	 * field it should not have consumed. */
+	private inFlightActionId?: ActionId;
+
 	protected constructor(
 		public readonly id: CollectionId,
 		public readonly transactor: ITransactor,
@@ -442,7 +470,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	}
 
 	/** Drops the pending actions this sync's OWN committed entry already made durable, instead of
-	 * replaying them into a duplicate entry (see {@link updateInternal}'s `inFlightActionId`).
+	 * replaying them into a duplicate entry (see {@link inFlightActionId}).
 	 *
 	 * `addActions` wrote exactly the snapshot pending list under this action id, and `act()` shares
 	 * the collection latch with `syncInternal`, so `this.pending` cannot have grown mid-sync: the
@@ -477,16 +505,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return { after, mutated: after.length !== before.length || after.some((a, i) => a !== before[i]) };
 	}
 
-	/** @param inFlightActionId - The action id {@link syncInternal} is currently retrying, when this
-	 * refresh runs between a failed transact and its retry. If the committed log now carries an entry
-	 * under this id, that action's work is already durable despite the failure answer —
-	 * `NetworkTransactor.commit` commits the collection header and log tail BEFORE sweeping the
-	 * remaining blocks, so a later sweep block confirming a conflict reports failure over an action
-	 * whose log entry already landed. Such an entry is CONSUMED ({@link consumeOwnEntry}) rather
-	 * than replayed, because replaying re-appends content the committed tail already carries,
-	 * producing a duplicate entry. Omitted by every other caller —
-	 * {@link update} and {@link updateAndSync} pass nothing and the loop behaves exactly as before. */
-	private async updateInternal(inFlightActionId?: ActionId) {
+	/** Refresh this instance against the stored log: adopt the latest committed revision, resolve
+	 * pending actions against everything that landed since, and replay them if anything conflicts.
+	 *
+	 * Takes no in-flight action id — it reads {@link inFlightActionId} off `this`, which is set for
+	 * exactly the write attempt cycles that own one (see that field). Callers cannot get this wrong
+	 * by omission. */
+	private async updateInternal() {
 		// Start with a context that can see to the end of the log
 		const source = new TransactorSource(this.id, this.transactor, undefined);
 		const tracker = new Tracker(source);
@@ -531,7 +556,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// Process the entries and track the blocks they affect
 		let anyConflicts = false;
 		for (const entry of latest?.entries ?? []) {
-			const isOwnEntry = inFlightActionId !== undefined && entry.actionId === inFlightActionId;
+			const isOwnEntry = this.inFlightActionId !== undefined && entry.actionId === this.inFlightActionId;
 			const { after, mutated } = isOwnEntry
 				? this.consumeOwnEntry(entry)
 				: this.filterAgainstEntry(entry);
@@ -805,6 +830,37 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return Latches.acquire(this.latchId);
 	}
 
+	/** Bracket a write attempt cycle on this instance under `actionId`, so a refresh taken between
+	 * a failed attempt and its retry recognises that action's own already-durable log entry (see
+	 * {@link inFlightActionId} for why, and for the lifetime this must span).
+	 *
+	 * The returned disposer clears the mark and MUST be called in a `finally` covering every exit
+	 * from the retry cycle — return, retry exhaustion, partial commit, hard error, abort. A mark
+	 * left behind would let a LATER, unrelated refresh consume a foreign entry that happens to
+	 * carry the same id. The clear is id-guarded, so a disposer whose mark has since been replaced
+	 * by another attempt is a no-op rather than wiping the newer one; disposers may therefore be
+	 * called out of order and more than once. Shaped like {@link acquireLatch} deliberately: a
+	 * disposer is harder to forget than a paired `end…` call.
+	 *
+	 * NOTE: the mark deliberately outlives the latch (see {@link inFlightActionId}), so two writes
+	 * overlapping on ONE instance can trample each other's: a second write that acquires the latch
+	 * between the first's failed attempt and its retry-refresh replaces the id, and the first's
+	 * refresh then reads the SECOND write's id — consuming that write's durable entry and dropping
+	 * pending actions of its own that never landed. Not reachable today: a coordinator commit and a
+	 * `sync()` both run on one session call path, which is the same assumption the participant
+	 * selection in `TransactionCoordinator.commitOnce` and its `rollback` already rest on. If a
+	 * second writer is ever allowed to drive the SAME instance concurrently, this must become a
+	 * per-attempt token (a mark object compared by identity, refusing to replace a live one) rather
+	 * than a bare id. */
+	beginInFlightAction(actionId: ActionId): () => void {
+		this.inFlightActionId = actionId;
+		return () => {
+			if (this.inFlightActionId === actionId) {
+				this.inFlightActionId = undefined;
+			}
+		};
+	}
+
 	/** Push our pending actions to the transactor */
 	async sync(options?: SyncOptions) {
 		const release = await Latches.acquire(this.latchId);
@@ -815,10 +871,25 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 	}
 
+	/** Mints the one action id this sync reuses across all of its retry attempts, and owns it for
+	 * the WHOLE cycle — including the inter-attempt refresh, which is the only thing that reads it
+	 * (see {@link inFlightActionId}). `sync()`/`updateAndSync()` hold the collection latch across
+	 * all of this, so the mark's lifetime is contained inside the latched span here; the disposer
+	 * runs on every exit, including a throw out of retry exhaustion or an abort. */
 	private async syncInternal(options?: SyncOptions) {
 		const bytes = randomBytes(16);
 		const actionId = uint8ArrayToString(bytes, 'base64url');
 
+		const endInFlight = this.beginInFlightAction(actionId);
+		try {
+			await this.syncAttempts(actionId, options);
+		} finally {
+			endInFlight();
+		}
+	}
+
+	/** The retry loop behind {@link syncInternal}, run with `actionId` already marked in flight. */
+	private async syncAttempts(actionId: ActionId, options?: SyncOptions) {
 		const maxAttempts = options?.maxAttempts ?? DefaultMaxAttempts;
 		const baseBackoffMs = options?.baseBackoffMs ?? PendingRetryDelayMs;
 		const maxBackoffMs = options?.maxBackoffMs ?? DefaultMaxBackoffMs;
@@ -900,10 +971,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 				const delay = jitteredBackoffMs(consecutiveFailures - 1, { baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
 				await abortableDelay(delay, signal);
 				// Fetch latest state - updateInternal() will call replayActions() if there are conflicts.
-				// Thread this attempt's actionId so the refresh can recognize a log entry written by
-				// THIS action (a commit that landed durably but answered stale — see updateInternal's
-				// entry loop) and consume it rather than replaying it into a duplicate entry.
-				await this.updateInternal(actionId);
+				// This sync's actionId is marked in flight for the whole cycle (see syncInternal), so
+				// the refresh recognizes a log entry written by THIS action (a commit that landed
+				// durably but answered stale — see the entry loop in updateInternal) and consumes it
+				// rather than replaying it into a duplicate entry.
+				await this.updateInternal();
 			} else {
 				// Forward progress: reset the no-progress budget.
 				consecutiveFailures = 0;
