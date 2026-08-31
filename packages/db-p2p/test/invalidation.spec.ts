@@ -14,6 +14,7 @@ import {
 	buildDisputeResolutionProof,
 	verifyInvalidationCertificate,
 	computeRevertedBlock,
+	hashBlockContent,
 	computeTargetHash,
 	computeArbitratorSetHash,
 	voteSigningPayload,
@@ -806,6 +807,154 @@ describe('applyInvalidation', () => {
 			} finally {
 				releaseOnce();
 			}
+		});
+
+		// ─── The entry may only describe writes that actually landed ───
+
+		it('reads tips under the latch: a commit that lands first shifts the slot, and the entry describes the write that landed', async () => {
+			const raw = new MemoryRawStorage();
+			const blockId = 'inv-race';
+			const { repo, createBlockStorage } = await seedBlock(raw, blockId, [
+				{ actionId: 'a1', value: 'original', rev: 1 },
+				{ actionId: 'a2', value: 'tinv', rev: 2 },
+			]);
+			const log = await Log.create<unknown>(new MemLogStore());
+			const proof = await challengerWinsProof('d1', 'msg-1', { invalidatedActionId: 'a2', blockIds: [blockId] });
+
+			// Pend the competing action BEFORE holding the key: pend takes the same latch.
+			await repo.pend({ actionId: 'c3', transforms: updateOp(blockId, 'concurrent'), rev: 3 } as Parameters<StorageRepo['pend']>[0]);
+
+			const release = await Latches.acquire(blockWriteLatchKey(blockId));
+			let released = false;
+			const releaseOnce = () => { if (!released) { released = true; release(); } };
+
+			let commitP: ReturnType<StorageRepo['commit']>;
+			let invP: ReturnType<typeof applyInvalidation>;
+			try {
+				// The commit queues on the held latch first; the invalidation (no explicit slot) runs its
+				// read-only prefix — dedup, certificate verification — and queues behind it.
+				commitP = repo.commit({ actionId: 'c3', rev: 3, blockIds: [blockId], tailId: 'log' });
+				await delay(0);
+				invP = applyInvalidation({ log, createBlockStorage }, {
+					invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: [blockId], proof,
+				});
+				await delay(25);
+			} finally {
+				releaseOnce();
+			}
+			const commitResult = await commitP;
+			const result = await invP;
+
+			// The competing commit landed rev 3 and is untouched by the invalidation.
+			expect(commitResult.success).to.equal(true);
+
+			// Because the tip is read INSIDE the latch, the slot is one past what the commit actually
+			// landed (4, not the stale 3 the pre-fix code computed from a tip read outside the latch).
+			// The compensating write therefore lands rather than being refused by the monotonic guard.
+			expect(result.applied).to.equal(true);
+			expect(result.rev).to.equal(4);
+
+			const latest = await createBlockStorage(blockId).getLatest();
+			expect(latest!.rev).to.equal(4);
+			// The revision in effect belongs to the invalidation, not to the competing commit.
+			expect(latest!.actionId).to.not.equal('c3');
+
+			// The recorded reversal describes the state that is actually in effect: the tip it rolled
+			// forward from is the commit's rev 3, and the hash is the hash of the stored content.
+			const entryBlock = result.reverted[0]!;
+			expect(entryBlock.blockId).to.equal(blockId);
+			expect(entryBlock.fromRev).to.equal(3);
+			const current = await createBlockStorage(blockId).getBlock();
+			expect(entryBlock.restoredContentHash).to.equal(await hashBlockContent(current!.block));
+
+			// The durable entry carries the same landed reversal.
+			const inv = await log.findInvalidation('a2');
+			expect(inv?.reverted).to.deep.equal([...result.reverted]);
+		});
+
+		it('refuses wholesale when an explicit slot is at or below a tip: no write, no entry, no partial revert', async () => {
+			const raw = new MemoryRawStorage();
+			const { createBlockStorage } = await seedWrites(raw, [
+				{ actionId: 'a1', rev: 1, blockId: 'X', value: 'x1' },
+				{ actionId: 'a2', rev: 2, blockId: 'X', value: 'x2' },
+				{ actionId: 'a2b', rev: 2, blockId: 'Y', value: 'y2' },
+				{ actionId: 'a3', rev: 3, blockId: 'Y', value: 'y3' },
+			]);
+			const log = await Log.create<unknown>(new MemLogStore());
+			const proof = await challengerWinsProof('d1', 'msg-1', { invalidatedActionId: 'a2', blockIds: ['X', 'Y'] });
+
+			// Slot 3 is past X's tip (2) but NOT past Y's (3) — so a per-block loop would have written X
+			// and had Y refused, leaving a log entry that claims both.
+			const result = await applyInvalidation({ log, createBlockStorage }, {
+				invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['X', 'Y'], proof, rev: 3,
+			});
+
+			expect(result.applied).to.equal(false);
+			expect(result.reason).to.equal('stale-revision');
+			expect(result.reverted).to.deep.equal([]);
+
+			// Nothing written on EITHER block — including the one whose write would have succeeded.
+			expect(await createBlockStorage('X').getLatest()).to.deep.equal({ rev: 2, actionId: 'a2' });
+			expect(await createBlockStorage('Y').getLatest()).to.deep.equal({ rev: 3, actionId: 'a3' });
+			expect(((await createBlockStorage('X').getBlock())!.block as ValueBlock).value).to.equal('x2');
+
+			// And nothing appended — the invalidation stays re-deliverable at a slot past every tip.
+			expect(await log.findInvalidation('a2')).to.equal(undefined);
+			const retry = await applyInvalidation({ log, createBlockStorage }, {
+				invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['X', 'Y'], proof, rev: 4,
+			});
+			expect(retry.applied).to.equal(true);
+			expect(retry.rev).to.equal(4);
+			expect((await log.findInvalidation('a2'))?.reverted.length).to.equal(2);
+		});
+
+		it('acquires multi-block latches in sorted order: a commit and an invalidation over the same two blocks do not deadlock', async () => {
+			const raw = new MemoryRawStorage();
+			// Ids chosen so request order (['mb-z','mb-a']) differs from sorted acquisition order.
+			const { repo, createBlockStorage } = await seedWrites(raw, [
+				{ actionId: 'a1', rev: 1, blockId: 'mb-a', value: 'a1' },
+				{ actionId: 'a1z', rev: 1, blockId: 'mb-z', value: 'z1' },
+				{ actionId: 'a2', rev: 2, blockId: 'mb-a', value: 'a2' },
+			]);
+			const log = await Log.create<unknown>(new MemLogStore());
+			const proof = await challengerWinsProof('d1', 'msg-1', { invalidatedActionId: 'a2', blockIds: ['mb-z', 'mb-a'] });
+
+			await repo.pend({
+				actionId: 'c3',
+				transforms: { updates: { ...updateOp('mb-a', 'a3').updates, ...updateOp('mb-z', 'z3').updates } },
+				rev: 3,
+			} as Parameters<StorageRepo['pend']>[0]);
+
+			// Both multi-latch holders take their keys in sorted id order, so whichever queues first runs
+			// to completion and the other follows — no acquisition cycle, so neither can hang.
+			const [commitResult, invResult] = await Promise.all([
+				repo.commit({ actionId: 'c3', rev: 3, blockIds: ['mb-a', 'mb-z'], tailId: 'log' }),
+				applyInvalidation({ log, createBlockStorage }, {
+					invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['mb-z', 'mb-a'], proof,
+				}),
+			]);
+
+			// Whatever the interleaving, latest is monotonic on both blocks and the invalidation only
+			// reports blocks whose compensating write is the revision actually in effect.
+			const latestA = (await createBlockStorage('mb-a').getLatest())!;
+			const latestZ = (await createBlockStorage('mb-z').getLatest())!;
+			expect(latestA.rev).to.be.at.least(2);
+			expect(latestZ.rev).to.be.at.least(1);
+
+			if (invResult.applied) {
+				expect(invResult.reverted.map(r => r.blockId)).to.have.members(['mb-z', 'mb-a']);
+				for (const rb of invResult.reverted) {
+					const latest = (await createBlockStorage(rb.blockId).getLatest())!;
+					expect(latest.rev).to.equal(invResult.rev);
+					const current = await createBlockStorage(rb.blockId).getBlock();
+					expect(rb.restoredContentHash).to.equal(
+						current ? await hashBlockContent(current.block) : DELETED_BLOCK_RESTORE);
+				}
+			} else {
+				expect(invResult.reason).to.equal('stale-revision');
+				expect(await log.findInvalidation('a2')).to.equal(undefined);
+			}
+			expect(commitResult.success).to.equal(true);
 		});
 	});
 });

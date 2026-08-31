@@ -1,12 +1,12 @@
 import { peerIdFromString } from '@libp2p/peer-id';
 import { fromString as uint8ArrayFromString } from 'uint8arrays/from-string';
 import type {
-	ActionId, BlockId, IBlock, Log,
+	ActionId, ActionRev, BlockId, IBlock, Log,
 	DisputeResolutionProof, ArbitrationVoteProof, RevertedBlock,
 } from '@optimystic/db-core';
 import { applyTransform, hashString } from '@optimystic/db-core';
 import type { IBlockStorage } from '../storage/i-block-storage.js';
-import { withBlockWriteLatch } from '../storage/block-latch.js';
+import { acquireBlockWriteLatch, type BlockWriteLatch } from '../storage/block-latch.js';
 import type { DisputeResolution, ArbitrationVote } from './types.js';
 import { createLogger } from '../logger.js';
 
@@ -490,8 +490,19 @@ export type ApplyInvalidationParams = {
 	readonly proof: DisputeResolutionProof;
 	/**
 	 * Consensus-assigned revision slot for the compensating revision (collection-global). When
-	 * omitted, computed as one past the highest current tip across the reverted blocks — the value a
-	 * local/single-node apply uses; the consensus path passes the agreed slot.
+	 * omitted, computed as one past the highest current tip across the reverted blocks — read under
+	 * the blocks' write latches, so an omitted slot is strictly past every tip and its compensating
+	 * writes can never be refused by the monotonic guard.
+	 *
+	 * An explicit slot at or below any affected block's tip is refused wholesale (`applied: false`,
+	 * reason `stale-revision`) rather than partially written.
+	 *
+	 * NOTE: nothing on the wire supplies this today. `InvalidateRequest`
+	 * (`db-core/src/network/struct.ts`) carries `invalidatedActionId` / `invalidatedRev` / `blockIds` /
+	 * `collectionId` / `resolution` and NO compensating-revision field, so the network-facing apply
+	 * path leaves this undefined and every member computes its own slot locally. The `stale-revision`
+	 * path is therefore reachable only from tests and from a future caller that does pass an agreed
+	 * slot; adding that wire field is out of scope here.
 	 */
 	readonly rev?: number;
 	/**
@@ -517,10 +528,39 @@ export type ApplyInvalidationParams = {
 
 export type ApplyInvalidationResult = {
 	readonly applied: boolean;
-	readonly reason?: 'already-applied' | 'invalid-certificate';
+	/**
+	 *  - `already-applied` — a re-receipt; the log already holds this `(invalidatedActionId, disputeId)`.
+	 *    `reverted` carries the EXISTING entry's blocks, so a caller can reuse them.
+	 *  - `invalid-certificate` — the proof is not a valid challenger-wins certificate for the target.
+	 *  - `stale-revision` — at least one affected block already sits at or past the compensating
+	 *    revision slot, so the compensating write would be refused by the monotonic guard. Nothing was
+	 *    written and nothing was appended (all-or-nothing); the invalidation is safely re-deliverable
+	 *    once the caller supplies a slot past every affected block's tip. Reachable only when the
+	 *    caller supplies an explicit {@link ApplyInvalidationParams.rev} — a slot this function
+	 *    computes itself is strictly past every tip by construction.
+	 */
+	readonly reason?: 'already-applied' | 'invalid-certificate' | 'stale-revision';
 	readonly rev?: number;
 	readonly reverted: ReadonlyArray<RevertedBlock>;
 };
+
+/**
+ * Boundary invariant for the compensating write: the effective `ActionRev` a forward write returns
+ * must be the one we intended. The precheck above already establishes that, so a mismatch means a
+ * write path refused for a reason the precheck does not model — an internal contradiction (a write
+ * refused while its latch was held and its tip was checked), not a condition to degrade around. It
+ * throws rather than returning `applied: false`: `ClusterRepo.applyConsensusInvalidation` tolerates a
+ * sink throw, logs it, and rolls back its dedup marker so a re-broadcast retries.
+ */
+function assertWriteLanded(blockId: BlockId, intended: ActionRev, effective: ActionRev): void {
+	if (effective.rev !== intended.rev || effective.actionId !== intended.actionId) {
+		throw new Error(
+			`Invalidation compensating write did not land for block ${blockId}: intended ` +
+			`{ rev: ${intended.rev}, actionId: ${intended.actionId} }, effective ` +
+			`{ rev: ${effective.rev}, actionId: ${effective.actionId} }`
+		);
+	}
+}
 
 /**
  * Deterministically applies a single-collection invalidation: the durable reversal primitive every
@@ -531,10 +571,16 @@ export type ApplyInvalidationResult = {
  *  1. **Dedup** — if the log already holds an invalidation for `(invalidatedActionId, disputeId)`,
  *     this is a re-receipt (rebroadcast / sync / retry): no-op, append nothing.
  *  2. **Certificate** — reject (append nothing) unless `proof` is a valid challenger-wins certificate.
- *  3. **Reverted revisions** — for each block, recompute the as-if-`T_inv`-absent content and write a
- *     new monotonic revision (a forward compensating transform; prior revisions are retained).
+ *  3. **Reverted revisions** — holding EVERY affected block's write latch, recompute each block's
+ *     as-if-`T_inv`-absent content and write a new monotonic revision (a forward compensating
+ *     transform; prior revisions are retained). All-or-nothing: if any block already sits at or past
+ *     the compensating slot, nothing is written and nothing is appended.
  *  4. **Log entry** — append the {@link InvalidationEntry} carrying the proof and `reverted` targets,
  *     making `committed-invalidated` durable and recoverable on sync.
+ *
+ * The `reverted` entries an applied result carries therefore describe writes that ACTUALLY landed,
+ * at the revision and with the content hash they name — the property `cascade.ts` relies on when it
+ * decides a read-dependent's fate by comparing observed content against `restoredContentHash`.
  */
 export async function applyInvalidation(ctx: InvalidationContext, params: ApplyInvalidationParams): Promise<ApplyInvalidationResult> {
 	const { invalidatedActionId, invalidatedRev, blockIds, proof } = params;
@@ -558,45 +604,108 @@ export async function applyInvalidation(ctx: InvalidationContext, params: ApplyI
 		return { applied: false, reason: 'invalid-certificate', reverted: [] };
 	}
 
-	// 3. Compute compensating content + the collection-global revision slot.
-	const computations = await Promise.all(
-		blockIds.map(async (blockId) => {
-			const storage = ctx.createBlockStorage(blockId);
-			return { blockId, storage, computation: await computeRevertedBlock(storage, invalidatedRev) };
-		})
-	);
-	const maxFromRev = computations.reduce((max, c) => Math.max(max, c.computation.fromRev), invalidatedRev);
-	const rev = params.rev ?? maxFromRev + 1;
+	// 3. Compensating revisions — ONE critical section spanning every affected block.
+	//
+	// Latch discipline: acquire ALL affected blocks' write latches up front, sequentially, in sorted
+	// block-id order, and hold them across compute → revision slot → precheck → writes. That is the
+	// same discipline `StorageRepo.commit` follows, so the two cannot deadlock against each other:
+	// every multi-latch holder in this package takes its keys in the one global (sorted) order, so
+	// there is no acquisition cycle. (The previous code took each block's latch around only its own
+	// write, which left the tips it computed from — and the revision slot derived from them — read
+	// outside any latch: a concurrent commit could land a newer revision in the gap, the monotonic
+	// guard in saveReplica/saveDeletion would correctly refuse the compensating write, and the log
+	// entry appended in step 4 would then assert a restore that never happened.)
+	//
+	// Duplicate ids are collapsed before acquisition: `Latches` is a plain FIFO mutex with no
+	// re-entrancy, so acquiring the same key twice in this loop would deadlock against ourselves.
+	// The certificate target above deliberately still uses the caller's `blockIds` verbatim — the
+	// arbitrators signed over that list.
+	const uniqueBlockIds = Array.from(new Set(blockIds));
+	const latchOrder = [...uniqueBlockIds].sort();
+	const releases: (() => void)[] = [];
+	let reverted: RevertedBlock[];
+	let rev: number;
+	try {
+		const latches = new Map<BlockId, BlockWriteLatch>();
+		for (const id of latchOrder) {
+			const { latch, release } = await acquireBlockWriteLatch(id);
+			releases.push(release);
+			latches.set(id, latch);
+		}
 
-	const reverted: RevertedBlock[] = [];
-	for (const { blockId, storage, computation } of computations) {
-		// Deterministic compensating-revision actionId — identical on every member, so all converge on
-		// the same (rev, actionId) for both the restore and the tombstone path.
-		const revertActionId = await hashString(`inv:${invalidatedActionId}:${proof.disputeId}:${blockId}:${rev}`);
-		// Hold the block write latch around ONLY the compensating write (matching saveReplicatedBlock's
-		// scope): the monotonic guard inside saveReplica/saveDeletion then runs under the same latch a
-		// concurrent commit holds, so the two read-modify-writes of the metadata blob serialize and
-		// latest stays monotonic. Acquire per block, one at a time — invalidation never holds two block
-		// latches, so it cannot deadlock against commit's sorted multi-latch acquisition.
-		if (computation.kind === 'delete') {
-			// Block-creation reversal: physically remove the created block by writing a forward tombstone
-			// revision. The `restoredContentHash` is the DELETED_BLOCK_RESTORE sentinel — a deleted block
-			// has no content hash, and the sentinel tells dependents "observed content is gone → invalidate".
-			await withBlockWriteLatch(blockId, latch => storage.saveDeletion({ rev, actionId: revertActionId }, latch));
-			log('apply-delete-restore blockId=%s invalidatedRev=%d rev=%d', blockId, invalidatedRev, rev);
-			reverted.push({ blockId, fromRev: computation.fromRev, restoredContentHash: DELETED_BLOCK_RESTORE });
-			continue;
+		// --- Start of critical section ---
+
+		// Compute compensating content from tips read UNDER the latches. `computeRevertedBlock` reads
+		// only through getLatest/listRevisions/getBlock/getTransaction — none of which acquire a latch,
+		// so it is safe to call while holding them. Keep it that way: routing it through a healing read
+		// path (`StorageRepo.get` heals under the block latch) would self-deadlock here.
+		const computations = await Promise.all(
+			uniqueBlockIds.map(async (blockId) => {
+				const storage = ctx.createBlockStorage(blockId);
+				return {
+					blockId,
+					storage,
+					latch: latches.get(blockId)!,
+					latest: await storage.getLatest(),
+					computation: await computeRevertedBlock(storage, invalidatedRev),
+				};
+			})
+		);
+		const maxFromRev = computations.reduce((max, c) => Math.max(max, c.computation.fromRev), invalidatedRev);
+		rev = params.rev ?? maxFromRev + 1;
+
+		// All-or-nothing precheck, mirroring the monotonic guard in `BlockStorage.saveForwardRevision`
+		// (`meta.latest.rev >= rev` ⇒ refuse). With the tips read under these same latches, a computed
+		// slot is strictly greater than every tip by construction, so this can only trip when the CALLER
+		// supplied an explicit `rev` at or below a current tip. Writing nothing is the right outcome:
+		// skipping the block or retrying at a higher slot would make one member's durable entry differ
+		// from another's for the same invalidation, and step 1 dedups on (invalidatedActionId, disputeId)
+		// so an invalidation that appended nothing is simply re-deliverable.
+		const stale = computations.find(c => c.latest !== undefined && c.latest.rev >= rev);
+		if (stale) {
+			log('apply-reject-stale-revision actionId=%s disputeId=%s rev=%d blockId=%s held=%d',
+				invalidatedActionId, proof.disputeId, rev, stale.blockId, stale.latest!.rev);
+			return { applied: false, reason: 'stale-revision', reverted: [] };
 		}
-		if (computation.laterActions > 0) {
-			// Surviving later actions were replayed verbatim; true read-dependents are out of scope here.
-			log('apply-replayed-later-actions blockId=%s count=%d', blockId, computation.laterActions);
+
+		reverted = [];
+		for (const { blockId, storage, latch, computation } of computations) {
+			// Deterministic compensating-revision actionId — identical on every member, so all converge on
+			// the same (rev, actionId) for both the restore and the tombstone path.
+			const revertActionId = await hashString(`inv:${invalidatedActionId}:${proof.disputeId}:${blockId}:${rev}`);
+			const intended: ActionRev = { rev, actionId: revertActionId };
+			let effective: ActionRev;
+			if (computation.kind === 'delete') {
+				// Block-creation reversal: physically remove the created block by writing a forward tombstone
+				// revision. The `restoredContentHash` is the DELETED_BLOCK_RESTORE sentinel — a deleted block
+				// has no content hash, and the sentinel tells dependents "observed content is gone → invalidate".
+				effective = await storage.saveDeletion(intended, latch);
+				assertWriteLanded(blockId, intended, effective);
+				log('apply-delete-restore blockId=%s invalidatedRev=%d rev=%d', blockId, invalidatedRev, rev);
+				reverted.push({ blockId, fromRev: computation.fromRev, restoredContentHash: DELETED_BLOCK_RESTORE });
+				continue;
+			}
+			if (computation.laterActions > 0) {
+				// Surviving later actions were replayed verbatim; true read-dependents are out of scope here.
+				log('apply-replayed-later-actions blockId=%s count=%d', blockId, computation.laterActions);
+			}
+			effective = await storage.saveReplica(computation.block, intended, undefined, latch);
+			assertWriteLanded(blockId, intended, effective);
+			reverted.push({ blockId, fromRev: computation.fromRev, restoredContentHash: computation.restoredContentHash });
 		}
-		await withBlockWriteLatch(blockId, latch =>
-			storage.saveReplica(computation.block, { rev, actionId: revertActionId }, undefined, latch));
-		reverted.push({ blockId, fromRev: computation.fromRev, restoredContentHash: computation.restoredContentHash });
+
+		// --- End of critical section ---
+	} finally {
+		// Release in reverse acquisition order; every acquired latch is released even if a write threw.
+		for (let i = releases.length - 1; i >= 0; i--) {
+			releases[i]!();
+		}
 	}
 
 	// 4. Durable, append-only invalidation entry (the source of truth for committed-invalidated).
+	//    Appended OUTSIDE the block latches on purpose: `ctx.log` writes through a `BlockStore` that may
+	//    itself be repo-backed, and `Latches` has no re-entrancy — appending under a block latch could
+	//    self-deadlock.
 	//    `cascadeRoot` is set when this is a cascade step (a reverted read-dependent), undefined for a root.
 	await ctx.log.addInvalidation(invalidatedActionId, invalidatedRev, proof, reverted, rev, params.cascadeRoot, params.timestamp);
 	log('apply-complete actionId=%s disputeId=%s rev=%d blocks=%d', invalidatedActionId, proof.disputeId, rev, reverted.length);

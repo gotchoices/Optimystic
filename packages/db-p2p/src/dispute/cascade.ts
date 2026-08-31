@@ -206,7 +206,12 @@ export type CascadeEscalation = {
 	readonly collections: ReadonlyArray<CollectionId>;
 	/** Read-dependents left un-cascaded at the horizon — surfaced, never silently dropped. */
 	readonly remainder: ReadonlyArray<CascadeStanding>;
-	/** Candidates that could not be re-evaluated (e.g. legacy entries with no engine to re-execute them). */
+	/**
+	 * Candidates whose fate could not be decided — a legacy entry with no persisted read set (no engine
+	 * to re-execute it), or one the cascade decided to invalidate but whose compensating write was
+	 * refused wholesale (`applyInvalidation` reason `stale-revision`), so the reversal did not happen
+	 * and the dependent must not be dropped from the frontier as if it were fine.
+	 */
 	readonly unevaluable: ReadonlyArray<CascadeStanding>;
 };
 
@@ -365,7 +370,17 @@ export async function cascadeInvalidate(input: CascadeInput): Promise<CascadeRes
 			if (!result.applied && result.reason !== 'already-applied') {
 				// invalid-certificate should be impossible: the child verifies the root proof against the
 				// root's target (rootCertificateTarget), and the root proof is a valid challenger-wins cert.
+				// `stale-revision` means the child's compensating write was refused wholesale (nothing
+				// written, nothing appended) — we do NOT know whether this dependent still holds, so it
+				// must NOT be silently dropped from the frontier as if it were fine. Record it as
+				// unevaluable: that already produces an `unevaluable` escalation telling the caller the
+				// affected collections need a full re-sync, which is exactly what "could not decide this
+				// dependent's fate" means here.
 				log('child-apply-rejected actionId=%s reason=%s', cand.actionId, result.reason);
+				if (!unevaluable.some(u => u.collectionId === cand.collectionId && u.actionId === cand.actionId)) {
+					unevaluable.push(standing(cand));
+				}
+				affectedCollections.add(cand.collectionId);
 				continue;
 			}
 
