@@ -215,6 +215,8 @@ interface LocalClusterWithExecutionTracking extends ICluster {
 	wasTransactionExecuted?(messageHash: string): boolean;
 	/** Local storage's verdict for a pend applied during consensus; see ClusterMember.getExecutedPendResult. */
 	getExecutedPendResult?(messageHash: string): PendResult | undefined;
+	/** Local storage's verdict for a commit applied during consensus; see ClusterMember.getExecutedCommitResult. */
+	getExecutedCommitResult?(messageHash: string): CommitResult | undefined;
 }
 
 /**
@@ -400,7 +402,8 @@ export class CoordinatorRepo implements IRepo {
 			update: localCluster.update.bind(localCluster),
 			peerId: localPeerId,
 			wasTransactionExecuted: localCluster.wasTransactionExecuted?.bind(localCluster),
-			getExecutedPendResult: localCluster.getExecutedPendResult?.bind(localCluster)
+			getExecutedPendResult: localCluster.getExecutedPendResult?.bind(localCluster),
+			getExecutedCommitResult: localCluster.getExecutedCommitResult?.bind(localCluster)
 		} : undefined;
 		this.coordinator = new ClusterCoordinator(keyNetwork, createClusterClient, policy, localClusterRef, fretService, reputation, stateStore);
 	}
@@ -1605,8 +1608,30 @@ export class CoordinatorRepo implements IRepo {
 		};
 
 		try {
-			const { record, localExecuted } = await this.coordinator.executeClusterTransaction(blockIds[0]!, message, options);
+			const { record, localExecuted, localCommitResult } = await this.coordinator.executeClusterTransaction(blockIds[0]!, message, options);
 			if (localExecuted) {
+				// Our own member applied this commit during consensus. Its retained storage verdict is
+				// the one honest signal we have about durability: the member-side apply tolerates an
+				// "ahead" refusal as divergence (see the NOTE in ClusterMember.applyConsensusOperation),
+				// which is correct for a redelivered or lagging commit — but when the refusal's real
+				// cause is a RIVAL action holding the requested revision, that tolerance turns a commit
+				// no member durably stored into a fabricated success. This is the
+				// signed-but-not-yet-applied window: two commits for one revision can BOTH assemble
+				// consensus when every member signs the second after signing (but before applying) the
+				// first, because signing drops the member's reservation. Confirm the rival against local
+				// storage (never the verdict's prose) and answer the writer with a retryable conflict so
+				// it re-drives at a fresh revision. Own-action or unconfirmed refusals keep the
+				// prior fabricated-success shape: consensus is authoritative and this member converges
+				// via replication.
+				if (localCommitResult !== undefined && !localCommitResult.success) {
+					const rival = await this.confirmCommitRivalAgainstLocal(request);
+					if (typeof rival === 'object') return rival;
+					this.log('coordinator-repo:commit-local-refusal-tolerated', {
+						actionId: request.actionId,
+						confirmation: rival ?? 'unconfirmed',
+						reason: localCommitResult.reason
+					});
+				}
 				this.markBlocksSeen(blockIds);
 				return { success: true };
 			}
@@ -1688,6 +1713,26 @@ export class CoordinatorRepo implements IRepo {
 	 */
 	private async classifyCommitStaleRejection(error: unknown, request: CommitRequest): Promise<StaleFailure | undefined> {
 		if (!(error instanceof ValidatorRejectionError)) return undefined;
+		const rival = await this.confirmCommitRivalAgainstLocal(request);
+		// 'own-durable' and unconfirmed both stay a throw here: fail-fast for genuine faults, and a
+		// commit already durable under this action must never be answered `conflict` (the writer
+		// would rebase and re-append it — a duplicate entry).
+		return typeof rival === 'object' ? rival : undefined;
+	}
+
+	/**
+	 * Shared confirmation core for the two commit-tier conversion sites ({@link classifyCommitStaleRejection}
+	 * and the locally-executed refusal check in {@link commit}): decide, from LOCAL storage only, who
+	 * holds the requested revision.
+	 *  - a confirmed RIVAL → the {@link StaleFailure} conflict answer (with `staleAt` = highest
+	 *    confirmed holder);
+	 *  - our OWN action durable at the requested revision → `'own-durable'` (callers must not answer
+	 *    `conflict` — the writer would rebase an already-landed action into a duplicate entry);
+	 *  - anything else (behind, truncated history, read faults, capability absent) → `undefined`,
+	 *    unconfirmed.
+	 * The signed reject text / retained verdict prose is never consulted.
+	 */
+	private async confirmCommitRivalAgainstLocal(request: CommitRequest): Promise<StaleFailure | 'own-durable' | undefined> {
 		const blockIds = request.blockIds;
 		let results: GetBlockResults;
 		try {
@@ -1711,7 +1756,7 @@ export class CoordinatorRepo implements IRepo {
 					this.log('coordinator-repo:commit-stale-classify-own-action', {
 						actionId: request.actionId, blockId, rev: request.rev
 					});
-					return undefined;
+					return 'own-durable';
 				}
 				rivalStales.push({ blockId, rev: latest.rev });
 				continue;
@@ -1732,7 +1777,7 @@ export class CoordinatorRepo implements IRepo {
 				this.log('coordinator-repo:commit-stale-classify-own-action', {
 					actionId: request.actionId, blockId, rev: request.rev, latestRev: latest.rev
 				});
-				return undefined;
+				return 'own-durable';
 			}
 			if (takenBy !== undefined) rivalStales.push({ blockId, rev: latest.rev });
 			// takenBy undefined (truncated history): unconfirmed for this block.

@@ -257,7 +257,11 @@ describe('CoordinatorRepo stale-revision classification (pend)', function () {
 			caught = err;
 		}
 		expect(caught).to.be.instanceOf(ValidatorRejectionError);
-		expect(storage.getCalls, 'no rev → classification skips the re-read').to.equal(0);
+		// The stale classifier skips its re-read without a rev (nothing to compare against), but the
+		// pending-conflict classifier still runs one confirmation read: a rival PENDING action can
+		// block a pend regardless of revision, so that check is rev-independent by design. With no
+		// pendings in storage it confirms nothing and the rejection stays a throw.
+		expect(storage.getCalls, 'exactly the pending-conflict confirmation read, not the stale one').to.equal(1);
 	});
 
 	it('returns a retryable StaleFailure (no staleAt) when the pend lost a conflict race', async () => {

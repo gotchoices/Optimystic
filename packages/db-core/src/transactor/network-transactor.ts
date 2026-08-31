@@ -710,10 +710,22 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			!(request.headerId && bid === request.headerId && !request.blockIds.includes(request.headerId))
 		);
 		if (remainingBlocks.length > 0) {
-			const { error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev, tailId: request.tailId, blockDigests: request.blockDigests });
+			const { batches, error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev, tailId: request.tailId, blockDigests: request.blockDigests });
 			if (error) {
-				// Non-tail block commit failures should not fail the overall action once the tail has committed.
-				// Proceed and rely on reconciliation paths (e.g. reads with context) to finalize state on lagging peers.
+				// Split by the failure's NATURE, exactly as commitBlock does for the tail: a RETURNED
+				// `success:false` from a cohort coordinator is a confirmed optimistic-concurrency loss
+				// (post conversion-arms, coordinators only return non-success for confirmed conflicts) —
+				// a rival holds one of these blocks' revisions, no reconciliation will ever apply OUR
+				// transform there, and proceeding would acknowledge a torn action (tail committed, the
+				// conflicted block permanently pointing elsewhere — the acknowledged-but-absent write).
+				// Surface it so the caller cancels and re-drives at a fresh revision.
+				const stale = this.staleFromBatches(batches);
+				if (stale) {
+					return stale;
+				}
+				// Transport-shaped failures (throws, no returned refusal) keep the tolerance: the commit
+				// consensus for these blocks exists, so lagging peers converge via reconciliation paths
+				// (e.g. reads with context).
 				try { log('WARN: non-tail commit had errors; proceeding after tail commit: %s', error.message); } catch { /* ignore */ }
 			}
 		}
@@ -730,24 +742,39 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			// which owns the retry budget and the committed-vs-pending picture — self-cancelling here
 			// would tear down a pend a caller's retry loop is still working against, and double-cancel.
 			// Collect and return any active stale failures
-			const stale = Array.from(allBatches(tailBatches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
-			if (stale.length > 0) {
-				// NOTE: a reason-only StaleFailure (success:false, no `missing`) lands here too and
-				// returns { missing: [], success:false } — the `reason` PROSE is still dropped rather
-				// than surfaced via `throw tailError`. `staleAt` is carried, so the one machine-readable
-				// fact in that prose (which block is at which revision) now survives; only the free-form
-				// wording is lost. If the wording itself is ever needed, gate this branch on non-empty
-				// missing rather than reinstating it unconditionally.
-				const staleAt = highestStaleAt(stale.map(b => (b.request!.response! as StaleFailure).staleAt));
-				return {
-					missing: distinctBlockActionTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing).filter((x): x is ActionTransforms => x !== undefined)),
-					...(staleAt === undefined ? {} : { staleAt }),
-					success: false as const
-				};
+			const stale = this.staleFromBatches(tailBatches);
+			if (stale) {
+				return stale;
 			}
 			throw tailError;
 		}
 		return { success: true };
+	}
+
+	/**
+	 * Merge the RETURNED `success:false` responses out of a set of commit batches into one
+	 * {@link StaleFailure}, or `undefined` when every failure was transport-shaped (thrown, no
+	 * response). Shared by {@link commitBlock} (tail/header) and {@link commit}'s non-tail sweep —
+	 * both must distinguish a confirmed conflict (return it; the caller cancels and re-drives) from
+	 * a transient fault (throw / tolerate).
+	 *
+	 * NOTE: a reason-only StaleFailure (success:false, no `missing`) lands here too and returns
+	 * `{ missing: [], success:false }` — the `reason` PROSE is dropped rather than surfaced.
+	 * `staleAt` is carried, so the one machine-readable fact in that prose (which block is at which
+	 * revision) survives; only the free-form wording is lost. If the wording itself is ever needed,
+	 * gate this on non-empty missing rather than reinstating it unconditionally.
+	 */
+	private staleFromBatches(batches: CoordinatorBatch<BlockId[], CommitResult>[]): StaleFailure | undefined {
+		const stale = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
+		if (stale.length === 0) {
+			return undefined;
+		}
+		const staleAt = highestStaleAt(stale.map(b => (b.request!.response! as StaleFailure).staleAt));
+		return {
+			missing: distinctBlockActionTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing).filter((x): x is ActionTransforms => x !== undefined)),
+			...(staleAt === undefined ? {} : { staleAt }),
+			success: false as const
+		};
 	}
 
 	/** Attempts to commit a set of blocks, and handles failures and errors.

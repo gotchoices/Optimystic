@@ -228,6 +228,14 @@ export class ClusterMember implements ICluster {
 	// a pend that every member refused (rival pending action, or the revision already taken) must
 	// reach the writer as a conflict, not a win. Pruned alongside executedTransactions (same TTL).
 	private executedPendResults: Map<string, PendResult> = new Map();
+	// Local storage's verdict for a COMMIT operation applied during consensus (messageHash ->
+	// CommitResult). Retained so the coordinator can detect when the ahead-divergence tolerance in
+	// applyConsensusOperation swallowed a refusal whose real cause was a RIVAL action holding the
+	// requested revision — the commit-tier acknowledgement hole: a commit that assembled consensus
+	// inside every member's signed-but-not-yet-applied window is refused by every member's storage
+	// at apply, and without this verdict the coordinator fabricates a success no member durably
+	// stored. Pruned alongside executedTransactions (same TTL).
+	private executedCommitResults: Map<string, CommitResult> = new Map();
 	// Fast in-memory dedup for applied invalidations, keyed `${invalidatedActionId}:${disputeId}`.
 	// The durable source of truth is the invalidation log entry (Log.findInvalidation, re-checked
 	// inside the sink); this map only spares redundant work when the same invalidation reaches
@@ -330,6 +338,7 @@ export class ClusterMember implements ICluster {
 		this.activeTransactions.clear();
 		this.cleanupQueue.length = 0;
 		this.executedPendResults.clear();
+		this.executedCommitResults.clear();
 	}
 
 	/**
@@ -352,6 +361,19 @@ export class ClusterMember implements ICluster {
 	 */
 	getExecutedPendResult(messageHash: string): PendResult | undefined {
 		return this.executedPendResults.get(messageHash);
+	}
+
+	/**
+	 * Commit-shaped sibling of {@link getExecutedPendResult}: local storage's verdict for a commit
+	 * operation applied during consensus, when this member retained one. `CoordinatorRepo.commit`
+	 * consults it after a locally-executed commit-consensus — a retained refusal whose cause a local
+	 * re-read confirms as a rival holding the requested revision is returned to the writer as a
+	 * retryable conflict instead of the fabricated success the ahead-divergence tolerance would
+	 * otherwise imply. Same availability caveats as the pend accessor: in-memory only, absent for
+	 * pre-restart applies, pruned on the executed-transaction TTL.
+	 */
+	getExecutedCommitResult(messageHash: string): CommitResult | undefined {
+		return this.executedCommitResults.get(messageHash);
 	}
 
 	/**
@@ -1334,10 +1356,14 @@ export class ClusterMember implements ICluster {
 	 * yet APPLIED it sits in a window where it holds neither the winner's record (reservation
 	 * dropped at commit-sign, `shouldPersist = false`) nor the winner's revision (storage still
 	 * behind) — it abstains here. A capability-less member, or one with history truncated below
-	 * `latest`, abstains at `latest.rev > commit.rev` too. A dead rival's re-commit can therefore
-	 * still pass the promise round if EVERY member is simultaneously in one of those states; the
-	 * coordinator-side arms (`CoordinatorRepo.commit` returning `ConflictRaceLostError` and
-	 * classified rejections as retryable conflicts) close the observed re-drive route.
+	 * `latest`, abstains at `latest.rev > commit.rev` too. A rival's commit can therefore still
+	 * pass the promise round if EVERY member is simultaneously in one of those states — on a fast
+	 * cohort that window is the COMMON case, not the corner. The backstop is downstream of
+	 * consensus: every member's apply then refuses the rival as stale, the coordinating node's own
+	 * member retains that refusal (`getExecutedCommitResult`), and `CoordinatorRepo.commit`
+	 * confirms the rival against local storage and answers the writer with a retryable conflict
+	 * instead of a fabricated success. `ConflictRaceLostError` conversion and classified
+	 * rejections close the re-drive route the same way.
 	 */
 	private async validateCommitRevisions(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
 		for (const operation of record.message.operations) {
@@ -1606,6 +1632,7 @@ export class ClusterMember implements ICluster {
 			// that is now considered not-executed, and a re-run will retain a fresh one.
 			this.executedTransactions.delete(record.messageHash);
 			this.executedPendResults.delete(record.messageHash);
+			this.executedCommitResults.delete(record.messageHash);
 			throw err;
 		}
 
@@ -1750,6 +1777,13 @@ export class ClusterMember implements ICluster {
 				}
 				throw err;
 			}
+			// Retain the verdict either way (see getExecutedCommitResult): a success confirms local
+			// durability, and an ahead-shaped refusal is the only evidence the coordinator has that
+			// the tolerance below swallowed a rival's win at the requested revision. The
+			// missing-pending throw path above retains nothing — no CommitResult exists there, and
+			// the coordinator's fabricated-success fallback plus cohort reconcile is the right shape
+			// for a member that is genuinely behind.
+			this.executedCommitResults.set(messageHash, result);
 			if (!result.success) {
 				// success:false is a StaleFailure. `missing` ⇒ ahead/stale divergence
 				// (we already hold ≥ this rev): tolerate, do NOT reconcile downward. A
@@ -1757,14 +1791,20 @@ export class ClusterMember implements ICluster {
 				// `reason` with no `missing` ⇒ a genuine internalCommit fault: propagate so
 				// handleConsensus rolls back the executed marker and rethrows.
 				//
-				// NOTE: this 'ahead' tolerance is what turns a DEAD rival's commit that somehow
-				// reaches consensus into a reported success no member durably stored (consensus
-				// without durability — the commit-tier acknowledgement hole). It must stay: a
-				// member genuinely ahead of a redelivered/lagging commit is the common, correct
-				// case. The guards live UPSTREAM: `validateCommitRevisions` rejects the rival at
-				// the promise round, and `CoordinatorRepo.commit` returns lost races as retryable
-				// conflicts instead of re-driving them. If consensus-without-durability is ever
-				// observed again, look at those guards' abstain residuals, not at this branch.
+				// NOTE: this 'ahead' tolerance is what turns a rival's commit that somehow reaches
+				// consensus into a reported success no member durably stored (consensus without
+				// durability — the commit-tier acknowledgement hole). It must stay: a member
+				// genuinely ahead of a redelivered/lagging commit is the common, correct case. The
+				// guards live UPSTREAM: `validateCommitRevisions` rejects the rival at the promise
+				// round, `CoordinatorRepo.commit` returns lost races as retryable conflicts instead
+				// of re-driving them, and the verdict retained just above (getExecutedCommitResult)
+				// lets the coordinating node convert its OWN member's rival-confirmed refusal into a
+				// conflict answer — that last guard is what closes the signed-but-not-yet-applied
+				// window, where two commits for one revision both assemble consensus because signing
+				// drops each member's reservation before applying advances its storage. If
+				// consensus-without-durability is ever observed again, look at those guards' abstain
+				// residuals (non-coordinating members' verdicts are not threaded back; capability-less
+				// or history-truncated storage abstains), not at this branch.
 				if (result.missing?.length) {
 					log('cluster-member:consensus-commit-diverged', {
 						messageHash,
@@ -2290,6 +2330,7 @@ export class ClusterMember implements ICluster {
 			if (executedAt < expirationThreshold) {
 				this.executedTransactions.delete(messageHash);
 				this.executedPendResults.delete(messageHash);
+				this.executedCommitResults.delete(messageHash);
 			}
 		}
 		// Prune old applied-invalidation dedup markers on the same TTL.
