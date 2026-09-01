@@ -298,6 +298,9 @@ describe('cohort-topic: scale anti-flood + anti-DoS (mock-tier e2e)', function (
 				expect(decidingEngine.budgetParticipantCount(TOPIC_B), 'B is populated in the budget').to.equal(1);
 				expect((await decidingEngine.engine.handleRegister(await signedRegister(await makeMember(), TOPIC_A, T0 + third, 'a', { ttl: DEFAULT_TTL_MS }), REG, T0 + third)).result, 'topic A instantiates (budget now full)').to.equal('accepted');
 				expect(decidingEngine.budgetParticipantCount(TOPIC_A), 'A is populated in the budget').to.equal(1);
+				// Pin the pre-condition for the teardown assertions below: B really does hold a cold-start
+				// forwarder before it is evicted, so its later absence is a teardown, not a never-created entry.
+				expect(decidingEngine.forwarder(TOPIC_B), 'B holds a cold-start forwarder before eviction').to.not.equal(undefined);
 
 				// Control: while both topics are populated the budget is genuinely saturated — a new topic is refused.
 				const refusedWhileFull = await decidingEngine.engine.handleRegister(await signedRegister(await makeMember(), TOPIC_C, T0 + third, 'c-early'), REG, T0 + third);
@@ -332,12 +335,12 @@ describe('cohort-topic: scale anti-flood + anti-DoS (mock-tier e2e)', function (
 				expect(decidingEngine.servesTopic(TOPIC_C), 'the newly-admitted topic serves').to.equal(true);
 				expect(decidingEngine.forwarder(TOPIC_C), 'the newly-admitted topic has a forwarder').to.not.equal(undefined);
 
-				// NOTE: the third onEvict arm (`traffic.forget`) is not asserted here — `topicTraffic()`'s
+				// NOTE: the other `onEvict` arm (`traffic.forget`) is not asserted here — `topicTraffic()`'s
 				// `arrivalsPerMin` is sourced from `published()` (frozen only by a `gossipRound`, which this
 				// test never drives), so it reads 0 whether or not `forget` ran; `directParticipants` comes from
 				// the store, already 0 from the TTL sweep independent of `onEvict`. Neither field can distinguish
-				// "torn down" from "never published" at this call depth — see `traffic.spec.ts`'s own `forget()`
-				// tests (which drive `publish()` directly) for that coverage.
+				// "torn down" from "never published" at this call depth — see `db-core/test/cohort-topic/traffic.spec.ts`'s
+				// own `forget()` tests (which drive `publish()` directly) for that coverage.
 			} finally {
 				await mesh.stop();
 			}
