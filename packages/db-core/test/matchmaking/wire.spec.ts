@@ -22,7 +22,7 @@ import type {
 	QueryReplyV1,
 	AggregateCountV1,
 } from '../../src/matchmaking/index.js';
-import { bytesToB64url } from '../../src/cohort-topic/wire/codec.js';
+import { bytesToB64url, encodeCohortMessage } from '../../src/cohort-topic/wire/codec.js';
 import { CohortWireError } from '../../src/cohort-topic/wire/validate.js';
 
 /** Deterministic pseudo-random bytes (no Math.random — keeps the test reproducible). */
@@ -229,6 +229,24 @@ describe('matchmaking wire', () => {
 			const bad = { ...sampleQuery(), v: 2 };
 			expect(() => encodeQueryV1(bad as unknown as QueryV1)).to.throw(CohortWireError, /v === 1/);
 		});
+
+		/**
+		 * `cohortEpoch` here is the same `H(sorted members)` SHA-256 digest the cohort-topic wire carries, so it
+		 * is pinned to 32 bytes on decode too — an attacker-chosen epoch is otherwise map-key material for the
+		 * seeker-side reply caches. `encodeCohortMessage` frames without re-validating, which is what lets these
+		 * exercise the decode gate rather than the encode gate.
+		 */
+		for (const len of [0, 31, 33, 64, 1024]) {
+			it(`rejects a ${len}-byte cohortEpoch on a QueryReply`, () => {
+				const bad = { ...sampleQueryReply(), cohortEpoch: b64(len, 40) };
+				expect(() => decodeQueryReplyV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /cohortEpoch/);
+			});
+
+			it(`rejects a ${len}-byte cohortEpoch on an AggregateCount`, () => {
+				const bad = { ...sampleAggregate(), cohortEpoch: b64(len, 41) };
+				expect(() => decodeAggregateCountV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /cohortEpoch/);
+			});
+		}
 	});
 
 	describe('byte fidelity', () => {

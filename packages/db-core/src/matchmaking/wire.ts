@@ -32,6 +32,8 @@ import {
 import {
 	asObject,
 	b64urlField,
+	b64urlFixedLen,
+	COORD_BYTES,
 	failWire as fail,
 	optBool,
 	optFiniteNumber,
@@ -113,7 +115,7 @@ export interface QueryReplyV1 {
 	providers?: ProviderEntryV1[];
 	seekers?: SeekerEntryV1[];
 	truncated: boolean;
-	/** base64url. */
+	/** Cohort epoch the reply was computed under, 32 bytes, base64url. */
 	cohortEpoch: string;
 	/** From cohort-topic; consumed by the hang-out engine (next ticket). */
 	topicTraffic: TopicTrafficV1;
@@ -167,7 +169,7 @@ export interface AggregateCountV1 {
 	signature: string;
 	/** PeerIds of the `>= minSigs` threshold signers, base64url (aligns the `signature` blob). */
 	signers: string[];
-	/** base64url. */
+	/** Cohort epoch the counts were aggregated under, 32 bytes, base64url. */
 	cohortEpoch: string;
 }
 
@@ -373,7 +375,7 @@ export function validateQueryReplyV1(value: unknown): QueryReplyV1 {
 	const out: QueryReplyV1 = {
 		v: 1,
 		truncated: reqBool(obj, "truncated", what),
-		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
+		cohortEpoch: b64urlFixedLen(reqString(obj, "cohortEpoch", what), "cohortEpoch", COORD_BYTES, what),
 		topicTraffic: validateTopicTrafficV1(obj["topicTraffic"], `${what}.topicTraffic`),
 		signature: b64urlField(reqString(obj, "signature", what), "signature", what),
 	};
@@ -421,7 +423,7 @@ export function validateAggregateCountV1(value: unknown): AggregateCountV1 {
 		bucketCounts: buckets.map(validateAggregateBucketV1),
 		signature: b64urlField(reqString(obj, "signature", what), "signature", what),
 		signers: (signers as string[]).map((s, i) => b64urlField(s, `signers[${i}]`, what)),
-		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
+		cohortEpoch: b64urlFixedLen(reqString(obj, "cohortEpoch", what), "cohortEpoch", COORD_BYTES, what),
 	};
 }
 

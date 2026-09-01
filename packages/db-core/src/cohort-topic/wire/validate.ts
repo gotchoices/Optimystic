@@ -14,6 +14,7 @@ import {
 	asObject,
 	b64urlField,
 	b64urlFixedLen,
+	COORD_BYTES,
 	failWire as fail,
 	optBool,
 	optFiniteNumber,
@@ -75,8 +76,6 @@ function treeTier(value: number, what: string): number {
 	return value;
 }
 
-/** Ring-coord / topic-id / epoch byte width (SHA-256 truncated to the ring width). */
-const COORD_BYTES = 32;
 /** Correlation-id byte width (a 16-byte nonce minted per walk probe / renew). */
 const CORRELATION_BYTES = 16;
 

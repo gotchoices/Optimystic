@@ -14,6 +14,7 @@ import {
 	decodeDemotionNoticeV1,
 	decodeCohortGossipV1,
 	decodeMembershipCertV1,
+	decodeSignRequestV1,
 	validateChildLinkV1,
 	validateCohortGossipV1,
 	registerSigningPayload,
@@ -37,6 +38,7 @@ import type {
 	DemotionNoticeV1,
 	CohortGossipV1,
 	MembershipCertV1,
+	SignRequestV1,
 } from '../../src/cohort-topic/wire/index.js';
 
 /** Deterministic pseudo-random bytes (no Math.random — keeps the test reproducible). */
@@ -183,6 +185,14 @@ const sampleMembershipCert = (): MembershipCertV1 => ({
 	thresholdSig: b64(64, 24),
 	signers: ['peer-a', 'peer-b'],
 	fretAttestation: b64(40, 25),
+});
+
+const sampleSignRequest = (): SignRequestV1 => ({
+	v: 1,
+	kind: 'promotion',
+	coord: b64(32, 26),
+	cohortEpoch: b64(32, 27),
+	payload: b64(96, 28),
 });
 
 describe('cohort-topic wire', () => {
@@ -341,11 +351,6 @@ describe('cohort-topic wire', () => {
 		it('rejects an over-length correlationId (a fixed 16-byte field cannot become a bloated replay-guard key)', () => {
 			const bad = { ...sampleRegister(), correlationId: bytesToB64url(seededBytes(64, 2)) };
 			expect(() => decodeRegisterV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /correlationId/);
-		});
-
-		it('rejects an over-length cohortEpoch (a fixed 32-byte field cannot become a bloated rotation-state map key)', () => {
-			const bad = { ...sampleMembershipCert(), cohortEpoch: bytesToB64url(seededBytes(64, 3)) };
-			expect(() => decodeMembershipCertV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /cohortEpoch/);
 		});
 
 		it('rejects a negative treeTier', () => {
@@ -682,6 +687,43 @@ describe('cohort-topic wire', () => {
 			const bad = encodeCohortMessage({ ...withRotation(), rotationSigners: 'peer-a' } as unknown as { v: 1 });
 			expect(() => decodeMembershipCertV1(bad)).to.throw(CohortWireError, /rotationSigners/);
 		});
+	});
+
+	describe('cohortEpoch 32-byte width', () => {
+		/**
+		 * Every `cohortEpoch` on the wire is `H(sorted members)` — a SHA-256 digest, always 32 bytes — and
+		 * every message that carries one is table-driven here rather than spot-checked, so a new
+		 * epoch-bearing message type that forgets the width gate shows up as a missing row. An unpinned
+		 * epoch is attacker-chosen map-key material (the verifier's rotation state, the gossip bus's
+		 * drift check), so both too-short and too-long must be rejected, not merely too-long.
+		 */
+		const epochCarriers: Array<{ name: string; frame: (epoch: string) => Uint8Array; decode: (f: Uint8Array) => unknown }> = [
+			{ name: 'RegisterReplyV1', frame: (e) => encodeCohortMessage({ ...sampleRegisterReply(), cohortEpoch: e }), decode: decodeRegisterReplyV1 },
+			{ name: 'RenewReplyV1', frame: (e) => encodeCohortMessage({ ...sampleRenewReply(), cohortEpoch: e }), decode: decodeRenewReplyV1 },
+			{ name: 'PromotionNoticeV1', frame: (e) => encodeCohortMessage({ ...samplePromotion(), cohortEpoch: e }), decode: decodePromotionNoticeV1 },
+			{ name: 'DemotionNoticeV1', frame: (e) => encodeCohortMessage({ ...sampleDemotion(), cohortEpoch: e }), decode: decodeDemotionNoticeV1 },
+			{ name: 'ChildLinkV1', frame: (e) => encodeCohortMessage({ ...sampleChildLink(), cohortEpoch: e }), decode: (f) => decodeChildLinkV1(f) },
+			{ name: 'CohortGossipV1', frame: (e) => encodeCohortMessage({ ...sampleGossip(), cohortEpoch: e }), decode: decodeCohortGossipV1 },
+			{ name: 'SignRequestV1', frame: (e) => encodeCohortMessage({ ...sampleSignRequest(), cohortEpoch: e }), decode: decodeSignRequestV1 },
+			{ name: 'MembershipCertV1', frame: (e) => encodeCohortMessage({ ...sampleMembershipCert(), cohortEpoch: e }), decode: decodeMembershipCertV1 },
+			{
+				name: 'MembershipCertV1.prevEpoch',
+				frame: (e) => encodeCohortMessage({ ...sampleMembershipCert(), prevEpoch: e, rotationSig: b64(64, 31), rotationSigners: ['peer-a', 'peer-b'] }),
+				decode: decodeMembershipCertV1,
+			},
+		];
+
+		for (const { name, frame, decode } of epochCarriers) {
+			it(`accepts a 32-byte epoch on ${name}`, () => {
+				expect(() => decode(frame(b64(32, 41)))).to.not.throw();
+			});
+
+			for (const len of [0, 1, 31, 33, 64, 1024]) {
+				it(`rejects a ${len}-byte epoch on ${name}`, () => {
+					expect(() => decode(frame(bytesToB64url(seededBytes(len, 42))))).to.throw(CohortWireError, /[eE]poch/);
+				});
+			}
+		}
 	});
 
 	describe('reply discriminant variants', () => {

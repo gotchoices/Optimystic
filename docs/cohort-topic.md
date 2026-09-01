@@ -1527,7 +1527,7 @@ interface RenewReplyV1 {
   // primary_moved:
   newPrimary?:     string
   newBackups?:     string[]
-  cohortEpoch?:    string
+  cohortEpoch?:    string             // 32 bytes
 }
 ```
 
@@ -1581,7 +1581,7 @@ interface PromotionNoticeV1 {
   effectiveAt:     number             // unix ms
   thresholdSig:    string             // cohort threshold sig (covers cohortCoord)
   signers:         string[]           // PeerIds, ≥ minSigs
-  cohortEpoch:     string
+  cohortEpoch:     string             // 32 bytes
 }
 ```
 
@@ -1597,7 +1597,7 @@ interface DemotionNoticeV1 {
   effectiveAt:     number
   thresholdSig:    string             // covers cohortCoord
   signers:         string[]
-  cohortEpoch:     string
+  cohortEpoch:     string             // 32 bytes
 }
 ```
 
@@ -1608,7 +1608,7 @@ interface CohortGossipV1 {
   v:                  1
   fromMember:         string          // PeerId
   coord:              string          // 32 bytes — the cohort coord this gossip is for (inbound routing key)
-  cohortEpoch:        string
+  cohortEpoch:        string          // 32 bytes
   willingnessBits:    string          // 4 bits T0..T3, hex
   loadBuckets:        number[]        // 4 entries, 0..7 per tier
   windowSeconds:      number          // observation window for the rate fields below, cohort-wide
@@ -1712,7 +1712,7 @@ round without waiting for the participant's first renewal touch — closing the 
 interface MembershipCertV1 {
   v:               1
   cohortCoord:     string             // 32 bytes
-  cohortEpoch:     string
+  cohortEpoch:     string             // 32 bytes
   members:         string[]           // PeerIds, sorted ascending, length k
   stabilizedAt:    number             // unix ms
   thresholdSig:    string             // sig of (cohortCoord, cohortEpoch, members, stabilizedAt)

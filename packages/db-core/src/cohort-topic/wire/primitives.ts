@@ -16,6 +16,13 @@
 
 import { b64urlToBytes } from "./codec.js";
 
+/**
+ * Ring-coord / topic-id / cohort-epoch byte width (SHA-256 truncated to the ring width). Lives here,
+ * not in a single validator module, because both wires built on these primitives — cohort-topic and
+ * matchmaking — pin the same hash-derived fields to it.
+ */
+export const COORD_BYTES = 32;
+
 /** Thrown for any malformed, oversized, or structurally invalid cohort-topic frame. */
 export class CohortWireError extends Error {
 	constructor(message: string) {

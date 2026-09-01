@@ -156,6 +156,7 @@ export interface RenewReplyV1 {
 	// primary_moved:
 	newPrimary?: string;
 	newBackups?: string[];
+	/** 32 bytes, base64url. */
 	cohortEpoch?: string;
 }
 
@@ -228,6 +229,7 @@ export interface PromotionNoticeV1 {
 	thresholdSig: string;
 	/** PeerIds, `>= minSigs`. */
 	signers: string[];
+	/** 32 bytes, base64url. */
 	cohortEpoch: string;
 }
 
@@ -248,6 +250,7 @@ export interface DemotionNoticeV1 {
 	effectiveAt: number;
 	thresholdSig: string;
 	signers: string[];
+	/** 32 bytes, base64url. */
 	cohortEpoch: string;
 }
 
@@ -322,6 +325,7 @@ export interface CohortGossipV1 {
 	 * naming its own coord, so a gossip for one cohort never pollutes a sibling cohort's store/view.
 	 */
 	coord: string;
+	/** 32 bytes, base64url. */
 	cohortEpoch: string;
 	/**
 	 * The tree tier `d` the originating cohort sits at (the coord encodes the tier-shard, but a coord is a
@@ -432,6 +436,7 @@ export interface MembershipCertV1 {
 	v: 1;
 	/** 32 bytes, base64url. */
 	cohortCoord: string;
+	/** 32 bytes, base64url. */
 	cohortEpoch: string;
 	/** PeerIds, sorted ascending, length `k`. */
 	members: string[];

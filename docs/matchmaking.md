@@ -187,7 +187,7 @@ QueryReplyV1 {
   providers:  ProviderEntryV1[]       // up to limit
   seekers?:   SeekerEntryV1[]         // when includeSeekers
   truncated:  boolean
-  cohortEpoch: string
+  cohortEpoch: string                 // 32 bytes
 }
 ```
 
@@ -698,7 +698,7 @@ interface QueryReplyV1 {
   providers?:    ProviderEntryV1[]
   seekers?:      SeekerEntryV1[]
   truncated:     boolean
-  cohortEpoch:   string
+  cohortEpoch:   string               // 32 bytes
   topicTraffic:  TopicTrafficV1        // see cohort-topic.md
   signature:     string                // cohort primary's reply signature; not threshold
 }
@@ -748,7 +748,7 @@ A seeker that set `pushOnArrival` receives arrival notifications over a dedicate
 interface ArrivalPushV1 {
   v:            1
   topicId:      string
-  cohortEpoch:  string
+  cohortEpoch:  string                // 32 bytes
   correlationId: string            // the seeker registration this push is bound to; a
                                    //   seeker that has since re-registered under a new
                                    //   correlationId acks unknown_seeker (see §Edge cases)
@@ -783,7 +783,7 @@ interface AggregateCountV1 {
   }[]
   signature:   string                 // cohort THRESHOLD-signature blob (not single-member)
   signers:     string[]               // PeerIds of the ≥ minSigs threshold signers; aligns the blob
-  cohortEpoch: string
+  cohortEpoch: string                 // 32 bytes
 }
 ```
 
