@@ -89,3 +89,52 @@ export class CoordinatorStaleLossError extends Error {
 		this.name = 'CoordinatorStaleLossError';
 	}
 }
+
+/**
+ * Thrown by {@link TransactionCoordinator.applyActions} and {@link TransactionCoordinator.commit}
+ * (and returned as a failure result by {@link TransactionCoordinator.execute}) when a second
+ * transaction stamp is opened while the coordinator already tracks an open stamp.
+ *
+ * ## Why the coordinator refuses instead of isolating
+ *
+ * The coordinator's registered collections hold exactly ONE staged state — one set of tracker
+ * transforms and one pending action queue per collection, shared by every open stamp. Two stamps
+ * staging through one coordinator therefore read each other's uncommitted rows, and committing
+ * either stamp writes the OTHER's staged actions into its own durable log entry (a commit builds
+ * each log entry from the collection's whole pending queue, and the pended transforms carry no
+ * stamp tag to filter by). There is no correct commit for that configuration, so the coordinator
+ * enforces at most one open stamp at a time.
+ *
+ * ## Recovery
+ *
+ * Commit or roll back the open stamp first. A CLEAN commit failure deliberately keeps its stamp
+ * open so `rollback(stampId)` remains a complete recovery — which means an abandoned failed
+ * commit holds the coordinator against new stamps until someone rolls it back.
+ *
+ * Callers that genuinely need concurrent writers must give each writer its own `Collection`
+ * instances — its own bridge and coordinator (see docs/transactions.md, "One writer at a time on
+ * the shared TransactionBridge"). Note the guard is per-coordinator: two coordinators sharing the
+ * same collection instances are NOT caught here and remain the caller's contract to avoid.
+ *
+ * A stamp opens at its first {@link TransactionCoordinator.applyActions} call. On the Quereus
+ * path that is the pre-stage-barrier call the bridge makes at the first STATEMENT — so a second
+ * bridge sharing this coordinator fails at its first statement, not at BEGIN.
+ */
+export class CoordinatorConcurrentStampError extends Error {
+	constructor(
+		/** The stamp already open on this coordinator. */
+		public readonly openStampId: string,
+		/** The stamp that was refused. */
+		public readonly rejectedStampId: string,
+	) {
+		super(
+			`Transaction stamp ${rejectedStampId} refused: this coordinator already tracks open stamp ` +
+			`${openStampId}, and its collections hold only one staged state, so two concurrent stamps ` +
+			`cannot be kept apart. Commit or roll back stamp ${openStampId} first — a failed commit ` +
+			`keeps its stamp open until it is rolled back. Concurrent writers each need their own ` +
+			`Collection instances (own bridge/coordinator per writer). A stamp opens at its first ` +
+			`applied statement (the pre-stage applyActions barrier), not at BEGIN.`
+		);
+		this.name = 'CoordinatorConcurrentStampError';
+	}
+}

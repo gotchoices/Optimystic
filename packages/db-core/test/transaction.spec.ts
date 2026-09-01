@@ -3384,7 +3384,7 @@ describe('Transaction', () => {
 			expect(usersCollection.source.actionContext?.rev, 'rev should increment to 2').to.equal(2);
 		});
 
-		it('should only rollback the given session transforms, preserving other sessions', async () => {
+		it('refuses a second concurrent session on the same coordinator', async () => {
 			const transactor = new TestTransactor();
 
 			type UserEntry = { key: number; name: string };
@@ -3399,104 +3399,42 @@ describe('Transaction', () => {
 			const coordinator = new TransactionCoordinator(transactor, collections);
 			const actionsEngine = new ActionsEngine();
 
-			// Session 1: apply actions
 			const session1 = await TransactionSession.create(coordinator, actionsEngine, 'peer1', 'schema1');
 			const actions1: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 			];
-			await session1.execute(createActionsStatements(actions1)[0]!, actions1);
+			const result1 = await session1.execute(createActionsStatements(actions1)[0]!, actions1);
+			expect(result1.success, 'first session stages normally').to.be.true;
 
-			// Session 2: apply actions (different data on same coordinator)
+			// A second session on the SAME coordinator shares the same collections, trackers and
+			// pending queues, so its staged state could not be kept apart from the first's — the
+			// coordinator refuses the second stamp at its first applyActions rather than let a
+			// later commit write one session's actions into the other's durable log entry.
+			// TransactionSession.execute catches the throw and reports it as a failure result.
 			const session2 = await TransactionSession.create(coordinator, actionsEngine, 'peer2', 'schema1');
 			const actions2: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[2, { key: 2, name: 'Bob' }]] }] }
 			];
-			await session2.execute(createActionsStatements(actions2)[0]!, actions2);
+			const result2 = await session2.execute(createActionsStatements(actions2)[0]!, actions2);
 
-			// Both sessions applied transforms to the shared tracker
-			const transformsBefore = coordinator.getTransforms();
-			expect(transformsBefore.size, 'Both sessions applied transforms').to.be.greaterThan(0);
+			expect(result2.success, 'second concurrent session is refused').to.be.false;
+			expect(result2.error, 'the error names the open stamp').to.contain(session1.getStampId());
+			expect(result2.error, 'the error names the refused stamp').to.contain(session2.getStampId());
 
-			// Rollback session 1 only
-			await session1.rollback();
+			// The refusal staged nothing for session 2, and session 1 is unaffected: it commits.
+			expect(await usersTree.get(2), 'Bob was never staged').to.be.undefined;
+			const commit1 = await session1.commit();
+			expect(commit1.success, 'first session still commits cleanly').to.be.true;
+			expect(await usersTree.get(1), 'Alice is durable').to.not.be.undefined;
 
-			// Session 1's data (Alice) should be gone
-			const alice = await usersTree.get(1);
-			expect(alice, 'Alice should be gone after session 1 rollback').to.be.undefined;
-
-			// Session 2's data (Bob) should survive the rollback
-			const bob = await usersTree.get(2);
-			expect(bob, 'Bob should survive session 1 rollback').to.not.be.undefined;
-			expect((bob as UserEntry).name, 'Bob\'s data should be intact').to.equal('Bob');
-
-			// Transforms should still exist (session 2's changes are preserved)
-			const transformsAfter = coordinator.getTransforms();
-			expect(transformsAfter.size,
-				'rollback should preserve other sessions\' transforms'
-			).to.be.greaterThan(0);
-		});
-
-		it('should preserve interleaved batches from lower-order stamp when higher-order stamp is rolled back', async () => {
-			const transactor = new TestTransactor();
-
-			type UserEntry = { key: number; name: string };
-			const usersTree = await Tree.createOrOpen<number, UserEntry>(
-				transactor, 'users', entry => entry.key
-			);
-
-			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
-			const collections = new Map();
-			collections.set('users', usersCollection);
-
-			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine();
-
-			// Session 1 created first (order=0)
-			const session1 = await TransactionSession.create(coordinator, actionsEngine, 'peer1', 'schema1');
-			// Session 2 created second (order=1)
-			const session2 = await TransactionSession.create(coordinator, actionsEngine, 'peer2', 'schema1');
-
-			// Session 1 inserts Alice (stamp1 gets snapshot S0={})
-			await session1.execute(createActionsStatements([
-				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
-			])[0]!, [
-				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
-			]);
-
-			// Session 2 inserts Bob (stamp2 gets snapshot S1={Alice})
-			await session2.execute(createActionsStatements([
-				{ collectionId: 'users', actions: [{ type: 'replace', data: [[2, { key: 2, name: 'Bob' }]] }] }
-			])[0]!, [
-				{ collectionId: 'users', actions: [{ type: 'replace', data: [[2, { key: 2, name: 'Bob' }]] }] }
-			]);
-
-			// Session 1 inserts Charlie AFTER session 2's snapshot (interleaved batch)
-			await session1.execute(createActionsStatements([
-				{ collectionId: 'users', actions: [{ type: 'replace', data: [[3, { key: 3, name: 'Charlie' }]] }] }
-			])[0]!, [
-				{ collectionId: 'users', actions: [{ type: 'replace', data: [[3, { key: 3, name: 'Charlie' }]] }] }
-			]);
-
-			// Verify all three exist before rollback
-			expect(await usersTree.get(1), 'Alice before rollback').to.not.be.undefined;
-			expect(await usersTree.get(2), 'Bob before rollback').to.not.be.undefined;
-			expect(await usersTree.get(3), 'Charlie before rollback').to.not.be.undefined;
-
-			// Rollback session 2 (higher-order stamp)
-			await session2.rollback();
-
-			// Bob (session 2) should be gone
-			const bob = await usersTree.get(2);
-			expect(bob, 'Bob should be gone after session 2 rollback').to.be.undefined;
-
-			// Alice and Charlie (session 1) should both survive
-			const alice = await usersTree.get(1);
-			expect(alice, 'Alice should survive session 2 rollback').to.not.be.undefined;
-			expect((alice as UserEntry).name).to.equal('Alice');
-
-			const charlie = await usersTree.get(3);
-			expect(charlie, 'Charlie should survive session 2 rollback (interleaved batch)').to.not.be.undefined;
-			expect((charlie as UserEntry).name).to.equal('Charlie');
+			// The commit released the stamp: a NEW session on the coordinator works.
+			const session3 = await TransactionSession.create(coordinator, actionsEngine, 'peer3', 'schema1');
+			const actions3: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[3, { key: 3, name: 'Carol' }]] }] }
+			];
+			const result3 = await session3.execute(createActionsStatements(actions3)[0]!, actions3);
+			expect(result3.success, 'a session opened after the commit is accepted').to.be.true;
+			await session3.rollback();
 		});
 	});
 

@@ -9,7 +9,7 @@ import { Log } from "../log/log.js";
 import { blockIdsForTransforms } from "../transform/helpers.js";
 import { computeBlockContentDigests, blockDigestsField } from "../transform/digest.js";
 import { collectOperations, hashOperations } from "./operations-hash.js";
-import { CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./errors.js";
+import { CoordinatorConcurrentStampError, CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./errors.js";
 import { jitteredBackoffMs, abortableDelay, makeAbortError } from "../utility/backoff.js";
 import { createLogger } from "../logger.js";
 
@@ -63,6 +63,19 @@ type CollectionCapture = { seq: number; snapshot: CollectionSnapshot<any> };
 export class TransactionCoordinator {
 	/** Per-stampId tracking: pre-staging snapshots + accumulated actions for replay.
 	 *
+	 * INVARIANT: `stampData.size <= 1` — at most ONE open stamp per coordinator, enforced by the
+	 * guards in {@link applyActions} and {@link commit} (which throw
+	 * {@link CoordinatorConcurrentStampError}) and {@link execute} (which returns it as a failure
+	 * result). The registered collections hold exactly one staged state — one tracker transform
+	 * set and one pending action queue each, shared by every open stamp — so two concurrent stamps
+	 * would read each other's uncommitted rows and a commit of either would write the other's
+	 * staged actions into its own durable log entry. A stamp is released by commit (success or
+	 * partial) or by rollback; a CLEAN commit failure keeps its entry so `rollback(stampId)`
+	 * stays a complete recovery, meaning an abandoned failed commit holds the coordinator against
+	 * new stamps until it is rolled back. The guard is per-coordinator only: two coordinators
+	 * sharing collection instances are the caller's contract ("own bridge per writer" —
+	 * docs/transactions.md), not this map's.
+	 *
 	 * Each snapshot holds BOTH halves of a collection's staged state — tracker transforms AND
 	 * the pending action queue — as one {@link Collection.snapshotPending} value. Restoring only
 	 * the transforms would leave a rolled-back stamp's actions queued, where the next commit on
@@ -112,6 +125,14 @@ export class TransactionCoordinator {
 	): Promise<void> {
 		let data = this.stampData.get(stampId);
 		if (!data) {
+			// At most one open stamp (see the invariant on stampData). Checked inside this method's
+			// await-free prologue — the check, the entry creation, and the capture below run as one
+			// atomic step, so a second stamp cannot register between a concurrent commit's guard
+			// and its log append.
+			const open = this.openStampOtherThan(stampId);
+			if (open !== undefined) {
+				throw new CoordinatorConcurrentStampError(open, stampId);
+			}
 			data = { order: this.nextStampOrder++, preSnapshot: new Map(), actionBatches: [] };
 			this.stampData.set(stampId, data);
 		}
@@ -153,6 +174,16 @@ export class TransactionCoordinator {
 	 * count ever grows large enough for the scan itself to matter, track a per-stamp "collections
 	 * map size at last capture" rather than dropping the reconcile.
 	 */
+	/** The id of the open stamp {@link stampData} tracks when it is not `stampId`; undefined when
+	 * no OTHER stamp is open. The single-open-stamp invariant on {@link stampData} is what makes
+	 * "the" (singular) correct here. */
+	private openStampOtherThan(stampId: string): string | undefined {
+		for (const open of this.stampData.keys()) {
+			if (open !== stampId) return open;
+		}
+		return undefined;
+	}
+
 	private captureUncaptured(into: Map<Collection<any>, CollectionCapture>): void {
 		for (const col of this.collections.values()) {
 			if (into.has(col)) continue;
@@ -202,6 +233,15 @@ export class TransactionCoordinator {
 	 * @param options - Retry knobs; shares the {@link SyncOptions} vocabulary with `Collection.sync`.
 	 */
 	async commit(transaction: Transaction, options?: SyncOptions): Promise<void> {
+		// At most one open stamp (see the invariant on stampData). Checked once, BEFORE the retry
+		// loop — this is a hard failure, never retryable: the open stamp must be committed or
+		// rolled back first. This guard is what catches a caller that staged directly (Tree.stage /
+		// Collection.act, which creates no stampData entry) and commits while a sibling stamp is
+		// tracked — such a commit would sweep the sibling's queued actions into its own log entry.
+		const open = this.openStampOtherThan(transaction.stamp.id);
+		if (open !== undefined) {
+			throw new CoordinatorConcurrentStampError(open, transaction.stamp.id);
+		}
 		const maxAttempts = options?.maxAttempts ?? DefaultMaxAttempts;
 		const baseBackoffMs = options?.baseBackoffMs ?? DefaultBaseBackoffMs;
 		const maxBackoffMs = options?.maxBackoffMs ?? DefaultMaxBackoffMs;
@@ -530,13 +570,9 @@ export class TransactionCoordinator {
 			collection.clearPendingActions();
 		}
 
-		// Clean up stamp tracking data.
-		// NOTE: only THIS stamp's entry is dropped. The reset+clear above is collection-wide, so any
-		// OTHER in-flight stamp's `preSnapshot` now describes a pre-commit world, and a later
-		// rollback of that stamp restores actions this commit already made durable. Not reachable
-		// today (the adapter drives one stamp at a time — docs/transactions.md "own bridge per
-		// writer"), but it is a latent defect, not an accepted tradeoff: see
-		// tickets/backlog/bug-coordinator-stamp-snapshots-go-stale-when-a-sibling-commits.md.
+		// Clean up stamp tracking data. The reset+clear above is collection-wide, which is safe
+		// precisely because the coordinator enforces at most ONE open stamp (the invariant on
+		// stampData): no sibling stamp's snapshot exists to go stale against this commit.
 		this.stampData.delete(transaction.stamp.id);
 	}
 
@@ -755,6 +791,15 @@ export class TransactionCoordinator {
 		// serve a rare branch. Unmeasured, and symmetric with commitOnceLatched, which pays the
 		// same on every commit. If execute() ever shows up hot in a profile, the way out is a
 		// copy-on-first-stage snapshot, not dropping the restore.
+		// At most one open stamp (see the invariant on stampData). execute() reports failures as
+		// results rather than throws (matching its conversion of applyActions' "Collection not
+		// found" throw below), so the refusal is a failure result here where applyActions and
+		// commit throw.
+		const openStamp = this.openStampOtherThan(transaction.stamp.id);
+		if (openStamp !== undefined) {
+			return { success: false, error: new CoordinatorConcurrentStampError(openStamp, transaction.stamp.id).message };
+		}
+
 		const preStageSnapshots = new Map<CollectionId, CollectionSnapshot<any>>();
 		for (const { collectionId } of result.actions) {
 			if (preStageSnapshots.has(collectionId)) continue;
@@ -905,18 +950,9 @@ export class TransactionCoordinator {
 					}
 					// The undo handle is now unsafe: rollback() is all-or-nothing and would rewind
 					// the collections that DID durably commit. Drop it, matching commitOnceLatched.
-					//
-					// NOTE: dropping the entry also removes this stamp's batches from the REPLAY set
-					// a later rollback(otherStampId) rebuilds from (see rollback's per-collection
-					// earliest-capture walk). With a second stamp in flight whose capture of a
-					// participant was taken after this one staged into it, that rollback would reset
-					// to a snapshot still carrying this transaction's transforms — re-staging the
-					// winner's already-durable actions, the very corruption this delete prevents on
-					// the direct path. Same shape at
-					// commitOnceLatched's delete; harmless while a session drives one stamp per
-					// coordinator. If concurrent stamps on one coordinator ever become real, the fix
-					// is a tombstone entry (batches dropped, snapshot kept for the replay walk)
-					// rather than an outright delete, at both sites.
+					// Dropping outright (no tombstone) is safe because the coordinator enforces at
+					// most ONE open stamp (the invariant on stampData): no sibling stamp exists
+					// whose later rollback could rebuild a replay set missing this entry.
 					this.stampData.delete(transaction.stamp.id);
 				}
 				return {

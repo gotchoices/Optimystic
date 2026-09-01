@@ -160,6 +160,37 @@ either side's commit/rollback tears down state the other still owns. The
 constraint is also noted at the `currentTransaction` field in
 [`txn-bridge.ts`](../packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts).
 
+### The coordinator refuses a second open transaction stamp
+
+`TransactionCoordinator` enforces the same one-writer constraint at its own
+level: **at most one transaction stamp may be open at a time.** A stamp opens at
+its first `applyActions` call — on the Quereus path that is the
+pre-stage-barrier call made at the first *statement*, not at BEGIN — and is
+released by a commit (successful **or** partial) or by a rollback. A second
+stamp opened while one is tracked is refused with
+`CoordinatorConcurrentStampError`: `applyActions` and `commit` throw it, and
+`execute` returns it as a failure result. The error names both stamps and the
+recovery.
+
+The refusal exists because the coordinator's registered collections hold
+exactly one staged state — one set of tracker transforms and one pending action
+queue per collection, shared by every open stamp. Two concurrent stamps read
+each other's uncommitted rows, and a commit of either would write the other's
+staged actions into its own durable log entry (a commit builds each entry from
+the collection's whole pending queue, and the pended transforms carry no stamp
+tag to filter by). There is no correct commit for that configuration.
+
+Two consequences worth knowing:
+
+- A **failed clean** commit (nothing durable) deliberately keeps its stamp open
+  so `rollback(stampId)` remains a complete recovery — an abandoned failed
+  commit therefore holds the coordinator against new stamps until it is rolled
+  back.
+- The guard is **per-coordinator**. Two coordinators sharing the same
+  `Collection` instances are not caught by it — that remains the caller's
+  contract, exactly as above: concurrent writers each need their **own** bridge
+  and their own collection instances.
+
 ### Committed reads refuse a degraded (partially-committed) store
 
 After a partial commit (`PartialCommitError` in legacy mode,

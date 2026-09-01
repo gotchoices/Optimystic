@@ -4,17 +4,17 @@
  * action list a commit records into the collection's durable action log).
  *
  * `TransactionCoordinator.rollback` used to restore only the tracker half, so an aborted
- * transaction's actions stayed queued. Two consequences, both covered here:
+ * transaction's actions stayed queued, and the NEXT transaction to commit on that collection wrote
+ * them into its own durable log entry (commitOnceLatched builds each entry from
+ * `getPendingActions()`). Reads right after such a commit still looked correct — the entry's
+ * transforms come from the tracker, which WAS rolled back — which is why the transform-and-read
+ * assertions in transaction.spec.ts missed it. The corruption lives in the action list, so these
+ * cases assert on the pending queue and on what reaches the log append, never on transforms.
  *
- *  - the NEXT transaction to commit on that collection wrote the aborted actions into its own
- *    durable log entry (commitOnceLatched builds each entry from `getPendingActions()`);
- *  - the replay of surviving stamps pushed onto the un-rewound queue again, leaving the phantom
- *    action PLUS two copies of each survivor's.
- *
- * Reads right after a bad commit still looked correct — the entry's transforms come from the
- * tracker, which WAS rolled back — which is why the transform-and-read assertions in
- * transaction.spec.ts missed it. The corruption lives in the action list, so these cases assert on
- * the pending queue and on what reaches the log append, never on transforms.
+ * The coordinator now enforces at most ONE open stamp at a time (locked by
+ * coordinator-single-stamp.spec.ts), so the multi-stamp rollback cases that used to live here —
+ * survivor replay, cross-stamp interleaved batches — are retired: the configuration they exercised
+ * is refused outright at the second stamp's first applyActions.
  *
  * Rollback is driven through `coordinator.rollback(stampId)` directly; `TransactionSession.rollback`
  * is a thin delegate to exactly that call.
@@ -85,8 +85,8 @@ async function stage(
 	return { stampId: stamp.id, transaction };
 }
 
-/** Stage another batch under an ALREADY-tracked stamp — no new snapshot is taken, which is how a
- *  lower-`order` stamp comes to apply actions after a higher-`order` stamp's snapshot. */
+/** Stage another batch under the ALREADY-tracked stamp — no new snapshot is taken; models a later
+ *  statement of the same session. */
 async function stageMore(
 	coordinator: TransactionCoordinator,
 	staged: Staged,
@@ -217,57 +217,17 @@ describe('TransactionCoordinator.rollback: pending queue', () => {
 		expectNoActionsFromStamp(collections, one.stampId, 'solo rollback');
 	});
 
-	it('leaves a survivor exactly one queued action — not the phantom, and not a second copy', async () => {
-		const id = 'rb-survivor';
-		const { coordinator, collections } = await makeCoordinator(new TestTransactor(), [id]);
-		const first = await stage(coordinator, [{ collectionId: id, value: 'aborted' }]);
-		await stage(coordinator, [{ collectionId: id, value: 'survivor' }]);
-
-		await coordinator.rollback(first.stampId);
-
-		// Pre-fix this was 3 entries: the phantom, plus the survivor twice (the replay pushed onto
-		// a queue that was never rewound). Assert the exact array, so a count regression bites.
-		expect(queuedValues(collections.get(id)!), 'survivor queued exactly once').to.deep.equal(['survivor']);
-		expectNoActionsFromStamp(collections, first.stampId, 'survivor rollback');
-	});
-
-	it('keeps every survivor once when a lower-order stamp staged after a higher-order snapshot', async () => {
-		const id = 'rb-interleaved';
-		const { coordinator, collections } = await makeCoordinator(new TestTransactor(), [id]);
-		// Snapshot order is fixed at each stamp's FIRST applyActions: a=0, b=1, c=2.
-		const a = await stage(coordinator, [{ collectionId: id, value: 'a1' }]);
-		const b = await stage(coordinator, [{ collectionId: id, value: 'b1' }]);
-		const c = await stage(coordinator, [{ collectionId: id, value: 'c1' }]);
-		// a's second batch lands AFTER b's and c's captures — the interleaving the per-collection
-		// earliest-capture walk exists for. Restoring to a's (first, seq 0) capture rewinds both
-		// halves to before anything was staged, so the replay lands each survivor batch once.
-		await stageMore(coordinator, a, [{ collectionId: id, value: 'a2' }]);
-
-		await coordinator.rollback(b.stampId);
-
-		expect(queuedValues(collections.get(id)!), 'both survivors, in stamp order, once each')
-			.to.deep.equal(['a1', 'a2', 'c1']);
-		expectNoActionsFromStamp(collections, b.stampId, 'interleaved rollback');
-		// The survivors' own tags must be intact — the replay re-tags with the replaying stamp id.
-		const tags = collections.get(id)!.getPendingActions().map(x => x.transaction);
-		expect(tags, 'survivor actions keep their own stamp tags')
-			.to.deep.equal([a.stampId, a.stampId, c.stampId]);
-	});
-
-	it('clears the rolled-back stamp from every collection it touched, leaving a survivor alone', async () => {
+	it('clears the rolled-back stamp from every collection it touched', async () => {
 		const [one, two] = ['rb-multi-one', 'rb-multi-two'];
 		const { coordinator, collections } = await makeCoordinator(new TestTransactor(), [one, two]);
 		const both = await stage(coordinator, [
 			{ collectionId: one, value: 'both-one' },
 			{ collectionId: two, value: 'both-two' },
 		]);
-		// A survivor touching only ONE of the two collections must be unaffected in the other.
-		await stage(coordinator, [{ collectionId: one, value: 'survivor-one' }]);
 
 		await coordinator.rollback(both.stampId);
 
-		expect(queuedValues(collections.get(one)!), 'first collection keeps only the survivor')
-			.to.deep.equal(['survivor-one']);
+		expect(queuedValues(collections.get(one)!), 'first collection is empty').to.deep.equal([]);
 		expect(queuedValues(collections.get(two)!), 'second collection is empty').to.deep.equal([]);
 		expectNoActionsFromStamp(collections, both.stampId, 'multi-collection rollback');
 	});
@@ -431,52 +391,6 @@ describe('TransactionCoordinator.rollback: collections registered mid-transactio
 		expectNoActionsFromStamp(collections, staged.stampId, 'late-registration rollback');
 	});
 
-	it('drops only the rolled-back stamp when a survivor staged into the late collection first', async () => {
-		const [a, b] = ['rb-late-2s-a', 'rb-late-2s-b'];
-		const transactor = new TestTransactor();
-		const { coordinator, collections } = await makeCoordinator(transactor, [a]);
-
-		// x (order 0) captures only `a` — `b` does not exist yet.
-		const x = await stage(coordinator, [{ collectionId: a, value: 'x-a' }]);
-		const late = await registerLate(transactor, collections, b);
-		// y (order 1) captures `b` CLEAN, then stages into it.
-		const y = await stage(coordinator, [{ collectionId: b, value: 'y-b' }]);
-		// x now reaches `b` for the first time, so x's capture of `b` is LATER than y's and already
-		// DIRTY with y's row — the case stamp `order` alone mis-ranks.
-		await stageMore(coordinator, x, [{ collectionId: b, value: 'x-b' }]);
-
-		await coordinator.rollback(y.stampId);
-
-		// Under the old order-only walk this restored from x's map, which had no entry for `b` at
-		// all, so `b` kept y's row AND replayed x's on top: ['y-b', 'x-b', 'x-b']. Assert the
-		// values, not just the count.
-		expect(queuedValues(late), 'only the survivor reaches the late collection').to.deep.equal(['x-b']);
-		expect(queuedValues(collections.get(a)!), 'the survivor\'s other collection is intact')
-			.to.deep.equal(['x-a']);
-		expectNoActionsFromStamp(collections, y.stampId, 'late-registration two-stamp rollback');
-		expect(late.getPendingActions().map(v => v.transaction), 'the survivor keeps its own stamp tag')
-			.to.deep.equal([x.stampId]);
-	});
-
-	it('drops the rolled-back stamp in the mirror direction, keeping the later stamp\'s row', async () => {
-		const [a, b] = ['rb-late-mirror-a', 'rb-late-mirror-b'];
-		const transactor = new TestTransactor();
-		const { coordinator, collections } = await makeCoordinator(transactor, [a]);
-
-		const x = await stage(coordinator, [{ collectionId: a, value: 'x-a' }]);
-		const late = await registerLate(transactor, collections, b);
-		const y = await stage(coordinator, [{ collectionId: b, value: 'y-b' }]);
-		await stageMore(coordinator, x, [{ collectionId: b, value: 'x-b' }]);
-
-		await coordinator.rollback(x.stampId);
-
-		expect(queuedValues(late), 'only y\'s row survives on the late collection').to.deep.equal(['y-b']);
-		expect(queuedValues(collections.get(a)!), 'x\'s other collection is emptied').to.deep.equal([]);
-		expectNoActionsFromStamp(collections, x.stampId, 'late-registration mirror rollback');
-		expect(late.getPendingActions().map(v => v.transaction), 'the survivor keeps its own stamp tag')
-			.to.deep.equal([y.stampId]);
-	});
-
 	it('does not re-capture a collection the stamp already staged into when it is re-registered', async () => {
 		const id = 'rb-reregister';
 		const { coordinator, collections } = await makeCoordinator(new TestTransactor(), [id]);
@@ -517,33 +431,6 @@ describe('TransactionCoordinator.rollback: collections registered mid-transactio
 		expect(queuedValues(original), 'the detached instance is rewound to its own capture')
 			.to.deep.equal([]);
 		expectNoActionsFromStamp(collections, staged.stampId, 'instance-swap rollback');
-	});
-
-	it('rewinds the late collection on a SECOND rollback, from the snapshot the first one rebuilt', async () => {
-		const [a, b] = ['rb-late-twice-a', 'rb-late-twice-b'];
-		const transactor = new TestTransactor();
-		const { coordinator, collections } = await makeCoordinator(transactor, [a]);
-
-		const x = await stage(coordinator, [{ collectionId: a, value: 'x-a' }]);
-		const late = await registerLate(transactor, collections, b);
-		const y = await stage(coordinator, [{ collectionId: b, value: 'y-b' }]);
-		await stageMore(coordinator, x, [{ collectionId: b, value: 'x-b' }]);
-
-		// rollback(y) replays x, and rebuilds x's captures from the LIVE map — which now includes
-		// the late collection. The rebuild is the only thing that carries `b` into x's snapshot at
-		// its post-restore (clean) state; leave x's original DIRTY capture of `b` in place and the
-		// second rollback below restores y's already-discarded row.
-		await coordinator.rollback(y.stampId);
-		expect(queuedValues(late), 'survivor state after the first rollback').to.deep.equal(['x-b']);
-
-		await coordinator.rollback(x.stampId);
-
-		expect(queuedValues(late), 'the late collection is empty after both stamps rolled back')
-			.to.deep.equal([]);
-		expect(queuedValues(collections.get(a)!), 'the eagerly-captured collection is empty too')
-			.to.deep.equal([]);
-		expectNoActionsFromStamp(collections, x.stampId, 'second rollback');
-		expectNoActionsFromStamp(collections, y.stampId, 'second rollback');
 	});
 
 	it('leaves a late-registered, transaction-created collection readable and committable', async () => {
