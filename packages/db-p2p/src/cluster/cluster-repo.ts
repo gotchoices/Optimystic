@@ -211,6 +211,13 @@ interface ClusterMemberComponents {
 	recomputeArbitratorSet?: RecomputeArbitratorSetCapability;
 	/** Member-side cluster derivation for the membership admission gate; see {@link DeriveExpectedClusterCallback}. */
 	deriveExpectedCluster?: DeriveExpectedClusterCallback;
+	/**
+	 * Wall clock in unix milliseconds; defaults to `Date.now`. Injectable so a test can age a held
+	 * reservation past {@link CONFLICT_STALE_THRESHOLD_MS} without sleeping. It governs BOTH sides of
+	 * the reservation's `lastUpdate` — the stamp and the comparison — so the two can never end up on
+	 * different time bases; every other clock read in this class stays on the real `Date.now`.
+	 */
+	now?: () => number;
 }
 
 export function clusterMember(components: ClusterMemberComponents): ClusterMember {
@@ -230,12 +237,21 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.onCommitCertificate,
 		components.onInvalidate,
 		components.recomputeArbitratorSet,
-		components.deriveExpectedCluster
+		components.deriveExpectedCluster,
+		components.now
 	);
 }
 
 // How long to keep executed transaction records (10 minutes)
 const ExecutedTransactionTtlMs = 10 * 60 * 1000;
+
+/**
+ * How long a held reservation may go untouched before the conflict scan ({@link ClusterMember.findConflict})
+ * sweeps it. Generous relative to a round-trip: the scan frees an ABANDONED coordinator's blocks, so
+ * sweeping too eagerly would drop a live transaction whose next delivery is merely in flight.
+ * Exported so a test can advance an injected clock past it without restating the number.
+ */
+export const CONFLICT_STALE_THRESHOLD_MS = 2000;
 
 // Upper bound on an awaited active reconciliation of a divergent commit. Bounds the
 // consensus path so a slow/unreachable cohort peer can't stall the cluster stream;
@@ -313,6 +329,8 @@ export class ClusterMember implements ICluster {
 	/** What a validator-configured member does with a pend carrying no `validation` payload — see
 	 * {@link ClusterConsensusConfig.unvalidatablePendPolicy}. Read once, like the gate parameters. */
 	private readonly unvalidatablePendPolicy: UnvalidatablePendPolicy;
+	/** Clock behind the reservation table's `lastUpdate` — see {@link ClusterMemberComponents.now}. */
+	private readonly now: () => number;
 
 	constructor(
 		private readonly storageRepo: IRepo,
@@ -331,8 +349,10 @@ export class ClusterMember implements ICluster {
 		private readonly onCommitCertificate?: CommitCertificateSink,
 		private readonly onInvalidate?: InvalidationApplySink,
 		private readonly recomputeArbitratorSet?: RecomputeArbitratorSetCapability,
-		private readonly deriveExpectedCluster?: DeriveExpectedClusterCallback
+		private readonly deriveExpectedCluster?: DeriveExpectedClusterCallback,
+		now?: () => number
 	) {
+		this.now = now ?? ((): number => Date.now());
 		this.superMajorityThreshold = consensusConfig?.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD;
 		this.minAbsoluteClusterSize = consensusConfig?.minAbsoluteClusterSize ?? 3;
 		this.clusterSizeTolerance = consensusConfig?.clusterSizeTolerance ?? 0.5;
@@ -603,7 +623,7 @@ export class ClusterMember implements ICluster {
 			const timeouts = this.setupTimeouts(currentRecord);
 			this.activeTransactions.set(record.messageHash, {
 				record: currentRecord,
-				lastUpdate: Date.now(),
+				lastUpdate: this.now(),
 				promiseTimeout: timeouts.promiseTimeout,
 				resolutionTimeout: timeouts.resolutionTimeout
 			});
@@ -2188,8 +2208,9 @@ export class ClusterMember implements ICluster {
 	 * entries are swept, and a held transaction that LOSES the race to `record` is cleared.
 	 */
 	private findConflict(record: ClusterRecord): { blockedBy: string } | undefined {
-		const now = Date.now();
-		const staleThresholdMs = 2000; // 2 seconds - allow more time for distributed consensus
+		// Same clock as the `lastUpdate` stamp (the `shouldPersist` set and `persistParticipantState`),
+		// so an injected test clock ages entries instead of putting stamp and comparison on different bases.
+		const now = this.now();
 
 		const incomingBlockIds = getAffectedBlockIds(record.message.operations);
 		log('cluster-member:findConflict-check', {
@@ -2199,6 +2220,13 @@ export class ClusterMember implements ICluster {
 		});
 
 		for (const [existingHash, state] of Array.from(this.activeTransactions.entries())) {
+			// Defensive only — no caller can reach it today. `getTransactionPhase` calls this scan solely
+			// when `!record.promises[ourId]`, and every write into `activeTransactions` already carries our
+			// vote (the `shouldPersist` set happens after the phase loop recorded it; `recoverTransactions`
+			// restores what that same branch persisted; `handleExpiration` re-sets with our reject added).
+			// A redelivery at a known hash is merged with the held record first (`mergeRecords`, first-seen
+			// wins), so our vote is present by the time the phase is computed. Kept because the scan is on
+			// the vote path, where self-blocking would be silent and permanent.
 			if (existingHash === record.messageHash) {
 				continue;
 			}
@@ -2211,8 +2239,9 @@ export class ClusterMember implements ICluster {
 				incomingBlockIds
 			});
 
-			// Clean up stale transactions that have been around too long
-			if (now - state.lastUpdate > staleThresholdMs) {
+			// Sweep abandoned reservations BEFORE the race is decided: an entry nobody is driving any
+			// more must not win a contest it should not be in and block a live rival for its whole life.
+			if (now - state.lastUpdate > CONFLICT_STALE_THRESHOLD_MS) {
 				log('cluster-member:stale-cleanup', {
 					messageHash: existingHash,
 					age: now - state.lastUpdate
@@ -2238,7 +2267,10 @@ export class ClusterMember implements ICluster {
 						incoming: record.messageHash
 					});
 					this.clearTransaction(existingHash);
-					continue; // Check other conflicts
+					// `continue`, not `break`: the incoming transaction may overlap several held
+					// reservations, and beating one says nothing about the rest. Stopping here would let it
+					// walk past a second, still-live rival it actually loses to.
+					continue;
 				}
 			}
 		}
@@ -2377,7 +2409,7 @@ export class ClusterMember implements ICluster {
 		this.stateStore.saveParticipantState(messageHash, {
 			messageHash,
 			record,
-			lastUpdate: Date.now()
+			lastUpdate: this.now()
 		}).catch(err => log('cluster-member:persist-error', { messageHash, error: (err as Error).message }));
 	}
 

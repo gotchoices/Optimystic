@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { ClusterMember, clusterMember } from '../src/cluster/cluster-repo.js';
+import { ClusterMember, clusterMember, CONFLICT_STALE_THRESHOLD_MS } from '../src/cluster/cluster-repo.js';
 import { resolveRace } from '../src/cluster/race-resolution.js';
 import { MemoryTransactionStateStore } from '../src/cluster/memory-transaction-state-store.js';
 import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, Transforms, IBlock, BlockId, BlockHeader, ClusterConsensusConfig } from '@optimystic/db-core';
@@ -758,6 +758,121 @@ describe('ClusterMember', () => {
 			const fresh = await createClusterRecord(peers, makePendOperation('a-fresh', 'block-contested'));
 			const freshResult = await clusterMemberInstance.update(fresh);
 			expect(freshResult.promises[ourId]?.type, 'the dead record must not hold its blocks').to.equal('approve');
+		});
+
+		// The reservation scan does two things on the way through besides answering the question it was
+		// asked, and each is invisible to the tests above. The next two pin them.
+
+		// Side effect 1 — ORDER. The staleness sweep sits ABOVE the conflict test, so an abandoned
+		// reservation is dropped before it can win a race it should not be in. Move the sweep below
+		// `operationsConflict` and nothing else in this file notices.
+		it('sweeps an abandoned reservation before deciding the race, not after', async () => {
+			const others = await Promise.all(Array.from({ length: 4 }, () => makeKeyPair()));
+			const [peer2, peer3] = others as [KeyPair, KeyPair];
+			const ourId = selfKeyPair.peerId.toString();
+			// 5 peers ⇒ superMajority = ceil(5 * 0.75) = 4. The headroom matters: a held record that
+			// reaches 4 approvals takes the commit branch and is CLEARED from the reservation table, so
+			// the rival below must stay at 3 or the test would assert against an empty table.
+			const peers = makeClusterPeers([selfKeyPair, ...others]);
+
+			// Seeded from a real `Date.now()` so it shares an epoch with the clock reads that are
+			// deliberately NOT injected (`message.expiration`, the promise/resolution timeouts) — a
+			// counter starting near zero would make every record look long expired.
+			let clockMs = Date.now();
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				now: () => clockMs
+			});
+
+			try {
+				// A reserves block-shared carrying peer2's and peer3's approvals; with ours that is 3 of 5.
+				const baseA = await createClusterRecord(peers, makePendOperation('a-abandoned', 'block-shared'));
+				const recordA: ClusterRecord = {
+					...baseA,
+					promises: {
+						[peer2.peerId.toString()]: await makeSignedPromise(peer2.privateKey, baseA),
+						[peer3.peerId.toString()]: await makeSignedPromise(peer3.privateKey, baseA)
+					}
+				};
+				const heldA = await member.update(recordA);
+				expect(heldA.promises[ourId]?.type, 'A must be genuinely held for this test to assert anything').to.equal('approve');
+				expect(heldA.commits[ourId], 'A must stay below super-majority, or it is cleared and the table is empty').to.equal(undefined);
+
+				// Its coordinator then goes away: nothing touches A again and the reservation ages out.
+				clockMs += CONFLICT_STALE_THRESHOLD_MS + 1;
+
+				// D contests the same block with zero approvals. On the merits D (0 approvals) loses to
+				// A (3) outright, so an `approve` can ONLY mean A was swept before `resolveRace` ran.
+				const recordD = await createClusterRecord(peers, makePendOperation('a-live', 'block-shared'));
+				const votedD = await member.update(recordD);
+				expect(votedD.promises[ourId]?.type, 'an abandoned reservation must not win the race it is swept out of').to.equal('approve');
+			} finally {
+				member.dispose();
+			}
+		});
+
+		// Side effect 2 — CONTINUE. An incoming transaction can overlap more than one held reservation.
+		// The scan clears the ones it beats and keeps scanning; a `break` there would let it walk past a
+		// second, still-live rival it actually loses to.
+		it('keeps scanning after clearing one loser, and is still blocked by a second live rival', async () => {
+			const others = await Promise.all(Array.from({ length: 4 }, () => makeKeyPair()));
+			const [peer2, peer3] = others as [KeyPair, KeyPair];
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, ...others]);
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey
+			});
+
+			try {
+				// `activeTransactions` is a Map, so the scan runs in insertion order: seed the LOSER first,
+				// otherwise a `break` would stop on the winner and the mutation would survive.
+				// A reserves block-a with our approve alone — 1 approval.
+				const recordA = await createClusterRecord(peers, makePendOperation('a-loser', 'block-a'));
+				const heldA = await member.update(recordA);
+				expect(heldA.promises[ourId]?.type, 'A must be held as the first reservation').to.equal('approve');
+
+				// C reserves block-c with peer2's approval plus ours — 2 approvals — and top priority.
+				const baseC = await createClusterRecord(peers, makePendOperationP('a-winner', 'block-c', { txPriority: MaxPriority }));
+				const recordC: ClusterRecord = {
+					...baseC,
+					promises: { [peer2.peerId.toString()]: await makeSignedPromise(peer2.privateKey, baseC) }
+				};
+				const heldC = await member.update(recordC);
+				expect(heldC.promises[ourId]?.type, 'C must be held as the second reservation').to.equal('approve');
+				expect(heldC.commits[ourId], 'C must stay below super-majority, or it is cleared before D arrives').to.equal(undefined);
+
+				// D touches BOTH blocks, carrying peer2's and peer3's approvals — 2 — at priority 0.
+				const transformsD: Transforms = {
+					inserts: { 'block-a': makeBlock('block-a'), 'block-c': makeBlock('block-c') },
+					updates: {},
+					deletes: []
+				};
+				const baseD = await createClusterRecord(peers, [{ pend: { actionId: 'a-incoming', transforms: transformsD, policy: 'c' } }]);
+				const recordD: ClusterRecord = {
+					...baseD,
+					promises: {
+						[peer2.peerId.toString()]: await makeSignedPromise(peer2.privateKey, baseD),
+						[peer3.peerId.toString()]: await makeSignedPromise(peer3.privateKey, baseD)
+					}
+				};
+
+				// D(2) beats A(1) on approvals ⇒ A is cleared and the scan continues. D(2) ties C(2) on
+				// approvals ⇒ priority breaks it for C ⇒ D is blocked, and the vote must name C. Under a
+				// `break` the scan stops at A and D comes back with a clean `approve`.
+				const votedD = await member.update(recordD);
+				const vote = votedD.promises[ourId];
+				if (vote?.type !== 'conflict') expect.fail(`a second live rival must still block D, got ${vote?.type ?? 'no vote at all'}`);
+				expect(vote.conflictWith, 'the blocking rival is the one past the cleared loser').to.equal(recordC.messageHash);
+			} finally {
+				member.dispose();
+			}
 		});
 	});
 
