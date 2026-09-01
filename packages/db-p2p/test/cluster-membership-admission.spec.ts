@@ -47,14 +47,20 @@ const makeClusterPeers = (keyPairs: KeyPair[]): ClusterPeers => {
 /**
  * A fresh record (no promises/commits) carrying a coordinating block id so the gate can derive a view.
  *
- * `coordinatingBlockId` defaults to the block the operations name — the bound, legitimate case. Passing
- * a different id models a coordinator that named a block its own operations never touch, which is the
- * free choice the binding check exists to remove.
+ * `coordinatingBlockIds` defaults to the block the operations name — the bound, legitimate case. Passing
+ * a different id models a coordinator that named a block its own operations never touch; passing `[]` or
+ * `'omit'` models one that named nothing at all (a present-but-empty array and an absent field are
+ * distinct wire shapes, both inadmissible). All of these are the sender's free choice, which is what the
+ * record-shape checks exist to remove.
  */
-const makeRecord = async (peers: ClusterPeers, blockId = 'block-1', coordinatingBlockId = blockId): Promise<ClusterRecord> => {
+const makeRecord = async (
+	peers: ClusterPeers,
+	blockId = 'block-1',
+	coordinatingBlockIds: string[] | 'omit' = [blockId]
+): Promise<ClusterRecord> => {
 	const message: RepoMessage = {
 		operations: [{ get: { blockIds: [blockId] } }],
-		coordinatingBlockIds: [coordinatingBlockId],
+		...(coordinatingBlockIds === 'omit' ? {} : { coordinatingBlockIds }),
 		expiration: Date.now() + 30000
 	};
 	const messageHash = await computeMessageHash(message);
@@ -95,13 +101,17 @@ const baseConfig = (over: Partial<ClusterConsensusConfig> = {}): ClusterConsensu
 /**
  * Build a member whose declared-set derivation returns `view`, then vote on a record for `declared`.
  * `config` may be omitted entirely, exercising the no-consensusConfig construction many other specs use.
+ *
+ * `view` may be a constant {@link ExpectedClusterView}, `undefined` for a member with NO derivation
+ * capability at all (a materially different case since the record-shape refusals require a capability),
+ * or a raw {@link DeriveExpectedClusterCallback} so a *throwing* capability can be exercised.
  */
 const voteOn = async (
 	self: KeyPair,
 	declared: KeyPair[],
-	view: ExpectedClusterView | undefined,
+	view: ExpectedClusterView | DeriveExpectedClusterCallback | undefined,
 	config?: ClusterConsensusConfig,
-	coordinatingBlockId?: string
+	coordinatingBlockIds?: string[] | 'omit'
 ): Promise<{ type: string; rejectReason?: string }> => {
 	const member = clusterMember({
 		storageRepo: new MockRepo(),
@@ -109,10 +119,10 @@ const voteOn = async (
 		peerId: self.peerId,
 		privateKey: self.privateKey,
 		consensusConfig: config,
-		deriveExpectedCluster: view ? constantDerive(view) : undefined
+		deriveExpectedCluster: view === undefined ? undefined : (typeof view === 'function' ? view : constantDerive(view))
 	});
 	try {
-		const record = await makeRecord(makeClusterPeers(declared), 'block-1', coordinatingBlockId);
+		const record = await makeRecord(makeClusterPeers(declared), 'block-1', coordinatingBlockIds);
 		const result = await member.update(record);
 		const sig = result.promises[self.peerId.toString()];
 		return { type: sig?.type ?? 'none', rejectReason: sig?.type === 'reject' ? sig.rejectReason : undefined };
@@ -349,40 +359,139 @@ describe('ClusterMember — membership admission gate', () => {
 		});
 	});
 
-	describe('the coordinating block must be bound to the record’s own operations', () => {
+	describe('the coordinating block must be present AND bound to the record’s own operations', () => {
 		// Hashing `coordinatingBlockIds` into `messageHash` makes it tamper-evident to a RELAY, but the
 		// coordinator is the party this gate exists to check and it picks the field before it computes the
 		// hash. Unbound, a Byzantine coordinator declares a shrunken cohort D and names a coordinating block
 		// whose real cohort IS D: every member then derives that block, finds kEst = |D|, symmetric
-		// difference 0, and admits — the gate fully defeated. These two cases are the same attack with the
-		// binding on and off, so the binding is what separates them and not some other predicate.
+		// difference 0, and admits — the gate fully defeated. Omitting the field entirely is the same free
+		// choice with an even weaker outcome. Both are defects of the SENDER (no current coordinator builds
+		// such a record — `ClusterCoordinator.executeClusterTransaction` stamps a bound id), so a member
+		// that CAN derive refuses them outright rather than downgrading to the fallback floor.
 		const shrunkDeclared = () => cluster(3);
 
 		it('is defeated-shaped when the named block IS one the operations touch (control)', async () => {
 			// D = 3, derived view = the same 3 → kEst 3, floor max(2, ceil(0.75 * 3)) = 3, symDiff 0 → approve.
 			// A legitimate small cohort looks exactly like this, which is why the size predicates alone cannot
-			// tell the two apart and the binding has to.
+			// tell the two apart and the record-shape checks have to carry the weight.
 			const declared = shrunkDeclared();
 			const vote = await voteOn(self, declared, view(declared, 0.9), baseConfig({ assumedClusterSize: 8 }));
 			expect(vote.type).to.equal('approve');
 		});
 
-		it('falls closed to the fallback floor when the named block is NOT one the operations touch', async () => {
+		it('refuses outright when the named block is NOT one the operations touch', async () => {
 			// Same record, same derived view, only the coordinating block changed to one the record's `get`
-			// never names. The derivation must not run at all, so the member judges D against the asserted
-			// cohort size instead: floor = ceil(0.75 * 8) = 6 > 3 → reject.
+			// never names. Previously this fell through to the fallback floor (a `low-confidence-downsize`
+			// reject that a member with no asserted cohort size would not have made at all).
 			const declared = shrunkDeclared();
 			let vote: { type: string; rejectReason?: string } | undefined;
 			const captured = await captureLog('cluster-member', async () => {
-				vote = await voteOn(self, declared, view(declared, 0.9), baseConfig({ assumedClusterSize: 8 }), 'block-the-operations-never-name');
+				vote = await voteOn(self, declared, view(declared, 0.9), baseConfig({ assumedClusterSize: 8 }), ['block-the-operations-never-name']);
 			});
 
 			expect(vote!.type).to.equal('reject');
-			expect(vote!.rejectReason).to.match(
-				new RegExp(`^${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize \\(declared=3, floor=6, assumedClusterSize=8\\)$`)
+			expect(vote!.rejectReason).to.equal(
+				`${MEMBERSHIP_NOT_ADMITTED}:unbound-coordinating-block (blockId=block-the-operations-never-name, affected=1)`
 			);
 			expect(hasTag(captured, 'cluster-member:coordinating-block-unbound'),
 				'the mismatch is logged, not silently swallowed').to.equal(true);
+		});
+
+		it('refuses an unbound block even with NO asserted cohort size', async () => {
+			// The half of the unbound case that was only nominally closed: with no `assumedClusterSize` the
+			// fallback admitted unconditionally, so the binding check bought nothing here.
+			const declared = shrunkDeclared();
+			const vote = await voteOn(self, declared, view(declared, 0.9), baseConfig(), ['block-the-operations-never-name']);
+			expect(vote.type).to.equal('reject');
+			expect(vote.rejectReason).to.equal(
+				`${MEMBERSHIP_NOT_ADMITTED}:unbound-coordinating-block (blockId=block-the-operations-never-name, affected=1)`
+			);
+		});
+
+		it('refuses a record that names no coordinating block at all', async () => {
+			const declared = shrunkDeclared();
+			let vote: { type: string; rejectReason?: string } | undefined;
+			const captured = await captureLog('cluster-member', async () => {
+				vote = await voteOn(self, declared, view(declared, 0.9), baseConfig({ assumedClusterSize: 8 }), 'omit');
+			});
+
+			expect(vote!.type).to.equal('reject');
+			expect(vote!.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:no-coordinating-block`);
+			expect(hasTag(captured, 'cluster-member:coordinating-block-absent'),
+				'the absence is logged, not silently swallowed').to.equal(true);
+		});
+
+		it('refuses an absent coordinating block with NO asserted cohort size (the headline case)', async () => {
+			// Today's behaviour before this change: admitted unconditionally. The refusal is about the
+			// sender's free choice, not about the floor's value — so removing the floor must not restore it.
+			const declared = shrunkDeclared();
+			const vote = await voteOn(self, declared, view(declared, 0.9), baseConfig(), 'omit');
+			expect(vote.type).to.equal('reject');
+			expect(vote.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:no-coordinating-block`);
+		});
+
+		it('treats a present-but-empty coordinatingBlockIds as naming nothing', async () => {
+			// A distinct wire shape from an absent field (the coordinator's own choke point tests `.length`
+			// precisely because of it), same defect.
+			const declared = shrunkDeclared();
+			const vote = await voteOn(self, declared, view(declared, 0.9), baseConfig({ assumedClusterSize: 8 }), []);
+			expect(vote.type).to.equal('reject');
+			expect(vote.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:no-coordinating-block`);
+		});
+
+		it('refuses an absent coordinating block even when D is the full set and the view agrees', async () => {
+			// The refusal is about the record's SHAPE, not its size: a full-size declared set that would sail
+			// through every size predicate does not excuse a record no current coordinator would build.
+			const full = cluster(8);
+			const vote = await voteOn(self, full, view(full, 0.9), baseConfig({ assumedClusterSize: 8 }), 'omit');
+			expect(vote.type).to.equal('reject');
+			expect(vote.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:no-coordinating-block`);
+		});
+
+		it('does NOT fire on a member with no derivation capability (legacy path intact)', async () => {
+			// A member with nothing to check against has no standing to judge the record's shape, so it must
+			// keep exactly its old behaviour on both halves of the fallback.
+			const legacyApprove = await voteOn(self, cluster(8), undefined, baseConfig(), 'omit');
+			expect(legacyApprove.type, 'no capability + no asserted size → legacy approve').to.equal('approve');
+
+			const legacyFloor = await voteOn(self, cluster(3), undefined, baseConfig({ assumedClusterSize: 8 }), 'omit');
+			expect(legacyFloor.type, 'no capability + asserted size → the existing floor reject').to.equal('reject');
+			expect(legacyFloor.rejectReason).to.match(
+				new RegExp(`^${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize \\(declared=3, floor=6, assumedClusterSize=8\\)$`)
+			);
+		});
+
+		it('keeps a failed derivation on a BOUND block lenient (receiver fault, not sender fault)', async () => {
+			// Only the sender-fault bucket moved. A block the operations DO name whose lookup throws is this
+			// member's own inability, so it keeps the fail-closed-against-assumedClusterSize posture —
+			// otherwise a transient routing hiccup would refuse every write.
+			const throwing: DeriveExpectedClusterCallback = async () => { throw new Error('routing unavailable'); };
+
+			const withAssertedSize = await voteOn(self, cluster(3), throwing, baseConfig({ assumedClusterSize: 8 }));
+			expect(withAssertedSize.type).to.equal('reject');
+			expect(withAssertedSize.rejectReason).to.match(
+				new RegExp(`^${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize \\(declared=3, floor=6, assumedClusterSize=8\\)$`)
+			);
+
+			const withoutAssertedSize = await voteOn(self, cluster(3), throwing, baseConfig());
+			expect(withoutAssertedSize.type, 'no asserted size → the legacy approve, unchanged').to.equal('approve');
+		});
+
+		it('the allowUnvalidatedSmallCluster opt-in still bypasses the record-shape refusal', async () => {
+			// It already bypasses the far stronger confident predicates; a weaker check must not become the
+			// one thing the documented single-node / local-dev escape hatch cannot get past.
+			const vote = await voteOn(self, cluster(3), view(cluster(3), 0.9),
+				baseConfig({ assumedClusterSize: 8, allowUnvalidatedSmallCluster: true }), 'omit');
+			expect(vote.type).to.equal('approve');
+		});
+
+		it('self-membership still wins over the record-shape refusal', async () => {
+			// A record that both omits this member and omits the coordinating block must still report
+			// `self-not-member` — the predicate order is load-bearing.
+			const withoutSelf = others.slice(0, 5);
+			const vote = await voteOn(self, withoutSelf, view(cluster(6), 0.9), baseConfig({ assumedClusterSize: 6 }), 'omit');
+			expect(vote.type).to.equal('reject');
+			expect(vote.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:self-not-member`);
 		});
 	});
 

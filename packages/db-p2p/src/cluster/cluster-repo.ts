@@ -132,12 +132,36 @@ export type ExpectedClusterView = {
  * Independently derive this member's own view of a block's responsible cluster. Injected so
  * {@link ClusterMember} stays transport-agnostic — the composition root supplies it from
  * `IKeyNetwork.findCluster` + FRET (mirroring how the coordinator derives the cluster). Absent on nodes
- * that cannot derive a view (no FRET, unit tests): with no derived view AND no asserted
+ * that cannot derive a view (no FRET, unit tests): with no capability AND no asserted
  * {@link ClusterConsensusConfig.assumedClusterSize} the gate preserves legacy approve behavior, but an
- * asserted size still lets the gate fail closed on an unjustified downsize. See {@link ClusterMember}
- * admission gate.
+ * asserted size still lets the gate fail closed on an unjustified downsize.
+ *
+ * Wiring this capability also arms the record-shape refusals: a member that CAN derive refuses outright
+ * (rather than falling back) when the record names no coordinating block, or names one the record's own
+ * operations never touch — those are the sender's free choice, not this member's inability. See
+ * {@link ClusterViewDerivation} and {@link ClusterMember} admission gate.
  */
 export type DeriveExpectedClusterCallback = (blockId: BlockId) => Promise<ExpectedClusterView>;
+
+/**
+ * Why a member does or does not have its own view of a record's cohort. The whole point of the union is
+ * that the caller MUST distinguish a fault of the RECEIVER (nothing to check against — stay lenient)
+ * from a fault of the SENDER (a record no current coordinator would build — refuse), a distinction a
+ * bare `undefined` erased and let a coordinator exploit: by choosing how it filled `coordinatingBlockIds`
+ * the coordinator chose which check every member ran.
+ *
+ * Module-internal on purpose — nothing outside this file consumes it.
+ */
+type ClusterViewDerivation =
+	/** The member resolved a view. Confidence / emptiness is judged by the caller, not here. */
+	| { kind: 'view'; view: ExpectedClusterView }
+	/** No {@link DeriveExpectedClusterCallback} wired (no FRET, unit tests): nothing to check against. */
+	| { kind: 'no-capability' }
+	/** A usable block was named but the lookup itself failed. Receiver fault. */
+	| { kind: 'underivable'; error: string }
+	/** The record names no block this member can legitimately derive from. Sender fault. */
+	| { kind: 'unusable-record'; variant: 'no-coordinating-block' }
+	| { kind: 'unusable-record'; variant: 'unbound-coordinating-block'; blockId: string; affected: number };
 
 /** Stable reject reason a member emits when a declared peer set fails the membership admission gate. */
 export const MEMBERSHIP_NOT_ADMITTED = 'membership-not-admitted';
@@ -1047,8 +1071,16 @@ export class ClusterMember implements ICluster {
 	 *  3. **Consistency with the derived view** — `|D △ E|` within `clusterSizeTolerance·|E|`; honest churn
 	 *     of a peer or two is absorbed, a wholesale-disjoint or half-size set is not.
 	 *
-	 * **Fail-closed posture.** When the member cannot confidently derive `E` (no capability, low FRET
-	 * confidence — exactly what a partition induces), it must refuse any *downsizing* decision — but it
+	 * **Inadmissible records come first.** Before any of that, a member that CAN derive refuses outright a
+	 * record whose coordinating block is the sender's free choice rather than a fact about the record: one
+	 * that names no coordinating block at all, or names a block the record's own operations never touch.
+	 * Those are defects of the SENDER, and no current coordinator produces them; treating them as "cannot
+	 * derive" would hand a dishonest coordinator the choice of which check every member ran. A member with
+	 * no derivation capability never reaches this refusal — it has nothing to check against.
+	 *
+	 * **Fail-closed posture.** When the member cannot confidently derive `E` — no capability, a bound
+	 * block whose lookup failed or returned an empty/low-confidence view (low FRET confidence is exactly
+	 * what a partition induces) — it must refuse any *downsizing* decision — but it
 	 * needs a size reference to judge "downsize" against, and it may NOT borrow `clusterSize` for that:
 	 * `clusterSize` is the replication factor (what a cohort should aim for), not a claim about how many
 	 * peers exist, so a small deployment configured with the default 10 would refuse every write. The
@@ -1073,12 +1105,53 @@ export class ClusterMember implements ICluster {
 		}
 
 		// Explicit opt-in: knowingly transact below the safe floor (single-node / local dev). Skips the
-		// size/consistency gates but not self-membership above.
+		// size/consistency gates AND the record-shape refusals below, but not self-membership above: it
+		// already bypasses the far stronger confident predicates, so making a weaker check the one thing it
+		// cannot bypass would be incoherent.
 		if (this.allowUnvalidatedSmallCluster) {
 			return { admit: true };
 		}
 
-		const derived = await this.deriveExpectedClusterView(record);
+		const derivation = await this.deriveExpectedClusterView(record);
+
+		// Split the sender's faults from this member's own. A record that names no coordinating block, or
+		// names one its own operations never touch, is one no current coordinator builds (every production
+		// sender goes through `ClusterCoordinator.executeClusterTransaction`, which stamps a bound id) — so
+		// it is inadmissible, not merely underived. Collapsing these into the lenient fallback let a
+		// dishonest coordinator choose which check every member ran, just by how it filled one field.
+		// Exhaustive switch on purpose: a future `kind` must not silently join the lenient bucket.
+		switch (derivation.kind) {
+			case 'unusable-record': {
+				log('cluster-member:admission-reject', {
+					messageHash: record.messageHash,
+					reason: derivation.variant,
+					declaredSize: declared.length
+				});
+				// The count of affected block ids, not the list: this string is signed into the vote and lands
+				// in dispute records, so a wide multi-block pend must not produce an unbounded reason.
+				// NOTE: `blockId` itself is copied verbatim from the (untrusted) record and nothing upstream
+				// bounds its length — fine while block ids are short content hashes; if a record ever carries
+				// a pathological id, truncate it here rather than signing an arbitrarily large reason string.
+				return {
+					admit: false,
+					reason: derivation.variant === 'no-coordinating-block'
+						? `${MEMBERSHIP_NOT_ADMITTED}:no-coordinating-block`
+						: `${MEMBERSHIP_NOT_ADMITTED}:unbound-coordinating-block (blockId=${derivation.blockId}, affected=${derivation.affected})`
+				};
+			}
+			// Receiver-side outcomes: a resolved view, no capability at all, or a bound block whose lookup
+			// failed. All three keep today's behaviour, judged below.
+			case 'view':
+			case 'no-capability':
+			case 'underivable':
+				break;
+			default: {
+				const exhaustive: never = derivation;
+				return exhaustive;
+			}
+		}
+
+		const derived = derivation.kind === 'view' ? derivation.view : undefined;
 		// An empty derived view (kEst === 0) carries no usable reference set: measured against it every
 		// non-empty declared set is wholly "inconsistent" (maxDiff = ceil(tol·0) = 0), which would spuriously
 		// reject a legitimate full cluster — a stricter, worse outcome than an absent view. Treat empty as
@@ -1180,23 +1253,40 @@ export class ClusterMember implements ICluster {
 	}
 
 	/**
-	 * Derive this member's own view of the record's block cluster via the injected capability, or
-	 * `undefined` when it cannot (no capability, no coordinating block id, a coordinating block not bound
-	 * to the record's own operations, or a derivation error — all of which the gate treats as "not
-	 * confident"). Derived from the record's coordinating block, the same key the coordinator used to
-	 * select the cluster.
+	 * Derive this member's own view of the record's block cluster via the injected capability, reporting
+	 * *why* when it cannot — see {@link ClusterViewDerivation}. Four outcomes, deliberately not collapsed
+	 * into one `undefined`: the member has no capability; the lookup failed; the record named no
+	 * coordinating block; the record named a block its own operations never touch. The last two are the
+	 * sender's choices and {@link admitMembership} refuses them; the first two are this member's own
+	 * limitation and stay lenient. Derived from the record's coordinating block, the same key the
+	 * coordinator used to select the cluster.
 	 *
 	 * Read off `record.message`, NOT a top-level record field: `messageHash` covers the message only, so
 	 * only the in-message copy is tamper-evident to a relaying peer. (There is no top-level copy any more —
 	 * see {@link ClusterRecord.message}.)
 	 */
-	private async deriveExpectedClusterView(record: ClusterRecord): Promise<ExpectedClusterView | undefined> {
+	private async deriveExpectedClusterView(record: ClusterRecord): Promise<ClusterViewDerivation> {
+		// Capability check FIRST, before the record's field is even read: a member with nothing to derive
+		// against must never report a sender fault — it has no standing to judge the record's shape.
 		if (!this.deriveExpectedCluster) {
-			return undefined;
+			return { kind: 'no-capability' };
 		}
+		// NOTE: only `coordinatingBlockIds[0]` is read. A pend may declare the whole consolidated batch
+		// here; the gate needs one block to derive a cohort from, and the coordinator's choke point puts
+		// the cohort key it actually selected against at index 0.
 		const blockId = record.message.coordinatingBlockIds?.[0];
 		if (blockId === undefined) {
-			return undefined;
+			// Covers both an absent field and a present-but-empty array — distinct wire shapes, same
+			// defect: the record names nothing to derive from. Every production sender routes through
+			// `ClusterCoordinator.executeClusterTransaction`, which stamps a bound id when the message has
+			// none, so no honest record reaches here.
+			//
+			// No rolling-upgrade gate is needed for this refusal: `validateRecord` already throws on a
+			// `membershipVersion` it does not implement, i.e. the cluster consensus code is one deployable
+			// unit that upgrades together, and a peer old enough to omit the field is on the pre-choke-point
+			// build of that same unit.
+			log('cluster-member:coordinating-block-absent', { messageHash: record.messageHash });
+			return { kind: 'unusable-record', variant: 'no-coordinating-block' };
 		}
 		// Hashing the field makes it tamper-evident to RELAYS, but the coordinator is the party this gate
 		// exists to check and it picks the field before it computes the hash. Unbound, a Byzantine
@@ -1206,14 +1296,21 @@ export class ClusterMember implements ICluster {
 		// record's OWN operations touch removes that free choice. `getAffectedBlockIds` is the same block
 		// extraction conflict detection already runs on this message — one definition, so the set a
 		// coordinating id must come from cannot drift from the set the record is judged to touch.
-		if (!this.getAffectedBlockIds(record.message.operations).includes(blockId)) {
+		const affected = this.getAffectedBlockIds(record.message.operations);
+		if (!affected.includes(blockId)) {
 			log('cluster-member:coordinating-block-unbound', {
 				messageHash: record.messageHash,
 				coordinatingBlockId: blockId
 			});
-			// Fail closed into the branch that already exists rather than throwing: a hard reject would
-			// change `validateRecord`'s failure surface, and "not confident" already refuses any downsize.
-			return undefined;
+			// Refuse, do not fall back: the fallback floor is the posture for a fault of THIS member, and
+			// letting a sender-chosen defect land there let the coordinator pick which check ran. Reported
+			// as a reject vote rather than a throw so the member emits a signed `reject` and dispute
+			// accounting keeps working — this stays out of `validateRecord`'s failure surface.
+			//
+			// `affected` is empty for a record with no operations, so any named block is unbound and the
+			// record is refused — correct (a record with no operations is malformed), and why `affected=0`
+			// can legitimately appear in the reason string.
+			return { kind: 'unusable-record', variant: 'unbound-coordinating-block', blockId, affected: affected.length };
 		}
 		// Which block a member derived its cohort view from is the single most useful fact when an
 		// admission decision has to be explained after the fact — and the only externally visible sign
@@ -1223,10 +1320,14 @@ export class ClusterMember implements ICluster {
 			// NOTE: derives (findCluster) once per inbound record on the promise path — one routing lookup
 			// per vote. If this shows up as hot, cache the derived view per (blockId, short TTL): it is a
 			// pure read of current topology, so a few-seconds-stale view is safe for admission.
-			return await this.deriveExpectedCluster(blockId as BlockId);
+			return { kind: 'view', view: await this.deriveExpectedCluster(blockId as BlockId) };
 		} catch (err) {
-			log('cluster-member:derive-expected-cluster-error', { messageHash: record.messageHash, error: (err as Error).message });
-			return undefined;
+			const error = (err as Error).message;
+			log('cluster-member:derive-expected-cluster-error', { messageHash: record.messageHash, error });
+			// Receiver fault: a bound block whose lookup threw. Stays lenient (the `assumedClusterSize`
+			// fallback) — that is the partition posture, and refusing here would make a transient routing
+			// hiccup refuse every write.
+			return { kind: 'underivable', error };
 		}
 	}
 
@@ -2282,8 +2383,9 @@ export class ClusterMember implements ICluster {
 	 * Every block id the message's own operations name. Two consumers, deliberately sharing one
 	 * definition: conflict detection (which writes must serialize against each other) and the membership
 	 * admission gate's binding check (the set a legitimate `coordinatingBlockIds[0]` must come from —
-	 * {@link ClusterMember.deriveExpectedClusterView}). If the two ever disagreed, a coordinator could
-	 * name a block the record is not judged to touch.
+	 * {@link ClusterMember.deriveExpectedClusterView}, which makes a record naming anything else
+	 * inadmissible). If the two ever disagreed, a coordinator could name a block the record is not judged
+	 * to touch.
 	 */
 	private getAffectedBlockIds(operations: RepoMessage['operations']): string[] {
 		const blockIds = new Set<string>();
