@@ -157,8 +157,11 @@ type ClusterViewDerivation =
 	| { kind: 'view'; view: ExpectedClusterView }
 	/** No {@link DeriveExpectedClusterCallback} wired (no FRET, unit tests): nothing to check against. */
 	| { kind: 'no-capability' }
-	/** A usable block was named but the lookup itself failed. Receiver fault. */
-	| { kind: 'underivable'; error: string }
+	/**
+	 * A usable block was named but the lookup itself failed. Receiver fault. Carries no payload: the
+	 * error is logged where it is caught, and the gate's response does not depend on which error it was.
+	 */
+	| { kind: 'underivable' }
 	/** The record names no block this member can legitimately derive from. Sender fault. */
 	| { kind: 'unusable-record'; variant: 'no-coordinating-block' }
 	| { kind: 'unusable-record'; variant: 'unbound-coordinating-block'; blockId: string; affected: number };
@@ -1132,6 +1135,9 @@ export class ClusterMember implements ICluster {
 				// NOTE: `blockId` itself is copied verbatim from the (untrusted) record and nothing upstream
 				// bounds its length — fine while block ids are short content hashes; if a record ever carries
 				// a pathological id, truncate it here rather than signing an arbitrarily large reason string.
+				// A fresh record carries no signatures, so `validateRecord` does not authenticate the sender
+				// before this point; what keeps it harmless is that the reason is bounded by the record the
+				// sender already transmitted (no amplification), not that the path is authenticated.
 				return {
 					admit: false,
 					reason: derivation.variant === 'no-coordinating-block'
@@ -1146,8 +1152,11 @@ export class ClusterMember implements ICluster {
 			case 'underivable':
 				break;
 			default: {
+				// `never` is the compile-time half of the guard: adding a `kind` without deciding its side
+				// of the sender/receiver split fails the build here. The runtime half returns a real
+				// verdict — fail closed — rather than the derivation object, which is not one.
 				const exhaustive: never = derivation;
-				return exhaustive;
+				return { admit: false, reason: `${MEMBERSHIP_NOT_ADMITTED}:${(exhaustive as { kind: string }).kind}` };
 			}
 		}
 
@@ -1281,10 +1290,13 @@ export class ClusterMember implements ICluster {
 			// `ClusterCoordinator.executeClusterTransaction`, which stamps a bound id when the message has
 			// none, so no honest record reaches here.
 			//
-			// No rolling-upgrade gate is needed for this refusal: `validateRecord` already throws on a
-			// `membershipVersion` it does not implement, i.e. the cluster consensus code is one deployable
-			// unit that upgrades together, and a peer old enough to omit the field is on the pre-choke-point
-			// build of that same unit.
+			// No rolling-upgrade gate guards this refusal, and `membershipVersion` is NOT that gate:
+			// `validateRecord` accepts v1 and unversioned records, and the choke point that stamps the
+			// field onto commit/cancel records (`commit-and-cancel-records-omit-the-coordinating-block`)
+			// landed without bumping the version — so a peer on a build older than that one sends
+			// commit/cancel records this refuses. The decision is that cluster consensus deploys as one
+			// unit and this project makes no cross-build compatibility promise; if that ever changes,
+			// the gate belongs here (admit an unversioned record on the lenient path), not in the caller.
 			log('cluster-member:coordinating-block-absent', { messageHash: record.messageHash });
 			return { kind: 'unusable-record', variant: 'no-coordinating-block' };
 		}
@@ -1322,12 +1334,11 @@ export class ClusterMember implements ICluster {
 			// pure read of current topology, so a few-seconds-stale view is safe for admission.
 			return { kind: 'view', view: await this.deriveExpectedCluster(blockId as BlockId) };
 		} catch (err) {
-			const error = (err as Error).message;
-			log('cluster-member:derive-expected-cluster-error', { messageHash: record.messageHash, error });
+			log('cluster-member:derive-expected-cluster-error', { messageHash: record.messageHash, error: (err as Error).message });
 			// Receiver fault: a bound block whose lookup threw. Stays lenient (the `assumedClusterSize`
 			// fallback) — that is the partition posture, and refusing here would make a transient routing
 			// hiccup refuse every write.
-			return { kind: 'underivable', error };
+			return { kind: 'underivable' };
 		}
 	}
 

@@ -112,6 +112,18 @@ const voteOn = async (
 	view: ExpectedClusterView | DeriveExpectedClusterCallback | undefined,
 	config?: ClusterConsensusConfig,
 	coordinatingBlockIds?: string[] | 'omit'
+): Promise<{ type: string; rejectReason?: string }> =>
+	voteOnRecord(self, view, config, await makeRecord(makeClusterPeers(declared), 'block-1', coordinatingBlockIds));
+
+/**
+ * The same vote, on an already-built record — for record shapes {@link makeRecord} cannot express
+ * (e.g. an operation list a well-typed sender could never produce but a wire record can carry).
+ */
+const voteOnRecord = async (
+	self: KeyPair,
+	view: ExpectedClusterView | DeriveExpectedClusterCallback | undefined,
+	config: ClusterConsensusConfig | undefined,
+	record: ClusterRecord
 ): Promise<{ type: string; rejectReason?: string }> => {
 	const member = clusterMember({
 		storageRepo: new MockRepo(),
@@ -122,7 +134,6 @@ const voteOn = async (
 		deriveExpectedCluster: view === undefined ? undefined : (typeof view === 'function' ? view : constantDerive(view))
 	});
 	try {
-		const record = await makeRecord(makeClusterPeers(declared), 'block-1', coordinatingBlockIds);
 		const result = await member.update(record);
 		const sig = result.promises[self.peerId.toString()];
 		return { type: sig?.type ?? 'none', rejectReason: sig?.type === 'reject' ? sig.rejectReason : undefined };
@@ -419,6 +430,34 @@ describe('ClusterMember — membership admission gate', () => {
 			expect(vote!.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:no-coordinating-block`);
 			expect(hasTag(captured, 'cluster-member:coordinating-block-absent'),
 				'the absence is logged, not silently swallowed').to.equal(true);
+			expect(hasTag(captured, 'cluster-member:admission-reject'),
+				'and it also emits the tag operators group every other admission refusal on').to.equal(true);
+		});
+
+		it('refuses with affected=0 when the record carries no operations at all', async () => {
+			// `RepoMessage.operations` is typed as exactly one operation, so no well-typed sender can build
+			// this — but a wire record can carry it, and nothing validates the arity before the gate runs.
+			// Nothing is bound, so any named block is unbound; this is the only shape that puts `affected=0`
+			// into the signed reason.
+			const declared = cluster(3);
+			const message: RepoMessage = {
+				operations: [] as unknown as RepoMessage['operations'],
+				coordinatingBlockIds: ['block-1'],
+				expiration: Date.now() + 30000
+			};
+			const record: ClusterRecord = {
+				messageHash: await computeMessageHash(message),
+				message,
+				peers: makeClusterPeers(declared),
+				promises: {},
+				commits: {}
+			};
+
+			const vote = await voteOnRecord(self, view(declared, 0.9), baseConfig({ assumedClusterSize: 8 }), record);
+			expect(vote.type).to.equal('reject');
+			expect(vote.rejectReason).to.equal(
+				`${MEMBERSHIP_NOT_ADMITTED}:unbound-coordinating-block (blockId=block-1, affected=0)`
+			);
 		});
 
 		it('refuses an absent coordinating block with NO asserted cohort size (the headline case)', async () => {
