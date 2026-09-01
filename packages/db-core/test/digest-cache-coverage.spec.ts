@@ -9,43 +9,42 @@ import type {
 /**
  * Declaration coverage under read-cache pressure.
  *
- * `computeBlockContentDigests` describes a commit WITHOUT loading anything: it peeks the read cache
- * for each touched block's base and omits any id the cache cannot answer for. The cache
- * (`CacheSource`) is an LRU with a default capacity of 128, and a `Collection` builds exactly one at
- * that default (`collection.ts` `probeHeader`). So coverage is bounded by the CACHE, not by the
- * transaction — and a commit whose update-carrying blocks outnumber the capacity declares only the
- * ids still resident.
+ * `computeBlockContentDigests` describes a commit WITHOUT loading anything: each updated block's
+ * committed base is PINNED at the moment its update is staged (`Tracker.update` -> `BasePins`) and
+ * the digest pass materializes from the pin, so coverage follows what the transaction read and
+ * staged — NOT what still happens to be resident in the 128-entry `CacheSource` LRU when the sync
+ * finally runs. The `update` module below reads the block before updating it, which is what every
+ * production caller (the B-tree write path specifically) does; that read is the moment the base
+ * gets pinned.
  *
- * That matters more than the omission-is-safe framing suggests: an undeclared block retains no
- * durable commit proof and so can never GAIN a holder by push. The consequence is stated in full at
- * `CommitRequest.blockDigests` in `src/network/struct.ts`.
+ * Declaration matters more than the omission-is-safe framing suggests: an undeclared block retains
+ * no durable commit proof and so can never GAIN a holder by push. The consequence is stated in full
+ * at `CommitRequest.blockDigests` in `src/network/struct.ts`.
  *
- * These tests measure that, through the production path (`Collection.act` → `Collection.sync` →
- * `computeBlockContentDigests`), rather than by poking the digest function directly — the unit-level
- * mechanics already have coverage in `digest.spec.ts`. They are the standing guard for the whole
- * class: if a remediation lands (size the cache to the transaction, or carry the base revision
- * alongside the staged updates), `declares every block it touches` starts passing and
- * `pins today's gap` starts failing, which is the signal to retire the second test and the NOTEs it
- * cites.
+ * These tests measure coverage through the production path (`Collection.act` → `Collection.sync` →
+ * `computeBlockContentDigests`), rather than by poking the digest function directly — the
+ * unit-level pin mechanics have their own coverage in `digest.spec.ts`. The one legitimate
+ * remaining omission for updates — a blind update to a block this node never read and that is not
+ * cached — has its own guard below, asserting it stays undeclared WITHOUT paying a network read.
  */
 
-/** Must match `CacheSource`'s `DefaultMaxSize`, which is what `Collection` constructs with.
- *
- * NOTE: the assertions below pin the SHAPE of the gap (bounded by the cache; identical at 2x and 4x),
- * not the exact declared count — deliberately, so they do not break on an off-by-one in how many
- * slots the collection's own header and log tail occupy. The consequence is that the concrete table
- * quoted in `src/transform/digest.ts` and in `debt-digest-coverage-capped-by-read-cache` (126
- * declared at N>=128) is NOT pinned by anything and will rot silently if `DefaultMaxSize` changes.
- * Re-measure it there if you change the cache default; last confirmed 2026-08-28. */
+/** Must match `CacheSource`'s `DefaultMaxSize`, which is what `Collection` constructs with. The
+ * pressure tests below stage transactions at multiples of this so eviction of every early base is
+ * guaranteed before the sync-time digest pass runs. */
 const CacheCapacity = 128
 
 interface TestAction { id?: string; op?: BlockOperation }
 
-/** Captures every CommitRequest reaching the transactor, delegating everything else. */
+/** Captures every CommitRequest reaching the transactor, and every block id requested through
+ * `get`, delegating everything else. */
 class CapturingTransactor implements ITransactor {
 	readonly commits: CommitRequest[] = []
+	readonly gotIds: string[] = []
 	constructor(private readonly inner: TestTransactor) { }
-	get(b: BlockGets): Promise<GetBlockResults> { return this.inner.get(b) }
+	get(b: BlockGets): Promise<GetBlockResults> {
+		this.gotIds.push(...b.blockIds)
+		return this.inner.get(b)
+	}
 	getStatus(a: ActionBlocks[]): Promise<BlockActionStatus[]> { return this.inner.getStatus(a) }
 	pend(r: PendRequest): Promise<PendResult> { return this.inner.pend(r) }
 	cancel(a: ActionBlocks): Promise<void> { return this.inner.cancel(a) }
@@ -64,7 +63,14 @@ const initOptions = {
 		insert: async (action: { data: TestAction }, store: BlockStore<IBlock>) => {
 			store.insert(makeBlock(store, action.data.id!))
 		},
+		// Read-then-write, like every production caller: the read is what makes the base pinnable
+		// at the moment the update is staged.
 		update: async (action: { data: TestAction }, store: BlockStore<IBlock>) => {
+			await store.tryGet(action.data.id!)
+			store.update(action.data.id!, action.data.op!)
+		},
+		// The blind form — no read — kept for the carve-out test below.
+		blindUpdate: async (action: { data: TestAction }, store: BlockStore<IBlock>) => {
 			store.update(action.data.id!, action.data.op!)
 		},
 	},
@@ -97,20 +103,36 @@ async function seedBlocks(
 	await collection.sync()
 }
 
+function makeIds(count: number): string[] {
+	return Array.from({ length: count }, (_, i) => `blk-${String(i).padStart(4, '0')}`)
+}
+
+const updateOp: BlockOperation = ['items', 0, 0, ['v']]
+
 describe('commit digest coverage under read-cache pressure', () => {
-	/** Drives one insert-then-update-everything round over `count` data blocks and reports what the
-	 *  update sync declared. */
-	async function measure(count: number, collectionId: string) {
+	async function setup(count: number, collectionId: string) {
 		const inner = new TestTransactor()
 		const transactor = new CapturingTransactor(inner)
 		const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
-
-		const ids = Array.from({ length: count }, (_, i) => `blk-${String(i).padStart(4, '0')}`)
+		const ids = makeIds(count)
 		await seedBlocks(collection, ids)
+		return { transactor, collection, ids }
+	}
+
+	/** Drives one insert-then-update-everything round over `count` data blocks and reports what the
+	 *  update sync declared. `actionType` picks the update module; `oneAct` batches every update
+	 *  into a single act() call (one Atomic) instead of one act() per block. */
+	async function measure(count: number, collectionId: string, actionType = 'update', oneAct = false) {
+		const { transactor, collection, ids } = await setup(count, collectionId)
 
 		const from = transactor.commits.length
-		for (const id of ids) {
-			await collection.act({ type: 'update', data: { id, op: ['items', 0, 0, ['v']] } })
+		const actions = ids.map(id => ({ type: actionType, data: { id, op: updateOp } }))
+		if (oneAct) {
+			await collection.act(...actions)
+		} else {
+			for (const action of actions) {
+				await collection.act(action)
+			}
 		}
 		await collection.sync()
 		expect(transactor.commits.length, 'the update round committed').to.be.greaterThan(from)
@@ -122,8 +144,8 @@ describe('commit digest coverage under read-cache pressure', () => {
 	}
 
 	// Control: a transaction that fits inside the cache declares everything it touches. Without this,
-	// the pressure test below could pass for a reason unrelated to eviction (a broken harness that
-	// never declares anything at all would look identical).
+	// the pressure tests below could pass for a reason unrelated to pinning (a broken harness that
+	// declares everything blindly, or nothing at all, would need this small case to differ).
 	it('declares every update-carrying block when the transaction fits in the read cache', async function () {
 		this.timeout(30_000)
 		const { updatedTouched, updatedDeclared } = await measure(CacheCapacity / 4, 'digest-coverage-small')
@@ -133,49 +155,62 @@ describe('commit digest coverage under read-cache pressure', () => {
 			.to.deep.equal(updatedTouched)
 	})
 
-	// The measurement arm C exists for. Twice the cache capacity in update-carrying blocks.
-	it('pins today\'s gap: a transaction larger than the read cache declares only part of itself', async function () {
-		this.timeout(60_000)
-		const count = CacheCapacity * 2
-		const { updatedTouched, updatedDeclared } = await measure(count, 'digest-coverage-large')
-
-		expect(updatedTouched.length, 'every seeded block is in the update commit').to.equal(count)
-
-		// The gap. When a remediation lands this flips and this test must be retired along with the
-		// accepted-tradeoff NOTEs at `transform/digest.ts` and `network/struct.ts` that cite it.
-		expect(updatedDeclared.length, 'coverage is bounded by the cache, so it is short of the transaction')
-			.to.be.lessThan(updatedTouched.length)
-
-		// ...and bounded by the cache specifically: the shortfall is never larger than eviction can
-		// explain. The collection's own header and log tail share the same 128 slots, so the declared
-		// count lands just under the capacity rather than exactly on it.
-		expect(updatedDeclared.length, 'no more update-carrying blocks are declared than the cache can hold')
-			.to.be.at.most(CacheCapacity)
-
-		// The surviving declarations are the RECENT ids, not an arbitrary subset — the LRU evicts
-		// oldest-first and the seeding loop touches ids in order. This is what makes the shortfall
-		// attributable to eviction rather than to some unrelated omission (an unreplayable op, a
-		// delete) that `digest.spec.ts` covers separately.
-		const declaredIndexes = updatedDeclared.map(id => updatedTouched.indexOf(id))
-		expect(Math.min(...declaredIndexes), 'the undeclared blocks are the oldest ones, i.e. the evicted ones')
-			.to.be.greaterThan(0)
-		expect(Math.max(...declaredIndexes), 'the newest touched block is still resident, so still declared')
-			.to.equal(updatedTouched.length - 1)
-	})
-
-	// The sharpest form of the defect, and the reason it is worth a standing guard rather than a
-	// comment: coverage does not merely thin out with transaction size, it CAPS. The number of
-	// declared blocks is a function of the cache capacity alone, so it is identical at 2x and 4x
-	// capacity while the touched count doubles — i.e. declared coverage decays as 1/N, and an
-	// arbitrarily large commit declares an arbitrarily small fraction of itself.
-	it('the declared count saturates at the cache capacity, so coverage decays as 1/N', async function () {
+	// The former defect: a transaction bigger than the cache used to declare only the ~126 ids still
+	// resident at sync time (min(N, capacity-2), decaying as 1/N). Pinning the base when the update
+	// is staged makes coverage a property of the transaction: every block the handlers read and
+	// updated is declared, at any multiple of the cache capacity.
+	it('declares every block it touches, even far beyond the cache capacity', async function () {
 		this.timeout(120_000)
 		const twoX = await measure(CacheCapacity * 2, 'digest-coverage-2x')
-		const fourX = await measure(CacheCapacity * 4, 'digest-coverage-4x')
+		expect(twoX.updatedDeclared, '2x the cache capacity: declared = touched')
+			.to.deep.equal(twoX.updatedTouched)
 
+		const fourX = await measure(CacheCapacity * 4, 'digest-coverage-4x')
 		expect(fourX.updatedTouched.length, 'the 4x transaction really does touch twice as much')
 			.to.equal(twoX.updatedTouched.length * 2)
-		expect(fourX.updatedDeclared.length, 'but declares exactly as many blocks as the 2x one')
-			.to.equal(twoX.updatedDeclared.length)
+		expect(fourX.updatedDeclared, '4x the cache capacity: declared = touched')
+			.to.deep.equal(fourX.updatedTouched)
+	})
+
+	// The Atomic.commit pin-adoption leg specifically: ONE act() whose handlers read+update more
+	// blocks than the cache holds. The flush to the collection tracker happens only at
+	// Atomic.commit, after every read in the batch already ran — so without the atomic capturing
+	// pins at stage time and adopting them into the parent, the early bases would be gone.
+	it('one act() carrying more actions than the cache capacity declares them all', async function () {
+		this.timeout(60_000)
+		const { updatedTouched, updatedDeclared } =
+			await measure(CacheCapacity * 2, 'digest-coverage-one-act', 'update', true)
+
+		expect(updatedTouched.length, 'every seeded block is in the update commit').to.equal(CacheCapacity * 2)
+		expect(updatedDeclared, 'a single oversized act() declares everything it staged')
+			.to.deep.equal(updatedTouched)
+	})
+
+	// The honest carve-out: a blind update — no read — to a block whose base is no longer cached
+	// has genuinely nothing to declare, and the commit must never pay a network read to describe
+	// itself. Seed 2x the capacity so the OLDEST quarter is guaranteed evicted, then blind-update
+	// only those: none may be declared, and none may be fetched to find out.
+	it('a blind update to a block this node never read stays undeclared, without fetching', async function () {
+		this.timeout(60_000)
+		const { transactor, collection, ids } = await setup(CacheCapacity * 2, 'digest-coverage-blind')
+
+		// The first quarter of the seed order — evicted from the LRU by the 192+ blocks seeded after
+		// them, and never read again below.
+		const evicted = ids.slice(0, CacheCapacity / 2)
+		const from = transactor.commits.length
+		const getsFrom = transactor.gotIds.length
+		for (const id of evicted) {
+			await collection.act({ type: 'blindUpdate', data: { id, op: updateOp } })
+		}
+		await collection.sync()
+
+		const { touched, declared } = coverageSince(transactor, from)
+		expect(evicted.filter(id => touched.has(id)), 'every blind-updated block is in the commit')
+			.to.deep.equal(evicted)
+		expect(evicted.filter(id => declared.has(id)), 'none of the never-read, evicted bases declare')
+			.to.deep.equal([])
+		const fetched = new Set(transactor.gotIds.slice(getsFrom))
+		expect(evicted.filter(id => fetched.has(id)), 'and nothing was fetched to find out')
+			.to.deep.equal([])
 	})
 })

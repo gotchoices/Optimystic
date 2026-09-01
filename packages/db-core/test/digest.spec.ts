@@ -170,6 +170,141 @@ describe('commit content digests', () => {
 		});
 	});
 
+	describe('base pins', () => {
+		it('pin survives LRU eviction: the base pinned at update time still declares', async () => {
+			const smallCache = new CacheSource(makeRevSource(blocks, revs), 1);
+			const smallTracker = new Tracker(smallCache);
+			await smallTracker.tryGet('a' as BlockId);
+			smallTracker.update('a' as BlockId, ['data', 0, 0, 'updated']);   // pin captured here
+			await smallTracker.tryGet('b' as BlockId);         // evicts 'a' from the cache
+			expect(smallCache.peek('a' as BlockId)).to.be.undefined;
+
+			const digests = await computeBlockContentDigests(smallTracker, ['a' as BlockId]);
+			expect(digests['a' as BlockId], 'declared from the pin despite eviction').to.not.be.undefined;
+			expect(digests['a' as BlockId]!.baseRev).to.equal(7);
+			const expected = applyTransform(
+				structuredClone(blocks.get('a')!),
+				transformForBlockId(smallTracker.transforms, 'a' as BlockId)
+			);
+			expect(digests['a' as BlockId]!.digest).to.equal(await canonicalBlockHash(expected!));
+		});
+
+		it('stale pin after clear(): omitted rather than declared from the stale base', async () => {
+			await tracker.tryGet('a' as BlockId);
+			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);          // pin captured
+			cache.clear(['a' as BlockId]);                     // generation bump: pin is now stale
+
+			// The cache can no longer answer either (cleared), so the only wrong outcome — declaring
+			// from the stale pin — must not happen; the id is omitted.
+			const digests = await computeBlockContentDigests(tracker, ['a' as BlockId]);
+			expect(digests).to.deep.equal({});
+		});
+
+		it('stale pin after transformCache(): recomputed from the folded live base, never the pin', async () => {
+			await tracker.tryGet('a' as BlockId);
+			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);          // pin captured at rev 7
+			const stalePinExpected = applyTransform(
+				structuredClone(blocks.get('a')!),
+				transformForBlockId(tracker.transforms, 'a' as BlockId)
+			);
+			cache.transformCache({ inserts: {}, updates: { ['a' as BlockId]: [['data', 0, 0, 'folded']] }, deletes: [] }, 9);
+
+			const digests = await computeBlockContentDigests(tracker, ['a' as BlockId]);
+			expect(digests['a' as BlockId]!.baseRev, 'declared at the folded revision').to.equal(9);
+			const foldedExpected = applyTransform(
+				cache.peek('a' as BlockId)!,
+				transformForBlockId(tracker.transforms, 'a' as BlockId)
+			);
+			expect(digests['a' as BlockId]!.digest).to.equal(await canonicalBlockHash(foldedExpected!));
+			expect(digests['a' as BlockId]!.digest, 'and NOT the stale pinned materialization')
+				.to.not.equal(await canonicalBlockHash(stalePinExpected!));
+		});
+
+		it('one base probe per id: 50 updates clone the base once', async () => {
+			await tracker.tryGet('a' as BlockId);
+			let peeks = 0;
+			const origPeek = cache.peek.bind(cache);
+			cache.peek = (id: BlockId) => { peeks++; return origPeek(id); };
+			for (let i = 0; i < 50; i++) {
+				tracker.update('a' as BlockId, ['items', 0, 0, [`v${i}`]]);
+			}
+			expect(peeks, 'the fresh-pin guard suppresses re-probing').to.equal(1);
+		});
+
+		it('insert after update drops the pin (result is base-independent)', async () => {
+			await tracker.tryGet('a' as BlockId);
+			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);
+			expect(tracker.pins.get('a' as BlockId)).to.not.be.undefined;
+			tracker.insert(makeBlock('a', 'replaced'));
+			expect(tracker.pins.get('a' as BlockId)).to.be.undefined;
+
+			const digests = await computeBlockContentDigests(tracker, ['a' as BlockId]);
+			expect(digests['a' as BlockId]).to.not.have.property('baseRev');
+		});
+
+		it('delete after update drops the pin (omitted)', async () => {
+			await tracker.tryGet('a' as BlockId);
+			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);
+			tracker.delete('a' as BlockId);
+			expect(tracker.pins.get('a' as BlockId)).to.be.undefined;
+
+			const digests = await computeBlockContentDigests(tracker, ['a' as BlockId]);
+			expect(digests).to.deep.equal({});
+		});
+
+		it('reset() empties the pin store; reset(transforms) retains exactly the still-staged updates', async () => {
+			await tracker.tryGet('a' as BlockId);
+			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);
+			await tracker.tryGet('b' as BlockId);
+			tracker.update('b' as BlockId, ['data', 0, 0, 'bee']);
+			expect(tracker.pins.size).to.equal(2);
+
+			tracker.reset();
+			expect(tracker.pins.size, 'a plain reset clears every pin').to.equal(0);
+
+			await tracker.tryGet('a' as BlockId);
+			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);
+			await tracker.tryGet('b' as BlockId);
+			tracker.update('b' as BlockId, ['data', 0, 0, 'bee']);
+			tracker.reset({ inserts: {}, updates: { ['a' as BlockId]: [['items', 0, 0, ['z']]] }, deletes: [] });
+			expect(tracker.pins.get('a' as BlockId), 'the still-staged id keeps its pin').to.not.be.undefined;
+			expect(tracker.pins.get('b' as BlockId), 'the dropped id loses its pin').to.be.undefined;
+			expect(tracker.pins.size).to.equal(1);
+		});
+
+		it('a source without getGeneration pins nothing and declares via the live path as before', async () => {
+			// peek/getCachedRevision present, getGeneration absent: drift-blind, so nothing pins —
+			// but the pre-pin live-peek path still answers.
+			const driftBlind = {
+				...makeRevSource(blocks, revs),
+				peek: (id: BlockId) => {
+					const block = blocks.get(id);
+					return block ? structuredClone(block) : undefined;
+				},
+				getCachedRevision: (id: BlockId) => revs.get(id),
+			} as BlockSource<TestBlock>;
+			const blindTracker = new Tracker(driftBlind);
+			await blindTracker.tryGet('a' as BlockId);
+			blindTracker.update('a' as BlockId, ['data', 0, 0, 'updated']);
+			expect(blindTracker.pins.size).to.equal(0);
+
+			const digests = await computeBlockContentDigests(blindTracker, ['a' as BlockId]);
+			expect(digests['a' as BlockId]!.baseRev).to.equal(7);
+		});
+
+		it('a digest pass leaves the pin store unchanged', async () => {
+			await tracker.tryGet('a' as BlockId);
+			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);
+			const pinBefore = structuredClone(tracker.pins.get('a' as BlockId));
+
+			const first = await computeBlockContentDigests(tracker, ['a' as BlockId]);
+			const second = await computeBlockContentDigests(tracker, ['a' as BlockId]);
+			expect(second, 'repeat passes agree (the pin is cloned on use, not mutated)').to.deep.equal(first);
+			expect(tracker.pins.size).to.equal(1);
+			expect(tracker.pins.get('a' as BlockId)).to.deep.equal(pinBefore);
+		});
+	});
+
 	describe('peekMaterialized', () => {
 		it('returns undefined when the source cannot answer locally (no peek probe)', () => {
 			// Tracker over a bare source (no peek/getCachedRevision): updates are un-digestable.

@@ -8,28 +8,23 @@ import type { Tracker } from "./tracker.js";
 const log = createLogger('digest');
 
 /** Digests for the blocks the tracker's staged transforms touch, computed WITHOUT loading anything
- * from the source. An id whose base is not already cached is omitted rather than fetched — an
- * omitted id never fails the commit, it only forfeits what a declaration buys (see the NOTE below).
+ * from the source. An id whose base is neither pinned nor cached is omitted rather than fetched —
+ * an omitted id never fails the commit, it only forfeits what a declaration buys (an undeclared
+ * block retains no durable `BlockCommitProof` and so can never GAIN a holder by push; stated once,
+ * canonically, at {@link CommitRequest.blockDigests} in `network/struct.ts`).
  * Each digest is the {@link canonicalBlockHash} of what {@link Tracker.peekMaterialized} says the
  * block will contain at the committing revision; `baseRev` rides along except for base-independent
  * (inserted) blocks. */
-// NOTE: coverage is bounded by the read cache, not by the transaction. A commit whose update-carrying
-// blocks outnumber the CacheSource capacity (default 128) silently digests only the ids still
-// resident, and the declared count does not merely thin out — it CAPS. Measured through the
-// production path (`Collection.act`/`sync`) in `test/digest-cache-coverage.spec.ts`: with N
-// update-carrying blocks the declared count is 32/32 at N=32, then 126 at N=128, 200, 256 AND 512
-// (126 = the 128 slots less the collection header and log tail), i.e. 100%, 98.4%, 63.0%, 49.2%,
-// 24.6%. Coverage therefore decays as 1/N and an arbitrarily large commit declares an arbitrarily
-// small fraction of itself. The survivors are the newest contiguous run, exactly as LRU eviction
-// predicts.
-// Omission also costs MORE than it used to: it still degrades gracefully on the read path, but an
-// undeclared block retains no durable `BlockCommitProof` and so can never GAIN a holder by push.
-// That consequence is stated once, canonically, at {@link CommitRequest.blockDigests} in
-// `network/struct.ts`; do not restate it here.
-// Still accepted here rather than fixed in place: both remedies are larger than this function —
-// size the cache to the transaction, or carry the base revision alongside the staged updates instead
-// of re-reading it here. Tracked as `debt-digest-coverage-capped-by-read-cache`. Revisit when a
-// workload legitimately commits more update-carrying blocks than the cache holds.
+// NOTE: declarability follows what the transaction read and staged, not read-cache residency. Each
+// updated block's committed base is pinned at the moment its update is staged (Tracker.update ->
+// BasePins) and held until the transaction boundary, so a commit of any size declares 100% of the
+// blocks whose bases it read — verified through the production path (`Collection.act`/`sync`) in
+// `test/digest-cache-coverage.spec.ts` at 2x and 4x the cache capacity. The two remaining
+// legitimate omissions: a delete (materializes to nothing) and a blind update to a block this node
+// never read whose base is not cached (nothing to declare, and a commit must never pay a network
+// read to describe itself). Residual gap: read-far-then-update — a block read, then evicted by
+// 128+ other reads, and only then updated, finds nothing to pin; see the NOTE at the pin site in
+// `tracker.ts`.
 export async function computeBlockContentDigests<T extends IBlock>(
 	tracker: Tracker<T>,
 	blockIds: BlockId[]

@@ -943,9 +943,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// Snapshot the pending actions so that any new actions aren't assumed to be part of this action
 			const pending = [...this.pending];
 
-			// Create a snapshot tracker for the action, so that we can ditch the log changes if we have to retry the action
+			// Create a snapshot tracker for the action, so that we can ditch the log changes if we have to retry the action.
+			// It SHARES the live tracker's pin store: the snapshot inherits transforms by copy and never
+			// stages the data-block updates itself, so without the shared pins the digest pass below
+			// could only describe bases still resident in the read cache.
 			const snapshot = copyTransforms(this.tracker.transforms);
-			const tracker = new Tracker(this.sourceCache, snapshot);
+			const tracker = new Tracker(this.sourceCache, snapshot, this.tracker.pins);
 
 			// Add the action to the log (in local tracking space)
 			const collectionLog = await Log.open<Action<TAction>>(tracker, this.id);

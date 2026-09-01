@@ -1,5 +1,7 @@
 import type { IBlock, BlockId, BlockStore as IBlockStore, BlockHeader, BlockOperation, BlockType, BlockSource as IBlockSource, ReadPurpose } from "../index.js";
 import { applyOperation, applyOperations, applyTransform, emptyTransforms, blockIdsForTransforms, transformForBlockId } from "./helpers.js";
+import { BasePins } from "./base-pins.js";
+import type { PinnedBase } from "./base-pins.js";
 import { ensured } from "../utility/ensured.js";
 
 /** A block store that collects transformations, without applying them to the underlying source.
@@ -19,12 +21,48 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 		private readonly source: IBlockSource<T>,
 		/** The collected set of transformations to be applied. Treat as immutable */
 		public transforms = emptyTransforms(),
+		/** Committed bases pinned at the moment each update was staged, so the digest pass can
+		 * describe every updated block even after the read cache evicts its base. Shared by
+		 * reference across the trackers of one transaction (see {@link BasePins}); pass an
+		 * existing store to join a transaction, omit for a private one. */
+		public readonly pins: BasePins = new BasePins(),
 	) { }
 
 	/** The source's generation for an id, or undefined if the source cannot report drift. */
 	private sourceGeneration(id: BlockId): number | undefined {
 		const src = this.source as { getGeneration?: (id: BlockId) => number };
 		return typeof src.getGeneration === 'function' ? src.getGeneration(id) : undefined;
+	}
+
+	/** The drift generation from the same authority {@link probeBase} pins from — chained through
+	 * nested trackers so an Atomic (whose source is the collection's tracker) validates its pins
+	 * against the collection's read cache, not against the drift-blind tracker in between. */
+	protected baseGeneration(id: BlockId): number | undefined {
+		if (this.source instanceof Tracker) return this.source.baseGeneration(id);
+		return this.sourceGeneration(id);
+	}
+
+	/** The committed base for `id` as this tracker's source can report it, plus that source's
+	 * revision and drift generation. Duck-typed on the source (CacheSource supplies all three),
+	 * and CHAINED when the source is itself a Tracker — the Atomic case — so an Atomic staged over
+	 * a Collection's tracker pins from the collection's read cache instead of finding nothing.
+	 * Returns undefined unless ALL THREE probes are available, which keeps drift-blind sources
+	 * (test doubles) on exactly the pre-pin behaviour. Recency-neutral: uses CacheSource.peek. */
+	protected probeBase(id: BlockId): PinnedBase | undefined {
+		if (this.source instanceof Tracker) return this.source.probeBase(id);
+		const src = this.source as {
+			peek?: (id: BlockId) => T | undefined;
+			getCachedRevision?: (id: BlockId) => number | undefined;
+			getGeneration?: (id: BlockId) => number;
+		};
+		if (typeof src.peek !== 'function' || typeof src.getCachedRevision !== 'function'
+			|| typeof src.getGeneration !== 'function') return undefined;
+		const block = src.peek(id);                      // already a clone (peek contract)
+		const rev = src.getCachedRevision(id);
+		// Require BOTH: an LRU-evicted id can leave a stale cached revision behind (see the NOTE on
+		// CacheSource's revisions map); peek returning undefined keeps it from pairing with a block.
+		if (block === undefined || rev === undefined) return undefined;
+		return { block, rev, gen: src.getGeneration(id) };
 	}
 
 	async tryGet(id: BlockId, purpose: ReadPurpose = 'value'): Promise<T | undefined> {
@@ -67,8 +105,9 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 
 	/** The block `id` materializes to under the staged transforms, computed WITHOUT loading from the
 	 * source, plus the committed revision of the base used. `undefined` when not computable here —
-	 * nothing staged for the id, the result is a delete, or an update's base is not locally cached
-	 * (a commit must not pay a network round trip to describe itself).
+	 * nothing staged for the id, the result is a delete, or an update's base is neither pinned
+	 * (see {@link pins}) nor locally cached (a commit must not pay a network round trip to
+	 * describe itself).
 	 *
 	 * Materializes with the canonical {@link applyTransform} — the exact function the member side
 	 * uses at commit — so client and member can never disagree on semantics (insert replaces the
@@ -91,6 +130,19 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 			transform.insert = structuredClone(transform.insert);
 			const block = applyTransform(undefined, transform);
 			return block ? { block } : undefined;
+		}
+		// Prefer the base pinned when the update was staged — it survives read-cache eviction, which
+		// is what keeps digest coverage a function of the transaction rather than of cache residency.
+		// The freshness check is correctness-critical, not an optimisation: a stale pin would declare
+		// a digest the member disagrees with, turning a blind-but-passing vote into a REJECT — an
+		// inaccurate declaration is strictly worse than no declaration, so a drifted pin falls through
+		// to the live peek below (which re-answers from the refreshed cache, or omits). The clone on
+		// use is also required, not defensive: applyTransform mutates, and syncAttempts re-runs the
+		// digest pass on every retry attempt against the same pin.
+		const pin = this.pins.get(id);
+		if (pin && pin.gen === this.baseGeneration(id)) {
+			const block = applyTransform(structuredClone(pin.block), transform);
+			return block ? { block, baseRev: pin.rev } : undefined;
 		}
 		const src = this.source as {
 			peek?: (id: BlockId) => T | undefined;
@@ -127,6 +179,8 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 		inserts[block.header.id] = structuredClone(block);
 		// Served from `inserts` now, not source+updates — the materialized memo no longer applies.
 		this.materialized.delete(block.header.id);
+		// An insert makes the materialized result base-independent, so any pinned base is moot.
+		this.pins.delete(block.header.id);
 		const deletes = this.transforms.deletes;
 		const deleteIndex = deletes?.indexOf(block.header.id) ?? -1;
 		if (deleteIndex >= 0) {
@@ -149,6 +203,20 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 			if (memo) {
 				applyOperation(memo.block, op);
 			}
+			// Pin the committed base NOW — the caller just read this block, so it is resident — and
+			// only when there is no still-fresh pin, so a block updated 50 times pays one base clone.
+			// A generation change (an external commit folded into the cache) re-pins against the new
+			// base, which is the base the member will apply the whole op list to.
+			// NOTE: read-far-then-update stays unpinned — a block read, then evicted by 128+ other
+			// reads, and only then updated, probes an already-evicted cache here and is omitted from
+			// the digest (pre-existing behaviour; digest.spec.ts pins it). If a workload ever reads a
+			// large batch before writing any of it, the closure is to pin on READ for ids that later
+			// get updated, at retention proportional to reads rather than to writes.
+			const existing = this.pins.get(blockId);
+			if (!existing || existing.gen !== this.baseGeneration(blockId)) {
+				const pin = this.probeBase(blockId);
+				if (pin) this.pins.set(blockId, pin);
+			}
 		}
 	}
 
@@ -156,6 +224,8 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 		if (this.transforms.inserts) delete this.transforms.inserts[blockId];
 		if (this.transforms.updates) delete this.transforms.updates[blockId];
 		this.materialized.delete(blockId);
+		// A delete materializes to nothing (delete-last-wins), so the pinned base is moot.
+		this.pins.delete(blockId);
 		const deletes = this.transforms.deletes ??= [];
 		deletes.push(blockId);
 	}
@@ -164,6 +234,9 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 		const oldTransform = this.transforms;
 		this.transforms = newTransform;
 		this.materialized.clear();
+		// The single reclamation point for pins: a plain reset clears them (empty updates), a
+		// rollback-style reset(transforms) keeps exactly the pins for ids still staged as updates.
+		this.pins.retainOnly(Object.keys(newTransform.updates ?? {}));
 		return oldTransform;
 	}
 
