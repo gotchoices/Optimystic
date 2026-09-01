@@ -40,7 +40,7 @@ interface Knobs {
 	treeTier: number;
 }
 
-function lifecycleWith(knobs: Knobs, config?: PromotionDeps['config']) {
+function lifecycleWith(knobs: Knobs, config?: PromotionDeps['config'], seed?: PromotionDeps['seedTransition']) {
 	const deps: PromotionDeps = {
 		store: { directParticipants: () => knobs.count },
 		loadBucket: () => knobs.loadBucket,
@@ -50,6 +50,7 @@ function lifecycleWith(knobs: Knobs, config?: PromotionDeps['config']) {
 		cohortCoord: () => COORD,
 		cohortEpoch: () => EPOCH,
 		signer,
+		seedTransition: seed,
 		config,
 	};
 	return createPromotionLifecycle(deps);
@@ -249,9 +250,12 @@ describe('cohort-topic / promotion remote-apply path', () => {
 // --- hasAdoptedState(): the eviction-ranking census the host's coord-engine registry reads ---
 //
 // The host tears down a coord engine under memory pressure. An engine whose lifecycle carries an adopted
-// promotion/demotion transition must not be treated as throwaway: `promoted` and the `lastEffectiveAt`
-// high-water cannot be rebuilt from the registration store, whereas growth samples and the low-load clock
-// are re-derived from it on the very next `onParticipantCountChange`. This suite covers that boundary.
+// promotion/demotion transition is preferentially kept: `promoted` and the `lastEffectiveAt` high-water do
+// not rebuild from the registration store the way growth samples and the low-load clock do (those re-derive
+// on the very next `onParticipantCountChange`). The ranking is a preference, not the safety mechanism: the
+// node-level adopted-transition record (`PromotionDeps.seedTransition` — db-p2p's promote-gate map) outlives
+// every engine and re-seeds a recreated one, so eviction costs a seed read, never correctness. This suite
+// covers that boundary.
 //
 // Note on wording: adopted state RANKS an engine (evicted only after every engine holding nothing), it does
 // not *pin* it — the host reserves "pinned" for registration records and cold-start forwarders, which are
@@ -318,5 +322,56 @@ describe('cohort-topic / promotion adopted-state census (hasAdoptedState)', () =
 		life.applyPromotionNotice(promoNotice(100, OTHER), 1_000);
 		expect(life.isPromoted(TOPIC), 'the first topic is untouched').to.be.false;
 		expect(life.hasAdoptedState(), 'the second topic ranks the engine anyway').to.be.true;
+	});
+});
+
+// --- seedTransition: re-seeding a recreated lifecycle from the node-level adopted-transition record ---
+//
+// The host's promote-gate map outlives every engine; a freshly created lifecycle reads it once per topic
+// (on first state creation, plus an isPromoted peek before any state exists) so eviction + recreation
+// neither reopens the replay window nor forgets a correct promoted mode.
+
+describe('cohort-topic / promotion seeded replay ordering (seedTransition)', () => {
+	const promoNotice = (effectiveAt: number): PromotionNoticeV1 => ({
+		v: 1, topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, cohortCoord: bytesToB64url(COORD), effectiveAt,
+		thresholdSig: '', signers: [], cohortEpoch: bytesToB64url(EPOCH),
+	});
+	const baseKnobs = (): Knobs => ({ count: 0, loadBucket: 0, children: 0, treeTier: 1 });
+
+	it('a promoted seed is visible to isPromoted with zero prior calls (the peek)', () => {
+		const life = lifecycleWith(baseKnobs(), undefined, () => ({ effectiveAt: 200, promoted: true }));
+		expect(life.isPromoted(TOPIC), 'the recreated lifecycle reports promoted straight off the seed').to.be.true;
+	});
+
+	it('a promoted seed re-arms the sticky window at state creation — a demotion is delayed, not skipped', async () => {
+		const knobs = baseKnobs();
+		const life = lifecycleWith(knobs, undefined, () => ({ effectiveAt: 200, promoted: true }));
+		const t0 = 1_000;
+		// The first count observation creates the state: seeded promoted, promotedAt re-armed to t0 (the
+		// original sticky anchor died with the evicted engine), and the low count stamps lowLoadSince = t0.
+		expect(await life.onParticipantCountChange(TOPIC, t0), 'already promoted — nothing new fires').to.equal(undefined);
+		// Inside the re-armed sticky window demotion is refused...
+		expect(await life.maybeDemote(TOPIC, t0 + DEFAULT_T_PROMOTE_STICKY_MS - 1), 'sticky re-armed at the seed').to.equal(undefined);
+		expect(life.isPromoted(TOPIC), 'still promoted inside the window').to.be.true;
+		// ...and non-vacuity: once sticky AND T_demote both clear, the same lifecycle DOES demote — the
+		// seeded promoted mode is a real, demotable promotion, not a stuck flag.
+		const notice = await life.maybeDemote(TOPIC, t0 + DEFAULT_T_DEMOTE_MS + DEFAULT_T_PROMOTE_STICKY_MS);
+		expect(notice, 'demotion fires once the hysteresis clears').to.not.equal(undefined);
+		expect(life.isPromoted(TOPIC), 'the seeded promotion demoted normally').to.be.false;
+	});
+
+	it('a demoted seed stale-drops a replayed older promotion (the eviction replay hole)', () => {
+		const life = lifecycleWith(baseKnobs(), undefined, () => ({ effectiveAt: 200, promoted: false }));
+		expect(life.isPromoted(TOPIC), 'the seed carries the demoted direction').to.be.false;
+		// The captured promote@100 replayed after eviction + recreation: 100 ≤ the seeded 200 → a no-op.
+		life.applyPromotionNotice(promoNotice(100), 1_000);
+		expect(life.isPromoted(TOPIC), 'the replayed stale promotion cannot re-promote the demoted cohort').to.be.false;
+	});
+
+	it('a seed returning undefined leaves the lifecycle cold — identical to no seed at all', () => {
+		const life = lifecycleWith(baseKnobs(), undefined, () => undefined);
+		expect(life.isPromoted(TOPIC), 'cold start').to.be.false;
+		life.applyPromotionNotice(promoNotice(100), 1_000);
+		expect(life.isPromoted(TOPIC), 'a first fresh notice applies exactly as before').to.be.true;
 	});
 });

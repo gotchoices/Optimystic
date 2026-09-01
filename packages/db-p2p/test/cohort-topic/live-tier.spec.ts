@@ -54,7 +54,7 @@ import { bytesToPeerIdString } from '../../src/cohort-topic/peer-codec.js';
 import { signPeer } from '../../src/cohort-topic/peer-sig.js';
 import { FretTrustAnchor, type FretRingView } from '../../src/cohort-topic/fret-trust-anchor.js';
 import { createVerifyOnlyThresholdCrypto } from '../../src/cohort-topic/threshold-crypto.js';
-import { verifyAndApplyNotice, type NoticeApplyTarget } from '../../src/cohort-topic/host.js';
+import { verifyAndApplyNotice, transitionKey, type NoticeApplyTarget } from '../../src/cohort-topic/host.js';
 import {
 	addressing,
 	buildMesh,
@@ -208,6 +208,13 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 			// The originator adopts promoted mode once the threshold-sign round completes; a node that did NOT
 			// originate the notice verify-applies it (over the `promote` + `membership` protocols).
 			expect(await waitFor(() => decidingEngine.isPromoted(TOPIC), 8_000), 'the originating cohort is promoted').to.equal(true);
+			// The origination path also writes the node-level adopted-transition record: `broadcastOver` excludes
+			// self, so nothing inbound can have written it on the deciding node — only the host's `broadcastNotice`
+			// origination seam. (`promote()` flips engine state before the host broadcasts, hence the poll.)
+			expect(
+				await waitFor(() => deciding.host.promoteGate.transitions.get(transitionKey(bytesToB64url(coord0), 0, bytesToB64url(TOPIC)))?.promoted === true, 8_000),
+				'the ORIGINATING node wrote its own node-level transition record',
+			).to.equal(true);
 			expect(await waitFor(() => siblingEngine.isPromoted(TOPIC), 8_000), 'a non-originating cohort node verify-applied the promotion notice').to.equal(true);
 
 			// One more registration past cap_promote now gets the cheap Promoted(d+1) redirect, not an accept.

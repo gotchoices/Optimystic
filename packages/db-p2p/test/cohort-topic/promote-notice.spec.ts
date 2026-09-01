@@ -35,6 +35,8 @@ import {
 	noticeBroadcastCoords,
 	handleInboundNotice,
 	createPromoteGate,
+	recordAdoptedTransition,
+	noticeTransitionKey,
 	PROMOTE_TRANSITIONS_MAX_KEYS,
 	type NoticeApplyTarget,
 	type InboundNoticeResult,
@@ -66,6 +68,8 @@ const OTHER_COORD: RingCoord = Uint8Array.from({ length: 32 }, (_v, i) => (i * 1
 const EPOCH = Uint8Array.from({ length: 32 }, (_v, i) => (i * 3 + 9) & 0xff);
 const PARENT: RingCoord = Uint8Array.from({ length: 32 }, (_v, i) => (i * 5 + 2) & 0xff);
 const TOPIC = Uint8Array.from({ length: 32 }, (_v, i) => (i + 11) & 0xff);
+/** A second topic at the same coord — the per-topic-keying tests need two topics ordering independently. */
+const TOPIC_B = Uint8Array.from({ length: 32 }, (_v, i) => (i * 13 + 29) & 0xff);
 
 /** `dialSign` that endorses honestly for every member in `byId`. */
 function honestDialSign(byId: Map<string, Member>): (peerStr: string, req: SignRequestV1) => Promise<SignReplyV1> {
@@ -321,9 +325,9 @@ const trustAllVerifier: MembershipVerifier = {
 };
 
 /** A structurally-valid promotion notice decided at `coord` (dummy sig — only used with {@link trustAllVerifier}). */
-function promotionNoticeAtCoord(coord: RingCoord, effectiveAt: number): PromotionNoticeV1 {
+function promotionNoticeAtCoord(coord: RingCoord, effectiveAt: number, topicId: Uint8Array = TOPIC): PromotionNoticeV1 {
 	return {
-		v: 1, topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, cohortCoord: bytesToB64url(coord), effectiveAt,
+		v: 1, topicId: bytesToB64url(topicId), fromTier: 1, toTier: 2, cohortCoord: bytesToB64url(coord), effectiveAt,
 		thresholdSig: DUMMY_SIG, signers: [bytesToB64url(TOPIC)], cohortEpoch: bytesToB64url(EPOCH),
 	};
 }
@@ -387,7 +391,7 @@ describe('cohort-topic: inbound promote-handler anti-abuse gate', () => {
 		expect(calls(), 'the verifier ran only for the admitted frames').to.equal(ratePerWindow);
 	});
 
-	it('a notice at or below the (topic, tier) high-water is dropped before the verifier (replay)', async () => {
+	it('a notice at or below the recorded (coord, tier, topic) adopted transition is dropped before the verifier (replay)', async () => {
 		const members = await makeMembers(4);
 		const byId = new Map(members.map((m) => [m.idStr, m]));
 		const encoded = await encodedCertOver(members, byId, minSigs);
@@ -398,7 +402,7 @@ describe('cohort-topic: inbound promote-handler anti-abuse gate', () => {
 		const gate = createPromoteGate({ ratePerWindow: 10_000 });
 		const from = peerIdToBytes('honest');
 
-		// A real promotion at effectiveAt = 5_000 verifies, applies, and sets the high-water.
+		// A real promotion at effectiveAt = 5_000 verifies, applies, and writes the adopted-transition record.
 		const promo = await realPromotionNotice(members, byId, minSigs, 5_000);
 		expect(await handleInboundNotice(encodeCohortMessage(promo), from, registry, verifier, gate, 6_000)).to.equal('applied');
 		expect(life.isPromoted(TOPIC), 'the fresh promotion applied').to.be.true;
@@ -412,7 +416,7 @@ describe('cohort-topic: inbound promote-handler anti-abuse gate', () => {
 		expect(calls(), 'neither stale notice reached the verifier').to.equal(afterApply);
 	});
 
-	it('a fresh legit notice above the high-water still applies, and advances the water', async () => {
+	it('a fresh legit notice above the recorded transition still applies, and advances the record', async () => {
 		const members = await makeMembers(4);
 		const byId = new Map(members.map((m) => [m.idStr, m]));
 		const encoded = await encodedCertOver(members, byId, minSigs);
@@ -431,7 +435,7 @@ describe('cohort-topic: inbound promote-handler anti-abuse gate', () => {
 		expect(await handleInboundNotice(encodeCohortMessage(fresh), from, registry, verifier, gate, 10_000)).to.equal('applied');
 		expect(life.isPromoted(TOPIC), 'the fresh promotion applied').to.be.true;
 
-		// The water advanced to 9_000: a replay at 9_000 is now stale.
+		// The record advanced to 9_000: a replay at 9_000 is now stale.
 		const replay = await realPromotionNotice(members, byId, minSigs, 9_000);
 		expect(await handleInboundNotice(encodeCohortMessage(replay), from, registry, verifier, gate, 11_000)).to.equal('stale');
 	});
@@ -483,22 +487,79 @@ describe('cohort-topic: inbound promote-handler anti-abuse gate', () => {
 		expect(b.life.isPromoted(TOPIC), 'sibling target B at a different coord is untouched').to.be.false;
 	});
 
-	it('a notice for cohort A does not advance or stale-drop cohort B (per-coord high-water)', async () => {
+	it('a notice for cohort A does not advance or stale-drop cohort B (per-coord transition record)', async () => {
 		// Pre-fix, both cohorts shared a `${topicId}|${tier}` high-water, so A applying at effectiveAt = t would
-		// stale-drop a legitimate B notice at the same t. Per-coord keying keeps their waters independent.
+		// stale-drop a legitimate B notice at the same t. Per-coord keying keeps their records independent.
 		const a = remoteTargetAt(COORD, minSigs);
 		const b = remoteTargetAt(OTHER_COORD, minSigs);
 		const registry = coordRegistry(a.target, b.target);
 		const gate = createPromoteGate({ ratePerWindow: 10_000 });
 		const from = peerIdToBytes('honest');
 
-		// A applies at effectiveAt = 5_000 → advances ONLY A's water.
+		// A applies at effectiveAt = 5_000 → advances ONLY A's record.
 		expect(await handleInboundNotice(encodeCohortMessage(promotionNoticeAtCoord(COORD, 5_000)), from, registry, trustAllVerifier, gate, 6_000)).to.equal('applied');
-		// B's own notice at the SAME effectiveAt must still apply — B's water was never touched by A.
+		// B's own notice at the SAME effectiveAt must still apply — B's record was never touched by A.
 		expect(await handleInboundNotice(encodeCohortMessage(promotionNoticeAtCoord(OTHER_COORD, 5_000)), from, registry, trustAllVerifier, gate, 7_000)).to.equal('applied');
 		expect(b.life.isPromoted(TOPIC), 'B adopted its own notice despite an equal effectiveAt to A').to.be.true;
-		// Sanity: an A replay at 5_000 IS stale — A's own per-coord water sits at 5_000.
+		// Sanity: an A replay at 5_000 IS stale — A's own per-coord record sits at 5_000.
 		expect(await handleInboundNotice(encodeCohortMessage(promotionNoticeAtCoord(COORD, 5_000)), from, registry, trustAllVerifier, gate, 8_000)).to.equal('stale');
+	});
+
+	it('a notice for topic B is not stale-dropped by topic A\'s record at the same (coord, tier) (per-topic keying)', async () => {
+		// Pre-fix the record was keyed `coord|tier` only, conflating every topic at one coord — topic A applying
+		// at effectiveAt = 5_000 would stale-drop a legitimate topic-B notice at 4_000 for the same coord. The
+		// per-topic key lets the two topics order independently. One engine serves both topics (a lifecycle is
+		// per-coord, keyed by topic internally), so a single target covers the pair.
+		const a = remoteTargetAt(COORD, minSigs);
+		const registry = servingRegistry(a.target);
+		const gate = createPromoteGate({ ratePerWindow: 10_000 });
+		const from = peerIdToBytes('honest');
+
+		// Topic A applies at effectiveAt = 5_000 → records ONLY (COORD, tier, TOPIC).
+		expect(await handleInboundNotice(encodeCohortMessage(promotionNoticeAtCoord(COORD, 5_000)), from, registry, trustAllVerifier, gate, 6_000)).to.equal('applied');
+		// Topic B at the SAME coord with an OLDER effectiveAt must still apply — its ordering is its own.
+		expect(await handleInboundNotice(encodeCohortMessage(promotionNoticeAtCoord(COORD, 4_000, TOPIC_B)), from, registry, trustAllVerifier, gate, 7_000), 'topic B is not shadowed by topic A\'s record').to.equal('applied');
+		expect(a.life.isPromoted(TOPIC_B), 'topic B adopted its own notice despite a lower effectiveAt than topic A').to.be.true;
+		// Sanity: a topic-A replay at 5_000 IS stale — its own per-topic record sits at 5_000.
+		expect(await handleInboundNotice(encodeCohortMessage(promotionNoticeAtCoord(COORD, 5_000)), from, registry, trustAllVerifier, gate, 8_000)).to.equal('stale');
+	});
+});
+
+// --- recordAdoptedTransition: the node-level adopted-transition record (unit) ---
+
+describe('cohort-topic: recordAdoptedTransition (node-level adopted-transition record)', () => {
+	// Plain notice literals: this path never validates or verifies — the caller already adopted the notice.
+	const promo = (effectiveAt: number, fromTier = 1): PromotionNoticeV1 => ({
+		v: 1, topicId: bytesToB64url(TOPIC), fromTier, toTier: fromTier + 1, cohortCoord: bytesToB64url(COORD), effectiveAt,
+		thresholdSig: '', signers: [], cohortEpoch: bytesToB64url(EPOCH),
+	});
+	const demo = (effectiveAt: number, tier = 1): DemotionNoticeV1 => ({
+		v: 1, topicId: bytesToB64url(TOPIC), tier, parentCohortCoord: bytesToB64url(PARENT), cohortCoord: bytesToB64url(COORD), effectiveAt,
+		thresholdSig: '', signers: [], cohortEpoch: bytesToB64url(EPOCH),
+	});
+
+	it('records the direction: a promotion sets promoted = true, a newer demotion overwrites it with false', () => {
+		const gate = createPromoteGate();
+		recordAdoptedTransition(gate, promo(100));
+		expect(gate.transitions.get(noticeTransitionKey(promo(100))), 'the promotion recorded its direction').to.deep.equal({ effectiveAt: 100, promoted: true });
+		recordAdoptedTransition(gate, demo(200));
+		expect(gate.transitions.get(noticeTransitionKey(demo(200))), 'the strictly-newer demotion overwrote it').to.deep.equal({ effectiveAt: 200, promoted: false });
+	});
+
+	it('is monotonic per key: an older or equal effectiveAt never overwrites', () => {
+		const gate = createPromoteGate();
+		recordAdoptedTransition(gate, demo(200));
+		recordAdoptedTransition(gate, promo(100)); // older — the captured-replay shape
+		expect(gate.transitions.get(noticeTransitionKey(demo(200))), 'an older promotion cannot overwrite').to.deep.equal({ effectiveAt: 200, promoted: false });
+		recordAdoptedTransition(gate, promo(200)); // equal effectiveAt
+		expect(gate.transitions.get(noticeTransitionKey(demo(200))), 'an equal-effectiveAt promotion cannot overwrite either').to.deep.equal({ effectiveAt: 200, promoted: false });
+	});
+
+	it('a demotion at tier t and a promotion from tier t address the same key at one (coord, topic)', () => {
+		// The two notice shapes carry the deciding cohort's tree tier in different fields (`tier` vs `fromTier`);
+		// they must land on ONE key so a demotion and a later promotion of the same cohort order against each other.
+		expect(noticeTransitionKey(demo(0, 1)), 'both shapes address the same (coord, tier, topic) entry')
+			.to.equal(noticeTransitionKey(promo(0, 1)));
 	});
 });
 
@@ -594,7 +655,7 @@ describe('cohort-topic: promote-gate bounded memory', () => {
 		expect(life.isPromoted(TOPIC), 'the engine idempotently ignored the stale demotion — no regression').to.be.true;
 	});
 
-	it('a flood of forged (never-applied) notices leaves highWater empty — only verified applies write it', async () => {
+	it('a flood of forged (never-applied) notices leaves the transition map empty — only verified applies write it', async () => {
 		const members = await makeMembers(4);
 		const byId = new Map(members.map((m) => [m.idStr, m]));
 		const verifier = await verifierOver(members, byId, minSigs);
@@ -727,7 +788,7 @@ describe('cohort-topic: demotion notice unlinks the child at its parent cohort',
 		expect(child.life.isPromoted(TOPIC), 'the sibling-adopt cleared promoted').to.be.false;
 		expect(parent.childCohortCount(TOPIC), 'the parent-unlink released the child — neither path shadows the other').to.equal(0);
 
-		// The sibling-adopt advanced the COORD high-water to 1_000; a replay of the SAME frame stale-drops the
+		// The sibling-adopt advanced the COORD adopted-transition record to 1_000; a replay of the SAME frame stale-drops the
 		// sibling path but the parent-unlink still runs (independent freshness) — a registry no-op, no throw.
 		const replay = await handleInboundNotice(encodeCohortMessage(demo), from, registry, verifier, gate, 3_000);
 		expect(result === 'applied' && replay === 'unlinked', 'the replay: sibling stale, parent-unlink still runs').to.be.true;

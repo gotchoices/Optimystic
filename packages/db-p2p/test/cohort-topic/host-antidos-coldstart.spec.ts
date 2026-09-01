@@ -18,13 +18,14 @@ import {
 	DEFAULT_REPLAY_MAX_AGE_MS,
 	validateChildLinkV1,
 	type ChildLinkV1,
+	type MembershipVerifier,
 	type RegisterV1,
 	type RenewV1,
 	type PromotionNoticeV1,
 	type RingCoord,
 	type Tier,
 } from '@optimystic/db-core';
-import { createCohortTopicHost, dispatchChildLink, resolveRenew, DEFAULT_COORD_ENGINES_MAX, EVICTION_RANK, CoordEngineRegistryFullError, type DispatchChildLinkDeps } from '../../src/cohort-topic/host.js';
+import { createCohortTopicHost, dispatchChildLink, resolveRenew, handleInboundNotice, transitionKey, DEFAULT_COORD_ENGINES_MAX, EVICTION_RANK, CoordEngineRegistryFullError, type DispatchChildLinkDeps } from '../../src/cohort-topic/host.js';
 import type { BootstrapParentTopicView } from '../../src/cohort-topic/bootstrap-parent-reference.js';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
 import { signPeerSig } from '../../src/cohort-topic/peer-sig.js';
@@ -852,6 +853,77 @@ describe('cohort-topic: coord-engine registry cap (attacker-keyed engine creatio
 		for (const coord of originals.slice(1)) {
 			expect(host.registry.findByCoord(coord), 'the cold originals were reclaimed').to.equal(undefined);
 		}
+
+		await host.stop();
+	});
+
+	// --- the adopted-transition record vs. engine eviction (bug-promotion-state-survives-engine-eviction) ---
+
+	/** A verifier that trusts every notice — isolates the record/seed behavior under test from crypto. */
+	const trustAll: MembershipVerifier = {
+		cache: (): undefined => undefined,
+		forget: (): undefined => undefined,
+		verifyMessage: (): Promise<'verified'> => Promise.resolve('verified'),
+	};
+	/** A structurally-valid b64url signature field: `decodeInboundNotice` validates shape, not crypto. */
+	const DUMMY_SIG = bytesToB64url(Uint8Array.from({ length: 64 }, () => 7));
+	/** A tier-0 promotion notice that survives `decodeInboundNotice`'s structural validation (the gate path —
+	 * unlike {@link promoNoticeFor}, which is fed straight to `applyPromotionNotice` and skips validation). */
+	function gateNoticeFor(topicId: Uint8Array, cohortCoord: RingCoord, effectiveAt: number): PromotionNoticeV1 {
+		return {
+			v: 1,
+			topicId: bytesToB64url(topicId),
+			fromTier: 0,
+			toTier: 1,
+			cohortCoord: bytesToB64url(cohortCoord),
+			effectiveAt,
+			thresholdSig: DUMMY_SIG,
+			signers: [bytesToB64url(topicId)],
+			cohortEpoch: bytesToB64url(new Uint8Array(32)),
+		};
+	}
+
+	it('an adopted transition survives engine eviction: the recreated engine seeds promoted mode and stale-drops the replay', async () => {
+		// THE regression the node-level transition record exists for. Pre-fix, the only replay ordering lived
+		// inside the engine (`PromotionState.lastEffectiveAt`), so evicting the engine under memory pressure
+		// discarded both the ordering AND the adopted `promoted = true` — anyone replaying a captured old
+		// notice could then re-apply it on the recreated engine.
+		const CAP = 2;
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { coordEnginesMax: CAP },
+		});
+		const participant = await makeParticipantBytes();
+		const T = topicAt(0);
+		const A = addressing.coord0(T);
+
+		// 1. Adopt a verified (trust-all) promotion at coord A → the engine flips promoted AND the adopt
+		//    writes the node-level record. The engine's tree tier (0) matches the notice's fromTier, so the
+		//    inbound write and the recreation-time seed read address the same key.
+		host.registry.forCoord(A, 0 as Tier, participant);
+		const frame = encodeCohortMessage(gateNoticeFor(T, A, 10_000));
+		expect(await handleInboundNotice(frame, participant, host.registry, trustAll, host.promoteGate, 11_000), 'the notice adopts').to.equal('applied');
+		expect(host.registry.findByCoord(A)!.isPromoted(T), 'the resident engine adopted promoted mode').to.equal(true);
+		expect(
+			host.promoteGate.transitions.get(transitionKey(bytesToB64url(A), 0, bytesToB64url(T))),
+			'the adopt wrote the node-level record',
+		).to.deep.equal({ effectiveAt: 10_000, promoted: true });
+
+		// 2. A rank-1 companion (linked child) created — and touched — AFTER A, so A is the LRU rank-1 victim.
+		//    (Promotion-holders are rank 1, never rank 0, so eviction must be forced via a rank-1 companion.)
+		const companion = host.registry.forCoord(addressing.coord0(topicAt(1)), 0 as Tier, participant);
+		companion.recordChild(topicAt(1), addressing.coord0(topicAt(500)), 1_000);
+
+		// 3. Overflow the cap of 2: no rank-0 engine exists, so the LRU rank-1 engine — A — is evicted.
+		host.registry.forCoord(addressing.coord0(topicAt(2)), 0 as Tier, participant);
+		expect(host.registry.findByCoord(A), 'the promotion-holding engine really was evicted').to.equal(undefined);
+
+		// 4. Recreate A (this evicts the rank-0 spray engine): the seed restores promoted mode with NO replay...
+		const recreated = host.registry.forCoord(A, 0 as Tier, participant);
+		expect(recreated.isPromoted(T), 'the recreated engine seeds promoted = true straight from the node-level record').to.equal(true);
+		// ...and a replay of the very frame captured in step 1 is stale-dropped by the record eviction never touched.
+		expect(await handleInboundNotice(frame, participant, host.registry, trustAll, host.promoteGate, 12_000), 'the captured replay is stale').to.equal('stale');
+		expect(host.registry.findByCoord(A)!.isPromoted(T), 'still promoted after the replay').to.equal(true);
 
 		await host.stop();
 	});
