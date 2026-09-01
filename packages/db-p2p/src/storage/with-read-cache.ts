@@ -102,8 +102,12 @@ class Lease implements ReadCacheLease {
  * Returns the storage **unchanged**, with no `lease`, when caching would not pay:
  * - `MemoryRawStorage` is already in memory; the cache would duplicate every map entry's
  *   bookkeeping with nothing to save (see `CachedStoreDriver`'s class doc).
- * - An already-cached storage (a host that wrapped before handing it over) is not wrapped twice,
- *   and stays the host's to dispose.
+ * - A storage that reports {@link IRawStorage.readCached} (a host that attached a cache before
+ *   handing it over) is not wrapped twice, and stays the host's to dispose. The capability, not
+ *   a class check: BOTH documented constructions — `new CachedRawStorage(inner)` and
+ *   `new KvRawStorage(new CachedStoreDriver(driver))` — report it, and only the first is a
+ *   `CachedRawStorage`. Checking the class instead sent the driver-level shape down the
+ *   construct path, where the pool's identity guard threw and the host's node failed to start.
  *
  * Why this is needed at all: `BlockStorage` re-reads block metadata on essentially every
  * operation and `StorageRepo` builds a fresh `BlockStorage` per block per call, so nothing above
@@ -148,7 +152,13 @@ class Lease implements ReadCacheLease {
  *               dedupe hit.
  */
 export function withReadCache(storage: IRawStorage, label?: string, pool?: SharedCachePool): ResolvedReadCache {
-	if (storage instanceof MemoryRawStorage || storage instanceof CachedRawStorage) {
+	// `readCached` is a plain property read, which keeps this whole function synchronous — see
+	// the "no `await` between lookup and insert" note above; never make it an accessor that
+	// could become async. `MemoryRawStorage` never carries the marker (its driver is uncached);
+	// it is excluded for a different reason and keeps its own class check. Note a plain
+	// `KvRawStorage` over a bare `MemoryStoreDriver` is NOT a `MemoryRawStorage` and is still
+	// wrapped — deliberate, and pinned by a test.
+	if (storage instanceof MemoryRawStorage || storage.readCached) {
 		return { storage, lease: undefined };
 	}
 

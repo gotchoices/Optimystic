@@ -6,7 +6,7 @@ import { KvRawStorage } from '../src/storage/kv-raw-storage.js';
 import { MemoryStoreDriver } from '../src/storage/memory-store-driver.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { CachedStoreDriver } from '../src/storage/cached-store-driver.js';
-import { CachedRawStorage } from '../src/storage/cached-raw-storage.js';
+import { CachedRawStorage, RawStorageDriverAdapter } from '../src/storage/cached-raw-storage.js';
 import { SharedCachePool } from '../src/storage/shared-cache-pool.js';
 import { withReadCache } from '../src/storage/with-read-cache.js';
 import type { StoreIdentity } from '../src/storage/store-identity.js';
@@ -480,6 +480,66 @@ describe('CachedRawStorage over an already-cached backing store', () => {
 		expect(pool.stats().stores.map(s => s.label)).to.deep.equal(['mem-a', 'mem-b']);
 		await a.dispose();
 		await b.dispose();
+	});
+});
+
+// --- Stacked vs side-by-side: two different failures, two different messages ---
+//
+// A SIDE-BY-SIDE pair (two caches, neither below the other, over one store) is incoherent —
+// each serves its own permanently stale view. That is what `SharedCachePool.registerStore`
+// catches, and the pinned cases above keep its wording. A STACKED wrap (a cache built over
+// something already cached) is merely redundant: the outer only ever reads through the inner.
+// Only `CachedStoreDriver` can tell them apart — the pool sees just a claimed identity — so the
+// check lives in its constructor, ahead of registration.
+
+describe('CachedStoreDriver over an already-cached inner driver', () => {
+	function identified(inner: RawStoreDriver, identity: StoreIdentity): RawStoreDriver {
+		return new Proxy(inner, {
+			get(target, prop, _receiver) {
+				if (prop === 'storeIdentity') return () => identity;
+				const value = Reflect.get(target, prop, target);
+				return typeof value === 'function' ? value.bind(target) : value;
+			},
+		});
+	}
+
+	it('refuses a stacked wrap over an identity-bearing cached driver, naming redundancy not divergence', () => {
+		const pool = new SharedCachePool();
+		const inner = new CachedStoreDriver(identified(new MemoryStoreDriver(), 'test:stacked-id'), pool, 'inner');
+
+		expect(() => new CachedStoreDriver(inner, pool, 'outer'))
+			.to.throw(/already read-cached/);
+		// The identity IS claimed, so registration would also have thrown — but with the wrong
+		// story. This check runs first precisely so the accurate message wins that race.
+		expect(() => new CachedStoreDriver(inner, pool, 'outer')).to.not.throw(/never converge/);
+		expect(() => new CachedStoreDriver(inner, pool, 'outer')).to.not.throw(/withReadCache/);
+		expect(pool.stats().stores.map(s => s.label), 'the refused wrap registered nothing')
+			.to.deep.equal(['inner']);
+	});
+
+	it('refuses a stacked wrap over an identity-LESS cached driver too (the pool guard cannot see this one)', () => {
+		// No identity means no claim, so `registerStore` would happily have built the second,
+		// stacked cache — silent overhead. Behavior change: this construction used to succeed.
+		const pool = new SharedCachePool();
+		const inner = new CachedStoreDriver(new MemoryStoreDriver(), pool, 'inner');
+
+		expect(() => new CachedStoreDriver(inner, pool, 'outer')).to.throw(/already read-cached/);
+		expect(pool.stats().stores.map(s => s.label)).to.deep.equal(['inner']);
+	});
+
+	it('the adapter carries the marker up from a cached storage, so re-kerneling one is caught', async () => {
+		// `RawStorageDriverAdapter` is the storage→driver direction. Without the passthrough a
+		// cached storage re-presented as a driver would read as uncached, and
+		// `new CachedRawStorage(alreadyCachedStorage)` would stack silently.
+		const pool = new SharedCachePool();
+		const cachedStorage = new CachedRawStorage(new MemoryRawStorage(), pool, 'inner');
+		expect(new RawStorageDriverAdapter(cachedStorage).readCached).to.equal(true);
+		expect(new RawStorageDriverAdapter(new MemoryRawStorage()).readCached, 'absent, never false')
+			.to.equal(undefined);
+
+		expect(() => new CachedRawStorage(cachedStorage, pool, 'outer')).to.throw(/already read-cached/);
+		expect(pool.stats().stores.map(s => s.label)).to.deep.equal(['inner']);
+		await cachedStorage.dispose();
 	});
 });
 

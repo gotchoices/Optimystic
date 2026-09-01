@@ -26,11 +26,15 @@ export class KvRawStorage implements IRawStorage {
 	 * (`typeof storage.listBlockIds === 'function'`) sees the driver's true
 	 * capability instead of a stub that silently reports 0 / no seed. The same rule
 	 * governs `getStoreIdentity`: a stub returning `undefined` would make every store
-	 * look identity-less to consumers that dedupe on it.
+	 * look identity-less to consumers that dedupe on it. `readCached` follows the same rule
+	 * for the same reason: it is set only when the driver reports a read cache at or below
+	 * itself, so `withReadCache` sees whether this composition is REALLY already cached
+	 * rather than inferring it from a concrete class name (see {@link IRawStorage.readCached}).
 	 */
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	getApproximateBytesUsed?: () => Promise<number>;
 	getStoreIdentity?: () => StoreIdentity;
+	readCached?: true;
 
 	constructor(private readonly driver: RawStoreDriver) {
 		if (driver.storeIdentity) {
@@ -41,6 +45,9 @@ export class KvRawStorage implements IRawStorage {
 		}
 		if (driver.approximateBytesUsed) {
 			this.getApproximateBytesUsed = () => driver.approximateBytesUsed!();
+		}
+		if (driver.readCached) {
+			this.readCached = true;
 		}
 	}
 

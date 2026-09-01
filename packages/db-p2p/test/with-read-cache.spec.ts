@@ -8,6 +8,7 @@ import type { RawStoreDriver } from '../src/storage/raw-store-driver.js';
 import type { StoreIdentity } from '../src/storage/store-identity.js';
 import type { IRawStorage } from '../src/storage/i-raw-storage.js';
 import { CachedRawStorage } from '../src/storage/cached-raw-storage.js';
+import { CachedStoreDriver } from '../src/storage/cached-store-driver.js';
 import { SharedCachePool } from '../src/storage/shared-cache-pool.js';
 import { CountingStoreDriver, READ_METHODS, runColdStartWorkload } from './support/cache-test-helpers.js';
 
@@ -333,5 +334,55 @@ describe('withReadCache (composition-seam helper)', () => {
 		// Idempotent.
 		await cached.lease!.release();
 		expect(pool.stats().stores).to.have.length(0);
+	});
+
+	// --- "already read-cached" is a reported capability, not a class ---
+	//
+	// `docs/storage.md` documents TWO cache constructions and recommends the driver-level one
+	// when the backend's `RawStoreDriver` is reachable. Only the storage-level one produces a
+	// `CachedRawStorage`, so a class check here misread the recommended shape as uncached and
+	// tried to attach a SECOND cache. These pin the marker (`IRawStorage.readCached`) instead.
+
+	it('returns a driver-level cache unchanged, with no lease (the recommended construction)', () => {
+		// The reproduction. Before the marker this THREW out of `SharedCachePool.registerStore`
+		// — the host's identity was already claimed by its own cache — with a message about two
+		// views never converging and a suggestion to call the very helper that was throwing.
+		const pool = new SharedCachePool();
+		const hostBuilt = new KvRawStorage(
+			new CachedStoreDriver(identified(new MemoryStoreDriver(), 'spec:drv-level'), pool, 'host-built'));
+
+		const resolved = withReadCache(hostBuilt, 'seam', pool);
+		expect(resolved.storage, 'passed straight through').to.equal(hostBuilt);
+		expect(resolved.lease, 'a pass-through mints no lease — the cache is the host\'s to dispose')
+			.to.equal(undefined);
+		expect(pool.stats().stores.map(s => s.label), 'one registration, the host\'s')
+			.to.deep.equal(['host-built']);
+	});
+
+	it('returns an identity-less driver-level cache unchanged too (no identity, so nothing threw before — it stacked)', () => {
+		// The quieter half: with no store identity the pool's guard never fires, so before the
+		// marker this silently returned a DOUBLY cached storage under a lease. Pure overhead,
+		// and only a pass-through assertion catches it.
+		const pool = new SharedCachePool();
+		const hostBuilt = new KvRawStorage(new CachedStoreDriver(new MemoryStoreDriver(), pool, 'host-built'));
+
+		const resolved = withReadCache(hostBuilt, 'seam', pool);
+		expect(resolved.storage, 'passed straight through').to.equal(hostBuilt);
+		expect(resolved.lease, 'and unleased — no second cache was built').to.equal(undefined);
+		expect(pool.stats().stores.map(s => s.label)).to.deep.equal(['host-built']);
+	});
+
+	it('the readCached marker is present for both cache constructions and absent otherwise', async () => {
+		const pool = new SharedCachePool();
+		const driverLevel = new KvRawStorage(new CachedStoreDriver(new MemoryStoreDriver(), pool));
+		const storageLevel = new CachedRawStorage(new MemoryRawStorage(), pool);
+
+		expect(driverLevel.readCached, 'driver-level: KvRawStorage over a CachedStoreDriver').to.equal(true);
+		expect(storageLevel.readCached, 'storage-level: CachedRawStorage').to.equal(true);
+		expect(new KvRawStorage(new MemoryStoreDriver()).readCached, 'uncached kernel: absent, never false')
+			.to.equal(undefined);
+		expect(new MemoryRawStorage().readCached, 'memory backend: absent').to.equal(undefined);
+
+		await storageLevel.dispose();
 	});
 });

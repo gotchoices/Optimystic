@@ -69,6 +69,23 @@ export interface IRawStorage {
 	getStoreIdentity?(): StoreIdentity;
 
 	/**
+	 * Optional — present (and only ever `true`) when a write-through read cache
+	 * (`CachedStoreDriver`) sits BELOW this storage, whichever of the two documented
+	 * constructions built it: `new CachedRawStorage(inner)` or
+	 * `new KvRawStorage(new CachedStoreDriver(driver))`. Both contain a `CachedStoreDriver`,
+	 * and both report this marker; `withReadCache` reads it to decide whether to attach a
+	 * cache, so neither shape is misread as uncached.
+	 *
+	 * A property, not a method: there is no behavior to invoke, only a fact to report.
+	 *
+	 * OPTIONAL BY DESIGN, and typed as the literal `true` so "present and false" is
+	 * unrepresentable — truthiness IS the feature detection. Never install a `false` stub: an
+	 * uncached storage must omit the property entirely, exactly as `getStoreIdentity` /
+	 * `listBlockIds` / `getApproximateBytesUsed` are omitted when unsupported.
+	 */
+	readCached?: true;
+
+	/**
 	 * Approximate bytes currently stored by this backend.
 	 *
 	 * Used by `StorageMonitor` to feed real used-space figures into ring selection.

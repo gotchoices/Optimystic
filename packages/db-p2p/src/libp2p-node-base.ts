@@ -140,14 +140,17 @@ const wiringLog = createLogger('node-wiring');
 /**
  * Factory function or instance for creating raw storage. The node puts the write-through read
  * cache in front of the resolved instance (`withReadCache`, unless it is a `MemoryRawStorage` or
- * already cached) under a lease, and releases THAT LEASE when it stops; the instance you supplied
- * is never disposed. The cache is shared per backing store: two concurrently running nodes handed
+ * already read-cached) under a lease, and releases THAT LEASE when it stops; the instance you
+ * supplied is never disposed. The cache is shared per backing store: two concurrently running nodes handed
  * one uncached instance — or two instances that report the same `getStoreIdentity()`, such as two
  * `FileRawStorage` over one directory — read and write through ONE cache, which is cleared and
  * unregistered only when the last of them stops. Sequential reuse (a restart over the same
  * instance) starts cold once the previous node's lease has released. What remains unguarded is
- * the cross-process case (Invariant 5 in `packages/db-p2p/docs/storage.md`). A host that builds
- * its own `CachedRawStorage` and hands it in keeps owning it; the node never releases it.
+ * the cross-process case (Invariant 5 in `packages/db-p2p/docs/storage.md`). A host that attaches
+ * its own read cache and hands the result in keeps owning it; the node never releases it. Either
+ * documented cache construction is accepted here — `new CachedRawStorage(inner)` or
+ * `new KvRawStorage(new CachedStoreDriver(driver))`, the latter preferred when the backend's
+ * driver is reachable. Both report `IRawStorage.readCached`, which is what the seam checks.
  */
 export type RawStorageProvider = IRawStorage | (() => IRawStorage);
 
@@ -362,13 +365,13 @@ export type NodeOptions = ClusterPolicyOptions & {
 /**
  * Resolve the node's raw storage and put the write-through read cache in front of it. This is
  * the single place the network node resolves its `IRawStorage`, so it is the single place the
- * cache is wired (`withReadCache` states the exclusions: memory storage and already-cached
- * storage pass through unchanged). The default is a bare `MemoryRawStorage`, deliberately not
- * routed through the helper — nothing to cache.
+ * cache is wired (`withReadCache` states the exclusions: memory storage, and storage that
+ * already reports `readCached`, pass through unchanged). The default is a bare
+ * `MemoryRawStorage`, deliberately not routed through the helper — nothing to cache.
  *
  * `lease` is this node's claim on the (possibly shared) cache, and the ONLY thing its stop path
- * may release — a host that supplied its own `CachedRawStorage` keeps owning it (see
- * {@link ResolvedReadCache}).
+ * may release — a host that supplied an already-cached storage, in either documented
+ * construction, keeps owning it (see {@link ResolvedReadCache}).
  */
 function resolveStorage(provider: RawStorageProvider | undefined, networkName: string): ResolvedReadCache {
 	if (!provider) {

@@ -426,12 +426,30 @@ Semantics worth knowing:
   place instead of being re-derived per site. It returns
   `{ storage, lease }`: `storage` is the argument *unchanged* when it is a
   `MemoryRawStorage` (already in memory — see the "never wrap" bullet below) or
-  already a `CachedRawStorage` (a host that wrapped before handing it over is not
-  wrapped twice), and otherwise **the one `CachedRawStorage` for that backing
+  **already read-cached** (a host that attached a cache before handing it over is
+  not wrapped twice), and otherwise **the one `CachedRawStorage` for that backing
   store** — constructed on the first call, and handed back again to every later
   call over the same store while any earlier caller still holds it. `lease` is
-  set only in that last case — see **Lease obligations** below for why the two
-  are separate answers. The two seams that call it:
+  set only in that last case — a pass-through hands back **no lease**, because the
+  cache stays the host's to dispose; see **Lease obligations** below for why the
+  two are separate answers.
+
+  "Already read-cached" is a **capability the composition reports**, not a class
+  the helper recognises: `IRawStorage.readCached` / `RawStoreDriver.readCached`,
+  an optional property present (and only ever `true`) when a `CachedStoreDriver`
+  sits at or below that object. `CachedStoreDriver` sets it unconditionally — it
+  *is* the cache — and it travels up the same wire as `storeIdentity`:
+  `KvRawStorage`'s constructor copies it from its driver, and
+  `RawStorageDriverAdapter`'s from its inner storage. Both documented
+  constructions below therefore report it, and the helper's check is
+  `storage.readCached`. It used to be `storage instanceof CachedRawStorage`,
+  which only the storage-level construction satisfies — so handing the helper the
+  *recommended* driver-level shape made it try to attach a second cache, and the
+  host's node failed to start on the pool's identity guard. The `readCached` read
+  is a plain property access, which is what keeps the helper synchronous end to
+  end (see the concurrency note above); do not turn it into an accessor.
+
+  The two seams that call it:
   - `CollectionFactory.createLocalTransactor`
     (`packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts`)
     — wraps the host's `rawStorageFactory` result, label `quereus:local`.
@@ -485,23 +503,38 @@ Semantics worth knowing:
   through a bare `FileRawStorage`) must release every lease in between, or the
   second `Database` reads pre-tamper values.
 
-  **The construction guard behind the dedupe.** Deduping in this helper only
+  **The construction guards behind the dedupe.** Deduping in this helper only
   covers caches this helper built. A cache can also be constructed directly —
   `new CachedRawStorage(inner)` and `new KvRawStorage(new
   CachedStoreDriver(driver))` are both supported — so a host that hand-builds a
   cache over a directory, while a second consumer's `rawStorageFactory` returns
   a fresh storage over that same directory, still ends up with two caches: the
-  helper never saw the first one. Every cache however constructed registers a
-  store with a `SharedCachePool`, and that registration is the one choke point
-  all construction paths share, so it is where the conflict is caught:
-  `SharedCachePool.registerStore` takes the backing store's identity (passed by
-  `CachedStoreDriver`'s constructor) and **throws** when that identity already
-  has a live registration on the pool, naming both labels and the fix. Throwing
-  rather than logging is the point — the failure it replaces is silent wrong
-  data returned to a caller with no way to notice. The check runs before any
-  mutation, so a refused registration leaves the pool untouched, and
-  `unregisterStore` frees the identity, so sequential reuse of one store (stop a
-  node, start another over the same directory) registers cleanly.
+  helper never saw the first one. Two *different* failures live here, and they
+  are caught in two places because only one of them is visible to the pool:
+
+  - **Stacked** — a cache built over something that is *already cached*, the
+    outer reading through the inner. Redundant, not incoherent: every cold miss
+    pays two layers of bookkeeping and nothing is saved. Caught in
+    `CachedStoreDriver`'s constructor, which checks `inner.readCached` in its
+    synchronous prefix **before** touching the pool, and throws saying so.
+    Ahead of registration deliberately: when the inner driver names an identity
+    the pool's guard would also fire, with the (wrong, and much scarier)
+    divergence message below; and when it names none the pool sees nothing at
+    all, so this is the only thing that catches a stacked wrap over an
+    identity-less driver. That construction used to succeed silently.
+  - **Side-by-side** — two caches over one backing store, neither below the
+    other. Incoherent: each is write-through, so each serves its own half of the
+    process a permanently stale picture. Every cache however constructed
+    registers a store with a `SharedCachePool`, and that registration is the one
+    choke point all construction paths share, so it is where this is caught:
+    `SharedCachePool.registerStore` takes the backing store's identity (passed by
+    `CachedStoreDriver`'s constructor) and **throws** when that identity already
+    has a live registration on the pool, naming both labels and the fix. Throwing
+    rather than logging is the point — the failure it replaces is silent wrong
+    data returned to a caller with no way to notice. The check runs before any
+    mutation, so a refused registration leaves the pool untouched, and
+    `unregisterStore` frees the identity, so sequential reuse of one store (stop
+    a node, start another over the same directory) registers cleanly.
 
   **What remains of Invariant 5 for the cache.** Dedupe plus the guard close the
   in-process case only as far as identity reaches, and only within one pool.
@@ -535,6 +568,13 @@ Semantics worth knowing:
   miss** (hits never reach the adapter); same optional `pool`/`label` args.
   `clearCache()` drops every entry; `dispose()` releases the pool
   registration when the workspace departs.
+- **Either form may cross a composition seam.** A host that builds its own cache
+  and hands it to `rawStorageFactory` or a `RawStorageProvider` may hand over
+  *either* shape — the seam detects both via `readCached` (above), returns it
+  unchanged with no lease, and the host keeps owning it. The driver-level form
+  stays the recommended one whenever the driver is reachable; requiring the
+  storage-level form at a seam would force exactly the hosts that *have* a driver
+  into the strictly worse composition.
 - **Never wrap `MemoryRawStorage`/`MemoryStoreDriver`** in production wiring:
   the memory driver already holds the same byte references, so the cache is
   pure bookkeeping overhead (tests do wrap it, to prove semantics match).

@@ -308,13 +308,18 @@ export class CollectionFactory {
    * directory see each other's commits. A re-opened `Database` therefore starts cold only if
    * every earlier lease over that store was released (`plugin.dispose()`); otherwise it joins
    * the still-warm shared cache, which is coherent because every in-process write went
-   * through it. `MemoryRawStorage` passes through unwrapped (nothing to save).
+   * through it. `MemoryRawStorage` passes through unwrapped (nothing to save), and so does a
+   * backend the host already read-cached — in EITHER documented construction
+   * (`new CachedRawStorage(inner)` or `new KvRawStorage(new CachedStoreDriver(driver))`,
+   * the latter preferred when the backend's driver is reachable). `withReadCache` detects both
+   * via the `readCached` capability rather than by class, and hands such a storage back with no
+   * lease, so it stays the host's to dispose.
    */
   private async createLocalTransactor(options: ParsedOptimysticOptions): Promise<ITransactor> {
     const { storage: rawStorage, lease } = withReadCache(
       options.rawStorageFactory?.() ?? new MemoryRawStorage(), 'quereus:local');
-    // Only a lease THIS call was handed is ours to release. A host that hands a pre-built
-    // `CachedRawStorage` to `register()` gets it back unchanged, with no lease, and keeps
+    // Only a lease THIS call was handed is ours to release. A host that hands an already
+    // read-cached storage to `register()` gets it back unchanged, with no lease, and keeps
     // owning it.
     if (lease) {
       this.readCacheLeases.push(lease);

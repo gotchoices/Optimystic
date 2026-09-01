@@ -24,11 +24,15 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 	 * Optional passthroughs wired only when the inner storage provides them, mirroring
 	 * `KvRawStorage`'s constructor: feature-detection above must observe the inner
 	 * storage's true capability. `IRawStorage` has no `close`/`approximateBytesUsed`
-	 * driver names — they map from `listBlockIds`/`getApproximateBytesUsed`.
+	 * driver names — they map from `listBlockIds`/`getApproximateBytesUsed`. `readCached`
+	 * keeps its name across the boundary; carrying it up is what lets a re-kerneled cached
+	 * storage still report itself as cached, and what makes `CachedStoreDriver`'s
+	 * redundant-wrap guard fire for `new CachedRawStorage(alreadyCachedStorage)`.
 	 */
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	approximateBytesUsed?: () => Promise<number>;
 	storeIdentity?: () => StoreIdentity;
+	readCached?: true;
 
 	constructor(private readonly inner: IRawStorage) {
 		if (inner.getStoreIdentity) {
@@ -39,6 +43,9 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 		}
 		if (inner.getApproximateBytesUsed) {
 			this.approximateBytesUsed = () => inner.getApproximateBytesUsed!();
+		}
+		if (inner.readCached) {
+			this.readCached = true;
 		}
 	}
 
@@ -175,6 +182,19 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
  */
 export class CachedRawStorage extends KvRawStorage {
 	private readonly cacheDriver: CachedStoreDriver;
+
+	/**
+	 * Always present here: this class is a `KvRawStorage` over a `CachedStoreDriver`, so the
+	 * base constructor's passthrough always sets it. Narrowed from the base's optional
+	 * `readCached?: true` purely for the type.
+	 *
+	 * `declare` — type-only, NO emit. `tsconfig.base.json` targets ES2022 without
+	 * `useDefineForClassFields`, which therefore defaults to true, so a plain field
+	 * declaration here would emit a `defineProperty(this, 'readCached', undefined)` that runs
+	 * AFTER `super()` and clobber what the base constructor just assigned. Same reason
+	 * `FileRawStorage` &c. use `declare getStoreIdentity: …`.
+	 */
+	declare readonly readCached: true;
 
 	constructor(inner: IRawStorage, pool?: SharedCachePool, label?: string) {
 		const cacheDriver = new CachedStoreDriver(new RawStorageDriverAdapter(inner), pool, label);

@@ -22,7 +22,13 @@ export async function collect<T>(iter: AsyncIterable<T>): Promise<T[]> {
  * Deliberately does NOT pass `storeIdentity` through, and must not start: tests build several
  * of these over one shared inner driver precisely so each wrapper stays INDEPENDENT. Passing
  * identity through would let identity-keyed consumers collapse them into one, silently voiding
- * the isolation the counts depend on. Same reason it passes no `close`. */
+ * the isolation the counts depend on. Same reason it passes no `close`.
+ *
+ * NOTE: it also passes no `readCached`, which is correct only because every use today places it
+ * UNDER a cache (or alone), where the marker is absent anyway. Put one ABOVE a `CachedStoreDriver`
+ * and the composition would report itself uncached — `withReadCache` would attach a second cache,
+ * and `CachedStoreDriver`'s redundant-wrap guard would not fire. Forward `readCached` here if that
+ * ever happens; unlike `storeIdentity` there is no isolation reason to withhold it. */
 export class CountingStoreDriver implements RawStoreDriver {
 	readonly counts: Record<string, number> = {};
 

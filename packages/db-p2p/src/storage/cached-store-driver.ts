@@ -200,11 +200,34 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 	approximateBytesUsed?: () => Promise<number>;
 	storeIdentity?: () => StoreIdentity;
 
+	/**
+	 * This driver IS the read cache, so the marker is unconditional — unlike the passthroughs
+	 * above, which mirror the inner driver's capabilities. Wrappers above (`KvRawStorage`,
+	 * `RawStorageDriverAdapter`) carry it up, which is how `withReadCache` recognises BOTH
+	 * documented cache constructions without naming a concrete class.
+	 */
+	readonly readCached: true = true;
+
 	constructor(
 		private readonly inner: RawStoreDriver,
 		private readonly pool: SharedCachePool = defaultCachePool(),
 		label?: string,
 	) {
+		// Stacked wrap — the inner driver already has a read cache at or below it, so this one
+		// would only ever read through that one. Caught HERE, and before `registerStore`, because
+		// the pool cannot tell a stacked wrap from a side-by-side pair: it sees only that the
+		// identity is claimed, and would report the (wrong, and much scarier) divergence failure.
+		// Identity-less inner drivers reach the pool's guard not at all, so without this check a
+		// stacked wrap over one of them builds silently — pure overhead, never useful.
+		if (inner.readCached) {
+			throw new Error(
+				`redundant read cache: the inner driver is already read-cached`
+				+ `${inner.storeIdentity ? ` (${JSON.stringify(inner.storeIdentity())})` : ''}, so wrapping `
+				+ `it again (label ${JSON.stringify(label ?? null)}) stacks a second bookkeeping layer that `
+				+ `can only ever read through the first — every miss pays twice and nothing is saved. `
+				+ `Use the inner cached driver as-is.`
+			);
+		}
 		// Registration is the choke point every construction path shares (this constructor, the
 		// `CachedRawStorage` wrapper, `withReadCache`), so naming the backing store here is what
 		// lets the pool refuse a second, permanently divergent view of it. Throws before anything else is

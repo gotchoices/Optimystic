@@ -113,6 +113,23 @@ export interface RawStoreDriver {
 	 * - It identifies the STORE, not its contents.
 	 */
 	storeIdentity?(): StoreIdentity;
+
+	/**
+	 * Optional — present (and only ever `true`) when a write-through read cache
+	 * (`CachedStoreDriver`) sits AT or BELOW this driver, so a composition seam can ask
+	 * "is this already read-cached?" of the composition itself instead of guessing from a
+	 * concrete class name. Set unconditionally by `CachedStoreDriver` (it *is* the cache) and
+	 * passed up by every wrapper that fronts a driver, the same way `storeIdentity` is.
+	 *
+	 * A property, not a method: there is no behavior to invoke, only a fact to report.
+	 *
+	 * OPTIONAL BY DESIGN, and typed as the literal `true` so "present and false" is
+	 * unrepresentable — truthiness IS the feature detection. Never install a `false` stub: an
+	 * uncached driver must omit the property entirely, exactly as `storeIdentity` /
+	 * `listBlockIds` / `approximateBytesUsed` are omitted when unsupported.
+	 */
+	readCached?: true;
+
 	/** Optional — enumerate block ids with durable metadata (startup seed). Passed through by the kernel. */
 	listBlockIds?(): AsyncIterable<BlockId>;
 	/** Optional — best cheap byte estimate. Passed through by the kernel. */
