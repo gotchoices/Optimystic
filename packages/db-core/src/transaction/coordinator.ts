@@ -72,8 +72,9 @@ export class TransactionCoordinator {
 	 * staged actions into its own durable log entry. A stamp is released by commit (success or
 	 * partial) or by rollback; a CLEAN commit failure keeps its entry so `rollback(stampId)`
 	 * stays a complete recovery, meaning an abandoned failed commit holds the coordinator against
-	 * new stamps until it is rolled back. The guard is per-coordinator only: two coordinators
-	 * sharing collection instances are the caller's contract ("own bridge per writer" —
+	 * new stamps until it is rolled back. The guard sees only what opens a stamp, so two
+	 * coordinators sharing collection instances — and writers that stage only via Tree.stage /
+	 * Collection.act, which open none — stay the caller's contract ("own bridge per writer" —
 	 * docs/transactions.md), not this map's.
 	 *
 	 * Each snapshot holds BOTH halves of a collection's staged state — tracker transforms AND
@@ -127,8 +128,11 @@ export class TransactionCoordinator {
 		if (!data) {
 			// At most one open stamp (see the invariant on stampData). Checked inside this method's
 			// await-free prologue — the check, the entry creation, and the capture below run as one
-			// atomic step, so a second stamp cannot register between a concurrent commit's guard
-			// and its log append.
+			// atomic step, so a second stamp cannot register between a TRACKED stamp's commit guard
+			// and its log append: that stamp's entry stays in the map for the whole commit span, so
+			// this check keeps seeing it. An UNTRACKED commit (the Tree.stage / Collection.act path,
+			// which creates no entry) leaves the map empty and so cannot be interlocked this way —
+			// that is the documented out-of-scope case, not a hole this guard closes.
 			const open = this.openStampOtherThan(stampId);
 			if (open !== undefined) {
 				throw new CoordinatorConcurrentStampError(open, stampId);
@@ -143,6 +147,16 @@ export class TransactionCoordinator {
 		data.actionBatches.push(actions);
 
 		await this.applyActionsRaw(actions, stampId);
+	}
+
+	/** The id of the open stamp {@link stampData} tracks when it is not `stampId`; undefined when
+	 * no OTHER stamp is open. The single-open-stamp invariant on {@link stampData} is what makes
+	 * "the" (singular) correct here. */
+	private openStampOtherThan(stampId: string): string | undefined {
+		for (const open of this.stampData.keys()) {
+			if (open !== stampId) return open;
+		}
+		return undefined;
 	}
 
 	/**
@@ -174,16 +188,6 @@ export class TransactionCoordinator {
 	 * count ever grows large enough for the scan itself to matter, track a per-stamp "collections
 	 * map size at last capture" rather than dropping the reconcile.
 	 */
-	/** The id of the open stamp {@link stampData} tracks when it is not `stampId`; undefined when
-	 * no OTHER stamp is open. The single-open-stamp invariant on {@link stampData} is what makes
-	 * "the" (singular) correct here. */
-	private openStampOtherThan(stampId: string): string | undefined {
-		for (const open of this.stampData.keys()) {
-			if (open !== stampId) return open;
-		}
-		return undefined;
-	}
-
 	private captureUncaptured(into: Map<Collection<any>, CollectionCapture>): void {
 		for (const col of this.collections.values()) {
 			if (into.has(col)) continue;
@@ -753,6 +757,24 @@ export class TransactionCoordinator {
 			return { success: true }; // Nothing to do
 		}
 
+		// At most one open stamp (see the invariant on stampData). execute() reports failures as
+		// results rather than throws (matching its conversion of applyActions' "Collection not
+		// found" throw below), so the refusal is a failure result here where applyActions and
+		// commit throw.
+		//
+		// Deliberately BELOW the empty-actions short-circuit above: a transaction that stages
+		// nothing cannot mix its state with the open stamp's, so a read-only execute is allowed to
+		// run alongside one. Hoisting this to the top of the method would refuse those too — see
+		// the "does not refuse a second stamp that stages nothing" case in
+		// coordinator-single-stamp.spec.ts. The engine has already run by this point, which costs
+		// nothing here: reaching this line means the engine was a pure translator (a
+		// side-effecting engine returns EMPTY actions and short-circuits above, and its own
+		// staging goes through applyActions, which guards).
+		const openStamp = this.openStampOtherThan(transaction.stamp.id);
+		if (openStamp !== undefined) {
+			return { success: false, error: new CoordinatorConcurrentStampError(openStamp, transaction.stamp.id).message };
+		}
+
 		// 1b. Stage the returned actions into the collection trackers.
 		//
 		// Reaching here means the engine RETURNED non-empty actions — i.e. the pure-
@@ -764,11 +786,12 @@ export class TransactionCoordinator {
 		// method merely re-read the already-staged trackers; that side effect is gone, so
 		// the application must happen explicitly here. A side-effecting engine that
 		// applied internally would instead return EMPTY actions and short-circuit at the
-		// guard above.)
+		// empty-actions check above.)
 		//
 		// applyActions() throws if a referenced collection is not registered — the same
 		// "Collection not found" the engine's side-effecting apply used to surface. Convert
 		// it back into a failure result so execute() keeps its return contract.
+
 		// Pre-staging snapshot, one per DISTINCT participating collection, captured here so the
 		// partial-commit branch below can unwind the collections that did NOT land. The unwind
 		// point is "before execute() staged anything", not "before the log append": unlike
@@ -791,15 +814,6 @@ export class TransactionCoordinator {
 		// serve a rare branch. Unmeasured, and symmetric with commitOnceLatched, which pays the
 		// same on every commit. If execute() ever shows up hot in a profile, the way out is a
 		// copy-on-first-stage snapshot, not dropping the restore.
-		// At most one open stamp (see the invariant on stampData). execute() reports failures as
-		// results rather than throws (matching its conversion of applyActions' "Collection not
-		// found" throw below), so the refusal is a failure result here where applyActions and
-		// commit throw.
-		const openStamp = this.openStampOtherThan(transaction.stamp.id);
-		if (openStamp !== undefined) {
-			return { success: false, error: new CoordinatorConcurrentStampError(openStamp, transaction.stamp.id).message };
-		}
-
 		const preStageSnapshots = new Map<CollectionId, CollectionSnapshot<any>>();
 		for (const { collectionId } of result.actions) {
 			if (preStageSnapshots.has(collectionId)) continue;

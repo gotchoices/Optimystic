@@ -113,8 +113,9 @@ export class CoordinatorStaleLossError extends Error {
  *
  * Callers that genuinely need concurrent writers must give each writer its own `Collection`
  * instances — its own bridge and coordinator (see docs/transactions.md, "One writer at a time on
- * the shared TransactionBridge"). Note the guard is per-coordinator: two coordinators sharing the
- * same collection instances are NOT caught here and remain the caller's contract to avoid.
+ * the shared TransactionBridge"). Two configurations stay the caller's contract to avoid because
+ * this guard cannot see them: two coordinators sharing the same collection instances, and two
+ * writers that stage only via `Tree.stage` / `Collection.act` (which open no stamp at all).
  *
  * A stamp opens at its first {@link TransactionCoordinator.applyActions} call. On the Quereus
  * path that is the pre-stage-barrier call the bridge makes at the first STATEMENT — so a second

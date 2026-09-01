@@ -135,6 +135,20 @@ class PendAlwaysFailsHard extends DelegatingTransactor {
 	}
 }
 
+/** Hard-rejects the FIRST pend only, so a commit fails cleanly once and the caller's own retry
+ *  (a second `commit()` of the same transaction) succeeds. */
+class PendFailsOnce extends DelegatingTransactor {
+	private failed = false;
+	constructor(inner: TestTransactor) { super(inner); }
+	override async pend(request: PendRequest): Promise<PendResult> {
+		if (!this.failed) {
+			this.failed = true;
+			return { success: false, reason: 'injected first-attempt pend rejection' };
+		}
+		return this.inner.pend(request);
+	}
+}
+
 /** Permanently loses the COMMIT for one collection while the other lands — the partial landing
  *  that drops the stamp entry. Same shape as coordinator-rollback-pending.spec.ts. */
 class PartialLossTransactor extends DelegatingTransactor {
@@ -220,6 +234,50 @@ describe('TransactionCoordinator: single open stamp', () => {
 		expect(result.error, 'the error names the open stamp').to.contain(open.stampId);
 		expect(result.error, 'the error names the refused stamp').to.contain(second.stampId);
 		expect(await durableLogValues(transactor, id), 'nothing reached the durable log').to.deep.equal([]);
+	});
+
+	it('does not refuse a second stamp that stages nothing', async () => {
+		// The guard sits BELOW execute()'s empty-actions short-circuit on purpose: a transaction
+		// that stages nothing has no state to mix with the open stamp's, and it opens no stampData
+		// entry either. Hoisting the guard to the top of execute() would refuse read-only work
+		// alongside an open stamp; this case is what bites if someone does.
+		const id = 'ss-execute-empty';
+		const transactor = new TestTransactor();
+		const { coordinator } = await makeCoordinator(transactor, [id]);
+
+		await stage(coordinator, [{ collectionId: id, value: 'open' }]);
+		const readOnly = await build([]);
+
+		const result = await coordinator.execute(readOnly.transaction, new ActionsEngine());
+		expect(result.success, 'a no-action transaction runs alongside the open stamp').to.equal(true);
+		expect(result.error, 'and reports no refusal').to.equal(undefined);
+	});
+
+	it('re-commits the same stamp after a clean commit failure — the other advertised recovery',
+		async () => {
+		// The refusal message offers TWO ways out: "commit or roll back". The rollback half is
+		// covered by the wedge case below; this locks the commit half, which the kept stamp entry
+		// and the restored pre-append snapshots are what make possible.
+		const id = 'ss-recommit';
+		const inner = new TestTransactor();
+		const failing = new PendFailsOnce(inner);
+		const { coordinator } = await makeCoordinator(failing, [id]);
+
+		const staged = await stage(coordinator, [{ collectionId: id, value: 'retried' }]);
+		let commitErr: unknown;
+		try {
+			await coordinator.commit(staged.transaction, { maxAttempts: 1, baseBackoffMs: 1, maxBackoffMs: 5 });
+		} catch (e) { commitErr = e; }
+		expect(commitErr, 'the first attempt failed cleanly').to.be.instanceOf(Error);
+
+		// Same stamp, so the guard lets it through, and the restored queue re-appends exactly once.
+		await coordinator.commit(staged.transaction);
+		expect(await durableLogValues(inner, id), 'the retry lands the action exactly once')
+			.to.deep.equal(['retried']);
+
+		// The successful retry released the stamp.
+		const accepted = await stageRefusal(coordinator, [{ collectionId: id, value: 'after' }]);
+		expect(accepted, 'a fresh stamp is accepted after the retry committed').to.equal(undefined);
 	});
 
 	it('rollback releases the stamp, so a fresh stamp is accepted and commits', async () => {

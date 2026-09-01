@@ -186,10 +186,11 @@ Two consequences worth knowing:
   so `rollback(stampId)` remains a complete recovery — an abandoned failed
   commit therefore holds the coordinator against new stamps until it is rolled
   back.
-- The guard is **per-coordinator**. Two coordinators sharing the same
-  `Collection` instances are not caught by it — that remains the caller's
-  contract, exactly as above: concurrent writers each need their **own** bridge
-  and their own collection instances.
+- The guard sees only what opens a **stamp**. Two coordinators sharing the same
+  `Collection` instances are not caught by it, and neither are two writers that
+  stage only through `Tree.stage` / `Collection.act` (those open no stamp at
+  all). Both remain the caller's contract, exactly as above: concurrent writers
+  each need their **own** bridge and their own collection instances.
 
 ### Committed reads refuse a degraded (partially-committed) store
 

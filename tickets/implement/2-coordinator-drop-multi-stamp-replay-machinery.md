@@ -91,6 +91,12 @@ cross-stamp `seq` paragraph. Its `NOTE:` about per-call cost stays.
   but `Action.transaction` is still the provenance ground truth that
   `coordinator-rollback-pending.spec.ts`'s `expectNoActionsFromStamp` helper
   asserts on. Keep the tagging and keep the method; do not inline it away.
+- **`openStampOtherThan` STAYS.** Added by the prereq ticket and sitting just above
+  `captureUncaptured`, it scans `stampData` for a *sibling* stamp — which reads like
+  the cross-stamp machinery this ticket removes, but it is the opposite: it is what
+  *enforces* the one-stamp invariant, and all three guards call it. Deleting it silently
+  removes the enforcement. Keep it, and keep its single-key early return (do not
+  "correct" it into collecting every key).
 - **Untracked stamp rollback** stays a no-op (`coordinator-rollback-pending.spec.ts`
   ~339).
 - **Rollback after a partial landing** stays a no-op, because the partial-commit
