@@ -549,9 +549,10 @@ export interface CohortTopicHost {
 	 */
 	readonly gossipTransport: FretCohortGossipTransport;
 	/**
-	 * The node-level `promote`-handler anti-abuse gate (per-`(peer, topic)` rate limiter + per-`(topic, tier)`
-	 * `effectiveAt` high-water). Exposed for test/diagnostic introspection over its bounded-memory state — the
-	 * limiter's `size` and the `highWater` `LruMap` — and so the gossip-cadence sweep wiring is observable.
+	 * The node-level `promote`-handler anti-abuse gate (per-`(peer, topic)` rate limiter + the
+	 * per-`(coord, tier, topic)` adopted-transition record). Exposed for test/diagnostic introspection over
+	 * its bounded-memory state — the limiter's `size` and the `transitions` `LruMap` — and so the
+	 * gossip-cadence sweep wiring is observable.
 	 */
 	readonly promoteGate: PromoteGate;
 	/**
@@ -643,6 +644,15 @@ interface CoordEngineContext {
 	 * key-less / unit composition.
 	 */
 	readonly onEngineEvicted?: (coord: RingCoord) => void;
+	/**
+	 * Read the node-level record of the last adopted promotion/demotion transition for one
+	 * `(coord, tier, topic)` — the host's {@link PromoteGate.transitions} map, which outlives every
+	 * engine. A freshly created {@link CoordEngine} seeds its {@link PromotionLifecycle}'s per-topic
+	 * ordering and direction from it (via `PromotionDeps.seedTransition`), so eviction + recreation
+	 * neither reopens the replay window nor forgets a correct promoted mode. Wired unconditionally by the
+	 * host (key-less nodes also adopt verified inbound notices); optional only for unit composition.
+	 */
+	readonly adoptedTransition?: (coord: RingCoord, tier: number, topicId: Uint8Array) => AdoptedTransition | undefined;
 }
 
 /**
@@ -751,6 +761,13 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// demotion, additionally to the parent coord (childCohortCount bookkeeping). Reuses the gossip
 	// transport's cohort peer resolution.
 	const broadcastNotice = (notice: PromotionNoticeV1 | DemotionNoticeV1, servedCoord: RingCoord): void => {
+		// Record the origination in the node-level adopted-transition map BEFORE fanning out: `broadcastOver`
+		// excludes self, so an originated notice never arrives back on the inbound path — this is the ONLY
+		// write for locally-originated transitions. Keyed off the notice's own `cohortCoord` only; the parent
+		// coord a demotion also fans to is deliberately outside this ordering (the parent-unlink is ordered by
+		// the child registry's per-child `lastEffectiveAt` — see `applyDemotionUnlinkAtParent`). `promoteGate`
+		// is declared below; this closure only runs on a (later) notice, after it is initialized.
+		recordAdoptedTransition(promoteGate, notice);
 		const frame = encodeCohortMessage(notice, maxBytes);
 		// A demotion fans to BOTH the demoting child's served coord (siblings adopt `promoted = false` via the
 		// `cohortCoord`-routed apply) and the parent coord (the parent unrecords the child). `handleInboundNotice`
@@ -789,8 +806,8 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 
 	// Node-level `promote`-handler anti-abuse gate (`cohort-topic-promote-handler-verify-amplification`):
 	// a per-(peer, topic) rate limiter (own instance — the register-path limiter is per-coord inside each
-	// engine; this handler is node-level) plus the per-(topic, tier) effectiveAt high-water. Defaults to
-	// `register_rate_per_peer` (4 / min / peer / topic) with exponential back-off.
+	// engine; this handler is node-level) plus the per-(coord, tier, topic) adopted-transition record.
+	// Defaults to `register_rate_per_peer` (4 / min / peer / topic) with exponential back-off.
 	const promoteGate = createPromoteGate(options.antiDos?.rateLimiter);
 
 	const ctx: CoordEngineContext = {
@@ -841,6 +858,10 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		// ANY engine (even one holding no records) may have published a cert via the gossip-cadence
 		// `pumpMembership` sweep. A no-op for a coord the verifier holds nothing for.
 		onEngineEvicted: (coord: RingCoord): void => verifier.forget(bytesToB64url(coord)),
+		// Node-level adopted-transition reader (engine seeding). Wired unconditionally — key-less hosts also
+		// adopt verified inbound notices, so their recreated engines need the seed just the same.
+		adoptedTransition: (coord: RingCoord, tier: number, topicId: Uint8Array): AdoptedTransition | undefined =>
+			promoteGate.transitions.get(transitionKey(bytesToB64url(coord), tier, bytesToB64url(topicId))),
 	};
 	const registry = createCoordRegistry(ctx, options.antiDos?.coordEnginesMax);
 
@@ -1995,6 +2016,11 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		cohortCoord: (): Uint8Array => servedCoord,
 		cohortEpoch: localEpoch,
 		signer: noticeSigner,
+		// Seed a topic's replay ordering + direction from the node-level adopted-transition record (the
+		// promote gate's map), which outlives this engine — so recreating an evicted engine neither reopens
+		// the replay window nor forgets a correct promoted mode. For a notice at this served coord both a
+		// promotion's `fromTier` and a demotion's `tier` equal `treeTier`, so this key matches both writes.
+		seedTransition: (topicId: Uint8Array): AdoptedTransition | undefined => ctx.adoptedTransition?.(servedCoord, treeTier, topicId),
 		// Production defaults (cap_promote = 64, …) unless the host was given a promotion override — the
 		// live-tier e2e lowers `capPromote` to drive promotion with a small participant count. The
 		// coord-derived inputs above (treeTier / childCohortCount / parentCoord) are never overridden.
@@ -2613,13 +2639,24 @@ export type NoticeOutcome = "applied" | "untrusted" | "dropped";
  *
  * - `"undecodable"`  — the frame is neither a promotion nor a demotion notice.
  * - `"rate-limited"` — the dialing `(peer, topic)` is over its `register_rate_per_peer` ceiling.
- * - `"stale"`        — the notice's `effectiveAt` is at or below the last *applied* notice for its served
- *   cohort coord (a replay / out-of-order frame); dropped before `verifyMessage`.
+ * - `"stale"`        — the notice's `effectiveAt` is at or below the last *adopted* transition recorded for
+ *   its `(cohortCoord, tier, topicId)` (a replay / out-of-order frame); dropped before `verifyMessage`.
  * - `"unlinked"`     — a demotion notice that did not sibling-adopt on this node (no local child-coord engine,
  *   or that path was stale) but **did** verify + unrecord the demoting child at its parent cohort here (the
  *   parent-unlink path). Distinct from `"applied"` (a sibling-adopt) so a test can assert the parent-only case.
  */
 export type InboundNoticeResult = NoticeOutcome | "undecodable" | "rate-limited" | "stale" | "unlinked";
+
+/**
+ * The last promotion/demotion transition this node adopted for one `(coord, tier, topic)`: its
+ * `effectiveAt` (the replay ordering) and its direction (`promoted` — what the transition left the cohort
+ * as). Stored in {@link PromoteGate.transitions}; direction matters because a recreated engine must
+ * restore *which way* the last transition went, not just how recent it was.
+ */
+export interface AdoptedTransition {
+	readonly effectiveAt: number;
+	readonly promoted: boolean;
+}
 
 /**
  * Node-level anti-abuse state for the `promote` handler (`cohort-topic-promote-handler-verify-amplification`).
@@ -2633,35 +2670,72 @@ export interface PromoteGate {
 	 */
 	readonly rateLimiter: RegisterRateLimiter;
 	/**
-	 * Per-served-coord high-water (key: `` `${cohortCoord}|${tier}` ``) of the last *applied* notice's
-	 * `effectiveAt`. A notice at or below the water is a replay / out-of-order frame and is dropped before
-	 * verification. Keyed by the served coord — not `(topic, tier)` — so two sibling cohorts a node serves for
-	 * one `(topic, tier)` do not share an entry (an applied notice for one must not stale-drop a legitimate
-	 * notice for the other). Updated **only** on an `"applied"` outcome (never on an unverified frame), so a
-	 * forged notice carrying `effectiveAt = Infinity` cannot poison the water and lock out legitimate notices.
+	 * The node's durable record of the last adopted promotion/demotion transition per
+	 * `(cohortCoord, tier, topicId)` (key: {@link transitionKey}). Written by **every** adopt path —
+	 * a verified inbound apply ({@link handleInboundNotice}) *and* a locally-originated broadcast (the
+	 * host's `broadcastNotice`, which `broadcastOver` never echoes back to self) — via
+	 * {@link recordAdoptedTransition}, and read by two consumers: the inbound stale gate (a notice at or
+	 * below the recorded `effectiveAt` is dropped before verification) and engine seeding (a freshly
+	 * created {@link CoordEngine}'s {@link PromotionLifecycle} initializes its per-topic ordering and
+	 * direction from here, via `CoordEngineContext.adoptedTransition` → `PromotionDeps.seedTransition`).
 	 *
-	 * **Bounded.** An {@link LruMap} capped at {@link PROMOTE_HIGHWATER_MAX_KEYS} so the retain-forever shape
-	 * cannot leak on a long-lived node. Unlike the limiter this is *not* attacker-growable (it is written only
-	 * on an `"applied"` outcome, which needs a verified `≥ minSigs` cohort signature — reads of forged
-	 * `topicId`s via `.get` create nothing), so it never evicts under legitimate load; the cap is the
-	 * belt-and-suspenders bound. Evicting an entry is safe: the engine's {@link PromotionLifecycle} is
-	 * independently idempotent and `effectiveAt`-ordered (`PromotionState.lastEffectiveAt`), so an
-	 * evicted-then-replayed older notice re-verifies (one bounded, rate-capped `verifyMessage`) and then
-	 * **no-ops at the engine** rather than (re-)applying. Water absence only *opens* the gate, never closes it.
+	 * This map — not the engine — is the node's replay-ordering authority: the engine's
+	 * `PromotionState.lastEffectiveAt` is a same-process second layer that is discarded whenever the
+	 * registry evicts the engine under memory pressure, while this map outlives every engine. Keying
+	 * includes the coord so two sibling cohorts a node serves for one `(topic, tier)` never share an
+	 * entry, and the topic so two topics at one coord order independently.
+	 *
+	 * **Bounded.** An {@link LruMap} capped at {@link PROMOTE_TRANSITIONS_MAX_KEYS} (deliberately above
+	 * the 2048-engine registry cap, so seeding never misses for a resident engine) so the retain-forever
+	 * shape cannot leak on a long-lived node. Not attacker-growable: it is written only on adopted
+	 * transitions — a verified `≥ minSigs` cohort signature, or a locally threshold-signed notice — and
+	 * reads of forged keys via `.get` create nothing, so it never evicts under legitimate load; the cap
+	 * is the belt-and-suspenders bound. Record absence only *opens* the stale gate, never closes it.
 	 */
-	readonly highWater: LruMap<string, number>;
+	readonly transitions: LruMap<string, AdoptedTransition>;
 }
 
 /**
- * Hard cap on tracked per-served-coord high-water entries; the least-recently-touched are evicted beyond
- * this. A modest bound is plenty — only verified applies grow the map, so it never evicts under legitimate
- * load — but it caps the otherwise retain-forever shape on a long-lived node.
+ * Hard cap on tracked adopted-transition entries; the least-recently-touched are evicted beyond this. A
+ * modest bound is plenty — only adopted transitions grow the map, so it never evicts under legitimate
+ * load — but it caps the otherwise retain-forever shape on a long-lived node. Kept above the coord-engine
+ * registry cap ({@link DEFAULT_COORD_ENGINES_MAX} = 2048) so every resident engine's transitions fit.
  */
-export const PROMOTE_HIGHWATER_MAX_KEYS = 8192;
+export const PROMOTE_TRANSITIONS_MAX_KEYS = 8192;
 
 /** Build the default {@link PromoteGate} from the (optional) anti-DoS rate-limiter config. */
 export function createPromoteGate(rateLimiterConfig?: RegisterRateLimiterConfig): PromoteGate {
-	return { rateLimiter: createRegisterRateLimiter(rateLimiterConfig), highWater: new LruMap<string, number>(PROMOTE_HIGHWATER_MAX_KEYS) };
+	return { rateLimiter: createRegisterRateLimiter(rateLimiterConfig), transitions: new LruMap<string, AdoptedTransition>(PROMOTE_TRANSITIONS_MAX_KEYS) };
+}
+
+/** The {@link PromoteGate.transitions} key for one `(cohortCoord, tier, topicId)` (all b64url-encoded parts). */
+export function transitionKey(cohortCoordB64: string, tier: number, topicIdB64: string): string {
+	return `${cohortCoordB64}|${tier}|${topicIdB64}`;
+}
+
+/**
+ * The {@link transitionKey} a notice's own fields address: the served `cohortCoord` it was decided at, the
+ * tier the deciding cohort serves the topic at (`fromTier` on a promotion, `tier` on a demotion — both the
+ * engine's own tree tier for a notice at its served coord), and the topic. A demotion also fans to the
+ * parent coord, but that parent-unlink path is deliberately outside this ordering — see
+ * {@link applyDemotionUnlinkAtParent}.
+ */
+export function noticeTransitionKey(notice: PromotionNoticeV1 | DemotionNoticeV1): string {
+	return transitionKey(notice.cohortCoord, "parentCohortCoord" in notice ? notice.tier : notice.fromTier, notice.topicId);
+}
+
+/**
+ * Record `notice` as the last adopted transition for its `(coord, tier, topic)` — monotonic per key (an
+ * older or equal `effectiveAt` never overwrites), with the direction taken from the notice's shape (a
+ * promotion sets `promoted = true`, a demotion `false`). Called from BOTH adopt paths: the verified
+ * inbound apply in {@link handleInboundNotice} and the host's `broadcastNotice` origination seam.
+ */
+export function recordAdoptedTransition(gate: PromoteGate, notice: PromotionNoticeV1 | DemotionNoticeV1): void {
+	const key = noticeTransitionKey(notice);
+	const held = gate.transitions.get(key);
+	if (held === undefined || notice.effectiveAt > held.effectiveAt) {
+		gate.transitions.set(key, { effectiveAt: notice.effectiveAt, promoted: !("parentCohortCoord" in notice) });
+	}
 }
 
 /**
@@ -2780,11 +2854,12 @@ export type ParentUnlinkOutcome = "unlinked" | "no-parent" | "untrusted";
  * - `"unlinked"`  — verified; the child was unrecorded (or was already released — the child registry's own
  *   per-`(topic, childCoord)` freshness makes a replay an idempotent no-op).
  *
- * **Freshness is the child registry's, not the promote-gate high-water.** The sibling-adopt high-water is keyed
- * by the child coord and advanced only on a sibling-adopt `"applied"`; the unlink is ordered independently by
- * the child registry's per-child `lastEffectiveAt`, so a demotion that is a stale no-op for the sibling-adopt
- * target still applies the unlink at the parent, and vice-versa. The verify carries the same
- * {@link PROMOTE_REFETCH_MIN_INTERVAL_MS} bound as the sibling-adopt, so it cannot amplify into dials.
+ * **Freshness is the child registry's, not the promote-gate transition record.** The sibling-adopt record is
+ * keyed by the child coord and, on the inbound path, advanced only on a sibling-adopt `"applied"`; the unlink
+ * is ordered independently by the child registry's per-child `lastEffectiveAt`, so a demotion that is a stale
+ * no-op for the sibling-adopt target still applies the unlink at the parent, and vice-versa. The verify
+ * carries the same {@link PROMOTE_REFETCH_MIN_INTERVAL_MS} bound as the sibling-adopt, so it cannot amplify
+ * into dials.
  */
 export async function applyDemotionUnlinkAtParent(
 	notice: DemotionNoticeV1,
@@ -2823,16 +2898,17 @@ export async function applyDemotionUnlinkAtParent(
  * work:
  *
  * ```
- *   decode → per-(peer,topic) rate limit → resolve engine by carried cohortCoord → effectiveAt high-water → verify+apply
- *                                                                                                          ↘ (demotion) parent-unlink at parentCohortCoord
+ *   decode → per-(peer,topic) rate limit → resolve engine by carried cohortCoord → adopted-transition stale gate → verify+apply
+ *                                                                                                                ↘ (demotion) parent-unlink at parentCohortCoord
  * ```
  *
  * A **demotion** carries a second, independent apply semantics: beyond the sibling-adopt above, it also
  * releases the demoting child at its parent cohort ({@link applyDemotionUnlinkAtParent}). Both paths may fire
  * on one node (one that serves both the child coord and the parent coord). The parent-unlink runs OUTSIDE the
- * sibling-adopt high-water (which is keyed by the child coord and would otherwise stale-drop the parent-coord
- * frame after the child-coord frame advanced it); its freshness is the child registry's own per-child key.
- * `"unlinked"` is returned when the unlink fired but the sibling-adopt did not (a parent-only node).
+ * sibling-adopt transition record (which is keyed by the child coord and would otherwise stale-drop the
+ * parent-coord frame after the child-coord frame advanced it); its freshness is the child registry's own
+ * per-child key. `"unlinked"` is returned when the unlink fired but the sibling-adopt did not (a parent-only
+ * node).
  *
  * - **Rate limit** (`gate.rateLimiter`) keys on `(from, topicId)`; an over-rate peer is dropped before the
  *   coord lookup and the verify, so a peer cannot amplify junk into verify/network work.
@@ -2840,10 +2916,11 @@ export async function applyDemotionUnlinkAtParent(
  *   notice was decided for, covered by its signature. A node serving several sibling cohorts for one
  *   `(topic, tier)` applies the notice to the cohort that produced it, never a first-match `(topic, tier)`
  *   scan; a coord this node does not serve is dropped.
- * - **High-water** (`gate.highWater`, keyed per served `cohortCoord`) drops a notice whose `effectiveAt` is
- *   at or below the last *applied* one — a replay / out-of-order frame — before `verifyMessage`. It is
- *   advanced **only** on an `"applied"` outcome, so a forged frame (which never verifies) cannot poison it.
- *   Keying by coord (not `(topic, tier)`) keeps two sibling cohorts on one node from sharing a water.
+ * - **Stale gate** (`gate.transitions`, keyed per `(cohortCoord, tier, topicId)`) drops a notice whose
+ *   `effectiveAt` is at or below the last *adopted* transition — a replay / out-of-order frame — before
+ *   `verifyMessage`. On this inbound path it advances **only** on an `"applied"` outcome, so a forged frame
+ *   (which never verifies) cannot poison it. Keying by coord keeps two sibling cohorts on one node from
+ *   sharing an entry; keying by topic keeps two topics at one coord ordering independently.
  * - The receiver-side `cohortEpoch` is intentionally **not** gated on: the epoch rotates on every
  *   membership change, so a legitimately in-flight notice can briefly carry the prior epoch right after a
  *   rotation — making an epoch check a brittle, false-positive-prone filter. The rate limiter + high-water
@@ -2888,20 +2965,19 @@ export async function handleInboundNotice(
 	if (target === undefined) {
 		siblingOutcome = "dropped";
 	} else {
-		// Freshness / replay gate: drop an at-or-below-high-water notice before the expensive verify. Keyed by the
-		// served coord (which uniquely identifies the cohort) so two sibling cohorts on one node do not share a
-		// high-water — an applied notice for cohort A must not stale-drop a legitimate cohort-B notice. `tier` is
-		// kept in the key only for readability.
-		const waterKey = `${inbound.notice.cohortCoord}|${tier}`;
-		const water = gate.highWater.get(waterKey);
-		if (water !== undefined && inbound.notice.effectiveAt <= water) {
-			log("promote: stale %s notice for topic %s tier %d (effectiveAt %d <= high-water %d)", inbound.kind, inbound.notice.topicId, tier, inbound.notice.effectiveAt, water);
+		// Freshness / replay gate: drop a notice at or below the last adopted transition for its
+		// `(coord, tier, topic)` before the expensive verify. Keyed per coord (so two sibling cohorts on one
+		// node never share an entry) AND per topic (so an applied notice for topic A never stale-drops a
+		// legitimate topic-B notice at the same coord).
+		const held = gate.transitions.get(noticeTransitionKey(inbound.notice));
+		if (held !== undefined && inbound.notice.effectiveAt <= held.effectiveAt) {
+			log("promote: stale %s notice for topic %s tier %d (effectiveAt %d <= last adopted %d)", inbound.kind, inbound.notice.topicId, tier, inbound.notice.effectiveAt, held.effectiveAt);
 			siblingOutcome = "stale";
 		} else {
 			siblingOutcome = await verifyAndApplyNotice(inbound, target, verifier, now);
 			if (siblingOutcome === "applied") {
-				// Advance the high-water only on a *verified-and-applied* notice, so a forged frame cannot poison it.
-				gate.highWater.set(waterKey, inbound.notice.effectiveAt);
+				// Record only a *verified-and-applied* notice, so a forged frame cannot poison the ordering.
+				recordAdoptedTransition(gate, inbound.notice);
 			} else {
 				log("promote: %s %s notice for topic %s tier %d", siblingOutcome, inbound.kind, inbound.notice.topicId, tier);
 			}
@@ -2914,12 +2990,12 @@ export async function handleInboundNotice(
 
 	// --- Parent-unlink path (demotion only): additionally release the demoting child at its parent cohort. ---
 	// A demotion is fanned to BOTH the child coord (sibling-adopt, above) and the parent coord (this unlink),
-	// arriving as two independent frames. This path is deliberately OUTSIDE the sibling-adopt high-water: that
-	// water is keyed by the child coord and advanced only on a sibling-adopt apply, so — on a node serving both
-	// coords — the child-coord frame would advance the water and stale-drop the parent-coord frame before it
-	// could unrecord. The child registry's own per-`(topic, childCoord)` freshness orders the unlink instead, so
-	// a replay is an idempotent no-op. The verify is against the child cohort cert (same as the sibling-adopt),
-	// so a forged demotion cannot unrecord.
+	// arriving as two independent frames. This path is deliberately OUTSIDE the sibling-adopt transition
+	// record: that record is keyed by the child coord and advanced on a sibling-adopt apply, so — on a node
+	// serving both coords — the child-coord frame would advance it and stale-drop the parent-coord frame before
+	// it could unrecord. The child registry's own per-`(topic, childCoord)` freshness orders the unlink instead,
+	// so a replay is an idempotent no-op. The verify is against the child cohort cert (same as the
+	// sibling-adopt), so a forged demotion cannot unrecord.
 	const unlink = await applyDemotionUnlinkAtParent(inbound.notice, registry, verifier, now);
 	if (siblingOutcome === "applied") {
 		return "applied"; // a node serving both coords: the sibling-adopt is the primary reported outcome

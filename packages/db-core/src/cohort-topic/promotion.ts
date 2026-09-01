@@ -42,6 +42,9 @@
  * idempotent and `effectiveAt`-ordered via the monotonic {@link PromotionState.lastEffectiveAt}
  * high-water mark, so re-applying a notice (including this member's own echoed broadcast) or a replayed
  * older notice is a no-op — a stale promotion can never un-demote a cohort that has since demoted.
+ * A freshly created lifecycle can seed that per-topic ordering from a longer-lived node-level record via
+ * the optional {@link PromotionDeps.seedTransition}, so recreating an engine (e.g. after a memory-pressure
+ * eviction) does not reopen the replay window.
  */
 
 import { b64urlToBytes, bytesToB64url } from "./wire/codec.js";
@@ -103,9 +106,14 @@ interface PromotionState {
 	/**
 	 * `effectiveAt` of the most recent promotion/demotion this cohort has adopted — locally originated
 	 * (`promote()` / `demote()`) or remotely applied (`applyPromotionNotice` / `applyDemotionNotice`).
-	 * Monotonic and **never cleared** (a demotion clears `promoted`/`promotedAt` but keeps this), so it
-	 * is the high-water mark the remote-apply path orders against: a notice whose `effectiveAt` is not
-	 * strictly newer is a no-op — re-applied (incl. this member's own echoed broadcast) or stale-replayed.
+	 * Monotonic and never cleared within the lifecycle's lifetime (a demotion clears
+	 * `promoted`/`promotedAt` but keeps this), so it is the high-water mark the remote-apply path orders
+	 * against: a notice whose `effectiveAt` is not strictly newer is a no-op — re-applied (incl. this
+	 * member's own echoed broadcast) or stale-replayed. It is the **in-engine layer** of the replay
+	 * ordering, not the durable anchor: the lifecycle lives inside an engine the host may evict under
+	 * memory pressure, so on first touch of a topic it is seeded from the node-level adopted-transition
+	 * record ({@link PromotionDeps.seedTransition} — db-p2p's promote-gate `transitions` map), which
+	 * outlives the engine.
 	 */
 	lastEffectiveAt?: number;
 }
@@ -135,6 +143,16 @@ export interface PromotionDeps {
 	cohortEpoch: () => Uint8Array;
 	/** Threshold signer (the gossip ticket's `k − x` cohort signer). */
 	signer: CohortSigner;
+	/**
+	 * The node-level record of the last adopted promotion/demotion transition for `topicId` at this
+	 * cohort's `(coord, tier)` — db-p2p's promote-gate `transitions` map, which outlives the engine this
+	 * lifecycle lives in. Read once per topic, on first state creation, to seed
+	 * {@link PromotionState.lastEffectiveAt} and the promoted direction — so a recreated engine (after a
+	 * memory-pressure eviction) neither re-adopts a replayed stale notice nor forgets a correct
+	 * `promoted = true`. Optional: absent (key-less / unit composition) a fresh lifecycle starts cold,
+	 * exactly as before.
+	 */
+	seedTransition?: (topicId: Uint8Array) => { readonly effectiveAt: number; readonly promoted: boolean } | undefined;
 	config?: PromotionConfig;
 }
 
@@ -175,7 +193,9 @@ export interface PromotionLifecycle {
 	 * True iff any topic carries adopted promotion/demotion state — a `promoted` flag or a
 	 * `lastEffectiveAt` high-water. Growth samples / `lowLoadSince` alone do not count: they are
 	 * reconstructed from the store on the next {@link onParticipantCountChange}. Read by the host's
-	 * engine-eviction ranking, which must not discard an engine holding a transition it cannot rebuild.
+	 * engine-eviction ranking, which prefers to keep an engine holding an adopted transition. A ranking
+	 * preference, not the safety mechanism: the node-level adopted-transition record
+	 * ({@link PromotionDeps.seedTransition}) outlives the engine and re-seeds a recreated one.
 	 */
 	hasAdoptedState(): boolean;
 }
@@ -204,7 +224,7 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 	}
 
 	async onParticipantCountChange(topicId: Uint8Array, now: number): Promise<PromotionNoticeV1 | undefined> {
-		const state = this.stateFor(topicId);
+		const state = this.stateFor(topicId, now);
 		const count = this.deps.store.directParticipants(topicId);
 		this.pushGrowthSample(state, count, now);
 		this.refreshLowLoadClock(state, count, now);
@@ -229,7 +249,18 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 	}
 
 	isPromoted(topicId: Uint8Array): boolean {
-		return this.states.get(bytesKey(topicId))?.promoted ?? false;
+		const state = this.states.get(bytesKey(topicId));
+		if (state !== undefined) {
+			// In-engine state wins when present: it was itself seed-initialized on creation, so any divergence
+			// from the node-level record means a newer transition landed here first.
+			return state.promoted;
+		}
+		// Seed peek, not a state creation. `isPromoted` has no `now` to arm the sticky-window anchor
+		// (`promotedAt`), and creating promoted state without it would skip the sticky gate and allow an
+		// early demotion — so the direction is read straight off the node-level record. Nothing else calls
+		// `stateFor` on a freshly recreated engine before `isPromoted` is first read, so without this peek a
+		// correct `promoted = true` would be invisible until some notice or count change re-created the state.
+		return this.deps.seedTransition?.(topicId)?.promoted ?? false;
 	}
 
 	hasAdoptedState(): boolean {
@@ -246,7 +277,7 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 	// --- remote apply (verified notices this member did not originate) ---
 
 	applyPromotionNotice(n: PromotionNoticeV1, now: number): void {
-		const state = this.stateFor(b64urlToBytes(n.topicId));
+		const state = this.stateFor(b64urlToBytes(n.topicId), now);
 		if (!this.isNewerTransition(state, n.effectiveAt)) {
 			return; // already adopted, our own echoed broadcast, or a stale replay
 		}
@@ -255,8 +286,8 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 		state.lastEffectiveAt = n.effectiveAt;
 	}
 
-	applyDemotionNotice(n: DemotionNoticeV1, _now: number): void {
-		const state = this.stateFor(b64urlToBytes(n.topicId));
+	applyDemotionNotice(n: DemotionNoticeV1, now: number): void {
+		const state = this.stateFor(b64urlToBytes(n.topicId), now);
 		if (!this.isNewerTransition(state, n.effectiveAt)) {
 			return;
 		}
@@ -390,11 +421,24 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 
 	// --- bookkeeping ---
 
-	private stateFor(topicId: Uint8Array): PromotionState {
+	private stateFor(topicId: Uint8Array, now: number): PromotionState {
 		const key = bytesKey(topicId);
 		let state = this.states.get(key);
 		if (state === undefined) {
 			state = { promoted: false, samples: [] };
+			// Seed the replay ordering (and direction) from the node-level adopted-transition record, so a
+			// recreated engine picks up where the evicted one left off. The original sticky-window anchor is
+			// unrecoverable, so a seeded promotion re-arms `promotedAt` at `now` — that only delays demotion
+			// (the conservative direction), never allows an early one. `lowLoadSince` stays undefined: it is
+			// rebuilt from the store on the next `onParticipantCountChange`.
+			const seed = this.deps.seedTransition?.(topicId);
+			if (seed !== undefined) {
+				state.lastEffectiveAt = seed.effectiveAt;
+				state.promoted = seed.promoted;
+				if (seed.promoted) {
+					state.promotedAt = now;
+				}
+			}
 			this.states.set(key, state);
 		}
 		return state;
