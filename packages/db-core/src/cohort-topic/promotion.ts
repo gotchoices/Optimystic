@@ -231,7 +231,7 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 		if (state.promoted) {
 			return undefined; // already promoted — sticky until a demotion clears it
 		}
-		if (!this.promotionTriggered(topicId, state, count, now)) {
+		if (!this.promotionTriggered(topicId, state, count)) {
 			return undefined;
 		}
 		return this.promote(topicId, state, now);
@@ -266,6 +266,12 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 	hasAdoptedState(): boolean {
 		// Adopted transition state only: a promoted flag or the lastEffectiveAt high-water. Growth samples /
 		// lowLoadSince are rebuilt from the store on the next onParticipantCountChange, so they never count.
+		// NOTE: this reports only in-engine state, so a freshly recreated engine whose promoted mode is
+		// currently visible ONLY through the `isPromoted` seed peek (no `stateFor` call yet) answers false and
+		// ranks 0 in the host's eviction ranking — as evictable as an engine holding nothing. Correctness is
+		// unaffected (the node-level record survives eviction and re-seeds again), so this is a ranking
+		// preference lost, not state lost. If recreated-promoted engines are ever observed thrashing through
+		// eviction, give the peek a `now` and let it create the seeded state instead of peeking.
 		for (const state of this.states.values()) {
 			if (state.promoted || state.lastEffectiveAt !== undefined) {
 				return true;
@@ -305,18 +311,22 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 
 	// --- promotion ---
 
-	private promotionTriggered(topicId: Uint8Array, state: PromotionState, count: number, now: number): boolean {
+	private promotionTriggered(topicId: Uint8Array, state: PromotionState, count: number): boolean {
 		if (count >= this.capPromote) {
 			return true;
 		}
 		if (this.deps.loadBucket(topicId) >= this.bucketOverload && count >= this.capPromoteFast) {
 			return true;
 		}
-		return this.slopePredictsCrossing(state, count, now);
+		return this.slopePredictsCrossing(state, count);
 	}
 
-	/** Linear extrapolation over the growth window: will `directParticipants` cross `cap_promote` within lookahead? */
-	private slopePredictsCrossing(state: PromotionState, count: number, now: number): boolean {
+	/**
+	 * Linear extrapolation over the growth window: will `directParticipants` cross `cap_promote` within
+	 * lookahead? Needs no `now` — the caller stamps the current `(now, count)` as the last growth sample
+	 * before asking, so `samples[last].t` *is* `now`.
+	 */
+	private slopePredictsCrossing(state: PromotionState, count: number): boolean {
 		const samples = state.samples;
 		if (samples.length < 2) {
 			return false;

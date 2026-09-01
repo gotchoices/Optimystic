@@ -663,23 +663,40 @@ A cohort may also pre-promote on observing rapid growth: if the slope of `direct
 > ordered via a monotonic per-topic high-water mark that survives demotion, so re-applying a notice
 > (including a member's own echoed broadcast) or a replayed older one is a no-op — a stale promotion can
 > never un-demote a cohort. `isPromoted` reflects remotely-applied state, so a member that learned of a
-> promotion answers `Promoted(d+1)` even though it did not originate it. On the wire (db-p2p host): a
+> promotion answers `Promoted(d+1)` even though it did not originate it.
+>
+> **The ordering outlives the engine.** `PromotionState.lastEffectiveAt` lives inside a `CoordEngine`, which
+> the host's registry evicts under memory pressure — so it is the *in-process second layer*, not the node's
+> authority. The authority is the host's node-level **adopted-transition record**
+> (`PromoteGate.transitions`, keyed `(cohortCoord, tier, topicId)`), holding both the `effectiveAt` and the
+> direction the transition left the cohort in. Every adopt path writes it: a verified inbound apply *and* the
+> node's own origination (`broadcastNotice` — `broadcastOver` excludes self, so an originated notice never
+> returns on the inbound path). A freshly created lifecycle reads it back through
+> `PromotionDeps.seedTransition`, seeding `lastEffectiveAt` and `promoted` on first touch of a topic, so
+> eviction + recreation neither reopens the replay window (threshold signatures never expire — ordering is
+> the only defense against a captured notice) nor forgets a correct `promoted = true`. The original
+> sticky-window anchor is unrecoverable, so a seeded promotion re-arms `promotedAt` at the seeding instant:
+> demotion is *delayed* by up to one `T_promote_sticky`, never made early. Data flow is one-way — the
+> engine never writes back to the record. Ticket: `bug-promotion-state-survives-engine-eviction`. On the
+> wire (db-p2p host): a
 > freshly-signed notice surfaced on an arrival is captured via the engine's `onNotice` hook and
 > `sendOneWay`-broadcast over the `promote` protocol to the cohort around the served coord (and, for a
 > demotion, additionally the parent coord); inbound, the `promote` handler (`handleInboundNotice`) runs a
 > cheapest-first anti-abuse gate before any signature/network work — `decode → per-(peer, topic) rate
-> limit → resolve engine by carried cohortCoord → high-water → verify+apply` — so a peer streaming junk over the
+> limit → resolve engine by carried cohortCoord → adopted-transition stale gate → verify+apply` — so a peer
+> streaming junk over the
 > protocol cannot amplify into per-message signature verification or membership dials. The rate limiter
 > is the same `register_rate_per_peer` sliding-window limiter (its own node-level instance, since the
-> handler is node-level); the per-served-coord `effectiveAt` high-water drops a replay/out-of-order
-> notice before `verifyMessage` and is advanced **only** on a verified-and-applied notice (so a forged
-> frame cannot poison it); and the verify itself passes a `PROMOTE_REFETCH_MIN_INTERVAL_MS` (60 s)
+> handler is node-level); the adopted-transition record drops a replay/out-of-order
+> notice before `verifyMessage` and — on this inbound path — is advanced **only** on a verified-and-applied
+> notice (so a forged frame cannot poison it); and the verify itself passes a `PROMOTE_REFETCH_MIN_INTERVAL_MS` (60 s)
 > bound that rate-limits the stale-cert refetch to one `source.fetch()` per coord per interval (eventual
 > refetch preserved — a cold cache / membership rotation still re-fetches once it elapses). It resolves the
 > target cohort by the notice's **signed `cohortCoord`** (the exact served coord the decision was made for)
 > rather than by a first-match `(topic, tier)` scan: a node serving several sibling cohorts for one
 > `(topic, tier)` — possible at `d ≥ 1` — thus routes the notice to the cohort that produced it, and keys
-> the high-water by that coord so one cohort's notice can neither mis-apply to nor stale-drop a sibling's.
+> the record by that coord (and by topic) so neither one cohort's notice nor one topic's can mis-apply to
+> or stale-drop another's.
 > It then verifies the threshold signature against that cohort's `MembershipCertV1` via the participant
 > `MembershipVerifier` (signers ⊆ cert, `≥ minSigs`, multisig valid — `cohortCoord` is covered by the
 > signature, so rewriting it to hijack a sibling breaks verification), and applies it — a notice for a coord
@@ -687,7 +704,10 @@ A cohort may also pre-promote on observing rapid growth: if the slope of `direct
 > on the stream). Specs: `promotion.spec.ts`
 > (remote-apply ordering/idempotency), db-p2p `promote-notice.spec.ts` (verify + apply, forged/short-quorum
 > + non-member rejection, no-engine drop, broadcast fan-out, anti-abuse gate: flood-bounded refetch /
-> rate-limit drop / high-water replay drop), db-core `membership.spec.ts` (bounded-refetch rate limit).
+> rate-limit drop / adopted-transition replay drop / per-coord + per-topic key independence), db-p2p
+> `host-antidos-coldstart.spec.ts` (the transition record surviving engine eviction), db-p2p
+> `live-tier.spec.ts` (the originating node writing its own record), db-core `membership.spec.ts`
+> (bounded-refetch rate limit).
 
 ### Demotion (cohort shrinks)
 
@@ -697,7 +717,7 @@ A cohort demotes for topic `T` when, for a quorum of members:
 - The above has held for at least `T_demote` (default 5 minutes), AND
 - The cohort has no live `childCohorts` for `T`.
 
-Demotion threshold-signs a `DemotionNoticeV1` and fans it to **two** targets: the demoting cohort's own served coord (siblings adopt `promoted = false`) **and** its `parentCohortCoord`. At the parent, the notice is a second, independent apply — the parent verifies it against the **child** cohort cert (the same threshold verify a sibling runs) and, on success, **unrecords the child** from its per-engine child registry ("drop me from your tier-(d+1) children"). That release gossips across the parent cohort exactly as the link does (last-writer-wins by `effectiveAt`), so every parent member's `childCohortCount` falls; once the last child is gone the parent's own demotion gate (`childCohortCount > 0` no longer blocks) can fire in turn. The demoting cohort releases all forwarder state for `T`. (A node that serves *both* the demoting child coord and the parent coord applies both semantics from one notice; the parent-unlink runs independently of the sibling-adopt replay high-water, ordered by the child registry's own per-child freshness — see `cohort-topic-child-link-replicate-unlink`.)
+Demotion threshold-signs a `DemotionNoticeV1` and fans it to **two** targets: the demoting cohort's own served coord (siblings adopt `promoted = false`) **and** its `parentCohortCoord`. At the parent, the notice is a second, independent apply — the parent verifies it against the **child** cohort cert (the same threshold verify a sibling runs) and, on success, **unrecords the child** from its per-engine child registry ("drop me from your tier-(d+1) children"). That release gossips across the parent cohort exactly as the link does (last-writer-wins by `effectiveAt`), so every parent member's `childCohortCount` falls; once the last child is gone the parent's own demotion gate (`childCohortCount > 0` no longer blocks) can fire in turn. The demoting cohort releases all forwarder state for `T`. (A node that serves *both* the demoting child coord and the parent coord applies both semantics from one notice; the parent-unlink runs independently of the sibling-adopt replay ordering, and writes no adopted-transition record — it is ordered by the child registry's own per-child freshness instead; see `cohort-topic-child-link-replicate-unlink`.)
 
 ### Cold-start instantiation
 
@@ -824,7 +844,7 @@ real warm replicas and failover.
 > | `records`    | pinned   | A live cohort's registrations — never evicted. |
 > | `forwarders` | pinned   | A mid-link cold-start forwarder (possibly `awaiting_parent`) — never evicted. |
 > | `children`   | 1        | Linked child cohorts. Evictable, but only after everything at rank 0. |
-> | `promotion`  | 1        | Adopted promotion/demotion state (`promoted`, or the `lastEffectiveAt` high-water). Same. |
+> | `promotion`  | 1        | Adopted promotion/demotion state (`promoted`, or the `lastEffectiveAt` high-water). Same — but a *preference* only: the node-level adopted-transition record re-seeds a recreated engine (§Promotion), so this ranking saves a seed read, not correctness. |
 >
 > An engine holding none of them is rank 0 — the attacker-sprayed cold coord the cap exists for. The victim
 > is the `(rank, recency)`-lexicographically-least candidate: rank first, LRU only to break ties within a
@@ -1103,20 +1123,29 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 > **Promote-handler gate (`promote` protocol, not registration).** The four defenses above guard the
 > *register* path; the inbound `promote`-notice handler (§Promotion and demotion lifecycle) reuses the
 > same primitives against verify/refetch amplification: a **node-level** `RegisterRateLimiter` keyed on
-> `(peer, topicId)` sheds an over-rate peer before the `findServing` scan, a per-`(topic, tier)`
-> `effectiveAt` high-water drops replays before the signature verify, and the verify passes a 60 s
+> `(peer, topicId)` sheds an over-rate peer before the `findServing` scan, the per-`(cohortCoord, tier,
+> topicId)` adopted-transition record drops replays before the signature verify, and the verify passes a 60 s
 > per-coord refetch bound (`PROMOTE_REFETCH_MIN_INTERVAL_MS`) so a flood drives a *bounded* membership
 > refetch rate rather than one dial per frame. Both maps are bounded for a long-lived node
 > (`cohort-topic-promote-gate-map-eviction`): the limiter — the attacker-growable one, since the rate
 > check runs before `findServing` so a forged notice for an unserved `topicId` still allocates a
 > `(peer, topic)` entry — carries the register-path limiter's inline `maxKeys` LRU hard cap plus an
-> idle-TTL `sweep` driven on the host's gossip cadence; the high-water is an `LruMap` capped at
-> `PROMOTE_HIGHWATER_MAX_KEYS = 8192` and is written **only** on a verified `applied` outcome (so it
-> is *not* attacker-growable and never evicts under legitimate load). Evicting a high-water entry is
-> safe: the high-water is a strictly-weaker early-drop optimization, not the idempotency authority —
-> the engine's `PromotionLifecycle` is independently idempotent and `effectiveAt`-ordered
-> (`PromotionState.lastEffectiveAt`), so an evicted-then-replayed stale notice re-verifies once (itself
-> rate-capped) and then no-ops at the engine rather than (re-)applying.
+> idle-TTL `sweep` driven on the host's gossip cadence; the adopted-transition record is an `LruMap`
+> capped at `PROMOTE_TRANSITIONS_MAX_KEYS = 8192` and is written **only** on an adopted transition — a
+> verified `applied` inbound outcome, or this node's own threshold-signed origination — so it is *not*
+> attacker-growable (a `.get` for a forged key creates nothing).
+>
+> **Losing an entry costs ordering, so keep the two eviction paths distinct.** Unlike the pre-eviction-fix
+> high-water this record is the node's replay-ordering *authority*, not a strictly-weaker early-drop
+> optimization (§Promotion, "The ordering outlives the engine"). While the engine stays **resident**,
+> evicting a map entry is still harmless — the engine's `PromotionState.lastEffectiveAt` no-ops the
+> replay. What the record buys is the case where the *engine* was evicted: the recreated engine seeds
+> from it. Only losing **both** — the engine to the registry cap and the entry to this LRU — reopens the
+> replay window. Reads refresh recency (`LruMap.get`), and both consumers (the stale gate and engine
+> seeding) read, so an actively-transitioning `(coord, tier, topic)` stays resident; the cap bounds the
+> otherwise retain-forever shape on a long-lived node. Note the cap counts `(coord, tier, topic)` triples,
+> **not** engines — a node at the 2048-engine registry cap serving more than ~4 topics per coord can
+> exceed 8192 entries, and the oldest-touched then evict first.
 
 > **Open question — `F^d` fan-out under per-coord rate limits (not resolved here).** The per-peer
 > rate limit bounds cost *per cohort*, but a malicious peer can hit every one of the `F^d`
@@ -1293,7 +1322,7 @@ limit, topic-budget refusal, and `bootstrap: true` root instantiation.
 >   child is linked (cohort-wide, converged via gossip), and the demotion notice fanned to the parent coord
 >   **unlinks** the child so the count falls and the parent can shrink in turn
 >   (`cohort-topic-child-link-replicate-unlink`). The parent-unlink (verify against the child cohort cert →
->   `unrecordChild`), the dual-role node, the forged-rejected, and the high-water-independence cases are
+>   `unrecordChild`), the dual-role node, the forged-rejected, and the ordering-independence cases are
 >   unit-covered (`promote-notice.spec.ts`); the two-member child-union + unlink convergence is covered by
 >   `gossip-cadence.spec.ts`. Promotion/demotion hysteresis is unit-covered by `promotion.spec.ts`.
 > - **membership-rotation primary handoff** (inventory → pull → dual-serve → ack): `registration/handoff.ts`

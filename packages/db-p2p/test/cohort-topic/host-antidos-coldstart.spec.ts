@@ -21,6 +21,7 @@ import {
 	type MembershipVerifier,
 	type RegisterV1,
 	type RenewV1,
+	type DemotionNoticeV1,
 	type PromotionNoticeV1,
 	type RingCoord,
 	type Tier,
@@ -924,6 +925,74 @@ describe('cohort-topic: coord-engine registry cap (attacker-keyed engine creatio
 		// ...and a replay of the very frame captured in step 1 is stale-dropped by the record eviction never touched.
 		expect(await handleInboundNotice(frame, participant, host.registry, trustAll, host.promoteGate, 12_000), 'the captured replay is stale').to.equal('stale');
 		expect(host.registry.findByCoord(A)!.isPromoted(T), 'still promoted after the replay').to.equal(true);
+
+		await host.stop();
+	});
+
+	/** A structurally-valid tier-1 demotion notice at `cohortCoord`, handing off to `parentCohortCoord`. */
+	function gateDemotionFor(topicId: Uint8Array, cohortCoord: RingCoord, parentCohortCoord: RingCoord, effectiveAt: number): DemotionNoticeV1 {
+		return {
+			v: 1,
+			topicId: bytesToB64url(topicId),
+			tier: 1,
+			parentCohortCoord: bytesToB64url(parentCohortCoord),
+			cohortCoord: bytesToB64url(cohortCoord),
+			effectiveAt,
+			thresholdSig: DUMMY_SIG,
+			signers: [bytesToB64url(topicId)],
+			cohortEpoch: bytesToB64url(new Uint8Array(32)),
+		};
+	}
+
+	it('a DEMOTED transition survives engine eviction: the recreated engine seeds promoted = false and the captured promotion cannot re-promote it', async () => {
+		// The other half of the eviction hole, and the damaging one. A cohort promotes, later demotes, then its
+		// engine is evicted under memory pressure. Threshold signatures never expire, so the promotion notice
+		// captured off the wire back at step 1 is still perfectly valid — ordering is the ONLY thing that
+		// refuses it. Pre-fix that ordering died with the engine and the replay re-promoted a cohort that had
+		// since demoted, leaving the node acting on a group layout that no longer exists.
+		const CAP = 2;
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { coordEnginesMax: CAP },
+		});
+		const participant = await makeParticipantBytes();
+		const T = topicAt(0);
+		// A tier-1 cohort, so the demotion has a real parent to hand off to (the root never demotes).
+		const A = addressing.coord(1, participant, T);
+		const PARENT = addressing.coord0(T);
+
+		// 1. Promote@10_000 adopts; the frame is the attacker's capture.
+		host.registry.forCoord(A, 1, participant);
+		const capturedPromotion = encodeCohortMessage({ ...gateNoticeFor(T, A, 10_000), fromTier: 1, toTier: 2 });
+		expect(await handleInboundNotice(capturedPromotion, participant, host.registry, trustAll, host.promoteGate, 11_000), 'the promotion adopts').to.equal('applied');
+		expect(host.registry.findByCoord(A)!.isPromoted(T), 'promoted').to.equal(true);
+
+		// 2. Demote@20_000 adopts at the same (coord, tier, topic) key — a demotion's `tier` and a promotion's
+		//    `fromTier` deliberately address ONE entry, so the two directions order against each other.
+		const demotion = encodeCohortMessage(gateDemotionFor(T, A, PARENT, 20_000));
+		expect(await handleInboundNotice(demotion, participant, host.registry, trustAll, host.promoteGate, 21_000), 'the demotion adopts').to.equal('applied');
+		expect(host.registry.findByCoord(A)!.isPromoted(T), 'demoted').to.equal(false);
+		expect(
+			host.promoteGate.transitions.get(transitionKey(bytesToB64url(A), 1, bytesToB64url(T))),
+			'the record carries the LATEST transition and its direction',
+		).to.deep.equal({ effectiveAt: 20_000, promoted: false });
+
+		// 3. Evict A: a rank-1 companion touched after it, then an overflow past the cap of 2.
+		const companion = host.registry.forCoord(addressing.coord0(topicAt(1)), 0 as Tier, participant);
+		companion.recordChild(topicAt(1), addressing.coord0(topicAt(500)), 1_000);
+		host.registry.forCoord(addressing.coord0(topicAt(2)), 0 as Tier, participant);
+		expect(host.registry.findByCoord(A), 'the demoted engine was evicted').to.equal(undefined);
+
+		// 4. Recreate A and replay the step-1 capture. 10_000 is below the recorded 20_000, so the node-level
+		//    record — which eviction never touched — stale-drops it before the verifier.
+		//    (`isPromoted` here is a sanity check, not a seed assertion: a cold engine also reports false. The
+		//    seed's demoted direction is isolated at the layer where it *is* distinguishable, in db-core's
+		//    `promotion.spec.ts` "a demoted seed stale-drops a replayed older promotion". What this test adds
+		//    is the end-to-end composition: promote → demote → evict → replay, over the real host gate.)
+		const recreated = host.registry.forCoord(A, 1, participant);
+		expect(recreated.isPromoted(T), 'the recreated engine is not promoted').to.equal(false);
+		expect(await handleInboundNotice(capturedPromotion, participant, host.registry, trustAll, host.promoteGate, 30_000), 'the captured promotion is stale').to.equal('stale');
+		expect(host.registry.findByCoord(A)!.isPromoted(T), 'the replay could not re-promote the demoted cohort').to.equal(false);
 
 		await host.stop();
 	});

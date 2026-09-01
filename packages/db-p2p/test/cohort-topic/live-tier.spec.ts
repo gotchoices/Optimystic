@@ -34,7 +34,6 @@
 
 import { expect } from 'chai';
 import {
-	bytesEqual,
 	bytesToB64url,
 	b64urlToBytes,
 	compareBytes,

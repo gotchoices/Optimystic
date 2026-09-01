@@ -755,6 +755,14 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			return members.includes(bytesToPeerIdString(fromBytes));
 		};
 
+	// Node-level `promote`-handler anti-abuse gate (`cohort-topic-promote-handler-verify-amplification`):
+	// a per-(peer, topic) rate limiter (own instance — the register-path limiter is per-coord inside each
+	// engine; this handler is node-level) plus the per-(coord, tier, topic) adopted-transition record.
+	// Defaults to `register_rate_per_peer` (4 / min / peer / topic) with exponential back-off. Declared here
+	// rather than with the other anti-DoS wiring below because `broadcastNotice` writes the record on the
+	// origination path.
+	const promoteGate = createPromoteGate(options.antiDos?.rateLimiter);
+
 	// --- outbound notice broadcast (gap 4) ---
 	// A coord engine that threshold-signs a promotion/demotion notice hands it here; we fan it over the
 	// `promote` protocol to the cohort around the served coord (siblings adopt the state) and, for a
@@ -765,8 +773,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		// excludes self, so an originated notice never arrives back on the inbound path — this is the ONLY
 		// write for locally-originated transitions. Keyed off the notice's own `cohortCoord` only; the parent
 		// coord a demotion also fans to is deliberately outside this ordering (the parent-unlink is ordered by
-		// the child registry's per-child `lastEffectiveAt` — see `applyDemotionUnlinkAtParent`). `promoteGate`
-		// is declared below; this closure only runs on a (later) notice, after it is initialized.
+		// the child registry's per-child `lastEffectiveAt` — see `applyDemotionUnlinkAtParent`).
 		recordAdoptedTransition(promoteGate, notice);
 		const frame = encodeCohortMessage(notice, maxBytes);
 		// A demotion fans to BOTH the demoting child's served coord (siblings adopt `promoted = false` via the
@@ -803,12 +810,6 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	const hasCommittedParentBacking =
 		options.antiDos?.parentTopicView !== undefined || options.committedParentTopicReader !== undefined;
 	const bootstrapEvidence = createBootstrapEvidencePolicy(options.antiDos, hash, log, parentTopicView, hasCommittedParentBacking);
-
-	// Node-level `promote`-handler anti-abuse gate (`cohort-topic-promote-handler-verify-amplification`):
-	// a per-(peer, topic) rate limiter (own instance — the register-path limiter is per-coord inside each
-	// engine; this handler is node-level) plus the per-(coord, tier, topic) adopted-transition record.
-	// Defaults to `register_rate_per_peer` (4 / min / peer / topic) with exponential back-off.
-	const promoteGate = createPromoteGate(options.antiDos?.rateLimiter);
 
 	const ctx: CoordEngineContext = {
 		hash,
@@ -2685,21 +2686,28 @@ export interface PromoteGate {
 	 * includes the coord so two sibling cohorts a node serves for one `(topic, tier)` never share an
 	 * entry, and the topic so two topics at one coord order independently.
 	 *
-	 * **Bounded.** An {@link LruMap} capped at {@link PROMOTE_TRANSITIONS_MAX_KEYS} (deliberately above
-	 * the 2048-engine registry cap, so seeding never misses for a resident engine) so the retain-forever
+	 * **Bounded.** An {@link LruMap} capped at {@link PROMOTE_TRANSITIONS_MAX_KEYS}, so the retain-forever
 	 * shape cannot leak on a long-lived node. Not attacker-growable: it is written only on adopted
 	 * transitions — a verified `≥ minSigs` cohort signature, or a locally threshold-signed notice — and
-	 * reads of forged keys via `.get` create nothing, so it never evicts under legitimate load; the cap
-	 * is the belt-and-suspenders bound. Record absence only *opens* the stale gate, never closes it.
+	 * reads of forged keys via `.get` create nothing. Both consumers read through `.get`, which refreshes
+	 * recency, so an actively-transitioning `(coord, tier, topic)` stays resident. Record absence only
+	 * *opens* the stale gate, never closes it: losing an entry while its engine is still resident costs
+	 * one re-verify (the engine's `lastEffectiveAt` still no-ops the replay), and only losing BOTH the
+	 * entry and the engine reopens the replay window.
 	 */
 	readonly transitions: LruMap<string, AdoptedTransition>;
 }
 
 /**
  * Hard cap on tracked adopted-transition entries; the least-recently-touched are evicted beyond this. A
- * modest bound is plenty — only adopted transitions grow the map, so it never evicts under legitimate
- * load — but it caps the otherwise retain-forever shape on a long-lived node. Kept above the coord-engine
- * registry cap ({@link DEFAULT_COORD_ENGINES_MAX} = 2048) so every resident engine's transitions fit.
+ * modest bound is plenty — only adopted transitions grow the map — but it caps the otherwise
+ * retain-forever shape on a long-lived node.
+ *
+ * NOTE: this counts `(coord, tier, topic)` triples, NOT engines, so it is not a per-engine guarantee: a
+ * node at the {@link DEFAULT_COORD_ENGINES_MAX} (2048) registry cap that has transitioned more than ~4
+ * topics per coord can overflow it, and the least-recently-touched entries go first. That is safe while
+ * the owning engine is resident (its `lastEffectiveAt` still orders replays); if a node ever runs that
+ * wide AND evicts engines, raise this cap rather than relying on the engine layer.
  */
 export const PROMOTE_TRANSITIONS_MAX_KEYS = 8192;
 
@@ -2731,6 +2739,12 @@ export function noticeTransitionKey(notice: PromotionNoticeV1 | DemotionNoticeV1
  * inbound apply in {@link handleInboundNotice} and the host's `broadcastNotice` origination seam.
  */
 export function recordAdoptedTransition(gate: PromoteGate, notice: PromotionNoticeV1 | DemotionNoticeV1): void {
+	// NOTE: this write is monotonic but `promote()` / `demote()` origination is not — the lifecycle stamps
+	// `effectiveAt = now` without consulting its own `lastEffectiveAt`. A backwards local clock can therefore
+	// originate a transition the record refuses, leaving the record's direction stale relative to the engine
+	// until the next forward-clock transition. Harmless today (the wall clock only skews backwards on an NTP
+	// step, and the same skew already perturbs every `effectiveAt`-ordered path); if origination ever gains a
+	// monotonic clock, drop the divergence by ordering `promote()` / `demote()` against `lastEffectiveAt` too.
 	const key = noticeTransitionKey(notice);
 	const held = gate.transitions.get(key);
 	if (held === undefined || notice.effectiveAt > held.effectiveAt) {
