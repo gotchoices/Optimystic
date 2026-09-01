@@ -272,6 +272,16 @@ export class OptimysticVirtualTable extends VirtualTable {
   private isProvisionallyInitialized = false;
   /** In-flight provisional initialization, shared by concurrent committed reads. */
   private provisionalInitPromise?: Promise<void>;
+  /**
+   * Whether the DDL that declared this table supplied columns (`CREATE TABLE`, or a
+   * connect carrying columns) as opposed to a hydrate/connect that must load them from
+   * storage. Captured at construction: doInitialize populates `tableSchema.columns` on
+   * the load arm, so re-reading the length inside would make a re-run (a retry after a
+   * failed attempt, or the provisional→full upgrade) take a different branch than the
+   * first pass — specifically the DDL-wins arm, which can WRITE the schema where the
+   * first pass intended a read-only load.
+   */
+  private readonly declaredColumns: boolean;
   private txnBridge: TransactionBridge;
   private collectionFactory: CollectionFactory;
   private options: ParsedOptimysticOptions;
@@ -311,6 +321,7 @@ export class OptimysticVirtualTable extends VirtualTable {
   ) {
     super(db, module, schemaName, tableName);
     this.tableSchema = tableSchema;
+    this.declaredColumns = tableSchema.columns.length > 0;
     this.options = options;
     this.collectionFactory = collectionFactory;
     this.txnBridge = txnBridge;
@@ -333,8 +344,29 @@ export class OptimysticVirtualTable extends VirtualTable {
       return this.initializationPromise;
     }
 
-    // Start initialization
-    this.initializationPromise = (async () => {
+    // Start initialization.
+    //
+    // The memo must never memoize its own REJECTION: a first touch that failed for a
+    // passing reason (a network hiccup, a storage node answering late) would otherwise
+    // replay that one stale error for every later statement, for the life of the
+    // process, long after the cohort recovered. Clearing the field in a `finally` —
+    // the shape initializeForCommittedRead already uses for its provisional pass —
+    // leaves the next statement free to retry. Callers that arrive while the attempt
+    // is still in flight hold the same object and keep sharing it; only the SETTLED
+    // case changes.
+    //
+    // NOTE: accepted tradeoff — a table pointed at a genuinely dead cohort re-attempts
+    // initialization on every statement rather than caching the failure for a cooldown
+    // window; un-damped retry weighed over a window this layer has no basis to pick
+    // (the same reasoning that made this module decline to declare `expectedLatencyMs`
+    // — see that note on OptimysticModule — applies unchanged to a damping window, and
+    // damping would reintroduce this very bug in miniature, delaying recovery by up to
+    // the window). A statement against an unreachable cohort was going to make network
+    // calls and fail regardless, and every attempt is user-driven — nothing re-enters
+    // initialize() in the background. Revisit if initialization storms against a dead
+    // cohort ever show up in profiles — damp in the transactor layer that already
+    // models unreachable blocks, not here.
+    const attempt = (async () => {
       // An in-flight PROVISIONAL (read-only) initialization shares this table's
       // instance fields; let it settle before rebuilding fully so the two cannot
       // interleave half-assigned state. Its failure is irrelevant here — the full
@@ -347,8 +379,18 @@ export class OptimysticVirtualTable extends VirtualTable {
         }
       }
       await this.doInitialize(false);
-    })();
-    return this.initializationPromise;
+    })().finally(() => {
+      // Cleared either way: on success `isInitialized` gates re-entry; on failure the
+      // next statement is free to retry against a cohort that may have recovered. The
+      // identity check is defensive — this `finally` runs before any awaiting caller
+      // resumes, so no newer attempt can exist yet — but it costs nothing and survives
+      // future reordering.
+      if (this.initializationPromise === attempt) {
+        this.initializationPromise = undefined;
+      }
+    });
+    this.initializationPromise = attempt;
+    return attempt;
   }
 
   /**
@@ -422,6 +464,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   private async doInitialize(readOnly: boolean): Promise<void> {
     try {
+      // A failed attempt must leave no message behind for a successful retry to wear.
+      // Diagnostics only (nothing in the engine reads `errorMessage` — see the note on
+      // OptimysticModule), but it should not outlive the open it describes.
+      this.setErrorMessage(undefined);
       const txnState = readOnly ? null : this.txnBridge.getCurrentTransaction();
       // NOTE: create-on-missing is intentional here, and stays. A table registered in the
       // schema catalog but never written to has NO committed header block — the header is
@@ -443,11 +489,15 @@ export class OptimysticVirtualTable extends VirtualTable {
       //   - xConnect / hydrated (no local columns): load the persisted schema
       //     and stamp it onto the placeholder tableSchema so query planning
       //     can see the real columns.
+      //
+      // The branch is a function of the DECLARATION ({@link declaredColumns}), not of
+      // `this.tableSchema.columns.length` — the load arm below populates that list, so
+      // reading it here would send a re-run (a retry after a failed attempt, or the
+      // provisional→full upgrade) down the DDL-wins arm instead.
       const persistedSchema = await this.schemaManager.getSchema(this.tableName, txnState?.transactor);
-      const hasLocalColumns = this.tableSchema.columns.length > 0;
       let storedSchema: StoredTableSchema;
 
-      if (hasLocalColumns) {
+      if (this.declaredColumns) {
         // Build the would-be-persisted form of the local DDL and short-circuit
         // when it matches what's already on disk. Without this, every cold-start
         // `connect()` after `hydrate()` re-writes a byte-identical schema and
@@ -609,13 +659,20 @@ export class OptimysticVirtualTable extends VirtualTable {
       // per-transaction snapshot includes them.
       this.registerCollections();
 
-      // NOTE: this is the one path on which doInitialize runs TWICE for a table — the
-      // upgrade after a provisional pass — so it is the only one that replaces
-      // `rowCodec`/`indexManager` while a committed scan started off the provisional
-      // state may still be iterating (scans re-read both fields per row). Harmless
-      // while both passes resolve the same schema, which they do unless DDL changed the
-      // table in between; if concurrent DDL ever becomes real here, a scan must capture
-      // its codec and index manager as locals alongside its pinned views.
+      // NOTE: this is one of two paths on which doInitialize runs TWICE for a table —
+      // the upgrade after a provisional pass, and a retry after a failed attempt (see
+      // initialize()) — so it replaces `rowCodec`/`indexManager` while a committed scan
+      // started off the provisional state may still be iterating (scans re-read both
+      // fields per row). Harmless while both passes resolve the same schema, which they
+      // do unless DDL changed the table in between; if concurrent DDL ever becomes real
+      // here, a scan must capture its codec and index manager as locals alongside its
+      // pinned views. The same field replacement has a FAILURE face: a pass that throws
+      // between the `indexManager` assignment above and its `initialize()` leaves an
+      // UNINITIALIZED IndexManager on a table such a scan is reading. Needs a
+      // successful provisional init, an in-flight committed scan, AND a full pass
+      // failing in that window, so it is not reachable today; capturing the locals
+      // closes both faces at once, and that is the fix to reach for if concurrent DDL
+      // or committed scans outliving an upgrade ever become real.
       this.isProvisionallyInitialized = false;
       this.isInitialized = true;
 

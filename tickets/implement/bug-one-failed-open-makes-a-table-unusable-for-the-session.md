@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-09-01T06:32:06.267Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\bug-one-failed-open-makes-a-table-unusable-for-the-session.implement.2026-09-01T06-32-06-267Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: If a table's very first read fails for a passing reason — a brief network hiccup, a storage node that answers late — that table keeps failing with the same stale error for the rest of the session, even after everything is healthy again. Make the next statement free to try again.
 files: packages/quereus-plugin-optimystic/src/optimystic-module.ts, packages/quereus-plugin-optimystic/test/drop-table-orphan-rows.spec.ts (harness to copy), packages/quereus-plugin-optimystic/test/init-retry-after-transient-failure.spec.ts (new)
 difficulty: medium
