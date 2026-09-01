@@ -236,12 +236,13 @@ export class TransactionCoordinator {
 	 *
 	 * @param transaction - The transaction to commit
 	 * @param inFlightDisposers - Collects one disposer per participant marked in flight under this
-	 * transaction's id (see {@link Collection.beginInFlightAction}). The caller owns clearing them,
-	 * because the mark has to survive past this attempt — see the array's declaration in
-	 * {@link commit}. Omitted only by a caller that drives a single attempt and never refreshes
-	 * between attempts, which today is nobody.
+	 * transaction's id (see {@link Collection.beginInFlightAction}). REQUIRED, so a future caller
+	 * cannot silently reintroduce the unmarked refresh this parameter exists to prevent: a caller
+	 * that never refreshes between attempts passes a throwaway array and simply ignores it. The
+	 * caller owns clearing them, because the mark has to survive past this attempt — see the
+	 * array's declaration in {@link commit}.
 	 */
-	private async commitOnce(transaction: Transaction, inFlightDisposers?: (() => void)[]): Promise<void> {
+	private async commitOnce(transaction: Transaction, inFlightDisposers: (() => void)[]): Promise<void> {
 		if (isTransactionExpired(transaction.stamp)) {
 			throw new Error(`Transaction expired at ${transaction.stamp.expiration}`);
 		}
@@ -297,7 +298,7 @@ export class TransactionCoordinator {
 				// under the same id. `transaction.id` is stable across retries, so re-marking on a
 				// later attempt re-states the same fact. Only participants are marked; a registered
 				// non-participant is left unmarked and its refresh behaves exactly as a reader's.
-				inFlightDisposers?.push(collection.beginInFlightAction(transaction.id));
+				inFlightDisposers.push(collection.beginInFlightAction(transaction.id));
 			}
 			await this.commitOnceLatched(transaction, collectionData);
 		} finally {

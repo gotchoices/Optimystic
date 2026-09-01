@@ -581,21 +581,32 @@ saveMaterializedBlock(block): store(structuredClone(block));
   durable when the failure is reported, because `NetworkTransactor.commit` commits the log tail
   BEFORE sweeping the remaining blocks. (It has a header-first step too, but that branch is
   unreachable from the only production caller — see the NOTE at the sweep — so in practice a
-  touched header commits inside the sweep, after the tail.) `Collection.syncInternal` therefore
-  threads the attempt's action id into its between-retries refresh
-  (`updateInternal(inFlightActionId)`), and an entry carrying that id is **consumed**
-  (`Collection.consumeOwnEntry`) instead of run through the conflict filter and replayed —
+  touched header commits inside the sweep, after the tail.) A refresh taken between a failed
+  attempt and its retry therefore **consumes** (`Collection.consumeOwnEntry`) an entry carrying the
+  retry's own action id, instead of running it through the conflict filter and replaying it —
   replaying re-appends content the committed tail already holds, leaving the same action recorded
   twice in the log. Consuming drops the entry's actions off the head of `pending` and forces the
-  replay that resets the tracker, so `hasUnsyncedChanges()` turns false and the sync loop exits
-  reporting the success the writer is owed. This is the only caller that passes an id: `update()`
-  and `updateAndSync()` pass none and the entry loop behaves exactly as it always did.
+  replay that resets the tracker, so `hasUnsyncedChanges()` turns false and the write reports the
+  success it is owed.
+- **The collection, not the caller, holds the in-flight id.** Which action is in flight is a field
+  on the instance (`Collection.inFlightActionId`), set for the duration of a write's attempt CYCLE
+  by `Collection.beginInFlightAction(actionId)` and cleared by the disposer it returns;
+  `updateInternal` reads the field and takes no parameter, so no refresh path can be correct-only-
+  by-remembering-to-pass-it. `update()` and `updateAndSync()` refresh on a READER's behalf, leave
+  the field unset, and the consume branch cannot fire. Both write paths set it: `Collection.sync`
+  brackets its whole retry loop, and `TransactionCoordinator.commitOnce` marks each participant
+  right after taking its latch, pushing the disposers into an array `commit` clears in a `finally`
+  around the WHOLE retry loop. The coordinator's clear cannot be latch-scoped: its inter-attempt
+  `collection.update()` — the only reader of the mark — runs after the commit span released its
+  latches, because `Latches` is non-reentrant. (Before the field, the coordinator's refresh went
+  through the same `update()` a reader calls and was indistinguishable from one, so a torn action
+  committed through the coordinator replayed into a duplicate entry.)
   `packages/db-core/test/collection-own-action-replay.spec.ts` is the regression test at the
-  collection tier; `packages/db-p2p/test/concurrent-diary-append-acknowledgement.spec.ts` ("a torn
-  commit — tail durable, a later block refused") pins the same recovery end-to-end on the mesh.
-  **Not yet true of the coordinator path.** `TransactionCoordinator.commit`'s retry loop refreshes
-  participants with a plain `collection.update()`, with no in-flight id, so a torn action committed
-  through the coordinator still replays into a duplicate entry — tracked separately.
+  collection tier and `packages/db-core/test/coordinator-own-action-replay.spec.ts` at the
+  coordinator tier (single-collection tear, one participant tearing while another cleanly loses,
+  and an abandoned commit leaving no mark behind);
+  `packages/db-p2p/test/concurrent-diary-append-acknowledgement.spec.ts` ("a torn commit — tail
+  durable, a later block refused") pins the same recovery end-to-end on the mesh.
 - **A lost conflict race is returned too — and needs no confirmation.** A member holding the
   transaction that won a race against this one answers with a signed `conflict` vote naming the
   winner, and the coordinator raises `ConflictRaceLostError` (never `ValidatorRejectionError`:

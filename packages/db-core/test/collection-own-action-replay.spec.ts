@@ -127,6 +127,64 @@ describe('Collection: own committed action on retry', () => {
 		expect((await readLog(local)).map(a => a.data.value)).to.deep.equal(['rival', 'local'])
 	})
 
+	it('consuming keeps actions staged AFTER the entry was written', async () => {
+		// The slice is a LEADING slice, which is only right because act() appends. Under sync() the
+		// collection latch makes a mid-cycle act() impossible, but TransactionCoordinator.commit's
+		// mark spans a latch-free inter-attempt window where one CAN land — so the tail must
+		// survive the consume. Driving that window from a live commit would be a race, so the state
+		// is built directly: `committer` writes the durable entry, `later` adopts it as its own
+		// in-flight action with extra work already queued behind it.
+		const inner = new TestTransactor()
+		// `later` is opened BEFORE the commit so the entry is still unseen when it refreshes;
+		// an instance opened afterwards has already adopted that revision and getFrom returns
+		// nothing to consume.
+		const later = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
+		const committer = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
+		await committer.act({ type: 'set', data: { value: 'durable', timestamp: 1 } })
+		await committer.sync(retryFast)
+		const ownActionId = committer.committedActionId()!
+
+		await later.act({ type: 'set', data: { value: 'durable', timestamp: 1 } })
+		await later.act({ type: 'set', data: { value: 'staged-after', timestamp: 2 } })
+
+		later.beginInFlightAction(ownActionId)
+		await later.update()
+
+		// The entry's single action came off the head; the one queued behind it is still ours to
+		// commit. Too large a slice would lose it silently — that is the whole hazard.
+		expect(later.hasUnsyncedChanges()).to.equal(true)
+		await later.sync(retryFast)
+		expect((await readLog(later)).map(a => a.data.value)).to.deep.equal(['durable', 'staged-after'])
+	})
+
+	it('refuses to consume an entry longer than the pending list', async () => {
+		// The correspondence between an entry's actions and the head of `pending` is an invariant,
+		// not a checked fact, and `slice` breaks SILENTLY when it fails — a too-long entry would
+		// drop work that was never committed. The guard turns that into a throw.
+		const inner = new TestTransactor()
+		// Opened before the commit, for the same reason as the case above.
+		const short = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
+		const committer = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
+		await committer.act({ type: 'set', data: { value: 'a', timestamp: 1 } })
+		await committer.act({ type: 'set', data: { value: 'b', timestamp: 2 } })
+		await committer.sync(retryFast)
+		const ownActionId = committer.committedActionId()!
+
+		// One pending action against a two-action entry: the impossible state the guard names.
+		await short.act({ type: 'set', data: { value: 'only-one', timestamp: 1 } })
+
+		short.beginInFlightAction(ownActionId)
+		let thrown: unknown
+		try {
+			await short.update()
+		} catch (err) {
+			thrown = err
+		}
+		expect(thrown, 'the impossible slice is refused, not silently applied').to.be.instanceOf(Error)
+		expect((thrown as Error).message).to.contain('never committed')
+		expect(short.hasUnsyncedChanges(), 'and the pending action is still there').to.equal(true)
+	})
+
 	it('update() with no in-flight action is unaffected', async () => {
 		// The entry loop must behave exactly as before when no in-flight id is threaded: a plain
 		// update() over a log entry this instance did not write keeps its pending action.

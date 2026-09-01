@@ -472,15 +472,25 @@ export class Collection<TAction> implements ICollection<TAction> {
 	/** Drops the pending actions this sync's OWN committed entry already made durable, instead of
 	 * replaying them into a duplicate entry (see {@link inFlightActionId}).
 	 *
-	 * `addActions` wrote exactly the snapshot pending list under this action id, and `act()` shares
-	 * the collection latch with `syncInternal`, so `this.pending` cannot have grown mid-sync: the
-	 * entry's actions are the leading `entry.actions.length` items of `this.pending`.
-	 * NOTE: that correspondence rests on the shared latch, and `slice` fails SILENTLY if it ever
-	 * breaks — an entry longer than `pending` would drop actions that were never committed. If a
-	 * path is ever added that stages actions outside the collection latch, assert
-	 * `entry.actions.length <= this.pending.length` here (and see the sibling note on
-	 * `syncInternal`'s post-commit replay, which relies on the same invariant). */
+	 * `addActions` wrote exactly the snapshot pending list under this action id, and the entry's
+	 * actions are therefore the LEADING `entry.actions.length` items of `this.pending` — anything
+	 * staged since is behind them, because {@link actInternal} appends. Under
+	 * {@link syncInternal} nothing can even be staged mid-cycle (`act()` shares the collection
+	 * latch); under `TransactionCoordinator.commit` the mark spans a latch-free inter-attempt
+	 * window, so an `act()` there CAN grow `pending` — still only at the tail, so the slice stays
+	 * right.
+	 *
+	 * The guard below is the load-bearing part: `slice` fails SILENTLY if that correspondence ever
+	 * breaks, dropping actions that were never committed, so an entry longer than `pending` throws
+	 * instead of losing work. (See the sibling note on `syncInternal`'s post-commit replay, which
+	 * rests on the same invariant.) */
 	private consumeOwnEntry(entry: ActionEntry<Action<TAction>>) {
+		if (entry.actions.length > this.pending.length) {
+			throw new Error(
+				`Collection ${this.id}: own committed entry for action ${entry.actionId} holds `
+				+ `${entry.actions.length} actions but only ${this.pending.length} are pending; `
+				+ `consuming it would drop actions that were never committed`);
+		}
 		// `mutated` is unconditional, even for a zero-action entry: the tracker still holds this
 		// action's staged transforms, and only the replay at the end of `updateInternal` — which
 		// resets the tracker and re-stages just what remains — drops them. That reset is what turns
@@ -842,16 +852,24 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * called out of order and more than once. Shaped like {@link acquireLatch} deliberately: a
 	 * disposer is harder to forget than a paired `end…` call.
 	 *
-	 * NOTE: the mark deliberately outlives the latch (see {@link inFlightActionId}), so two writes
-	 * overlapping on ONE instance can trample each other's: a second write that acquires the latch
-	 * between the first's failed attempt and its retry-refresh replaces the id, and the first's
-	 * refresh then reads the SECOND write's id — consuming that write's durable entry and dropping
-	 * pending actions of its own that never landed. Not reachable today: a coordinator commit and a
-	 * `sync()` both run on one session call path, which is the same assumption the participant
-	 * selection in `TransactionCoordinator.commitOnce` and its `rollback` already rest on. If a
-	 * second writer is ever allowed to drive the SAME instance concurrently, this must become a
-	 * per-attempt token (a mark object compared by identity, refusing to replace a live one) rather
-	 * than a bare id. */
+	 * A concurrent READER's refresh landing in that latch-free window is fine, and is reachable
+	 * today (`OptimysticModule` declares `concurrencyMode = 'reentrant-reads'`, so scans inside a
+	 * transaction share one instance and only serialize on the latch). Consuming is a property of
+	 * the (instance, action id) pair, not of who calls: whoever refreshes first drops exactly the
+	 * durable entry's actions and the write's own later refresh then finds nothing new. The leading
+	 * slice stays right because {@link actInternal} APPENDS, so anything staged after the entry was
+	 * written survives it.
+	 *
+	 * NOTE: a concurrent WRITER is the hazard. The mark deliberately outlives the latch (see
+	 * {@link inFlightActionId}), so two writes overlapping on ONE instance can trample each other's:
+	 * a second write that acquires the latch between the first's failed attempt and its
+	 * retry-refresh replaces the id, and the first's refresh then reads the SECOND write's id —
+	 * consuming that write's durable entry and dropping pending actions of its own that never
+	 * landed. Not reachable today: a coordinator commit and a `sync()` both run on one session call
+	 * path, which is the same assumption the participant selection in
+	 * `TransactionCoordinator.commitOnce` and its `rollback` already rest on. If a second writer is
+	 * ever allowed to drive the SAME instance concurrently, this must become a per-attempt token (a
+	 * mark object compared by identity, refusing to replace a live one) rather than a bare id. */
 	beginInFlightAction(actionId: ActionId): () => void {
 		this.inFlightActionId = actionId;
 		return () => {
