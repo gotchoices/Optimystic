@@ -20,10 +20,11 @@ import {
 	type ChildLinkV1,
 	type RegisterV1,
 	type RenewV1,
+	type PromotionNoticeV1,
 	type RingCoord,
 	type Tier,
 } from '@optimystic/db-core';
-import { createCohortTopicHost, dispatchChildLink, resolveRenew, DEFAULT_COORD_ENGINES_MAX, CoordEngineRegistryFullError, type DispatchChildLinkDeps } from '../../src/cohort-topic/host.js';
+import { createCohortTopicHost, dispatchChildLink, resolveRenew, DEFAULT_COORD_ENGINES_MAX, EVICTION_RANK, CoordEngineRegistryFullError, type DispatchChildLinkDeps } from '../../src/cohort-topic/host.js';
 import type { BootstrapParentTopicView } from '../../src/cohort-topic/bootstrap-parent-reference.js';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
 import { signPeerSig } from '../../src/cohort-topic/peer-sig.js';
@@ -756,6 +757,180 @@ describe('cohort-topic: coord-engine registry cap (attacker-keyed engine creatio
 		expect(reply.result, 'a register the cap refuses is a clean unwilling_cohort — never an unhandled throw').to.equal('unwilling_cohort');
 		expect((reply.retryAfterMs ?? 0) > 0, 'carries a back-off so the walk retries in time').to.equal(true);
 		expect(host.registry.all().length, 'the refused register created no engine').to.equal(1);
+
+		await host.stop();
+	});
+
+	// --- Ranked eviction: the state classes a bare "no records, no forwarder" idle test could not see ---
+	//
+	// An engine owns four classes of state (`EngineStateKind`). Records and cold-start forwarders PIN it (never
+	// evicted). Linked child cohorts and adopted promotion state are RANKED: still evictable — pinning on them
+	// would let a key-less child-link spray make every slot un-evictable — but only after every engine holding
+	// nothing at all. These tests pin that ordering and the eviction-time trust-lock release.
+
+	/** A promotion notice the lifecycle can adopt: only `topicId` / `effectiveAt` are consumed on the apply path. */
+	function promoNoticeFor(topicId: Uint8Array, cohortCoord: RingCoord, effectiveAt: number): PromotionNoticeV1 {
+		return {
+			v: 1,
+			topicId: bytesToB64url(topicId),
+			fromTier: 0,
+			toTier: 1,
+			cohortCoord: bytesToB64url(cohortCoord),
+			effectiveAt,
+			thresholdSig: '',
+			signers: [],
+			cohortEpoch: bytesToB64url(new Uint8Array(32)),
+		};
+	}
+
+	it('a child-holding engine is evicted only after every childless one (and keeps its child set)', async () => {
+		const CAP = 4;
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { coordEnginesMax: CAP },
+		});
+		const participant = await makeParticipantBytes();
+
+		// Fill the cap with cold engines, then give the OLDEST (the pure-LRU victim) a linked child cohort. It
+		// holds no record and no forwarder, so the old idle predicate would have called it a throwaway.
+		const originals: RingCoord[] = [];
+		for (let i = 0; i < CAP; i++) {
+			const coord = addressing.coord0(topicAt(i));
+			originals.push(coord);
+			host.registry.forCoord(coord, 0 as Tier, participant);
+		}
+		const parent = host.registry.findByCoord(originals[0]!)!;
+		parent.recordChild(topicAt(0), addressing.coord0(topicAt(500)), 1_000);
+		expect(parent.hasState() || parent.hasForwarders(), 'the child-holder is unpinned — records/forwarders are what pin').to.equal(false);
+		expect(parent.liveness().children, 'it does hold a linked child').to.equal(true);
+
+		// Spray well past the cap. The rank-0 engines go first — the originals, then the spray's own tail.
+		for (let i = CAP; i < 6 * CAP; i++) {
+			host.registry.forCoord(addressing.coord0(topicAt(i)), 0 as Tier, participant);
+		}
+
+		expect(host.registry.all().length, 'still bounded by the cap').to.equal(CAP);
+		expect(host.registry.findByCoord(originals[0]!), 'the child-holding engine outranks every cold one and survives').to.not.equal(undefined);
+		for (const coord of originals.slice(1)) {
+			expect(host.registry.findByCoord(coord), 'every childless original was reclaimed').to.equal(undefined);
+		}
+		// Survival is the point *because* eviction would have silently zeroed this count.
+		expect(host.registry.findByCoord(originals[0]!)!.childCohortCount(topicAt(0)), 'the child set is intact').to.equal(1);
+
+		await host.stop();
+	});
+
+	it('a promotion-holding engine outranks a cold one (adopted promotion state is not throwaway)', async () => {
+		const CAP = 4;
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { coordEnginesMax: CAP },
+		});
+		const participant = await makeParticipantBytes();
+
+		const originals: RingCoord[] = [];
+		for (let i = 0; i < CAP; i++) {
+			const coord = addressing.coord0(topicAt(i));
+			originals.push(coord);
+			host.registry.forCoord(coord, 0 as Tier, participant);
+		}
+		// Adopting a verified promotion notice needs no signing key — the notice is already a quorum decision.
+		const promoted = host.registry.findByCoord(originals[0]!)!;
+		promoted.applyPromotionNotice(promoNoticeFor(topicAt(0), originals[0]!, 1_000), 1_000);
+		expect(promoted.isPromoted(topicAt(0)), 'the notice was adopted').to.equal(true);
+		expect(promoted.hasState() || promoted.hasForwarders(), 'still unpinned — it holds no record or forwarder').to.equal(false);
+		expect(promoted.liveness().promotion, 'but it does hold adopted promotion state').to.equal(true);
+
+		for (let i = CAP; i < 6 * CAP; i++) {
+			host.registry.forCoord(addressing.coord0(topicAt(i)), 0 as Tier, participant);
+		}
+
+		expect(host.registry.all().length, 'still bounded by the cap').to.equal(CAP);
+		const survivor = host.registry.findByCoord(originals[0]!);
+		expect(survivor, 'the promotion-holding engine survives the spray').to.not.equal(undefined);
+		expect(survivor!.isPromoted(topicAt(0)), 'and its promoted mode was not silently forgotten').to.equal(true);
+		for (const coord of originals.slice(1)) {
+			expect(host.registry.findByCoord(coord), 'the cold originals were reclaimed').to.equal(undefined);
+		}
+
+		await host.stop();
+	});
+
+	it('a child-link spray cannot refuse a legitimate coord (children are ranked, never pinned)', async () => {
+		// The reason `children` is rank 1 and not "pinned": in key-less-permissive mode a peer records a child
+		// link with no signature check, so pinning on it would let one peer make all `coordEnginesMax` slots
+		// un-evictable and turn every subsequent legitimate coord into a CoordEngineRegistryFullError.
+		const CAP = 4;
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { coordEnginesMax: CAP },
+		});
+		const participant = await makeParticipantBytes();
+
+		for (let i = 0; i < CAP; i++) {
+			const ce = host.registry.forCoord(addressing.coord0(topicAt(i)), 0 as Tier, participant);
+			ce.recordChild(topicAt(i), addressing.coord0(topicAt(600 + i)), 1_000);
+			expect(ce.liveness().children, `sprayed engine ${i} holds a child link`).to.equal(true);
+		}
+
+		// Every slot is rank 1, so the rank-0 tier is empty — but rank 1 is still a *candidate* rank.
+		const legit = addressing.coord0(topicAt(900));
+		expect(() => host.registry.forCoord(legit, 0 as Tier, participant), 'a full-of-child-links registry still admits a new coord').to.not.throw();
+		expect(host.registry.findByCoord(legit), 'the legitimate coord resolves to a live engine').to.not.equal(undefined);
+		expect(host.registry.all().length, 'and the cap still holds').to.equal(CAP);
+
+		await host.stop();
+	});
+
+	it('eviction drops the verifier trust-lock for the evicted coord', async () => {
+		// On a keyed node the gossip-cadence driver calls `pumpMembership` for EVERY engine, record-less ones
+		// included — so an evicted engine may well have published a cert and trust-locked its coord. The host
+		// wires the registry's `onEngineEvicted` hook to `verifier.forget` for exactly that reason.
+		const CAP = 2;
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { coordEnginesMax: CAP },
+		});
+		const participant = await makeParticipantBytes();
+
+		// `service.verifier()` hands back the very instance the host wired into the engine context, so an own
+		// property shadowing the prototype method observes the host's own calls (the wiring reads it per call).
+		const verifier = host.service.verifier();
+		const forgotten: string[] = [];
+		const realForget = verifier.forget.bind(verifier);
+		(verifier as { forget: (coord: string) => void }).forget = (coord: string): void => {
+			forgotten.push(coord);
+			realForget(coord);
+		};
+
+		const first = addressing.coord0(topicAt(0));
+		host.registry.forCoord(first, 0 as Tier, participant);
+		host.registry.forCoord(addressing.coord0(topicAt(1)), 0 as Tier, participant);
+		expect(forgotten, 'nothing evicted yet').to.have.length(0);
+
+		// One creation over a full registry → exactly one eviction, of the least-recently-used coord.
+		host.registry.forCoord(addressing.coord0(topicAt(2)), 0 as Tier, participant);
+		expect(forgotten, 'the eviction released exactly one trust-lock').to.deep.equal([bytesToB64url(first)]);
+		expect(host.registry.findByCoord(first), 'and that coord really was evicted').to.equal(undefined);
+
+		await host.stop();
+	});
+
+	it('EVICTION_RANK covers exactly the state classes liveness() reports (exhaustiveness guard)', async () => {
+		// TypeScript's `Record<EngineStateKind, ...>` pins the rank table's keys at compile time, but nothing
+		// checks the *engine* actually reports every kind. A liveness() literal that grows a fifth field, or
+		// silently drops one, would leave a state class outside the ranking — evictable with no rank at all.
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { coordEnginesMax: 2 },
+		});
+		const participant = await makeParticipantBytes();
+		const engine = host.registry.forCoord(addressing.coord0(topicAt(0)), 0 as Tier, participant);
+
+		expect(Object.keys(engine.liveness()).sort(), 'the rank table and the liveness census must name the same state classes')
+			.to.deep.equal(Object.keys(EVICTION_RANK).sort());
+		// A fresh engine holds none of them — the rank-0 throwaway the cap exists to reclaim.
+		expect(Object.values(engine.liveness()).every((v) => v === false), 'a freshly-created engine holds nothing').to.equal(true);
 
 		await host.stop();
 	});

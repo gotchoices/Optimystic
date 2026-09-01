@@ -811,12 +811,40 @@ real warm replicas and failover.
 > instantiates, register-once → `accepted`, and the record replicates).
 >
 > **Cost (tripwires).** The coord-engine registry is hard-capped (`createCoordRegistry`,
-> `coordEnginesMax`, default 2048) with LRU eviction of *idle* engines (no records, no cold-start
-> forwarder), so cold-sibling instantiation is no longer a permanent per-co-member-coord cost: an idle
-> gossip-instantiated engine is reclaimed under memory pressure, and a creation over a full-of-live registry
-> is refused (`CoordEngineRegistryFullError`, surfaced as `unwilling_cohort` / `rejected` / a dropped
-> cold-sibling). Eviction is idle-only, so it never strands a verifier trust-lock (an idle engine never
-> published a cert). The heartbeat re-broadcasts willingness for every idle-but-willing cohort every
+> `coordEnginesMax`, default 2048) with **ranked** LRU eviction, so cold-sibling instantiation is no longer a
+> permanent per-co-member-coord cost: a gossip-instantiated engine holding nothing is reclaimed under memory
+> pressure, and a creation over a registry full of *pinned* engines is refused
+> (`CoordEngineRegistryFullError`, surfaced as `unwilling_cohort` / `rejected` / a dropped cold-sibling).
+>
+> The rank is over the four classes of state a `CoordEngine` owns — the exhaustive `EngineStateKind` set that
+> `CoordEngine.liveness()` reports and `EVICTION_RANK` scores:
+>
+> | State class  | Rank     | Why |
+> | ------------ | -------- | --- |
+> | `records`    | pinned   | A live cohort's registrations — never evicted. |
+> | `forwarders` | pinned   | A mid-link cold-start forwarder (possibly `awaiting_parent`) — never evicted. |
+> | `children`   | 1        | Linked child cohorts. Evictable, but only after everything at rank 0. |
+> | `promotion`  | 1        | Adopted promotion/demotion state (`promoted`, or the `lastEffectiveAt` high-water). Same. |
+>
+> An engine holding none of them is rank 0 — the attacker-sprayed cold coord the cap exists for. The victim
+> is the `(rank, recency)`-lexicographically-least candidate: rank first, LRU only to break ties within a
+> rank, so a hot rank-0 engine still goes before any rank-1 one.
+>
+> **Child links and promotion state are ranked, not pinned — deliberately.** A child link is peer-supplied
+> input (key-less-permissive mode records one with no signature check), so pinning on it would let any peer
+> make all `coordEnginesMax` slots un-evictable and drive `CoordEngineRegistryFullError` for legitimate
+> coords — reopening the very spray vector the cap closes. Ranking keeps the hard guarantee (some engine is
+> always evictable while any unpinned one exists) while making the realistic loss — a handful of real
+> parent/promoted engines among ~2000 attacker-cold ones — the *last* to go rather than a pure LRU-age pick.
+>
+> Eviction **drops the coord's verifier trust-lock** (`onEngineEvicted` → `verifier.forget(coord)`),
+> unconditionally. On a keyed node the gossip-cadence driver calls `pumpMembership` for *every* engine,
+> record-less ones included, so any evicted engine may have published a membership cert and locked its coord
+> (`onCertPublished` → `verifier.cache`); "holds no records" never implied "never published". `forget` drops
+> the cached cert and the stale-gap strike count but deliberately **keeps** `lastFetchAt`, which is
+> anti-amplification state — so a forget cannot reset a flood-exposed coord's refetch budget.
+>
+> The heartbeat re-broadcasts willingness for every idle-but-willing cohort every
 > `T_willingness_heartbeat`; the throttle plus the willing-for-something gate are the mitigations, but a node
 > serving very many idle cohorts may need to batch heartbeats or lengthen the interval.
 
@@ -1006,8 +1034,11 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 > on the inbound register so a forged/replayed/over-rate frame never pollutes downstream state. Wrapping all
 > of these is a host-level bound on the *number* of `CoordEngine`s: the served coord is a hash over
 > attacker-chosen inputs and an engine is created **before** its per-coord guards run, so the registry is
-> hard-capped (`coordEnginesMax`, default 2048) with LRU eviction of idle engines (no records, no cold-start
-> forwarder) — one peer spraying distinct coords can no longer force unbounded engine allocation. Because
+> hard-capped (`coordEnginesMax`, default 2048) with ranked LRU eviction — engines holding nothing go first,
+> then child-/promotion-holding ones, while records and cold-start forwarders are pinned and never evicted
+> (see §Cold-start instantiation for the full rank table and why child links are ranked rather than pinned).
+> Eviction releases the coord's verifier trust-lock via `verifier.forget`. One peer spraying distinct coords
+> can no longer force unbounded engine allocation. Because
 > db-core embeds no PoW/reputation scheme, the host supplies the verifiers
 > ([`bootstrap-evidence-verifiers.ts`](../packages/db-p2p/src/cohort-topic/bootstrap-evidence-verifiers.ts))
 > and the participant-side minter

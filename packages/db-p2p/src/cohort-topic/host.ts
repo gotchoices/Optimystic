@@ -2215,6 +2215,11 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		liveness,
 		// Derivations of `liveness()` — kept on the interface for existing callers/specs, but sourced from
 		// the same census so the two views cannot drift.
+		// NOTE: each call now runs the FULL census (allocating one record, and touching the child registry and
+		// promotion lifecycle) where it used to be a bare `store.listAll()` check. Free today: as of this
+		// writing nothing in `src/` calls either accessor — the registry ranks via `liveness()` directly and
+		// the only callers are specs. If a hot path (a per-frame dispatch gate, say) ever starts calling one
+		// per message, give it a direct single-field read instead of routing it through the census.
 		hasState: (): boolean => liveness().records,
 		hasForwarders: (): boolean => liveness().forwarders,
 		holds: (topicId: Uint8Array, participantId: Uint8Array): boolean =>

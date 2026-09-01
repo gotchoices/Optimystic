@@ -196,6 +196,7 @@ describe('cohort-topic / member-engine: onAdmit fires on accept', () => {
 				isPromoted: (): boolean => false,
 				applyPromotionNotice: (): void => {},
 				applyDemotionNotice: (): void => {},
+				hasAdoptedState: (): boolean => false,
 			},
 			coldStart,
 			traffic: {
@@ -311,6 +312,7 @@ describe('cohort-topic / member-engine: followOn cold-start admission', () => {
 				isPromoted: (): boolean => false,
 				applyPromotionNotice: (): void => {},
 				applyDemotionNotice: (): void => {},
+				hasAdoptedState: (): boolean => false,
 			},
 			coldStart,
 			traffic: {
@@ -416,6 +418,7 @@ describe('cohort-topic / member-engine: handleProbe (read-only lookup)', () => {
 			isPromoted: (): boolean => opts?.isPromoted === true,
 			applyPromotionNotice: (): void => {},
 			applyDemotionNotice: (): void => {},
+			hasAdoptedState: (): boolean => false,
 		};
 		const coldStart = {
 			// A probe must never instantiate; if it does, fail loudly.
@@ -729,6 +732,7 @@ describe('cohort-topic / member-engine: topic-budget eviction reconciles the for
 				isPromoted: (): boolean => false,
 				applyPromotionNotice: (): void => {},
 				applyDemotionNotice: (): void => {},
+				hasAdoptedState: (): boolean => false,
 			},
 			coldStart,
 			traffic: traffic as never,
@@ -809,6 +813,7 @@ describe('cohort-topic / member-engine: TTL clamping in accept()', () => {
 				isPromoted: (): boolean => false,
 				applyPromotionNotice: (): void => {},
 				applyDemotionNotice: (): void => {},
+				hasAdoptedState: (): boolean => false,
 			},
 			coldStart,
 			traffic: {

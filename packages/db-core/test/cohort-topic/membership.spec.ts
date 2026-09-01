@@ -629,6 +629,81 @@ describe('cohort-topic / membership stale trust-lock recovery', () => {
 		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'fresh strike 3 recovers').to.equal('verified');
 	});
 
+	// --- forget(): the explicit lock release the host fires when it evicts a coord's engine ---
+	//
+	// Bounded re-TOFU (above) is the *self-healing* exit from a stale lock. `forget` is the *deliberate* one:
+	// the coord-engine registry evicts an engine and the host calls `verifier.forget(coord)`, so a lock this
+	// node published for a coord it no longer serves cannot strand that coord's later-epoch messages while
+	// waiting for N gap strikes to accrue.
+
+	it('forget() releases the trust lock: the same un-anchored refetch that was rejected now TOFU-verifies', async () => {
+		// A later-epoch cert over the ROTATED keyset carrying NO rotation attestation — un-anchored, and not
+		// even gap-recovery-eligible (recovery demands a full attestation), so a trust-locked coord rejects it
+		// forever. Exactly the stranded state eviction must not leave behind.
+		const rotated = buildCertOver({ epoch: EPOCH_N1, members: ROTATED });
+		const source = new QueueSource([encodeCohortMessage(rotated), encodeCohortMessage(rotated)]);
+		const v = makeVerifier(source, { anchor: constAnchor('unknown') });
+		lockedAtN(v); // self-published N cert → COORD is trust-locked at epoch N
+
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'the lock rejects the un-anchored later-epoch cert').to.equal('untrusted');
+
+		// The host's `onEngineEvicted` hook: this node no longer serves COORD, so it drops its lock.
+		v.forget(bytesToB64url(COORD));
+
+		// Same source, same un-anchored cert — but the coord is cold again, so first-use TOFU accepts it.
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'after forget the coord is back in the cold-cache TOFU regime').to.equal('verified');
+	});
+
+	it('forget() clears the stale-gap strike count along with the cert', async () => {
+		// Two gap strikes accrue against the lock (threshold 3, so neither recovers). `forget` drops the cert
+		// AND the counter together; were the counter left behind, a later re-lock of the same coord would sit
+		// one strike from release — a lock weakened by an unrelated eviction.
+		const gap = gapCertN2();
+		const source = new QueueSource(Array.from({ length: 6 }, () => encodeCohortMessage(gap)));
+		const v = makeVerifier(source, { anchor: constAnchor('unknown') }); // default threshold = 3
+		lockedAtN(v);
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'strike 1').to.equal('untrusted');
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'strike 2').to.equal('untrusted');
+
+		v.forget(bytesToB64url(COORD));
+		lockedAtN(v); // the coord is served (and self-published) again — a fresh lock
+
+		// A fresh lock needs three fresh strikes: if `forget` had left the count at 2, this first one would recover.
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'fresh strike 1 — the pre-forget count did not carry over').to.equal('untrusted');
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'fresh strike 2').to.equal('untrusted');
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'fresh strike 3 recovers').to.equal('verified');
+	});
+
+	it('forget() KEEPS lastFetchAt: it cannot reset the refetch budget of a flood-exposed coord', async () => {
+		// `lastFetchAt` is anti-amplification state, not trust state. A forget that reset it would hand an
+		// attacker who can drive evictions a free extra membership dial per eviction.
+		const gap = gapCertN2();
+		const source = new QueueSource(Array.from({ length: 6 }, () => encodeCohortMessage(gap)));
+		const v = makeVerifier(source, { anchor: constAnchor('unknown') });
+		lockedAtN(v);
+		const bound = { minRefetchIntervalMs: 60_000, now: 1_000 };
+
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG), bound)).to.equal('untrusted');
+		expect(source.fetchCalls, 'the first miss paid one refetch').to.equal(1);
+
+		v.forget(bytesToB64url(COORD));
+
+		// Still inside the interval → the rate limit holds across the forget; no second dial.
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG), { minRefetchIntervalMs: 60_000, now: 1_500 })).to.equal('untrusted');
+		expect(source.fetchCalls, 'forget did not reset the per-coord refetch clock').to.equal(1);
+
+		// Past the interval the (bounded) refetch resumes normally — forget did not break eventual refresh.
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG), { minRefetchIntervalMs: 60_000, now: 62_000 })).to.equal('verified');
+		expect(source.fetchCalls, 'the interval elapsed → exactly one further refetch').to.equal(2);
+	});
+
+	it('forget() on a coord the verifier holds nothing for is a no-op', () => {
+		// The host calls forget unconditionally on every eviction — including engines that never published a
+		// cert — so the never-seen-coord path must not throw.
+		const v = makeVerifier(new QueueSource([]), { anchor: constAnchor('unknown') });
+		expect(() => v.forget(bytesToB64url(COORD)), 'forgetting an unknown coord is silent').to.not.throw();
+	});
+
 	it('with recovery disabled (staleGapRecoveryStrikes = 0) a stale-locked coord never self-heals', async () => {
 		// The documented "0 (or negative) disables recovery — which re-opens the stale-lock liveness bug"
 		// contract: the `> 0` gate in staleGapRecovery must short-circuit so even a genuine gap never strikes.
