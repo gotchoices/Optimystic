@@ -94,3 +94,13 @@ main reason a maintainer might decline this — see `tradeoffs:`.
 
 Fixing gossipsub is upstream (ChainSafe) and needs an upstream release; there is no published
 version to move to. Removing the dead service is the separate ticket named in `prereq:`.
+
+## Status correction (backlog gardening, 2026-09-01)
+
+The body above says the gossipsub ticket is "in `tickets/implement/` at time of writing". It has since
+landed: `tickets/complete/3-bug-gossipsub-pubsub-service-cannot-work-on-libp2p-3.md`. So the `prereq:`
+is satisfied and **the 2.x rows this ticket's enumeration assumes are gone are actually gone** — every
+"after the gossipsub removal lands" caveat in arms 1 and 3 now reads in the present tense.
+
+Re-run the enumeration before starting; the numbers above predate the removal and are the reason this
+ticket exists, not a current measurement.

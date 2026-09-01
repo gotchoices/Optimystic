@@ -4,8 +4,8 @@ files:
   - packages/db-p2p/test/multi-coordinator-write-relay.integration.spec.ts:148 (the `this.skip()` that fires when the keyspace probe never places B in A's cohort)
   - packages/db-p2p/test/multi-coordinator-write-relay.integration.spec.ts:105-121 (the comment explaining why the *previous* bimodal skip was removed — same failure mode, different precondition)
 difficulty: medium
-severity: coverage-integrity
-likelihood: observed-twice-in-two-consecutive-gate-runs
+severity: edge-case
+likelihood: normal-use
 tradeoffs: Making cohort membership deterministic means constructing peer ids or coordinates for the test rather than taking whatever libp2p generates, which couples the spec to the keyspace layout it is meant to be agnostic about. The alternative — keep probing but fail instead of skip — trades a silent gap for a flaky red. Either is better than the current silent green, but which one is a judgement call.
 ----
 
@@ -70,3 +70,17 @@ demonstrates that lowering the rate is not the same as closing the hole.
 
 Whichever route, the spec must be observed to actually run — a `pending` count for this suite that
 varies between two runs of an unchanged tree is the symptom to watch.
+
+## Triage note (backlog gardening, 2026-09-01)
+
+`severity:` / `likelihood:` previously read `coverage-integrity` / `observed-twice-in-two-consecutive-gate-runs`,
+which are not values the triage vocabulary defines. Normalized to `edge-case` / `normal-use`:
+
+- **`edge-case`, not `wrong-result`** — deliberately the lower of the two readings. A skipped test
+  causes no user-visible effect by itself; the wrong result it could hide (a broken relay-crossing
+  write) is hypothetical until someone breaks that path. Rank this ticket on the *frequency* of the
+  silent green, not on the severity of what it might one day conceal.
+- **`normal-use`** — the skip fires on an ordinary run of the suite with no special setup, and was
+  observed on two consecutive runs of an unchanged tree.
+
+The observed-frequency detail is not lost: it is recorded verbatim under "What was observed" above.

@@ -1,6 +1,7 @@
 description: The main transactions document is half a maintained reference and half a frozen proposal from when the feature was first designed, with nothing telling the two apart — so a reader can follow example code that stopped matching the real implementation long ago.
 files:
   - docs/transactions.md (2496 lines; maintained prose lines 1-737, frozen design-time material "Key Components" 738 through "Success Criteria" ~1949)
+difficulty: medium
 tradeoffs: A maintainer may prefer to leave it alone — nobody has been misled loudly enough to notice, the frozen half still records genuinely useful design intent, and adding a banner is cheap only if it is honest about which half is which.
 ----
 

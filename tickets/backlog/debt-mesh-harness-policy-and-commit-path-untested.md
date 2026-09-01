@@ -52,3 +52,18 @@ cannot materialize, and asserts it heals through the cohort, would close it.
 The harness deliberately refuses to serve block content from a peer a test has marked silent, so a
 test that silences a peer cannot accidentally converge *through* that peer. The reasoning is written
 down at the code site; no test holds it in place.
+
+## Related, and it shares a fixture with this one (backlog gardening, 2026-09-01)
+
+`debt-torn-commit-mesh-coverage-drops-no-blocks` is a separate ticket — different production code
+(`storage-repo.ts`'s pend-time own-revision carve-out, not `cluster-repo.ts`'s
+`reconcileDivergentCommit`) and a different assertion (a torn write lands exactly once, not a block
+heals through the cohort). It was deliberately **not** merged into this one for that reason.
+
+What the two share is the missing *fixture*, and it is this ticket's arm two: **no mesh case ever
+drives a commit whose blocks the committing node does not hold.** Every current mesh case enters from
+the read side. Whoever builds arm two should look at `tearFirstCommit` in
+`packages/db-p2p/test/concurrent-diary-append-acknowledgement.spec.ts` first — it already tears a
+commit and records how many blocks it dropped, and that ticket independently suggests promoting it
+into `mesh-harness.ts`. Build it once, in the shared harness, and both tickets get cheaper; build it
+twice and the two copies drift the way the log-capture helper already has.

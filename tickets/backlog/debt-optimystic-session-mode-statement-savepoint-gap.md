@@ -87,3 +87,16 @@ SELECT count(*) FROM t;              -- must be 1 (row 2 must NOT be committed)
 and the `OR FAIL` per-row analogue, must hold under the coordinator commit path,
 not just the legacy flush path. Add session-mode regressions modeled on
 `test/savepoint-rollback.spec.ts` + `test/session-mode-commit.spec.ts`.
+
+## Sequencing (backlog gardening, 2026-09-01)
+
+`debt-session-mode-bridge-coverage` builds the plugin-level harness that stands `TransactionBridge` up
+in session mode with a real coordinator, and names this ticket as the reason it is worth building
+("a real latent defect in the same mode, not test debt. This harness is what its regressions would be
+written against"). That cross-reference was only pointing one way; it now points both.
+
+No `prereq:` header is set, deliberately — `enableSessionMode` in
+`packages/quereus-plugin-optimystic/test/session-mode-commit.spec.ts` already exists and is enough to
+write this ticket's regressions against, so this is not gated. But if both are promoted, do the
+coverage ticket first: it turns that helper into a real harness and this ticket's regressions land on
+it instead of extending it in passing.

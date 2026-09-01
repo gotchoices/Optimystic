@@ -8,6 +8,7 @@ files:
   - packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts:233 (createLibp2pNode call — passes no validator)
   - packages/reference-peer/src/cli.ts:377 (createLibp2pNode call — passes no validator)
   - packages/db-core/src/transaction/validator.ts (TransactionValidator — the checks that go unrun)
+difficulty: hard
 tradeoffs: Turning re-validation on is a behaviour change with a real chance of rejecting traffic that works today (schema-hash skew across versions, operations-hash format skew, stale reads that the current path tolerates), so a maintainer could reasonably keep the current permissive posture until there is an operational reason to close it.
 ----
 
@@ -91,3 +92,27 @@ signed reject vote — so a cohort of failing validators degrades toward not-val
 refusing. Filed separately as `debt-pend-validation-is-skipped-instead-of-failing-closed`, because
 they are worth closing *before* this wiring lands: with them open, turning validation on only partly
 turns it on.
+
+## Gardening correction (2026-09-01): the "filed separately" ticket was never filed
+
+The last paragraph says the two fail-open holes in `ClusterMember.validatePendOperations` were
+"filed separately as `debt-pend-validation-is-skipped-instead-of-failing-closed`". **That slug exists
+nowhere** — not in any stage folder, not in `tickets/.pruned-tickets.jsonl`, and not under any
+sequence prefix. It was never created, so if this ticket is promoted as written, the work it says is
+already tracked would be silently dropped.
+
+Rather than file a second ticket for the same code site, treat those holes as **arm 0 of this
+ticket** — they resolve at the same method, and the paragraph above is right that they must close
+*before* the wiring lands, because with them open, turning validation on only partly turns it on:
+
+- **A sender that omits `operationsHash` (or `transaction`) falls through the presence guard
+  unchecked.** A member with a validator configured skips the check rather than refusing, so a
+  coordinator can opt every member out of re-validation by omitting a field.
+- **A validator that throws escapes as an error rather than becoming a signed reject vote.** A cohort
+  whose validators are all failing therefore degrades toward *not validating*, not toward refusing —
+  the opposite of fail-closed.
+
+Both are at `packages/db-p2p/src/cluster/cluster-repo.ts:1129-1200`, already in this ticket's `files:`
+list. Close them first, then do the wiring; or split them out into their own `debt-` ticket at
+promotion time and chain this one behind it with `prereq:`. Either is fine — what is not fine is
+promoting this while believing they are covered elsewhere.

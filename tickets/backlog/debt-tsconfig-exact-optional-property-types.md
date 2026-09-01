@@ -52,3 +52,14 @@ latent bugs. This is not a find-and-replace.
 
 - Depends on `tsconfig-base-consolidation` landing first (the base file must exist).
 - `verbatimModuleSyntax` is already enabled by the consolidation ticket — not in scope here.
+
+## Status correction (backlog gardening, 2026-09-01)
+
+The "Notes" section says this depends on `tsconfig-base-consolidation` landing first, "the base file
+must exist". It exists: `tsconfig.base.json` is present at the repository root. That consolidation
+ticket is not on the board and not in `tickets/.pruned-tickets.jsonl` — it predates the ledger — so
+treat the dependency as satisfied rather than missing. The `prereq:` header is (correctly) empty.
+
+The ~211 error counts in the table were measured before that landing and before an unknown amount of
+subsequent work; re-measure with `tsc --noEmit` per package before deciding whether to split this into
+per-package tickets.

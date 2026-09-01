@@ -1,6 +1,9 @@
 description: Six of this package's background services write their diagnostic logs to a channel name that the debug filter our own documentation tells operators to switch on does not match, so turning that filter on silently hides them. Make it impossible to create a log channel outside the documented tree by accident.
 files: packages/db-p2p/src/logger.ts, packages/db-p2p/src/cluster/service.ts, packages/db-p2p/src/repo/service.ts, packages/db-p2p/src/sync/service.ts, packages/db-p2p/src/dispute/service.ts, packages/db-p2p/src/network/network-manager-service.ts, packages/db-p2p/src/cluster/block-transfer-service.ts, docs/debugging.md
 difficulty: medium
+repro: static
+severity: cosmetic
+likelihood: normal-use
 tradeoffs: These are service-lifecycle and error logs rather than the per-request diagnostics people usually chase, and an operator who already knows to also set `DEBUG=db-p2p:*` sees everything today — so a maintainer could reasonably rank this below work with user-visible effects.
 ----
 
@@ -65,3 +68,16 @@ Fix the class, not the six instances:
 Static — read from the code, not observed in a running system. `test/logger.spec.ts` shows the
 shape of a test that would confirm it: capture under `optimystic:db-p2p:*` while exercising one of
 the six services, and assert its lines appear.
+
+## Triage note (backlog gardening, 2026-09-01)
+
+`severity: cosmetic` / `likelihood: normal-use` / `repro: static`, derived from the body:
+
+- **`cosmetic`** — deliberately the lower reading. Nothing computes or stores a wrong value; the
+  effect is confined to which diagnostic lines an operator sees. It is ranked high anyway because of
+  the likelihood, not the severity.
+- **`normal-use`** — an operator who follows `docs/debugging.md` exactly hits it every time. It has
+  already happened to an outside reporter (issue #12), who concluded from the silence that a code
+  path never ran.
+- **`repro: static`** — read from the code; the body's own "## Repro" section says the same and names
+  the test shape (`test/logger.spec.ts`) that would turn it into `verified`.

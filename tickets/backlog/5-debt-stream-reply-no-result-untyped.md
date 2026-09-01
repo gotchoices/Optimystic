@@ -1,5 +1,6 @@
 description: When a peer answers a request with "I have nothing for you", the answer looks identical to a real but empty answer, so callers have to remember to check for it by hand — and one caller forgot, which makes a subscriber give up recovering instead of asking the next peer.
 files: packages/db-p2p/src/cohort-topic/stream-util.ts, packages/db-p2p/src/reactivity/recover-transport.ts, packages/db-p2p/src/matchmaking/query-transport.ts, packages/db-p2p/src/cohort-topic/membership-source.ts
+difficulty: medium
 repro: static
 severity: edge-case
 likelihood: unusual

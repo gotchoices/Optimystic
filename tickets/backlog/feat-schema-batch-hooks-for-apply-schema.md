@@ -6,8 +6,6 @@ files:
   - packages/quereus-plugin-optimystic/test/local-transactor-read-cache.spec.ts (plugin-side read-cache coverage)
   - packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts:314 (`withReadCache` — the mitigation that landed)
 difficulty: medium
-severity: performance
-likelihood: certain-on-cold-schema-apply
 tradeoffs: The read cache already removed ~96% of the redundant reads the issue was filed about, so the remaining win is commit-count and round-trip batching rather than the amplification that made this urgent. A maintainer could reasonably leave this unimplemented until someone measures a cold apply that is still too slow.
 ----
 
@@ -55,3 +53,11 @@ offers) rather than a performance one, and should be scoped accordingly.
 Issue #8 deserves an answer regardless of whether this is built: the reporter supplied measurements
 and a reproduction, and the read-cache work that fixed their symptom shipped without anyone telling
 them. Worth saying what landed, what did not, and what the current numbers are.
+
+## Triage note (backlog gardening, 2026-09-01)
+
+This ticket carried `severity: performance` / `likelihood: certain-on-cold-schema-apply`. Both were
+removed: `severity` / `likelihood` describe the user-visible effect and reachability of a *defect*,
+and this is a feature ticket — the plugin declines an interface the engine offers; nothing computes a
+wrong answer. The performance framing those fields were reaching for is already stated more precisely
+in the body (the measured 809 → 33 read cut) and in `tradeoffs:`.

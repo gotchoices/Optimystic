@@ -58,3 +58,19 @@ workloads that legitimately depend on the current retry budget. It deserves its 
   Any new behaviour must degrade to today's loop when it is missing.
 - Retryability is already decided by a single existing rule; the new logic must not become a second,
   competing answer to "should this retry?".
+
+## Status correction (backlog gardening, 2026-09-01)
+
+The body says "the prerequisite ticket adds a field to the rejection carrying the revision the
+responder actually holds". That field has landed and the `prereq:` header is (correctly) empty — this
+ticket is buildable now, not gated:
+
+- `StaleFailure.staleAt` (`{ blockId, rev }`) carries the last confirmed revision a responder reported.
+- `Collection.sync` already threads it: `lastStaleAt` at `packages/db-core/src/collection/collection.ts:932`,
+  updated at :986, cleared at :1017, and surfaced as `SyncRetryExhaustedError.staleAt`
+  (`packages/db-core/src/collection/struct.ts:38-53`).
+
+So the retry loop already *has* the number it needs on every attempt; what is missing is only the
+decision about what to do with it. Note the doc comment on that field — it is absent whenever no
+rejection carried a confirmed number, "which is normal" — which is exactly the degrade-to-today's-loop
+case the body's third bullet calls for.

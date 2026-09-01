@@ -51,3 +51,17 @@ db-p2p and coldstart copies already do) and leave the formatting to whichever te
 the text. Confirm that before writing it — if it turns out the shared helper genuinely needs
 `node:util`, then whether the `@optimystic/db-core/test` subpath is allowed to depend on Node is a
 question worth settling deliberately rather than in passing, since that subpath is published.
+
+## Related shared-fixture work (backlog gardening, 2026-09-01)
+
+`debt-transaction-spec-oversized` carries an arm with the identical shape one directory over: the
+four-part `TransactionValidator` wiring is hand-copied at roughly fifteen sites inside
+`packages/db-core/test/transaction.spec.ts` and again in two other db-core specs, and it proposes
+lifting the copies into a shared `packages/db-core/test/helpers/` module.
+
+The two were **not** merged — this one is a ten-line helper dedup, that one is a 5,150-line file
+split, and they resolve at different sites. But they disagree about where db-core's shared test
+plumbing should live: this ticket proposes `packages/db-core/src/testing/` (published as the
+`@optimystic/db-core/test` subpath, which is why it raises the Node-built-ins question), and that one
+proposes `packages/db-core/test/helpers/` (unpublished, so no such constraint). Whichever lands first
+picks the home; the second should follow it rather than open a third location.

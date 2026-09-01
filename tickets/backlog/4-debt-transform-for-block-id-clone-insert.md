@@ -1,6 +1,9 @@
 description: A shared helper that extracts one block's pending changes hands back part of the data by reference instead of copying it, so every caller has to remember to make its own copy before using it — three places already do this by hand, and the fourth that forgets will silently corrupt the original.
 files: packages/db-core/src/transform/helpers.ts, packages/db-core/src/testing/test-transactor.ts, packages/db-core/src/transform/tracker.ts, packages/db-p2p/src/storage/storage-repo.ts, packages/db-core/src/transactor/network-transactor.ts
 difficulty: easy
+repro: static
+severity: corruption
+likelihood: contrived
 tradeoffs: Makes every caller pay a deep copy of an inserted block even when it only needs to read a flag — on the pend/commit path that is one extra copy per inserted block per call, and nobody has measured whether that matters.
 ----
 
@@ -56,3 +59,17 @@ Whoever picks this up should decide, rather than assume, whether the extra copy 
 pend/commit path — and if it is not, the alternative is the opposite move: make the helper's
 no-clone contract explicit in its name and type, so forgetting is a compile-time event rather than a
 convention. Either resolution retires the class; leaving the contract half-total does not.
+
+## Triage note (backlog gardening, 2026-09-01)
+
+`severity: corruption` / `likelihood: contrived` / `repro: static`, derived from the body:
+
+- **`corruption`** — the failure mode is a caller's staged `insert` being mutated underneath it, with
+  no error and no test that would catch it. That is silent bad data, which is the worst plausible
+  effect even though nothing produces it today.
+- **`contrived`** — every current caller is safe (verified by reading all of them; three carry
+  hand-written guards, the rest never reach `applyTransform`). Reaching the bad state needs a
+  *future* caller written a specific way, so no user can hit it now.
+- **`repro: static`** — read from the code. What would confirm it: a test that hands
+  `transformForBlockId`'s result to `applyTransform` with both `insert` and `updates` on one block id,
+  then asserts the input `Transforms` is unchanged.

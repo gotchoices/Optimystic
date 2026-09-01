@@ -78,3 +78,16 @@ whether two tests are validating under the same conditions. When the split lifts
 Other tickets have in-flight edits against this file (they cite line ranges within it). A split
 invalidates those line references and will conflict with any uncommitted work, so this should be
 scheduled when the board is quiet on `transaction.spec.ts`, not alongside it.
+
+## Related shared-fixture work (backlog gardening, 2026-09-01)
+
+`debt-three-copies-of-the-log-capture-test-helper` is the same shape at smaller scale — one ~10-line
+`debug`-capture helper copied into three files, two of them db-core specs — and it proposes
+`packages/db-core/src/testing/` as the shared home rather than the `test/helpers/` this ticket names.
+The difference matters: `src/testing/` is published as the `@optimystic/db-core/test` subpath and
+imports zero Node built-ins on purpose, so it constrains what a helper may depend on; `test/helpers/`
+does not.
+
+Not merged (different deliverables, different sites), but whichever lands first should pick the home
+and the other should follow it, so db-core does not end up with three places shared test plumbing can
+live instead of one.

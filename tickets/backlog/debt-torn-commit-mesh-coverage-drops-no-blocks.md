@@ -42,3 +42,15 @@ assert that number is greater than zero, which is precisely what the diary case 
 
 Worth checking while doing this whether the helper belongs in the shared mesh test harness rather
 than in one spec file, since a second consumer is exactly what this ticket creates.
+
+## Related, and it shares a fixture with this one (backlog gardening, 2026-09-01)
+
+`debt-mesh-harness-policy-and-commit-path-untested` arm two wants the same thing this ticket wants
+from a different angle: a mesh-level case that drives a commit the committing node cannot satisfy from
+what it holds locally. Every existing mesh case enters from the read side.
+
+The two were deliberately **not** merged — they cover different production code and assert different
+things. But the body's own closing suggestion (that `tearFirstCommit` "belongs in the shared mesh test
+harness rather than in one spec file, since a second consumer is exactly what this ticket creates") is
+now concrete: that second consumer is the other ticket's arm two. Whichever is picked up first should
+land the helper in `packages/db-p2p/src/testing/mesh-harness.ts`, not in its own spec.

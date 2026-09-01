@@ -1,6 +1,9 @@
 description: When a machine asks a group of peers to co-sign a write, it points at the piece of data the write is about, but nothing checks that the pointer actually matches the write before it is sent — so a future coding slip there would make every write on that path fail outright at the receiving end, with no error at the source that says why.
 files: packages/db-p2p/src/repo/cluster-coordinator.ts, packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/cluster/cluster-repo.ts, packages/db-core/src/network/i-repo.ts, packages/db-core/src/transactor/network-transactor.ts
 difficulty: medium
+repro: static
+severity: edge-case
+likelihood: contrived
 tradeoffs: Every sender is correct today (verified by reading all three call sites), so this buys nothing until someone changes one — and the natural fix moves a helper across a package boundary, which is more churn than a plain assertion would be.
 
 # One side asserts a rule the other side is trusted to follow
@@ -65,3 +68,17 @@ at the choke point — drive `pend`, `commit` and `cancel` and assert the stampe
 `coordinatingBlockIds[0]` is always in the extracted affected set — is the regression guard this
 ticket is really about, and it would have made the review's "no honest sender loses its block" claim
 mechanical instead of argued.
+
+## Triage note (backlog gardening, 2026-09-01)
+
+`severity: edge-case` / `likelihood: contrived` / `repro: static`, derived from the body:
+
+- **`edge-case`** — deliberately the lower reading. The consequence of a mis-stamped id is that
+  capable members hard-reject the record, so the write *fails* rather than landing wrongly. Nothing
+  is corrupted and no wrong answer is returned; the cost is an opaque failure whose reason lives in
+  N peers' reject strings.
+- **`contrived`** — all three current senders are correct (verified by reading every call site), and
+  the field is only reachable by a caller that sets `MessageOptions.coordinatingBlockIds` from
+  somewhere other than the batch's own transforms.
+- **`repro: static`** — read from the code. What would confirm it: the generalized choke-point test
+  this ticket asks for, driving `pend` / `commit` / `cancel` with a deliberately unbound id.

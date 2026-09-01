@@ -4,6 +4,8 @@ files:
   - packages/db-core/src/transactor/transactor-source.ts (~lines 163, 167 — the caller-driven cancel)
   - packages/db-p2p/src/storage/storage-repo.ts (StorageRepo.commit's doc comment, which already records this gap; cancel; dropUnpromotablePendings)
   - docs/repository.md (Invariant P, ~line 132)
+difficulty: hard
+repro: static
 severity: wrong-result
 likelihood: unusual
 tradeoffs: Cleanup depends entirely on a client that may never come back, so any fix has to guess when a marker is abandoned rather than in-flight — and guessing too eagerly deletes a live write, which is worse than the leak it cures.
@@ -79,3 +81,16 @@ Things a design would need to settle:
 Nobody has observed an accumulation in practice; the reasoning is from the code and from the
 existing doc comments that already name the gap. The window is real but narrow, and the wrong fix is
 actively harmful, so this wants a deliberate design pass rather than an opportunistic patch.
+
+## Triage note (backlog gardening, 2026-09-01)
+
+Added `repro: static` and `difficulty: hard`.
+
+- **`repro: static`** — the body states plainly that no accumulation has been observed; the reasoning
+  comes from the code and from the doc comments at `StorageRepo.commit` and
+  `NetworkTransactor.pendPhase` that already name the gap. What would confirm it: kill a client
+  between a refused pend and its background cancel, then assert the marker survives on every member
+  and blocks the next write to that block.
+- **`difficulty: hard`** — the ticket's own "What a fix has to answer" section is four open design
+  questions (abandonment signal, where the sweep runs, whether members must agree, whether the client
+  is hardened too), and the ticket says the wrong fix is worse than the leak.
