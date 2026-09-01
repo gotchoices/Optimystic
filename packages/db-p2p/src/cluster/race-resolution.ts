@@ -1,8 +1,9 @@
 /**
  * The deterministic arbiter between two conflicting cluster transactions: which of two writes to a
- * shared block wins. Every function here is pure and total — `resolveRace` runs on the vote path,
- * where a throw would cost the member its vote entirely — so the ordering rule can be read and
- * tested on its own. The stateful scan that consults them (`findConflict`, which sweeps stale
+ * shared block wins. Every function here is a total function of its arguments, with no member state
+ * and no effect beyond a debug log — `resolveRace` runs on the vote path, where a throw would cost
+ * the member its vote entirely — so the ordering rule can be read and tested on its own (see
+ * `test/race-resolution.spec.ts`). The stateful scan that consults them (`findConflict`, which sweeps stale
  * reservations and clears a losing transaction) stays on `ClusterMember` in `cluster-repo.ts`.
  */
 import type { ClusterRecord, RepoMessage } from "@optimystic/db-core";
@@ -124,6 +125,12 @@ export function recordPriority(record: ClusterRecord): number {
 	return 0;
 }
 
+/**
+ * Whether two messages must serialize against each other: true when they touch a common block AND
+ * are not the same action. The same-action escape is what lets a commit follow its own pend — both
+ * name every block the action writes, so a bare overlap test would have each transaction blocking
+ * its own next phase. Gates whether {@link resolveRace} runs at all.
+ */
 export function operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMessage['operations']): boolean {
 	// Check if one is a commit for the same action as a pend - these don't conflict
 	const actionId1 = getActionId(ops1);

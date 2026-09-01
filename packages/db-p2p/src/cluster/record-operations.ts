@@ -38,8 +38,12 @@ export function getAffectedBlockIds(operations: RepoMessage['operations']): stri
 }
 
 /**
- * The action id the message names, or `undefined` if none of its operations carry one. Returns the
- * FIRST match and stops, with `pend` / `commit` / `cancel` precedence within a single operation.
+ * The action id the message names, or `undefined` if it names none. `pend`, `commit` and `cancel`
+ * each carry one; `get` and `invalidate` do not — an `invalidate` deliberately does NOT surface its
+ * `invalidatedActionId`, which names the action being reversed rather than this message's own, and
+ * would otherwise tell `operationsConflict` that an invalidation and the pend it reverses are "the
+ * same action" and need not serialize. `RepoMessage.operations` is a one-element tuple, so the scan
+ * is a formality; it returns on the first operation that carries an id either way.
  */
 export function getActionId(operations: RepoMessage['operations']): string | undefined {
 	for (const operation of operations) {
