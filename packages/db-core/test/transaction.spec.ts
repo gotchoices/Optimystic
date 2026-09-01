@@ -4030,10 +4030,13 @@ describe('Transaction', () => {
 			expect(inner.getCommittedActions().size, 'nothing durably committed').to.equal(0);
 		});
 
-		it('execute() surfaces the partition on ExecutionResult (does not throw) and resets the committed subset', async () => {
+		it('execute() surfaces the partition on ExecutionResult (does not throw) and gives the committed subset the full success-path treatment', async () => {
 			const inner = new TestTransactor();
-			// 'posts' loses its commit permanently (stale loss); 'users' commits durably.
-			const transactor = new SelectiveCommitFailTransactor(inner, 'posts');
+			// 'posts' loses its commit permanently (stale loss); 'users' commits durably. The
+			// N-times variant with an unbounded fail count is the permanent-loss case too, and it
+			// additionally RECORDS which collections landed — needed below to show the winner is
+			// the only one that ever committed, across two transactions.
+			const transactor = new FailCollectionNTimesTransactor(inner, 'posts', Infinity);
 
 			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', e => e.key);
 			const postsTree = await Tree.createOrOpen<number, PostEntry>(transactor, 'posts', e => e.key);
@@ -4044,18 +4047,28 @@ describe('Transaction', () => {
 			const coordinator = new TransactionCoordinator(transactor, collections);
 			const engine = new ActionsEngine();
 
-			const actions: CollectionActions[] = [
+			const buildTransaction = async (actions: CollectionActions[]): Promise<Transaction> => {
+				const statements = createActionsStatements(actions);
+				const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+				return { stamp, statements, reads: [], id: await createTransactionId(stamp.id, statements, []) };
+			};
+
+			// PRIOR committed state on the winner is what makes the read-cache assertion below bite:
+			// a pristine collection's log tail lives in its own tracker, so a stale cache has nothing
+			// to serve in its place and the assertion would pass with or without the fold. 'posts' is
+			// untouched here, so this one commits cleanly.
+			const priorResult = await coordinator.execute(
+				await buildTransaction([
+					{ collectionId: 'users', actions: [{ type: 'replace', data: [[0, { key: 0, name: 'Zero' }]] }] },
+				]),
+				engine
+			);
+			expect(priorResult.success, `prior users-only commit: ${priorResult.error ?? ''}`).to.be.true;
+
+			const transaction = await buildTransaction([
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
 				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[100, { key: 100, userId: 1, title: 'First' }]] }] },
-			];
-			const statements = createActionsStatements(actions);
-			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
-			const transaction: Transaction = {
-				stamp,
-				statements,
-				reads: [],
-				id: await createTransactionId(stamp.id, statements, []),
-			};
+			]);
 
 			// The execute() path is NOT snapshot/restore-wrapped: it RETURNS the partition on the
 			// ExecutionResult rather than throwing CoordinatorPartialCommitError.
@@ -4065,8 +4078,12 @@ describe('Transaction', () => {
 			expect(result.committedCollections, 'committed set on ExecutionResult').to.deep.equal(['users']);
 			expect(result.failedCollections, 'failed set on ExecutionResult').to.deep.equal(['posts']);
 
-			// The committed subset got the success-path local treatment (recordCommitted + tracker.reset),
-			// so the winner's tracker no longer carries the staged change.
+			// The committed subset got the FULL success-path local treatment — the same four steps,
+			// in the same order, as commitOnceLatched's partial-commit fold (asserted by the
+			// session-mode case at the top of this block). Each step is asserted separately because
+			// each has its own silent failure mode.
+
+			// recordCommitted + tracker.reset: the winner's tracker no longer carries the staged change.
 			const t = usersCollection.tracker.transforms;
 			const usersPendingChanges =
 				Object.keys(t.inserts ?? {}).length +
@@ -4074,10 +4091,30 @@ describe('Transaction', () => {
 				(t.deletes?.length ?? 0);
 			expect(usersPendingChanges, 'committed collection tracker was reset').to.equal(0);
 
-			// Exactly one collection ('users') landed durably through the transactor; 'posts' did not.
-			const durable = inner.getCommittedActions();
-			expect(durable.size, 'exactly one collection landed durably').to.equal(1);
-			expect(durable.has(transaction.id as ActionId), 'the durable commit is this transaction').to.be.true;
+			// applyCommittedToCache: read the log through the SAME instance that committed. The
+			// tracker reset above dropped the appended log-tail block, and update() sees the
+			// revision is already current and refetches nothing — so without the fold this
+			// instance keeps serving its PRE-commit log tail and 'Alice' is invisible to its own
+			// committer, while the prior 'Zero' entry still reads fine.
+			const usersLog: unknown[] = [];
+			for await (const action of usersCollection.selectLog()) usersLog.push(action);
+			expect(usersLog.length, 'committed collection observes both its own commits').to.equal(2);
+			expect(await usersTree.get(1), 'and the durable row reads back')
+				.to.deep.equal({ key: 1, name: 'Alice' });
+
+			// clearPendingActions: the winner's queue is EMPTY, not still holding its now-durable
+			// actions. A queue left behind is invisible until the next commit() on this collection
+			// re-logs them as a duplicate entry.
+			expect(usersCollection.getPendingActions(), 'committed collection pending should be cleared')
+				.to.deep.equal([]);
+
+			// This transaction landed durably, and 'users' is the only collection it landed for —
+			// `durableCommits` records one entry per collection actually promoted by the transactor
+			// (here: 'users' from the prior commit, then 'users' again from this partial one).
+			expect(inner.getCommittedActions().has(transaction.id as ActionId), 'the partial transaction reached storage')
+				.to.be.true;
+			expect(transactor.durableCommits, 'only users ever committed durably')
+				.to.deep.equal(['users', 'users']);
 		});
 
 		it('re-driving commit() after a partial landing re-attempts only the failed collection (no double-apply on the winner)', async () => {

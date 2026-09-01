@@ -62,6 +62,7 @@ import {
 	type IBlock,
 	type ITransactor,
 	type Transaction,
+	type ActionEntry,
 	Log,
 } from '../src/index.js';
 import { FlakyCommitTransactor, GatedCommitTransactor, TestTransactor } from '../src/testing/test-transactor.js';
@@ -145,16 +146,23 @@ function spyAcquisitionOrder(collections: Collection<SpecAction>[]): string[] {
 }
 
 /**
- * A collection's log, as one array of action values per ENTRY.
+ * A collection's log entries, as written.
  *
  * `selectLog` flattens entries together, so it cannot tell one entry carrying two actions apart
  * from two entries carrying one each — exactly the distinction the coalescing cases below turn on.
- * Reading the entries directly keeps that boundary visible.
+ * Reading the entries directly keeps that boundary visible, and also exposes the per-entry
+ * metadata (`collectionIds`) the coalescing decides.
  */
-async function logEntries(collection: Collection<SpecAction>): Promise<string[][]> {
+async function logEntryRecords(collection: Collection<SpecAction>): Promise<ActionEntry<Action<SpecAction>>[]> {
 	const log = await Log.open<Action<SpecAction>>(collection.tracker, collection.id);
 	expect(log, `log found for ${collection.id}`).to.not.be.undefined;
 	const { entries } = await log!.getFrom(0);
+	return entries;
+}
+
+/** {@link logEntryRecords}, reduced to one array of action values per entry. */
+async function logEntries(collection: Collection<SpecAction>): Promise<string[][]> {
+	const entries = await logEntryRecords(collection);
 	return entries.map(entry => entry.actions.map(action => action.data.value));
 }
 
@@ -246,8 +254,15 @@ describe('coordinator commit latch span', () => {
 		// silently dropped by an id-keyed map overwrite.
 		const fresh = await Collection.open<SpecAction>(inner, collectionA, init());
 		expect(fresh, 'span-a is durable in storage').to.not.be.undefined;
-		expect(await logEntries(fresh!), 'one log entry, carrying both batches in emission order')
+		const entries = await logEntryRecords(fresh!);
+		expect(entries.map(e => e.actions.map(x => x.data.value)), 'one log entry, carrying both batches in emission order')
 			.to.deep.equal([['first', 'second']]);
+		// The participant list PERSISTED on the entry is the distinct set too. It is written from
+		// the same `allCollectionIds` the latch acquisition uses, and a later invalidation cascade
+		// reads it as "the collections this action is conditional on" — a repeated id there would
+		// be a duplicate conditional, not just cosmetic noise.
+		expect(entries[0]!.collectionIds, 'the entry records each participant once')
+			.to.deep.equal([collectionA]);
 		expect(a.committedRevision(), 'span-a recorded a revision').to.be.a('number');
 		expect(fresh!.committedRevision(), 'local record and storage agree on the revision')
 			.to.equal(a.committedRevision());
@@ -286,6 +301,58 @@ describe('coordinator commit latch span', () => {
 			.to.deep.equal([['first', 'second']]);
 		expect(await logEntries(freshB!), 'span-b: its own entry, untouched by the duplicate')
 			.to.deep.equal([['b-only']]);
+	});
+
+	it('execute coalesces THREE batches for one collection, not just a pair', async () => {
+		// The grouping accumulates with `push(...)`, so a pairwise-merge regression (or a
+		// second-wins overwrite that happens to keep the last two) would still satisfy the
+		// two-batch cases above. Three is the smallest count that separates them.
+		const inner = new TestTransactor();
+		const a = await Collection.createOrOpen<SpecAction>(inner, collectionA, init());
+		const coordinator = new TransactionCoordinator(inner, new Map([[collectionA, a]]));
+		const transaction = await buildTransaction([
+			{ collectionId: collectionA, actions: [setAction('first')] },
+			{ collectionId: collectionA, actions: [setAction('second')] },
+			{ collectionId: collectionA, actions: [setAction('third')] },
+		]);
+		const order = spyAcquisitionOrder([a]);
+
+		const result = await coordinator.execute(transaction, new ActionsEngine());
+
+		expect(result.success, `execute completed: ${result.error ?? ''}`).to.be.true;
+		expect(order, 'still one latch, however many batches name the collection')
+			.to.deep.equal([collectionA]);
+		const fresh = await Collection.open<SpecAction>(inner, collectionA, init());
+		expect(await logEntries(fresh!), 'all three batches, in emission order, in one entry')
+			.to.deep.equal([['first', 'second', 'third']]);
+	});
+
+	it('execute keeps a collection whose only batch is EMPTY as a participant', async () => {
+		// An engine may name a collection and emit nothing for it. The grouping registers it
+		// (`batches.set(id, [])`), so it takes a latch, appends an entry, and joins consensus —
+		// which is what makes its pristine header/log blocks durable. Pinned because the two
+		// plausible regressions are silent: skipping empty batches would drop span-b from the
+		// participant set entirely, and folding them into the previous collection's group would
+		// mis-attribute its actions.
+		const inner = new TestTransactor();
+		const [a, b] = await openPair(inner);
+		const coordinator = new TransactionCoordinator(inner, new Map([[collectionA, a], [collectionB, b]]));
+		const transaction = await buildTransaction([
+			{ collectionId: collectionA, actions: [setAction('a-only')] },
+			{ collectionId: collectionB, actions: [] },
+		]);
+		const order = spyAcquisitionOrder([a, b]);
+
+		const result = await coordinator.execute(transaction, new ActionsEngine());
+
+		expect(result.success, `execute completed: ${result.error ?? ''}`).to.be.true;
+		expect(order, 'the empty participant is latched like any other').to.deep.equal([collectionA, collectionB]);
+
+		const freshA = await Collection.open<SpecAction>(inner, collectionA, init());
+		const freshB = await Collection.open<SpecAction>(inner, collectionB, init());
+		expect(await logEntries(freshA!), 'span-a keeps its own action').to.deep.equal([['a-only']]);
+		expect(await logEntries(freshB!), 'span-b gets an entry, carrying no actions')
+			.to.deep.equal([[]]);
 	});
 
 	it('execute clears the pending queue, so a later commit does not re-log its actions', async () => {
