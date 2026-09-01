@@ -13,3 +13,4 @@
 {"slug":"announce-addrs-option","file":"announce-addrs-option.md","completedAt":"2026-08-01","commit":"64298e7dd6e406d6faee79aa4e6278a3a5ddf849","prunedAt":"2026-08-31T14:51:07.929Z"}
 {"slug":"coordinator-cache-poisoned-by-boot-time-self-selection","file":"coordinator-cache-poisoned-by-boot-time-self-selection.md","completedAt":"2026-08-01","commit":"892ac32471f2463fb1fdaab730a78e06ef338730","prunedAt":"2026-08-31T14:51:07.929Z"}
 {"slug":"corroboration-floor-defaults-to-two-for-large-meshes","file":"corroboration-floor-defaults-to-two-for-large-meshes.md","completedAt":"2026-08-01","commit":"9266833c2ad4471dcc252af1abf794c6d32677f3","prunedAt":"2026-08-31T14:51:07.929Z"}
+{"slug":"collection-forgets-revision-on-absent-header","file":"1-collection-forgets-revision-on-absent-header.md","completedAt":"2026-08-02","commit":"2d7d3c1310e31399ce7be6aa06c228d029a68b46","prunedAt":"2026-09-01T05:33:04.155Z"}
