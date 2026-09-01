@@ -319,6 +319,25 @@ describe('cohort-topic: scale anti-flood + anti-DoS (mock-tier e2e)', function (
 				expect(decidingEngine.budgetHasTopic(TOPIC_C), 'the new topic was admitted into the freed slot').to.equal(true);
 				expect(decidingEngine.budgetParticipantCount(TOPIC_A), 'the still-populated topic is never evicted for a new instantiation').to.equal(1);
 				expect(decidingEngine.servesTopic(TOPIC_A), 'the populated topic keeps serving').to.equal(true);
+
+				// The teardown side of eviction (the part this test previously never checked): dropping a topic
+				// from the budget must ALSO remove its cold-start forwarder, or `servesTopic` stays true off the
+				// leftover forwarder forever and the forwarder map grows unbounded (host.ts `onEvict`, ~line 2076).
+				// This is the load-bearing assertion — it fails if `coldStart.remove` is dropped from `onEvict`.
+				expect(decidingEngine.servesTopic(TOPIC_B), 'the evicted topic no longer serves — its forwarder was torn down').to.equal(false);
+				expect(decidingEngine.forwarder(TOPIC_B), 'the evicted topic\'s cold-start forwarder entry is gone').to.equal(undefined);
+
+				// Negative controls: teardown hit only the evicted topic, not everything.
+				expect(decidingEngine.forwarder(TOPIC_A), 'the still-populated topic keeps its forwarder').to.not.equal(undefined);
+				expect(decidingEngine.servesTopic(TOPIC_C), 'the newly-admitted topic serves').to.equal(true);
+				expect(decidingEngine.forwarder(TOPIC_C), 'the newly-admitted topic has a forwarder').to.not.equal(undefined);
+
+				// NOTE: the third onEvict arm (`traffic.forget`) is not asserted here — `topicTraffic()`'s
+				// `arrivalsPerMin` is sourced from `published()` (frozen only by a `gossipRound`, which this
+				// test never drives), so it reads 0 whether or not `forget` ran; `directParticipants` comes from
+				// the store, already 0 from the TTL sweep independent of `onEvict`. Neither field can distinguish
+				// "torn down" from "never published" at this call depth — see `traffic.spec.ts`'s own `forget()`
+				// tests (which drive `publish()` directly) for that coverage.
 			} finally {
 				await mesh.stop();
 			}
