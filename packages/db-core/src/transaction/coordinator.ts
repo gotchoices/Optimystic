@@ -660,7 +660,29 @@ export class TransactionCoordinator {
 		const collectionTransforms = new Map<CollectionId, Transforms>();
 		const criticalBlocks = new Map<CollectionId, BlockId>();
 		const actionResults = new Map<CollectionId, any[]>();
-		const allCollectionIds = result.actions.map(ca => ca.collectionId);
+
+		// Coalesce the engine's batches to ONE per collection. Nothing stops an engine from
+		// emitting two `CollectionActions` entries naming the same collection (with the built-in
+		// ActionsEngine that is just two statements against one table), but everything downstream
+		// of here is written per-PARTICIPANT, not per-batch: the apply loop would append two log
+		// entries stamped with the same revision (the revision only advances at recordCommitted),
+		// the id-keyed maps below would discard the first batch's entry, and both folds would call
+		// recordCommitted twice — the second throwing on the revision it already advanced past,
+		// AFTER the transaction committed durably. One log entry per collection per transaction is
+		// the invariant commitOnceLatched holds by construction (it appends one entry carrying that
+		// collection's whole pending queue), so match it here by grouping instead.
+		//
+		// First-appearance collection order, and each collection's own actions in the order the
+		// engine emitted them. The STAGING above deliberately ran on the original, un-coalesced
+		// list: staging order is what a re-executing validator reproduces, so it stays exactly as
+		// the engine emitted it. Grouping is only for the log-append and fold phase below.
+		const batches = new Map<CollectionId, unknown[]>();
+		for (const { collectionId, actions } of result.actions) {
+			const existing = batches.get(collectionId);
+			if (existing) existing.push(...actions);
+			else batches.set(collectionId, [...actions]);
+		}
+		const allCollectionIds = [...batches.keys()];
 		// Same single-capture rev threading as commitOnce: stamped at the log append below,
 		// named again at pend, commit, and recordCommitted.
 		const pendedRevs = new Map<CollectionId, number>();
@@ -668,25 +690,26 @@ export class TransactionCoordinator {
 		// Hold each participating collection's instance latch for the commit span, same
 		// discipline as commitOnce (sorted acquisition; see the comment there). Acquired only
 		// AFTER applyActions above: collection.act takes the same non-reentrant instance latch
-		// itself, so latching earlier would deadlock. Deduped before acquiring — taking one
-		// instance's latch twice would also deadlock. Released in the finally: execute has
-		// early failure returns.
+		// itself, so latching earlier would deadlock. The list must be DISTINCT — taking one
+		// instance's latch twice would also deadlock — which the grouping above now guarantees
+		// upstream (`allCollectionIds` is `batches.keys()`) instead of at the acquisition.
+		// Released in the finally: execute has early failure returns.
 		const latchReleases: (() => void)[] = [];
 		try {
 			// NOTE: deadlock-freedom against a concurrent commitOnce needs BOTH paths to acquire in
 			// the SAME order, not merely each in a sorted one. `CollectionId` is a string, so this
 			// default `.sort()` and commitOnce's explicit `<`/`>` comparator agree today. If either
 			// spelling changes — a custom comparator, a non-string id — change both together.
-			for (const collectionId of [...new Set(allCollectionIds)].sort()) {
+			for (const collectionId of [...allCollectionIds].sort()) {
 				const collection = this.collections.get(collectionId);
 				if (collection) {
 					latchReleases.push(await collection.acquireLatch());
 				}
 			}
 
-			for (const collectionActions of result.actions) {
+			for (const [collectionId, actions] of batches) {
 				const applyResult = await this.applyActionsToCollection(
-					collectionActions,
+					{ collectionId, actions },
 					transaction,
 					allCollectionIds
 				);
@@ -695,10 +718,10 @@ export class TransactionCoordinator {
 					return { success: false, error: applyResult.error };
 				}
 
-				collectionTransforms.set(collectionActions.collectionId, applyResult.transforms!);
-				criticalBlocks.set(collectionActions.collectionId, applyResult.logTailBlockId!);
-				actionResults.set(collectionActions.collectionId, applyResult.results!);
-				pendedRevs.set(collectionActions.collectionId, applyResult.rev!);
+				collectionTransforms.set(collectionId, applyResult.transforms!);
+				criticalBlocks.set(collectionId, applyResult.logTailBlockId!);
+				actionResults.set(collectionId, applyResult.results!);
+				pendedRevs.set(collectionId, applyResult.rev!);
 			}
 
 			// 3. Compute operations hash for validation (order-independent; see commit()).
@@ -721,16 +744,20 @@ export class TransactionCoordinator {
 				log('execute:done trxId=%s engine=%dms apply=%dms coordinate=%dms success=false total=%dms', trxId, engineMs, applyMs, coordMs, Date.now() - t0);
 				// Stop lying to the caller about a partial commit: if some collections durably
 				// committed, surface that set. execute() is not snapshot/restore-wrapped (see the
-				// note above), but the committed subset must still get the success-path local
-				// treatment (recordCommitted + tracker.reset, as on the success path below) so its
-				// trackers aren't left mis-tracking already-durable state.
+				// note above), but the committed subset must still get the full success-path local
+				// treatment (the same four steps as commitOnceLatched's partial-commit fold, in the
+				// same order — see the success fold below) so its trackers, read caches and pending
+				// queues aren't left mis-tracking already-durable state.
+				// Kept await-free for the same reason the success fold is.
 				const committed = coordResult.committedCollections ?? new Set<CollectionId>();
 				if (committed.size > 0) {
-					for (const collectionActions of result.actions) {
-						const collection = this.collections.get(collectionActions.collectionId);
-						if (collection && committed.has(collectionActions.collectionId)) {
-							collection.recordCommitted(transaction.id, pendedRevs.get(collectionActions.collectionId)!);
+					for (const collectionId of batches.keys()) {
+						const collection = this.collections.get(collectionId);
+						if (collection && committed.has(collectionId)) {
+							const rev = collection.recordCommitted(transaction.id, pendedRevs.get(collectionId)!);
+							collection.applyCommittedToCache(collectionTransforms.get(collectionId)!, rev);
 							collection.tracker.reset();
+							collection.clearPendingActions();
 						}
 					}
 				}
@@ -742,28 +769,34 @@ export class TransactionCoordinator {
 				};
 			}
 
-			// 5. Update actionContext and reset trackers after successful commit
-			// NOTE: this iterates `result.actions`, not the DISTINCT participant set the latch
-			// acquisition above deduped to — so a transaction whose actions name one collection
-			// twice folds that collection twice, and the second recordCommitted throws on the
-			// revision it already advanced past. The partial-commit fold in the `!coordResult.success`
-			// branch above has the SAME shape, so a fix has to cover both loops. Dormant today (no
-			// caller emits duplicate CollectionActions entries); tracked as
-			// `debt-execute-duplicate-collection-actions-double-record`, and pinned meanwhile by the
-			// duplicate-collection case in test/coordinator-latch-span.spec.ts, which deliberately
-			// does not assert this method's outcome.
-			for (const collectionActions of result.actions) {
-				const collection = this.collections.get(collectionActions.collectionId);
+			// 5. Advance actionContext, fold the committed transforms into each collection's read
+			// cache, reset the tracker, and drop the now-committed pending actions — the same four
+			// steps, in the same order, as commitOnceLatched's success fold. Order matters: cache
+			// the committed blocks BEFORE resetting the tracker (the transforms are read live), so a
+			// collection with prior committed state serves the new revision instead of the stale
+			// cached one. Clearing pending keeps a subsequent commit() on this same collection from
+			// re-logging these already-durable actions.
+			// NOTE: this fold loop must stay await-free, for the same reason commitOnce's does —
+			// session-mode publish relies on it being event-loop-atomic across collections.
+			for (const collectionId of batches.keys()) {
+				const collection = this.collections.get(collectionId);
 				if (collection) {
-					collection.recordCommitted(transaction.id, pendedRevs.get(collectionActions.collectionId)!);
+					const rev = collection.recordCommitted(transaction.id, pendedRevs.get(collectionId)!);
+					collection.applyCommittedToCache(collectionTransforms.get(collectionId)!, rev);
 					collection.tracker.reset();
+					collection.clearPendingActions();
 				}
 			}
 
 			// Clean up stamp tracking data
 			this.stampData.delete(transaction.stamp.id);
 
-			// 6. Return results from actions
+			// 6. Return results from actions.
+			// `actions` is the engine's ORIGINAL batch list, un-coalesced — the field is documented
+			// as "the actions produced by executing the transaction", and the caller's own shape is
+			// the honest answer to that. `results` is keyed by collection id, so the two are NOT
+			// positionally aligned when an engine named one collection in more than one batch; join
+			// them on collectionId, never by index.
 			log('execute:done trxId=%s engine=%dms apply=%dms coordinate=%dms total=%dms', trxId, engineMs, applyMs, coordMs, Date.now() - t0);
 			return {
 				success: true,

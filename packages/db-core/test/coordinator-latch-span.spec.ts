@@ -13,10 +13,13 @@
  *
  * `execute` has two ordering constraints `commitOnce` does not. The latch is non-reentrant, so
  * `execute` must acquire AFTER `applyActions` (applying an action calls `Collection.act`, which
- * takes that very latch) and must DE-DUPLICATE its collection list before locking (the action list
- * can name one collection twice, and taking one instance's latch twice self-deadlocks). Both cases
- * below are load-bearing precisely because a regression there does not fail an assertion — it
- * hangs, and the mocha timeout is the detector.
+ * takes that very latch) and its participant list must be DISTINCT before locking — the engine's
+ * action list can name one collection twice, and taking one instance's latch twice self-deadlocks.
+ * `execute` gets that distinctness by grouping the engine's batches to one per collection up front
+ * (which is also what keeps the log append and the post-commit fold to one per collection), so the
+ * duplicate cases below assert both halves at once. They are load-bearing precisely because a
+ * regression in the latch half does not fail an assertion — it hangs, and the mocha timeout is the
+ * detector.
  *
  * **The acquisition-order case is the load-bearing proof of the sort.** Both paths sort
  * participants by collection id before acquiring, so two commits over overlapping participant sets
@@ -59,6 +62,7 @@ import {
 	type IBlock,
 	type ITransactor,
 	type Transaction,
+	Log,
 } from '../src/index.js';
 import { FlakyCommitTransactor, GatedCommitTransactor, TestTransactor } from '../src/testing/test-transactor.js';
 import { drainMacrotasks, releaseRefresh } from '../src/testing/refresh-probe.js';
@@ -140,6 +144,20 @@ function spyAcquisitionOrder(collections: Collection<SpecAction>[]): string[] {
 	return order;
 }
 
+/**
+ * A collection's log, as one array of action values per ENTRY.
+ *
+ * `selectLog` flattens entries together, so it cannot tell one entry carrying two actions apart
+ * from two entries carrying one each — exactly the distinction the coalescing cases below turn on.
+ * Reading the entries directly keeps that boundary visible.
+ */
+async function logEntries(collection: Collection<SpecAction>): Promise<string[][]> {
+	const log = await Log.open<Action<SpecAction>>(collection.tracker, collection.id);
+	expect(log, `log found for ${collection.id}`).to.not.be.undefined;
+	const { entries } = await log!.getFrom(0);
+	return entries.map(entry => entry.actions.map(action => action.data.value));
+}
+
 /** Short, bounded backoff: where a case retries at all, the retry is incidental to what it asserts,
  *  not its subject. */
 const retryOptions = { maxAttempts: 2, baseBackoffMs: 1, maxBackoffMs: 2, deadlineMs: 2000 };
@@ -203,7 +221,7 @@ describe('coordinator commit latch span', () => {
 		}
 	});
 
-	it('execute takes exactly one span latch for a collection its actions name twice', async () => {
+	it('execute takes one span latch and writes one log entry for a collection its actions name twice', async () => {
 		const inner = new TestTransactor();
 		const a = await Collection.createOrOpen<SpecAction>(inner, collectionA, init());
 		const coordinator = new TransactionCoordinator(inner, new Map([[collectionA, a]]));
@@ -213,24 +231,108 @@ describe('coordinator commit latch span', () => {
 		]);
 		const order = spyAcquisitionOrder([a]);
 
-		// The OUTCOME is deliberately unasserted. This transaction commits correctly and durably and
-		// then throws out of execute's post-commit fold, which iterates result.actions rather than
-		// the distinct participant set and so folds the one collection twice — a separate, currently
-		// dormant defect tracked as `debt-execute-duplicate-collection-actions-double-record`. What
-		// escapes today is `Collection span-a: action <id> was pended at rev N but the collection now
-		// expects rev N+1 — the collection was refreshed mid-commit`, from the second fold.
-		// Asserting the outcome either way would make this case fail when that defect is fixed; what
-		// it is here to prove — one latch, and a durable landing — holds under both behaviours.
-		// Reaching this line AT ALL is the assertion that matters most: an undeduped span would take
-		// this instance's non-reentrant latch twice and hang until the mocha timeout.
-		await coordinator.execute(transaction, new ActionsEngine()).catch(() => undefined);
+		// Reaching this line AT ALL is one of the two assertions: a span that did not reduce its
+		// participant list to distinct collections would take this instance's non-reentrant latch
+		// twice and hang until the mocha timeout, with nothing to assert on afterwards.
+		const result = await coordinator.execute(transaction, new ActionsEngine());
 
-		expect(order, 'the span deduped its participant list before acquiring')
-			.to.deep.equal([collectionA]);
+		expect(result.success, `execute completed: ${result.error ?? ''}`).to.be.true;
+		expect(order, 'one latch for the one participant').to.deep.equal([collectionA]);
 		expect(inner.getCommittedActions().has(transaction.id), 'and the transaction reached storage')
 			.to.be.true;
-		// This coordinator and collection are now poisoned (durably committed, then thrown out of
-		// mid-fold) — nothing else may be asserted through them.
+
+		// Both batches' actions landed, in emission order, in ONE entry — not two entries stamped
+		// with the same revision (the revision only advances at the fold below), and not one batch
+		// silently dropped by an id-keyed map overwrite.
+		const fresh = await Collection.open<SpecAction>(inner, collectionA, init());
+		expect(fresh, 'span-a is durable in storage').to.not.be.undefined;
+		expect(await logEntries(fresh!), 'one log entry, carrying both batches in emission order')
+			.to.deep.equal([['first', 'second']]);
+		expect(a.committedRevision(), 'span-a recorded a revision').to.be.a('number');
+		expect(fresh!.committedRevision(), 'local record and storage agree on the revision')
+			.to.equal(a.committedRevision());
+		expect(fresh!.committedActionId(), 'and on the lineage').to.equal(transaction.id);
+
+		// `results` is keyed by collection id, so a per-BATCH fill lets the second batch overwrite
+		// the first's entry. Only the map's SHAPE is asserted: applyActionsToCollection still
+		// returns `results: []` unconditionally (a standing TODO there about collecting handler
+		// return values), so the empty array is that TODO, not this defect.
+		expect([...result.results!.keys()], 'one results entry, for the one participant')
+			.to.deep.equal([collectionA]);
+	});
+
+	it('execute coalesces a duplicated collection without dropping its other participant', async () => {
+		const inner = new TestTransactor();
+		const [a, b] = await openPair(inner);
+		const coordinator = new TransactionCoordinator(inner, new Map([[collectionA, a], [collectionB, b]]));
+		// b first, then a twice: the participant list arrives b-then-a AND carries a duplicate, so
+		// the grouping (first-appearance order) and the sorted acquisition have to compose.
+		const transaction = await buildTransaction([
+			{ collectionId: collectionB, actions: [setAction('b-only')] },
+			{ collectionId: collectionA, actions: [setAction('first')] },
+			{ collectionId: collectionA, actions: [setAction('second')] },
+		]);
+		const order = spyAcquisitionOrder([a, b]);
+
+		const result = await coordinator.execute(transaction, new ActionsEngine());
+
+		expect(result.success, `execute completed: ${result.error ?? ''}`).to.be.true;
+		expect(order, 'two latches, sorted — not three, and not in arrival order')
+			.to.deep.equal([collectionA, collectionB]);
+
+		const freshA = await Collection.open<SpecAction>(inner, collectionA, init());
+		const freshB = await Collection.open<SpecAction>(inner, collectionB, init());
+		expect(await logEntries(freshA!), 'span-a: both of its batches, in one entry')
+			.to.deep.equal([['first', 'second']]);
+		expect(await logEntries(freshB!), 'span-b: its own entry, untouched by the duplicate')
+			.to.deep.equal([['b-only']]);
+	});
+
+	it('execute clears the pending queue, so a later commit does not re-log its actions', async () => {
+		const inner = new TestTransactor();
+		const a = await Collection.createOrOpen<SpecAction>(inner, collectionA, init());
+		const coordinator = new TransactionCoordinator(inner, new Map([[collectionA, a]]));
+
+		const first = await buildTransaction([{ collectionId: collectionA, actions: [setAction('first')] }]);
+		const firstResult = await coordinator.execute(first, new ActionsEngine());
+		expect(firstResult.success, `execute completed: ${firstResult.error ?? ''}`).to.be.true;
+
+		// Stage directly and commit through the session-mode path, which logs whatever sits in the
+		// collection's PENDING queue. commitOnce selects participants by non-empty tracker
+		// transforms, so a queue execute forgot to clear is invisible until exactly this moment.
+		await a.act(setAction('second'));
+		const second = await buildTransaction([{ collectionId: collectionA, actions: [setAction('second')] }]);
+		await coordinator.commit(second, retryOptions);
+
+		const fresh = await Collection.open<SpecAction>(inner, collectionA, init());
+		expect(await logEntries(fresh!), 'two entries, one action each — the second must not replay the first')
+			.to.deep.equal([['first'], ['second']]);
+	});
+
+	it('execute folds the committed transforms into the read cache: a read through the same instance is not stale', async () => {
+		const inner = new TestTransactor();
+		const a = await Collection.createOrOpen<SpecAction>(inner, collectionA, init());
+		const coordinator = new TransactionCoordinator(inner, new Map([[collectionA, a]]));
+
+		// PRIOR committed state is what makes this bite: a pristine collection's log tail lives in
+		// its own tracker, so a stale read cache has nothing to serve in its place. Commit that
+		// first revision through commitOnce, which already folds correctly, so only execute's own
+		// fold is under test.
+		await a.act(setAction('first'));
+		const first = await buildTransaction([{ collectionId: collectionA, actions: [setAction('first')] }]);
+		await coordinator.commit(first, retryOptions);
+
+		const second = await buildTransaction([{ collectionId: collectionA, actions: [setAction('second')] }]);
+		const result = await coordinator.execute(second, new ActionsEngine());
+		expect(result.success, `execute completed: ${result.error ?? ''}`).to.be.true;
+
+		// Read through the SAME instance, not a fresh handle. execute resets the tracker, and
+		// update() sees the revision is already current and refetches nothing, so without the cache
+		// fold this instance keeps serving the pre-commit log tail and 'second' is invisible.
+		const logged: string[] = [];
+		for await (const action of a.selectLog()) logged.push(action.data.value);
+		expect(logged, 'the committing instance observes its own second commit')
+			.to.deep.equal(['first', 'second']);
 	});
 
 	it('execute acquires span latches in sorted collection-id order', async () => {
