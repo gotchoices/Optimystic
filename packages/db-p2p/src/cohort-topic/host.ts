@@ -1665,6 +1665,13 @@ interface ChildRegistry {
 	 * parents that matter.
 	 */
 	linkedChildren(): readonly LinkedChild[];
+	/**
+	 * Whether any child is currently linked (tombstones excluded) — the same predicate as
+	 * `linkedChildren().length > 0`, but short-circuiting and allocation-free. The eviction census
+	 * ({@link CoordEngine.liveness}) runs it once per resident engine per eviction, where materializing every
+	 * linked child only to read `.length` is pure garbage.
+	 */
+	hasLinkedChildren(): boolean;
 }
 
 /**
@@ -1736,6 +1743,16 @@ function createChildRegistry(): ChildRegistry {
 				}
 			}
 			return n;
+		},
+		hasLinkedChildren(): boolean {
+			for (const children of byTopic.values()) {
+				for (const entry of children.values()) {
+					if (entry.linked) {
+						return true;
+					}
+				}
+			}
+			return false;
 		},
 		linkedChildren(): readonly LinkedChild[] {
 			const out: LinkedChild[] = [];
@@ -1911,6 +1928,16 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		}
 	};
 
+	// Set by `close()` (registry eviction, or host `stop()`); makes every time-driven entry point below inert.
+	// The gossip-cadence driver iterates a `registry.all()` SNAPSHOT and awaits between engines, so an inbound
+	// register / child-link / cold-sibling frame landing in one of those awaits can evict — and close — an
+	// engine the tick is still walking. Driving a closed engine afterwards is not merely wasted work: a
+	// `pumpMembership` would publish a cert and re-run `onCertPublished` → `verifier.cache`, re-locking the very
+	// coord `onEngineEvicted` → `verifier.forget` had just released, for a coord this node no longer serves.
+	// Guarding here rather than in the driver keeps the invariant total: a closed engine does nothing, whoever
+	// still holds a reference to it.
+	let closed = false;
+
 	/**
 	 * Publish (or refresh) this cohort's membership cert, attaching a rotation attestation when the cohort
 	 * identity (epoch) changed since the last publish. `refresh` selects the publisher path: `false` for a
@@ -1921,7 +1948,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	 * tick. Key-less interim mode no-ops (the verify-only signer cannot assemble).
 	 */
 	const publishMembership = async (now: number, refresh: boolean): Promise<MembershipCertV1 | undefined> => {
-		if (!canPublish) {
+		if (closed || !canPublish) {
 			return undefined;
 		}
 		const snapshot = snapshotAt(now); // also observes the current identity (snapshotAt → cohort())
@@ -2102,6 +2129,9 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	// frame — except a willingness heartbeat, where an idle but willing engine still emits a willingness/load-
 	// only frame so a cold cohort can bootstrap.
 	const gossipRound = async (now: number): Promise<CohortGossipV1 | undefined> => {
+		if (closed) {
+			return undefined;
+		}
 		engine.sweepStale(now);
 		const topicSummaries = residentTopics().map((topicId) =>
 			toCohortTopicSummary(topicId, traffic.publish(topicId, now), {
@@ -2177,7 +2207,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	// parent coord) via the same path a promotion uses. Skipped without a key (verify-only signer can't
 	// assemble); for the single-cohort tier-0 milestone the lifecycle never demotes (the root has no parent).
 	const demotionTick = async (now: number): Promise<void> => {
-		if (!canPublish) {
+		if (closed || !canPublish) {
 			return;
 		}
 		for (const topicId of residentTopics()) {
@@ -2199,10 +2229,16 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	// derives from the *linked* set (tombstones excluded), so a parent whose every child demoted away is
 	// reclaimable again; `promotion` counts only adopted transition state (a `promoted` flag or a
 	// `lastEffectiveAt` high-water — growth samples alone are rebuilt from the store and do not count).
+	// NOTE: `evictOne` runs this once per resident engine per eviction — up to `coordEnginesMax` (2048)
+	// censuses for one reclaim. Three of the four arms short-circuit and allocate nothing; `records` still
+	// materializes every registration via `store.listAll()` only to read `.length` (pre-dating this census —
+	// the old idle predicate did the same). Unmeasured, and bounded by a registry that is full of *cold*
+	// engines in the case that matters. If eviction ever shows up in a profile, give `RegistrationStore` an
+	// `isEmpty()` (its `byTopic` map already knows) and read that here.
 	const liveness = (): EngineLiveness => ({
 		records: store.listAll().length > 0,
 		forwarders: coldStart.hasForwarders(),
-		children: childRegistry.linkedChildren().length > 0,
+		children: childRegistry.hasLinkedChildren(),
 		promotion: promotion.hasAdoptedState(),
 	});
 
@@ -2215,7 +2251,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		liveness,
 		// Derivations of `liveness()` — kept on the interface for existing callers/specs, but sourced from
 		// the same census so the two views cannot drift.
-		// NOTE: each call now runs the FULL census (allocating one record, and touching the child registry and
+		// NOTE: each call runs the FULL census (allocating one record, and touching the child registry and
 		// promotion lifecycle) where it used to be a bare `store.listAll()` check. Free today: as of this
 		// writing nothing in `src/` calls either accessor — the registry ranks via `liveness()` directly and
 		// the only callers are specs. If a hot path (a per-frame dispatch gate, say) ever starts calling one
@@ -2264,7 +2300,10 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		pumpMembership: (now: number): Promise<MembershipCertV1 | undefined> => publishMembership(now, true),
 		gossipRound,
 		demotionTick,
-		close: (): void => bus.close(),
+		close: (): void => {
+			closed = true;
+			bus.close();
+		},
 	};
 }
 

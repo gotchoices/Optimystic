@@ -211,6 +211,15 @@ class CachingMembershipVerifier implements MembershipVerifier {
 		// coord returns to the cold-cache / interim-TOFU regime. `lastFetchAt` is deliberately KEPT: it is
 		// anti-amplification state (the refetch rate-limit clock), not trust state, and keeping it means a
 		// forget cannot be used to reset a flood-exposed coord's refetch budget.
+		//
+		// NOTE: this drops the coord's entry whatever its provenance — a *remotely* fetched cert is discarded
+		// alongside a self-published lock, so the next sight of the coord re-runs the trust gate from cold.
+		// Harmless in both regimes today: with a working trust anchor the refetch re-derives the same
+		// `"trusted"` verdict, and with the anchor `"unknown"` the coord was already TOFU-grade with a bounded
+		// re-TOFU exit (`staleGapRecoveryStrikes`), so a forget only shortens a path that was already open.
+		// The caller today is engine eviction, which an attacker can drive by spraying coords — so if `forget`
+		// ever gains a caller in a regime where re-TOFU is NOT otherwise reachable, narrow it to the
+		// self-published lock (clear `trusted`, keep the cert) instead of deleting the entry.
 		this.byCoord.delete(cohortCoord);
 		this.staleGapStrikes.delete(cohortCoord);
 	}

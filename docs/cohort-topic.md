@@ -844,6 +844,12 @@ real warm replicas and failover.
 > the cached cert and the stale-gap strike count but deliberately **keeps** `lastFetchAt`, which is
 > anti-amplification state — so a forget cannot reset a flood-exposed coord's refetch budget.
 >
+> Eviction also **closes** the engine, and a closed engine is inert — `gossipRound`, `pumpMembership` and
+> `demotionTick` all no-op. That guard matters because the cadence driver walks a *snapshot* of the registry
+> and awaits between engines, so a frame arriving mid-tick can evict an engine the tick has not reached yet;
+> without it that engine would broadcast on a closed bus and republish a cert, re-locking the very coord the
+> eviction had just released.
+>
 > The heartbeat re-broadcasts willingness for every idle-but-willing cohort every
 > `T_willingness_heartbeat`; the throttle plus the willing-for-something gate are the mitigations, but a node
 > serving very many idle cohorts may need to batch heartbeats or lengthen the interval.

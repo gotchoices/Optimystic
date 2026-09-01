@@ -251,7 +251,11 @@ describe('cohort-topic / promotion remote-apply path', () => {
 // The host tears down a coord engine under memory pressure. An engine whose lifecycle carries an adopted
 // promotion/demotion transition must not be treated as throwaway: `promoted` and the `lastEffectiveAt`
 // high-water cannot be rebuilt from the registration store, whereas growth samples and the low-load clock
-// are re-derived from it on the very next `onParticipantCountChange`. This suite pins that boundary.
+// are re-derived from it on the very next `onParticipantCountChange`. This suite covers that boundary.
+//
+// Note on wording: adopted state RANKS an engine (evicted only after every engine holding nothing), it does
+// not *pin* it — the host reserves "pinned" for registration records and cold-start forwarders, which are
+// never eviction candidates at all. See `EVICTION_RANK` in `db-p2p/src/cohort-topic/host.ts`.
 
 describe('cohort-topic / promotion adopted-state census (hasAdoptedState)', () => {
 	const promoNotice = (effectiveAt: number, topicId: Uint8Array = TOPIC): PromotionNoticeV1 => ({
@@ -278,7 +282,7 @@ describe('cohort-topic / promotion adopted-state census (hasAdoptedState)', () =
 			expect(await life.onParticipantCountChange(TOPIC, t), 'well below every promotion trigger').to.equal(undefined);
 		}
 		expect(life.isPromoted(TOPIC), 'never promoted').to.be.false;
-		expect(life.hasAdoptedState(), 'sample/clock state does not pin the engine').to.be.false;
+		expect(life.hasAdoptedState(), 'sample/clock state leaves the engine rank-0').to.be.false;
 	});
 
 	it('a locally-originated promotion is adopted state', async () => {
@@ -286,33 +290,33 @@ describe('cohort-topic / promotion adopted-state census (hasAdoptedState)', () =
 		const life = lifecycleWith(knobs);
 		expect(life.hasAdoptedState()).to.be.false;
 		expect(await life.onParticipantCountChange(TOPIC, 500), 'the cap fires a promotion').to.not.equal(undefined);
-		expect(life.hasAdoptedState(), 'a promoted topic pins the engine').to.be.true;
+		expect(life.hasAdoptedState(), 'a promoted topic outranks a state-less one').to.be.true;
 	});
 
 	it('a remotely-applied promotion notice is adopted state', () => {
 		const life = lifecycleWith({ count: 0, loadBucket: 0, children: 0, treeTier: 1 });
 		life.applyPromotionNotice(promoNotice(100), 1_000);
 		expect(life.isPromoted(TOPIC)).to.be.true;
-		expect(life.hasAdoptedState(), 'an adopted notice pins the engine').to.be.true;
+		expect(life.hasAdoptedState(), 'an adopted notice outranks a state-less engine').to.be.true;
 	});
 
-	it('demotion keeps the engine pinned: the lastEffectiveAt high-water outlives the promoted flag', () => {
+	it('demotion keeps the engine ranked: the lastEffectiveAt high-water outlives the promoted flag', () => {
 		// By design. The high-water is what makes a replayed older promotion a no-op; discarding the engine
 		// would discard it, so a stale promotion notice could re-promote a cohort that has since demoted.
 		const life = lifecycleWith({ count: 0, loadBucket: 0, children: 0, treeTier: 1 });
 		life.applyPromotionNotice(promoNotice(100), 1_000);
 		life.applyDemotionNotice(demoNotice(200), 2_000);
 		expect(life.isPromoted(TOPIC), 'no longer promoted').to.be.false;
-		expect(life.hasAdoptedState(), 'but the transition high-water still pins the engine').to.be.true;
+		expect(life.hasAdoptedState(), 'but the transition high-water still ranks it above a cold engine').to.be.true;
 	});
 
-	it('scans every topic: adopted state on any one topic pins the whole engine', () => {
+	it('scans every topic: adopted state on any one topic ranks the whole engine', () => {
 		// One lifecycle serves every topic resident at a coord, and eviction is all-or-nothing per engine —
 		// so a single promoted topic among many sample-only ones must still report true.
 		const OTHER = bytes('promo-topic-other');
 		const life = lifecycleWith({ count: 0, loadBucket: 0, children: 0, treeTier: 1 });
 		life.applyPromotionNotice(promoNotice(100, OTHER), 1_000);
 		expect(life.isPromoted(TOPIC), 'the first topic is untouched').to.be.false;
-		expect(life.hasAdoptedState(), 'the second topic pins the engine anyway').to.be.true;
+		expect(life.hasAdoptedState(), 'the second topic ranks the engine anyway').to.be.true;
 	});
 });

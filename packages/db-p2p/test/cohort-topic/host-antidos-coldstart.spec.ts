@@ -916,10 +916,44 @@ describe('cohort-topic: coord-engine registry cap (attacker-keyed engine creatio
 		await host.stop();
 	});
 
+	it('an evicted engine is inert — a tick still holding it cannot broadcast or re-lock its coord', async () => {
+		// The gossip-cadence driver walks a `registry.all()` SNAPSHOT and awaits between engines, so an inbound
+		// frame landing in one of those awaits can evict — and close — an engine the tick has yet to reach. It
+		// then drives a victim that is no longer resident: `gossipRound` broadcasts on a closed bus, and on a
+		// keyed node `pumpMembership` republishes a cert, re-running `onCertPublished` → `verifier.cache` and
+		// re-locking the coord `onEngineEvicted` → `verifier.forget` had just released. `close()` therefore makes
+		// every time-driven entry point inert. (Only `gossipRound` is observable on this key-less fake host —
+		// `pumpMembership` / `demotionTick` already no-op without a signing key — but all three share the guard.)
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { coordEnginesMax: 1 },
+		});
+		const participant = await makeParticipantBytes();
+
+		// A child-holding engine is unpinned (rank 1) yet builds a real frame — its queued child-link delta makes
+		// the round non-idle — so "did the round emit?" is a non-vacuous read on whether the engine is still live.
+		const doomed = host.registry.forCoord(addressing.coord0(topicAt(0)), 0 as Tier, participant);
+		doomed.recordChild(topicAt(0), addressing.coord0(topicAt(700)), 1_000);
+		expect(await doomed.gossipRound(2_000), 'while resident it emits the queued child-link frame').to.not.equal(undefined);
+
+		// Re-arm a pending delta, then overflow the cap of 1 — `doomed` is the sole (unpinned) candidate.
+		doomed.recordChild(topicAt(0), addressing.coord0(topicAt(701)), 2_000);
+		host.registry.forCoord(addressing.coord0(topicAt(1)), 0 as Tier, participant);
+		expect(host.registry.findByCoord(doomed.servedCoord), 'it really was evicted').to.equal(undefined);
+
+		// The in-flight tick reaches its snapshot entry only now. It must do nothing.
+		expect(await doomed.gossipRound(3_000), 'a closed engine emits no frame, pending delta or not').to.equal(undefined);
+		expect(await doomed.pumpMembership(3_000), 'and publishes no cert to re-lock the coord it just released').to.equal(undefined);
+
+		await host.stop();
+	});
+
 	it('EVICTION_RANK covers exactly the state classes liveness() reports (exhaustiveness guard)', async () => {
-		// TypeScript's `Record<EngineStateKind, ...>` pins the rank table's keys at compile time, but nothing
-		// checks the *engine* actually reports every kind. A liveness() literal that grows a fifth field, or
-		// silently drops one, would leave a state class outside the ranking — evictable with no rank at all.
+		// `EngineLiveness` is a total `Record<EngineStateKind, boolean>`, so the engine's `liveness()` literal
+		// already fails to compile if it drops a kind or grows an unknown one. This guard covers what the
+		// compiler cannot: a `liveness()` built dynamically (an `Object.fromEntries` / `as EngineLiveness` cast,
+		// or a stand-in implementation) reporting a key set that no longer matches the rank table — which would
+		// leave a state class outside the ranking, evictable with no rank at all.
 		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
 			wantK: 1,
 			antiDos: { coordEnginesMax: 2 },
