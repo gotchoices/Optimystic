@@ -774,13 +774,13 @@ export class TransactionBridge {
     //   - Session mode: the coordinator owns it. session.rollback() (above)
     //     already restored every registered collection's tracker AND its pending
     //     action queue to the coordinator's pre-stamp capture. The dirty trees ARE
-    //     those registered collections, so a second per-tree restore is at best
-    //     redundant — and it restores a DIFFERENT baseline: markDirty snapshots a
-    //     tree at its own first stage, which on this path always follows the
-    //     coordinator's capture (optimystic-module.ts staging is gated behind an
-    //     awaited applyActions). Replaying that later, dirtier snapshot over the
-    //     already-rewound collection would re-install staged state the coordinator
-    //     just discarded. Skip it.
+    //     those registered collections, so a second per-tree restore is redundant
+    //     in the usual case, where the two baselines coincide: markDirty snapshots
+    //     a tree before its first stage, and the coordinator captured that same
+    //     pre-stage state at or before then (optimystic-module.ts stages only after
+    //     an awaited applyActions). Where the two can diverge, markDirty's is never
+    //     the earlier — so restoring it over the already-rewound collection could
+    //     only re-install staged state the coordinator just discarded. Skip it.
     //   - Legacy mode (no coordinator): restore each dirty tree from its
     //     pre-stage snapshot — this reverts in-memory reads and leaves storage
     //     untouched, the actual fix for the deferred-constraint atomicity bug.

@@ -184,12 +184,14 @@ export class TransactionCoordinator {
 	}
 
 	/**
-	 * Apply actions without opening or updating a stampData entry.
+	 * Stage each action against its collection, tagged `transaction: stampId`, without touching
+	 * the {@link stampData} bookkeeping.
 	 *
-	 * Only {@link applyActions} calls this today, but it stays a separate method because the
-	 * `transaction: stampId` tag it stamps onto each action is the provenance ground truth the
-	 * rollback tests assert on (`expectNoActionsFromStamp` in coordinator-rollback-pending.spec.ts)
-	 * — it is not incidental to the tracking bookkeeping above it.
+	 * That tag is a contract, not an implementation detail: it is the provenance the rollback tests
+	 * read (`expectNoActionsFromStamp` in coordinator-rollback-pending.spec.ts) to tell one stamp's
+	 * queued actions from another's. Only {@link applyActions} calls this; the split exists just to
+	 * keep the single-open-stamp guard and the pre-stage capture readable apart from the staging
+	 * loop.
 	 */
 	private async applyActionsRaw(
 		actions: CollectionActions[],
@@ -584,6 +586,12 @@ export class TransactionCoordinator {
 	 *
 	 * Rolling back a stamp with no tracked entry — never opened, or already released by a commit
 	 * or an earlier rollback — is a no-op.
+	 *
+	 * NOTE: this method is complete only while that invariant holds. If the guard is ever relaxed
+	 * to permit concurrent stamps, a plain rewind stops being enough — it would discard a sibling
+	 * stamp's staged state along with this one — and the per-collection-earliest-capture plus
+	 * survivor-replay this method used to carry has to come back. Recover it from commit 26718f8a
+	 * (`ticket(implement): coordinator-drop-multi-stamp-replay-machinery`) rather than re-deriving.
 	 *
 	 * @param stampId - The transaction stamp ID to rollback
 	 */
