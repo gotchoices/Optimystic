@@ -2,7 +2,7 @@ import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, Commi
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
 import { isConflictFailure } from "../network/stale-failure.js";
-import type { Collection } from "../collection/collection.js";
+import type { Collection, CollectionSnapshot } from "../collection/collection.js";
 import type { SyncOptions } from "../collection/index.js";
 import { isTransactionExpired, clampPriority } from "./transaction.js";
 import { Log } from "../log/log.js";
@@ -67,7 +67,7 @@ export class TransactionCoordinator {
 	 * value makes half-restored staged state unrepresentable here. */
 	private stampData = new Map<string, {
 		order: number;
-		preSnapshot: Map<CollectionId, ReturnType<Collection<any>['snapshotPending']>>;
+		preSnapshot: Map<CollectionId, CollectionSnapshot<any>>;
 		actionBatches: CollectionActions[][];
 	}>();
 	private nextStampOrder = 0;
@@ -98,7 +98,7 @@ export class TransactionCoordinator {
 			// applyActions. A lazy capture could take a lower-`order` stamp's snapshot AFTER a
 			// higher-`order` stamp staged into that collection, and rollback (which restores to the
 			// earliest-`order` snapshot) would then keep the rolled-back action.
-			const snapshot = new Map<CollectionId, ReturnType<Collection<any>['snapshotPending']>>();
+			const snapshot = new Map<CollectionId, CollectionSnapshot<any>>();
 			for (const [id, col] of this.collections) {
 				snapshot.set(id, col.snapshotPending());
 			}
@@ -359,7 +359,7 @@ export class TransactionCoordinator {
 		// failed commit leaves each tracker exactly as it was: a retry re-appends cleanly
 		// (no duplicate log entry) and a directly-staged tree's rollback (which no-ops
 		// when the stamp was never tracked via applyActions) has nothing poisoned to undo.
-		const preCommitSnapshots = new Map<CollectionId, ReturnType<Collection<any>['snapshotPending']>>();
+		const preCommitSnapshots = new Map<CollectionId, CollectionSnapshot<any>>();
 		for (const { collectionId, collection } of collectionData) {
 			preCommitSnapshots.set(collectionId, collection.snapshotPending());
 		}
@@ -483,7 +483,13 @@ export class TransactionCoordinator {
 			collection.clearPendingActions();
 		}
 
-		// Clean up stamp tracking data
+		// Clean up stamp tracking data.
+		// NOTE: only THIS stamp's entry is dropped. The reset+clear above is collection-wide, so any
+		// OTHER in-flight stamp's `preSnapshot` now describes a pre-commit world, and a later
+		// rollback of that stamp restores actions this commit already made durable. Not reachable
+		// today (the adapter drives one stamp at a time — docs/transactions.md "own bridge per
+		// writer"), but it is a latent defect, not an accepted tradeoff: see
+		// tickets/backlog/bug-coordinator-stamp-snapshots-go-stale-when-a-sibling-commits.md.
 		this.stampData.delete(transaction.stamp.id);
 	}
 
@@ -548,7 +554,7 @@ export class TransactionCoordinator {
 			// Update the snapshot to reflect current (post-replay) state. Both halves: a survivor
 			// replayed later in this loop must carry its pending queue forward too, or the next
 			// rollback restores a snapshot that is missing it.
-			const newSnapshot = new Map<CollectionId, ReturnType<Collection<any>['snapshotPending']>>();
+			const newSnapshot = new Map<CollectionId, CollectionSnapshot<any>>();
 			for (const [id, col] of this.collections) {
 				newSnapshot.set(id, col.snapshotPending());
 			}
@@ -685,7 +691,7 @@ export class TransactionCoordinator {
 		// serve a rare branch. Unmeasured, and symmetric with commitOnceLatched, which pays the
 		// same on every commit. If execute() ever shows up hot in a profile, the way out is a
 		// copy-on-first-stage snapshot, not dropping the restore.
-		const preStageSnapshots = new Map<CollectionId, ReturnType<Collection<any>['snapshotPending']>>();
+		const preStageSnapshots = new Map<CollectionId, CollectionSnapshot<any>>();
 		for (const { collectionId } of result.actions) {
 			if (preStageSnapshots.has(collectionId)) continue;
 			const collection = this.collections.get(collectionId);

@@ -177,9 +177,11 @@ export class TransactionSession {
 	/**
 	 * Rollback the transaction (undo this session's applied actions).
 	 *
-	 * Delegates to coordinator.rollback(stampId) which restores collection
-	 * trackers to the pre-session snapshot and replays any later sessions'
-	 * actions to preserve their transforms.
+	 * Delegates to coordinator.rollback(stampId), which restores each collection's staged
+	 * state — tracker transforms AND the pending action queue — to the pre-session snapshot
+	 * and replays any later sessions' actions to preserve their staged state. Restoring both
+	 * halves is what keeps this session's actions out of the next transaction's durable log
+	 * entry; see the snapshot contract on TransactionCoordinator.stampData.
 	 */
 	async rollback(): Promise<void> {
 		if (this.committed) {
