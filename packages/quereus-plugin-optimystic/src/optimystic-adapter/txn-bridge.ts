@@ -264,10 +264,12 @@ export class TransactionBridge {
    * Snapshotting the full {@link collectionRegistry} — rather than only the trees
    * marked dirty so far — is what covers "the tree set the bridge could flush":
    * a tree still clean at create time but dirtied within the savepoint captures
-   * its clean staged state here, so rollback returns it to clean. (A tree
-   * *created* after the savepoint, e.g. a brand-new index mid-statement, is not in
-   * that create-time set — an accepted edge case, unreachable via the DML
-   * executor's per-statement savepoints since schema is stable within a statement.)
+   * its clean staged state here, so rollback returns it to clean. A tree
+   * *registered* after the savepoint (e.g. a table that finishes initializing
+   * mid-statement) is topped up into every open savepoint at registration time
+   * instead — see {@link registerCollection} — which is sound because
+   * registration always precedes any DML staged into that tree, so the top-up
+   * capture is clean at every open depth, same as this create-time set.
    *
    * Empty in session mode: there the coordinator owns tracker rollback (see
    * {@link rollbackTransaction}), so a statement-level savepoint rollback is NOT
@@ -351,15 +353,38 @@ export class TransactionBridge {
   /**
    * Register a collection the vtab stages into (main table or index tree) so a
    * session-mode coordinator can read its staged transforms at commit and revert
-   * them at rollback. Idempotent (keyed by collection id) and mode-agnostic:
-   * always called as a table initializes, BEFORE any DML, so the collection is
-   * present when the coordinator snapshots on the transaction's first action.
+   * them at rollback, and so LEGACY-mode savepoints (see {@link savepoints}) cover
+   * it too. Idempotent (keyed by collection id) and mode-agnostic: registration
+   * must always precede any DML staged into the collection — a capture taken
+   * after staging would record already-dirty state as "before" — which holds
+   * because this is always called as a table initializes, before any DML.
    *
    * The registry is the live map handed to the coordinator, so registering after
    * the coordinator was constructed still makes the collection visible to it.
+   *
+   * Also tops up every currently-open legacy savepoint with a clean capture of
+   * this collection, so a savepoint created before this collection existed still
+   * restores it correctly (see {@link savepoints}). Skipped entirely for a repeat
+   * registration of an ALREADY-known instance (`reconcileMaintainedIndexes`
+   * re-registers already-open index trees, by which point they may hold this
+   * statement's staged rows — re-capturing then would record that dirty state as
+   * "before" and defeat the savepoint it belongs to). A new instance replacing a
+   * known id, or a first-time registration, still tops up.
    */
   registerCollection(collection: Collection<any>): void {
+    const known = this.collectionRegistry.get(collection.id);
     this.collectionRegistry.set(collection.id, collection);
+    if (known === collection) {
+      return;
+    }
+    // One snapshotPending() per open savepoint that doesn't already have this
+    // collection. Savepoint depth is shallow (statement/row nesting) and a
+    // just-registered collection's transforms are empty, so this is negligible.
+    for (const snapshots of this.savepoints.values()) {
+      if (!snapshots.has(collection)) {
+        snapshots.set(collection, collection.snapshotPending());
+      }
+    }
   }
 
   /**

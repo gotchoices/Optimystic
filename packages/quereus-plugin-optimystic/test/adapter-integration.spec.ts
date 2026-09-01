@@ -15,6 +15,9 @@ import type { SqlValue } from '@quereus/quereus';
 import register from '../dist/plugin.js';
 import type { TransactionState } from '../dist/index.js';
 import { captureTrace, commitTraces } from './trace-helpers.js';
+import { Collection } from '@optimystic/db-core';
+import type { ActionHandler, BlockId, BlockStore, CollectionInitOptions, IBlock } from '@optimystic/db-core';
+import { TestTransactor } from '@optimystic/db-core/test';
 
 type Row = Record<string, SqlValue>;
 
@@ -674,6 +677,140 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			// Rolling back / releasing an absent depth is a clean no-op.
 			expect(() => bridge.rollbackToSavepoint(5)).to.not.throw();
 			expect(() => bridge.releaseSavepoint(5)).to.not.throw();
+		});
+
+		// `TransactionBridge.registerCollection` tops up every open savepoint with a
+		// clean capture of a collection registered after the savepoint was created
+		// (bug ticket `bug-savepoint-rollback-skips-late-registered-collections`).
+		// Without the top-up, a table that finishes initializing mid-statement (e.g.
+		// a committed-read connection completing its full init inside the first
+		// `xUpdate`) is invisible to the statement's savepoint, so a mid-statement
+		// failure leaves its partial rows staged to flush at the next commit.
+		//
+		// These drive the bridge directly with real `Collection` instances (a `set`
+		// action stages one fresh block, observable via both the pending queue and
+		// the tracker) rather than a full SQL repro — `initializeForCommittedRead`
+		// timing is fiddly to force from SQL, and the bridge-level case is the
+		// actual invariant these methods must uphold.
+		describe('registerCollection tops up open savepoints for late-registered collections', () => {
+			type SpecAction = { value: string };
+
+			const handlers: Record<string, ActionHandler<SpecAction>> = {
+				set: async (_action, store) => {
+					store.insert({ header: store.createBlockHeader('TEST', store.generateId()) });
+				},
+			};
+
+			const init = (): CollectionInitOptions<SpecAction> => ({
+				modules: handlers,
+				createHeaderBlock: (id: BlockId, store: BlockStore<IBlock>) => ({
+					header: store.createBlockHeader('TEST', id),
+				}),
+			});
+
+			async function makeCollection(transactor: TestTransactor, id: string): Promise<Collection<SpecAction>> {
+				return Collection.createOrOpen<SpecAction>(transactor, id, init());
+			}
+
+			function queuedValues(collection: Collection<SpecAction>): string[] {
+				return collection.getPendingActions().map(a => a.data.value);
+			}
+
+			async function stageInto(collection: Collection<SpecAction>, value: string): Promise<void> {
+				await collection.act({ type: 'set', data: { value } });
+			}
+
+			it('discards rows staged into a collection registered after the savepoint (primary repro)', async () => {
+				const { plugin } = createTestEnv();
+				const bridge = plugin.txnBridge;
+				const transactor = new TestTransactor();
+
+				const a = await makeCollection(transactor, 'rb-bridge-a');
+				bridge.registerCollection(a);
+				bridge.createSavepoint(1);
+
+				// b does not exist yet when the savepoint is created — the late-registration case.
+				const b = await makeCollection(transactor, 'rb-bridge-b');
+				bridge.registerCollection(b);
+
+				await stageInto(a, 'a1');
+				await stageInto(b, 'b1');
+				expect(queuedValues(a), 'staged before rollback').to.deep.equal(['a1']);
+				expect(queuedValues(b), 'staged before rollback').to.deep.equal(['b1']);
+
+				bridge.rollbackToSavepoint(1);
+
+				expect(queuedValues(a), 'eagerly-captured collection is emptied').to.deep.equal([]);
+				expect(queuedValues(b), 'late-registered collection is emptied too').to.deep.equal([]);
+			});
+
+			it('holds a top-up entry at every nested open depth', async () => {
+				const { plugin } = createTestEnv();
+				const bridge = plugin.txnBridge;
+				const transactor = new TestTransactor();
+
+				const a = await makeCollection(transactor, 'rb-bridge-nested-a');
+				bridge.registerCollection(a);
+				bridge.createSavepoint(1);
+				bridge.createSavepoint(2);
+
+				// Registered only after BOTH savepoints are already open.
+				const b = await makeCollection(transactor, 'rb-bridge-nested-b');
+				bridge.registerCollection(b);
+
+				await stageInto(b, 'first');
+				bridge.rollbackToSavepoint(2);
+				expect(queuedValues(b), 'depth 2 discards the first stage').to.deep.equal([]);
+
+				await stageInto(b, 'second');
+				bridge.rollbackToSavepoint(1);
+				expect(queuedValues(b), 'depth 1 discards the second stage too').to.deep.equal([]);
+			});
+
+			it('does not re-capture an already-registered instance that has since staged rows', async () => {
+				const { plugin } = createTestEnv();
+				const bridge = plugin.txnBridge;
+				const transactor = new TestTransactor();
+
+				const a = await makeCollection(transactor, 'rb-bridge-reregister');
+				bridge.registerCollection(a);
+				bridge.createSavepoint(1);
+
+				await stageInto(a, 'staged');
+				// `reconcileMaintainedIndexes` shape: the SAME instance registered again
+				// after it has staged this statement's rows.
+				bridge.registerCollection(a);
+
+				bridge.rollbackToSavepoint(1);
+
+				expect(queuedValues(a), 'the staged row is still discarded').to.deep.equal([]);
+			});
+
+			it('captures a replacement instance registered under an already-known id', async () => {
+				const { plugin } = createTestEnv();
+				const bridge = plugin.txnBridge;
+				const transactor = new TestTransactor();
+				const id = 'rb-bridge-instance-swap';
+
+				const original = await makeCollection(transactor, id);
+				bridge.registerCollection(original);
+				bridge.createSavepoint(1);
+				await stageInto(original, 'on-original');
+
+				// A different Collection instance registers under the SAME id while the
+				// savepoint is open (a table re-initializing mid-transaction).
+				const replacement = await makeCollection(transactor, id);
+				bridge.registerCollection(replacement);
+				await stageInto(replacement, 'on-replacement');
+
+				bridge.rollbackToSavepoint(1);
+
+				// Both instances are tracked (by object identity, not id) and rewound to
+				// their own capture — the replacement must not be silently skipped just
+				// because its id was already known.
+				expect(queuedValues(replacement), 'the new instance is rewound to its own capture').to.deep.equal([]);
+				expect(queuedValues(original), 'the detached instance is rewound to its own capture too').to.deep.equal([]);
+			});
 		});
 	});
 });
