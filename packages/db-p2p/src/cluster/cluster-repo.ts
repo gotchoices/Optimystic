@@ -1,4 +1,4 @@
-import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, CommitResult, PendResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
@@ -17,7 +17,8 @@ import type { FretService } from "p2p-fret";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
-import { isMissingBaseRevisionFailure, PEND_NOT_VALIDATABLE, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister, type IRevisionActionReader } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister, type IRevisionActionReader } from "../storage/storage-repo.js";
+import { checkPendValidation } from "../pend-validation.js";
 import { buildBlockCommitProof } from "./commit-proof.js";
 import { RECONCILE_TIMEOUT_MS } from "./reconcile-block.js";
 
@@ -150,14 +151,13 @@ export const MEMBERSHIP_NOT_ADMITTED = 'membership-not-admitted';
 export const CONTENT_DIGEST_MISMATCH = 'content-digest-mismatch';
 
 /**
- * Stable reject reason a validator-configured member emits, under
- * `ClusterConsensusConfig.unvalidatablePendPolicy: 'reject'`, for a pend that carries no
- * `validation` payload (nothing to re-execute — the single-collection `Collection.sync` shape).
- * Defined in `storage/storage-repo.ts` (the storage tier refuses with the same prefix and
- * cluster-repo already imports from that module; the reverse import would be a cycle) and
- * re-exported here next to its siblings above.
+ * The two stable reject reasons a validator-configured member emits from the shared
+ * {@link checkPendValidation}: `PEND_NOT_VALIDATABLE` for a pend carrying no `validation` payload
+ * under `ClusterConsensusConfig.unvalidatablePendPolicy: 'reject'`, and `VALIDATOR_FAULT` for a
+ * checker that threw. Defined in `pend-validation.ts` (which the storage tier runs too, so both
+ * tiers refuse with the same prefixes) and re-exported here next to its siblings above.
  */
-export { PEND_NOT_VALIDATABLE } from "../storage/storage-repo.js";
+export { PEND_NOT_VALIDATABLE, VALIDATOR_FAULT } from "../pend-validation.js";
 
 interface ClusterMemberComponents {
 	storageRepo: IRepo;
@@ -283,7 +283,7 @@ export class ClusterMember implements ICluster {
 	private readonly allowUnvalidatedSmallCluster: boolean;
 	/** What a validator-configured member does with a pend carrying no `validation` payload — see
 	 * {@link ClusterConsensusConfig.unvalidatablePendPolicy}. Read once, like the gate parameters. */
-	private readonly unvalidatablePendPolicy: 'accept' | 'reject';
+	private readonly unvalidatablePendPolicy: UnvalidatablePendPolicy;
 
 	constructor(
 		private readonly storageRepo: IRepo,
@@ -1329,54 +1329,31 @@ export class ClusterMember implements ICluster {
 					}
 				}
 
-				// Run custom validator if configured. The presence test is on the ONE `validation`
-				// pair (transaction + operations hash together), so a sender cannot disable this
-				// member's own check by omitting half of it.
-				if (this.validator) {
-					if (!pendRequest.validation) {
-						// Nothing to re-execute — the single-collection `Collection.sync` shape. An
-						// explicit, logged policy decision on BOTH branches, never a silent fall-through:
-						// an operator can grep this line to see how much traffic goes unchecked.
-						log('cluster-member:pend-unvalidatable', {
+				// Re-check the transaction when a validator is configured. The unvalidatable-pend
+				// policy and the throwing-validator catch live in the shared `checkPendValidation`,
+				// which the storage tier runs too, so a member cannot vote approve on a shape its own
+				// storage would refuse at apply. Its reasons are fed to computeSigningPayload and
+				// carried as Signature.rejectReason, exactly like the stale-revision reason above, so
+				// a fail-closed refusal here is signed evidence rather than a lost vote.
+				const validator = this.validator;
+				const validation = await checkPendValidation(
+					pendRequest,
+					validator && (({ transaction, operationsHash }) => validator.validate(transaction, operationsHash)),
+					this.unvalidatablePendPolicy,
+					event => event.kind === 'unvalidatable'
+						// An operator can grep this line to see how much traffic goes unchecked.
+						? log('cluster-member:pend-unvalidatable', {
 							messageHash: record.messageHash,
 							actionId: pendRequest.actionId,
-							policy: this.unvalidatablePendPolicy
-						});
-						if (this.unvalidatablePendPolicy === 'reject') {
-							// Plain prose after the stable prefix: the reason is fed to
-							// computeSigningPayload and carried as Signature.rejectReason, like the
-							// stale-revision reason above.
-							return { valid: false, reason: `${PEND_NOT_VALIDATABLE}: pend carries no transaction to re-execute` };
-						}
-					} else {
-						let result: { valid: boolean; reason?: string };
-						try {
-							result = await this.validator.validate(pendRequest.validation.transaction, pendRequest.validation.operationsHash);
-						} catch (err) {
-							// A checker that throws (engine fault, missing table, parse error) casts a
-							// signed reject, never no vote at all: uncaught, the throw escapes the
-							// promise handler and the coordinator records nothing — indistinguishable
-							// from an unreachable cohort, with no rejectReason for the dispute path.
-							// Same fail-closed treatment the block-unavailable branch above got. The
-							// 'validator-fault:' prefix keeps an engine fault distinguishable from a
-							// genuine content verdict.
-							// NOTE: a TRANSIENT engine fault (database busy, momentary connection loss)
-							// now produces a terminal reject instead of an abstain a redelivery could
-							// have turned into an approve, and 'validator-fault:' matches neither
-							// CoordinatorRepo classifier, so it reaches the writer as a non-retryable
-							// throw. If transient validator faults ever show up in practice, make
-							// 'validator-fault:' retryable via a third classifier arm rather than
-							// reverting to abstain.
-							log('cluster-member:validator-fault', {
-								messageHash: record.messageHash,
-								error: (err as Error).message
-							});
-							return { valid: false, reason: `validator-fault: ${(err as Error).message}` };
-						}
-						if (!result.valid) {
-							return { valid: false, reason: result.reason };
-						}
-					}
+							policy: event.policy
+						})
+						: log('cluster-member:validator-fault', {
+							messageHash: record.messageHash,
+							error: event.error
+						})
+				);
+				if (!validation.valid) {
+					return { valid: false, reason: validation.reason };
 				}
 			}
 		}
@@ -2252,7 +2229,11 @@ export class ClusterMember implements ICluster {
 	private recordPriority(record: ClusterRecord): number {
 		for (const op of record.message.operations) {
 			if ('pend' in op) {
-				return clampPriority(op.pend.validation?.transaction.priority ?? op.pend.priority);
+				// Every hop optional: `validation` arrives off the wire inside a signed message whose
+				// hash binds its bytes, not its shape, so a malformed pair must yield priority 0 (what
+				// clampPriority already does for a missing or Byzantine number) rather than throw out
+				// of the vote path — the lost vote this fail-closed pass exists to prevent.
+				return clampPriority(op.pend.validation?.transaction?.priority ?? op.pend.priority);
 			}
 		}
 		return 0;

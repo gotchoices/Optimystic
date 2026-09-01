@@ -1095,6 +1095,20 @@ describe('ClusterMember', () => {
 			expect(raceOf().resolveRace(txAged, fresh)).to.equal('keep-existing');
 		});
 
+		it('treats a MALFORMED validation pair as priority 0 instead of throwing out of the vote path', async () => {
+			// `validation` arrives off the wire: the record's hash binds its bytes, not its shape, so a
+			// peer can sign `validation: {}` (no transaction) and every member will accept the hash. A
+			// non-optional hop here (`validation?.transaction.priority`) would throw a TypeError out of
+			// findConflict — costing this member its vote entirely, the exact failure the fail-closed
+			// pend work exists to remove.
+			const peers = makeClusterPeers([selfKeyPair]);
+			const malformed = await createClusterRecord(peers, makePendOperationP('malformed', 'block-shared'));
+			(malformed.message.operations[0] as { pend: Record<string, unknown> }).pend.validation = {};
+			const aged = await createClusterRecord(peers, makePendOperationP('aged', 'block-shared', { priority: 3 }));
+			expect(raceOf().resolveRace(malformed, aged)).to.equal('accept-incoming');
+			expect(raceOf().resolveRace(aged, malformed)).to.equal('keep-existing');
+		});
+
 		it('an aged transaction beats fresh rivals within MaxPriority+1 concurrent rounds (livelock guarantee)', async () => {
 			const peers = makeClusterPeers([selfKeyPair]);
 			// Model a transaction that keeps losing: its priority = clampPriority(losses) rises each round,

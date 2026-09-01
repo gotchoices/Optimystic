@@ -553,6 +553,21 @@ saveMaterializedBlock(block): store(structuredClone(block));
   (`MISSING_BASE_REVISION_REASON`, matched by `isMissingBaseRevisionFailure`). The same
   refusal covers a block whose existing `latest` is itself unmaterializable, so a node
   wedged by older code recovers on the next write touching that block.
+- **A node that can re-check a transaction never skips the check silently.** Both validating tiers
+  — a `ClusterMember` casting its promise vote and a `StorageRepo` applying a pend — run the one
+  `checkPendValidation` ([`db-p2p/src/pend-validation.ts`](../packages/db-p2p/src/pend-validation.ts)),
+  so they cannot drift on what they refuse. Two shapes are decided there. A pend carrying no
+  `validation` payload (the single-collection `Collection.sync` shape: bare transforms, nothing to
+  re-execute) takes a **logged policy branch** — `unvalidatablePendPolicy: 'accept'` (default) admits
+  it unchecked, `'reject'` refuses with `PEND_NOT_VALIDATABLE` — rather than falling through the same
+  path as a checked one; the payload is ONE optional pair, so a sender cannot talk a receiver out of
+  validating by omitting half of it. And a checker that **throws** becomes a reject reasoned
+  `VALIDATOR_FAULT` (`validator-fault: …`): uncaught it would escape the member's promise handler and
+  cost the member its vote entirely — indistinguishable from an unreachable peer, and with no signed
+  reason for the dispute path. Neither shape changes the arithmetic (an abstain contributes no
+  approval either); what they buy is classification, signed evidence, and an operator-visible count
+  of how much traffic went unchecked. A node with no checker configured is unaffected by the policy.
+  No composition root supplies a checker today (backlog `feat-no-deployment-validates-transactions-at-pend`).
 - **A pend rejection is returned only when local storage confirms a revision loss.** When
   enough members vote reject, `ClusterCoordinator` throws a typed `ValidatorRejectionError`
   carrying the (free-form, wire-visible) reject reasons. `CoordinatorRepo.pend` then

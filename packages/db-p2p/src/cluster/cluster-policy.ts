@@ -1,4 +1,4 @@
-import { DEFAULT_SUPER_MAJORITY_THRESHOLD, type ClusterConsensusConfig } from "@optimystic/db-core";
+import { DEFAULT_SUPER_MAJORITY_THRESHOLD, type ClusterConsensusConfig, type UnvalidatablePendPolicy } from "@optimystic/db-core";
 import { createLogger } from "../logger.js";
 import { CORROBORATION_FLOOR } from "./quorum-restore.js";
 
@@ -107,11 +107,10 @@ export interface ClusterPolicyOptions {
 		assumedClusterSize?: number;
 		/**
 		 * What a validator-configured member does with a pend that carries no `validation` payload
-		 * (nothing to re-execute — the single-collection `Collection.sync` shape): 'accept' (default)
-		 * admits it unchecked; 'reject' fails closed, knowingly refusing `Collection.sync` writes.
-		 * See `ClusterConsensusConfig.unvalidatablePendPolicy`.
+		 * (nothing to re-execute — the single-collection `Collection.sync` shape). Default 'accept';
+		 * see {@link UnvalidatablePendPolicy}.
 		 */
-		unvalidatablePendPolicy?: 'accept' | 'reject';
+		unvalidatablePendPolicy?: UnvalidatablePendPolicy;
 	};
 }
 

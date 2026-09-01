@@ -1295,6 +1295,18 @@ export class TransactionCoordinator {
 
 ### 6. ITransactor Interface Updates (db-core)
 
+> **Shipped shape.** The sketch below is the original design; the field names it settled on are in
+> [`db-core/src/network/struct.ts`](../packages/db-core/src/network/struct.ts). The transaction and
+> its operations hash ship as ONE optional pair, `PendRequest.validation: { transaction,
+> operationsHash }`, not two independently optional fields — "a transaction without its hash" was a
+> state no producer ever created, and a receiver whose guard required both could be talked out of
+> validating by a sender that omitted one. Only the multi-collection path
+> (`TransactionCoordinator.pendCollection`) sends the pair; a single-collection `Collection.sync`
+> pend carries bare transforms and is therefore not re-checkable, which is what
+> `ClusterConsensusConfig.unvalidatablePendPolicy` decides (see
+> [internals.md](internals.md), "A node that can re-check a transaction never skips the check
+> silently").
+
 The `ITransactor` interface needs updates to support transaction validation:
 
 ```typescript

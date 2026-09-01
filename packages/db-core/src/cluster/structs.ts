@@ -192,11 +192,22 @@ export interface ClusterConsensusConfig {
 	allowUnvalidatedSmallCluster?: boolean;
 	/**
 	 * What a member WITH a transaction validator does with a pend that carries no `validation`
-	 * payload — the single-collection (`Collection.sync`) shape, which has no transaction to
-	 * re-execute. 'accept' (default) preserves the historical behaviour: the pend is approved
-	 * unchecked. 'reject' is the fail-closed posture for a deployment that has decided every write
-	 * must be re-checkable; it REFUSES `Collection.sync` writes, which is the point, not a bug.
-	 * Irrelevant on a member with no validator, which never re-checks anything.
+	 * payload. See {@link UnvalidatablePendPolicy}; default 'accept'.
 	 */
-	unvalidatablePendPolicy?: 'accept' | 'reject';
+	unvalidatablePendPolicy?: UnvalidatablePendPolicy;
 }
+
+/**
+ * What a receiver WITH a transaction checker does with a pend that carries no
+ * {@link PendRequest.validation} payload — the single-collection (`Collection.sync`) shape, which
+ * has no transaction to re-execute.
+ *
+ * - `'accept'` (default) preserves the historical behaviour: the pend is approved unchecked.
+ * - `'reject'` is the fail-closed posture for a deployment that has decided every write must be
+ *   re-checkable; it REFUSES `Collection.sync` writes, which is the point, not a bug.
+ *
+ * Irrelevant on a receiver with no checker, which never re-checks anything. Named once here and
+ * referenced by every tier that carries the knob (`ClusterConsensusConfig`, db-p2p's
+ * `ClusterPolicyOptions` and `StorageRepoOptions`) so the three cannot drift apart.
+ */
+export type UnvalidatablePendPolicy = 'accept' | 'reject';

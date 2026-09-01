@@ -332,6 +332,24 @@ describe('StorageRepo', () => {
 			}
 		});
 
+		it("ignores unvalidatablePendPolicy: 'reject' when NO hook is configured — a storage-only node still writes", async () => {
+			// The policy answers "what does a node that CAN re-check do when it cannot?", so a node that
+			// re-checks nothing must be unaffected by it. Without this the knob would silently brick
+			// every storage-only node that set it.
+			const storageOnlyRepo = new StorageRepo(
+				(blockId) => new BlockStorage(blockId, rawStorage),
+				{ unvalidatablePendPolicy: 'reject' }
+			);
+
+			const result = await storageOnlyRepo.pend({
+				actionId: 'action-no-hook' as ActionId,
+				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1')),
+				policy: 'c'
+			});
+
+			expect(result.success, 'a repo with no validation hook is never gated by the policy').to.equal(true);
+		});
+
 		it("turns a THROWING validation hook into a 'validator-fault:' rejection, not an escaping error", async () => {
 			// An engine fault (missing table, parse error) must cast a hard rejection the caller can
 			// classify, never an exception out of pend.

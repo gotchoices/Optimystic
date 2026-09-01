@@ -2,7 +2,7 @@ import type {
 	IRepo, MessageOptions, BlockId, CommitRequest, CommitResult, GetBlockResults, PendRequest, PendResult, ActionBlocks,
 	ActionId, BlockGets, ActionPending, PendSuccess, ActionTransform, ActionTransforms,
 	GetBlockResult, IBlock, ActionRev, BlockUnavailableReason,
-	PendValidationHook,
+	PendValidationHook, UnvalidatablePendPolicy,
 	CollectionId, IBlockChangeNotifier, CollectionChangeListener, CollectionChangeEvent,
 	StaleFailure
 } from "@optimystic/db-core";
@@ -17,6 +17,7 @@ import { proofDeclaredDigest, type BlockCommitProof } from "../cluster/commit-pr
 import { RevisionNotCoveredError } from "./i-block-storage.js";
 import { acquireBlockWriteLatches, withBlockWriteLatch, type BlockWriteLatch } from "./block-latch.js";
 import { createLogger } from "../logger.js";
+import { checkPendValidation } from "../pend-validation.js";
 
 const log = createLogger('storage-repo');
 
@@ -29,13 +30,12 @@ const log = createLogger('storage-repo');
 export const MISSING_BASE_REVISION_REASON = 'missing-base-revision';
 
 /**
- * Stable, greppable prefix on the failure reason a validating receiver emits when it refuses a pend
- * that carries no `validation` payload (nothing to re-execute — the single-collection
- * `Collection.sync` shape) under the fail-closed `unvalidatablePendPolicy: 'reject'`. Defined here,
- * at the lower storage layer, and re-exported next to its siblings (`MEMBERSHIP_NOT_ADMITTED`,
- * `CONTENT_DIGEST_MISMATCH`) in `cluster/cluster-repo.ts` — both tiers refuse with the same prefix.
+ * The two stable reject-reason prefixes a validating receiver emits, re-exported here (and from
+ * `cluster/cluster-repo.ts`) next to their siblings so a caller inspecting a `PendResult` reason
+ * need not know which module defines them. Both tiers refuse with the same prefixes because both
+ * run the same {@link checkPendValidation}.
  */
-export const PEND_NOT_VALIDATABLE = 'pend-not-validatable';
+export { PEND_NOT_VALIDATABLE, VALIDATOR_FAULT } from "../pend-validation.js";
 
 /**
  * This node was asked to commit revision N of a block it holds no materializable base for, so
@@ -65,13 +65,19 @@ export type StorageRepoOptions = {
 	validatePend?: PendValidationHook;
 	/**
 	 * What this repo does — when a `validatePend` hook IS configured — with a pend that carries no
-	 * `validation` payload and therefore nothing to re-check: 'accept' (default) admits it unchecked,
-	 * preserving the single-collection `Collection.sync` write path; 'reject' refuses it with a
-	 * {@link PEND_NOT_VALIDATABLE} reason — the fail-closed posture, which knowingly refuses
-	 * `Collection.sync` writes. Irrelevant without a hook. The cluster tier's mirror of this knob is
-	 * `ClusterConsensusConfig.unvalidatablePendPolicy`.
+	 * `validation` payload and therefore nothing to re-check. Default 'accept'; see
+	 * {@link UnvalidatablePendPolicy}. The cluster tier's mirror of this knob is
+	 * `ClusterConsensusConfig.unvalidatablePendPolicy`, and both are enforced by the one
+	 * `checkPendValidation`.
+	 *
+	 * NOTE: the two tiers are configured INDEPENDENTLY, so a node set to 'accept' at the cluster tier
+	 * and 'reject' here would vote approve on a pend its own storage then refuses at apply — burning
+	 * a consensus round to reach a verdict it already knew. Harmless today because no composition
+	 * root supplies a checker at either tier (backlog
+	 * `feat-no-deployment-validates-transactions-at-pend`); when one does, resolve both knobs from a
+	 * single operator field rather than letting a deployment set them apart.
 	 */
-	unvalidatablePendPolicy?: 'accept' | 'reject';
+	unvalidatablePendPolicy?: UnvalidatablePendPolicy;
 };
 
 /**
@@ -134,7 +140,7 @@ export interface IRevisionActionReader {
 
 export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ICommitProofPersister, IRevisionActionReader {
 	private readonly validatePend?: PendValidationHook;
-	private readonly unvalidatablePendPolicy: 'accept' | 'reject';
+	private readonly unvalidatablePendPolicy: UnvalidatablePendPolicy;
 	/** Per-collection change listeners; empty sets are pruned on unsubscribe. */
 	private readonly changeListeners = new Map<CollectionId, Set<CollectionChangeListener>>();
 	/** Catch-all change listeners — fire for EVERY collection's commit on this node. */
@@ -493,47 +499,25 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	}
 
 	async pend(request: PendRequest, _options?: MessageOptions): Promise<PendResult> {
-		// Re-check the transaction when a validation hook is configured. The presence test is on the
-		// ONE `validation` pair (transaction + operations hash together), so a sender cannot disable
-		// the check by omitting half of it; a pend with NO pair — the single-collection
-		// `Collection.sync` shape, which has nothing to re-execute — takes the explicit policy branch
-		// instead of falling through the same path as a well-formed one.
-		if (this.validatePend) {
-			if (!request.validation) {
-				log('pend-unvalidatable actionId=%s policy=%s', request.actionId, this.unvalidatablePendPolicy);
-				if (this.unvalidatablePendPolicy === 'reject') {
-					// Hard rejection (no `conflict` flag): re-driving the same shape fails the same way.
-					return {
-						success: false,
-						reason: `${PEND_NOT_VALIDATABLE}: pend carries no transaction to re-execute`
-					};
-				}
-			} else {
-				let validationResult: { valid: boolean; reason?: string };
-				try {
-					validationResult = await this.validatePend(request.validation.transaction, request.validation.operationsHash);
-				} catch (err) {
-					// A hook that throws (engine fault, parse error) casts a hard rejection, never a
-					// silent pass — mirroring ClusterMember.validatePendOperations' catch.
-					// NOTE: a TRANSIENT hook fault (database busy, momentary connection loss) now
-					// produces a terminal reject a retry could have cleared; if transient validator
-					// faults ever show up in practice, classify 'validator-fault:' as retryable rather
-					// than reverting to a silent pass.
-					log('pend validator-fault actionId=%s error=%s', request.actionId, (err as Error).message);
-					return {
-						success: false,
-						reason: `validator-fault: ${(err as Error).message}`
-					};
-				}
-				if (!validationResult.valid) {
-					// Hard rejection: the transaction itself is invalid, so no `conflict` flag — a
-					// re-read and re-pend would fail the same way and only burn the retry budget.
-					return {
-						success: false,
-						reason: validationResult.reason ?? 'Transaction validation failed'
-					};
-				}
-			}
+		// Re-check the transaction when a validation hook is configured — the unvalidatable-pend
+		// policy and the throwing-hook catch both live in the shared `checkPendValidation`, so this
+		// tier and the cluster tier cannot drift apart on what they refuse.
+		const hook = this.validatePend;
+		const validation = await checkPendValidation(
+			request,
+			hook && (({ transaction, operationsHash }) => hook(transaction, operationsHash)),
+			this.unvalidatablePendPolicy,
+			event => event.kind === 'unvalidatable'
+				? log('pend-unvalidatable actionId=%s policy=%s', request.actionId, event.policy)
+				: log('pend validator-fault actionId=%s error=%s', request.actionId, event.error)
+		);
+		if (!validation.valid) {
+			// Hard rejection: no `conflict` flag, because re-driving the same request fails the same
+			// way and would only burn the writer's retry budget.
+			return {
+				success: false,
+				reason: validation.reason ?? 'Transaction validation failed'
+			};
 		}
 
 		const blockIds = blockIdsForTransforms(request.transforms);
