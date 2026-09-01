@@ -586,6 +586,7 @@ export async function createLibp2pNodeBase(
 			// `publish` always resolves with zero recipients. Verified end-to-end against this repo's
 			// installed dependency tree (gotchoices/Optimystic#9). Nothing in this repo uses `pubsub`
 			// today — re-add only against a gossipsub release built for libp2p 3.
+
 			// Circuit relay server - enables this node to relay connections for other peers
 			...(options.relay ? { relay: circuitRelayServer(options.relayServerInit) } : {}),
 
