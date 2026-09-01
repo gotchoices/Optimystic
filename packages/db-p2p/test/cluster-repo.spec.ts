@@ -191,8 +191,8 @@ const makePendOperation = (actionId: string, blockId: string): RepoMessage['oper
 /**
  * Like {@link makePendOperation} but carrying an aged priority. `priority` sets the top-level
  * single-collection carrier (`pend.priority`); `txPriority` sets the multi-collection carrier
- * (`pend.transaction.priority`) — resolveRace reads the transaction carrier first. A minimal
- * transaction stub is fine here: resolveRace only reads `.priority` off it.
+ * (`pend.validation.transaction.priority`) — resolveRace reads the transaction carrier first. A
+ * minimal transaction stub is fine here: resolveRace only reads `.priority` off it.
  */
 const makePendOperationP = (
 	actionId: string,
@@ -206,7 +206,7 @@ const makePendOperationP = (
 	};
 	const pend: Record<string, unknown> = { actionId, transforms, policy: 'c' };
 	if (opts?.priority !== undefined) pend.priority = opts.priority;
-	if (opts?.txPriority !== undefined) pend.transaction = { priority: opts.txPriority };
+	if (opts?.txPriority !== undefined) pend.validation = { transaction: { priority: opts.txPriority } };
 	return [{ pend } as RepoMessage['operations'][number]];
 };
 
@@ -1088,7 +1088,7 @@ describe('ClusterMember', () => {
 			expect(raceOf().resolveRace(y, x)).to.equal('accept-incoming');
 		});
 
-		it('reads priority from the multi-collection carrier (pend.transaction.priority) too', async () => {
+		it('reads priority from the multi-collection carrier (pend.validation.transaction.priority) too', async () => {
 			const peers = makeClusterPeers([selfKeyPair]);
 			const txAged = await createClusterRecord(peers, makePendOperationP('tx-aged', 'block-shared', { txPriority: 4 }));
 			const fresh = await createClusterRecord(peers, makePendOperationP('fresh', 'block-shared'));
@@ -1404,8 +1404,7 @@ describe('ClusterMember', () => {
 						actionId: 'a1',
 						transforms,
 						policy: 'c',
-						transaction: { statements: [], stamp: {} } as any,
-						operationsHash: 'hash'
+						validation: { transaction: { statements: [], stamp: {} } as any, operationsHash: 'hash' }
 					}
 				}]
 			);
@@ -1442,8 +1441,7 @@ describe('ClusterMember', () => {
 						actionId: 'a1',
 						transforms,
 						policy: 'c',
-						transaction: { statements: [], stamp: {} } as any,
-						operationsHash: 'hash'
+						validation: { transaction: { statements: [], stamp: {} } as any, operationsHash: 'hash' }
 					}
 				}]
 			);
@@ -1474,7 +1472,7 @@ describe('ClusterMember', () => {
 				updates: {},
 				deletes: []
 			};
-			// `transaction` + `operationsHash` are what make validatePendOperations consult the validator.
+			// The `validation` pair is what makes validatePendOperations consult the validator.
 			const record = await createClusterRecord(
 				peers,
 				[{
@@ -1482,8 +1480,7 @@ describe('ClusterMember', () => {
 						actionId: 'a1',
 						transforms,
 						policy: 'c',
-						transaction: { statements: [], stamp: {} } as any,
-						operationsHash: 'hash'
+						validation: { transaction: { statements: [], stamp: {} } as any, operationsHash: 'hash' }
 					}
 				}]
 			);
@@ -1498,6 +1495,83 @@ describe('ClusterMember', () => {
 				activeTransactions: Map<string, unknown>
 			}).activeTransactions;
 			expect(active.has(record.messageHash)).to.equal(false);
+		});
+
+		it("rejects a pend with NO validation payload under unvalidatablePendPolicy: 'reject'", async () => {
+			// The single-collection `Collection.sync` shape (bare transforms, no `validation` pair)
+			// meeting a validator-armed member running the fail-closed policy. The validator approves
+			// everything, so the reject can only come from the policy branch.
+			const rejectingMember = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				validator: {
+					validate: async () => ({ valid: true }),
+					getSchemaHash: async () => 'test-hash'
+				},
+				consensusConfig: {
+					superMajorityThreshold: 0.75,
+					simpleMajorityThreshold: 0.51,
+					minAbsoluteClusterSize: 2,
+					allowClusterDownsize: true,
+					clusterSizeTolerance: 0.5,
+					partitionDetectionWindow: 60000,
+					unvalidatablePendPolicy: 'reject'
+				}
+			});
+
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair]);
+			const record = await createClusterRecord(peers, makePendOperation('a1', 'block-1'));
+
+			const result = await rejectingMember.update(record);
+
+			const vote = result.promises[ourId];
+			if (vote?.type !== 'reject') expect.fail(`expected a reject vote, got ${vote?.type}`);
+			expect(vote.rejectReason).to.include('pend-not-validatable');
+		});
+
+		it("casts a signed 'validator-fault:' reject when the validator THROWS — never a lost vote", async () => {
+			// Uncaught, the throw would escape the promise handler and the coordinator would record
+			// NO vote from this member — indistinguishable from an unreachable peer, with no signed
+			// reason for the dispute path.
+			const faultingMember = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				validator: {
+					validate: async () => { throw new Error('engine exploded: no such table t'); },
+					getSchemaHash: async () => 'test-hash'
+				}
+			});
+
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair]);
+			const transforms: Transforms = {
+				inserts: { 'block-1': makeBlock('block-1') },
+				updates: {},
+				deletes: []
+			};
+			const record = await createClusterRecord(
+				peers,
+				[{
+					pend: {
+						actionId: 'a1',
+						transforms,
+						policy: 'c',
+						validation: { transaction: { statements: [], stamp: {} } as any, operationsHash: 'hash' }
+					}
+				}]
+			);
+
+			const result = await faultingMember.update(record);
+
+			const vote = result.promises[ourId];
+			if (vote?.type !== 'reject') expect.fail(`expected a reject vote, got ${vote?.type}`);
+			expect(vote.rejectReason).to.match(/^validator-fault: /);
+			expect(vote.rejectReason).to.include('engine exploded');
 		});
 	});
 

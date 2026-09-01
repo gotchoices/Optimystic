@@ -322,8 +322,7 @@ describe('Signature Validation Integration (TEST-6.2.1)', () => {
 					actionId: 'a1',
 					transforms: { inserts: { 'b1': { header: { id: 'b1' as any, type: 'test', collectionId: 'c1' as any } } }, updates: {}, deletes: [] },
 					policy: 'c',
-					transaction: { statements: [], stamp: {} } as any,
-					operationsHash: 'hash'
+					validation: { transaction: { statements: [], stamp: {} } as any, operationsHash: 'hash' }
 				}
 			}]);
 

@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { StorageRepo, MISSING_BASE_REVISION_REASON } from '../src/storage/storage-repo.js';
+import { StorageRepo, MISSING_BASE_REVISION_REASON, PEND_NOT_VALIDATABLE } from '../src/storage/storage-repo.js';
 import { blockWriteLatchKey, withBlockWriteLatch, type BlockWriteLatch } from '../src/storage/block-latch.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
@@ -281,13 +281,78 @@ describe('StorageRepo', () => {
 				actionId: 'action-1' as ActionId,
 				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1')),
 				policy: 'c',
-				transaction: { statements: [], stamp: {} } as any,
-				operationsHash: 'mock-hash'
+				validation: { transaction: { statements: [], stamp: {} } as any, operationsHash: 'mock-hash' }
 			});
 
 			expect(result.success).to.equal(false);
 			if (!result.success && 'reason' in result) {
 				expect(result.reason).to.equal('Test rejection');
+			}
+		});
+
+		it('accepts a pend with NO validation payload under the default policy — accept is asserted, not assumed', async () => {
+			// The single-collection `Collection.sync` shape: bare transforms, nothing to re-execute.
+			// The hook rejects everything, proving it is never consulted on this path.
+			const validatingRepo = new StorageRepo(
+				(blockId) => new BlockStorage(blockId, rawStorage),
+				{
+					validatePend: async () => ({ valid: false, reason: 'hook must not be consulted for a validation-free pend' })
+				}
+			);
+
+			const result = await validatingRepo.pend({
+				actionId: 'action-unvalidatable-accept' as ActionId,
+				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1')),
+				policy: 'c'
+			});
+
+			expect(result.success, 'the default policy admits the validation-free pend unchecked').to.equal(true);
+		});
+
+		it("refuses a pend with NO validation payload under unvalidatablePendPolicy: 'reject'", async () => {
+			// Fail-closed posture: same validation-free shape, hook approves everything — the refusal
+			// can only come from the policy branch, with the stable greppable prefix.
+			const validatingRepo = new StorageRepo(
+				(blockId) => new BlockStorage(blockId, rawStorage),
+				{
+					validatePend: async () => ({ valid: true }),
+					unvalidatablePendPolicy: 'reject'
+				}
+			);
+
+			const result = await validatingRepo.pend({
+				actionId: 'action-unvalidatable-reject' as ActionId,
+				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1')),
+				policy: 'c'
+			});
+
+			expect(result.success).to.equal(false);
+			if (!result.success && 'reason' in result) {
+				expect(result.reason).to.include(PEND_NOT_VALIDATABLE);
+			}
+		});
+
+		it("turns a THROWING validation hook into a 'validator-fault:' rejection, not an escaping error", async () => {
+			// An engine fault (missing table, parse error) must cast a hard rejection the caller can
+			// classify, never an exception out of pend.
+			const validatingRepo = new StorageRepo(
+				(blockId) => new BlockStorage(blockId, rawStorage),
+				{
+					validatePend: async () => { throw new Error('engine exploded: no such table t'); }
+				}
+			);
+
+			const result = await validatingRepo.pend({
+				actionId: 'action-hook-throws' as ActionId,
+				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1')),
+				policy: 'c',
+				validation: { transaction: { statements: [], stamp: {} } as any, operationsHash: 'mock-hash' }
+			});
+
+			expect(result.success).to.equal(false);
+			if (!result.success && 'reason' in result) {
+				expect(result.reason).to.match(/^validator-fault: /);
+				expect(result.reason).to.include('engine exploded');
 			}
 		});
 	});

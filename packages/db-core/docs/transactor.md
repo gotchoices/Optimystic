@@ -351,6 +351,15 @@ type PendRequest = {
   actionId: ActionId;
   rev?: number;
   policy: 'c' | 'f' | 'r';  // Continue, Fail, or Return
+  // Present only on the multi-collection path (TransactionCoordinator.pendCollection):
+  // the transaction to re-execute plus the hash of all operations it must produce.
+  // Absent on the single-collection Collection.sync path, which is not re-checkable —
+  // see ClusterConsensusConfig.unvalidatablePendPolicy for what a validating receiver
+  // does with that shape.
+  validation?: {
+    transaction: Transaction;
+    operationsHash: string;
+  };
 };
 ```
 

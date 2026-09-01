@@ -507,8 +507,8 @@ describe('Transaction', () => {
 			const originalPend = transactor.pend.bind(transactor);
 			transactor.pend = async (request) => {
 				pendRequests.push({
-					operationsHash: request.operationsHash,
-					transaction: request.transaction
+					operationsHash: request.validation?.operationsHash,
+					transaction: request.validation?.transaction
 				});
 				return originalPend(request);
 			};
@@ -1143,8 +1143,8 @@ describe('Transaction', () => {
 					phase: 'PEND',
 					data: {
 						actionId: request.actionId,
-						hasTransaction: !!request.transaction,
-						hasOperationsHash: !!request.operationsHash,
+						hasTransaction: !!request.validation?.transaction,
+						hasOperationsHash: !!request.validation?.operationsHash,
 						blockCount: Object.keys(request.transforms.inserts ?? {}).length +
 							Object.keys(request.transforms.updates ?? {}).length +
 							(request.transforms.deletes?.length ?? 0)

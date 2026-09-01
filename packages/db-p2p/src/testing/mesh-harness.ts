@@ -76,6 +76,10 @@ export interface MeshOptions {
 	 *
 	 * A FACTORY rather than one shared instance because enforcement is a per-node decision, and a
 	 * mixed mesh — some members enforcing, some not — is exactly the case worth testing.
+	 *
+	 * A mesh that arms validators can also set `clusterPolicy.unvalidatablePendPolicy: 'reject'` to
+	 * refuse pends that carry no `validation` payload (the single-collection `Collection.sync`
+	 * shape, which a validator cannot re-check); the default 'accept' admits them unchecked.
 	 */
 	validatorFactory?: (index: number, peerId: PeerId) => ITransactionValidator;
 	/**

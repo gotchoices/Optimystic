@@ -52,7 +52,7 @@
  */
 
 import { expect } from 'chai';
-import type { BlockId, IBlock, BlockHeader, Transforms, Transaction } from '@optimystic/db-core';
+import type { BlockId, IBlock, BlockHeader, Transforms, Transaction, ITransactionValidator, ValidationResult } from '@optimystic/db-core';
 import { DEFAULT_SUPER_MAJORITY_THRESHOLD } from '@optimystic/db-core';
 import type { PrivateKey } from '@libp2p/interface';
 import { createMesh, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
@@ -64,6 +64,7 @@ import {
 	buildSignedTx,
 	buildUnsignedTx,
 	generateClientIdentity,
+	SCHEMA_HASH,
 } from './support/client-tx-signature.js';
 
 // ─── block/transform helpers ───
@@ -84,16 +85,16 @@ const makeTransforms = (blockId: string): Transforms => ({
 
 /**
  * The multi-collection pend shape `TransactionCoordinator.pendCollection` builds: transforms plus
- * the transaction and its operations hash, which are the only two fields
- * `ClusterMember.validatePendOperations` hands to a configured validator.
+ * the `validation` pair — the transaction and its operations hash, together the one payload
+ * `ClusterMember.validatePendOperations` hands to a configured validator. Pend directly (no
+ * helper, no pair) to build the single-collection `Collection.sync` shape instead.
  */
 const pendTx = async (node: MeshNode, blockId: string, actionId: string, transaction: Transaction) =>
 	node.coordinatorRepo.pend({
 		actionId,
 		transforms: makeTransforms(blockId),
 		policy: 'c',
-		transaction,
-		operationsHash: await emptyOpsHash()
+		validation: { transaction, operationsHash: await emptyOpsHash() }
 	});
 
 const commitBlock = (node: MeshNode, blockId: string, actionId: string, rev = 1) =>
@@ -144,16 +145,22 @@ const maxAllowedRejections = (peerCount: number): number =>
  * get a signature-ENFORCING validator (omit it for "all of them"); the rest still get a validator,
  * but one with no verifier port — the phased-rollout posture, where signed and unsigned alike pass
  * the signature step. For the case where a node has NO validator at all, build the mesh without
- * `validatorFactory`.
+ * `validatorFactory`. `unvalidatablePendPolicy` is what a validator-armed member does with a pend
+ * carrying no `validation` pair: omitted ⇒ the production default ('accept', admit unchecked);
+ * 'reject' fails closed with the stable `pend-not-validatable` reason.
  */
-const createEnforcingMesh = async (nodeCount: number, enforcingIndices?: number[]): Promise<Mesh> => {
+const createEnforcingMesh = async (
+	nodeCount: number,
+	enforcingIndices?: number[],
+	unvalidatablePendPolicy?: 'accept' | 'reject'
+): Promise<Mesh> => {
 	const enforcing = enforcingIndices === undefined
 		? undefined
 		: new Set(enforcingIndices);
 	return await createMesh(nodeCount, {
 		responsibilityK: nodeCount,
 		clusterSize: nodeCount,
-		clusterPolicy: { assumedClusterSize: nodeCount },
+		clusterPolicy: { assumedClusterSize: nodeCount, unvalidatablePendPolicy },
 		validatorFactory: (index) =>
 			// `enforcing === undefined` ⇒ every node enforces. A named subset arms only those indices;
 			// the others still receive a validator, but one with NO verifier port — the migration
@@ -326,6 +333,78 @@ describe('mesh — client transaction signature enforcement at PEND', () => {
 			const result = await pendTx(mesh.nodes[0]!, blockId, 'a-no-validator', await buildUnsignedTx(clientPeerId));
 			expect(result.success, 'with no validator the unsigned pend succeeds').to.equal(true);
 			expect((await commitBlock(mesh.nodes[0]!, blockId, 'a-no-validator')).success).to.equal(true);
+		});
+	});
+
+	describe('a pend with NO validation payload — the unvalidatable-pend policy', () => {
+		it("under 'reject', a validator-armed cohort refuses the pend, naming pend-not-validatable", async () => {
+			// The single-collection `Collection.sync` shape: bare transforms, no `validation` pair, so
+			// a member has nothing to re-execute. Under `unvalidatablePendPolicy: 'reject'` every
+			// validator-armed member fails closed instead of admitting the write unchecked.
+			const mesh = await createEnforcingMesh(3, undefined, 'reject');
+			const blockId = 'block-no-validation-payload';
+
+			const error = await captureFailure(async () => mesh.nodes[0]!.coordinatorRepo.pend({
+				actionId: 'a-no-validation',
+				transforms: makeTransforms(blockId),
+				policy: 'c'
+			}));
+
+			expect(error, 'the unvalidatable pend must be refused, never silently unchecked')
+				.to.be.instanceOf(ValidatorRejectionError);
+			expect(error!.message).to.include('pend-not-validatable');
+			expect(reasonsOf(error), 'every member named the stable prefix')
+				.to.satisfy((rs: string[]) => rs.length > 0 && rs.every(r => r.startsWith('pend-not-validatable')));
+			await expectNowhereCommitted(mesh, blockId);
+		});
+
+		it("under the DEFAULT policy the same pend succeeds — 'accept' is asserted, not assumed", async () => {
+			// The historical behaviour, now a named and logged choice: an all-enforcing cohort with no
+			// policy override admits the validation-free shape ('reject' as the default would break
+			// `Collection.sync` writes everywhere). Also the control proving the refusal above came
+			// from the policy knob and not from something else in the pend path.
+			const mesh = await createEnforcingMesh(3);
+			const blockId = 'block-no-validation-accepted';
+
+			const result = await mesh.nodes[0]!.coordinatorRepo.pend({
+				actionId: 'a-no-validation-accept',
+				transforms: makeTransforms(blockId),
+				policy: 'c'
+			});
+			expect(result.success, 'the default policy admits the unvalidatable pend').to.equal(true);
+		});
+	});
+
+	describe('a throwing validator casts a signed reject, it does not lose its vote', () => {
+		it("surfaces the fault as ValidatorRejectionError with 'validator-fault:' reasons, not an escaping error", async () => {
+			// A checker that THROWS (engine fault: missing table, parse error) used to escape the
+			// member's promise handler entirely — the coordinator recorded no vote, indistinguishable
+			// from an unreachable cohort, and the writer saw a generic super-majority failure with no
+			// per-peer evidence. The catch in `validatePendOperations` turns it into a signed reject
+			// prefixed 'validator-fault:', so the writer gets classification and the dispute path gets
+			// signed evidence.
+			class ThrowingValidator implements ITransactionValidator {
+				async validate(): Promise<ValidationResult> { throw new Error('engine exploded: no such table t'); }
+				async getSchemaHash(): Promise<string | undefined> { return SCHEMA_HASH; }
+			}
+			const mesh = await createMesh(3, {
+				responsibilityK: 3,
+				clusterSize: 3,
+				clusterPolicy: { assumedClusterSize: 3 },
+				validatorFactory: () => new ThrowingValidator()
+			});
+			const blockId = 'block-throwing-validator';
+
+			const error = await captureFailure(
+				async () => pendTx(mesh.nodes[0]!, blockId, 'a-throws', await buildUnsignedTx(clientPeerId))
+			);
+
+			expect(error, 'a throwing validator is a verdict, not a crash — before the fix this was a plain Error with zero rejections')
+				.to.be.instanceOf(ValidatorRejectionError);
+			expect(reasonsOf(error), 'every member cast the validator-fault reject')
+				.to.satisfy((rs: string[]) => rs.length > 0 && rs.every(r => r.startsWith('validator-fault:')));
+			expect(error!.message).to.include('engine exploded');
+			await expectNowhereCommitted(mesh, blockId);
 		});
 	});
 });
