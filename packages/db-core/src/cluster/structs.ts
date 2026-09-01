@@ -190,4 +190,13 @@ export interface ClusterConsensusConfig {
 	 * single-node / local dev where you knowingly run below the safe floor.
 	 */
 	allowUnvalidatedSmallCluster?: boolean;
+	/**
+	 * What a member WITH a transaction validator does with a pend that carries no `validation`
+	 * payload — the single-collection (`Collection.sync`) shape, which has no transaction to
+	 * re-execute. 'accept' (default) preserves the historical behaviour: the pend is approved
+	 * unchecked. 'reject' is the fail-closed posture for a deployment that has decided every write
+	 * must be re-checkable; it REFUSES `Collection.sync` writes, which is the point, not a bug.
+	 * Irrelevant on a member with no validator, which never re-checks anything.
+	 */
+	unvalidatablePendPolicy?: 'accept' | 'reject';
 }

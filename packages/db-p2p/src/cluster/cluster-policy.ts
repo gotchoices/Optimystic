@@ -105,6 +105,13 @@ export interface ClusterPolicyOptions {
 		 * `clusterSize: 2`) to self-repair.
 		 */
 		assumedClusterSize?: number;
+		/**
+		 * What a validator-configured member does with a pend that carries no `validation` payload
+		 * (nothing to re-execute — the single-collection `Collection.sync` shape): 'accept' (default)
+		 * admits it unchecked; 'reject' fails closed, knowingly refusing `Collection.sync` writes.
+		 * See `ClusterConsensusConfig.unvalidatablePendPolicy`.
+		 */
+		unvalidatablePendPolicy?: 'accept' | 'reject';
 	};
 }
 
@@ -268,6 +275,9 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 		// Fail closed by default (an undersized cluster with no confident network-size estimate is
 		// rejected); embedders running knowingly-small meshes opt in through clusterPolicy.
 		allowUnvalidatedSmallCluster: options.clusterPolicy?.allowUnvalidatedSmallCluster ?? false,
+		// Pass through undefined (ClusterMember defaults it to 'accept') so an operator who said
+		// nothing gets the historical behaviour.
+		unvalidatablePendPolicy: options.clusterPolicy?.unvalidatablePendPolicy,
 		partitionDetectionWindow: 60000,
 		// Replication factor / target cohort breadth — what the coordinator aims for when selecting a
 		// cohort. Deliberately NOT the membership admission gate's yardstick: it says nothing about how

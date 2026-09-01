@@ -392,8 +392,10 @@ export type ValidationResult = {
  * Transaction validator interface.
  * Pluggable validators implement this to verify transaction integrity.
  *
- * Validators are invoked when a node receives a PendRequest with a transaction.
- * They re-execute the transaction and verify the operations match.
+ * Validators are invoked when a node receives a PendRequest carrying a `validation`
+ * payload (the transaction plus its operations hash). They re-execute the transaction
+ * and verify the operations match. A throw out of {@link validate} is treated by
+ * callers as a rejection ("validator-fault: …"), never as an approval or an abstain.
  */
 export interface ITransactionValidator {
 	/**

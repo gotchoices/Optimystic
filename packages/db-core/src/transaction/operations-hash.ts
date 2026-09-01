@@ -176,7 +176,7 @@ export function canonicalOperationsPayload(operations: readonly Operation[]): st
  * stringify, SHA-256 (base64url) via {@link hashString}, then prefix the versioned
  * {@link OPS_HASH_PREFIX} token (`ops.v1:`) so the wire string is self-describing.
  *
- * This is the fingerprint the coordinator sends in PendRequest.operationsHash and
+ * This is the fingerprint the coordinator sends in PendRequest.validation.operationsHash and
  * the validator recomputes; equality of this string is the cross-node agreement
  * that a transaction's operations match.
  *

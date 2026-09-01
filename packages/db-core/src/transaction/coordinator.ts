@@ -1069,14 +1069,14 @@ export class TransactionCoordinator {
 			throw new Error(`Collection not found: ${collectionId}`);
 		}
 
-		// Create pend request with transaction and operations hash for validation
+		// Create pend request with the validation payload (transaction + operations hash) —
+		// always BOTH, as one pair: this is the only producer of PendRequest.validation.
 		const pendRequest: PendRequest = {
 			actionId,
 			rev,
 			transforms,
 			policy: 'r', // Return policy: fail but return pending actions
-			transaction,
-			operationsHash,
+			validation: { transaction, operationsHash },
 			superclusterNominees: nominees
 		};
 

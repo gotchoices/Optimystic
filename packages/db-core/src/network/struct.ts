@@ -33,17 +33,29 @@ export type PendRequest = ActionTransforms & {
 	 * 'f' is fail, returning the pending ActionIds,
 	 * 'r' is return, which fails but returns the pending ActionIds and their transforms */
 	policy: 'c' | 'f' | 'r';
-	/** For multi-collection transactions: the full transaction for replay/validation */
-	transaction?: Transaction;
-	/** For multi-collection transactions: hash of ALL operations across all blocks */
-	operationsHash?: string;
+	/**
+	 * Present only on the multi-collection path (`TransactionCoordinator.pendCollection`): the
+	 * transaction to re-execute plus the hash of ALL operations across all blocks it must produce.
+	 * Absent on the single-collection `Collection.sync` path, which carries bare transforms and is
+	 * therefore not re-checkable — see `ClusterConsensusConfig.unvalidatablePendPolicy` for what a
+	 * validating receiver does with that shape. ONE optional pair, deliberately: "transaction
+	 * without its hash" (or the reverse) was a state the old two independent optional fields
+	 * permitted and no producer ever created — and a receiver whose guard required both could be
+	 * talked out of validating by a sender that omitted one.
+	 */
+	validation?: {
+		/** The full transaction for replay/validation. */
+		transaction: Transaction;
+		/** Hash of ALL operations across all blocks the re-executed transaction must produce. */
+		operationsHash: string;
+	};
 	/** For multi-collection transactions: supercluster nominees for consensus */
 	superclusterNominees?: PeerId[];
 	/**
 	 * Aged, advisory retry priority for the *single-collection* pend path (default 0 when absent).
-	 * The multi-collection path instead carries priority on {@link PendRequest.transaction}
-	 * ({@link Transaction.priority}); this top-level field is the carrier for a `Collection.sync`
-	 * pend, which has no `transaction`. A cluster member reads whichever is present as the first
+	 * The multi-collection path instead carries priority on the transaction inside
+	 * {@link PendRequest.validation} ({@link Transaction.priority}); this top-level field is the
+	 * carrier for a `Collection.sync` pend, which has no transaction. A cluster member reads whichever is present as the first
 	 * `resolveRace` tiebreak. FAIRNESS-ONLY: it rides inside the signed cluster `message` (so it is
 	 * integrity-protected in transit) but MUST NOT affect the operations hash, stale-read checks, or
 	 * validity — a stale pend is still rejected regardless of priority.
@@ -296,8 +308,11 @@ export type PendValidationResult = {
  * Hook for validating transactions in PendRequests.
  *
  * This hook is called by the storage layer when receiving a PendRequest
- * that includes a transaction and operationsHash. If validation fails,
- * the pend operation is rejected.
+ * that carries a `validation` payload (the transaction plus its operations
+ * hash). If validation fails — or the hook throws — the pend operation is
+ * rejected. What a hook-configured node does with a pend carrying NO
+ * `validation` payload is a policy decision
+ * (`StorageRepoOptions.unvalidatablePendPolicy` in db-p2p).
  *
  * If the hook is not provided, validation is skipped (storage-only nodes).
  */

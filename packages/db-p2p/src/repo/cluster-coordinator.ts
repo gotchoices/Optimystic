@@ -194,7 +194,7 @@ export class ClusterCoordinator {
 	 * reproduces the legacy v1 hash byte-for-byte.
 	 *
 	 * NOTE: the whole `message` is hashed (canonicalJson), so a transaction's advisory aged priority —
-	 * which rides inside the pend operation as `pend.transaction.priority` (multi-collection) or
+	 * which rides inside the pend operation as `pend.validation.transaction.priority` (multi-collection) or
 	 * `pend.priority` (single-collection) — is automatically covered here and by the derived
 	 * promise/commit hashes. That is what makes priority integrity-protected in transit: a relaying peer
 	 * cannot strip or inflate it without invalidating the message hash the members verify. No separate

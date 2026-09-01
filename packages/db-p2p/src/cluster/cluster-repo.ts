@@ -17,7 +17,7 @@ import type { FretService } from "p2p-fret";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
-import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister, type IRevisionActionReader } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, PEND_NOT_VALIDATABLE, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister, type IRevisionActionReader } from "../storage/storage-repo.js";
 import { buildBlockCommitProof } from "./commit-proof.js";
 import { RECONCILE_TIMEOUT_MS } from "./reconcile-block.js";
 
@@ -149,6 +149,16 @@ export const MEMBERSHIP_NOT_ADMITTED = 'membership-not-admitted';
  */
 export const CONTENT_DIGEST_MISMATCH = 'content-digest-mismatch';
 
+/**
+ * Stable reject reason a validator-configured member emits, under
+ * `ClusterConsensusConfig.unvalidatablePendPolicy: 'reject'`, for a pend that carries no
+ * `validation` payload (nothing to re-execute — the single-collection `Collection.sync` shape).
+ * Defined in `storage/storage-repo.ts` (the storage tier refuses with the same prefix and
+ * cluster-repo already imports from that module; the reverse import would be a cycle) and
+ * re-exported here next to its siblings above.
+ */
+export { PEND_NOT_VALIDATABLE } from "../storage/storage-repo.js";
+
 interface ClusterMemberComponents {
 	storageRepo: IRepo;
 	peerNetwork: IPeerNetwork;
@@ -271,6 +281,9 @@ export class ClusterMember implements ICluster {
 	/** Operator-asserted smallest genuine cohort size, or undefined when unknown. */
 	private readonly assumedClusterSize: number | undefined;
 	private readonly allowUnvalidatedSmallCluster: boolean;
+	/** What a validator-configured member does with a pend carrying no `validation` payload — see
+	 * {@link ClusterConsensusConfig.unvalidatablePendPolicy}. Read once, like the gate parameters. */
+	private readonly unvalidatablePendPolicy: 'accept' | 'reject';
 
 	constructor(
 		private readonly storageRepo: IRepo,
@@ -297,6 +310,7 @@ export class ClusterMember implements ICluster {
 		this.membershipAdmissionFraction = consensusConfig?.membershipAdmissionFraction ?? 0.75;
 		this.assumedClusterSize = consensusConfig?.assumedClusterSize;
 		this.allowUnvalidatedSmallCluster = consensusConfig?.allowUnvalidatedSmallCluster ?? false;
+		this.unvalidatablePendPolicy = consensusConfig?.unvalidatablePendPolicy ?? 'accept';
 		// State the resolved gate parameters once, so an operator diagnosing a membership rejection can see
 		// what this node actually resolved. A fact, not a warning: `assumedClusterSize < clusterSize` is the
 		// normal default state, so warning on it would fire for every node and be ignored.
@@ -1315,11 +1329,53 @@ export class ClusterMember implements ICluster {
 					}
 				}
 
-				// Run custom validator if configured
-				if (this.validator && pendRequest.transaction && pendRequest.operationsHash) {
-					const result = await this.validator.validate(pendRequest.transaction, pendRequest.operationsHash);
-					if (!result.valid) {
-						return { valid: false, reason: result.reason };
+				// Run custom validator if configured. The presence test is on the ONE `validation`
+				// pair (transaction + operations hash together), so a sender cannot disable this
+				// member's own check by omitting half of it.
+				if (this.validator) {
+					if (!pendRequest.validation) {
+						// Nothing to re-execute — the single-collection `Collection.sync` shape. An
+						// explicit, logged policy decision on BOTH branches, never a silent fall-through:
+						// an operator can grep this line to see how much traffic goes unchecked.
+						log('cluster-member:pend-unvalidatable', {
+							messageHash: record.messageHash,
+							actionId: pendRequest.actionId,
+							policy: this.unvalidatablePendPolicy
+						});
+						if (this.unvalidatablePendPolicy === 'reject') {
+							// Plain prose after the stable prefix: the reason is fed to
+							// computeSigningPayload and carried as Signature.rejectReason, like the
+							// stale-revision reason above.
+							return { valid: false, reason: `${PEND_NOT_VALIDATABLE}: pend carries no transaction to re-execute` };
+						}
+					} else {
+						let result: { valid: boolean; reason?: string };
+						try {
+							result = await this.validator.validate(pendRequest.validation.transaction, pendRequest.validation.operationsHash);
+						} catch (err) {
+							// A checker that throws (engine fault, missing table, parse error) casts a
+							// signed reject, never no vote at all: uncaught, the throw escapes the
+							// promise handler and the coordinator records nothing — indistinguishable
+							// from an unreachable cohort, with no rejectReason for the dispute path.
+							// Same fail-closed treatment the block-unavailable branch above got. The
+							// 'validator-fault:' prefix keeps an engine fault distinguishable from a
+							// genuine content verdict.
+							// NOTE: a TRANSIENT engine fault (database busy, momentary connection loss)
+							// now produces a terminal reject instead of an abstain a redelivery could
+							// have turned into an approve, and 'validator-fault:' matches neither
+							// CoordinatorRepo classifier, so it reaches the writer as a non-retryable
+							// throw. If transient validator faults ever show up in practice, make
+							// 'validator-fault:' retryable via a third classifier arm rather than
+							// reverting to abstain.
+							log('cluster-member:validator-fault', {
+								messageHash: record.messageHash,
+								error: (err as Error).message
+							});
+							return { valid: false, reason: `validator-fault: ${(err as Error).message}` };
+						}
+						if (!result.valid) {
+							return { valid: false, reason: result.reason };
+						}
 					}
 				}
 			}
@@ -2180,7 +2236,7 @@ export class ClusterMember implements ICluster {
 
 	/**
 	 * Aged advisory priority carried by a record's pend operation, clamped to [0, MaxPriority].
-	 * The multi-collection path carries it on `pend.transaction.priority`; the single-collection
+	 * The multi-collection path carries it on `pend.validation.transaction.priority`; the single-collection
 	 * (`Collection.sync`) path carries it as top-level `pend.priority`; a record with neither — a
 	 * legacy/unversioned coordinator's transaction, or a non-pend operation — is priority 0
 	 * (backward compatible: such transactions simply never age). Both carriers live inside the signed
@@ -2196,7 +2252,7 @@ export class ClusterMember implements ICluster {
 	private recordPriority(record: ClusterRecord): number {
 		for (const op of record.message.operations) {
 			if ('pend' in op) {
-				return clampPriority(op.pend.transaction?.priority ?? op.pend.priority);
+				return clampPriority(op.pend.validation?.transaction.priority ?? op.pend.priority);
 			}
 		}
 		return 0;
