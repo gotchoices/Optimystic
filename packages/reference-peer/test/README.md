@@ -91,7 +91,7 @@ Three debug configurations are available in `.vscode/launch.json`:
 
 Common places to set breakpoints:
 - `packages/reference-peer/src/cli.ts` - `createDiary()`, `addEntry()`
-- `packages/db-core/src/collections/diary.ts` - `append()`, `select()`
+- `packages/db-core/src/collections/diary/diary.ts` - `append()`, `select()`
 - `packages/db-core/src/transactor/network-transactor.ts` - `pend()`, `commit()`
 - `packages/db-p2p/src/storage/storage-repo.ts` - Storage operations
 

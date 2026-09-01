@@ -564,8 +564,9 @@ Cohort-topic's promotion machinery handles this with `cap_promote_fast`: when th
 > on decode, byte-fidelity round-trips. `SubscribeAppPayloadV1` is the opaque `RegisterV1.appPayload`
 > (the cohort-topic envelope frames it and carries the `correlationId` + `timestamp` + peer-key
 > signature, so the payload itself carries no signature); `NotificationV1` is a length-prefixed frame.
-> The `ResumeV1` / `ResumeReplyV1` / `BackfillV1` / `BackfillReplyV1` codecs below are implemented in
-> `resume.ts` / `backfill.ts` by `11.5-reactivity-backfill-resume-checkpoints`, same conventions.
+> The codecs below are implemented by `11.5-reactivity-backfill-resume-checkpoints`, same
+> conventions: `ResumeV1` and `ResumeReplyV1` in `packages/db-core/src/reactivity/resume.ts`,
+> `BackfillV1` and `BackfillReplyV1` in `packages/db-core/src/reactivity/backfill.ts`.
 > `reactivity-recover-wire-signing` added the `timestamp` freshness field on `BackfillV1`, the canonical
 > `backfillSigningPayload` / `resumeSigningPayload` helpers, and the `RecoverRequestV1` / `RecoverReplyV1`
 > envelope (`recover.ts`) that the live recover transport frames over the wire.
@@ -645,8 +646,8 @@ interface ResumeReplyV1 {
 > checkpoints[i-1].toRevision + 1`, validated on decode. Each link's endpoints are the **full** bracketing
 > notifications, not bare signatures, so the subscriber can verify every link end-to-end. The chain is a
 > single link in steady state and the two-link `[inherited, rolling]` bridge for a cross-rotation resume
-> (§Resume, §Tail rotation step 5). The codecs are `encode/decodeResumeV1` and `encode/decodeResumeReplyV1`
-> in `packages/db-core/src/reactivity/resume.ts` (JSON, byte fields base64url, unix-ms timestamps,
+> (§Resume, §Tail rotation step 5). The codecs are `encodeResumeV1` / `decodeResumeV1` and
+> `encodeResumeReplyV1` / `decodeResumeReplyV1` in `packages/db-core/src/reactivity/resume.ts` (JSON, byte fields base64url, unix-ms timestamps,
 > per-message structural validation on decode).
 
 ### Backfill
@@ -676,8 +677,8 @@ interface BackfillReplyV1 {
 The backfill and resume exchanges share one libp2p **request-reply** protocol
 (`/optimystic/reactivity/1.0.0/recover`); a discriminated wrapper makes the kind authoritative (a
 `kind: "backfill"` frame MUST carry a `backfill` body and no `resume` body, and vice-versa). The codecs
-are `encode/decodeRecoverRequestV1` / `encode/decodeRecoverReplyV1` in
-`packages/db-core/src/reactivity/recover.ts`.
+are `encodeRecoverRequestV1` / `decodeRecoverRequestV1` and `encodeRecoverReplyV1` /
+`decodeRecoverReplyV1` in `packages/db-core/src/reactivity/recover.ts`.
 
 ```
 interface RecoverRequestV1 { v: 1, kind: "backfill" | "resume", backfill?: BackfillV1, resume?: ResumeV1 }

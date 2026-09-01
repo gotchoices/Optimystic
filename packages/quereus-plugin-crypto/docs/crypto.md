@@ -287,7 +287,7 @@ All encoding parameters default to `base64url` unless otherwise specified.
 
 - **Transaction hashing**: SHA-256 via `multiformats/hashes/sha2` (not this plugin)
 - **Schema hashing**: SHA-256 (first 16 bytes, base64url) in `quereus-engine.ts`
-- **Cluster consensus**: `verify` from this plugin (see [cluster-signature-verification](../../../tickets/complete/4-cluster-signature-verification.md))
+- **Cluster consensus**: `verify` from this plugin — cluster peers verify each other's Ed25519 signatures over the transaction digest before a promise counts toward the super-majority (see [db-p2p cluster docs §Phase 1: Promise Collection (Super-Majority Required)](../../db-p2p/docs/cluster.md#phase-1-promise-collection-super-majority-required))
 
 ---
 

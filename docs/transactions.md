@@ -248,7 +248,8 @@ When Quereus records a DML statement for the distributed transaction log, it doe
 capture the source SQL text. Instead, the engine **rebuilds** the statement from the
 already-evaluated row values after the DML executor runs each row (see
 `buildInsertStatement` / `buildUpdateStatement` / `buildDeleteStatement` in
-`@quereus/quereus/src/util/mutation-statement.ts`, called from `dml-executor.ts`).
+`@quereus/quereus/src/util/mutation-statement.ts`, called from
+`@quereus/quereus/src/runtime/emit/dml-executor.ts`).
 
 A function's arguments are evaluated and discarded before the rebuild. So a statement
 like:
@@ -1578,11 +1579,11 @@ validators hash, rather than re-deriving the serialization and risking drift.
 - Block operation extraction from collections
 
 **Key Files**:
-- `src/transaction/transaction.ts` - Transaction types (TransactionStamp, Transaction, StampId)
-- `src/transaction/coordinator.ts` - TransactionCoordinator (applyActions, commit, rollback)
-- `src/transaction/session.ts` - TransactionSession (execute, commit, rollback)
-- `src/transaction/actions-engine.ts` - Built-in ActionsEngine
-- `src/transactor.ts` - Updated PendRequest with transaction validation
+- `packages/db-core/src/transaction/transaction.ts` - Transaction types (TransactionStamp, Transaction, StampId)
+- `packages/db-core/src/transaction/coordinator.ts` - TransactionCoordinator (applyActions, commit, rollback)
+- `packages/db-core/src/transaction/session.ts` - TransactionSession (execute, commit, rollback)
+- `packages/db-core/src/transaction/actions-engine.ts` - Built-in ActionsEngine
+- `packages/db-core/src/transactor/transactor.ts` - Updated PendRequest with transaction validation
 
 **Dependencies**: None (core package)
 
@@ -1593,9 +1594,9 @@ validators hash, rather than re-deriving the serialization and risking drift.
 - "with context" clause support
 
 **Modified Files**:
-- `src/vtab/context.ts` - Add sql, params fields
-- `src/execution/executor.ts` - Populate context, enforce determinism
-- `src/parser/parser.ts` - Parse "with context" clause
+- `@quereus/quereus/src/vtab/context.ts` - Add sql, params fields
+- `@quereus/quereus/src/execution/executor.ts` - Populate context, enforce determinism
+- `@quereus/quereus/src/parser/parser.ts` - Parse "with context" clause
 
 **Dependencies**: None (core package)
 
@@ -1624,8 +1625,10 @@ validators hash, rather than re-deriving the serialization and risking drift.
 - No SQL-specific knowledge (engine-agnostic)
 
 **Modified Files**:
-- `src/network-transactor.ts` - Updated PendRequest handling, GATHER phase support
-- `src/transaction-validator.ts` - Generic transaction validator (uses ITransactionEngine)
+- `packages/db-core/src/transactor/network-transactor.ts` - Updated PendRequest handling, GATHER phase support
+- `packages/db-core/src/transaction/validator.ts` - Generic transaction validator (uses ITransactionEngine)
+
+  (Both landed in `db-core` rather than `db-p2p` as this manifest originally planned.)
 
 **Dependencies**: db-core
 

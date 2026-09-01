@@ -20,6 +20,40 @@
 
 This is an important system; write production-grade, maintainble, and expressive code that we don't have to revisit later.  Read @docs/internals.md to come up to speed - also maintain the docs.
 
+## Documentation citations
+
+When prose points at code, bind an **anchor** to a **path**. Two forms, both house style:
+
+```
+`determineRing` in `packages/db-p2p/src/storage/ring-selector.ts`
+(`disputeEnabled`, `packages/db-p2p/src/dispute/types.ts`)
+```
+
+- **The anchor is a symbol name** wherever one exists. A symbol survives edits above it, is
+  greppable, and when it does break it degrades to "search for this name" rather than to silently
+  wrong.
+- **Where no symbol fits** — a comment, a magic constant, a TODO — the anchor is a **short
+  distinctive fragment in double quotes**, e.g. the "single choke point" comment in
+  `packages/db-p2p/src/storage/kv-raw-storage.ts`. Only when neither a symbol nor a distinctive
+  fragment is available, cite the *enclosing* symbol and say in prose which part is meant.
+- **Line numbers never appear in prose.** Not singly, not as ranges. They look valid long after an
+  edit above them has made them point at unrelated code, and nothing signals the drift.
+- **Ranges are replaced by the enclosing symbol plus prose** — cite the method and say in a
+  sentence which part of it you mean.
+- **Doc-to-doc references use section anchors**, and the visible link text names the section, not a
+  line: `[docs/cohort-topic.md §Topic traffic signal](docs/cohort-topic.md#topic-traffic-signal)`.
+- **A file outside this repository must say so** by carrying its package or repo prefix —
+  `@quereus/quereus/src/parser/parser.ts`, never a bare *parser.ts* that reads as ours.
+- **No slash-alternation anchors.** Write `encodeRecoverReplyV1` and `decodeRecoverReplyV1`, or
+  cite the shared `RecoverReplyV1` type — `encode/decodeRecoverReplyV1` matches neither symbol.
+- A bare filename in flowing prose ("`libp2p-node-base.ts` wires the services") is a *mention*, not
+  a citation. It stays legal, and is checked only for existence.
+
+`yarn lint:docs` (`scripts/check-doc-citations.mjs`, also run by `yarn check`) enforces all of the
+above across tracked markdown outside `tickets/`. Fenced code blocks are exempt — a stack trace or
+a tool transcript is a literal record, not a claim about where code lives — and that exemption is
+the only escape hatch there is.
+
 ## Testing
 
 All packages use mocha + chai directly (no aegir wrapper). The test command pattern is:

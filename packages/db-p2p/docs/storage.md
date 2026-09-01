@@ -35,12 +35,13 @@ what breaks if it's violated.
 ### 1. Every write to a store goes through `IRawStorage`
 
 Nothing mutates a backend's bytes behind the interface. `KvRawStorage`'s save
-methods are, in the kernel's own words, "the single choke point" for every
-value write (`packages/db-p2p/src/storage/kv-raw-storage.ts:47-56`):
+methods are the one place every value write funnels through — the
+"single choke point" comment in `packages/db-p2p/src/storage/kv-raw-storage.ts`:
 
 > every value write funnels through the driver put/delete calls in the methods
-> below (saveMetadata / saveRevision / save*Transaction / saveMaterializedBlock).
-> This is the single choke point where an incremental byte counter would hook in…
+> below (saveMetadata / saveRevision / save*Transaction / saveBlockProof /
+> saveMaterializedBlock). This is the single choke point where an incremental
+> byte counter would hook in…
 
 **Scope:** this holds only for writes issued *in this process*. It is not a
 guarantee against mutation from outside the process — that boundary is
@@ -246,7 +247,7 @@ The `IRawStorage` interface defines low-level storage operations, abstracting th
 
 ### 4. File-based Storage (`FileRawStorage`)
 
-`FileRawStorage` (`packages/db-p2p-storage-fs/src/file-storage.ts:466`) is a thin
+`FileRawStorage` in `packages/db-p2p-storage-fs/src/file-storage.ts` is a thin
 shell over the shared `KvRawStorage` kernel: it supplies a `FileStoreDriver` that
 lays out the six logical stores as filesystem subdirectories, and the kernel
 owns JSON (de)serialization on top. See "Shared KV Kernel" below.

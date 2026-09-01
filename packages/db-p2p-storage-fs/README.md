@@ -108,7 +108,8 @@ cleanup:
 
 **No cross-process lock.** Two separate Node processes pointing at the same
 `basePath` can interleave writes with no coordination. The constructor carries
-a TODO (`file-storage.ts:52`) to integrate
+a TODO — the "proper-lockfile" comment in
+`packages/db-p2p-storage-fs/src/file-storage.ts` — to integrate
 [`proper-lockfile`](https://www.npmjs.com/package/proper-lockfile) along with
 an explicit `dispose()` pattern. Until that lands, `FileRawStorage` is
 single-process only.

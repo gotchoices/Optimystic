@@ -43,13 +43,15 @@ Two live code paths flip responsibility with no safety:
    `RingSelector.shouldTransition()` every 60 s and, on a move, immediately calls
    `fretAdapter.setArachnodeInfo(newRing)` — a single metadata write that changes the node's
    advertised responsibility instantly, with no `moving` phase and no data handoff. The demand
-   signal driving it, `RingSelector.determineRing()` = `ceil(-log2(coverage))`
-   (`ring-selector.ts:79`), is computed from an **instantaneous** snapshot of `getRingStats()`
+   signal driving it — `RingSelector.determineRing()` = `ceil(-log2(coverage))`, defined as
+   `determineRing` in `packages/db-p2p/src/storage/ring-selector.ts` — is computed from an
+   **instantaneous** snapshot of `getRingStats()`
    and capacity with no smoothing — a classic undamped reactive loop that oscillates when
    `-log2(coverage)` sits near an integer.
-2. **Release-before-confirm on rebalance.** On the cohort-churn path
-   (`libp2p-node-base.ts:982-988`) a `lost` block is *released* — `untrackBlock` stops the spread
-   monitor re-pushing it — **synchronously and unconditionally**, while the corresponding push to
+2. **Release-before-confirm on rebalance.** On the cohort-churn path (the `handleRebalanceEvent`
+   branch that calls `untrackBlock` in `packages/db-p2p/src/libp2p-node-base.ts`) a `lost` block is
+   *released* — `untrackBlock` stops the spread monitor re-pushing it — **synchronously and
+   unconditionally**, while the corresponding push to
    the new owners (`BlockTransferCoordinator.handleRebalanceEvent`) runs fire-and-forget,
    is **skipped entirely during a partition**, is timeout-bounded, and has its result only logged.
    So a node can stop being a spreading holder of a block whose push failed or never ran.

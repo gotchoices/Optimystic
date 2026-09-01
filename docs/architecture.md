@@ -64,7 +64,7 @@ The **cohort-topic substrate** (and its reactivity / matchmaking applications) d
 
 | Term | Meaning |
 |------|---------|
-| **Block** | Versioned storage unit identified by a stable base64url `BlockId` (random for data blocks, derived from the collection name for header blocks). Its revisions are immutable, but not content-addressed: each revision maps to an `ActionId`, which on the plain `Collection.sync` path is itself random (`randomBytes(16)`, `packages/db-core/src/collection/collection.ts:502`) — only the coordinator-level `transaction.id` is content-addressed. The `BlockId` itself is not a content hash either, since a block's content changes across revisions. |
+| **Block** | Versioned storage unit identified by a stable base64url `BlockId` (random for data blocks, derived from the collection name for header blocks). Its revisions are immutable, but not content-addressed: each revision maps to an `ActionId`, which on the plain `Collection.sync` path is itself random (`randomBytes(16)`, `packages/db-core/src/collection/collection.ts`) — only the coordinator-level `transaction.id` is content-addressed. The `BlockId` itself is not a content hash either, since a block's content changes across revisions. |
 | **Operation** | Splice-style mutation on one block: `[entity, index, deleteCount, inserted]`. |
 | **Transform** | A set of inserts/updates/deletes applied to a single block. |
 | **Action** | A logical mutation scoped to one *collection*, realized as one or more operations. |

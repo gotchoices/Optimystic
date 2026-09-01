@@ -118,7 +118,7 @@ For persistent storage on RN, use `@optimystic/db-p2p-storage-rn` (LevelDB backe
 
 Hermes requires polyfills for several globals (crypto, structuredClone,
 Promise.withResolvers, EventTarget, etc.) and Metro module aliases for Node.js
-built-ins (os, crypto, stream, buffer).  See [packages/db-p2p README](packages/db-p2p/README.md#react-native)
+built-ins (os, crypto, stream, buffer).  See [packages/db-p2p readme](packages/db-p2p/readme.md#react-native)
 for the full polyfill checklist and recommended shims.
 
 ## Use Cases
@@ -140,12 +140,8 @@ yarn workspace @optimystic/reference-peer build
 yarn workspace @optimystic/reference-peer test:quick
 ```
 
-**📖 See [START-HERE.md](START-HERE.md) to begin using the automated test loop!**
-
-Additional documentation:
-- [TESTING-GUIDE.md](TESTING-GUIDE.md) - Comprehensive testing guide
-- [QUICK-REFERENCE.md](QUICK-REFERENCE.md) - Command reference
-- [packages/reference-peer/test/README.md](packages/reference-peer/test/README.md) - Test-specific docs
+See [packages/reference-peer/test/README.md](packages/reference-peer/test/README.md) for
+test-specific docs, and `AGENTS.md` for the env-gated suites and the full `yarn check` chain.
 
 ## Contributing
 
