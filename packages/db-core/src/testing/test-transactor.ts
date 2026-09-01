@@ -4,6 +4,7 @@ import { Latches } from "../utility/latches.js";
 import { applyTransform, blockIdsForTransforms, transformForBlockId, emptyTransforms, concatTransform, transformsFromTransform } from "../transform/index.js";
 import { Tree } from "../collections/tree/tree.js";
 import type { TreeReplaceAction } from "../collections/tree/struct.js";
+import type { Collection } from "../collection/collection.js";
 
 type RevisionNumber = number;
 
@@ -615,6 +616,101 @@ export class CompetingWriterTransactor extends DelegatingTransactor {
 		this.commitCalls++;
 		return this.inner.commit(request);
 	}
+}
+
+type Deferred = { promise: Promise<void>; resolve: () => void };
+
+function deferred(): Deferred {
+	let resolve!: () => void;
+	const promise = new Promise<void>(r => { resolve = r; });
+	return { promise, resolve };
+}
+
+/**
+ * Parks the commit AFTER the inner transactor has made it durable and BEFORE the result gets back
+ * to the coordinator — precisely the window in which storage already holds the new revision but
+ * the caller's local fold (`Collection.recordCommitted`) has not run.
+ *
+ * Everything else delegates, so the pend/commit round trip is otherwise the real one.
+ *
+ * Parks only the FIRST commit call and delegates every later one: a multi-collection commit issues
+ * one `commit` per participant, and parking all of them would mean the span never completes.
+ */
+export class GatedCommitTransactor extends DelegatingTransactor {
+	/** The `rev` carried on each pend request seen, in call order. */
+	readonly pendRevs: (number | undefined)[] = [];
+	/** The `rev` carried on each commit request seen, in call order. */
+	readonly commitRevs: number[] = [];
+	/** Resolves once a commit has landed durably in the inner transactor and is parked. */
+	readonly commitParked: Promise<void>;
+	private readonly parked = deferred();
+	private readonly gate = deferred();
+	private parkedOnce = false;
+
+	constructor(inner: TestTransactor) {
+		super(inner);
+		this.commitParked = this.parked.promise;
+	}
+
+	override async pend(request: PendRequest): Promise<PendResult> {
+		this.pendRevs.push(request.rev);
+		return this.inner.pend(request);
+	}
+
+	override async commit(request: CommitRequest): Promise<CommitResult> {
+		this.commitRevs.push(request.rev);
+		const result = await this.inner.commit(request);	// durable FIRST
+		if (!this.parkedOnce) {
+			this.parkedOnce = true;
+			this.parked.resolve();
+			await this.gate.promise;
+		}
+		return result;
+	}
+
+	openGate(): void { this.gate.resolve(); }
+}
+
+/**
+ * Parks the FIRST pend BEFORE it reaches the inner transactor, so a rival can durably take the
+ * revision while the coordinator is already committed to a set of transforms it captured at the
+ * log append.
+ *
+ * Snapshots the pair `(what was handed to the network, what the collection's tracker held)` at
+ * DELEGATION time — after the gate — for every pend, so a refresh that swapped the tracker's
+ * transforms object out from under the coordinator shows up as a divergent pair.
+ */
+export class GatedPendTransactor<TAction> extends DelegatingTransactor {
+	/** One entry per delegated pend, in call order. */
+	readonly snapshots: { pended: Transforms; staged: Transforms }[] = [];
+	/** Resolves once a pend is parked and has NOT yet reached the inner transactor. */
+	readonly pendParked: Promise<void>;
+	/** The collection under test. Assigned after construction — the collection is built over this
+	 *  wrapper, so it cannot be a constructor argument. */
+	collection?: Collection<TAction>;
+	private readonly parked = deferred();
+	private readonly gate = deferred();
+	private parkedOnce = false;
+
+	constructor(inner: TestTransactor) {
+		super(inner);
+		this.pendParked = this.parked.promise;
+	}
+
+	override async pend(request: PendRequest): Promise<PendResult> {
+		if (!this.parkedOnce) {
+			this.parkedOnce = true;
+			this.parked.resolve();
+			await this.gate.promise;
+		}
+		this.snapshots.push({
+			pended: structuredClone(request.transforms),
+			staged: structuredClone(this.collection!.tracker.transforms),
+		});
+		return this.inner.pend(request);
+	}
+
+	openGate(): void { this.gate.resolve(); }
 }
 
 /**

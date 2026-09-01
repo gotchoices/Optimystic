@@ -45,16 +45,12 @@ import {
 	type BlockStore,
 	type CollectionActions,
 	type CollectionInitOptions,
-	type CommitRequest,
-	type CommitResult,
 	type IBlock,
 	type ITransactor,
-	type PendRequest,
-	type PendResult,
 	type Transaction,
-	type Transforms,
 } from '../src/index.js';
-import { DelegatingTransactor, TestTransactor } from '../src/testing/test-transactor.js';
+import { GatedCommitTransactor, GatedPendTransactor, TestTransactor } from '../src/testing/test-transactor.js';
+import { drainMacrotasks, releaseRefresh } from '../src/testing/refresh-probe.js';
 
 type SpecAction = { value: string };
 
@@ -74,54 +70,6 @@ const init = (): CollectionInitOptions<SpecAction> => ({
 		header: store.createBlockHeader('TEST', id),
 	}),
 });
-
-type Deferred = { promise: Promise<void>; resolve: () => void };
-
-function deferred(): Deferred {
-	let resolve!: () => void;
-	const promise = new Promise<void>(r => { resolve = r; });
-	return { promise, resolve };
-}
-
-/** Yield the event loop through the MACROTASK queue `turns` times, so a refresh that is free to
- *  proceed gets every chance to run its (await-heavy) course before the gate opens. A microtask
- *  drain would not be enough: `update()` awaits real transactor reads.
- *
- *  NOTE: the turn count is what gives {@link releaseRefresh}'s `blocked()` assertions their teeth
- *  — an unlatched `Collection.update()` has to be able to run to COMPLETION within these turns,
- *  or "still pending" stops distinguishing "blocked on the latch" from "merely slow". Ten is a
- *  ~10x margin today: with the coordinator's latch reverted locally, both cases' refreshes
- *  completed on macrotask turn 1 against `TestTransactor`. If `update()` ever grows a deeper await
- *  chain — or these cases move onto a transactor with real I/O — raise this rather than letting
- *  the assertion quietly weaken into a tautology. */
-async function drainMacrotasks(turns = 10): Promise<void> {
-	for (let i = 0; i < turns; i++) {
-		await new Promise(r => setTimeout(r, 0));
-	}
-}
-
-/** Start a refresh and report — via the returned `blocked()` — whether it is STILL pending.
- *
- *  The final-state assertions in both cases would also pass if the refresh had simply run to
- *  completion harmlessly, so on its own neither case proves the latch is what protected them.
- *  This does: checked after {@link drainMacrotasks} but before the gate opens, a still-pending
- *  refresh is a refresh queued behind the coordinator's held latch. */
-function releaseRefresh(collection: Collection<SpecAction>): { settle: () => Promise<void>; blocked: () => boolean } {
-	let done = false;
-	let failure: unknown;
-	// Both handlers attach SYNCHRONOUSLY, and the rethrowing promise is built only when the caller
-	// asks for it. The refresh sits unawaited across drainMacrotasks below, so a rejection reaching
-	// the end of a turn with no handler would be a fatal unhandled rejection — killing the process
-	// instead of failing the case. Captured here, rethrown at `settle()`.
-	const captured = collection.update().then(
-		() => { done = true; },
-		(e: unknown) => { done = true; failure = e; },
-	);
-	return {
-		settle: () => captured.then(() => { if (failure !== undefined) throw failure; }),
-		blocked: () => !done,
-	};
-}
 
 /** Every action recorded in a collection's committed log, oldest first. One entry per landed
  *  transaction, so the length is the no-duplicate-log-entry assertion. */
@@ -145,90 +93,6 @@ async function stageOne(coordinator: TransactionCoordinator, value: string): Pro
 	};
 	await coordinator.applyActions(actions, stamp.id);
 	return transaction;
-}
-
-/**
- * Parks the commit AFTER the inner transactor has made it durable and BEFORE the result gets back
- * to the coordinator — precisely the window in which storage already holds the new revision but
- * `recordCommitted` has not run.
- *
- * Everything else delegates, so the pend/commit round trip is otherwise the real one.
- */
-class GatedCommitTransactor extends DelegatingTransactor {
-	/** The `rev` carried on each pend request seen, in call order. */
-	readonly pendRevs: (number | undefined)[] = [];
-	/** The `rev` carried on each commit request seen, in call order. */
-	readonly commitRevs: number[] = [];
-	/** Resolves once a commit has landed durably in the inner transactor and is parked. */
-	readonly commitParked: Promise<void>;
-	private readonly parked = deferred();
-	private readonly gate = deferred();
-	private parkedOnce = false;
-
-	constructor(inner: TestTransactor) {
-		super(inner);
-		this.commitParked = this.parked.promise;
-	}
-
-	override async pend(request: PendRequest): Promise<PendResult> {
-		this.pendRevs.push(request.rev);
-		return this.inner.pend(request);
-	}
-
-	override async commit(request: CommitRequest): Promise<CommitResult> {
-		this.commitRevs.push(request.rev);
-		const result = await this.inner.commit(request);	// durable FIRST
-		if (!this.parkedOnce) {
-			this.parkedOnce = true;
-			this.parked.resolve();
-			await this.gate.promise;
-		}
-		return result;
-	}
-
-	openGate(): void { this.gate.resolve(); }
-}
-
-/**
- * Parks the FIRST pend BEFORE it reaches the inner transactor, so a rival can durably take the
- * revision while the coordinator is already committed to a set of transforms it captured at the
- * log append.
- *
- * Snapshots the pair `(what was handed to the network, what the collection's tracker held)` at
- * DELEGATION time — after the gate — for every pend, so a refresh that swapped the tracker's
- * transforms object out from under the coordinator shows up as a divergent pair.
- */
-class GatedPendTransactor extends DelegatingTransactor {
-	/** One entry per delegated pend, in call order. */
-	readonly snapshots: { pended: Transforms; staged: Transforms }[] = [];
-	/** Resolves once a pend is parked and has NOT yet reached the inner transactor. */
-	readonly pendParked: Promise<void>;
-	/** The collection under test. Assigned after construction — the collection is built over this
-	 *  wrapper, so it cannot be a constructor argument. */
-	collection?: Collection<SpecAction>;
-	private readonly parked = deferred();
-	private readonly gate = deferred();
-	private parkedOnce = false;
-
-	constructor(inner: TestTransactor) {
-		super(inner);
-		this.pendParked = this.parked.promise;
-	}
-
-	override async pend(request: PendRequest): Promise<PendResult> {
-		if (!this.parkedOnce) {
-			this.parkedOnce = true;
-			this.parked.resolve();
-			await this.gate.promise;
-		}
-		this.snapshots.push({
-			pended: structuredClone(request.transforms),
-			staged: structuredClone(this.collection!.tracker.transforms),
-		});
-		return this.inner.pend(request);
-	}
-
-	openGate(): void { this.gate.resolve(); }
 }
 
 /** A SECOND Collection over the same id, committing 'rival' through the single-collection sync
@@ -293,7 +157,7 @@ describe('coordinator commit / collection refresh interleaving', () => {
 
 	it('a refresh released against a parked pend cannot desync the transforms on the wire', async () => {
 		const inner = new TestTransactor();
-		const transactor = new GatedPendTransactor(inner);
+		const transactor = new GatedPendTransactor<SpecAction>(inner);
 		const collection = await Collection.createOrOpen<SpecAction>(transactor, collectionId, init());
 		transactor.collection = collection;
 		const coordinator = new TransactionCoordinator(transactor, new Map([[collectionId, collection]]));

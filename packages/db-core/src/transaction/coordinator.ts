@@ -739,6 +739,14 @@ export class TransactionCoordinator {
 			}
 
 			// 5. Update actionContext and reset trackers after successful commit
+			// NOTE: this iterates `result.actions`, not the DISTINCT participant set the latch
+			// acquisition above deduped to — so a transaction whose actions name one collection
+			// twice folds that collection twice, and the second recordCommitted throws on the
+			// revision it already advanced past. Dormant today (no caller emits duplicate
+			// CollectionActions entries); tracked as
+			// `debt-execute-duplicate-collection-actions-double-record`, and pinned meanwhile by the
+			// duplicate-collection case in test/coordinator-latch-span.spec.ts, which deliberately
+			// does not assert this method's outcome.
 			for (const collectionActions of result.actions) {
 				const collection = this.collections.get(collectionActions.collectionId);
 				if (collection) {
