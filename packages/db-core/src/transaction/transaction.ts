@@ -342,8 +342,18 @@ export type ExecutionResult = {
 	 * On a PARTIAL multi-collection commit failure, the collections that DID durably
 	 * commit through consensus before the failure (and thus CANNOT be rolled back —
 	 * reconciliation is required). Absent/empty means nothing durably committed, so
-	 * the caller may treat the failure as a clean abort. See
-	 * {@link CoordinatorPartialCommitError} for the session-mode (commit) analog.
+	 * the caller may treat the failure as a clean abort — including calling
+	 * `coordinator.rollback(stampId)`, which is still a valid and complete recovery there.
+	 *
+	 * When this IS present, the coordinator has already given the committed collections
+	 * the success-path local treatment and restored the failed ones to their pre-staging
+	 * state, and has DROPPED the transaction's rollback tracking — so
+	 * `coordinator.rollback(stampId)` is a deliberate no-op rather than a rewind that
+	 * would corrupt the collections that did commit. Reconciliation means driving a NEW
+	 * transaction naming only the failed collections; re-driving THIS transaction through
+	 * `execute()` would re-stage and re-apply the committed half a second time.
+	 *
+	 * See {@link CoordinatorPartialCommitError} for the session-mode (commit) analog.
 	 */
 	committedCollections?: CollectionId[];
 	/** On a partial multi-collection commit failure, the collections that failed to commit. */

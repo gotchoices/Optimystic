@@ -647,10 +647,18 @@ export class TransactionCoordinator {
 		//
 		// snapshotPending() is synchronous and latch-free — keep it that way: NO await may sit
 		// between this loop and the applyActions() call below, or an interleaved stage would be
-		// captured inside the snapshot. Dedupe is first-appearance by collection id so an engine
-		// naming one collection in two batches yields the state before EITHER batch. An
+		// captured inside the snapshot. Because the whole loop runs before ANY staging, an engine
+		// naming one collection in two batches yields the state before EITHER batch whichever
+		// batch wins the key — so the dedupe is a COST guard (snapshotPending deep-copies the
+		// transforms and structuredClones the action context), not a correctness one. An
 		// unregistered collection is skipped; applyActions throws on it moments later and the
 		// catch below converts that to a failure result, so the map is never read.
+		//
+		// NOTE: this runs unconditionally, so the overwhelmingly common all-succeed execute() pays
+		// one deep transforms copy + one structuredClone of the action context per participant to
+		// serve a rare branch. Unmeasured, and symmetric with commitOnceLatched, which pays the
+		// same on every commit. If execute() ever shows up hot in a profile, the way out is a
+		// copy-on-first-stage snapshot, not dropping the restore.
 		const preStageSnapshots = new Map<CollectionId, ReturnType<Collection<any>['snapshotPending']>>();
 		for (const { collectionId } of result.actions) {
 			if (preStageSnapshots.has(collectionId)) continue;
@@ -801,6 +809,17 @@ export class TransactionCoordinator {
 					}
 					// The undo handle is now unsafe: rollback() is all-or-nothing and would rewind
 					// the collections that DID durably commit. Drop it, matching commitOnceLatched.
+					//
+					// NOTE: dropping the entry also removes this stamp's batches from the REPLAY set
+					// a later rollback(otherStampId) rebuilds from (see rollback's earliest-snapshot
+					// walk). With a second stamp in flight whose preSnapshot was taken after this
+					// one staged, that rollback would reset to a snapshot still carrying this
+					// transaction's transforms — re-staging the winner's already-durable actions,
+					// the very corruption this delete prevents on the direct path. Same shape at
+					// commitOnceLatched's delete; harmless while a session drives one stamp per
+					// coordinator. If concurrent stamps on one coordinator ever become real, the fix
+					// is a tombstone entry (batches dropped, snapshot kept for the replay walk)
+					// rather than an outright delete, at both sites.
 					this.stampData.delete(transaction.stamp.id);
 				}
 				return {

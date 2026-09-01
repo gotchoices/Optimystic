@@ -4244,6 +4244,60 @@ describe('Transaction', () => {
 			expect(await postsTree.get(999), 'restored invented collection stays readable').to.be.undefined;
 		});
 
+		it('execute() restores a DUPLICATED failed collection to the state before EITHER of its batches', async () => {
+			// Every other duplicate-batch case in the suite SUCCEEDS, so none of them reaches the
+			// restore arm at all. This is the only case where the coalescing (two `posts` batches
+			// folded into one participant, with `users` between them) composes with the loser
+			// restore — the arm has to unwind BOTH batches from the single coalesced log entry.
+			// Note the dedupe policy itself is not what this locks: the snapshot loop runs entirely
+			// before any staging, so first- and last-appearance dedupe capture the same state.
+			const inner = new TestTransactor();
+			const transactor = new FailCollectionNTimesTransactor(inner, 'posts', Infinity);
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', e => e.key);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(transactor, 'posts', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const postsCollection = (postsTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection], ['posts', postsCollection]]);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const engine = new ActionsEngine();
+
+			// 'posts' named TWICE, in two separate batches, with 'users' between them so the grouping
+			// and the snapshot loop both have to survive a non-adjacent duplicate.
+			const statements = createActionsStatements([
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[100, { key: 100, userId: 1, title: 'First' }]] }] },
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[200, { key: 200, userId: 1, title: 'Second' }]] }] },
+			]);
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+			const transaction: Transaction = {
+				stamp, statements, reads: [], id: await createTransactionId(stamp.id, statements, []),
+			};
+
+			const prePosts = postsCollection.snapshotPending();
+
+			const result = await coordinator.execute(transaction, engine);
+
+			expect(result.success).to.be.false;
+			expect(result.committedCollections, 'committed set on ExecutionResult').to.deep.equal(['users']);
+			expect(result.failedCollections, 'failed set on ExecutionResult').to.deep.equal(['posts']);
+
+			// BOTH batches are gone — not just the second.
+			expect(postsCollection.tracker.transforms, 'duplicated loser restored to before EITHER batch')
+				.to.deep.equal(prePosts.transforms);
+			expect(postsCollection.getPendingActions(), 'duplicated loser pending queue restored to before EITHER batch')
+				.to.deep.equal(prePosts.pending);
+			expect(await postsTree.get(100), "the duplicated loser's FIRST batch row is gone").to.be.undefined;
+			expect(await postsTree.get(200), "the duplicated loser's SECOND batch row is gone").to.be.undefined;
+
+			// ...and the winner still got the success-path fold, with the undo handle dropped.
+			expect(await usersTree.get(1), 'winner row is durable').to.deep.equal({ key: 1, name: 'Alice' });
+			expect(usersCollection.getPendingActions(), 'winner pending queue cleared').to.deep.equal([]);
+			expect((coordinator as any).stampData.has(stamp.id),
+				'a partial landing must not leave an all-or-nothing undo handle behind').to.be.false;
+		});
+
 		it('a clean (empty-committed) execute() failure keeps its undo handle, and rollback() unwinds every tracker', async () => {
 			const inner = new TestTransactor();
 			const flaky = new FlakyCommitTransactor(inner, Infinity); // every commit fails → nothing durable

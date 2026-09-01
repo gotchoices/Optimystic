@@ -114,8 +114,9 @@ This document describes the architecture for multi-collection transactions in Op
 >   rejection carries no `conflict` flag and no `missing`/`pending` evidence, which
 >   is exactly what keeps it out of the retry loop.
 >
-> `coordinator.execute()` is intentionally **not** retry-wrapped; it still reports
-> the committed/failed partition on its `ExecutionResult` rather than throwing.
+> `coordinator.execute()` is intentionally **not** retry-wrapped: neither branch of
+> its failure disposition (see the honest-reporting block above) is re-driven for
+> the caller.
 >
 > **Resolved — honest downgrade, not real cross-collection 2PC.** The design decision
 > (previously "still open") is settled: the default multi-collection guarantee is
