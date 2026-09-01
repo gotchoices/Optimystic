@@ -57,10 +57,17 @@ class PendRejectedError extends Error {
  * - Commit transactions by running consensus phases (GATHER, PEND, COMMIT)
  */
 export class TransactionCoordinator {
-	/** Per-stampId tracking: snapshot before first apply + accumulated actions for replay */
+	/** Per-stampId tracking: snapshot before first apply + accumulated actions for replay.
+	 *
+	 * The snapshot holds BOTH halves of a collection's staged state — tracker transforms AND
+	 * the pending action queue — as one {@link Collection.snapshotPending} value. Restoring only
+	 * the transforms would leave a rolled-back stamp's actions queued, where the next commit on
+	 * that collection would write them into ITS durable log entry (and a conflicting sync's
+	 * `replayActions` would re-apply them into the tracker as live data). Keeping the pair in one
+	 * value makes half-restored staged state unrepresentable here. */
 	private stampData = new Map<string, {
 		order: number;
-		preSnapshot: Map<CollectionId, Transforms>;
+		preSnapshot: Map<CollectionId, ReturnType<Collection<any>['snapshotPending']>>;
 		actionBatches: CollectionActions[][];
 	}>();
 	private nextStampOrder = 0;
@@ -86,9 +93,14 @@ export class TransactionCoordinator {
 	): Promise<void> {
 		// On first call for this stampId, snapshot all collections for potential rollback
 		if (!this.stampData.has(stampId)) {
-			const snapshot = new Map<CollectionId, Transforms>();
+			// Capture EVERY registered collection eagerly, not lazily on first touch: `order` is
+			// assigned here, so it only implies capture time while capture happens at first
+			// applyActions. A lazy capture could take a lower-`order` stamp's snapshot AFTER a
+			// higher-`order` stamp staged into that collection, and rollback (which restores to the
+			// earliest-`order` snapshot) would then keep the rolled-back action.
+			const snapshot = new Map<CollectionId, ReturnType<Collection<any>['snapshotPending']>>();
 			for (const [id, col] of this.collections) {
-				snapshot.set(id, structuredClone(col.tracker.transforms));
+				snapshot.set(id, col.snapshotPending());
 			}
 			this.stampData.set(stampId, {
 				order: this.nextStampOrder++,
@@ -478,18 +490,21 @@ export class TransactionCoordinator {
 	/**
 	 * Rollback a transaction (undo only the given stampId's applied actions).
 	 *
-	 * Restores tracker state to the snapshot taken before the stampId's first
-	 * applyActions call, then replays any later stamps' actions to preserve
-	 * other sessions' transforms.
+	 * Restores each collection's staged state — tracker transforms and the pending action
+	 * queue — to the snapshot taken before the stampId's first applyActions call, then
+	 * replays any later stamps' actions to preserve those sessions' staged state.
 	 *
 	 * @param stampId - The transaction stamp ID to rollback
 	 */
 	async rollback(stampId: string): Promise<void> {
-		// NOTE: unlike the commit path, this resets and replays into participant trackers WITHOUT
+		// NOTE: unlike the commit path, this overwrites BOTH halves of each participant's staged
+		// state — tracker transforms AND the pending action queue — and replays into them WITHOUT
 		// holding their instance latches. Safe today because a session drives abort and commit from
-		// one call path, so a rollback cannot overlap a commit span on the same collections. If
-		// rollback ever becomes reachable concurrently with a commit (a background abort, a second
-		// session sharing collection instances), latch the participants here the way commitOnce does.
+		// one call path, so a rollback cannot overlap a commit span on the same collections. The
+		// hazard class is the same one the transforms-only reset already carried: a concurrent
+		// act/sync would already have raced `tracker.reset`. If rollback ever becomes reachable
+		// concurrently with a commit (a background abort, a second session sharing collection
+		// instances), latch the participants here the way commitOnce does.
 		const data = this.stampData.get(stampId);
 		if (!data) return;
 
@@ -511,20 +526,31 @@ export class TransactionCoordinator {
 			}
 		}
 
-		// Restore to the earliest snapshot
-		for (const [collectionId, transforms] of earliestSnapshot) {
+		// Restore to the earliest snapshot — transforms AND pending queue together, so the
+		// rolled-back stamp's actions leave the queue instead of being written into the next
+		// transaction's durable log entry. `restorePending` deep-copies the transforms itself,
+		// so no structuredClone here.
+		// NOTE: this also discards actions staged OUTSIDE any tracked stamp (the Tree.stage /
+		// deferred-DML path, which calls Collection.act directly and creates no stampData entry)
+		// that landed after the earliest tracked snapshot. Accepted: the tracker half already
+		// discards their transforms, and symmetric is the safer state — leaving such an action
+		// queued while its transforms are gone is exactly the phantom that a conflicting sync's
+		// replayActions would resurrect as live data.
+		for (const [collectionId, snapshot] of earliestSnapshot) {
 			const collection = this.collections.get(collectionId);
 			if (collection) {
-				collection.tracker.reset(structuredClone(transforms));
+				collection.restorePending(snapshot);
 			}
 		}
 
 		// Replay all remaining stamps' batches in order
 		for (const [replayStampId, replayData] of toReplay) {
-			// Update the snapshot to reflect current (post-replay) state
-			const newSnapshot = new Map<CollectionId, Transforms>();
+			// Update the snapshot to reflect current (post-replay) state. Both halves: a survivor
+			// replayed later in this loop must carry its pending queue forward too, or the next
+			// rollback restores a snapshot that is missing it.
+			const newSnapshot = new Map<CollectionId, ReturnType<Collection<any>['snapshotPending']>>();
 			for (const [id, col] of this.collections) {
-				newSnapshot.set(id, structuredClone(col.tracker.transforms));
+				newSnapshot.set(id, col.snapshotPending());
 			}
 			replayData.preSnapshot = newSnapshot;
 
