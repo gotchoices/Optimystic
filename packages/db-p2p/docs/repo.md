@@ -234,10 +234,13 @@ from selecting each other's peers into a cohort.
 | routing (FRET) | `/optimystic/<network>/fret/1.0.0/{ping,neighbors,neighbors/announce,maybeAct,leave}` | `p2p-fret` |
 
 A node also advertises the stock libp2p protocols its services bring with them — `/ipfs/ping/1.0.0`,
-`/libp2p/dcutr`, `/libp2p/autonat/1.0.0`, `/libp2p/circuit/relay/0.2.0/…`, `/meshsub/…`,
-`/floodsub/1.0.0`. Those keep their upstream ids and are **not** network-scoped, so two nodes on
-different Optimystic networks can still ping and gossip each other; only the ids above decide whether
-a peer is treated as part of this network.
+`/libp2p/dcutr`, `/libp2p/autonat/1.0.0`, `/libp2p/circuit/relay/0.2.0/…`. Those keep their upstream
+ids and are **not** network-scoped, so two nodes on different Optimystic networks can still ping each
+other; only the ids above decide whether a peer is treated as part of this network.
+
+No `pubsub` service is registered — `@chainsafe/libp2p-gossipsub` (newest release 14.1.2) is built
+against `@libp2p/interface@^2` and cannot work on this repo's libp2p 3 (gotchoices/Optimystic#9); see
+the `NOTE:` at its former registration site in `libp2p-node-base.ts`.
 
 Two traps in that table:
 

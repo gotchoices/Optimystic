@@ -36,8 +36,12 @@ import { expectWellFormedProtocolIds } from './util/protocol-ids.js';
  *    re-push of later address/protocol changes to already-connected peers (#7).
  *  - `ping` / `dcutr` / `autoNAT` — liveness, hole-punch upgrade of relayed connections, and
  *    public-reachability discovery.
- *  - `pubsub` — gossipsub.
  *  - `cluster` / `repo` / `sync` / `blockTransfer` — the Optimystic protocol handlers.
+ *
+ * No `pubsub` key: the `gossipsub` registration was removed (gotchoices/Optimystic#9) because it
+ * cannot work on this repo's libp2p 3 — gossipsub's newest release (14.1.2) is built against
+ * `@libp2p/interface@^2`, whose `Stream` shape `it-pipe` needs no longer exists on libp2p 3's
+ * `Stream`, so every outbound gossipsub stream throws and `publish` silently reaches nobody.
  *  - `networkManager` / `fret` — cluster sizing policy and the FRET routing table.
  *
  * `relay` (the circuit-relay *server*) is deliberately absent: it is registered only when
@@ -53,7 +57,6 @@ const EXPECTED_SERVICE_KEYS = [
 	'identifyPush',
 	'networkManager',
 	'ping',
-	'pubsub',
 	'repo',
 	'sync'
 ].sort();

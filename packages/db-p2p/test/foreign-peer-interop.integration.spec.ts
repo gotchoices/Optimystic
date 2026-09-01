@@ -68,9 +68,9 @@ const FOREIGN_IDENTIFY_PREFIX = `optimystic/${NETWORK}`;
  * exchange lists at all, and `cluster`/`repo` because those two are exactly what
  * `Libp2pKeyPeerNetwork.membershipOf` keys peer classification on. The node advertises more than
  * this — `sync` and `block-transfer` (which carry a surprising `/db-p2p/` infix), the five FRET
- * routing ids, and the stock libp2p ids (`/ipfs/ping/1.0.0`, `/meshsub/…`, …). All of those are
- * covered by the whole-list well-formedness assertion below rather than named here, per this spec's
- * scope guard; the full inventory is in `packages/db-p2p/docs/repo.md` § Protocol id conventions.
+ * routing ids, and the stock libp2p ids (`/ipfs/ping/1.0.0`, …). All of those are covered by the
+ * whole-list well-formedness assertion below rather than named here, per this spec's scope guard;
+ * the full inventory is in `packages/db-p2p/docs/repo.md` § Protocol id conventions.
  */
 const IDENTIFY_PROTOCOL = `/optimystic/${NETWORK}/id/1.0.0`;
 const IDENTIFY_PUSH_PROTOCOL = `/optimystic/${NETWORK}/id/push/1.0.0`;

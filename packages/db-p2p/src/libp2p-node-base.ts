@@ -5,7 +5,6 @@ import { identify, identifyPush } from '@libp2p/identify';
 import { ping } from '@libp2p/ping';
 import { dcutr } from '@libp2p/dcutr';
 import { autoNAT } from '@libp2p/autonat';
-import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { bootstrap } from '@libp2p/bootstrap';
 import { circuitRelayServer, type CircuitRelayServerInit } from '@libp2p/circuit-relay-v2';
 import { peerIdFromString } from '@libp2p/peer-id';
@@ -577,10 +576,16 @@ export async function createLibp2pNodeBase(
 			// is acceptable — they neither throw nor break the build in that case.
 			dcutr: dcutr(),
 			autoNAT: autoNAT(),
-			pubsub: gossipsub({
-				allowPublishToZeroTopicPeers: true,
-				heartbeatInterval: 7000
-			}),
+			// NOTE: no `pubsub` service. `@chainsafe/libp2p-gossipsub` (currently at 14.1.2, the newest
+			// published version) is built against `@libp2p/interface@^2` — its `Stream` still expects
+			// `.sink`/`.source`. Under libp2p 3 `Stream extends MessageStream` (event target +
+			// AsyncIterable), which has neither, so `it-pipe`'s `isDuplex` check on the outbound stream
+			// fails and `OutboundStream`'s constructor throws `fns.shift(...) is not a function`
+			// synchronously — before gossipsub's own `.catch` can attach. Gossipsub logs and swallows
+			// it, so the service reports as running while never sending a subscription to any peer:
+			// `publish` always resolves with zero recipients. Verified end-to-end against this repo's
+			// installed dependency tree (gotchoices/Optimystic#9). Nothing in this repo uses `pubsub`
+			// today — re-add only against a gossipsub release built for libp2p 3.
 			// Circuit relay server - enables this node to relay connections for other peers
 			...(options.relay ? { relay: circuitRelayServer(options.relayServerInit) } : {}),
 
