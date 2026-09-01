@@ -677,7 +677,7 @@ Nodes automatically transition between rings based on capacity thresholds:
 - **[@optimystic/db-p2p-storage-rn](../db-p2p-storage-rn)**: React Native LevelDB storage backend
 - **[@optimystic/db-p2p-storage-web](../db-p2p-storage-web)**: Browser IndexedDB storage backend
 - **[@optimystic/quereus-plugin-optimystic](../quereus-plugin-optimystic)**: Quereus query-engine plugin and data access patterns
-- **p2p-fret**: DHT implementation for peer discovery (external package, `p2p-fret`)
+- **p2p-fret**: DHT implementation for peer discovery — an external package, not a workspace here
 
 ### Internal Architecture
 

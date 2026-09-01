@@ -24,10 +24,12 @@ This is an important system; write production-grade, maintainble, and expressive
 
 When prose points at code, bind an **anchor** to a **path**. Two forms, both house style:
 
-```
-`determineRing` in `packages/db-p2p/src/storage/ring-selector.ts`
-(`disputeEnabled`, `packages/db-p2p/src/dispute/types.ts`)
-```
+> `determineRing` in `packages/db-p2p/src/storage/ring-selector.ts`
+>
+> (`disputeEnabled`, `packages/db-p2p/src/dispute/types.ts`)
+
+(These two examples are quoted rather than fenced on purpose: fenced blocks are exempt from the
+check below, and the examples in the document that *defines* the convention should be held to it.)
 
 - **The anchor is a symbol name** wherever one exists. A symbol survives edits above it, is
   greppable, and when it does break it degrades to "search for this name" rather than to silently
@@ -49,10 +51,24 @@ When prose points at code, bind an **anchor** to a **path**. Two forms, both hou
 - A bare filename in flowing prose ("`libp2p-node-base.ts` wires the services") is a *mention*, not
   a citation. It stays legal, and is checked only for existence.
 
-`yarn lint:docs` (`scripts/check-doc-citations.mjs`, also run by `yarn check`) enforces all of the
-above across tracked markdown outside `tickets/`. Fenced code blocks are exempt — a stack trace or
-a tool transcript is a literal record, not a claim about where code lives — and that exemption is
-the only escape hatch there is.
+`yarn lint:docs` (`scripts/check-doc-citations.mjs`, also run by `yarn check`) checks tracked
+markdown outside `tickets/` and `CHANGELOG.md`. It enforces the line-number ban, verifies that every
+backticked path names a tracked file, that an anchored citation's anchor is still present in the
+file it names, and that every doc-to-doc link and its `#section` resolves.
+
+The rest of the rules above are convention the check does not police, so keep them by hand. What it
+deliberately does not verify:
+
+- **Fenced code blocks are skipped entirely** — a stack trace or a tool transcript is a literal
+  record, not a claim about where code lives. This is the escape hatch for text that must keep a
+  line number.
+- **Paths it does not own**: anything with a URI scheme, a `../` sibling-checkout path, an
+  `@scope/`-prefixed external file, and anything under `tess/` or `tickets/`.
+- **Extensions other than** `.ts`, `.tsx`, `.mts`, `.cts`, `.mjs` and `.md`. A `.js`/`.json`/`.yml`
+  token in this repo's prose is nearly always an illustrative or runtime file, not a tracked one.
+- **Anchors in any shape but the two above.** A citation written some other way degrades to a bare
+  mention: its path is still required to exist, its anchor is never checked. Slash-alternation
+  anchors are in this bucket — they are not flagged, they are simply never verified.
 
 ## Testing
 

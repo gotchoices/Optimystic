@@ -1594,9 +1594,12 @@ validators hash, rather than re-deriving the serialization and risking drift.
 - "with context" clause support
 
 **Modified Files**:
-- `@quereus/quereus/src/vtab/context.ts` - Add sql, params fields
-- `@quereus/quereus/src/execution/executor.ts` - Populate context, enforce determinism
 - `@quereus/quereus/src/parser/parser.ts` - Parse "with context" clause
+
+  (Only the parser arm exists today. The `VirtualTableContext` extension — adding `sql` and
+  `params` fields and enforcing deterministic execution — has no counterpart in the current
+  Quereus tree: no such type is declared there, and the two files this manifest originally
+  named — *src/vtab/context.ts* and *src/execution/executor.ts* — were never created.)
 
 **Dependencies**: None (core package)
 
@@ -1609,10 +1612,10 @@ validators hash, rather than re-deriving the serialization and risking drift.
 - P2P integration
 
 **Key Files**:
-- `src/optimystic-module.ts` - OptimysticModule (VirtualTableModule implementation)
-- `src/types.ts` - Module types
-- `src/transaction/quereus-engine.ts` - QuereusEngine (executeStatement, execute, getSchemaHash)
-- `src/plugin.ts` - Integrates module + coordinator + p2p
+- `packages/quereus-plugin-optimystic/src/optimystic-module.ts` - OptimysticModule (VirtualTableModule implementation)
+- `packages/quereus-plugin-optimystic/src/types.ts` - Module types
+- `packages/quereus-plugin-optimystic/src/transaction/quereus-engine.ts` - QuereusEngine (executeStatement, execute, getSchemaHash)
+- `packages/quereus-plugin-optimystic/src/plugin.ts` - Integrates module + coordinator + p2p
 
 **Dependencies**: quereus, db-core, db-p2p
 

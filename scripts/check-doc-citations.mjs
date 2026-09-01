@@ -111,29 +111,31 @@ function buildSuffixIndex(paths) {
  * Returns the blanked text plus a finding if a fence was never closed — an unterminated fence must
  * not silently blank the remainder of the file and turn real breakage into a pass.
  */
+// A fence delimiter is 3+ backticks/tildes at line start; list indentation and blockquote markers
+// are allowed before it, so a fence nested inside a `>` quote is still a fence.
+const FENCE_RE = /^[ \t]*(?:>[ \t]?)*[ \t]*(`{3,}|~{3,})(.*)$/;
+
 function blankFences(text) {
 	const lines = text.split('\n');
 	const out = lines.slice();
 	const findings = [];
 	let open = null;
 	for (let i = 0; i < lines.length; i++) {
-		// CommonMark: a fence opener is 3+ backticks/tildes at line start (list indentation is
-		// allowed), and a backtick opener's info string may not itself contain a backtick. That
-		// second rule is what keeps an inline span from being read as an opener.
-		const match = /^(\s*)(`{3,}|~{3,})(.*)$/.exec(lines[i]);
-		if (!match) continue;
-		const [, , marker, info] = match;
-		const char = marker[0];
-		if (open === null) {
-			if (char === '`' && info.includes('`')) continue;
-			open = { char, length: marker.length, line: i };
+		const match = FENCE_RE.exec(lines[i]);
+		if (open !== null) {
+			// Every line of an open block is blanked, delimiter and content alike. Blanking only
+			// the delimiters would leave the block's body being read as prose — which is the
+			// opposite of the exemption this function exists to provide.
 			out[i] = '';
-		} else if (char === open.char && marker.length >= open.length && info.trim() === '') {
-			out[i] = '';
-			open = null;
-		} else {
-			out[i] = '';
+			if (match && match[1][0] === open.char && match[1].length >= open.length && match[2].trim() === '') open = null;
+			continue;
 		}
+		if (!match) continue;
+		// CommonMark: a backtick opener's info string may not itself contain a backtick. That rule
+		// is what keeps an inline span from being read as an opener.
+		if (match[1][0] === '`' && match[2].includes('`')) continue;
+		open = { char: match[1][0], length: match[1].length, line: i };
+		out[i] = '';
 	}
 	if (open !== null) {
 		findings.push({ line: open.line + 1, message: 'unterminated code fence — close it, or everything below it goes unchecked' });
@@ -213,6 +215,9 @@ function isPathShaped(token) {
 function skipReason(token) {
 	if (/^[a-z][a-z0-9+.-]*:/i.test(token)) return 'uri-scheme';
 	if (token.startsWith('../')) return 'sibling-repo';          // ../../Fret/docs/fret.md
+	// NOTE: skipping `@scope/`-prefixed paths is a real blind spot, not just a simplification —
+	// `docs/transactions.md` cited two `@quereus/quereus/src/...` files that do not exist and the
+	// check passed. Widening it is tracked as `debt-external-citations-unverified`.
 	if (token.startsWith('@')) return 'npm-scope';               // @quereus/quereus/src/parser/parser.ts
 	if (/[*<>{}\s]/.test(token)) return 'glob-or-placeholder';
 	const segments = token.replace(/^\.\//, '').split('/');
@@ -371,152 +376,201 @@ function anchorCandidates(anchor) {
 // -- The check -----------------------------------------------------------------------------------
 
 const LINE_NUMBER_RE = /(?<![A-Za-z0-9_@:./-])([A-Za-z0-9_@./-]*[A-Za-z0-9_]\.(?:ts|tsx|mts|cts|js|mjs|cjs|jsx|md)):(\d+(?:-\d+)?)/g;
+// NOTE: only inline `[text](target)` links are checked. A link carrying a title
+// (`](target "title")`) or written reference-style (`[text][ref]` plus a `[ref]: target`
+// definition) is silently skipped; neither shape appears anywhere in this tree today. If one is
+// introduced, extend this regex rather than assuming those links are covered.
 const LINK_RE = /\[(?:[^\]\n]*)\]\(\s*([^)\s]+?)\s*\)/g;
 
-function run() {
+/** The repository facts every check needs: what exists, and how to read it. */
+function buildRepoIndex() {
 	const tracked = trackedFiles();
-	const index = buildSuffixIndex(tracked);
-	const trackedSet = new Set(tracked);
 	const directories = new Set();
 	for (const path of tracked) {
 		const segments = path.split('/');
 		for (let i = 1; i < segments.length; i++) directories.add(segments.slice(0, i).join('/'));
 	}
-	const docs = tracked.filter((p) => p.endsWith('.md') && !EXCLUDED.some((skip) => skip(p)));
+	const caches = new Map();
+	const cached = (kind, path, build) => {
+		const key = `${kind}\0${path}`;
+		if (!caches.has(key)) {
+			let text = '';
+			try { text = readFileSync(path, 'utf8'); } catch { /* unreadable: treat as empty */ }
+			caches.set(key, build(text));
+		}
+		return caches.get(key);
+	};
+	return {
+		index: buildSuffixIndex(tracked),
+		trackedSet: new Set(tracked),
+		directories,
+		docs: tracked.filter((p) => p.endsWith('.md') && !EXCLUDED.some((skip) => skip(p))),
+		/** Whitespace-normalized source text, for anchor searches. */
+		sourceText: (path) => cached('text', path, normalize),
+		slugsFor: (path) => cached('slugs', path, headingSlugs)
+	};
+}
 
-	if (docs.length === 0) {
+/** Character offset to 1-based line number, without re-splitting the document at every lookup. */
+function lineLookup(text) {
+	const starts = [0];
+	for (let i = 0; i < text.length; i++) if (text[i] === '\n') starts.push(i + 1);
+	return (offset) => {
+		let lo = 0;
+		let hi = starts.length - 1;
+		while (lo < hi) {
+			const mid = (lo + hi + 1) >> 1;
+			if (starts[mid] <= offset) lo = mid;
+			else hi = mid - 1;
+		}
+		return lo + 1;
+	};
+}
+
+/**
+ * No allowlist and no per-citation escape marker: the convention keeps zero line numbers, so an
+ * exception mechanism would only be a place for drift to hide. Fenced blocks are the entire escape
+ * hatch, and a stack trace or tool transcript belongs in a fence anyway.
+ */
+function checkLineNumbers(text, lineOf, report) {
+	LINE_NUMBER_RE.lastIndex = 0;
+	let match;
+	while ((match = LINE_NUMBER_RE.exec(text)) !== null) {
+		if (!TOKEN_RE.test(match[1]) || !isPathShaped(match[1])) continue;
+		report(lineOf(match.index), `line-number citation \`${match[0]}\`\n  — line numbers rot silently; cite a symbol or a quoted fragment instead, e.g. \`someSymbol\` in \`${match[1]}\``);
+	}
+}
+
+/**
+ * The path must resolve to exactly one file, and the anchor must still be findable in it. Returns
+ * how many citations were actually checked, for the summary line.
+ */
+function checkCitations(citations, repo, lineOf, report) {
+	let checked = 0;
+	for (const { anchor, path } of citations) {
+		const token = path.value;
+		if (skipReason(token)) continue;
+		checked++;
+		const matches = resolvePath(token, repo.index);
+		if (matches.length === 0) {
+			report(lineOf(path.start), `citation names \`${token}\`, which is not a tracked file`);
+			continue;
+		}
+		if (matches.length > 1) {
+			const shown = matches.slice(0, 3).join(', ') + (matches.length > 3 ? ', ...' : '');
+			report(lineOf(path.start), `citation path \`${token}\` is ambiguous — ${matches.length} tracked files match (${shown})\n  — add leading path segments so the anchor can be checked against one file`);
+			continue;
+		}
+		const target = matches[0];
+		const haystack = repo.sourceText(target);
+		if (anchor.quoted) {
+			if (!haystack.includes(normalize(anchor.value))) {
+				report(lineOf(anchor.start), `quoted anchor "${anchor.value}" not found in ${target}\n  — the quotation has drifted from the source; re-read it and requote`);
+			}
+			continue;
+		}
+		const candidates = anchorCandidates(anchor.value);
+		if (!candidates.some((c) => haystack.includes(c))) {
+			report(lineOf(anchor.start), `anchor \`${anchor.value}\` not found in ${target}\n  — searched for ${candidates.map((c) => `\`${c}\``).join(', ')}; the symbol was renamed, moved, or never lived there`);
+		}
+	}
+	return checked;
+}
+
+/**
+ * A filename in flowing prose is a mention, not a citation, but it still has to name something that
+ * exists. One-or-more matches is enough — only an anchored citation needs to pin down a single
+ * file. Only inline code spans count: unmarked prose says "Node.js, browsers, and React Native are
+ * first-class", which is not a claim about a file.
+ */
+function checkMentions(spans, citedSpans, repo, lineOf, report) {
+	let checked = 0;
+	for (const span of spans) {
+		if (span.quoted || citedSpans.has(span.start)) continue;
+		const token = span.value.trim();
+		if (!TOKEN_RE.test(token) || !isPathShaped(token) || skipReason(token)) continue;
+		checked++;
+		if (resolvePath(token, repo.index).length === 0) {
+			report(lineOf(span.start), `\`${token}\` does not name any tracked file\n  — the file was renamed, moved, or never existed`);
+		}
+	}
+	return checked;
+}
+
+/** Resolve a link target against the citing document. Null when it climbs above the repo root. */
+function resolveLinkTarget(doc, rawTarget) {
+	if (rawTarget === '') return doc;                        // a bare `#section` links this document
+	const resolved = [];
+	for (const segment of [...doc.split('/').slice(0, -1), ...rawTarget.split('/')]) {
+		if (segment === '.' || segment === '') continue;
+		if (segment !== '..') resolved.push(segment);
+		else if (resolved.length) resolved.pop();
+		else return null;                                      // points at a sibling checkout
+	}
+	return resolved.join('/');
+}
+
+/**
+ * The target must resolve relative to *this* document, and a `#section` must match a heading in the
+ * target. Compared case-sensitively against git's index — a link to `packages/db-p2p/README.md`
+ * when the tracked file is `readme.md` works on Windows and breaks on Linux and on github.com, and
+ * that is exactly the class this catches.
+ */
+function checkLinks(doc, text, repo, lineOf, report) {
+	let checked = 0;
+	LINK_RE.lastIndex = 0;
+	let link;
+	while ((link = LINK_RE.exec(text)) !== null) {
+		const raw = link[1].replace(/^</, '').replace(/>$/, '');
+		if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) continue;
+		const hash = raw.indexOf('#');
+		const rawTarget = hash < 0 ? raw : raw.slice(0, hash);
+		const fragment = hash < 0 ? '' : raw.slice(hash + 1);
+
+		const target = resolveLinkTarget(doc, rawTarget);
+		if (target === null) continue;
+		checked++;
+		if (!repo.trackedSet.has(target)) {
+			// A link may legitimately name a directory (`[tickets/](tickets/)`, a source module
+			// folder). Accept it when the tree actually has one.
+			if (repo.directories.has(target)) continue;
+			report(lineOf(link.index), `link target \`${rawTarget || raw}\` does not resolve to a tracked file or directory (looked for \`${target}\`)`);
+			continue;
+		}
+		if (!fragment || !target.endsWith('.md')) continue;
+		if (!repo.slugsFor(target).has(fragment.toLowerCase())) {
+			report(lineOf(link.index), `link \`${rawTarget}#${fragment}\` names no heading in ${target}\n  — the heading was renamed; check its GitHub anchor slug`);
+		}
+	}
+	return checked;
+}
+
+function run() {
+	const repo = buildRepoIndex();
+	if (repo.docs.length === 0) {
 		stderr.write('check-doc-citations: the scope filter matched zero documents. That is a bug in this\n');
 		stderr.write('script, not a clean tree — refusing to report success.\n');
 		exit(1);
 	}
 
-	const sources = new Map();       // path -> whitespace-normalized text, for anchor searches
-	const slugCache = new Map();     // path -> heading slugs
 	const findings = [];
-	let citationCount = 0;
-	let mentionCount = 0;
-	let linkCount = 0;
+	const counts = { citations: 0, mentions: 0, links: 0 };
 
-	const cached = (cache, path, build) => {
-		if (!cache.has(path)) {
-			let text = '';
-			try { text = readFileSync(path, 'utf8'); } catch { /* unreadable: treat as empty */ }
-			cache.set(path, build(text));
-		}
-		return cache.get(path);
-	};
-	const sourceText = (path) => cached(sources, path, normalize);
-	const slugsFor = (path) => cached(slugCache, path, headingSlugs);
-
-	for (const doc of docs) {
+	for (const doc of repo.docs) {
 		const { text: defenced, findings: fenceFindings } = blankFences(readFileSync(doc, 'utf8'));
 		const text = blankQuoteMarkers(defenced);
-		const lineOf = (i) => text.slice(0, i).split('\n').length;
+		const lineOf = lineLookup(text);
 		const report = (line, message) => findings.push({ doc, line, message });
-
 		for (const f of fenceFindings) report(f.line, f.message);
 
-		// -- Line-number ban --------------------------------------------------------------------
-		// No allowlist and no per-citation escape marker: the convention keeps zero line numbers,
-		// so an exception mechanism would only be a place for drift to hide. Fenced blocks are the
-		// entire escape hatch, and a stack trace or tool transcript belongs in a fence anyway.
-		LINE_NUMBER_RE.lastIndex = 0;
-		let ln;
-		while ((ln = LINE_NUMBER_RE.exec(text)) !== null) {
-			if (!TOKEN_RE.test(ln[1]) || !isPathShaped(ln[1])) continue;
-			report(lineOf(ln.index), `line-number citation \`${ln[0]}\`\n  — line numbers rot silently; cite a symbol or a quoted fragment instead, e.g. \`someSymbol\` in \`${ln[1]}\``);
-		}
-
-		// -- Anchored citations -----------------------------------------------------------------
-		// The path must resolve to exactly one file, and the anchor must still be findable in it.
 		const spans = findSpans(text);
 		const citations = findCitations(text, spans);
 		const citedSpans = new Set(citations.map((c) => c.path.start));
-		for (const { anchor, path } of citations) {
-			const token = path.value;
-			if (skipReason(token)) continue;
-			citationCount++;
-			const matches = resolvePath(token, index);
-			if (matches.length === 0) {
-				report(lineOf(path.start), `citation names \`${token}\`, which is not a tracked file`);
-				continue;
-			}
-			if (matches.length > 1) {
-				const shown = matches.slice(0, 3).join(', ') + (matches.length > 3 ? ', ...' : '');
-				report(lineOf(path.start), `citation path \`${token}\` is ambiguous — ${matches.length} tracked files match (${shown})\n  — add leading path segments so the anchor can be checked against one file`);
-				continue;
-			}
-			const target = matches[0];
-			const haystack = sourceText(target);
-			if (anchor.quoted) {
-				if (!haystack.includes(normalize(anchor.value))) {
-					report(lineOf(anchor.start), `quoted anchor "${anchor.value}" not found in ${target}\n  — the quotation has drifted from the source; re-read it and requote`);
-				}
-				continue;
-			}
-			const candidates = anchorCandidates(anchor.value);
-			if (!candidates.some((c) => haystack.includes(c))) {
-				report(lineOf(anchor.start), `anchor \`${anchor.value}\` not found in ${target}\n  — searched for ${candidates.map((c) => `\`${c}\``).join(', ')}; the symbol was renamed, moved, or never lived there`);
-			}
-		}
 
-		// -- Bare mentions ----------------------------------------------------------------------
-		// A filename in flowing prose is a mention, not a citation, but it still has to name
-		// something that exists. One-or-more matches is enough — only an anchored citation needs to
-		// pin down a single file. Only inline code spans count: unmarked prose says "Node.js,
-		// browsers, and React Native are first-class", which is not a claim about a file.
-		for (const span of spans) {
-			if (span.quoted || citedSpans.has(span.start)) continue;
-			const token = span.value.trim();
-			if (!TOKEN_RE.test(token) || !isPathShaped(token) || skipReason(token)) continue;
-			mentionCount++;
-			if (resolvePath(token, index).length === 0) {
-				report(lineOf(span.start), `\`${token}\` does not name any tracked file\n  — the file was renamed, moved, or never existed`);
-			}
-		}
-
-		// -- Doc-to-doc links -------------------------------------------------------------------
-		// The target must resolve relative to *this* document, and a `#section` must match a
-		// heading in the target. Compared case-sensitively against git's index — a link to
-		// `packages/db-p2p/README.md` when the tracked file is `readme.md` works on Windows and
-		// breaks on Linux and on github.com, and that is exactly the class this catches.
-		LINK_RE.lastIndex = 0;
-		let link;
-		while ((link = LINK_RE.exec(text)) !== null) {
-			const raw = link[1].replace(/^</, '').replace(/>$/, '');
-			if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) continue;
-			const hash = raw.indexOf('#');
-			const rawTarget = hash < 0 ? raw : raw.slice(0, hash);
-			const fragment = hash < 0 ? '' : raw.slice(hash + 1);
-			const line = lineOf(link.index);
-
-			let target = doc;                                    // a bare `#section` links this document
-			if (rawTarget !== '') {
-				const resolved = [];
-				let escapes = false;
-				for (const segment of [...doc.split('/').slice(0, -1), ...rawTarget.split('/')]) {
-					if (segment === '.' || segment === '') continue;
-					if (segment !== '..') resolved.push(segment);
-					else if (resolved.length) resolved.pop();
-					else escapes = true;
-				}
-				// A link that climbs above the repository root points at a sibling checkout.
-				if (escapes) continue;
-				target = resolved.join('/');
-			}
-			linkCount++;
-			if (!trackedSet.has(target)) {
-				// A link may legitimately name a directory (`[tickets/](tickets/)`, a source module
-				// folder). Accept it when the tree actually has one.
-				if (directories.has(target)) continue;
-				report(line, `link target \`${rawTarget || raw}\` does not resolve to a tracked file or directory (looked for \`${target}\`)`);
-				continue;
-			}
-			if (!fragment || !target.endsWith('.md')) continue;
-			if (!slugsFor(target).has(fragment.toLowerCase())) {
-				report(line, `link \`${rawTarget}#${fragment}\` names no heading in ${target}\n  — the heading was renamed; check its GitHub anchor slug`);
-			}
-		}
+		checkLineNumbers(text, lineOf, report);
+		counts.citations += checkCitations(citations, repo, lineOf, report);
+		counts.mentions += checkMentions(spans, citedSpans, repo, lineOf, report);
+		counts.links += checkLinks(doc, text, repo, lineOf, report);
 	}
 
 	// The same broken name often appears as both link text and link target on one line; report it
@@ -526,11 +580,11 @@ function run() {
 	for (const f of unique) stdout.write(`${f.doc}:${f.line}: ${f.message}\n`);
 
 	if (unique.length) {
-		stdout.write(`\ncheck-doc-citations: ${unique.length} finding(s) across ${docs.length} documents.\n`);
+		stdout.write(`\ncheck-doc-citations: ${unique.length} finding(s) across ${repo.docs.length} documents.\n`);
 		stdout.write('See AGENTS.md § Documentation citations for the convention.\n');
 		exit(1);
 	}
-	stdout.write(`check-doc-citations: ${docs.length} documents, ${citationCount} anchored citations, ${mentionCount} file mentions, ${linkCount} links — all resolve.\n`);
+	stdout.write(`check-doc-citations: ${repo.docs.length} documents, ${counts.citations} anchored citations, ${counts.mentions} file mentions, ${counts.links} links — all resolve.\n`);
 }
 
 if (argv.includes('--help') || argv.includes('-h')) {
