@@ -4070,13 +4070,21 @@ describe('Transaction', () => {
 				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[100, { key: 100, userId: 1, title: 'First' }]] }] },
 			]);
 
-			// The execute() path is NOT snapshot/restore-wrapped: it RETURNS the partition on the
-			// ExecutionResult rather than throwing CoordinatorPartialCommitError.
+			// The execute() path REPORTS rather than throws: it returns the partition on the
+			// ExecutionResult instead of raising CoordinatorPartialCommitError. Locally it gives a
+			// partial landing the same disposition as commitOnceLatched — success-path fold on the
+			// committed half, pre-staging restore on the failed half, stamp tracking dropped.
 			const result = await coordinator.execute(transaction, engine);
 
 			expect(result.success).to.be.false;
 			expect(result.committedCollections, 'committed set on ExecutionResult').to.deep.equal(['users']);
 			expect(result.failedCollections, 'failed set on ExecutionResult').to.deep.equal(['posts']);
+
+			// The now-unsafe undo handle was dropped: rollback() is all-or-nothing and would rewind
+			// the collection that DID durably commit. (Its consequences are asserted by the
+			// dedicated rollback case below.)
+			expect((coordinator as any).stampData.has(transaction.stamp.id),
+				'stampData should be cleared for a partial landing through execute()').to.be.false;
 
 			// The committed subset got the FULL success-path local treatment — the same four steps,
 			// in the same order, as commitOnceLatched's partial-commit fold (asserted by the
@@ -4115,6 +4123,172 @@ describe('Transaction', () => {
 				.to.be.true;
 			expect(transactor.durableCommits, 'only users ever committed durably')
 				.to.deep.equal(['users', 'users']);
+		});
+
+		it('execute() drops the undo handle on a partial landing, so a later rollback() cannot corrupt the winner', async () => {
+			const inner = new TestTransactor();
+			const transactor = new FailCollectionNTimesTransactor(inner, 'posts', Infinity);
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', e => e.key);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(transactor, 'posts', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const postsCollection = (postsTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection], ['posts', postsCollection]]);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const engine = new ActionsEngine();
+
+			const buildTransaction = async (actions: CollectionActions[]): Promise<Transaction> => {
+				const statements = createActionsStatements(actions);
+				const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+				return { stamp, statements, reads: [], id: await createTransactionId(stamp.id, statements, []) };
+			};
+
+			// Same shape as the case above: a PRIOR users-only commit gives the winner durable state,
+			// which is what makes a corrupting rewind observable (a pristine collection has nothing
+			// durable for rollback to disagree with).
+			const priorResult = await coordinator.execute(
+				await buildTransaction([
+					{ collectionId: 'users', actions: [{ type: 'replace', data: [[0, { key: 0, name: 'Zero' }]] }] },
+				]),
+				engine
+			);
+			expect(priorResult.success, `prior users-only commit: ${priorResult.error ?? ''}`).to.be.true;
+
+			const transaction = await buildTransaction([
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[100, { key: 100, userId: 1, title: 'First' }]] }] },
+			]);
+
+			const result = await coordinator.execute(transaction, engine);
+			expect(result.success).to.be.false;
+			expect(result.committedCollections, 'committed set on ExecutionResult').to.deep.equal(['users']);
+
+			// The undo handle is gone...
+			expect((coordinator as any).stampData.has(transaction.stamp.id),
+				'a partial landing must not leave an all-or-nothing undo handle behind').to.be.false;
+
+			// ...so rollback() is a NO-OP rather than a rewind of the durable winner. Without the
+			// stampData.delete this call rewinds 'users' to its pre-transaction snapshot and
+			// re-stages its already-durable actions, so tracker memory disagrees with storage.
+			await coordinator.rollback(transaction.stamp.id);
+
+			// The winner is untouched: both durable rows still read back...
+			expect(await usersTree.get(1), 'winner row survives the rollback')
+				.to.deep.equal({ key: 1, name: 'Alice' });
+			expect(await usersTree.get(0), 'the prior committed row survives too')
+				.to.deep.equal({ key: 0, name: 'Zero' });
+
+			// ...its pending queue is still empty (nothing re-staged)...
+			expect(usersCollection.getPendingActions(), 'winner pending queue must stay cleared')
+				.to.deep.equal([]);
+
+			// ...and its tracker carries no staged changes (same count as the case above).
+			const t = usersCollection.tracker.transforms;
+			const usersPendingChanges =
+				Object.keys(t.inserts ?? {}).length +
+				Object.keys(t.updates ?? {}).length +
+				(t.deletes?.length ?? 0);
+			expect(usersPendingChanges, 'winner tracker must not be re-populated by the rollback').to.equal(0);
+		});
+
+		it('execute() restores the failed collection to its pre-staging state on a partial landing (and leaves it readable)', async () => {
+			const inner = new TestTransactor();
+			const transactor = new FailCollectionNTimesTransactor(inner, 'posts', Infinity);
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', e => e.key);
+			// 'posts' is an INVENTED collection here: created in-test and never synced, so its
+			// header/root blocks live in the tracker as uncommitted inserts. A reset-to-empty would
+			// leave it unreadable; restorePending returns it to its prior readable state.
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(transactor, 'posts', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const postsCollection = (postsTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection], ['posts', postsCollection]]);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const engine = new ActionsEngine();
+
+			const buildTransaction = async (actions: CollectionActions[]): Promise<Transaction> => {
+				const statements = createActionsStatements(actions);
+				const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+				return { stamp, statements, reads: [], id: await createTransactionId(stamp.id, statements, []) };
+			};
+
+			const transaction = await buildTransaction([
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[100, { key: 100, userId: 1, title: 'First' }]] }] },
+			]);
+
+			// Captured BEFORE execute() stages anything — that is the state the loser must return to.
+			// (Not "before the log append": execute() re-runs the engine and re-stages on a re-drive,
+			// so leaving this attempt's actions pending would double-stage them.)
+			const prePosts = postsCollection.snapshotPending();
+
+			const result = await coordinator.execute(transaction, engine);
+			expect(result.success).to.be.false;
+			expect(result.committedCollections, 'committed set on ExecutionResult').to.deep.equal(['users']);
+			expect(result.failedCollections, 'failed set on ExecutionResult').to.deep.equal(['posts']);
+
+			// The loser's tracker is back to pre-staging — no appended-but-uncommitted log entry left.
+			expect(postsCollection.tracker.transforms, 'failed collection tracker restored to pre-staging')
+				.to.deep.equal(prePosts.transforms);
+			// ...and its pending queue too, so a re-drive cannot stage the same actions twice.
+			expect(postsCollection.getPendingActions(), 'failed collection pending queue restored to pre-staging')
+				.to.deep.equal(prePosts.pending);
+
+			// The loser's row is neither stored nor staged.
+			expect(await postsTree.get(100), 'the failed row is gone from local state').to.be.undefined;
+
+			// And the invented collection is still READABLE — the structural baseline survived the
+			// restore (a reset-to-empty would have thrown or returned garbage above).
+			expect(await postsTree.get(999), 'restored invented collection stays readable').to.be.undefined;
+		});
+
+		it('a clean (empty-committed) execute() failure keeps its undo handle, and rollback() unwinds every tracker', async () => {
+			const inner = new TestTransactor();
+			const flaky = new FlakyCommitTransactor(inner, Infinity); // every commit fails → nothing durable
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(flaky, 'users', e => e.key);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(flaky, 'posts', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const postsCollection = (postsTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection], ['posts', postsCollection]]);
+
+			const coordinator = new TransactionCoordinator(flaky, collections);
+			const engine = new ActionsEngine();
+
+			const statements = createActionsStatements([
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[100, { key: 100, userId: 1, title: 'First' }]] }] },
+			]);
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+			const transaction: Transaction = {
+				stamp, statements, reads: [], id: await createTransactionId(stamp.id, statements, []),
+			};
+
+			const preUsers = usersCollection.snapshotPending();
+			const prePosts = postsCollection.snapshotPending();
+
+			const result = await coordinator.execute(transaction, engine);
+
+			// Nothing landed durably → this is NOT the partial branch, and its disposition must be
+			// unchanged by the partial-landing fix.
+			expect(result.success).to.be.false;
+			expect(result.committedCollections, 'no collection committed').to.be.undefined;
+
+			// The undo handle is KEPT: rollback(stampId) is a valid AND complete recovery here (it
+			// also replays the other in-flight stamps, which a targeted restore cannot).
+			expect((coordinator as any).stampData.has(stamp.id),
+				'a clean failure must keep its undo handle').to.be.true;
+
+			await coordinator.rollback(stamp.id);
+
+			// Both trackers unwound to their pre-staging state. Pending queues are deliberately NOT
+			// asserted here: coordinator.rollback does not restore them today — tracked separately by
+			// bug-coordinator-rollback-leaves-pending-queue-populated.
+			expect(usersCollection.tracker.transforms).to.deep.equal(preUsers.transforms);
+			expect(postsCollection.tracker.transforms).to.deep.equal(prePosts.transforms);
+			expect(inner.getCommittedActions().size, 'nothing durably committed').to.equal(0);
 		});
 
 		it('re-driving commit() after a partial landing re-attempts only the failed collection (no double-apply on the winner)', async () => {

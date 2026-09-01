@@ -637,6 +637,27 @@ export class TransactionCoordinator {
 		// applyActions() throws if a referenced collection is not registered — the same
 		// "Collection not found" the engine's side-effecting apply used to surface. Convert
 		// it back into a failure result so execute() keeps its return contract.
+		// Pre-staging snapshot, one per DISTINCT participating collection, captured here so the
+		// partial-commit branch below can unwind the collections that did NOT land. The unwind
+		// point is "before execute() staged anything", not "before the log append": unlike
+		// commit(), a re-drive of execute() re-runs the engine and re-stages every collection it
+		// names, so leaving this attempt's actions in the pending queue would double-stage them.
+		// That is also exactly the state rollback() would have restored, which is why dropping
+		// the stamp on that branch loses nothing.
+		//
+		// snapshotPending() is synchronous and latch-free — keep it that way: NO await may sit
+		// between this loop and the applyActions() call below, or an interleaved stage would be
+		// captured inside the snapshot. Dedupe is first-appearance by collection id so an engine
+		// naming one collection in two batches yields the state before EITHER batch. An
+		// unregistered collection is skipped; applyActions throws on it moments later and the
+		// catch below converts that to a failure result, so the map is never read.
+		const preStageSnapshots = new Map<CollectionId, ReturnType<Collection<any>['snapshotPending']>>();
+		for (const { collectionId } of result.actions) {
+			if (preStageSnapshots.has(collectionId)) continue;
+			const collection = this.collections.get(collectionId);
+			if (collection) preStageSnapshots.set(collectionId, collection.snapshotPending());
+		}
+
 		try {
 			await this.applyActions(result.actions, transaction.stamp.id);
 		} catch (error) {
@@ -647,15 +668,21 @@ export class TransactionCoordinator {
 
 		// 2. Build a log entry per collection from the now-staged tracker transforms.
 		//
-		// NOTE: like commit(), this loop appends a log entry into each collection's
-		// tracker and these failure returns do NOT restore that state — so a partially
-		// applied engine transaction leaves appended-but-uncommitted entries in the
-		// trackers. This is deliberately NOT snapshot/restore-wrapped the way commit()
-		// is, because execute()'s asymmetry makes it lower risk: it is not the retryable
-		// session.commit() entry point (a failed execute() is not re-driven through the
-		// same loop), and its actions were tracked via applyActions() so rollback(stampId)
-		// CAN unwind them (unlike commit()'s directly-staged path). If execute() ever
-		// becomes retryable, mirror the commit() snapshot/restore fix here.
+		// NOTE: like commit(), this loop appends a log entry into each collection's tracker.
+		// What happens to that appended-but-uncommitted state on failure depends on whether
+		// anything landed durably:
+		//
+		//  - Failure BEFORE any durable commit (engine failure, log-append failure, or a
+		//    coordination failure with an empty committed set): the failure returns below do NOT
+		//    restore, so the appended entries survive in the trackers and `stampData` is kept.
+		//    That is deliberate — the actions were tracked via applyActions(), so rollback(stampId)
+		//    is a valid AND complete recovery there (it also replays the other in-flight stamps,
+		//    which a targeted restore cannot). Do not add blind restores to these paths.
+		//  - PARTIAL landing (some collections durably committed, others lost): the committed half
+		//    gets the success-path fold, the failed half is restored to the pre-staging snapshot
+		//    captured above, and `stampData` is dropped — because an all-or-nothing rollback() run
+		//    after a partial landing would rewind the collection that DID commit, re-staging
+		//    already-durable actions. Same disposition as commitOnceLatched. See that branch below.
 		const tApply = Date.now();
 		const collectionTransforms = new Map<CollectionId, Transforms>();
 		const criticalBlocks = new Map<CollectionId, BlockId>();
@@ -743,23 +770,38 @@ export class TransactionCoordinator {
 			if (!coordResult.success) {
 				log('execute:done trxId=%s engine=%dms apply=%dms coordinate=%dms success=false total=%dms', trxId, engineMs, applyMs, coordMs, Date.now() - t0);
 				// Stop lying to the caller about a partial commit: if some collections durably
-				// committed, surface that set. execute() is not snapshot/restore-wrapped (see the
-				// note above), but the committed subset must still get the full success-path local
-				// treatment (the same four steps as commitOnceLatched's partial-commit fold, in the
-				// same order — see the success fold below) so its trackers, read caches and pending
-				// queues aren't left mis-tracking already-durable state.
-				// Kept await-free for the same reason the success fold is.
+				// committed, surface that set. The committed subset gets the full success-path
+				// local treatment (the same four steps as commitOnceLatched's partial-commit fold,
+				// in the same order — see the success fold below) so its trackers, read caches and
+				// pending queues aren't left mis-tracking already-durable state; the failed subset
+				// is unwound to its pre-staging snapshot, and the stamp tracking is dropped so no
+				// unsafe all-or-nothing undo handle survives (rollback() would rewind the winner).
+				// Kept await-free for the same reason the success fold is — restorePending is
+				// synchronous and latch-free by contract, so it is safe inside this latched span.
 				const committed = coordResult.committedCollections ?? new Set<CollectionId>();
 				if (committed.size > 0) {
 					for (const collectionId of batches.keys()) {
 						const collection = this.collections.get(collectionId);
-						if (collection && committed.has(collectionId)) {
+						if (!collection) continue;
+						if (committed.has(collectionId)) {
 							const rev = collection.recordCommitted(transaction.id, pendedRevs.get(collectionId)!);
 							collection.applyCommittedToCache(collectionTransforms.get(collectionId)!, rev);
 							collection.tracker.reset();
 							collection.clearPendingActions();
+						} else {
+							// NOTE: blind overwrite of this collection's staged state — any OTHER
+							// stamp's actions staged on it between the pre-stage snapshot above and
+							// here are discarded. Same single-call-path assumption rollback()
+							// documents. It cannot be softened by replaying the other stamps here:
+							// replay goes through collection.act, which takes the same non-reentrant
+							// instance latch this span already holds.
+							const snapshot = preStageSnapshots.get(collectionId);
+							if (snapshot) collection.restorePending(snapshot);
 						}
 					}
+					// The undo handle is now unsafe: rollback() is all-or-nothing and would rewind
+					// the collections that DID durably commit. Drop it, matching commitOnceLatched.
+					this.stampData.delete(transaction.stamp.id);
 				}
 				return {
 					success: false,

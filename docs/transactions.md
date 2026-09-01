@@ -69,8 +69,23 @@ This document describes the architecture for multi-collection transactions in Op
 > cluster storage, and restores only the failed collections. It deliberately does
 > **not** uniformly roll back — doing so would re-stage the committed collections'
 > already-durable actions as still-pending, making memory disagree with storage.
-> `coordinator.execute()` mirrors this on its (non-retryable) path by surfacing
-> `committedCollections`/`failedCollections` on the `ExecutionResult`.
+> `coordinator.execute()` gives a partial landing the same local disposition on
+> its (non-retryable) path: it reports the partition as
+> `committedCollections`/`failedCollections` on the `ExecutionResult` instead of
+> throwing, gives the committed half the success-path fold, and restores the
+> failed half to the state it was in *before `execute()` staged anything*. It also
+> drops the transaction's rollback tracking, so `rollback(stampId)` after a
+> partial landing from `execute()` is a **no-op** rather than a corrupting rewind
+> of the collections that did commit — matching `commit()`.
+>
+> **Caller recovery differs between the two entry points.** Re-driving `commit()`
+> for the same transaction re-attempts only the failed collection: the winner's
+> pending queue was cleared by the success-path fold, so there is nothing left to
+> re-log. `execute()` does **not** have that property — it re-runs the engine and
+> re-stages every collection the engine names, so re-driving the *same*
+> transaction would apply the winner's actions a second time. An `execute()`
+> caller reconciling a partial landing must build a **new** transaction naming only
+> the failed collections.
 >
 > The Quereus adapter (`txn-bridge.ts`) special-cases this exactly like the legacy
 > `PartialCommitError`: on a `CoordinatorPartialCommitError` it tears down
