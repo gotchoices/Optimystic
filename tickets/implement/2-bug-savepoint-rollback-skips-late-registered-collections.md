@@ -143,3 +143,19 @@ bridge-level case is the actual invariant.
 - Add the bridge-level tests above.
 - Run `yarn build && yarn test` in `packages/quereus-plugin-optimystic` (foreground,
   no redirection — its specs import `../dist/`, so the build must precede the test).
+
+## Arm added by the review of `bug-coordinator-rollback-skips-late-registered-collections`
+
+Same site, one extra line of doc drift to fix while you are in
+`registerCollection`. Its doc-comment currently ends:
+
+> *"...always called as a table initializes, BEFORE any DML, so the collection is
+> present when the coordinator snapshots on the transaction's first action."*
+
+The coordinator half has since changed: it now re-captures newly registered
+collections at **every** `applyActions`, not only a stamp's first, so a collection
+registered mid-transaction is no longer invisible to `coordinator.rollback`. What
+still matters — and what the reworded comment should say — is that registration must
+precede any *staging* into that collection, because a capture taken after a stage
+records already-staged state as "before". Nothing was changed in this file by that
+review, to keep it out of this ticket's way.

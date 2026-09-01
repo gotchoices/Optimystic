@@ -840,10 +840,11 @@ export class TransactionBridge {
    * replicated Transaction record is compiled from) only AFTER awaiting
    * `coordinator.applyActions`. Firing it off unawaited raced the finalize at
    * commit — a statement could be silently absent from the record validator peers
-   * re-execute, diverging their operation set. The empty-actions apply also
-   * creates the coordinator's per-transaction rollback snapshot on its first call,
-   * so awaiting here (before the caller stages rows) makes that snapshot's timing
-   * deterministic — it captures pre-stage state, which session-mode rollback needs.
+   * re-execute, diverging their operation set. The empty-actions apply also captures
+   * the coordinator's rollback snapshots — on the first call for the stamp, and again
+   * for any collection registered since the previous call — so awaiting here (before
+   * the caller stages rows) makes that capture's timing deterministic: it records
+   * pre-stage state, which session-mode rollback needs.
    *
    * NOTE: statements recorded here are engine-REBUILT from evaluated row values
    * (see buildInsertStatement / buildUpdateStatement in @quereus/quereus), NOT

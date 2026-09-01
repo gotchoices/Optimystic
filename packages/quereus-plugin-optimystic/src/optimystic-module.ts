@@ -678,8 +678,8 @@ export class OptimysticVirtualTable extends VirtualTable {
 
       // Register the main + index collections with the bridge so a session-mode
       // coordinator shares the very trackers this vtab stages into (see
-      // registerCollections). Must happen before any DML so the coordinator's
-      // per-transaction snapshot includes them.
+      // registerCollections). Must happen before any DML so the coordinator
+      // captures their pre-stage state at the next applyActions barrier.
       this.registerCollections();
 
       // NOTE: this is one of two paths on which doInitialize runs TWICE for a table —
@@ -1566,9 +1566,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    * transforms at commit and revert them at rollback.
    *
    * Called as the table initializes — BEFORE any DML — so the collections are
-   * present in the coordinator's (shared) map when it snapshots on the
-   * transaction's first action. Distinct from {@link markDirtyTrees}, which runs
-   * per-DML and is therefore too late to seed that snapshot. Idempotent and
+   * present in the coordinator's (shared) map before anything stages into them.
+   * The coordinator re-captures newly registered collections at each applyActions,
+   * so registering late is recoverable; registering AFTER a stage is not, because
+   * the capture would then record already-staged state as "before". Idempotent and
    * mode-agnostic: the registry is a plain map the bridge maintains regardless of
    * whether session mode is ever wired up.
    */
@@ -2151,10 +2152,11 @@ export class OptimysticVirtualTable extends VirtualTable {
     // Await so recording lands in the session's statement array BEFORE any
     // collection.stage below (deterministic snapshot timing) and so a recording
     // failure aborts this DML instead of committing a record missing a statement.
-    // NOTE: this await must stay ABOVE every collection.stage in this method. The
-    // first addStatement per transaction is what makes coordinator.applyActions
-    // snapshot pre-stage tracker state for rollback; reordering a stage above it
-    // reopens the non-deterministic-snapshot race and breaks session-mode rollback.
+    // NOTE: this await must stay ABOVE every collection.stage in this method.
+    // addStatement is what drives coordinator.applyActions, which captures pre-stage
+    // tracker state for rollback — for every collection registered since the last
+    // call, not only on the transaction's first. Reordering a stage above it reopens
+    // the non-deterministic-snapshot race and breaks session-mode rollback.
     // NOTE: recording precedes every throw below (requirePreWriteRow, the
     // 'requires values'/'requires old key values' guards), so a DML that fails
     // leaves its statement in the session record. Harmless today because the
@@ -2559,11 +2561,12 @@ export class OptimysticVirtualTable extends VirtualTable {
     // the manager, opens a tree for any union-added sibling index (setSchema
     // alone would make staging iterate an index with no registered tree and
     // throw), and registers every index collection with the transaction bridge
-    // so a session-mode coordinator sees them. CREATE INDEX normally runs
-    // outside a DML transaction, so the coordinator picks the new collection up
-    // before the next transaction's snapshot. (An index created mid-transaction
-    // would miss that transaction's already-taken snapshot — a known,
-    // documented edge.)
+    // so a session-mode coordinator sees them. Registering mid-transaction is
+    // fine for rollback: the coordinator re-captures newly registered collections
+    // on every applyActions, not just the transaction's first. What it cannot
+    // rewind is anything staged into the new tree BEFORE that next applyActions —
+    // which is why backfillIndexTrees below flushes the trees it populates instead
+    // of leaving those entries staged for the enclosing transaction's commit.
     this.indexManager.registerIndexTree(indexSchema.name, indexTree);
     const attached = await this.reconcileMaintainedIndexes(writtenSchema, txnState?.transactor);
 

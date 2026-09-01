@@ -519,6 +519,33 @@ describe('TransactionCoordinator.rollback: collections registered mid-transactio
 		expectNoActionsFromStamp(collections, staged.stampId, 'instance-swap rollback');
 	});
 
+	it('rewinds the late collection on a SECOND rollback, from the snapshot the first one rebuilt', async () => {
+		const [a, b] = ['rb-late-twice-a', 'rb-late-twice-b'];
+		const transactor = new TestTransactor();
+		const { coordinator, collections } = await makeCoordinator(transactor, [a]);
+
+		const x = await stage(coordinator, [{ collectionId: a, value: 'x-a' }]);
+		const late = await registerLate(transactor, collections, b);
+		const y = await stage(coordinator, [{ collectionId: b, value: 'y-b' }]);
+		await stageMore(coordinator, x, [{ collectionId: b, value: 'x-b' }]);
+
+		// rollback(y) replays x, and rebuilds x's captures from the LIVE map — which now includes
+		// the late collection. The rebuild is the only thing that carries `b` into x's snapshot at
+		// its post-restore (clean) state; leave x's original DIRTY capture of `b` in place and the
+		// second rollback below restores y's already-discarded row.
+		await coordinator.rollback(y.stampId);
+		expect(queuedValues(late), 'survivor state after the first rollback').to.deep.equal(['x-b']);
+
+		await coordinator.rollback(x.stampId);
+
+		expect(queuedValues(late), 'the late collection is empty after both stamps rolled back')
+			.to.deep.equal([]);
+		expect(queuedValues(collections.get(a)!), 'the eagerly-captured collection is empty too')
+			.to.deep.equal([]);
+		expectNoActionsFromStamp(collections, x.stampId, 'second rollback');
+		expectNoActionsFromStamp(collections, y.stampId, 'second rollback');
+	});
+
 	it('leaves a late-registered, transaction-created collection readable and committable', async () => {
 		const [early, late] = ['rb-late-read-early', 'rb-late-read-new'];
 		const transactor = new TestTransactor();

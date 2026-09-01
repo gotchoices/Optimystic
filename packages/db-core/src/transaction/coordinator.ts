@@ -46,6 +46,10 @@ class PendRejectedError extends Error {
 	}
 }
 
+/** One collection's pre-staging state, plus its rank in the coordinator-global capture order.
+ * See {@link TransactionCoordinator.stampData} for why the rank is needed. */
+type CollectionCapture = { seq: number; snapshot: CollectionSnapshot<any> };
+
 /**
  * Coordinates multi-collection transactions.
  *
@@ -80,7 +84,7 @@ export class TransactionCoordinator {
 	private stampData = new Map<string, {
 		/** Replay ordering ONLY — assigned at the stamp's first applyActions. Not a capture time. */
 		order: number;
-		preSnapshot: Map<Collection<any>, { seq: number; snapshot: CollectionSnapshot<any> }>;
+		preSnapshot: Map<Collection<any>, CollectionCapture>;
 		actionBatches: CollectionActions[][];
 	}>();
 	private nextStampOrder = 0;
@@ -112,38 +116,48 @@ export class TransactionCoordinator {
 			this.stampData.set(stampId, data);
 		}
 
-		// Reconcile the live collection map on EVERY call, not only the first. `this.collections`
-		// is owned by the caller (the Quereus adapter's registry) and grows as tables open
-		// mid-transaction; a collection registered after the first applyActions would otherwise be
-		// visible to commit but absent from every snapshot, so rollback would never visit it and
-		// its staged state would survive into the next transaction's durable log entry.
-		//
-		// applyActions is the right reconcile point because it sits BEFORE any staging this call
-		// performs, and — in the Quereus path, where the vtab stages directly into the trees — the
-		// awaited empty-actions applyActions call exists precisely to be that pre-stage barrier
-		// (see optimystic-module.ts's "applyActions before any collection.stage" invariant).
-		//
-		// The `has` guard is load-bearing: registration is idempotent (the adapter re-registers
-		// already-open index trees), and re-capturing a collection this stamp already staged into
-		// would record a DIRTY state as "before", making rollback preserve the very actions it must
-		// discard.
-		//
-		// Keep this loop synchronous and await-free through to applyActionsRaw below, for the same
-		// reason execute()'s pre-stage snapshot loop is: an interleaved stage would land inside the
-		// snapshot.
-		// NOTE: this runs per applyActions call rather than once per transaction. Per-call cost for
-		// an already-captured collection is one Map.has; snapshotPending (which deep-copies the
-		// transforms) still runs at most once per collection per stamp. If the registered-collection
-		// count ever grows large enough for the scan itself to matter, track a per-stamp "collections
-		// map size at last reconcile" rather than dropping the reconcile.
-		for (const col of this.collections.values()) {
-			if (data.preSnapshot.has(col)) continue;
-			data.preSnapshot.set(col, { seq: this.nextCaptureSeq++, snapshot: col.snapshotPending() });
-		}
+		// Runs on EVERY call, and stays await-free through to applyActionsRaw — see the method doc.
+		this.captureUncaptured(data.preSnapshot);
 
 		data.actionBatches.push(actions);
 
 		await this.applyActionsRaw(actions, stampId);
+	}
+
+	/**
+	 * Capture the pre-staging state of every registered collection `into` does not already hold.
+	 *
+	 * Called on EVERY {@link applyActions}, not only a stamp's first. `this.collections` is owned
+	 * by the caller (the Quereus adapter's registry) and grows as tables open mid-transaction; a
+	 * collection registered after the stamp's first call would otherwise be visible to commit but
+	 * absent from every snapshot, so {@link rollback} would never visit it and its staged state
+	 * would survive into the next transaction's durable log entry.
+	 *
+	 * `applyActions` is the right capture point because it precedes any staging that call performs
+	 * — and on the Quereus path, where the vtab stages directly into the trees, the awaited
+	 * empty-actions applyActions call exists precisely to be that pre-stage barrier (see
+	 * optimystic-module.ts's "applyActions before any collection.stage" invariant).
+	 *
+	 * The already-captured guard is load-bearing: registration is idempotent (the adapter
+	 * re-registers already-open index trees), and re-capturing a collection this stamp already
+	 * staged into would record a DIRTY state as "before", making rollback preserve the very
+	 * actions it must discard.
+	 *
+	 * Synchronous and await-free BY CONTRACT, for the same reason execute()'s pre-stage snapshot
+	 * loop is: an interleaved stage would land inside a snapshot. Callers must not await between
+	 * this call and the staging it guards.
+	 *
+	 * NOTE: this runs per applyActions call rather than once per transaction. Per-call cost for an
+	 * already-captured collection is one Map.has; snapshotPending (which deep-copies the transforms)
+	 * still runs at most once per collection per stamp. Unmeasured. If the registered-collection
+	 * count ever grows large enough for the scan itself to matter, track a per-stamp "collections
+	 * map size at last capture" rather than dropping the reconcile.
+	 */
+	private captureUncaptured(into: Map<Collection<any>, CollectionCapture>): void {
+		for (const col of this.collections.values()) {
+			if (into.has(col)) continue;
+			into.set(col, { seq: this.nextCaptureSeq++, snapshot: col.snapshotPending() });
+		}
 	}
 
 	/**
@@ -571,8 +585,8 @@ export class TransactionCoordinator {
 		// own capture of `c` precedes that stamp's batches touching `c`, and the cross-stamp
 		// minimum is no later than any of them. So no batch replayed below was already folded into
 		// the snapshot it is replayed onto: no double-apply.
-		const earliest = new Map<Collection<any>, { seq: number; snapshot: CollectionSnapshot<any> }>();
-		const foldEarliest = (from: Map<Collection<any>, { seq: number; snapshot: CollectionSnapshot<any> }>) => {
+		const earliest = new Map<Collection<any>, CollectionCapture>();
+		const foldEarliest = (from: Map<Collection<any>, CollectionCapture>) => {
 			for (const [collection, entry] of from) {
 				const existing = earliest.get(collection);
 				if (!existing || entry.seq < existing.seq) earliest.set(collection, entry);
@@ -602,13 +616,13 @@ export class TransactionCoordinator {
 		for (const [replayStampId, replayData] of toReplay) {
 			// Update the snapshot to reflect current (post-replay) state. Both halves: a survivor
 			// replayed later in this loop must carry its pending queue forward too, or the next
-			// rollback restores a snapshot that is missing it. Fresh (still monotonic) seqs, so the
-			// rebuilt captures rank after everything captured before this rollback.
-			const newSnapshot = new Map<Collection<any>, { seq: number; snapshot: CollectionSnapshot<any> }>();
-			for (const col of this.collections.values()) {
-				newSnapshot.set(col, { seq: this.nextCaptureSeq++, snapshot: col.snapshotPending() });
-			}
-			replayData.preSnapshot = newSnapshot;
+			// rollback restores a snapshot that is missing it. Capturing into an EMPTY map re-captures
+			// everything at fresh (still monotonic) seqs, so the rebuilt captures rank after
+			// everything captured before this rollback — and detached instances no longer in the live
+			// map drop out, which is correct: nothing stages into or commits from them any more.
+			const rebuilt = new Map<Collection<any>, CollectionCapture>();
+			this.captureUncaptured(rebuilt);
+			replayData.preSnapshot = rebuilt;
 
 			for (const actionBatch of replayData.actionBatches) {
 				await this.applyActionsRaw(actionBatch, replayStampId);
