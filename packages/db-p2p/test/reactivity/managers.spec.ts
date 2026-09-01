@@ -36,6 +36,7 @@ import { ReactivityOriginationManager } from '../../src/reactivity/origination-m
 class FixedVerifier implements MembershipVerifier {
 	constructor(private readonly verdict: VerifyResult = 'verified') {}
 	cache(): void {}
+	forget(): void {}
 	verifyMessage(): Promise<VerifyResult> {
 		return Promise.resolve(this.verdict);
 	}

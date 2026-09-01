@@ -70,6 +70,14 @@ export interface MembershipVerifier {
 	/** Cache `cert` as the latest known membership for its coord. */
 	cache(cert: MembershipCertV1): void;
 	/**
+	 * Drop everything cached for `cohortCoord` (base64url form, as on a cert's `cohortCoord`): the cached
+	 * cert — including a *trusted* self-published one, i.e. the trust lock — and any stale-gap strike
+	 * count. The coord re-enters the cold-cache regime (interim TOFU on next sight). The host calls this
+	 * when it evicts the coord's engine, so a lock published by a since-evicted engine cannot strand the
+	 * coord's later-epoch messages. A no-op for a coord the verifier holds nothing for.
+	 */
+	forget(cohortCoord: string): void;
+	/**
 	 * Verify a threshold-signed message. `expectedCoord` is the cohort the `signers` should belong to;
 	 * `tier` selects the membership source. Performs the single refetch+retry internally.
 	 *
@@ -196,6 +204,15 @@ class CachingMembershipVerifier implements MembershipVerifier {
 		// The public cache feeds this node its OWN freshly-published cert — a node trusts a cert it itself
 		// published, so it is marked trusted and may anchor the next rotation in the attestation chain.
 		this.byCoord.set(cert.cohortCoord, { cert, trusted: true });
+	}
+
+	forget(cohortCoord: string): void {
+		// Drop the cached cert (the trust lock, when the entry was trusted) and the strike counter — the
+		// coord returns to the cold-cache / interim-TOFU regime. `lastFetchAt` is deliberately KEPT: it is
+		// anti-amplification state (the refetch rate-limit clock), not trust state, and keeping it means a
+		// forget cannot be used to reset a flood-exposed coord's refetch budget.
+		this.byCoord.delete(cohortCoord);
+		this.staleGapStrikes.delete(cohortCoord);
 	}
 
 	async verifyMessage(signers: readonly Uint8Array[], expectedCoord: RingCoord, tier: number, payload: Uint8Array, sig: Uint8Array, opts?: RefetchBound): Promise<VerifyResult> {

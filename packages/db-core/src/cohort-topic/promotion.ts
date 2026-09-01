@@ -171,6 +171,13 @@ export interface PromotionLifecycle {
 	 * `effectiveAt` ordering as {@link applyPromotionNotice} — a stale promotion can never un-demote.
 	 */
 	applyDemotionNotice(n: DemotionNoticeV1, now: number): void;
+	/**
+	 * True iff any topic carries adopted promotion/demotion state — a `promoted` flag or a
+	 * `lastEffectiveAt` high-water. Growth samples / `lowLoadSince` alone do not count: they are
+	 * reconstructed from the store on the next {@link onParticipantCountChange}. Read by the host's
+	 * engine-eviction ranking, which must not discard an engine holding a transition it cannot rebuild.
+	 */
+	hasAdoptedState(): boolean;
 }
 
 class CohortPromotionLifecycle implements PromotionLifecycle {
@@ -223,6 +230,17 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 
 	isPromoted(topicId: Uint8Array): boolean {
 		return this.states.get(bytesKey(topicId))?.promoted ?? false;
+	}
+
+	hasAdoptedState(): boolean {
+		// Adopted transition state only: a promoted flag or the lastEffectiveAt high-water. Growth samples /
+		// lowLoadSince are rebuilt from the store on the next onParticipantCountChange, so they never count.
+		for (const state of this.states.values()) {
+			if (state.promoted || state.lastEffectiveAt !== undefined) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	// --- remote apply (verified notices this member did not originate) ---

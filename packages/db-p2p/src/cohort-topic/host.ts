@@ -285,9 +285,10 @@ export interface CohortTopicAntiDosOptions {
 	 * Hard cap on the number of live per-coord cohort engines this node keeps. The served coord is a hash
 	 * over attacker-chosen `(treeTier, participantCoord, topicId)`, and an engine is created **before** the
 	 * per-coord anti-DoS gates run, so without this cap one peer spraying distinct coords forces unbounded
-	 * engine allocation. On overflow the registry evicts the least-recently-used **idle** engine (no records,
-	 * no cold-start forwarder) and tears it down; if every slot holds a live cohort it refuses the new coord.
-	 * Default {@link DEFAULT_COORD_ENGINES_MAX}.
+	 * engine allocation. On overflow the registry evicts the lowest-ranked, least-recently-used candidate
+	 * engine (see {@link EVICTION_RANK}: engines holding nothing go first, child-/promotion-holding engines
+	 * last) and tears it down; if every slot holds a pinned engine (records or a cold-start forwarder) it
+	 * refuses the new coord. Default {@link DEFAULT_COORD_ENGINES_MAX}.
 	 */
 	readonly coordEnginesMax?: number;
 	/**
@@ -336,6 +337,18 @@ export interface CohortTopicAntiDosOptions {
 }
 
 /**
+ * The classes of engine-owned state that evicting a {@link CoordEngine} destroys. **Exhaustive by
+ * contract**: every piece of state a `CoordEngine` owns and eviction would lose must appear here, and
+ * every consumer indexes it as a total `Record` ({@link EngineLiveness}, {@link EVICTION_RANK}), so
+ * adding a member without declaring it everywhere is a compile error — never a silently-evictable
+ * fifth piece of state.
+ */
+export type EngineStateKind = "records" | "forwarders" | "children" | "promotion";
+
+/** Which state classes an engine currently holds. Total — one boolean per kind, never partial. */
+export type EngineLiveness = Readonly<Record<EngineStateKind, boolean>>;
+
+/**
  * One cohort the node serves, bound to a FRET-routed coordinate. Owns the per-coord slice of cohort
  * state; the node-wide collaborators are injected (see {@link CoordEngineContext}).
  */
@@ -356,13 +369,19 @@ export interface CoordEngine {
 	 * the requester then re-anchors). See `cohort-topic-trust-anchor-rotation-production`.
 	 */
 	cohortIdentityAt(epoch: Uint8Array): readonly string[] | undefined;
-	/** True iff this engine currently holds any registration record (a cold probe leaves it empty). */
+	/**
+	 * Which classes of engine-owned state this engine currently holds — the single, exhaustive answer to
+	 * "does evicting this engine destroy state it cannot cheaply reconstruct?". The registry's eviction
+	 * ranking consumes it ({@link EVICTION_RANK}); {@link hasState} / {@link hasForwarders} are
+	 * derivations of it, so the two views can never disagree.
+	 */
+	liveness(): EngineLiveness;
+	/** True iff this engine currently holds any registration record (= `liveness().records`). */
 	hasState(): boolean;
 	/**
-	 * True iff this engine currently holds any cold-start forwarder (possibly `awaiting_parent`). Together
-	 * with {@link hasState}, this is the "engine is idle / safe to reclaim" predicate the coord-engine
-	 * registry's LRU eviction reads: an engine with neither a record nor a forwarder is a throwaway (an
-	 * attacker-sprayed cold coord), an engine with either holds genuine cohort state and is never evicted.
+	 * True iff this engine currently holds any cold-start forwarder (possibly `awaiting_parent`)
+	 * (= `liveness().forwarders`). Records and forwarders are the *pinned* state classes: an engine holding
+	 * either is never an eviction candidate at all (see {@link EVICTION_RANK}).
 	 */
 	hasForwarders(): boolean;
 	/** True iff this engine holds the record for `(topicId, participantId)` — the renewal lookup key. */
@@ -475,9 +494,11 @@ export interface CoordRegistry {
 	 *
 	 * **Capacity.** The registry is hard-capped (see {@link CohortTopicAntiDosOptions.coordEnginesMax}). A
 	 * lookup that returns an already-resident engine always succeeds. A *creation* over a full registry
-	 * first evicts the least-recently-used idle engine; when every slot holds a live cohort it throws
-	 * {@link CoordEngineRegistryFullError} rather than growing unbounded — callers on the register /
-	 * child-link / cold-sibling paths catch it and answer a clean capacity refusal.
+	 * first evicts the lowest-ranked, least-recently-used candidate engine ({@link EVICTION_RANK}: engines
+	 * holding nothing before child-/promotion-holding ones); when every slot holds a pinned engine (records
+	 * or a cold-start forwarder) it throws {@link CoordEngineRegistryFullError} rather than growing
+	 * unbounded — callers on the register / child-link / cold-sibling paths catch it and answer a clean
+	 * capacity refusal.
 	 */
 	forCoord(coord: RingCoord, treeTier: number, participantCoord: Uint8Array): CoordEngine;
 	/** The engine holding the record for `(topicId, participantId)`, or `undefined` (renewal dispatch). */
@@ -611,6 +632,17 @@ interface CoordEngineContext {
 	 * notices signed by its own cohort without a network refetch. Absent in unit composition.
 	 */
 	readonly onCertPublished?: (cert: MembershipCertV1) => void;
+	/**
+	 * Hook fired by the coord-engine registry AFTER it evicts (and closes) an engine, with the evicted
+	 * engine's served coord. The host wires it to `verifier.forget(coord)`: on a keyed node the
+	 * gossip-cadence driver calls {@link CoordEngine.pumpMembership} for EVERY engine — record-less ones
+	 * included — so any evicted engine may have published a cert and trust-locked its coord in the
+	 * verifier ({@link onCertPublished} → `verifier.cache`). Eviction therefore drops the lock
+	 * unconditionally (a cheap no-op for a coord that never published) rather than trying to track "did
+	 * this engine publish" — that would be another declare-yourself-or-be-forgotten trap. Absent in
+	 * key-less / unit composition.
+	 */
+	readonly onEngineEvicted?: (coord: RingCoord) => void;
 }
 
 /**
@@ -799,13 +831,16 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		// cohort it stops republishing and its anchor goes `"unknown"`, so it can be stranded distrusting the
 		// coord's later-epoch messages. The verifier self-heals via bounded re-TOFU on a demonstrated chain gap
 		// (`staleGapRecoveryStrikes`, see `db-core/.../membership/verifier.ts` + `docs/cohort-topic.md`
-		// §Bootstrapping trust). The *root-cause* fix is for the host to drop the lock here on demotion, but
-		// that needs an engine-reclaim / demotion signal the host does not emit today. `createCoordRegistry`
-		// now evicts, but only IDLE engines (no records → never published a cert), so it never strands a
-		// trust-lock and does not resolve this on its own (see the NOTE at `evictOneIdle`). When a demotion /
-		// cert-publishing-engine reclaim signal lands, add a `verifier.forget(coord)` / downgrade call on
-		// demotion and prefer it over (or alongside) the strike-counter heuristic.
+		// §Bootstrapping trust). Engine EVICTION drops the lock for the evicted coord via `onEngineEvicted`
+		// below — on a keyed node `pumpMembership` publishes for every engine (record-less ones included), so
+		// eviction cannot assume "no records → never published". Demotion, however, does NOT release the engine
+		// (a demoted engine keeps its records/forwarder and stays resident), so the demotion-side lock drop
+		// still has no signal to hang off; the strike-counter heuristic remains the recovery there.
 		onCertPublished: (cert: MembershipCertV1): void => verifier.cache(cert),
+		// Drop the verifier trust-lock for an evicted engine's coord — unconditional, because on a keyed node
+		// ANY engine (even one holding no records) may have published a cert via the gossip-cadence
+		// `pumpMembership` sweep. A no-op for a coord the verifier holds nothing for.
+		onEngineEvicted: (coord: RingCoord): void => verifier.forget(bytesToB64url(coord)),
 	};
 	const registry = createCoordRegistry(ctx, options.antiDos?.coordEnginesMax);
 
@@ -829,10 +864,11 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// link work — so a tier-`d > 0` frame for an unknown coord falls through to today's drop (the bus has no
 	// engine subscribed to it). See `docs/cohort-topic.md` §Cold-start instantiation.
 	//
-	// The registry is hard-capped with LRU eviction of idle engines (`createCoordRegistry`), so a
-	// gossip-instantiated cold sibling is no longer a permanent per-co-member-coord cost: an idle one is
-	// reclaimed under memory pressure like any other cold engine, and a creation over a full-of-live registry
-	// is refused (`CoordEngineRegistryFullError`) and dropped here rather than crashing the gossip handler.
+	// The registry is hard-capped with ranked LRU eviction (`createCoordRegistry`), so a
+	// gossip-instantiated cold sibling is no longer a permanent per-co-member-coord cost: one holding no
+	// state is reclaimed under memory pressure like any other cold engine, and a creation over a
+	// full-of-pinned registry is refused (`CoordEngineRegistryFullError`) and dropped here rather than
+	// crashing the gossip handler.
 	const maybeInstantiateColdSibling = (frame: Uint8Array): void => {
 		if (verifyGossip === undefined) {
 			return; // key-less / interim mode: no co-member gate, so never auto-instantiate
@@ -1347,7 +1383,7 @@ export const DEFAULT_COORD_ENGINES_MAX = 2048;
 
 /**
  * Thrown by {@link CoordRegistry.forCoord} when it must create a new engine but the registry is full of
- * **live** cohorts (every slot holds records or a cold-start forwarder, so nothing is idle-evictable).
+ * **pinned** engines (every slot holds records or a cold-start forwarder, so nothing is evictable).
  * Signals a capacity refusal, not a bug — the register / child-link / cold-sibling dispatch paths catch it
  * and answer a clean refusal (`unwilling_cohort` / `rejected` / drop) rather than letting it escape.
  */
@@ -1359,19 +1395,46 @@ export class CoordEngineRegistryFullError extends Error {
 }
 
 /**
+ * Eviction rank per {@link EngineStateKind}. `"pinned"` — an engine holding it is not an eviction
+ * candidate at all. A number — the engine IS a candidate, but only after every candidate whose rank is
+ * strictly lower; higher = evicted later. An engine holding nothing is rank 0: the genuinely-cold
+ * attacker-sprayed coord the cap exists for.
+ *
+ * `children` / `promotion` are deliberately NOT pinned. A child link is peer-supplied input —
+ * key-less-permissive mode records one without any signature check — so pinning on it would let any peer
+ * make all `coordEnginesMax` slots un-evictable and drive {@link CoordEngineRegistryFullError} for
+ * legitimate coords, reopening the exact spray vector the cap closes. Ranking keeps the hard guarantee
+ * (some engine is always evictable while any unpinned one exists) while making the realistic loss — a
+ * handful of real parent/promoted engines among ~2000 attacker-cold ones — the *last* to go instead of a
+ * pure LRU-age pick.
+ *
+ * EXHAUSTIVE: a new {@link EngineStateKind} with no rank here does not typecheck, and the spec's
+ * exhaustiveness guard cross-checks this table's keys against a `liveness()` result at runtime.
+ */
+export const EVICTION_RANK: Record<EngineStateKind, "pinned" | number> = {
+	records: "pinned",
+	forwarders: "pinned",
+	children: 1,
+	promotion: 1,
+};
+
+/**
  * Build the lazy `servedCoord → CoordEngine` registry over the shared collaborators, hard-capped at
- * `maxEngines` with least-recently-used eviction of **idle** engines.
+ * `maxEngines` with ranked least-recently-used eviction.
  *
  * The served coord is a hash over attacker-chosen `(treeTier, participantCoord, topicId)`, and `forCoord`
  * runs on the register hot path **before** the per-coord anti-DoS gates — so, uncapped, one peer spraying
  * distinct coords drives unbounded engine allocation (each engine owns a store, gossip bus, rate limiter,
  * replay guard, topic budget, …). The cap bounds that: on a creation over a full registry we evict the
- * least-recently-used **idle** engine (no records, no cold-start forwarder — a throwaway cold coord) and
- * tear it down; when every slot holds a live cohort we refuse the new coord ({@link CoordEngineRegistryFullError})
- * so a legitimate multi-cohort node keeps working while attacker-driven cold engines cannot pile up.
+ * `(rank, recency)`-least candidate engine ({@link EVICTION_RANK} over {@link CoordEngine.liveness}) and
+ * tear it down; when every slot holds a pinned engine (records or a forwarder) we refuse the new coord
+ * ({@link CoordEngineRegistryFullError}) so a legitimate multi-cohort node keeps working while
+ * attacker-driven cold engines cannot pile up.
  *
  * Recency is bumped on every lookup that hands back an engine (`forCoord` / `findByCoord` / `findHolder` /
- * `findServing`), so a hot cohort under load is never the eviction victim.
+ * `findServing`) and breaks ties *within* a rank, so a hot cohort under load loses only to a colder engine
+ * of the same rank — but rank is applied first, so even a hot rank-0 engine is evicted before any rank-1
+ * one (intended: a child-/promotion-holding engine survives a spray of freshly-touched cold coords).
  */
 function createCoordRegistry(ctx: CoordEngineContext, maxEngines: number = DEFAULT_COORD_ENGINES_MAX): CoordRegistry {
 	if (!Number.isInteger(maxEngines) || maxEngines <= 0) {
@@ -1384,28 +1447,49 @@ function createCoordRegistry(ctx: CoordEngineContext, maxEngines: number = DEFAU
 	let seq = 0;
 	const touch = (key: string): void => { recency.set(key, ++seq); };
 
-	// An engine is idle-evictable iff it holds no registration record AND no cold-start forwarder — i.e. no
-	// genuine cohort state to lose. A live engine (records or a forwarder) is never a throwaway.
-	const isIdle = (engine: CoordEngine): boolean => !engine.hasState() && !engine.hasForwarders();
+	// An engine's eviction rank: `undefined` when it holds any pinned state class (not a candidate at all),
+	// else the maximum numeric rank over the classes it holds (0 when it holds nothing). Iterates the rank
+	// table, whose keys the type system pins to exactly the EngineStateKind set the liveness record carries.
+	const evictionRank = (engine: CoordEngine): number | undefined => {
+		const liveness = engine.liveness();
+		let rank = 0;
+		for (const kind of Object.keys(EVICTION_RANK) as EngineStateKind[]) {
+			if (!liveness[kind]) {
+				continue;
+			}
+			const r = EVICTION_RANK[kind];
+			if (r === "pinned") {
+				return undefined;
+			}
+			if (r > rank) {
+				rank = r;
+			}
+		}
+		return rank;
+	};
 
-	// Evict the least-recently-used idle engine to free a slot; returns true iff one was freed. Tears the
-	// victim down (`close()` drops its gossip-bus subscription) so eviction does not leak the subscription.
+	// Evict the `(rank, recency)`-lexicographically-least candidate engine to free a slot; returns true iff
+	// one was freed. Tears the victim down (`close()` drops its gossip-bus subscription) so eviction does not
+	// leak the subscription, and fires `ctx.onEngineEvicted` so the host drops the coord's verifier
+	// trust-lock.
 	//
-	// NOTE (verifier trust-lock, cohort-topic-treetier-bound-engine-cap): only IDLE engines are evicted here,
-	// and an idle engine (`hasState() === false`) has never published a membership cert — so there is no
-	// verifier trust-lock (`onCertPublished` → `verifier.cache`, above) to drop for its coord. If this policy
-	// is ever widened to evict a cert-publishing engine, add a `verifier.forget(coord)` / downgrade here:
-	// otherwise the stale trust-lock strands the coord's later-epoch messages (the drop-the-lock tripwire the
-	// `onCertPublished` NOTE describes). Do NOT widen without that.
-	const evictOneIdle = (): boolean => {
+	// NOTE (verifier trust-lock): eviction can reclaim an engine that HAS published a membership cert — on a
+	// keyed node the gossip-cadence driver calls `pumpMembership` for every engine in `registry.all()`,
+	// record-less ones included, so "no records" never implied "never published". `onEngineEvicted` is
+	// therefore called for EVERY victim, unconditionally (the host wires it to `verifier.forget(coord)`, a
+	// cheap no-op for a coord that never published); do not try to track which engines published.
+	const evictOne = (): boolean => {
 		let victimKey: string | undefined;
+		let victimRank = Infinity;
 		let victimSeq = Infinity;
 		for (const [key, engine] of engines) {
-			if (!isIdle(engine)) {
-				continue; // live cohort (records) or mid-link cold-start forwarder — never evicted
+			const rank = evictionRank(engine);
+			if (rank === undefined) {
+				continue; // pinned: holds records or a mid-link cold-start forwarder — never evicted
 			}
 			const s = recency.get(key) ?? 0;
-			if (s < victimSeq) {
+			if (rank < victimRank || (rank === victimRank && s < victimSeq)) {
+				victimRank = rank;
 				victimSeq = s;
 				victimKey = key;
 			}
@@ -1413,9 +1497,11 @@ function createCoordRegistry(ctx: CoordEngineContext, maxEngines: number = DEFAU
 		if (victimKey === undefined) {
 			return false;
 		}
-		engines.get(victimKey)!.close();
+		const victim = engines.get(victimKey)!;
+		victim.close();
 		engines.delete(victimKey);
 		recency.delete(victimKey);
+		ctx.onEngineEvicted?.(victim.servedCoord);
 		return true;
 	};
 
@@ -1426,8 +1512,8 @@ function createCoordRegistry(ctx: CoordEngineContext, maxEngines: number = DEFAU
 			// share one engine rather than racing to construct a second.
 			let engine = engines.get(key);
 			if (engine === undefined) {
-				if (engines.size >= maxEngines && !evictOneIdle()) {
-					// Full of live cohorts — refuse rather than grow unbounded. Callers turn this into a clean
+				if (engines.size >= maxEngines && !evictOne()) {
+					// Full of pinned engines — refuse rather than grow unbounded. Callers turn this into a clean
 					// capacity reply/drop (see the paths listed on `CoordEngineRegistryFullError`).
 					log("cohort-topic: coord-engine registry full (max=%d) — refusing new coord %s", maxEngines, key);
 					throw new CoordEngineRegistryFullError(maxEngines);
@@ -2108,14 +2194,29 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		}
 	};
 
+	// The exhaustive engine-owned-state census the registry's eviction ranking consults. One entry per
+	// EngineStateKind — the total-Record type makes forgetting a new kind here a compile error. `children`
+	// derives from the *linked* set (tombstones excluded), so a parent whose every child demoted away is
+	// reclaimable again; `promotion` counts only adopted transition state (a `promoted` flag or a
+	// `lastEffectiveAt` high-water — growth samples alone are rebuilt from the store and do not count).
+	const liveness = (): EngineLiveness => ({
+		records: store.listAll().length > 0,
+		forwarders: coldStart.hasForwarders(),
+		children: childRegistry.linkedChildren().length > 0,
+		promotion: promotion.hasAdoptedState(),
+	});
+
 	return {
 		servedCoord,
 		treeTier,
 		engine,
 		cohort,
 		cohortIdentityAt: (epoch: Uint8Array): readonly string[] | undefined => rotationState.membersAt(bytesToB64url(epoch)),
-		hasState: (): boolean => store.listAll().length > 0,
-		hasForwarders: (): boolean => coldStart.hasForwarders(),
+		liveness,
+		// Derivations of `liveness()` — kept on the interface for existing callers/specs, but sourced from
+		// the same census so the two views cannot drift.
+		hasState: (): boolean => liveness().records,
+		hasForwarders: (): boolean => liveness().forwarders,
 		holds: (topicId: Uint8Array, participantId: Uint8Array): boolean =>
 			store.getByParticipant(topicId, participantId) !== undefined,
 		records: (topicId: Uint8Array): readonly RegistrationRecord[] => store.listByTopic(topicId),

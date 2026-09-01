@@ -288,6 +288,7 @@ function countingVerifier(inner: MembershipVerifier): { verifier: MembershipVeri
 	let calls = 0;
 	const verifier: MembershipVerifier = {
 		cache: (cert) => inner.cache(cert),
+		forget: (coord) => inner.forget(coord),
 		verifyMessage: (signers, coord, tier, payload, sig, opts) => {
 			calls++;
 			return inner.verifyMessage(signers, coord, tier, payload, sig, opts);
@@ -315,6 +316,7 @@ function coordRegistry(...targets: NoticeApplyTarget[]): CoordRegistry {
  * (the signature binding is covered separately by the coord-tamper test with real threshold signatures). */
 const trustAllVerifier: MembershipVerifier = {
 	cache: (): void => undefined,
+	forget: (): void => undefined,
 	verifyMessage: (): Promise<'verified'> => Promise.resolve('verified'),
 };
 
