@@ -1581,17 +1581,20 @@ interface ChildRegistry {
 	linkedChildren(): readonly LinkedChild[];
 }
 
-/** One linked child cohort, as re-advertised by the throttled child-set resync round. */
+/**
+ * One linked child cohort, as re-advertised by the throttled child-set resync round. The two byte fields
+ * alias the registry's own copies (never clone-on-read), so a consumer must treat them as read-only.
+ */
 interface LinkedChild {
-	topicId: Uint8Array;
-	childCohortCoord: Uint8Array;
-	effectiveAt: number;
+	readonly topicId: Uint8Array;
+	readonly childCohortCoord: Uint8Array;
+	readonly effectiveAt: number;
 }
 
 interface ChildEntry {
 	linked: boolean;
 	lastEffectiveAt: number;
-	/** The original bytes, retained (both are in hand at the single `apply` call site) so `linkedChildren` needs no key decode. */
+	/** The key's original bytes, retained on first insert (both are in hand in `apply`) so `linkedChildren` needs no key decode. */
 	topicId: Uint8Array;
 	childCohortCoord: Uint8Array;
 }
@@ -2032,10 +2035,12 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		// re-emit the *currently-linked* set at each child's original `effectiveAt`. Safe by construction: the
 		// receiving merge is last-writer-wins on `effectiveAt`, so a re-advertisement is a no-op on a member
 		// that already holds it and cannot resurrect a child released by a newer unlink. Queued through
-		// `pending` (not straight into the frame) so a same-round unlink at a newer `effectiveAt` supersedes it;
-		// sourcing from the registry rather than the queue means an unlinked child is never re-advertised, so
-		// the equal-`effectiveAt` case in that collapse is unreachable. Bounded to one extra frame per engine
-		// per heartbeat, and the round is deliberately non-idle — the frame is the carrier.
+		// `pending` (not straight into the frame) so a same-round *local* link for the same child collapses to
+		// one ref instead of two (`queueChild` is last-writer-wins per `(topic, child)`). Sourcing from the
+		// registry rather than the queue is what makes the unlink direction safe: an already-released child is
+		// simply absent from `linkedChildren()`, and nothing between here and `drain()` awaits, so a
+		// re-advertisement can never race a same-round unlink. Bounded to one extra frame per engine per
+		// heartbeat, and the round is deliberately non-idle — the frame is the carrier.
 		// NOTE: this heals a missed *link*, never a missed *unlink* — absence is not advertised, so a member
 		// that dropped an unlink frame over-counts until it hears another delta for that child. Both consumers
 		// fail conservatively there (demotion stays blocked; a seeker sweeps a no-longer-promoted tier —

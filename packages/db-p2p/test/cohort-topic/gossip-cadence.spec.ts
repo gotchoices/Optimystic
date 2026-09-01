@@ -825,6 +825,46 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 
 		await a.host.stop();
 	});
+
+	it('a gossip interval longer than the heartbeat makes every round a resync round', async () => {
+		// The resync throttle is wall-clock (`now - lastChildReadvertAt >= willingnessHeartbeatMs`), not a
+		// round counter, so it never *lengthens* convergence past one round — but a node configured with
+		// `gossipIntervalMs > willingnessHeartbeatMs` re-advertises on EVERY round. That is more traffic, not
+		// a correctness problem; pin it so the coupling between the two knobs stays deliberate.
+		const { a, coord0 } = await twoNodeCohort();
+		const e = a.host.registry.forCoord(coord0, 0 as Tier, a.member.bytes);
+		e.recordChild(TOPIC, childCoord(9), 1_000);
+
+		for (const t of [1_000, 41_000, 81_000, 121_000]) {
+			const g = await e.gossipRound(t);
+			expect(g?.childLinks?.length, `round at ${t} (40s apart, past the 30s heartbeat) re-advertises`).to.equal(1);
+		}
+
+		await a.host.stop();
+	});
+
+	it('a key-less (verify-only) engine still re-advertises its linked child set', async () => {
+		// The resync path adds no `canPublish` gate: a node running without a private key cannot threshold-sign
+		// or originate promotions, but it does hold a child registry and must still tell the cohort about it —
+		// otherwise a key-less parent member silently stops carrying the child set it holds.
+		const key = await generateKeyPair('Ed25519');
+		const peerId = peerIdFromPrivateKey(key);
+		const coord0 = addressing.coord0(TOPIC);
+		const coordKey = bytesToB64url(coord0);
+		const cohortFor = (coord: RingCoord): string[] => (bytesToB64url(coord) === coordKey ? [peerId.toString()] : []);
+		const host = await createCohortTopicHost(makeFakeNode(peerId) as never, makeFakeFret(cohortFor) as never, { wantK: 1, minSigs: 1, gossipIntervalMs: 3_600_000 });
+		const e = host.registry.forCoord(coord0, 0 as Tier, peerIdToBytes(peerId));
+		e.recordChild(TOPIC, childCoord(9), 1_000);
+
+		const gFirst = await e.gossipRound(1_500);
+		expect(gFirst?.childLinks?.length, 'the key-less engine drains its own link').to.equal(1);
+		expect(gFirst?.signature, 'and the frame is unsigned — there is no key to sign it').to.equal('');
+		const gResync = await e.gossipRound(31_501);
+		expect(gResync?.childLinks?.length, 'and re-advertises it on the next heartbeat boundary').to.equal(1);
+		expect(gResync?.childLinks?.[0]?.effectiveAt, 'at the original effectiveAt').to.equal(1_000);
+
+		await host.stop();
+	});
 });
 
 describe('cohort-topic: gossip driver timer lifecycle', () => {

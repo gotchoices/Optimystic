@@ -1677,7 +1677,7 @@ interface MembershipCertV1 {
 | `ttl` | 90 s | Default registration TTL |
 | `ping_interval` | 30 s | Participant ping cadence (`ttl / 3`) |
 | `T_membership_refresh` | 5 min | Default refresh interval for membership certs |
-| `T_willingness_heartbeat` | 30 s | Slow re-broadcast interval for an idle-but-willing engine's willingness heartbeat (§Cold-start instantiation). First idle round emits immediately; a record-carrying round resets the clock. Cost/latency tradeoff: shorter converges a cold cohort faster but re-broadcasts willingness for every idle willing cohort more often. |
+| `T_willingness_heartbeat` | 30 s | Slow re-broadcast interval, shared by **two** periodic re-advertisements. (1) An idle-but-willing engine's willingness heartbeat (§Cold-start instantiation): first idle round emits immediately; a record-carrying round resets the clock. (2) A parent engine's child-set resync (§Cohort gossip): the linked child set is re-advertised at most once per interval, which bounds how long a rotated-in parent member reads `childCohortCount == 0`. Cost/latency tradeoff: shorter converges a cold cohort *and* a rotated-in parent faster, but re-broadcasts more often — for every idle willing cohort and for every parent with children. Setting it longer than `gossip_round` is required for the throttle to bite at all; shorter than a round and every round re-advertises. |
 | `d_max_cap` | 60 | Hard cap on walk-toward-root start tier |
 | `confidence_min` | 0.3 | Below this `n_est` confidence, cap `d_max` at ⌊d_max_cap/2⌋ (upper bound) |
 | `topics_max` | 2048 | Max topics with forwarder state per cohort |
