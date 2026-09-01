@@ -126,9 +126,9 @@ class Lease implements ReadCacheLease {
  * unwrapped instance handed to two consumers). Identity is one-directional — equal proves
  * sameness, unequal proves nothing — so backends whose identity under-approximates (path
  * aliases, two handles over one database; each backend's `NOTE:` lists its gaps) can still end
- * up with two caches; and a host that builds its own `CachedRawStorage` never enters the
- * registry, so a second consumer wrapping a fresh instance over that store still gets a second
- * cache. What remains of Invariant 5 (`packages/db-p2p/docs/storage.md`) is the cross-process
+ * up with two caches; and a host that builds its own cache — in either construction — never
+ * enters the registry, so a second consumer wrapping a fresh instance over that store still gets
+ * a second cache. What remains of Invariant 5 (`packages/db-p2p/docs/storage.md`) is the cross-process
  * case: the filesystem driver takes no lock, and a second process's writes bypass this cache.
  *
  * On a dedupe hit the FIRST caller's `label` and `pool` stick: `pool.stats()` shows whoever

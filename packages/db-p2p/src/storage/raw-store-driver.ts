@@ -136,4 +136,13 @@ export interface RawStoreDriver {
 	approximateBytesUsed?(): Promise<number>;
 	/** Optional — release the underlying handle. */
 	close?(): Promise<void>;
+
+	// NOTE: forwarding each optional above is a WRITTEN contract for wrapper drivers, not an
+	// enforced one — a wrapper that forgets one silently reports the composition as less capable
+	// than it is, and for `readCached` that means a seam attaches a redundant second cache. Fine
+	// today: the only two wrapper drivers in the tree are `CachedStoreDriver` and
+	// `RawStorageDriverAdapter`, both forward deliberately (`CachedStoreDriver` withholds `close`
+	// on purpose, and says why at its site), and each has direct tests. If a THIRD wrapper driver
+	// appears, replace the per-wrapper tests with one shared conformance check that asserts
+	// forwarding of each optional, with an explicit per-wrapper exception list.
 }

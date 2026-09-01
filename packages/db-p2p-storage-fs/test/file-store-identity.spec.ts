@@ -1,8 +1,10 @@
 import assert from 'node:assert';
 import * as os from 'os';
 import * as path from 'path';
-import { FileRawStorage } from '../src/index.js';
-import { CachedRawStorage, SharedCachePool } from '@optimystic/db-p2p';
+import { FileRawStorage, FileStoreDriver } from '../src/index.js';
+import {
+	CachedRawStorage, CachedStoreDriver, KvRawStorage, SharedCachePool, withReadCache,
+} from '@optimystic/db-p2p';
 
 // FileStoreDriver names the RESOLVED directory it is backed by, so two storages over one
 // directory — however spelled — compare equal, and two over different directories do not.
@@ -102,6 +104,62 @@ describe('FileRawStorage store identity', () => {
 			const a = new CachedRawStorage(new FileRawStorage(path.join(base, 'a')), pool);
 			const b = new CachedRawStorage(new FileRawStorage(path.join(base, 'b')), pool);
 			assert.notStrictEqual(a.getStoreIdentity?.(), b.getStoreIdentity?.());
+		});
+	});
+
+	// The construction `docs/storage.md` RECOMMENDS whenever the backend's driver is reachable —
+	// which for this package it is, since `FileStoreDriver` is exported. db-p2p pins the seam's
+	// behaviour over memory drivers and a synthetic-identity proxy; these pin the same behaviour
+	// over a real filesystem driver reporting a real identity, which is the composition an
+	// embedding host actually builds and hands to `rawStorageFactory` / a `RawStorageProvider`.
+	describe('through a driver-level cache (KvRawStorage over CachedStoreDriver(FileStoreDriver))', () => {
+		const driverLevel = (dir: string, pool: SharedCachePool, label?: string) =>
+			new KvRawStorage(new CachedStoreDriver(new FileStoreDriver(dir), pool, label));
+
+		it('reports readCached, and the file identity, up through the kernel', () => {
+			const dir = path.join(base, 'drv-level');
+			const storage = driverLevel(dir, new SharedCachePool(), 'host-built');
+			assert.strictEqual(storage.readCached, true);
+			assert.strictEqual(storage.getStoreIdentity?.(), new FileRawStorage(dir).getStoreIdentity());
+		});
+
+		it('passes through withReadCache unchanged, with no lease and no second registration', () => {
+			// The reported bug, over the real backend: the seam used to check
+			// `instanceof CachedRawStorage`, miss this shape, and try to attach a second cache —
+			// which `SharedCachePool.registerStore` then refused, because the directory's identity
+			// was already claimed by the host's own cache. The host's node failed to start.
+			const pool = new SharedCachePool();
+			const hostBuilt = driverLevel(path.join(base, 'drv-level-seam'), pool, 'host-built');
+
+			const resolved = withReadCache(hostBuilt, 'seam', pool);
+			assert.strictEqual(resolved.storage, hostBuilt, 'passed straight through');
+			assert.strictEqual(resolved.lease, undefined, 'a pass-through mints no lease');
+			assert.deepStrictEqual(pool.stats().stores.map(s => s.label), ['host-built']);
+		});
+
+		it('refuses a stack over it, naming redundancy rather than divergence', () => {
+			// Both guards are reachable here, and the redundant-wrap one must win: the directory's
+			// identity IS claimed, so the pool would otherwise report a divergence that cannot
+			// happen between two stacked caches.
+			const pool = new SharedCachePool();
+			const dir = path.join(base, 'drv-level-stack');
+			const hostBuilt = driverLevel(dir, pool, 'host-built');
+
+			assert.throws(() => new CachedRawStorage(hostBuilt, pool, 'stacked'), /already read-cached/);
+			assert.deepStrictEqual(pool.stats().stores.map(s => s.label), ['host-built']);
+		});
+
+		it('still refuses a genuinely SIDE-BY-SIDE cache over the same directory', () => {
+			// The other failure, unchanged: a second consumer wrapping its own FileRawStorage over
+			// the directory the host already cached is two independent write-through views.
+			const pool = new SharedCachePool();
+			const dir = path.join(base, 'drv-level-sidebyside');
+			driverLevel(dir, pool, 'host-built');
+
+			assert.throws(
+				() => withReadCache(new FileRawStorage(dir), 'second-consumer', pool),
+				/never converge/
+			);
 		});
 	});
 });

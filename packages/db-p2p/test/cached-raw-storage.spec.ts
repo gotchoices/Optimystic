@@ -11,7 +11,7 @@ import { SharedCachePool } from '../src/storage/shared-cache-pool.js';
 import { withReadCache } from '../src/storage/with-read-cache.js';
 import type { StoreIdentity } from '../src/storage/store-identity.js';
 import {
-	CountingStoreDriver, READ_METHODS, WRITE_METHODS,
+	CountingStoreDriver, identifiedDriver, READ_METHODS, WRITE_METHODS,
 	makeBlock, collect, runColdStartWorkload,
 } from './support/cache-test-helpers.js';
 
@@ -391,24 +391,10 @@ describe('CachedStoreDriver coherence', () => {
 // --- The one-cache-per-backing-store guard, through the real construction path ---
 
 describe('CachedRawStorage over an already-cached backing store', () => {
-	/**
-	 * A driver reporting a fixed store identity — the shape `FileRawStorage` presents (two
-	 * instances over one directory report ONE identity) without touching a disk. Each call
-	 * forwards to its own memory driver, so the two storages below are genuinely two objects
-	 * that merely CLAIM to be one store, which is exactly the bad wiring under test.
-	 */
-	function identified(inner: RawStoreDriver, identity: StoreIdentity): RawStoreDriver {
-		return new Proxy(inner, {
-			get(target, prop, _receiver) {
-				if (prop === 'storeIdentity') return () => identity;
-				const value = Reflect.get(target, prop, target);
-				return typeof value === 'function' ? value.bind(target) : value;
-			},
-		});
-	}
-
+	// Each storage below gets its OWN memory driver, so the two are genuinely two objects that
+	// merely CLAIM to be one store — exactly the bad wiring under test.
 	const storageOver = (identity: StoreIdentity) =>
-		new KvRawStorage(identified(new MemoryStoreDriver(), identity));
+		new KvRawStorage(identifiedDriver(new MemoryStoreDriver(), identity));
 
 	it('refuses the second construction, and accepts it once the first is disposed', async () => {
 		// The hole `withReadCache`'s dedupe cannot close: a host hand-builds a cache over a store,
@@ -493,19 +479,9 @@ describe('CachedRawStorage over an already-cached backing store', () => {
 // check lives in its constructor, ahead of registration.
 
 describe('CachedStoreDriver over an already-cached inner driver', () => {
-	function identified(inner: RawStoreDriver, identity: StoreIdentity): RawStoreDriver {
-		return new Proxy(inner, {
-			get(target, prop, _receiver) {
-				if (prop === 'storeIdentity') return () => identity;
-				const value = Reflect.get(target, prop, target);
-				return typeof value === 'function' ? value.bind(target) : value;
-			},
-		});
-	}
-
 	it('refuses a stacked wrap over an identity-bearing cached driver, naming redundancy not divergence', () => {
 		const pool = new SharedCachePool();
-		const inner = new CachedStoreDriver(identified(new MemoryStoreDriver(), 'test:stacked-id'), pool, 'inner');
+		const inner = new CachedStoreDriver(identifiedDriver(new MemoryStoreDriver(), 'test:stacked-id'), pool, 'inner');
 
 		expect(() => new CachedStoreDriver(inner, pool, 'outer'))
 			.to.throw(/already read-cached/);

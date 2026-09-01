@@ -4,13 +4,11 @@ import { withReadCache } from '../src/storage/with-read-cache.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { KvRawStorage } from '../src/storage/kv-raw-storage.js';
 import { MemoryStoreDriver } from '../src/storage/memory-store-driver.js';
-import type { RawStoreDriver } from '../src/storage/raw-store-driver.js';
-import type { StoreIdentity } from '../src/storage/store-identity.js';
 import type { IRawStorage } from '../src/storage/i-raw-storage.js';
 import { CachedRawStorage } from '../src/storage/cached-raw-storage.js';
 import { CachedStoreDriver } from '../src/storage/cached-store-driver.js';
 import { SharedCachePool } from '../src/storage/shared-cache-pool.js';
-import { CountingStoreDriver, READ_METHODS, runColdStartWorkload } from './support/cache-test-helpers.js';
+import { CountingStoreDriver, identifiedDriver, READ_METHODS, runColdStartWorkload } from './support/cache-test-helpers.js';
 
 /**
  * `withReadCache` is the ONE helper both production composition seams go through
@@ -28,22 +26,6 @@ describe('withReadCache (composition-seam helper)', () => {
 	const blockId = 'blk' as BlockId;
 	const meta = (rev: number): Parameters<IRawStorage['saveMetadata']>[1] =>
 		({ ranges: [[1]], latest: { rev, actionId: `a${rev}` as ActionId } });
-
-	/**
-	 * A driver that reports a fixed store identity — the shape `FileRawStorage` presents (two
-	 * instances over one directory report one identity) without touching a disk. Every other
-	 * call forwards to `inner`, so several identified drivers over one memory driver ARE one
-	 * backing store.
-	 */
-	function identified(inner: RawStoreDriver, identity: StoreIdentity): RawStoreDriver {
-		return new Proxy(inner, {
-			get(target, prop, _receiver) {
-				if (prop === 'storeIdentity') return () => identity;
-				const value = Reflect.get(target, prop, target);
-				return typeof value === 'function' ? value.bind(target) : value;
-			},
-		});
-	}
 
 	it('returns a MemoryRawStorage unchanged, with no lease (already in memory — nothing to save)', () => {
 		const memory = new MemoryRawStorage();
@@ -123,8 +105,8 @@ describe('withReadCache (composition-seam helper)', () => {
 		// drivers report one identity over one backing driver.
 		const pool = new SharedCachePool();
 		const backing = new MemoryStoreDriver();
-		const storageA = new KvRawStorage(identified(backing, 'spec:same-store'));
-		const storageB = new KvRawStorage(identified(backing, 'spec:same-store'));
+		const storageA = new KvRawStorage(identifiedDriver(backing, 'spec:same-store'));
+		const storageB = new KvRawStorage(identifiedDriver(backing, 'spec:same-store'));
 		expect(storageA, 'distinct objects').to.not.equal(storageB);
 		expect(storageA.getStoreIdentity!()).to.equal(storageB.getStoreIdentity!());
 
@@ -154,14 +136,14 @@ describe('withReadCache (composition-seam helper)', () => {
 		const identity = 'spec:retired-identity';
 		const counting = new CountingStoreDriver(backing);
 
-		const first = withReadCache(new KvRawStorage(identified(counting, identity)), 'first', pool);
+		const first = withReadCache(new KvRawStorage(identifiedDriver(counting, identity)), 'first', pool);
 		await first.storage.saveMetadata(blockId, meta(1));
 		await first.lease!.release();
 		expect(pool.stats().stores, 'the identity entry was retired, not just emptied').to.have.length(0);
 
 		// A DIFFERENT storage object under the same identity: a stale byIdentity entry would hand
 		// back the dead cache instead of building one.
-		const reopened = withReadCache(new KvRawStorage(identified(counting, identity)), 'reopened', pool);
+		const reopened = withReadCache(new KvRawStorage(identifiedDriver(counting, identity)), 'reopened', pool);
 		expect(reopened.storage, 'a fresh cache, not the retired one').to.not.equal(first.storage);
 		expect(pool.stats().stores.map(s => s.label)).to.deep.equal(['reopened']);
 		const readsBefore = counting.count('getMetadata');
@@ -179,8 +161,8 @@ describe('withReadCache (composition-seam helper)', () => {
 		// The dedupe must not over-merge: several db-p2p specs build two caches over two memory
 		// drivers and compare them, and two stores that merely LOOK alike must stay apart.
 		const pool = new SharedCachePool();
-		const byIdentityA = withReadCache(new KvRawStorage(identified(new MemoryStoreDriver(), 'spec:x')), 'x', pool);
-		const byIdentityB = withReadCache(new KvRawStorage(identified(new MemoryStoreDriver(), 'spec:y')), 'y', pool);
+		const byIdentityA = withReadCache(new KvRawStorage(identifiedDriver(new MemoryStoreDriver(), 'spec:x')), 'x', pool);
+		const byIdentityB = withReadCache(new KvRawStorage(identifiedDriver(new MemoryStoreDriver(), 'spec:y')), 'y', pool);
 		expect(byIdentityA.storage).to.not.equal(byIdentityB.storage);
 
 		const objectA = withReadCache(new KvRawStorage(new MemoryStoreDriver()), 'obj-a', pool);
@@ -349,7 +331,7 @@ describe('withReadCache (composition-seam helper)', () => {
 		// views never converging and a suggestion to call the very helper that was throwing.
 		const pool = new SharedCachePool();
 		const hostBuilt = new KvRawStorage(
-			new CachedStoreDriver(identified(new MemoryStoreDriver(), 'spec:drv-level'), pool, 'host-built'));
+			new CachedStoreDriver(identifiedDriver(new MemoryStoreDriver(), 'spec:drv-level'), pool, 'host-built'));
 
 		const resolved = withReadCache(hostBuilt, 'seam', pool);
 		expect(resolved.storage, 'passed straight through').to.equal(hostBuilt);

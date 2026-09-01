@@ -476,10 +476,10 @@ Semantics worth knowing:
   construct.
 
   **Lease obligations — a seam releases `lease`, never disposes `storage`.**
-  "The result is a `CachedRawStorage`" and "the result is mine to tear down" are
+  "The result is read-cached" and "the result is mine to tear down" are
   different questions: the returned cache may be serving other consumers, and
   the pass-through branch returns a cache the HOST built. A seam that disposed
-  on `instanceof` alone would clear and unregister the shared store the moment
+  on the shape of the result alone would clear and unregister the shared store the moment
   its first consumer departed — the pool keeps charging that store's entries
   while dropping its row from `stats()`, leaving live occupancy unattributable
   for the rest of the process. So each caller gets a `ReadCacheLease` and
@@ -489,8 +489,8 @@ Semantics worth knowing:
   leases it holds and is called by `shutdown()` and surfaced to hosts as
   `plugin.dispose()`; a libp2p node releases automatically, via a stop wrapper
   installed at construction that runs in a `finally` after the rest of the stop
-  chain. A host-built `CachedRawStorage` never enters the registry and is never
-  released by a seam.
+  chain. A host-built cache — in either construction — never enters the registry
+  and is never released by a seam.
 
   *Lifetime now spans consumers.* `plugin.dispose()` is opt-in, and `db.close()`
   does not reach it, so a host that never releases keeps the store's cache

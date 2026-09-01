@@ -227,6 +227,11 @@ export class SharedCachePool {
 	 * a log line is not a way to notice. A registration with no identity is unaffected: it
 	 * registers exactly as it always did.
 	 *
+	 * This catches the SIDE-BY-SIDE pair only. A cache stacked over an already-cached inner is a
+	 * different (merely redundant) failure and is refused earlier, in `CachedStoreDriver`'s
+	 * constructor, so it never reaches here with the wrong story — see the two `readCached`
+	 * guards in `packages/db-p2p/docs/storage.md`.
+	 *
 	 * The check runs BEFORE any mutation, so a refused registration leaves the pool exactly as it
 	 * was — no store row, no consumed id, no claim.
 	 *
@@ -239,7 +244,7 @@ export class SharedCachePool {
 				`two caches over one backing store never converge: ${JSON.stringify(identity)} is already `
 				+ `cached (label ${JSON.stringify(claimed.label ?? null)}); this registration `
 				+ `(label ${JSON.stringify(label ?? null)}) would be a second, independent view. Share one `
-				+ `CachedRawStorage — withReadCache does this for you — or dispose the first.`
+				+ `read cache — withReadCache does this for you — or dispose the first.`
 			);
 		}
 		const handle = new CacheStoreHandle(`s${++this.storeCounter}`, label, identity);

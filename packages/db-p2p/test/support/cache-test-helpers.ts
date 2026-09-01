@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import type { BlockId, ActionId, IBlock, Transforms } from '@optimystic/db-core';
 import type { RawStoreDriver } from '../../src/storage/raw-store-driver.js';
 import type { IRawStorage } from '../../src/storage/i-raw-storage.js';
+import type { StoreIdentity } from '../../src/storage/store-identity.js';
 import { StorageRepo } from '../../src/storage/storage-repo.js';
 import { BlockStorage } from '../../src/storage/block-storage.js';
 
@@ -14,6 +15,27 @@ export async function collect<T>(iter: AsyncIterable<T>): Promise<T[]> {
 	const out: T[] = [];
 	for await (const item of iter) out.push(item);
 	return out;
+}
+
+/**
+ * A driver that reports a fixed store identity — the shape `FileRawStorage` presents (two
+ * instances over one directory report ONE identity) without touching a disk. Every other member
+ * forwards to `inner`, including `readCached`, so a composition built over this proxy reports its
+ * true capabilities and only its identity is synthetic.
+ *
+ * Two uses, and the difference matters when reading a failing test: several of these over ONE
+ * inner driver are one backing store with several fronts; several over their OWN inner drivers
+ * are genuinely distinct stores that merely CLAIM to be one — the bad wiring the identity guard
+ * exists to refuse.
+ */
+export function identifiedDriver(inner: RawStoreDriver, identity: StoreIdentity): RawStoreDriver {
+	return new Proxy(inner, {
+		get(target, prop, _receiver) {
+			if (prop === 'storeIdentity') return () => identity;
+			const value = Reflect.get(target, prop, target);
+			return typeof value === 'function' ? value.bind(target) : value;
+		},
+	});
 }
 
 /** Counts every driver call by method name, then delegates. Placed UNDER the cache to
