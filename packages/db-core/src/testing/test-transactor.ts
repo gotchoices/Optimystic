@@ -496,10 +496,10 @@ export class FlakyCommitTransactor extends DelegatingTransactor {
 
 /**
  * Commits durably on the inner {@link TestTransactor}, then reports a stale failure anyway —
- * the exact observable shape of `NetworkTransactor.commit`'s TORN ACTION: the collection header
- * and log tail are committed BEFORE the sweep of the remaining blocks, so a later sweep block
- * coming back as a confirmed conflict returns a stale failure over an action whose log entry is
- * already durable.
+ * the exact observable shape of `NetworkTransactor.commit`'s TORN ACTION: the collection's log
+ * tail is committed BEFORE the sweep of the remaining blocks, so a later sweep block coming back
+ * as a confirmed conflict returns a stale failure over an action whose log entry is already
+ * durable.
  *
  * Safe against the inner transactor's bookkeeping because `TransactorSource.transact` cancels
  * the pend on the reported failure and {@link TestTransactor.cancel} only deletes PENDING records

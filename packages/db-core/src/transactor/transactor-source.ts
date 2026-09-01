@@ -131,7 +131,7 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	 * @param headerId - The Id of the collection's header block. Forwarded to the commit only when the header is a
 	 * fresh insert, so the collection-identifying metadata (see `CommitRequest.headerId`) is present on the commit
 	 * that creates it.
-	 * @param tailId - The Id of the collection's log tail block.  If specified, this block's transform is performed next
+	 * @param tailId - The Id of the collection's log tail block.  This block's transform is committed FIRST
 	 * (prior to the rest of the block operations), to resolve the "winner" of a race to commit to the collection.
 	 * @param priority - Aged, advisory retry priority (default 0). Rides on the pend so a repeatedly-losing
 	 * single-collection sync out-ranks fresh rivals in a concurrent race (`resolveRace`); fairness-only, never

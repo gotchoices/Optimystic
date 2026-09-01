@@ -77,7 +77,11 @@ const fakeDigest = (id: string, baseRev?: number) =>
 
 describe('commit content digest threading', () => {
 	describe('NetworkTransactor per-batch subsetting', () => {
-		/** Five routable blocks over three peers; the preference lists also pin where a retry lands. */
+		/** Five routable blocks over three peers; the preference lists also pin where a retry lands.
+		 *  NOTE: the header/tail/b2 routes below are load-bearing for the single-block-batch tests —
+		 *  they assert the header and tail land as SEPARATE commits on peer-A, which only holds while
+		 *  the other swept block (b2) prefers a different peer. Re-pointing b2 at peer-A would merge
+		 *  them into one batch and quietly stop exercising that; keep the split if you retune routes. */
 		async function setup(throwFirstOnB = 0) {
 			const ids = {
 				header: 'blk-header' as BlockId,
@@ -126,7 +130,7 @@ describe('commit content digest threading', () => {
 				rev: 8,
 				headerId: ids.header,
 				tailId: ids.tail,
-				blockIds: [ids.tail, ids.b1, ids.b2],
+				blockIds: [ids.tail, ids.header, ids.b1, ids.b2],
 				blockDigests,
 			})
 			expect(result.success).to.be.true

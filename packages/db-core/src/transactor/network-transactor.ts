@@ -721,7 +721,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				if (stale) {
 					return stale;
 				}
-				// The tail (and header) already committed durably when this returns — a torn action.
+				// The tail already committed durably when this returns, as has any sweep batch that
+				// landed before the error — a torn action.
 				// Refusing is still right, and must NOT be softened back into a blanket tolerance:
 				// acknowledging a torn action would report a write as durable while one of its blocks
 				// permanently points somewhere else. The two consequences that used to make the refusal
@@ -773,7 +774,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	/**
 	 * Merge the RETURNED `success:false` responses out of a set of commit batches into one
 	 * {@link StaleFailure}, or `undefined` when every failure was transport-shaped (thrown, no
-	 * response). Shared by {@link commitBlock} (tail/header) and {@link commit}'s non-tail sweep —
+	 * response). Shared by {@link commitBlock} (the tail) and {@link commit}'s non-tail sweep —
 	 * both must distinguish a confirmed conflict (return it; the caller cancels and re-drives) from
 	 * a transient fault (throw / tolerate).
 	 *

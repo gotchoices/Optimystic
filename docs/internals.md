@@ -622,8 +622,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
 - **The writer's retry consumes its own committed log entry.** The carve-out above only stops the
   *storage* side refusing the retry; the client half is that a torn action's log entry is already
   durable when the failure is reported, because `NetworkTransactor.commit` commits the log tail
-  BEFORE sweeping the remaining blocks. A refresh taken between a failed
-  attempt and its retry therefore **consumes** (`Collection.consumeOwnEntry`) an entry carrying the
+  BEFORE sweeping the remaining blocks. A refresh taken between a failed attempt and its retry
+  therefore **consumes** (`Collection.consumeOwnEntry`) an entry carrying the
   retry's own action id, instead of running it through the conflict filter and replaying it —
   replaying re-appends content the committed tail already holds, leaving the same action recorded
   twice in the log. Consuming drops the entry's actions off the head of `pending` and forces the
