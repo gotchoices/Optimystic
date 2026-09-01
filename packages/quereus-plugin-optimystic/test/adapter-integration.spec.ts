@@ -811,6 +811,65 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 				expect(queuedValues(replacement), 'the new instance is rewound to its own capture').to.deep.equal([]);
 				expect(queuedValues(original), 'the detached instance is rewound to its own capture too').to.deep.equal([]);
 			});
+
+			it('rewinds a late-registered collection to its capture, not to empty', async () => {
+				const { plugin } = createTestEnv();
+				const bridge = plugin.txnBridge;
+				const transactor = new TestTransactor();
+
+				bridge.createSavepoint(1);
+				// `createOrOpen` on an absent id INVENTS the collection: its header and log
+				// blocks sit in the tracker (unsynced) from construction, before any DML.
+				// The top-up capture must preserve that structural baseline — a rollback
+				// that reset the collection to empty instead would leave it unreadable.
+				const b = await makeCollection(transactor, 'rb-bridge-baseline');
+				expect(b.hasUnsyncedChanges(), 'invented collection is structurally staged').to.be.true;
+				bridge.registerCollection(b);
+
+				await stageInto(b, 'b1');
+				bridge.rollbackToSavepoint(1);
+
+				expect(queuedValues(b), 'the DML staged after the capture is discarded').to.deep.equal([]);
+				expect(b.hasUnsyncedChanges(), 'the structural baseline survives the rollback').to.be.true;
+			});
+
+			it('keeps a late-registered collection staged when the savepoint is RELEASED', async () => {
+				const { plugin } = createTestEnv();
+				const bridge = plugin.txnBridge;
+				const transactor = new TestTransactor();
+
+				bridge.createSavepoint(1);
+				const b = await makeCollection(transactor, 'rb-bridge-release');
+				bridge.registerCollection(b);
+				await stageInto(b, 'b1');
+
+				// Release absorbs the staged work into the enclosing scope; it must never
+				// restore, and a subsequent rollback of the released depth is a no-op.
+				bridge.releaseSavepoint(1);
+				bridge.rollbackToSavepoint(1);
+
+				expect(queuedValues(b), 'released work stays staged for commit').to.deep.equal(['b1']);
+			});
+
+			it('does not re-capture a late-registered collection on a repeat createSavepoint at the same depth', async () => {
+				const { plugin } = createTestEnv();
+				const bridge = plugin.txnBridge;
+				const transactor = new TestTransactor();
+
+				// One bridge is shared across every table connection, so Quereus broadcasts
+				// createSavepoint(depth) once PER CONNECTION. The second broadcast can land
+				// after a late registration has already staged rows — the depth dedup in
+				// createSavepoint is what stops it re-capturing that dirty state as "before".
+				bridge.createSavepoint(1);
+				const b = await makeCollection(transactor, 'rb-bridge-rebroadcast');
+				bridge.registerCollection(b);
+				await stageInto(b, 'b1');
+				bridge.createSavepoint(1);
+
+				bridge.rollbackToSavepoint(1);
+
+				expect(queuedValues(b), 'the row staged before the re-broadcast is still discarded').to.deep.equal([]);
+			});
 		});
 	});
 });

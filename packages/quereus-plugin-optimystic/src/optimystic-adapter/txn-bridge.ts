@@ -269,7 +269,18 @@ export class TransactionBridge {
    * mid-statement) is topped up into every open savepoint at registration time
    * instead — see {@link registerCollection} — which is sound because
    * registration always precedes any DML staged into that tree, so the top-up
-   * capture is clean at every open depth, same as this create-time set.
+   * capture holds no staged DML at any open depth, same as this create-time set.
+   *
+   * "No staged DML" is not the same as "empty": an INVENTED collection carries its
+   * header/log blocks in the tracker from construction (see
+   * `Collection.createOrOpen`), and both capture paths record those, so a rollback
+   * returns such a tree to readable-but-unwritten rather than destroying it.
+   * NOTE: that also means rolling back to a savepoint does NOT un-create a tree
+   * invented while the savepoint was open — `CREATE INDEX` inside an explicit
+   * transaction leaves the new tree's structural blocks staged even if the
+   * statement is rolled back. Harmless today (addIndex's backfill flushes those
+   * trees eagerly, so the create is already durable by then); if DDL ever becomes
+   * savepoint-reversible, capture invented trees as absent instead.
    *
    * Empty in session mode: there the coordinator owns tracker rollback (see
    * {@link rollbackTransaction}), so a statement-level savepoint rollback is NOT
@@ -364,22 +375,29 @@ export class TransactionBridge {
    *
    * Also tops up every currently-open legacy savepoint with a clean capture of
    * this collection, so a savepoint created before this collection existed still
-   * restores it correctly (see {@link savepoints}). Skipped entirely for a repeat
-   * registration of an ALREADY-known instance (`reconcileMaintainedIndexes`
-   * re-registers already-open index trees, by which point they may hold this
-   * statement's staged rows — re-capturing then would record that dirty state as
-   * "before" and defeat the savepoint it belongs to). A new instance replacing a
-   * known id, or a first-time registration, still tops up.
+   * restores it correctly (see {@link savepoints}).
+   *
+   * The load-bearing guard is the per-savepoint `has` check: registration is
+   * idempotent (`reconcileMaintainedIndexes` re-registers already-open index
+   * trees, by which point they may hold this statement's staged rows), and
+   * re-capturing then would record that dirty state as "before" and defeat the
+   * savepoint it belongs to. It is keyed by object IDENTITY, not id, so a NEW
+   * instance registered under an already-known id (a table re-initializing
+   * mid-transaction) still gets its own clean capture while the old instance's
+   * capture is left alone.
    */
   registerCollection(collection: Collection<any>): void {
     const known = this.collectionRegistry.get(collection.id);
     this.collectionRegistry.set(collection.id, collection);
+    // Fast path only: a re-registration of a known INSTANCE is already present in
+    // every open savepoint (captured either by createSavepoint's sweep or by this
+    // loop's first pass), so the `has` check below would skip it anyway.
     if (known === collection) {
       return;
     }
     // One snapshotPending() per open savepoint that doesn't already have this
     // collection. Savepoint depth is shallow (statement/row nesting) and a
-    // just-registered collection's transforms are empty, so this is negligible.
+    // just-registered collection has staged no DML, so this is negligible.
     for (const snapshots of this.savepoints.values()) {
       if (!snapshots.has(collection)) {
         snapshots.set(collection, collection.snapshotPending());
