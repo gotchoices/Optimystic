@@ -125,12 +125,12 @@ export type BlockContentDigest = {
 export type BlockContentDigests = Record<BlockId, BlockContentDigest>;
 
 export type CommitRequest = ActionBlocks & {
-	/** The header block of the collection, if this is a new collection. Nominally "commit first" —
-	 *  but see the NOTE in `NetworkTransactor.commit`: the header-first step is unreachable from the
-	 *  only production producer of this field, so today it only affects hand-built requests. */
+	/** The header block of the collection, present only when this commit creates the collection
+	 *  (the header is a fresh insert). Collection-identifying metadata, not an ordering signal —
+	 *  the header commits inside the ordinary sweep, after the tail, like any other touched block.
+	 *  Consumed by dispute reporting (`dispute-service.ts`) as a fallback to name the collection. */
 	headerId?: BlockId;
-	/** The tail block of the log.  Nominally "commit next"; since the header-first step above never
-	 *  fires in production, this is in practice the FIRST block committed, which is the ordering
+	/** The tail block of the log. Unconditionally the first block committed — the ordering
 	 *  `Collection.bootstrapContext` relies on. */
 	tailId: BlockId;
 	/** The new revision for the committed action */

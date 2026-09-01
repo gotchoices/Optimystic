@@ -52,7 +52,7 @@ const entriesOf = async (diary: Diary<DiaryEntry>): Promise<string[]> => {
  * `Collection.syncInternal` retries on any stale failure at all, never on `isConflictFailure`.
  *
  * That is the torn action in its exact production shape. `NetworkTransactor.commit` commits the
- * header (when it is not itself in `blockIds`), then the tail, then sweeps the rest — so by the
+ * tail, then sweeps the rest (the header included, when the action touches it) — so by the
  * time a later block confirms a conflict the log entry the tail carries is already durable, and
  * the writer is nonetheless told it failed. Everything after that is the code under test: the
  * writer cancels (a no-op on the already-promoted records) and refreshes, and that refresh must
@@ -80,9 +80,8 @@ const tearFirstCommit = (inner: ITransactor): { transactor: ITransactor; tears: 
 		commit: async (request: CommitRequest): Promise<CommitResult> => {
 			if (torn) return inner.commit(request);
 			torn = true;
-			// Keep only the tail and (when it rides in `blockIds`) the header. A header that is NOT in
-			// `blockIds` still commits, because the inner transactor commits it first from
-			// `request.headerId`, which is passed through untouched.
+			// Keep only the tail and (when present) the header — both are already in `blockIds` in
+			// production, so this is just naming the two ids that should survive the tear.
 			const kept = request.blockIds.filter(id => id === request.tailId || id === request.headerId);
 			tears.push({ committed: kept.length, dropped: request.blockIds.length - kept.length });
 			const truncated = await inner.commit({ ...request, blockIds: kept });

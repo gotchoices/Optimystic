@@ -156,18 +156,20 @@ describe('commit content digest threading', () => {
 			await networkTransactor.commit({
 				actionId: generateRandomActionId(),
 				rev: 8,
-				headerId: ids.header,          // not in blockIds -> committed as its own batch
-				tailId: ids.tail,              // committed as its own batch
-				blockIds: [ids.tail, ids.b2],
+				headerId: ids.header,          // a fresh insert: present on the commit that creates the collection
+				tailId: ids.tail,              // committed first, on its own
+				blockIds: [ids.tail, ids.header, ids.b2],
 				blockDigests,
 			})
 
-			// Header and tail both route to peer-A, but as two separate single-block commits.
+			// Header and tail both route to peer-A, but land as two separate single-block commits: the
+			// tail commits first by itself, then the header is swept afterward alongside the other
+			// touched blocks and lands in its own per-peer batch because b2 routes to peer-C instead.
 			const aCommits = repos['peer-A']!.commits
-			expect(aCommits.map(c => sorted(c.blockIds))).to.deep.equal([[ids.header], [ids.tail]])
-			expect(aCommits.map(digestKeys)).to.deep.equal([[ids.header], [ids.tail]])
-			expect(aCommits[0]!.blockDigests![ids.header]).to.deep.equal(fakeDigest(ids.header))
-			expect(aCommits[1]!.blockDigests![ids.tail]).to.deep.equal(fakeDigest(ids.tail, 7))
+			expect(aCommits.map(c => sorted(c.blockIds))).to.deep.equal([[ids.tail], [ids.header]])
+			expect(aCommits.map(digestKeys)).to.deep.equal([[ids.tail], [ids.header]])
+			expect(aCommits[0]!.blockDigests![ids.tail]).to.deep.equal(fakeDigest(ids.tail, 7))
+			expect(aCommits[1]!.blockDigests![ids.header]).to.deep.equal(fakeDigest(ids.header))
 		})
 
 		it('omits the field entirely on a batch whose blocks are all undeclared', async () => {

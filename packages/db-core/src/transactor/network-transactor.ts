@@ -683,7 +683,6 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		const t0 = Date.now();
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
 
-		// Commit the header block if provided and not already in blockIds.
 		// `request.tailId` is threaded into every per-block commit so the coordinator carries it into the
 		// consensus commit op → each committing node's StorageRepo.commit stamps it onto the emitted
 		// CollectionChangeEvent (the reactivity topic anchor). Without this the per-block RepoCommitRequest
@@ -691,12 +690,6 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// `request.blockDigests` (when present) is the FULL per-block declaration map for the action;
 		// it is threaded whole through commitBlock/commitBlocks and subset per batch at send time (see
 		// commitBlocks) so each cohort only signs for the blocks it is actually driving.
-		if (request.headerId && !request.blockIds.includes(request.headerId)) {
-			const headerResult = await this.commitBlock(request.headerId, request.actionId, request.rev, request.tailId, request.blockDigests);
-			if (!headerResult.success) {
-				return headerResult;
-			}
-		}
 
 		// Commit the tail block
 		const tailResult = await this.commitBlock(request.tailId, request.actionId, request.rev, request.tailId, request.blockDigests);
@@ -704,24 +697,10 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			return tailResult;
 		}
 
-		// Sweep every non-tail block. The tail is the ONLY exclusion needed: the header-first commit
-		// above fires only when the header is NOT in `blockIds`, so a header that IS in `blockIds`
-		// belongs here, in this sweep. (The removed second filter clause tested
-		// `!blockIds.includes(headerId)` against a `bid` drawn from `blockIds` — unsatisfiable
-		// whenever `bid === headerId`, so it never excluded anything.)
+		// Sweep every non-tail block (the header, when the action touches it, lands here too — after
+		// the tail, like any other touched block). The tail is the only exclusion needed.
 		//
-		// NOTE: measured, not assumed — the header-first branch above is currently UNREACHABLE from
-		// the only production producer of `headerId`. `TransactorSource.transact` sets it solely when
-		// the header is a fresh insert, and an inserted id is by construction in the pend's
-		// `blockIds`, so `!blockIds.includes(headerId)` is never true there. Instrumenting the branch
-		// and running both suites: 0 hits across every db-p2p mesh test, 2 hits in db-core, both from
-		// `commit-digest-threading.spec.ts` requests hand-built with the header held out of
-		// `blockIds`. So the order that actually runs in production is tail -> sweep, with the header
-		// (when the action touches it) inside the sweep — i.e. after the tail. Whether to wire the
-		// branch up or delete it, along with the three contracts that still describe it as live, is
-		// `tickets/backlog/debt-commit-header-first-branch-is-unreachable`.
-		//
-		// The tail -> sweep half of that order IS load-bearing; do not reorder it to put the
+		// The tail-then-sweep order IS load-bearing; do not reorder it to put the
 		// contested blocks first. `Collection.bootstrapContext` documents the guarantee it rests on:
 		// "The tail is always committed first (commit protocol guarantee), so it's readable with
 		// context=undefined" — that bootstrap is what makes pending non-tail blocks visible to a

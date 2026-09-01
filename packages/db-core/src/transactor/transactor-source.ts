@@ -128,11 +128,9 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	 * @param transform - The transforms to apply.
 	 * @param actionId - The action id.
 	 * @param rev - The revision number.
-	 * @param headerId - The Id of the collection's header block.  Forwarded to the commit only when the header is a
-	 * fresh insert, which is the create-the-collection race this was meant to order.  NOTE: that forwarding no longer
-	 * has any effect — `NetworkTransactor.commit` runs its header-first step only for a header held OUT of `blockIds`,
-	 * and an inserted id is always IN it, so the header commits inside the ordinary sweep (after the tail) like any
-	 * other touched block.  Wire it up or drop it: `tickets/backlog/debt-commit-header-first-branch-is-unreachable`.
+	 * @param headerId - The Id of the collection's header block. Forwarded to the commit only when the header is a
+	 * fresh insert, so the collection-identifying metadata (see `CommitRequest.headerId`) is present on the commit
+	 * that creates it.
 	 * @param tailId - The Id of the collection's log tail block.  If specified, this block's transform is performed next
 	 * (prior to the rest of the block operations), to resolve the "winner" of a race to commit to the collection.
 	 * @param priority - Aged, advisory retry priority (default 0). Rides on the pend so a repeatedly-losing
