@@ -287,7 +287,7 @@ export class TransactionBridge {
    * applied to the coordinator's staged transforms — a documented gap. The
    * primary bug this fixes (a failed/aborted statement flushing its partial rows
    * at commit) is a legacy / staged-tracker concern; session mode routes rollback
-   * through the coordinator's own snapshot replay instead, and closing the
+   * through the coordinator's own snapshot restore instead, and closing the
    * statement-level gap there means teaching the coordinator per-statement
    * checkpoints — out of scope here. See {@link createSavepoint}.
    *
@@ -772,11 +772,15 @@ export class TransactionBridge {
     // while every staged tree is still un-synced. Tracker rollback has a single
     // owner per mode:
     //   - Session mode: the coordinator owns it. session.rollback() (above)
-    //     already restored every registered collection's tracker to the
-    //     pre-session snapshot (and replays any interleaved sessions). The dirty
-    //     trees ARE those registered collections, so a second per-tree restore
-    //     here would be redundant and, against a multi-session coordinator, would
-    //     clobber that careful replay. Skip it.
+    //     already restored every registered collection's tracker AND its pending
+    //     action queue to the coordinator's pre-stamp capture. The dirty trees ARE
+    //     those registered collections, so a second per-tree restore is at best
+    //     redundant — and it restores a DIFFERENT baseline: markDirty snapshots a
+    //     tree at its own first stage, which on this path always follows the
+    //     coordinator's capture (optimystic-module.ts staging is gated behind an
+    //     awaited applyActions). Replaying that later, dirtier snapshot over the
+    //     already-rewound collection would re-install staged state the coordinator
+    //     just discarded. Skip it.
     //   - Legacy mode (no coordinator): restore each dirty tree from its
     //     pre-stage snapshot — this reverts in-memory reads and leaves storage
     //     untouched, the actual fix for the deferred-constraint atomicity bug.

@@ -46,10 +46,6 @@ class PendRejectedError extends Error {
 	}
 }
 
-/** One collection's pre-staging state, plus its rank in the coordinator-global capture order.
- * See {@link TransactionCoordinator.stampData} for why the rank is needed. */
-type CollectionCapture = { seq: number; snapshot: CollectionSnapshot<any> };
-
 /**
  * Coordinates multi-collection transactions.
  *
@@ -61,7 +57,8 @@ type CollectionCapture = { seq: number; snapshot: CollectionSnapshot<any> };
  * - Commit transactions by running consensus phases (GATHER, PEND, COMMIT)
  */
 export class TransactionCoordinator {
-	/** Per-stampId tracking: pre-staging snapshots + accumulated actions for replay.
+	/** Per-stampId tracking: the pre-staging snapshot of every collection the stamp may have
+	 * staged into, which is everything {@link rollback} needs to rewind it.
 	 *
 	 * INVARIANT: `stampData.size <= 1` — at most ONE open stamp per coordinator, enforced by the
 	 * guards in {@link applyActions} and {@link commit} (which throw
@@ -91,19 +88,12 @@ export class TransactionCoordinator {
 	 * instance keys make that unrepresentable — the new instance simply gets its own capture at
 	 * the next reconcile, and the stale entry restores a detached object nobody reads.
 	 *
-	 * `seq` is a coordinator-global monotonic capture counter. Because capture is LAZY (a
-	 * collection is captured at the first {@link applyActions} after it appears in the map), stamp
-	 * `order` no longer ranks capture times across stamps — `seq` does. `order` now means replay
-	 * ordering ONLY. */
+	 * Capture is LAZY: a collection enters the map at the first {@link applyActions} after it
+	 * appears in `this.collections` (see {@link captureUncaptured}), so a collection registered
+	 * mid-transaction is still captured before anything stages into it. */
 	private stampData = new Map<string, {
-		/** Replay ordering ONLY — assigned at the stamp's first applyActions. Not a capture time. */
-		order: number;
-		preSnapshot: Map<Collection<any>, CollectionCapture>;
-		actionBatches: CollectionActions[][];
+		preSnapshot: Map<Collection<any>, CollectionSnapshot<any>>;
 	}>();
-	private nextStampOrder = 0;
-	/** Monotonic capture sequence, shared across stamps — see {@link stampData}. */
-	private nextCaptureSeq = 0;
 
 	constructor(
 		private readonly transactor: ITransactor,
@@ -137,14 +127,12 @@ export class TransactionCoordinator {
 			if (open !== undefined) {
 				throw new CoordinatorConcurrentStampError(open, stampId);
 			}
-			data = { order: this.nextStampOrder++, preSnapshot: new Map(), actionBatches: [] };
+			data = { preSnapshot: new Map() };
 			this.stampData.set(stampId, data);
 		}
 
 		// Runs on EVERY call, and stays await-free through to applyActionsRaw — see the method doc.
 		this.captureUncaptured(data.preSnapshot);
-
-		data.actionBatches.push(actions);
 
 		await this.applyActionsRaw(actions, stampId);
 	}
@@ -188,15 +176,20 @@ export class TransactionCoordinator {
 	 * count ever grows large enough for the scan itself to matter, track a per-stamp "collections
 	 * map size at last capture" rather than dropping the reconcile.
 	 */
-	private captureUncaptured(into: Map<Collection<any>, CollectionCapture>): void {
+	private captureUncaptured(into: Map<Collection<any>, CollectionSnapshot<any>>): void {
 		for (const col of this.collections.values()) {
 			if (into.has(col)) continue;
-			into.set(col, { seq: this.nextCaptureSeq++, snapshot: col.snapshotPending() });
+			into.set(col, col.snapshotPending());
 		}
 	}
 
 	/**
-	 * Apply actions without tracking (used internally and for replay during rollback).
+	 * Apply actions without opening or updating a stampData entry.
+	 *
+	 * Only {@link applyActions} calls this today, but it stays a separate method because the
+	 * `transaction: stampId` tag it stamps onto each action is the provenance ground truth the
+	 * rollback tests assert on (`expectNoActionsFromStamp` in coordinator-rollback-pending.spec.ts)
+	 * — it is not incidental to the tracking bookkeeping above it.
 	 */
 	private async applyActionsRaw(
 		actions: CollectionActions[],
@@ -584,89 +577,45 @@ export class TransactionCoordinator {
 	 * Rollback a transaction (undo only the given stampId's applied actions).
 	 *
 	 * Restores each collection's staged state — tracker transforms and the pending action
-	 * queue — to the snapshot taken before the stampId's first applyActions call, then
-	 * replays any later stamps' actions to preserve those sessions' staged state.
+	 * queue — to the snapshot taken before the stampId's first applyActions call. Because the
+	 * coordinator allows at most ONE open stamp (the invariant on {@link stampData}), there is
+	 * never a sibling stamp whose staged state that restore could clobber, so rewinding is the
+	 * whole of rollback.
+	 *
+	 * Rolling back a stamp with no tracked entry — never opened, or already released by a commit
+	 * or an earlier rollback — is a no-op.
 	 *
 	 * @param stampId - The transaction stamp ID to rollback
 	 */
 	async rollback(stampId: string): Promise<void> {
 		// NOTE: unlike the commit path, this overwrites BOTH halves of each participant's staged
-		// state — tracker transforms AND the pending action queue — and replays into them WITHOUT
-		// holding their instance latches. Safe today because a session drives abort and commit from
-		// one call path, so a rollback cannot overlap a commit span on the same collections. The
-		// hazard class is the same one the transforms-only reset already carried: a concurrent
-		// act/sync would already have raced `tracker.reset`. If rollback ever becomes reachable
-		// concurrently with a commit (a background abort, a second session sharing collection
-		// instances), latch the participants here the way commitOnce does.
+		// state — tracker transforms AND the pending action queue — WITHOUT holding their instance
+		// latches. Safe today because a session drives abort and commit from one call path, so a
+		// rollback cannot overlap a commit span on the same collections. The hazard class is the
+		// same one the transforms-only reset already carried: a concurrent act/sync would already
+		// have raced `tracker.reset`. If rollback ever becomes reachable concurrently with a commit
+		// (a background abort, a second coordinator sharing collection instances), latch the
+		// participants here the way commitOnce does.
 		const data = this.stampData.get(stampId);
 		if (!data) return;
 
 		this.stampData.delete(stampId);
 
-		// Collect all remaining stamps to replay
-		const toReplay = [...this.stampData.entries()]
-			.sort(([, a], [, b]) => a.order - b.order);
-
-		// Find the EARLIEST capture per collection, across the rolled-back stamp and every
-		// survivor — the state to rewind each collection to before replaying the survivors.
-		//
-		// This is a per-collection minimum by capture `seq`, NOT a single lowest-`order` stamp's
-		// map. Interleaved execution means a lower-order stamp may stage batches after a
-		// higher-order stamp captured; and because capture is lazy (a collection is captured at
-		// the first applyActions AFTER it is registered), a lower-`order` stamp can capture a
-		// collection later than a higher-`order` stamp already staged into it. `order` therefore
-		// does not rank capture times — `seq` does, per collection.
-		//
-		// INVARIANT that makes "restore to the minimum, then replay ALL survivor batches" correct:
-		// for every collection `c`, the minimum capture seq for `c` precedes every tracked batch
-		// that touches `c`. It holds because a batch naming `c` requires `c` to be present in
-		// `this.collections` at that applyActions call (applyActionsRaw throws "Collection not
-		// found" otherwise), so that same call's reconcile captured `c` first — hence each stamp's
-		// own capture of `c` precedes that stamp's batches touching `c`, and the cross-stamp
-		// minimum is no later than any of them. So no batch replayed below was already folded into
-		// the snapshot it is replayed onto: no double-apply.
-		const earliest = new Map<Collection<any>, CollectionCapture>();
-		const foldEarliest = (from: Map<Collection<any>, CollectionCapture>) => {
-			for (const [collection, entry] of from) {
-				const existing = earliest.get(collection);
-				if (!existing || entry.seq < existing.seq) earliest.set(collection, entry);
-			}
-		};
-		foldEarliest(data.preSnapshot);
-		for (const [, d] of toReplay) foldEarliest(d.preSnapshot);
-
-		// Restore each collection to its earliest capture — transforms AND pending queue together,
-		// so the rolled-back stamp's actions leave the queue instead of being written into the next
+		// Restore each captured collection — transforms AND pending queue together, so the
+		// rolled-back stamp's actions leave the queue instead of being written into the next
 		// transaction's durable log entry. `restorePending` deep-copies the transforms itself,
 		// so no structuredClone here. Restoring through the CAPTURED instance (rather than
 		// re-looking-up by id) is what keeps a mid-transaction instance swap under one id from
 		// pushing the old instance's staged state onto the new one.
 		// NOTE: this also discards actions staged OUTSIDE any tracked stamp (the Tree.stage /
 		// deferred-DML path, which calls Collection.act directly and creates no stampData entry)
-		// that landed after that collection's earliest tracked capture — including on a collection
-		// registered mid-transaction, whose capture is simply later than the eagerly-captured ones.
+		// that landed after that collection's capture — including on a collection registered
+		// mid-transaction, whose capture is simply later than the eagerly-captured ones.
 		// Accepted: the tracker half already discards their transforms, and symmetric is the safer
 		// state — leaving such an action queued while its transforms are gone is exactly the
 		// phantom that a conflicting sync's replayActions would resurrect as live data.
-		for (const [collection, { snapshot }] of earliest) {
+		for (const [collection, snapshot] of data.preSnapshot) {
 			collection.restorePending(snapshot);
-		}
-
-		// Replay all remaining stamps' batches in order
-		for (const [replayStampId, replayData] of toReplay) {
-			// Update the snapshot to reflect current (post-replay) state. Both halves: a survivor
-			// replayed later in this loop must carry its pending queue forward too, or the next
-			// rollback restores a snapshot that is missing it. Capturing into an EMPTY map re-captures
-			// everything at fresh (still monotonic) seqs, so the rebuilt captures rank after
-			// everything captured before this rollback — and detached instances no longer in the live
-			// map drop out, which is correct: nothing stages into or commits from them any more.
-			const rebuilt = new Map<Collection<any>, CollectionCapture>();
-			this.captureUncaptured(rebuilt);
-			replayData.preSnapshot = rebuilt;
-
-			for (const actionBatch of replayData.actionBatches) {
-				await this.applyActionsRaw(actionBatch, replayStampId);
-			}
 		}
 	}
 
@@ -839,8 +788,9 @@ export class TransactionCoordinator {
 		//    coordination failure with an empty committed set): the failure returns below do NOT
 		//    restore, so the appended entries survive in the trackers and `stampData` is kept.
 		//    That is deliberate — the actions were tracked via applyActions(), so rollback(stampId)
-		//    is a valid AND complete recovery there (it also replays the other in-flight stamps,
-		//    which a targeted restore cannot). Do not add blind restores to these paths.
+		//    is a valid AND complete recovery there: its capture predates this staging and covers
+		//    every registered collection, including ones this call never touched. Do not add blind
+		//    restores to these paths.
 		//  - PARTIAL landing (some collections durably committed, others lost): the committed half
 		//    gets the success-path fold, the failed half is restored to the pre-staging snapshot
 		//    captured above, and `stampData` is dropped — because an all-or-nothing rollback() run
@@ -952,12 +902,13 @@ export class TransactionCoordinator {
 							collection.tracker.reset();
 							collection.clearPendingActions();
 						} else {
-							// NOTE: blind overwrite of this collection's staged state — any OTHER
-							// stamp's actions staged on it between the pre-stage snapshot above and
-							// here are discarded. Same single-call-path assumption rollback()
-							// documents. It cannot be softened by replaying the other stamps here:
-							// replay goes through collection.act, which takes the same non-reentrant
-							// instance latch this span already holds.
+							// NOTE: blind overwrite of this collection's staged state — anything
+							// staged on it between the pre-stage snapshot above and here is discarded.
+							// No sibling stamp can be that writer (at most one stamp is open), so the
+							// only source is the untracked Tree.stage / Collection.act path, and this
+							// is the same single-call-path assumption rollback() documents. It cannot
+							// be softened by re-applying those actions here: collection.act takes the
+							// same non-reentrant instance latch this span already holds.
 							const snapshot = preStageSnapshots.get(collectionId);
 							if (snapshot) collection.restorePending(snapshot);
 						}
@@ -965,8 +916,8 @@ export class TransactionCoordinator {
 					// The undo handle is now unsafe: rollback() is all-or-nothing and would rewind
 					// the collections that DID durably commit. Drop it, matching commitOnceLatched.
 					// Dropping outright (no tombstone) is safe because the coordinator enforces at
-					// most ONE open stamp (the invariant on stampData): no sibling stamp exists
-					// whose later rollback could rebuild a replay set missing this entry.
+					// most ONE open stamp (the invariant on stampData): no sibling stamp exists,
+					// so nothing else can later look for this entry and be misled by its absence.
 					this.stampData.delete(transaction.stamp.id);
 				}
 				return {
