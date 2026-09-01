@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-09-01T19:52:33.183Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\2-coordinator-drop-multi-stamp-replay-machinery.review.2026-09-01T19-52-33-182Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Cancelling a transaction used to run an elaborate rewind-and-replay routine that protected other transactions open at the same time. Since the system no longer allows two open at once, that routine was deleted and replaced with the plain rewind it always reduced to.
 files:
   - packages/db-core/src/transaction/coordinator.ts (`stampData` decl ~57-95; `applyActions` ~103-140; `captureUncaptured` ~150-183; `applyActionsRaw` ~185-210; `rollback` ~570-620; `execute` prose ~788, ~902, ~917)
