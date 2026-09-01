@@ -673,6 +673,10 @@ export class TransactionCoordinator {
 		// early failure returns.
 		const latchReleases: (() => void)[] = [];
 		try {
+			// NOTE: deadlock-freedom against a concurrent commitOnce needs BOTH paths to acquire in
+			// the SAME order, not merely each in a sorted one. `CollectionId` is a string, so this
+			// default `.sort()` and commitOnce's explicit `<`/`>` comparator agree today. If either
+			// spelling changes — a custom comparator, a non-string id — change both together.
 			for (const collectionId of [...new Set(allCollectionIds)].sort()) {
 				const collection = this.collections.get(collectionId);
 				if (collection) {
@@ -742,8 +746,9 @@ export class TransactionCoordinator {
 			// NOTE: this iterates `result.actions`, not the DISTINCT participant set the latch
 			// acquisition above deduped to — so a transaction whose actions name one collection
 			// twice folds that collection twice, and the second recordCommitted throws on the
-			// revision it already advanced past. Dormant today (no caller emits duplicate
-			// CollectionActions entries); tracked as
+			// revision it already advanced past. The partial-commit fold in the `!coordResult.success`
+			// branch above has the SAME shape, so a fix has to cover both loops. Dormant today (no
+			// caller emits duplicate CollectionActions entries); tracked as
 			// `debt-execute-duplicate-collection-actions-double-record`, and pinned meanwhile by the
 			// duplicate-collection case in test/coordinator-latch-span.spec.ts, which deliberately
 			// does not assert this method's outcome.

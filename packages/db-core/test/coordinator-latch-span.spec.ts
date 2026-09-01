@@ -158,7 +158,11 @@ describe('coordinator commit latch span', () => {
 		// act then waits on, and execute would never reach the transactor at all.
 		const executePromise = coordinator.execute(transaction, new ActionsEngine());
 		// Parked with the first participant's commit already durable and the span still held.
-		await transactor.commitParked;
+		// Raced against `execute` itself rather than awaited bare: the park happens INSIDE the commit
+		// `execute` is awaiting, so `execute` settling first means it never reached the gate. Waiting
+		// on `commitParked` alone would then hang to the mocha timeout while the real rejection went
+		// unhandled — fatal to the whole run, not just this case.
+		await Promise.race([transactor.commitParked, executePromise]);
 
 		const refreshA = releaseRefresh(a);
 		const refreshB = releaseRefresh(b);
@@ -190,6 +194,12 @@ describe('coordinator commit latch span', () => {
 			expect(fresh!.committedRevision(), `${id}: local record and storage agree on the revision`)
 				.to.equal(collection.committedRevision());
 			expect(fresh!.committedActionId(), `${id}: and on the lineage`).to.equal(transaction.id);
+			// Revision + lineage agreement alone would still pass if the span had appended the entry
+			// twice at one revision, so read the log back: one entry, carrying this collection's
+			// own action. Same assertion shape as the sibling interleaving spec's.
+			const logged: string[] = [];
+			for await (const action of fresh!.selectLog()) logged.push(action.data.value);
+			expect(logged, `${id}: one log entry, once`).to.deep.equal([id]);
 		}
 	});
 
@@ -287,6 +297,13 @@ describe('coordinator commit latch span', () => {
 		await drainMacrotasks();
 		const secondCommit = second.commit(secondTransaction, retryOptions);
 		await drainMacrotasks();
+		// Both promises sit unawaited across the drains above. A rejection reaching the end of a turn
+		// with no handler attached is a FATAL unhandled rejection — it kills the whole mocha run
+		// instead of failing this case (the same hazard `releaseRefresh` guards against). These
+		// no-op catches attach a handler without swallowing anything: the `Promise.all` below is
+		// still on the originals, so a real rejection is still reported there.
+		firstCommit.catch(() => undefined);
+		secondCommit.catch(() => undefined);
 
 		// Released BEFORE the assertion below, and exactly once, so a failing assertion cannot leave
 		// the collections latched for the rest of the file.

@@ -835,7 +835,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * (log append → pend → commit → local fold), keeping any refresh of this instance from
 	 * interleaving with a mid-flight commit. `Latches` is non-reentrant: while holding this,
 	 * the holder must not call any of those latched methods on this instance. The caller
-	 * MUST call the release exactly once, in a `finally`. */
+	 * MUST call the release exactly once, in a `finally`.
+	 *
+	 * NOTE: the commit paths are the ONLY callers — {@link act}, {@link update} and {@link sync}
+	 * take the same mutex through `Latches.acquire` directly, never through here. The acquisition
+	 * -order cases in `test/coordinator-latch-span.spec.ts` rely on that: they shadow this method
+	 * to record the span's order, so routing a refresh path through it would silently fold
+	 * refreshes into those recordings and weaken the assertions rather than fail them. Route a new
+	 * refresh caller here only alongside a filter in that spy. */
 	acquireLatch(): Promise<() => void> {
 		return Latches.acquire(this.latchId);
 	}
