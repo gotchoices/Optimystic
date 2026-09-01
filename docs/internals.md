@@ -141,6 +141,34 @@ both commit modes — see docs/transactions.md § "Committed reads run concurren
 a stalled commit" for what holds it, the first-touch provisional initialization, the
 conformance harness's blind spot, and the residual degraded-store limit.
 
+#### A failed first open is retried, not remembered
+
+`OptimysticVirtualTable` does its real setup lazily on the first touch of a table and
+memoizes the in-flight promise so the next hundred statements share one pass. That memo
+holds only while the attempt is *in flight*: it is cleared when the attempt settles, in a
+`finally`, so a first touch that failed for a passing reason (a network hiccup, a storage
+node answering late) is retried by the next statement instead of replaying the same stale
+error for the life of the process. Both memos work this way — `initialize()` for the full
+pass and `initializeForCommittedRead()` for the provisional one.
+
+Two consequences are deliberate:
+
+- **No damping.** A table pointed at a genuinely dead cohort re-attempts initialization on
+  every statement rather than caching the failure for a cooldown window. Every attempt is
+  user-driven — nothing re-enters initialization in the background — and a statement against
+  an unreachable cohort was going to make network calls and fail regardless. If
+  initialization storms ever show up in profiles, damp them in the transactor layer that
+  already models unreachable blocks, not here.
+- **A rerun must be indistinguishable from a first run.** Because initialization now runs
+  more than once for a table (a retry, or the provisional→full upgrade), nothing in it may
+  branch on state an earlier pass wrote: the schema branch reads whether the *declaration*
+  supplied columns, not the current `tableSchema.columns` length that the load branch itself
+  populates. And a pass that throws part-way must leave no residue — `collection`, `rowCodec`
+  and `indexManager` are built as locals and published in one synchronous step after the last
+  `await`, so a failed pass cannot strand, say, an `IndexManager` whose trees never opened
+  (which `assertIndexMaintained` would then read as 'unmaintained' and refuse every
+  index-driven plan against the table, at plan time, for the rest of the session).
+
 ### Write Path (Local Changes)
 ```
 Collection.act(action)

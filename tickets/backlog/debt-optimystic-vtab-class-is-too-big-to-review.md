@@ -23,6 +23,14 @@ added the two storage-adoption guards and their doc comments): the same command 
 class (declaration-time storage adoption, which has to read the schema catalog *and* probe the data
 collection *and* probe index trees), so it is evidence for the split, not an argument against it.
 
+Re-measured 2026-09-01 while reviewing `bug-one-failed-open-makes-a-table-unusable-for-the-session`
+(which reworked the initialization memo and made a pass's field publication atomic): the same command
+now reports **3782**. That review's core difficulty was exactly what this ticket names — deciding
+whether a failed initialization pass leaves coherent state required reading initialization, the
+storage-adoption guard, the row-emptiness probe and the query dispatcher, all in one class, and one
+of the four (`guardStorageAdoption` reaching for `this.collection` before the pass had published it)
+was a hidden ordering dependency the split would have made visible.
+
 Top-level shape (`grep -n "^export class\|^class\|^function" …`):
 
 | lines | what |

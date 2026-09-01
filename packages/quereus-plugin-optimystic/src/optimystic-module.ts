@@ -475,7 +475,10 @@ export class OptimysticVirtualTable extends VirtualTable {
       // genuinely indistinguishable at the block layer on this path. Inventing the tree in
       // the local tracker is the correct representation of an empty table; switching this to
       // `getCollection` would make `select` from a created-but-never-written table fail.
-      this.collection = await this.collectionFactory.createOrGetCollection(
+      //
+      // Built as a LOCAL, and published with the codec and index manager below only
+      // once every await has succeeded — see the note at that publish point.
+      const collection = await this.collectionFactory.createOrGetCollection(
         this.options,
         txnState || undefined
       );
@@ -547,7 +550,11 @@ export class OptimysticVirtualTable extends VirtualTable {
           // warm, hydrated and live-record paths never pay the catalog walk inside.
           // Returns the record's index-tree descriptions so addIndex can hold the
           // same rule over `<uri>/index/<name>` later (see that guard).
-          const orphanedIndexes = await this.guardStorageAdoption(candidateStored, txnState?.transactor);
+          const orphanedIndexes = await this.guardStorageAdoption(
+            candidateStored,
+            collection,
+            txnState?.transactor,
+          );
           if (orphanedIndexes) {
             mergedCandidate = { ...mergedCandidate, orphanedIndexes };
           }
@@ -624,26 +631,42 @@ export class OptimysticVirtualTable extends VirtualTable {
       // its CREATE UNIQUE INDEX siblings once derived.
       this.attachPersistedUniqueConstraints(storedSchema);
 
-      this.rowCodec = new RowCodec(storedSchema, this.options.encoding);
+      const rowCodec = new RowCodec(storedSchema, this.options.encoding);
 
       // Create and initialize index manager
-      this.indexManager = new IndexManager(
+      const indexManager = new IndexManager(
         storedSchema,
         (indexName, transactor) => this.openIndexTree(indexName, transactor)
       );
 
-      await this.indexManager.initialize(txnState?.transactor);
+      await indexManager.initialize(txnState?.transactor);
 
       // Give every point-enforceable secondary UNIQUE constraint a backing index tree
       // so probeUniqueConstraint can probe it instead of full-scanning the table per
       // DML row (an O(N) scan per row -> O(log n) point probe). Must run BEFORE
       // registerCollections so the synthesized trees are present in getIndexTrees()
       // when the bridge snapshots this table's collections.
-      this.uniqueEnforcementIndexes = this.buildUniqueEnforcementIndexes(storedSchema);
-      await this.indexManager.setUniqueEnforcementIndexes(
-        this.uniqueEnforcementIndexes,
+      const uniqueEnforcementIndexes = this.buildUniqueEnforcementIndexes(storedSchema);
+      await indexManager.setUniqueEnforcementIndexes(
+        uniqueEnforcementIndexes,
         txnState?.transactor,
       );
+
+      // Publish the rebuilt state in ONE synchronous step, after the last await.
+      // doInitialize runs more than once for a table — the upgrade after a
+      // provisional pass, and a retry after a failed attempt (see initialize()) — so
+      // a rerun that throws part-way must leave the fields it would have replaced
+      // exactly as the previous pass left them. Assigning as they were built instead
+      // left, for example, an IndexManager that had been constructed but whose trees
+      // never opened: `indexMaintenanceState` then reads 'unmaintained', and
+      // OptimysticModule.assertIndexMaintained refuses every index-driven plan
+      // against the table — at PLAN time, which no amount of re-initialization
+      // downstream can rescue — until some non-index query happens to run a
+      // successful full pass.
+      this.collection = collection;
+      this.rowCodec = rowCodec;
+      this.indexManager = indexManager;
+      this.uniqueEnforcementIndexes = uniqueEnforcementIndexes;
 
       if (readOnly) {
         // Provisional pass: leave the bridge's collection registry untouched (a
@@ -663,16 +686,12 @@ export class OptimysticVirtualTable extends VirtualTable {
       // the upgrade after a provisional pass, and a retry after a failed attempt (see
       // initialize()) — so it replaces `rowCodec`/`indexManager` while a committed scan
       // started off the provisional state may still be iterating (scans re-read both
-      // fields per row). Harmless while both passes resolve the same schema, which they
-      // do unless DDL changed the table in between; if concurrent DDL ever becomes real
-      // here, a scan must capture its codec and index manager as locals alongside its
-      // pinned views. The same field replacement has a FAILURE face: a pass that throws
-      // between the `indexManager` assignment above and its `initialize()` leaves an
-      // UNINITIALIZED IndexManager on a table such a scan is reading. Needs a
-      // successful provisional init, an in-flight committed scan, AND a full pass
-      // failing in that window, so it is not reachable today; capturing the locals
-      // closes both faces at once, and that is the fix to reach for if concurrent DDL
-      // or committed scans outliving an upgrade ever become real.
+      // fields per row). A rerun that FAILS can no longer be seen half-applied (the
+      // publish above is one synchronous step), but a rerun that SUCCEEDS still swaps
+      // the fields under such a scan. Harmless while both passes resolve the same
+      // schema, which they do unless DDL changed the table in between; if concurrent
+      // DDL ever becomes real here, a scan must capture its codec and index manager as
+      // locals alongside its pinned views.
       this.isProvisionallyInitialized = false;
       this.isInitialized = true;
 
@@ -716,6 +735,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   private async guardStorageAdoption(
     candidate: StoredTableSchema,
+    collection: Tree<string, any>,
     transactor?: ITransactor
   ): Promise<PersistedIndexSchema[] | undefined> {
     // The record that still describes the storage this declaration adopts: the
@@ -739,8 +759,10 @@ export class OptimysticVirtualTable extends VirtualTable {
     const orphanedIndexes = described.length > 0 ? described : undefined;
 
     // An EMPTY data collection cannot mangle anything — a table created, never
-    // written, then dropped re-declares freely under any shape.
-    if (await this.hasNoRowsToBackfill()) {
+    // written, then dropped re-declares freely under any shape. Probed through the
+    // collection the caller passes in, not `this.collection`: this guard runs mid-
+    // initialization, before the pass publishes the fields it rebuilt.
+    if (await this.hasNoRowsToBackfill(collection)) {
       return orphanedIndexes;
     }
 
@@ -2697,7 +2719,9 @@ export class OptimysticVirtualTable extends VirtualTable {
 
   /**
    * Whether {@link backfillIndexTrees} provably has nothing to copy, checked WITHOUT the
-   * cache-bypassing {@link Collection.update} the scan itself needs. Attaching an index
+   * cache-bypassing {@link Collection.update} the scan itself needs. Defaults to this
+   * table's published collection; {@link guardStorageAdoption} passes its own, because it
+   * runs mid-initialization before the pass publishes what it rebuilt. Attaching an index
    * to a table with no rows is the common cold-start shape (`CREATE TABLE` then
    * `CREATE INDEX`, both on an empty table), and the scan that follows is pure cost
    * there: it reads a whole log chain to copy zero rows.
@@ -2726,9 +2750,9 @@ export class OptimysticVirtualTable extends VirtualTable {
    * re-declare. Healing those needs the explicit repair entry point named there, not a
    * refresh on this path.
    */
-  private async hasNoRowsToBackfill(): Promise<boolean> {
-    if (!this.collection) return true;
-    return this.collection.at(await this.collection.first()) === undefined;
+  private async hasNoRowsToBackfill(collection = this.collection): Promise<boolean> {
+    if (!collection) return true;
+    return collection.at(await collection.first()) === undefined;
   }
 
   /**

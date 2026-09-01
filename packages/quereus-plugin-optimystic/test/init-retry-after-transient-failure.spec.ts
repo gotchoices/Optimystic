@@ -427,4 +427,112 @@ describe('A failed first open must not be memoized for the life of the session',
 			db.close();
 		}
 	});
+	it('a committed read after a FAILED full pass is not poisoned by what that pass half-built', async () => {
+		// A full pass replaces `rowCodec`/`indexManager` in place, so one that throws inside
+		// the index-tree open leaves an IndexManager that was assigned but never opened its
+		// trees. `isProvisionallyInitialized` is untouched by that failure, so a later
+		// committed read arriving while a writer is active would short-circuit straight onto
+		// that wreckage — an index-driven scan then fails the maintained-index backstop for
+		// the rest of the transaction, which is this ticket's own bug in miniature.
+		const storage = new MemoryRawStorage();
+		const healthy = buildSharedLocalTransactor(storage);
+		await seed(healthy, 'tree://initretry/provisional', { indexOn: 'a' });
+
+		const gate: Gate = {};
+		const db = new Database();
+		const plugin = registerWithSharedTransactor(db, gatedTransactor(healthy, gate));
+		const opens = countCollectionOpens(plugin);
+		try {
+			await plugin.hydrate(db);
+			// A second table carries the writer transaction, so the bridge reads as ACTIVE —
+			// the condition that routes a first-touch committed read down the PROVISIONAL
+			// (read-only) branch instead of a full initialization.
+			await db.exec(`create table w (k integer primary key) using optimystic('tree://initretry/provisional-w')`);
+			await db.exec('begin');
+			await db.exec(`insert into w (k) values (1)`);
+
+			expect(await queryAll(db, `select * from committed.t`)).to.deep.equal([{ id: 1, a: 'aa', b: 'bb' }]);
+			const afterProvisional = opens('tree://initretry/provisional');
+			expect(afterProvisional, 'the committed read must have run a provisional pass').to.be.greaterThan(0);
+
+			gate.failing = anyIndexTree;
+			const failure = await captureFailure(
+				() => queryAll(db, `select * from t`),
+				'the live touch must fail its full pass under the gate',
+			);
+			expect(failure.message).to.include(INJECTED);
+			const afterFailure = opens('tree://initretry/provisional');
+
+			// The load-bearing assertion. Before the atomic publish this threw at PLAN time
+			// — "Table 't' does not maintain index 'ix'" out of assertIndexMaintained, which
+			// reads the half-built IndexManager the failed pass left behind — and kept
+			// throwing for every index-driven plan until some non-index query happened to
+			// run a successful full pass.
+			gate.failing = undefined;
+			expect(await queryAll(db, `select * from committed.t where a = 'aa'`))
+				.to.deep.equal([{ id: 1, a: 'aa', b: 'bb' }]);
+
+			// And it answers from the provisional state the failed pass left INTACT — no
+			// rebuild needed, because nothing was half-replaced. (The counter moved once
+			// during the failed pass itself, which is why it is sampled after it.)
+			expect(
+				opens('tree://initretry/provisional'),
+				'the surviving provisional state is coherent, so the committed read re-opens nothing',
+			).to.equal(afterFailure);
+		} finally {
+			db.close();
+		}
+	});
+	it('a provisional→full upgrade of a column-less open stays on the load branch and writes no schema', async () => {
+		// The other face of the `declaredColumns` capture. doInitialize also runs twice on the
+		// provisional→full upgrade, and the SAME branch must be chosen both times: a column-less
+		// open is a read of the persisted schema, and upgrading it must not turn into a write.
+		const storage = new MemoryRawStorage();
+		const healthy = buildSharedLocalTransactor(storage);
+		await seed(healthy, 'tree://initretry/upgrade', { indexOn: 'a' });
+
+		const db = new Database();
+		const plugin = registerWithSharedTransactor(db, healthy);
+		try {
+			await plugin.hydrate(db);
+			// A second table carries the writer transaction, so the bridge reads as ACTIVE and
+			// the committed read below takes the PROVISIONAL branch rather than a full pass.
+			await db.exec(`create table w (k integer primary key) using optimystic('tree://initretry/upgrade-w')`);
+
+			const hydrated = db.schemaManager.findTable('t', 'main')!;
+			const placeholder = {
+				...hydrated,
+				columns: [],
+				columnIndexMap: new Map<string, number>(),
+				primaryKeyDefinition: [],
+			} as unknown as TableSchema;
+
+			const manager = sharedSchemaManager(plugin);
+			const originalToStored = manager.tableSchemaToStored.bind(manager);
+			let ddlBranchEntries = 0;
+			manager.tableSchemaToStored = (schema: TableSchema) => {
+				ddlBranchEntries++;
+				return originalToStored(schema);
+			};
+
+			const module = moduleOf(plugin);
+			await db.exec('begin');
+			await db.exec(`insert into w (k) values (1)`);
+			await module.connect(db, undefined, 'optimystic', 'main', 't', { _readCommitted: true }, placeholder);
+			expect(placeholder.columns, 'the provisional pass must have loaded the columns').to.have.lengthOf(3);
+			expect(ddlBranchEntries, 'the provisional pass must take the load branch').to.equal(0);
+
+			// The upgrade: a live touch of the same instance runs the FULL pass.
+			await module.connect(db, undefined, 'optimystic', 'main', 't', {}, placeholder);
+			expect(
+				ddlBranchEntries,
+				'the full pass must take the SAME (load) branch — an upgrade is not a re-declaration',
+			).to.equal(0);
+			await db.exec('rollback');
+
+			expect(await queryAll(db, `select * from t`)).to.deep.equal([{ id: 1, a: 'aa', b: 'bb' }]);
+		} finally {
+			db.close();
+		}
+	});
 });
