@@ -215,7 +215,13 @@ interface ClusterMemberComponents {
 	 * Wall clock in unix milliseconds; defaults to `Date.now`. Injectable so a test can age a held
 	 * reservation past {@link CONFLICT_STALE_THRESHOLD_MS} without sleeping. It governs BOTH sides of
 	 * the reservation's `lastUpdate` — the stamp and the comparison — so the two can never end up on
-	 * different time bases; every other clock read in this class stays on the real `Date.now`.
+	 * different time bases.
+	 *
+	 * NOTE: partial injection, by design. This clock reaches ONLY `lastUpdate`; `message.expiration`,
+	 * the promise/resolution timeouts, the periodic expiry sweep and the executed-transaction TTL all
+	 * still read the real `Date.now`. So an injected clock must share an epoch with real time (seed it
+	 * from `Date.now()`, then advance) — one starting near zero makes every record look long expired
+	 * via the un-injected expiration check. Widen the injection if a test needs to drive expiry too.
 	 */
 	now?: () => number;
 }

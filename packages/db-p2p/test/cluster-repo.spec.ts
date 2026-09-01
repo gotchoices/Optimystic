@@ -575,6 +575,26 @@ describe('ClusterMember', () => {
 	});
 
 	describe('conflict detection', () => {
+		/**
+		 * A member whose reservation table ages on `clock.ms` rather than the wall clock, so the
+		 * staleness sweep can be driven (or held still) without sleeping. Seeded from a real
+		 * `Date.now()` so it shares an epoch with the clock reads this member deliberately does NOT
+		 * inject (`message.expiration`, the promise/resolution timeouts) — a counter starting near
+		 * zero would make every record look long expired. Leaving `clock.ms` alone freezes the
+		 * reservation ages at 0, which is how a test says "no sweeping is involved here".
+		 */
+		const makeClockedMember = (): { member: ClusterMember; clock: { ms: number } } => {
+			const clock = { ms: Date.now() };
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				now: () => clock.ms
+			});
+			return { member, clock };
+		};
+
 		it('detects conflicting operations on same block', async () => {
 			const peers = makeClusterPeers([selfKeyPair]);
 
@@ -761,7 +781,8 @@ describe('ClusterMember', () => {
 		});
 
 		// The reservation scan does two things on the way through besides answering the question it was
-		// asked, and each is invisible to the tests above. The next two pin them.
+		// asked, and each is invisible to the tests above. The next three pin them: the sweep's
+		// position, the walk's `continue`, and the clock basis both of those depend on.
 
 		// Side effect 1 — ORDER. The staleness sweep sits ABOVE the conflict test, so an abandoned
 		// reservation is dropped before it can win a race it should not be in. Move the sweep below
@@ -775,17 +796,7 @@ describe('ClusterMember', () => {
 			// the rival below must stay at 3 or the test would assert against an empty table.
 			const peers = makeClusterPeers([selfKeyPair, ...others]);
 
-			// Seeded from a real `Date.now()` so it shares an epoch with the clock reads that are
-			// deliberately NOT injected (`message.expiration`, the promise/resolution timeouts) — a
-			// counter starting near zero would make every record look long expired.
-			let clockMs = Date.now();
-			const member = clusterMember({
-				storageRepo: mockRepo,
-				peerNetwork: mockNetwork,
-				peerId: selfKeyPair.peerId,
-				privateKey: selfKeyPair.privateKey,
-				now: () => clockMs
-			});
+			const { member, clock } = makeClockedMember();
 
 			try {
 				// A reserves block-shared carrying peer2's and peer3's approvals; with ours that is 3 of 5.
@@ -802,7 +813,7 @@ describe('ClusterMember', () => {
 				expect(heldA.commits[ourId], 'A must stay below super-majority, or it is cleared and the table is empty').to.equal(undefined);
 
 				// Its coordinator then goes away: nothing touches A again and the reservation ages out.
-				clockMs += CONFLICT_STALE_THRESHOLD_MS + 1;
+				clock.ms += CONFLICT_STALE_THRESHOLD_MS + 1;
 
 				// D contests the same block with zero approvals. On the merits D (0 approvals) loses to
 				// A (3) outright, so an `approve` can ONLY mean A was swept before `resolveRace` ran.
@@ -823,12 +834,10 @@ describe('ClusterMember', () => {
 			const ourId = selfKeyPair.peerId.toString();
 			const peers = makeClusterPeers([selfKeyPair, ...others]);
 
-			const member = clusterMember({
-				storageRepo: mockRepo,
-				peerNetwork: mockNetwork,
-				peerId: selfKeyPair.peerId,
-				privateKey: selfKeyPair.privateKey
-			});
+			// Frozen clock — never advanced. Nothing here is about staleness, and on real time a stall
+			// of CONFLICT_STALE_THRESHOLD_MS between seeding a reservation and D's arrival would sweep
+			// the very rivals the assertion depends on.
+			const { member } = makeClockedMember();
 
 			try {
 				// `activeTransactions` is a Map, so the scan runs in insertion order: seed the LOSER first,
@@ -870,6 +879,44 @@ describe('ClusterMember', () => {
 				const vote = votedD.promises[ourId];
 				if (vote?.type !== 'conflict') expect.fail(`a second live rival must still block D, got ${vote?.type ?? 'no vote at all'}`);
 				expect(vote.conflictWith, 'the blocking rival is the one past the cleared loser').to.equal(recordC.messageHash);
+			} finally {
+				member.dispose();
+			}
+		});
+
+		// Side effect 3 — CLOCK BASIS. The sweep compares `lastUpdate` against `now`, and both must be
+		// read from the same clock. The two tests above only pin the comparison side: they would still
+		// pass if the STAMP reverted to a raw `Date.now()`, because a reservation stamped once at
+		// seed-time looks equally stale either way. This one drives a re-delivery after the advance, so
+		// a stamp on the wrong clock lands behind the comparison and the entry is swept when it must not
+		// be — the silent failure mode where every future clock-injecting test ages records it re-touched.
+		it('re-stamps a re-delivered reservation on the injected clock, keeping it out of the sweep', async () => {
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, await makeKeyPair(), await makeKeyPair()]);
+
+			const { member, clock } = makeClockedMember();
+
+			try {
+				// A reserves block-shared with our approve alone — 1 of 3, below super-majority, so it is
+				// retained rather than committed and cleared.
+				const recordA = await createClusterRecord(peers, makePendOperation('a-redelivered', 'block-shared'));
+				const heldA = await member.update(recordA);
+				expect(heldA.promises[ourId]?.type, 'A must be genuinely held for this test to assert anything').to.equal('approve');
+				expect(heldA.commits[ourId], 'A must stay below super-majority, or the table is empty').to.equal(undefined);
+
+				// Past the sweep threshold — but the coordinator is alive and re-delivers A, which the
+				// phase loop retains and re-stamps at the CURRENT injected time.
+				clock.ms += CONFLICT_STALE_THRESHOLD_MS + 1;
+				await member.update(recordA);
+
+				// D contests the same block with zero approvals. A is fresh as of the re-delivery, so it
+				// survives the sweep and beats D (1 approval vs 0); a stamp on the wall clock would leave
+				// A looking abandoned and D would come back with a clean `approve`.
+				const recordD = await createClusterRecord(peers, makePendOperation('a-rival', 'block-shared'));
+				const votedD = await member.update(recordD);
+				const vote = votedD.promises[ourId];
+				if (vote?.type !== 'conflict') expect.fail(`a re-delivered reservation must still block D, got ${vote?.type ?? 'no vote at all'}`);
+				expect(vote.conflictWith, 'the surviving reservation is the one that was re-stamped').to.equal(recordA.messageHash);
 			} finally {
 				member.dispose();
 			}
@@ -1795,12 +1842,11 @@ describe('ClusterMember', () => {
 			partitionDetectionWindow: 60000
 		};
 
-		it('minority rejection (1 of 5) allows transaction to proceed', async () => {
-			const peers4 = await Promise.all([makeKeyPair(), makeKeyPair(), makeKeyPair(), makeKeyPair()]);
-			const allKeys = [selfKeyPair, ...peers4];
-			const ourId = selfKeyPair.peerId.toString();
-			const peers = makeClusterPeers(allKeys);
-
+		/** These tests need a member on a non-default config, so the suite's shared instance will not
+		 *  do. Disposed after each test rather than in every body: the interval and timeout handles are
+		 *  `.unref()`ed (the process still exits) but they otherwise accumulate for the whole run. */
+		const thresholdMembers: ClusterMember[] = [];
+		const makeThresholdMember = (): ClusterMember => {
 			const member = clusterMember({
 				storageRepo: mockRepo,
 				peerNetwork: mockNetwork,
@@ -1808,6 +1854,20 @@ describe('ClusterMember', () => {
 				privateKey: selfKeyPair.privateKey,
 				consensusConfig: thresholdConfig
 			});
+			thresholdMembers.push(member);
+			return member;
+		};
+		afterEach(() => {
+			for (const member of thresholdMembers.splice(0)) member.dispose();
+		});
+
+		it('minority rejection (1 of 5) allows transaction to proceed', async () => {
+			const peers4 = await Promise.all([makeKeyPair(), makeKeyPair(), makeKeyPair(), makeKeyPair()]);
+			const allKeys = [selfKeyPair, ...peers4];
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers(allKeys);
+
+			const member = makeThresholdMember();
 
 			const baseRecord = await createClusterRecord(peers, makeGetOperation(['block-1']));
 
@@ -1842,13 +1902,7 @@ describe('ClusterMember', () => {
 			const ourId = selfKeyPair.peerId.toString();
 			const peers = makeClusterPeers(allKeys);
 
-			const member = clusterMember({
-				storageRepo: mockRepo,
-				peerNetwork: mockNetwork,
-				peerId: selfKeyPair.peerId,
-				privateKey: selfKeyPair.privateKey,
-				consensusConfig: thresholdConfig
-			});
+			const member = makeThresholdMember();
 
 			const baseRecord = await createClusterRecord(peers, makeGetOperation(['block-1']));
 

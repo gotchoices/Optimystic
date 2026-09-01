@@ -355,29 +355,44 @@ export class ClusterMember implements ICluster {
 
 ### Conflict Detection Algorithm
 
-The system prevents conflicting transactions by analyzing affected block IDs:
+The system prevents conflicting transactions by analyzing affected block IDs. The stateful scan
+below (`findConflict`) lives on `ClusterMember`; the two pure decisions it consults —
+`operationsConflict` and `resolveRace` — are module functions in
+[`race-resolution.ts`](../src/cluster/race-resolution.ts), testable without a member:
 
 ```typescript
 /** The winner's messageHash when a held transaction beats `record`, else undefined. */
 private findConflict(record: ClusterRecord): { blockedBy: string } | undefined {
+  const now = this.now();  // injectable clock — same one that stamps `lastUpdate`
   for (const [existingHash, state] of this.activeTransactions) {
-    if (this.operationsConflict(
+    // The sweep runs BEFORE the race is decided, not after: an abandoned entry must not win a
+    // contest it should not be in and reserve its blocks against a live rival for the rival's
+    // whole life. Both orderings answer "is there a conflict?" the same way, so the position is
+    // load-bearing but invisible to a naive test — pinned in `cluster-repo.spec.ts`.
+    if (now - state.lastUpdate > CONFLICT_STALE_THRESHOLD_MS) {
+      this.clearTransaction(existingHash);
+      continue;
+    }
+    if (operationsConflict(
       state.record.message.operations,
       record.message.operations
     )) {
       // Race resolution decides which one survives; the loser is cleared, not silently kept.
-      if (this.resolveRace(state.record, record) === 'keep-existing') {
+      if (resolveRace(state.record, record) === 'keep-existing') {
         return { blockedBy: existingHash };  // becomes the conflict vote's `conflictWith`
       }
       this.clearTransaction(existingHash);
+      // `continue`, not `break`: `record` may overlap several held reservations, and beating one
+      // says nothing about the rest.
+      continue;
     }
   }
   return undefined;
 }
 
-private operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMessage['operations']): boolean {
-  const blocks1 = new Set(this.getAffectedBlockIds(ops1));
-  const blocks2 = new Set(this.getAffectedBlockIds(ops2));
+export function operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMessage['operations']): boolean {
+  const blocks1 = new Set(getAffectedBlockIds(ops1));
+  const blocks2 = new Set(getAffectedBlockIds(ops2));
   
   for (const block of blocks1) {
     if (blocks2.has(block)) return true;
@@ -392,10 +407,10 @@ private operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMessage['o
 When two transactions conflict (operate on the same blocks), the system uses deterministic race resolution:
 
 ```typescript
-private resolveRace(existing: ClusterRecord, incoming: ClusterRecord): 'keep-existing' | 'accept-incoming' {
+export function resolveRace(existing: ClusterRecord, incoming: ClusterRecord): 'keep-existing' | 'accept-incoming' {
   // APPROVE votes only — `promises` is the vote map, and a reject is not progress.
-  const existingCount = ClusterMember.approvalCount(existing);
-  const incomingCount = ClusterMember.approvalCount(incoming);
+  const existingCount = approvalCount(existing);
+  const incomingCount = approvalCount(incoming);
 
   // Transaction with more approvals wins
   if (existingCount !== incomingCount) {
@@ -429,7 +444,11 @@ super-majority is unreachable (`TransactionPhase.Rejected`), or enough `conflict
 (`TransactionPhase.ConflictSuperseded`) — including the case where the member's own vote is the one
 that makes it unreachable. A member never keeps a record it conflict-voted: it already holds the
 winner, and keeping the loser would reserve the same blocks twice. Absent such proof the only release
-is the 2-second staleness sweep inside `findConflict`.
+is the staleness sweep inside `findConflict` (`CONFLICT_STALE_THRESHOLD_MS`, 2 seconds), which runs
+*before* the race is decided so an abandoned entry never wins a contest it should not be in. The
+clock behind both the sweep's comparison and the `lastUpdate` stamp it reads is injectable
+(`ClusterMemberComponents.now`, defaulting to `Date.now`) so a test can age a reservation without
+sleeping; no other clock read in `ClusterMember` is injected.
 
 That leaves the coordinator responsible for telling members about an abandonment they cannot see for
 themselves. When it abandons a transaction at the `rejected-by-validators` branch — or at the
