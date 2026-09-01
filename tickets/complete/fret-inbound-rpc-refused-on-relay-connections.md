@@ -1,3 +1,23 @@
+RESOLVED 2026-08-31 - the decision was made and the dependency shipped. FRET filed the fix as
+implement/1-bug-inbound-rpc-refused-on-relay-connections (commit dd63b42 there), landed it in
+62fe1f3, and published it as v1.0.0-beta.4 (65379e9). Optimystic's packages/db-p2p and
+packages/substrate-simulator now depend on ^1.0.0-beta.4, and the local portal resolves to the same
+tree, so local dev and published consumers agree for the first time.
+
+Verified: FRET's registerRpcHandler now builds its node.handle options through a private
+handleOptions() that bakes in runOnLimitedConnection: true as a constant and omits absent stream
+caps instead of passing undefined (which had been overwriting libp2p's 32/64 defaults for outside
+callers of the exported seam). Both arms mutation-tested in that repo.
+
+Consequence for release notes: relay reachability is now genuinely end to end - Optimystic answers
+over limited connections on all 13 of its registrations, and FRET answers on all five of its
+routing protocols, so a relay-only peer can both be reached and be found. That claim was NOT safe to
+make before beta.4 shipped.
+
+Filed to complete/ rather than left in the human inbox; nothing here is still awaiting a decision.
+
+----
+
 description: The routing library this project depends on still refuses incoming calls from peers that can only be reached through a relay, so those peers stay half-cut-off even now that Optimystic's own protocols answer them. The one-line fix lives in a different repository, so a human has to decide whether and how to make it.
 files: ../Fret/packages/fret/src/rpc/protocols.ts, packages/db-p2p/src/network/register-protocol-handler.ts, package.json
 repro: verified
