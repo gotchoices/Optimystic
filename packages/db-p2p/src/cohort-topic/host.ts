@@ -1560,9 +1560,10 @@ class RotationState {
  * cohort-wide. Because merge is last-writer-wins by `effectiveAt`, a link and a later unlink converge in any
  * arrival order, and a never-seen unlink writes a `linked = false` tombstone that a subsequently-arriving stale
  * link cannot resurrect. The union is keyed by child coord, never the parent epoch, so a parent membership
- * rotation does not reset it. NOTE: a link/unlink is broadcast once (drained from the pending delta queue);
- * a parent member that joins the cohort *after* the delta drained (rotation cold-start) learns the child set
- * only on the next local record/unrecord for that child — see `debt-cohort-topic-child-set-late-joiner-resync`.
+ * rotation does not reset it. A link/unlink is broadcast once (drained from the pending delta queue), so a
+ * member that missed that one frame — a rotation cold-start, most of all — is healed by the throttled
+ * re-advertisement of {@link ChildRegistry.linkedChildren} in `gossipRound` (one frame per
+ * `T_willingness_heartbeat`, see there).
  */
 interface ChildRegistry {
 	/** Link the child; returns true iff this advanced the state (a fresh link or a strictly-newer effectiveAt). */
@@ -1570,13 +1571,35 @@ interface ChildRegistry {
 	/** Release the child (linked = false); returns true iff this advanced the state. A never-seen child writes a tombstone. */
 	unrecordChild(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): boolean;
 	count(topicId: Uint8Array): number;
+	/**
+	 * Every currently-linked child across **all** topics (released children — tombstones — excluded), each at
+	 * the `effectiveAt` that linked it. Deliberately not per-topic: `gossipRound` iterates only *resident*
+	 * topics (ones this engine holds records or forwarders for), and a parent can hold child links for a topic
+	 * whose participants sharded entirely down to the children, so a per-topic accessor would miss exactly the
+	 * parents that matter.
+	 */
+	linkedChildren(): readonly LinkedChild[];
+}
+
+/** One linked child cohort, as re-advertised by the throttled child-set resync round. */
+interface LinkedChild {
+	topicId: Uint8Array;
+	childCohortCoord: Uint8Array;
+	effectiveAt: number;
 }
 
 interface ChildEntry {
 	linked: boolean;
 	lastEffectiveAt: number;
+	/** The original bytes, retained (both are in hand at the single `apply` call site) so `linkedChildren` needs no key decode. */
+	topicId: Uint8Array;
+	childCohortCoord: Uint8Array;
 }
 
+// NOTE: released children are kept forever as `linked = false` tombstones (the high-water that stops a stale
+// link resurrecting them), so a long-lived engine's map grows with child churn. They cost memory only, never
+// traffic — `linkedChildren` excludes them, so re-advertisement volume is bounded by the *live* child count.
+// If child churn on a long-lived parent ever makes this map large, age tombstones out past a demotion horizon.
 function createChildRegistry(): ChildRegistry {
 	const byTopic = new Map<string, Map<string, ChildEntry>>();
 	// Freshness-ordered write shared by link/unlink: apply `linked` only if `effectiveAt` is strictly newer than
@@ -1594,7 +1617,7 @@ function createChildRegistry(): ChildRegistry {
 		if (existing === undefined) {
 			// A never-seen unlink writes a `linked = false` tombstone (never a negative count), so a later stale
 			// link with an earlier effectiveAt cannot resurrect a demoted child.
-			children.set(childKey, { linked, lastEffectiveAt: effectiveAt });
+			children.set(childKey, { linked, lastEffectiveAt: effectiveAt, topicId, childCohortCoord });
 			return true;
 		}
 		if (effectiveAt <= existing.lastEffectiveAt) {
@@ -1624,6 +1647,17 @@ function createChildRegistry(): ChildRegistry {
 				}
 			}
 			return n;
+		},
+		linkedChildren(): readonly LinkedChild[] {
+			const out: LinkedChild[] = [];
+			for (const children of byTopic.values()) {
+				for (const entry of children.values()) {
+					if (entry.linked) {
+						out.push({ topicId: entry.topicId, childCohortCoord: entry.childCohortCoord, effectiveAt: entry.lastEffectiveAt });
+					}
+				}
+			}
+			return out;
 		},
 	};
 }
@@ -1969,10 +2003,15 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	// node ever serves very many idle cohorts, batch the heartbeats or lengthen the interval.
 	let lastGossipAt: number | undefined;
 
+	// Timestamp of the last round in which this engine re-advertised its linked child set, or `undefined` if it
+	// never has. Bounds child-set resync to one frame per `T_willingness_heartbeat`, not one per gossip round.
+	let lastChildReadvertAt: number | undefined;
+
 	// One gossip round: sweep stale records (firing the `evicted` deltas), freeze each resident topic's
-	// traffic summary, drain the touch/evicted deltas, then assemble + sign + broadcast the frame. An idle
-	// engine (no topics, no deltas) normally builds no frame — except a willingness heartbeat, where an idle
-	// but willing engine still emits a willingness/load-only frame so a cold cohort can bootstrap.
+	// traffic summary, re-advertise the linked child set on its throttle, drain the touch/evicted/child deltas,
+	// then assemble + sign + broadcast the frame. An idle engine (no topics, no deltas) normally builds no
+	// frame — except a willingness heartbeat, where an idle but willing engine still emits a willingness/load-
+	// only frame so a cold cohort can bootstrap.
 	const gossipRound = async (now: number): Promise<CohortGossipV1 | undefined> => {
 		engine.sweepStale(now);
 		const topicSummaries = residentTopics().map((topicId) =>
@@ -1986,6 +2025,32 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 				childCohortCount: childRegistry.count(topicId),
 			}),
 		);
+		// Child-set resync. A link/unlink delta is broadcast exactly once, so a member whose engine was
+		// instantiated after a link drained (a parent rotation, or any FRET reshuffle adding a node to the
+		// parent cohort) would read `childCohortCount == 0` for children that plainly exist — wrongly clearing
+		// the demotion gate and telling seekers the topic is not promoted. So every `willingnessHeartbeatMs`
+		// re-emit the *currently-linked* set at each child's original `effectiveAt`. Safe by construction: the
+		// receiving merge is last-writer-wins on `effectiveAt`, so a re-advertisement is a no-op on a member
+		// that already holds it and cannot resurrect a child released by a newer unlink. Queued through
+		// `pending` (not straight into the frame) so a same-round unlink at a newer `effectiveAt` supersedes it;
+		// sourcing from the registry rather than the queue means an unlinked child is never re-advertised, so
+		// the equal-`effectiveAt` case in that collapse is unreachable. Bounded to one extra frame per engine
+		// per heartbeat, and the round is deliberately non-idle — the frame is the carrier.
+		// NOTE: this heals a missed *link*, never a missed *unlink* — absence is not advertised, so a member
+		// that dropped an unlink frame over-counts until it hears another delta for that child. Both consumers
+		// fail conservatively there (demotion stays blocked; a seeker sweeps a no-longer-promoted tier —
+		// wasteful, not wrong). If over-counting ever needs healing too, advertise the tombstones as well.
+		if (lastChildReadvertAt === undefined || now - lastChildReadvertAt >= ctx.willingnessHeartbeatMs) {
+			const linked = childRegistry.linkedChildren();
+			for (const child of linked) {
+				pending.childLink(child.topicId, child.childCohortCoord, child.effectiveAt);
+			}
+			// Only start the clock once something was actually enqueued: an engine that parents nothing stays
+			// silent and re-advertises immediately when it first does hold a child.
+			if (linked.length > 0) {
+				lastChildReadvertAt = now;
+			}
+		}
 		const { records, evicted, childLinks, childUnlinks } = pending.drain();
 		const idle = topicSummaries.length === 0 && records.length === 0 && evicted.length === 0
 			&& childLinks.length === 0 && childUnlinks.length === 0;

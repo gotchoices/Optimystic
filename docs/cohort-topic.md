@@ -394,8 +394,15 @@ A participant that receives `NoState` at tier `d` gets no traffic signal from th
 > different members), so a per-member count is a shard, not the total. Each member gossips its own child
 > link/unlink deltas (`CohortGossipV1.childLinks` / `childUnlinks`) and merges inbound ones straight into its
 > per-engine child registry (last-writer-wins by `effectiveAt`, keyed by child coord — **not** the parent
-> epoch, so a parent rotation never drops the set), so after one gossip round every parent member holds the
-> full union and `childCohortCount` is consistent cohort-wide (`cohort-topic-child-link-replicate-unlink`). It
+> epoch, so a parent rotation never drops the set), so after one gossip round every parent member present for
+> it holds the full union and `childCohortCount` is consistent cohort-wide
+> (`cohort-topic-child-link-replicate-unlink`). Convergence is two mechanisms, not one: a one-shot delta on
+> each local link/unlink, **plus** a re-advertisement of the whole *linked* set every
+> `T_willingness_heartbeat`, which is what heals a member who was not there for the one-shot (a rotated-in
+> member's engine starts with an empty registry). A missed **unlink** is *not* re-advertised — absence means
+> uncounted, so a member that dropped an unlink frame keeps over-counting until another delta for that child
+> arrives; both consumers fail conservatively there (demotion stays blocked, and a seeker sweeps a tier that
+> is no longer promoted — wasteful, not wrong). It
 > is supplied to the traffic snapshot as the promotion-layer override. (The override is *always* authoritative
 > when wired — it returns a number, `0` included, so the nullish-coalescing `childOverride ?? maxOfSiblings`
 > never falls through to the gossiped max; that max-of-siblings computation is dormant while the registry
@@ -1596,9 +1603,22 @@ The `childLinks` / `childUnlinks` deltas converge the **child set** a parent coh
 demotion, the unlink) replicates it to every parent member, which merges it straight into its per-engine
 child registry (last-writer-wins by `effectiveAt` per `(topic, childCohortCoord)`). Unlike record deltas,
 these merge **regardless of `cohortEpoch`** — the child set is keyed by child coord, not the parent's
-membership snapshot, so a parent rotation does not drop it and a rotated-in member converges via gossip.
-A merged delta is a direct registry write, never re-gossiped (one broadcast reaches the whole cohort). All
-four delta arrays are covered by the gossip `signature`, so a MITM cannot strip or inject one.
+membership snapshot, so a parent rotation does not drop it. A merged delta is a direct registry write, never
+re-gossiped (one broadcast reaches the whole cohort). All four delta arrays are covered by the gossip
+`signature`, so a MITM cannot strip or inject one.
+
+Because each delta is broadcast exactly once, a member who was not in the cohort when it drained — a
+rotated-in member builds a fresh engine with an **empty** child registry — would otherwise read
+`childCohortCount == 0` forever. So each round, before draining, an engine re-advertises its currently
+**linked** children as `childLinks` at their original `effectiveAt`, throttled to once per
+`T_willingness_heartbeat` (`willingnessHeartbeatMs`, default 30 s — the same knob as the idle willingness
+heartbeat; lengthening it lengthens child-set convergence equally). The re-advertisement is a no-op on a
+member that already holds the link, and cannot resurrect a released child: its `effectiveAt` is older than
+the unlink's, so the tombstone's high-water drops it. A re-advertising round is deliberately **not** idle —
+it builds and broadcasts a frame even for an engine that would otherwise emit nothing, since the frame is
+the carrier. Only *links* are re-advertised: an **unlink** that a member missed is never re-sent (absence is
+not advertised), so such a member over-counts until another delta for that child arrives — conservative in
+both consumers (the demotion gate stays shut; matchmaking sweeps a tier that is no longer promoted).
 
 **Per-coord routing.** A node serves many cohorts at once (one per coord FRET routes to it — see
 §FRET integration), and a delivered `cohort-gossip` frame is fanned to every coord engine's bus on the

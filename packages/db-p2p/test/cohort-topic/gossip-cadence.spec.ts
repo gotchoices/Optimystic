@@ -603,8 +603,13 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 		expect(eB.childCohortCount(TOPIC), 'B converged on the union {C1, C2}').to.equal(2);
 
 		// A received delta is a direct registry write, NOT re-gossiped — A's next round carries no child deltas.
+		// This also pins the re-advertisement throttle: A re-advertised on its round at 1_500 (first-ever, so
+		// immediate), so every round inside the next `willingnessHeartbeatMs` window must carry NO child links
+		// at all — not merely the merged one. Without the throttle these rounds would carry both C1 and C2.
 		const gA2 = await eA.gossipRound(2_000);
-		expect(gA2?.childLinks ?? [], 'a merged child link is not re-gossiped').to.deep.equal([]);
+		expect(gA2?.childLinks, 'a merged child link is not re-gossiped, and the resync throttle holds').to.equal(undefined);
+		const gA3 = await eA.gossipRound(11_500);
+		expect(gA3?.childLinks, 'still inside the heartbeat window — no re-advertisement').to.equal(undefined);
 
 		await a.host.stop();
 		await b.host.stop();
@@ -681,6 +686,144 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 
 		await a.host.stop();
 		await b.host.stop();
+	});
+
+	// --- throttled re-advertisement of the linked child set (debt-cohort-topic-child-set-late-joiner-resync) ---
+
+	/** Three keyed hosts that all sit in the cohort for `coord0(TOPIC)` — a parent cohort a member can join late. */
+	async function threeNodeCohort(): Promise<{
+		members: Array<{ host: Awaited<ReturnType<typeof createCohortTopicHost>>; node: FakeNode; member: Member }>;
+		coord0: RingCoord;
+	}> {
+		const ms = [await makeMember(), await makeMember(), await makeMember()];
+		const coord0 = addressing.coord0(TOPIC);
+		const coordKey = bytesToB64url(coord0);
+		const ids = ms.map((m) => m.idStr);
+		const cohortFor = (coord: RingCoord): string[] => (bytesToB64url(coord) === coordKey ? ids : []);
+		const built = [];
+		for (const m of ms) {
+			const node = makeFakeNode(m.peerId);
+			const host = await createCohortTopicHost(node as never, makeFakeFret(cohortFor) as never, { privateKey: m.key, wantK: 3, minSigs: 2, gossipIntervalMs: 3_600_000 });
+			built.push({ host, node, member: m });
+		}
+		return { members: built, coord0 };
+	}
+
+	it('a parent member that joins AFTER the one-shot child link drained converges on the next re-advertisement', async () => {
+		// The rotation cold-start: FRET adds C to the parent cohort after A's link delta has already been
+		// broadcast and drained. C's engine starts with an EMPTY child registry, so it reads
+		// childCohortCount == 0 for a child that plainly exists — which would wrongly clear the demotion gate
+		// and tell seekers the topic is not promoted. Nothing re-advertises a one-shot delta, so only the
+		// throttled resync round heals it.
+		const { members, coord0 } = await threeNodeCohort();
+		const [a, b, c] = members as [typeof members[0], typeof members[0], typeof members[0]];
+		const eA = a.host.registry.forCoord(coord0, 0 as Tier, a.member.bytes);
+		const eB = b.host.registry.forCoord(coord0, 0 as Tier, b.member.bytes);
+		const c1 = childCoord(7);
+
+		// A records the FRET-routed child link and drains it into its round at t0; only A and B see it.
+		eA.recordChild(TOPIC, c1, 1_000);
+		const t0 = 1_500;
+		const gLink = await eA.gossipRound(t0);
+		expect(gLink?.childLinks?.length, 'A drained the one-shot child link').to.equal(1);
+		deliverGossip(b.node, encodeCohortMessage(gLink!), a.member.peerId);
+		await waitFor(() => eB.childCohortCount(TOPIC) === 1, { description: 'B (present for the one-shot) learned the child' });
+
+		// C's engine is instantiated only NOW — after the delta drained.
+		const eC = c.host.registry.forCoord(coord0, 0 as Tier, c.member.bytes);
+		expect(eC.childCohortCount(TOPIC), 'the late joiner starts with an empty child registry').to.equal(0);
+
+		// No further local record/unrecord anywhere — the ONLY thing that can heal C is the resync round.
+		const gResync = await eA.gossipRound(t0 + 30_001);
+		expect(gResync?.childLinks?.length, 'A re-advertised its linked child set once the heartbeat elapsed').to.equal(1);
+		expect(gResync?.childLinks?.[0]?.effectiveAt, 're-advertised at the ORIGINAL effectiveAt (so a newer unlink still wins)').to.equal(1_000);
+		deliverGossip(c.node, encodeCohortMessage(gResync!), a.member.peerId);
+		await waitFor(() => eC.childCohortCount(TOPIC) === 1, { description: 'the late joiner converged via the re-advertisement' });
+		expect(eC.childCohortCount(TOPIC), 'the late joiner now counts the child — the demotion gate and traffic signal are right').to.equal(1);
+
+		for (const m of members) await m.host.stop();
+	});
+
+	it('the round that drains a fresh local child link does not double-advertise it', async () => {
+		// `lastChildReadvertAt` starts undefined, so the very first round with a linked child re-advertises
+		// immediately — in the same round that drains the real delta. `PendingDeltas.queueChild` collapses the
+		// two (same key, same effectiveAt) into one ref; routing the re-advertisement through the queue rather
+		// than straight into the frame is what makes that collapse happen.
+		const { a, coord0 } = await twoNodeCohort();
+		const e = a.host.registry.forCoord(coord0, 0 as Tier, a.member.bytes);
+		e.recordChild(TOPIC, childCoord(7), 1_000);
+
+		const g = await e.gossipRound(1_500);
+		expect(g?.childLinks?.length, 'the local delta and its same-effectiveAt re-advertisement collapse to one ref').to.equal(1);
+
+		await a.host.stop();
+	});
+
+	it('a re-advertised child link cannot resurrect a released child, in either arrival order', async () => {
+		const { a, b, coord0 } = await twoNodeCohort();
+		const e = a.host.registry.forCoord(coord0, 0 as Tier, a.member.bytes);
+		const epoch = e.cohort().cohortEpoch;
+		const released = childCoord(7);
+		const control = childCoord(13);
+
+		// Order 1 — the tombstone is already held; the stale re-advertisement arrives after.
+		e.recordChild(TOPIC, released, 1_000);
+		e.unrecordChild(TOPIC, released, 2_000);
+		expect(e.childCohortCount(TOPIC), 'the child is released before the re-advertisement lands').to.equal(0);
+		const readvert = await signedGossip(b.member, coord0, epoch, {
+			childLinks: [
+				{ topicId: bytesToB64url(TOPIC), childCohortCoord: bytesToB64url(released), effectiveAt: 1_000 },
+				// A positive control in the SAME frame: this child has no tombstone, so it DOES link — waiting on
+				// it proves the frame was merged, which settles the negative without a sleep.
+				{ topicId: bytesToB64url(TOPIC), childCohortCoord: bytesToB64url(control), effectiveAt: 1_000 },
+			] satisfies ChildLinkRefV1[],
+		});
+		deliverGossip(a.node, readvert, b.member.peerId);
+		await waitFor(() => e.childCohortCount(TOPIC) === 1, { description: 'the re-advertisement frame merged (its control child linked)' });
+		expect(e.childCohortCount(TOPIC), 'only the control linked — the released child stayed released').to.equal(1);
+
+		// Order 2 (reversed arrival, on a second topic to keep the count clean) — the re-advertised link lands
+		// FIRST, then the newer unlink; the merge must still settle at 0.
+		const late = childCoord(21);
+		const link2 = await signedGossip(b.member, coord0, epoch, {
+			childLinks: [{ topicId: bytesToB64url(TOPIC2), childCohortCoord: bytesToB64url(late), effectiveAt: 1_000 }] satisfies ChildLinkRefV1[],
+		});
+		deliverGossip(a.node, link2, b.member.peerId);
+		await waitFor(() => e.childCohortCount(TOPIC2) === 1, { description: 'the re-advertised link landed first' });
+		e.unrecordChild(TOPIC2, late, 2_000);
+		expect(e.childCohortCount(TOPIC2), 'the newer unlink still wins over an already-merged re-advertisement').to.equal(0);
+
+		await a.host.stop();
+		await b.host.stop();
+	});
+
+	it('re-advertisement is bounded to one frame per heartbeat and covers topics this engine holds no records for', async () => {
+		// The child is under TOPIC2, for which this engine holds no registrations — so it is NOT a resident
+		// topic and a per-topic accessor keyed off `residentTopics()` would miss it entirely. That is exactly
+		// the parent whose participants have all sharded down to the children, i.e. the case that matters.
+		const { a, coord0 } = await twoNodeCohort();
+		const e = a.host.registry.forCoord(coord0, 0 as Tier, a.member.bytes);
+		const c1 = childCoord(9);
+		e.recordChild(TOPIC2, c1, 1_000);
+
+		const carried: number[] = [];
+		let lastRefs: readonly ChildLinkRefV1[] | undefined;
+		for (const t of [1_000, 6_000, 11_000, 16_000, 21_000, 26_000, 31_001, 36_000]) {
+			const g = await e.gossipRound(t);
+			if ((g?.childLinks?.length ?? 0) > 0) {
+				carried.push(t);
+				lastRefs = g!.childLinks;
+			}
+		}
+		// 1_000 drains the real delta (and the immediate first re-advertisement, collapsed); 31_001 is the next
+		// heartbeat boundary. The six rounds in between carry nothing — and note 31_001's frame exists ONLY
+		// because the re-advertisement makes an otherwise-idle round non-idle: the frame is the carrier.
+		expect(carried, 'exactly one frame per heartbeat window carries child links').to.deep.equal([1_000, 31_001]);
+		expect(lastRefs?.length, 'the resync frame carried the one linked child').to.equal(1);
+		expect(lastRefs?.[0]?.topicId, 'a non-resident topic is still re-advertised').to.equal(bytesToB64url(TOPIC2));
+		expect(lastRefs?.[0]?.effectiveAt, 're-advertised at the original effectiveAt').to.equal(1_000);
+
+		await a.host.stop();
 	});
 });
 
