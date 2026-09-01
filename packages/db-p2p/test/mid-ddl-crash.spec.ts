@@ -325,8 +325,10 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 	// Crash-B: partial pending across multiple blocks (`when: 'before'`)
 	//
 	// With `when: 'before'` on block[1], the proxy throws without delegating, so
-	// block[1]'s pending is not persisted. Block[0] and block[2] run concurrently
-	// under Promise.all and DO complete their writes. Result: genuinely partial.
+	// block[1]'s pending is not persisted. `pend` writes its pending records SEQUENTIALLY, in
+	// request order, inside one multi-block write-latch hold, so the throw also stops block[2]
+	// from ever being written: only block[0], written before the crash, persists. Result: still
+	// genuinely partial, and one record fewer to clean up than the old concurrent fan-out left.
 	// ------------------------------------------------------------------------
 	describe('Crash-B: partial pending across 3 blocks', () => {
 		const b0 = 'crash-b-block-0' as BlockId;
@@ -344,7 +346,7 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 			policy: 'c'
 		});
 
-		it('crash leaves partial pending (b1 missing) and does not permanently wedge any block', async () => {
+		it('crash leaves partial pending (b0 only) and does not permanently wedge any block', async () => {
 			const raw = new MemoryRawStorage();
 			const { mesh, proxy } = await buildCrashingMesh(raw, {
 				method: 'savePendingTransaction',
@@ -361,13 +363,14 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 			assertIsCrash(caught);
 			expect(proxy.fired).to.equal(true);
 
-			// b0 and b2 wrote pending (Promise.all fans out concurrently), b1 did not.
+			// b0 was written before the crash; b1 threw; b2 is never reached, because the saves run
+			// sequentially in request order inside one latch hold.
 			const p0 = await raw.getPendingTransaction(b0, staleActionId);
 			const p1 = await raw.getPendingTransaction(b1, staleActionId);
 			const p2 = await raw.getPendingTransaction(b2, staleActionId);
 			expect(p0, 'b0 pending persisted').to.not.equal(undefined);
 			expect(p1, 'b1 pending NOT persisted (crash before)').to.equal(undefined);
-			expect(p2, 'b2 pending persisted').to.not.equal(undefined);
+			expect(p2, 'b2 pending NOT persisted (the crash stopped the sequential save)').to.equal(undefined);
 
 			// Recovery: cancel the stale action across all blocks; then a fresh action on the
 			// same block-set must succeed (no permanent wedge).

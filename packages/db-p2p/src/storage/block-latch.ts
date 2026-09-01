@@ -90,10 +90,11 @@ export type BlockWriteLatches = {
 
 /**
  * Acquire the write latches for a whole set of blocks at once — the only sanctioned way to hold more
- * than one. Two callers need it (`StorageRepo.commit` and `applyInvalidation`), and the property that
- * keeps them from deadlocking against each other is not local to either: it is that EVERY multi-latch
- * holder acquires in the one global order. Owning that here makes it a property of the module that
- * owns the key rather than a rule each call site restates and a third one could get wrong.
+ * than one. Three callers need it (`StorageRepo.pend`, `StorageRepo.commit` and `applyInvalidation`),
+ * and the property that keeps them from deadlocking against each other is not local to any of them:
+ * it is that EVERY multi-latch holder acquires in the one global order. Owning that here makes it a
+ * property of the module that owns the key rather than a rule each call site restates and the next
+ * one could get wrong.
  *
  * Three things this does that a hand-rolled loop keeps getting wrong:
  *  - **Dedups** the ids. `Latches` is a plain FIFO mutex with no re-entrancy, so a repeated id in the

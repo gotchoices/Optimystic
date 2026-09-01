@@ -150,6 +150,26 @@ rest refused) is waved through as **satisfied** and no pending record is written
 would strand it exactly as the paragraph below describes: `commit` partitions that block as
 already-done and never promotes the record.
 
+Two mechanisms *enforce* that obligation rather than merely stating it:
+
+- **`pend` classifies and saves under one hold.** It takes the write latches for all of its blocks
+  up front (`acquireBlockWriteLatches`, the same sorted, deduped entry point `commit` and
+  `applyInvalidation` use), then runs two passes inside that hold: pass 1 reads each block's
+  `latest` and decides satisfied / stale / pendable, pass 2 writes the pending records. Because the
+  read and the write are one atomic step, no commit can land in between and make a decision from
+  pass 1 obsolete. Splitting it into two passes rather than one interleaved loop also means a block
+  refused partway through leaves *no* records written for the blocks before it — every refusal path
+  returns having written nothing.
+- **The storage seam refuses the write outright.** `BlockStorage.savePendingTransaction` takes the
+  revision the record claims and throws `PendRevisionTakenError` when the block has already
+  committed at or past it. Its question is "could this record ever be promoted?", not "is this our
+  own revision?", so one `latest.rev >= rev` comparison covers both unpromotable cases: our own
+  already-committed revision (`===`, which `commit` treats as already-done) and a rival's win
+  (`>`, which `commit` refuses as stale). A pend that claims no revision (an insert-only pend, with
+  no `rev`) names nothing to compare and is unaffected. The refusal costs no extra read — that
+  method already reads the block's metadata — and under the hold above it is unreachable from
+  `pend`, so a throw means some caller reintroduced a check-then-act split.
+
 The invariant matters because a pending record left beside a committed one can never be promoted:
 once the block's `latest` has advanced past the revision the record was pended at, a commit retry
 partitions the block as already-done or stale and never revisits it. `pend` then reports that

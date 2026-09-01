@@ -21,6 +21,28 @@ export class RevisionNotCoveredError extends Error {
 }
 
 /**
+ * Thrown by {@link IBlockStorage.savePendingTransaction} when the block has already committed a
+ * revision at or past the one the pending record names, so the record could never be promoted:
+ * `StorageRepo.commit` partitions such a block as already-done (`latest.rev === rev`, same action)
+ * or refuses it as stale (`latest.rev > rev`, or a rival at the same rev), and neither path runs
+ * the promotion that is the only thing removing a pending record on the success path. The record
+ * would then be reported as a conflicting in-flight action to every later writer of the block —
+ * see **Invariant P** on {@link IBlockStorage.promotePendingTransaction}.
+ *
+ * It is a throw rather than a returned status because a caller reaching it has reintroduced a
+ * check-then-act split that `StorageRepo.pend` closed by classifying and saving under one held
+ * latch; a status is a value a caller can ignore, which is the failure mode being designed out.
+ */
+export class PendRevisionTakenError extends Error {
+	constructor(readonly blockId: BlockId, readonly actionId: ActionId, readonly rev: number, readonly latest: ActionRev) {
+		super(`Block ${blockId}: cannot pend action ${actionId} at revision ${rev}; the block is `
+			+ `already committed at revision ${latest.rev} (action ${latest.actionId}), so the `
+			+ `pending record could never be promoted`);
+		this.name = 'PendRevisionTakenError';
+	}
+}
+
+/**
  * Interface for block-level storage operations.
  *
  * **One block, one write lock.** Every method that writes — metadata, revision records, action
@@ -70,8 +92,27 @@ export interface IBlockStorage {
     /** Lists all pending action IDs */
     listPendingTransactions(): AsyncIterable<ActionId>;
 
-    /** Saves a pending action (seeding this block's metadata when it has none). */
-    savePendingTransaction(actionId: ActionId, transform: Transform, latch: BlockWriteLatch): Promise<void>;
+    /**
+     * Saves a pending action (seeding this block's metadata when it has none).
+     *
+     * `rev` is the revision the pend is claiming — the `rev` of the `PendRequest` this record
+     * belongs to, or `undefined` for a claim that names no revision (an insert-only pend). When it
+     * names one and the block has already committed at or past it, this REFUSES with
+     * {@link PendRevisionTakenError} and writes nothing.
+     *
+     * The question the refusal asks is **"could this record ever be promoted?"**, not "is this our
+     * own revision?" — which is why it does not use `isOwnRevision`. A single `latest.rev >= rev`
+     * comparison collapses both unpromotable cases: the writer's own already-committed revision
+     * (`===`, which `StorageRepo.commit` partitions as already-done and never promotes) and a
+     * rival's win (`>`, which `commit` refuses as stale). The error carries `latest` so the message
+     * can name which it was. `rev === undefined` names no revision, so no comparison applies.
+     *
+     * The refusal is an assertion, not a control-flow path: `StorageRepo.pend` classifies and saves
+     * under one multi-block write-latch hold, so every block it saves was observed under that same
+     * hold to satisfy `latest === undefined || latest.rev < rev`, and no writer can advance a block
+     * without its latch. A throw here means a caller reintroduced check-then-act.
+     */
+    savePendingTransaction(actionId: ActionId, transform: Transform, rev: number | undefined, latch: BlockWriteLatch): Promise<void>;
 
     /** Deletes a pending action */
     deletePendingTransaction(actionId: ActionId, latch: BlockWriteLatch): Promise<void>;
@@ -104,6 +145,10 @@ export interface IBlockStorage {
      * writes the committed one. A pending record left beside a committed one can never be promoted,
      * and is reported as a phantom conflicting action by `StorageRepo.pend` on every later write to
      * the block.
+     *
+     * The pend side of the invariant is enforced rather than merely required:
+     * {@link savePendingTransaction} refuses ({@link PendRevisionTakenError}) to write a pending
+     * record for a revision the block has already reached.
      */
     promotePendingTransaction(actionId: ActionId, latch: BlockWriteLatch): Promise<void>;
 

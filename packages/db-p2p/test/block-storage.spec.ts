@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
-import { RevisionNotCoveredError } from '../src/storage/i-block-storage.js';
+import { RevisionNotCoveredError, PendRevisionTakenError } from '../src/storage/i-block-storage.js';
 import { withBlockWriteLatch, type BlockWriteLatch } from '../src/storage/block-latch.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from '../src/storage/struct.js';
@@ -68,7 +68,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 		const storage = new BlockStorage(blockId, raw);
 
 		await withBlockWriteLatch(blockId, l =>
-			storage.savePendingTransaction('a1' as ActionId, { insert: makeBlock('block-pend') }, l));
+			storage.savePendingTransaction('a1' as ActionId, { insert: makeBlock('block-pend') }, undefined, l));
 
 		const meta = await raw.getMetadata(blockId);
 		expect(meta, 'metadata seeded').to.not.equal(undefined);
@@ -105,7 +105,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
 		// Seed pending-only metadata (ranges: []), but never commit rev 1 locally.
 		await withBlockWriteLatch(blockId, l =>
-			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore') }, l));
+			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore') }, undefined, l));
 
 		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback));
 		const result = (await repo.get({ blockIds: [blockId], context: { rev: 1, committed: [] } }))[blockId];
@@ -129,7 +129,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 			expect(l.blockId).to.equal(a);
 			let thrown: unknown;
 			try {
-				await storageB.savePendingTransaction('p' as ActionId, { insert: makeBlock('block-token-b') }, l);
+				await storageB.savePendingTransaction('p' as ActionId, { insert: makeBlock('block-token-b') }, undefined, l);
 			} catch (err) {
 				thrown = err;
 			}
@@ -152,7 +152,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 		expect(stashed.live, 'the token is dead once its scope released the latch').to.equal(false);
 		let thrown: unknown;
 		try {
-			await storage.savePendingTransaction('p' as ActionId, { insert: makeBlock('block-stale-token') }, stashed);
+			await storage.savePendingTransaction('p' as ActionId, { insert: makeBlock('block-stale-token') }, undefined, stashed);
 		} catch (err) {
 			thrown = err;
 		}
@@ -176,7 +176,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 		const blockId = 'block-local-only' as BlockId;
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
 		await withBlockWriteLatch(blockId, l =>
-			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-local-only') }, l));
+			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-local-only') }, undefined, l));
 		expect(await storage.getBlock(), 'pending-only with no rev named reads absent').to.equal(undefined);
 
 		let gap: unknown;
@@ -202,7 +202,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 		const blockId = 'block-no-restore' as BlockId;
 		const storage = new BlockStorage(blockId, raw);	// no restoreCallback wired
 		await withBlockWriteLatch(blockId, l =>
-			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-no-restore') }, l));
+			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-no-restore') }, undefined, l));
 
 		// The local-only contract underneath: the named rev is outside the (empty) ranges, so the
 		// direct read reports the gap rather than answering it.
@@ -239,7 +239,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
 		await withBlockWriteLatch(blockId, l =>
-			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore-empty') }, l));
+			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore-empty') }, undefined, l));
 
 		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback));
 		const got = (await repo.get({ blockIds: [blockId], context: { rev: 1, committed: [] } }))[blockId];
@@ -294,7 +294,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
 		await withBlockWriteLatch(blockId, l =>
-			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore-hollow') }, l));
+			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore-hollow') }, undefined, l));
 
 		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback));
 		const got = (await repo.get({ blockIds: [blockId], context: { rev: 1, committed: [] } }))[blockId];
@@ -649,7 +649,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 			const block = makeBlock('block-invariant-p-replica', { items: [] });
 
 			// This node pended the action but diverged before committing it.
-			await withBlockWriteLatch(blockId, l => storage.savePendingTransaction(actionId, { insert: block }, l));
+			await withBlockWriteLatch(blockId, l => storage.savePendingTransaction(actionId, { insert: block }, undefined, l));
 			expect(await storage.getPendingTransaction(actionId), 'pended here').to.not.equal(undefined);
 
 			// The reconcile path supplies the committed revision for the SAME action.
@@ -685,7 +685,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 
 			await withBlockWriteLatch(blockId, async (l) => {
 				await storage.saveReplica(makeBlock('block-invariant-p-deletion', { items: ['live'] }), { rev: 1, actionId: 'r1' as ActionId }, undefined, l);
-				await storage.savePendingTransaction(actionId, { delete: true }, l);
+				await storage.savePendingTransaction(actionId, { delete: true }, undefined, l);
 			});
 			expect(await storage.getPendingTransaction(actionId), 'delete pended here').to.not.equal(undefined);
 
@@ -703,7 +703,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 			const storage = new BlockStorage(blockId, raw);
 
 			await withBlockWriteLatch(blockId, async (l) => {
-				await storage.savePendingTransaction('a-inflight' as ActionId, { updates: [['items', 0, 0, ['x']]] }, l);
+				await storage.savePendingTransaction('a-inflight' as ActionId, { updates: [['items', 0, 0, ['x']]] }, undefined, l);
 				await storage.saveReplica(makeBlock('block-invariant-p-scoped', { items: [] }), { rev: 2, actionId: 'a-land' as ActionId }, undefined, l);
 			});
 
@@ -722,7 +722,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 
 			await withBlockWriteLatch(blockId, async (l) => {
 				await storage.saveReplica(makeBlock('block-invariant-p-noop', { items: [] }), { rev: 5, actionId: 'r5' as ActionId }, undefined, l);
-				await storage.savePendingTransaction(actionId, { updates: [['items', 0, 0, ['x']]] }, l);
+				await storage.savePendingTransaction(actionId, { updates: [['items', 0, 0, ['x']]] }, undefined, l);
 			});
 			const before = await raw.getMetadata(blockId);
 
@@ -745,7 +745,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 		// but setLatest (and its range merge) was lost — latest undefined, ranges [].
 		const block = makeBlock('block-recover', { items: [] });
 		await withBlockWriteLatch(blockId, async (l) => {
-			await storage.savePendingTransaction(actionId, { insert: block }, l);
+			await storage.savePendingTransaction(actionId, { insert: block }, undefined, l);
 			await storage.saveMaterializedBlock(actionId, block, l);
 			await storage.saveRevision(1, actionId, l);
 			await storage.promotePendingTransaction(actionId, l);
@@ -1485,7 +1485,7 @@ describe('commit-proof persistence on the replica path', () => {
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
 		// Seed pending-only metadata (ranges: []) so rev 1 is a genuine gap and the restore fires.
 		await withBlockWriteLatch(blockId, l =>
-			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-proof-strip') }, l));
+			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-proof-strip') }, undefined, l));
 
 		await withBlockWriteLatch(blockId, l => storage.restoreRevision(1, l));
 		const result = await storage.getBlock(1);
@@ -1728,5 +1728,99 @@ describe('one block, one write lock', () => {
 			.to.deep.equal({ rev: 1, actionId: 'r1' });
 		expect(await raw.getPendingTransaction(B, 'p1' as ActionId), 'the pending record is present')
 			.to.not.equal(undefined);
+	});
+});
+
+/**
+ * The pend seam refuses a record that could never be promoted.
+ *
+ * `BlockStorage.savePendingTransaction` is handed the revision the pending record claims, and
+ * throws {@link PendRevisionTakenError} when the block has already committed at or past it. The
+ * question it asks is "could this record ever be promoted?", not "is this our own revision?", so
+ * one `latest.rev >= rev` comparison covers both unpromotable cases — the writer's own committed
+ * revision (`StorageRepo.commit` partitions it as already-done and never promotes) and a rival's
+ * win (`commit` refuses it as stale). A record written past either would be reported as a
+ * conflicting in-flight action to every later writer of the block, forever.
+ */
+describe('BlockStorage.savePendingTransaction — unpromotable-record refusal', () => {
+	let raw: MemoryRawStorage;
+
+	beforeEach(() => {
+		raw = new MemoryRawStorage();
+	});
+
+	it('refuses a pend at a revision this same action already committed', async () => {
+		const blockId = 'block-seam-own' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+		const actionId = 'a1' as ActionId;
+		const block = makeBlock('block-seam-own', { items: [] });
+
+		await withBlockWriteLatch(blockId, l => storage.saveReplica(block, { rev: 3, actionId }, undefined, l));
+
+		// `commit` would partition this block as already-done and never run the promotion, so the
+		// record could only sit there refusing every later writer.
+		const err = await withBlockWriteLatch(blockId, async (l) =>
+			storage.savePendingTransaction(actionId, { insert: block }, 3, l).then(() => undefined, (e: unknown) => e));
+		expect(err, 'the seam must refuse').to.be.instanceOf(PendRevisionTakenError);
+		expect((err as PendRevisionTakenError).latest).to.deep.equal({ rev: 3, actionId });
+
+		expect(await raw.getPendingTransaction(blockId, actionId), 'nothing written').to.equal(undefined);
+	});
+
+	it('refuses a pend at a revision a RIVAL action has already passed', async () => {
+		const blockId = 'block-seam-rival' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+		const block = makeBlock('block-seam-rival', { items: [] });
+
+		await withBlockWriteLatch(blockId, l => storage.saveReplica(block, { rev: 5, actionId: 'r5' as ActionId }, undefined, l));
+
+		const err = await withBlockWriteLatch(blockId, async (l) =>
+			storage.savePendingTransaction('a-late' as ActionId, { insert: block }, 4, l).then(() => undefined, (e: unknown) => e));
+		expect(err, 'the seam must refuse').to.be.instanceOf(PendRevisionTakenError);
+		expect((err as PendRevisionTakenError).rev).to.equal(4);
+		expect((err as PendRevisionTakenError).latest).to.deep.equal({ rev: 5, actionId: 'r5' });
+
+		expect(await raw.getPendingTransaction(blockId, 'a-late' as ActionId), 'nothing written').to.equal(undefined);
+	});
+
+	it('allows a pend one revision ahead of the committed tip', async () => {
+		const blockId = 'block-seam-ahead' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+		const block = makeBlock('block-seam-ahead', { items: [] });
+
+		await withBlockWriteLatch(blockId, l => storage.saveReplica(block, { rev: 5, actionId: 'r5' as ActionId }, undefined, l));
+		await withBlockWriteLatch(blockId, l =>
+			storage.savePendingTransaction('a-next' as ActionId, { updates: [['items', 0, 0, ['x']]] }, 6, l));
+
+		expect(await storage.getPendingTransaction('a-next' as ActionId), 'record written').to.not.equal(undefined);
+	});
+
+	it('allows a rev-less pend on a block that already has a committed latest', async () => {
+		// A claim that names no revision names nothing to compare, so no refusal applies and the
+		// existing insert-collision handling in `StorageRepo.pend` is untouched.
+		const blockId = 'block-seam-revless' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+		const block = makeBlock('block-seam-revless', { items: [] });
+
+		await withBlockWriteLatch(blockId, l => storage.saveReplica(block, { rev: 7, actionId: 'r7' as ActionId }, undefined, l));
+		await withBlockWriteLatch(blockId, l =>
+			storage.savePendingTransaction('a-revless' as ActionId, { updates: [['items', 0, 0, ['x']]] }, undefined, l));
+
+		expect(await storage.getPendingTransaction('a-revless' as ActionId), 'record written').to.not.equal(undefined);
+		expect((await raw.getMetadata(blockId))!.latest, 'committed latest untouched').to.deep.equal({ rev: 7, actionId: 'r7' });
+	});
+
+	it('allows a pend on a block with no metadata at all, and still seeds empty ranges', async () => {
+		const blockId = 'block-seam-fresh' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+		const block = makeBlock('block-seam-fresh', { items: [] });
+
+		await withBlockWriteLatch(blockId, l => storage.savePendingTransaction('a1' as ActionId, { insert: block }, 1, l));
+
+		expect(await storage.getPendingTransaction('a1' as ActionId), 'record written').to.not.equal(undefined);
+		const meta = await raw.getMetadata(blockId);
+		expect(meta, 'metadata seeded').to.not.equal(undefined);
+		expect(meta!.latest, 'nothing committed yet').to.equal(undefined);
+		expect(meta!.ranges, 'no coverage claimed').to.deep.equal([]);
 	});
 });

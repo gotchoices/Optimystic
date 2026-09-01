@@ -520,6 +520,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			};
 		}
 
+		// Already deduped: `blockIdsForTransforms` builds its result through a Set. So the pass-2 save
+		// loop below cannot write one block twice, and the echoed `blockIds` carries no duplicate.
 		const blockIds = blockIdsForTransforms(request.transforms);
 		log('pend actionId=%s blockIds=%d rev=%s', request.actionId, blockIds.length, request.rev);
 		const pendings: ActionPending[] = [];
@@ -531,124 +533,149 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// Blocks this action ALREADY committed at exactly the requested revision — the durable half
 		// of a torn action whose retry reuses the same actionId. Sibling of the `alreadyDone`
 		// partition in `commit` below: satisfied, not merely non-stale, so no pending is recorded
-		// for them (see the fan-out at the end of this method).
+		// for them (see pass 2).
 		const satisfied = new Set<BlockId>();
 
-		// Potential race condition: A concurrent commit operation could complete
-		// between the conflict checks (latest.rev, listPendingTransactions) and the
-		// savePendingTransaction call below. This pend operation might succeed based on
-		// stale information, but the subsequent commit for this pend would likely
-		// fail correctly later if a conflict arose. Locking here could make the initial
-		// check more accurate but adds overhead. The current approach prioritizes
-		// letting the commit be the final arbiter.
-		for (const blockId of blockIds) {
-			const blockStorage = this.createBlockStorage(blockId);
-			const transforms = transformForBlockId(request.transforms, blockId);
+		// Classifying and saving are ONE atomic step per pend: both passes below run inside a single
+		// multi-block write-latch hold, so no commit can land between deciding a block is pendable
+		// and writing its pending record. That is the whole property — a pend never writes a pending
+		// record for a revision already taken. Such a record could never be promoted (`commit`
+		// partitions the block as already-done or refuses it as stale, and promotion is the only
+		// thing that removes a record on the success path), and would then be reported as a
+		// conflicting in-flight action to every later writer of the block. See docs/repository.md,
+		// Invariant P; `BlockStorage.savePendingTransaction` refuses such a write outright.
+		//
+		// TWO passes, not one interleaved loop: with a single loop a block refused partway through
+		// would leave records already written for its predecessors, and retracting those under the
+		// hold could delete a record an EARLIER pend of the same action legitimately left. Classify
+		// everything before writing anything, and no record is ever written that must be taken back.
+		//
+		// Everything inside the hold is local storage I/O. No network I/O and no caller-supplied
+		// code may enter it — `checkPendValidation` above can call the caller's validation hook,
+		// which is precisely why it stays outside. `commit` keeps the same rule. Acquiring through
+		// `acquireBlockWriteLatches` (deduped, sorted) is what keeps the three multi-latch holders —
+		// this, `commit`, and `applyInvalidation` — free of deadlock, and no caller of `pend`
+		// (`ClusterRepo`, `CoordinatorRepo`, `service.ts`) holds a block latch, so the hold cannot
+		// re-enter itself.
+		//
+		// NOTE: a pend now blocks concurrent commits on its blocks for the span of BOTH passes, not
+		// just its writes. Accepted: every call inside is local storage I/O, and `commit` already
+		// holds the same set for a comparable span. If pend latency on contended blocks ever shows
+		// up in a profile, the thing to look at is the policy-'r' arm, which reads one transform per
+		// rival inside the hold.
+		const { latches, release } = await acquireBlockWriteLatches(blockIds);
+		try {
+			// --- Pass 1: classify. Every read below runs under the hold. ---
+			for (const blockId of blockIds) {
+				const blockStorage = this.createBlockStorage(blockId);
+				const transforms = transformForBlockId(request.transforms, blockId);
 
-			// Handle any conflicting revisions FIRST: a block this same action already committed at
-			// exactly the requested revision is satisfied, and skips both this check and the
-			// pending-action listing below.
-			if (request.rev !== undefined || transforms.insert) {
-				const latest = await blockStorage.getLatest();
-				// Our own already-durable work, met again by a retry (see {@link isOwnRevision}):
-				// treating it as a stale rival would refuse the writer with its own commit.
-				// NOTE: a rev-less pend (`request.rev === undefined`, an insert-only claim) can
-				// never match, so a torn action retried WITHOUT a revision is still refused by its
-				// own insert. No production caller sends one — `TransactorSource.transact` and the
-				// multi-collection coordinator both require a rev — so this is unreachable today;
-				// if a rev-less write path ever appears, match on `latest.actionId` alone here.
-				if (isOwnRevision(latest, request.rev, request.actionId)) {
-					satisfied.add(blockId);
-					continue;
-				}
-				if (latest && latest.rev >= (request.rev ?? 0)) {
-					// Only a real revision race yields a meaningful `staleAt`. When `request.rev` is
-					// undefined this same branch fires for an insert collision (the comparison degrades
-					// to `latest.rev >= 0`, true for any existing block), and reporting that block's
-					// revision would be a number that answers a question nobody asked.
-					if (request.rev !== undefined) {
-						staleAt = highestStaleAt([staleAt, { blockId, rev: latest.rev }]);
+				// Handle any conflicting revisions FIRST: a block this same action already committed at
+				// exactly the requested revision is satisfied, and skips both this check and the
+				// pending-action listing below.
+				if (request.rev !== undefined || transforms.insert) {
+					const latest = await blockStorage.getLatest();
+					// Our own already-durable work, met again by a retry (see {@link isOwnRevision}):
+					// treating it as a stale rival would refuse the writer with its own commit.
+					// NOTE: a rev-less pend (`request.rev === undefined`, an insert-only claim) can
+					// never match, so a torn action retried WITHOUT a revision is still refused by its
+					// own insert. No production caller sends one — `TransactorSource.transact` and the
+					// multi-collection coordinator both require a rev — so this is unreachable today;
+					// if a rev-less write path ever appears, match on `latest.actionId` alone here.
+					if (isOwnRevision(latest, request.rev, request.actionId)) {
+						satisfied.add(blockId);
+						continue;
 					}
-					const transforms = await asyncIteratorToArray(blockStorage.listRevisions(request.rev ?? 0, latest.rev));
-					for (const actionRev of transforms) {
-						const transform = await blockStorage.getTransaction(actionRev.actionId);
-						if (!transform) {
-							throw new Error(`Missing action ${actionRev.actionId} for block ${blockId}`);
+					if (latest && latest.rev >= (request.rev ?? 0)) {
+						// Only a real revision race yields a meaningful `staleAt`. When `request.rev` is
+						// undefined this same branch fires for an insert collision (the comparison degrades
+						// to `latest.rev >= 0`, true for any existing block), and reporting that block's
+						// revision would be a number that answers a question nobody asked.
+						if (request.rev !== undefined) {
+							staleAt = highestStaleAt([staleAt, { blockId, rev: latest.rev }]);
 						}
-						missing.push({
-							actionId: actionRev.actionId,
-							rev: actionRev.rev,
-							transforms: transformsFromTransform(transform, blockId)
-						});
+						const transforms = await asyncIteratorToArray(blockStorage.listRevisions(request.rev ?? 0, latest.rev));
+						for (const actionRev of transforms) {
+							const transform = await blockStorage.getTransaction(actionRev.actionId);
+							if (!transform) {
+								throw new Error(`Missing action ${actionRev.actionId} for block ${blockId}`);
+							}
+							missing.push({
+								actionId: actionRev.actionId,
+								rev: actionRev.rev,
+								transforms: transformsFromTransform(transform, blockId)
+							});
+						}
 					}
 				}
+
+				// Then handle any pending actions
+				const pending = await asyncIteratorToArray(blockStorage.listPendingTransactions());
+				pendings.push(...pending.map(actionId => ({ blockId, actionId })));
 			}
 
-			// Then handle any pending actions
-			const pending = await asyncIteratorToArray(blockStorage.listPendingTransactions());
-			pendings.push(...pending.map(actionId => ({ blockId, actionId })));
-		}
-
-		if (missing.length) {
-			log('pend:stale actionId=%s missing=%d', request.actionId, missing.length);
-			return {
-				success: false,
-				conflict: true,
-				missing,
-				...(staleAt === undefined ? {} : { staleAt })
-			};
-		}
-
-		if (pendings.length > 0) {
-			if (request.policy === 'f') {	// Fail on pending actions
-				return { success: false, conflict: true, pending: pendings };
-			} else if (request.policy === 'r') {	// Return populated pending actions
+			// Every refusal below returns having written ZERO pending records — that is what pass 1
+			// finishing before pass 2 begins buys.
+			if (missing.length) {
+				log('pend:stale actionId=%s missing=%d', request.actionId, missing.length);
 				return {
 					success: false,
 					conflict: true,
-					pending: await Promise.all(pendings.map(async action => {
-						const blockStorage = this.createBlockStorage(action.blockId);
-						return {
-							blockId: action.blockId,
-							actionId: action.actionId,
-							transform: (await blockStorage.getPendingTransaction(action.actionId))
-								?? (await blockStorage.getTransaction(action.actionId))!	// Possible that since enumeration, the action has been promoted
-						}
-					}))
+					missing,
+					...(staleAt === undefined ? {} : { staleAt })
 				};
 			}
+
+			if (pendings.length > 0) {
+				if (request.policy === 'f') {	// Fail on pending actions
+					return { success: false, conflict: true, pending: pendings };
+				} else if (request.policy === 'r') {	// Return populated pending actions
+					return {
+						success: false,
+						conflict: true,
+						pending: await Promise.all(pendings.map(async action => {
+							const blockStorage = this.createBlockStorage(action.blockId);
+							return {
+								blockId: action.blockId,
+								actionId: action.actionId,
+								// The fallback stays: a rival enumerated on a block we hold cannot be promoted
+								// out from under us mid-hold, but a partially-overlapping pend can still have
+								// promoted one on a block outside this hold.
+								transform: (await blockStorage.getPendingTransaction(action.actionId))
+									?? (await blockStorage.getTransaction(action.actionId))!
+							}
+						}))
+					};
+				}
+			}
+
+			// --- Pass 2: save. Same hold, so nothing advanced a block since pass 1 observed it. ---
+			//
+			// `satisfied` blocks are skipped: `commit`'s `alreadyDone` arm skips `internalCommit`, the
+			// only thing that promotes (and thereby removes) a pending record, so a pending saved here
+			// would never clear — a permanent durable reservation that the rival-pending checks (this
+			// method's listPendingTransactions scan, and `ClusterMember.validatePendOperations`) refuse
+			// every future writer against. They still ride in the returned `blockIds` so `cancel`
+			// covers them (deleting an absent pending is a no-op that writes no metadata).
+			for (const blockId of blockIds) {
+				if (satisfied.has(blockId)) {
+					continue;
+				}
+				const blockStorage = this.createBlockStorage(blockId);
+				const blockTransform = transformForBlockId(request.transforms, blockId);
+				await blockStorage.savePendingTransaction(request.actionId, blockTransform, request.rev, latches.get(blockId)!);
+			}
+
+			return {
+				success: true,
+				pending: pendings,
+				blockIds
+			} as PendSuccess;
+		} finally {
+			// Releases on every path, including the early returns above and the
+			// `Missing action … for block …` throw inside pass 1.
+			release();
 		}
-
-
-		// Simultaneously save pending action for each block
-		// Note: that this is not atomic, after we checked for conflicts and pending actions
-		// new pending or committed actions may have been added.  This is okay, because
-		// this check during pend is conservative.
-		//
-		// Each block's pending write runs under THAT block's write latch, one latch per branch and
-		// never nested: savePendingTransaction seeds the block's metadata blob when it has none, and
-		// an unlatched seed racing a concurrent commit/replica on a fresh block erases the `latest`
-		// the other writer just landed. Never more than one block latch is held by a branch, so this
-		// cannot deadlock against commit's sorted multi-latch acquisition.
-		//
-		// `satisfied` blocks are skipped: `commit`'s `alreadyDone` arm skips `internalCommit`, the
-		// only thing that promotes (and thereby removes) a pending record, so a pending saved here
-		// would never clear — a permanent durable reservation that the rival-pending checks (this
-		// method's listPendingTransactions scan, and `ClusterMember.validatePendOperations`) refuse
-		// every future writer against, a worse wedge than the one this carve-out fixes. They still
-		// ride in the returned `blockIds` so `cancel` covers them (deleting an absent pending is a
-		// no-op that writes no metadata).
-		await Promise.all(blockIds.filter(blockId => !satisfied.has(blockId)).map(blockId => {
-			const blockStorage = this.createBlockStorage(blockId);
-			const blockTransform = transformForBlockId(request.transforms, blockId);
-			return withBlockWriteLatch(blockId, latch => blockStorage.savePendingTransaction(request.actionId, blockTransform, latch));
-		}));
-
-		return {
-			success: true,
-			pending: pendings,
-			blockIds
-		} as PendSuccess;
 	}
 
 	async cancel(actionRef: ActionBlocks, _options?: MessageOptions): Promise<void> {

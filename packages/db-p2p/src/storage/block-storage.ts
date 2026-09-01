@@ -4,7 +4,7 @@ import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
 import { mergeRanges } from "./helpers.js";
-import { RevisionNotCoveredError, type IBlockStorage } from "./i-block-storage.js";
+import { RevisionNotCoveredError, PendRevisionTakenError, type IBlockStorage } from "./i-block-storage.js";
 import type { BlockWriteLatch } from "./block-latch.js";
 import { createLogger } from "../logger.js";
 
@@ -155,10 +155,18 @@ export class BlockStorage implements IBlockStorage {
 		yield* this.storage.listPendingTransactions(this.blockId);
 	}
 
-	async savePendingTransaction(actionId: ActionId, transform: Transform, latch: BlockWriteLatch): Promise<void> {
+	async savePendingTransaction(actionId: ActionId, transform: Transform, rev: number | undefined, latch: BlockWriteLatch): Promise<void> {
 		this.assertLatch(latch);
-		log('pend blockId=%s actionId=%s', this.blockId, actionId);
+		log('pend blockId=%s actionId=%s rev=%s', this.blockId, actionId, rev);
 		let meta = await this.storage.getMetadata(this.blockId);
+		// Refuse a record that could never be promoted (see IBlockStorage.savePendingTransaction).
+		// The metadata read above is unconditional anyway, so this costs one comparison and no I/O.
+		// `>=` deliberately covers BOTH unpromotable cases at once — our own already-committed
+		// revision (commit partitions it as already-done) and a rival's win (commit refuses it as
+		// stale) — so this is not an `isOwnRevision` check.
+		if (rev !== undefined && meta?.latest !== undefined && meta.latest.rev >= rev) {
+			throw new PendRevisionTakenError(this.blockId, actionId, rev, meta.latest);
+		}
 		if (!meta) {
 			// A freshly-pended block holds NO committed revision, so it can reconstruct
 			// nothing yet: seed empty ranges. The first commit anchors an OPEN-ENDED span at
