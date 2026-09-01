@@ -3035,3 +3035,41 @@ describe('StorageRepo.pend — classification and save are one atomic step', () 
 		expect(outcome, 'opposite acquisition orders must not deadlock').to.equal('settled');
 	});
 });
+
+/**
+ * A block that lost the revision race must be REFUSED, never handed to pass 2.
+ *
+ * Pass 1 decides staleness from `latest`; the catch-up list it hands the loser comes from a
+ * separate walk of the revision index. Those can disagree: a node whose index is sparse over
+ * `[request.rev, latest.rev]` enumerates nothing while still having lost. Gating the refusal on the
+ * enumeration would let such a block reach pass 2, where `savePendingTransaction` refuses it — so
+ * `pend` would throw `PendRevisionTakenError` at the caller instead of returning a stale conflict.
+ * `commit` already takes the other position: it records the block as missed "even if transforms is
+ * empty, because we want to reject the older version".
+ */
+describe('StorageRepo.pend — a stale block is refused even when nothing can be enumerated for it', () => {
+	it('returns a stale conflict, not a throw, when the revision index is sparse over the lost range', async () => {
+		const raw = new MemoryRawStorage();
+		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const B = 'block-sparse-index' as BlockId;
+
+		// A committed tip with no revision record under it — the shape a torn/repaired index leaves.
+		await raw.saveMetadata(B, { latest: { rev: 5, actionId: 'rival' as ActionId }, ranges: [[5]] });
+		await raw.saveMaterializedBlock(B, 'rival' as ActionId, makeBlock(B, { items: [] }));
+
+		const result = await repo.pend({
+			actionId: 'mine' as ActionId,
+			transforms: makeUpdateTransforms(B, [['items', 0, 0, ['x']]]),
+			rev: 5,
+			policy: 'f'
+		});
+
+		expect(result.success, 'the losing writer is refused').to.equal(false);
+		expect((result as StaleFailure).conflict).to.equal(true);
+		expect((result as StaleFailure).staleAt?.rev, 'and told the revision it lost to').to.equal(5);
+		expect((result as StaleFailure).missing, 'with an empty catch-up list, which is honest here')
+			.to.deep.equal([]);
+		expect(await raw.getPendingTransaction(B, 'mine' as ActionId), 'and no record written')
+			.to.equal(undefined);
+	});
+});

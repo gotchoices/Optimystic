@@ -535,6 +535,15 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// partition in `commit` below: satisfied, not merely non-stale, so no pending is recorded
 		// for them (see pass 2).
 		const satisfied = new Set<BlockId>();
+		// Blocks observed at or past the requested revision under a DIFFERENT action — a real stale
+		// loss. Counted separately from `missing` because the two are not the same question: `missing`
+		// is the catch-up the loser is handed, and a node whose revision index is sparse over
+		// [request.rev, latest.rev] hands back an empty one while still having lost. Gating the
+		// refusal on the enumeration would then let a block pass classification that pass 2 cannot
+		// write (`savePendingTransaction` refuses it), turning a stale answer into a throw. `commit`
+		// takes the same position — it pushes a `missedCommits` entry "even if transforms is empty,
+		// because we want to reject the older version".
+		let staleCount = 0;
 
 		// Classifying and saving are ONE atomic step per pend: both passes below run inside a single
 		// multi-block write-latch hold, so no commit can land between deciding a block is pendable
@@ -561,8 +570,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// NOTE: a pend now blocks concurrent commits on its blocks for the span of BOTH passes, not
 		// just its writes. Accepted: every call inside is local storage I/O, and `commit` already
 		// holds the same set for a comparable span. If pend latency on contended blocks ever shows
-		// up in a profile, the thing to look at is the policy-'r' arm, which reads one transform per
-		// rival inside the hold.
+		// up in a profile, two things inside the hold scale with width and are the ones to look at:
+		// the policy-'r' arm reads one transform per rival, and pass 2 awaits its saves one block at
+		// a time (where the pre-latch code fanned out with `Promise.all`). Sequential is the
+		// deliberate choice — a throw mid-pass then strands records for FEWER blocks, not more — so
+		// batch or fan out only with that tradeoff in hand.
 		const { latches, release } = await acquireBlockWriteLatches(blockIds);
 		try {
 			// --- Pass 1: classify. Every read below runs under the hold. ---
@@ -594,8 +606,9 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 						if (request.rev !== undefined) {
 							staleAt = highestStaleAt([staleAt, { blockId, rev: latest.rev }]);
 						}
-						const transforms = await asyncIteratorToArray(blockStorage.listRevisions(request.rev ?? 0, latest.rev));
-						for (const actionRev of transforms) {
+						staleCount++;
+						const missedRevisions = await asyncIteratorToArray(blockStorage.listRevisions(request.rev ?? 0, latest.rev));
+						for (const actionRev of missedRevisions) {
 							const transform = await blockStorage.getTransaction(actionRev.actionId);
 							if (!transform) {
 								throw new Error(`Missing action ${actionRev.actionId} for block ${blockId}`);
@@ -616,8 +629,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 
 			// Every refusal below returns having written ZERO pending records — that is what pass 1
 			// finishing before pass 2 begins buys.
-			if (missing.length) {
-				log('pend:stale actionId=%s missing=%d', request.actionId, missing.length);
+			if (staleCount > 0) {
+				log('pend:stale actionId=%s stale=%d missing=%d', request.actionId, staleCount, missing.length);
 				return {
 					success: false,
 					conflict: true,
