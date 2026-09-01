@@ -101,10 +101,18 @@ coordinator forwards a commit without materializing it, and may not even have se
 Three properties are load-bearing:
 
 - **It is optional, per block.** The client computes digests from what it already has in memory and
-  never pays a network read to describe itself, so a block whose base is not locally cached is
-  simply left out. An undeclared block is not an error; it falls back to the corroboration the
-  cohort already does. The field is omitted entirely — not sent as an empty object — when a request
+  never pays a network read to describe itself, so a block it cannot describe from memory is simply
+  left out. An undeclared block is not an error; it falls back to the corroboration the cohort
+  already does. The field is omitted entirely — not sent as an empty object — when a request
   declares nothing.
+
+  What "from memory" covers is a property of the *transaction*, not of the read cache's size. When a
+  change to a block is staged, the client pins the committed content it changed it from, and keeps
+  that pin until the transaction ends — so a transaction that touches far more blocks than the read
+  cache holds still describes every block it read and changed, rather than only the most recently
+  read ones. The remaining undeclarable cases are a deletion (there is no post-commit content to
+  describe), and a *blind* change — one written without first reading the block — to a block that is
+  not in the read cache, where the client genuinely has nothing to describe.
 - **It rides *inside* the commit request.** The request is the consensus message, and the cluster
   hash helpers canonicalise that message generically, so the declarations land inside every cohort
   signature's preimage with no change to the hashing. A peer built before this field existed still

@@ -4,7 +4,8 @@ import { CacheSource } from '../src/transform/cache-source.js';
 import { Tracker } from '../src/transform/tracker.js';
 import { computeBlockContentDigests } from '../src/transform/digest.js';
 import { canonicalBlockHash } from '../src/blocks/helpers.js';
-import { applyTransform, transformForBlockId } from '../src/transform/helpers.js';
+import { applyTransform, copyTransforms, transformForBlockId } from '../src/transform/helpers.js';
+import { Atomic } from '../src/transform/atomic.js';
 
 interface TestBlock extends IBlock {
 	data: string;
@@ -302,6 +303,51 @@ describe('commit content digests', () => {
 			expect(second, 'repeat passes agree (the pin is cloned on use, not mutated)').to.deep.equal(first);
 			expect(tracker.pins.size).to.equal(1);
 			expect(tracker.pins.get('a' as BlockId)).to.deep.equal(pinBefore);
+		});
+
+		it('Atomic.commit hands its pins to the parent, so an oversized atomic still declares', async () => {
+			const smallCache = new CacheSource(makeRevSource(blocks, revs), 1);
+			const parent = new Tracker(smallCache);
+			const atomic = new Atomic<TestBlock>(parent);
+			await atomic.tryGet('a' as BlockId);
+			atomic.update('a' as BlockId, ['data', 0, 0, 'updated']);   // pinned inside the atomic
+			await atomic.tryGet('b' as BlockId);               // evicts 'a' from the shared cache
+			atomic.update('b' as BlockId, ['data', 0, 0, 'bee']);
+			expect(smallCache.peek('a' as BlockId), 'the early base is gone by flush time').to.be.undefined;
+
+			atomic.commit();
+			expect(atomic.pins.size, 'the atomic reclaims its own store on commit').to.equal(0);
+
+			const digests = await computeBlockContentDigests(parent, parent.transformedBlockIds());
+			expect(Object.keys(digests).sort(), 'both bases survived the flush').to.deep.equal(['a', 'b']);
+			expect(digests['a' as BlockId]!.baseRev).to.equal(7);
+			expect(digests['b' as BlockId]!.baseRev).to.equal(3);
+		});
+
+		it('a joined tracker declares from the pins the staging tracker took', async () => {
+			const smallCache = new CacheSource(makeRevSource(blocks, revs), 1);
+			const live = new Tracker(smallCache);
+			await live.tryGet('a' as BlockId);
+			live.update('a' as BlockId, ['data', 0, 0, 'updated']);
+			await live.tryGet('b' as BlockId);                 // evicts 'a'
+			expect(smallCache.peek('a' as BlockId)).to.be.undefined;
+
+			// The Collection.syncAttempts shape: a per-attempt tracker over the same cache that
+			// inherits the transforms by COPY (so it never stages the update itself, and would have
+			// nothing to pin) and JOINS the live tracker's pin store.
+			const attempt = new Tracker(smallCache, copyTransforms(live.transforms), live.pins);
+			const digests = await computeBlockContentDigests(attempt, ['a' as BlockId]);
+			expect(digests['a' as BlockId]!.baseRev, 'the joined store answers for the evicted base').to.equal(7);
+		});
+
+		it('a pin store cannot be joined by a tracker over a different base source', async () => {
+			await tracker.tryGet('a' as BlockId);
+			tracker.update('a' as BlockId, ['data', 0, 0, 'updated']);
+			// A second cache numbers its generations from 0 for the same ids, so a pin taken against
+			// `cache` would pass the freshness check here and declare the wrong base.
+			const otherCache = new CacheSource(makeRevSource(blocks, revs));
+			expect(() => new Tracker(otherCache, undefined, tracker.pins))
+				.to.throw(/different base sources/);
 		});
 	});
 

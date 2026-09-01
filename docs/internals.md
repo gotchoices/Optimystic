@@ -538,7 +538,8 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
 | `CacheSource.tryGet()` | structuredClone | Prevents cache corruption |
 | `CacheSource.peek()` | structuredClone | Recency-neutral read; callers apply ops to the result |
 | `Tracker.tryGet()` for inserts | structuredClone | Inserts are cloned on retrieval |
-| `Tracker.peekMaterialized()` | structuredClone | Clones the staged insert before `applyTransform` mutates it |
+| `Tracker.peekMaterialized()` | structuredClone | Clones the staged insert, and the pinned base, before `applyTransform` mutates either |
+| `Tracker.update()` → `BasePins` | structuredClone (via `CacheSource.peek`) | The pinned committed base is a clone, and stays pristine: every use re-clones it |
 
 ### Storage Clone Requirements
 **Memory storage MUST clone on get/save** to prevent cross-revision contamination:

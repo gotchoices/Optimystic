@@ -23,6 +23,24 @@ export type PinnedBase = {
  * request already carries), and every transaction boundary reclaims it via reset(). */
 export class BasePins {
 	private pins = new Map<BlockId, PinnedBase>();
+	/** The base source every `rev`/`gen` in here was read from — see {@link bindAuthority}. */
+	private authority: unknown;
+	private bound = false;
+
+	/** Claim this store for `source`, the base source at the bottom of the binding tracker's stack.
+	 * A fresh store binds; a store being joined must present the same source. Both `rev` and `gen`
+	 * are counters private to one source — a second CacheSource numbers generations from 0 for the
+	 * same ids — so a store shared across two sources would let a pin taken from one pass the
+	 * freshness check against the other and declare the wrong content. Throwing here makes that
+	 * mistake impossible to make quietly. */
+	bindAuthority(source: unknown): void {
+		if (!this.bound) {
+			this.authority = source;
+			this.bound = true;
+		} else if (this.authority !== source) {
+			throw new Error('BasePins shared between trackers over different base sources: pin revisions and generations are per-source counters and are not comparable across them.');
+		}
+	}
 
 	get(id: BlockId): PinnedBase | undefined {
 		return this.pins.get(id);
@@ -51,6 +69,9 @@ export class BasePins {
 	 * atomic's pin is the later observation of the same base chain, and the use-time freshness
 	 * check re-validates it anyway. */
 	adopt(other: BasePins): void {
+		if (other.authority !== this.authority) {
+			throw new Error('BasePins.adopt across different base sources: pin revisions and generations are not comparable across them.');
+		}
 		for (const [id, pin] of other.pins) {
 			this.pins.set(id, pin);
 		}

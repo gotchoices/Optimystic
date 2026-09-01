@@ -4,6 +4,25 @@ import { BasePins } from "./base-pins.js";
 import type { PinnedBase } from "./base-pins.js";
 import { ensured } from "../utility/ensured.js";
 
+/** The base a source can answer from memory, with the committed revision of that content — the
+ * shared probe behind both {@link Tracker.probeBase} (pin time) and {@link Tracker.peekMaterialized}
+ * (declare time), so the two can never disagree about what "locally answerable" means. Duck-typed,
+ * because Tracker layers over test doubles as well as CacheSource.
+ *
+ * Returns undefined unless BOTH probes answer: an LRU-evicted id can leave a stale cached revision
+ * behind (see the NOTE on CacheSource's `revisions` map), and `peek` returning undefined for that id
+ * is what keeps the stale revision from pairing with a block. */
+function cachedBase(source: unknown, id: BlockId): { block: IBlock; rev: number } | undefined {
+	const src = source as {
+		peek?: (id: BlockId) => IBlock | undefined;
+		getCachedRevision?: (id: BlockId) => number | undefined;
+	};
+	if (typeof src.peek !== 'function' || typeof src.getCachedRevision !== 'function') return undefined;
+	const block = src.peek(id);                        // already a clone (peek contract)
+	const rev = src.getCachedRevision(id);
+	return block === undefined || rev === undefined ? undefined : { block, rev };
+}
+
 /** A block store that collects transformations, without applying them to the underlying source.
  * Transformations are also applied to the retrieved blocks, making it seem like the source has been modified.
  */
@@ -26,7 +45,23 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 		 * reference across the trackers of one transaction (see {@link BasePins}); pass an
 		 * existing store to join a transaction, omit for a private one. */
 		public readonly pins: BasePins = new BasePins(),
-	) { }
+	) {
+		// A pin's `gen` and `rev` are counters PRIVATE to one base source, so a store may only be
+		// shared between trackers that bottom out at the same one. Binding here turns the otherwise
+		// silent failure (a pin from cache A passing the freshness check against cache B, which
+		// numbers generations from 0 independently, and declaring A's content for B's block) into a
+		// throw at the moment the stores are joined.
+		pins.bindAuthority(this.baseSource());
+	}
+
+	/** The non-Tracker source at the bottom of the tracker stack. Single authority for everything
+	 * pin-related: an Atomic layers over a Collection's tracker, which layers over the read cache,
+	 * and only that cache can report a base, its committed revision, and its drift generation. */
+	private baseSource(): unknown {
+		let src: unknown = this.source;
+		while (src instanceof Tracker) src = src.source;
+		return src;
+	}
 
 	/** The source's generation for an id, or undefined if the source cannot report drift. */
 	private sourceGeneration(id: BlockId): number | undefined {
@@ -34,35 +69,26 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 		return typeof src.getGeneration === 'function' ? src.getGeneration(id) : undefined;
 	}
 
-	/** The drift generation from the same authority {@link probeBase} pins from — chained through
-	 * nested trackers so an Atomic (whose source is the collection's tracker) validates its pins
-	 * against the collection's read cache, not against the drift-blind tracker in between. */
+	/** The drift generation from the same authority {@link probeBase} pins from — the base source,
+	 * so an Atomic validates its pins against the collection's read cache rather than against the
+	 * drift-blind tracker in between. */
 	protected baseGeneration(id: BlockId): number | undefined {
-		if (this.source instanceof Tracker) return this.source.baseGeneration(id);
-		return this.sourceGeneration(id);
+		const src = this.baseSource() as { getGeneration?: (id: BlockId) => number };
+		return typeof src.getGeneration === 'function' ? src.getGeneration(id) : undefined;
 	}
 
-	/** The committed base for `id` as this tracker's source can report it, plus that source's
-	 * revision and drift generation. Duck-typed on the source (CacheSource supplies all three),
-	 * and CHAINED when the source is itself a Tracker — the Atomic case — so an Atomic staged over
-	 * a Collection's tracker pins from the collection's read cache instead of finding nothing.
-	 * Returns undefined unless ALL THREE probes are available, which keeps drift-blind sources
-	 * (test doubles) on exactly the pre-pin behaviour. Recency-neutral: uses CacheSource.peek. */
+	/** The committed base for `id` as the base source can report it, plus that source's revision and
+	 * drift generation. Duck-typed (CacheSource supplies all three) and taken from
+	 * {@link baseSource}, so an Atomic staged over a Collection's tracker pins from the collection's
+	 * read cache instead of finding nothing. Returns undefined unless ALL THREE probes are
+	 * available, which keeps drift-blind sources (test doubles) on exactly the pre-pin behaviour.
+	 * Recency-neutral: uses CacheSource.peek. */
 	protected probeBase(id: BlockId): PinnedBase | undefined {
-		if (this.source instanceof Tracker) return this.source.probeBase(id);
-		const src = this.source as {
-			peek?: (id: BlockId) => T | undefined;
-			getCachedRevision?: (id: BlockId) => number | undefined;
-			getGeneration?: (id: BlockId) => number;
-		};
-		if (typeof src.peek !== 'function' || typeof src.getCachedRevision !== 'function'
-			|| typeof src.getGeneration !== 'function') return undefined;
-		const block = src.peek(id);                      // already a clone (peek contract)
-		const rev = src.getCachedRevision(id);
-		// Require BOTH: an LRU-evicted id can leave a stale cached revision behind (see the NOTE on
-		// CacheSource's revisions map); peek returning undefined keeps it from pairing with a block.
-		if (block === undefined || rev === undefined) return undefined;
-		return { block, rev, gen: src.getGeneration(id) };
+		const src = this.baseSource() as { getGeneration?: (id: BlockId) => number };
+		// Without a drift signal a pin could never be proven fresh, so never take one.
+		if (typeof src.getGeneration !== 'function') return undefined;
+		const base = cachedBase(src, id);
+		return base && { ...base, gen: src.getGeneration(id) };
 	}
 
 	async tryGet(id: BlockId, purpose: ReadPurpose = 'value'): Promise<T | undefined> {
@@ -144,18 +170,12 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 			const block = applyTransform(structuredClone(pin.block), transform);
 			return block ? { block, baseRev: pin.rev } : undefined;
 		}
-		const src = this.source as {
-			peek?: (id: BlockId) => T | undefined;
-			getCachedRevision?: (id: BlockId) => number | undefined;
-		};
-		if (typeof src.peek !== 'function' || typeof src.getCachedRevision !== 'function') return undefined;
-		const base = src.peek(id);
-		const baseRev = src.getCachedRevision(id);
-		// Require BOTH: an LRU-evicted id can leave a stale cached revision behind (see the NOTE on
-		// CacheSource's revisions map); peek returning undefined keeps it from pairing with a block.
-		if (base === undefined || baseRev === undefined) return undefined;
-		const block = applyTransform(base, transform);   // base already a clone (peek contract)
-		return block ? { block, baseRev } : undefined;
+		// Unpinned fallback: the IMMEDIATE source, not {@link baseSource} — a drift-blind source that
+		// can still peek keeps exactly its pre-pin behaviour here.
+		const base = cachedBase(this.source, id);
+		if (!base) return undefined;
+		const block = applyTransform(base.block, transform); // base already a clone (peek contract)
+		return block ? { block, baseRev: base.rev } : undefined;
 	}
 
 	/** Forward a leaf-value upgrade down to the source's read collector (duck-typed: only the

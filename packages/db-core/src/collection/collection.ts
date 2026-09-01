@@ -947,6 +947,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// It SHARES the live tracker's pin store: the snapshot inherits transforms by copy and never
 			// stages the data-block updates itself, so without the shared pins the digest pass below
 			// could only describe bases still resident in the read cache.
+			// NOTE: an attempt that ends in a stale failure is abandoned WITHOUT reset(), so the log
+			// tail/header bases its append pinned stay in the shared store until the live tracker's
+			// next reset. Bounded and harmless — a few log blocks per attempt, capped by maxAttempts,
+			// each re-validated against the source generation before any use — but if this loop ever
+			// grows a per-attempt footprint beyond the log blocks, reset the abandoned tracker on the
+			// stale-failure branch instead of letting the residue ride to the end of the sync.
 			const snapshot = copyTransforms(this.tracker.transforms);
 			const tracker = new Tracker(this.sourceCache, snapshot, this.tracker.pins);
 
