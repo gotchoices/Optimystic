@@ -130,9 +130,9 @@ async function logValues(collection: Collection<SpecAction>): Promise<string[]> 
 	return out;
 }
 
-/** Create N collections on one coordinator, all registered BEFORE any staging — the case the
- *  eager per-stamp snapshot covers. (A collection registered after every stamp snapshotted is a
- *  separate, pre-existing gap: backlog/bug-coordinator-rollback-skips-late-registered-collections.) */
+/** Create N collections on one coordinator, all registered BEFORE any staging. The collection map
+ *  is handed to the coordinator and stays live afterwards — see {@link registerLate} for the
+ *  mid-transaction-registration case, which the same snapshot machinery must also cover. */
 async function makeCoordinator(
 	transactor: ConstructorParameters<typeof TransactionCoordinator>[0],
 	collectionIds: string[],
@@ -143,6 +143,29 @@ async function makeCoordinator(
 	}
 	const coordinator = new TransactionCoordinator(transactor, collections as Map<string, Collection<any>>);
 	return { coordinator, collections };
+}
+
+/** Add a BRAND-NEW collection to the coordinator's live map AFTER the coordinator was built —
+ *  the shape the Quereus adapter produces when a table is first opened partway through a
+ *  transaction (`TransactionBridge.registerCollection` mutates the same map the coordinator holds).
+ *  The coordinator does not own this map, so it can only notice the addition at its next
+ *  `applyActions`. */
+async function registerLate(
+	transactor: ConstructorParameters<typeof TransactionCoordinator>[0],
+	collections: Map<string, Collection<SpecAction>>,
+	collectionId: string,
+): Promise<Collection<SpecAction>> {
+	const collection = await Collection.createOrOpen<SpecAction>(transactor as any, collectionId, init());
+	collections.set(collectionId, collection);
+	return collection;
+}
+
+/** The tracker's insert keys, sorted. A collection with no committed revision carries its own
+ *  header/root blocks here, so "rolled back" is "back to the keys it had before staging" — not
+ *  "empty". Asserting the transform half matters because the pending half alone was already being
+ *  restored for eagerly-captured collections, which is how the sibling defect stayed hidden. */
+function insertKeys(collection: Collection<SpecAction>): string[] {
+	return Object.keys(collection.tracker.transforms.inserts ?? {}).sort();
 }
 
 /** Permanently loses the COMMIT for one collection while the other lands, producing the partial
@@ -215,8 +238,8 @@ describe('TransactionCoordinator.rollback: pending queue', () => {
 		const a = await stage(coordinator, [{ collectionId: id, value: 'a1' }]);
 		const b = await stage(coordinator, [{ collectionId: id, value: 'b1' }]);
 		const c = await stage(coordinator, [{ collectionId: id, value: 'c1' }]);
-		// a's second batch lands AFTER b's and c's snapshots — the interleaving the
-		// earliest-snapshot walk exists for. Restoring to a's (order 0) snapshot rewinds both
+		// a's second batch lands AFTER b's and c's captures — the interleaving the per-collection
+		// earliest-capture walk exists for. Restoring to a's (first, seq 0) capture rewinds both
 		// halves to before anything was staged, so the replay lands each survivor batch once.
 		await stageMore(coordinator, a, [{ collectionId: id, value: 'a2' }]);
 
@@ -375,5 +398,143 @@ describe('TransactionCoordinator.rollback: pending queue', () => {
 
 		expect(queuedValues(collection), 'rollback after a failed commit empties the queue').to.deep.equal([]);
 		expectNoActionsFromStamp(collections, staged.stampId, 'rollback after failed commit');
+	});
+});
+
+describe('TransactionCoordinator.rollback: collections registered mid-transaction', () => {
+	it('empties a collection registered after the stamp started and staged into by that stamp', async () => {
+		const [early, late] = ['rb-late-early', 'rb-late-new'];
+		const transactor = new TestTransactor();
+		const { coordinator, collections } = await makeCoordinator(transactor, [early]);
+
+		const staged = await stage(coordinator, [{ collectionId: early, value: 'early' }]);
+		// The table opens partway through the transaction: the adapter drops the new collection
+		// straight into the live map the coordinator was handed. The stamp's FIRST applyActions —
+		// the only capture point before this fix — is already spent.
+		const lateCollection = await registerLate(transactor, collections, late);
+		const baseline = insertKeys(lateCollection);
+
+		await stageMore(coordinator, staged, [{ collectionId: late, value: 'late' }]);
+		expect(queuedValues(lateCollection), 'staged before rollback').to.deep.equal(['late']);
+		expect(insertKeys(lateCollection), 'staging really moved the tracker too').to.not.deep.equal(baseline);
+
+		await coordinator.rollback(staged.stampId);
+
+		// Pre-fix BOTH halves survived here: the queue kept 'late', so the next commit on this
+		// collection wrote it into that transaction's durable log entry, still tagged with the
+		// cancelled stamp.
+		expect(queuedValues(lateCollection), 'the late-registered queue is empty').to.deep.equal([]);
+		expect(insertKeys(lateCollection), 'the late-registered tracker holds no staged transforms')
+			.to.deep.equal(baseline);
+		expect(queuedValues(collections.get(early)!), 'the eagerly-captured collection is empty too')
+			.to.deep.equal([]);
+		expectNoActionsFromStamp(collections, staged.stampId, 'late-registration rollback');
+	});
+
+	it('drops only the rolled-back stamp when a survivor staged into the late collection first', async () => {
+		const [a, b] = ['rb-late-2s-a', 'rb-late-2s-b'];
+		const transactor = new TestTransactor();
+		const { coordinator, collections } = await makeCoordinator(transactor, [a]);
+
+		// x (order 0) captures only `a` — `b` does not exist yet.
+		const x = await stage(coordinator, [{ collectionId: a, value: 'x-a' }]);
+		const late = await registerLate(transactor, collections, b);
+		// y (order 1) captures `b` CLEAN, then stages into it.
+		const y = await stage(coordinator, [{ collectionId: b, value: 'y-b' }]);
+		// x now reaches `b` for the first time, so x's capture of `b` is LATER than y's and already
+		// DIRTY with y's row — the case stamp `order` alone mis-ranks.
+		await stageMore(coordinator, x, [{ collectionId: b, value: 'x-b' }]);
+
+		await coordinator.rollback(y.stampId);
+
+		// Under the old order-only walk this restored from x's map, which had no entry for `b` at
+		// all, so `b` kept y's row AND replayed x's on top: ['y-b', 'x-b', 'x-b']. Assert the
+		// values, not just the count.
+		expect(queuedValues(late), 'only the survivor reaches the late collection').to.deep.equal(['x-b']);
+		expect(queuedValues(collections.get(a)!), 'the survivor\'s other collection is intact')
+			.to.deep.equal(['x-a']);
+		expectNoActionsFromStamp(collections, y.stampId, 'late-registration two-stamp rollback');
+		expect(late.getPendingActions().map(v => v.transaction), 'the survivor keeps its own stamp tag')
+			.to.deep.equal([x.stampId]);
+	});
+
+	it('drops the rolled-back stamp in the mirror direction, keeping the later stamp\'s row', async () => {
+		const [a, b] = ['rb-late-mirror-a', 'rb-late-mirror-b'];
+		const transactor = new TestTransactor();
+		const { coordinator, collections } = await makeCoordinator(transactor, [a]);
+
+		const x = await stage(coordinator, [{ collectionId: a, value: 'x-a' }]);
+		const late = await registerLate(transactor, collections, b);
+		const y = await stage(coordinator, [{ collectionId: b, value: 'y-b' }]);
+		await stageMore(coordinator, x, [{ collectionId: b, value: 'x-b' }]);
+
+		await coordinator.rollback(x.stampId);
+
+		expect(queuedValues(late), 'only y\'s row survives on the late collection').to.deep.equal(['y-b']);
+		expect(queuedValues(collections.get(a)!), 'x\'s other collection is emptied').to.deep.equal([]);
+		expectNoActionsFromStamp(collections, x.stampId, 'late-registration mirror rollback');
+		expect(late.getPendingActions().map(v => v.transaction), 'the survivor keeps its own stamp tag')
+			.to.deep.equal([y.stampId]);
+	});
+
+	it('does not re-capture a collection the stamp already staged into when it is re-registered', async () => {
+		const id = 'rb-reregister';
+		const { coordinator, collections } = await makeCoordinator(new TestTransactor(), [id]);
+		const collection = collections.get(id)!;
+		const staged = await stage(coordinator, [{ collectionId: id, value: 'first' }]);
+
+		// `TransactionBridge.registerCollection` is idempotent and `reconcileMaintainedIndexes`
+		// re-registers already-open index trees: the SAME instance is written back into the live
+		// map after it has been staged into.
+		collections.set(id, collection);
+		await stageMore(coordinator, staged, [{ collectionId: id, value: 'second' }]);
+
+		await coordinator.rollback(staged.stampId);
+
+		// Without the has-guard the reconcile would record the DIRTY state as "before", and
+		// 'first' would survive the rollback it belongs to.
+		expect(queuedValues(collection), 'both of the stamp\'s actions are discarded').to.deep.equal([]);
+		expectNoActionsFromStamp(collections, staged.stampId, 're-registration rollback');
+	});
+
+	it('rolls back a replacement instance registered under an id already in the map', async () => {
+		const id = 'rb-instance-swap';
+		const transactor = new TestTransactor();
+		const { coordinator, collections } = await makeCoordinator(transactor, [id]);
+		const original = collections.get(id)!;
+		const staged = await stage(coordinator, [{ collectionId: id, value: 'on-original' }]);
+
+		// A table re-initializes mid-transaction: a DIFFERENT Collection object replaces the value
+		// stored under the same id. An id-keyed snapshot would push the OLD instance's staged state
+		// onto the NEW one; instance keys give the replacement its own capture instead.
+		const replacement = await registerLate(transactor, collections, id);
+		expect(replacement, 'the map really holds a new instance').to.not.equal(original);
+		await stageMore(coordinator, staged, [{ collectionId: id, value: 'on-replacement' }]);
+
+		await coordinator.rollback(staged.stampId);
+
+		expect(queuedValues(replacement), 'the live instance is rewound').to.deep.equal([]);
+		expect(queuedValues(original), 'the detached instance is rewound to its own capture')
+			.to.deep.equal([]);
+		expectNoActionsFromStamp(collections, staged.stampId, 'instance-swap rollback');
+	});
+
+	it('leaves a late-registered, transaction-created collection readable and committable', async () => {
+		const [early, late] = ['rb-late-read-early', 'rb-late-read-new'];
+		const transactor = new TestTransactor();
+		const { coordinator, collections } = await makeCoordinator(transactor, [early]);
+		const staged = await stage(coordinator, [{ collectionId: early, value: 'early' }]);
+		const lateCollection = await registerLate(transactor, collections, late);
+		await stageMore(coordinator, staged, [{ collectionId: late, value: 'aborted' }]);
+
+		await coordinator.rollback(staged.stampId);
+
+		// This collection has no committed revision, so its header/root blocks live in the tracker.
+		// Restoring the SNAPSHOT (rather than resetting to empty) is what keeps them there; a reset
+		// would leave the collection unreadable and the commit below could not resolve.
+		const kept = await stage(coordinator, [{ collectionId: late, value: 'kept' }]);
+		await coordinator.commit(kept.transaction);
+
+		expect(await logValues(lateCollection), 'only the kept action is durable').to.deep.equal(['kept']);
 	});
 });

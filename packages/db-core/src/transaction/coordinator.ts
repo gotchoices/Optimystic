@@ -57,20 +57,35 @@ class PendRejectedError extends Error {
  * - Commit transactions by running consensus phases (GATHER, PEND, COMMIT)
  */
 export class TransactionCoordinator {
-	/** Per-stampId tracking: snapshot before first apply + accumulated actions for replay.
+	/** Per-stampId tracking: pre-staging snapshots + accumulated actions for replay.
 	 *
-	 * The snapshot holds BOTH halves of a collection's staged state — tracker transforms AND
+	 * Each snapshot holds BOTH halves of a collection's staged state — tracker transforms AND
 	 * the pending action queue — as one {@link Collection.snapshotPending} value. Restoring only
 	 * the transforms would leave a rolled-back stamp's actions queued, where the next commit on
 	 * that collection would write them into ITS durable log entry (and a conflicting sync's
 	 * `replayActions` would re-apply them into the tracker as live data). Keeping the pair in one
-	 * value makes half-restored staged state unrepresentable here. */
+	 * value makes half-restored staged state unrepresentable here.
+	 *
+	 * `preSnapshot` is keyed by the {@link Collection} INSTANCE, not by {@link CollectionId}: the
+	 * collection map this coordinator is handed is owned by its caller (the Quereus adapter's
+	 * registry), which may replace the instance stored under an id when a table re-initializes.
+	 * An id-keyed snapshot would then restore the OLD instance's staged state onto the NEW one;
+	 * instance keys make that unrepresentable — the new instance simply gets its own capture at
+	 * the next reconcile, and the stale entry restores a detached object nobody reads.
+	 *
+	 * `seq` is a coordinator-global monotonic capture counter. Because capture is LAZY (a
+	 * collection is captured at the first {@link applyActions} after it appears in the map), stamp
+	 * `order` no longer ranks capture times across stamps — `seq` does. `order` now means replay
+	 * ordering ONLY. */
 	private stampData = new Map<string, {
+		/** Replay ordering ONLY — assigned at the stamp's first applyActions. Not a capture time. */
 		order: number;
-		preSnapshot: Map<CollectionId, CollectionSnapshot<any>>;
+		preSnapshot: Map<Collection<any>, { seq: number; snapshot: CollectionSnapshot<any> }>;
 		actionBatches: CollectionActions[][];
 	}>();
 	private nextStampOrder = 0;
+	/** Monotonic capture sequence, shared across stamps — see {@link stampData}. */
+	private nextCaptureSeq = 0;
 
 	constructor(
 		private readonly transactor: ITransactor,
@@ -91,24 +106,42 @@ export class TransactionCoordinator {
 		actions: CollectionActions[],
 		stampId: string
 	): Promise<void> {
-		// On first call for this stampId, snapshot all collections for potential rollback
-		if (!this.stampData.has(stampId)) {
-			// Capture EVERY registered collection eagerly, not lazily on first touch: `order` is
-			// assigned here, so it only implies capture time while capture happens at first
-			// applyActions. A lazy capture could take a lower-`order` stamp's snapshot AFTER a
-			// higher-`order` stamp staged into that collection, and rollback (which restores to the
-			// earliest-`order` snapshot) would then keep the rolled-back action.
-			const snapshot = new Map<CollectionId, CollectionSnapshot<any>>();
-			for (const [id, col] of this.collections) {
-				snapshot.set(id, col.snapshotPending());
-			}
-			this.stampData.set(stampId, {
-				order: this.nextStampOrder++,
-				preSnapshot: snapshot,
-				actionBatches: []
-			});
+		let data = this.stampData.get(stampId);
+		if (!data) {
+			data = { order: this.nextStampOrder++, preSnapshot: new Map(), actionBatches: [] };
+			this.stampData.set(stampId, data);
 		}
-		this.stampData.get(stampId)!.actionBatches.push(actions);
+
+		// Reconcile the live collection map on EVERY call, not only the first. `this.collections`
+		// is owned by the caller (the Quereus adapter's registry) and grows as tables open
+		// mid-transaction; a collection registered after the first applyActions would otherwise be
+		// visible to commit but absent from every snapshot, so rollback would never visit it and
+		// its staged state would survive into the next transaction's durable log entry.
+		//
+		// applyActions is the right reconcile point because it sits BEFORE any staging this call
+		// performs, and — in the Quereus path, where the vtab stages directly into the trees — the
+		// awaited empty-actions applyActions call exists precisely to be that pre-stage barrier
+		// (see optimystic-module.ts's "applyActions before any collection.stage" invariant).
+		//
+		// The `has` guard is load-bearing: registration is idempotent (the adapter re-registers
+		// already-open index trees), and re-capturing a collection this stamp already staged into
+		// would record a DIRTY state as "before", making rollback preserve the very actions it must
+		// discard.
+		//
+		// Keep this loop synchronous and await-free through to applyActionsRaw below, for the same
+		// reason execute()'s pre-stage snapshot loop is: an interleaved stage would land inside the
+		// snapshot.
+		// NOTE: this runs per applyActions call rather than once per transaction. Per-call cost for
+		// an already-captured collection is one Map.has; snapshotPending (which deep-copies the
+		// transforms) still runs at most once per collection per stamp. If the registered-collection
+		// count ever grows large enough for the scan itself to matter, track a per-stamp "collections
+		// map size at last reconcile" rather than dropping the reconcile.
+		for (const col of this.collections.values()) {
+			if (data.preSnapshot.has(col)) continue;
+			data.preSnapshot.set(col, { seq: this.nextCaptureSeq++, snapshot: col.snapshotPending() });
+		}
+
+		data.actionBatches.push(actions);
 
 		await this.applyActionsRaw(actions, stampId);
 	}
@@ -520,43 +553,60 @@ export class TransactionCoordinator {
 		const toReplay = [...this.stampData.entries()]
 			.sort(([, a], [, b]) => a.order - b.order);
 
-		// Find the earliest snapshot among the rolled-back stamp and all remaining stamps.
-		// This is necessary because interleaved execution means a lower-order stamp
-		// may have batches applied after a higher-order stamp's snapshot was taken.
-		let earliestSnapshot = data.preSnapshot;
-		let earliestOrder = data.order;
-		for (const [, d] of toReplay) {
-			if (d.order < earliestOrder) {
-				earliestSnapshot = d.preSnapshot;
-				earliestOrder = d.order;
+		// Find the EARLIEST capture per collection, across the rolled-back stamp and every
+		// survivor — the state to rewind each collection to before replaying the survivors.
+		//
+		// This is a per-collection minimum by capture `seq`, NOT a single lowest-`order` stamp's
+		// map. Interleaved execution means a lower-order stamp may stage batches after a
+		// higher-order stamp captured; and because capture is lazy (a collection is captured at
+		// the first applyActions AFTER it is registered), a lower-`order` stamp can capture a
+		// collection later than a higher-`order` stamp already staged into it. `order` therefore
+		// does not rank capture times — `seq` does, per collection.
+		//
+		// INVARIANT that makes "restore to the minimum, then replay ALL survivor batches" correct:
+		// for every collection `c`, the minimum capture seq for `c` precedes every tracked batch
+		// that touches `c`. It holds because a batch naming `c` requires `c` to be present in
+		// `this.collections` at that applyActions call (applyActionsRaw throws "Collection not
+		// found" otherwise), so that same call's reconcile captured `c` first — hence each stamp's
+		// own capture of `c` precedes that stamp's batches touching `c`, and the cross-stamp
+		// minimum is no later than any of them. So no batch replayed below was already folded into
+		// the snapshot it is replayed onto: no double-apply.
+		const earliest = new Map<Collection<any>, { seq: number; snapshot: CollectionSnapshot<any> }>();
+		const foldEarliest = (from: Map<Collection<any>, { seq: number; snapshot: CollectionSnapshot<any> }>) => {
+			for (const [collection, entry] of from) {
+				const existing = earliest.get(collection);
+				if (!existing || entry.seq < existing.seq) earliest.set(collection, entry);
 			}
-		}
+		};
+		foldEarliest(data.preSnapshot);
+		for (const [, d] of toReplay) foldEarliest(d.preSnapshot);
 
-		// Restore to the earliest snapshot — transforms AND pending queue together, so the
-		// rolled-back stamp's actions leave the queue instead of being written into the next
+		// Restore each collection to its earliest capture — transforms AND pending queue together,
+		// so the rolled-back stamp's actions leave the queue instead of being written into the next
 		// transaction's durable log entry. `restorePending` deep-copies the transforms itself,
-		// so no structuredClone here.
+		// so no structuredClone here. Restoring through the CAPTURED instance (rather than
+		// re-looking-up by id) is what keeps a mid-transaction instance swap under one id from
+		// pushing the old instance's staged state onto the new one.
 		// NOTE: this also discards actions staged OUTSIDE any tracked stamp (the Tree.stage /
 		// deferred-DML path, which calls Collection.act directly and creates no stampData entry)
-		// that landed after the earliest tracked snapshot. Accepted: the tracker half already
-		// discards their transforms, and symmetric is the safer state — leaving such an action
-		// queued while its transforms are gone is exactly the phantom that a conflicting sync's
-		// replayActions would resurrect as live data.
-		for (const [collectionId, snapshot] of earliestSnapshot) {
-			const collection = this.collections.get(collectionId);
-			if (collection) {
-				collection.restorePending(snapshot);
-			}
+		// that landed after that collection's earliest tracked capture — including on a collection
+		// registered mid-transaction, whose capture is simply later than the eagerly-captured ones.
+		// Accepted: the tracker half already discards their transforms, and symmetric is the safer
+		// state — leaving such an action queued while its transforms are gone is exactly the
+		// phantom that a conflicting sync's replayActions would resurrect as live data.
+		for (const [collection, { snapshot }] of earliest) {
+			collection.restorePending(snapshot);
 		}
 
 		// Replay all remaining stamps' batches in order
 		for (const [replayStampId, replayData] of toReplay) {
 			// Update the snapshot to reflect current (post-replay) state. Both halves: a survivor
 			// replayed later in this loop must carry its pending queue forward too, or the next
-			// rollback restores a snapshot that is missing it.
-			const newSnapshot = new Map<CollectionId, CollectionSnapshot<any>>();
-			for (const [id, col] of this.collections) {
-				newSnapshot.set(id, col.snapshotPending());
+			// rollback restores a snapshot that is missing it. Fresh (still monotonic) seqs, so the
+			// rebuilt captures rank after everything captured before this rollback.
+			const newSnapshot = new Map<Collection<any>, { seq: number; snapshot: CollectionSnapshot<any> }>();
+			for (const col of this.collections.values()) {
+				newSnapshot.set(col, { seq: this.nextCaptureSeq++, snapshot: col.snapshotPending() });
 			}
 			replayData.preSnapshot = newSnapshot;
 
@@ -843,11 +893,12 @@ export class TransactionCoordinator {
 					// the collections that DID durably commit. Drop it, matching commitOnceLatched.
 					//
 					// NOTE: dropping the entry also removes this stamp's batches from the REPLAY set
-					// a later rollback(otherStampId) rebuilds from (see rollback's earliest-snapshot
-					// walk). With a second stamp in flight whose preSnapshot was taken after this
-					// one staged, that rollback would reset to a snapshot still carrying this
-					// transaction's transforms — re-staging the winner's already-durable actions,
-					// the very corruption this delete prevents on the direct path. Same shape at
+					// a later rollback(otherStampId) rebuilds from (see rollback's per-collection
+					// earliest-capture walk). With a second stamp in flight whose capture of a
+					// participant was taken after this one staged into it, that rollback would reset
+					// to a snapshot still carrying this transaction's transforms — re-staging the
+					// winner's already-durable actions, the very corruption this delete prevents on
+					// the direct path. Same shape at
 					// commitOnceLatched's delete; harmless while a session drives one stamp per
 					// coordinator. If concurrent stamps on one coordinator ever become real, the fix
 					// is a tombstone entry (batches dropped, snapshot kept for the replay walk)
