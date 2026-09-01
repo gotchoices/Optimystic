@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { ClusterMember, clusterMember } from '../src/cluster/cluster-repo.js';
+import { resolveRace } from '../src/cluster/race-resolution.js';
 import { MemoryTransactionStateStore } from '../src/cluster/memory-transaction-state-store.js';
 import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, Transforms, IBlock, BlockId, BlockHeader, ClusterConsensusConfig } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
@@ -1053,11 +1054,6 @@ describe('ClusterMember', () => {
 	});
 
 	describe('priority-aged race resolution', () => {
-		// resolveRace is private; a cast keeps these as focused unit tests of the deterministic tiebreak.
-		const raceOf = () => (clusterMemberInstance as unknown as {
-			resolveRace(a: ClusterRecord, b: ClusterRecord): 'keep-existing' | 'accept-incoming'
-		});
-
 		it('a rival with MORE promises wins even against higher aged priority (monotonicity)', async () => {
 			const peers = makeClusterPeers([selfKeyPair]);
 			// Aged transaction: priority 2, ZERO promises.
@@ -1067,8 +1063,8 @@ describe('ClusterMember', () => {
 				peers, makePendOperationP('fresh', 'block-shared'), { p1: dummySig, p2: dummySig }
 			);
 			// Promises come first now: the further-along transaction is never displaced by priority.
-			expect(raceOf().resolveRace(aged, fresh)).to.equal('accept-incoming');
-			expect(raceOf().resolveRace(fresh, aged)).to.equal('keep-existing');
+			expect(resolveRace(aged, fresh)).to.equal('accept-incoming');
+			expect(resolveRace(fresh, aged)).to.equal('keep-existing');
 		});
 
 		it('priority cannot displace a promise-supermajority transaction (adversarial monotonicity)', async () => {
@@ -1084,15 +1080,15 @@ describe('ClusterMember', () => {
 			// The commit path has NO conflict re-check, so resolveRace is the only arbiter. Under
 			// approvals-first it can never displace a quorum-reached transaction — regression guard for
 			// occ-priority-first-breaks-promise-monotonicity (this FAILED under the old priority-first order).
-			expect(raceOf().resolveRace(x, y)).to.equal('keep-existing');
-			expect(raceOf().resolveRace(y, x)).to.equal('accept-incoming');
+			expect(resolveRace(x, y)).to.equal('keep-existing');
+			expect(resolveRace(y, x)).to.equal('accept-incoming');
 		});
 
 		it('reads priority from the multi-collection carrier (pend.validation.transaction.priority) too', async () => {
 			const peers = makeClusterPeers([selfKeyPair]);
 			const txAged = await createClusterRecord(peers, makePendOperationP('tx-aged', 'block-shared', { txPriority: 4 }));
 			const fresh = await createClusterRecord(peers, makePendOperationP('fresh', 'block-shared'));
-			expect(raceOf().resolveRace(txAged, fresh)).to.equal('keep-existing');
+			expect(resolveRace(txAged, fresh)).to.equal('keep-existing');
 		});
 
 		it('treats a MALFORMED validation pair as priority 0 instead of throwing out of the vote path', async () => {
@@ -1105,8 +1101,8 @@ describe('ClusterMember', () => {
 			const malformed = await createClusterRecord(peers, makePendOperationP('malformed', 'block-shared'));
 			(malformed.message.operations[0] as { pend: Record<string, unknown> }).pend.validation = {};
 			const aged = await createClusterRecord(peers, makePendOperationP('aged', 'block-shared', { priority: 3 }));
-			expect(raceOf().resolveRace(malformed, aged)).to.equal('accept-incoming');
-			expect(raceOf().resolveRace(aged, malformed)).to.equal('keep-existing');
+			expect(resolveRace(malformed, aged)).to.equal('accept-incoming');
+			expect(resolveRace(aged, malformed)).to.equal('keep-existing');
 		});
 
 		it('an aged transaction beats fresh rivals within MaxPriority+1 concurrent rounds (livelock guarantee)', async () => {
@@ -1120,8 +1116,8 @@ describe('ClusterMember', () => {
 				const fresh = await createClusterRecord(peers, makePendOperationP(`fresh-${losses}`, 'block-shared'));
 				// priority ≥ 1 deterministically out-ranks a fresh priority-0 rival at equal approval counts,
 				// regardless of the hash — so the starved transaction wins by round 1 (≤ MaxPriority+1).
-				expect(raceOf().resolveRace(aged, fresh), `aged wins at priority ${agedPriority}`).to.equal('keep-existing');
-				expect(raceOf().resolveRace(fresh, aged), `mirror at priority ${agedPriority}`).to.equal('accept-incoming');
+				expect(resolveRace(aged, fresh), `aged wins at priority ${agedPriority}`).to.equal('keep-existing');
+				expect(resolveRace(fresh, aged), `mirror at priority ${agedPriority}`).to.equal('accept-incoming');
 			}
 		});
 
@@ -1131,8 +1127,8 @@ describe('ClusterMember', () => {
 			// b self-asserts an over-cap priority; recordPriority clamps it to MaxPriority so it TIES a.
 			const b = await createClusterRecord(peers, makePendOperationP('b', 'block-shared', { priority: MaxPriority + 5 }));
 
-			const ab = raceOf().resolveRace(a, b);
-			const ba = raceOf().resolveRace(b, a);
+			const ab = resolveRace(a, b);
+			const ba = resolveRace(b, a);
 			// Both orderings must agree on the SAME actual winning record (no deadlock, order-independent).
 			const winnerAB = ab === 'keep-existing' ? a.messageHash : b.messageHash;
 			const winnerBA = ba === 'keep-existing' ? b.messageHash : a.messageHash;
@@ -1146,8 +1142,8 @@ describe('ClusterMember', () => {
 			const aged = await createClusterRecord(peers, makePendOperationP('aged', 'block-shared', { priority: 3 }));
 			// Legacy record: NO priority field anywhere in the pend (older coordinator).
 			const legacy = await createClusterRecord(peers, makePendOperation('legacy', 'block-shared'));
-			expect(raceOf().resolveRace(aged, legacy)).to.equal('keep-existing');
-			expect(raceOf().resolveRace(legacy, aged)).to.equal('accept-incoming');
+			expect(resolveRace(aged, legacy)).to.equal('keep-existing');
+			expect(resolveRace(legacy, aged)).to.equal('accept-incoming');
 		});
 
 		it('a record carrying only a REJECT vote does not outrank a fresh rival', async () => {
@@ -1168,8 +1164,8 @@ describe('ClusterMember', () => {
 			// equal approve counts (0 vs 0) rather than by the hash, keeping this assertion deterministic.
 			const freshB = await createClusterRecord(peers, makePendOperationP('b', 'block-shared', { priority: 1 }));
 
-			expect(raceOf().resolveRace(rejectedA, freshB)).to.equal('accept-incoming');
-			expect(raceOf().resolveRace(freshB, rejectedA)).to.equal('keep-existing');
+			expect(resolveRace(rejectedA, freshB)).to.equal('accept-incoming');
+			expect(resolveRace(freshB, rejectedA)).to.equal('keep-existing');
 		});
 
 		it('rejects a record whose priority was inflated after signing (integrity in transit)', async () => {

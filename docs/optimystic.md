@@ -285,7 +285,7 @@ carried all of them — see [debugging.md](debugging.md#which-collections-did-a-
 
 ### Per-collection throughput ceiling
 
-Every write to a collection is ordered by a single **log-tail cluster** — the K peers responsible for the tail block of that collection's transaction log. Each write must clear a super-majority promise+commit round before it completes (the `resolveRace` path in `cluster-repo.ts`). That consensus round is the hard throughput ceiling: roughly one completed write per super-majority round-trip, regardless of how many clients are writing.
+Every write to a collection is ordered by a single **log-tail cluster** — the K peers responsible for the tail block of that collection's transaction log. Each write must clear a super-majority promise+commit round before it completes (the `resolveRace` path in `race-resolution.ts`). That consensus round is the hard throughput ceiling: roughly one completed write per super-majority round-trip, regardless of how many clients are writing.
 
 This is a CP design choice — strong linearizability per collection, with a structural cap on write rate. There is no way to raise the ceiling for a single collection. The only relief is to spread writes across more collections, each with its own log-tail cluster.
 
