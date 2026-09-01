@@ -343,6 +343,11 @@ describe('cohort-topic wire', () => {
 			expect(() => decodeRegisterV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /correlationId/);
 		});
 
+		it('rejects an over-length cohortEpoch (a fixed 32-byte field cannot become a bloated rotation-state map key)', () => {
+			const bad = { ...sampleMembershipCert(), cohortEpoch: bytesToB64url(seededBytes(64, 3)) };
+			expect(() => decodeMembershipCertV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /cohortEpoch/);
+		});
+
 		it('rejects a negative treeTier', () => {
 			const bad = { ...sampleRegister(), treeTier: -1 };
 			const frame = encodeCohortMessage(bad);

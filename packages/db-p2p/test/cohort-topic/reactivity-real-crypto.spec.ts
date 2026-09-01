@@ -118,7 +118,7 @@ const makeVerifier = (members: string[], minSigs: number) => {
 	const membershipCert: MembershipCertV1 = {
 		v: 1,
 		cohortCoord: bytesToB64url(expectedCoord),
-		cohortEpoch: bytesToB64url(new Uint8Array([7])),
+		cohortEpoch: bytesToB64url(new Uint8Array(32).fill(7)),
 		members,
 		stabilizedAt: 1_700_000_000_000,
 		thresholdSig: bytesToB64url(new Uint8Array([0])),

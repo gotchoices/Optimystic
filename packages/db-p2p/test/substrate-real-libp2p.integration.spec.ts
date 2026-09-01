@@ -465,7 +465,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		const staleCert: MembershipCertV1 = {
 			v: 1,
 			cohortCoord: bytesToB64url(coord0),
-			cohortEpoch: bytesToB64url(new Uint8Array([9, 9, 9])),
+			cohortEpoch: bytesToB64url(new Uint8Array(32).fill(9)),
 			members: stale,
 			stabilizedAt: Date.now() - 1_000_000,
 			thresholdSig: bytesToB64url(new Uint8Array([0])),

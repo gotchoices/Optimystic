@@ -81,7 +81,7 @@ function realVerifier(members: string[], minSigs = 1): NotificationVerifier {
 	const cert: MembershipCertV1 = {
 		v: 1,
 		cohortCoord: bytesToB64url(expectedCoord),
-		cohortEpoch: bytesToB64url(new Uint8Array([7])),
+		cohortEpoch: bytesToB64url(new Uint8Array(32).fill(7)),
 		members,
 		stabilizedAt: NOW,
 		thresholdSig: bytesToB64url(new Uint8Array([0])),

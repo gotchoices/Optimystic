@@ -164,10 +164,7 @@ export function validateRegisterReplyV1(value: unknown): RegisterReplyV1 {
 	assignDefined(out, "backups", optStringArray(obj, "backups", what));
 	const cohortEpoch = optString(obj, "cohortEpoch", what);
 	if (cohortEpoch !== undefined) {
-		// NOTE: cohortEpoch is NOT length-pinned though real epochs are a 32-byte SHA-256 — several
-		// test fixtures (db-core reactivity + db-p2p) feed 1-byte synthetic epochs. Pinning is tracked
-		// by debt-cohort-topic-pin-cohort-epoch. See b64urlField's note.
-		out.cohortEpoch = b64urlField(cohortEpoch, "cohortEpoch", what);
+		out.cohortEpoch = b64urlFixedLen(cohortEpoch, "cohortEpoch", COORD_BYTES, what);
 	}
 	assignDefined(out, "cohortMembers", optStringArray(obj, "cohortMembers", what));
 	if (obj["topicTraffic"] !== undefined) {
@@ -211,9 +208,7 @@ export function validateRenewReplyV1(value: unknown): RenewReplyV1 {
 	assignDefined(out, "newBackups", optStringArray(obj, "newBackups", what));
 	const cohortEpoch = optString(obj, "cohortEpoch", what);
 	if (cohortEpoch !== undefined) {
-		// NOTE: cohortEpoch is NOT length-pinned — see validateRegisterReplyV1's note and
-		// debt-cohort-topic-pin-cohort-epoch.
-		out.cohortEpoch = b64urlField(cohortEpoch, "cohortEpoch", what);
+		out.cohortEpoch = b64urlFixedLen(cohortEpoch, "cohortEpoch", COORD_BYTES, what);
 	}
 	return out;
 }
@@ -236,7 +231,7 @@ export function validatePromotionNoticeV1(value: unknown): PromotionNoticeV1 {
 		effectiveAt: reqFiniteNumber(obj, "effectiveAt", what),
 		thresholdSig: b64urlField(reqString(obj, "thresholdSig", what), "thresholdSig", what),
 		signers: reqStringArray(obj, "signers", what),
-		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
+		cohortEpoch: b64urlFixedLen(reqString(obj, "cohortEpoch", what), "cohortEpoch", COORD_BYTES, what),
 	};
 }
 
@@ -253,7 +248,7 @@ export function validateDemotionNoticeV1(value: unknown): DemotionNoticeV1 {
 		effectiveAt: reqFiniteNumber(obj, "effectiveAt", what),
 		thresholdSig: b64urlField(reqString(obj, "thresholdSig", what), "thresholdSig", what),
 		signers: reqStringArray(obj, "signers", what),
-		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
+		cohortEpoch: b64urlFixedLen(reqString(obj, "cohortEpoch", what), "cohortEpoch", COORD_BYTES, what),
 	};
 }
 
@@ -290,7 +285,7 @@ export function validateChildLinkV1(value: unknown, minSigs?: number): ChildLink
 		effectiveAt: reqFiniteNumber(obj, "effectiveAt", what),
 		thresholdSig,
 		signers,
-		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
+		cohortEpoch: b64urlFixedLen(reqString(obj, "cohortEpoch", what), "cohortEpoch", COORD_BYTES, what),
 	};
 }
 
@@ -393,7 +388,7 @@ export function validateCohortGossipV1(value: unknown): CohortGossipV1 {
 		v: 1,
 		fromMember: reqString(obj, "fromMember", what),
 		coord: b64urlFixedLen(reqString(obj, "coord", what), "coord", COORD_BYTES, what),
-		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
+		cohortEpoch: b64urlFixedLen(reqString(obj, "cohortEpoch", what), "cohortEpoch", COORD_BYTES, what),
 		treeTier,
 		willingnessBits,
 		loadBuckets: loadBuckets as number[],
@@ -443,7 +438,7 @@ export function validateSignRequestV1(value: unknown): SignRequestV1 {
 		v: 1,
 		kind: reqEnum(obj, "kind", SIGN_KINDS, what),
 		coord: b64urlFixedLen(reqString(obj, "coord", what), "coord", COORD_BYTES, what),
-		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
+		cohortEpoch: b64urlFixedLen(reqString(obj, "cohortEpoch", what), "cohortEpoch", COORD_BYTES, what),
 		payload: b64urlField(reqString(obj, "payload", what), "payload", what),
 	};
 }
@@ -473,7 +468,7 @@ export function validateMembershipCertV1(value: unknown): MembershipCertV1 {
 	const out: MembershipCertV1 = {
 		v: 1,
 		cohortCoord: b64urlFixedLen(reqString(obj, "cohortCoord", what), "cohortCoord", COORD_BYTES, what),
-		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
+		cohortEpoch: b64urlFixedLen(reqString(obj, "cohortEpoch", what), "cohortEpoch", COORD_BYTES, what),
 		members: reqStringArray(obj, "members", what),
 		stabilizedAt: reqFiniteNumber(obj, "stabilizedAt", what),
 		thresholdSig: b64urlField(reqString(obj, "thresholdSig", what), "thresholdSig", what),
@@ -504,9 +499,7 @@ function validateRotationAttestation(obj: Record<string, unknown>, out: Membersh
 	if (presentCount !== 3) {
 		fail(`${what}: rotation attestation requires all of prevEpoch, rotationSig, rotationSigners — or none`);
 	}
-	// prevEpoch is a prior cohortEpoch, so it inherits cohortEpoch's leniency (see the b64urlField note
-	// and debt-cohort-topic-pin-cohort-epoch).
-	out.prevEpoch = b64urlField(prevEpoch!, "prevEpoch", what);
+	out.prevEpoch = b64urlFixedLen(prevEpoch!, "prevEpoch", COORD_BYTES, what);
 	out.rotationSig = b64urlField(rotationSig!, "rotationSig", what);
 	out.rotationSigners = rotationSigners!;
 }
