@@ -23,8 +23,12 @@ import {
 
 const THRESHOLD = 0.51;
 
-const claim = (peerId: string, rev: number, actionId: string, certified?: boolean): RevClaim =>
-	({ peerId, rev, actionId, ...(certified !== undefined ? { certified } : {}) });
+const claim = (peerId: string, rev: number, actionId: string, certified?: boolean, signerCount?: number): RevClaim =>
+	({
+		peerId, rev, actionId,
+		...(certified !== undefined ? { certified } : {}),
+		...(signerCount !== undefined ? { certifiedSignerCount: signerCount } : {})
+	});
 
 const block = (id: string, extra: Record<string, unknown> = {}): IBlock =>
 	({ header: { id, type: 'test', collectionId: 'c', ...extra } } as unknown as IBlock);
@@ -61,16 +65,35 @@ describe('certified claim selection (quorum-restore)', () => {
 			expect(sel!.certified).to.equal(undefined);
 		});
 
-		it('the equal-rev tie goes to certified — the proof outweighs votes', () => {
-			// Two voters corroborate (5, 'votes-say') while one certified claim proves (5,
-			// 'proof-says'): the pair the cohort actually SIGNED wins over what peers now assert.
+		it('the equal-rev tie goes to a MULTI-SIGNER certified claim — the cohort proof outweighs votes', () => {
+			// Two voters corroborate (5, 'votes-say') while one claim carries a verified THREE-signer
+			// proof for (5, 'proof-says'): the pair the cohort actually SIGNED wins over what peers
+			// now assert. (A single-signer proof does NOT get this — see the solo-proof cases below.)
 			const claims = [
 				claim('h1', 5, 'votes-say'),
 				claim('h2', 5, 'votes-say'),
-				claim('holder', 5, 'proof-says', true)
+				claim('holder', 5, 'proof-says', true, 3)
 			];
 			const sel = selectQuorumRev(claims, THRESHOLD, 9);
 			expect(sel).to.deep.equal({ rev: 5, actionId: 'proof-says', supporters: ['holder'], certified: true });
+		});
+
+		it('a SINGLE-SIGNER certified claim loses the equal-rev tie to multi-peer corroboration', () => {
+			// The solo-fork case (ticket single-signer-proof-outweighs-corroboration): a machine that
+			// was briefly alone self-signed (5, 'solo-fork'); the cohort's peers agree on (5, 'cohort')
+			// without proofs. Several machines agreeing outweigh one machine's own receipt.
+			const claims = [
+				claim('h1', 5, 'cohort'),
+				claim('h2', 5, 'cohort'),
+				claim('solo', 5, 'solo-fork', true, 1)
+			];
+			const sel = selectQuorumRev(claims, THRESHOLD, 9);
+			expect(sel).to.deep.equal({ rev: 5, actionId: 'cohort', supporters: ['h1', 'h2'] });
+		});
+
+		it('a single-signer certified claim still wins where NOTHING multi-peer contests it', () => {
+			const sel = selectQuorumRev([claim('solo', 5, 'a', true, 1)], THRESHOLD, 9);
+			expect(sel).to.deep.equal({ rev: 5, actionId: 'a', supporters: ['solo'], certified: true });
 		});
 
 		it('declines outright on two actions certified at the same top rev (equivocation)', () => {
@@ -85,16 +108,41 @@ describe('certified claim selection (quorum-restore)', () => {
 			expect(conflict!.actionIds.sort()).to.deep.equal(['a', 'b']);
 		});
 
-		it('equivocation declines even when a corroborated pair exists at the SAME rev', () => {
-			// Step 4 only yields to a corroborated rev STRICTLY above the top certified rev; at a
-			// tie the certified path decides, and a certified conflict there declines everything.
+		it('MULTI-SIGNER equivocation declines even when a corroborated pair exists at the SAME rev', () => {
+			// Two cohort-grade (multi-signer) proofs for distinct actions at one rev: the certified
+			// path decides the tie and a certified conflict there declines everything — votes cannot
+			// pick between two proofs the same keys plausibly signed.
 			const claims = [
 				claim('h1', 5, 'a'),
 				claim('h2', 5, 'a'),
-				claim('p1', 5, 'a', true),
-				claim('p2', 5, 'b', true)
+				claim('p1', 5, 'a', true, 3),
+				claim('p2', 5, 'b', true, 3)
 			];
 			expect(selectQuorumRev(claims, THRESHOLD, 9)).to.equal(undefined);
+		});
+
+		it('two SINGLE-SIGNER certified actions at one rev yield to multi-peer corroboration instead of deadlocking', () => {
+			const claims = [
+				claim('h1', 5, 'a'),
+				claim('h2', 5, 'a'),
+				claim('solo1', 5, 'a', true, 1),
+				claim('solo2', 5, 'b', true, 1)
+			];
+			const sel = selectQuorumRev(claims, THRESHOLD, 9);
+			expect(sel).to.not.equal(undefined);
+			expect(sel!.actionId).to.equal('a');
+			expect(sel!.certified).to.equal(undefined);
+		});
+
+		it('a multi-signer certified claim beats a single-signer one at the same rev — no equivocation decline', () => {
+			// A solo machine's self-signed receipt cannot veto the cohort's own proof.
+			const claims = [
+				claim('cohort-holder', 5, 'cohort-action', true, 3),
+				claim('solo', 5, 'solo-fork', true, 1)
+			];
+			const sel = selectQuorumRev(claims, THRESHOLD, 9);
+			expect(sel).to.deep.equal({ rev: 5, actionId: 'cohort-action', supporters: ['cohort-holder'], certified: true });
+			expect(certifiedEquivocation(claims)).to.equal(undefined);
 		});
 
 		it('ignores a certified conflict at a LOWER rev than the certified winner', () => {
@@ -180,8 +228,12 @@ describe('certified claim selection (quorum-restore)', () => {
 	});
 
 	describe('selectQuorumBlock', () => {
-		const hashed = async (peerId: string, b: IBlock, certified?: boolean): Promise<BlockHashCandidate> =>
-			({ peerId, hash: await canonicalBlockHash(b), block: b, ...(certified !== undefined ? { certified } : {}) });
+		const hashed = async (peerId: string, b: IBlock, certified?: boolean, signerCount?: number): Promise<BlockHashCandidate> =>
+			({
+				peerId, hash: await canonicalBlockHash(b), block: b,
+				...(certified !== undefined ? { certified } : {}),
+				...(signerCount !== undefined ? { certifiedSignerCount: signerCount } : {})
+			});
 
 		it('accepts a single certified candidate outright, even as the only copy at large capacity', async () => {
 			const only = block('b', { payload: 'proven' });
@@ -192,15 +244,38 @@ describe('certified claim selection (quorum-restore)', () => {
 			expect(sel!.block).to.equal(only);
 		});
 
-		it('a certified candidate wins over an uncertified majority serving different bytes', async () => {
+		it('a MULTI-SIGNER certified candidate wins over an uncertified majority serving different bytes', async () => {
 			const proven = block('b', { payload: 'proven' });
 			const cands = await Promise.all([
-				hashed('holder', proven, true),
+				hashed('holder', proven, true, 3),
 				hashed('m1', block('b', { payload: 'majority' })),
 				hashed('m2', block('b', { payload: 'majority' }))
 			]);
 			const sel = selectQuorumBlock(cands, THRESHOLD, 9);
 			expect(sel!.hash).to.equal(await canonicalBlockHash(proven));
+		});
+
+		it('a SINGLE-SIGNER certified candidate loses to a multi-peer hash quorum serving different bytes', async () => {
+			// Content-side sibling of the solo-fork rev case: one machine's self-signed bytes must not
+			// displace several distinct carriers agreeing with each other.
+			const majority = block('b', { payload: 'majority' });
+			const cands = await Promise.all([
+				hashed('solo', block('b', { payload: 'solo-fork' }), true, 1),
+				hashed('m1', majority),
+				hashed('m2', block('b', { payload: 'majority' }))
+			]);
+			const sel = selectQuorumBlock(cands, THRESHOLD, 9);
+			expect(sel!.hash).to.equal(await canonicalBlockHash(majority));
+		});
+
+		it('a single-signer certified candidate still wins where nothing multi-peer contests it', async () => {
+			const solo = block('b', { payload: 'solo' });
+			const cands = await Promise.all([
+				hashed('solo-holder', solo, true, 1),
+				hashed('bare', block('b', { payload: 'bare-word' })) // one uncertified dissenter, no quorum
+			]);
+			const sel = selectQuorumBlock(cands, THRESHOLD, 9);
+			expect(sel!.hash).to.equal(await canonicalBlockHash(solo));
 		});
 
 		it('two certified candidates agreeing on one hash still win as that single hash', async () => {

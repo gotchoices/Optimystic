@@ -1109,6 +1109,9 @@ export class CoordinatorRepo implements IRepo {
 			);
 			if (verdict.certified) {
 				claim.certified = true;
+				// The verdict's signer count, never proof.peerIds read here — selection weighs a
+				// single-signer certification below multi-peer corroboration (quorum-restore.ts).
+				claim.certifiedSignerCount = verdict.signerCount;
 				return;
 			}
 			this.log('cluster-fetch:proof-uncertified', {
@@ -1357,6 +1360,12 @@ export class CoordinatorRepo implements IRepo {
 		if (!this.reputation || selected.certified) return;
 		try {
 			for (const c of claims) {
+				// A CERTIFIED disagreeing claim is exempt: its proof verified, so the peer honestly
+				// served a commit that really happened — when multi-peer corroboration outweighs its
+				// single-signer proof at the same rev (quorum-restore.ts), that peer is a partition
+				// casualty on the losing side of a fork, not a liar. Provably-bad proof SERVICE was
+				// already penalized at verification time above.
+				if (c.certified === true) continue;
 				if (c.rev === selected.rev && c.actionId !== selected.actionId) {
 					this.reputation.reportPeer(c.peerId, PenaltyReason.InvalidRestoration, `read-repair:${blockId}`);
 				}

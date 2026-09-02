@@ -100,7 +100,7 @@ describe('certified-claims (shared proof certification)', () => {
 			const commit = makeCommit();
 			const { proof } = await makeSignedProof(3, commit);
 			const result = await certifyClaim(proof, claimFor(commit), PROOF_THRESHOLDS);
-			expect(result).to.deep.equal({ certified: true });
+			expect(result).to.deep.equal({ certified: true, signerCount: 3 });
 		});
 
 		it('declines an oversized signer list BEFORE any hash/signature work, non-attributably', async () => {
@@ -256,7 +256,7 @@ describe('certified-claims (shared proof certification)', () => {
 			const { proof } = await makeSignedProof(3, commit);
 			const { anchoring, calls } = recordingAnchoring();
 			const result = await certifyContent(proof, claimFor(commit), served, PROOF_THRESHOLDS, anchoring);
-			expect(result).to.deep.equal({ revCertified: true, contentCertified: true });
+			expect(result).to.deep.equal({ revCertified: true, contentCertified: true, signerCount: 3 });
 			expect(calls.map(c => c.reason)).to.deep.equal(['no-recompute-capability']);
 		});
 
@@ -268,7 +268,7 @@ describe('certified-claims (shared proof certification)', () => {
 			const result = await certifyContent(
 				proof, claimFor(commit), testBlock('tampered-content'), PROOF_THRESHOLDS);
 			expect(result).to.deep.equal({
-				revCertified: true, contentCertified: false, failure: 'digest-mismatch'
+				revCertified: true, contentCertified: false, failure: 'digest-mismatch', signerCount: 3
 			});
 			expect(isAttributableProofFailure('digest-mismatch')).to.equal(true);
 		});
@@ -279,7 +279,7 @@ describe('certified-claims (shared proof certification)', () => {
 			const result = await certifyContent(
 				proof, claimFor(commit), testBlock(), PROOF_THRESHOLDS);
 			expect(result).to.deep.equal({
-				revCertified: true, contentCertified: false, failure: 'no-digest-declared'
+				revCertified: true, contentCertified: false, failure: 'no-digest-declared', signerCount: 3
 			});
 			expect(isAttributableProofFailure('no-digest-declared')).to.equal(false);
 		});

@@ -16,8 +16,13 @@ import type { BlockCommitProof } from "./commit-proof.js";
  * caller has already verified (`cluster/certified-claims.ts`) and marked via the
  * injected `certified` flag — so a lone honest holder with a valid proof is
  * sufficient where uncertified claims still need distinct-peer corroboration.
- * Verification itself never happens here: both selectors stay pure and
- * synchronous; verdicts arrive as booleans.
+ * Certified claims are additionally weighed by the proof's SIGNER COUNT
+ * (`certifiedSignerCount`, injected alongside the flag): a single-signer proof —
+ * routine since solo cohorts mint their own commit receipts — is one machine's
+ * honest word about its own commit, so it wins only where nothing multi-peer
+ * contests it, and never outranks several distinct peers agreeing at the same
+ * revision. Verification itself never happens here: both selectors stay pure and
+ * synchronous; verdicts arrive as booleans and counts.
  */
 
 /** A single peer's self-reported (rev, actionId) for a block. */
@@ -41,6 +46,16 @@ export interface RevClaim {
 	 * Never set this from the mere presence of {@link proof}.
 	 */
 	certified?: boolean;
+	/**
+	 * Distinct signers in the verified proof, injected by the caller from the certification verdict
+	 * (`ClaimCertification.signerCount`, `cluster/certified-claims.ts`) — never read off
+	 * {@link proof} here. Meaningful only when {@link certified} is set. Selection weighs a certified
+	 * claim as SINGLE-SIGNER when this is absent or below two: the conservative direction, since a
+	 * single-signer proof (a solo cohort's self-signed commit receipt) must never outrank multi-peer
+	 * agreement, and a caller that forgot to plumb the count should degrade toward corroboration,
+	 * not toward trusting one signature.
+	 */
+	certifiedSignerCount?: number;
 }
 
 /** The (rev, actionId) pair a quorum agreed on, plus the peers that corroborated it. */
@@ -136,18 +151,26 @@ export function corroboratorCapacity(cohortPeerCount: number, repairCorroboratio
  *
  * **Certified claims** (`certified === true`, injected by a caller that verified the claim's
  * cohort commit proof — see `cluster/certified-claims.ts`) short-circuit the distinct-peer rule,
- * because the proof's signature set IS the corroboration:
+ * because the proof's signature set IS the corroboration — weighed by how many signers that set
+ * actually holds ({@link RevClaim.certifiedSignerCount}):
  *
  *  - No certified claims → today's corroboration result, unchanged.
  *  - A corroborated pair at a HIGHER rev than every certified claim wins — corroboration stays a
  *    legitimate weaker path, so a legacy uncertified tail written after the last proven rev
  *    remains readable.
- *  - Otherwise the highest certified rev wins: this covers a certified rev beaten in raw rev only
- *    by an *uncorroborated* claim (which failed quorum and is no evidence), and the equal-rev
- *    tie, where the proof outweighs votes.
- *  - Except: two distinct `actionId`s certified at that top rev is equivocation — the cohort
- *    provably signed two different actions into one revision — and the whole selection declines
- *    (`undefined`). Callers distinguish this decline from a plain no-quorum via
+ *  - A MULTI-SIGNER certified claim (two-plus signers) at the top certified rev wins over an
+ *    equal-rev corroborated pair and over any uncorroborated claim: the proof outweighs votes.
+ *    Single-signer certified claims at that rev neither outrank it nor equivocate against it — a
+ *    solo cohort's self-signed receipt is one machine's word, not the cohort's second signature.
+ *  - A SINGLE-SIGNER-only certified rev still wins where nothing multi-peer contests it (a lone
+ *    holder with a solo proof stays repairable), but it never beats corroboration by
+ *    {@link CORROBORATION_FLOOR}-plus distinct peers at the SAME revision — one machine that was
+ *    briefly alone must not outrank the cohort that stayed together. A corroborated pair that
+ *    AGREES with the sole certified action is convergence, not a contest; the certified verdict
+ *    is kept.
+ *  - Two distinct `actionId`s still CONTENDING at the top certified rev is equivocation — the
+ *    same keys provably signed two different actions into one revision — and the whole selection
+ *    declines (`undefined`). Callers distinguish this decline from a plain no-quorum via
  *    {@link certifiedEquivocation}.
  */
 export function selectQuorumRev(
@@ -195,43 +218,81 @@ export function selectQuorumRev(
 	// must stay readable. A merely UNcorroborated higher rev never reaches here (it is not in
 	// `corroborated`), so it cannot outrank a proof.
 	if (corroborated && corroborated.rev > certified.rev) return corroborated;
-	// Two actions provably signed into the same top revision: decline the whole selection rather
-	// than pick a side. Callers log via certifiedEquivocation.
-	if (certified.byAction.size !== 1) return undefined;
-	const [entry] = certified.byAction;
-	const [actionId, supporters] = entry!; // size === 1 checked above
-	return { rev: certified.rev, actionId, supporters: [...supporters], certified: true };
+	const contenders = certifiedContenders(certified.byAction);
+	// A single-signer-only certified rev loses the equal-rev tie to genuinely multi-peer
+	// corroboration — unless the corroborated pair AGREES with the sole certified action, which is
+	// convergence rather than a contest and keeps the certified verdict (and its logging/penalty
+	// exemptions) intact.
+	if (!contenders.multiSigner && corroborated && corroborated.rev === certified.rev
+		&& corroborated.supporters.length >= CORROBORATION_FLOOR
+		&& !(certified.byAction.size === 1 && certified.byAction.has(corroborated.actionId))) {
+		return corroborated;
+	}
+	// Two actions provably signed into the same top revision by contending proofs: decline the
+	// whole selection rather than pick a side. Callers log via certifiedEquivocation.
+	if (contenders.entries.length !== 1) return undefined;
+	const [actionId, group] = contenders.entries[0]!;
+	return { rev: certified.rev, actionId, supporters: [...group.supporters], certified: true };
 }
 
-/** Certified claims at the top certified rev, keyed by actionId → distinct certified claimants. */
-function certifiedGroups(claims: RevClaim[]): { rev: number; byAction: Map<string, Set<string>> } | undefined {
+/** Distinct certified claimants of one action at the top certified rev, and whether any of their
+ * proofs carried two-plus signers. */
+interface CertifiedActionGroup {
+	supporters: Set<string>;
+	/** True when at least one certified claim for this action had `certifiedSignerCount >= 2`. */
+	multiSigner: boolean;
+}
+
+/** Certified claims at the top certified rev, keyed by actionId → the claimants behind each. */
+function certifiedGroups(claims: RevClaim[]): { rev: number; byAction: Map<string, CertifiedActionGroup> } | undefined {
 	let top: number | undefined;
 	for (const c of claims) {
 		if (c.certified === true && (top === undefined || c.rev > top)) top = c.rev;
 	}
 	if (top === undefined) return undefined;
-	const byAction = new Map<string, Set<string>>();
+	const byAction = new Map<string, CertifiedActionGroup>();
 	for (const c of claims) {
 		if (c.certified !== true || c.rev !== top) continue;
-		let s = byAction.get(c.actionId);
-		if (!s) {
-			s = new Set();
-			byAction.set(c.actionId, s);
+		let g = byAction.get(c.actionId);
+		if (!g) {
+			g = { supporters: new Set(), multiSigner: false };
+			byAction.set(c.actionId, g);
 		}
-		s.add(c.peerId);
+		g.supporters.add(c.peerId);
+		// Absent or sub-two count weighs as single-signer — see RevClaim.certifiedSignerCount.
+		if ((c.certifiedSignerCount ?? 1) >= 2) g.multiSigner = true;
 	}
 	return { rev: top, byAction };
 }
 
 /**
+ * Which certified actions at the top rev actually CONTEND for selection. A multi-signer proof is
+ * the cohort's own signature set; a single-signer proof is one machine's word about its own solo
+ * commit — so when any action is multi-signer-backed, only the multi-signer-backed ones contend
+ * (a solo receipt can neither outrank nor equivocate against a cohort proof), and only with no
+ * multi-signer action anywhere do the single-signer ones contend among themselves. One helper so
+ * {@link selectQuorumRev} and {@link certifiedEquivocation} cannot drift on the rule.
+ */
+function certifiedContenders(
+	byAction: Map<string, CertifiedActionGroup>
+): { entries: [string, CertifiedActionGroup][]; multiSigner: boolean } {
+	const multi = [...byAction].filter(([, g]) => g.multiSigner);
+	return multi.length > 0
+		? { entries: multi, multiSigner: true }
+		: { entries: [...byAction], multiSigner: false };
+}
+
+/**
  * The conflicting certified set at the top certified rev, when there is one: two-plus distinct
- * `actionId`s each carrying a verified cohort commit proof for the SAME revision. It deserves a
- * distinct log line from a plain no-quorum — the cohort (or whoever holds its keys) provably
- * signed both sides. Selection stays pure, so callers do the logging with what this reports.
+ * `actionId`s that CONTEND there ({@link certifiedContenders}) — each carrying a verified cohort
+ * commit proof for the SAME revision, at comparable weight. It deserves a distinct log line from a
+ * plain no-quorum — whoever holds the signing keys provably signed both sides. Selection stays
+ * pure, so callers do the logging with what this reports.
  *
- * `undefined` when no certified claim exists or the top certified rev names a single action —
- * conflicts at LOWER certified revs are history already superseded, not equivocation worth
- * declining over.
+ * `undefined` when no certified claim exists or a single action contends at the top certified rev —
+ * conflicts at LOWER certified revs are history already superseded, and a single-signer proof
+ * disagreeing with a multi-signer one at the same rev is a solo machine's fork losing to the
+ * cohort, not equivocation worth declining over.
  *
  * **Ask this only on a decline.** A non-`undefined` result does NOT imply {@link selectQuorumRev}
  * returned `undefined`: a corroborated pair STRICTLY above the top certified rev still wins, and
@@ -240,8 +301,10 @@ function certifiedGroups(claims: RevClaim[]): { rev: number; byAction: Map<strin
  */
 export function certifiedEquivocation(claims: RevClaim[]): { rev: number; actionIds: string[] } | undefined {
 	const groups = certifiedGroups(claims);
-	if (!groups || groups.byAction.size < 2) return undefined;
-	return { rev: groups.rev, actionIds: [...groups.byAction.keys()] };
+	if (!groups) return undefined;
+	const contenders = certifiedContenders(groups.byAction);
+	if (contenders.entries.length < 2) return undefined;
+	return { rev: groups.rev, actionIds: contenders.entries.map(([actionId]) => actionId) };
 }
 
 /** One block candidate paired with its serving peer and canonical hash
@@ -256,6 +319,13 @@ export interface BlockHashCandidate {
 	 * bytes), so the cohort's signatures stand in for other peers serving the same hash.
 	 */
 	certified?: boolean;
+	/**
+	 * Distinct signers in the verified proof, from the certification verdict
+	 * (`ContentCertification.signerCount`) — the content-side sibling of
+	 * {@link RevClaim.certifiedSignerCount}, with the same weighing: meaningful only when
+	 * {@link certified} is set, and absent or sub-two counts as single-signer.
+	 */
+	certifiedSignerCount?: number;
 }
 
 /**
@@ -279,11 +349,23 @@ export interface BlockHashCandidate {
  * *genuinely* that small reaches this branch.
  *
  * **Certified candidates** (`certified === true` — a caller verified a cohort commit proof whose
- * declared digest matches these exact bytes) short-circuit the hash quorum: exactly one distinct
- * certified hash → that block wins outright, however many peers served it. Two-plus distinct
- * certified hashes is certified content equivocation → decline (`undefined`), mirroring the
- * existing unique-hash-tie decline; callers name that decline via
- * {@link certifiedContentEquivocation}. No certified candidate → the hash quorum below, unchanged.
+ * declared digest matches these exact bytes) are weighed by the proof's signer count, mirroring
+ * {@link selectQuorumRev}:
+ *
+ *  - Exactly one distinct MULTI-SIGNER certified hash → that block wins outright, however many
+ *    peers served anything else: the cohort's own signatures over the digest outweigh other
+ *    carriers' bytes. Two-plus distinct multi-signer certified hashes is certified content
+ *    equivocation → decline (`undefined`); a single-signer certified hash alongside a
+ *    multi-signer one neither wins nor forces that decline (a solo receipt cannot equivocate
+ *    against the cohort's proof).
+ *  - SINGLE-SIGNER-only certified hashes no longer short-circuit: a hash group carried by
+ *    {@link CORROBORATION_FLOOR}-plus distinct peers that meets the ordinary quorum displaces
+ *    them (two-plus such groups is a genuine content disagreement → decline, as ever). With no
+ *    multi-peer group to defer to, a sole single-signer certified hash still wins on its proof —
+ *    a lone certified holder stays repairable — and two-plus distinct ones decline.
+ *  - No certified candidate → the hash quorum below, unchanged.
+ *
+ * Callers name the certified declines via {@link certifiedContentEquivocation}.
  */
 export function selectQuorumBlock(
 	candidates: BlockHashCandidate[],
@@ -293,12 +375,12 @@ export function selectQuorumBlock(
 	if (candidates.length === 0) return undefined;
 
 	const certifiedByHash = certifiedHashes(candidates);
-	if (certifiedByHash.size === 1) {
-		const [entry] = certifiedByHash;
-		const [hash, block] = entry!;
+	const multiSignerHashes = [...certifiedByHash].filter(([, v]) => v.multiSigner);
+	if (multiSignerHashes.length === 1) {
+		const [hash, { block }] = multiSignerHashes[0]!;
 		return { block, hash };
 	}
-	if (certifiedByHash.size > 1) return undefined; // certified content equivocation — decline
+	if (multiSignerHashes.length > 1) return undefined; // certified content equivocation — decline
 
 	// One vote per distinct peer per hash group, matching selectQuorumRev — a peer appearing twice
 	// must not be able to second itself into a content quorum.
@@ -316,33 +398,66 @@ export function selectQuorumBlock(
 
 	const quorum = quorumSize(voters.size, simpleMajorityThreshold, corroboratorCapacity);
 	const meeting = [...groups.entries()].filter(([, g]) => g.supporters.size >= quorum);
-	// Exactly one hash may meet quorum; a tie is a genuine content disagreement → decline.
-	if (meeting.length !== 1) return undefined;
-	const [hash, group] = meeting[0]!;
-	return { block: group.block, hash };
+
+	if (certifiedByHash.size === 0) {
+		// Exactly one hash may meet quorum; a tie is a genuine content disagreement → decline.
+		if (meeting.length !== 1) return undefined;
+		const [hash, group] = meeting[0]!;
+		return { block: group.block, hash };
+	}
+
+	// Only single-signer certified hashes remain. Genuinely multi-peer agreement — a quorum-meeting
+	// group of CORROBORATION_FLOOR-plus distinct carriers — outranks a solo proof, with the usual
+	// uniqueness rule among such groups. (A quorum-meeting group of ONE carrier, possible only on a
+	// capacity-one cohort, is a bare assertion and does not displace a verified proof.)
+	const multiPeer = meeting.filter(([, g]) => g.supporters.size >= CORROBORATION_FLOOR);
+	if (multiPeer.length > 1) return undefined;
+	if (multiPeer.length === 1) {
+		const [hash, group] = multiPeer[0]!;
+		return { block: group.block, hash };
+	}
+	// No multi-peer agreement to defer to: a sole single-signer certified hash wins on its proof;
+	// two-plus distinct ones are solo-vs-solo equivocation → decline.
+	if (certifiedByHash.size > 1) return undefined;
+	const [entry] = certifiedByHash;
+	const [hash, { block }] = entry!;
+	return { block, hash };
 }
 
-/** Distinct hashes carried by certified candidates → the first block instance serving each. */
-function certifiedHashes(candidates: BlockHashCandidate[]): Map<string, IBlock> {
-	const byHash = new Map<string, IBlock>();
+/** Distinct hashes carried by certified candidates → the first block instance serving each, and
+ * whether any certified candidate at that hash carried a two-plus-signer proof. */
+function certifiedHashes(candidates: BlockHashCandidate[]): Map<string, { block: IBlock; multiSigner: boolean }> {
+	const byHash = new Map<string, { block: IBlock; multiSigner: boolean }>();
 	for (const c of candidates) {
-		if (c.certified === true && !byHash.has(c.hash)) byHash.set(c.hash, c.block);
+		if (c.certified !== true) continue;
+		let entry = byHash.get(c.hash);
+		if (!entry) {
+			entry = { block: c.block, multiSigner: false };
+			byHash.set(c.hash, entry);
+		}
+		// Absent or sub-two count weighs as single-signer — see BlockHashCandidate.certifiedSignerCount.
+		if ((c.certifiedSignerCount ?? 1) >= 2) entry.multiSigner = true;
 	}
 	return byHash;
 }
 
 /**
- * The conflicting certified hashes when there are two or more — the content-side sibling of
- * {@link certifiedEquivocation}, and the reason {@link selectQuorumBlock} declines outright.
- * Candidates reaching that selector all carry the SAME `(rev, actionId)`, so two certified hashes
- * mean the cohort's keys signed two different digests into one revision: a provable compromise an
- * operator must be able to tell apart from the routine "not enough carriers agreed" decline. Both
- * declines return `undefined`, so without this they log identically.
+ * The conflicting certified hashes when there are two or more CONTENDING — the content-side
+ * sibling of {@link certifiedEquivocation}, and the reason {@link selectQuorumBlock} declines
+ * outright. Candidates reaching that selector all carry the SAME `(rev, actionId)`, so two
+ * contending certified hashes mean the same keys signed two different digests into one revision: a
+ * provable compromise an operator must be able to tell apart from the routine "not enough carriers
+ * agreed" decline. Both declines return `undefined`, so without this they log identically.
+ * Contention mirrors the selector: multi-signer certified hashes when any exist, else the
+ * single-signer ones among themselves — a solo receipt disagreeing with a cohort proof is a fork
+ * losing, not equivocation.
  *
- * `undefined` when fewer than two distinct certified hashes exist — including the ordinary
+ * `undefined` when fewer than two certified hashes contend — including the ordinary
  * no-certified-candidate case, where a decline really is a plain content-quorum shortfall.
  */
 export function certifiedContentEquivocation(candidates: BlockHashCandidate[]): { hashes: string[] } | undefined {
 	const byHash = certifiedHashes(candidates);
-	return byHash.size < 2 ? undefined : { hashes: [...byHash.keys()] };
+	const multi = [...byHash].filter(([, v]) => v.multiSigner);
+	const contenders = multi.length > 0 ? multi : [...byHash];
+	return contenders.length < 2 ? undefined : { hashes: contenders.map(([hash]) => hash) };
 }

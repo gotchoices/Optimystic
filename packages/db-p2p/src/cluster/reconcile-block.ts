@@ -46,6 +46,12 @@ interface ReconcileCandidate {
 	/** Injected by the certification pass: the proof's declared digest matches these exact bytes. */
 	contentCertified?: boolean;
 	/**
+	 * Injected by the certification pass alongside {@link revCertified}: the verified proof's
+	 * distinct signer count, from the certification verdict. The selectors weigh a single-signer
+	 * certification below multi-peer agreement (`quorum-restore.ts`).
+	 */
+	certifiedSignerCount?: number;
+	/**
 	 * Set on `digest-mismatch` only: the served bytes provably contradict the proof's declared
 	 * digest, so this candidate is dropped from the content quorum (its rev claim still counts —
 	 * that half genuinely verified).
@@ -177,6 +183,7 @@ async function certifyCandidates(deps: ReconcileBlockDeps, blockId: BlockId, can
 			const verdict = await certifyContent(c.proof, claim, c.block, thresholds, deps.anchoring);
 			if (verdict.revCertified) {
 				c.revCertified = true;
+				c.certifiedSignerCount = verdict.signerCount;
 				if (verdict.contentCertified) {
 					c.contentCertified = true;
 				} else if (verdict.failure === 'digest-mismatch') {
@@ -198,6 +205,7 @@ async function certifyCandidates(deps: ReconcileBlockDeps, blockId: BlockId, can
 		const verdict = await certifyClaim(c.proof, claim, thresholds, deps.anchoring);
 		if (verdict.certified) {
 			c.revCertified = true;
+			c.certifiedSignerCount = verdict.signerCount;
 			return;
 		}
 		logUncertified(blockId, c, verdict.failure);
@@ -247,12 +255,19 @@ async function hashCarriers(
 		carriers.map(async c => ({
 			peerId: c.peerId, hash: await canonicalBlockHash(c.block!), block: c.block!,
 			...(c.contentCertified ? { certified: true } : {}),
+			...(c.contentCertified && c.certifiedSignerCount !== undefined
+				? { certifiedSignerCount: c.certifiedSignerCount } : {}),
 			...(c.contentCertified && c.proof ? { proof: c.proof } : {})
 		}))
 	);
 }
 
-/** Report cohort members that served content contradicting the agreed hash. Best-effort; never throws. */
+/**
+ * Report cohort members that served content contradicting the agreed hash. Best-effort; never
+ * throws. A CERTIFIED disagreeing carrier is exempt: its bytes match a verified proof's declared
+ * digest, so it honestly served a commit that really happened — when the hash quorum outweighs its
+ * single-signer proof (`selectQuorumBlock`), it is the losing side of a fork, not a fabricator.
+ */
 function penalizeContradictingContent(
 	reputation: Pick<IPeerReputation, 'reportPeer'> | undefined,
 	candidates: BlockHashCandidate[],
@@ -262,7 +277,7 @@ function penalizeContradictingContent(
 	if (!reputation) return;
 	try {
 		for (const c of candidates) {
-			if (c.hash !== agreedHash) {
+			if (c.hash !== agreedHash && c.certified !== true) {
 				reputation.reportPeer(c.peerId, PenaltyReason.InvalidRestoration, `reconcile:${blockId}`);
 			}
 		}
@@ -281,8 +296,11 @@ function penalizeContradictingContent(
  *
  * Peer-attached cohort commit proofs are verified first ({@link certifyCandidates}) and both gates
  * weigh the verdicts: a claim — and, separately, the bytes — that a verified proof certifies is
- * accepted with no second peer at any cohort size, and the proof that certified the bytes is
- * persisted alongside them so the repaired replica serves it onward.
+ * accepted with no second peer where nothing multi-peer contests it. The proof's signer count is
+ * weighed too: a SINGLE-SIGNER proof (a solo cohort's self-signed receipt) never outranks several
+ * distinct peers agreeing at the same revision or on the same bytes — see `quorum-restore.ts`. The
+ * proof that certified the agreed bytes is persisted alongside them so the repaired replica serves
+ * it onward.
  *
  * Both quorums are capped by {@link corroboratorCapacity} for the claims that still need
  * corroboration: demanding two corroborators from a cohort that contains exactly one other peer is
@@ -298,8 +316,10 @@ function penalizeContradictingContent(
  * no honest majority to appeal to in the first place. It is closed for a candidate that carries a
  * verified cohort commit proof — {@link certifyCandidates} binds the proof's declared digest to the
  * served bytes, which is a check against the *cohort's own signatures* rather than against other
- * peers, so a certified carrier wins the content gate outright and this exposure never applies to
- * it. It remains open for a proof-less candidate, and for the residual that layer 1 proves only
+ * peers, so a certified carrier wins the content gate with no second carrier and this exposure
+ * never applies to it. (Weighing still applies at larger widths: a SINGLE-SIGNER certified carrier
+ * does not displace a multi-peer hash quorum — see `selectQuorumBlock` — but at the capacity-one
+ * width this paragraph describes there is no multi-peer group to lose to.) It remains open for a proof-less candidate, and for the residual that layer 1 proves only
  * that the listed signers signed (`feat-cluster-membership-threshold-cert-anchoring`).
  *
  * Declines are cheap and retryable: nothing is persisted, nothing is marked, and the next commit
@@ -319,8 +339,10 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 
 		await certifyCandidates(deps, blockId, candidates);
 
-		const revClaims: RevClaim[] = candidates.map(({ peerId, rev, actionId, revCertified }) => ({
-			peerId, rev, actionId, ...(revCertified ? { certified: true } : {})
+		const revClaims: RevClaim[] = candidates.map(({ peerId, rev, actionId, revCertified, certifiedSignerCount }) => ({
+			peerId, rev, actionId,
+			...(revCertified ? { certified: true } : {}),
+			...(revCertified && certifiedSignerCount !== undefined ? { certifiedSignerCount } : {})
 		}));
 		const selected = selectQuorumRev(revClaims, deps.simpleMajorityThreshold, capacity);
 		if (!selected) {
@@ -381,9 +403,10 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 			return;
 		}
 
-		// Detection is sound: selectQuorumBlock's certified branch fires iff exactly one distinct
-		// certified hash exists, so a defined `agreed` with a certified carrier at `agreed.hash` ⇔
-		// the certified rule won.
+		// A certified carrier at the agreed hash means a proof was verified against exactly these
+		// bytes — safe to persist whichever rule won the selection. (Since single-signer certified
+		// hashes stopped short-circuiting the quorum, the hash-quorum rule CAN win at a hash that
+		// also has a certified carrier; the proof still certifies those bytes.)
 		const certifiedCarrier = hashCandidates.find(c => c.certified === true && c.hash === agreed.hash);
 
 		// Contradicting-content penalties run ONLY on a corroborated win, mirroring the read path's

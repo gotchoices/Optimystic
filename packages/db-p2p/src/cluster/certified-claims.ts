@@ -180,8 +180,15 @@ export function proofThresholds(superMajorityThreshold: number): ProofThresholds
  * when uncertified and unrepresentable when certified.
  */
 export type ClaimCertification =
-	/** The proof certifies `claim` — cap passed, thresholds of valid cohort signatures met. */
-	| { certified: true }
+	/**
+	 * The proof certifies `claim` — cap passed, thresholds of valid cohort signatures met.
+	 * `signerCount` is the proof's distinct signer list size (`proof.peerIds.length`, the same
+	 * number {@link UnanchoredProofAcceptance} reports): the selection helpers weigh a
+	 * single-signer certification — routine since solo cohorts self-sign their commits — below
+	 * multi-peer corroboration, and carrying the count in the verdict keeps the two repair paths
+	 * from each measuring it off the proof themselves.
+	 */
+	| { certified: true; signerCount: number }
 	/** Classify the reason via {@link isAttributableProofFailure} before penalizing anyone. */
 	| { certified: false; failure: CertifyFailure };
 
@@ -191,14 +198,18 @@ export type ClaimCertification =
  * alongside full success) cannot be constructed:
  */
 export type ContentCertification =
-	/** Both halves passed: the proof certifies `(blockId, rev, actionId)` AND these exact bytes. */
-	| { revCertified: true; contentCertified: true }
+	/**
+	 * Both halves passed: the proof certifies `(blockId, rev, actionId)` AND these exact bytes.
+	 * `signerCount` as in {@link ClaimCertification} — the selectors weigh it.
+	 */
+	| { revCertified: true; contentCertified: true; signerCount: number }
 	/**
 	 * The claim half passed, the content half did not: `digest-mismatch` (attributable — drop AND
 	 * penalize the served bytes) or `no-digest-declared` (drop only; the cohort declared nothing to
-	 * compare against). The `(rev, actionId)` is certified either way.
+	 * compare against). The `(rev, actionId)` is certified either way, with `signerCount` weighing
+	 * that certified half exactly as on full success.
 	 */
-	| { revCertified: true; contentCertified: false; failure: 'digest-mismatch' | 'no-digest-declared' }
+	| { revCertified: true; contentCertified: false; failure: 'digest-mismatch' | 'no-digest-declared'; signerCount: number }
 	/** The claim half failed, so nothing is certified. Classify via {@link isAttributableProofFailure}. */
 	| { revCertified: false; contentCertified: false; failure: CertifyFailure };
 
@@ -218,7 +229,9 @@ export async function certifyClaim(
 		return { certified: false, failure: verdict.reason };
 	}
 	await anchorAcceptedProof(proof, claim, anchoring);
-	return { certified: true };
+	// Safe unguarded: the verifier only passes a proof whose peerIds it validated (the same read
+	// anchorAcceptedProof just performed).
+	return { certified: true, signerCount: proof.peerIds.length };
 }
 
 /**
@@ -239,11 +252,11 @@ export async function certifyContent(
 	const verdict = await verifyBlockCommitProofContent(proof, claim, block, thresholds);
 	if (verdict.ok) {
 		await anchorAcceptedProof(proof, claim, anchoring);
-		return { revCertified: true, contentCertified: true };
+		return { revCertified: true, contentCertified: true, signerCount: proof.peerIds.length };
 	}
 	if (verdict.reason === 'digest-mismatch' || verdict.reason === 'no-digest-declared') {
 		await anchorAcceptedProof(proof, claim, anchoring);
-		return { revCertified: true, contentCertified: false, failure: verdict.reason };
+		return { revCertified: true, contentCertified: false, failure: verdict.reason, signerCount: proof.peerIds.length };
 	}
 	return { revCertified: false, contentCertified: false, failure: verdict.reason };
 }
