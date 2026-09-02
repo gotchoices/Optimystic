@@ -133,3 +133,13 @@ adds a collaborator adds a placeholder to all of them. `coordinatorRepo(componen
 options-object factory in the same file — is already the production entry point and the shape the
 constructor should have; the positional signature survives only because the tests use it. Whatever
 seam the extraction creates, give the class one options object rather than a thirteenth slot.
+
+## Sixth measurement (review pass on `mint-solo-cohort-commit-proof`)
+
+Re-measured (`wc -l packages/db-p2p/src/repo/coordinator-repo.ts`): **1937 lines**, up from 1570.
+Evidence only — this ticket's shape is unchanged. The growth is `commit` taking on proof production:
+the solo-cohort short-circuit now builds a message, mints a one-peer proof through the local cluster
+member and threads it into storage, and the post-consensus fallback threads the consensus record's
+projected proof, each under a long block comment explaining why the two must differ. `commit` is now
+roughly 190 lines. That is a third concern living on this class alongside freshness and write
+coordination, and it argues for the extraction naming a commit seam as well as a freshness one.

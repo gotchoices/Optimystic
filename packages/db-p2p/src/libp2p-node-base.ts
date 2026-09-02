@@ -274,10 +274,12 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * confirms them, so a rebalance never releases them and a ring shift's confirm phase aborts on
 	 * them (`docs/arachnode-ring-handoff.md` § Phase B). Clearing the backlog means running the
 	 * receivers with this `false` until every such block has been rewritten under current code.
-	 * That backlog is bounded rather than growing: every commit path under current code attaches a
-	 * proof, solo cohorts included (the lone member self-signs one via `mintSoloCommitProof`), so
-	 * the only blocks that can still be uncertifiable are those whose last write predates that,
-	 * plus any committed without a content digest (which the retention rule stores no proof for).
+	 * That backlog no longer grows from commits: every `CoordinatorRepo.commit` path under current
+	 * code attaches a proof, solo cohorts included (the lone member self-signs one via
+	 * `mintSoloCommitProof`). Still uncertifiable: blocks whose last write predates that, blocks
+	 * committed without a content digest (the retention rule stores no proof for those), and
+	 * revisions landed by the read-driven promotion in `StorageRepo.get`, which has no proof to
+	 * attach — the last of those heal when a push back-fills one.
 	 */
 	blockTransfer?: { requirePushCertificate?: boolean };
 

@@ -527,20 +527,21 @@ export class ClusterCoordinator {
 		return await this.commitTransaction(promised.record);
 	}
 
-	async getClusterSize(blockId: BlockId): Promise<number> {
-		const peers = await this.getClusterForBlock(blockId);
-		return Object.keys(peers ?? {}).length;
-	}
-
 	/**
-	 * The block's cohort peer ids as currently derivable — {@link getClusterSize} without discarding
-	 * the ids. Empty when `findCluster` fails (getClusterForBlock swallows the throw), so a caller
-	 * branching on `length <= 1` is also taking the degraded-routing branch; `CoordinatorRepo.commit`
-	 * uses the ids to log whether a solo cohort is genuinely just self or a routing failure.
+	 * The block's cohort peer ids as currently derivable. Empty when `findCluster` fails
+	 * (getClusterForBlock swallows the throw), so a caller branching on `length <= 1` is also taking
+	 * the degraded-routing branch; `CoordinatorRepo.commit` uses the ids to log whether a solo cohort
+	 * is genuinely just self or a routing failure.
 	 */
 	async getClusterPeerIds(blockId: BlockId): Promise<string[]> {
 		const peers = await this.getClusterForBlock(blockId);
 		return Object.keys(peers ?? {});
+	}
+
+	/** {@link getClusterPeerIds}, counted. Derived from it rather than re-deriving the cohort, so the
+	 *  size a caller branches on and the ids it logs can never come from two different rules. */
+	async getClusterSize(blockId: BlockId): Promise<number> {
+		return (await this.getClusterPeerIds(blockId)).length;
 	}
 
 	/**

@@ -21,12 +21,13 @@
 import { expect } from 'chai';
 import type {
 	IRepo, IKeyNetwork, ClusterPeers, BlockGets, GetBlockResults, PendRequest, PendResult,
-	CommitRequest, CommitResult, ActionBlocks, MessageOptions, BlockId, ClusterRecord, RepoMessage
+	CommitRequest, ActionBlocks, MessageOptions, BlockId, ClusterRecord, RepoMessage
 } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { CoordinatorRepo, type ICoordinatorClusterSeam } from '../src/repo/coordinator-repo.js';
-import { MISSING_BASE_REVISION_REASON } from '../src/storage/storage-repo.js';
+import { MISSING_BASE_REVISION_REASON, type ICommitProofPersister } from '../src/storage/storage-repo.js';
+import { buildBlockCommitProof, type BlockCommitProof } from '../src/cluster/commit-proof.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 
 const BLOCK = 'block-commit-divergence' as BlockId;
@@ -55,8 +56,13 @@ const makeRecord = (approvals: number, peerCount: number): ClusterRecord => {
 	return { messageHash: 'mh', peers, message: {} as RepoMessage, promises: {}, commits };
 };
 
-/** A storage repo whose commit does whatever `commit` says; everything else is inert. */
-const makeStorageRepo = (commit: () => Promise<CommitResult>): IRepo => ({
+/**
+ * A storage repo whose commit does whatever `commit` says; everything else is inert. Typed as the
+ * proof-carrying {@link ICommitProofPersister} overload — the one `CoordinatorRepo` actually calls
+ * on this path — so a test can observe the proof argument instead of it vanishing into an
+ * `IRepo`-shaped double that never declared it.
+ */
+const makeStorageRepo = (commit: ICommitProofPersister['commit']): IRepo => ({
 	async get(gets: BlockGets, _o?: MessageOptions): Promise<GetBlockResults> {
 		return Object.fromEntries(gets.blockIds.map(id => [id, { state: {} }]));
 	},
@@ -139,5 +145,51 @@ describe('CoordinatorRepo commit — local divergence after cluster consensus', 
 		);
 
 		expect((await repo.commit(REQUEST)).success).to.equal(false);
+	});
+});
+
+/**
+ * The same fallback branch, viewed from the proof side. It is the sibling of the solo-cohort mint
+ * (`coordinator-repo-solo-commit-proof.spec.ts`): a solo commit self-signs, whereas here consensus
+ * genuinely ran on the cohort, so the record's REAL votes are what must reach storage — self-signing
+ * would be a false statement about who committed. Without a proof the fallback writes a revision no
+ * receiver will ever accept by push.
+ *
+ * These tests pin the THREADING, not the cryptography: the records here carry unsigned placeholder
+ * votes, which is all `buildBlockCommitProof`'s projection reads. Whether a projected proof verifies
+ * is `commit-proof.spec.ts`'s subject.
+ */
+describe('CoordinatorRepo commit — the local fallback carries the consensus record\'s proof', () => {
+	/** Capture every proof argument `CoordinatorRepo` hands to storage on the fallback commit. */
+	const commitWithProofCapture = (record: ClusterRecord) => {
+		const proofs: (BlockCommitProof | undefined)[] = [];
+		const repo = makeRepo(
+			makeStorageRepo(async (_request, _options, proof) => { proofs.push(proof); return { success: true }; }),
+			record
+		);
+		return { repo, proofs };
+	};
+
+	it('passes the projection of a membership-v2 record', async () => {
+		const record = { ...makeRecord(3, 3), membershipVersion: 2 as const, membershipDigest: 'md' };
+		const { repo, proofs } = commitWithProofCapture(record);
+
+		expect((await repo.commit(REQUEST)).success).to.equal(true);
+
+		expect(proofs, 'exactly one fallback commit').to.have.length(1);
+		expect(proofs[0], 'storage must receive the record\'s own projection, not a re-derived one')
+			.to.deep.equal(buildBlockCommitProof(record));
+		expect(proofs[0]!.peerIds, 'the proof binds the whole committing cohort, not just this node')
+			.to.deep.equal(['peer-0', 'peer-1', 'peer-2']);
+	});
+
+	it('passes undefined for a v1 / unversioned record instead of an uncertifiable half-proof', async () => {
+		// A pre-v2 record's hashes bind no peer set, so its signer list is unbound and no verifier can
+		// ever accept it. Storage must be handed nothing rather than something that looks like evidence.
+		const { repo, proofs } = commitWithProofCapture(makeRecord(3, 3));
+
+		expect((await repo.commit(REQUEST)).success).to.equal(true);
+
+		expect(proofs).to.deep.equal([undefined]);
 	});
 });
