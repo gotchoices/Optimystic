@@ -223,6 +223,12 @@ export function selectQuorumRev(
 	// corroboration — unless the corroborated pair AGREES with the sole certified action, which is
 	// convergence rather than a contest and keeps the certified verdict (and its logging/penalty
 	// exemptions) intact.
+	// NOTE: the weighing reaches EQUAL revisions only. A solo fork that committed twice while its
+	// cohort committed once claims the higher rev and still wins above. That is not an oversight of
+	// this rule: a claim carries no lineage, so "one peer ahead of two" is identical whether it
+	// forked or the two are lagging, and refusing it would break ordinary lagging-cohort repair.
+	// Pinned by 'does NOT reach a solo fork one revision AHEAD' in quorum-restore-certified.spec.ts;
+	// closing it needs new evidence — debt-repair-cannot-tell-a-fork-from-a-lagging-cohort.
 	if (!contenders.multiSigner && corroborated && corroborated.rev === certified.rev
 		&& corroborated.supporters.length >= CORROBORATION_FLOOR
 		&& !(certified.byAction.size === 1 && certified.byAction.has(corroborated.actionId))) {

@@ -122,8 +122,10 @@ const makeCommit = (blockId: BlockId, rev: number, actionId: string): CommitRequ
  * fresh 3-peer cohort, which suffices because verification checks the proof's internal consistency,
  * never that its signers are the block's cohort (that anchoring layer is observational-only).
  */
-const certifiedAnswer = async (blockId: BlockId, rev: number, actionId: string): Promise<CertifiedActionRev> => {
-	const { proof } = await makeSignedProof(3, makeCommit(blockId, rev, actionId));
+const certifiedAnswer = async (
+	blockId: BlockId, rev: number, actionId: string, signers = 3
+): Promise<CertifiedActionRev> => {
+	const { proof } = await makeSignedProof(signers, makeCommit(blockId, rev, actionId));
 	return { actionId, rev, proof };
 };
 
@@ -399,6 +401,59 @@ describe('CoordinatorRepo read-repair CERTIFIED claims (cohort commit proofs)', 
 		expect(restore!.context!.committed).to.deep.equal([{ actionId: 'action-7', rev: 7 }]);
 		expect(calls.find(c => c.context?.rev === 3), 'the outweighed corroborated rev must not restore').to.equal(undefined);
 		expect(reports, 'lagging voters are never penalized').to.deep.equal([]);
+	});
+
+	/**
+	 * The proof's signer count is measured in `certified-claims.ts` and weighed in
+	 * `quorum-restore.ts`; this pair drives it the whole way through `queryClusterForLatest` so the
+	 * WIRING between them is covered on the read-repair path too. An absent count weighs as
+	 * single-signer, so a broken plumb throws nothing and logs nothing — the first test fails if the
+	 * count stops arriving, the second if it arrives as a constant.
+	 */
+	it('a MULTI-SIGNER certified claim still wins the equal-rev tie against a corroborated pair', async () => {
+		const localPeer = await makePeerId();
+		const certifiedHolder = await makePeerId();
+		const voterA = await makePeerId();
+		const voterB = await makePeerId();
+		const answer = await certifiedAnswer(blockId, 5, 'action-cert', 3);
+		const cohort: ActionRev = { actionId: 'action-cohort', rev: 5 };
+		const callback: ClusterLatestCallback = async (peerId) =>
+			peerId.equals(certifiedHolder) ? answer
+				: (peerId.equals(voterA) || peerId.equals(voterB)) ? cohort : undefined;
+		const { rep, reports } = makeReputationStub();
+		const { repo, calls } = makeRepo([localPeer, certifiedHolder, voterA, voterB], localPeer, 4, callback, rep);
+
+		await repo.get({ blockIds: [blockId] });
+
+		const restore = calls.find(c => c.context?.committed);
+		expect(restore?.context?.committed, 'three signers outrank two voters at one revision')
+			.to.deep.equal([{ actionId: 'action-cert', rev: 5 }]);
+		expect(reports, 'a certified selection never convicts the dissenting cohort').to.deep.equal([]);
+	});
+
+	it('a SINGLE-SIGNER certified claim loses the equal-rev tie, and is not penalized for losing', async () => {
+		// The motivating fork on the read path: a briefly-alone machine self-signed (5, action-solo)
+		// while the cohort that stayed together committed (5, action-cohort). The cohort wins, and
+		// the displaced holder is exempt from the contradicting-claim penalty — its proof verified,
+		// so it served a commit that really happened.
+		const localPeer = await makePeerId();
+		const soloHolder = await makePeerId();
+		const voterA = await makePeerId();
+		const voterB = await makePeerId();
+		const answer = await certifiedAnswer(blockId, 5, 'action-solo', 1);
+		const cohort: ActionRev = { actionId: 'action-cohort', rev: 5 };
+		const callback: ClusterLatestCallback = async (peerId) =>
+			peerId.equals(soloHolder) ? answer
+				: (peerId.equals(voterA) || peerId.equals(voterB)) ? cohort : undefined;
+		const { rep, reports } = makeReputationStub();
+		const { repo, calls } = makeRepo([localPeer, soloHolder, voterA, voterB], localPeer, 4, callback, rep);
+
+		await repo.get({ blockIds: [blockId] });
+
+		const restore = calls.find(c => c.context?.committed);
+		expect(restore?.context?.committed, 'a self-signed receipt does not outrank the cohort')
+			.to.deep.equal([{ actionId: 'action-cohort', rev: 5 }]);
+		expect(reports, 'the displaced solo holder is a partition casualty, not a liar').to.deep.equal([]);
 	});
 
 	it('two certified claims, same rev, different actions: no restoration, equivocation logged, nobody penalized', async () => {

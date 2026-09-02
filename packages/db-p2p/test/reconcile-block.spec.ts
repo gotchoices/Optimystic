@@ -644,5 +644,57 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 			expect(h.saved[0]!.source, 'the inflated claim never steers restoration')
 				.to.deep.equal({ actionId: 'action-2', rev: 2 });
 		});
+
+		/**
+		 * The signer count is measured in `certified-claims.ts` and weighed in `quorum-restore.ts`;
+		 * every test either side of that pins one end. These two drive a real proof the whole way
+		 * through `certifyCandidates` → `selectQuorumRev` so the WIRING is covered: an absent count
+		 * weighs as single-signer, so a broken plumb throws nothing and logs nothing — multi-signer
+		 * proofs would simply start losing ties they should win. The pair is deliberately symmetric:
+		 * the first fails if the count stops arriving, the second if it arrives as a constant.
+		 */
+		it('a MULTI-SIGNER proof still beats an equal-rev corroborated pair end to end', async () => {
+			const certBlock = makeBlock('cert');
+			const { proof } = await makeSignedProof(3, await commitFor(2, 'action-cert', certBlock));
+			const h = harness(
+				{
+					cert: archiveAt(2, 'action-cert', certBlock, proof),
+					h1: archiveAt(2, 'action-cohort', makeBlock('cohort')),
+					h2: archiveAt(2, 'action-cohort', makeBlock('cohort'))
+				},
+				{ repairCorroborationClusterSize: 4 }
+			);
+
+			await h.reconcile(BLOCK_ID, COMMITTED, ['cert', 'h1', 'h2']);
+
+			expect(h.saved.length).to.equal(1);
+			expect(h.saved[0]!.source, 'three signers outrank two voters at one revision')
+				.to.deep.equal({ actionId: 'action-cert', rev: 2 });
+			expect(h.saved[0]!.proof, 'the certified bytes carry their proof onward').to.equal(proof);
+		});
+
+		it('a SINGLE-SIGNER proof loses the same shape to the corroborated pair', async () => {
+			// The motivating fork, end to end: a briefly-alone machine self-signed (2, 'action-solo')
+			// while the cohort that stayed together committed (2, 'action-cohort').
+			const soloBlock = makeBlock('solo-fork');
+			const { proof } = await makeSignedProof(1, await commitFor(2, 'action-solo', soloBlock));
+			const h = harness(
+				{
+					solo: archiveAt(2, 'action-solo', soloBlock, proof),
+					h1: archiveAt(2, 'action-cohort', makeBlock('cohort')),
+					h2: archiveAt(2, 'action-cohort', makeBlock('cohort'))
+				},
+				{ repairCorroborationClusterSize: 4 }
+			);
+
+			await h.reconcile(BLOCK_ID, COMMITTED, ['solo', 'h1', 'h2']);
+
+			expect(h.saved.length).to.equal(1);
+			expect(h.saved[0]!.source, 'a self-signed receipt does not outrank the cohort that stayed together')
+				.to.deep.equal({ actionId: 'action-cohort', rev: 2 });
+			expect(h.saved[0]!.proof, 'the losing proof is never persisted').to.equal(undefined);
+			expect(h.penalties, 'the displaced solo holder is a partition casualty, not a liar')
+				.to.deep.equal([]);
+		});
 	});
 });

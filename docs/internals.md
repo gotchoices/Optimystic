@@ -301,7 +301,12 @@ exactly what this branch mints — no longer out-ranks a corroborated claim at e
 more distinct peers agreeing on a different `(rev, actionId)` at that revision beat it, and so does
 any multi-signer proof there, so the briefly-alone machine's fork loses to the cohort that stayed
 together. It stays repairable where nothing contradicts it, which is the ordinary solo case this
-mint exists for. See *The certified exception* below.
+mint exists for. **The weighing reaches exactly as far as an equal revision**: a machine that
+committed twice while alone, against a cohort that committed once, still presents the higher
+revision and still wins, because a claim carries no lineage — one peer ahead of two looks identical
+whether it forked or the other two are simply lagging, and refusing it would break the ordinary
+lagging-cohort repair this mint exists for. Closing that needs evidence a claim does not carry today
+(`debt-repair-cannot-tell-a-fork-from-a-lagging-cohort`). See *The certified exception* below.
 
 **Persistence and retention.** `ClusterMember.applyConsensusOperation` builds the proof from the
 consensus record (membership-v2 records only) and passes it into `StorageRepo.commit`, which
@@ -830,7 +835,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
     proofs disagreeing at one revision do not deadlock the selection — they both yield to whatever
     multi-peer agreement exists. A claim marked certified with no signer count recorded is weighed as
     single-signer, the conservative direction. This is what keeps a briefly-partitioned machine's
-    self-signed fork from overruling the cohort that stayed together.
+    self-signed fork from overruling the cohort that stayed together *at the same revision* — and
+    only there: a fork that got a revision ahead while alone still wins, for want of any lineage in
+    the claim to tell it apart from a lagging cohort
+    (`debt-repair-cannot-tell-a-fork-from-a-lagging-cohort`).
   - **Ordinary corroboration still wins when it is higher.** A pair corroborated by peers at a
     *strictly higher* revision than the top certified one is selected over the proof, so a legacy
     uncertified tail written after the last proven revision stays readable. (A merely

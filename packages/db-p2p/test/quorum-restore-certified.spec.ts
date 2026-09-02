@@ -91,6 +91,23 @@ describe('certified claim selection (quorum-restore)', () => {
 			expect(sel).to.deep.equal({ rev: 5, actionId: 'cohort', supporters: ['h1', 'h2'] });
 		});
 
+		it('does NOT reach a solo fork one revision AHEAD of the cohort — a known residual', () => {
+			// Scope boundary, pinned so nobody reads the equal-rev rule as a general fork defence.
+			// The weighing only fires at an EQUAL revision, because at an unequal one the claim data
+			// cannot tell a forked solo machine apart from a cohort that is merely lagging — both
+			// look like "one peer ahead of two". A partitioned machine that commits twice while the
+			// cohort commits once therefore still wins, and that is the ordinary solo-repair rule
+			// doing its job on data that cannot distinguish the two cases. Closing it needs proofs
+			// to carry lineage: `feat-commit-proofs-carry-predecessor-action`.
+			const claims = [
+				claim('h1', 5, 'cohort'),
+				claim('h2', 5, 'cohort'),
+				claim('solo', 6, 'solo-fork', true, 1)
+			];
+			const sel = selectQuorumRev(claims, THRESHOLD, 9);
+			expect(sel).to.deep.equal({ rev: 6, actionId: 'solo-fork', supporters: ['solo'], certified: true });
+		});
+
 		it('a single-signer certified claim still wins where NOTHING multi-peer contests it', () => {
 			const sel = selectQuorumRev([claim('solo', 5, 'a', true, 1)], THRESHOLD, 9);
 			expect(sel).to.deep.equal({ rev: 5, actionId: 'a', supporters: ['solo'], certified: true });
