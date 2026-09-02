@@ -58,7 +58,11 @@ interface Harness {
 const makeHarness = async (withLocalCluster: boolean): Promise<Harness> => {
 	const privateKey = await generateKeyPair('Ed25519');
 	const selfPeerId = peerIdFromPrivateKey(privateKey);
-	const storageRepo = new StorageRepo(id => new BlockStorage(id, new MemoryRawStorage()));
+	// ONE raw store shared by every BlockStorage this repo makes. The factory is called per block
+	// AND per operation, so constructing the store inside it gives pend and commit different
+	// storage and the commit dies on `Pending action ... not found`.
+	const raw = new MemoryRawStorage();
+	const storageRepo = new StorageRepo(id => new BlockStorage(id, raw));
 	// A REAL ClusterMember, not a double: the solo path's proof must come out of the same delegate
 	// the production wiring exposes. The peer network is a dead stub — the solo short-circuit never
 	// dials anyone, which is rather the point.
@@ -85,7 +89,9 @@ const pendAndCommit = async (
 	harness: Harness, blockId: BlockId, actionId: ActionId, block: IBlock
 ): Promise<void> => {
 	const transforms: Transforms = { inserts: { [blockId]: block }, updates: {}, deletes: [] };
-	const pended = await harness.coordinated.pend({ actionId, rev: 1, transforms, policy: 'c' });
+	// No `rev` on the pend: rev 1 is the block's first revision, so there is no base to name — the
+	// same shape `block-archive-proof.spec.ts`'s landRevision uses (`rev > 1 ? { rev } : {}`).
+	const pended = await harness.coordinated.pend({ actionId, transforms, policy: 'c' });
 	expect(pended.success, 'pend must land').to.equal(true);
 
 	const digest = await canonicalBlockHash(block);

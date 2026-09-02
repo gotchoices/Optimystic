@@ -31,7 +31,7 @@ import type {
 import { isConflictFailure } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
-import { CoordinatorRepo } from '../src/repo/coordinator-repo.js';
+import { CoordinatorRepo, type ICoordinatorClusterSeam } from '../src/repo/coordinator-repo.js';
 import { ValidatorRejectionError } from '../src/repo/cluster-coordinator.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 
@@ -83,8 +83,10 @@ const makeRepo = (
 		storageRepo,
 		{ clusterSize: 3 }
 	);
-	(repo as unknown as { coordinator: unknown }).coordinator = {
+	(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 		async getClusterSize(): Promise<number> { return 3; },
+		async getClusterPeerIds(): Promise<string[]> { return ['peer-1', 'peer-2', 'peer-3']; },
+		async recoverTransactions(): Promise<void> { /* unused on these paths */ },
 		async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, localPendResult?: PendResult }> {
 			if ('throws' in consensus) throw consensus.throws;
 			return { record: RECORD, localExecuted: true, ...consensus };

@@ -310,9 +310,36 @@ export function coordinatorRepo(
 	);
 }
 
+/**
+ * The slice of {@link ClusterCoordinator} that {@link CoordinatorRepo} actually consumes.
+ *
+ * It exists so a test double has something COMPLETE to satisfy. The doubles in
+ * `test/coordinator-repo-*.spec.ts` replace the private `coordinator` field wholesale, and while
+ * that field was typed as the whole class and the doubles were assigned through
+ * `as unknown as { coordinator: unknown }`, every method this class newly called on the coordinator
+ * type-checked fine and then threw `... is not a function` at runtime in every spec holding a
+ * double — `getClusterPeerIds` cost 21 specs exactly that way. Widening this interface now breaks
+ * the doubles at COMPILE time, at the point of widening, which is where the cost belongs.
+ *
+ * NOTE: the doubles still name the private field by string (`{ coordinator: ... }`), so renaming
+ * `CoordinatorRepo.coordinator` would make those casts silently stop applying and every double
+ * revert to being ignored. If that field is ever renamed, grep the specs for `coordinator:`.
+ */
+export interface ICoordinatorClusterSeam {
+	getClusterSize(blockId: BlockId): Promise<number>;
+	getClusterPeerIds(blockId: BlockId): Promise<string[]>;
+	executeClusterTransaction(blockId: BlockId, message: RepoMessage, options?: MessageOptions): Promise<{
+		record: ClusterRecord;
+		localExecuted: boolean;
+		localPendResult?: PendResult;
+		localCommitResult?: CommitResult;
+	}>;
+	recoverTransactions(): Promise<void>;
+}
+
 /** Cluster coordination repo - uses local store, as well as distributes changes to other nodes using cluster consensus. */
 export class CoordinatorRepo implements IRepo {
-	private coordinator: ClusterCoordinator;
+	private coordinator: ICoordinatorClusterSeam;
 	private readonly DEFAULT_TIMEOUT = 30000; // 30 seconds default timeout
 	private readonly localPeerId?: PeerId;
 	private readonly responsibilityCache = new LruMap<string, { inCluster: boolean, expires: number }>(1000);

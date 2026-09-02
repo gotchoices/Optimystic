@@ -25,7 +25,7 @@ import type {
 } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
-import { CoordinatorRepo } from '../src/repo/coordinator-repo.js';
+import { CoordinatorRepo, type ICoordinatorClusterSeam } from '../src/repo/coordinator-repo.js';
 import { MISSING_BASE_REVISION_REASON } from '../src/storage/storage-repo.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 
@@ -78,8 +78,10 @@ const makeRepo = (storageRepo: IRepo, record: ClusterRecord): CoordinatorRepo =>
 		storageRepo,
 		{ clusterSize: 3 }
 	);
-	(repo as unknown as { coordinator: unknown }).coordinator = {
+	(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 		async getClusterSize(): Promise<number> { return 3; },
+		async getClusterPeerIds(): Promise<string[]> { return ['peer-1', 'peer-2', 'peer-3']; },
+		async recoverTransactions(): Promise<void> { /* unused on these paths */ },
 		async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean }> {
 			return { record, localExecuted: false };
 		}
