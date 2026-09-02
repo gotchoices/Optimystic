@@ -454,6 +454,12 @@ function certifiedHashes(candidates: BlockHashCandidate[]): Map<string, { block:
  *
  * `undefined` when fewer than two certified hashes contend — including the ordinary
  * no-certified-candidate case, where a decline really is a plain content-quorum shortfall.
+ *
+ * **Ask this only on a decline**, exactly as with {@link certifiedEquivocation}: a non-`undefined`
+ * result does NOT imply {@link selectQuorumBlock} returned `undefined`. Two contending
+ * single-signer certified hashes yield to a {@link CORROBORATION_FLOOR}-plus-carrier quorum group,
+ * so selection can succeed while the solo-versus-solo conflict is still reported here. Call it when
+ * selection declined, to say WHY.
  */
 export function certifiedContentEquivocation(candidates: BlockHashCandidate[]): { hashes: string[] } | undefined {
 	const byHash = certifiedHashes(candidates);

@@ -294,10 +294,14 @@ The mint is deliberately **not** gated on the sole cohort peer being this node. 
 either way; since `peerIds` is already not evidence of cohort membership (previous paragraph), the
 gate would buy no safety while opening a silent no-proof hole exactly when routing is degraded. The
 `commit:solo-cohort` log line carries `cohortSize` and `soleIsSelf` so an operator can tell a real
-cohort of one (1 / true) from a routing failure (0, or a sole peer that is not this node). What this
-does not address: a node briefly alone can mint a proof for a revision the rest of its cohort never
-saw, and a certified claim currently out-ranks a corroborated one at equal revision — tracked
-separately as `single-signer-proof-outweighs-corroboration`.
+cohort of one (1 / true) from a routing failure (0, or a sole peer that is not this node). A node briefly
+alone can still mint a proof for a revision the rest of its cohort never saw, so the repair
+selectors weigh a proof by **how many distinct peers signed it**: a one-signer proof — which is
+exactly what this branch mints — no longer out-ranks a corroborated claim at equal revision. Two or
+more distinct peers agreeing on a different `(rev, actionId)` at that revision beat it, and so does
+any multi-signer proof there, so the briefly-alone machine's fork loses to the cohort that stayed
+together. It stays repairable where nothing contradicts it, which is the ordinary solo case this
+mint exists for. See *The certified exception* below.
 
 **Persistence and retention.** `ClusterMember.applyConsensusOperation` builds the proof from the
 consensus record (membership-v2 records only) and passes it into `StorageRepo.commit`, which
@@ -805,13 +809,28 @@ saveMaterializedBlock(block): store(structuredClone(block));
   bytes too — so a verifier checks it offline against the proof's signer list instead of polling for
   a second opinion. Both restoration paths (`CoordinatorRepo` read-repair and the commit-path
   reconcile) run peer-attached proofs through `cluster/certified-claims.ts` first, and a claim whose
-  proof verifies is selected with **no corroborating peer, at any cohort size** — the
-  declared-two-machine row's relaxation, available everywhere, and earned rather than assumed. The
-  content gate has the same short-circuit for a proof that declared a digest matching the served
-  bytes. So the *never* in the two-machine undeclared row, and "a block only one cohort peer holds
-  cannot be repaired at any machine count", are both statements about proof-less holders only. A
-  certified lone holder repairs in either case. Three limits worth knowing:
+  proof verifies is selected with **no corroborating peer, at any cohort size, where nothing
+  multi-peer contests it** — the declared-two-machine row's relaxation, available everywhere, and
+  earned rather than assumed. The content gate has the same short-circuit for a proof that declared
+  a digest matching the served bytes. So the *never* in the two-machine undeclared row, and "a block
+  only one cohort peer holds cannot be repaired at any machine count", are both statements about
+  proof-less holders only. A certified lone holder repairs in either case. Four limits worth
+  knowing:
 
+  - **How many peers signed the proof decides how far it reaches.** A solo cohort self-signs its own
+    commits (*One-peer proofs* above), so a one-signature proof is routine rather than exceptional,
+    and it is only ever one machine's word about its own commit. The selectors therefore weigh the
+    proof's signer count (`ClaimCertification.signerCount` → `RevClaim.certifiedSignerCount`, and
+    the content-side pair): a **multi-signer** proof — two or more distinct cohort members signed —
+    outranks peer votes at the same revision outright, while a **single-signer** proof wins only
+    while nothing multi-peer contests it. At the same revision, two or more distinct peers agreeing
+    on a different `(rev, actionId)` beat it, and so does any multi-signer proof; on the content
+    gate, a group of two or more distinct carriers agreeing on different bytes displaces it (a
+    single carrier does not, even where a relaxed quorum lets one vote "meet" it). Two single-signer
+    proofs disagreeing at one revision do not deadlock the selection — they both yield to whatever
+    multi-peer agreement exists. A claim marked certified with no signer count recorded is weighed as
+    single-signer, the conservative direction. This is what keeps a briefly-partitioned machine's
+    self-signed fork from overruling the cohort that stayed together.
   - **Ordinary corroboration still wins when it is higher.** A pair corroborated by peers at a
     *strictly higher* revision than the top certified one is selected over the proof, so a legacy
     uncertified tail written after the last proven revision stays readable. (A merely
@@ -915,6 +934,15 @@ saveMaterializedBlock(block): store(structuredClone(block));
     declines rather than picking a side, so the block stays unrepaired permanently and by design.
   - **`reconcile:certified-content-equivocation`** — two proofs that both verify certify *different
     content digests for one revision*. Same outcome on the content gate.
+
+  Only proofs of **comparable weight** equivocate, so these lines fire on multi-signer conflicts and
+  on solo-versus-solo with nothing else to defer to. A single-signer proof disagreeing with a
+  multi-signer one at the same revision is a lone machine's fork losing to the cohort — it resolves
+  in the cohort's favor and logs a routine selection, not an incident. Two single-signer proofs
+  disagreeing likewise resolve, rather than declining, whenever multi-peer corroboration exists at
+  that revision to defer to. That is deliberate: an incident line has to mean *the keys signed both
+  sides at comparable authority*, and a self-signed solo receipt would otherwise let any one machine
+  manufacture a permanent decline.
 
   Both mean whoever holds the cohort's signing keys signed both sides. **This is a key compromise,
   not a capacity problem: adding machines or lowering a corroboration setting does nothing.** The

@@ -145,6 +145,22 @@ describe('certified claim selection (quorum-restore)', () => {
 			expect(certifiedEquivocation(claims)).to.equal(undefined);
 		});
 
+		it('certifiedEquivocation reports only the CONTENDING proofs when signer weights are mixed', () => {
+			// Two cohort-grade proofs genuinely equivocate at rev 5; a third, solo-signed action is
+			// not of comparable weight and must not appear in the incident. The reporter must agree
+			// with the selector on who contends, or an operator reads a conflict the selector never
+			// weighed.
+			const claims = [
+				claim('p1', 5, 'a', true, 3),
+				claim('p2', 5, 'b', true, 3),
+				claim('solo', 5, 'solo-fork', true, 1)
+			];
+			expect(selectQuorumRev(claims, THRESHOLD, 9)).to.equal(undefined);
+			const conflict = certifiedEquivocation(claims);
+			expect(conflict!.rev).to.equal(5);
+			expect(conflict!.actionIds.sort()).to.deep.equal(['a', 'b']);
+		});
+
 		it('ignores a certified conflict at a LOWER rev than the certified winner', () => {
 			// Superseded history, not live equivocation: only the TOP certified rev is examined.
 			const claims = [
@@ -297,6 +313,54 @@ describe('certified claim selection (quorum-restore)', () => {
 			// cohort's keys signed two digests into one revision" from "not enough carriers agreed".
 			const conflict = certifiedContentEquivocation(cands);
 			expect(conflict).to.not.equal(undefined);
+			expect(conflict!.hashes.sort())
+				.to.deep.equal([await canonicalBlockHash(a), await canonicalBlockHash(b)].sort());
+		});
+
+		it('two SINGLE-SIGNER certified hashes yield to a multi-carrier quorum group instead of declining', async () => {
+			// Solo-vs-solo would deadlock on its own, but several distinct carriers agreeing outrank
+			// both self-signed forks — the content-side sibling of the two-single-signer rev case.
+			const majority = block('b', { payload: 'majority' });
+			const cands = await Promise.all([
+				hashed('solo1', block('b', { payload: 'fork-A' }), true, 1),
+				hashed('solo2', block('b', { payload: 'fork-B' }), true, 1),
+				hashed('m1', majority),
+				hashed('m2', block('b', { payload: 'majority' }))
+			]);
+			const sel = selectQuorumBlock(cands, THRESHOLD, 9);
+			expect(sel!.hash).to.equal(await canonicalBlockHash(majority));
+			// Selection SUCCEEDED while the solo-vs-solo conflict is still reportable — so callers must
+			// key the incident line off the decline, never off this being non-undefined.
+			expect(certifiedContentEquivocation(cands)).to.not.equal(undefined);
+		});
+
+		it('a quorum-meeting group of ONE carrier does NOT displace a single-signer certified hash', async () => {
+			// Capacity 1 drops the quorum to a single vote, so the lone dissenter's group "meets
+			// quorum" on nothing but its own word. A verified proof still outranks a bare assertion;
+			// only CORROBORATION_FLOOR-plus distinct carriers displace one.
+			const proven = block('b', { payload: 'proven' });
+			const cands = await Promise.all([
+				hashed('solo-holder', proven, true, 1),
+				hashed('bare', block('b', { payload: 'bare-word' }))
+			]);
+			const sel = selectQuorumBlock(cands, THRESHOLD, 1);
+			expect(sel!.hash).to.equal(await canonicalBlockHash(proven));
+		});
+
+		it('certifiedContentEquivocation reports only the CONTENDING hashes when signer weights are mixed', async () => {
+			const a = block('b', { payload: 'A' });
+			const b = block('b', { payload: 'B' });
+			// One solo-signed hash alongside a cohort-grade one is a fork losing, not equivocation.
+			expect(certifiedContentEquivocation(await Promise.all([
+				hashed('cohort', a, true, 3),
+				hashed('solo', b, true, 1)
+			]))).to.equal(undefined);
+			// Two cohort-grade hashes DO equivocate, and the solo one stays out of the incident.
+			const conflict = certifiedContentEquivocation(await Promise.all([
+				hashed('c1', a, true, 3),
+				hashed('c2', b, true, 3),
+				hashed('solo', block('b', { payload: 'C' }), true, 1)
+			]));
 			expect(conflict!.hashes.sort())
 				.to.deep.equal([await canonicalBlockHash(a), await canonicalBlockHash(b)].sort());
 		});
