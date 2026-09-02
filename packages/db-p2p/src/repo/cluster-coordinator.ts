@@ -533,6 +533,17 @@ export class ClusterCoordinator {
 	}
 
 	/**
+	 * The block's cohort peer ids as currently derivable — {@link getClusterSize} without discarding
+	 * the ids. Empty when `findCluster` fails (getClusterForBlock swallows the throw), so a caller
+	 * branching on `length <= 1` is also taking the degraded-routing branch; `CoordinatorRepo.commit`
+	 * uses the ids to log whether a solo cohort is genuinely just self or a routing failure.
+	 */
+	async getClusterPeerIds(blockId: BlockId): Promise<string[]> {
+		const peers = await this.getClusterForBlock(blockId);
+		return Object.keys(peers ?? {});
+	}
+
+	/**
 	 * Validate that a small cluster size is legitimate by querying remote peers
 	 * for their network size estimates. Returns true if estimates roughly agree.
 	 */

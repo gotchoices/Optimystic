@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import {
-	buildBlockCommitProof, proofDeclaredDigest, verifyBlockCommitProofClaim, verifyBlockCommitProofContent,
+	buildBlockCommitProof, mintSoloCommitProof, proofDeclaredDigest, verifyBlockCommitProofClaim,
+	verifyBlockCommitProofContent,
 	type BlockCommitProof, type ProofClaim, type ProofFailure, type ProofThresholds
 } from '../src/cluster/commit-proof.js';
 import { clusterMember } from '../src/cluster/cluster-repo.js';
@@ -111,6 +112,38 @@ describe('BlockCommitProof', () => {
 			expect(buildBlockCommitProof({ ...record, membershipVersion: 1 })).to.equal(undefined);
 			const { membershipVersion: _v, membershipDigest: _d, ...unversioned } = record;
 			expect(buildBlockCommitProof(unversioned as ClusterRecord)).to.equal(undefined);
+		});
+	});
+
+	describe('mintSoloCommitProof', () => {
+		it('mints a one-peer proof that content-verifies for the exact (blockId, rev, actionId) it committed', async () => {
+			const { peerId, privateKey } = await makeKeyPair();
+			const block = insertBlock();
+			const commit = makeCommit({ [BLOCK]: { digest: await canonicalBlockHash(block) } });
+			const proof = await mintSoloCommitProof(peerId.toString(), privateKey, makeMessage(commit));
+			expect(proof.peerIds).to.deep.equal([peerId.toString()]);
+			const verdict = await verifyBlockCommitProofContent(proof, claimFor(commit), block, THRESHOLDS);
+			expect(verdict.ok, `solo proof must verify: ${JSON.stringify(verdict)}`).to.equal(true);
+		});
+
+		it('stops replay: a minted proof presented for a neighbouring revision fails claim-not-in-message', async () => {
+			const { peerId, privateKey } = await makeKeyPair();
+			const commit = makeCommit({ [BLOCK]: { digest: 'declared' } });
+			const proof = await mintSoloCommitProof(peerId.toString(), privateKey, makeMessage(commit));
+			await expectFailure(verifyBlockCommitProofClaim(
+				proof, { ...claimFor(commit), rev: commit.rev + 1 }, THRESHOLDS), 'claim-not-in-message');
+		});
+
+		it('growth from one to many: a one-peer proof at rev N and a multi-peer proof at rev N+1 both verify', async () => {
+			// Nothing keys proof retention or verification to cohort size — pinned rather than assumed.
+			const { peerId, privateKey } = await makeKeyPair();
+			const soloCommit = makeCommit({ [BLOCK]: { digest: 'digest-rev-1' } });
+			const soloProof = await mintSoloCommitProof(peerId.toString(), privateKey, makeMessage(soloCommit));
+			const grownCommit = makeCommit({ [BLOCK]: { digest: 'digest-rev-2' } }, { rev: 2 });
+			const { proof: grownProof } = await makeSignedProof(3, grownCommit);
+
+			expect((await verifyBlockCommitProofClaim(soloProof, claimFor(soloCommit), THRESHOLDS)).ok).to.equal(true);
+			expect((await verifyBlockCommitProofClaim(grownProof, claimFor(grownCommit), THRESHOLDS)).ok).to.equal(true);
 		});
 	});
 

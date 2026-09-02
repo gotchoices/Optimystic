@@ -12,7 +12,8 @@ import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocatio
 import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAnchoring } from "../cluster/certified-claims.js";
 import { DEFAULT_CLUSTER_SIZE } from "../cluster/cluster-policy.js";
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
-import { isMissingBaseRevisionFailure, MISSING_BASE_REVISION_REASON, type IRevisionActionReader } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, MISSING_BASE_REVISION_REASON, type ICommitProofPersister, type IRevisionActionReader } from "../storage/storage-repo.js";
+import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
 import type { ReconcileBlockCallback } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
 
@@ -217,6 +218,10 @@ interface LocalClusterWithExecutionTracking extends ICluster {
 	getExecutedPendResult?(messageHash: string): PendResult | undefined;
 	/** Local storage's verdict for a commit applied during consensus; see ClusterMember.getExecutedCommitResult. */
 	getExecutedCommitResult?(messageHash: string): CommitResult | undefined;
+	/** Self-sign a one-peer commit proof for the solo-cohort commit path; see ClusterMember.mintSoloCommitProof.
+	 *  Optional like its siblings: absent on a bare ICluster double, and then the solo path simply
+	 *  commits proof-less — exactly the pre-mint behavior. */
+	mintSoloCommitProof?(message: RepoMessage): Promise<BlockCommitProof>;
 }
 
 /**
@@ -347,7 +352,7 @@ export class CoordinatorRepo implements IRepo {
 		readonly createClusterClient: (peerId: PeerId) => ICluster,
 		private readonly storageRepo: IRepo,
 		cfg?: CoordinatorRepoConfig,
-		localCluster?: LocalClusterWithExecutionTracking,
+		private readonly localCluster?: LocalClusterWithExecutionTracking,
 		localPeerId?: PeerId,
 		fretService?: FretService,
 		private readonly clusterLatestCallback?: ClusterLatestCallback,
@@ -1621,9 +1626,40 @@ export class CoordinatorRepo implements IRepo {
 		const blockIds = request.blockIds;
 		await this.verifyResponsibility(blockIds);
 
-		const peerCount = await this.coordinator.getClusterSize(blockIds[0]!);
+		const cohortPeerIds = await this.coordinator.getClusterPeerIds(blockIds[0]!);
+		const peerCount = cohortPeerIds.length;
 		if (peerCount <= 1) {
-			const result = await this.storageRepo.commit(request, options);
+			// Solo cohort: consensus never runs, so no ClusterRecord exists to project a proof from —
+			// the lone member self-signs a one-peer proof instead (mintSoloCommitProof), which is what
+			// lets a block born on a cohort of one ever gain a second holder under the certified-push
+			// default (handlePush refuses a proof-less block). Minted even when peerCount is 0 or the
+			// sole peer is not self — findCluster failing (getClusterPeerIds returns []) puts the
+			// DEGRADED-ROUTING case in this same branch, and self genuinely committed these bytes
+			// either way; a proof's peer list is already not evidence of cohort membership by design
+			// (caller obligation #1 on verifyBlockCommitProofClaim), so gating the mint on cohort
+			// composition would buy no safety while opening a silent no-proof hole exactly when
+			// routing is degraded. The log line is how an operator tells a real cohort of one
+			// (cohortSize 1, soleIsSelf true) from a routing failure (cohortSize 0, or a sole peer
+			// that is not this node).
+			this.log('commit:solo-cohort', {
+				blockId: blockIds[0],
+				cohortSize: peerCount,
+				soleIsSelf: peerCount === 1 && this.localPeerId !== undefined
+					&& cohortPeerIds[0] === this.localPeerId.toString()
+			});
+			// Same message shape the multi-peer path produces — executeClusterTransaction stamps
+			// coordinatingBlockIds at its choke point, so the solo artifact must carry it too or a
+			// solo proof's message is distinguishable from every other proof's.
+			const message: RepoMessage = {
+				operations: [{ commit: request }],
+				coordinatingBlockIds: [blockIds[0]!],
+				expiration: options?.expiration ?? Date.now() + this.DEFAULT_TIMEOUT
+			};
+			// `undefined` when no local cluster is wired (direct constructors, unit-test doubles) —
+			// then the commit lands proof-less, exactly the pre-mint behavior. The cast is the named
+			// ICommitProofPersister contract; a plain IRepo double ignores the extra argument.
+			const proof = await this.localCluster?.mintSoloCommitProof?.(message);
+			const result = await (this.storageRepo as IRepo & ICommitProofPersister).commit(request, options, proof);
 			if (result.success) this.markBlocksSeen(blockIds);
 			return result;
 		}
@@ -1684,8 +1720,18 @@ export class CoordinatorRepo implements IRepo {
 			// caller instead would surface a committed transaction as a stale loss: db-core's
 			// commitPhase treats any returned `success:false` as a permanent stale failure, so the
 			// client would retry an action the cluster already landed until it exhausted its budget.
+			//
+			// Deliberately NOT self-signed here (unlike the solo short-circuit above): consensus for
+			// this commit ran on the cohort, so a one-peer minted proof would be a FALSE statement
+			// about the committing cohort. Thread the record's REAL proof instead —
+			// executeClusterTransaction resolves only after the record's promise/commit votes are
+			// populated, so the projection is genuine. Passed unconditionally, threshold or not:
+			// persistProofIfContentMatches retains it under the digest-match rule, and a record that
+			// never reached threshold simply yields a proof no verifier accepts — the same posture
+			// ClusterMember.applyConsensusOperation takes with its own projection.
+			const consensusProof = buildBlockCommitProof(record);
 			try {
-				const result = await this.storageRepo.commit(request, options);
+				const result = await (this.storageRepo as IRepo & ICommitProofPersister).commit(request, options, consensusProof);
 				if (result.success) {
 					this.markBlocksSeen(blockIds);
 					return result;

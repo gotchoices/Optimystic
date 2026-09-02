@@ -1,11 +1,14 @@
 import type { ActionId, BlockId, ClusterRecord, IBlock, RepoMessage, Signature, CommitRequest } from "@optimystic/db-core";
 import {
-	canonicalBlockHash, clusterVoteVerificationPayload, computeClusterCommitHash,
-	computeClusterMessageHash, computeClusterPromiseHash, membershipDigestFromIds
+	canonicalBlockHash, clusterVoteSigningPayload, clusterVoteVerificationPayload,
+	computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash,
+	membershipDigestFromIds
 } from "@optimystic/db-core";
+import type { PrivateKey } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { publicKeyFromRaw } from "@libp2p/crypto/keys";
 import { fromString as uint8ArrayFromString } from "uint8arrays/from-string";
+import { toString as uint8ArrayToString } from "uint8arrays/to-string";
 
 /**
  * A durable, self-contained proof that a cluster cohort agreed on a commit — everything an offline
@@ -88,6 +91,39 @@ export function buildBlockCommitProof(record: ClusterRecord): BlockCommitProof |
 		membershipVersion: 2,
 		membershipDigest: record.membershipDigest,
 		peerIds: Object.keys(record.peers).sort()
+	};
+}
+
+/**
+ * Mint a fully-signed one-peer {@link BlockCommitProof} — the producing sibling of
+ * {@link verifyBlockCommitProofClaim}, kept in this file so the hash recipe the two must agree on
+ * lives in one place. Used by the solo-cohort commit path (`CoordinatorRepo.commit`'s
+ * `peerCount <= 1` short-circuit), where consensus never runs and there is no {@link ClusterRecord}
+ * to project: the lone member IS the whole cohort, so it signs both rounds itself over a one-peer
+ * membership. The artifact stays honest — "one peer, which was the whole cohort at the time,
+ * committed these bytes at this revision" — and verifies offline from the peer id alone, exactly
+ * like a consensus-produced proof: `ceil(0.75 × 1) = 1` approve satisfies the promise round and
+ * `1 > 1 × 0.5` the commit round under the production thresholds.
+ *
+ * The promise round is signed FIRST: the commit hash's preimage includes the promises map
+ * (`computeClusterCommitHash`), so the order is load-bearing, not stylistic.
+ */
+export async function mintSoloCommitProof(
+	peerId: string, privateKey: PrivateKey, message: RepoMessage
+): Promise<BlockCommitProof> {
+	const membershipDigest = await membershipDigestFromIds([peerId]);
+	const messageHash = await computeClusterMessageHash(message, membershipDigest);
+	const signApprove = async (hash: string): Promise<Signature> => ({
+		type: 'approve',
+		signature: uint8ArrayToString(await privateKey.sign(clusterVoteSigningPayload(hash, 'approve')), 'base64url')
+	});
+	const promiseHash = await computeClusterPromiseHash(messageHash, message, membershipDigest);
+	const promises: Record<string, Signature> = { [peerId]: await signApprove(promiseHash) };
+	const commitHash = await computeClusterCommitHash(messageHash, message, promises, membershipDigest);
+	const commits: Record<string, Signature> = { [peerId]: await signApprove(commitHash) };
+	return {
+		v: 1, messageHash, message, promises, commits,
+		membershipVersion: 2, membershipDigest, peerIds: [peerId]
 	};
 }
 

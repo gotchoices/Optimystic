@@ -21,7 +21,7 @@ import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDig
 import { checkPendValidation } from "../pend-validation.js";
 import { getAffectedBlockIds } from "./record-operations.js";
 import { operationsConflict, resolveRace } from "./race-resolution.js";
-import { buildBlockCommitProof } from "./commit-proof.js";
+import { buildBlockCommitProof, mintSoloCommitProof, type BlockCommitProof } from "./commit-proof.js";
 import { RECONCILE_TIMEOUT_MS } from "./reconcile-block.js";
 
 const log = createLogger('cluster-member')
@@ -443,6 +443,17 @@ export class ClusterMember implements ICluster {
 	 */
 	getExecutedCommitResult(messageHash: string): CommitResult | undefined {
 		return this.executedCommitResults.get(messageHash);
+	}
+
+	/**
+	 * Self-sign a one-peer {@link BlockCommitProof} over `message` — a thin delegate to
+	 * {@link mintSoloCommitProof} with this member's own id and key. Lives here because this class is
+	 * the key holder: `CoordinatorRepo` (the caller, on its solo-cohort commit short-circuit) knows
+	 * the local peer id but never sees the private key. Nothing else moves — no record, no consensus
+	 * state; the mint is a pure signing operation over the message the caller built.
+	 */
+	async mintSoloCommitProof(message: RepoMessage): Promise<BlockCommitProof> {
+		return mintSoloCommitProof(this.peerId.toString(), this.privateKey, message);
 	}
 
 	/**
