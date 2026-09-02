@@ -16,3 +16,4 @@
 {"slug":"collection-forgets-revision-on-absent-header","file":"1-collection-forgets-revision-on-absent-header.md","completedAt":"2026-08-02","commit":"2d7d3c1310e31399ce7be6aa06c228d029a68b46","prunedAt":"2026-09-01T05:33:04.155Z"}
 {"slug":"stale-failure-carries-coordinator-revision","file":"1-stale-failure-carries-coordinator-revision.md","completedAt":"2026-08-02","commit":"092f33f8fc98f919fefdc4efb263a636842de8e1","prunedAt":"2026-09-01T12:22:03.222Z"}
 {"slug":"cluster-read-consult-cannot-report-unreachable","file":"2-cluster-read-consult-cannot-report-unreachable.md","completedAt":"2026-08-02","commit":"c33a9c0218ec0024a21b5cec1b026fe666242dcb","prunedAt":"2026-09-01T12:22:03.222Z"}
+{"slug":"isolated-node-can-serve-its-own-keys","file":"isolated-node-can-serve-its-own-keys.md","completedAt":"2026-08-03","commit":"610d6d1f105e2c75eca7f8f60a45f2c1101f802d","prunedAt":"2026-09-02T16:17:45.468Z"}
