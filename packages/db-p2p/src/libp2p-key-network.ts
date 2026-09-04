@@ -304,8 +304,14 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	/**
 	 * This node's own dialable addresses, as strings, memoized between address changes.
 	 *
-	 * `libp2p.getMultiaddrs()` is NOT cheap: on Node it re-derives announce addresses from
-	 * `os.networkInterfaces()`, a full NIC sweep measured at **3.19 ms of a 3.49 ms call**. Every
+	 * `libp2p.getMultiaddrs()` is NOT cheap **when this node has a wildcard listen address**:
+	 * expanding `0.0.0.0` across the host's interfaces goes through `os.networkInterfaces()`, a
+	 * full NIC sweep measured at **3.19 ms of a 3.49 ms call**. Measured per configuration on one
+	 * host: 4.44 ms/call with a TCP listener, **0.001 ms/call with no listen addrs at all** (an
+	 * edge/mobile client dialling out over websockets — nothing to expand, empty address list).
+	 * So the win here is real for listening peers (service and reference nodes, which commit too)
+	 * and near-zero for a dial-only client; do not quote the headline figure at a profile that
+	 * never pays it. Every
 	 * `findCluster` builds a cluster record containing self's addresses, and every commit calls
 	 * `findCluster` through `getClusterPeerIds` — so a cold `apply schema` paid one NIC sweep per
 	 * commit. On a solo node with zero peers that was ~13.8 ms per call and **49% of the whole

@@ -27,6 +27,20 @@ recomputing an identical answer every time.
 The end-to-end gain (8–10×) is larger than `findCluster`'s own 49% share of the operation because
 `os.networkInterfaces()` is a blocking syscall — it was also stalling unrelated async work.
 
+**Scope of the win, measured after the fact (2026-09-04) and worth stating before anyone quotes the
+table above.** The sweep happens only when there is a wildcard listen address to expand. On one host:
+
+| node configuration | `getMultiaddrs()` |
+|---|---|
+| TCP listener (what the figures above were measured on) | 4.44 ms/call |
+| dial-only client, websockets, no listen addrs | **0.001 ms/call** |
+
+So this materially helps **listening** peers — service and reference nodes, which commit as much as
+anyone — and is close to a no-op for an edge or mobile client that only dials out. That matters
+specifically because the on-device report driving this issue is the second shape: the fix was
+measured, shipped, and then explicitly *not* offered to the reporter as a likely cause of their
+symptom (issue #8 comment 5545490485).
+
 ## 2. Cost gates for the coordinated cold-apply path
 
 `local-transactor-read-cache.spec.ts` already guarded the `local` transactor. Nothing guarded the
