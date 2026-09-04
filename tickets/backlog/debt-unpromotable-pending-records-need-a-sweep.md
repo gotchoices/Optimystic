@@ -94,3 +94,33 @@ Added `repro: static` and `difficulty: hard`.
 - **`difficulty: hard`** — the ticket's own "What a fix has to answer" section is four open design
   questions (abandonment signal, where the sweep runs, whether members must agree, whether the client
   is hardened too), and the ticket says the wrong fix is worse than the leak.
+
+## Arm: this has now been observed, and one candidate signal is ruled out (2026-09-04)
+
+Filed from `fix/a-half-applied-commit-wedges-a-block-forever`, which reproduced an abandoned marker
+**deterministically** on the in-process mesh harness — so `repro: static` above is no longer the whole
+picture for the *class*, even though the two client-crash producers this ticket names are still
+unobserved.
+
+The producer found there is a third one, not covered by the two listed above:
+`NetworkTransactor.commit` commits the collection's tail block first and then sweeps the remaining
+blocks in a second call whose transport-shaped failure it deliberately **tolerates**, returning
+`{ success: true }`. The writer is therefore told the write succeeded and never sends the cancel that
+is the only cure. Every cohort member keeps the marker forever, and every later write to that block
+is refused. That producer is being fixed at its own site by
+`torn-commit-must-cancel-the-blocks-it-abandoned`, which is why this is an arm here rather than a
+merge — but the cancel that fix adds is itself best-effort over the network, so this ticket remains
+the backstop for when it does not arrive.
+
+**The cheap signal this ticket hoped for does not cover that case.** The body above proposes "a record
+whose revision the block has already passed can never be promoted, which is decidable locally with no
+timing guess at all". In the reproduced instance the block sat at revision 1 while the orphaned marker
+was for revision 2 — still nominally promotable, so a sweep on that rule finds nothing. Same for the
+related idea in the `save`-path tripwire in `packages/db-p2p/src/storage/block-storage.ts`, which
+anticipated orphans on blocks "whose committing action id differs": here the committing action id is
+the *same* id as the orphan's, because the commit for that block simply never ran.
+
+That leaves the two expensive options the body already lists — a time bound, or a cancel driven from
+somewhere that knows the transaction is gone — and removes the cheap third. Worth knowing before the
+design pass starts, because "decidable locally with no timing guess" was the reason to think this
+might be easier than it looks.
