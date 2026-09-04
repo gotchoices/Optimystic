@@ -65,9 +65,20 @@ function makeTableInfo(indexes: Array<{ name: string; columns: Array<{ index: nu
 		vtabModuleName: 'optimystic',
 		isView: false,
 		indexes,
-		estimatedRows: 1_000_000,
 	};
 }
+
+/**
+ * The table size the planner hands the module.
+ *
+ * It rides on the REQUEST, not on the schema: quereus 4.19 retired
+ * `TableSchema.estimatedRows`, and `rule-select-access-path` now passes the catalog's count
+ * down as `BestAccessPlanRequest.estimatedRows`. Stating it here rather than leaving it
+ * `undefined` is what keeps these cases exercising a SUPPLIED row count — the module's
+ * no-answer fallback happens to be 1,000,000 too, so an omitted value would leave every
+ * assertion below passing for the wrong reason.
+ */
+const TABLE_ROWS = 1_000_000;
 
 function eqFilter(columnIndex: number): any {
 	return { columnIndex, op: '=', usable: true, value: 'x' };
@@ -79,7 +90,11 @@ function plan(
 	requiredOrdering: Array<{ columnIndex: number; desc: boolean }>
 ): any {
 	const mod = new OptimysticModule({} as any, {} as any);
-	return mod.getBestAccessPlan({} as any, tableInfo, { columns: [], filters, requiredOrdering } as any);
+	return mod.getBestAccessPlan(
+		{} as any,
+		tableInfo,
+		{ columns: [], filters, requiredOrdering, estimatedRows: TABLE_ROWS } as any
+	);
 }
 
 // --- SQL harness ------------------------------------------------------------

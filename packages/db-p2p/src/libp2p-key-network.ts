@@ -315,6 +315,19 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * changes (a transport binding, a relay reservation, an observed-address promotion), so the
 	 * cache cannot outlive its answer. A fresh array is returned on every call: the value goes
 	 * into a `ClusterPeers` record the caller owns and may mutate.
+	 *
+	 * NOTE: the invalidation is not instantaneous, and it is not unconditional. libp2p reaches
+	 * that event through `AddressManager._updatePeerStoreAddresses`, which is **debounced by
+	 * 1000 ms** and then writes the peer record — so for up to about a second after a transport
+	 * starts or stops listening, a record published here can carry the previous address set.
+	 * That write is also fire-and-forget (`.catch` logs and swallows), so a peerStore failure
+	 * leaves this memo stale until the next successful address change. Both are acceptable
+	 * today: addresses change at startup and at relay-reservation time, not per commit, and a
+	 * momentarily-stale record lands on paths that already handle it — a missing address reads
+	 * as `addressless` and a departed one fails the dial, and the caller retries or excludes in
+	 * either case. Revisit if address churn ever becomes routine (frequent relay rotation, a
+	 * mobile node changing networks under load), or if a stale published address ever shows up
+	 * as a dial failure nobody can explain — this memo is the first thing to suspect.
 	 */
 	private selfMultiaddrsCache: string[] | undefined;
 

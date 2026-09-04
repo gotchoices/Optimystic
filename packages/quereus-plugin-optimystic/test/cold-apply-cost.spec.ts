@@ -119,6 +119,7 @@ interface ApplyCost {
 	driverCalls: number;
 	driverReads: number;
 	commits: number;
+	transactorGets: number;
 	findClusterCalls: number;
 	/** Per-object driver cost — the figure gate 3 compares ACROSS scales. */
 	callsPerObject: number;
@@ -177,6 +178,7 @@ async function measureColdApply(tables: number, indexes: number): Promise<ApplyC
 		driverCalls,
 		driverReads,
 		commits: transactorCounts['commit'] ?? 0,
+		transactorGets: transactorCounts['get'] ?? 0,
 		findClusterCalls: keyNetworkCounts['findCluster'] ?? 0,
 		callsPerObject: driverCalls / objects,
 	};
@@ -189,8 +191,8 @@ const LARGE = { tables: 54, indexes: 13 };
 
 /** Measured 2026-09-03; thresholds carry ~20% headroom. Re-measure before moving any of them. */
 const MEASURED = {
-	small: { callsPerObject: 32.7, commitsPerObject: 1.59, findClusterPerCommit: 2.40 },
-	large: { callsPerObject: 23.5, commitsPerObject: 1.19, findClusterPerCommit: 2.23 },
+	small: { callsPerObject: 32.7, commitsPerObject: 1.59, findClusterPerCommit: 2.40, getsPerObject: 40.9 },
+	large: { callsPerObject: 23.5, commitsPerObject: 1.19, findClusterPerCommit: 2.23, getsPerObject: 55.0 },
 };
 
 const MAX_DRIVER_CALLS_PER_OBJECT = 40;
@@ -198,6 +200,11 @@ const MAX_COMMITS_PER_OBJECT = 2.0;
 const MAX_FINDCLUSTER_PER_COMMIT = 3.0;
 /** Gate 3's allowance: per-object cost may not grow with scale, bar a few percent of noise. */
 const SCALE_GROWTH_TOLERANCE = 1.05;
+/**
+ * Gate 5's ceilings — one per scale, because this quantity legitimately GROWS with scale today
+ * and a cross-scale comparison would fail on arrival. See gate 5 for why it is gated anyway.
+ */
+const MAX_GETS_PER_OBJECT = { small: 50, large: 66 };
 
 describe('cold `apply schema` cost through the coordinated commit path', function () {
 	// Two full schema applies over an in-process mesh; no sockets, no libp2p boot.
@@ -260,6 +267,25 @@ describe('cold `apply schema` cost through the coordinated commit path', functio
 			.to.be.at.most(MAX_FINDCLUSTER_PER_COMMIT);
 	});
 
+	it('gate 5: transactor reads per object do not get worse than the shape measured here', () => {
+		// The number gate 3 CANNOT see. `ITransactor.get` per object is 40.9 / 55.0 / 80.6 at
+		// 22 / 67 / 250 objects — each created object re-reads a catalog that grows underneath
+		// it. Gate 3 watches DRIVER calls, and the read cache absorbs this growth before it
+		// reaches the driver, so gate 3 reads flat (32.7 -> 23.5) while this rises. Nothing
+		// would have caught it.
+		//
+		// Unlike gate 3 this asserts a CEILING PER SCALE rather than "must not grow", because
+		// the growth is real and present: a no-growth assertion would fail the moment it was
+		// written. What this pins is that the shape does not get WORSE unnoticed. It is not a
+		// blessing of the current curve — that is tracked as its own work item; see
+		// `tickets/backlog/feat-schema-batch-hooks-for-apply-schema`, whose batch-scoped context
+		// is what would stop the catalog being re-read per object at all.
+		expect(small.transactorGets / small.objects, `small: ${small.transactorGets} gets / ${small.objects} objects`)
+			.to.be.at.most(MAX_GETS_PER_OBJECT.small);
+		expect(large.transactorGets / large.objects, `large: ${large.transactorGets} gets / ${large.objects} objects`)
+			.to.be.at.most(MAX_GETS_PER_OBJECT.large);
+	});
+
 	it('reports the measured cost (diagnostic, not an assertion)', () => {
 		// Printed so a failure above has its context in the same output, and so a deliberate
 		// threshold move has a number to copy. Mirrors the before/after print in
@@ -275,7 +301,9 @@ describe('cold `apply schema` cost through the coordinated commit path', functio
 				`${cost.commits} commits = ${(cost.commits / cost.objects).toFixed(2)}/object ` +
 				`[baseline ${baseline.commitsPerObject}], ` +
 				`${cost.findClusterCalls} findCluster = ${(cost.findClusterCalls / cost.commits).toFixed(2)}/commit ` +
-				`[baseline ${baseline.findClusterPerCommit}]`
+				`[baseline ${baseline.findClusterPerCommit}], ` +
+				`${cost.transactorGets} transactor gets = ${(cost.transactorGets / cost.objects).toFixed(1)}/object ` +
+				`[baseline ${baseline.getsPerObject}]`
 			);
 		}
 	});

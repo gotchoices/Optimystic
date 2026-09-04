@@ -98,16 +98,30 @@ export interface StoredTableSchema {
 	vtabModuleName: string;
 	vtabArgs?: Record<string, any>;
 	/**
-	 * Catalog row count, as WE persist it. Deliberately still a flat number under this name
-	 * even though quereus 4.19 moved its in-memory home to `TableSchema.statistics.rowCount`:
-	 * this is our stored format, and renaming it would make every already-persisted schema
-	 * compare unequal against its own candidate, costing a rewrite of every table on first
-	 * open for no gain. Mapped to and from `statistics` at the two conversion sites below.
+	 * Catalog row count slot in our stored format. **Nothing populates it and nothing reads it
+	 * back into a live schema** — it is retained only so a schema persisted by an older build
+	 * still parses.
 	 *
-	 * Only the row count round-trips. The rest of `TableStatistics` (per-column stats,
-	 * histograms, `lastAnalyzed`) is ANALYZE output that we have never persisted and that no
-	 * optimystic path produces; a hydrated schema therefore carries an empty `columnStats`,
-	 * which reads as "no column statistics known" — the same thing an unanalyzed table says.
+	 * It has always been inert in practice. Quereus never set `TableSchema.estimatedRows` for a
+	 * plain virtual table (only its materialized-view helpers did), so the value this used to
+	 * copy was `undefined` on every real table, and `undefined` keys vanish under JSON — no
+	 * persisted optimystic schema carries one.
+	 *
+	 * NOTE: quereus 4.19 moved the in-memory row count onto `TableSchema.statistics`, which
+	 * `ANALYZE` DOES populate — so mapping this field to and from `statistics` would, for the
+	 * first time, make the slot live. That is deliberately NOT done here. It would silently
+	 * deliver the first bullet of `tickets/backlog/feat-optimystic-persisted-planner-statistics`
+	 * — a persisted row count surviving restart — while skipping the two questions that ticket
+	 * defers the feature over: when statistics refresh, and what happens when several nodes
+	 * compute and persist statistics for the same collection. It would also make `ANALYZE`
+	 * dirty the stored schema, so the next table initialization takes the write branch in
+	 * `OptimysticModule` (`schemasEqual` fails) and commits a schema rewrite — a write caused by
+	 * what a user reasonably reads as a statistics-only command. Wire this up in that ticket,
+	 * with those answers, not as a side effect of a type migration.
+	 *
+	 * In-session `ANALYZE` is unaffected either way: quereus keeps the statistics on its own
+	 * catalog schema and hands the count to `getBestAccessPlan` through
+	 * `BestAccessPlanRequest.estimatedRows`, which needs nothing from us.
 	 */
 	estimatedRows?: number;
 	/**
@@ -918,13 +932,10 @@ export class SchemaManager {
 			vtabModuleName: stored.vtabModuleName,
 			isView: false,
 			indexes,
-			// `undefined` must stay `undefined`, never a synthesized `{ rowCount: 0 }`: quereus
-			// reads absent statistics as "nobody knows" and applies its own fallback, whereas a
-			// real 0 means "analyzed, and empty". Handing it a fabricated 0 would tell the planner
-			// every never-analyzed optimystic table is empty.
-			statistics: stored.estimatedRows === undefined
-				? undefined
-				: { rowCount: stored.estimatedRows, columnStats: new Map() },
+			// No `statistics`: see StoredTableSchema.estimatedRows. Absent is the honest answer —
+			// quereus reads absent as "nobody has measured this table" and applies its own
+			// fallback, whereas any value we synthesized here would claim an ANALYZE that never
+			// ran and, with no column statistics behind it, would claim it badly.
 			uniqueConstraints: this.storedToUniqueConstraints(stored),
 		};
 	}
@@ -997,10 +1008,9 @@ export class SchemaManager {
 			indexes: (schema.indexes || []).map(idx => this.indexSchemaToStored(idx)),
 			vtabModuleName: schema.vtabModuleName,
 			vtabArgs: schema.vtabArgs as Record<string, any>,
-			// Undefined-valued keys vanish under JSON serialization, so a table with no
-			// statistics stays byte-identical with schemas persisted before quereus moved
-			// this field — same reasoning as `primaryKeyDefaultConflict` above.
-			estimatedRows: schema.statistics?.rowCount,
+			// `estimatedRows` is deliberately not emitted: see StoredTableSchema.estimatedRows.
+			// Omitting it keeps this byte-identical with every schema persisted before quereus
+			// 4.19 moved the row count onto `statistics`, so the migration costs no rewrites.
 			uniqueConstraints: uniqueConstraints.length > 0 ? uniqueConstraints : undefined,
 		};
 	}
