@@ -26,3 +26,5 @@
 {"slug":"committed-read-snapshot-declaration","file":"3-committed-read-snapshot-declaration.md","completedAt":"2026-08-05","commit":"fd29a46f1dbb00bb4ca5699902afb5c472e3b92f","prunedAt":"2026-09-04T21:54:05.636Z"}
 {"slug":"debt-concat-transform-overlapping-updates","file":"4-debt-concat-transform-overlapping-updates.md","completedAt":"2026-08-05","commit":"e5ada4b22848d82f44cd4a4acf7f31e10a2e2367","prunedAt":"2026-09-04T21:54:05.636Z"}
 {"slug":"bug-docs-out-of-date-with-code","file":"6-bug-docs-out-of-date-with-code.md","completedAt":"2026-08-05","commit":"ab52c47e0b39d7d14bc109d310a4bd0a554a6230","prunedAt":"2026-09-04T21:54:05.636Z"}
+{"slug":"bug-cluster-size-resolution-single-source","file":"1-bug-cluster-size-resolution-single-source.md","completedAt":"2026-08-05","commit":"3968b20a41269feca8102294c00665d1f1845e78","prunedAt":"2026-09-04T23:25:53.126Z"}
+{"slug":"optimystic-honor-declared-conflict-action","file":"optimystic-honor-declared-conflict-action.md","completedAt":"2026-08-05","commit":"088f1eb3b912d3adccd394f16ef0eeea61a8f76d","prunedAt":"2026-09-04T23:25:53.126Z"}
