@@ -207,6 +207,20 @@ non-tail sweep whose transport failed after the tail committed — now cancels t
 before acknowledging. That cancel is itself best-effort over the network; a node-side backstop for a
 cancel that also fails is tracked in backlog `debt-unpromotable-pending-records-need-a-sweep`.
 
+A stranded record is at least **named** rather than left to be re-derived. Every refusal it causes is
+reported as an ordinary optimistic-concurrency loss, because that is what a single refusal is
+indistinguishable from — so a permanently wedged block's logs read exactly like a busy block's. What
+no healthy reservation produces is *repetition against an unchanged holder*: a healthy holder keeps
+the block only for its own pend-to-commit window, so at most (concurrent writers − 1) distinct actions
+can lose to it before it releases. `coordinator-repo:stuck-reservation` (`noteStuckReservation` in
+`packages/db-p2p/src/repo/coordinator-repo.ts`) says the condition out loud once per episode, when one
+unchanged holding action has refused eight *distinct* later actions on a block — distinct actions, not
+refusals, since a retrying writer reuses one action id (`syncAttempts` in
+`packages/db-core/src/collection/collection.ts`). The line carries the block id, the holding action
+ids, the count, and prose naming the only two cures: a cancel for that action id, or that action's own
+commit. It is a diagnosis only — nothing expires, refuses, or deletes a record on the strength of it,
+which remains the open problem the backlog ticket above exists for.
+
 ## Block Storage Repository
 
 ![Block Storage Repository](figures/storage-repo.svg)
