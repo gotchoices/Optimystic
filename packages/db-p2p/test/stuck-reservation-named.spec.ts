@@ -8,11 +8,13 @@
  * them apart today is to notice that the same rival action id keeps appearing across unrelated
  * writers. `coordinator-repo:stuck-reservation` says the real condition out loud, once per episode.
  *
- * The three arms:
+ * The four arms:
  *  - THRESHOLD: a wedged block stays quiet under the threshold, speaks exactly once at it, and stays
  *    quiet afterwards however many more writers it refuses.
  *  - SECOND EPISODE: after the cure the line names (a cancel for the holding action), a later wedge
  *    on the same block is named again — the say-once flag is per episode, not per block for ever.
+ *  - EVERY STRANDED SIBLING: one torn commit strands every block it left behind, and each of them is
+ *    named in its own right — the count is per block, not per refusal.
  *  - HEALTHY CONTENTION: rivals genuinely losing to a holder that then commits emit nothing at all,
  *    and the measurement that calibrates the threshold — how many distinct actions one healthy
  *    holder refuses — is read off the classification lines rather than assumed.
@@ -145,6 +147,53 @@ describe('A block stuck behind a reservation that will never clear is named as s
 		const stuck = payloadsOf<StuckPayload>(second, STUCK);
 		expect(stuck, 'a later wedge on the same block must be named again').to.have.lengthOf(1);
 		expect(stuck[0]!.holdingActionIds, 'the second episode must name its OWN holder').to.deep.equal(['holder-b']);
+	});
+
+	/**
+	 * One torn commit strands EVERY sibling it left behind, not just one, and each stranded block is
+	 * its own wedge with its own remedy. The counter is therefore per block: a refusal naming two held
+	 * blocks counts once against each, and crossing the threshold names both.
+	 *
+	 * This is the shape the wedge actually arrives in — `wedgeSideBlock` above only narrows it to one
+	 * sibling for readability — and it is the only arm that exercises the per-block grouping in
+	 * `noteStuckReservation` at all; every other arm refuses a single block per pend.
+	 */
+	it('names EACH block a single stranded action holds, not just one of them', async () => {
+		// Three blocks at revision 1, then a pend over all three of which only the tail commits: `S`
+		// and `R` both keep `holder-a`'s record for revision 2 and neither will ever shed it.
+		const seedPend = await transactor.pend({ actionId: 'seed', transforms: insertsFor('T', 'S', 'R'), rev: 1, policy: 'c' });
+		expect(seedPend.success, 'seed pend must succeed').to.equal(true);
+		expect((await transactor.commit({ actionId: 'seed', blockIds: ['T', 'S', 'R'] as BlockId[], tailId: 'T' as BlockId, rev: 1 })).success).to.equal(true);
+		const wedge = await transactor.pend({ actionId: 'holder-a', transforms: updatesFor('holder-a', 'T', 'S', 'R'), rev: 2, policy: 'c' });
+		expect(wedge.success, 'the wedging pend must succeed').to.equal(true);
+		expect((await transactor.commit({ actionId: 'holder-a', blockIds: ['T'] as BlockId[], tailId: 'T' as BlockId, rev: 2 })).success).to.equal(true);
+
+		// Writers that want both stranded blocks. Each refusal names both, so both counts advance in
+		// step and both cross on the same one.
+		const drive = async (prefix: string, count: number) => {
+			for (let i = 0; i < count; i++) {
+				const result = await transactor.pend({ actionId: `${prefix}-${i}`, transforms: updatesFor(`${prefix}-${i}`, 'S', 'R'), rev: 2, policy: 'c' });
+				expect(result.success, `write ${prefix}-${i} must be refused`).to.equal(false);
+			}
+		};
+
+		const below = await capture(async () => { await drive('below', THRESHOLD - 1); });
+		expect(linesWith(below, STUCK), 'neither block may be named below the threshold').to.have.lengthOf(0);
+
+		const at = await capture(async () => { await drive('at', 1); });
+		const stuck = payloadsOf<StuckPayload>(at, STUCK);
+		expect(stuck.map(p => p.blockId).sort(), 'BOTH stranded blocks must be named, each once')
+			.to.deep.equal(['R', 'S']);
+		for (const line of stuck) {
+			expect(line.holdingActionIds, `${line.blockId} must name the one action holding it`).to.deep.equal(['holder-a']);
+			expect(line.distinctRefusedActions, `${line.blockId} must carry its own count`).to.equal(THRESHOLD);
+		}
+		// The healthy tail is not a wedge and must never be named alongside its stranded siblings.
+		expect(stuck.some(p => p.blockId === 'T'), 'the block that DID commit must not be named').to.equal(false);
+
+		const after = await capture(async () => { await drive('after', 3); });
+		expect(linesWith(after, CLASSIFIED), 'later writers are still refused and still classified').to.have.lengthOf(3);
+		expect(linesWith(after, STUCK), 'each block says it once, not once per later refusal').to.have.lengthOf(0);
 	});
 
 	/**

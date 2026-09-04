@@ -207,7 +207,8 @@ interface StuckReservationWatch {
 	/**
 	 * Distinct action ids these holders have refused. Distinct ACTIONS, not refusals: one writer
 	 * retrying is one writer, because a sync reuses a single action id across all of its retry
-	 * attempts (`Collection.syncAttempts` mints the id once, in `syncInternal`). Emptied at the
+	 * attempts (`Collection.syncInternal` mints the id once and `syncAttempts` reuses it for every
+	 * attempt of that cycle). Emptied at the
 	 * moment the episode is reported — the count is in the line, and nothing reads the ids again —
 	 * so the set is bounded by {@link STUCK_RESERVATION_DISTINCT_ACTIONS}.
 	 */
@@ -235,6 +236,13 @@ interface StuckReservationWatch {
  * and cannot exceed that either, for the same reason: at most (writers - 1) rivals can lose to one
  * winner. 8 is four times the measured healthy figure, and it is a floor a genuinely stuck block
  * clears trivially (the field instance refused hundreds).
+ *
+ * **The bound stated exactly.** It is distinct SYNC CYCLES, not distinct writers: one writer that
+ * exhausts a sync's retry budget and is re-driven by its caller mints a fresh id for the next cycle,
+ * so it can contribute more than one. That does not widen the window much — a cycle only ends in
+ * exhaustion after `DefaultMaxAttempts` (10) attempts of backoff, roughly 21s (see the exhaustion
+ * NOTE in `Collection.syncAttempts`), so a lone writer needs a holder to keep the block for upwards
+ * of two and a half minutes before it reaches 8 by itself, which is not a healthy holder.
  *
  * **What the margin does NOT cover, stated honestly.** A block with more than 8 distinct writers
  * racing it inside a single pend-to-commit round trip could reach 8 with a perfectly healthy holder.
@@ -1515,10 +1523,12 @@ export class CoordinatorRepo implements IRepo {
 		await this.verifyResponsibility(allBlockIds);
 		const result = await this.pendThroughCluster(request, allBlockIds, options);
 		// A pend the blocks ACCEPTED is the proof that no reservation is holding them any more — the
-		// only such proof this node gets without asking a question it has no reason to ask. Forgetting
-		// the episode here is what lets a LATER stuck reservation on the same block speak: the holder
-		// comparison in `noteStuckReservation` already covers a new episode under a different holder,
-		// and this covers the residue (an LRU entry outliving the condition it described).
+		// only such proof this node gets without asking a question it has no reason to ask.
+		// Scope, honestly: this is NOT what re-arms the line for a later wedge. The holder comparison
+		// in `noteStuckReservation` already does that on its own, and every real holder set is new,
+		// since an action id is 16 random bytes minted per sync cycle (`Collection.syncInternal`). What
+		// forgetting buys is that a settled episode stops occupying an LRU slot it can only use to
+		// evict a live one — plus defence in depth if an action id ever does repeat.
 		if (result.success) this.clearStuckReservations(allBlockIds);
 		return result;
 	}
@@ -1735,6 +1745,13 @@ export class CoordinatorRepo implements IRepo {
 			}
 		}
 		if (pending.length === 0) return undefined;
+		// Counted as its own statement, never inside the log payload below: this call is the detection
+		// mechanism, not a formatting step, and payload expressions in this repo are fair game to wrap
+		// in an `enabled` gate (`Collection.advanceContext` does exactly that). A gate added there
+		// later would silently stop the counter and with it `coordinator-repo:stuck-reservation`.
+		// {@link reportRepairDeadlock} keeps its say-once bookkeeping outside its own log call for the
+		// same reason.
+		const distinctRefusedActions = this.noteStuckReservation(pending, request.actionId);
 		this.log('coordinator-repo:pend-conflict-classified', {
 			actionId: request.actionId,
 			rivals: pending.map(p => `${p.blockId}:${p.actionId}`),
@@ -1742,7 +1759,7 @@ export class CoordinatorRepo implements IRepo {
 			// (see {@link noteStuckReservation}). Carried on every classification, not just the stuck
 			// ones, so a healthy contended deployment's real figure is readable from its own logs rather
 			// than assumed — which is what calibrates STUCK_RESERVATION_DISTINCT_ACTIONS.
-			distinctRefusedActions: this.noteStuckReservation(pending, request.actionId)
+			distinctRefusedActions
 		});
 		return {
 			success: false,
@@ -1840,8 +1857,12 @@ export class CoordinatorRepo implements IRepo {
 	 *
 	 * Called from the two events the message itself names as the only cures: a write the block accepted
 	 * ({@link pend}), and a cancel for the holding action ({@link cancel}). Forgetting is the whole
-	 * effect — the episode is a say-once flag, so dropping it only restores this node's ability to name
-	 * a LATER wedge on the same block.
+	 * effect, and it is LRU hygiene rather than behaviour: a later wedge is named by a DIFFERENT holder,
+	 * which `noteStuckReservation`'s holder comparison already treats as a new episode whether the old
+	 * entry is still there or not. Both call sites therefore have no observable effect through the
+	 * public surface (no spec can distinguish them — reproducing a repeated holder set would mean
+	 * reusing an action id, which nothing that mints them does), and both are kept because a settled
+	 * episode holding an LRU slot can only evict a live one.
 	 */
 	private clearStuckReservations(blockIds: BlockId[], holderActionId?: ActionId): void {
 		for (const blockId of blockIds) {

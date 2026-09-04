@@ -143,3 +143,27 @@ member and threads it into storage, and the post-consensus fallback threads the 
 projected proof, each under a long block comment explaining why the two must differ. `commit` is now
 roughly 190 lines. That is a third concern living on this class alongside freshness and write
 coordination, and it argues for the extraction naming a commit seam as well as a freshness one.
+
+## Seventh measurement (review pass on `name-a-block-that-is-stuck-behind-a-stale-reservation`)
+
+Re-measured (`wc -l packages/db-p2p/src/repo/coordinator-repo.ts`): **2199 lines**, up from 1937.
+Evidence only — this ticket's shape is unchanged, and the growth is mostly the long operator-facing
+prose the new diagnostic needs, which is exactly the kind of context the tradeoff note above says a
+maintainer may not want moved.
+
+One structural fact does belong here, because it is the counter-example to the third measurement's
+complaint. That measurement objected that a new per-block fact was crammed into an existing map
+"because there was already a map". This ticket did the opposite and added a **fourth** per-block
+`LruMap(1000)` on the class (`stuckReservations`, joining `responsibilityCache`, `lastSeenCommitMs`
+and `unsettledAheadClaims`), with a doc comment arguing — correctly, for a single change in
+isolation — that the new fact has a different lifetime from the freshness entry's and should not
+widen it. Both calls are locally right and they point opposite ways, which is the clearest evidence
+yet that the missing thing is not a rule about where to put the next fact but a collaborator that
+owns per-block state and states each fact's lifetime in one place. The extraction should absorb all
+four maps, not only the freshness ones; whoever does it should expect four different clearing
+conditions (a TTL, a timestamp, convergence on a revision, and a block accepting a write).
+
+A second, smaller observation for the same pass: all four maps are keyed `string` though every one of
+them is keyed by a block id, so the compiler cannot tell a block key from any other string the class
+handles. Cheap to fix inside the extraction, not worth a ticket on its own.
+

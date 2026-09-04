@@ -215,10 +215,12 @@ the block only for its own pend-to-commit window, so at most (concurrent writers
 can lose to it before it releases. `coordinator-repo:stuck-reservation` (`noteStuckReservation` in
 `packages/db-p2p/src/repo/coordinator-repo.ts`) says the condition out loud once per episode, when one
 unchanged holding action has refused eight *distinct* later actions on a block — distinct actions, not
-refusals, since a retrying writer reuses one action id (`syncAttempts` in
+refusals, since a retrying writer reuses one action id (minted once per sync cycle in `syncInternal`,
 `packages/db-core/src/collection/collection.ts`). The line carries the block id, the holding action
 ids, the count, and prose naming the only two cures: a cancel for that action id, or that action's own
-commit. It is a diagnosis only — nothing expires, refuses, or deletes a record on the strength of it,
+commit. Like every diagnostic in this package it goes to the `debug` logger, so a node that may need
+it has to be running with `DEBUG='optimystic:db-p2p:coordinator-repo*'` — see
+[debugging.md](debugging.md). It is a diagnosis only — nothing expires, refuses, or deletes a record on the strength of it,
 which remains the open problem the backlog ticket above exists for.
 
 ## Block Storage Repository
