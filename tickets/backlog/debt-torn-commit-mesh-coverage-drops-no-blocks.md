@@ -54,3 +54,18 @@ things. But the body's own closing suggestion (that `tearFirstCommit` "belongs i
 harness rather than in one spec file, since a second consumer is exactly what this ticket creates") is
 now concrete: that second consumer is the other ticket's arm two. Whichever is picked up first should
 land the helper in `packages/db-p2p/src/testing/mesh-harness.ts`, not in its own spec.
+
+## Arm: the shared injection seam this ticket asked for now exists (review, 2026-09-04)
+
+The body's closing suggestion — move the tear helper into the shared mesh harness, because a second
+consumer is coming — has a partial answer already in the tree.
+`packages/db-p2p/src/testing/mesh-harness.ts` `buildNetworkTransactor` now takes a `wrapRepo` option
+that wraps each node's repo before the transactor sees it, so a test can fail one specific RPC (a
+sweep commit, a pend) and leave every other call on the production path.
+`packages/db-p2p/test/torn-commit-cancels-abandoned-blocks.spec.ts` is its first consumer.
+
+That seam sits one layer BELOW `tearFirstCommit`, which wraps the whole transactor and rewrites the
+commit request. Both are legitimate; whoever picks this ticket up should decide which layer the
+shared helper belongs at rather than adding a third. The repo-level seam is the more faithful
+injection (it cannot accidentally change what production code runs); the transactor-level one is the
+only way to express "commit fewer blocks than were pended".

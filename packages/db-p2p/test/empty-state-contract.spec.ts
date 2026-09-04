@@ -1,12 +1,12 @@
 import { expect } from 'chai';
 import type {
-	ActionId, BlockHeader, BlockId, IBlock, IRepo, ITransactor, PendRequest, PeerId as DbPeerId, Transforms
+	ActionId, BlockHeader, BlockId, IBlock, IRepo, ITransactor, PendRequest, Transforms
 } from '@optimystic/db-core';
-import { NetworkTransactor, Tracker, TransactorSource, emptyTransforms } from '@optimystic/db-core';
+import { Tracker, TransactorSource, emptyTransforms } from '@optimystic/db-core';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
-import { createMesh, type Mesh } from '../src/testing/mesh-harness.js';
+import { createMesh, buildNetworkTransactor, type Mesh } from '../src/testing/mesh-harness.js';
 
 // Pins the "empty-state" contract at every layer boundary so future refactors can't
 // silently reintroduce the ticket-5 class of bug (layer drift on unknown / pending-only
@@ -48,22 +48,9 @@ async function seedPendingOnly(storageRepo: IRepo, blockId: BlockId, actionId: A
 	}
 }
 
-const buildNetworkTransactor = (mesh: Mesh): ITransactor => {
-	const repoByPeer = new Map<string, IRepo>();
-	for (const node of mesh.nodes) {
-		repoByPeer.set(node.peerId.toString(), node.coordinatorRepo as unknown as IRepo);
-	}
-	return new NetworkTransactor({
-		timeoutMs: 3_000,
-		abortOrCancelTimeoutMs: 3_000,
-		keyNetwork: mesh.keyNetwork,
-		getRepo: (peerId: DbPeerId) => {
-			const repo = repoByPeer.get(peerId.toString());
-			if (!repo) throw new Error(`Unknown peer ${peerId.toString()}`);
-			return repo;
-		}
-	});
-};
+/** The shared harness builder, at this suite's tighter fast-fail budget. */
+const buildTransactor = (mesh: Mesh): ITransactor =>
+	buildNetworkTransactor(mesh, { timeoutMs: 3_000, abortOrCancelTimeoutMs: 3_000 });
 
 describe('Empty-state contract (cross-layer)', function () {
 	// Contract assertions — fast-fail is the point. If any call stalls on an empty
@@ -135,7 +122,7 @@ describe('Empty-state contract (cross-layer)', function () {
 
 		beforeEach(async () => {
 			mesh = await createMesh(1, { responsibilityK: 1, clusterSize: 1, superMajorityThreshold: 0.51 });
-			transactor = buildNetworkTransactor(mesh);
+			transactor = buildTransactor(mesh);
 		});
 
 		it('unknown block: networkTransactor.get returns { state: {} }, merge path does not raise "missing"', async function () {
@@ -163,7 +150,7 @@ describe('Empty-state contract (cross-layer)', function () {
 
 		beforeEach(async () => {
 			mesh = await createMesh(1, { responsibilityK: 1, clusterSize: 1, superMajorityThreshold: 0.51 });
-			transactor = buildNetworkTransactor(mesh);
+			transactor = buildTransactor(mesh);
 		});
 
 		it('TransactorSource.tryGet on unknown block returns undefined', async function () {

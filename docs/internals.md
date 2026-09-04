@@ -654,6 +654,16 @@ saveMaterializedBlock(block): store(structuredClone(block));
   follow-on commit is refused as stale anyway, so approving would defer the refusal by a round
   trip, and `latest` alone can no longer name who holds the requested revision. Rival behavior,
   and the signed reject prose that carries it, are untouched.
+- **Not every torn action is reported as a failure — the tolerated arm cancels instead of
+  retrying.** `NetworkTransactor.commit` splits the sweep's failure by shape. A *returned*
+  `success:false` is a confirmed conflict and is surfaced, so the writer retries (everything below
+  is about that path). A *thrown* sweep is transport-shaped: the tail is already durable, so
+  refusing would disown an acknowledged write, and commit returns `{ success:true }`. That leaves
+  nobody to retry the sweep's blocks, so `cancelAbandonedSweepBlocks` releases their pending
+  records before the acknowledgement — the writer's obligation under `docs/repository.md`
+  §"A pending record's lifetime is bounded by its writer". The abandoned block's transform is
+  therefore dropped, not deferred: an acknowledged torn action leaves its non-tail blocks at their
+  prior revision, and only the log entry the tail carries is durable.
 - **The writer's retry consumes its own committed log entry.** The carve-out above only stops the
   *storage* side refusing the retry; the client half is that a torn action's log entry is already
   durable when the failure is reported, because `NetworkTransactor.commit` commits the log tail

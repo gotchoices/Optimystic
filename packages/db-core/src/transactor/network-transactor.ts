@@ -745,46 +745,69 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				//
 				// Transport-shaped failures (throws, no returned refusal) keep the tolerance for the
 				// RESULT — the tail committed durably, and reporting failure now would disown an
-				// acknowledged write — but NOT for the state the sweep abandoned. A throw does not
-				// imply the sweep's commit consensus exists anywhere: it also covers a sweep whose
-				// cluster transaction reached NOBODY, where no consensus record exists, no
-				// reconciliation will ever run, and every cohort member still holds the pending record
-				// its pend wrote for those blocks. Nothing else removes such a record (its only
-				// removers are a client cancel, a divergence-shaped commit refusal, and a forward
-				// write of the SAME action — see docs/repository.md "a pending record's lifetime is
-				// bounded by its writer"), and while it stands the members reject every later write to
-				// the block from any writer. So before acknowledging, cancel each block whose sweep
-				// batch never confirmed success. Cancel is safe in every direction:
-				//  - if the sweep's commit DID land on a member (a lost response), that member already
-				//    promoted the record and the cancel is a no-op there;
-				//  - if it did not, the cancel is exactly the repair;
-				//  - if the sweep's consensus is still in flight and lands AFTER the cancel, the member
-				//    meets a missing pend, which ClusterMember.applyConsensusOperation already treats
-				//    as "behind" divergence and cures by reconciling the block from a cohort peer.
-				// Residual: the cancel is itself best-effort over the network — if it ALSO fails, the
-				// record still wedges until a node-side backstop sweep exists (backlog:
-				// debt-unpromotable-pending-records-need-a-sweep). And this covers only the sweep's
-				// abandonment: StorageRepo.commit's genuine-fault arm deliberately KEEPS a failed
-				// batch's pendings for a retry, so it is a second producer of the same durable state
-				// whenever that retry never comes — out of scope here.
+				// acknowledged write — but NOT for the state the sweep abandoned, which
+				// `cancelAbandonedSweepBlocks` below repairs before this returns.
 				try { log('WARN: non-tail commit had errors; cancelling unconfirmed blocks, proceeding after tail commit: %s', error.message); } catch { /* ignore */ }
-				const confirmed = new Set<BlockId>();
-				for (const b of allBatches(batches, bb => bb.request?.isResponse === true && bb.request!.response!.success)) {
-					for (const bid of b.payload) confirmed.add(bid);
-				}
-				const abandoned = remainingBlocks.filter(bid => !confirmed.has(bid));
-				if (abandoned.length > 0) {
-					try {
-						await this.cancel({ actionId: request.actionId, blockIds: abandoned });
-					} catch (cancelError) {
-						try { log('WARN: cancel of abandoned sweep blocks failed — pending records may wedge until the node-side sweep lands: %o', cancelError); } catch { /* ignore */ }
-					}
-				}
+				await this.cancelAbandonedSweepBlocks(request.actionId, remainingBlocks, batches);
 			}
 		}
 
 		log('commit:done actionId=%s ms=%d', request.actionId, Date.now() - t0);
 		return { success: true };
+	}
+
+	/**
+	 * Cancels every sweep block whose commit batch never confirmed success, so an acknowledged
+	 * commit never walks away from a pending record. Best-effort: a failed cancel is logged, never
+	 * thrown, because the tail is already durable and the caller has nothing left to retry.
+	 *
+	 * **Why cancelling is required.** A thrown sweep does not imply the sweep's commit consensus
+	 * exists anywhere: it also covers a sweep whose cluster transaction reached NOBODY, where no
+	 * consensus record exists, no reconciliation will ever run, and every cohort member still holds
+	 * the pending record its pend wrote. Nothing else removes such a record (its only removers are a
+	 * client cancel, a divergence-shaped commit refusal, and a forward write of the SAME action — see
+	 * docs/repository.md "a pending record's lifetime is bounded by its writer"), and while it stands
+	 * the members reject every later write to the block from any writer.
+	 *
+	 * **Why cancelling is safe** in all three timings:
+	 *  - the sweep's commit DID land on a member (a lost response) ⇒ that member already promoted the
+	 *    record, so the cancel is a no-op there;
+	 *  - it did not land ⇒ the cancel is exactly the repair;
+	 *  - its consensus is still in flight and lands AFTER the cancel ⇒ the member meets a missing
+	 *    pend, which `ClusterMember.applyConsensusOperation` already treats as "behind" divergence and
+	 *    cures by reconciling the block from a cohort peer.
+	 *
+	 * Confirmed blocks are excluded only to skip a pointless consensus round — cancelling one would
+	 * also be a no-op — so an over-broad `confirmed` set costs latency, never correctness.
+	 *
+	 * Residuals: the cancel is itself best-effort over the network, so a cancel that ALSO fails leaves
+	 * the record wedged until a node-side backstop sweep exists (backlog:
+	 * `debt-unpromotable-pending-records-need-a-sweep`); and this covers only the sweep's abandonment
+	 * — `StorageRepo.commit`'s genuine-fault arm deliberately KEEPS a failed batch's pendings for a
+	 * retry, so it is a second producer of the same durable state whenever that retry never comes.
+	 */
+	private async cancelAbandonedSweepBlocks(actionId: ActionId, sweptBlocks: BlockId[], batches: CoordinatorBatch<BlockId[], CommitResult>[]): Promise<void> {
+		// NOTE: `confirmed` is only ever non-empty when the sweep spans MORE THAN ONE batch, and it
+		// does so only when no single peer covers every swept block — `consolidateCoordinators`'
+		// greedy set cover collapses the pend onto one coordinator otherwise, and commit reuses that
+		// resolution. So on a mesh whose nodes are all responsible for all blocks — every in-process
+		// test mesh today — this filter is structurally unreachable, and
+		// packages/db-p2p/test/torn-commit-cancels-abandoned-blocks.spec.ts cannot cover it. Pinning
+		// a partial sweep needs a mesh whose responsibility sets are disjoint enough to force two
+		// pend batches; a new failure injection alone will not reach it.
+		const confirmed = new Set<BlockId>();
+		for (const b of allBatches(batches, bb => bb.request?.isResponse === true && bb.request!.response!.success)) {
+			for (const bid of b.payload) confirmed.add(bid);
+		}
+		const abandoned = sweptBlocks.filter(bid => !confirmed.has(bid));
+		if (abandoned.length === 0) {
+			return;
+		}
+		try {
+			await this.cancel({ actionId, blockIds: abandoned });
+		} catch (cancelError) {
+			try { log('WARN: cancel of abandoned sweep blocks failed — pending records may wedge until the node-side sweep lands: %o', cancelError); } catch { /* ignore */ }
+		}
 	}
 
 	private async commitBlock(blockId: BlockId, actionId: ActionId, rev: number, tailId?: BlockId, blockDigests?: BlockContentDigests): Promise<CommitResult> {

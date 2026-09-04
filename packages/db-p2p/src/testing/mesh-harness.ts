@@ -485,6 +485,12 @@ export async function nonResponsibleNodes(mesh: Mesh, blockId: string): Promise<
 export interface BuildTransactorOptions {
 	timeoutMs?: number;
 	abortOrCancelTimeoutMs?: number;
+	/**
+	 * Wraps each node's repo before the transactor sees it, so a test can inject a transport-shaped
+	 * failure into one RPC (a dropped sweep commit, a refused pend) and leave every other call — and
+	 * therefore all of the production code after the injection — untouched.
+	 */
+	wrapRepo?: (repo: IRepo, node: MeshNode) => IRepo;
 }
 
 /**
@@ -496,7 +502,8 @@ export interface BuildTransactorOptions {
 export const buildNetworkTransactor = (mesh: Mesh, options: BuildTransactorOptions = {}): ITransactor => {
 	const repoByPeer = new Map<string, IRepo>();
 	for (const node of mesh.nodes) {
-		repoByPeer.set(node.peerId.toString(), node.coordinatorRepo as unknown as IRepo);
+		const repo = node.coordinatorRepo as unknown as IRepo;
+		repoByPeer.set(node.peerId.toString(), options.wrapRepo ? options.wrapRepo(repo, node) : repo);
 	}
 	return new NetworkTransactor({
 		timeoutMs: options.timeoutMs ?? 5_000,

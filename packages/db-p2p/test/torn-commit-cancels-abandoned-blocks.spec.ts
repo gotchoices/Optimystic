@@ -11,7 +11,7 @@
  * stands `ClusterMember.validatePendOperations` votes reject on every later pend touching the
  * block — from any writer, on any machine. The block is wedged forever.
  *
- * Two arms:
+ * The arms:
  *  - MECHANISM: pend two blocks through consensus, then commit only the tail (a client that walks
  *    away from the sibling). Every member keeps the sibling's pending record, later writes to it
  *    are refused, and an explicit cancel is exactly the repair. Independent of HOW the tear was
@@ -20,12 +20,12 @@
  *    of the non-tail commit, after the tail committed durably). Before the fix, commit reported
  *    success and stranded the sweep's pending records on every member. With the fix, commit cancels
  *    the abandoned blocks before acknowledging, so later writes succeed.
+ *  - CONFIRMED CONFLICT: a returned `success:false` still surfaces as a stale failure.
  */
 
 import { expect } from 'chai';
-import type { BlockHeader, BlockId, IBlock, Transforms, IRepo, PeerId as DbPeerId, RepoCommitRequest, MessageOptions, ActionId, BlockActionState } from '@optimystic/db-core';
-import { NetworkTransactor } from '@optimystic/db-core';
-import { createMesh, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
+import type { BlockHeader, BlockId, IBlock, Transforms, IRepo, RepoCommitRequest, MessageOptions, ActionId, BlockActionState, ITransactor } from '@optimystic/db-core';
+import { createMesh, buildNetworkTransactor, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
 
 const makeHeader = (id: string): BlockHeader => ({ id: id as BlockId, type: 'test', collectionId: 'torn-commit-collection' as BlockId });
 const makeBlock = (id: string): IBlock => ({ header: makeHeader(id), entries: [] } as unknown as IBlock);
@@ -55,42 +55,53 @@ const assertPendingLifetimeInvariant = async (mesh: Mesh, actionId: ActionId, bl
 	}
 };
 
+/** A commit request is the SWEEP stage iff it names a tail it is not itself committing. */
+const isSweep = (request: RepoCommitRequest): boolean =>
+	request.tailId !== undefined && !request.blockIds.includes(request.tailId);
+
+interface SweepInjection {
+	transactor: ITransactor;
+	arm: () => void;
+	disarm: () => void;
+	sweepFailures: () => number;
+	/** Every block id the transactor asked any peer to cancel, in call order. */
+	cancelledBlocks: () => BlockId[];
+}
+
 /**
  * A NetworkTransactor over the mesh whose per-peer repo lets the test fail the SWEEP commit — the
- * non-tail second stage of a multi-block commit, recognizable as a commit request that does not
- * carry the tail — with a transport-shaped throw. `cancel`, `pend`, `get`, and tail commits pass
- * through untouched, so everything after the injected failure is the production code under test.
+ * non-tail second stage of a multi-block commit — with a transport-shaped throw, and records the
+ * cancels the transactor issues. `cancel`, `pend`, `get`, and tail commits pass through untouched,
+ * so everything after the injected failure is the production code under test.
  */
-const buildSweepDroppingTransactor = (mesh: Mesh): { transactor: NetworkTransactor; arm: () => void; disarm: () => void; sweepFailures: () => number } => {
+const buildSweepDroppingTransactor = (mesh: Mesh): SweepInjection => {
 	let dropSweeps = false;
 	let failures = 0;
-	const repoByPeer = new Map<string, IRepo>();
-	for (const node of mesh.nodes) {
-		const inner = node.coordinatorRepo as unknown as IRepo;
-		repoByPeer.set(node.peerId.toString(), {
+	const cancelled: BlockId[] = [];
+	const transactor = buildNetworkTransactor(mesh, {
+		wrapRepo: (inner: IRepo): IRepo => ({
 			get: (g, o) => inner.get(g, o),
 			pend: (r, o) => inner.pend(r, o),
-			cancel: (r, o) => inner.cancel(r, o),
+			cancel: (r, o) => {
+				cancelled.push(...r.blockIds);
+				return inner.cancel(r, o);
+			},
 			commit: (r: RepoCommitRequest, o?: MessageOptions) => {
-				if (dropSweeps && r.tailId !== undefined && !r.blockIds.includes(r.tailId)) {
+				if (dropSweeps && isSweep(r)) {
 					failures++;
 					return Promise.reject(new Error('injected: sweep RPC failed'));
 				}
 				return inner.commit(r, o);
 			}
-		});
-	}
-	const transactor = new NetworkTransactor({
-		timeoutMs: 5_000,
-		abortOrCancelTimeoutMs: 5_000,
-		keyNetwork: mesh.keyNetwork,
-		getRepo: (p: DbPeerId) => {
-			const repo = repoByPeer.get(p.toString());
-			if (!repo) throw new Error(`Unknown peer ${p.toString()}`);
-			return repo;
-		}
+		})
 	});
-	return { transactor, arm: () => { dropSweeps = true; }, disarm: () => { dropSweeps = false; }, sweepFailures: () => failures };
+	return {
+		transactor,
+		arm: () => { dropSweeps = true; },
+		disarm: () => { dropSweeps = false; },
+		sweepFailures: () => failures,
+		cancelledBlocks: () => [...cancelled]
+	};
 };
 
 describe('Torn commit — the blocks a sweep abandons are cancelled, never stranded', function () {
@@ -158,7 +169,7 @@ describe('Torn commit — the blocks a sweep abandons are cancelled, never stran
 	});
 
 	it('production path: a transport-failed sweep is tolerated for the result but cancels the blocks it abandoned', async () => {
-		const { transactor, arm, disarm, sweepFailures } = buildSweepDroppingTransactor(mesh);
+		const { transactor, arm, disarm, sweepFailures, cancelledBlocks } = buildSweepDroppingTransactor(mesh);
 
 		// rev 1: both blocks exist and are committed.
 		const pend1 = await transactor.pend({ actionId: 'a1', transforms: insertsFor('T', 'S'), rev: 1, policy: 'c' });
@@ -179,6 +190,11 @@ describe('Torn commit — the blocks a sweep abandons are cancelled, never stran
 		// tail committed durably before the sweep failed, so the commit is still acknowledged.
 		expect(sweepFailures(), 'the sweep injection must have fired').to.be.at.least(1);
 		expect(commit2.success, 'a transport-failed sweep must not disown the durably committed tail').to.equal(true);
+
+		// The cancel is scoped to the sweep. The TAIL must never appear in it: its commit is durable,
+		// and it is the block the acknowledgement is owed on.
+		expect(cancelledBlocks(), 'the abandoned sweep block must be cancelled').to.include('S');
+		expect(cancelledBlocks(), 'the durably committed tail must never be cancelled').to.not.include('T');
 
 		// THE FIX: the acknowledged return must not have stranded S's pending record. Tail advanced;
 		// S did not (its commit never ran) — but its record is cancelled, not wedged, on every member.
