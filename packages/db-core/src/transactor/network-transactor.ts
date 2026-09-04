@@ -743,10 +743,43 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				// tickets/fix/refresh-must-always-know-its-own-in-flight-action, and to be fixed there
 				// rather than by tolerating the failure here.
 				//
-				// Transport-shaped failures (throws, no returned refusal) keep the tolerance: the commit
-				// consensus for these blocks exists, so lagging peers converge via reconciliation paths
-				// (e.g. reads with context).
-				try { log('WARN: non-tail commit had errors; proceeding after tail commit: %s', error.message); } catch { /* ignore */ }
+				// Transport-shaped failures (throws, no returned refusal) keep the tolerance for the
+				// RESULT — the tail committed durably, and reporting failure now would disown an
+				// acknowledged write — but NOT for the state the sweep abandoned. A throw does not
+				// imply the sweep's commit consensus exists anywhere: it also covers a sweep whose
+				// cluster transaction reached NOBODY, where no consensus record exists, no
+				// reconciliation will ever run, and every cohort member still holds the pending record
+				// its pend wrote for those blocks. Nothing else removes such a record (its only
+				// removers are a client cancel, a divergence-shaped commit refusal, and a forward
+				// write of the SAME action — see docs/repository.md "a pending record's lifetime is
+				// bounded by its writer"), and while it stands the members reject every later write to
+				// the block from any writer. So before acknowledging, cancel each block whose sweep
+				// batch never confirmed success. Cancel is safe in every direction:
+				//  - if the sweep's commit DID land on a member (a lost response), that member already
+				//    promoted the record and the cancel is a no-op there;
+				//  - if it did not, the cancel is exactly the repair;
+				//  - if the sweep's consensus is still in flight and lands AFTER the cancel, the member
+				//    meets a missing pend, which ClusterMember.applyConsensusOperation already treats
+				//    as "behind" divergence and cures by reconciling the block from a cohort peer.
+				// Residual: the cancel is itself best-effort over the network — if it ALSO fails, the
+				// record still wedges until a node-side backstop sweep exists (backlog:
+				// debt-unpromotable-pending-records-need-a-sweep). And this covers only the sweep's
+				// abandonment: StorageRepo.commit's genuine-fault arm deliberately KEEPS a failed
+				// batch's pendings for a retry, so it is a second producer of the same durable state
+				// whenever that retry never comes — out of scope here.
+				try { log('WARN: non-tail commit had errors; cancelling unconfirmed blocks, proceeding after tail commit: %s', error.message); } catch { /* ignore */ }
+				const confirmed = new Set<BlockId>();
+				for (const b of allBatches(batches, bb => bb.request?.isResponse === true && bb.request!.response!.success)) {
+					for (const bid of b.payload) confirmed.add(bid);
+				}
+				const abandoned = remainingBlocks.filter(bid => !confirmed.has(bid));
+				if (abandoned.length > 0) {
+					try {
+						await this.cancel({ actionId: request.actionId, blockIds: abandoned });
+					} catch (cancelError) {
+						try { log('WARN: cancel of abandoned sweep blocks failed — pending records may wedge until the node-side sweep lands: %o', cancelError); } catch { /* ignore */ }
+					}
+				}
 			}
 		}
 

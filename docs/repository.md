@@ -191,6 +191,22 @@ never received the pend), because the cluster layer reconciles the whole batch a
 block advances past the action. A genuine storage fault keeps the batch's pendings, because that
 failure is retried and the retry can still replay them.
 
+#### A pending record's lifetime is bounded by its writer
+
+Invariant P constrains which states may coexist on a member; this sibling rule constrains how long
+the pending state may outlive the transaction that created it. Only three things ever remove a
+pending record: the client's `cancel` (routed through consensus, so every member drops it), a
+divergence-shaped commit refusal (`StorageRepo.dropUnpromotablePendings`), and a forward write
+carrying the *same* action id (`BlockStorage.saveForwardRevision`'s same-action delete). There is no
+age bound and no background sweep. So the writer that pends a block owns its record's fate: when
+`NetworkTransactor.commit` returns, every block in the request must be either **committed** or have
+had its pending record **cancelled** — a client that reports success while walking away from a
+pended block strands the record permanently, and the members then reject every later write to that
+block from any writer (the wedge described two paragraphs up). The one path that violated this — a
+non-tail sweep whose transport failed after the tail committed — now cancels the abandoned blocks
+before acknowledging. That cancel is itself best-effort over the network; a node-side backstop for a
+cancel that also fails is tracked in backlog `debt-unpromotable-pending-records-need-a-sweep`.
+
 ## Block Storage Repository
 
 ![Block Storage Repository](figures/storage-repo.svg)
