@@ -2054,4 +2054,107 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect(result.toString()).to.equal(peerA.toString());
 		});
 	});
+	// --- Self-address memoization ------------------------------------------------
+	/**
+	 * `findCluster` puts this node's own addresses into every cluster record it builds, and it
+	 * used to ask libp2p for them on every single call. That is not a cheap question: on Node
+	 * `getMultiaddrs()` re-derives announce addresses from `os.networkInterfaces()`, a full NIC
+	 * sweep measured at 3.19 ms of a 3.49 ms `findCluster`. Every commit calls `findCluster`
+	 * through `getClusterPeerIds`, so a cold `apply schema` paid one NIC sweep per commit — on a
+	 * solo node that was ~49% of the whole operation (GitHub issue #8), recomputing an identical
+	 * answer each time.
+	 *
+	 * Counting `getMultiaddrs()` calls is the only way to observe this: the RESULT is byte-identical
+	 * either way, so nothing about the returned record can tell a memoized run from a recomputing
+	 * one. Wall clock is not asserted for the usual reason — it is a property of the host's NIC
+	 * count, not of this code.
+	 */
+	describe('findCluster() — self addresses are memoized between address changes', () => {
+		/** A solo-cohort mock that counts `getMultiaddrs()` and can fire `self:peer:update`. */
+		function soloLibp2p(addr: string) {
+			const listeners = new Set<() => void>();
+			let calls = 0;
+			const libp2p = {
+				peerId: selfPeerId,
+				getConnections: () => [],
+				getMultiaddrs: () => { calls++; return [multiaddr(addr)]; },
+				addEventListener: (event: string, handler: () => void) => {
+					if (event === 'self:peer:update') listeners.add(handler);
+				},
+				removeEventListener: () => { },
+				peerStore: { all: async () => [], get: async () => ({ addresses: [] }) },
+				services: {
+					fret: {
+						assembleCohort: () => [],
+						getNetworkSizeEstimate: () => ({ size_estimate: 1, confidence: 1 }),
+						detectPartition: () => false,
+						exportTable: () => undefined,
+						getNeighbors: () => []
+					}
+				}
+			} as unknown as Libp2p;
+			return {
+				libp2p,
+				get calls() { return calls; },
+				fireSelfPeerUpdate: () => { for (const h of listeners) h(); }
+			};
+		}
+
+		const KEY = new TextEncoder().encode('memo-key');
+
+		it('asks libp2p for its own addresses once across many findCluster calls', async () => {
+			const mock = soloLibp2p(`/ip4/10.0.0.99/tcp/4001/ws/p2p/${selfPeerId.toString()}`);
+			const network = new Libp2pKeyPeerNetwork(mock.libp2p, 1, undefined, 'joining');
+
+			for (let i = 0; i < 25; i++) await network.findCluster(KEY);
+
+			expect(mock.calls, '25 findCluster calls should cost exactly one address derivation')
+				.to.equal(1);
+		});
+
+		it('still reports the same addresses on every call', async () => {
+			const addr = `/ip4/10.0.0.99/tcp/4001/ws/p2p/${selfPeerId.toString()}`;
+			const mock = soloLibp2p(addr);
+			const network = new Libp2pKeyPeerNetwork(mock.libp2p, 1, undefined, 'joining');
+
+			const first = await network.findCluster(KEY);
+			const second = await network.findCluster(KEY);
+
+			expect(first[selfPeerId.toString()]!.multiaddrs).to.deep.equal([addr]);
+			expect(second[selfPeerId.toString()]!.multiaddrs).to.deep.equal([addr]);
+		});
+
+		it('re-derives after self:peer:update, so a new address is not masked by the cache', async () => {
+			// The correctness half of the optimization. A node that binds a transport or takes a
+			// relay reservation AFTER its first findCluster must publish the new address; a cache
+			// with no invalidation would keep advertising the old one forever.
+			const mock = soloLibp2p(`/ip4/10.0.0.99/tcp/4001/ws/p2p/${selfPeerId.toString()}`);
+			const network = new Libp2pKeyPeerNetwork(mock.libp2p, 1, undefined, 'joining');
+
+			await network.findCluster(KEY);
+			await network.findCluster(KEY);
+			expect(mock.calls, 'memoized before the update').to.equal(1);
+
+			mock.fireSelfPeerUpdate();
+
+			await network.findCluster(KEY);
+			expect(mock.calls, 'the update must invalidate the memo').to.equal(2);
+			await network.findCluster(KEY);
+			expect(mock.calls, 're-memoized after the update').to.equal(2);
+		});
+
+		it('hands each caller its own array, so a mutating caller cannot corrupt the memo', async () => {
+			// The record goes to a caller that owns it; `ClusterPeers` is not frozen. Returning the
+			// cached array itself would let one caller's push land in every later cluster record.
+			const addr = `/ip4/10.0.0.99/tcp/4001/ws/p2p/${selfPeerId.toString()}`;
+			const mock = soloLibp2p(addr);
+			const network = new Libp2pKeyPeerNetwork(mock.libp2p, 1, undefined, 'joining');
+
+			const first = await network.findCluster(KEY);
+			first[selfPeerId.toString()]!.multiaddrs.push('/ip4/6.6.6.6/tcp/1/ws');
+
+			const second = await network.findCluster(KEY);
+			expect(second[selfPeerId.toString()]!.multiaddrs).to.deep.equal([addr]);
+		});
+	});
 });

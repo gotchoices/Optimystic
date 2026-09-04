@@ -262,6 +262,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		this.networkMode = networkMode ?? 'forming';
 		this.persistence = persistence;
 		this.setupConnectionTracking();
+		this.setupSelfAddressTracking();
 	}
 
 	/** The cluster size this instance actually resolved to, for `assertClusterSizeCoupling`. */
@@ -298,6 +299,35 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		this.libp2p.addEventListener('connection:open', () => {
 			this.updateNetworkObservations();
 		});
+	}
+
+	/**
+	 * This node's own dialable addresses, as strings, memoized between address changes.
+	 *
+	 * `libp2p.getMultiaddrs()` is NOT cheap: on Node it re-derives announce addresses from
+	 * `os.networkInterfaces()`, a full NIC sweep measured at **3.19 ms of a 3.49 ms call**. Every
+	 * `findCluster` builds a cluster record containing self's addresses, and every commit calls
+	 * `findCluster` through `getClusterPeerIds` — so a cold `apply schema` paid one NIC sweep per
+	 * commit. On a solo node with zero peers that was ~13.8 ms per call and **49% of the whole
+	 * apply** (issue #8); the addresses it recomputed were identical every time.
+	 *
+	 * Invalidated on `self:peer:update`, which libp2p emits whenever this node's own address set
+	 * changes (a transport binding, a relay reservation, an observed-address promotion), so the
+	 * cache cannot outlive its answer. A fresh array is returned on every call: the value goes
+	 * into a `ClusterPeers` record the caller owns and may mutate.
+	 */
+	private selfMultiaddrsCache: string[] | undefined;
+
+	private setupSelfAddressTracking(): void {
+		this.libp2p.addEventListener('self:peer:update', () => {
+			this.selfMultiaddrsCache = undefined;
+		});
+	}
+
+	/** {@link selfMultiaddrsCache}, populated on first use. */
+	private getSelfMultiaddrs(): string[] {
+		this.selfMultiaddrsCache ??= this.libp2p.getMultiaddrs().map(ma => ma.toString());
+		return this.selfMultiaddrsCache.slice();
 	}
 
 	/**
@@ -1024,7 +1054,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		for (const idStr of ids) {
 			if (idStr === selfId) {
 				const raw = this.libp2p.peerId.publicKey?.raw ?? new Uint8Array()
-				peers[idStr] = { multiaddrs: this.libp2p.getMultiaddrs().map(ma => ma.toString()), publicKey: u8ToString(raw, 'base64url') }
+				peers[idStr] = { multiaddrs: this.getSelfMultiaddrs(), publicKey: u8ToString(raw, 'base64url') }
 				continue
 			}
 			const connectedStrings = connectedByPeer[idStr] ?? []

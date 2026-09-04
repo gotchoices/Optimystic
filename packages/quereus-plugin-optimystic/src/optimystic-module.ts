@@ -3444,7 +3444,24 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     tableInfo: TableSchema,
     request: BestAccessPlanRequest
   ): BestAccessPlanResult {
-    const tableRowCount = tableInfo.estimatedRows || 1000000;
+    // Quereus 4.19 retired the flat `TableSchema.estimatedRows` this used to read. The row
+    // count now reaches a module through the REQUEST — `rule-select-access-path` passes the
+    // catalog's number down as `request.estimatedRows`, `undefined` when the table has never
+    // been ANALYZEd — which is also the field a module that can size itself would substitute
+    // its own count into. Reading the request rather than `tableInfo.statistics` directly is
+    // what keeps this module's answer consistent with the plan costed around it.
+    //
+    // `||` rather than `??`, matching the shipped memory module's `request.estimatedRows || 1000`:
+    // it collapses an ANALYZEd-empty table (a real 0) into the default. Quereus documents that
+    // collapse at its own `|| default` sites and calls it harmless — any plan over 0 rows is
+    // cheap either way — so this stays deliberately identical to the reference implementation
+    // rather than quietly diverging from it.
+    //
+    // NOTE: the default is 1,000,000 where the memory module uses 1,000. Unchanged here on
+    // purpose: it predates this migration, it biases an unanalyzed table toward index seeks
+    // (the right instinct for a distributed store where a full scan is a network cost), and
+    // retuning it is a costing decision that wants its own measurement, not a drive-by.
+    const tableRowCount = request.estimatedRows || 1000000;
     const tableScanCost = Math.max(1000, tableRowCount);
 
     // Track best plan found

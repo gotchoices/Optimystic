@@ -97,6 +97,18 @@ export interface StoredTableSchema {
 	indexes: StoredIndexSchema[];
 	vtabModuleName: string;
 	vtabArgs?: Record<string, any>;
+	/**
+	 * Catalog row count, as WE persist it. Deliberately still a flat number under this name
+	 * even though quereus 4.19 moved its in-memory home to `TableSchema.statistics.rowCount`:
+	 * this is our stored format, and renaming it would make every already-persisted schema
+	 * compare unequal against its own candidate, costing a rewrite of every table on first
+	 * open for no gain. Mapped to and from `statistics` at the two conversion sites below.
+	 *
+	 * Only the row count round-trips. The rest of `TableStatistics` (per-column stats,
+	 * histograms, `lastAnalyzed`) is ANALYZE output that we have never persisted and that no
+	 * optimystic path produces; a hydrated schema therefore carries an empty `columnStats`,
+	 * which reads as "no column statistics known" — the same thing an unanalyzed table says.
+	 */
 	estimatedRows?: number;
 	/**
 	 * Non-derived UNIQUE constraints (column-level `unique` / table-level
@@ -906,7 +918,13 @@ export class SchemaManager {
 			vtabModuleName: stored.vtabModuleName,
 			isView: false,
 			indexes,
-			estimatedRows: stored.estimatedRows,
+			// `undefined` must stay `undefined`, never a synthesized `{ rowCount: 0 }`: quereus
+			// reads absent statistics as "nobody knows" and applies its own fallback, whereas a
+			// real 0 means "analyzed, and empty". Handing it a fabricated 0 would tell the planner
+			// every never-analyzed optimystic table is empty.
+			statistics: stored.estimatedRows === undefined
+				? undefined
+				: { rowCount: stored.estimatedRows, columnStats: new Map() },
 			uniqueConstraints: this.storedToUniqueConstraints(stored),
 		};
 	}
@@ -979,7 +997,10 @@ export class SchemaManager {
 			indexes: (schema.indexes || []).map(idx => this.indexSchemaToStored(idx)),
 			vtabModuleName: schema.vtabModuleName,
 			vtabArgs: schema.vtabArgs as Record<string, any>,
-			estimatedRows: schema.estimatedRows,
+			// Undefined-valued keys vanish under JSON serialization, so a table with no
+			// statistics stays byte-identical with schemas persisted before quereus moved
+			// this field — same reasoning as `primaryKeyDefaultConflict` above.
+			estimatedRows: schema.statistics?.rowCount,
 			uniqueConstraints: uniqueConstraints.length > 0 ? uniqueConstraints : undefined,
 		};
 	}
