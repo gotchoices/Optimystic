@@ -38,24 +38,100 @@ its own sub-namespace so a single concern can be traced in isolation:
 
 ### db-p2p sub-namespaces
 
-| Sub-namespace              | What it covers                                         |
-|----------------------------|--------------------------------------------------------|
-| `protocol-client`          | Dial start/ok/fail, first-byte timing, response timing |
-| `storage-repo`             | Pend/commit/cancel entry with ids and revs             |
-| `block-storage`            | Block-level pend/commit/cancel                         |
-| `repo-service`             | Redirect decisions (inCluster vs redirect)             |
-| `cluster`                  | ClusterCoordinator phase transitions, majority calc    |
-| `cluster-member`           | ClusterMember promise/commit counts, phase transitions |
-| `coordinator-repo`         | CoordinatorRepo operations (peer-id suffixed)          |
-| `storage:restoration`      | Block restoration coordination                         |
-| `libp2p-key-network`       | Key network operations (peer-id suffixed)              |
-| `peer-address-book`        | Peer multiaddrs learned or rejected: `merge`, `capped`, `record-capped` (peer-id suffixed) |
+`db-p2p` emits 45 sub-namespaces under `optimystic:db-p2p:`. They are grouped below by subsystem;
+`DEBUG='optimystic:db-p2p:*'` turns on all of them at once. Rows marked *(peer-id suffixed)* append
+the owning node's peer id — see *Telling nodes apart in one process* below.
+
+This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fails if any
+`createLogger('…')` in `packages/db-p2p/src` has no row here.
+
+#### Transactions and cluster consensus
+
+| Sub-namespace         | What it covers                                                                            |
+|-----------------------|-------------------------------------------------------------------------------------------|
+| `cluster`             | `ClusterCoordinator`'s `cluster-tx:*` trace: cluster membership, promise/commit rounds, majority reached, merge inputs/results, conflict race lost, abandon broadcasts |
+| `cluster-member`      | `ClusterMember`'s `cluster-member:*` trace: promise/commit/consensus handling, admission config and rejects, superseded conflicts, staleness reads, reconcile attempts |
+| `cluster-client`      | Record-level address learning on the client side of a cluster call — `peer-address-book:record-capped` and unparseable-peer-id warnings from records this node fetched |
+| `cluster-service`     | Errors raised while handling an inbound cluster protocol message (decode/dispatch). Default name only — `ClusterService`'s `logPrefix` init option can rename it |
+| `cluster-policy`      | The `repair-fault-tolerance` decision: the fault-tolerance/repair-cost trade the sizing policy computes |
+| `coordinator-repo`    | Coordinator-side reads and repairs: `cluster-fetch:*` quorum, sync and promote decisions, `cluster-tx:read-repair-*` outcomes, solo-cohort commits *(peer-id suffixed)* |
+| `commit-cert`         | Originations skipped because no commit certificate was retained for the action              |
+| `certified-claims`    | Certified-claim anchoring: unanchored accepts with signer counts, anchor/cohort overlap, recompute and callback errors |
+| `reconcile-block`     | Block reconciliation after divergence: certified selection, content and revision equivocation, missing quorums, fetch and penalize errors |
+
+#### Storage and block movement
+
+| Sub-namespace         | What it covers                                                                            |
+|-----------------------|-------------------------------------------------------------------------------------------|
+| `storage-repo`        | Pend/commit/cancel entry with action ids, revs and block counts, plus commit-proof digest mismatches, missing or unmaterializable bases, and stale-pending drops |
+| `block-storage`       | Block-level pend/commit/cancel, per-revision save/skip, prune, latest-revision recovery, and refused restores |
+| `block-archive`       | Serving archived revisions: pinned-read skips that refuse to mislabel content, and commit-proof lookup failures or claim mismatches |
+| `storage:restoration` | Block restoration coordination: per-block restore success/failure with elapsed ms, peer query failures, solo-node skips |
+| `block-transfer`      | Rebalance block movement: per-block push/pull/confirm outcomes, retries, holder counts, and partition-detected bail-outs |
+| `block-transfer-service` | The inbound side of the same protocol: push/pull request and response sizes, certified-push accepts and rejects, persist failures, service start/stop |
+| `rebalance-monitor`   | Periodic rebalance checks: gained/lost/grown block counts, growth budget deferrals and give-ups, throttling, partition suppression |
+| `spread-on-churn`     | Replica spreading triggered by peer churn: per-block push ok/fail/rejected, blocks untracked for missing local data, partition suppression |
+| `ring-shift`          | Ring-shift phases: `phaseA:advertise`, `phaseB:abort` with the ring it rolled back to, `phaseC:release` with shed counts, and resumed old ranges |
+
+#### Networking and routing
+
+| Sub-namespace         | What it covers                                                                            |
+|-----------------------|-------------------------------------------------------------------------------------------|
+| `protocol-client`     | Dial start/ok/fail, dial and response timeouts, first-byte timing, response timing         |
+| `repo-service`        | Redirect decisions (in-cluster vs redirect) and errors handling an inbound repo protocol message. Default name only — `RepoService`'s `logPrefix` init option can rename it |
+| `libp2p-key-network`  | Coordinator and cluster lookup: FRET neighbour candidates, connected-peer selection and retries, membership filtering, addressless and self-relay-only members *(peer-id suffixed)* |
+| `network-manager`     | `NetworkManagerService`: `awaitHealthy` connection counts and timeouts, cohort key seeding failures, invalid peer ids in a cohort |
+| `network:get-manager` | Failures injecting the real libp2p node into the network manager after construction        |
+| `peer-address-book`   | Peer multiaddrs learned or rejected: `merge`, `capped`, `record-capped` *(peer-id suffixed)* |
+| `peer-reputation`     | Reputation scoring: per-peer reports with reason, weight, resulting score and context, and resets |
+| `matchmaking-query`   | Matchmaking query transport: dropped and rate-limited inbound queries, dial/decode failures against a primary |
+| `sync-service`        | Sync protocol service start/stop, request-handling errors, and archive-build failures per block |
+
+#### Node startup wiring
+
+| Sub-namespace           | What it covers                                                                          |
+|-------------------------|------------------------------------------------------------------------------------------|
+| `node-wiring`           | Node construction and startup: in-factory `setLibp2p` proxy fallbacks, owned-block seeding, spread-on-churn init, rollback failures after a failed start |
+| `node-wiring:arachnode` | Arachnode ring membership during startup: ring announcements, ring transitions, ring-shift outcomes, unconfirmed cohort growth, rebalance reaction failures |
+| `reactivity-node-wiring`| Reactivity wiring at startup — currently, a rotation re-registration that fired with no subscribe factory wired |
+
+#### Reactivity (change subscription and propagation)
+
+| Sub-namespace                  | What it covers                                                                   |
+|--------------------------------|------------------------------------------------------------------------------------|
+| `reactivity-subscription`      | Subscription manager: backfill retries per revision range, escalation to `resume()`, placeholder subscriber coordinates |
+| `reactivity-subscribers`       | Subscriber registry: deliveries rejected and handlers that threw, isolated per revision |
+| `reactivity-origination`       | Change origination per collection: origination failures, block-fill and warm-up rotation observations |
+| `reactivity-notify`            | Notify transport: dropped sends, undecodable inbound frames, swallowed send failures |
+| `reactivity-forwarder-host`    | Forwarder host: ingest failures per topic and revision, isolated local-delivery and notify-send errors, undecodable tail ids |
+| `reactivity-recover`           | Recover transport: dial fall-through to the next target, replay/stale and signature-verification rejections, malformed sticky primary |
+| `reactivity-push-state-gossip` | Push-state gossip: undecodable frames, frames from non-members, replay entries clipped to fit `maxBytes`, isolated round failures |
+| `reactivity-rotation-rereg`    | Rotation re-registration scheduler: scheduling with delay, duplicate notices ignored, ledger-cap evictions, rejected or throwing re-registrations |
+
+#### Disputes
+
+| Sub-namespace      | What it covers                                                                               |
+|--------------------|-----------------------------------------------------------------------------------------------|
+| `dispute`          | Dispute lifecycle: initiation, arbitrator selection, challenge handling and signature checks, vote collection, resolution, revalidation, skips when disabled or the engine is unhealthy |
+| `dispute-protocol` | Errors raised while handling an inbound dispute protocol message                                |
+| `invalidation`     | Applying and verifying invalidations: duplicate and stale-revision skips, delete/restore, replayed later actions, rejected certificates, signature-verification errors |
+| `cascade`          | Dispute escalation cascade: escalate decisions with collection/remainder counts, rejected child applies, escalation-sink errors |
+| `engine-health`    | Dispute-engine health: recorded losses, engines marked unhealthy, auto-recovery                 |
+
+#### Cohort-topic integration
+
+| Sub-namespace          | What it covers                                                                           |
+|------------------------|---------------------------------------------------------------------------------------------|
+| `cohort-topic`         | The cohort-topic host wired into a db-p2p node: promotion and demotion notices (adopted, stale, rate-limited, untrusted, undecodable), coord-engine registry caps, gossip-tick failures, and warnings when register/renew bodies are unsigned or the bootstrap-evidence gate is permissive. Distinct from the `optimystic:cohort-topic:*` substrate namespaces listed above |
+| `cohort-change-bridge` | The collection-change to origination bridge: origination hooks that threw, per collection and revision |
 
 Address learning is reported from two places: the inbound path (a cluster record arriving from a
 coordinator) logs under `peer-address-book`, while the outbound path
 (`Libp2pKeyPeerNetwork.recordPeerAddresses`, reached from the cluster/repo clients) logs the same
 `peer-address-book:merge` tag under `libp2p-key-network`. Enable `optimystic:db-p2p:*`, or both
-sub-namespaces, to see the whole picture.
+sub-namespaces, to see the whole picture. (`ClusterClient` walks records it fetched too, but only
+the record-level `peer-address-book:record-capped` tag comes from it, under `cluster-client`; the
+per-peer `merge` lines still come from whichever of the two sinks above did the merging.)
 
 ### Telling nodes apart in one process
 
@@ -510,7 +586,9 @@ DEBUG='optimystic:db-core:network-transactor,optimystic:db-p2p:protocol-client' 
 # Cache diagnostics
 DEBUG='optimystic:db-core:cache' node app.js
 
-# Cluster consensus (coordinator + member)
+# Cluster consensus (coordinator + member). `cluster` is ClusterCoordinator alone — an exact
+# match, so it does NOT pull in cluster-client/cluster-policy/cluster-service. Use
+# `optimystic:db-p2p:cluster*` if you want the whole cluster family.
 DEBUG='optimystic:db-p2p:cluster,optimystic:db-p2p:cluster-member' node app.js
 
 # Storage layer (repo + block storage)
@@ -531,11 +609,29 @@ DEBUG='optimystic:db-core:cohort-topic:*' node app.js
 # Trace a registration walk plus the anti-DoS rejections it triggers
 DEBUG='optimystic:db-core:cohort-topic:walk,optimystic:db-core:cohort-topic:antidos' node app.js
 
-# Full transaction lifecycle
-DEBUG='optimystic:db-core:network-transactor,optimystic:db-p2p:storage-repo,optimystic:db-p2p:block-storage,optimystic:db-p2p:cluster,optimystic:db-p2p:cluster-member' node app.js
+# Full transaction lifecycle. `cluster*` (not the exact `cluster`) on purpose: a lifecycle trace
+# wants the whole cluster family — coordinator, member, client, policy and the protocol service —
+# because a transaction that stalls is as likely to be a sizing or protocol-handler problem as a
+# consensus one.
+DEBUG='optimystic:db-core:network-transactor,optimystic:db-p2p:storage-repo,optimystic:db-p2p:block-storage,optimystic:db-p2p:cluster*,optimystic:db-p2p:coordinator-repo*' node app.js
 ```
 
 ## Adding new loggers
+
+**In this repo a log channel is created only through the package's own `createLogger`.** Two
+nearby alternatives are banned in `packages/*/src`, because both produce a namespace outside
+`optimystic:*` that none of the `DEBUG` filters on this page will ever match:
+
+- libp2p's `components.logger.forComponent('x')` — the factory closest to hand inside a libp2p
+  service, and the one that put nine `db-p2p` channels outside the documented tree. It yields the
+  bare namespace `x`.
+- `import debug from 'debug'` outside a package's `src/logger.ts` — that file is the chokepoint
+  that prepends `optimystic:<package>:`; bypassing it means nothing prepends anything.
+
+`eslint.config.js` enforces both (`no-restricted-syntax`), and
+`packages/db-p2p/test/logger.spec.ts` re-checks them under `yarn test` along with the completeness
+of the db-p2p table above. Test files are exempt: specs legitimately stub a `forComponent` method
+to satisfy libp2p-shaped interfaces, and `test/support/capture-log.ts` imports `debug` by design.
 
 Each package has a `createLogger(subNamespace)` helper (in `db-p2p` it takes an optional second
 argument, the owning node's peer id — see *Telling nodes apart in one process* above):

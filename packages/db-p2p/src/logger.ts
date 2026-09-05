@@ -195,6 +195,15 @@ export interface Logger extends debug.Debugger {
  * The peer-id suffix goes BEFORE `:error` / `:trace` — those are children of the concrete channel,
  * so a two-node process gets `…:x:12D3KooWAb:error`, not `…:x:error:12D3KooWAb`.
  */
+/*
+ * NOTE: `packages/db-p2p/test/logger.spec.ts` asserts that every namespace this package emits has
+ * a row in the db-p2p table of `docs/debugging.md`, and it finds them by scanning `src/` for
+ * `createLogger("…")` / `createLogger('…')` — STRING LITERALS ONLY. A namespace built from a
+ * variable (`createLogger(someName)`) is invisible to that guard, so it would go undocumented
+ * silently. No such call site exists today; the two that pass a fallback
+ * (`createLogger(init.logPrefix ?? 'repo-service')`) still carry the literal, which is what the
+ * scan picks up. If you ever need a fully computed namespace, document it by hand and say so here.
+ */
 export function createLogger(subNamespace: string, peerId?: string): Logger {
 	const suffix = peerId ? `:${peerId.substring(0, 12)}` : ''
 	const namespace = `${BASE_NAMESPACE}:${subNamespace}${suffix}`

@@ -10,6 +10,9 @@
  * rather than something like `…:undefined`.
  */
 
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { expect } from 'chai';
 import debug from 'debug';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
@@ -471,5 +474,109 @@ describe('createLogger format specifiers ported from @libp2p/logger', () => {
 			log('p=%p a=%a c=%c b=%b t=%t m=%m');
 		});
 		expect(withNoArgs).to.include('p=undefined a=undefined c=undefined b=undefined t=undefined m=undefined');
+	});
+});
+
+/**
+ * Ticket: lock-and-document-db-p2p-log-namespaces
+ *
+ * The three specs above pin what `createLogger` *does*. These pin what the package is *allowed to
+ * do*: every diagnostic channel in `packages/db-p2p/src` is created through `createLogger`, so
+ * every namespace is rooted in `optimystic:db-p2p:` and `docs/debugging.md` can enumerate them.
+ *
+ * `eslint.config.js` enforces the first two of these under `yarn lint`; they are repeated here so
+ * `yarn test` catches the same class, and so a contributor who never runs lint still sees it.
+ *
+ * The package's `src/` is resolved from this file rather than from `process.cwd()` — mocha runs
+ * from the package root today, but these specs should not depend on that. `dist/` must never be
+ * scanned: it holds compiled copies of the very strings being asserted absent, so a walk rooted
+ * one level too high passes before the fix and fails after it.
+ */
+describe('db-p2p log-namespace guards', () => {
+	const SRC_DIR = fileURLToPath(new URL('../src/', import.meta.url));
+
+	/** Every `.ts` file under `packages/db-p2p/src`, as paths relative to that directory. */
+	function listSourceFiles(dir: string, prefix = ''): string[] {
+		const out: string[] = [];
+		for (const entry of readdirSync(dir, { withFileTypes: true })) {
+			const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+			if (entry.isDirectory()) {
+				out.push(...listSourceFiles(join(dir, entry.name), rel));
+			} else if (entry.name.endsWith('.ts')) {
+				out.push(rel);
+			}
+		}
+		return out;
+	}
+
+	/**
+	 * Blank out comments so a prose mention of a banned construct is not a violation — the ban is
+	 * on calling it, and `libp2p-node-base.ts` legitimately explains in a comment which
+	 * reach-through it replaced.
+	 *
+	 * NOTE: this is a lexer's-eye approximation, not a parser. A string literal containing the
+	 * characters `/*` or a non-URL `//` would be over-stripped for the rest of that line/comment.
+	 * No such literal exists in this package; if one ever does, the symptom is a guard that goes
+	 * quiet, so prefer widening this over deleting the assertion.
+	 */
+	const stripComments = (source: string): string => source
+		.replace(/\/\*[\s\S]*?\*\//g, '')
+		.replace(/(^|[^:])\/\/.*$/gm, '$1');
+
+	const sourceFiles = listSourceFiles(SRC_DIR)
+		.map(rel => ({ rel, code: stripComments(readFileSync(join(SRC_DIR, rel), 'utf8')) }));
+
+	it('finds source files to scan at all', () => {
+		// Guards the guards: a bad path or a silent walk failure would make every assertion below
+		// vacuously pass.
+		expect(sourceFiles.length).to.be.greaterThan(20);
+		expect(sourceFiles.map(f => f.rel)).to.include('logger.ts');
+	});
+
+	it('never calls libp2p\'s components.logger.forComponent()', () => {
+		const offenders = sourceFiles.filter(f => f.code.includes('.forComponent(')).map(f => f.rel);
+		expect(offenders, `these files create a log namespace outside optimystic:db-p2p: ${offenders.join(', ')}`)
+			.to.deep.equal([]);
+	});
+
+	it('imports `debug` only in src/logger.ts', () => {
+		const importsDebug = /(?:^|\n)\s*import\s[^;]*?from\s*['"]debug['"]/;
+		const offenders = sourceFiles
+			.filter(f => f.rel !== 'logger.ts' && importsDebug.test(f.code))
+			.map(f => f.rel);
+		expect(offenders, `these files build debug channels outside createLogger: ${offenders.join(', ')}`)
+			.to.deep.equal([]);
+	});
+
+	it('documents every sub-namespace the package emits in docs/debugging.md', () => {
+		// Both quote styles: the tree has single-quoted and double-quoted call sites, and a
+		// single-quote-only regex is exactly how the existing table came to be a subset of reality.
+		// The literal may not be the first token — `createLogger(init.logPrefix ?? 'repo-service')`
+		// is a real call site — so take the first string literal inside the call.
+		const call = /createLogger\(\s*[^)'"]*['"]([^'"]+)['"]/g;
+		const emitted = new Set<string>();
+		for (const { rel, code } of sourceFiles) {
+			// `logger.ts` is the factory's own definition; its only match is the `parent:child`
+			// example in the doc comment for `createLogger`, which is not a real channel. (The
+			// comment stripper already removes it — this skip states the intent rather than
+			// relying on that.)
+			if (rel === 'logger.ts') continue;
+			for (const m of code.matchAll(call)) emitted.add(m[1]!);
+		}
+
+		// Scope to the db-p2p section so a coincidental mention elsewhere in the file (a recipe, a
+		// prose aside, the cohort-topic table) cannot satisfy the check.
+		const docs = readFileSync(fileURLToPath(new URL('../../../docs/debugging.md', import.meta.url)), 'utf8');
+		// Split on `'\n### '` WITH the trailing space: the section is internally divided by `####`
+		// sub-headings (one table per subsystem), and a bare `'\n###'` would stop at the first of
+		// those and silently check only a ninth of the table.
+		const section = docs.split('### db-p2p sub-namespaces')[1]?.split('\n### ')[0];
+		expect(section, 'docs/debugging.md no longer has a "### db-p2p sub-namespaces" section').to.be.a('string');
+
+		// Backticked cell, matched literally: `network:get-manager` and `storage:restoration` are
+		// nested channels, so anything that splits on `:` would fail to find them.
+		const undocumented = [...emitted].filter(ns => !section!.includes(`\`${ns}\``)).sort();
+		expect(undocumented, `add a row to the db-p2p table in docs/debugging.md for: ${undocumented.join(', ')}`)
+			.to.deep.equal([]);
 	});
 });
