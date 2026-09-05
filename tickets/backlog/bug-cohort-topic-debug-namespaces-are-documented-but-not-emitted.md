@@ -1,5 +1,5 @@
 description: The debug-logging guide tells operators to switch on seven diagnostic channels for the cohort-topic subsystem, and to reach them under a name that no code uses. Four of the seven channels do not exist anywhere in the codebase, so an operator following the guide sees nothing and has no way to tell whether the subsystem is silent or simply never ran.
-files: docs/debugging.md, packages/db-core/src/logger.ts, packages/db-p2p/src/cohort-topic/host.ts, packages/db-p2p/src/cohort-topic/change-bridge.ts
+files: docs/debugging.md, packages/db-core/src/logger.ts, packages/db-p2p/src/cohort-topic/host.ts, packages/db-p2p/src/cohort-topic/change-bridge.ts, packages/db-p2p/test/logger.spec.ts
 repro: static
 severity: cosmetic
 likelihood: normal-use
@@ -94,3 +94,27 @@ the same *class* of defect (a documented `DEBUG` filter that does not match the 
 in `db-p2p`'s service loggers. Those three tickets deliberately leave this section alone — different
 packages, different root cause. The guard test the third of them adds checks only the db-p2p table,
 so it will not catch this one.
+
+## Arm added during review of `lock-and-document-db-p2p-log-namespaces`
+
+That ticket landed a guard test that now checks the db-p2p table **in both directions** — every
+channel the code creates has a row, and every row names a channel the code creates (plus: no
+duplicate rows). It lives in `packages/db-p2p/test/logger.spec.ts`, under
+`describe('db-p2p log-namespace guards')`, and both directions were mutation-proven. It is a
+copyable template for the other three tables in the same file.
+
+Checking the other tables by hand while reviewing that work turned up one more discrepancy, in the
+same file and of the same class:
+
+- **`### db-core sub-namespaces` is incomplete.** `packages/db-core/src` creates nine channels;
+  the table lists four. `digest` and `trx:coordinator` appear nowhere in the guide. (The other
+  three are `cohort-topic:antidos` / `:antiflood` / `:coldstart`, which are the ones this ticket is
+  already about — they are documented, but under a base namespace nothing emits.)
+- **`### quereus-plugin sub-namespaces` is correct** — four rows, four channels, exact match.
+  Nothing to do there beyond wiring it to a guard so it stays that way.
+
+So whoever picks this up is fixing three things in one file: the cohort-topic base name and its
+four phantom rows (above), the two missing db-core rows, and — the part that stops all of it
+recurring — extending the bijection guard to cover the db-core, cohort-topic and quereus-plugin
+tables, not just db-p2p. The guard for a table owned by more than one package needs to scan more
+than one package's `src/`, which is why it was not simply generalized in place during that review.

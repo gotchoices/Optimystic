@@ -71,7 +71,7 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 | `block-transfer-service` | The inbound side of the same protocol: push/pull request and response sizes, certified-push accepts and rejects, persist failures, service start/stop |
 | `rebalance-monitor`   | Periodic rebalance checks: gained/lost/grown block counts, growth budget deferrals and give-ups, throttling, partition suppression |
 | `spread-on-churn`     | Replica spreading triggered by peer churn: per-block push ok/fail/rejected, blocks untracked for missing local data, partition suppression |
-| `ring-shift`          | Ring-shift phases: `phaseA:advertise`, `phaseB:abort` with the ring it rolled back to, `phaseC:release` with shed counts, and resumed old ranges |
+| `ring-shift`          | Ring-shift phases: `phaseA:advertise`, `phaseB:abort` with the ring it rolled back to, `phaseC:release` with shed counts, `moveIn:advertise` for the shed-nothing inward move, and resumed old ranges |
 
 #### Networking and routing
 
@@ -82,7 +82,7 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 | `libp2p-key-network`  | Coordinator and cluster lookup: FRET neighbour candidates, connected-peer selection and retries, membership filtering, addressless and self-relay-only members *(peer-id suffixed)* |
 | `network-manager`     | `NetworkManagerService`: `awaitHealthy` connection counts and timeouts, cohort key seeding failures, invalid peer ids in a cohort |
 | `network:get-manager` | Failures injecting the real libp2p node into the network manager after construction        |
-| `peer-address-book`   | Peer multiaddrs learned or rejected: `merge`, `capped`, `record-capped` *(peer-id suffixed)* |
+| `peer-address-book`   | Peer multiaddrs learned, capped or rejected: `merge`, `capped`, `record-capped`, `peerstore-miss`, plus `WARN:` lines for multiaddrs that address nothing or fail to parse, records carrying an unparseable peer id, and failed peerstore merges *(peer-id suffixed)* |
 | `peer-reputation`     | Reputation scoring: per-peer reports with reason, weight, resulting score and context, and resets |
 | `matchmaking-query`   | Matchmaking query transport: dropped and rate-limited inbound queries, dial/decode failures against a primary |
 | `sync-service`        | Sync protocol service start/stop, request-handling errors, and archive-build failures per block |

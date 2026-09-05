@@ -548,35 +548,76 @@ describe('db-p2p log-namespace guards', () => {
 			.to.deep.equal([]);
 	});
 
-	it('documents every sub-namespace the package emits in docs/debugging.md', () => {
-		// Both quote styles: the tree has single-quoted and double-quoted call sites, and a
-		// single-quote-only regex is exactly how the existing table came to be a subset of reality.
-		// The literal may not be the first token — `createLogger(init.logPrefix ?? 'repo-service')`
-		// is a real call site — so take the first string literal inside the call.
+	/**
+	 * Every sub-namespace `src/` actually creates, by string literal.
+	 *
+	 * Both quote styles: the tree has single-quoted and double-quoted call sites, and a
+	 * single-quote-only regex is exactly how the table came to be a subset of reality. The literal
+	 * may not be the first token — `createLogger(init.logPrefix ?? 'repo-service')` is a real call
+	 * site — so take the first string literal inside the call.
+	 */
+	const emittedNamespaces = (() => {
 		const call = /createLogger\(\s*[^)'"]*['"]([^'"]+)['"]/g;
-		const emitted = new Set<string>();
+		const out = new Set<string>();
 		for (const { rel, code } of sourceFiles) {
 			// `logger.ts` is the factory's own definition; its only match is the `parent:child`
 			// example in the doc comment for `createLogger`, which is not a real channel. (The
 			// comment stripper already removes it — this skip states the intent rather than
 			// relying on that.)
 			if (rel === 'logger.ts') continue;
-			for (const m of code.matchAll(call)) emitted.add(m[1]!);
+			for (const m of code.matchAll(call)) out.add(m[1]!);
 		}
+		return out;
+	})();
 
-		// Scope to the db-p2p section so a coincidental mention elsewhere in the file (a recipe, a
-		// prose aside, the cohort-topic table) cannot satisfy the check.
+	/**
+	 * The `### db-p2p sub-namespaces` section, scoped so a coincidental mention elsewhere in the
+	 * file (a recipe, a prose aside, the cohort-topic table) cannot satisfy either check.
+	 *
+	 * Split on `'\n### '` WITH the trailing space: the section is internally divided by `####`
+	 * sub-headings (one table per subsystem), and a bare `'\n###'` would stop at the first of
+	 * those and silently check only a ninth of the table.
+	 */
+	function docsSection(): string {
 		const docs = readFileSync(fileURLToPath(new URL('../../../docs/debugging.md', import.meta.url)), 'utf8');
-		// Split on `'\n### '` WITH the trailing space: the section is internally divided by `####`
-		// sub-headings (one table per subsystem), and a bare `'\n###'` would stop at the first of
-		// those and silently check only a ninth of the table.
 		const section = docs.split('### db-p2p sub-namespaces')[1]?.split('\n### ')[0];
 		expect(section, 'docs/debugging.md no longer has a "### db-p2p sub-namespaces" section').to.be.a('string');
+		return section!;
+	}
 
+	/** First cell of each table row, anchored so prose backticks are not mistaken for rows. */
+	const documentedNamespaces = (section: string): string[] =>
+		[...section.matchAll(/^\|\s*`([^`]+)`\s*\|/gm)].map(m => m[1]!);
+
+	/**
+	 * Namespaces documented by hand because the scan cannot see them — a `createLogger` call whose
+	 * argument is computed rather than a literal (see the NOTE above `createLogger` in
+	 * `src/logger.ts`). Empty today: add the namespace here rather than weakening the assertion.
+	 */
+	const HAND_DOCUMENTED = new Set<string>();
+
+	it('documents every sub-namespace the package emits in docs/debugging.md', () => {
+		const section = docsSection();
 		// Backticked cell, matched literally: `network:get-manager` and `storage:restoration` are
 		// nested channels, so anything that splits on `:` would fail to find them.
-		const undocumented = [...emitted].filter(ns => !section!.includes(`\`${ns}\``)).sort();
+		const undocumented = [...emittedNamespaces].filter(ns => !section.includes(`\`${ns}\``)).sort();
 		expect(undocumented, `add a row to the db-p2p table in docs/debugging.md for: ${undocumented.join(', ')}`)
+			.to.deep.equal([]);
+	});
+
+	it('emits every sub-namespace the db-p2p table documents', () => {
+		// The mirror of the check above, and the one that matters to an operator: a row for a
+		// channel nothing emits turns `DEBUG=…` silence into false evidence about the *system*
+		// rather than about the docs. That failure has already been reported once against this
+		// file (the cohort-topic section, still open).
+		const section = docsSection();
+		const rows = documentedNamespaces(section);
+		const phantom = rows.filter(ns => !emittedNamespaces.has(ns) && !HAND_DOCUMENTED.has(ns)).sort();
+		expect(phantom, `these rows in docs/debugging.md name channels no createLogger call creates: ${phantom.join(', ')}`)
+			.to.deep.equal([]);
+
+		const duplicated = rows.filter((ns, i) => rows.indexOf(ns) !== i).sort();
+		expect(duplicated, `these sub-namespaces have more than one row in docs/debugging.md: ${duplicated.join(', ')}`)
 			.to.deep.equal([]);
 	});
 });
