@@ -18,6 +18,18 @@ const BASE_NAMESPACE = 'optimystic:db-p2p'
  * loggers use `weald` (via @libp2p/logger) and carry their own copy — the two registries are
  * independent, and enabling one from test code does not enable the other.
  *
+ * NOTE: `debug.formatters` is process-wide, and the other six packages' `createLogger` factories
+ * import the same `debug` module — so importing this file makes `%p`/`%e`/… work from their
+ * loggers too. Harmless today (no other package registers any specifier, and none of these letters
+ * is a `util.format` specifier except `%c`, whose Node meaning is a no-op that swallows its
+ * argument). If a second package ever registers one of these letters, last import wins silently;
+ * move the registry somewhere both can share rather than racing on it.
+ *
+ * NOTE: only `%e` is guaranteed not to throw — its call sites take a `catch`-bound `unknown`. The
+ * other six call `.toString()` / an encoder on whatever they are handed, so a caller that passes
+ * the wrong type turns a log line into an exception. That matches upstream; tighten them if a
+ * call site ever formats a value it did not construct.
+ *
  * `%k` (`interface-datastore`'s `Key`) is deliberately NOT ported: `interface-datastore` is not a
  * declared dependency of this package and no call site formats one. Add it if that changes.
  */
@@ -153,6 +165,11 @@ debug.formatters['e'] = (v?: Error): string => {
  * conditional version reads its enablement once at construction — wrong for anything built before
  * `DEBUG` is set. `newScope` is deliberately omitted; `createLogger('parent:child')` says the same
  * thing and nothing calls it.
+ *
+ * NOTE: because `trace` is a real channel, the wildcard `optimystic:db-p2p:*` that
+ * `docs/debugging.md` tells operators to set will also show trace lines. Nothing calls `.trace`
+ * yet, so that is currently free; if trace logging ever becomes voluminous, give the docs a
+ * narrower default filter rather than stubbing the channel back out.
  */
 export interface Logger extends debug.Debugger {
 	error: debug.Debugger

@@ -562,3 +562,40 @@ log('operation key=%s count=%d', key, count);
 ```
 
 Use `printf`-style format strings (`%s`, `%d`, `%o`) for structured output.
+
+### Severity sub-channels and extra specifiers (db-p2p only)
+
+`db-p2p`'s `createLogger` returns a `Logger` — the ordinary channel plus two child channels,
+`<namespace>:error` and `<namespace>:trace`:
+
+```typescript
+const log = createLogger('my-module');
+log('normal line');            // optimystic:db-p2p:my-module
+log.error('failure line');     // optimystic:db-p2p:my-module:error
+log.trace('very noisy line');  // optimystic:db-p2p:my-module:trace
+```
+
+They are ordinary child namespaces, so a wildcard filter reaches them and an exact-match one does
+not — `DEBUG=optimystic:db-p2p:my-module` shows only the first line and
+`DEBUG=optimystic:db-p2p:my-module*` shows all three. Same caveat as the peer-id suffix
+(*Telling nodes apart in one process* above); when both are present the peer id comes first
+(`optimystic:db-p2p:my-module:12D3KooWAb:error`). Unlike libp2p's own logger, `trace` here is a
+real channel rather than a no-op, so a broad `optimystic:db-p2p:*` will include trace lines.
+
+`packages/db-p2p/src/logger.ts` also registers these format specifiers, ported from libp2p's
+logger so a log line can move between the two factories unchanged:
+
+| Specifier | Argument     | Renders as                                             |
+|-----------|--------------|--------------------------------------------------------|
+| `%p`      | `PeerId`     | the peer id string                                     |
+| `%a`      | `Multiaddr`  | the multiaddr string                                   |
+| `%c`      | `CID`        | the CID string                                         |
+| `%e`      | `Error`      | message + stack, expanding each inner `AggregateError` |
+| `%b`      | `Uint8Array` | base58btc                                              |
+| `%t`      | `Uint8Array` | base32                                                 |
+| `%m`      | `Uint8Array` | base64                                                 |
+
+Each renders `undefined` for a missing or nullish argument. Registration happens when
+`packages/db-p2p/src/logger.ts` is first imported and applies to the whole `debug` module, so the
+specifiers reach every package's logger in a process that loaded `db-p2p` — but only `db-p2p`
+guarantees that import, so only use them there.

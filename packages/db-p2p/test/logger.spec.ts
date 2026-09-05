@@ -435,4 +435,41 @@ describe('createLogger format specifiers ported from @libp2p/logger', () => {
 
 		expect(text).to.include('[Error list was empty]');
 	});
+
+	/**
+	 * The indentation arithmetic in `printError`'s AggregateError branch is the one part of the
+	 * port that is easy to get subtly wrong and impossible to notice from a single-level case:
+	 * each nesting level indents its children four more spaces, and siblings at one level align,
+	 * so a nested aggregate reads as a tree rather than as a flat run of stacks.
+	 */
+	it('indents each nesting level of an AggregateError by four more spaces', async () => {
+		const inner = new AggregateError([new Error('leaf-a'), new Error('leaf-b')], 'inner-agg');
+
+		const text = await captureOneLine('fmt-probe-agg-nested', log => {
+			log('%e', new AggregateError([inner, new Error('sibling')], 'outer-agg'));
+		});
+
+		expect(text).to.include('\n    AggregateError: inner-agg');
+		expect(text).to.include('\n        Error: leaf-a');
+		expect(text).to.include('\n        Error: leaf-b');
+		// A sibling of the inner aggregate stays at the outer level rather than inheriting its indent.
+		expect(text).to.include('\n    Error: sibling');
+	});
+
+	/**
+	 * All six value specifiers share one nullish guard. Pinning the whole set in one line catches a
+	 * future specifier added without it, which would throw from inside a log call rather than
+	 * printing something.
+	 */
+	it('renders `undefined` for a nullish or missing argument on every value specifier', async () => {
+		const withNullish = await captureOneLine('fmt-probe-nullish', log => {
+			log('p=%p a=%a c=%c b=%b t=%t m=%m', undefined, null, undefined, null, undefined, null);
+		});
+		expect(withNullish).to.include('p=undefined a=undefined c=undefined b=undefined t=undefined m=undefined');
+
+		const withNoArgs = await captureOneLine('fmt-probe-noargs', log => {
+			log('p=%p a=%a c=%c b=%b t=%t m=%m');
+		});
+		expect(withNoArgs).to.include('p=undefined a=undefined c=undefined b=undefined t=undefined m=undefined');
+	});
 });
