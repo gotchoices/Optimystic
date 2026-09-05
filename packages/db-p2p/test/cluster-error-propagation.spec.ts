@@ -13,6 +13,7 @@ import {
 	isClusterErrorEnvelope,
 	clusterErrorFromEnvelope,
 } from '../src/cluster/cluster-error.js';
+import { captureLog, hasLine } from './support/capture-log.js';
 
 async function makePeerId(): Promise<PeerId> {
 	const pk = await generateKeyPair('Ed25519');
@@ -80,7 +81,6 @@ function makeServiceStream(requestChunks: Uint8Array[]) {
 }
 
 const makeComponents = (cluster: ICluster, peerId: PeerId): ClusterServiceComponents => ({
-	logger: { forComponent: () => ({ error: () => {}, info: () => {}, trace: () => {}, debug: () => {} }) as any },
 	registrar: { handle: async () => {}, unhandle: async () => {} },
 	cluster,
 	peerId,
@@ -147,6 +147,45 @@ describe('cluster error envelope', () => {
 			expect(detail.message).to.equal('processUpdate rejected: consensus throw');
 			expect(detail.name).to.equal('ConsensusError');
 			expect(detail.code).to.equal('ERR_CONSENSUS');
+		});
+
+		/**
+		 * The line that reports the throw formats with `%p` (peer id) and `%e` (error) — specifiers
+		 * `@libp2p/logger` registers on `weald`, NOT specifiers `debug` knows out of the box. This
+		 * service used to log through libp2p's factory and now logs through this package's
+		 * `createLogger`, which carries its own port of them (`src/logger.ts`). Without that port
+		 * the operator would read the literal text `%p - %e` at exactly the moment a cluster update
+		 * failed, so the substitution is pinned here rather than left to the port's own unit specs.
+		 */
+		it('formats the failure line with the peer id and the error, not literal %p / %e', async () => {
+			const peerId = await makePeerId();
+			const throwingCluster: ICluster = {
+				async update(): Promise<ClusterRecord> {
+					throw Object.assign(new Error('processUpdate rejected: consensus throw'), {
+						name: 'ConsensusError',
+						code: 'ERR_CONSENSUS',
+					});
+				},
+			};
+			const service = new ClusterService(makeComponents(throwingCluster, peerId));
+			const { stream, done } = makeServiceStream(
+				await encodeJson({ operation: 'update', record: makeRecord() })
+			);
+
+			const captured = await captureLog('cluster-service', async () => {
+				(service as unknown as { handleIncomingStream: (s: unknown, c: unknown) => void })
+					.handleIncomingStream(stream, { remotePeer: peerId });
+				await done;
+			});
+
+			expect(hasLine(captured, 'error processing cluster update'),
+				'the failure is reported on the service own channel').to.equal(true);
+			expect(hasLine(captured, peerId.toString()),
+				'%p resolves to the remote peer id').to.equal(true);
+			expect(hasLine(captured, 'processUpdate rejected: consensus throw'),
+				'%e resolves to the error text').to.equal(true);
+			expect(hasLine(captured, '%p'), 'no unresolved %p survives into the output').to.equal(false);
+			expect(hasLine(captured, '%e'), 'no unresolved %e survives into the output').to.equal(false);
 		});
 
 		it('returns the record (not an envelope) when update succeeds', async () => {

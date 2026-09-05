@@ -1,22 +1,19 @@
 import { pipe } from 'it-pipe'
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed'
-import type { Startable, Logger, Stream, Connection, StreamHandler, PeerId, Libp2p } from '@libp2p/interface'
+import type { Startable, Stream, Connection, StreamHandler, PeerId, Libp2p } from '@libp2p/interface'
 import type { IRepo, RepoMessage } from '@optimystic/db-core'
 import { blockIdsForTransforms } from '@optimystic/db-core'
 import { peersEqual } from '../peer-utils.js'
 import { encodePeers, type RedirectPayload } from './redirect.js'
 import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js'
 import type { Uint8ArrayList } from 'uint8arraylist'
-import { createLogger } from '../logger.js'
+import { createLogger, type Logger } from '../logger.js'
 import { publishableAddrsForPeer, type AddressLog, type DirectionalConnection } from '../peer-address-book.js'
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js'
 import { registerProtocolHandler } from '../network/register-protocol-handler.js'
 
-const debugLog = createLogger('repo-service')
-
 // Define Components interface
 interface BaseComponents {
-	logger: { forComponent: (name: string) => Logger },
 	registrar: {
 		handle: (protocol: string, handler: StreamHandler, options: any) => Promise<void>
 		unhandle: (protocol: string) => Promise<void>
@@ -52,6 +49,12 @@ export type RepoServiceInit = InboundStreamAuthorizationInit & {
 	protocolPrefix?: string,
 	maxInboundStreams?: number,
 	maxOutboundStreams?: number,
+	/**
+	 * Sub-namespace this service logs under, i.e. the `<x>` in `optimystic:db-p2p:<x>`.
+	 * NOT a full namespace: an embedder cannot use this to move the service's lines outside the
+	 * `optimystic:db-p2p:*` tree `docs/debugging.md` tells operators to filter on.
+	 * Default: `repo-service`.
+	 */
 	logPrefix?: string,
 	kBucketSize?: number,
 	/**
@@ -94,8 +97,8 @@ export class RepoService implements Startable {
 	private readonly authorization: InboundStreamAuthorization | undefined
 	/**
 	 * Sink for this service's `peer-address-book:*` lines — same reasoning as `ClusterService`'s:
-	 * `this.log.error` would strand them under `db-p2p:repo-service:error`, outside the
-	 * `optimystic:db-p2p:*` tree every other address-book line lives in.
+	 * `this.log.error` would scatter one tag family across whichever service happened to be the
+	 * ingress point, instead of keeping it filterable as the single `peer-address-book` namespace.
 	 */
 	private readonly addressLog: AddressLog
 
@@ -105,7 +108,7 @@ export class RepoService implements Startable {
 		this.protocol = computed
 		this.maxInboundStreams = init.maxInboundStreams ?? 32
 		this.maxOutboundStreams = init.maxOutboundStreams ?? 64
-		this.log = components.logger.forComponent(init.logPrefix ?? 'db-p2p:repo-service')
+		this.log = createLogger(init.logPrefix ?? 'repo-service')
 		this.addressLog = createLogger('peer-address-book', components.peerId?.toString())
 		this.repo = components.repo
 		this.running = false
@@ -246,7 +249,7 @@ export class RepoService implements Startable {
 
 		if (!smallMesh && !isMember) {
 			const peers = cluster.filter((p: PeerId) => !peersEqual(p, selfId))
-			debugLog('redirect op=%s blockKey=%s cluster=%d', opName, blockKey, cluster.length)
+			this.log('redirect op=%s blockKey=%s cluster=%d', opName, blockKey, cluster.length)
 			return encodePeers(await Promise.all(peers.map(async (pid: PeerId) => ({
 				id: pid.toString(),
 				addrs: await this.getPeerAddrs(pid)

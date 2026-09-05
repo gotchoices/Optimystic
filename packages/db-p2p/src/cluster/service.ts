@@ -1,19 +1,18 @@
 import { pipe } from 'it-pipe';
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed';
 import { peerIdFromString } from '@libp2p/peer-id';
-import type { Startable, Logger, Stream, Connection, StreamHandler, PeerId } from '@libp2p/interface';
+import type { Startable, Stream, Connection, StreamHandler, PeerId } from '@libp2p/interface';
 import type { ICluster, ClusterRecord } from '@optimystic/db-core';
 import { encodePeers, type RedirectPayload } from '../repo/redirect.js';
 import { toClusterErrorEnvelope } from './cluster-error.js';
 import { mergeRecordPeerAddresses, publishableAddrsForPeer, type AddressLog, type DirectionalConnection } from '../peer-address-book.js';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
-import { createLogger } from '../logger.js';
+import { createLogger, type Logger } from '../logger.js';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
 import { registerProtocolHandler } from '../network/register-protocol-handler.js';
 
 interface BaseComponents {
-	logger: { forComponent: (name: string) => Logger },
 	registrar: {
 		handle: (protocol: string, handler: StreamHandler, options: any) => Promise<void>,
 		unhandle: (protocol: string) => Promise<void>
@@ -49,6 +48,12 @@ export interface ClusterServiceInit extends InboundStreamAuthorizationInit {
 	protocolPrefix?: string,
 	maxInboundStreams?: number,
 	maxOutboundStreams?: number,
+	/**
+	 * Sub-namespace this service logs under, i.e. the `<x>` in `optimystic:db-p2p:<x>`.
+	 * NOT a full namespace: an embedder cannot use this to move the service's lines outside the
+	 * `optimystic:db-p2p:*` tree `docs/debugging.md` tells operators to filter on.
+	 * Default: `cluster-service`.
+	 */
 	logPrefix?: string,
 	/**
 	 * Responsibility K - the replica set size for determining cluster membership.
@@ -74,11 +79,11 @@ export class ClusterService implements Startable {
 	private readonly maxOutboundStreams: number;
 	private readonly log: Logger;
 	/**
-	 * Sink for this service's `peer-address-book:*` lines. Deliberately NOT `this.log.error`, which
-	 * lands them under libp2p's `db-p2p:cluster:error` namespace — invisible to the
-	 * `DEBUG=optimystic:db-p2p:*` filter this package's docs recommend, and the reason
-	 * gotchoices/Optimystic#12 read a zero log count as proof the mechanism never ran. One tag
-	 * family, one namespace tree.
+	 * Sink for this service's `peer-address-book:*` lines. Deliberately NOT `this.log.error`: the
+	 * `peer-address-book:*` tag family is emitted from several unrelated call sites (this service,
+	 * `ClusterClient`, `Libp2pKeyPeerNetwork`) and must be filterable as ONE namespace, rather than
+	 * scattered across whichever service happened to be the ingress point. That scattering is what
+	 * gotchoices/Optimystic#12 read as proof the mechanism never ran. One tag family, one namespace.
 	 */
 	private readonly addressLog: AddressLog;
 	private readonly cluster: ICluster;
@@ -94,7 +99,7 @@ export class ClusterService implements Startable {
 		this.protocol = init.protocol ?? (init.protocolPrefix ?? '/db-p2p') + '/cluster/1.0.0';
 		this.maxInboundStreams = init.maxInboundStreams ?? 32;
 		this.maxOutboundStreams = init.maxOutboundStreams ?? 64;
-		this.log = components.logger.forComponent(init.logPrefix ?? 'db-p2p:cluster');
+		this.log = createLogger(init.logPrefix ?? 'cluster-service');
 		this.addressLog = createLogger('peer-address-book', components.peerId?.toString());
 		this.cluster = components.cluster;
 		this.running = false;

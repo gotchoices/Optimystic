@@ -19,6 +19,7 @@ import {
 	UnauthorizedInboundStreamError,
 	type AuthorizeInboundStream,
 } from '../src/inbound-authorization.js';
+import { captureLog, hasLine } from './support/capture-log.js';
 
 /**
  * Inbound-stream authorization (feat-inbound-stream-authorization-hook).
@@ -41,18 +42,6 @@ const makePeerId = async (): Promise<PeerId> => {
 	const key = await generateKeyPair('Ed25519');
 	return peerIdFromPrivateKey(key);
 };
-
-/** A callable logger that records everything written to `.error` (the authorization sink). */
-function makeLogger() {
-	const errors: string[] = [];
-	const fn: any = (..._args: unknown[]) => { };
-	fn.error = (msg: string, ...args: unknown[]) => { errors.push(`${msg} ${args.map(a => String(a)).join(' ')}`); };
-	fn.trace = () => { };
-	fn.debug = () => { };
-	fn.info = () => { };
-	fn.warn = () => { };
-	return { logger: { forComponent: () => fn } as any, errors };
-}
 
 /** A registrar that captures the handler registered by a service's `start()`. */
 function capturingRegistrar() {
@@ -119,11 +108,16 @@ function recordingPredicate(verdict: boolean): { predicate: AuthorizeInboundStre
 interface ServiceCase {
 	readonly name: string;
 	readonly protocol: string;
+	/**
+	 * The `createLogger` sub-namespace this service's own lines land under, i.e. the `<x>` in
+	 * `optimystic:db-p2p:<x>`. The logging cases below assert the denial text appears on THIS
+	 * namespace's `:error` child, so a service silently retargeted at another one fails here.
+	 */
+	readonly namespace: string;
 	build: (init: { authorizeInboundStream?: AuthorizeInboundStream, authorizeInboundStreamTimeoutMs?: number }) => Promise<{
 		drive: (connection?: unknown) => Promise<void>;
 		mock: ReturnType<typeof makeMockStream>;
 		executions: () => number;
-		errors: string[];
 	}>;
 }
 
@@ -132,17 +126,16 @@ const PREFIX = '/optimystic/authz-test';
 const SERVICE_CASES: ServiceCase[] = [
 	{
 		name: 'repo',
+		namespace: 'repo-service',
 		protocol: `${PREFIX}/repo/1.0.0`,
 		async build(init) {
 			const repo = { calls: 0, async get() { repo.calls++; return {}; }, async pend() { repo.calls++; return {}; }, async cancel() { repo.calls++; return {}; }, async commit() { repo.calls++; return {}; } };
-			const { logger, errors } = makeLogger();
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new RepoService({ logger, registrar, repo: repo as any }, { protocolPrefix: PREFIX, ...init });
+			const service = new RepoService({ registrar, repo: repo as any }, { protocolPrefix: PREFIX, ...init });
 			await service.start();
 			const mock = makeMockStream(await encodeMessages({ operations: [{ get: { blockIds: ['block-1'] } }] }));
 			return {
 				mock,
-				errors,
 				executions: () => repo.calls,
 				drive: async (connection) => { getHandler()(mock.stream as any, connection as any); await mock.finished; },
 			};
@@ -150,17 +143,16 @@ const SERVICE_CASES: ServiceCase[] = [
 	},
 	{
 		name: 'cluster',
+		namespace: 'cluster-service',
 		protocol: `${PREFIX}/cluster/1.0.0`,
 		async build(init) {
 			const cluster = { calls: 0, async update(record: any) { cluster.calls++; return record; } };
-			const { logger, errors } = makeLogger();
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new ClusterService({ logger, registrar, cluster: cluster as any }, { protocolPrefix: PREFIX, ...init });
+			const service = new ClusterService({ registrar, cluster: cluster as any }, { protocolPrefix: PREFIX, ...init });
 			await service.start();
 			const mock = makeMockStream(await encodeMessages({ operation: 'update', record: { messageHash: 'h1', peers: {} } }));
 			return {
 				mock,
-				errors,
 				executions: () => cluster.calls,
 				drive: async (connection) => { getHandler()(mock.stream as any, connection as any); await mock.finished; },
 			};
@@ -168,17 +160,16 @@ const SERVICE_CASES: ServiceCase[] = [
 	},
 	{
 		name: 'sync',
+		namespace: 'sync-service',
 		protocol: `${PREFIX}/db-p2p/sync/1.0.0`,
 		async build(init) {
 			const repo = { calls: 0, async get() { repo.calls++; return {}; } };
-			const { logger, errors } = makeLogger();
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new SyncService({ logger, registrar, repo: repo as any }, { protocolPrefix: PREFIX, ...init });
+			const service = new SyncService({ registrar, repo: repo as any }, { protocolPrefix: PREFIX, ...init });
 			await service.start();
 			const mock = makeMockStream(await encodeMessages({ blockId: 'block-1' }));
 			return {
 				mock,
-				errors,
 				executions: () => repo.calls,
 				drive: async (connection) => { getHandler()(mock.stream as any, connection as any); await mock.finished; },
 			};
@@ -186,17 +177,16 @@ const SERVICE_CASES: ServiceCase[] = [
 	},
 	{
 		name: 'block-transfer',
+		namespace: 'block-transfer-service',
 		protocol: `${PREFIX}/db-p2p/block-transfer/1.0.0`,
 		async build(init) {
 			const repo = { calls: 0, async get() { repo.calls++; return {}; }, async saveReplicatedBlock() { repo.calls++; } } as unknown as IBlockReplicaStore & { calls: number };
-			const { logger, errors } = makeLogger();
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new BlockTransferService({ registrar, repo, logger, superMajorityThreshold: 0.75 }, { protocolPrefix: PREFIX, ...init });
+			const service = new BlockTransferService({ registrar, repo, superMajorityThreshold: 0.75 }, { protocolPrefix: PREFIX, ...init });
 			await service.start();
 			const mock = makeMockStream(await encodeMessages({ type: 'pull', blockIds: ['block-1'], reason: 'rebalance' }));
 			return {
 				mock,
-				errors,
 				executions: () => repo.calls,
 				drive: async (connection) => { await getHandler()(mock.stream as any, connection as any); await mock.finished; },
 			};
@@ -298,27 +288,54 @@ describe('inbound stream authorization', () => {
 		});
 	}
 
-	// All four services route the gate's diagnostics through the component logger's `error` sink,
-	// so an embedder sees denials on the same channel as every other service error.
+	/**
+	 * All four services route the gate's diagnostics through their own `createLogger` channel's
+	 * `.error` child, so ONE `DEBUG=optimystic:db-p2p:*` filter shows denials next to every other
+	 * line this package writes. Asserted through `captureLog` on the real `debug` output rather
+	 * than through a stub handed to the service: the services no longer take an injectable logger,
+	 * and only the captured namespace proves WHERE the line landed — a sink-was-called assertion
+	 * passes just as happily when the line is stranded outside the documented tree, which is the
+	 * regression this migration exists to close.
+	 *
+	 * `captureLog` enables `optimystic:db-p2p:<n>` AND `optimystic:db-p2p:<n>:*`, so the `:error`
+	 * child is covered without naming it. Assertions go through `hasLine`, not `hasTag`: these
+	 * lines carry their peer/protocol/reason as `%s` arguments that `debug` leaves for downstream
+	 * `util.format` to substitute, so the literal template `hasTag` sees still reads `peer=%s`.
+	 */
 	for (const svc of SERVICE_CASES) {
 		describe(`${svc.name} service logging`, () => {
 			it('logs the predicate failure rather than swallowing it', async () => {
 				const driven = await svc.build({
 					authorizeInboundStream: () => { throw new Error('membership lookup exploded'); },
 				});
-				await driven.drive({ remotePeer: await makePeerId() });
+				const peerId = await makePeerId();
 
-				expect(driven.errors.join('\n'), 'the throw itself must be logged, not swallowed')
-					.to.contain('authorization predicate threw');
-				expect(driven.errors.join('\n'), 'the denial is logged with its reason')
-					.to.contain('inbound stream denied');
+				const captured = await captureLog(svc.namespace, async () => {
+					await driven.drive({ remotePeer: peerId });
+				});
+
+				expect(hasLine(captured, 'authorization predicate threw'), 'the throw itself must be logged, not swallowed')
+					.to.equal(true);
+				expect(hasLine(captured, 'inbound stream denied'), 'the denial is logged with its reason')
+					.to.equal(true);
+				expect(hasLine(captured, `optimystic:db-p2p:${svc.namespace}:error`),
+					'the denial lands on this service own :error channel, inside the documented tree')
+					.to.equal(true);
 			});
 
 			it('logs the denial when the predicate simply returns false', async () => {
 				const driven = await svc.build({ authorizeInboundStream: () => false });
-				await driven.drive({ remotePeer: await makePeerId() });
+				const peerId = await makePeerId();
 
-				expect(driven.errors.join('\n')).to.contain('inbound stream denied');
+				const captured = await captureLog(svc.namespace, async () => {
+					await driven.drive({ remotePeer: peerId });
+				});
+
+				expect(hasLine(captured, 'inbound stream denied')).to.equal(true);
+				expect(hasLine(captured, `peer=${peerId.toString()}`),
+					'the denial names the peer it denied').to.equal(true);
+				expect(hasLine(captured, `protocol=${svc.protocol}`),
+					'and the protocol it was denied on').to.equal(true);
 			});
 		});
 	}
@@ -363,9 +380,8 @@ describe('inbound stream authorization — what the dialing client observes', ()
 			header: { id: BLOCK_ID, type: 'test', collectionId: 'col-1' as BlockId } as BlockHeader
 		});
 
-		const { logger } = makeLogger();
 		const { registrar, getHandler } = capturingRegistrar();
-		const service = new BlockTransferService({ registrar, repo, logger, superMajorityThreshold: 0.75 }, { protocolPrefix: PREFIX, ...init });
+		const service = new BlockTransferService({ registrar, repo, superMajorityThreshold: 0.75 }, { protocolPrefix: PREFIX, ...init });
 		await service.start();
 
 		const peerNetwork = {

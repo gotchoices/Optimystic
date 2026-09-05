@@ -120,7 +120,6 @@ function makeServiceStream(requestChunks: Uint8Array[]) {
 }
 
 const makeServiceComponents = (repo: IRepo, peerId: PeerId): RepoServiceComponents => ({
-	logger: { forComponent: () => ({ error: () => { }, info: () => { }, trace: () => { }, debug: () => { } }) as any },
 	registrar: { handle: async () => { }, unhandle: async () => { } },
 	repo,
 	peerId,

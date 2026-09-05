@@ -1,4 +1,4 @@
-import type { Startable, Logger, PeerId, Libp2p } from '@libp2p/interface'
+import type { Startable, PeerId, Libp2p } from '@libp2p/interface'
 import { peerIdFromString } from '@libp2p/peer-id'
 import type { FretService } from 'p2p-fret'
 import { hashKey } from 'p2p-fret'
@@ -9,6 +9,7 @@ import { RebalanceMonitor, type RebalanceMonitorConfig } from '../cluster/rebala
 import { SpreadOnChurnMonitor, type SpreadOnChurnConfig, type SpreadOnChurnDeps } from '../cluster/spread-on-churn.js'
 import type { PartitionDetector } from '../cluster/partition-detector.js'
 import type { ArachnodeFretAdapter } from '../storage/arachnode-fret-adapter.js'
+import { createLogger, type Logger } from '../logger.js'
 
 export type NetworkManagerServiceInit = {
 	clusterSize?: number
@@ -22,7 +23,6 @@ export type NetworkManagerServiceInit = {
 }
 
 type Components = {
-	logger: { forComponent: (name: string) => Logger },
 	registrar: { handle: (...args: any[]) => Promise<void>, unhandle: (...args: any[]) => Promise<void> },
 	libp2p?: Libp2p
 }
@@ -45,7 +45,7 @@ export class NetworkManagerService implements Startable {
 	private spreadOnChurnMonitor?: SpreadOnChurnMonitor
 
 	constructor(private readonly components: Components, init: NetworkManagerServiceInit = {}) {
-		this.log = components.logger.forComponent('db-p2p:network-manager')
+		this.log = createLogger('network-manager')
 		this.cfg = {
 			clusterSize: init.clusterSize ?? 1,
 			seedKeys: init.seedKeys ?? [],

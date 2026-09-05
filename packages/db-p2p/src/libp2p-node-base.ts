@@ -608,7 +608,6 @@ export async function createLibp2pNodeBase(
 					...inboundAuthorization
 				});
 				return serviceFactory({
-					logger: components.logger,
 					registrar: components.registrar,
 					cluster: clusterProxy,
 					// Identity for membership scoping on the update path. peerId is a core
@@ -652,7 +651,6 @@ export async function createLibp2pNodeBase(
 				// (getCluster(encode(blockKey)) → hashKey(encode(...))), matching the
 				// coordinator's findCluster(encode(blockId)) — same cohort, no spurious redirect.
 				return serviceFactory({
-					logger: components.logger,
 					registrar: components.registrar,
 					repo: repoProxy
 				});
@@ -664,7 +662,6 @@ export async function createLibp2pNodeBase(
 					...inboundAuthorization
 				});
 				return serviceFactory({
-					logger: components.logger,
 					registrar: components.registrar,
 					repo: repoProxy
 				});
@@ -689,9 +686,7 @@ export async function createLibp2pNodeBase(
 					// Read from the SAME resolved `consensusConfig` the member and coordinator read (whose
 					// coupling `assertSuperMajorityCoupling` below already asserts) — a third copy resolving
 					// its own default would defeat that.
-					superMajorityThreshold: consensusConfig.superMajorityThreshold,
-					// So this service's authorization denials reach the same error sink as the other three.
-					logger: components.logger
+					superMajorityThreshold: consensusConfig.superMajorityThreshold
 				});
 			},
 
@@ -1082,7 +1077,7 @@ export async function createLibp2pNodeBase(
 				// Spread is a resilience optimization, not a correctness requirement - a wiring
 				// failure (e.g. FRET briefly unavailable) must NOT hard-fail node startup, unlike the
 				// operator-opted-in cohortTopic block. Log and continue with spread inert.
-				((node as any).logger?.forComponent?.('db-p2p:spread-on-churn'))?.('init failed: %o', err);
+				wiringLog('spread-on-churn init failed: %o', err);
 			}
 		}
 
@@ -1108,7 +1103,17 @@ export async function createLibp2pNodeBase(
 		// Initialize Arachnode ring membership and restoration
 		const enableArachnode = options.arachnode?.enableRingZulu ?? true;
 		if (enableArachnode) {
-			const log = (node as any).logger?.forComponent?.('db-p2p:arachnode');
+			// Tagged view of the file's own `node-wiring` channel rather than a namespace of its own:
+			// these lines explain a half-started node and belong with the rest of the wiring story.
+			// Unconditional — the previous `(node as any).logger?.forComponent?.(...)` reach-through
+			// silently dropped every one of them when the node exposed no logger.
+			//
+			// NOTE: the `arachnode:` tag is prose, not a namespace, so these lines cannot be filtered
+			// apart from the rest of `optimystic:db-p2p:node-wiring`. Fine while arachnode logs a
+			// handful of lines per ring transition; if ring/rebalance logging ever gets voluminous
+			// enough that it drowns the wiring lines, promote it to its own `createLogger('arachnode')`
+			// and add the namespace to the table in `docs/debugging.md`.
+			const log = (msg: string, ...args: unknown[]): void => { wiringLog(`arachnode: ${msg}`, ...args); };
 			const fret = (node as any).services?.fret as any;
 
 			if (fret) {
@@ -1150,7 +1155,7 @@ export async function createLibp2pNodeBase(
 				const arachnodeInfo = await ringSelector.createArachnodeInfo(peerId);
 				fretAdapter.setArachnodeInfo(arachnodeInfo);
 
-				log?.('Announced Arachnode membership: Ring %d', arachnodeInfo.ringDepth);
+				log('Announced Arachnode membership: Ring %d', arachnodeInfo.ringDepth);
 
 				// Setup restoration coordinator with FRET adapter
 				const restorationCoordinatorV2 = new RestorationCoordinator(
@@ -1253,7 +1258,7 @@ export async function createLibp2pNodeBase(
 								}
 								if (result.underReplicated.length > 0) {
 									const growthDiag = rebalanceMonitor.getGrowthDiagnostics();
-									log?.('cohort-growth: %d of %d grown blocks not confirmed on new peers this pass ' +
+									log('cohort-growth: %d of %d grown blocks not confirmed on new peers this pass ' +
 										'(awaiting-confirmation=%d given-up-pairs=%d)',
 										result.underReplicated.length, event.grown.size,
 										growthDiag.blocksAwaitingConfirmation, growthDiag.abandonedPairs);
@@ -1267,7 +1272,7 @@ export async function createLibp2pNodeBase(
 								// and a loud unbounded retry is the right way to surface one — silently abandoning
 								// the block would hide it and leave the block singly held. Revisit if a legitimate
 								// recoverable condition is ever allowed to throw out of the reaction.
-								log?.('rebalance reaction failed: %o', err);
+								log('rebalance reaction failed: %o', err);
 							});
 						});
 
@@ -1320,7 +1325,7 @@ export async function createLibp2pNodeBase(
 					} catch (err) {
 						// Rebalance is a resilience optimization, not a correctness requirement - a wiring
 						// failure (e.g. FRET briefly unavailable) must NOT hard-fail node startup.
-						log?.('rebalance wiring init failed: %o', err);
+						log('rebalance wiring init failed: %o', err);
 					}
 				}
 
@@ -1337,15 +1342,15 @@ export async function createLibp2pNodeBase(
 					if (!ringShift) return;
 					const transition = await ringSelector.shouldTransition();
 					if (transition.shouldMove && transition.direction && transition.newRingDepth !== undefined) {
-						log?.('Ring transition needed: moving %s to Ring %d', transition.direction, transition.newRingDepth);
+						log('Ring transition needed: moving %s to Ring %d', transition.direction, transition.newRingDepth);
 						try {
 							const outcome = await ringShift.executeShift({
 								direction: transition.direction,
 								newRingDepth: transition.newRingDepth
 							});
-							log?.('Ring shift outcome: %o', outcome);
+							log('Ring shift outcome: %o', outcome);
 						} catch (err) {
-							log?.('Ring shift failed: %o', err);
+							log('Ring shift failed: %o', err);
 						} finally {
 							// Measure the minimum dwell from the SETTLED shift (completed or rolled back), not
 							// just the trigger stamped inside shouldTransition (docs/arachnode-ring-handoff.md §1.3).
@@ -1361,7 +1366,7 @@ export async function createLibp2pNodeBase(
 					await originalStop();
 				};
 			} else {
-				log?.('FRET service not available, Arachnode disabled');
+				log('FRET service not available, Arachnode disabled');
 			}
 		}
 
@@ -1393,7 +1398,7 @@ export async function createLibp2pNodeBase(
 				await previousStop();
 			};
 			void seedOwnedBlocksFromStorage(rawStorage, ownedBlocks, () => seedStopping)
-				.catch((err) => ((node as any).logger?.forComponent?.('db-p2p:owned-block-seed'))?.('seed failed: %o', err));
+				.catch((err) => { wiringLog('owned-block-seed seed failed: %o', err); });
 		}
 
 		// [dispute-subsystem-dormant] The DisputeService object is constructed below so tests and

@@ -59,7 +59,6 @@ const makeComponents = (opts: {
 	networkManager?: NetworkManagerLike,
 	getConnectionAddrs?: (pid: PeerId) => string[]
 }): RepoServiceComponents => ({
-	logger: { forComponent: () => ({ error: () => {}, info: () => {}, trace: () => {}, debug: () => {} }) as any },
 	registrar: {
 		handle: async () => {},
 		unhandle: async () => {}

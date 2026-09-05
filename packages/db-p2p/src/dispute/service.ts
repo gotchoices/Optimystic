@@ -1,14 +1,14 @@
 import { pipe } from 'it-pipe';
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed';
-import type { Startable, Logger, Stream, Connection, StreamHandler } from '@libp2p/interface';
+import type { Startable, Stream, Connection, StreamHandler } from '@libp2p/interface';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { DisputeMessage } from './types.js';
 import type { DisputeService } from './dispute-service.js';
 import { registerProtocolHandler } from '../network/register-protocol-handler.js';
+import { createLogger, type Logger } from '../logger.js';
 
 interface BaseComponents {
-	logger: { forComponent: (name: string) => Logger };
 	registrar: {
 		handle: (protocol: string, handler: StreamHandler, options: any) => Promise<void>;
 		unhandle: (protocol: string) => Promise<void>;
@@ -48,7 +48,7 @@ export class DisputeProtocolService implements Startable {
 		this.protocol = init.protocol ?? (init.protocolPrefix ?? '/db-p2p') + '/dispute/1.0.0';
 		this.maxInboundStreams = init.maxInboundStreams ?? 16;
 		this.maxOutboundStreams = init.maxOutboundStreams ?? 32;
-		this.log = components.logger.forComponent('db-p2p:dispute');
+		this.log = createLogger('dispute-protocol');
 		this.disputeService = components.disputeService;
 		this.running = false;
 	}

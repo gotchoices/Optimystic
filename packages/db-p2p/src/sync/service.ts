@@ -1,4 +1,4 @@
-import type { ComponentLogger, Connection, Startable } from '@libp2p/interface';
+import type { Connection, Startable } from '@libp2p/interface';
 import { buildSyncProtocol, type SyncRequest, type SyncResponse } from './protocol.js';
 import { pipe } from 'it-pipe';
 import { toString as u8ToString } from 'uint8arrays/to-string';
@@ -9,13 +9,13 @@ import { createInboundStreamAuthorization, type InboundStreamAuthorization, type
 import { serveBlockArchive, type ArchiveServingRepo } from '../storage/block-archive.js';
 import { registerProtocolHandler } from '../network/register-protocol-handler.js';
 import type { BlockArchive } from '../storage/struct.js';
+import { createLogger, type Logger } from '../logger.js';
 
 export interface SyncServiceInit extends InboundStreamAuthorizationInit {
 	protocolPrefix?: string;
 }
 
 export interface SyncServiceComponents {
-	logger: ComponentLogger;
 	registrar: { handle: (...args: any[]) => Promise<void>, unhandle: (...args: any[]) => Promise<void> };
 	/**
 	 * The local store this node answers repair fetches out of. Declared as `ArchiveServingRepo`
@@ -27,8 +27,6 @@ export interface SyncServiceComponents {
 	 */
 	repo: ArchiveServingRepo;
 }
-
-type Logger = ReturnType<ComponentLogger['forComponent']>;
 
 /**
  * Service for handling incoming sync requests from other cluster peers.
@@ -53,7 +51,7 @@ export class SyncService implements Startable {
 		components: SyncServiceComponents,
 		init: SyncServiceInit = {}
 	) {
-		this.log = components.logger.forComponent('db-p2p:sync-service');
+		this.log = createLogger('sync-service');
 		this.protocol = buildSyncProtocol(init.protocolPrefix ?? '');
 		this.repo = components.repo;
 		this.registrar = components.registrar;

@@ -34,7 +34,6 @@ const makeComponents = (opts: {
 	libp2p?: unknown
 }): ClusterServiceComponents => ({
 	...(opts.libp2p === undefined ? {} : { libp2p: opts.libp2p }),
-	logger: { forComponent: () => ({ error: () => {}, info: () => {}, trace: () => {}, debug: () => {} }) as any },
 	registrar: {
 		handle: async () => {},
 		unhandle: async () => {}

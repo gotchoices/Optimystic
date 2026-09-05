@@ -213,12 +213,6 @@ export interface BlockTransferServiceComponents {
 	 * its thresholds with.
 	 */
 	superMajorityThreshold: number;
-	/**
-	 * Optional libp2p component logger. Supplied by the node factory so authorization denials
-	 * land on the same `logger.forComponent(...).error` sink as the repo/cluster/sync services;
-	 * without it they fall back to this module's `debug` logger.
-	 */
-	logger?: { forComponent: (name: string) => { error: (message: string, ...args: unknown[]) => void } };
 }
 
 /**
@@ -248,9 +242,11 @@ export class BlockTransferService implements Startable {
 		this.registrar = components.registrar;
 		this.proofThresholds = proofThresholds(components.superMajorityThreshold);
 		this.requirePushCertificate = init.requirePushCertificate ?? true;
-		const componentLog = components.logger?.forComponent('db-p2p:block-transfer');
+		// Denials are errors, so they go to this module's own `:error` child channel rather than its
+		// main one — visible under `optimystic:db-p2p:block-transfer-service:*`, not under an exact
+		// match on `optimystic:db-p2p:block-transfer-service` alone.
 		this.authorization = createInboundStreamAuthorization(init, this.protocol,
-			componentLog ? (msg, ...args) => componentLog.error(msg, ...args) : (msg, ...args) => log(msg, ...args));
+			(msg, ...args) => log.error(msg, ...args));
 	}
 
 	async start(): Promise<void> {

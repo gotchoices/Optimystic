@@ -44,17 +44,6 @@ const makePeerId = async (): Promise<PeerId> => {
 	return peerIdFromPrivateKey(key);
 };
 
-/** A callable logger with the `.error`/etc. methods the services expect. */
-function makeLogger(): any {
-	const fn: any = (..._args: any[]) => { };
-	fn.error = () => { };
-	fn.trace = () => { };
-	fn.debug = () => { };
-	fn.info = () => { };
-	fn.warn = () => { };
-	return { forComponent: () => fn };
-}
-
 /** A registrar that captures the handler registered by a service's `start()`. */
 function capturingRegistrar() {
 	let handler: ((...args: any[]) => any) | undefined;
@@ -133,7 +122,7 @@ describe('inbound message caps', () => {
 		it('aborts the stream on an oversized frame (declared > control cap)', async () => {
 			const stub = { calls: 0, async update(r: any) { stub.calls++; return r; } };
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new ClusterService({ logger: makeLogger(), registrar, cluster: stub as any }, {});
+			const service = new ClusterService({ registrar, cluster: stub as any }, {});
 			await service.start();
 
 			const mock = makeMockStream([oversizedFrame(MAX_CONTROL_MESSAGE_BYTES + 1)]);
@@ -147,7 +136,7 @@ describe('inbound message caps', () => {
 		it('processes only the first of two requests on one stream', async () => {
 			const stub = { calls: 0, async update(r: any) { stub.calls++; return r; } };
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new ClusterService({ logger: makeLogger(), registrar, cluster: stub as any }, {});
+			const service = new ClusterService({ registrar, cluster: stub as any }, {});
 			await service.start();
 
 			const req = { operation: 'update', record: { peers: {} } };
@@ -165,7 +154,7 @@ describe('inbound message caps', () => {
 		it('aborts the stream on an oversized frame (declared > block cap)', async () => {
 			const repo = { calls: 0, async get() { repo.calls++; return {}; } };
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new RepoService({ logger: makeLogger(), registrar, repo: repo as any }, {});
+			const service = new RepoService({ registrar, repo: repo as any }, {});
 			await service.start();
 
 			const mock = makeMockStream([oversizedFrame(MAX_BLOCK_MESSAGE_BYTES + 1)]);
@@ -184,7 +173,7 @@ describe('inbound message caps', () => {
 			// supplied, so no message is decoded; the point is only that the cap did not fire.)
 			const repo = { calls: 0, async get() { repo.calls++; return {}; } };
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new RepoService({ logger: makeLogger(), registrar, repo: repo as any }, {});
+			const service = new RepoService({ registrar, repo: repo as any }, {});
 			await service.start();
 
 			const mock = makeMockStream([oversizedFrame(MAX_CONTROL_MESSAGE_BYTES + 1)]);
@@ -203,7 +192,7 @@ describe('inbound message caps', () => {
 			// above the default) cannot distinguish.
 			const repo = { calls: 0, async get() { repo.calls++; return {}; } };
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new RepoService({ logger: makeLogger(), registrar, repo: repo as any }, {});
+			const service = new RepoService({ registrar, repo: repo as any }, {});
 			await service.start();
 
 			const mock = makeMockStream([oversizedFrame(LIBRARY_DEFAULT_MAX_BYTES + 1)]);
@@ -216,7 +205,7 @@ describe('inbound message caps', () => {
 		it('processes only the first of two requests on one stream', async () => {
 			const repo = { calls: 0, async get() { repo.calls++; return {}; } };
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new RepoService({ logger: makeLogger(), registrar, repo: repo as any }, {});
+			const service = new RepoService({ registrar, repo: repo as any }, {});
 			await service.start();
 
 			const req = { operations: [{ get: { blockIds: ['b1'] } }] };
@@ -234,7 +223,7 @@ describe('inbound message caps', () => {
 		it('aborts the stream on an oversized frame (declared > control cap)', async () => {
 			const disputeService = { calls: 0, async handleChallenge() { disputeService.calls++; return { verdict: 'ok' }; }, handleResolution() { } };
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new DisputeProtocolService({ logger: makeLogger(), registrar, disputeService: disputeService as any }, {});
+			const service = new DisputeProtocolService({ registrar, disputeService: disputeService as any }, {});
 			await service.start();
 
 			const mock = makeMockStream([oversizedFrame(MAX_CONTROL_MESSAGE_BYTES + 1)]);
@@ -248,7 +237,7 @@ describe('inbound message caps', () => {
 		it('processes only the first of two requests on one stream', async () => {
 			const disputeService = { calls: 0, async handleChallenge() { disputeService.calls++; return { verdict: 'ok' }; }, handleResolution() { } };
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new DisputeProtocolService({ logger: makeLogger(), registrar, disputeService: disputeService as any }, {});
+			const service = new DisputeProtocolService({ registrar, disputeService: disputeService as any }, {});
 			await service.start();
 
 			const req = { type: 'challenge', challenge: { disputeId: 'd1' } };
@@ -266,7 +255,7 @@ describe('inbound message caps', () => {
 		it('aborts the stream on an oversized frame (declared > control cap)', async () => {
 			const repo = { calls: 0, async get() { repo.calls++; return {}; } };
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new SyncService({ logger: makeLogger(), registrar, repo: repo as any }, {});
+			const service = new SyncService({ registrar, repo: repo as any }, {});
 			await service.start();
 
 			const mock = makeMockStream([oversizedFrame(MAX_CONTROL_MESSAGE_BYTES + 1)]);
