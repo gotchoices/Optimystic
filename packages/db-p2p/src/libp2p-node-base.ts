@@ -1103,17 +1103,13 @@ export async function createLibp2pNodeBase(
 		// Initialize Arachnode ring membership and restoration
 		const enableArachnode = options.arachnode?.enableRingZulu ?? true;
 		if (enableArachnode) {
-			// Tagged view of the file's own `node-wiring` channel rather than a namespace of its own:
-			// these lines explain a half-started node and belong with the rest of the wiring story.
+			// A child of the file's own `node-wiring` channel (same nesting convention as
+			// `storage:restoration` and `network:get-manager`): these lines explain a half-started
+			// node, so `optimystic:db-p2p:node-wiring*` shows them next to the rest of the wiring
+			// story, while the child name still lets ring/rebalance chatter be filtered on its own.
 			// Unconditional — the previous `(node as any).logger?.forComponent?.(...)` reach-through
-			// silently dropped every one of them when the node exposed no logger.
-			//
-			// NOTE: the `arachnode:` tag is prose, not a namespace, so these lines cannot be filtered
-			// apart from the rest of `optimystic:db-p2p:node-wiring`. Fine while arachnode logs a
-			// handful of lines per ring transition; if ring/rebalance logging ever gets voluminous
-			// enough that it drowns the wiring lines, promote it to its own `createLogger('arachnode')`
-			// and add the namespace to the table in `docs/debugging.md`.
-			const log = (msg: string, ...args: unknown[]): void => { wiringLog(`arachnode: ${msg}`, ...args); };
+			// silently dropped every one of these lines when the node exposed no logger.
+			const log = createLogger('node-wiring:arachnode');
 			const fret = (node as any).services?.fret as any;
 
 			if (fret) {
