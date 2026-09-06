@@ -281,7 +281,6 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		if (missingIds.length > 0) {
 			log('get:missing blockIds=%o', missingIds);
 			const details = this.formatBatchStatuses(batches,
-				b => (b.request?.isResponse as boolean) ?? false,
 				b => {
 					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'response' : 'in-flight')
 					const errMsg = b.request?.isError ? ` cause=${errorMessage(b.request.error)}` : ''
@@ -569,7 +568,6 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 
 		if (!everyBatch(batches, b => b.request?.isResponse as boolean && b.request!.response!.success)) {
 			const details = this.formatBatchStatuses(batches,
-				b => (b.request?.isResponse as boolean && (b.request as any).response?.success) ?? false,
 				b => {
 					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'non-success' : 'in-flight')
 					const errMsg = b.request?.isError ? ` cause=${errorMessage(b.request.error)}` : ''
@@ -806,7 +804,9 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// test mesh today — this filter is structurally unreachable, and
 		// packages/db-p2p/test/torn-commit-cancels-abandoned-blocks.spec.ts cannot cover it. Pinning
 		// a partial sweep needs a mesh whose responsibility sets are disjoint enough to force two
-		// pend batches; a new failure injection alone will not reach it.
+		// pend batches; a new failure injection alone will not reach it. That fixture is tracked in
+		// backlog `debt-no-mesh-fixture-forces-two-coordinator-batches`, which collects this site and
+		// the two others with the same gap.
 		const confirmed = new Set<BlockId>();
 		for (const b of allBatches(batches, bb => bb.request?.isResponse === true && bb.request!.response!.success)) {
 			for (const bid of b.payload) confirmed.add(bid);
@@ -894,7 +894,6 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 
 		if (!everyBatch(batches, b => b.request?.isResponse as boolean && b.request!.response!.success)) {
 			const details = this.formatBatchStatuses(batches,
-				b => (b.request?.isResponse as boolean && (b.request as any).response?.success) ?? false,
 				b => {
 					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'non-success' : 'in-flight')
 					const resp: any = (b.request as any)?.response;
@@ -993,18 +992,21 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * record); every later round re-resolves live. Throws on failure to discharge — see
 	 * {@link dischargeCancel}.
 	 *
-	 * The seed is derived from each batch's ANCHOR block id (`b.blockId`), so when
-	 * `consolidateCoordinators` collapsed several blocks onto one coordinator the seed round only
-	 * carries the anchor. That was silently lossy before — the non-anchor blocks got no cancel at
-	 * all; now `dischargeCancel`'s per-block outstanding set notices and the next round resolves
-	 * them live. The cost is one extra round on a consolidated pend's failure path.
+	 * The seed uses each batch's `coordinatingBlockIds` — the full set `consolidateCoordinators`
+	 * assigned to that peer — not its anchor `blockId` alone. Anchor-only was silently lossy: when
+	 * consolidation collapsed several blocks onto one coordinator, the non-anchor blocks got no
+	 * cancel at all. `processBatches`' retry batches carry no `coordinatingBlockIds` and fall back to
+	 * their anchor, so a retried multi-block batch can still under-cover the seed round;
+	 * `dischargeCancel`'s per-block outstanding set notices and the next round resolves those live.
+	 * That residual costs a round, never correctness, and is unreachable on a mesh where every node
+	 * covers every block — see backlog `debt-no-mesh-fixture-forces-two-coordinator-batches`.
 	 */
 	private async cancelBatch<TPayload, TResponse>(
 		batches: CoordinatorBatch<TPayload, TResponse>[],
 		actionRef: ActionBlocks,
 	) {
 		const operationBatches = makeBatchesByPeer<BlockId[], void>(
-			Array.from(allBatches(batches)).map(b => [b.blockId, b.peerId] as const),
+			Array.from(allBatches(batches)).flatMap(b => (b.coordinatingBlockIds ?? [b.blockId]).map(bid => [bid, b.peerId] as const)),
 			actionRef.blockIds,
 			mergeBlocks,
 			[]
@@ -1016,12 +1018,15 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * Rounds {@link dischargeCancel} will run before giving up, in addition to the
 	 * `abortOrCancelTimeoutMs` deadline; whichever bound trips first ends the loop.
 	 *
-	 * NOTE: accepted tradeoff — the round cap can end the loop well before the deadline. With
-	 * `baseMs` 50 / `capMs` 500 the six rounds span roughly 0.9–1.5 s of retrying, which clears a
-	 * stream reset and reconnect, and against a genuinely dead transport it hands the caller a
-	 * legible failure in about a second instead of spending its whole (typically 5 s) abort budget
-	 * issuing RPCs nobody will answer. Raise it if faults longer than ~1.5 s but shorter than the
-	 * abort budget turn out to strand records in practice.
+	 * NOTE: accepted tradeoff — the round cap can end the loop well before the deadline. Six rounds
+	 * means five backoffs, whose pre-jitter values with `baseMs` 50 / `capMs` 500 are 50, 100, 200,
+	 * 400, 500 ms, each drawn from `(0.5·exp, exp]` — so 0.63–1.25 s of waiting, plus each round's
+	 * own RPC time (measured end to end: 1054 ms for the dead-transport arm of
+	 * packages/db-p2p/test/reset-does-not-strand-its-own-pend.spec.ts). That clears a stream reset
+	 * and reconnect, and against a genuinely dead transport it hands the caller a legible failure in
+	 * about a second instead of spending its whole (typically 5 s) abort budget issuing RPCs nobody
+	 * will answer. Raise it if faults longer than that but shorter than the abort budget turn out to
+	 * strand records in practice.
 	 */
 	private static readonly MAX_CANCEL_ROUNDS = 6;
 
@@ -1105,7 +1110,6 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		}
 
 		const details = this.formatBatchStatuses(roundBatches,
-			b => b.request?.isResponse === true,
 			b => {
 				const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'responded' : 'in-flight');
 				const errMsg = b.request?.isError ? ` cause=${errorMessage(b.request.error)}` : '';
@@ -1120,9 +1124,11 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		throw aggregate;
 	}
 
+	/** Renders the batches worth naming in an aggregate error: the ones that never completed, or —
+	 * when every batch completed and the aggregate is about a non-success RESPONSE rather than a
+	 * transport fault — all of them. */
 	private formatBatchStatuses<TPayload, TResponse>(
 		batches: CoordinatorBatch<TPayload, TResponse>[],
-		_isSuccess: (b: CoordinatorBatch<TPayload, TResponse>) => boolean,
 		formatter: (b: CoordinatorBatch<TPayload, TResponse>) => string
 	): string {
 		const incompletes = Array.from(incompleteBatches(batches))

@@ -161,17 +161,11 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 				...blockDigestsField(blockDigests)
 			});
 			if (!commitResult.success) {
-				// The cancel is a checked, retried operation and can now throw (NetworkTransactor.cancel
-				// verifies that some peer actually answered). It must NOT be allowed to replace the
-				// verdict it is cleaning up after: a confirmed conflict has to be RETURNED as the
-				// StaleFailure, because `Collection.sync` and the multi-collection pend phase read it via
-				// `isConflictFailure` to decide to rebase — converting it into a throw turns a routine,
-				// recoverable race into a hard failure. So: log, keep the verdict.
-				try {
-					await this.transactor.cancel({ actionId, blockIds: pendResult.blockIds });
-				} catch (cancelError) {
-					log('WARN: cancel after failed commit did not discharge actionId=%s blocks=%o: %o', actionId, pendResult.blockIds, cancelError);
-				}
+				// A confirmed conflict has to be RETURNED as the StaleFailure, because `Collection.sync`
+				// and the multi-collection pend phase read it via `isConflictFailure` to decide to
+				// rebase — letting the cancel's own failure throw over it would turn a routine,
+				// recoverable race into a hard failure. So the cancel fault is logged, not raised.
+				await this.dischargePend(actionId, pendResult.blockIds);
 				return commitResult;
 			}
 		} catch (e) {
@@ -179,15 +173,34 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 			// that also fails must not silently take its place, but it must not be lost either: the
 			// pend was left undischarged and that is what wedges the block against the caller's own
 			// retry. Attach it to `e` so one report names both.
-			try {
-				await this.transactor.cancel({ actionId, blockIds: pendResult.blockIds });
-			} catch (cancelError) {
-				log('WARN: cancel after failed commit did not discharge actionId=%s blocks=%o: %o', actionId, pendResult.blockIds, cancelError);
-				if (e && typeof e === 'object') {
-					(e as { cancelError?: unknown }).cancelError = cancelError;
-				}
+			const cancelError = await this.dischargePend(actionId, pendResult.blockIds);
+			if (cancelError !== undefined && e !== null && typeof e === 'object') {
+				// A frozen or sealed error would make this assignment throw, and a throw here would
+				// replace the cause the caller actually needs. The log above already named the cancel.
+				try { (e as { cancelError?: unknown }).cancelError = cancelError; } catch { /* ignore */ }
 			}
 			throw e;
+		}
+	}
+
+	/**
+	 * Discharges the pending records this attempt left behind, on both of `transact`'s abort paths.
+	 *
+	 * `ITransactor.cancel` returns only when the records are gone and throws otherwise
+	 * (`NetworkTransactor.cancel` retries and then verifies that some peer actually answered), so a
+	 * throw here means the block stays wedged against every later writer. That has to be reported —
+	 * but never by displacing the verdict the cancel is cleaning up after, so it comes back as a
+	 * value rather than propagating.
+	 *
+	 * @returns the cancel's own failure, or `undefined` when it discharged.
+	 */
+	private async dischargePend(actionId: ActionId, blockIds: BlockId[]): Promise<unknown> {
+		try {
+			await this.transactor.cancel({ actionId, blockIds });
+			return undefined;
+		} catch (cancelError) {
+			log('WARN: cancel after failed commit did not discharge actionId=%s blocks=%o: %o', actionId, blockIds, cancelError);
+			return cancelError;
 		}
 	}
 }

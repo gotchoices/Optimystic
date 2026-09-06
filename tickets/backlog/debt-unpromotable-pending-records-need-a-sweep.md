@@ -1,7 +1,7 @@
 description: If a client crashes at the wrong moment, a storage node keeps a leftover "write in progress" marker forever, and the node then refuses every later write to that block. Nothing on the node ever cleans such a marker up.
 files:
-  - packages/db-core/src/transactor/network-transactor.ts (~line 589 — the best-effort background cancel after a failed pend)
-  - packages/db-core/src/transactor/transactor-source.ts (~lines 163, 167 — the caller-driven cancel)
+  - packages/db-core/src/transactor/network-transactor.ts (`pend`'s awaited cancel, and `dischargeCancel` — the retried, checked cancel that bounds the client-side hole)
+  - packages/db-core/src/transactor/transactor-source.ts (`dischargePend` — the caller-driven cancel on both of `transact`'s abort paths)
   - packages/db-p2p/src/storage/storage-repo.ts (StorageRepo.commit's doc comment, which already records this gap; cancel; dropUnpromotablePendings)
   - docs/repository.md (Invariant P, ~line 132)
 difficulty: hard
@@ -149,3 +149,24 @@ attempt writes normally. What it does not cover is any fault that outlasts that 
 that dies mid-window — which is precisely the population this ticket exists for. That population is
 now smaller and better characterised, not gone: the node-side sweep remains the only cure for a
 record whose writer never comes back.
+
+## Arm: the client-side half has LANDED — two statements in the body above are now stale (review, 2026-09-05)
+
+`implement/a-failed-attempt-must-discharge-its-own-pend` landed in commit `28349d2`. Two things this
+ticket says about the client are no longer true of the code, and a reader planning the node-side
+sweep should not design against them:
+
+- The body's "How a marker gets abandoned → **A refused pend**" bullet says the cancel is fired as a
+  background, best-effort microtask whose failure is only logged (and names a method,
+  `NetworkTransactor.pendPhase`, that does not exist — the site is `NetworkTransactor.pend`). It is
+  now **awaited**, and the cancel underneath it retries and verifies that some peer actually
+  answered, throwing when it could not.
+- The last bullet of "What a fix has to answer" — "whether the client side should be hardened too,
+  so a refused pend's cancel is retried rather than fired once into the background" — is **answered
+  and done**. It is no longer an open design question for this ticket.
+
+What remains for this ticket is exactly the residual the 2026-09-05 arm above describes: a fault
+that outlasts the client's retry budget (six rounds, ~0.6–1.25 s of backoff, inside
+`abortOrCancelTimeoutMs`), or a client that dies mid-window. The client now *reports* that it failed
+to discharge, so a node-side sweep can be designed knowing the client-side hole is closed for
+transient faults and only the abandoned-writer population is left.

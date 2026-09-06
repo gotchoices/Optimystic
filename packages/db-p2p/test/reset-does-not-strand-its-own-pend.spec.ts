@@ -67,7 +67,7 @@ type RpcKind = 'pend' | 'cancel' | 'commit';
 
 interface Gate {
 	transactor: ITransactor;
-	/** Break `kinds` at the client transport for the next `windowMs`, starting now. */
+	/** Break `kinds` at the client transport for `windowMs`, timed from the first call it catches. */
 	breakFor: (kinds: RpcKind[], windowMs: number) => void;
 	/** Break `kinds` with no end — the genuinely dead transport. */
 	breakForever: (kinds: RpcKind[]) => void;
@@ -85,10 +85,23 @@ interface Gate {
  */
 const buildGatedTransactor = (mesh: Mesh): Gate => {
 	let broken = new Set<RpcKind>();
+	let windowMs = 0;
+	/** 0 = armed but not yet tripped; otherwise the wall-clock instant the fault heals. */
 	let brokenUntil = 0;
 	const repliesLost = new Set<string>();
 	let injected = 0;
-	const isDown = (kind: RpcKind): boolean => broken.has(kind) && Date.now() < brokenUntil;
+	/**
+	 * The window starts at the FIRST gated call, not when the arm arms it. Arming starts the clock
+	 * against everything that happens to run first — an ungated pend, mesh setup — so on a loaded
+	 * machine the window could expire before the gated RPC was ever reached and the arm would assert
+	 * against an injector that never fired. Starting on first contact keeps the fault time-shaped
+	 * (once tripped it is down for every peer for `windowMs`) without that dependence.
+	 */
+	const isDown = (kind: RpcKind): boolean => {
+		if (!broken.has(kind)) return false;
+		if (brokenUntil === 0) brokenUntil = Date.now() + windowMs;
+		return Date.now() < brokenUntil;
+	};
 	const reset = (): never => { injected++; throw new Error('The stream has been reset'); };
 
 	const transactor = buildNetworkTransactor(mesh, {
@@ -112,9 +125,9 @@ const buildGatedTransactor = (mesh: Mesh): Gate => {
 
 	return {
 		transactor,
-		breakFor: (kinds, windowMs) => { broken = new Set(kinds); brokenUntil = Date.now() + windowMs; },
-		breakForever: (kinds) => { broken = new Set(kinds); brokenUntil = Number.POSITIVE_INFINITY; },
-		heal: () => { broken = new Set(); brokenUntil = 0; },
+		breakFor: (kinds, ms) => { broken = new Set(kinds); windowMs = ms; brokenUntil = 0; },
+		breakForever: (kinds) => { broken = new Set(kinds); windowMs = Number.POSITIVE_INFINITY; brokenUntil = 0; },
+		heal: () => { broken = new Set(); windowMs = 0; brokenUntil = 0; },
 		loseReplyForPend: (actionId) => { repliesLost.add(actionId); },
 		injectedFailures: () => injected
 	};

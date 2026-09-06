@@ -69,3 +69,12 @@ commit request. Both are legitimate; whoever picks this ticket up should decide 
 shared helper belongs at rather than adding a third. The repo-level seam is the more faithful
 injection (it cannot accidentally change what production code runs); the transactor-level one is the
 only way to express "commit fewer blocks than were pended".
+
+## Cross-reference: the fixture question is now its own ticket (review, 2026-09-05)
+
+`debt-no-mesh-fixture-forces-two-coordinator-batches` collects a related but distinct gap: no test
+mesh ever produces a write that goes out as MORE THAN ONE request, so three branches in the client's
+failure handling have never run. It names the same "which layer does the shared helper live at"
+question this ticket's arm above raises, and its fixture would live beside the helpers discussed
+here. Whoever picks up either should read both; they are separate assertions over a shared fixture,
+not duplicates.
