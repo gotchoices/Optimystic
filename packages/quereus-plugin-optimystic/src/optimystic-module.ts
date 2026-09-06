@@ -27,6 +27,18 @@ import { createLogger, revisionToken } from './logger.js';
 
 const log = createLogger('module');
 
+/**
+ * Every catch arm below that surfaces a caught error to the SQL layer funnels through
+ * here, so the original error (a `BlockUnavailableError` with its `reason`, a
+ * `BlockPossiblyStaleError` with its `claimedRev`, or any other typed failure db-core
+ * raises) stays reachable via `Error.cause` instead of being flattened into the message
+ * string. A caller reading through SQL can then walk `err.cause` to recover the typed
+ * fields a plain `.message` cannot carry (tickets/fix/2-a-sql-caller-cannot-see-why-a-read-failed).
+ */
+function rewrapAsQueryError(prefix: string, error: unknown): Error {
+  const message = `${prefix}: ${error instanceof Error ? error.message : String(error)}`;
+  return new Error(message, { cause: error });
+}
 
 
 /**
@@ -700,9 +712,9 @@ export class OptimysticVirtualTable extends VirtualTable {
       // Self-isolating: a wiring failure here never blocks initialization.
       await this.ensureChangeSubscription();
     } catch (error) {
-      const message = `Failed to initialize Optimystic table: ${error instanceof Error ? error.message : String(error)}`;
-      this.setErrorMessage(message);
-      throw new Error(message);
+      const wrapped = rewrapAsQueryError('Failed to initialize Optimystic table', error);
+      this.setErrorMessage(wrapped.message);
+      throw wrapped;
     }
   }
 
@@ -1148,9 +1160,9 @@ export class OptimysticVirtualTable extends VirtualTable {
         yield* this.executeTableScan(mainRead);
       }
     } catch (error) {
-      const message = `Query failed: ${error instanceof Error ? error.message : String(error)}`;
-      this.setErrorMessage(message);
-      throw new Error(message);
+      const wrapped = rewrapAsQueryError('Query failed', error);
+      this.setErrorMessage(wrapped.message);
+      throw wrapped;
     }
   }
 
@@ -2400,9 +2412,9 @@ export class OptimysticVirtualTable extends VirtualTable {
       if (error instanceof QuereusError) {
         throw error;
       }
-      const message = `${operation} failed: ${error instanceof Error ? error.message : String(error)}`;
-      this.setErrorMessage(message);
-      throw new Error(message);
+      const wrapped = rewrapAsQueryError(`${operation} failed`, error);
+      this.setErrorMessage(wrapped.message);
+      throw wrapped;
     }
   }
 
@@ -2911,9 +2923,9 @@ export class OptimysticVirtualTable extends VirtualTable {
       await this.ensureConnectionRegistered();
       await this.txnBridge.beginTransaction(this.options);
     } catch (error) {
-      const message = `Begin transaction failed: ${error instanceof Error ? error.message : String(error)}`;
-      this.setErrorMessage(message);
-      throw new Error(message);
+      const wrapped = rewrapAsQueryError('Begin transaction failed', error);
+      this.setErrorMessage(wrapped.message);
+      throw wrapped;
     }
   }
 
@@ -2924,9 +2936,9 @@ export class OptimysticVirtualTable extends VirtualTable {
     try {
       await this.txnBridge.commitTransaction();
     } catch (error) {
-      const message = `Commit transaction failed: ${error instanceof Error ? error.message : String(error)}`;
-      this.setErrorMessage(message);
-      throw new Error(message);
+      const wrapped = rewrapAsQueryError('Commit transaction failed', error);
+      this.setErrorMessage(wrapped.message);
+      throw wrapped;
     }
   }
 
@@ -2937,9 +2949,9 @@ export class OptimysticVirtualTable extends VirtualTable {
     try {
       await this.txnBridge.rollbackTransaction();
     } catch (error) {
-      const message = `Rollback transaction failed: ${error instanceof Error ? error.message : String(error)}`;
-      this.setErrorMessage(message);
-      throw new Error(message);
+      const wrapped = rewrapAsQueryError('Rollback transaction failed', error);
+      this.setErrorMessage(wrapped.message);
+      throw wrapped;
     }
   }
 
