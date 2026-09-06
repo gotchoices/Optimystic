@@ -148,36 +148,36 @@ verified the fix's discrimination by neutering it (round cap 1, throw replaced b
 reproducing the reported refusal chain verbatim, then reverting; that evidence was reviewed but not
 re-run.
 
-## Correction, 2026-09-06 — one of the two fixes is not actually guarded by its test
+## Verification, 2026-09-06 — the awaited-cancel arm was re-run and it does discriminate
 
-Added during a tending pass that re-verified this ticket's claims rather than trusting them. The
-code shipped here is unchanged and still believed correct; what is corrected is the coverage claim.
+The Validation section above records discrimination evidence for the `cancel` completeness check
+(round cap 1, throw replaced by a log) and states plainly that it "was reviewed but not re-run", and
+says nothing of the kind for the *other* change in this ticket — moving the pend failure path from an
+unawaited background microtask to an awaited `cancelBatch`. A tending pass closed that gap by
+re-running it.
 
-Test C's failure message reads "a wasted attempt means the cancel was not awaited", which presents
-it as the guard for changing the pend failure path from an unawaited background microtask to an
-awaited `cancelBatch`. Measured:
+Reverting the pend-failure arm to its exact prior expression, rebuilding `db-core`, and running the
+spec alone:
 
-| pend-failure arm in `network-transactor.ts` | spec alone | whole `db-p2p` suite |
-| --- | --- | --- |
-| `await this.cancelBatch(...)` (as shipped) | 4 passing | 2581 passing |
-| reverted to `void Promise.resolve().then(() => this.cancelBatch(...))` | **4 passing** | **2581 passing, 0 failing** |
+```
+1 failing
+  C: a pend whose reply is lost discharges before it returns...
+     AssertionError: attempt 2 must land — a wasted attempt means the cancel was not awaited.
+     attempts: armC-1:threw(...The stream has been reset)
+             | armC-2:refused(pending conflict: block(s) held by unresolved rival action(s) armC-1)
+             | armC-3:committed
+     expected 3 to equal 2
+```
 
-The awaited-cancel change can be reverted whole and nothing goes red. The reason is the fixture, not
-the test's intent: on the in-process mesh the cancel needs no round trip, and `source.transact`
-yields enough microtask ticks that the background cancel lands before the retry's pend reaches the
-members. The ordering test C names is unreachable there.
+Test C discriminates, and the intermediate attempt it exposes is the downstream fingerprint verbatim
+— an attempt refused by its own predecessor's record. Both arms of this ticket are now guarded by a
+test demonstrated to fail without its fix.
 
-This is consistent with, rather than contradicted by, the Validation section above: the
-discrimination evidence recorded there is for the *`cancel` completeness check* (round cap 1, throw
-replaced by a log) — test D's defect — and that section already states the evidence "was reviewed but
-not re-run". The awaited-cancel arm was simply never separately demonstrated.
-
-**What this does and does not mean.** Test C still earns its place: it asserts the user-visible
-outcome (a pend whose reply is lost costs one attempt, not the write), which is what the downstream
-report was about. It does not pin the mechanism, so a later refactor could restore the background
-microtask and stay green. The `await` is held in place by the reasoning at the site — the writer's
-documented obligation to discharge its own pending records — and by this note.
-
-Recorded as an arm on `backlog/debt-no-mesh-fixture-forces-two-coordinator-batches`, which already
-names this spec for a *different* limitation of the same fixture (no write spans two coordinator
-batches). Closing it needs the harness to make a peer respond *late* rather than only *fail*.
+**A trap worth recording, because it produced a wrong conclusion first.** `db-p2p`'s specs import
+their own package through `../src/...` but import `@optimystic/db-core` through its package exports,
+which resolve to `dist/src/index.js`. So editing `db-core`'s **source** and re-running `db-p2p`'s
+tests exercises the *previous* build and every test passes, which reads exactly like "the test does
+not guard this". The same applies to `quereus-plugin-optimystic`, whose specs import
+`../dist/plugin.js` directly. **Rebuild the edited package before drawing any conclusion from a
+cross-package disarm.** Within a single package (`db-p2p` source against `db-p2p` specs) no rebuild
+is needed, which is what makes the inconsistency easy to miss.
