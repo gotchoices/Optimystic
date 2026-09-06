@@ -919,6 +919,13 @@ export class CoordinatorRepo implements IRepo {
 		const blockIdBytes = new TextEncoder().encode(blockId);
 		const peers = await this.keyNetwork.findCluster(blockIdBytes);
 		const peerIds = peers ? Object.keys(peers) : [];
+		// NOTE: deliberately does NOT call `markBlocksSeen` — unlike the solo-self exit below.
+		// An empty cohort is a ROUTING FAILURE, not a settled answer: `findCluster` found nobody
+		// responsible, which can recover at any moment. Arming the lazy read-repair window here
+		// would suppress a genuine repair for a whole `readRepairWindowMs` after a transient
+		// routing blip. Re-entering this exit is also cheap — it performs no network work beyond
+		// the `findCluster` lookup the read already makes — so leaving it unarmed costs little.
+		// Do not "fix" this by symmetry with the solo-self exit.
 		if (peerIds.length === 0) return { absence: 'confirmed' };
 
 		// Solo-cluster short-circuit: the only responsible peer is us. There is no
@@ -931,6 +938,19 @@ export class CoordinatorRepo implements IRepo {
 			&& peerIds[0] === this.localPeerId.toString()
 		) {
 			this.log('cluster-fetch:solo-self-skip', { blockId });
+			// Arm the lazy read-repair window. This node IS the whole cohort, so the local answer
+			// is as current as any answer can be — the same premise the `absence: 'confirmed'`
+			// verdict above already rests on, and the same conclusion `cluster-fetch:local-current`
+			// reaches before arming. Without this the window never gets stamped, `shouldReadRepair`
+			// reads `lastSeen == null` forever, and every read re-enters this exit: read -> stale ->
+			// consult -> solo skip -> no-op -> still stale, unbounded (GitHub issue #8: a solo node
+			// spent 47 minutes on a cold schema apply, 3,880 triggers against 3,879 no-ops).
+			// Distinct from the commit-side rule that a commit arms the window only when its
+			// approvals form a majority of the full cohort: that removes arming from a path which
+			// proves nothing about RIVALS, while this adds it to a path where there are no rivals
+			// by construction. Cost when the cohort later grows: at most one window
+			// (`readRepairWindowMs`) of suppressed consult, then it self-heals.
+			this.markBlocksSeen([blockId]);
 			return { absence: 'confirmed' };
 		}
 

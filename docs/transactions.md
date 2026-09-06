@@ -677,6 +677,10 @@ In the default `lazy` read-repair mode, a locally-present block is not re-verifi
 
 **Worst-case staleness bound:** within the read-repair window a caller can observe state that is up to one commit behind the cluster's current head. Once the window expires, the next read polls the cohort for the current revision.
 
+**A solo node arms the window too.** When `findCluster` returns exactly one peer and that peer is this node, `fetchBlockFromCluster` (`packages/db-p2p/src/repo/coordinator-repo.ts`) skips the cohort consult entirely — there is no remote to sync from, and dialling self can hang a node with no listen addresses — and marks the block freshly checked on the way out. That stamp is what bounds the loop: without it the window is never armed, every read finds `lastSeen` unset, and the node re-enters the same skip forever (one `cluster-tx:read-repair-triggered` and one `cluster-tx:read-repair-noop` per read, indefinitely — the shape of GitHub issue #8, where a lone React Native node spent 47 minutes on a schema apply that takes seconds). Arming is honest here for the same reason the pass reports an authoritative absence: this node *is* the whole cohort, so the local answer is as current as any answer can be. The cost is paid only if the cohort later grows — a peer that joins inside the window is not consulted until the window lapses, at most `readRepairWindowMs`, after which repair resumes normally.
+
+**A cohort of zero deliberately does not.** An empty `findCluster` result is a routing failure, not a settled answer: routing can recover at any moment, and arming there would suppress a genuine repair for a whole window after a transient blip. Re-entering that exit costs only the cohort lookup the read already performs, so it stays unarmed and every read re-checks. The asymmetry with the solo case is intentional and carries a `NOTE:` at the site.
+
 #### What a repair pass will and will not accept
 
 A repair pass adopts the highest `(rev, actionId)` **corroborated by peers other than the reader** (`cluster/quorum-restore.ts`). Two rules matter to operators:
