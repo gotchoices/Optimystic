@@ -574,20 +574,39 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 		// confirmed. That is the original lie, re-opened `readRepairWindowMs` at a time.
 		describe('the mark outlives the consult (read-repair window)', () => {
 			/** Cohort of three where both remote peers claim `remoteRev` and nothing can acquire it,
-			 *  so every pass corroborates a revision this node fails to converge onto. */
+			 *  so every pass corroborates a revision this node fails to converge onto.
+			 *
+			 *  The returned `cluster` object is the SAME one `makeKeyNetwork` reads on every
+			 *  `findCluster` (it spreads at call time), so a spec can shrink the cohort between reads
+			 *  by deleting keys from it — that is how the solo-self and empty-cohort variants below
+			 *  reach the exits that consult nobody. `silenceRemotes()` is the third variant: the
+			 *  cohort stays whole and both remote callbacks reject instead. */
 			const buildUnacquirableCohort = async (remoteRev: number) => {
 				const localPeer = await makePeerId();
 				const holderA = await makePeerId();
 				const holderB = await makePeerId();
 				const cluster = makeClusterPeers([localPeer, holderA, holderB]);
 				let consults = 0;
+				let remotesSilent = false;
 				const callback: ClusterLatestCallback = async (peerId) => {
 					consults++;
-					return peerId.equals(localPeer)
-						? { actionId: 'local-action', rev: 1 }
-						: { actionId: 'remote-action', rev: remoteRev };
+					if (peerId.equals(localPeer)) return { actionId: 'local-action', rev: 1 };
+					if (remotesSilent) throw new Error('dial failed');
+					return { actionId: 'remote-action', rev: remoteRev };
 				};
-				return { localPeer, cluster, callback, consultCount: () => consults };
+				return {
+					localPeer, holderA, holderB, cluster, callback,
+					consultCount: () => consults,
+					silenceRemotes: () => { remotesSilent = true; }
+				};
+			};
+
+			/** Drop every peer but `keep` from the cohort view, in place, so the next `findCluster`
+			 *  returns the shrunken cohort. Pass nothing to empty it entirely. */
+			const shrinkCohort = (cluster: ClusterPeers, keep?: PeerId): void => {
+				for (const id of Object.keys(cluster)) {
+					if (keep === undefined || id !== keep.toString()) delete cluster[id];
+				}
 			};
 
 			it('keeps marking a read whose consult the window skipped', async () => {
@@ -650,6 +669,90 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 				const after = await repo.get({ blockIds: [blockId] });
 
 				expect('unconfirmedAheadRev' in after[blockId]!, 'caught up — nothing to doubt').to.equal(false);
+			});
+
+			// A consult that reached NOBODY refutes nothing (ticket
+			// a-consult-that-asked-nobody-erases-recorded-doubt). Three exits of
+			// `fetchBlockFromCluster` ask no cohort member at all — solo-self, empty cohort, and every
+			// asked peer staying silent — and each used to report the same "no claim" the healthy
+			// no-claim case reports, erasing a memo an earlier pass recorded and serving the stale
+			// copy as confirmed-current. All three run in `paranoid` mode so a consult definitely
+			// RUNS on the second read: this is about what a running consult learned, not about the
+			// read-repair window suppressing it (that is the first spec in this describe).
+			it('keeps the mark when the cohort shrinks to this node alone (solo-self exit)', async () => {
+				const { localPeer, cluster, callback } = await buildUnacquirableCohort(3);
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev).to.equal(3);
+
+				// The two holders drop out of the cohort view — a mid-identify or churning routing
+				// table. The solo short-circuit now runs, dialling nobody. It learned nothing about
+				// the claim, so it must not clear it.
+				shrinkCohort(cluster, localPeer);
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect(after[blockId]?.unconfirmedAheadRev, 'a solo consult refutes nothing').to.equal(3);
+			});
+
+			it('keeps the mark when the cohort lookup comes back empty (empty-cohort exit)', async () => {
+				const { localPeer, cluster, callback } = await buildUnacquirableCohort(3);
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev).to.equal(3);
+
+				// An empty cohort is a routing failure, not an answer — the sharpest form of "asked
+				// nobody" there is.
+				shrinkCohort(cluster);
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect(after[blockId]?.unconfirmedAheadRev, 'an empty cohort refutes nothing').to.equal(3);
+			});
+
+			it('keeps the mark when every cohort peer goes silent (total silence)', async () => {
+				const { localPeer, cluster, callback, silenceRemotes } = await buildUnacquirableCohort(3);
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev).to.equal(3);
+
+				// The whole cohort is still in the view and every one of them rejects. The consult
+				// ran, dialled, and came back with nothing — no evidence, same as never asking.
+				// This is the common field shape and the one unaffected by read-repair-window arming.
+				silenceRemotes();
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect(after[blockId]?.unconfirmedAheadRev, 'total silence refutes nothing').to.equal(3);
+			});
+
+			it('drops the mark when peers answer with a claim strictly BELOW what this node holds', async () => {
+				// The refutation that must keep working, and the row most easily broken by an
+				// over-cautious reading of the ticket above: peers DID answer, and what they hold is
+				// behind this node — so nothing is ahead and the memo goes. Distinct from the
+				// equality case in `drops the mark once a consult finds nothing ahead any more`, and
+				// deliberately arranged so the served revision (2) stays BELOW the memo (3): the
+				// catch-up branch in `flagUnconfirmedCurrency` cannot fire, leaving the refutation
+				// itself as the only thing that can clear the mark.
+				const localPeer = await makePeerId();
+				const holderA = await makePeerId();
+				const holderB = await makePeerId();
+				const cluster = makeClusterPeers([localPeer, holderA, holderB]);
+				let remoteRev = 3;
+				const callback: ClusterLatestCallback = async (peerId) =>
+					peerId.equals(localPeer)
+						? { actionId: 'local-action', rev: 2 }
+						: { actionId: 'remote-action', rev: remoteRev };
+
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 2);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev).to.equal(3);
+
+				remoteRev = 1;	// the cohort now holds LESS than this node
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect('unconfirmedAheadRev' in after[blockId]!, 'answered peers behind us refute the claim').to.equal(false);
 			});
 		});
 	});

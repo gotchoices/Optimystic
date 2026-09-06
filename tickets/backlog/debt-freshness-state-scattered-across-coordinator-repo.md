@@ -239,3 +239,32 @@ is now decided at five separate sites (three read-path exits, two write-path one
 its case in a prose comment, and no two of them share a helper that states the underlying rule —
 "arm only when re-asking sooner could not learn anything". A gap between two of those sites is
 exactly what `bug-a-cohort-that-cannot-corroborate-re-asks-on-every-read` reports.
+
+## Eleventh measurement (implement of `a-consult-that-asked-nobody-erases-recorded-doubt`)
+
+Re-measured (`wc -l packages/db-p2p/src/repo/coordinator-repo.ts`): **2341 lines**, up from 2270.
+
+The currency half is now a named verdict too. The ninth measurement predicted the extraction should
+treat "what did this consult actually establish?" as one named answer covering both halves rather
+than "a verdict plus a loose optional number"; that fix has landed, so the extraction now inherits
+**both** halves named: `fetchBlockFromCluster` returns `{ absence: AbsenceVerdict; currency:
+CurrencyVerdict }`, with `currency` required so a new exit cannot mean "peers refuted the claim" by
+leaving a field off. `CurrencyVerdict` distinguishes three things the old `number | undefined`
+could not: `refuted` (a cohort member answered and nothing is ahead — the only verdict that may
+clear the remembered claim), `no-evidence` (nobody was asked or nobody answered — the memo stands),
+and `unsettled-claim` (a peer claims a revision ahead that this pass did not converge onto).
+
+What this does and does not change for the extraction:
+
+- **Does:** the acceptance criterion "existence and currency returned as separate, named results"
+  is now satisfied at the current seam, so the extraction can lift the pair wholesale instead of
+  re-designing the currency return on the way out. Two shared verdict values are computed once
+  beside each other — `silenceVerdict` for existence, `nothingAheadVerdict` for currency — and both
+  key off the same `answered` count; a collaborator owning freshness should own that count and
+  derive both, rather than each exit re-deriving them.
+- **Does not:** the wider seam the tenth measurement describes is untouched. Whether a node re-asks
+  the cohort is still decided at five sites, and this ticket's fix deliberately left the read-repair
+  window arming exactly as it was — the solo exit still arms the window *and* now also keeps the
+  memo, because "was this checked recently?" and "is there recorded doubt?" are different questions.
+  Those two facts being independently maintained at the same exits is the same coupling this ticket
+  is about; the extraction should make the pair one decision, not two calls an author must remember.
