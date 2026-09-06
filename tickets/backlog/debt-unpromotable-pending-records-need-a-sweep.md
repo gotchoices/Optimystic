@@ -124,3 +124,28 @@ That leaves the two expensive options the body already lists — a time bound, o
 somewhere that knows the transaction is gone — and removes the cheap third. Worth knowing before the
 design pass starts, because "decidable locally with no timing guess" was the reason to think this
 might be easier than it looks.
+
+## Arm: the client-side half named in "What a fix has to answer" is being fixed (2026-09-05)
+
+Filed from `fix/a-reset-attempt-leaves-a-pend-the-retry-collides-with`, now promoted as
+`implement/a-failed-attempt-must-discharge-its-own-pend`.
+
+The body above asks, as one of its open questions, "whether the client side should be hardened too,
+so a refused pend's cancel is retried rather than fired once into the background". That question is
+now answered and is being implemented — but the measurement changes the picture for this ticket in
+two ways worth recording before the design pass starts.
+
+**The client side was worse than "fired once into the background".** `NetworkTransactor.cancel`
+runs `processBatches`, which never rethrows, and — unlike `pend` and `commit` — follows it with no
+`everyBatch` completeness check. A cancel whose every peer RPC failed **returns normally**. Verified
+on the in-process mesh: all three members still held the record afterwards, and the call reported
+nothing. So the two producers this ticket lists are joined by a third that needs no crashed client
+at all — an ordinary transient stream reset during the cancel is enough, and nobody upstream ever
+learns the cleanup did not happen.
+
+**A retried, checked cancel covers the transient case, and only the transient case.** With the
+cancel retrying inside `abortOrCancelTimeoutMs`, a 150 ms transport fault is absorbed and the next
+attempt writes normally. What it does not cover is any fault that outlasts that budget, or a client
+that dies mid-window — which is precisely the population this ticket exists for. That population is
+now smaller and better characterised, not gone: the node-side sweep remains the only cure for a
+record whose writer never comes back.
