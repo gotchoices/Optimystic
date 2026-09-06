@@ -920,12 +920,12 @@ export class CoordinatorRepo implements IRepo {
 		const peers = await this.keyNetwork.findCluster(blockIdBytes);
 		const peerIds = peers ? Object.keys(peers) : [];
 		// NOTE: deliberately does NOT call `markBlocksSeen` — unlike the solo-self exit below.
-		// An empty cohort is a ROUTING FAILURE, not a settled answer: `findCluster` found nobody
-		// responsible, which can recover at any moment. Arming the lazy read-repair window here
-		// would suppress a genuine repair for a whole `readRepairWindowMs` after a transient
-		// routing blip. Re-entering this exit is also cheap — it performs no network work beyond
-		// the `findCluster` lookup the read already makes — so leaving it unarmed costs little.
-		// Do not "fix" this by symmetry with the solo-self exit.
+		// An empty cohort is a ROUTING FAILURE, not a settled answer, and `Libp2pKeyPeerNetwork`
+		// cannot even produce one (its `findCluster` always includes self); the only producer
+		// today is the mesh harness's injected `findClusterFails`. Arming the read-repair window
+		// here would suppress a genuine repair for a whole `readRepairWindowMs` after a transient
+		// blip, and re-entering costs no network work beyond the `findCluster` the read already
+		// makes. Do not "fix" this by symmetry with the solo-self exit.
 		if (peerIds.length === 0) return { absence: 'confirmed' };
 
 		// Solo-cluster short-circuit: the only responsible peer is us. There is no
@@ -938,18 +938,23 @@ export class CoordinatorRepo implements IRepo {
 			&& peerIds[0] === this.localPeerId.toString()
 		) {
 			this.log('cluster-fetch:solo-self-skip', { blockId });
-			// Arm the lazy read-repair window. This node IS the whole cohort, so the local answer
-			// is as current as any answer can be — the same premise the `absence: 'confirmed'`
-			// verdict above already rests on, and the same conclusion `cluster-fetch:local-current`
-			// reaches before arming. Without this the window never gets stamped, `shouldReadRepair`
-			// reads `lastSeen == null` forever, and every read re-enters this exit: read -> stale ->
-			// consult -> solo skip -> no-op -> still stale, unbounded (GitHub issue #8: a solo node
-			// spent 47 minutes on a cold schema apply, 3,880 triggers against 3,879 no-ops).
-			// Distinct from the commit-side rule that a commit arms the window only when its
-			// approvals form a majority of the full cohort: that removes arming from a path which
-			// proves nothing about RIVALS, while this adds it to a path where there are no rivals
-			// by construction. Cost when the cohort later grows: at most one window
-			// (`readRepairWindowMs`) of suppressed consult, then it self-heals.
+			// Arm the lazy read-repair window. Without this the window is never stamped,
+			// `shouldReadRepair` reads `lastSeen == null` forever, and every read re-enters this
+			// exit — read -> stale -> consult -> solo skip -> no-op -> still stale, unbounded
+			// (GitHub issue #8: a solo node spent 47 minutes on a cold schema apply, logging 3,880
+			// triggers against 3,879 no-ops).
+			// What arming claims, precisely: NOT that this node has no rivals. A self-only cohort
+			// is also what `Libp2pKeyPeerNetwork.findCluster` returns while genuine same-network
+			// peers are still 'unknown' mid-identify (see its membership-scoping comment). It
+			// claims only that re-asking sooner than one window cannot learn anything the next
+			// `findCluster` would not, since this exit runs no other query — so a cohort that
+			// appears, grows, or finishes identifying is consulted within one `readRepairWindowMs`.
+			// NOTE: that self-heal delay IS `readRepairWindowMs` — 10s by default, well under
+			// bootstrap. If it is ever configured into the minutes, a cold node would serve
+			// unverified reads for that whole period; gate arming on cohort provenance if so.
+			// Deliberately opposite to the commit-side rule that withholds arming from a commit
+			// whose quorum proves nothing about rivals: that damps nothing, this bounds an
+			// otherwise unbounded loop. Landing both, keep both — see the specs for each.
 			this.markBlocksSeen([blockId]);
 			return { absence: 'confirmed' };
 		}

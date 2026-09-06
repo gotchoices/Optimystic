@@ -90,6 +90,20 @@ const makePresentStorageRepo = (blockId: BlockId, rev: number): IRepo => {
 	};
 };
 
+/** Storage repo that holds nothing, so every read of `blockId` is a local miss. */
+const makeEmptyStorageRepo = (): IRepo => ({
+	async get(blockGets: BlockGets, _options?: MessageOptions): Promise<GetBlockResults> {
+		return Object.fromEntries(blockGets.blockIds.map(id => [id, { state: {} }]));
+	},
+	async pend(_request: PendRequest, _options?: MessageOptions): Promise<PendResult> {
+		return { success: true, pending: [], blockIds: [] };
+	},
+	async cancel(_actionRef: ActionBlocks, _options?: MessageOptions): Promise<void> { },
+	async commit(_request: CommitRequest, _options?: MessageOptions): Promise<CommitResult> {
+		return { success: true };
+	}
+});
+
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const makeClusterClient = ((_peerId: PeerId) => ({} as any)) as (peerId: PeerId) => ClusterClient;
 
@@ -216,6 +230,42 @@ describe('CoordinatorRepo solo-cohort read-repair window', () => {
 		setClock(BASE_TIME + WINDOW_MS + 1);
 		await repo.get({ blockIds: [blockId] });
 		expect(callbackInvocations).to.include(newPeer.toString());
+	});
+
+	it('does not suppress reads of a block this node does not hold', async () => {
+		// The solo exit stamps whatever block id reached it, INCLUDING one that is missing
+		// locally. That stamp is inert because `get` short-circuits on `isMissing` before it ever
+		// consults `shouldReadRepair` — a missing block is re-consulted on every read regardless
+		// of the window. Pinned here because "inert" is the only thing keeping the stamp harmless:
+		// if the missing-block bypass is ever narrowed, this case fails and says so, instead of a
+		// never-held block quietly reporting an authoritative absence for a whole window.
+		const localPeer = await makePeerId();
+		const cluster = makeClusterPeers([localPeer]);
+		const repo = new CoordinatorRepo(
+			makeMutableKeyNetwork(cluster),
+			makeClusterClient,
+			makeEmptyStorageRepo(),
+			{ clusterSize: 3, readRepairMode: 'lazy', readRepairWindowMs: WINDOW_MS, readRepairSampleRate: 0 },
+			undefined,
+			localPeer,
+			undefined,
+			async () => undefined
+		);
+		let clock = BASE_TIME;
+		repo.now = () => clock;
+
+		const captured = await captureCoordinatorLog(async () => {
+			for (let i = 0; i < 9; i++) {
+				clock = BASE_TIME + i * 1_000;	// all nine reads land inside the window
+				await repo.get({ blockIds: [blockId] });
+			}
+		});
+
+		expect(countTag(captured, 'cluster-fetch:solo-self-skip'),
+			'a locally-missing block consults on every read, window or no window').to.equal(9);
+		// Not a stale-content decision, so it is not read-repair: the triggered/no-op pair belongs
+		// to the present-but-possibly-stale path only.
+		expect(countTag(captured, 'cluster-tx:read-repair-triggered')).to.equal(0);
 	});
 
 	it('leaves the empty-cohort exit unarmed: every read re-triggers', async () => {

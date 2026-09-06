@@ -193,3 +193,31 @@ A second, smaller observation for the same pass: all four maps are keyed `string
 them is keyed by a block id, so the compiler cannot tell a block key from any other string the class
 handles. Cheap to fix inside the extraction, not worth a ticket on its own.
 
+
+## Ninth measurement (review pass on `solo-node-read-repair-never-settles`)
+
+Re-measured (`wc -l packages/db-p2p/src/repo/coordinator-repo.ts`): **2224 lines**, up from 2199.
+Two things this pass settled, recorded here so they are not re-opened.
+
+**The eighth measurement's open question is answered.** It asked whether the `peerIds.length === 0`
+exit "should arm" the read-repair window like the solo exit now does. It should not, and the reason
+turned out not to be the interesting part: `Libp2pKeyPeerNetwork.findCluster` always includes this
+node in the cohort it returns, so an empty result is not something the production key network can
+produce at all — only the mesh harness's injected lookup failure reaches that branch. Both exits
+now carry a `NOTE:` stating their side of the asymmetry.
+
+**A third instance of the predicted mistake, in the currency half.** The eighth measurement argued
+that "consult finished" and "window armed" being two facts a caller must keep in sync is what let
+one exit forget. The same shape produced a second, independent defect at the same site, now filed as
+`fix/a-consult-that-asked-nobody-erases-recorded-doubt`: `fetchBlockFromCluster` returns
+`claimedAheadRev: undefined` for *both* "peers answered and claim nothing ahead" and "no peer was
+asked, or none answered", so `get` clears the remembered ahead-claim on a consult that reached
+nobody — and `recordAheadClaim`'s own doc comment states the invariant this violates ("Only a
+consult that actually RAN may call this"). Verified by probe on both the solo-self and
+total-silence paths.
+
+This is the strongest evidence yet for the acceptance criterion this ticket already carries —
+existence and currency returned as separate, *named* results. Note that `AbsenceVerdict` fixed
+exactly this flattening for existence and the currency half was left as a bare optional number, so
+the extraction should treat "what did this consult actually establish?" as one named answer covering
+both halves rather than a verdict plus a loose field.
