@@ -43,9 +43,10 @@ derived from the other.
 - New spec `read-error-cause-passthrough.spec.ts`: drives a table init whose transactor
   raises `BlockUnavailableError('cohort-unreachable')`, catches what SQL throws, and asserts
   the cause chain reaches an error with `reason === 'cohort-unreachable'`. Passes.
-- Full package suite: `npm run build && npm test` in
-  `packages/quereus-plugin-optimystic` — 706 passing, 13 pending (pre-existing skips),
-  0 failing.
+- Full package suite, re-run at implement→review promotion (this pass):
+  `npm run build && npm test` in `packages/quereus-plugin-optimystic` —
+  build clean (ESM + DTS), **706 passing, 13 pending (pre-existing skips), 0 failing**.
+  Same counts as the original implement pass, confirming nothing regressed since.
 - Swept the rest of the package (`optimystic-adapter/collection-factory.ts`,
   `optimystic-adapter/txn-bridge.ts`, `transaction/quereus-engine.ts`, `schema/*.ts`) for the
   same rewrap-loses-cause shape. Found none: the other `catch` arms either (a) log-and-swallow
@@ -53,14 +54,31 @@ derived from the other.
   `string` field from a result object (`result.error`) that was never an `Error` instance and
   so had no `cause` to lose. The six sites in `optimystic-module.ts` were the full count.
 
-## Gaps for review
+## Use cases for reviewer testing
+
+- **Golden path**: force a `BlockUnavailableError` (or any db-core typed error) out of a
+  transactor during a query/init/txn call, catch what the SQL layer throws, and confirm
+  `err.cause` — or `err.cause.cause` if Quereus's own wrap sits on top — is the *original*
+  error instance (`instanceof BlockUnavailableError`, `.reason` intact). The existing spec
+  does exactly this for `reason`.
+- **Message-text consumers**: anything grepping/matching on `.message` strings (logs,
+  existing tests asserting error text) should see byte-identical text to before — only
+  `.cause` is new. Worth a spot check that no existing test asserts `err.cause` is
+  `undefined` (would now fail).
+- **Non-Error throws**: the helper's `String(error)` branch — confirm a thrown non-Error
+  value (e.g. a plain string or object) still produces a sane message and a `cause` pointing
+  at that raw value (not further wrapped).
+
+## Gaps for review (carried over from implement, not yet closed)
 
 - No test asserts `BlockPossiblyStaleError.claimedRev` survives the same way — only
   `BlockUnavailableError.reason` is covered. The helper is generic (any `Error` passed as
   `cause`) so the code path is identical, but a reviewer may want a second spec for the
-  `claimedRev` case for parity with the ticket's stated scope.
+  `claimedRev` case for parity with the ticket's stated scope. This is a coverage gap, not a
+  known defect — decide during review whether to add it inline (minor) or accept the
+  parity argument as sufficient.
 - The historical claim "confirm the spec fails at HEAD before the fix" from the originating
-  ticket could not be re-verified in this pass, since the fix was already committed
-  (`e81094c5`) before this ticket reached the implement stage — reverting locally to check
-  was judged not worth the churn given the spec's assertions are unambiguous about what
-  they'd catch (no cause chain, or wrong `reason`, both fail loudly).
+  ticket could not be re-verified, since the fix was already committed (`e81094c5`) before
+  this ticket reached the implement stage — reverting locally to check was judged not worth
+  the churn given the spec's assertions are unambiguous about what they'd catch (no cause
+  chain, or wrong `reason`, both fail loudly).
