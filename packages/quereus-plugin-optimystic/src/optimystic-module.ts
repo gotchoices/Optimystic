@@ -33,13 +33,14 @@ const log = createLogger('module');
  * `BlockPossiblyStaleError` with its `claimedRev`, or any other typed failure db-core
  * raises) stays reachable via `Error.cause` instead of being flattened into the message
  * string. A caller reading through SQL can then walk `err.cause` to recover the typed
- * fields a plain `.message` cannot carry (tickets/fix/2-a-sql-caller-cannot-see-why-a-read-failed).
+ * fields a plain `.message` cannot carry. The message text is identical to the
+ * hand-rolled wraps this replaced, so `cause` is purely additive and message-matching
+ * consumers are unaffected.
  */
 function rewrapAsQueryError(prefix: string, error: unknown): Error {
   const message = `${prefix}: ${error instanceof Error ? error.message : String(error)}`;
   return new Error(message, { cause: error });
 }
-
 
 /**
  * Configuration interface for Optimystic module

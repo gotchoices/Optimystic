@@ -263,6 +263,43 @@ Quereus is not SQLite — it is a distinct SQL engine with intentional departure
 
 For the full dialect reference, see the [Quereus SQL Reference](https://github.com/nicktobey/quereus/blob/main/docs/sql.md), particularly Section 11 ("Quereus vs. SQLite").
 
+## Error Handling: typed causes survive the SQL boundary
+
+Optimystic's storage layer raises *typed* read failures so a caller can branch on the
+reason rather than parse a sentence — `BlockUnavailableError` carries `reason`
+(`'unmaterializable'`, `'peers-unreachable'`, `'cohort-unreachable'`, `'claimed-elsewhere'`)
+and `BlockPossiblyStaleError` carries `claimedRev` (see
+[docs/transactions.md](../../docs/transactions.md) § Unavailable reads).
+
+This module rewraps a caught failure so the SQL layer gets a message with context
+(`"Query failed: …"`), but the original error is preserved on `Error.cause`. Quereus wraps
+that in turn and preserves `cause` as well, so the chain reaching an application is:
+
+```
+QuereusError  ->  Error ("Query failed: …")  ->  BlockUnavailableError (reason intact)
+```
+
+Walk `cause` rather than matching on message text:
+
+```typescript
+function rootCause(error: unknown): unknown {
+  while (error instanceof Error && error.cause !== undefined) error = error.cause;
+  return error;
+}
+
+try {
+  await db.eval(`select * from t`);
+} catch (error) {
+  const cause = rootCause(error);
+  if (cause instanceof BlockUnavailableError && cause.reason === 'cohort-unreachable') {
+    // this node simply could not reach the cohort — retry later, don't treat as absent
+  }
+}
+```
+
+A value thrown that is not an `Error` reaches `cause` unchanged. Message text is unaffected
+by this — anything matching on `.message` keeps working.
+
 ## Limitations
 
 - Primary keys are stored as strings; non-TEXT keys work correctly but are not order-optimised (the engine re-sorts them rather than reading them ordered from the tree)
