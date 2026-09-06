@@ -59,3 +59,49 @@ randomly generated; navigation only touches existing blocks). The removal is not
 regression against the validator's *designed* guarantee (stale read of an existing
 revision). This ticket parks the isolation-level question for a human to weigh
 against the system's intended concurrency semantics.
+
+## Arm, 2026-09-05 — a downstream consumer's correctness depends on this answer being "yes"
+
+Added during a tending pass, from the sibling `../sereus` checkout. It does not change the ticket's
+shape; it changes the weight of its `tradeoffs:` line, which currently says the answer "may simply be
+no" and the right outcome may be to close it having recorded that the removal was deliberate. That
+is now a costlier call than it looks, because a real consumer's schema semantics rest on it.
+
+**Their ticket** is `sereus/tickets/blocked/optimystic-concurrent-same-pk-insert-silent-lww`,
+`repro: verified`. Their unblock condition, in their words: a change making a commit whose primary
+key (or unique value) was taken by a **concurrent committed** writer FAIL at merge/sync rather than
+replace the earlier row — surfacing as the ordinary `UNIQUE constraint failed:` error the SQL layer
+already raises for a *sequential* duplicate.
+
+**Their measurement, three experiments:**
+
+| | setup | result |
+| --- | --- | --- |
+| 1 | two real nodes, replication cohort 2 on both sides, both inserting the same primary key in one tick | both promises FULFILLED; exactly one row survives on both nodes' views (the second writer's); **no error anywhere** |
+| 2 | one node, two database handles over one local store | identical shape — two writers the local write queue cannot see are sufficient; two machines are not required |
+| 3 | discriminator: same setup, **different** primary keys | both rows survive — ordinary convergence |
+
+Experiment 3 is what makes this this ticket's question rather than a replication bug: the loss is
+specific to a *shared* key.
+
+**Why it is the phantom-read case and not something else.** Each writer reads the row's block, finds
+it absent, and inserts. Under the isolation this ticket describes, an absent read records no
+dependency — so when the other writer creates that block, nothing makes the second commit stale, and
+it merges as a plain overwrite. Turn the answer to "yes" and the second writer's commit has a
+dependency on a block that has since been created, fails the stale-read check, and surfaces through
+the SQL layer as the UNIQUE violation their schema is written to expect. That is the whole of their
+unblock condition, reached from this ticket's decision rather than from any new mechanism.
+
+**What this does and does not settle.** It supplies the missing thing the body asks for — a concrete
+consumer and a measured consequence — so the decision can be made on evidence rather than on
+principle. It does **not** decide it: "no" remains defensible if the intended isolation level really
+is the current one, but choosing "no" now means telling that consumer their schema's uniqueness
+guarantee does not hold across concurrent writers, and that is a statement someone has to be willing
+to make out loud rather than a quiet close.
+
+One caveat, from their own ticket: `formation-unique-token-redesign` has since shipped on their side
+and removed the specific product need that first motivated their report. So this is a correctness
+argument, not an urgency one — nobody is currently stuck waiting on it.
+
+**Not promoted.** This ticket asks "should we do this at all", which is a human's call and not a
+tending pull; the evidence is recorded here so that call can be made without re-deriving it.
