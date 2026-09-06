@@ -1,5 +1,5 @@
-import type { ITransactor, GetBlockResults, ActionBlocks, BlockActionStatus, PendResult, CommitResult, PendRequest, BlockId, CommitRequest, BlockGets, IBlock, ActionId, ActionTransforms, StaleFailure, Transform, Transforms, ClusterNomineesResult, CollectionId } from "../index.js";
-import { highestStaleAt } from "../network/stale-failure.js";
+import type { ITransactor, GetBlockResults, ActionBlocks, BlockActionStatus, PendResult, CommitResult, PendRequest, BlockId, CommitRequest, BlockGets, IBlock, ActionId, ActionRev, ActionTransforms, StaleFailure, Transform, Transforms, ClusterNomineesResult, CollectionId } from "../index.js";
+import { highestStaleAt, isOwnRevision } from "../network/stale-failure.js";
 import { ensuredMap } from "../utility/ensured.js";
 import { Latches } from "../utility/latches.js";
 import { applyTransform, blockIdsForTransforms, transformForBlockId, emptyTransforms, concatTransform, transformsFromTransform } from "../transform/index.js";
@@ -193,7 +193,11 @@ export class TestTransactor implements ITransactor {
 				if (rev !== undefined || blockTransform.insert) {
 					const checkRev = rev ?? 0; // Check from revision 0 if it's an insert
 					if (blockState.latestRev >= checkRev) {
-						if (blockState.revisionActions.get(blockState.latestRev) !== actionId) {
+						// Mirrors StorageRepo.pend exactly: only a real revision race yields a
+						// meaningful `staleAt`. A rev-less pend reaches here as an insert collision
+						// (`checkRev` degraded to 0), where the block's revision answers a question
+						// nobody asked; and our own durable half of a torn action is not a rival's win.
+						if (rev !== undefined && !isOwnRevision(latestActionRev(blockState), rev, actionId)) {
 							staleCandidates.push({ blockId, rev: blockState.latestRev });
 						}
 						// Collect conflicting committed actions
@@ -341,7 +345,7 @@ export class TestTransactor implements ITransactor {
         // durable half of a torn action, which its own retry must not be refused by).
         const staleAt = highestStaleAt(staleBlocks.map(blockId => {
           const blockState = this.blocks.get(blockId)!;
-          return blockState.revisionActions.get(blockState.latestRev) === actionId
+          return isOwnRevision(latestActionRev(blockState), rev, actionId)
             ? undefined
             : { blockId, rev: blockState.latestRev };
         }));
@@ -766,6 +770,14 @@ function newBlockState(): BlockState {
 		pendingActions: new Map(),
 		committedActions: new Map()
 	};
+}
+
+/** This block's latest committed revision in the shape {@link isOwnRevision} compares — the
+ *  harness equivalent of `IBlockStorage.getLatest()`. `undefined` when nothing is recorded at that
+ *  revision, which is how a never-written block reads (`latestRev` starts at 0 with no entry). */
+function latestActionRev(blockState: BlockState): ActionRev | undefined {
+	const actionId = blockState.revisionActions.get(blockState.latestRev);
+	return actionId === undefined ? undefined : { actionId, rev: blockState.latestRev };
 }
 
 /** Returns the materialized block at the highest revision ≤ the given revision, together with

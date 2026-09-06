@@ -272,8 +272,14 @@ Two rules govern it:
   Suspicion, or a number lifted from another peer's reject text, leaves it absent. Absent means "no
   confirmed number", never "not stale" — a peer on an older build simply omits it (the repo protocol
   is plain JSON).
-- **Diagnostic, never a retryability signal.** `conflict` (via `isConflictFailure`) stays the single
-  source of truth for "can a re-read and re-pend win?". Nothing branches retry decisions on `staleAt`.
+- **Never a retryability signal.** `conflict` (via `isConflictFailure`) stays the single source of
+  truth for "can a re-read and re-pend win?", and no producer or consumer re-derives that from
+  `staleAt`. One consumer does branch on it, for a strictly different question: `Collection.sync`
+  compares the revision its next attempt would request against `staleAt` to answer "can that
+  attempt possibly differ from the one that just failed?", and stops with `SyncRevisionStalledError`
+  when the answer is provably no (see `SyncOptions.maxStalledAttempts` in
+  [collections.md](collections.md)). It only ever ends a loop `isConflictFailure` had already
+  decided to continue — it never starts one.
 
 Where more than one candidate exists — a producer scanning several blocks, or `NetworkTransactor`
 rebuilding one response from many per-batch ones — every site picks the **highest** `rev` through

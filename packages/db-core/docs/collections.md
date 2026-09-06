@@ -237,11 +237,23 @@ Key aspects of the sync process:
 - **Stale detection**: Retries when remote state has changed during sync
 - **Bounded retry**: A persistent stale failure gives up after `maxAttempts` consecutive no-progress
   attempts (default 10), throwing `SyncRetryExhaustedError` instead of spinning the latch forever.
-  Configure via `SyncOptions` (`maxAttempts`, `deadlineMs`, `baseBackoffMs`, `maxBackoffMs`, `signal`)
-  passed to `sync()` / `updateAndSync()`. The error carries the last rejection's `lastReason` prose
-  and, when a responder confirmed one, `staleAt` — the block and revision it actually holds, as data
-  rather than a number buried in that prose (see `StaleFailure.staleAt` in
-  [transactor.md](transactor.md)).
+  Configure via `SyncOptions` (`maxAttempts`, `maxStalledAttempts`, `deadlineMs`, `baseBackoffMs`,
+  `maxBackoffMs`, `signal`) passed to `sync()` / `updateAndSync()`. The error carries the last
+  rejection's `lastReason` prose and, when a responder confirmed one, `staleAt` — the block and
+  revision it actually holds, as data rather than a number buried in that prose (see
+  `StaleFailure.staleAt` in [transactor.md](transactor.md)). Where several responders confirmed
+  different revisions, the **highest** is kept: the next request has to clear every holder.
+- **Fail-fast on a wedged view**: retrying is only worth waiting for while the next attempt can
+  differ from the one that just failed. When the refresh between attempts moves the collection's
+  revision nowhere at all *and* a responder confirmed a revision at or above the one the next
+  attempt would request, that attempt is provably identical and already lost. After
+  `maxStalledAttempts` consecutive such rounds (default 2 — two, so one transiently-lagging read is
+  absorbed) `sync()` throws `SyncRevisionStalledError`, a subclass of `SyncRetryExhaustedError`
+  carrying `staleAt`, `requestedRev` and `heldRev`. Neither ordinary contention nor a collection
+  still catching up reaches that: both move the revision, which resets the counter. Set
+  `maxStalledAttempts` to `maxAttempts` to restore the pre-existing whole-budget behaviour. This
+  makes the failure fast and correctly named — it does not make the write land; `sync()` never
+  adopts the confirmed revision, because it is a bare number rather than the history behind it.
 - **Pending management**: Waits (with exponential backoff) for conflicting transactions to complete
 - **State consistency**: Maintains proper revision tracking and cache coherence
 

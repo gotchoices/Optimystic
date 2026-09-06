@@ -1370,6 +1370,89 @@ describe('Collection', () => {
         expect(values).to.have.members(['winner', 'loser'])
       })
 
+      /** Passes commits through until `arm()`, then refuses every one with a confirmed rev 42 while
+       *  advancing the collection's own held revision by one on each of the first `climbFor`
+       *  refusals — the shape of a client catching up off a replica that lags the confirmed holder.
+       *  The adoption is applied directly rather than by staging a rival commit: what is under test
+       *  is how the retry loop reads a RISING requested revision, not how the revision came to rise
+       *  (`advanceContext` adopts either the same way, and can only ever move it up). The
+       *  pass-through phase is not decoration — a collection must genuinely own a committed header
+       *  before its revision may run ahead of storage, or `CollectionHeaderVanishedError` fires
+       *  first and rightly so. */
+      class ClimbingRefreshTransactor implements ITransactor {
+        commitAttempts = 0
+        collection: Collection<TestAction> | undefined
+        private armed = false
+        constructor(private readonly inner: TestTransactor, private readonly climbFor: number) {}
+        get(b: BlockGets) { return this.inner.get(b) }
+        getStatus(a: ActionBlocks[]) { return this.inner.getStatus(a) }
+        pend(r: PendRequest) { return this.inner.pend(r) }
+        cancel(a: ActionBlocks) { return this.inner.cancel(a) }
+        arm() { this.armed = true }
+        async commit(request: CommitRequest): Promise<CommitResult> {
+          if (!this.armed) return this.inner.commit(request)
+          this.commitAttempts++
+          if (this.commitAttempts <= this.climbFor) {
+            const target = this.collection!
+            target.recordCommitted(`climb-${this.commitAttempts}`, target.getNextRev())
+          }
+          return {
+            success: false,
+            conflict: true,
+            reason: 'stale revision: block hot-block at rev 42',
+            staleAt: { blockId: 'hot-block', rev: 42 },
+          }
+        }
+      }
+
+      /** Commits one action for real (so a header exists at rev 1), then arms the refusals. */
+      const armedAtRevOne = async (transactorUnderTest: ClimbingRefreshTransactor) => {
+        const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
+        transactorUnderTest.collection = collection
+        await collection.act({ type: 'set', data: { value: 'first', timestamp: 1 } })
+        await collection.sync({ maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 })
+        transactorUnderTest.arm()
+        return collection
+      }
+
+      it('does not strike while the refresh is still climbing toward the confirmed revision', async () => {
+        // The rule is "the refresh moved the collection NOWHERE", not "it did not move far enough".
+        // A client whose reads keep landing short advances a revision at a time while a holder sits
+        // far ahead: every one of those attempts is a genuinely different request that may yet win,
+        // so none of them may count as a strike even though all of them are below rev 42.
+        const transactorUnderTest = new ClimbingRefreshTransactor(new TestTransactor(), Infinity)
+        const collection = await armedAtRevOne(transactorUnderTest)
+        await collection.act({ type: 'set', data: { value: 'climbing', timestamp: 2 } })
+
+        const syncPromise = collection.sync({ maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 })
+        syncPromise.catch(() => { /* asserted below */ })
+        const err = await syncPromise.catch(e => e) as SyncRetryExhaustedError
+
+        // The attempt cap ended it, not the stall check — and the whole budget really was spent.
+        expect(err).to.be.instanceOf(SyncRetryExhaustedError)
+        expect(err).to.not.be.instanceOf(SyncRevisionStalledError)
+        expect(transactorUnderTest.commitAttempts).to.equal(5)
+      })
+
+      it('counts strikes consecutively, so movement in between clears the earlier ones', async () => {
+        // Climb twice, then freeze. If strikes accumulated across the climb the sync would stop at
+        // the second attempt; because movement resets them, it takes two FRESH stalled rounds after
+        // the freeze — attempts 3 and 4 — before the error is raised.
+        const transactorUnderTest = new ClimbingRefreshTransactor(new TestTransactor(), 2)
+        const collection = await armedAtRevOne(transactorUnderTest)
+        await collection.act({ type: 'set', data: { value: 'climbs then wedges', timestamp: 2 } })
+
+        const syncPromise = collection.sync({ maxAttempts: 10, baseBackoffMs: 1, maxBackoffMs: 5 })
+        syncPromise.catch(() => { /* asserted below */ })
+        const err = await syncPromise.catch(e => e) as SyncRevisionStalledError
+
+        expect(err).to.be.instanceOf(SyncRevisionStalledError)
+        expect(transactorUnderTest.commitAttempts).to.equal(4)
+        // Frozen at the revision the two climbing attempts reached, which is what makes it a wedge.
+        expect(err.heldRev).to.equal(3)
+        expect(err.requestedRev).to.equal(4)
+      })
+
       it('reports every stalled observation on the collection debug namespace', async () => {
         const transactorUnderTest = new ConfirmedStaleCommitTransactor(new TestTransactor(), Infinity)
         const lines = await captureCollectionLog(async () => {

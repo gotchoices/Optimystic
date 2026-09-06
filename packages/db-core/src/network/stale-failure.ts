@@ -31,7 +31,10 @@ export function isConflictFailure(failure: StaleFailure): boolean {
  * NOTE: comparing revisions across blocks is only meaningful because one pend covers one
  * collection, so every candidate comes from the same revision counter. If a pend is ever allowed
  * to span collections, these numbers come from unrelated counters and selection must become
- * per-collection.
+ * per-collection. `Collection.syncAttempts` now compares the winner against its OWN next revision
+ * to decide whether a retry could differ (`SyncRevisionStalledError`), so a cross-collection
+ * candidate would not merely muddy a diagnostic — it would fail a sync against an unrelated
+ * counter.
  */
 export function highestStaleAt(candidates: readonly StaleFailure['staleAt'][]): StaleFailure['staleAt'] {
 	let best: StaleFailure['staleAt'];

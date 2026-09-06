@@ -30,16 +30,19 @@ export interface SyncOptions {
 	/** Advanced/testing hook: source of uniform [0,1) randomness for the backoff jitter. Defaults to
 	 * the package CSPRNG; inject a deterministic sequence to assert exact retry delays. */
 	rand?: RandFn;
-	/** Consecutive refreshes that fail to move this collection past a revision a responder has
-	 * CONFIRMED is already committed, before sync gives up with {@link SyncRevisionStalledError}.
-	 * Such a retry provably re-requests the same taken revision, so the wait buys nothing. Two
-	 * absorbs one transiently-lagging read; set it to {@link maxAttempts} or higher to restore the
-	 * pre-existing behaviour of burning the whole budget. Default 2.
+	/** Consecutive refreshes that move this collection's revision NOWHERE while a responder has
+	 * CONFIRMED a revision at or above the one the next attempt would request, before sync gives up
+	 * with {@link SyncRevisionStalledError}. Such a retry provably re-sends the identical, already
+	 * lost request, so the wait buys nothing. Two absorbs one transiently-lagging read; set it to
+	 * {@link maxAttempts} or higher to restore the pre-existing behaviour of burning the whole
+	 * budget. Default 2.
 	 *
-	 * Ordinary contention never trips this: the rival's commit is what the refresh adopts, so the
-	 * next request lands above the confirmed revision and the counter resets. {@link deadlineMs} is
-	 * still checked first, so a sync that is both past its deadline and stalled reports the
-	 * deadline (as {@link SyncRetryExhaustedError}), not the stall. */
+	 * Neither shape of progress trips this. Ordinary contention: the rival's commit is what the
+	 * refresh adopts, so the next request lands above the confirmed revision. A collection still
+	 * catching up: the refresh moves the revision forward without yet clearing the confirmed
+	 * number, so the next request differs from the one that just failed. Either resets the counter.
+	 * {@link deadlineMs} is still checked first, so a sync that is both past its deadline and
+	 * stalled reports the deadline (as {@link SyncRetryExhaustedError}), not the stall. */
 	maxStalledAttempts?: number;
 }
 
@@ -64,9 +67,9 @@ export class SyncRetryExhaustedError extends Error {
 }
 
 /** Thrown by {@link ICollection.sync} / {@link ICollection.updateAndSync} when refreshing
- * repeatedly failed to move this collection past a revision a responder confirmed it already
- * holds — the client's view of the current revision disagrees with the cluster's, and retrying
- * would re-request the identical taken number.
+ * repeatedly moved this collection nowhere at all while a responder confirmed a revision at or
+ * above the one being requested — the client's view of the current revision disagrees with the
+ * cluster's, and retrying would re-send the identical taken number.
  *
  * The distinction matters because the two failures need different responses. Plain exhaustion
  * means "I lost a race too many times", and waiting longer or retrying later can succeed. This

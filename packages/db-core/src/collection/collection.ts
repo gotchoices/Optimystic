@@ -51,9 +51,14 @@ const PendingRetryDelayMs = 100;
 const DefaultMaxAttempts = 10;
 /** Default ceiling on a single exponential-backoff sleep, in ms. */
 const DefaultMaxBackoffMs = 5000;
-/** Default consecutive stalled refreshes — ones that failed to move this collection past a
- * revision a responder CONFIRMED is committed — before {@link Collection.sync} gives up.
- * Two, not one, so a single transiently-lagging read is absorbed. */
+/** Default consecutive stalled refreshes — ones that moved this collection's revision NOWHERE
+ * while a responder CONFIRMED a revision at or above the one being requested — before
+ * {@link Collection.sync} gives up. Two, not one, so a single transiently-lagging read is absorbed.
+ *
+ * NOTE: two is a judgement call, not a measurement — nothing here counts how often a legitimate
+ * loser reads a view that moves nowhere for two consecutive rounds. The check only strikes when the
+ * refresh made NO progress at all, so a client merely catching up is already excluded; if a
+ * spurious `SyncRevisionStalledError` ever shows up under real contention anyway, raise this. */
 const DefaultMaxStalledAttempts = 2;
 
 export type CollectionInitOptions<TAction> = {
@@ -941,8 +946,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// responder to have re-confirmed the number this round, not merely an older observation
 		// left standing in `lastStaleAt`.
 		let lastFailureConfirmedStaleAt = false;
-		// Consecutive refreshes that failed to move `getNextRev()` past `lastStaleAt.rev`.
+		// Consecutive refreshes that moved `getNextRev()` nowhere at all while a confirmed revision
+		// stood at or above it.
 		let consecutiveStalls = 0;
+		// The revision the PREVIOUS iteration would have requested, so the stall check can tell a
+		// refresh that moved nowhere from one that is still climbing toward the confirmed number.
+		let previousRequestedRev: number | undefined;
 
 		while (this.hasUnsyncedChanges()) {
 			if (signal?.aborted) {
@@ -955,22 +964,32 @@ export class Collection<TAction> implements ICollection<TAction> {
 				throw new SyncRetryExhaustedError(this.id, consecutiveFailures, lastReason ?? 'deadline exceeded', lastStaleAt);
 			}
 
-			// Can the attempt about to run possibly differ from the one that just failed? A producer
-			// sets `staleAt` only after reading that revision as durably held by someone else out of
-			// its own storage, revisions are one per-collection counter that every commit touches,
-			// and a confirmed revision never becomes un-taken (invalidation takes a NEW slot). So a
-			// request at or below a confirmed number is provably already lost, and the refresh that
-			// was supposed to fix that demonstrably did not — `advanceContext` refuses to lower the
-			// held revision, and an equal or absent read leaves it unchanged.
+			// Can the attempt about to run possibly differ from the one that just failed? Only when
+			// BOTH of these hold is the answer provably no:
+			//
+			//  - The revision it would request is at or below one a responder CONFIRMED is taken. A
+			//    producer sets `staleAt` only after reading that revision as durably held by someone
+			//    else out of its own storage, revisions are one per-collection counter that every
+			//    commit touches, and a confirmed revision never becomes un-taken (invalidation takes
+			//    a NEW slot). So the request is already lost before it is sent.
+			//  - The refresh in between moved the collection nowhere. `advanceContext` never lowers
+			//    the held revision, so "nowhere" is exactly `requestedRev` unchanged since the last
+			//    iteration. A refresh that moved forward WITHOUT clearing the confirmed number is a
+			//    collection still climbing (it read a replica that lags the holder — the same
+			//    partial catch-up `reportShortfall` exists to report), and its next attempt is a
+			//    genuinely different request that may yet win.
 			//
 			// This is NOT a second answer to "is this failure retryable?" — `isConflictFailure`
 			// remains the sole rule for that, untouched. It only ever stops a loop that rule had
 			// already decided to continue.
 			const requestedRev = this.getNextRev();
+			const refreshMoved = previousRequestedRev !== undefined && requestedRev > previousRequestedRev;
+			previousRequestedRev = requestedRev;
 			if (lastStaleAt !== undefined) {
-				if (requestedRev > lastStaleAt.rev) {
-					// The refresh adopted a revision above the confirmed one — ordinary contention,
-					// where the rival's commit is exactly what we just read. Not a stall.
+				if (requestedRev > lastStaleAt.rev || refreshMoved) {
+					// Either the refresh adopted a revision above the confirmed one — ordinary
+					// contention, where the rival's commit is exactly what we just read — or it made
+					// partial forward progress. Both mean the next attempt differs. Not a stall.
 					consecutiveStalls = 0;
 				} else if (lastFailureConfirmedStaleAt) {
 					consecutiveStalls++;

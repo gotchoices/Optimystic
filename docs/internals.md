@@ -719,8 +719,12 @@ saveMaterializedBlock(block): store(structuredClone(block));
   own storage (`StorageRepo.pend`/`.commit`, and the confirmed branch of
   `CoordinatorRepo.classifyStaleRejection` — the site that matters most, since that failure carries
   no `missing`). A number lifted from another peer's reject text is never promoted to this field,
-  and absent means "no confirmed number", never "not stale". It is **diagnostic only**: `conflict`
-  remains the single retryability rule and nothing branches on `staleAt`. Where several candidates
+  and absent means "no confirmed number", never "not stale". It is **never a retryability signal**:
+  `conflict` remains the single rule for "can a re-read and re-pend win?", and nothing re-derives
+  that from `staleAt`. Its one branching consumer answers a different question — `Collection.sync`
+  compares the revision its next attempt would request against it to decide whether that attempt
+  could possibly differ from the one that just failed (see the wedged-view bullet under
+  "The revision context is monotonic" below), which can only end a retry loop, never start one. Where several candidates
   exist — a producer scanning multiple blocks, or `NetworkTransactor` rebuilding one response from
   many per-batch ones — every site picks the **highest** `rev` through the shared `highestStaleAt`
   ([`network/stale-failure.ts`](../packages/db-core/src/network/stale-failure.ts)), because the
@@ -1253,8 +1257,22 @@ saveMaterializedBlock(block): store(structuredClone(block));
 - The rule exists because a read that found *less* than what the client already committed is a
   read that lost information, not a revision rollback. Accepting it makes the next `sync` request a
   revision that is long gone, and — since `syncInternal` re-runs `updateInternal` between retries —
-  every retry repeats the same doomed request, burning the whole retry budget and surfacing as a
-  contention-shaped `SyncRetryExhaustedError` rather than the real fault.
+  every retry repeats the same doomed request.
+- **Monotonicity is also what makes a wedged view detectable, and `sync` stops on it.** Because
+  the refresh can only advance the revision or leave it alone, "the refresh moved the collection
+  nowhere" is exactly "the revision the next attempt would request is unchanged". Pair that with a
+  responder's confirmed `StaleFailure.staleAt` at or above that revision — a number a producer only
+  sets after reading it out of its own storage, and a revision never becomes un-taken — and the
+  next attempt is provably byte-identical to the one that just failed. `Collection.syncAttempts`
+  counts those (`maxStalledAttempts`, default 2, reported as `collection:sync-stalled`) and throws
+  `SyncRevisionStalledError` rather than spending the rest of the budget on a decided failure.
+  Both shapes of progress reset the counter, so neither is mistaken for a wedge: clearing the
+  confirmed revision (ordinary contention — the rival's commit is what the refresh adopted) and
+  advancing toward it without reaching it (a collection still catching up off a lagging replica —
+  the same partial refresh `context-short-of-tail` below reports). The error names the
+  disagreement; it does **not** make the write land, and `sync` deliberately never adopts the
+  confirmed number to get past it — `staleAt` is a bare revision, not content, so submitting staged
+  transforms at a revision built on unread history would overwrite that history silently.
 - Monotonicity means a refresh can end **below** where it started looking. `updateInternal` reads
   the committed tail's revision (the authoritative "latest committed under this id") before the
   walk, and compares it against where the walk left the collection; landing short means the refresh
@@ -1279,7 +1297,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   which: on `updateInternal` (`site=refresh`) it contrasts this node's copy with the stored log,
   while on `attachToLog` (`site=attach`) it contrasts the tail block's `state.latest` (adopted on
   trust by `bootstrapContext`) with a walk of that tail's own chain, so a line there indicts
-  storage rather than a replica. `tag=` on all three lines names the reporting *handle*
+  storage rather than a replica. `tag=` on all four lines of this namespace names the reporting *handle*
   (`Collection.instanceTag`), since one process routinely holds several over one collection id and
   their lines otherwise read as one handle contradicting itself.
 - A header that reads *authoritatively absent* while the collection holds a committed revision is

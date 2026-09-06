@@ -528,10 +528,11 @@ A responder sets a *confirmed revision* on a rejection only after reading that r
 own storage as durably held by somebody other than the requester. Revisions are one counter per
 collection and every commit touches the log tail, so that number binds the whole collection; and
 because reverting a commit consumes a **new** revision rather than releasing the old one, a
-confirmed revision never becomes free again. This line is emitted when the revision the next
-attempt would ask for is at or below such a confirmed number — the request is provably already
-lost, and the refresh that was supposed to fix that demonstrably did not move the collection.
-Fields:
+confirmed revision never becomes free again. This line is emitted when both halves of "the next
+attempt cannot possibly differ" hold: the revision the next attempt would ask for is at or below
+such a confirmed number (so the request is already lost before it is sent), *and* the refresh in
+between moved the collection nowhere — `requestedRev` unchanged since the previous attempt, which
+is what "nowhere" means for a revision that can only ever advance. Fields:
 
 - `id=` / `tag=` — the collection id and the reporting handle, exactly as on the three lines above.
 - `heldRev=` — the revision this handle believes is current, or `none` for a collection that has
@@ -546,8 +547,12 @@ Fields:
 
 Two strikes rather than one because a writer that merely **lost a race** can transiently read a
 view that has not yet caught up with the rival's commit, which looks identical for exactly one
-round. Ordinary contention does not reach even one strike in the steady case: the rival's commit is
-what the refresh adopts, so `requestedRev` lands above `staleRev` and the counter resets.
+round. Neither shape of progress reaches even one strike: under ordinary contention the rival's
+commit is what the refresh adopts, so `requestedRev` lands above `staleRev`; and a collection
+catching up off a lagging replica moves `requestedRev` forward without yet clearing `staleRev`,
+which is still a different request from the one that failed. Either resets the counter, so a rising
+`requestedRev` across attempts is the signature of a sync that is behind rather than wedged —
+`collection:context-short-of-tail` on the same namespace is the read side of that same story.
 
 **What it does not do.** Sync deliberately does not adopt `staleRev` to get unstuck. That number is
 a bare revision, not content: submitting the writer's staged changes at a revision built on history
