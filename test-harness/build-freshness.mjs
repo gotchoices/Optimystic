@@ -42,7 +42,7 @@
  * Escape hatch: `OPTIMYSTIC_SKIP_BUILD_CHECK=1` skips the check, loudly (see `assertBuildFresh`).
  */
 
-import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
+import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
@@ -114,7 +114,7 @@ export function buildFreshnessProblems(packageDir, options = {}) {
  */
 export function assertBuildFresh(registerUrl, options = {}) {
 	if ((process.env[SKIP_ENV] ?? '') !== '') {
-		process.stderr.write(`build-freshness: skipped by ${SKIP_ENV}\n`);
+		writeStderr(`build-freshness: skipped by ${SKIP_ENV}\n`);
 		return;
 	}
 
@@ -125,7 +125,7 @@ export function assertBuildFresh(registerUrl, options = {}) {
 	const problems = buildFreshnessProblems(packageDir, options);
 	if (problems.length === 0) return;
 
-	process.stderr.write(
+	writeStderr(
 		'Stale build detected: these tests run real compiled output.\n' +
 		problems.map((p) => `  - ${p}\n`).join('')
 	);
@@ -334,6 +334,15 @@ export function findWorkspaceRoot(from) {
  * NOTE: an absent or unreadable `src` reports fresh. A package consumed without its sources cannot
  * be shown stale, and a hard failure there would break for a reason the caller cannot act on.
  *
+ * NOTE: the source side is the mtimes of the *files* under `src` and nothing else, so three kinds
+ * of change leave a package reading fresh when its output is not: deleting a source file (only the
+ * containing directory's mtime moves, and directory mtimes are deliberately not read — adding a
+ * spec file moves them too, which would undo the test-file exclusion above); editing `tsconfig.json`
+ * or `tsconfig.base.json`; and upgrading a dependency the output inlines. All three are rare beside
+ * an ordinary source edit, and all three are cleared by the `clean &&` rebuild the message already
+ * suggests. If one of them ever produces a wrong test result, hash the build inputs rather than
+ * widening the mtime walk.
+ *
  * NOTE: mtime is not content. A git operation in a sibling checkout can bump a `src` file's mtime
  * with its bytes unchanged; the compiler's change detection is content-based, so a rebuild no-ops
  * and this still reports stale — a rebuild that appears not to work. The two answers are the
@@ -392,6 +401,23 @@ function newestMtime(dir, accept) {
 }
 
 // -- Small helpers --------------------------------------------------------------------------------
+
+/**
+ * Writes to stderr synchronously, so `process.exit(1)` cannot truncate the message.
+ *
+ * `process.stderr.write` is only guaranteed synchronous for some destinations: node documents it as
+ * *asynchronous* on a Windows terminal and on a macOS pipe. `process.exit` does not drain a pending
+ * asynchronous write, so the guard's one job — telling the reader which package to rebuild — is
+ * exactly what would be lost, leaving a bare exit 1. `writeSync` on fd 2 has no such gap; the
+ * fallback covers an `EAGAIN` on a non-blocking pipe, where a partial message beats none.
+ */
+function writeStderr(text) {
+	try {
+		writeSync(2, text);
+	} catch {
+		process.stderr.write(text);
+	}
+}
 
 /** mtime in ms, or `undefined` when the path doesn't exist / can't be stat'd. */
 function mtimeMs(path) {

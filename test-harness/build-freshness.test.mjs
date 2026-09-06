@@ -239,6 +239,33 @@ describe('buildFreshnessProblems', () => {
 		assert.equal(buildFreshnessProblems(consumerDir).length, 1);
 	});
 
+	it('reports a manifest that names no built entry point at all', () => {
+		// A working copy that was never packaged for consumption: nothing to compare against, and
+		// nothing the freshness walk could say about it. `yarn install` is the honest remedy.
+		const { consumerDir, depDir } = writeRepo();
+		writeManifest(depDir, { name: 'dep-a' });
+
+		const problems = buildFreshnessProblems(consumerDir);
+
+		assert.deepEqual(problems, ['dep-a: its package.json names no built entry point.\n    Run: yarn install']);
+	});
+
+	it('reports every problem it finds, not just the first', () => {
+		// `quereus-plugin-optimystic` guards four dependencies and its own output at once; a reader
+		// staring at one rebuild at a time would go round the loop four times.
+		const { consumerDir } = writeRepo({ dep: { srcAt: NEW, distAt: OLD } });
+		writePackage(consumerDir, { name: 'consumer', srcAt: NEW, distAt: OLD });
+		writeManifest(consumerDir, {
+			name: 'consumer', main: 'dist/src/index.js', dependencies: { 'dep-a': 'workspace:^' }
+		});
+
+		const problems = buildFreshnessProblems(consumerDir, { checkSelf: true });
+
+		assert.equal(problems.length, 2);
+		assert.match(problems[0], /^dep-a: dist is stale/);
+		assert.match(problems[1], /^consumer: dist is stale/);
+	});
+
 	it('reads the built entry point from exports before falling back to main', () => {
 		const { consumerDir, depDir } = writeRepo({ dep: { dist: false } });
 		writeManifest(depDir, {

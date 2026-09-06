@@ -95,6 +95,8 @@ the package, the reason, and the directory to run the rebuild in, since `yarn wo
 reach a sibling repository. `quereus-plugin-optimystic` and `quereus-plugin-crypto` additionally
 check their *own* output, because their specs import it directly. Registering above the `ts-node/esm`
 call is deliberate: a mocha root hook would fire after every spec file had already been imported.
+The guard therefore covers *every* `--import ./register.mjs` invocation, not only `test` — including
+`yarn workspace @optimystic/demo start`, which loads the same compiled dependencies.
 
 `OPTIMYSTIC_SKIP_BUILD_CHECK=1` skips the check, printing a one-line warning to stderr on **every**
 run so a hatch left set in a shell profile stays visible. It exists for one situation: an ordinary
