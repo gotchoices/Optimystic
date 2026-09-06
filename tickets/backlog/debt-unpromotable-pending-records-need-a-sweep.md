@@ -170,3 +170,54 @@ that outlasts the client's retry budget (six rounds, ~0.6–1.25 s of backoff, i
 `abortOrCancelTimeoutMs`), or a client that dies mid-window. The client now *reports* that it failed
 to discharge, so a node-side sweep can be designed knowing the client-side hole is closed for
 transient faults and only the abandoned-writer population is left.
+
+## Arm, 2026-09-06 — the residual this ticket owns has now been OBSERVED, not just reasoned about
+
+The header says `repro: static`. The mechanism below is still reasoned rather than reproduced
+in-repo, but its *consequence* has now been measured on a real deployment, which is worth recording
+before someone weighs the `tradeoffs:` line again.
+
+**Where.** Eight isolated rounds of `control-write-degraded-cohort-member.integration.ts` in the
+sibling `../sereus` checkout, run against this repo's `main` immediately after
+`complete/1-a-failed-attempt-must-discharge-its-own-pend` landed. That fix makes a failing attempt
+await its own cancel and makes `cancel` throw rather than silently returning undischarged.
+
+**What the run shows, in order:**
+
+```
+Control write [self-record-update] failed non-transiently on attempt 1/3, not retried here:
+  Some peers did not complete: 12D3KooW…[blocks:1](in-flight) cause=The stream has been reset
+  cause: StreamResetError: The stream has been reset
+  cancelError: [Error]                       <- the new field from TransactorSource.transact
+...
+Control write [peer-remove] failed non-transiently on attempt 1/3, not retried here:
+  SyncRetryExhaustedError: sync for collection default/CadrePeer exhausted 10 retries:
+  pending conflict: block(s) held by unresolved rival action(s) yRfPLIpAdguxZUfWV8U9YA
+```
+
+`cancelError` present is the client-side hole reporting itself exactly as designed: the transport
+fault that killed the commit also killed the cancel, so the pend was left standing and the new
+contract said so instead of hiding it. The `pending conflict` two operations later is that same
+standing record refusing a later, unrelated write — which is what this ticket is about.
+
+**What that does and does not establish.**
+
+- It does **not** reproduce this ticket's stated trigger. The body describes a client that *crashes*
+  and never comes back. Here the client is alive and simply could not reach anyone with a cancel.
+- It **does** establish the consequence is reachable without a crash at all, which widens the case:
+  any fault that outlives the client's bounded cancel effort (`MAX_CANCEL_ROUNDS`, ~0.6–1.25 s of
+  backoff) leaves the same permanent marker. A crash is the extreme; a long-enough transport fault
+  is enough.
+- It **strengthens the argument against the "declare it a client obligation" resolution.** The
+  client here did everything the contract asks — awaited its cancel, retried it, reported the
+  failure — and the block stayed wedged regardless.
+
+**One thing it does not say.** It is not evidence the landed fix failed. The same gate was 5-red of 5
+on every round before it and is 3 clean of 8 after (see the sereus board). The fix removed the cases
+where the transport had recovered by the time the cancel ran; what is left is the case where it had
+not, which is precisely the hole this ticket was filed to cover.
+
+**For whoever picks this up:** the timing question in the `tradeoffs:` line — how to tell an
+abandoned marker from an in-flight one — now has a concrete shape to reason about. In this capture
+the abandoning client is still running and still writing to the same collection under a *different*
+action id, which a node-side sweep could in principle notice.
