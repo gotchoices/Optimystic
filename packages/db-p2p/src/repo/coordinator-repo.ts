@@ -886,6 +886,30 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
+	 * True when a commit's approve votes form a strict majority of the FULL cohort — the only case
+	 * where "this node committed" is evidence that no rival commit moved past it. The intersection
+	 * argument: two strict majorities of the same cohort must share at least one member, so a rival
+	 * commit that assembled its own majority had a voter in common with this one, and that voter
+	 * would have surfaced the rival (a conflict vote) instead of approving both. A commit on a
+	 * downsized quorum — the solo short-circuit under degraded routing, or a consensus record that
+	 * enrolled fewer than a full-cohort majority — rules nothing out: a rival quorum that excludes
+	 * this node can exist at the same moment, which is precisely when forks happen. Such a commit
+	 * still succeeds; it just must not arm the lazy read-repair window ({@link markBlocksSeen}), so
+	 * the next read past the window consults the cohort as if the commit had not happened.
+	 *
+	 * Denominator: the full cohort, never the enrolled/reachable subset — `record.peers` is exactly
+	 * the thing a downsize shrinks (contrast {@link clusterReachedCommitConsensus}, whose
+	 * enrolled-subset majority answers "did consensus complete", a different question — leave it be).
+	 * {@link repairCorroborationClusterSize} is the declared yardstick resolved for this same
+	 * shrunken-view trap on the repair side, maxed with the observed cohort for the case where
+	 * routing sees more peers than were declared.
+	 */
+	private commitQuorumRulesOutRivals(approvals: number, observedCohortSize: number): boolean {
+		const fullCohortSize = Math.max(observedCohortSize, this.repairCorroborationClusterSize);
+		return approvals > fullCohortSize / 2;
+	}
+
+	/**
 	 * Test seam: directly set the last-seen timestamp for a block. Used by read-repair
 	 * specs to simulate "the local commit happened at time T" without needing to drive
 	 * a full pend/commit cycle through the cluster coordinator.
@@ -1983,7 +2007,13 @@ export class CoordinatorRepo implements IRepo {
 			// ICommitProofPersister contract; a plain IRepo double ignores the extra argument.
 			const proof = await this.localCluster?.mintSoloCommitProof?.(message);
 			const result = await (this.storageRepo as IRepo & ICommitProofPersister).commit(request, options, proof);
-			if (result.success) this.markBlocksSeen(blockIds);
+			// One self-approval arms the read-repair window only for a genuine cohort of one
+			// (declared and observed). Under degraded routing (peerCount 0) or an undeclared/larger
+			// declared size, this commit proves nothing about rival quorums — see
+			// commitQuorumRulesOutRivals — so the window stays unarmed and the read path's
+			// solo-self-skip exit re-arms it once per consult instead (which keeps GitHub issue #8's
+			// consult storm bounded at one per window).
+			if (result.success && this.commitQuorumRulesOutRivals(1, peerCount)) this.markBlocksSeen(blockIds);
 			return result;
 		}
 
@@ -1994,6 +2024,9 @@ export class CoordinatorRepo implements IRepo {
 
 		try {
 			const { record, localExecuted, localCommitResult } = await this.coordinator.executeClusterTransaction(blockIds[0]!, message, options);
+			// Decided once for every success shape below (local-executed, local fallback, tolerated
+			// divergence): whether this commit's quorum is freshness evidence or merely a commit.
+			const armFreshness = this.commitQuorumRulesOutRivals(countApprovingCommitVotes(record), peerCount);
 			if (localExecuted) {
 				// Our own member applied this commit during consensus. Its retained storage verdict is
 				// the one honest signal we have about durability: the member-side apply tolerates an
@@ -2027,7 +2060,7 @@ export class CoordinatorRepo implements IRepo {
 						reason: localCommitResult.reason
 					});
 				}
-				this.markBlocksSeen(blockIds);
+				if (armFreshness) this.markBlocksSeen(blockIds);
 				return { success: true };
 			}
 			// Local cluster didn't execute during consensus. Attempt a local commit, but tolerate
@@ -2056,16 +2089,16 @@ export class CoordinatorRepo implements IRepo {
 			try {
 				const result = await (this.storageRepo as IRepo & ICommitProofPersister).commit(request, options, consensusProof);
 				if (result.success) {
-					this.markBlocksSeen(blockIds);
+					if (armFreshness) this.markBlocksSeen(blockIds);
 					return result;
 				}
 				if (isMissingBaseRevisionFailure(result) && clusterReachedCommitConsensus(record)) {
-					return this.tolerateLocalCommitDivergence(request, blockIds, result.reason ?? MISSING_BASE_REVISION_REASON);
+					return this.tolerateLocalCommitDivergence(request, blockIds, result.reason ?? MISSING_BASE_REVISION_REASON, armFreshness);
 				}
 				return result;
 			} catch (err) {
 				if (clusterReachedCommitConsensus(record)) {
-					return this.tolerateLocalCommitDivergence(request, blockIds, (err as Error).message);
+					return this.tolerateLocalCommitDivergence(request, blockIds, (err as Error).message, armFreshness);
 				}
 				throw err;
 			}
@@ -2204,13 +2237,17 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
-	 * Report success for a commit the cluster carried but this peer could not apply locally. The
-	 * blocks are marked seen so the read path treats them as freshness-checked; convergence comes
-	 * from replication (cohort reconcile, or read-driven acquisition), not from replay here.
+	 * Report success for a commit the cluster carried but this peer could not apply locally.
+	 * Convergence comes from replication (cohort reconcile, or read-driven acquisition), not from
+	 * replay here. `armFreshness` says whether the commit's quorum was strong enough
+	 * ({@link commitQuorumRulesOutRivals}) for the read path to treat the blocks as
+	 * freshness-checked; a divergence tolerated on a downsized quorum leaves the window unarmed —
+	 * this peer is known to be behind here, the last place a self-referential freshness stamp
+	 * belongs.
 	 */
-	private tolerateLocalCommitDivergence(request: CommitRequest, blockIds: BlockId[], detail: string): CommitResult {
+	private tolerateLocalCommitDivergence(request: CommitRequest, blockIds: BlockId[], detail: string, armFreshness: boolean): CommitResult {
 		this.log('coordinator-repo:commit-local-failed-cluster-succeeded', { actionId: request.actionId, error: detail });
-		this.markBlocksSeen(blockIds);
+		if (armFreshness) this.markBlocksSeen(blockIds);
 		return { success: true };
 	}
 }
@@ -2221,4 +2258,9 @@ function clusterReachedCommitConsensus(record: ClusterRecord): boolean {
 	if (peerCount === 0) return false;
 	const approvedCommits = Object.values(record.commits).filter(s => s.type === 'approve').length;
 	return approvedCommits > peerCount / 2;
+}
+
+/** Approve-typed commit votes on a consensus record — the numerator `commitQuorumRulesOutRivals` measures against the full cohort. */
+function countApprovingCommitVotes(record: ClusterRecord): number {
+	return Object.values(record.commits).filter(s => s.type === 'approve').length;
 }
