@@ -887,19 +887,23 @@ export class CoordinatorRepo implements IRepo {
 
 	/**
 	 * True when a commit's approve votes form a strict majority of the FULL cohort — the only case
-	 * where "this node committed" is evidence that no rival commit moved past it. The intersection
-	 * argument: two strict majorities of the same cohort must share at least one member, so a rival
-	 * commit that assembled its own majority had a voter in common with this one, and that voter
-	 * would have surfaced the rival (a conflict vote) instead of approving both. A commit on a
-	 * downsized quorum — the solo short-circuit under degraded routing, or a consensus record that
-	 * enrolled fewer than a full-cohort majority — rules nothing out: a rival quorum that excludes
-	 * this node can exist at the same moment, which is precisely when forks happen. Such a commit
-	 * still succeeds; it just must not arm the lazy read-repair window ({@link markBlocksSeen}), so
-	 * the next read past the window consults the cohort as if the commit had not happened.
+	 * where "this node committed" is evidence that no rival commit moved past it. Two strict
+	 * majorities of one cohort must share a voter, so a rival that also reached a full-cohort
+	 * majority would have surfaced here as a conflict vote instead of approving both. A commit below
+	 * that bar — the solo short-circuit under a larger declared cohort, or a record that enrolled
+	 * fewer than a full-cohort majority — rules nothing out; it still succeeds, it just must not arm
+	 * the lazy read-repair window ({@link markBlocksSeen}), so the next read consults the cohort as
+	 * if the commit had not happened.
+	 *
+	 * What it does NOT rule out, at any vote count: a rival that assembled its own quorum on a
+	 * SHRUNKEN cohort view, which needs no full-cohort majority to complete
+	 * ({@link clusterReachedCommitConsensus} accepts an enrolled-subset majority). Two commits that
+	 * land at one revision on disjoint quorums are a fork, and healing one is
+	 * `docs/partition-healing.md`'s business, not a freshness window's.
 	 *
 	 * Denominator: the full cohort, never the enrolled/reachable subset — `record.peers` is exactly
-	 * the thing a downsize shrinks (contrast {@link clusterReachedCommitConsensus}, whose
-	 * enrolled-subset majority answers "did consensus complete", a different question — leave it be).
+	 * the thing a downsize shrinks (contrast `clusterReachedCommitConsensus`, whose enrolled-subset
+	 * majority answers "did consensus complete", a different question — leave it be).
 	 * {@link repairCorroborationClusterSize} is the declared yardstick resolved for this same
 	 * shrunken-view trap on the repair side, maxed with the observed cohort for the case where
 	 * routing sees more peers than were declared.
@@ -2007,9 +2011,10 @@ export class CoordinatorRepo implements IRepo {
 			// ICommitProofPersister contract; a plain IRepo double ignores the extra argument.
 			const proof = await this.localCluster?.mintSoloCommitProof?.(message);
 			const result = await (this.storageRepo as IRepo & ICommitProofPersister).commit(request, options, proof);
-			// One self-approval arms the read-repair window only for a genuine cohort of one
-			// (declared and observed). Under degraded routing (peerCount 0) or an undeclared/larger
-			// declared size, this commit proves nothing about rival quorums — see
+			// One self-approval arms the read-repair window only where the DECLARED cohort is also one
+			// — then no rival quorum can exist to be missed. At any larger declared size (including
+			// an undeclared one, which resolves to the replication factor, and including degraded
+			// routing where peerCount is 0) this commit proves nothing about rival quorums — see
 			// commitQuorumRulesOutRivals — so the window stays unarmed and the read path's
 			// solo-self-skip exit re-arms it once per consult instead (which keeps GitHub issue #8's
 			// consult storm bounded at one per window).
@@ -2026,6 +2031,11 @@ export class CoordinatorRepo implements IRepo {
 			const { record, localExecuted, localCommitResult } = await this.coordinator.executeClusterTransaction(blockIds[0]!, message, options);
 			// Decided once for every success shape below (local-executed, local fallback, tolerated
 			// divergence): whether this commit's quorum is freshness evidence or merely a commit.
+			// NOTE: one verdict covers every block in `blockIds`, though it is measured against
+			// `blockIds[0]`'s cohort alone. Consistent with the rest of this path — consensus for the
+			// whole commit runs on that one cohort — so a per-block verdict would be measuring a
+			// quorum that never voted. If commits ever coordinate per-block cohorts separately (see
+			// `debt-sender-side-coordinating-block-binding-is-unchecked`), this must follow them.
 			const armFreshness = this.commitQuorumRulesOutRivals(countApprovingCommitVotes(record), peerCount);
 			if (localExecuted) {
 				// Our own member applied this commit during consensus. Its retained storage verdict is
@@ -2256,8 +2266,7 @@ export class CoordinatorRepo implements IRepo {
 function clusterReachedCommitConsensus(record: ClusterRecord): boolean {
 	const peerCount = Object.keys(record.peers).length;
 	if (peerCount === 0) return false;
-	const approvedCommits = Object.values(record.commits).filter(s => s.type === 'approve').length;
-	return approvedCommits > peerCount / 2;
+	return countApprovingCommitVotes(record) > peerCount / 2;
 }
 
 /** Approve-typed commit votes on a consensus record — the numerator `commitQuorumRulesOutRivals` measures against the full cohort. */

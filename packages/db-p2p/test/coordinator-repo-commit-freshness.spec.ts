@@ -288,6 +288,23 @@ describe('CoordinatorRepo commit-side freshness (quorum-intersection gate)', () 
 			expect(callbackInvocations, 'no consult inside the window').to.deep.equal([]);
 		});
 
+		it('a RETURNED missing-base-revision divergence takes the gate too (not only the throw)', async () => {
+			// The other divergence shape: local storage returns `success:false` with
+			// `missing-base-revision` rather than throwing. Same tolerance, same gate — a full-cohort
+			// majority arms, so the in-window read must not consult. This case also proves the flag
+			// survives the returned-failure branch: were it dropped, the read would consult.
+			const { repo, callbackInvocations, setClock } = await makeConsensusRepo({
+				clusterSize: 3, cohortPeers: 3, record: makeRecord(3, 3), localExecuted: false,
+				storageCommit: async () => ({ success: false, reason: `missing-base-revision: block ${BLOCK} cannot materialize rev 2` })
+			});
+
+			expect((await repo.commit(REQUEST)).success, 'divergence is tolerated as success').to.equal(true);
+			setClock(BASE_TIME + 1_000);
+			await repo.get({ blockIds: [BLOCK] });
+
+			expect(callbackInvocations, 'no consult inside the window').to.deep.equal([]);
+		});
+
 		it('a tolerated local divergence on a downsized quorum does NOT arm the window', async () => {
 			// Enrolled-subset consensus (2 of 2) tolerates the divergence, but 2 of a declared 5
 			// proves nothing about rivals — and this peer is KNOWN to be behind here, the worst

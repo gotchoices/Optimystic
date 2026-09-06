@@ -221,3 +221,21 @@ existence and currency returned as separate, *named* results. Note that `Absence
 exactly this flattening for existence and the currency half was left as a bare optional number, so
 the extraction should treat "what did this consult actually establish?" as one named answer covering
 both halves rather than a verdict plus a loose field.
+
+## Tenth measurement (review of `a-reader-cannot-tell-its-view-stopped-advancing`)
+
+Re-measured (`wc -l packages/db-p2p/src/repo/coordinator-repo.ts`): **2270 lines**, up from 2224.
+
+That ticket added an eleventh thing the freshness question depends on: a rule deciding whether a
+*write* this node just performed counts as evidence its copy is current
+(`commitQuorumRulesOutRivals`). The rule itself is a single named predicate — deliberately, so the
+eventual extraction can lift it whole — but its inputs come from the write path (how many peers
+approved, how many the router saw) while its only consumer is the read path's window. So the
+"how fresh is this copy?" answer now has to be assembled from the read side *and* the write side of
+the same class, which is a wider seam than the eight-measurement version of this ticket described.
+
+**Concrete consequence, and why the extraction should own it:** whether a node re-asks the cohort
+is now decided at five separate sites (three read-path exits, two write-path ones), each arguing
+its case in a prose comment, and no two of them share a helper that states the underlying rule —
+"arm only when re-asking sooner could not learn anything". A gap between two of those sites is
+exactly what `bug-a-cohort-that-cannot-corroborate-re-asks-on-every-read` reports.
