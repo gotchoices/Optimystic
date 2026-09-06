@@ -784,6 +784,201 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 
 				expect('unconfirmedAheadRev' in after[blockId]!, 'answered peers behind us refute the claim').to.equal(false);
 			});
+
+			// Only the peers that MADE a claim can retire it (ticket
+			// currency-doubt-cleared-by-a-partial-answer). "Somebody answered and said nothing is
+			// ahead" used to be enough, so a peer that never knew the claimed revision could erase
+			// the memo the moment the peer holding that revision went unreachable — the silent stale
+			// serve this marker exists to end. The rule is now: retire when at least one non-self
+			// cohort member answered AND no peer that made the claim was silent. All of these run in
+			// `paranoid` mode so a consult definitely RUNS on the second read.
+			it('keeps the mark under PARTIAL silence — a silent claimant is not spoken for', async () => {
+				// Read 1: both remote peers claim rev 3 and nothing can acquire it. Read 2: holder A
+				// (a claimant) is unreachable and holder B answers "I hold nothing". B never reported
+				// rev 3, so its answer is no evidence about A's claim.
+				const localPeer = await makePeerId();
+				const holderA = await makePeerId();
+				const holderB = await makePeerId();
+				const cluster = makeClusterPeers([localPeer, holderA, holderB]);
+				let phase = 1;
+				const callback: ClusterLatestCallback = async (peerId) => {
+					if (peerId.equals(localPeer)) return { actionId: 'local-action', rev: 1 };
+					if (phase === 1) return { actionId: 'remote-action', rev: 3 };
+					if (peerId.equals(holderA)) throw new Error('dial failed');
+					return undefined;	// holder B answers, holding nothing
+				};
+
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev).to.equal(3);
+
+				phase = 2;
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect(after[blockId]?.unconfirmedAheadRev, 'a non-claimant cannot retire a silent peer\'s claim').to.equal(3);
+			});
+
+			it('keeps the mark when the ONLY claimant goes silent and the other peer never knew the claim', async () => {
+				// The sharpest form of the same defect: holder B answers "I hold nothing" on BOTH
+				// reads, so it demonstrably never knew rev 3. Holder A is the sole claimant, and when
+				// it drops out its word is the only thing that could retire the doubt.
+				const localPeer = await makePeerId();
+				const holderA = await makePeerId();
+				const holderB = await makePeerId();
+				const cluster = makeClusterPeers([localPeer, holderA, holderB]);
+				let holderAReachable = true;
+				const callback: ClusterLatestCallback = async (peerId) => {
+					if (peerId.equals(localPeer)) return { actionId: 'local-action', rev: 1 };
+					if (peerId.equals(holderB)) return undefined;
+					if (!holderAReachable) throw new Error('dial failed');
+					return { actionId: 'remote-action', rev: 3 };
+				};
+
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev, 'one claim, quorum declines, doubt recorded').to.equal(3);
+
+				holderAReachable = false;
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect(after[blockId]?.unconfirmedAheadRev, 'the sole holder of rev 3 is unreachable — nothing refutes it').to.equal(3);
+			});
+
+			it('drops the mark when the claimant itself answers, even with another peer silent', async () => {
+				// The rule must not degrade into "any silence blocks retirement" — that would flag a
+				// block forever behind one permanently unreachable cohort peer. Here holder A, the
+				// only peer that ever claimed rev 3, answers rev 1: it has retired its own word. B is
+				// silent, but B never claimed anything, so its silence is irrelevant to this claim.
+				const localPeer = await makePeerId();
+				const holderA = await makePeerId();
+				const holderB = await makePeerId();
+				const cluster = makeClusterPeers([localPeer, holderA, holderB]);
+				let phase = 1;
+				const callback: ClusterLatestCallback = async (peerId) => {
+					if (peerId.equals(localPeer)) return { actionId: 'local-action', rev: 1 };
+					if (peerId.equals(holderB)) {
+						if (phase === 1) return undefined;
+						throw new Error('dial failed');
+					}
+					return phase === 1 ? { actionId: 'remote-action', rev: 3 } : { actionId: 'local-action', rev: 1 };
+				};
+
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev).to.equal(3);
+
+				phase = 2;
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect('unconfirmedAheadRev' in after[blockId]!, 'the claimant retired its own claim').to.equal(false);
+			});
+
+			it('drops the mark once the claimant leaves the cohort view — membership, not a timer, settles the doubt', async () => {
+				// What bounds the doubt when a claimant never comes back. There is deliberately no
+				// expiry: erasing a correctness signal because time passed re-opens the same lie
+				// through a slower door. Instead, a peer that is genuinely gone leaves the routing
+				// table, so `findCluster` stops holding it responsible for the block — it is then
+				// neither an answer nor a silence, and its old word no longer binds the cohort.
+				const localPeer = await makePeerId();
+				const holderA = await makePeerId();
+				const holderB = await makePeerId();
+				const cluster = makeClusterPeers([localPeer, holderA, holderB]);
+				const callback: ClusterLatestCallback = async (peerId) => {
+					if (peerId.equals(localPeer)) return { actionId: 'local-action', rev: 1 };
+					if (peerId.equals(holderA)) return { actionId: 'remote-action', rev: 3 };
+					return undefined;	// holder B holds nothing, throughout
+				};
+
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev).to.equal(3);
+
+				// The claimant departs the cohort view. Two peers remain, so this is still a real
+				// consult (not the solo-self exit), and holder B answers it.
+				delete cluster[holderA.toString()];
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect('unconfirmedAheadRev' in after[blockId]!, 'a departed claimant stops blocking retirement').to.equal(false);
+			});
+
+			it('accumulates claimants across passes that claim the SAME revision', async () => {
+				// Two passes hear rev 3 from DIFFERENT peers. If the second pass simply replaced the
+				// recorded claimants, holder A's still-unanswered word would be forgotten and the
+				// third pass — where A is silent and B answers "I hold nothing" — would retire the
+				// claim on B's answer alone. Claimants for an unchanged revision therefore union.
+				const localPeer = await makePeerId();
+				const holderA = await makePeerId();
+				const holderB = await makePeerId();
+				const cluster = makeClusterPeers([localPeer, holderA, holderB]);
+				let pass = 1;
+				const callback: ClusterLatestCallback = async (peerId) => {
+					if (peerId.equals(localPeer)) return { actionId: 'local-action', rev: 1 };
+					if (peerId.equals(holderA)) {
+						if (pass === 1) return { actionId: 'remote-action', rev: 3 };
+						throw new Error('dial failed');	// silent from pass 2 onward
+					}
+					// Holder B claims rev 3 only on pass 2 — one claim per pass, so the corroboration
+					// quorum declines throughout and every pass records the claim uncorroborated.
+					return pass === 2 ? { actionId: 'remote-action', rev: 3 } : undefined;
+				};
+
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev, 'pass 1: A claims 3').to.equal(3);
+
+				pass = 2;
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev, 'pass 2: B claims 3, A silent').to.equal(3);
+
+				pass = 3;
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect(after[blockId]?.unconfirmedAheadRev, 'A is still a claimant and still silent').to.equal(3);
+			});
+
+			it('this node\'s own answer refutes nothing, even with localPeerId left unset', async () => {
+				// `localPeerId` is optional for the single-node/test construction this class has
+				// always tolerated, and with it unset this node's own answer counts as a peer answer.
+				// That used to reach "somebody answered, nothing is ahead" off this node agreeing
+				// with itself and erase the memo. Provenance closes it without touching the
+				// constructor: the claimant recorded is the REMOTE peer that reported rev 3 (this
+				// node's own answer reads the storage being repaired, so it can only ever corroborate
+				// the revision already held), and when that peer goes silent the memo stands.
+				const nodePeer = await makePeerId();
+				const holderA = await makePeerId();
+				const cluster = makeClusterPeers([nodePeer, holderA]);
+				let holderAReachable = true;
+				const callback: ClusterLatestCallback = async (peerId) => {
+					if (peerId.equals(nodePeer)) return { actionId: 'local-action', rev: 1 };
+					if (!holderAReachable) throw new Error('dial failed');
+					return { actionId: 'remote-action', rev: 3 };
+				};
+
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+				// Built directly rather than through `buildRepo`: the whole point is the unset
+				// `localPeerId` (the sixth constructor argument).
+				const repo = new CoordinatorRepo(
+					makeKeyNetwork(cluster),
+					makeClusterClient,
+					storageRepo,
+					{ clusterSize: 3, readRepairMode: 'paranoid' },
+					undefined,
+					undefined,
+					undefined,
+					callback
+				);
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev).to.equal(3);
+
+				holderAReachable = false;
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect(after[blockId]?.unconfirmedAheadRev, 'agreeing with itself retires nothing').to.equal(3);
+			});
 		});
 	});
 

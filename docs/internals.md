@@ -1080,14 +1080,40 @@ saveMaterializedBlock(block): store(structuredClone(block));
   pin above holds. The doubt **outlives the consult that formed it**: a corroborated-but-unacquired
   pass marks the block seen, so the read-repair window skips the next consults, and a doubt that
   lived only in that consult's return value would let every read inside the window serve the same
-  content as confirmed again. `CoordinatorRepo` remembers the unsettled claim per block and keeps
-  stamping from it; only a consult that actually **reached a cohort member** may clear it, or the
-  node reaching the claimed revision. "Ran" is not enough and used to be the rule: a consult that
-  asked nobody — no cohort in the routing view, a cohort shrunk to this node alone, or every asked
-  peer silent — reported the same "nothing ahead" a healthy refutation reports, so it erased the
-  memo and the next read served the stale copy as confirmed-current. The consult now returns a
-  named currency verdict (`CoordinatorRepo`'s `CurrencyVerdict`: `refuted` / `no-evidence` /
-  `unsettled-claim`) whose `no-evidence` case leaves the memo exactly as it was. Consumers mirror
+  content as confirmed again. `CoordinatorRepo` remembers the unsettled claim per block —
+  **with the peers that made it** — and keeps stamping from it. The memo is retired on exactly one
+  rule: **at least one cohort member outside this node answered the consult, AND no peer that made
+  the claim was silent in it** (or the node reached the claimed revision, which settles the claim
+  outright). Each of the three positions a claimant can be in has its own reason: one that
+  *answered*, on a consult that found nothing ahead, has retired its own word; one that was
+  *silent* blocks retirement, because nobody else can speak for it; and one that is *neither* has
+  left this node's cohort view, so `findCluster` no longer holds it responsible for the block and
+  its old word no longer binds the current cohort. The non-self cohort is exactly the answered set
+  plus the silent set, so "answered, or gone from the cohort" is just "not silent" — no membership
+  set is carried or diffed. Two weaker rules were tried and are both wrong at an edge: *"ran" is
+  enough* (a consult that asked nobody — no cohort in the routing view, a cohort shrunk to this node
+  alone, or every asked peer silent — reported the same "nothing ahead" a healthy refutation
+  reports, erasing the memo and serving the stale copy as confirmed-current), and *any answer
+  refutes* (a peer that never knew the claimed revision retires a claim the moment its sole holder
+  goes unreachable — the same lie, one step slower). The consult returns a named currency verdict
+  (`CoordinatorRepo`'s `CurrencyVerdict`: `nothing-ahead` / `no-evidence` / `unsettled-claim`);
+  `no-evidence` leaves the memo exactly as it was, and `nothing-ahead` carries the *evidence* — who
+  answered, who was silent — rather than a pre-baked refutation, so the retirement decision is made
+  once, against the claim actually held.
+
+  **What settles doubt when a claimant never comes back is cohort membership, not a timer.** There
+  is deliberately no expiry: erasing a correctness signal because time passed re-opens the same
+  stale-serve through a slower door. A peer that is permanently gone leaves the routing table that
+  `Libp2pKeyPeerNetwork.findCluster` builds the cohort from, and so stops appearing as silent and
+  stops blocking retirement. Two consequences are accepted rather than worked around. If a dead peer
+  never leaves the cohort view the memo stands forever — that is a membership defect to fix in the
+  membership layer, not a licence to lie in the read path, and the coordinator logs
+  `cluster-fetch:claim-unrefutable` (block, revision, silent claimants) so an operator has a name
+  for it. And a *transiently* shrunken view can retire a live claim early, since `findCluster` never
+  admits a peer that is still mid-identify; that is self-correcting — the peer rejoins, still holds
+  the higher revision, and the next consult re-records the claim from its own answer — and it is
+  much cheaper than the alternative, where one unreachable cohort peer denies every unpinned read of
+  the block permanently. Consumers mirror
   the existence flag: `NetworkTransactor.get` treats a marked
   entry as *not* answered (it earns the second-chance retry) and merges per block by the ranking
   **confirmed block > unconfirmed block > authoritative absent > unconfirmed absent >

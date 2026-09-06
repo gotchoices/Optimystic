@@ -88,13 +88,28 @@ interface ClusterLatestQuery {
 	 */
 	uncorroboratedRev?: number;
 	/**
-	 * How many cohort peers OTHER than this node answered the consult at all — with a claim
-	 * or with "I hold nothing". `silent` says who could not be asked; this says how many
-	 * could. Zero with a non-empty `silent` means this node reached NOBODY, which is a
+	 * Cohort peers OTHER than this node that answered the consult at all — with a claim or with
+	 * "I hold nothing". `silent` says who could not be asked; this says who could, and the two
+	 * together are exactly the non-self cohort view this pass saw (`answered` ∪ `silent`, no
+	 * overlap). Empty with a non-empty `silent` means this node reached NOBODY, which is a
 	 * different fact from partial silence: there is no better-informed answer to be had from
 	 * this node's position (see {@link AbsenceVerdict}).
+	 *
+	 * Was a bare count, and `answered.length` is still that number wherever only the count is
+	 * wanted. The IDENTITIES are what let a claim recorded by an EARLIER pass be matched against
+	 * the peers that actually made it: an answer refutes only the claim it bears on (see
+	 * {@link CoordinatorRepo.recordAheadClaim}).
 	 */
-	answered: number;
+	answered: string[];
+	/**
+	 * Every claim this consult collected, whatever the quorum then did with it — the ones a
+	 * corroborated selection was built from included. The caller derives a claim's CLAIMANTS
+	 * from these (the peers claiming at or above the revision in doubt), which is what
+	 * {@link CoordinatorRepo.recordAheadClaim} later matches against `silent` to decide whether
+	 * a recorded memo may be retired. Read-only: selection has already run and nothing
+	 * downstream may re-vote off these.
+	 */
+	claims: readonly RevClaim[];
 }
 
 /**
@@ -114,6 +129,16 @@ interface AheadClaimState {
 	 * consult finds nothing ahead of what this node holds.
 	 */
 	rev?: number;
+	/**
+	 * Which cohort peers reported {@link rev} when the claim was recorded — the peers whose later
+	 * answer is evidence ABOUT this claim, and the only peers whose silence may keep it standing.
+	 * Nobody else can speak for them: a peer that never knew the claimed revision saying "I hold
+	 * nothing" is not a refutation of it (see {@link CoordinatorRepo.recordAheadClaim}).
+	 *
+	 * Bounded by cohort width. Meaningless without `rev`, and written and cleared with it — the
+	 * pair is one fact. `deadlocksReported` keeps its own independent lifetime.
+	 */
+	claimants?: readonly string[];
 	/**
 	 * Which `cluster-fetch:repair-deadlock` reasons have already been said for this block (see
 	 * {@link CoordinatorRepo.reportRepairDeadlock}). Neither reason is about any one revision — one is
@@ -315,23 +340,34 @@ type AbsenceVerdict =
 
 /**
  * What one consult established about whether this node's copy is CURRENT — the currency
- * counterpart to {@link AbsenceVerdict}. Three cases, and the difference between the first two
- * is the whole point: A CONSULT THAT REACHED NOBODY REFUTES NOTHING. An earlier pass's recorded
- * doubt ({@link CoordinatorRepo.unsettledAheadClaims}) may only be cleared by evidence, and
- * "nobody answered" is not evidence. Kept as a named union rather than an optional number so a
- * `return` added later cannot mean "refuted" by leaving a field off — the compiler asks.
+ * counterpart to {@link AbsenceVerdict}. Three cases, and two rules the difference between them
+ * exists to state:
+ *
+ *  - A CONSULT THAT REACHED NOBODY REFUTES NOTHING. An earlier pass's recorded doubt
+ *    ({@link CoordinatorRepo.unsettledAheadClaims}) may only be cleared by evidence, and "nobody
+ *    answered" is not evidence.
+ *  - AN ANSWER REFUTES ONLY THE CLAIM IT BEARS ON. A peer that never reported the claimed
+ *    revision saying "I hold nothing" says nothing about a claim another peer made; only the
+ *    claimants can retire their own word. So the reaching-somebody case carries its EVIDENCE
+ *    (who answered, who was silent) rather than a pre-baked "refuted", and
+ *    {@link CoordinatorRepo.recordAheadClaim} weighs it against the claim it actually holds.
+ *
+ * Kept as a named union rather than an optional number so a `return` added later cannot mean
+ * "nothing is ahead" by leaving a field off — the compiler asks.
  */
 type CurrencyVerdict =
-	/** At least one cohort member outside this node answered, and nothing they said is a revision
-	 *  ahead of this node that the pass left unsettled. A refutation — the ONLY verdict that may
-	 *  clear a memo an earlier pass recorded. */
-	| { kind: 'refuted' }
+	/** The consult reached the cohort and nothing it heard is ahead of this node. NOT by itself a
+	 *  refutation of a recorded memo: it carries the evidence — `answered` and `silent`, the two
+	 *  halves of the non-self cohort view — so `recordAheadClaim` can ask whether the peers that
+	 *  MADE the recorded claim are among the ones that spoke. */
+	| { kind: 'nothing-ahead'; answered: readonly string[]; silent: readonly string[] }
 	/** No cohort member outside this node was asked (no cohort, solo-self, no callback) or none
 	 *  answered. No evidence either way: a recorded memo stands exactly as it was. */
 	| { kind: 'no-evidence' }
-	/** A cohort peer claims `rev`, strictly ahead of what this node holds, and this pass did not
-	 *  converge onto it — quorum declined the claim, or corroborated it and acquisition failed. */
-	| { kind: 'unsettled-claim'; rev: number };
+	/** Cohort peers `claimants` claim `rev`, strictly ahead of what this node holds, and this pass
+	 *  did not converge onto it — quorum declined the claim, or corroborated it and acquisition
+	 *  failed. `claimants` is recorded with the claim: it is who must later answer for it. */
+	| { kind: 'unsettled-claim'; rev: number; claimants: readonly string[] };
 
 /**
  * Extended cluster interface that includes the ability to check if a transaction was executed.
@@ -747,11 +783,12 @@ export class CoordinatorRepo implements IRepo {
 					}
 					// A PRESENT block served below a cohort claim the repair could not settle is
 					// the mirror lie: real content posing as confirmed-current. A consult that
-					// REACHED somebody is the authority on that claim, so it replaces whatever an
-					// earlier one recorded — including clearing it when nobody claims anything any
-					// more. One that reached nobody (`currency.kind === 'no-evidence'` — no cohort,
-					// solo-self, or total silence) refutes nothing and leaves the memo standing;
-					// `recordAheadClaim` reads the verdict for exactly that distinction. The missing
+					// REACHED THE CLAIMANTS is the authority on that claim, so it replaces whatever
+					// an earlier one recorded — including clearing it when those peers claim nothing
+					// any more. One that reached nobody (`currency.kind === 'no-evidence'` — no
+					// cohort, solo-self, or total silence) refutes nothing, and neither does one
+					// whose answers came from peers that never made the claim; `recordAheadClaim`
+					// weighs the verdict's evidence against the recorded claimants. The missing
 					// case is excluded — it is the absence path above, and a bare absent below a
 					// claim already reads as either authoritative (cohort answered, nothing
 					// corroborated) or flagged.
@@ -814,28 +851,82 @@ export class CoordinatorRepo implements IRepo {
 	 * that consult's {@link CurrencyVerdict}. Entries are also dropped once this node reaches the
 	 * claimed revision (see {@link flagUnconfirmedCurrency}), which is what bounds the map.
 	 *
-	 * Forgetting requires EVIDENCE — a `refuted` verdict, meaning a cohort member outside this node
-	 * actually answered and said nothing ahead. A consult that reached nobody (`no-evidence`)
-	 * refutes nothing and leaves the memo exactly as it was. That used to be a rule the caller had
-	 * to obey and could not: the old `claimedAheadRev: number | undefined` said the same thing for
-	 * "peers refuted the claim" and for "nobody was asked", so every non-consulting exit silently
-	 * erased the doubt and served stale content as confirmed-current. The verdict type states the
-	 * difference instead, so a new exit cannot mean the wrong one by omission.
+	 * **The retirement rule, in one sentence.** A recorded claim is retired when at least one
+	 * non-self cohort member answered this consult AND no peer that MADE the claim was silent in
+	 * it. Everything else about the rule follows from that, and each of the three cases a
+	 * claimant can be in has its own reason:
+	 *
+	 *  - A claimant that ANSWERED, on a consult whose verdict is "nothing ahead", has retired its
+	 *    own word. Its answer is evidence about its own claim — the only kind that counts.
+	 *  - A claimant that was SILENT blocks retirement. Nobody else can speak for it; a peer that
+	 *    never knew the claimed revision answering "I hold nothing" is not a refutation.
+	 *  - A claimant that is NEITHER answered nor silent has left this node's cohort view:
+	 *    `findCluster` no longer holds it responsible for the block, so its old word no longer
+	 *    binds the current cohort. This is what BOUNDS the doubt — see the membership discussion
+	 *    at `nothingAheadVerdict` in {@link fetchBlockFromCluster}.
+	 *
+	 * Note the arithmetic that makes it a one-liner: the non-self cohort IS `answered` ∪ `silent`,
+	 * so "answered, or gone from the cohort" is exactly "not silent". No membership set has to be
+	 * carried or diffed.
+	 *
+	 * Forgetting requires EVIDENCE. A consult that reached nobody (`no-evidence`) refutes nothing
+	 * and leaves the memo exactly as it was. That used to be a rule the caller had to obey and
+	 * could not: the old `claimedAheadRev: number | undefined` said the same thing for "peers
+	 * refuted the claim" and for "nobody was asked", so every non-consulting exit silently erased
+	 * the doubt and served stale content as confirmed-current. The verdict type states the
+	 * difference instead, so a new exit cannot mean the wrong one by omission — and `nothing-ahead`
+	 * now carries the evidence rather than a pre-baked refutation for the same reason, so a caller
+	 * cannot assert a refutation it did not observe.
 	 */
 	private recordAheadClaim(blockId: BlockId, currency: CurrencyVerdict): void {
 		if (currency.kind === 'no-evidence') return;
 		const prior = this.unsettledAheadClaims.get(blockId);
-		if (currency.kind === 'refuted') {
+		if (currency.kind === 'nothing-ahead') {
+			if (prior?.rev === undefined) return;	// nothing recorded to retire
+			// Only the claimants' own silence protects their claim. Everyone else's silence is
+			// irrelevant to it — degrading this into "any silence blocks retirement" would flag a
+			// block forever behind one permanently unreachable cohort peer.
+			const silentClaimants = (prior.claimants ?? []).filter(id => currency.silent.includes(id));
+			if (currency.answered.length === 0 || silentClaimants.length > 0) {
+				// The operator's only signal that a block's doubt CANNOT settle from this node's
+				// position: the peer that claimed the revision is unreachable, so every read of the
+				// block stays marked possibly-stale until it answers or leaves the cohort view.
+				// NOTE: emitted per pass, not say-once. In `lazy` mode `readRepairWindowMs` (10s
+				// default) rate-limits consults, so this is at most one line per window; in
+				// `paranoid` mode a consult runs on EVERY read and so this logs on every read. If
+				// that ever shows as noise, move it behind a say-once flag on the entry (beside
+				// `deadlocksReported`) rather than dropping the line — it is the only place the
+				// condition is named.
+				if (silentClaimants.length > 0) {
+					this.log('cluster-fetch:claim-unrefutable', { blockId, rev: prior.rev, silentClaimants });
+				}
+				return;
+			}
 			// The consult is the authority on the CLAIM, and only on the claim. A recorded deadlock is
 			// not about any revision — it is about how many machines this deployment can field, or how
 			// many of them hold the block — so it outlives the claim that first exposed it and is
 			// dropped only when the block converges (see {@link flagUnconfirmedCurrency}).
-			if (prior?.deadlocksReported) this.unsettledAheadClaims.set(blockId, { deadlocksReported: prior.deadlocksReported });
+			if (prior.deadlocksReported) this.unsettledAheadClaims.set(blockId, { deadlocksReported: prior.deadlocksReported });
 			else this.unsettledAheadClaims.delete(blockId);
 			return;
 		}
+		// Repeated claims at the SAME revision accumulate claimants: pass 1 hears it from A, pass 2
+		// hears it from B while A is silent, and retiring later on B's answer alone would ignore A's
+		// still-unanswered word. A claim at a DIFFERENT revision replaces outright: a higher one
+		// subsumes the old, and a lower one is the pre-existing newest-consult-is-the-authority
+		// behaviour — the latest pass's picture of the cohort wins, doubt included.
+		// NOTE: that replacement drops the older, HIGHER claim's claimants along with its revision,
+		// so doubt can be revised down by a consult the earlier claimant did not answer. Provenance
+		// makes a stricter rule (keep the higher claim while its claimants are unaccounted for)
+		// expressible for the first time; deliberately not taken here, because it widens what the
+		// marker asserts rather than fixing what it got wrong. Revisit if a deployment shows reads
+		// flipping between two claimed revisions.
+		const claimants = prior?.rev === currency.rev
+			? [...new Set([...(prior.claimants ?? []), ...currency.claimants])]
+			: [...currency.claimants];
 		this.unsettledAheadClaims.set(blockId, {
 			rev: currency.rev,
+			claimants,
 			...(prior?.deadlocksReported ? { deadlocksReported: prior.deadlocksReported } : {})
 		});
 	}
@@ -972,9 +1063,11 @@ export class CoordinatorRepo implements IRepo {
 	 *    failed the corroboration quorum, or was corroborated but could not be acquired. Content
 	 *    `get` serves below that revision cannot be confirmed current (see
 	 *    {@link GetBlockResult.unconfirmedAheadRev}); the claim itself must never drive
-	 *    restoration. `refuted` and `no-evidence` differ in exactly one way that matters:
-	 *    `refuted` clears an earlier pass's memo, `no-evidence` leaves it standing. Required, not
-	 *    optional, so an exit added later has to say which it means.
+	 *    restoration. `nothing-ahead` and `no-evidence` differ in exactly one way that matters:
+	 *    `nothing-ahead` carries the evidence that can retire an earlier pass's memo (and does
+	 *    retire it when the memo's claimants are among the peers that answered), `no-evidence`
+	 *    leaves it standing untouched. Required, not optional, so an exit added later has to say
+	 *    which it means.
 	 */
 	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext, localRev?: number): Promise<{ absence: AbsenceVerdict; currency: CurrencyVerdict }> {
 		if (!this.clusterLatestCallback) return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
@@ -1029,7 +1122,7 @@ export class CoordinatorRepo implements IRepo {
 			return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
 		}
 
-		const { corroborated, local, silent, answered, uncorroboratedRev } = await this.queryClusterForLatest(peerIds, blockId, context);
+		const { corroborated, local, silent, answered, claims, uncorroboratedRev } = await this.queryClusterForLatest(peerIds, blockId, context);
 		// Any silence taints the WHOLE consult, not a fraction of it (fail-closed): one silent
 		// peer could be the sole holder, and the cost — an extra transactor-level retry against
 		// another coordinator — is paid only while a peer is actually unreachable. Silence with
@@ -1037,32 +1130,49 @@ export class CoordinatorRepo implements IRepo {
 		// connected coordinator", total silence says there is no better-informed answer to be
 		// had from this node.
 		const silenceVerdict: AbsenceVerdict =
-			silent.length > 0 ? (answered === 0 ? 'isolated' : 'unconfirmed') : 'confirmed';
-		// Mirror of `silenceVerdict` for the CURRENCY half: the verdict to use at every exit that
-		// found nothing ahead. A consult that reached NOBODY outside this node refutes nothing, so a
-		// memo an earlier pass recorded must survive it; only an answer from a cohort member is
-		// evidence that nothing is ahead. Keyed on `answered` (cohort members other than this node
-		// that answered at all) rather than on `silenceVerdict === 'isolated'`: the two agree in
-		// every reachable state — `answered === 0` with an EMPTY silent set would need a cohort of
+			silent.length > 0 ? (answered.length === 0 ? 'isolated' : 'unconfirmed') : 'confirmed';
+		// The CURRENCY half's counterpart: the verdict to use at every exit that found nothing ahead.
+		// A consult that reached NOBODY outside this node refutes nothing, so a memo an earlier pass
+		// recorded must survive it. Keyed on `answered` (cohort members other than this node that
+		// answered at all) rather than on `silenceVerdict === 'isolated'`: the two agree in every
+		// reachable state — an empty `answered` with an EMPTY silent set would need a cohort of
 		// nothing but self, which the solo short-circuit above already took — but stating the rule
 		// in terms of "did anyone answer" says what it means without depending on that argument.
 		// Computed once here, like `silenceVerdict`, so it is stated in one place instead of
 		// re-derived at four `return`s.
-		// NOTE: `answered` counts this node itself when `localPeerId` was left unset (see the
-		// self-exclusion NOTE in `queryClusterForLatest`), so THAT construction reaches `refuted`
-		// off its own answer on a self-only cohort — the exact erasure this verdict exists to
-		// prevent. Dormant: both production wirings pass `localPeerId`. Filed as an arm of
-		// `fix/currency-doubt-cleared-by-a-partial-answer`.
-		// NOTE: deliberately NOT the same shape as `silenceVerdict` above — this one is two-level
-		// where that one is three, so PARTIAL silence resolves to `refuted` and clears the memo.
-		// That is a known gap, not the finished rule: with the sole holder of the claimed revision
-		// silent and one other peer answering "I hold nothing", `answered > 0` and the recorded
-		// doubt is erased by peers that never knew about it (verified by probe). Tracked as
-		// `fix/currency-doubt-cleared-by-a-partial-answer`; do not "harmonize" the two verdicts
-		// here without reading it, and do not widen this to `silent.length === 0` on its own —
-		// that makes one permanently unreachable cohort peer flag the block forever.
+		//
+		// Deliberately NOT the same shape as `silenceVerdict` above, and no longer a defect that it
+		// is not: the two answer DIFFERENT QUESTIONS. `silenceVerdict` asks whether this pass saw
+		// the whole cohort, which partial silence answers "no" (fail-closed: one silent peer could
+		// be the sole holder of a block this node lacks entirely). This one carries EVIDENCE rather
+		// than a verdict, because whether an answer refutes anything depends on the claim being
+		// weighed: `recordAheadClaim` retires a memo only when a claimant answered and no claimant
+		// was silent. Do not "harmonize" them into one three-level verdict; and do not collapse this
+		// back to a bare `refuted`, which is what let a peer that never knew the claim retire it.
+		//
+		// **How doubt settles when a claimant never comes back — not a timer.** A permanently silent
+		// claimant would keep a block marked forever, so what bounds the doubt is COHORT MEMBERSHIP:
+		// `Libp2pKeyPeerNetwork.findCluster` builds `peerIds` from the live routing table, so a peer
+		// that is genuinely gone leaves the cohort view, stops appearing in `silent`, and stops
+		// blocking retirement. Two consequences, both accepted:
+		//  - If a dead peer never leaves the cohort view, the memo stands forever. That is a
+		//    membership defect to fix in the membership layer, not a licence to lie here — the block
+		//    genuinely IS possibly stale while a responsible cohort member holds a revision nobody
+		//    can obtain. `cluster-fetch:claim-unrefutable` (see `recordAheadClaim`) gives the
+		//    operator a name for it rather than erasing the doubt silently.
+		//  - A transiently-shrunken cohort view can retire a live claim early: `findCluster` never
+		//    admits a not-yet-identified peer, so one mid-identify is briefly absent and briefly
+		//    looks departed. Self-correcting — when it rejoins still holding the higher revision, the
+		//    next consult re-records the claim from its answer. One window of clean reads, versus the
+		//    permanent denial the alternative rule ("only a fully-answered cohort refutes") produces
+		//    from a single unreachable peer.
 		const nothingAheadVerdict: CurrencyVerdict =
-			answered === 0 ? { kind: 'no-evidence' } : { kind: 'refuted' };
+			answered.length === 0 ? { kind: 'no-evidence' } : { kind: 'nothing-ahead', answered, silent };
+		/** The peers whose word this pass would be recording: those claiming at or above `rev`. A
+		 *  claimant is who must later answer for the claim, so a peer claiming something LOWER is
+		 *  not one — its answer says nothing about the revision in doubt. */
+		const claimantsAtOrAbove = (rev: number): string[] =>
+			claims.filter(c => c.rev >= rev).map(c => c.peerId);
 		// Nothing corroborated: keep local data AND stay eligible for repair — marking the
 		// block seen here would suppress the next attempt for the whole read-repair window.
 		// An uncorroborated claim strictly ahead of what this node holds still travels up as
@@ -1074,12 +1184,12 @@ export class CoordinatorRepo implements IRepo {
 			// exists, the sharpest fact this pass can surface. It outranks silence.
 			const absence: AbsenceVerdict = uncorroboratedRev !== undefined ? 'claimed' : silenceVerdict;
 			// A claim present but NOT ahead of the baseline falls to the shared verdict — which
-			// resolves to `refuted` in practice here, since `uncorroboratedRev` can only exist when a
-			// peer answered. Using the shared value anyway keeps the rule stated once.
+			// resolves to `nothing-ahead` in practice here, since `uncorroboratedRev` can only exist
+			// when a peer answered. Using the shared value anyway keeps the rule stated once.
 			const currency: CurrencyVerdict =
 				uncorroboratedRev !== undefined
 					&& (uncorroboratedBaseline === undefined || uncorroboratedRev > uncorroboratedBaseline)
-					? { kind: 'unsettled-claim', rev: uncorroboratedRev }
+					? { kind: 'unsettled-claim', rev: uncorroboratedRev, claimants: claimantsAtOrAbove(uncorroboratedRev) }
 					: nothingAheadVerdict;
 			return { absence, currency };
 		}
@@ -1109,7 +1219,8 @@ export class CoordinatorRepo implements IRepo {
 			// consults this verdict — computed consistently rather than hard-coded.
 			// Currency: the cohort corroborated at or below what this node holds, so nothing is
 			// ahead. Only reachable when a peer answered (a corroboration requires claims), so the
-			// shared verdict resolves to `refuted` and the memo is cleared.
+			// shared verdict resolves to `nothing-ahead` and a memo whose claimants are among those
+			// answers is cleared.
 			return { absence: silenceVerdict, currency: nothingAheadVerdict };
 		}
 
@@ -1147,10 +1258,11 @@ export class CoordinatorRepo implements IRepo {
 		// same window rather than widening `isMissing`.
 		this.markBlocksSeen([blockId]);
 		// Converged: the corroboration is itself the evidence that nothing is ahead, and it came from
-		// peers that answered — the shared verdict resolves to `refuted` and clears the memo.
+		// peers that answered — the shared verdict resolves to `nothing-ahead`, and the memo retires
+		// if its claimants are among those peers.
 		const currency: CurrencyVerdict = converged
 			? nothingAheadVerdict
-			: { kind: 'unsettled-claim', rev: corroborated.rev };
+			: { kind: 'unsettled-claim', rev: corroborated.rev, claimants: claimantsAtOrAbove(corroborated.rev) };
 		return { absence, currency };
 	}
 
@@ -1306,8 +1418,16 @@ export class CoordinatorRepo implements IRepo {
 		// make self report something the reader does not hold, make `localPeerId` required instead.
 		// The same unset-`localPeerId` tolerance also lets self count toward `answered` below, and
 		// lets a self read that REJECTS land in `silent`: a solo repo whose own storage throws then
-		// reads as `answered === 0` and reports isolation ('cohort-unreachable') rather than a local
-		// fault. Same fix if it ever matters — require `localPeerId`.
+		// reads as an EMPTY `answered` and reports isolation ('cohort-unreachable') rather than a
+		// local fault. Same fix if it ever matters — require `localPeerId`.
+		// What this tolerance no longer does is let this node erase its own doubt. `answered` used
+		// to be a bare count, so an unset `localPeerId` on a self-only-answering pass reached
+		// "somebody answered, nothing is ahead" off this node's own answer and dropped the memo —
+		// the exact erasure the marker exists to prevent. Claim PROVENANCE closes it without
+		// touching the constructor: the claimant recorded is the remote peer that reported the
+		// revision (never self, whose answer reads the storage being repaired, per the argument
+		// above), so when that peer goes silent it is a silent claimant and the memo stands. This
+		// node agreeing with itself retires nothing.
 		const selfId = this.localPeerId?.toString();
 		let local: CertifiedActionRev | undefined;
 		const claims: RevClaim[] = [];
@@ -1385,7 +1505,10 @@ export class CoordinatorRepo implements IRepo {
 		}));
 
 		const nonSelfCount = peerIds.filter(id => id !== selfId).length;
-		const answered = nonSelfCount - silent.length;
+		// Identities, not a count: the caller matches a memo's recorded claimants against who spoke
+		// this pass. `answered` and `silent` partition the non-self cohort view, so the old
+		// `nonSelfCount - silent.length` is exactly `answered.length`.
+		const answered = peerIds.filter(id => id !== selfId && !silent.includes(id));
 		const capacity = corroboratorCapacity(nonSelfCount, this.repairCorroborationClusterSize);
 		const required = quorumSize(claims.length, this.simpleMajorityThreshold, capacity);
 		const selected = selectQuorumRev(claims, this.simpleMajorityThreshold, capacity);
@@ -1409,7 +1532,7 @@ export class CoordinatorRepo implements IRepo {
 				blockId,
 				cohortPeers: nonSelfCount,
 				holders: claims.length,
-				absent: answered - claims.length,
+				absent: answered.length - claims.length,
 				silent: silent.length,
 				required,
 				repairCorroborationClusterSize: this.repairCorroborationClusterSize
@@ -1417,7 +1540,7 @@ export class CoordinatorRepo implements IRepo {
 			// ...and, when this decline is provably permanent rather than transient, say THAT once,
 			// in words. The `no-quorum` line above fires on every pass and cannot tell the two apart.
 			this.reportRepairDeadlock({
-				blockId, claims, silentCount: silent.length, cohortPeers: nonSelfCount, answered, required, capacity
+				blockId, claims, silentCount: silent.length, cohortPeers: nonSelfCount, answered: answered.length, required, capacity
 			});
 			// The claims themselves must not drive restoration — but their existence is
 			// evidence the caller needs: an answer served below the highest claim cannot be
@@ -1433,7 +1556,7 @@ export class CoordinatorRepo implements IRepo {
 			// (the verification machinery now exists) rather than on the bare assertion — at the
 			// cost of re-opening the stale-serve window for the proof-less honest majority.
 			const uncorroboratedRev = claims.length > 0 ? Math.max(...claims.map(c => c.rev)) : undefined;
-			return { local, silent, answered, ...(uncorroboratedRev !== undefined ? { uncorroboratedRev } : {}) };
+			return { local, silent, answered, claims, ...(uncorroboratedRev !== undefined ? { uncorroboratedRev } : {}) };
 		}
 
 		if (selected.certified) {
@@ -1450,7 +1573,7 @@ export class CoordinatorRepo implements IRepo {
 		// (an unanchored proof must not be able to convict the honest cohort). Never let this throw.
 		this.penalizeContradictingRevClaims(claims, selected, blockId);
 
-		return { corroborated: { actionId: selected.actionId, rev: selected.rev }, local, silent, answered };
+		return { corroborated: { actionId: selected.actionId, rev: selected.rev }, local, silent, answered, claims };
 	}
 
 	/**
