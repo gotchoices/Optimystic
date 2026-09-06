@@ -115,6 +115,32 @@ noting for whoever does the extraction: "how does this operation decide whether 
 applies at all" is a second small concern living inline in this file three times over, and it is
 adjacent to, but distinct from, the freshness state this ticket is about.
 
+## Eighth measurement — the predicted mistake happened again, and this time a user hit it
+
+Added 2026-09-05. This ticket's `description:` says it is "easy for a future change to read a record
+without checking everything that is known about how fresh it is — a mistake that has already
+happened once." It has now happened twice, and the second one blocked an outside consumer for
+47 minutes per attempt (GitHub issue #8; tracked as `fix/1-solo-node-read-repair-never-settles`).
+
+The instance: `fetchBlockFromCluster` has three exits. Two stamp `lastSeenCommitMs` via
+`markBlocksSeen`, which is the only thing that arms the read-repair window. The solo short-circuit
+(`cluster-fetch:solo-self-skip`) does not — so on a cohort of one, `shouldReadRepair` reads
+`lastSeen == null` forever and every read re-runs a consult that can never do anything. Measured:
+9 reads inside the window produce 9 consults at HEAD and 1 with the exit stamped.
+
+**Why this is the strongest evidence yet for the collaborator, and not just another arm.** The
+earlier measurements argued from size and reviewability — a ~450-line span, four `LruMap`s, rationale
+spread through long comments. This one is different in kind: the bug is not that someone misread the
+code, it is that *"consult finished"* and *"window armed"* are two separate facts a caller has to
+remember to keep in sync, and one exit forgot. A collaborator owning the window would make the
+forgetting unrepresentable — arming would be a consequence of the consult returning, not a call the
+author has to remember at each of three (soon four, see below) exit points.
+
+Note the fourth exit already visible at the same site: `peerIds.length === 0` also returns
+`{ absence: 'confirmed' }` without arming. Whether that one *should* arm is a real question (an
+empty cohort is routing failure, not a settled answer) — but the fact that answering it requires
+reasoning about each exit independently is the shape this ticket exists to retire.
+
 ## Fifth measurement (review pass on `certified-claims-read-repair`)
 
 Re-measured (`wc -l packages/db-p2p/src/repo/coordinator-repo.ts`): **1570 lines**, up from 1451.
