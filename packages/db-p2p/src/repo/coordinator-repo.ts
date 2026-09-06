@@ -1041,11 +1041,26 @@ export class CoordinatorRepo implements IRepo {
 		// Mirror of `silenceVerdict` for the CURRENCY half: the verdict to use at every exit that
 		// found nothing ahead. A consult that reached NOBODY outside this node refutes nothing, so a
 		// memo an earlier pass recorded must survive it; only an answer from a cohort member is
-		// evidence that nothing is ahead. Keyed on `answered` rather than on `silenceVerdict`
-		// because `answered === 0` with an EMPTY silent set is reachable — a self-only cohort where
-		// `localPeerId` was left unset skips the solo short-circuit above and queries only self,
-		// which is another consult that learned nothing. Computed once here, like `silenceVerdict`,
-		// so the rule is stated in one place instead of re-derived at four `return`s.
+		// evidence that nothing is ahead. Keyed on `answered` (cohort members other than this node
+		// that answered at all) rather than on `silenceVerdict === 'isolated'`: the two agree in
+		// every reachable state — `answered === 0` with an EMPTY silent set would need a cohort of
+		// nothing but self, which the solo short-circuit above already took — but stating the rule
+		// in terms of "did anyone answer" says what it means without depending on that argument.
+		// Computed once here, like `silenceVerdict`, so it is stated in one place instead of
+		// re-derived at four `return`s.
+		// NOTE: `answered` counts this node itself when `localPeerId` was left unset (see the
+		// self-exclusion NOTE in `queryClusterForLatest`), so THAT construction reaches `refuted`
+		// off its own answer on a self-only cohort — the exact erasure this verdict exists to
+		// prevent. Dormant: both production wirings pass `localPeerId`. Filed as an arm of
+		// `fix/currency-doubt-cleared-by-a-partial-answer`.
+		// NOTE: deliberately NOT the same shape as `silenceVerdict` above — this one is two-level
+		// where that one is three, so PARTIAL silence resolves to `refuted` and clears the memo.
+		// That is a known gap, not the finished rule: with the sole holder of the claimed revision
+		// silent and one other peer answering "I hold nothing", `answered > 0` and the recorded
+		// doubt is erased by peers that never knew about it (verified by probe). Tracked as
+		// `fix/currency-doubt-cleared-by-a-partial-answer`; do not "harmonize" the two verdicts
+		// here without reading it, and do not widen this to `silent.length === 0` on its own —
+		// that makes one permanently unreachable cohort peer flag the block forever.
 		const nothingAheadVerdict: CurrencyVerdict =
 			answered === 0 ? { kind: 'no-evidence' } : { kind: 'refuted' };
 		// Nothing corroborated: keep local data AND stay eligible for repair — marking the

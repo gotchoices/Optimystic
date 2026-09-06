@@ -268,3 +268,13 @@ What this does and does not change for the extraction:
   memo, because "was this checked recently?" and "is there recorded doubt?" are different questions.
   Those two facts being independently maintained at the same exits is the same coupling this ticket
   is about; the extraction should make the pair one decision, not two calls an author must remember.
+
+### Addendum from the review of that ticket
+
+The two shared verdict values are *not* the same shape: `silenceVerdict` (existence) has three
+levels and `nothingAheadVerdict` (currency) has two, so partial cohort silence reads as an
+incomplete picture on one side and as a complete refutation on the other. That asymmetry is a
+verified defect, filed separately as `fix/currency-doubt-cleared-by-a-partial-answer`. It matters
+here because the fix likely needs the memo to remember *which peer* made the claim — a per-block
+fact with yet another lifetime, and a fifth thing this ticket's collaborator would own. Sequence
+the extraction after it, or expect to redesign the memo's contents on the way out.

@@ -1081,8 +1081,14 @@ saveMaterializedBlock(block): store(structuredClone(block));
   pass marks the block seen, so the read-repair window skips the next consults, and a doubt that
   lived only in that consult's return value would let every read inside the window serve the same
   content as confirmed again. `CoordinatorRepo` remembers the unsettled claim per block and keeps
-  stamping from it; only a consult that actually ran may clear it, or the node reaching the claimed
-  revision. Consumers mirror the existence flag: `NetworkTransactor.get` treats a marked
+  stamping from it; only a consult that actually **reached a cohort member** may clear it, or the
+  node reaching the claimed revision. "Ran" is not enough and used to be the rule: a consult that
+  asked nobody — no cohort in the routing view, a cohort shrunk to this node alone, or every asked
+  peer silent — reported the same "nothing ahead" a healthy refutation reports, so it erased the
+  memo and the next read served the stale copy as confirmed-current. The consult now returns a
+  named currency verdict (`CoordinatorRepo`'s `CurrencyVerdict`: `refuted` / `no-evidence` /
+  `unsettled-claim`) whose `no-evidence` case leaves the memo exactly as it was. Consumers mirror
+  the existence flag: `NetworkTransactor.get` treats a marked
   entry as *not* answered (it earns the second-chance retry) and merges per block by the ranking
   **confirmed block > unconfirmed block > authoritative absent > unconfirmed absent >
   unavailable** — the confirmed-over-unconfirmed split is load-bearing, since without it the
@@ -1100,7 +1106,12 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `Collection.sync` surfaces it instead of absorbing it into its retry loop. Accepted tradeoff: a
   node partitioned from every coordinator able to confirm currency used to read stale data
   silently and now raises on those reads until the partition heals (see the `NOTE:` at the
-  `tryGet` throw site). Tripwire, recorded at the no-quorum site in `queryClusterForLatest`: one
+  `tryGet` throw site). That tradeoff widened once a no-evidence consult stopped clearing the
+  memo: a node that recorded a claim and *then* lost its cohort keeps raising on the affected
+  block indefinitely, because only an answer from a cohort member — or reaching the claimed
+  revision — can settle it, and it can do neither alone. That is the intended direction (an
+  unavailable read over a silently wrong one), but it is a real availability consequence rather
+  than a pure bug fix. Tripwire, recorded at the no-quorum site in `queryClusterForLatest`: one
   uncorroborated claim is enough to raise doubt, so a single lying cohort peer can deny unpinned
   reads of a block it falsely claims to be ahead on — cheaper than the silent-staleness it
   replaces, and revisited when commit-certificate verification can make a claim attestable.

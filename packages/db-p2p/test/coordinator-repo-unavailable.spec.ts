@@ -726,6 +726,36 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 				expect(after[blockId]?.unconfirmedAheadRev, 'total silence refutes nothing').to.equal(3);
 			});
 
+			it('drops the mark when the surviving claim fails quorum AND is not ahead of us', async () => {
+				// The remaining "nothing ahead" row the fix left argued rather than asserted: the
+				// no-quorum exit, reached with a claim present that is NOT ahead of this node's
+				// baseline. It falls to the shared `nothingAheadVerdict`, which is only correct
+				// there because a claim can exist at all only when a peer answered. Pinning it
+				// keeps that reasoning honest if the shared verdict is ever re-keyed.
+				const localPeer = await makePeerId();
+				const holderA = await makePeerId();
+				const holderB = await makePeerId();
+				const cluster = makeClusterPeers([localPeer, holderA, holderB]);
+				let phase = 1;
+				const callback: ClusterLatestCallback = async (peerId) => {
+					if (peerId.equals(localPeer)) return { actionId: 'local-action', rev: 2 };
+					if (phase === 1) return { actionId: 'remote-action', rev: 3 };
+					// Same revision as this node holds, and the two peers name DIFFERENT actions, so
+					// the quorum declines and the claim survives only as `uncorroboratedRev`.
+					return { actionId: peerId.equals(holderA) ? 'fork-a' : 'fork-b', rev: 2 };
+				};
+
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 2);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev).to.equal(3);
+
+				phase = 2;
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect('unconfirmedAheadRev' in after[blockId]!, 'an answered claim level with us refutes the old one').to.equal(false);
+			});
+
 			it('drops the mark when peers answer with a claim strictly BELOW what this node holds', async () => {
 				// The refutation that must keep working, and the row most easily broken by an
 				// over-cautious reading of the ticket above: peers DID answer, and what they hold is
