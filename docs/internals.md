@@ -1081,12 +1081,17 @@ saveMaterializedBlock(block): store(structuredClone(block));
   pass marks the block seen, so the read-repair window skips the next consults, and a doubt that
   lived only in that consult's return value would let every read inside the window serve the same
   content as confirmed again. `CoordinatorRepo` remembers the unsettled claim per block —
-  **with the peers that made it** — and keeps stamping from it. The memo is retired on exactly one
-  rule: **at least one cohort member outside this node answered the consult, AND no peer that made
-  the claim was silent in it** (or the node reached the claimed revision, which settles the claim
-  outright). Each of the three positions a claimant can be in has its own reason: one that
-  *answered*, on a consult that found nothing ahead, has retired its own word; one that was
-  *silent* blocks retirement, because nobody else can speak for it; and one that is *neither* has
+  **with the peers that made it** — and keeps stamping from it. The memo is *weakened* — retired, or
+  revised down to a lower revision — on exactly one rule: **at least one cohort member outside this
+  node answered the consult, AND no peer that made the claim was silent in it** (or the node reached
+  the claimed revision, which settles the claim outright). Both directions of weakening answer to
+  that one rule, because they hide the same thing: a later consult that records a *lower* claim
+  replaces the higher one, and once this node reaches the lower revision the mark disappears
+  entirely — so a peer that never made the higher claim must not be able to revise it away either.
+  Raising a claim needs no such licence; a higher claimed revision stamps everything the one it
+  replaces did and more. Each of the three positions a claimant can be in has its own reason: one
+  that *answered*, on a consult that found nothing ahead, has retired its own word; one that was
+  *silent* blocks weakening, because nobody else can speak for it; and one that is *neither* has
   left this node's cohort view, so `findCluster` no longer holds it responsible for the block and
   its old word no longer binds the current cohort. The non-self cohort is exactly the answered set
   plus the silent set, so "answered, or gone from the cohort" is just "not silent" — no membership
@@ -1097,8 +1102,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   refutes* (a peer that never knew the claimed revision retires a claim the moment its sole holder
   goes unreachable — the same lie, one step slower). The consult returns a named currency verdict
   (`CoordinatorRepo`'s `CurrencyVerdict`: `nothing-ahead` / `no-evidence` / `unsettled-claim`);
-  `no-evidence` leaves the memo exactly as it was, and `nothing-ahead` carries the *evidence* — who
-  answered, who was silent — rather than a pre-baked refutation, so the retirement decision is made
+  `no-evidence` leaves the memo exactly as it was, and the other two both carry the *evidence* — who
+  answered, who was silent — rather than a pre-baked refutation, so the weakening decision is made
   once, against the claim actually held.
 
   **What settles doubt when a claimant never comes back is cohort membership, not a timer.** There
@@ -1113,8 +1118,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   admits a peer that is still mid-identify; that is self-correcting — the peer rejoins, still holds
   the higher revision, and the next consult re-records the claim from its own answer — and it is
   much cheaper than the alternative, where one unreachable cohort peer denies every unpinned read of
-  the block permanently. Consumers mirror
-  the existence flag: `NetworkTransactor.get` treats a marked
+  the block permanently.
+
+  Consumers mirror the existence flag: `NetworkTransactor.get` treats a marked
   entry as *not* answered (it earns the second-chance retry) and merges per block by the ranking
   **confirmed block > unconfirmed block > authoritative absent > unconfirmed absent >
   unavailable** — the confirmed-over-unconfirmed split is load-bearing, since without it the

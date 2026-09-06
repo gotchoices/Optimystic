@@ -278,3 +278,26 @@ verified defect, filed separately as `fix/currency-doubt-cleared-by-a-partial-an
 here because the fix likely needs the memo to remember *which peer* made the claim — a per-block
 fact with yet another lifetime, and a fifth thing this ticket's collaborator would own. Sequence
 the extraction after it, or expect to redesign the memo's contents on the way out.
+
+## Twelfth measurement (implement + review of `currency-doubt-cleared-by-a-partial-answer`)
+
+Re-measured (`wc -l packages/db-p2p/src/repo/coordinator-repo.ts`): **2503 lines**, up from 2341.
+
+The addendum above predicted this: the memo now remembers *which peers* made the claim. The fifth
+per-block fact was added as a field on the existing `AheadClaimState` entry rather than a fifth
+`LruMap` — the opposite call from the seventh measurement's, and locally right for the same reason
+that one was, because the claimant list is meaningless without the revision it belongs to and is
+written and cleared with it. Two structural notes for the extraction:
+
+- The consult's two shared verdict values are still not the same shape, and after this ticket that
+  is settled as correct rather than a defect: existence asks "did this pass see the whole cohort?"
+  (three levels), currency now carries **evidence** — who answered, who was silent — because whether
+  an answer refutes anything depends on which claim is being weighed. A collaborator owning
+  freshness owns that asymmetry deliberately; do not harmonize the two on the way out.
+- The review pass found the same erasure surviving in a second direction: a *lower* claim recorded by
+  a later consult replaced a higher one outright, dropping the higher claimant's word exactly as an
+  unrelated peer's "I hold nothing" once did. Fixed by making one gate cover both weakenings
+  (retire, and revise down). That is the third time this concern has been fixed at an instance: the
+  invariant "a recorded fact may only be weakened by the peers that produced it" has no single home
+  today, which is precisely what the collaborator would give it.
+

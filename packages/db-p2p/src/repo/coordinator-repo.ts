@@ -106,7 +106,7 @@ interface ClusterLatestQuery {
 	 * corroborated selection was built from included. The caller derives a claim's CLAIMANTS
 	 * from these (the peers claiming at or above the revision in doubt), which is what
 	 * {@link CoordinatorRepo.recordAheadClaim} later matches against `silent` to decide whether
-	 * a recorded memo may be retired. Read-only: selection has already run and nothing
+	 * a recorded memo may be weakened. Read-only: selection has already run and nothing
 	 * downstream may re-vote off these.
 	 */
 	claims: readonly RevClaim[];
@@ -131,12 +131,15 @@ interface AheadClaimState {
 	rev?: number;
 	/**
 	 * Which cohort peers reported {@link rev} when the claim was recorded — the peers whose later
-	 * answer is evidence ABOUT this claim, and the only peers whose silence may keep it standing.
-	 * Nobody else can speak for them: a peer that never knew the claimed revision saying "I hold
-	 * nothing" is not a refutation of it (see {@link CoordinatorRepo.recordAheadClaim}).
+	 * answer is evidence ABOUT this claim, and the only peers whose silence may keep it standing
+	 * against a consult that would retire it or revise it downward. Nobody else can speak for them:
+	 * a peer that never knew the claimed revision saying "I hold nothing" is not a refutation of it
+	 * (see {@link CoordinatorRepo.recordAheadClaim}).
 	 *
-	 * Bounded by cohort width. Meaningless without `rev`, and written and cleared with it — the
-	 * pair is one fact. `deadlocksReported` keeps its own independent lifetime.
+	 * One pass contributes at most a cohort's width; passes at an unchanged `rev` union rather than
+	 * replace, so under churn the set is bounded by the distinct peers that ever claimed that exact
+	 * revision (see the NOTE at the union). Meaningless without `rev`, and written and cleared with
+	 * it — the pair is one fact. `deadlocksReported` keeps its own independent lifetime.
 	 */
 	claimants?: readonly string[];
 	/**
@@ -348,9 +351,11 @@ type AbsenceVerdict =
  *    answered" is not evidence.
  *  - AN ANSWER REFUTES ONLY THE CLAIM IT BEARS ON. A peer that never reported the claimed
  *    revision saying "I hold nothing" says nothing about a claim another peer made; only the
- *    claimants can retire their own word. So the reaching-somebody case carries its EVIDENCE
- *    (who answered, who was silent) rather than a pre-baked "refuted", and
+ *    claimants can retire their own word. So BOTH cases that reached somebody carry `silent` —
+ *    who could not be asked — rather than a pre-baked "refuted", and
  *    {@link CoordinatorRepo.recordAheadClaim} weighs it against the claim it actually holds.
+ *    That applies to `unsettled-claim` too, which weakens a recorded claim whenever its own
+ *    revision is LOWER: same erasure, one step less obvious.
  *
  * Kept as a named union rather than an optional number so a `return` added later cannot mean
  * "nothing is ahead" by leaving a field off — the compiler asks.
@@ -366,8 +371,11 @@ type CurrencyVerdict =
 	| { kind: 'no-evidence' }
 	/** Cohort peers `claimants` claim `rev`, strictly ahead of what this node holds, and this pass
 	 *  did not converge onto it — quorum declined the claim, or corroborated it and acquisition
-	 *  failed. `claimants` is recorded with the claim: it is who must later answer for it. */
-	| { kind: 'unsettled-claim'; rev: number; claimants: readonly string[] };
+	 *  failed. `claimants` is recorded with the claim: it is who must later answer for it.
+	 *  `silent` is the same evidence `nothing-ahead` carries, needed for the same reason: this
+	 *  verdict REPLACES a recorded claim, so when its `rev` is lower it must not do so behind the
+	 *  back of a claimant that could not be asked. */
+	| { kind: 'unsettled-claim'; rev: number; claimants: readonly string[]; silent: readonly string[] };
 
 /**
  * Extended cluster interface that includes the ability to check if a transaction was executed.
@@ -788,7 +796,8 @@ export class CoordinatorRepo implements IRepo {
 					// any more. One that reached nobody (`currency.kind === 'no-evidence'` — no
 					// cohort, solo-self, or total silence) refutes nothing, and neither does one
 					// whose answers came from peers that never made the claim; `recordAheadClaim`
-					// weighs the verdict's evidence against the recorded claimants. The missing
+					// weighs the verdict's evidence against the recorded claimants, and only in the
+					// direction that could hide a stale serve (a higher claim always lands). The missing
 					// case is excluded — it is the absence path above, and a bare absent below a
 					// claim already reads as either authoritative (cohort answered, nothing
 					// corroborated) or flagged.
@@ -851,14 +860,14 @@ export class CoordinatorRepo implements IRepo {
 	 * that consult's {@link CurrencyVerdict}. Entries are also dropped once this node reaches the
 	 * claimed revision (see {@link flagUnconfirmedCurrency}), which is what bounds the map.
 	 *
-	 * **The retirement rule, in one sentence.** A recorded claim is retired when at least one
-	 * non-self cohort member answered this consult AND no peer that MADE the claim was silent in
-	 * it. Everything else about the rule follows from that, and each of the three cases a
-	 * claimant can be in has its own reason:
+	 * **The weakening rule, in one sentence.** A recorded claim may be WEAKENED — retired, or
+	 * revised down to a lower revision — when at least one non-self cohort member answered this
+	 * consult AND no peer that MADE the claim was silent in it. Everything else about the rule
+	 * follows from that, and each of the three cases a claimant can be in has its own reason:
 	 *
-	 *  - A claimant that ANSWERED, on a consult whose verdict is "nothing ahead", has retired its
+	 *  - A claimant that ANSWERED, on a consult that found nothing ahead of it, has retired its
 	 *    own word. Its answer is evidence about its own claim — the only kind that counts.
-	 *  - A claimant that was SILENT blocks retirement. Nobody else can speak for it; a peer that
+	 *  - A claimant that was SILENT blocks weakening. Nobody else can speak for it; a peer that
 	 *    never knew the claimed revision answering "I hold nothing" is not a refutation.
 	 *  - A claimant that is NEITHER answered nor silent has left this node's cohort view:
 	 *    `findCluster` no longer holds it responsible for the block, so its old word no longer
@@ -868,6 +877,11 @@ export class CoordinatorRepo implements IRepo {
 	 * Note the arithmetic that makes it a one-liner: the non-self cohort IS `answered` ∪ `silent`,
 	 * so "answered, or gone from the cohort" is exactly "not silent". No membership set has to be
 	 * carried or diffed.
+	 *
+	 * RAISING a claim needs no licence — a higher claimed revision subsumes the one it replaces,
+	 * so `flagUnconfirmedCurrency` stamps everything it used to and more. Only the weakening
+	 * direction can hide a stale serve, which is why the gate below is one test applied to both
+	 * shapes rather than a rule attached to retirement alone.
 	 *
 	 * Forgetting requires EVIDENCE. A consult that reached nobody (`no-evidence`) refutes nothing
 	 * and leaves the memo exactly as it was. That used to be a rule the caller had to obey and
@@ -881,13 +895,19 @@ export class CoordinatorRepo implements IRepo {
 	private recordAheadClaim(blockId: BlockId, currency: CurrencyVerdict): void {
 		if (currency.kind === 'no-evidence') return;
 		const prior = this.unsettledAheadClaims.get(blockId);
-		if (currency.kind === 'nothing-ahead') {
-			if (prior?.rev === undefined) return;	// nothing recorded to retire
-			// Only the claimants' own silence protects their claim. Everyone else's silence is
-			// irrelevant to it — degrading this into "any silence blocks retirement" would flag a
-			// block forever behind one permanently unreachable cohort peer.
-			const silentClaimants = (prior.claimants ?? []).filter(id => currency.silent.includes(id));
-			if (currency.answered.length === 0 || silentClaimants.length > 0) {
+		const priorRev = prior?.rev;
+		// The one gate, applied to both shapes that can weaken a recorded claim: retiring it
+		// (`nothing-ahead`) and revising it down to a lower revision (`unsettled-claim` below
+		// `priorRev`) are the same act, and a lower claim replacing a higher one used to slip past
+		// the retirement rule and erase the higher claimant's word exactly as an unrelated peer's
+		// "I hold nothing" once did. Only the claimants' own silence protects their claim, though:
+		// everyone else's silence is irrelevant to it, and degrading this into "any silence blocks
+		// weakening" would flag a block forever behind one permanently unreachable cohort peer.
+		const weakensPrior = priorRev !== undefined
+			&& (currency.kind === 'nothing-ahead' || currency.rev < priorRev);
+		if (weakensPrior) {
+			const silentClaimants = (prior?.claimants ?? []).filter(id => currency.silent.includes(id));
+			if (silentClaimants.length > 0) {
 				// The operator's only signal that a block's doubt CANNOT settle from this node's
 				// position: the peer that claimed the revision is unreachable, so every read of the
 				// block stays marked possibly-stale until it answers or leaves the cohort view.
@@ -897,32 +917,36 @@ export class CoordinatorRepo implements IRepo {
 				// that ever shows as noise, move it behind a say-once flag on the entry (beside
 				// `deadlocksReported`) rather than dropping the line — it is the only place the
 				// condition is named.
-				if (silentClaimants.length > 0) {
-					this.log('cluster-fetch:claim-unrefutable', { blockId, rev: prior.rev, silentClaimants });
-				}
-				return;
+				this.log('cluster-fetch:claim-unrefutable', { blockId, rev: priorRev, silentClaimants });
+				return;	// the memo stands exactly as recorded
 			}
+		}
+		if (currency.kind === 'nothing-ahead') {
+			// Nothing recorded to retire, or a consult nobody outside this node answered — which
+			// `fetchBlockFromCluster` reports as `no-evidence` rather than this verdict, so the
+			// second test is the type's guarantee restated, not a reachable path.
+			if (priorRev === undefined || currency.answered.length === 0) return;
 			// The consult is the authority on the CLAIM, and only on the claim. A recorded deadlock is
 			// not about any revision — it is about how many machines this deployment can field, or how
 			// many of them hold the block — so it outlives the claim that first exposed it and is
 			// dropped only when the block converges (see {@link flagUnconfirmedCurrency}).
-			if (prior.deadlocksReported) this.unsettledAheadClaims.set(blockId, { deadlocksReported: prior.deadlocksReported });
+			if (prior?.deadlocksReported) this.unsettledAheadClaims.set(blockId, { deadlocksReported: prior.deadlocksReported });
 			else this.unsettledAheadClaims.delete(blockId);
 			return;
 		}
 		// Repeated claims at the SAME revision accumulate claimants: pass 1 hears it from A, pass 2
 		// hears it from B while A is silent, and retiring later on B's answer alone would ignore A's
-		// still-unanswered word. A claim at a DIFFERENT revision replaces outright: a higher one
-		// subsumes the old, and a lower one is the pre-existing newest-consult-is-the-authority
-		// behaviour — the latest pass's picture of the cohort wins, doubt included.
-		// NOTE: that replacement drops the older, HIGHER claim's claimants along with its revision,
-		// so doubt can be revised down by a consult the earlier claimant did not answer. Provenance
-		// makes a stricter rule (keep the higher claim while its claimants are unaccounted for)
-		// expressible for the first time; deliberately not taken here, because it widens what the
-		// marker asserts rather than fixing what it got wrong. Revisit if a deployment shows reads
-		// flipping between two claimed revisions.
-		const claimants = prior?.rev === currency.rev
-			? [...new Set([...(prior.claimants ?? []), ...currency.claimants])]
+		// still-unanswered word. A claim at a DIFFERENT revision replaces outright — a higher one
+		// subsumes the old, and a lower one has just passed the weakening gate above, so every peer
+		// that made the older claim has either answered this pass or left the cohort view.
+		// NOTE: the same-revision union never prunes, so a claimant that departed the cohort while
+		// the revision stayed stuck lingers in the list. Inert (a departed peer is never `silent`,
+		// so it never blocks weakening) and bounded per pass by cohort width, but across many passes
+		// with churn the list is bounded only by how many distinct peers ever claimed that exact
+		// revision. Prune against the pass's `answered` ∪ `silent` if a long-lived stuck block ever
+		// shows this entry growing.
+		const claimants = priorRev === currency.rev
+			? [...new Set([...(prior?.claimants ?? []), ...currency.claimants])]
 			: [...currency.claimants];
 		this.unsettledAheadClaims.set(blockId, {
 			rev: currency.rev,
@@ -1189,7 +1213,7 @@ export class CoordinatorRepo implements IRepo {
 			const currency: CurrencyVerdict =
 				uncorroboratedRev !== undefined
 					&& (uncorroboratedBaseline === undefined || uncorroboratedRev > uncorroboratedBaseline)
-					? { kind: 'unsettled-claim', rev: uncorroboratedRev, claimants: claimantsAtOrAbove(uncorroboratedRev) }
+					? { kind: 'unsettled-claim', rev: uncorroboratedRev, claimants: claimantsAtOrAbove(uncorroboratedRev), silent }
 					: nothingAheadVerdict;
 			return { absence, currency };
 		}
@@ -1262,7 +1286,7 @@ export class CoordinatorRepo implements IRepo {
 		// if its claimants are among those peers.
 		const currency: CurrencyVerdict = converged
 			? nothingAheadVerdict
-			: { kind: 'unsettled-claim', rev: corroborated.rev, claimants: claimantsAtOrAbove(corroborated.rev) };
+			: { kind: 'unsettled-claim', rev: corroborated.rev, claimants: claimantsAtOrAbove(corroborated.rev), silent };
 		return { absence, currency };
 	}
 

@@ -44,6 +44,7 @@ import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import { CoordinatorRepo, type ClusterLatestCallback } from '../src/repo/coordinator-repo.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { toString as u8ToString } from 'uint8arrays';
+import { captureLog, hasTagAtRev } from './support/capture-log.js';
 
 const makePeerId = async (): Promise<PeerId> => {
 	const key = await generateKeyPair('Ed25519');
@@ -978,6 +979,103 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 				const after = await repo.get({ blockIds: [blockId] });
 
 				expect(after[blockId]?.unconfirmedAheadRev, 'agreeing with itself retires nothing').to.equal(3);
+			});
+
+			// Retiring a claim and revising it DOWN are the same act, so they answer to the same
+			// rule. A lower claim replacing a higher one used to slip past the retirement check
+			// entirely and drop the higher claimant's word — the same erasure by a peer that never
+			// made the claim, one step less obvious, and it erases the mark outright once this node
+			// reaches the lower revision.
+			it('keeps the HIGHER recorded claim when a lower one arrives while the higher claimant is silent', async () => {
+				// Read 1: holder A alone claims rev 5 — one claim of two non-self peers, so the
+				// corroboration quorum declines and rev 5 is recorded as A's unsettled claim. Read 2:
+				// A is unreachable and holder B claims rev 3. B never reported rev 5, so its lower
+				// claim is no evidence that rev 5 does not exist.
+				const localPeer = await makePeerId();
+				const holderA = await makePeerId();
+				const holderB = await makePeerId();
+				const cluster = makeClusterPeers([localPeer, holderA, holderB]);
+				let phase = 1;
+				const callback: ClusterLatestCallback = async (peerId) => {
+					if (peerId.equals(localPeer)) return { actionId: 'local-action', rev: 1 };
+					if (peerId.equals(holderA)) {
+						if (phase === 2) throw new Error('dial failed');
+						return { actionId: 'remote-action', rev: 5 };
+					}
+					return phase === 1 ? undefined : { actionId: 'other-action', rev: 3 };
+				};
+
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev, 'A claims 5, quorum declines').to.equal(5);
+
+				phase = 2;
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect(after[blockId]?.unconfirmedAheadRev, 'a lower claim cannot revise away the higher claim of a silent peer').to.equal(5);
+			});
+
+			it('lets a lower claim replace the recorded one once the higher claimant has answered', async () => {
+				// The over-correction side: keeping the higher claim forever would deny reads on the
+				// word of a peer that has since answered. Here holder A, the only claimant of rev 5,
+				// answers rev 2 on read 2 — it has retired its own word — so holder B's rev 3 claim
+				// becomes the whole of the recorded doubt.
+				const localPeer = await makePeerId();
+				const holderA = await makePeerId();
+				const holderB = await makePeerId();
+				const cluster = makeClusterPeers([localPeer, holderA, holderB]);
+				let phase = 1;
+				const callback: ClusterLatestCallback = async (peerId) => {
+					if (peerId.equals(localPeer)) return { actionId: 'local-action', rev: 1 };
+					if (peerId.equals(holderA)) {
+						return phase === 1 ? { actionId: 'remote-action', rev: 5 } : { actionId: 'lagging-action', rev: 2 };
+					}
+					return phase === 1 ? undefined : { actionId: 'other-action', rev: 3 };
+				};
+
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev).to.equal(5);
+
+				phase = 2;
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect(after[blockId]?.unconfirmedAheadRev, 'the rev-5 claimant answered, so the doubt is now the rev 3 holder B reported').to.equal(3);
+			});
+
+			it('names the unreachable claimant in the log — the only operator signal that doubt cannot settle', async () => {
+				// A block whose mark can never be cleared from this node looks, from the outside,
+				// exactly like a block that is genuinely behind: every read carries the same marker.
+				// `cluster-fetch:claim-unrefutable` is what tells an operator the difference — the
+				// claimant is unreachable rather than the content stale — so it is worth pinning.
+				const localPeer = await makePeerId();
+				const holderA = await makePeerId();
+				const holderB = await makePeerId();
+				const cluster = makeClusterPeers([localPeer, holderA, holderB]);
+				let holderAReachable = true;
+				const callback: ClusterLatestCallback = async (peerId) => {
+					if (peerId.equals(localPeer)) return { actionId: 'local-action', rev: 1 };
+					if (peerId.equals(holderB)) return undefined;
+					if (!holderAReachable) throw new Error('dial failed');
+					return { actionId: 'remote-action', rev: 3 };
+				};
+
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+				await repo.get({ blockIds: [blockId] });	// records A's rev-3 claim
+
+				holderAReachable = false;
+				const captured = await captureLog('coordinator-repo', async () => {
+					await repo.get({ blockIds: [blockId] });
+				});
+
+				expect(hasTagAtRev(captured, 'cluster-fetch:claim-unrefutable', 3), 'the declined retirement is named').to.equal(true);
+				const line = captured.find(args => typeof args[0] === 'string' && args[0].includes('cluster-fetch:claim-unrefutable'))!;
+				expect((line[1] as { silentClaimants: string[] }).silentClaimants, 'and it names WHO is unreachable')
+					.to.deep.equal([holderA.toString()]);
 			});
 		});
 	});
