@@ -147,3 +147,37 @@ No pre-existing failures surfaced; `tickets/.pre-existing-error.md` was not writ
 verified the fix's discrimination by neutering it (round cap 1, throw replaced by a log) and
 reproducing the reported refusal chain verbatim, then reverting; that evidence was reviewed but not
 re-run.
+
+## Correction, 2026-09-06 — one of the two fixes is not actually guarded by its test
+
+Added during a tending pass that re-verified this ticket's claims rather than trusting them. The
+code shipped here is unchanged and still believed correct; what is corrected is the coverage claim.
+
+Test C's failure message reads "a wasted attempt means the cancel was not awaited", which presents
+it as the guard for changing the pend failure path from an unawaited background microtask to an
+awaited `cancelBatch`. Measured:
+
+| pend-failure arm in `network-transactor.ts` | spec alone | whole `db-p2p` suite |
+| --- | --- | --- |
+| `await this.cancelBatch(...)` (as shipped) | 4 passing | 2581 passing |
+| reverted to `void Promise.resolve().then(() => this.cancelBatch(...))` | **4 passing** | **2581 passing, 0 failing** |
+
+The awaited-cancel change can be reverted whole and nothing goes red. The reason is the fixture, not
+the test's intent: on the in-process mesh the cancel needs no round trip, and `source.transact`
+yields enough microtask ticks that the background cancel lands before the retry's pend reaches the
+members. The ordering test C names is unreachable there.
+
+This is consistent with, rather than contradicted by, the Validation section above: the
+discrimination evidence recorded there is for the *`cancel` completeness check* (round cap 1, throw
+replaced by a log) — test D's defect — and that section already states the evidence "was reviewed but
+not re-run". The awaited-cancel arm was simply never separately demonstrated.
+
+**What this does and does not mean.** Test C still earns its place: it asserts the user-visible
+outcome (a pend whose reply is lost costs one attempt, not the write), which is what the downstream
+report was about. It does not pin the mechanism, so a later refactor could restore the background
+microtask and stay green. The `await` is held in place by the reasoning at the site — the writer's
+documented obligation to discharge its own pending records — and by this note.
+
+Recorded as an arm on `backlog/debt-no-mesh-fixture-forces-two-coordinator-batches`, which already
+names this spec for a *different* limitation of the same fixture (no write spans two coordinator
+batches). Closing it needs the harness to make a peer respond *late* rather than only *fail*.
