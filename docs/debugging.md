@@ -18,7 +18,7 @@ Logging is controlled via the `DEBUG` environment variable.
 | `network-transactor`  | Batch creation sizes, retries, stale/missing, cancel triggers |
 | `batch-coordinator`   | Batch creation, retry paths, excluded peers       |
 | `cache`               | Block cache hit/miss                              |
-| `collection`          | `collection:invented` — `createOrOpen` found no committed header and staged a fresh empty collection |
+| `collection`          | `collection:invented` (`createOrOpen` found no committed header and staged a fresh empty collection), plus the read path's `collection:context-short-of-tail` / `collection:context-not-lowered` / `collection:lineage-divergence` and the write path's `collection:sync-stalled` |
 
 ### cohort-topic sub-namespaces
 
@@ -347,7 +347,7 @@ been told about. Fields:
   handle is opened. One process routinely holds several handles on one collection id (a reader and
   a writer, or one per open); without this field their lines interleave into what reads like a
   single handle contradicting itself. Two different tags on one `id=` means two handles — same
-  process or not, this field alone cannot say which. All three lines on this namespace carry it.
+  process or not, this field alone cannot say which. All four lines on this namespace carry it.
 - `before=` / `after=` — the revision the collection held going into the refresh and coming out of
   it. `before` equal to `after` means the refresh moved it nowhere at all. `none` in either position
   means the collection held no committed revision at that point.
@@ -399,7 +399,7 @@ optimystic:db-core:collection collection:context-not-lowered id=default/Usage/in
     means the same on the read's side — see *Silence is weaker evidence* below.
 - `site=` — which call path reported; see the description of the field under `lineage-divergence`.
 
-All three lines are worth enabling together:
+All four lines are worth enabling together:
 
 ```bash
 DEBUG='optimystic:db-core:collection' node your-app.js
@@ -439,7 +439,7 @@ optimystic:db-core:collection collection:lineage-divergence id=default/Usage/ind
   recent checkpoint is reported at the lowest surviving disagreement instead of at the true split.
 - `heldAction=` / `readAction=` — the two action ids **at `forkRev=`**: `heldAction` is what this
   handle's own context carries there (its lineage marker), `readAction` is what the freshly-read log
-  names there. Across all three lines on this namespace a `*Rev=` field is always a revision number
+  names there. Across all four lines on this namespace a `*Rev=` field is always a revision number
   and a `*Action=` field is always an action id.
 - `heldRev=` / `readRev=` — the two contexts' own current revisions. Together with `forkRev=` these
   say how far each side has travelled since the split: `forkRev=1 heldRev=8 readRev=8` is a fork
@@ -512,6 +512,55 @@ same process, which is the finding.
 
 (The tags and ids above are illustrative; the point is which questions the fields answer, not the
 particular values.)
+
+##### The write path's report of the same failure
+
+The three lines above are the *read* path's account of a refresh that closed nothing. `sync()`
+reports the same failure from the *write* side, and it is the one that has consequences: a write
+whose refresh cannot move it is re-requesting a revision that is already taken, so every remaining
+retry is guaranteed to fail exactly as the first one did.
+
+```
+optimystic:db-core:collection collection:sync-stalled id=default/Usage/index/by_token tag=k3Vq_A heldRev=none requestedRev=1 staleBlock=default/Usage/index/by_token/log staleRev=42 strike=1 of=2
+```
+
+A responder sets a *confirmed revision* on a rejection only after reading that revision out of its
+own storage as durably held by somebody other than the requester. Revisions are one counter per
+collection and every commit touches the log tail, so that number binds the whole collection; and
+because reverting a commit consumes a **new** revision rather than releasing the old one, a
+confirmed revision never becomes free again. This line is emitted when the revision the next
+attempt would ask for is at or below such a confirmed number — the request is provably already
+lost, and the refresh that was supposed to fix that demonstrably did not move the collection.
+Fields:
+
+- `id=` / `tag=` — the collection id and the reporting handle, exactly as on the three lines above.
+- `heldRev=` — the revision this handle believes is current, or `none` for a collection that has
+  committed nothing (an invented one, or one whose first write is still failing).
+- `requestedRev=` — the revision the next attempt would ask for: `heldRev + 1`, or 1 for `none`.
+- `staleBlock=` / `staleRev=` — the block a responder named, and the confirmed revision it reported
+  that block already committed at. `requestedRev` at or below `staleRev` is the whole finding.
+- `strike=N of=M` — consecutive stalled refreshes, and the budget. `M` is the `maxStalledAttempts`
+  sync option (default 2). At `strike == of`, sync throws `SyncRevisionStalledError` rather than
+  spending the rest of its attempt budget; the line is emitted on **every** strike, so `strike=1`
+  on its own is a warning, not a failure.
+
+Two strikes rather than one because a writer that merely **lost a race** can transiently read a
+view that has not yet caught up with the rival's commit, which looks identical for exactly one
+round. Ordinary contention does not reach even one strike in the steady case: the rival's commit is
+what the refresh adopts, so `requestedRev` lands above `staleRev` and the counter resets.
+
+**What it does not do.** Sync deliberately does not adopt `staleRev` to get unstuck. That number is
+a bare revision, not content: submitting the writer's staged changes at a revision built on history
+it never read would overwrite that history silently — the member-side content check abstains rather
+than rejecting when the declared base revision is one it no longer holds. Reconciling a genuine
+fork is partition healing's job (see `docs/transactions.md`), not the retry loop's. So this line and
+the error it leads to make the failure **fast and correctly named**; they do not make the write
+land.
+
+`collection:lineage-divergence` appearing alongside this line, on the same `id=`, is the signature
+of a fork: the write is not behind the cluster, it is on a different history from it. Silence on
+this line during a slow sync means the opposite — the refresh *is* moving, and the sync is losing
+races rather than re-requesting a taken number.
 
 #### Comparing action ids
 

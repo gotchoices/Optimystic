@@ -1,10 +1,10 @@
 import { use, expect } from 'chai'
 import chaiAsPromised from 'chai-as-promised'
 use(chaiAsPromised)
-import { Collection, SyncRetryExhaustedError, type CollectionInitOptions } from '../src/collection/index.js'
+import { Collection, SyncRetryExhaustedError, SyncRevisionStalledError, type CollectionInitOptions } from '../src/collection/index.js'
 import { TestTransactor, FlakyCommitTransactor } from '../src/testing/test-transactor.js'
 import { waitFor } from '../src/testing/async-wait.js'
-import type { Action, ActionHandler, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult, StaleFailure } from '../src/index.js'
+import type { Action, ActionHandler, BlockId, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult, StaleFailure } from '../src/index.js'
 import { BlockUnavailableError, BlockPossiblyStaleError } from '../src/index.js'
 import debug from 'debug'
 import { format } from 'node:util'
@@ -1072,17 +1072,23 @@ describe('Collection', () => {
         }
       }
 
-      const exhaust = async (failure: StaleFailure) => {
+      /** Runs a sync that can only ever fail. `maxStalledAttempts` defaults to `maxAttempts` here so
+       *  these cases exercise the PLAIN-exhaustion path: a confirmed `staleAt` would otherwise trip
+       *  the stall check (see the `stalled revision view` suite) long before the attempt cap. */
+      const exhaust = async (failure: StaleFailure, maxStalledAttempts: number | undefined = 3) => {
         const transactorUnderTest = new StaleAtCommitTransactor(new TestTransactor(), failure)
         const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
         await collection.act({ type: 'set', data: { value: 'never-commits', timestamp: 1 } })
-        const syncPromise = collection.sync({ maxAttempts: 3, baseBackoffMs: 1, maxBackoffMs: 5 })
+        const syncPromise = collection.sync({ maxAttempts: 3, maxStalledAttempts, baseBackoffMs: 1, maxBackoffMs: 5 })
         syncPromise.catch(() => { /* asserted by the caller */ })
-        return await syncPromise.catch(e => e) as SyncRetryExhaustedError
+        const err = await syncPromise.catch(e => e) as SyncRetryExhaustedError
+        return { err, commitAttempts: transactorUnderTest.commitAttempts }
       }
 
       it('surfaces the reported revision on the error and names it in the message', async () => {
-        const err = await exhaust({
+        // maxStalledAttempts == maxAttempts is the documented escape hatch: a caller that wants the
+        // full budget under an always-confirming responder gets exactly the pre-existing behaviour.
+        const { err, commitAttempts } = await exhaust({
           success: false,
           conflict: true,
           reason: 'stale revision: block hot-block at rev 42, requested rev 41',
@@ -1090,16 +1096,50 @@ describe('Collection', () => {
         })
 
         expect(err).to.be.instanceOf(SyncRetryExhaustedError)
+        expect(err).to.not.be.instanceOf(SyncRevisionStalledError)
         expect(err.staleAt).to.deep.equal({ blockId: 'hot-block', rev: 42 })
         expect(err.message).to.contain('last seen block hot-block at rev 42')
         // The prefix every existing assertion reads is untouched by the appended clause.
         expect(err.message).to.contain(`sync for collection ${collectionId} exhausted 3 retries`)
+        // The whole budget really was spent — the stall check did not cut it short.
+        expect(commitAttempts).to.equal(3)
+      })
+
+      it('keeps the HIGHEST reported revision when a later responder reports a lower one', async () => {
+        // Highest-wins, not last-wins: the next request has to clear EVERY holder, so rev 4 arriving
+        // after rev 9 does not make rev 4 the binding constraint.
+        const transactorUnderTest = new (class implements ITransactor {
+          attempts = 0
+          constructor(readonly inner = new TestTransactor()) {}
+          get(b: BlockGets) { return this.inner.get(b) }
+          getStatus(a: ActionBlocks[]) { return this.inner.getStatus(a) }
+          pend(r: PendRequest) { return this.inner.pend(r) }
+          cancel(a: ActionBlocks) { return this.inner.cancel(a) }
+          async commit(_request: CommitRequest): Promise<CommitResult> {
+            this.attempts++
+            return this.attempts === 1
+              ? { success: false, conflict: true, reason: 'high', staleAt: { blockId: 'high-block', rev: 9 } }
+              : { success: false, conflict: true, reason: 'low', staleAt: { blockId: 'low-block', rev: 4 } }
+          }
+        })()
+
+        const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
+        await collection.act({ type: 'set', data: { value: 'never-commits', timestamp: 1 } })
+        const syncPromise = collection.sync({ maxAttempts: 3, maxStalledAttempts: 3, baseBackoffMs: 1, maxBackoffMs: 5 })
+        syncPromise.catch(() => { /* asserted below */ })
+        const err = await syncPromise.catch(e => e) as SyncRetryExhaustedError
+
+        expect(err.staleAt).to.deep.equal({ blockId: 'high-block', rev: 9 })
+        expect(err.lastReason).to.equal('low')
       })
 
       it('produces today\'s message verbatim when no responder reported a revision', async () => {
-        const err = await exhaust({ success: false, conflict: true, reason: 'always stale' })
+        // No confirmed revision anywhere means no stall can ever be detected, so the DEFAULT
+        // maxStalledAttempts is what runs here — the degrade path must be byte-identical.
+        const { err } = await exhaust({ success: false, conflict: true, reason: 'always stale' }, undefined)
 
         expect(err).to.be.instanceOf(SyncRetryExhaustedError)
+        expect(err).to.not.be.instanceOf(SyncRevisionStalledError)
         expect(err.staleAt).to.equal(undefined)
         expect(err.message).to.equal(`sync for collection ${collectionId} exhausted 3 retries: always stale`)
       })
@@ -1130,6 +1170,227 @@ describe('Collection', () => {
 
         expect(err.staleAt).to.deep.equal({ blockId: 'hot-block', rev: 7 })
         expect(err.lastReason).to.equal('later, unconfirmed')
+        // Only attempt 1 confirmed a revision; attempts 2 and 3 told us nothing new, so no SECOND
+        // consecutive strike accrued and the attempt cap — not the stall check — ended the sync.
+        expect(err).to.not.be.instanceOf(SyncRevisionStalledError)
+      })
+    })
+
+    // A sync whose view of "the current revision" is WRONG rather than merely behind re-requests
+    // the identical taken revision on every attempt: the refresh cannot move it (a collection never
+    // lowers its held revision, and an equal or absent read leaves it unchanged), so the whole retry
+    // budget is spent on a failure already decided on attempt one. Detected by comparing the
+    // revision the next attempt WOULD request against the highest revision a responder CONFIRMED is
+    // already committed.
+    describe('stalled revision view', () => {
+      /** Fails the first `failFirstN` commits with a confirmed `staleAt`, then delegates. Local to
+       *  this suite: the shared FlakyCommitTransactor must keep never setting `staleAt`, because the
+       *  degrade tests above depend on that. */
+      class ConfirmedStaleCommitTransactor implements ITransactor {
+        commitAttempts = 0
+        constructor(
+          readonly inner: TestTransactor,
+          private readonly failFirstN: number,
+          private readonly staleAt: { blockId: BlockId, rev: number } = { blockId: 'hot-block', rev: 42 },
+        ) {}
+        get(b: BlockGets) { return this.inner.get(b) }
+        getStatus(a: ActionBlocks[]) { return this.inner.getStatus(a) }
+        pend(r: PendRequest) { return this.inner.pend(r) }
+        cancel(a: ActionBlocks) { return this.inner.cancel(a) }
+        async commit(request: CommitRequest): Promise<CommitResult> {
+          this.commitAttempts++
+          if (this.commitAttempts <= this.failFirstN) {
+            return {
+              success: false,
+              conflict: true,
+              reason: `stale revision: block ${this.staleAt.blockId} at rev ${this.staleAt.rev}`,
+              staleAt: this.staleAt,
+            }
+          }
+          return this.inner.commit(request)
+        }
+      }
+
+      it('gives up after two stalled refreshes instead of burning the whole attempt budget', async () => {
+        const transactorUnderTest = new ConfirmedStaleCommitTransactor(new TestTransactor(), Infinity)
+        const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
+        await collection.act({ type: 'set', data: { value: 'wedged', timestamp: 1 } })
+
+        // A generous attempt budget: the point is that it is NOT spent.
+        const syncPromise = collection.sync({ maxAttempts: 10, baseBackoffMs: 1, maxBackoffMs: 5 })
+        syncPromise.catch(() => { /* asserted below */ })
+        const err = await syncPromise.catch(e => e) as SyncRevisionStalledError
+
+        expect(err).to.be.instanceOf(SyncRevisionStalledError)
+        // Callers that already catch the base class keep working.
+        expect(err).to.be.instanceOf(SyncRetryExhaustedError)
+        // Two strikes, not ten: attempt 1 confirms the revision, the refresh after it moves nowhere
+        // (strike 1), attempt 2 confirms it again, and the refresh after THAT is strike 2.
+        expect(transactorUnderTest.commitAttempts).to.equal(2)
+        expect(err.attempts).to.equal(2)
+
+        expect(err.collectionId).to.equal(collectionId)
+        expect(err.staleAt).to.deep.equal({ blockId: 'hot-block', rev: 42 })
+        expect(err.requestedRev).to.equal(1)
+        // Nothing has ever been committed under this id from this handle's point of view.
+        expect(err.heldRev).to.equal(undefined)
+
+        // The message names the disagreement, and deliberately does NOT reuse the base class's
+        // "exhausted N retries" wording — that reads as ordinary contention.
+        expect(err.message).to.contain(`sync for collection ${collectionId} stopped after 2 attempts`)
+        expect(err.message).to.contain('this client holds rev none and would request rev 1')
+        expect(err.message).to.contain('block hot-block is confirmed committed at rev 42')
+        expect(err.message).to.contain('refreshing did not close the gap')
+        expect(err.message).to.not.contain('exhausted')
+
+        // Latch was released by sync()'s finally — a subsequent latched op must not hang.
+        await collection.update()
+      })
+
+      it('reports the revision this handle actually holds once it has committed once', async () => {
+        // First commit lands, so the collection holds rev 1; everything after it is refused with a
+        // confirmed rev 42, which the refresh cannot reach.
+        const transactorUnderTest = new (class extends ConfirmedStaleCommitTransactor {
+          constructor() { super(new TestTransactor(), 0) }
+          override async commit(request: CommitRequest): Promise<CommitResult> {
+            this.commitAttempts++
+            return this.commitAttempts === 1
+              ? this.inner.commit(request)
+              : { success: false, conflict: true, reason: 'wedged', staleAt: { blockId: 'hot-block', rev: 42 } }
+          }
+        })()
+
+        const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
+        await collection.act({ type: 'set', data: { value: 'first', timestamp: 1 } })
+        await collection.sync({ maxAttempts: 10, baseBackoffMs: 1, maxBackoffMs: 5 })
+
+        await collection.act({ type: 'set', data: { value: 'second', timestamp: 2 } })
+        const syncPromise = collection.sync({ maxAttempts: 10, baseBackoffMs: 1, maxBackoffMs: 5 })
+        syncPromise.catch(() => { /* asserted below */ })
+        const err = await syncPromise.catch(e => e) as SyncRevisionStalledError
+
+        expect(err).to.be.instanceOf(SyncRevisionStalledError)
+        expect(err.heldRev).to.equal(1)
+        expect(err.requestedRev).to.equal(2)
+        expect(err.message).to.contain('this client holds rev 1 and would request rev 2')
+      })
+
+      it('absorbs a single stalled refresh and still commits', async () => {
+        // One transiently-lagging read looks identical to a wedged view for exactly one round. The
+        // two-strike rule is what keeps that from failing a sync that was going to succeed.
+        const transactorUnderTest = new ConfirmedStaleCommitTransactor(new TestTransactor(), 1)
+        const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
+        await collection.act({ type: 'set', data: { value: 'recovers', timestamp: 1 } })
+
+        await collection.sync({ maxAttempts: 10, baseBackoffMs: 1, maxBackoffMs: 5 })
+
+        expect(transactorUnderTest.commitAttempts).to.equal(2)
+        const actions: Action<TestAction>[] = []
+        for await (const a of collection.selectLog()) actions.push(a)
+        expect(actions).to.have.lengthOf(1)
+        expect(actions[0]!.data.value).to.equal('recovers')
+      })
+
+      it('trips on the first stalled refresh when maxStalledAttempts is 1', async () => {
+        const transactorUnderTest = new ConfirmedStaleCommitTransactor(new TestTransactor(), Infinity)
+        const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
+        await collection.act({ type: 'set', data: { value: 'wedged', timestamp: 1 } })
+
+        const syncPromise = collection.sync({ maxAttempts: 10, maxStalledAttempts: 1, baseBackoffMs: 1, maxBackoffMs: 5 })
+        syncPromise.catch(() => { /* asserted below */ })
+        const err = await syncPromise.catch(e => e) as SyncRevisionStalledError
+
+        expect(err).to.be.instanceOf(SyncRevisionStalledError)
+        expect(transactorUnderTest.commitAttempts).to.equal(1)
+      })
+
+      it('lets the abort signal win over a stall in progress', async () => {
+        const transactorUnderTest = new ConfirmedStaleCommitTransactor(new TestTransactor(), Infinity)
+        const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
+        await collection.act({ type: 'set', data: { value: 'aborted', timestamp: 1 } })
+
+        const controller = new AbortController()
+        // A long backoff parks the sync inside the sleep between the failure and the strike.
+        const syncPromise = collection.sync({
+          signal: controller.signal,
+          maxAttempts: 1000,
+          maxStalledAttempts: 1000,
+          baseBackoffMs: 60_000,
+          maxBackoffMs: 60_000,
+        })
+        syncPromise.catch(() => { /* asserted below */ })
+        await waitFor(() => transactorUnderTest.commitAttempts >= 1)
+        controller.abort()
+
+        const err = await syncPromise.catch(e => e) as Error
+        expect(err.name).to.equal('AbortError')
+      })
+
+      it('reports the deadline, not the stall, when both are true', async () => {
+        // The deadline is the documented progress-agnostic ceiling and is checked FIRST, so a sync
+        // that is past it reports plain exhaustion even though the stall rule would also have fired.
+        const transactorUnderTest = new ConfirmedStaleCommitTransactor(new TestTransactor(), Infinity)
+        const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
+        await collection.act({ type: 'set', data: { value: 'wedged', timestamp: 1 } })
+
+        const syncPromise = collection.sync({
+          maxAttempts: 10,
+          maxStalledAttempts: 1,   // strike 1 would trip at the top of iteration 2...
+          deadlineMs: 5,           // ...but 40ms of backoff has already blown the deadline by then.
+          baseBackoffMs: 40,
+          maxBackoffMs: 40,
+          rand: () => 0,           // no jitter: the sleep is exactly baseBackoffMs
+        })
+        syncPromise.catch(() => { /* asserted below */ })
+        const err = await syncPromise.catch(e => e) as SyncRetryExhaustedError
+
+        expect(err).to.be.instanceOf(SyncRetryExhaustedError)
+        expect(err).to.not.be.instanceOf(SyncRevisionStalledError)
+        expect(err.message).to.contain('exhausted 1 retries')
+      })
+
+      it('does not trip on ordinary contention between two handles', async () => {
+        // The loser's refresh adopts the winner's commit, so its next request lands ABOVE the
+        // confirmed revision and no strike is ever recorded. This is the case the rule must not
+        // mistake for a wedged view — it runs against the real TestTransactor, whose conflict
+        // answers now carry `staleAt` exactly as the storage tier's do.
+        const shared = new TestTransactor()
+        const winner = await Collection.createOrOpen<TestAction>(shared, collectionId, initOptions)
+        const loser = await Collection.createOrOpen<TestAction>(shared, collectionId, initOptions)
+
+        await winner.act({ type: 'set', data: { value: 'winner', timestamp: 1 } })
+        await winner.sync({ maxAttempts: 10, baseBackoffMs: 1, maxBackoffMs: 5 })
+
+        await loser.act({ type: 'set', data: { value: 'loser', timestamp: 2 } })
+        // Must not reject: the loser is behind, not wrong.
+        await loser.sync({ maxAttempts: 10, baseBackoffMs: 1, maxBackoffMs: 5 })
+
+        const values: string[] = []
+        for await (const a of loser.selectLog()) values.push(a.data.value)
+        expect(values).to.have.members(['winner', 'loser'])
+      })
+
+      it('reports every stalled observation on the collection debug namespace', async () => {
+        const transactorUnderTest = new ConfirmedStaleCommitTransactor(new TestTransactor(), Infinity)
+        const lines = await captureCollectionLog(async () => {
+          const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
+          await collection.act({ type: 'set', data: { value: 'wedged', timestamp: 1 } })
+          await collection.sync({ maxAttempts: 10, baseBackoffMs: 1, maxBackoffMs: 5 })
+            .catch(() => { /* the throw is the other tests' subject */ })
+        })
+
+        const stalled = lines.filter(l => l.includes('collection:sync-stalled'))
+        // Emitted on every stalled observation, not only the one that trips.
+        expect(stalled).to.have.lengthOf(2)
+        expect(stalled[0]).to.contain(`id=${collectionId}`)
+        expect(stalled[0]).to.contain('heldRev=none')
+        expect(stalled[0]).to.contain('requestedRev=1')
+        expect(stalled[0]).to.contain('staleBlock=hot-block')
+        expect(stalled[0]).to.contain('staleRev=42')
+        expect(stalled[0]).to.contain('strike=1 of=2')
+        expect(stalled[1]).to.contain('strike=2 of=2')
+        // Names the reporting handle, like every other line on this namespace.
+        expect(stalled[0]).to.match(/ tag=\S+ /)
       })
     })
 

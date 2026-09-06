@@ -1,4 +1,5 @@
-import type { ITransactor, GetBlockResults, ActionBlocks, BlockActionStatus, PendResult, CommitResult, PendRequest, BlockId, CommitRequest, BlockGets, IBlock, ActionId, ActionTransforms, Transform, Transforms, ClusterNomineesResult, CollectionId } from "../index.js";
+import type { ITransactor, GetBlockResults, ActionBlocks, BlockActionStatus, PendResult, CommitResult, PendRequest, BlockId, CommitRequest, BlockGets, IBlock, ActionId, ActionTransforms, StaleFailure, Transform, Transforms, ClusterNomineesResult, CollectionId } from "../index.js";
+import { highestStaleAt } from "../network/stale-failure.js";
 import { ensuredMap } from "../utility/ensured.js";
 import { Latches } from "../utility/latches.js";
 import { applyTransform, blockIdsForTransforms, transformForBlockId, emptyTransforms, concatTransform, transformsFromTransform } from "../transform/index.js";
@@ -169,6 +170,10 @@ export class TestTransactor implements ITransactor {
 		const blockIds = blockIdsForTransforms(transforms);
 		const conflictingPendings: { blockId: BlockId, actionId: ActionId }[] = [];
 		const missing: ActionTransforms[] = [];
+		// Confirmed revisions this pend is up against, mirroring StorageRepo.pend: a block whose own
+		// storage is already at or past the requested revision, held by someone other than this same
+		// action. Reported as `staleAt` so a caller reading the shared harness sees the real shape.
+		const staleCandidates: StaleFailure['staleAt'][] = [];
 
 		// Check for conflicts (pending or committed based on rev/insert)
 		for (const blockId of blockIds) {
@@ -188,6 +193,9 @@ export class TestTransactor implements ITransactor {
 				if (rev !== undefined || blockTransform.insert) {
 					const checkRev = rev ?? 0; // Check from revision 0 if it's an insert
 					if (blockState.latestRev >= checkRev) {
+						if (blockState.revisionActions.get(blockState.latestRev) !== actionId) {
+							staleCandidates.push({ blockId, rev: blockState.latestRev });
+						}
 						// Collect conflicting committed actions
 						const missingForBlock = new Map<ActionId, { rev: number, transform: Transform }>();
 						for (let r = checkRev as number; r <= blockState.latestRev; r++) {
@@ -219,10 +227,12 @@ export class TestTransactor implements ITransactor {
 		// `conflict: true` on the three optimistic-concurrency returns below mirrors what
 		// StorageRepo.pend now emits, so consumers of this test transactor see the real shape.
 		if (missing.length > 0) {
+			const staleAt = highestStaleAt(staleCandidates);
 			return {
 				success: false,
 				conflict: true,
-				missing
+				missing,
+				...(staleAt ? { staleAt } : {})
 			};
 		}
 
@@ -326,7 +336,16 @@ export class TestTransactor implements ITransactor {
             .find(([, aId]) => aId === actionId)?.[0] ?? rev,
           transforms
         }));
-        return { success: false, missing };
+        // Same rule as StorageRepo.commit's missedCommits branch: report the highest confirmed
+        // revision a stale block is already at, skipping one held by this very action (the
+        // durable half of a torn action, which its own retry must not be refused by).
+        const staleAt = highestStaleAt(staleBlocks.map(blockId => {
+          const blockState = this.blocks.get(blockId)!;
+          return blockState.revisionActions.get(blockState.latestRev) === actionId
+            ? undefined
+            : { blockId, rev: blockState.latestRev };
+        }));
+        return { success: false, missing, ...(staleAt ? { staleAt } : {}) };
       }
 
       // Verify all blocks have the pending action

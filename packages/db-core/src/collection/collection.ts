@@ -8,8 +8,9 @@ import { computeBlockContentDigests } from "../transform/digest.js";
 import { copyTransforms, isTransformsEmpty } from "../transform/helpers.js";
 import { TransactorSource } from "../transactor/transactor-source.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
+import { highestStaleAt } from "../network/stale-failure.js";
 import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions } from "./index.js";
-import { CollectionHeaderVanishedError, SyncRetryExhaustedError } from "./struct.js";
+import { CollectionHeaderVanishedError, SyncRetryExhaustedError, SyncRevisionStalledError } from "./struct.js";
 import type { ActionContext } from "./action.js";
 import { actionIdAt } from "./action.js";
 import type { ReadDependency } from "../transaction/transaction.js";
@@ -50,6 +51,10 @@ const PendingRetryDelayMs = 100;
 const DefaultMaxAttempts = 10;
 /** Default ceiling on a single exponential-backoff sleep, in ms. */
 const DefaultMaxBackoffMs = 5000;
+/** Default consecutive stalled refreshes — ones that failed to move this collection past a
+ * revision a responder CONFIRMED is committed — before {@link Collection.sync} gives up.
+ * Two, not one, so a single transiently-lagging read is absorbed. */
+const DefaultMaxStalledAttempts = 2;
 
 export type CollectionInitOptions<TAction> = {
 	modules: Record<ActionType, ActionHandler<TAction>>;
@@ -918,6 +923,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		const maxAttempts = options?.maxAttempts ?? DefaultMaxAttempts;
 		const baseBackoffMs = options?.baseBackoffMs ?? PendingRetryDelayMs;
 		const maxBackoffMs = options?.maxBackoffMs ?? DefaultMaxBackoffMs;
+		const maxStalledAttempts = options?.maxStalledAttempts ?? DefaultMaxStalledAttempts;
 		const deadlineMs = options?.deadlineMs;
 		const signal = options?.signal;
 		const startedAt = Date.now();
@@ -927,17 +933,61 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// large multi-batch sync (which iterates many times committing progress) never trips it.
 		let consecutiveFailures = 0;
 		let lastReason: string | undefined;
-		// Last confirmed revision a responder reported holding. Purely diagnostic — it is reported
-		// in the exhaustion error and never consulted to decide whether to keep retrying.
+		// Highest confirmed revision any responder has reported holding, accumulated with the
+		// codebase's single rule for picking among several candidates. Reported on the error, and
+		// the evidence the stall check below reasons from.
 		let lastStaleAt: { blockId: BlockId; rev: number } | undefined;
+		// Whether the failure most recently handled carried its OWN staleAt. A strike needs the
+		// responder to have re-confirmed the number this round, not merely an older observation
+		// left standing in `lastStaleAt`.
+		let lastFailureConfirmedStaleAt = false;
+		// Consecutive refreshes that failed to move `getNextRev()` past `lastStaleAt.rev`.
+		let consecutiveStalls = 0;
 
 		while (this.hasUnsyncedChanges()) {
 			if (signal?.aborted) {
 				throw makeAbortError(signal);
 			}
-			// Progress-agnostic ceiling: give up if the wall-clock deadline passed.
+			// Progress-agnostic ceiling: give up if the wall-clock deadline passed. Deliberately
+			// ahead of the stall check: the deadline is the documented outer bound, so a sync that
+			// is both past it and stalled reports the deadline.
 			if (deadlineMs !== undefined && Date.now() - startedAt >= deadlineMs) {
 				throw new SyncRetryExhaustedError(this.id, consecutiveFailures, lastReason ?? 'deadline exceeded', lastStaleAt);
+			}
+
+			// Can the attempt about to run possibly differ from the one that just failed? A producer
+			// sets `staleAt` only after reading that revision as durably held by someone else out of
+			// its own storage, revisions are one per-collection counter that every commit touches,
+			// and a confirmed revision never becomes un-taken (invalidation takes a NEW slot). So a
+			// request at or below a confirmed number is provably already lost, and the refresh that
+			// was supposed to fix that demonstrably did not — `advanceContext` refuses to lower the
+			// held revision, and an equal or absent read leaves it unchanged.
+			//
+			// This is NOT a second answer to "is this failure retryable?" — `isConflictFailure`
+			// remains the sole rule for that, untouched. It only ever stops a loop that rule had
+			// already decided to continue.
+			const requestedRev = this.getNextRev();
+			if (lastStaleAt !== undefined) {
+				if (requestedRev > lastStaleAt.rev) {
+					// The refresh adopted a revision above the confirmed one — ordinary contention,
+					// where the rival's commit is exactly what we just read. Not a stall.
+					consecutiveStalls = 0;
+				} else if (lastFailureConfirmedStaleAt) {
+					consecutiveStalls++;
+					if (log.enabled) {
+						log('collection:sync-stalled id=%s tag=%s heldRev=%s requestedRev=%d staleBlock=%s staleRev=%d strike=%d of=%d',
+							this.id, this.instanceTag, this.source.actionContext?.rev ?? 'none', requestedRev,
+							lastStaleAt.blockId, lastStaleAt.rev, consecutiveStalls, maxStalledAttempts);
+					}
+					// Two strikes, not one: a legitimate loser can transiently read a view that has
+					// not yet caught up with the rival's commit, which looks identical for one round.
+					if (consecutiveStalls >= maxStalledAttempts) {
+						throw new SyncRevisionStalledError(this.id, consecutiveFailures, lastStaleAt,
+							requestedRev, this.source.actionContext?.rev, lastReason);
+					}
+				}
+				// Else: the responder told us nothing new this round. No strike, and no reset either
+				// — the budget stays bounded by maxAttempts.
 			}
 
 			// Snapshot the pending actions so that any new actions aren't assumed to be part of this action
@@ -961,7 +1011,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			if (!collectionLog) {
 				throw new Error(`Log not found for collection ${this.id}`);
 			}
-			const newRev = (this.source.actionContext?.rev ?? 0) + 1;
+			const newRev = this.getNextRev();
 			const addResult = await collectionLog.addActions(pending, actionId, newRev, () => tracker.transformedBlockIds());
 
 			// Declare what each touched block will contain once committed, computed from this snapshot
@@ -983,7 +1033,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 			if (staleFailure) {
 				consecutiveFailures++;
 				lastReason = staleFailure.reason ?? lastReason;
-				lastStaleAt = staleFailure.staleAt ?? lastStaleAt;
+				// Highest-wins, not last-wins: the next request has to clear EVERY holder, so a later
+				// responder reporting a LOWER number understates the binding constraint. Same rule the
+				// producers and the transactor's aggregation already use.
+				lastStaleAt = highestStaleAt([lastStaleAt, staleFailure.staleAt]);
+				lastFailureConfirmedStaleAt = staleFailure.staleAt !== undefined;
 				// Give up once the consecutive no-progress budget is exhausted, so a transactor that
 				// persistently rejects the sync can no longer hold the collection latch forever.
 				// NOTE: this also bounds the legitimate `pending`-wait case (retrying the same action
@@ -1015,6 +1069,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 				consecutiveFailures = 0;
 				lastReason = undefined;
 				lastStaleAt = undefined;
+				lastFailureConfirmedStaleAt = false;
+				consecutiveStalls = 0;
 				// Clear the pending actions that were part of this action
 				this.pending = this.pending.slice(pending.length);
 				// Reset cache and replay any actions that were added during the action

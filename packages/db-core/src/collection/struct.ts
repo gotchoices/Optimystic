@@ -30,6 +30,17 @@ export interface SyncOptions {
 	/** Advanced/testing hook: source of uniform [0,1) randomness for the backoff jitter. Defaults to
 	 * the package CSPRNG; inject a deterministic sequence to assert exact retry delays. */
 	rand?: RandFn;
+	/** Consecutive refreshes that fail to move this collection past a revision a responder has
+	 * CONFIRMED is already committed, before sync gives up with {@link SyncRevisionStalledError}.
+	 * Such a retry provably re-requests the same taken revision, so the wait buys nothing. Two
+	 * absorbs one transiently-lagging read; set it to {@link maxAttempts} or higher to restore the
+	 * pre-existing behaviour of burning the whole budget. Default 2.
+	 *
+	 * Ordinary contention never trips this: the rival's commit is what the refresh adopts, so the
+	 * next request lands above the confirmed revision and the counter resets. {@link deadlineMs} is
+	 * still checked first, so a sync that is both past its deadline and stalled reports the
+	 * deadline (as {@link SyncRetryExhaustedError}), not the stall. */
+	maxStalledAttempts?: number;
 }
 
 /** Thrown by {@link ICollection.sync} / {@link ICollection.updateAndSync} when the retry budget
@@ -49,6 +60,51 @@ export class SyncRetryExhaustedError extends Error {
 			(lastReason ? `: ${lastReason}` : '') +
 			(staleAt ? `, last seen block ${staleAt.blockId} at rev ${staleAt.rev}` : ''));
 		this.name = 'SyncRetryExhaustedError';
+	}
+}
+
+/** Thrown by {@link ICollection.sync} / {@link ICollection.updateAndSync} when refreshing
+ * repeatedly failed to move this collection past a revision a responder confirmed it already
+ * holds — the client's view of the current revision disagrees with the cluster's, and retrying
+ * would re-request the identical taken number.
+ *
+ * The distinction matters because the two failures need different responses. Plain exhaustion
+ * means "I lost a race too many times", and waiting longer or retrying later can succeed. This
+ * one means the next attempt is provably identical to the one that just failed, so the remaining
+ * budget buys nothing — the caller's view of the collection has to be repaired first.
+ *
+ * Sync deliberately does NOT adopt the responder's revision to get past this. `staleAt` is a bare
+ * number, not content: submitting this client's staged transforms at a revision built on a
+ * history it never read would overwrite that history silently. Reconciling a genuine fork is
+ * partition healing's job (docs/transactions.md), not the retry loop's.
+ *
+ * Extends {@link SyncRetryExhaustedError} so existing callers that catch the base class keep
+ * working; catch this subclass to distinguish "my revision view is wrong" from "I lost a race
+ * too many times". */
+export class SyncRevisionStalledError extends SyncRetryExhaustedError {
+	/** Required here, unlike on the base class — it is the evidence the stall is based on. */
+	declare readonly staleAt: { blockId: BlockId; rev: number };
+
+	constructor(
+		collectionId: CollectionId,
+		attempts: number,
+		staleAt: { blockId: BlockId; rev: number },
+		/** The revision the next attempt would have requested. */
+		readonly requestedRev: number,
+		/** The revision this client believes is current. `undefined` for a collection that has
+		 * committed nothing. */
+		readonly heldRev: number | undefined,
+		lastReason?: string,
+	) {
+		super(collectionId, attempts, lastReason, staleAt);
+		// The base class's "exhausted N retries" wording is deliberately NOT reused: it reads as
+		// ordinary contention, which is exactly the misdiagnosis this class exists to prevent.
+		this.message = `sync for collection ${collectionId} stopped after ${attempts} attempts: `
+			+ `this client holds rev ${heldRev ?? 'none'} and would request rev ${requestedRev}, `
+			+ `but block ${staleAt.blockId} is confirmed committed at rev ${staleAt.rev} and `
+			+ `refreshing did not close the gap`
+			+ (lastReason ? `: ${lastReason}` : '');
+		this.name = 'SyncRevisionStalledError';
 	}
 }
 
