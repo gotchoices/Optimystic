@@ -82,6 +82,28 @@ Each testable package has a `register.mjs` that sets up `ts-node/esm`. Run tests
 
 To grep for a specific test: `yarn test -- --grep "pattern"`
 
+**A stale build refuses the run, before any spec is loaded.** Every `register.mjs` calls
+`assertBuildFresh` in `test-harness/build-freshness.mjs` above its `ts-node/esm` registration.
+Dependencies resolve through a `node_modules` symlink into a working copy whose manifest points at
+`dist`, so editing one package's `src` and running another package's tests would otherwise exercise
+the *previous* build with no warning — a false green or a false regression, both observed. The check
+derives its target list from the calling package's own manifest (sibling workspaces, plus the
+`portal:`-resolved sibling repositories `@quereus/quereus` and `p2p-fret`), classifies each by
+`lstat` — a symlink is a working copy worth judging, a registry install is skipped — and exits 1 when
+one has a source file newer than anything in its build output, or no output at all. The message names
+the package, the reason, and the directory to run the rebuild in, since `yarn workspace` does not
+reach a sibling repository. `quereus-plugin-optimystic` and `quereus-plugin-crypto` additionally
+check their *own* output, because their specs import it directly. Registering above the `ts-node/esm`
+call is deliberate: a mocha root hook would fire after every spec file had already been imported.
+
+`OPTIMYSTIC_SKIP_BUILD_CHECK=1` skips the check, printing a one-line warning to stderr on **every**
+run so a hatch left set in a shell profile stays visible. It exists for one situation: an ordinary
+`git checkout` in a sibling repository can bump source mtimes with the bytes unchanged, after which
+the compiler's content-based change detection makes a rebuild a no-op and the check keeps reporting
+stale. Prefer the `clean &&` rebuild the message suggests first. The guard has its own tests — `yarn
+test:harness` from the root, on node's built-in runner so the harness depends on nothing the build
+system produces — chained ahead of the workspace fan-out in `yarn test`.
+
 **`yarn test` is not the whole suite.** The integration specs (`test/**/*.integration.spec.ts` in
 `db-p2p` and `quereus-plugin-optimystic`) are env-gated on `OPTIMYSTIC_INTEGRATION=1` and run from a
 separate `test:integration` script — they exercise real TCP meshes, FRET cohort assembly, and
