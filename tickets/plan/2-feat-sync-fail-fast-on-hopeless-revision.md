@@ -74,3 +74,52 @@ So the retry loop already *has* the number it needs on every attempt; what is mi
 decision about what to do with it. Note the doc comment on that field — it is absent whenever no
 rejection carried a confirmed number, "which is normal" — which is exactly the degrade-to-today's-loop
 case the body's third bullet calls for.
+
+## Promotion note, 2026-09-05 — a downstream consumer is blocked on this exact case
+
+Promoted out of `backlog/` during a tending pass, on urgency rather than on the ranking: a
+`repro: verified` ticket in the sibling `sereus` checkout is blocked on this loop and names this
+ticket's "wrong rather than stale" case, not its contention case.
+
+**The downstream ticket** is `sereus/tickets/blocked/forked-control-collection-sync-livelocks`.
+Its fingerprint, re-measured there on 2026-09-02 across five isolated rounds (1 failure in 10 test
+cases, down from ~2 in 3 before an unrelated Sereus-side fix):
+
+```
+SyncRetryExhaustedError { collectionId: 'default/CadrePeer', attempts: 10 }
+  thrown out of Collection.syncInternal under TransactionBridge.commitTransaction
+```
+
+Their description of the mechanism is this ticket's second paragraph almost word for word: a node
+that committed while alone and its sibling hold two histories of one collection; on reconnect the
+alone node's `update()` refresh does not move its revision, so all ten attempts re-request the
+identical taken number and the caller waits the full ~21 s budget for a failure decided on attempt
+one.
+
+**This matters for which of the two candidate behaviours gets chosen, so weigh it explicitly.**
+
+- **"Stop early" alone does not help them.** It converts a 21-second failure into a fast one. The
+  write still fails, and their ticket is about writes that never succeed again, not about latency.
+- **"Correct and retry"** — adopt the revision the responder reported in `StaleFailure.staleAt`
+  instead of hoping the refresh re-derives it — is the arm that could actually let their write land,
+  because their refresh is precisely the step that fails to move.
+
+That is an argument for the correct-and-retry arm, **not** a conclusion. Two things a planner must
+settle before treating it as one:
+
+- On a genuinely **forked** lineage, adopting the responder's revision writes this node's action on
+  top of a history it never saw. Whether that is reconciliation or silent divergence-by-adoption is
+  the real question, and it is adjacent to — possibly the same as — what
+  `backlog/more-design/6.5-partition-healing` owns under "Forked (conflict)". Read that before
+  deciding. If the honest answer is that sync cannot make this write land without a healing policy
+  that does not exist yet, say so in the implement ticket and scope this to the fast, well-named
+  failure; do not stretch the design to reach the downstream symptom.
+- Their fork is on a **control-network** collection whose divergence the upstream diagnostic
+  `collection:lineage-divergence` already reports (`make-a-refresh-able-to-say-the-two-copies-disagree`,
+  complete). A retry that corrects itself past a revision that instrument would flag as forked is
+  worth at least logging, and possibly worth refusing.
+
+Do not treat "unblock sereus" as this ticket's acceptance criterion — their scenario is not
+runnable from this repo. The criterion stays the one the body states, plus: whatever is built must
+be re-measurable downstream by re-running `control-delete-while-alone-convergence` in isolation
+five times, which is what their ticket's unblock condition already asks for.

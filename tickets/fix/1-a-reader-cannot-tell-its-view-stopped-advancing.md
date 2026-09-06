@@ -93,3 +93,31 @@ The gate that fails is `bootControlTrio` step 6, "B resolves C's signed CadrePee
 record", after 45 s. `packages/cadre-core/src/cadre-node.ts` already logs the revision, address
 count and signature prefix on every failed resolution, which is what makes the stall legible
 without new instrumentation.
+
+## Arm, 2026-09-05 — the 466 `no-quorum` lines are now traced, not just suspected
+
+The measurement section above sets those lines aside as "a separate question and possibly benign".
+They are benign, and it is worth writing down so nobody re-traces it: read the code path rather
+than guessing, and it is a **naming** problem in the log, not a decline.
+
+`cluster-fetch:no-quorum` fires whenever `selectQuorumRev` returns nothing
+(`coordinator-repo.ts:1274`), and with `holders=0` there is nothing to select — so the line fires on
+a cohort that unanimously answered *"I hold nothing"*. That is an answer. Three lines further on,
+`reportRepairDeadlock` says so itself and returns early for exactly this shape
+(`if (claims.length === 0) return;` — "the cohort agrees the block is absent, which is an answer,
+not a deadlock"). And downstream, `answered > 0` with `silent === 0` yields verdict `confirmed`, so
+`get` leaves the absent **authoritative and unflagged** — the documented one-round-trip
+new-collection probe.
+
+So for the captured shape (`cohortPeers=2 holders=0 required=2`, on tables the scenario never
+writes) the read succeeded correctly and the log line is a misnomer. Two caveats for whoever reads
+the next capture:
+
+- **`silent` is the field that decides it, and the capture above did not record it.** With
+  `silent=2` the same block instead yields `answered=0` → verdict `isolated` →
+  `unavailable: 'cohort-unreachable'`, which is a real failed read and is the fingerprint that kills
+  `control-read-over-fresh-edge-stream-resets` at boot. Same `cohortPeers`/`holders` numbers, opposite
+  outcome. **Always record `silent` before calling one of these lines benign.**
+- Do not "fix" the log name as part of this ticket. It is a one-line diagnostics rename at a claimed
+  site with its own careful comment about not rolling the three populations together; it is not
+  worth widening a hard reader-staleness ticket to carry it.
