@@ -204,8 +204,28 @@ had its pending record **cancelled** — a client that reports success while wal
 pended block strands the record permanently, and the members then reject every later write to that
 block from any writer (the wedge described two paragraphs up). The one path that violated this — a
 non-tail sweep whose transport failed after the tail committed — now cancels the abandoned blocks
-before acknowledging. That cancel is itself best-effort over the network; a node-side backstop for a
-cancel that also fails is tracked in backlog `debt-unpromotable-pending-records-need-a-sweep`.
+before acknowledging.
+
+The cancel that discharges a record is a **checked, retried** operation, not a single best-effort
+shot. `NetworkTransactor.cancel` runs rounds until every block of the action has had its cancel
+answered by some peer, re-resolving coordinators each round and backing off between them, and it
+**throws** — naming the action and the blocks still held — if it runs out of budget having reached
+nobody. The retry is what distinguishes the two faults that used to look identical from the client:
+the peer-shaped one, where an alternate coordinator answers immediately (already handled by the
+batch layer's own retry), and the time-shaped one — a stream reset — where every peer is equally
+unreachable for the length of the fault and only a delayed re-attempt clears it. Checking matters
+just as much as retrying: the batch layer records each RPC's outcome and swallows the rejection, so
+without an explicit completeness test a cancel that reached nobody returns exactly like one that
+discharged everything, and every caller reads "returned" as "discharged". The same discipline
+applies to the cancel a failed pend issues for itself: it is awaited before the pend reports
+failure, so a caller that retries immediately does not meet its own still-standing record and spend
+an attempt on it.
+
+Callers must not let that throw displace the verdict it is cleaning up after: a confirmed conflict
+is still returned as a stale failure so the writer rebases, and a transport fault is still the error
+thrown — the cancel failure rides along beside it. Budgets are finite, so a fault outlasting one
+still strands the record; a node-side backstop for that residual is tracked in backlog
+`debt-unpromotable-pending-records-need-a-sweep`.
 
 A stranded record is at least **named** rather than left to be re-derived. Every refusal it causes is
 reported as an ordinary optimistic-concurrency loss, because that is what a single refusal is

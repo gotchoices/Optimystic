@@ -5,6 +5,9 @@ import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struc
 import type { ReadDependency } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 import { blockDigestsField } from "../transform/digest.js";
+import { createLogger } from "../logger.js";
+
+const log = createLogger('transactor-source');
 
 export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlock> {
 	/** Shared with this collection's CacheSource so cache hits also record dependencies.
@@ -158,11 +161,32 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 				...blockDigestsField(blockDigests)
 			});
 			if (!commitResult.success) {
-				await this.transactor.cancel({ actionId, blockIds: pendResult.blockIds });
+				// The cancel is a checked, retried operation and can now throw (NetworkTransactor.cancel
+				// verifies that some peer actually answered). It must NOT be allowed to replace the
+				// verdict it is cleaning up after: a confirmed conflict has to be RETURNED as the
+				// StaleFailure, because `Collection.sync` and the multi-collection pend phase read it via
+				// `isConflictFailure` to decide to rebase — converting it into a throw turns a routine,
+				// recoverable race into a hard failure. So: log, keep the verdict.
+				try {
+					await this.transactor.cancel({ actionId, blockIds: pendResult.blockIds });
+				} catch (cancelError) {
+					log('WARN: cancel after failed commit did not discharge actionId=%s blocks=%o: %o', actionId, pendResult.blockIds, cancelError);
+				}
 				return commitResult;
 			}
 		} catch (e) {
-			await this.transactor.cancel({ actionId, blockIds: pendResult.blockIds });
+			// `e` is the real cause — a transport fault, the thing the caller needs to see. A cancel
+			// that also fails must not silently take its place, but it must not be lost either: the
+			// pend was left undischarged and that is what wedges the block against the caller's own
+			// retry. Attach it to `e` so one report names both.
+			try {
+				await this.transactor.cancel({ actionId, blockIds: pendResult.blockIds });
+			} catch (cancelError) {
+				log('WARN: cancel after failed commit did not discharge actionId=%s blocks=%o: %o', actionId, pendResult.blockIds, cancelError);
+				if (e && typeof e === 'object') {
+					(e as { cancelError?: unknown }).cancelError = cancelError;
+				}
+			}
 			throw e;
 		}
 	}

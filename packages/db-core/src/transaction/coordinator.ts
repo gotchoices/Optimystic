@@ -1465,11 +1465,15 @@ export class TransactionCoordinator {
 		// Fan out the per-collection cancels concurrently. Each is best-effort: a cancel
 		// fault is logged and swallowed so it cannot mask the pend/commit failure that
 		// triggered this sweep, and so one failed cancel does not abort the others.
+		// The log line has to be enough to IDENTIFY the stranded pend on its own — action id and
+		// the exact blocks — because `NetworkTransactor.cancel` only throws here once it has
+		// retried and still reached nobody, which means those blocks' pending records are standing
+		// and will refuse every later write to them until something removes them by hand.
 		const cancels = Array.from(pendedBlockIds.entries())
 			.filter(([collectionId]) => !excludeCollections?.has(collectionId))
 			.map(([collectionId, blockIds]) =>
 				this.transactor.cancel({ actionId, blockIds }).catch(err => {
-					log('cancelPhase: best-effort cancel failed collection=%s: %o', collectionId, err);
+					log('cancelPhase: cancel did not discharge — pending records may be stranded actionId=%s collection=%s blocks=%o: %o', actionId, collectionId, blockIds, err);
 				})
 			);
 		await Promise.all(cancels);

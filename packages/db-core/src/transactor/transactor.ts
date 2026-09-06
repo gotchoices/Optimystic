@@ -26,6 +26,11 @@ export type ITransactor = {
 
 	/** Cancel a pending action
 		- If the given action ID is pending, it is canceled
+		- Returning means DISCHARGED: an implementation that could not remove the pending records
+		  must throw rather than return, because nothing else will ever remove them (a record's only
+		  removers are this cancel, a divergence-shaped commit refusal, and a forward write of the
+		  same action id — see docs/repository.md), and while one stands every later write to the
+		  block is refused. A caller that swallows the throw must still say so in its log.
 	 */
 	cancel(actionRef: ActionBlocks): Promise<void>;
 

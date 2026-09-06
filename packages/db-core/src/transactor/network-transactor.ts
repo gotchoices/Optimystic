@@ -14,6 +14,7 @@ import { groupBy } from "../utility/groupby.js";
 import { blockIdToBytes } from "../utility/block-id-to-bytes.js";
 import { isRecordEmpty } from "../utility/is-record-empty.js";
 import { type CoordinatorBatch, makeBatchesByPeer, incompleteBatches, everyBatch, allBatches, mergeBlocks, processBatches, createBatchesForPayload } from "../utility/batch-coordinator.js";
+import { abortableDelay, jitteredBackoffMs } from "../utility/backoff.js";
 import { createLogger, verbose } from "../logger.js";
 
 const log = createLogger('network-transactor');
@@ -584,9 +585,23 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			error = aggregate;
 		}
 
-		if (error) { // If any failures, cancel all pending actions as background microtask
+		if (error) { // If any failures, discharge every pending record this pend left behind
 			log('pend:cancel actionId=%s', blockAction.actionId);
-			void Promise.resolve().then(() => this.cancelBatch(batches, { blockIds, actionId: blockAction.actionId })).catch(e => log('WARN: cancel after pend failure rejected: %o', e));
+			// AWAITED, not fired off as a background microtask. Returning before the cancel lands means
+			// a caller that retries immediately meets its own still-standing pending record and burns a
+			// whole attempt out of its retry budget on it (measured: the attempt after a lost pend reply
+			// was rejected by its own record, and only the one after that landed).
+			// The tradeoff, stated: a losing pend now pays a cancel round-trip before it returns its
+			// StaleFailure, where before it returned at once and cleaned up behind itself. That is the
+			// right trade — the old shape spent one of the CALLER's retries instead of one round-trip.
+			// The catch matters now that `cancelBatch` is checked and throwable: a cancel that could not
+			// discharge must be reported, but must not replace the pend verdict below (the StaleFailure
+			// the caller reads via `isConflictFailure` to decide to rebase, or the original error).
+			try {
+				await this.cancelBatch(batches, { blockIds, actionId: blockAction.actionId });
+			} catch (cancelError) {
+				log('WARN: cancel after pend failure did not discharge: %o', cancelError);
+			}
 			const stale = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
 			if (stale.length > 0) {	// Any active stale failures should preempt reporting connection or other potential transient errors (we have information)
 				log('pend:stale actionId=%s staleCount=%d', blockAction.actionId, stale.length);
@@ -653,23 +668,20 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		};
 	}
 
+	/**
+	 * Discharges every pending record `actionRef` left behind, and THROWS if it could not.
+	 *
+	 * Cancel is the only removal path a client controls (see docs/repository.md, "a pending record's
+	 * lifetime is bounded by its writer"), so a cancel that silently did nothing wedges the block
+	 * against every later writer. `processBatches` never rethrows — it records each batch's outcome
+	 * and swallows the rejection — so a cancel in which every peer's RPC failed used to return
+	 * normally, and each of this method's callers read "returned" as "discharged". It now checks
+	 * completeness and rides out a transient fault, exactly as {@link pend} and {@link commitBlocks}
+	 * already do for their own rounds. See {@link dischargeCancel} for the loop and its bounds.
+	 */
 	async cancel(actionRef: ActionBlocks): Promise<void> {
 		log('cancel actionId=%s blockIds=%d', actionRef.actionId, actionRef.blockIds.length);
-		const batches = await this.batchesForPayload<BlockId[], void>(
-			actionRef.blockIds,
-			actionRef.blockIds,
-			mergeBlocks,
-			[]
-		);
-		const expiration = Date.now() + this.abortOrCancelTimeoutMs;
-		await processBatches(
-			batches,
-			(batch) => this.getRepo(batch.peerId).cancel({ actionId: actionRef.actionId, blockIds: batch.payload }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
-			batch => batch.payload,
-			mergeBlocks,
-			expiration,
-			async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
-		);
+		await this.dischargeCancel(actionRef);
 	}
 
 	async queryClusterNominees(blockId: BlockId): Promise<ClusterNomineesResult> {
@@ -780,8 +792,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * Confirmed blocks are excluded only to skip a pointless consensus round — cancelling one would
 	 * also be a no-op — so an over-broad `confirmed` set costs latency, never correctness.
 	 *
-	 * Residuals: the cancel is itself best-effort over the network, so a cancel that ALSO fails leaves
-	 * the record wedged until a node-side backstop sweep exists (backlog:
+	 * Residuals: the cancel is retried and checked ({@link dischargeCancel}) but still bounded, so a
+	 * fault outlasting its budget leaves the record wedged until a node-side backstop sweep exists (backlog:
 	 * `debt-unpromotable-pending-records-need-a-sweep`); and this covers only the sweep's abandonment
 	 * — `StorageRepo.commit`'s genuine-fault arm deliberately KEEPS a failed batch's pendings for a
 	 * retry, so it is a second producer of the same durable state whenever that retry never comes.
@@ -974,26 +986,138 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		return created.coordinators;
 	}
 
-	/** Cancels a pending transaction by canceling all blocks associated with the transaction, including failed peers */
+	/**
+	 * Cancels a pending transaction by canceling all blocks associated with the transaction,
+	 * including failed peers. Seeds the first round from the peers the failed operation actually
+	 * talked to (a coordinator that answered the pend is the one most likely to be holding the
+	 * record); every later round re-resolves live. Throws on failure to discharge — see
+	 * {@link dischargeCancel}.
+	 *
+	 * The seed is derived from each batch's ANCHOR block id (`b.blockId`), so when
+	 * `consolidateCoordinators` collapsed several blocks onto one coordinator the seed round only
+	 * carries the anchor. That was silently lossy before — the non-anchor blocks got no cancel at
+	 * all; now `dischargeCancel`'s per-block outstanding set notices and the next round resolves
+	 * them live. The cost is one extra round on a consolidated pend's failure path.
+	 */
 	private async cancelBatch<TPayload, TResponse>(
 		batches: CoordinatorBatch<TPayload, TResponse>[],
 		actionRef: ActionBlocks,
 	) {
-		const expiration = Date.now() + this.abortOrCancelTimeoutMs;
-		const operationBatches = makeBatchesByPeer(
+		const operationBatches = makeBatchesByPeer<BlockId[], void>(
 			Array.from(allBatches(batches)).map(b => [b.blockId, b.peerId] as const),
 			actionRef.blockIds,
 			mergeBlocks,
 			[]
 		);
-		await processBatches(
-			operationBatches,
-			(batch) => this.getRepo(batch.peerId).cancel({ actionId: actionRef.actionId, blockIds: batch.payload }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
-			batch => batch.payload,
-			mergeBlocks,
-			expiration,
-			async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
-		);
+		await this.dischargeCancel(actionRef, operationBatches);
+	}
+
+	/**
+	 * Rounds {@link dischargeCancel} will run before giving up, in addition to the
+	 * `abortOrCancelTimeoutMs` deadline; whichever bound trips first ends the loop.
+	 *
+	 * NOTE: accepted tradeoff — the round cap can end the loop well before the deadline. With
+	 * `baseMs` 50 / `capMs` 500 the six rounds span roughly 0.9–1.5 s of retrying, which clears a
+	 * stream reset and reconnect, and against a genuinely dead transport it hands the caller a
+	 * legible failure in about a second instead of spending its whole (typically 5 s) abort budget
+	 * issuing RPCs nobody will answer. Raise it if faults longer than ~1.5 s but shorter than the
+	 * abort budget turn out to strand records in practice.
+	 */
+	private static readonly MAX_CANCEL_ROUNDS = 6;
+
+	/**
+	 * Runs cancel rounds until every block of `actionRef` has had a cancel ANSWERED by some peer, or
+	 * the budget runs out — and then throws an aggregate naming the action and the blocks whose
+	 * pending records are still standing.
+	 *
+	 * **Why a completeness check.** `processBatches` deliberately never rethrows, so "it returned"
+	 * says nothing about whether any peer was reached. A block is only discharged once some batch
+	 * carrying it got a response; anything else leaves its pending record standing, and while it
+	 * stands `ClusterMember.validatePendOperations` votes reject on every later pend touching the
+	 * block, from any writer. An application retry loop opens a NEW transaction and so mints a new
+	 * action id, which is none of the three things that remove a record (client cancel,
+	 * divergence-shaped commit refusal, forward write of the SAME action id — docs/repository.md),
+	 * so the write collides with its own predecessor permanently.
+	 *
+	 * **Why a TIME-based retry on top of `processBatches`' own.** That one is a PEER retry: it
+	 * re-homes a failed block onto an alternate coordinator immediately, with no delay. A stream
+	 * reset is time-shaped, not peer-shaped — every peer is equally unreachable for the length of
+	 * the fault — so only a delayed re-attempt clears it. Each round rebuilds its batches from
+	 * scratch, so a re-resolved coordinator is picked up.
+	 *
+	 * **Why retrying is safe.** Cancel is idempotent, and the three-timings argument written out in
+	 * {@link cancelAbandonedSweepBlocks} covers a cancel that races a landing commit. Extra rounds
+	 * cost latency only. Each round narrows to the blocks still outstanding, so a partially
+	 * successful round does not re-issue the cancels that already landed.
+	 *
+	 * NOTE: a fault that outlasts these bounds still strands the record, and nothing node-side
+	 * reclaims it. That residual is the backstop tracked in backlog
+	 * `debt-unpromotable-pending-records-need-a-sweep`.
+	 *
+	 * @param seedBatches Batches to use for round 0 only (see {@link cancelBatch}). Omitted → round
+	 * 0 resolves coordinators live like every later round.
+	 */
+	private async dischargeCancel(
+		actionRef: ActionBlocks,
+		seedBatches?: CoordinatorBatch<BlockId[], void>[]
+	): Promise<void> {
+		let outstanding = Array.from(new Set(actionRef.blockIds));
+		if (outstanding.length === 0) {
+			return;
+		}
+		const deadline = Date.now() + this.abortOrCancelTimeoutMs;
+		let roundBatches: CoordinatorBatch<BlockId[], void>[] = [];
+		let lastError: Error | undefined;
+		for (let round = 0; ; ++round) {
+			roundBatches = [];
+			try {
+				// Batch construction can throw (coordinator lookup); `processBatches` cannot.
+				roundBatches = round === 0 && seedBatches
+					? seedBatches
+					: await this.batchesForPayload<BlockId[], void>(outstanding, outstanding, mergeBlocks, []);
+				await processBatches(
+					roundBatches,
+					(batch) => this.getRepo(batch.peerId).cancel({ actionId: actionRef.actionId, blockIds: batch.payload }, { expiration: deadline, dialTimeoutMs: this.dialTimeoutMs }),
+					batch => batch.payload,
+					mergeBlocks,
+					deadline,
+					async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
+				);
+			} catch (e) {
+				lastError = asError(e);
+			}
+
+			const discharged = dischargedBlocks(roundBatches);
+			outstanding = outstanding.filter(bid => !discharged.has(bid));
+			if (outstanding.length === 0) {
+				if (round > 0) {
+					log('cancel:discharged actionId=%s rounds=%d', actionRef.actionId, round + 1);
+				}
+				return;
+			}
+
+			const remainingMs = deadline - Date.now();
+			if (round + 1 >= NetworkTransactor.MAX_CANCEL_ROUNDS || remainingMs <= 0) {
+				break;
+			}
+			log('cancel:retry actionId=%s round=%d outstanding=%d', actionRef.actionId, round, outstanding.length);
+			await abortableDelay(Math.min(jitteredBackoffMs(round, { baseMs: 50, capMs: 500 }), remainingMs));
+		}
+
+		const details = this.formatBatchStatuses(roundBatches,
+			b => b.request?.isResponse === true,
+			b => {
+				const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'responded' : 'in-flight');
+				const errMsg = b.request?.isError ? ` cause=${errorMessage(b.request.error)}` : '';
+				return `${b.peerId.toString()}[block:${b.blockId}](${status})${errMsg}`;
+			});
+		const rootCause = firstBatchError(roundBatches) ?? lastError;
+		const aggregate = new Error(`Cancel of action ${actionRef.actionId} did not discharge ${outstanding.length} block(s): ${outstanding.join(', ')}`
+			+ (details ? `; peers: ${details}` : '')
+			+ (rootCause ? `; root: ${rootCause.message}` : ''));
+		(aggregate as any).cause = rootCause;
+		(aggregate as AggregateError).errors = rootCause ? [rootCause] : [];
+		throw aggregate;
 	}
 
 	private formatBatchStatuses<TPayload, TResponse>(
@@ -1010,6 +1134,20 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	}
 }
 
+
+/**
+ * The block ids some batch in the tree got an ANSWER for. A cancel batch that errored, or never
+ * responded, discharged nothing — its blocks' pending records are still standing. Batch payloads
+ * are block-id lists (built with {@link mergeBlocks}), including the retry batches
+ * `processBatches` re-homes, so the union across the whole tree is the discharged set.
+ */
+function dischargedBlocks(batches: CoordinatorBatch<BlockId[], void>[]): Set<BlockId> {
+	const discharged = new Set<BlockId>();
+	for (const b of allBatches(batches, bb => bb.request?.isResponse === true)) {
+		for (const bid of b.payload) discharged.add(bid);
+	}
+	return discharged;
+}
 
 /** The subset of `all` whose ids appear in `batchBlockIds`, wrapped (via {@link blockDigestsField})
  * so it spreads to nothing when the batch declares no digests. Called at SEND time, once per attempt,
