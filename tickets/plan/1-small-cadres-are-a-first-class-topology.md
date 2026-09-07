@@ -156,3 +156,35 @@ view. It may not; that is settled and the reason is above.
   than leaving it in a doc footnote.
 - Emit implement ticket(s) with the adversarial surface above pinned as tests, including the
   relay-only two-phone shape.
+
+## Two downstream reports that bear on this, found 2026-09-06
+
+Neither is an Optimystic defect. Both constrain what "supported" has to mean in practice, and the
+first is the product-facing consequence this ticket's TODO asks someone to file — already filed,
+downstream, and open since July.
+
+**A consumer cannot currently configure a small cohort at all.**
+[gotchoices/sereus#2](https://github.com/gotchoices/sereus/issues/2): `CadreNode` builds its
+libp2p options with `clusterSize: 3` as a literal, with no override on `CadreNodeConfig`, and
+constructs `clusterPolicy` inline **omitting `allowUnvalidatedSmallCluster`** — so the escape hatch
+this library provides for small cohorts cannot be reached through that consumer at all. The
+recommendation this ticket produces is inert until that seam exists: telling a two-machine cadre to
+declare `assumedClusterSize: 2` is advice its host cannot follow. Worth saying so explicitly in
+whatever comes out of here, and worth checking whether any of our own docs now recommend a setting
+that our largest consumer cannot pass through.
+
+Note the shape, because it argues for the recommendation being *a default*, not *a setting*: a
+hardcoded 3 is what a downstream author writes when the docs imply three is the real minimum. This
+ticket's decision says otherwise.
+
+**The relayed two-phone pairing does not currently work on React Native, for an unrelated reason.**
+[gotchoices/sereus#11](https://github.com/gotchoices/sereus/issues/11): RN declares
+`WebSocket.bufferedAmount` but never assigns it, so `@libp2p/websockets` reads `undefined`,
+concludes it can never send more, and waits for a `'drain'` whose own check (`bufferedAmount === 0`)
+is equally false forever. Every WebSocket write parks until the socket closes. A phone cannot
+listen, so no relay reservation is ever obtained and the node is never dialable.
+
+That is a polyfill gap, not a design problem — it has been added to this repo's own RN checklist
+(`packages/db-p2p/readme.md`) since our checklist is canonical for `@optimystic/db-p2p/rn` and did
+not carry it. But it means the *two phones over a relay* case in the adversarial surface above
+cannot be tested end-to-end on RN today. Design for it; do not expect to validate it there yet.

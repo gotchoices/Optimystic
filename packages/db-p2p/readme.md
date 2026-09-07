@@ -646,6 +646,25 @@ before any other imports).
 | Timer `.ref()` / `.unref()` | @optimystic/db-p2p, undici | Wrap Hermes numeric timer IDs in objects with no-op `.ref()`/`.unref()` methods; patch `clearTimeout`/`clearInterval` to unwrap |
 | `Event`, `CustomEvent`, `EventTarget` | libp2p, @libp2p/interface | Custom shim or npm `event-target-polyfill` |
 | `Intl.PluralRules` | moat-maker | English-only ordinal/cardinal shim is sufficient |
+| `WebSocket.prototype.bufferedAmount` | @libp2p/websockets | **RN declares the field but never assigns it, so it reads `undefined`.** See below — without this every WebSocket write hangs. |
+
+**`WebSocket.bufferedAmount` deserves its own note, because the symptom does not look like a
+missing polyfill.** React Native declares `bufferedAmount` as a type annotation with no
+initializer and never assigns it, so at runtime it is `undefined`. `@libp2p/websockets` computes
+back-pressure as `websocket.bufferedAmount < maxBufferedAmount`, and `undefined < n` is `false`,
+so **every** send reports "cannot send more" and waits for a `'drain'` event. The drain check is
+`bufferedAmount === 0`, which is also `false` forever, so the event never fires: the write parks
+until the socket closes and then rejects with a bare `undefined`, which libp2p's upgrader reports
+as a misleading `TypeError`.
+
+A phone cannot listen, so WebSockets are how it reaches a drone or a relay. The practical result
+is **no relay reservation and a node that is never dialable** — which matters most for exactly the
+small topologies Optimystic supports: a two-phone cadre has no path to its partner except a relay
+(see [architecture.md](../../docs/architecture.md)). Patch `bufferedAmount` to a real number
+(tracking sent bytes, or simply `0` if your app never needs genuine back-pressure) before any
+libp2p code loads. Reported downstream as
+[gotchoices/sereus#11](https://github.com/gotchoices/sereus/issues/11), which carries the full
+mechanism.
 
 **Node.js built-in module shims** (via Metro `extraNodeModules` or bundler aliases):
 
