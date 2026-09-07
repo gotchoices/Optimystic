@@ -301,3 +301,32 @@ written and cleared with it. Two structural notes for the extraction:
   invariant "a recorded fact may only be weakened by the peers that produced it" has no single home
   today, which is precisely what the collaborator would give it.
 
+
+## Thirteenth measurement (implement + review of `small-cohort-arming-rule`)
+
+Re-measured (`wc -l packages/db-p2p/src/repo/coordinator-repo.ts`): **2635 lines**, up from 2503.
+
+That ticket gave the read path a *sixth* freshness fact: **why** a corroboration decline is provably
+permanent (`cohort-too-small` / `sole-holder`), threaded out of the cohort consult as a new field on
+the same return value that already carries existence and currency, and consulted by a decision no
+other fact could answer — whether this pass may stamp the block freshness-checked.
+
+Two structural notes for the extraction, one encouraging and one not:
+
+- **The split it made is the shape the collaborator wants.** The verdict was previously computed
+  inside the once-per-episode *logging* routine and thrown away, which is why an undeclared
+  two-machine cohort re-ran a provably hopeless consult on every read. It is now a pure
+  `classifyRepairDeadlock(pass) -> reason | undefined` with the logging wrapped around it. A
+  freshness collaborator would own that function outright; it has no dependency on the repo beyond
+  one threshold.
+- **The arming decision still has no single home, and now has four.** `fetchBlockFromCluster` calls
+  `markBlocksSeen` at four separate exits (solo-self, the permanent-decline branch, `local-current`,
+  post-restore) and deliberately does not at two more (empty cohort, transient decline). All six are
+  applications of one stated rule — *stamp exactly when re-asking sooner than one window could not
+  teach this node anything* — but the rule lives only in prose, repeated at each site, and nothing
+  makes a seventh exit added later say which side of it that exit falls on. That is the invariant
+  the collaborator would give a home: make each exit return its arming decision as part of its
+  verdict (the same way `AbsenceVerdict` and `CurrencyVerdict` are already required rather than
+  optional, so an exit added later has to say which it means) instead of each exit remembering to
+  call a method. Evidence for this ticket, not a separate one — the arming rule is exactly the
+  "freshness knowledge scattered across the read path" this ticket names.

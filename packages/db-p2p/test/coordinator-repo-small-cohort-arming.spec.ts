@@ -291,6 +291,36 @@ describe('CoordinatorRepo small-cohort arming rule', () => {
 			expect(countTag(captured, 'cluster-fetch:repair-deadlock'),
 				'the verdict re-armed the second window without re-announcing the episode').to.equal(1);
 		});
+
+		it('arming a block this node does not hold changes nothing: the read still consults and still flags', async () => {
+			// The arming stamp is keyed on the block id, and `cohort-too-small` is a property of the
+			// COHORT, so it stamps a block the reader holds nothing of just as readily. That stamp must
+			// stay inert: `get` triggers on `isMissing` BEFORE it consults the window, because a read
+			// of a block this node lacks has to attempt an acquisition rather than serve an unverified
+			// absent. Pinned here so a future "unify the two triggers" edit cannot quietly turn an
+			// unheld block's arming into a suppressed acquisition — the block would then read as an
+			// authoritative absent for a whole window (`unavailable` unset, so NetworkTransactor stops
+			// retrying) while a cohort peer is claiming it exists.
+			const UNHELD: BlockId = 'block-this-node-does-not-hold';
+			const { repo, callbackInvocations, setClock } = await makeCohortRepo(
+				[{ kind: 'claims', rev: 3, actionId: 'a-elsewhere' }]
+			);
+
+			const captured = await captureCoordinatorLog(async () => {
+				for (let i = 0; i < 3; i++) {
+					setClock(BASE_TIME + i * 1_000);
+					const result = await repo.get({ blockIds: [UNHELD] });
+					expect(result[UNHELD]?.unavailable,
+						`read ${i + 1}: a peer claims the block, so the absent is never authoritative`)
+						.to.equal('claimed-elsewhere');
+				}
+			});
+
+			expect(callbackInvocations.length,
+				'every read consults — the window is stamped but a missing block never reads it').to.equal(6);
+			expect(countTag(captured, 'cluster-fetch:repair-deadlock'), 'still named once per episode').to.equal(1);
+			expect(payloadOf(captured, 'cluster-fetch:repair-deadlock')?.reason).to.equal('cohort-too-small');
+		});
 	});
 
 	describe('transient declines keep re-asking', () => {

@@ -248,15 +248,21 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 			: '';
 		// The rule and both advices above constrain proof-LESS claims only — without saying so the
 		// advisory overstates the emergency: an operator reading "every repair declines, permanently"
-		// would not guess that proof-carrying data is exempt, nor that the decline is now quiet.
+		// would not guess that proof-carrying data is exempt, nor that the cohort-too-small decline is
+		// now quiet. It must not overshoot in the other direction either: `sole-holder` is equally
+		// permanent and deliberately stays loud, so name WHICH decline went quiet, and for which blocks.
 		const certifiedCaveat =
 			` Two softeners to all of the above. A claim carrying a VERIFIED cohort commit proof repairs at any ` +
 			`size with no second voter (the proof's signature set is its corroboration), so every permanent-` +
 			`decline warning here applies to PROOF-LESS data only — legacy blocks written before proofs ` +
-			`shipped, or a peer that lost its proof store. And a provably permanent decline no longer consults ` +
-			`on every read: it arms the lazy read-repair window, so the steady-state cost is one declined ` +
-			`consult per readRepairWindowMs per block, with the permanence named once per episode ` +
-			`(cluster-fetch:repair-deadlock).`;
+			`shipped, or a peer that lost its proof store. And the decline this advisory is about — ` +
+			`reason=cohort-too-small, a cohort that cannot reach the quorum at any answer rate — no longer ` +
+			`consults on every read: it arms the lazy read-repair window, so the steady-state cost is one ` +
+			`declined consult per readRepairWindowMs for each block this node HOLDS, with the permanence named ` +
+			`once per episode (cluster-fetch:repair-deadlock). Two shapes still consult on every read, by ` +
+			`design: reason=sole-holder, where the missing thing is a COPY a later commit or cohort-growth ` +
+			`push can deliver, so re-asking can genuinely learn; and a block this node does not hold at all, ` +
+			`whose read must attempt an acquisition and therefore bypasses the window.`;
 		const noMarginAdvice = noRepairMargin
 			? ` This node resolved repairCorroborationClusterSize=${repairCorroborationClusterSize}, which leaves ` +
 			`repair with NO fault tolerance: the reader has ${availablePeers} cohort peer(s) and needs ` +

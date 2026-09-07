@@ -184,6 +184,33 @@ describe('resolveClusterPolicy', () => {
 			expect(message).to.contain('never more machines');
 		});
 
+		/**
+		 * Ticket: small-cohort-arming-rule (review pass).
+		 *
+		 * The advisory's permanent-decline warnings are about PROOF-LESS data, and only ONE of the two
+		 * permanent shapes went quiet. An operator who reads "a provably permanent decline no longer
+		 * consults on every read" and then watches `sole-holder` consult on every read has been told
+		 * something false by the same paragraph that exists to stop the advisory overstating itself.
+		 */
+		it('scopes its softeners: proof-less data only, and only cohort-too-small went quiet', async () => {
+			const captured = await captureLog('cluster-policy', async () => {
+				resolveClusterPolicy({ clusterSize: 10 });
+			});
+
+			const message = advisoryPayload(captured)?.message;
+			expect(message).to.contain('VERIFIED cohort commit proof');
+			expect(message).to.contain('PROOF-LESS data only');
+			// The quiet shape, named, and scoped to blocks this node holds.
+			expect(message).to.contain('reason=cohort-too-small');
+			expect(message).to.contain('arms the lazy read-repair window');
+			expect(message).to.contain('for each block this node HOLDS');
+			// ...and the two shapes that deliberately stay loud.
+			expect(message).to.contain('Two shapes still consult on every read');
+			expect(message).to.contain('does not hold at all');
+			// The over-broad claim the review replaced must not come back.
+			expect(message).to.not.contain('a provably permanent decline no longer consults');
+		});
+
 		it('still fires for a large, genuinely-provisioned clusterSize — it is advisory, not a fault', async () => {
 			// A deployment that really does run 16 machines is correctly configured and gets the
 			// advisory too; the wording is conditional ("if you actually run fewer than N machines"),

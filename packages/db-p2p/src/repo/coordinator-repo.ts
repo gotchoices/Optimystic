@@ -127,7 +127,16 @@ interface ClusterLatestQuery {
 	 * cohort commit proof's signature set rather than other voters. Observability only — selection
 	 * has already run and nothing downstream re-votes off this; it exists so "this node's currency
 	 * rests on one peer's word" is visible in the `cluster-fetch:local-current` line without
-	 * re-deriving it from the claim set.
+	 * re-deriving it from the claim set. Read the two together: `voters: 1` WITHOUT `certified` is one
+	 * peer's uncorroborated word; with it, the corroboration is a proof and the voter count is beside
+	 * the point.
+	 *
+	 * NOTE: `certified: true` with `voters: 1` does not distinguish a multi-signer cohort proof from a
+	 * solo cohort's self-signed receipt — a distinction selection itself makes
+	 * (`RevClaim.certifiedSignerCount`, weighed in `selectQuorumRev`) but {@link QuorumRev} does not
+	 * carry out. Fine while the flag is read as "proof-backed, not peer-backed"; if operators ever
+	 * need to tell the two apart from a log, add the signer count to `QuorumRev` and emit it here
+	 * rather than re-deriving it from the claim set.
 	 */
 	corroboration?: { voters: number; certified?: true };
 }
@@ -183,6 +192,25 @@ interface AheadClaimState {
  * for what makes each provable and which remedy each sends the operator to.
  */
 type DeadlockReason = 'cohort-too-small' | 'sole-holder';
+
+/**
+ * One corroboration-declining pass, as {@link CoordinatorRepo.classifyRepairDeadlock} weighs it and
+ * {@link CoordinatorRepo.reportRepairDeadlock} reports it. Named rather than written inline at both,
+ * so the field meanings — several of which are easy to confuse with a neighbour — are stated once.
+ */
+interface RepairDeclinePass {
+	blockId: BlockId;
+	claims: RevClaim[];
+	silentCount: number;
+	/** Cohort peers besides this node, from the cohort view — whether they answered or not. */
+	cohortPeers: number;
+	/** How many of those peers answered at all, holders and confirmed non-holders alike. */
+	answered: number;
+	/** The quorum THIS pass demanded, computed from the peers that actually claimed. */
+	required: number;
+	/** `corroboratorCapacity` for this pass — a function of the view and the resolved size, not of who answered. */
+	capacity: number;
+}
 
 /** The `cohort-too-small` wording: the cohort cannot field the quorum however healthy its peers are. */
 function cohortTooSmallMessage(
@@ -1740,18 +1768,7 @@ export class CoordinatorRepo implements IRepo {
 	 * that error's documented contract; deliberately out of scope here (see the ticket
 	 * `repair-deadlock-is-never-named`, *Not this ticket*).
 	 */
-	private reportRepairDeadlock(pass: {
-		blockId: BlockId;
-		claims: RevClaim[];
-		silentCount: number;
-		/** Cohort peers besides this node, from the cohort view — whether they answered or not. */
-		cohortPeers: number;
-		answered: number;
-		/** The quorum THIS pass demanded, computed from the peers that actually claimed. */
-		required: number;
-		/** `corroboratorCapacity` for this pass — a function of the view and the resolved size, not of who answered. */
-		capacity: number;
-	}): DeadlockReason | undefined {
+	private reportRepairDeadlock(pass: RepairDeclinePass): DeadlockReason | undefined {
 		const { blockId, claims, cohortPeers, answered, required, capacity } = pass;
 		const reason = this.classifyRepairDeadlock(pass);
 		if (reason === undefined) return undefined;
@@ -1811,15 +1828,7 @@ export class CoordinatorRepo implements IRepo {
 	 *    recover, so re-asking can learn; and permanent claims are not made off partial views);
 	 *  - a pass with ZERO claims is an agreed absence — an answer, not a deadlock.
 	 */
-	private classifyRepairDeadlock(pass: {
-		claims: RevClaim[];
-		silentCount: number;
-		/** Cohort peers besides this node, from the cohort view — whether they answered or not. */
-		cohortPeers: number;
-		answered: number;
-		/** `corroboratorCapacity` for this pass — a function of the view and the resolved size, not of who answered. */
-		capacity: number;
-	}): DeadlockReason | undefined {
+	private classifyRepairDeadlock(pass: RepairDeclinePass): DeadlockReason | undefined {
 		const { claims, silentCount, cohortPeers, answered, capacity } = pass;
 		// An incomplete picture proves nothing about the deployment; the next clean pass says it.
 		if (silentCount > 0) return undefined;
@@ -1852,11 +1861,18 @@ export class CoordinatorRepo implements IRepo {
 		const soleHolder = claims.length === 1 && answered === cohortPeers;
 		if (!cohortTooSmall && !soleHolder) return undefined;
 
-		// Both shapes can hold at once (an undeclared two-machine deployment whose single peer holds the
-		// block is both). `cohort-too-small` is reported in preference because its remedy is the one
-		// that actually works there: declaring the real size makes the floor reachable, after which the
-		// lone peer's claim IS adopted — so calling it a sole-holder problem would send the operator
-		// looking for a copy they do not need.
+		// Both shapes hold at once whenever `cohortTooSmall` does — not merely "can". At the fixed
+		// simple-majority term (0.51) the proportional quorum never exceeds the peer count, so
+		// `cohortTooSmall` reduces to exactly ONE non-self cohort peer with the resolved size at three
+		// or more; combined with the guards above (nobody silent, somebody claimed) that peer is also
+		// the only claimant and everybody answered, which is `soleHolder`. So this precedence is
+		// load-bearing on every cohort-too-small pass, not a rare tie-break — and it is what keeps the
+		// ARMING consumer keyed on the reason that means "no cadence can help" rather than on the one
+		// that means "a copy has not arrived yet".
+		// `cohort-too-small` is reported in preference because its remedy is the one that actually
+		// works there: declaring the real size makes the floor reachable, after which the lone peer's
+		// claim IS adopted — so calling it a sole-holder problem would send the operator looking for a
+		// copy they do not need.
 		return cohortTooSmall ? 'cohort-too-small' : 'sole-holder';
 	}
 
