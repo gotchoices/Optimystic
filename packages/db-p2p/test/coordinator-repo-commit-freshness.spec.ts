@@ -31,6 +31,7 @@ import type {
 } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import { CoordinatorRepo, type ClusterLatestCallback, type ICoordinatorClusterSeam } from '../src/repo/coordinator-repo.js';
+import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { toString as u8ToString } from 'uint8arrays';
 import { captureLog } from './support/capture-log.js';
@@ -165,6 +166,40 @@ describe('CoordinatorRepo commit-side freshness (quorum-intersection gate)', () 
 			});
 
 			expect(countTag(captured, 'cluster-tx:read-repair-triggered')).to.equal(1);
+		});
+
+		/**
+		 * Ticket: feat-declare-repair-yardstick-alone-apply-by-rebuild (review).
+		 *
+		 * The cases above hand-wire `CoordinatorRepo`, which bypasses `resolveClusterPolicy` — so a
+		 * change to how the composition root resolves `repairCorroborationClusterSize` could (and
+		 * briefly did) stop a solo node's commit arming the window with every one of them still green.
+		 * This runs the same solo case through the numbers a real node is built with.
+		 */
+		it('arms the window on the numbers the composition root actually resolves', async () => {
+			const localPeer = await makePeerId();
+			const resolved = resolveClusterPolicy({ clusterSize: 1 });
+			const repo = new CoordinatorRepo(
+				makeKeyNetwork(makeClusterPeers([localPeer])),
+				makeClusterClient,
+				makeStorageRepo(),
+				{ ...resolved, readRepairMode: 'lazy', readRepairWindowMs: WINDOW_MS, readRepairSampleRate: 0 },
+				undefined,
+				localPeer,
+				undefined,
+				async () => undefined
+			);
+			let clock = BASE_TIME;
+			repo.now = () => clock;
+
+			const captured = await captureCoordinatorLog(async () => {
+				expect((await repo.commit(REQUEST)).success).to.equal(true);
+				clock = BASE_TIME + 1_000;
+				await repo.get({ blockIds: [BLOCK] });
+			});
+
+			expect(countTag(captured, 'cluster-tx:read-repair-triggered'),
+				'a genuine cohort-of-one commit is freshness evidence — no consult inside the window').to.equal(0);
 		});
 
 		it('a solo commit on a genuine cohort of one DOES arm the window', async () => {

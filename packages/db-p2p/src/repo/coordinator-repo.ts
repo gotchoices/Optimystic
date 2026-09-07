@@ -10,7 +10,7 @@ import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocation, CORROBORATION_FLOOR, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
 import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAnchoring } from "../cluster/certified-claims.js";
-import { DEFAULT_CLUSTER_SIZE } from "../cluster/cluster-policy.js";
+import { DEFAULT_CLUSTER_SIZE, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
 import { isMissingBaseRevisionFailure, MISSING_BASE_REVISION_REASON, type ICommitProofPersister, type IRevisionActionReader } from "../storage/storage-repo.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
@@ -669,9 +669,12 @@ export class CoordinatorRepo implements IRepo {
 		// unrepaired, degraded rather than dead, so there is no reason to relax it for a caller that
 		// has not adopted the new field. A real node is handed an explicit
 		// `repairCorroborationClusterSize` by `resolveClusterPolicy`; the `assumedClusterSize` middle
-		// term keeps direct constructors (embedders, existing tests) behaving as before.
-		this.repairCorroborationClusterSize =
-			cfg?.repairCorroborationClusterSize ?? policy.assumedClusterSize ?? policy.clusterSize;
+		// term keeps direct constructors (embedders, existing tests) behaving as before. The chain
+		// itself is `resolveClusterPolicy`'s own, called rather than restated so this manual-wiring
+		// path and the node assembly cannot drift on how much trust a lone peer gets — including on
+		// degenerate declarations, which fall through here exactly as they do there.
+		this.repairCorroborationClusterSize = resolveRepairCorroborationClusterSize(
+			cfg?.repairCorroborationClusterSize, policy.assumedClusterSize, policy.clusterSize);
 		this.reputation = reputation;
 		const localClusterRef = localCluster && localPeerId ? {
 			update: localCluster.update.bind(localCluster),

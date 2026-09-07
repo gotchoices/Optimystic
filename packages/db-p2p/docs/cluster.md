@@ -906,9 +906,13 @@ trades write availability, since a node with no confident network-size estimate 
 `ceil(membershipAdmissionFraction · assumedClusterSize)` declared peers and refuses writes below that.
 A host that knows its real machine count and wants only repair tightened declares this field and
 leaves `assumedClusterSize` alone. It wins over `assumedClusterSize` for the repair floor when both are
-declared; a value above `clusterSize` is accepted and harmless, since the floor is capped at the
-corroboration floor of two either way. There is no runtime setter — see *Changing a size after the
-node is running* below.
+declared. A value above `clusterSize` is accepted and never raises the corroboration requirement,
+since the floor is capped at the corroboration floor of two either way — but it is not free:
+`commitQuorumRulesOutRivals` in `packages/db-p2p/src/repo/coordinator-repo.ts` uses the same yardstick
+as the denominator a local commit must beat to arm the lazy read-repair freshness window, so a
+yardstick well above the cohort a commit actually reaches stops that window arming and costs one
+cohort consult per written block per window. Declare the machine count you run, not a safety margin.
+There is no runtime setter — see *Changing a size after the node is running* below.
 
 Declaring `clusterPolicy.assumedClusterSize` sets both. A large deployment should declare its real
 cohort size, otherwise the admission gate cannot police a partition-induced downsize while its own size

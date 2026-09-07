@@ -89,6 +89,35 @@ describe('mesh repair runs the production quorum rules', () => {
 		expect(readerLocal?.block).to.deep.equal(holderLocal?.block);
 	});
 
+	/**
+	 * Ticket: feat-declare-repair-yardstick-alone-apply-by-rebuild (review).
+	 *
+	 * The arm above declares `clusterSize: 2`, which lowers the replication factor with it. The
+	 * downstream shape declares neither that nor `assumedClusterSize` (whose write floor it cannot
+	 * afford to raise) — only the repair yardstick. Every other spec for that field is unit-level
+	 * against `resolveClusterPolicy`; this is the one that proves the number reaches the real repair
+	 * path in a real mesh.
+	 */
+	it('a two-node mesh repairs on repairCorroborationClusterSize ALONE, at full replication factor', async () => {
+		const mesh = await createMesh(2, {
+			responsibilityK: 2,
+			clusterSize: 10,
+			clusterPolicy: { repairCorroborationClusterSize: 2 }
+		});
+		const reader = mesh.nodes[0]!;
+		const holder = mesh.nodes[1]!;
+		const blockId = 'block-repair-yardstick-alone';
+
+		await commitLocally(holder, blockId, 'a-yardstick');
+
+		const result = await reader.coordinatorRepo.get({ blockIds: [blockId] });
+
+		expect(result[blockId]?.block, 'read must serve the repaired block').to.not.equal(undefined);
+		expect(result[blockId]?.state?.latest?.rev).to.equal(1);
+		const readerLocal = await localState(reader, blockId);
+		expect(readerLocal?.state?.latest?.actionId, 'the repair persisted on the reader').to.equal('a-yardstick');
+	});
+
 	it('an UNDECLARED two-node mesh can never repair: no-quorum every pass, repair-deadlock named once', async () => {
 		// Nothing declared → repairCorroborationClusterSize resolves to DEFAULT_CLUSTER_SIZE (10):
 		// capacity = corroboratorCapacity(1, 10) = 9, requiredEvenIfAllAnswered = quorumSize(1, 0.51, 9)

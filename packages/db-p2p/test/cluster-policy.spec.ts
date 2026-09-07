@@ -16,7 +16,7 @@
 
 import { expect } from 'chai';
 import { DEFAULT_SUPER_MAJORITY_THRESHOLD } from '@optimystic/db-core';
-import { minAbsoluteClusterSize, resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
+import { minAbsoluteClusterSize, resolveClusterPolicy, resolveRepairCorroborationClusterSize } from '../src/cluster/cluster-policy.js';
 import { captureLog, hasTag } from './support/capture-log.js';
 
 describe('resolveClusterPolicy', () => {
@@ -112,7 +112,10 @@ describe('resolveClusterPolicy', () => {
 			expect(policy.clusterSize).to.equal(10);
 		});
 
-		it('is accepted above clusterSize — harmless, since the floor is capped anyway', () => {
+		it('is accepted above clusterSize — it never raises the corroboration requirement', () => {
+			// Not free, though: the same yardstick is the denominator a local commit must beat to arm
+			// the read-repair freshness window (`commitQuorumRulesOutRivals`), so overstating it costs
+			// cohort consults on the read path. Declare the count you run, not a safety margin.
 			const policy = resolveClusterPolicy({ clusterSize: 4, clusterPolicy: { repairCorroborationClusterSize: 32 } });
 
 			expect(policy.repairCorroborationClusterSize).to.equal(32);
@@ -120,37 +123,52 @@ describe('resolveClusterPolicy', () => {
 			expect(policy.assumedClusterSize).to.equal(minAbsoluteClusterSize);
 		});
 
-		it('is floored at minAbsoluteClusterSize when declared below it', () => {
-			// 1 would mean "a cohort of one", which has no peer to corroborate with at all.
+		it('is NOT floored at minAbsoluteClusterSize — a declared 1 stays 1', () => {
+			// Such a floor would be inert on the repair side (`quorumSize` already takes
+			// `max(1, min(CORROBORATION_FLOOR, capacity))`, and `corroboratorCapacity`'s max against
+			// visible peers absorbs the difference at every peer count) but NOT on the commit side:
+			// the same number is the full-cohort denominator `commitQuorumRulesOutRivals` measures a
+			// local commit against, so flooring a genuine solo cohort up to 2 costs a cohort consult
+			// per written block per window. See the solo arm in
+			// `test/coordinator-repo-commit-freshness.spec.ts`.
 			const policy = resolveClusterPolicy({ clusterPolicy: { repairCorroborationClusterSize: 1 } });
 
-			expect(policy.repairCorroborationClusterSize).to.equal(minAbsoluteClusterSize);
+			expect(policy.repairCorroborationClusterSize).to.equal(1);
 		});
 
 		it('resolves to the same yardstick a hand-wired CoordinatorRepo would', () => {
-			// `CoordinatorRepo` applies its own chain to the config object it is handed:
-			// `cfg?.repairCorroborationClusterSize ?? policy.assumedClusterSize ?? policy.clusterSize`
-			// (`repo/coordinator-repo.ts`). A real node and a direct `coordinatorRepo(...)` given the
-			// SAME operator numbers must land on the same yardstick, or the two composition paths
-			// silently disagree about how much a lone peer is trusted.
-			const coordinatorChain = (cfg: { repairCorroborationClusterSize?: number, assumedClusterSize?: number, clusterSize: number }) =>
-				cfg.repairCorroborationClusterSize ?? cfg.assumedClusterSize ?? cfg.clusterSize;
-
+			// There are two composition paths onto this number: `resolveClusterPolicy` (what
+			// `createLibp2pNodeBase` runs) and the `CoordinatorRepo` constructor (the readme's manual
+			// wiring). Both call `resolveRepairCorroborationClusterSize`, so the agreement is
+			// structural rather than a coincidence of two hand-matched chains — including for the
+			// degenerate values, where a restated chain would silently diverge (`?? ` keeps a 0, the
+			// shared function discards it).
 			for (const options of [
 				{ clusterSize: 10, clusterPolicy: { repairCorroborationClusterSize: 8 } },
 				{ clusterSize: 10, clusterPolicy: { assumedClusterSize: 3, repairCorroborationClusterSize: 8 } },
 				{ clusterSize: 10, clusterPolicy: { assumedClusterSize: 4 } },
+				{ clusterSize: 10, clusterPolicy: { repairCorroborationClusterSize: 0 } },
+				{ clusterSize: 10, clusterPolicy: { assumedClusterSize: Number.NaN } },
 				{ clusterSize: 6 }
-			]) {
+			] as { clusterSize: number, clusterPolicy?: { repairCorroborationClusterSize?: number, assumedClusterSize?: number } }[]) {
 				const resolved = resolveClusterPolicy(options);
-				const handWired = coordinatorChain({ clusterSize: options.clusterSize, ...options.clusterPolicy });
+				// Exactly the call `CoordinatorRepo`'s constructor makes on a cfg carrying the same
+				// operator numbers, with its own `?? DEFAULT_CLUSTER_SIZE` already applied.
+				const handWired = resolveRepairCorroborationClusterSize(
+					options.clusterPolicy?.repairCorroborationClusterSize,
+					options.clusterPolicy?.assumedClusterSize,
+					options.clusterSize
+				);
 
 				expect(handWired, `hand-wired cfg for ${JSON.stringify(options)}`)
 					.to.equal(resolved.repairCorroborationClusterSize);
 				// ...and the resolved policy is what `libp2p-node-base` spreads into that same factory,
-				// so on the resolved object the coordinator's chain is inert.
-				expect(coordinatorChain(resolved), JSON.stringify(options))
-					.to.equal(resolved.repairCorroborationClusterSize);
+				// so on the resolved object the second pass is idempotent.
+				expect(
+					resolveRepairCorroborationClusterSize(
+						resolved.repairCorroborationClusterSize, resolved.assumedClusterSize, resolved.clusterSize),
+					JSON.stringify(options)
+				).to.equal(resolved.repairCorroborationClusterSize);
 			}
 		});
 	});
@@ -195,10 +213,44 @@ describe('resolveClusterPolicy', () => {
 			});
 		}
 
-		it('floors a degenerate clusterSize at minAbsoluteClusterSize', () => {
-			// The only input for which the trailing max() is not a no-op.
-			expect(resolveClusterPolicy({ clusterSize: 1 }).repairCorroborationClusterSize).to.equal(minAbsoluteClusterSize);
-			expect(resolveClusterPolicy({ clusterSize: 0 }).repairCorroborationClusterSize).to.equal(minAbsoluteClusterSize);
+		it('passes a small clusterSize straight through — an honest solo node stays solo', () => {
+			// `clusterSize` is the operator's own number, not a declaration this function second-
+			// guesses. Raising it here would misreport a genuine cohort of one to
+			// `commitQuorumRulesOutRivals` and stop a solo commit arming the freshness window.
+			expect(resolveClusterPolicy({ clusterSize: 1 }).repairCorroborationClusterSize).to.equal(1);
+			expect(resolveClusterPolicy({ clusterSize: 0 }).repairCorroborationClusterSize).to.equal(0);
+		});
+
+		it('treats a discarded declaration as UNdeclared for the advisory too', async () => {
+			// The two notions of "declared" must not diverge: with a raw `!== undefined` check a typo'd
+			// declaration resolves to the strict `clusterSize` (which has margin, so the no-margin arm
+			// stays silent) while still counting as a declaration — so the operator who believes they
+			// declared a size gets LESS warning than one who declared nothing at all.
+			for (const value of [0, Number.NaN, 2.5]) {
+				const captured = await captureLog('cluster-policy', async () => {
+					resolveClusterPolicy({ clusterSize: 10, clusterPolicy: { repairCorroborationClusterSize: value } });
+				});
+
+				const payload = captured
+					.find(args => typeof args[0] === 'string' && args[0].includes('repair-fault-tolerance'))
+					?.[1] as { cohortUndeclared?: boolean, message?: string } | undefined;
+				expect(payload?.cohortUndeclared, `declared ${String(value)}`).to.equal(true);
+				// ...and the message says what was thrown away, so the operator can tell their number
+				// never took effect rather than reading "no size declared" as a contradiction.
+				expect(payload?.message, `declared ${String(value)}`)
+					.to.contain('is discarded and counts as no declaration');
+			}
+		});
+
+		it('says nothing about discarded values when the operator genuinely declared nothing', async () => {
+			const captured = await captureLog('cluster-policy', async () => {
+				resolveClusterPolicy({ clusterSize: 10 });
+			});
+
+			const message = captured
+				.find(args => typeof args[0] === 'string' && args[0].includes('repair-fault-tolerance'))
+				?.[1] as { message?: string } | undefined;
+			expect(message?.message).to.not.contain('is discarded');
 		});
 
 		it('leaves the admission gate an unvalidated pass-through — cluster-repo floors it itself', () => {
