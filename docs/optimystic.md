@@ -292,7 +292,10 @@ machine that joins because a *user* tapped "add a backup" rather than because an
 deployment — but the setting need not come from a person. The application that offers "add a backup"
 performed the enrollment, so it knows the machine count from its own authenticated membership records:
 derive `clusterPolicy.repairCorroborationClusterSize` from those and pass it at node construction, and
-no end user ever sees the number (settled by ticket `small-cohort-arming-rule`; see
+no end user ever sees the number. Derive it from the machines that **serve the network in question**,
+though, not from the whole membership roll — a host running several networks over one roll, each served
+by a subset, makes that network's blocks unrepairable by declaring the roll, and should declare nothing
+rather than over-declare (settled by ticket `small-cohort-arming-rule`; see
 [cluster.md](../packages/db-p2p/docs/cluster.md) for the recommendation's caveats).
 
 Feed the machine count to *that* field rather than to `clusterPolicy.assumedClusterSize`. Both raise

@@ -930,14 +930,16 @@ declared-size requirement squares with a machine that joins by a **user** action
 
 > A host application that manages cadre membership should derive
 > `clusterPolicy.repairCorroborationClusterSize` from its own membership records — the number of
-> machines actually enrolled — and pass it at node construction. Adding a backup is an authenticated,
+> machines that actually **serve this network**, which is not always the number enrolled; see the
+> third qualification below, where getting that distinction wrong makes blocks unrepairable — and
+> pass it at node construction. Adding a backup is an authenticated,
 > application-level membership operation, so this is a declaration from authenticated application
 > state, not an observation of the network, which keeps the property the declared field exists for.
 > An end user should never see or edit this number. Feed the count to *that* field rather than to
 > `clusterPolicy.assumedClusterSize` unless the host also wants the membership admission gate's
 > low-confidence write floor raised with it — see *Which numbers move together* below.
 
-Two qualifications to that recommendation:
+Three qualifications to that recommendation:
 
 - **The largest consumer pins the shared field at 2 for every group size.** Sereus declares
   `assumedClusterSize: 2` in both its control-network and its strand-network cluster policies, at
@@ -952,6 +954,17 @@ Two qualifications to that recommendation:
   of one per read, with the deadlock named once per episode), and self-repairs proof-carrying data
   with zero configuration. What the declaration still buys is repair of proof-less/legacy data (the
   relaxed uncertified floor) and the admission-gate yardstick above.
+- **Enrolled is not the same as serving, and over-declaring is worse than declaring nothing.** This
+  one bit a downstream implementation immediately (Sereus, 2026-09-07), so it is stated here rather
+  than left to be rediscovered. A host may run several networks over one membership roll — one shared
+  by every machine, others each served by a subset that opted into them. Feeding the whole roll to a
+  network that only a subset serves declares a cohort that cannot answer: at a declared size of three
+  or more the corroboration floor pins at two corroborators (`max(1, min(CORROBORATION_FLOOR,
+  max(visiblePeers, N - 1)))`), so a network fielding one peer can **never** repair a block — reads
+  fail as `Missing block` behind `cluster-fetch:no-quorum` — and the commit-freshness denominator
+  above demands approvals that set cannot supply. A host that cannot say how many machines serve a
+  given network should declare nothing for it: the undeclared exposure (a shrunken view relaxing the
+  floor toward a single voter) is real, but it is strictly better than a floor nothing can meet.
 
 **Which numbers move together.** Three numbers, three different scopes — conflating them is how
 deployments end up either refusing writes or trusting a lone peer:
@@ -962,7 +975,8 @@ deployments end up either refusing writes or trusting a lone peer:
   network. For a group growing from one machine up to `clusterSize` it need not change at all.
 - **The repair yardstick (`repairCorroborationClusterSize`) is per-node, and nodes may safely
   disagree** — each one protects only its own reads. It should track the number of machines actually
-  enrolled -- the count you actually run, not a safety margin above it. Setting it above `clusterSize`
+  serving this network -- the count you actually run, not a safety margin above it, and not a wider
+  membership roll that includes machines which never hold this network's blocks. Setting it above `clusterSize`
   never raises the corroboration requirement but is not free (it is the commit-freshness denominator;
   see the field description above); setting it below the real count only forgoes tightening, and is
   never worse than leaving it undeclared.
