@@ -892,16 +892,49 @@ place `libp2p-node-base` applies these defaults — resolves the single operator
 
 Declaring `clusterPolicy.assumedClusterSize` sets both. A large deployment should declare its real
 cohort size, otherwise the admission gate cannot police a partition-induced downsize while its own size
-estimate is unconfident. A two-node mesh needs one setting to *self-repair* —
+estimate is unconfident. A two-node mesh needs one setting to *self-repair* proof-less data —
 `clusterPolicy.assumedClusterSize: 2` (which does not lower the replication factor) or an honest
 `clusterSize: 2` — though it transacts and votes unconfigured. **One and two are supported cohort
 sizes**, not development-only ones: a group starts as a single machine and grows by a user adding a
 backup, or by pairing with another member's group of any size (see
-[architecture.md](../../../docs/architecture.md)). The declared-size requirement is therefore a rough
-edge on an ordinary path rather than a sign of a misconfigured deployment — the size is declared
-rather than observed because the observed view is unauthenticated and an attacker who can shrink it
-must not be able to lower the floor, and squaring that with a machine that joins by a *user* action
-is open work (`tickets/plan/1-small-cadres-are-a-first-class-topology`).
+[architecture.md](../../../docs/architecture.md)). The size stays declared rather than observed
+because the observed view is unauthenticated and an attacker who can shrink it must not be able to
+lower the floor. *Declared* does not have to mean *typed by an operator*, though — that is how the
+declared-size requirement squares with a machine that joins by a **user** action (settled by ticket
+`small-cohort-arming-rule`, which replaced the open-work note that stood here):
+
+> A host application that manages cadre membership should derive
+> `clusterPolicy.assumedClusterSize` from its own membership records — the number of machines
+> actually enrolled — and pass it at node construction. Adding a backup is an authenticated,
+> application-level membership operation, so this is a declaration from authenticated application
+> state, not an observation of the network, which keeps the property the declared field exists for.
+> An end user should never see or edit this number.
+
+Two qualifications to that recommendation:
+
+- **The largest consumer cannot pass it yet.** Sereus's `CadreNode` hardcodes `clusterSize: 3` and
+  builds its `clusterPolicy` inline without exposing `assumedClusterSize` or
+  `allowUnvalidatedSmallCluster` (`gotchoices/sereus#2`), so the recommendation is inert downstream
+  until that configuration seam exists. The hardcoded 3 is also the shape a downstream author
+  produces when docs imply three is the real minimum — it is not: one and two are supported.
+- **The declaration is lower-stakes than it used to be.** An undeclared two-machine group
+  transacts, reads quietly (certified claims converge without a second voter, and a provably
+  unmeetable corroboration floor arms the lazy read-repair window — one consult per window instead
+  of one per read, with the deadlock named once per episode), and self-repairs proof-carrying data
+  with zero configuration. What the declaration still buys is repair of proof-less/legacy data (the
+  relaxed uncertified floor) and the admission-gate yardstick above.
+
+**What a cohort of two protects against, stated honestly.** A user adding a rented cloud pod (or any
+second machine they do not fully control) gets *integrity* guarantees against a lying partner:
+fabricated revisions or content need commit proofs or corroboration the liar cannot supply, and a
+two-member commit requires **both** members' signatures (the super-majority ceil(2 × 0.75) and the
+majority > 1 both resolve to 2 of 2 — `ClusterMember.hasMajority`). They do **not** get *freshness*
+guarantees against a withholding partner: a commit proof certifies "revision R was committed",
+nothing can certify "no revision after R exists", so a partner that withholds a newer revision is
+indistinguishable from that revision never existing. The both-signatures rule keeps that narrow — a
+revision the reader never co-signed can only exist across the reader's own storage loss (a restore),
+or from a commit under a different cohort shape (the partner alone during a partition, which mints a
+single-signer proof the partner can present or withhold).
 
 **Every number above counts PEERS, not COPIES — and repair needs both.** `repairCorroborationClusterSize`
 and the corroboration floor it feeds are entirely about how many cohort *peers* exist and can be asked;

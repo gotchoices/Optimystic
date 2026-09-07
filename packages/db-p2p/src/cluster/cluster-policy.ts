@@ -242,10 +242,21 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 		const undeclaredAdvice = cohortUndeclared
 			? ` No clusterPolicy.assumedClusterSize declared, so the floor is measured against ` +
 			`repairCorroborationClusterSize=${repairCorroborationClusterSize} and never relaxes: if you actually ` +
-			`run fewer than ${minimumSelfHealingDeployment} machines, every repair declines, permanently. Set ` +
-			`clusterPolicy.assumedClusterSize to your real cohort size; it does not lower ` +
+			`run fewer than ${minimumSelfHealingDeployment} machines, every proof-less repair declines, ` +
+			`permanently. Set clusterPolicy.assumedClusterSize to your real cohort size; it does not lower ` +
 			`clusterSize=${clusterSize} (the replication factor). Larger deployments can ignore this.`
 			: '';
+		// The rule and both advices above constrain proof-LESS claims only — without saying so the
+		// advisory overstates the emergency: an operator reading "every repair declines, permanently"
+		// would not guess that proof-carrying data is exempt, nor that the decline is now quiet.
+		const certifiedCaveat =
+			` Two softeners to all of the above. A claim carrying a VERIFIED cohort commit proof repairs at any ` +
+			`size with no second voter (the proof's signature set is its corroboration), so every permanent-` +
+			`decline warning here applies to PROOF-LESS data only — legacy blocks written before proofs ` +
+			`shipped, or a peer that lost its proof store. And a provably permanent decline no longer consults ` +
+			`on every read: it arms the lazy read-repair window, so the steady-state cost is one declined ` +
+			`consult per readRepairWindowMs per block, with the permanence named once per episode ` +
+			`(cluster-fetch:repair-deadlock).`;
 		const noMarginAdvice = noRepairMargin
 			? ` This node resolved repairCorroborationClusterSize=${repairCorroborationClusterSize}, which leaves ` +
 			`repair with NO fault tolerance: the reader has ${availablePeers} cohort peer(s) and needs ` +
@@ -261,7 +272,7 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 			noRepairMargin,
 			requiredAnsweringPeers,
 			minimumSelfHealingDeployment,
-			message: rule + undeclaredAdvice + noMarginAdvice + holdersCaveat
+			message: rule + undeclaredAdvice + noMarginAdvice + certifiedCaveat + holdersCaveat
 		});
 	}
 

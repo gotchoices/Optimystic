@@ -262,8 +262,11 @@ before it trusts a copy, and it takes the number of peers a cohort *ought* to ha
 rather than from what the node can currently see — deliberately, because the observed view comes from
 unauthenticated routing and an attacker who can shrink it must not be able to talk the safety floor
 down. Undeclared, that number defaults to the replication factor (10), so **a two-machine deployment
-that declares nothing can never satisfy its own repair check**: it transacts and votes fine, but its
-members cannot repair each other, and every attempt logs `cluster-fetch:no-quorum`.
+that declares nothing can never satisfy its own repair check for proof-less data**: it transacts and
+votes fine, and data whose claims carry verified commit proofs still repairs, but its members cannot
+repair proof-less blocks off each other — each such attempt logs `cluster-fetch:no-quorum` (rate-
+limited to one attempt per read-repair window, since the decline is provably permanent), and the
+permanence is named once per block as `cluster-fetch:repair-deadlock`.
 
 ```ts
 // A two-machine cohort: declare the size so the corroboration floor relaxes to one.
@@ -280,10 +283,16 @@ and `cluster-fetch:repair-deadlock` (once per block, when a decline is provably 
 `reason` naming which shape). [transactions.md](transactions.md) has the full rule and
 [internals.md](internals.md) the size table.
 
-**Known rough edge.** Requiring an explicit setting is a poor fit for a machine that joins because a
-*user* tapped "add a backup" rather than because an operator configured a deployment. That mismatch
-is open work, tracked at `tickets/plan/1-small-cadres-are-a-first-class-topology`; until it is
-resolved, declare the size.
+**Who declares it.** Requiring an explicit setting looks like a poor fit for a machine that joins
+because a *user* tapped "add a backup" rather than because an operator configured a deployment — but
+the setting need not come from a person. The application that offers "add a backup" performed the
+enrollment, so it knows the machine count from its own authenticated membership records: derive
+`clusterPolicy.assumedClusterSize` from those and pass it at node construction, and no end user ever
+sees the number (settled by ticket `small-cohort-arming-rule`; see
+[cluster.md](../packages/db-p2p/docs/cluster.md) for the recommendation's caveats). An undeclared
+two-machine deployment is also no longer noisy while it waits for that: certified claims repair at
+any size, and a repair the cohort provably cannot satisfy now arms the lazy read-repair window —
+one consult per window instead of one per read — while still logging the deadlock once per episode.
 
 ## Deployment Targets
 

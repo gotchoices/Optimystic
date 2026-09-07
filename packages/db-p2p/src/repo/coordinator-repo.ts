@@ -110,6 +110,26 @@ interface ClusterLatestQuery {
 	 * downstream may re-vote off these.
 	 */
 	claims: readonly RevClaim[];
+	/**
+	 * Why this pass's corroboration decline is provably PERMANENT, when it is (see
+	 * {@link DeadlockReason}). Computed fresh on EVERY declining pass — the once-per-episode
+	 * suppression in {@link CoordinatorRepo.reportRepairDeadlock} applies to the LOG LINE, never to
+	 * this verdict — because the caller's arming decision has to fire on every qualifying pass (the
+	 * read-repair window expires and the next pass must re-arm), not only on the first. Set only
+	 * alongside an absent {@link corroborated}; absent here means the decline is, or at least may
+	 * be, transient — a silent peer, a plain shortfall, an agreed absence — and re-asking can learn.
+	 */
+	deadlock?: DeadlockReason;
+	/**
+	 * How the corroborated selection was supported, present exactly when {@link corroborated} is:
+	 * `voters` counts the distinct corroborating supporters (the certified claimants, when the
+	 * certified rule selected), and `certified` marks a selection whose corroboration is a verified
+	 * cohort commit proof's signature set rather than other voters. Observability only — selection
+	 * has already run and nothing downstream re-votes off this; it exists so "this node's currency
+	 * rests on one peer's word" is visible in the `cluster-fetch:local-current` line without
+	 * re-deriving it from the claim set.
+	 */
+	corroboration?: { voters: number; certified?: true };
 }
 
 /**
@@ -1146,7 +1166,7 @@ export class CoordinatorRepo implements IRepo {
 			return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
 		}
 
-		const { corroborated, local, silent, answered, claims, uncorroboratedRev } = await this.queryClusterForLatest(peerIds, blockId, context);
+		const { corroborated, corroboration, local, silent, answered, claims, uncorroboratedRev, deadlock } = await this.queryClusterForLatest(peerIds, blockId, context);
 		// Any silence taints the WHOLE consult, not a fraction of it (fail-closed): one silent
 		// peer could be the sole holder, and the cost — an extra transactor-level retry against
 		// another coordinator — is paid only while a peer is actually unreachable. Silence with
@@ -1197,8 +1217,10 @@ export class CoordinatorRepo implements IRepo {
 		 *  not one — its answer says nothing about the revision in doubt. */
 		const claimantsAtOrAbove = (rev: number): string[] =>
 			claims.filter(c => c.rev >= rev).map(c => c.peerId);
-		// Nothing corroborated: keep local data AND stay eligible for repair — marking the
-		// block seen here would suppress the next attempt for the whole read-repair window.
+		// Nothing corroborated: keep local data AND (usually) stay eligible for repair — marking the
+		// block seen suppresses the next attempt for the whole read-repair window, which is only
+		// right when re-asking sooner could not teach this node anything (see the `deadlock` arming
+		// below for the one decline where that is provable).
 		// An uncorroborated claim strictly ahead of what this node holds still travels up as
 		// doubt: the answer about to be served may be behind it, and only the caller knows
 		// whether that matters for the view it was asked for.
@@ -1215,6 +1237,25 @@ export class CoordinatorRepo implements IRepo {
 					&& (uncorroboratedBaseline === undefined || uncorroboratedRev > uncorroboratedBaseline)
 					? { kind: 'unsettled-claim', rev: uncorroboratedRev, claimants: claimantsAtOrAbove(uncorroboratedRev), silent }
 					: nothingAheadVerdict;
+			// Arm the lazy read-repair window when — and only when — the decline is provably
+			// PERMANENT for the cohort-size reason: `cohort-too-small` means the cohort cannot field
+			// the quorum even if every member answered and agreed (an undeclared two-machine cohort
+			// against the default floor is the ordinary producer), so repeating the identical
+			// hopeless consult sooner than one window teaches nothing — the same justification the
+			// solo-self exit arms under. Every other decline stays unarmed, because there re-asking
+			// CAN genuinely learn: a silent peer can recover (and the verdict is never computed off a
+			// pass with silence — the guard in classifyRepairDeadlock is load-bearing here, not just
+			// for the log), a `sole-holder`'s missing copy can arrive (the cohort-growth push, or a
+			// commit), and a plain shortfall can fill. The doubt memo above is untouched either way:
+			// the window damps repair EFFORT, never honesty — reads inside it still carry
+			// `unconfirmedAheadRev` via flagUnconfirmedCurrency (pinned in
+			// coordinator-repo-small-cohort-arming.spec.ts). Note the verdict arrives on EVERY
+			// qualifying pass while the deadlock LOG stays once-per-episode — the split in
+			// reportRepairDeadlock is what lets the window re-arm after it expires without the log
+			// repeating.
+			if (deadlock === 'cohort-too-small') {
+				this.markBlocksSeen([blockId]);
+			}
 			return { absence, currency };
 		}
 
@@ -1230,24 +1271,37 @@ export class CoordinatorRepo implements IRepo {
 		// cohort that lags behind the reader corroborates an OLDER revision; adopting it
 		// would be a regression, and logging it as a sync would be a lie. The cohort did
 		// answer, so the block is verified fresh — mark it seen.
-		// NOTE: in a cohort of two, that sole peer is the only corroborator, so a lying one can park
-		// the reader here — corroborating the revision it already holds — and re-arm the lazy window
-		// on every pass, hiding a real divergence. Bounded by `readRepairWindowMs` (10s default) and
-		// no worse than the peer simply staying silent.
-		// REVISIT CONDITION TRIPPED (2026-09-06). The condition this NOTE named — "if two-member
-		// cohorts become a supported production topology rather than a dev convenience" — has been
-		// answered: they are supported, and so is a cohort of one. A cadre starts as one machine
-		// (typically a phone) and the ordinary next step is a second as a backup, so two is a normal
-		// size reached by a user action, not an operator's. Behaviour is deliberately UNCHANGED here
-		// pending `plan/1-small-cadres-are-a-first-class-topology`, because the obvious remedy —
-		// stop arming on a single voter — collides with `plan/2-bug-a-cohort-that-cannot-corroborate-
-		// re-asks-on-every-read`, whose fix arms in the neighbouring case; applied naively the two
-		// leave a *correctly declared* two-machine cadre consulting on every read while an
-		// undeclared one stays quiet. Design them together, and cost the certified-claims path first
-		// (`cluster/certified-claims.ts`): a claim the reader verified itself is not "a single
-		// voter's word" in the sense this NOTE meant, and may already be sound here.
+		// NOTE: accepted tradeoff — this arm arms the lazy window even when the corroboration came
+		// from a SINGLE voter (a two-member cohort's sole partner, or a single-signer certified
+		// claim). The once-proposed remedy — stop re-arming on a single-voter corroboration — was
+		// weighed and REJECTED when cohorts of one and two became supported production topology
+		// (ticket `small-cohort-arming-rule`), for three reasons:
+		//  1. Re-asking the sole partner sooner learns nothing: the repeat consult reaches the same
+		//     one peer, and a lying peer repeats the lie. Same justification as the solo-self exit —
+		//     not "the partner is trusted", but "a faster cadence cannot produce new evidence".
+		//  2. Not arming punishes only the honest: an honest partner corroborating "you are current"
+		//     is also a single voter, so refusing to arm makes every healthy two-machine cohort pay
+		//     one network round trip per read, forever, while buying zero protection against a
+		//     dishonest partner.
+		//  3. The residual threat is a WITHHOLDING attack, and no consult cadence or proof rule
+		//     touches it: a commit proof certifies "revision R was committed", nothing can certify
+		//     "no revision after R exists", so a sole partner withholding a newer revision is
+		//     indistinguishable from that revision never existing. Kept narrow by the commit rule —
+		//     a two-member commit needs BOTH members' signatures (super-majority and majority both
+		//     resolve to 2 of 2; ClusterMember.hasMajority) — so a revision the reader never
+		//     co-signed can exist only across the reader's own storage loss, or from a commit under
+		//     a different cohort shape (a partition-era solo commit, whose single-signer proof the
+		//     partner can present or withhold).
+		// What was bought instead is observability: `voters` (and `certified`) on the line below say
+		// when this node's currency rests on one peer's word, without re-deriving it from logs.
+		// Revisit only if a cadence-independent freshness signal (e.g. cross-cohort anchoring) ever
+		// exists to arm against — a shorter cadence alone can never be the fix, per reason 1.
 		if (baselineRev !== undefined && corroborated.rev <= baselineRev) {
-			this.log('cluster-fetch:local-current', { blockId, localRev: baselineRev, clusterRev: corroborated.rev });
+			this.log('cluster-fetch:local-current', {
+				blockId, localRev: baselineRev, clusterRev: corroborated.rev,
+				voters: corroboration?.voters,
+				...(corroboration?.certified ? { certified: true } : {})
+			});
 			this.markBlocksSeen([blockId]);
 			// Only reachable when this node HOLDS a revision (the baseline), so `get` never
 			// consults this verdict — computed consistently rather than hard-coded.
@@ -1572,8 +1626,10 @@ export class CoordinatorRepo implements IRepo {
 				repairCorroborationClusterSize: this.repairCorroborationClusterSize
 			});
 			// ...and, when this decline is provably permanent rather than transient, say THAT once,
-			// in words. The `no-quorum` line above fires on every pass and cannot tell the two apart.
-			this.reportRepairDeadlock({
+			// in words — and return the verdict, which the caller acts on EVERY pass (arming the
+			// read-repair window on `cohort-too-small`; see fetchBlockFromCluster). The `no-quorum`
+			// line above fires on every pass and cannot tell the two apart.
+			const deadlock = this.reportRepairDeadlock({
 				blockId, claims, silentCount: silent.length, cohortPeers: nonSelfCount, answered: answered.length, required, capacity
 			});
 			// The claims themselves must not drive restoration — but their existence is
@@ -1590,7 +1646,11 @@ export class CoordinatorRepo implements IRepo {
 			// (the verification machinery now exists) rather than on the bare assertion — at the
 			// cost of re-opening the stale-serve window for the proof-less honest majority.
 			const uncorroboratedRev = claims.length > 0 ? Math.max(...claims.map(c => c.rev)) : undefined;
-			return { local, silent, answered, claims, ...(uncorroboratedRev !== undefined ? { uncorroboratedRev } : {}) };
+			return {
+				local, silent, answered, claims,
+				...(uncorroboratedRev !== undefined ? { uncorroboratedRev } : {}),
+				...(deadlock !== undefined ? { deadlock } : {})
+			};
 		}
 
 		if (selected.certified) {
@@ -1607,13 +1667,27 @@ export class CoordinatorRepo implements IRepo {
 		// (an unanchored proof must not be able to convict the honest cohort). Never let this throw.
 		this.penalizeContradictingRevClaims(claims, selected, blockId);
 
-		return { corroborated: { actionId: selected.actionId, rev: selected.rev }, local, silent, answered, claims };
+		return {
+			corroborated: { actionId: selected.actionId, rev: selected.rev },
+			// The supporters used to be dropped on the floor here, leaving "how many peers this
+			// currency judgment rests on" underivable downstream — see ClusterLatestQuery.corroboration.
+			corroboration: {
+				voters: selected.supporters.length,
+				...(selected.certified ? { certified: true as const } : {})
+			},
+			local, silent, answered, claims
+		};
 	}
 
 	/**
 	 * Say ONCE per block, in words, when a corroboration decline is provably PERMANENT rather than a
-	 * transient shortage of answers. There are exactly TWO permanent shapes, and they send the operator
-	 * to different places, so each gets its own `reason` and its own wording:
+	 * transient shortage of answers — and RETURN the verdict, computed fresh on every pass by
+	 * {@link classifyRepairDeadlock} (the pure half; the say-once suppression below applies only to
+	 * the log line). The caller acts on the returned reason every pass: `fetchBlockFromCluster` arms
+	 * the lazy read-repair window on `cohort-too-small`, because a decline the cohort provably cannot
+	 * escape teaches nothing when repeated sooner than one window. There are exactly TWO permanent
+	 * shapes, and they send the operator to different places, so each gets its own `reason` and its
+	 * own wording:
 	 *
 	 *  - `cohort-too-small` — this node's cohort has fewer peers than the quorum would demand even if
 	 *    every one of them answered and agreed. The remedy is machines or an honest declared size.
@@ -1677,13 +1751,81 @@ export class CoordinatorRepo implements IRepo {
 		required: number;
 		/** `corroboratorCapacity` for this pass — a function of the view and the resolved size, not of who answered. */
 		capacity: number;
-	}): void {
-		const { blockId, claims, silentCount, cohortPeers, answered, required, capacity } = pass;
+	}): DeadlockReason | undefined {
+		const { blockId, claims, cohortPeers, answered, required, capacity } = pass;
+		const reason = this.classifyRepairDeadlock(pass);
+		if (reason === undefined) return undefined;
+		// From here down is LOGGING only, under the once-per-episode suppression. The verdict above
+		// is returned regardless: the caller arms the read-repair window off it on every qualifying
+		// pass (a window that expired must re-arm), and letting the say-once flag swallow the verdict
+		// would arm exactly once per episode — one quiet window, then the re-ask-forever loop back.
+		const requiredEvenIfAllAnswered = quorumSize(cohortPeers, this.simpleMajorityThreshold, capacity);
+		const state = this.unsettledAheadClaims.get(blockId);
+		const alreadySaid = state?.deadlocksReported ?? [];
+		// Suppressed per REASON, not once outright: an episode that starts as `cohort-too-small` and
+		// becomes `sole-holder` — the operator added the machines that reason asked for, and the block
+		// is still stuck — has a second thing to say, and a silent log there is the failure this line
+		// exists to end. Neither reason repeats within an episode.
+		if (alreadySaid.includes(reason)) return reason;
+
+		this.log('cluster-fetch:repair-deadlock', {
+			blockId,
+			reason,
+			cohortPeers,
+			answered,
+			claimants: claims.length,
+			required,
+			requiredEvenIfAllAnswered,
+			repairCorroborationClusterSize: this.repairCorroborationClusterSize,
+			message: reason === 'cohort-too-small'
+				? cohortTooSmallMessage(cohortPeers, claims.length, requiredEvenIfAllAnswered, this.repairCorroborationClusterSize)
+				: soleHolderMessage(cohortPeers)
+		});
+		// Hung off the existing per-block freshness entry rather than a fourth per-block map. The entry
+		// survives `recordAheadClaim` clearing its `rev`, and is dropped wholesale once the block
+		// converges — so each reason is said once per non-convergence episode, not once per pass.
+		// NOTE: per BLOCK, though the condition is a property of the cohort, not of any block — so a node
+		// in this state that reads N distinct blocks emits N lines. Deliberate: the operator wants to
+		// know which blocks are stuck, and N is bounded by blocks actually read (1821 lines for a single
+		// block was the defect). If a deployment in this state ever makes this the noisy line again, add
+		// a node-level once-flag keyed on (cohortPeers, requiredEvenIfAllAnswered) and let the per-block
+		// entry only suppress repeats.
+		this.unsettledAheadClaims.set(blockId, { ...(state ?? {}), deadlocksReported: [...alreadySaid, reason] });
+		return reason;
+	}
+
+	/**
+	 * The PURE half of {@link reportRepairDeadlock}: classify one declining pass as provably
+	 * permanent (`cohort-too-small` / `sole-holder`) or not (`undefined`), with no logging and no
+	 * state. Split out so the verdict can run on EVERY pass — the caller in
+	 * `fetchBlockFromCluster` arms the lazy read-repair window off `cohort-too-small` each time,
+	 * and the window has to re-arm after it expires — while the log line keeps its once-per-episode
+	 * suppression. Before the split the verdict was computed for the log line and thrown away,
+	 * which is what left an undeclared two-machine cohort re-running the provably hopeless consult
+	 * on every read (measured: 6 peer queries across three reads inside one 10 s window, versus 0
+	 * with the size declared).
+	 *
+	 * The guards are part of the VERDICT, not merely of the logging — the arming consumer depends
+	 * on both:
+	 *  - a pass with ANY silent peer proves nothing (an incomplete picture — the silent peer could
+	 *    recover, so re-asking can learn; and permanent claims are not made off partial views);
+	 *  - a pass with ZERO claims is an agreed absence — an answer, not a deadlock.
+	 */
+	private classifyRepairDeadlock(pass: {
+		claims: RevClaim[];
+		silentCount: number;
+		/** Cohort peers besides this node, from the cohort view — whether they answered or not. */
+		cohortPeers: number;
+		answered: number;
+		/** `corroboratorCapacity` for this pass — a function of the view and the resolved size, not of who answered. */
+		capacity: number;
+	}): DeadlockReason | undefined {
+		const { claims, silentCount, cohortPeers, answered, capacity } = pass;
 		// An incomplete picture proves nothing about the deployment; the next clean pass says it.
-		if (silentCount > 0) return;
+		if (silentCount > 0) return undefined;
 		// Nobody claimed anything: the cohort agrees the block is absent, which is an answer, not a
 		// deadlock.
-		if (claims.length === 0) return;
+		if (claims.length === 0) return undefined;
 		// The decisive test for the first shape. `requiredEvenIfAllAnswered` is the quorum this cohort
 		// would face with every one of its peers answering and agreeing — the best case reachable
 		// without adding machines. A cohort that can meet it is not too small.
@@ -1704,47 +1846,18 @@ export class CoordinatorRepo implements IRepo {
 		// `tickets/blocked/repair-floor-defends-a-door-the-push-path-leaves-open`. If commit-to-push
 		// latency ever grows enough that operators see `sole-holder` on blocks that heal moments later,
 		// gate the line on the block having been quiet for longer than that latency rather than
-		// softening the wording.
+		// softening the wording. (`sole-holder` never arms the read-repair window — the missing thing
+		// is a COPY, which the cohort-growth push or the next commit can deliver at any moment, so
+		// re-asking can genuinely learn.)
 		const soleHolder = claims.length === 1 && answered === cohortPeers;
-		if (!cohortTooSmall && !soleHolder) return;
+		if (!cohortTooSmall && !soleHolder) return undefined;
 
 		// Both shapes can hold at once (an undeclared two-machine deployment whose single peer holds the
 		// block is both). `cohort-too-small` is reported in preference because its remedy is the one
 		// that actually works there: declaring the real size makes the floor reachable, after which the
 		// lone peer's claim IS adopted — so calling it a sole-holder problem would send the operator
 		// looking for a copy they do not need.
-		const reason: DeadlockReason = cohortTooSmall ? 'cohort-too-small' : 'sole-holder';
-		const state = this.unsettledAheadClaims.get(blockId);
-		const alreadySaid = state?.deadlocksReported ?? [];
-		// Suppressed per REASON, not once outright: an episode that starts as `cohort-too-small` and
-		// becomes `sole-holder` — the operator added the machines that reason asked for, and the block
-		// is still stuck — has a second thing to say, and a silent log there is the failure this line
-		// exists to end. Neither reason repeats within an episode.
-		if (alreadySaid.includes(reason)) return;
-
-		this.log('cluster-fetch:repair-deadlock', {
-			blockId,
-			reason,
-			cohortPeers,
-			answered,
-			claimants: claims.length,
-			required,
-			requiredEvenIfAllAnswered,
-			repairCorroborationClusterSize: this.repairCorroborationClusterSize,
-			message: cohortTooSmall
-				? cohortTooSmallMessage(cohortPeers, claims.length, requiredEvenIfAllAnswered, this.repairCorroborationClusterSize)
-				: soleHolderMessage(cohortPeers)
-		});
-		// Hung off the existing per-block freshness entry rather than a fourth per-block map. The entry
-		// survives `recordAheadClaim` clearing its `rev`, and is dropped wholesale once the block
-		// converges — so each reason is said once per non-convergence episode, not once per pass.
-		// NOTE: per BLOCK, though the condition is a property of the cohort, not of any block — so a node
-		// in this state that reads N distinct blocks emits N lines. Deliberate: the operator wants to
-		// know which blocks are stuck, and N is bounded by blocks actually read (1821 lines for a single
-		// block was the defect). If a deployment in this state ever makes this the noisy line again, add
-		// a node-level once-flag keyed on (cohortPeers, requiredEvenIfAllAnswered) and let the per-block
-		// entry only suppress repeats.
-		this.unsettledAheadClaims.set(blockId, { ...(state ?? {}), deadlocksReported: [...alreadySaid, reason] });
+		return cohortTooSmall ? 'cohort-too-small' : 'sole-holder';
 	}
 
 	/**

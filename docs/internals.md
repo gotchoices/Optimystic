@@ -808,8 +808,14 @@ saveMaterializedBlock(block): store(structuredClone(block));
   repair — as a rough edge on an ordinary path, not as a misconfiguration the operator should have
   known better than to create. The size is taken from configuration rather than from the observed view
   on purpose, because the observed view is unauthenticated and an attacker who can shrink it must not
-  be able to talk the floor down; squaring that with a second machine that arrives by a *user* action
-  is open work (`tickets/plan/1-small-cadres-are-a-first-class-topology`). Note too what the second
+  be able to talk the floor down; how that squares with a second machine that arrives by a *user*
+  action is settled (ticket `small-cohort-arming-rule`): the host application that performed the
+  enrollment should derive `clusterPolicy.assumedClusterSize` from its own membership records — an
+  authenticated application-level declaration, not a network observation (see
+  [cluster.md](../packages/db-p2p/docs/cluster.md) for the recommendation and its caveats). The
+  *never* in the first row is also cheaper than it reads: the provably-unmeetable floor now arms the
+  lazy read-repair window — one consult per window instead of one per read; see the
+  `cohort-too-small` arming note below — and certified claims repair at any size regardless. Note too what the second
   row buys and what it costs: the floor relaxes to one, so repair works — and the sole partner's
   uncertified word is then accepted with nothing to check it against.
 
@@ -899,7 +905,14 @@ saveMaterializedBlock(block): store(structuredClone(block));
       if **every** one of them answered and agreed (`requiredEvenIfAllAnswered`, reported in the
       payload, compared against how many peers the cohort has). Per the table above, that is the row
       where repair says *never*: one peer besides the reader, with the size undeclared. Remedy: more
-      machines, or an honest declared `clusterPolicy.assumedClusterSize` / `clusterSize`.
+      machines, or an honest declared `clusterPolicy.assumedClusterSize` / `clusterSize`. This reason
+      also **arms the lazy read-repair window** (ticket `small-cohort-arming-rule`): a decline the
+      cohort provably cannot escape teaches nothing when repeated sooner than one window, so the
+      block is re-consulted once per `readRepairWindowMs` instead of on every read. The verdict is
+      computed fresh on every pass — the once-per-episode suppression covers only this log line — so
+      each expired window re-arms without the line repeating; a pass with any silent peer never
+      produces the verdict at all (and so never arms), and arming never suppresses the
+      `unconfirmedAheadRev` doubt marker on reads served below an unsettled claim.
     - **`sole-holder`** — the cohort is big enough (does not trip `cohort-too-small`), but exactly
       ONE of its peers holds the block, that peer has no cohort commit proof for it, and every
       *other* peer answered that it holds nothing — an answer, not silence. Every row in the table
@@ -923,7 +936,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
       What does not help either way is machine count or any configuration setting. The usual cause is
       data written while the deployment (or that block's cohort) was smaller — growing the deployment
       afterwards does not copy existing blocks to the new peers, so founding data written before
-      proofs were retained can stay stranded at one copy indefinitely.
+      proofs were retained can stay stranded at one copy indefinitely. Unlike `cohort-too-small`,
+      this reason never arms the read-repair window: the missing thing is a *copy*, which the
+      cohort-growth push or the next commit can deliver at any moment, so re-asking on every read
+      can genuinely learn — the consult cost is bounded by the push landing, not by the window.
 
     Deliberately excluded from both: a shortfall where the cohort *could* reach quorum and some peer
     simply does not hold the block yet (that peer's own repair, or the next commit, fixes it); a
@@ -995,6 +1011,11 @@ saveMaterializedBlock(block): store(structuredClone(block));
   - **`reconcile:certified-selected`** / **`cluster-fetch:certified-selected`** — the certified rule,
     rather than peer corroboration, chose the revision. Carries `claimants`, which may legitimately
     be `1`: the corroboration is the proof's signature set, not other voters.
+    Relatedly, **`cluster-fetch:local-current`** (the read-repair pass that found the cohort
+    corroborating at or below what this node already holds) carries `voters` — the distinct
+    corroborating supporters behind that currency judgment, `1` in a two-member cohort — and
+    `certified: true` when the certified rule selected, so "this node's currency rests on one
+    peer's word" is visible in the line without re-deriving it (ticket `small-cohort-arming-rule`).
   - **`reconcile:proof-uncertified`** / **`cluster-fetch:proof-uncertified`** — a peer attached a
     proof that did not verify, with the `failure` reason. Expected in mixed-version deployments
     (`legacy-record`) and on relayed junk (`malformed-proof`); only the reasons that prove the

@@ -234,10 +234,16 @@ settled and are still catching up:
 * **A group of two has exactly one possible corroborator**, so every rule that asks two independent
   peers to agree degenerates there. What the system does about that is documented under *Corroboration
   floor* in [transactions.md](transactions.md) and, with the full size table, in
-  [internals.md](internals.md); the open design question is tracked as
-  `tickets/plan/1-small-cadres-are-a-first-class-topology`. Today a two-machine group must **declare**
-  its size (`clusterPolicy.assumedClusterSize: 2`) before its members can repair each other — see
-  [optimystic.md](optimystic.md#deployment-sizes) for what that means operationally.
+  [internals.md](internals.md). The design is settled (ticket `small-cohort-arming-rule`): a
+  two-machine group must still **declare** its size (`clusterPolicy.assumedClusterSize: 2`) before
+  its members can repair *proof-less* data off each other, but the declaration should come from the
+  host application's own membership records — the application performed the enrollment, so it knows
+  the count from authenticated state — rather than from an end user, and an undeclared pair already
+  transacts, reads quietly (one cohort consult per read-repair window), and self-repairs
+  proof-carrying data with zero configuration. See
+  [optimystic.md](optimystic.md#deployment-sizes) for what that means operationally and
+  [cluster.md](../packages/db-p2p/docs/cluster.md) for the recommendation's caveats, including what
+  a group of two does and does not protect against (fabrication is caught; withholding is not).
 
 ### Arachnode — concentric storage rings
 
