@@ -962,8 +962,10 @@ deployments end up either refusing writes or trusting a lone peer:
   network. For a group growing from one machine up to `clusterSize` it need not change at all.
 - **The repair yardstick (`repairCorroborationClusterSize`) is per-node, and nodes may safely
   disagree** — each one protects only its own reads. It should track the number of machines actually
-  enrolled. Setting it above `clusterSize` is harmless; setting it below the real count only forgoes
-  tightening, and is never worse than leaving it undeclared.
+  enrolled -- the count you actually run, not a safety margin above it. Setting it above `clusterSize`
+  never raises the corroboration requirement but is not free (it is the commit-freshness denominator;
+  see the field description above); setting it below the real count only forgoes tightening, and is
+  never worse than leaving it undeclared.
 - **The admission yardstick (`assumedClusterSize`) is per-node too, but disagreement costs write
   availability**, since each node applies its own floor to the pends it is asked to admit. Its honest
   value trades write availability under low confidence against defence from a partition-induced
