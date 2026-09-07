@@ -82,3 +82,12 @@ admission gate's permissive default (2) leaves a partition-induced downsize unpo
 node's own size estimate is unconfident. The friendly grow-from-one case is covered by the
 membership-derived declaration above; the unfriendly legitimate-shrink case is still the unsolved
 design question that keeps this unbuildable.
+
+## Cross-reference (added 2026-09-07, from the strand-scaling design pass)
+
+The "pass it at node construction" handoff above turned out to be the load-bearing gap: the value
+is fixed at construction, and the one field that carries it also raises the write-admission floor,
+so the downstream consumer pinned it at 2 for every group size. That half is now its own ticket —
+`feat-declare-repair-yardstick-alone-apply-by-rebuild` — which keeps the rebuild-not-mutate answer
+and adds the missing independent declaration. This ticket's scope is unchanged: observed
+high-water mark for large undeclared deployments, still blocked on the shrink question.
