@@ -63,3 +63,22 @@ Until the shrink question has an answer, this is not ready to plan.
   (repair floor; strict default = `clusterSize`). So the "default has to be permissive" cost above now
   applies only to the admission gate. A learned high-water mark should still subsume **both**;
   `cluster-policy.ts` is the site where it would replace them.
+
+## Narrowed by the small-cadre design (added 2026-09-07, plan pass on small-cadres-are-a-first-class-topology)
+
+Part of this ticket's motivation — a small group whose members never edit configuration — now has a
+cheaper answer that does not touch the shrink problem: a **host application that manages group
+membership can derive `assumedClusterSize` from its own membership records** (the machines the user
+actually enrolled) and pass it at node construction. That is a declaration from authenticated
+application state, not an observation of the network, so it needs none of this ticket's machinery
+and none of its risks; it is now the documented recommendation (see
+`implement/1-small-cohort-arming-rule`, and note downstream `gotchoices/sereus#2` — the consumer
+seam for passing it does not exist yet). Separately, claims carrying verified commit proofs already
+repair at any cohort size with zero configuration, so the undeclared small group is less exposed
+than when this ticket was filed.
+
+What remains genuinely this ticket's: a **large** deployment that never declares its size, where the
+admission gate's permissive default (2) leaves a partition-induced downsize unpoliced while the
+node's own size estimate is unconfident. The friendly grow-from-one case is covered by the
+membership-derived declaration above; the unfriendly legitimate-shrink case is still the unsolved
+design question that keeps this unbuildable.
