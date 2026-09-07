@@ -876,25 +876,46 @@ interface ClusterConsensusConfig {
   - The **read-repair and reconcile corroboration floor** (`corroboratorCapacity` in
     `cluster/quorum-restore.ts`), unconditionally:
     `max(peers currently visible, repairCorroborationClusterSize − 1)` caps how many corroborators a
-    restoration can be required to produce. An absent `assumedClusterSize` falls back to `clusterSize`
-    instead of being treated as unknown — a block that stays unrepaired is degraded, not dead, so
-    there is no reason to relax the floor for a caller that has not adopted the field.
+    restoration can be required to produce. This consumer has its own operator field —
+    `clusterPolicy.repairCorroborationClusterSize`, below — and reads `assumedClusterSize` only as its
+    fallback. With neither declared it falls back to `clusterSize` instead of being treated as unknown
+    — a block that stays unrepaired is degraded, not dead, so there is no reason to relax the floor for
+    a caller that has not adopted either field.
 
 **The two defaults differ on purpose.** `resolveClusterPolicy` (`cluster/cluster-policy.ts`) — the one
-place `libp2p-node-base` applies these defaults — resolves the single operator field into *two* values:
+place `libp2p-node-base` applies these defaults — resolves the operator fields into *two* values:
 
-- `assumedClusterSize` → the operator's value, else `minAbsoluteClusterSize` (2). Permissive, so an
-  unconfigured two- or three-node mesh can still transact; the cost of being wrong here is a
-  partition-induced downsize slipping past an unconfident node.
-- `repairCorroborationClusterSize` → the operator's value, else `clusterSize` (default 10). Strict, so
-  an unconfigured node's repair floor cannot be talked down to a single voter by a shrunken cohort
-  view; the cost of being wrong here is only a block that stays unrepaired.
+- `assumedClusterSize` → `clusterPolicy.assumedClusterSize`, else `minAbsoluteClusterSize` (2).
+  Permissive, so an unconfigured two- or three-node mesh can still transact; the cost of being wrong
+  here is a partition-induced downsize slipping past an unconfident node.
+- `repairCorroborationClusterSize` → `clusterPolicy.repairCorroborationClusterSize`, else
+  `clusterPolicy.assumedClusterSize`, else `clusterSize` (default 10). Strict, so an unconfigured
+  node's repair floor cannot be talked down to a single voter by a shrunken cohort view; the cost of
+  being wrong here is only a block that stays unrepaired.
+
+A declared value that is not a positive whole number (`0`, negative, `NaN`, `Infinity`, fractional) is
+treated as **not declared** and falls through to the next term, rather than being clamped. Clamping to
+2 would be the unsafe direction — two is the one size whose floor relaxes to a single corroborator, so
+a typo would buy a lone peer full trust; falling through lands on the strict default instead.
+
+**Declaring the repair yardstick on its own.** `clusterPolicy.repairCorroborationClusterSize` sets the
+corroboration floor's yardstick and *nothing else* — not the admission gate's write floor, not the
+replication factor. It exists because the two yardsticks are not symmetric in cost: raising the repair
+one is a pure tightening (worst case, a block stays unrepaired), while raising the admission one
+trades write availability, since a node with no confident network-size estimate then demands
+`ceil(membershipAdmissionFraction · assumedClusterSize)` declared peers and refuses writes below that.
+A host that knows its real machine count and wants only repair tightened declares this field and
+leaves `assumedClusterSize` alone. It wins over `assumedClusterSize` for the repair floor when both are
+declared; a value above `clusterSize` is accepted and harmless, since the floor is capped at the
+corroboration floor of two either way. There is no runtime setter — see *Changing a size after the
+node is running* below.
 
 Declaring `clusterPolicy.assumedClusterSize` sets both. A large deployment should declare its real
 cohort size, otherwise the admission gate cannot police a partition-induced downsize while its own size
-estimate is unconfident. A two-node mesh needs one setting to *self-repair* proof-less data —
-`clusterPolicy.assumedClusterSize: 2` (which does not lower the replication factor) or an honest
-`clusterSize: 2` — though it transacts and votes unconfigured. **One and two are supported cohort
+estimate is unconfident. A two-node mesh needs one setting to *self-repair* proof-less data — any of
+`clusterPolicy.repairCorroborationClusterSize: 2`, `clusterPolicy.assumedClusterSize: 2` (neither of
+which lowers the replication factor), or an honest `clusterSize: 2` — though it transacts and votes
+unconfigured. **One and two are supported cohort
 sizes**, not development-only ones: a group starts as a single machine and grows by a user adding a
 backup, or by pairing with another member's group of any size (see
 [architecture.md](../../../docs/architecture.md)). The size stays declared rather than observed
@@ -904,25 +925,74 @@ declared-size requirement squares with a machine that joins by a **user** action
 `small-cohort-arming-rule`, which replaced the open-work note that stood here):
 
 > A host application that manages cadre membership should derive
-> `clusterPolicy.assumedClusterSize` from its own membership records — the number of machines
-> actually enrolled — and pass it at node construction. Adding a backup is an authenticated,
+> `clusterPolicy.repairCorroborationClusterSize` from its own membership records — the number of
+> machines actually enrolled — and pass it at node construction. Adding a backup is an authenticated,
 > application-level membership operation, so this is a declaration from authenticated application
 > state, not an observation of the network, which keeps the property the declared field exists for.
-> An end user should never see or edit this number.
+> An end user should never see or edit this number. Feed the count to *that* field rather than to
+> `clusterPolicy.assumedClusterSize` unless the host also wants the membership admission gate's
+> low-confidence write floor raised with it — see *Which numbers move together* below.
 
 Two qualifications to that recommendation:
 
-- **The largest consumer cannot pass it yet.** Sereus's `CadreNode` hardcodes `clusterSize: 3` and
-  builds its `clusterPolicy` inline without exposing `assumedClusterSize` or
-  `allowUnvalidatedSmallCluster` (`gotchoices/sereus#2`), so the recommendation is inert downstream
-  until that configuration seam exists. The hardcoded 3 is also the shape a downstream author
-  produces when docs imply three is the real minimum — it is not: one and two are supported.
+- **The largest consumer pins the shared field at 2 for every group size.** Sereus declares
+  `assumedClusterSize: 2` in both its control-network and its strand-network cluster policies, at
+  every party size, and says why in its own comment: asserting the real count there would make the
+  admission gate demand `ceil(0.75 · count)` declared peers and refuse every real party's writes. So
+  the recommendation was inert downstream for as long as the repair yardstick could only be raised by
+  raising the write floor with it. `clusterPolicy.repairCorroborationClusterSize` is the field that
+  closes that gap; deriving the count and passing it is the downstream half of the work.
 - **The declaration is lower-stakes than it used to be.** An undeclared two-machine group
   transacts, reads quietly (certified claims converge without a second voter, and a provably
   unmeetable corroboration floor arms the lazy read-repair window — one consult per window instead
   of one per read, with the deadlock named once per episode), and self-repairs proof-carrying data
   with zero configuration. What the declaration still buys is repair of proof-less/legacy data (the
   relaxed uncertified floor) and the admission-gate yardstick above.
+
+**Which numbers move together.** Three numbers, three different scopes — conflating them is how
+deployments end up either refusing writes or trusting a lone peer:
+
+- **`clusterSize` (replication factor / target cohort breadth) is network-wide.** Every node must
+  agree on it, because the admission gate's confident path compares a coordinator's declared peer set
+  against the member's own derived width. Changing it is a coordinated rollout of every node on the
+  network. For a group growing from one machine up to `clusterSize` it need not change at all.
+- **The repair yardstick (`repairCorroborationClusterSize`) is per-node, and nodes may safely
+  disagree** — each one protects only its own reads. It should track the number of machines actually
+  enrolled. Setting it above `clusterSize` is harmless; setting it below the real count only forgoes
+  tightening, and is never worse than leaving it undeclared.
+- **The admission yardstick (`assumedClusterSize`) is per-node too, but disagreement costs write
+  availability**, since each node applies its own floor to the pends it is asked to admit. Its honest
+  value trades write availability under low confidence against defence from a partition-induced
+  downsize. The two separate fields give a host that choice; the library does not make it.
+
+**Changing a size after the node is running.** Both yardsticks are resolved **once**, by
+`resolveClusterPolicy` at node construction, and every consumer — the cluster member, the coordinator,
+and both block-restoration paths — holds the result as an immutable snapshot. There is deliberately no
+runtime setter. A host that learns a new machine count applies it by **building a new node**, which
+every embedder already does on restart and on wake from hibernation. Two reasons this is the design
+and not an omission: a construction-time argument is what keeps the number unreachable from the
+network (only the host process that built the node, acting on its own authenticated membership
+records, can set it), and a live change would either turn four immutable snapshots into readers of a
+shared mutable cell or reconstruct those four objects anyway — a restart wearing a different name.
+
+What a rebuild costs, in operator terms:
+
+- **Survives:** every block, every persisted commit proof, executed-transaction markers, and in-flight
+  coordinator/participant state *if* the host wired a `transactionStateStore` (recovered by
+  `ClusterMember.recoverTransactions` / `CoordinatorRepo.recoverTransactions`). A host that wires none
+  loses in-flight transactions — which is already what it does on every crash.
+- **Resets, all in the safe direction:** the read-repair freshness window, recorded doubt about peers
+  running ahead, the responsibility cache, and the rebalance monitor's responsibility snapshot. The
+  first read of each held block after a rebuild consults the cohort, so doubt is rediscovered rather
+  than lost, and the first rebalance check re-pushes to the whole non-self cohort. A `cohort-too-small`
+  deadlock that is still true is therefore re-reported once after the rebuild, since the once-per-
+  episode suppression lives in the state that resets.
+- **From peers' point of view:** a pend this node was coordinating is abandoned. Refused pends drop
+  immediately and live ones age out on the staleness window, so a vanished coordinator does not wedge
+  a block.
+
+Because the direction that matters is raise-only, a group that has not yet applied a higher number is
+running at exactly the value it runs at today — so applying it at the *next* rebuild costs nothing.
 
 **What a cohort of two protects against, stated honestly.** A user adding a rented cloud pod (or any
 second machine they do not fully control) gets *integrity* guarantees against a lying partner:
@@ -940,8 +1010,8 @@ single-signer proof the partner can present or withhold).
 and the corroboration floor it feeds are entirely about how many cohort *peers* exist and can be asked;
 none of it says how many of those peers actually *hold* the block being repaired. Wherever the floor is
 two — every configuration except a cohort that declares itself two-member, where it relaxes to one — a
-block that only one cohort peer holds cannot be repaired by raising `assumedClusterSize` /
-`clusterSize` at all: the sole holder cannot second itself, and the two mechanisms that would give a
+block that only one cohort peer holds cannot be repaired by raising `repairCorroborationClusterSize` /
+`assumedClusterSize` / `clusterSize` at all: the sole holder cannot second itself, and the two mechanisms that would give a
 second peer a copy (read-repair and reconcile) both decline on this same corroboration floor. Raising
 either setting only ever makes the floor harder to meet, never easier. The usual cause is data written while the
 deployment (or that block's cohort) was smaller: growing the deployment afterwards does not retroactively
@@ -949,7 +1019,7 @@ copy existing blocks to the new peers, so founding data can stay stranded at one
 is reported once per affected block as `cluster-fetch:repair-deadlock` with `reason: 'sole-holder'`
 (`CoordinatorRepo.reportRepairDeadlock`) — a different `reason` from `cohort-too-small`, which is purely
 about peer count — and its remedy is another cohort peer holding the block (committing a new revision),
-never a larger `assumedClusterSize` or `clusterSize`. See [internals.md](../../../docs/internals.md) for
+never a larger repair yardstick or `clusterSize`. See [internals.md](../../../docs/internals.md) for
 the full size table and both `reason` values.
 
 **Configuration in `libp2p-node-base.ts`:** the composition root no longer writes a config literal.

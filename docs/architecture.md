@@ -235,10 +235,14 @@ settled and are still catching up:
   peers to agree degenerates there. What the system does about that is documented under *Corroboration
   floor* in [transactions.md](transactions.md) and, with the full size table, in
   [internals.md](internals.md). The design is settled (ticket `small-cohort-arming-rule`): a
-  two-machine group must still **declare** its size (`clusterPolicy.assumedClusterSize: 2`) before
-  its members can repair *proof-less* data off each other, but the declaration should come from the
-  host application's own membership records — the application performed the enrollment, so it knows
-  the count from authenticated state — rather than from an end user, and an undeclared pair already
+  two-machine group must still **declare** its size (`clusterPolicy.repairCorroborationClusterSize: 2`
+  — the field that raises the repair floor without also raising the membership admission gate's
+  low-confidence write floor) before its members can repair *proof-less* data off each other, but the
+  declaration should come from the host application's own membership records — the application
+  performed the enrollment, so it knows the count from authenticated state — rather than from an end
+  user. The number is read once, when the node is built, so a group that grows or shrinks applies the
+  new count at its next node construction (a restart, or a wake from hibernation) rather than through
+  a live reconfiguration call. An undeclared pair already
   transacts, reads quietly (one cohort consult per read-repair window), and self-repairs
   proof-carrying data with zero configuration. See
   [optimystic.md](optimystic.md#deployment-sizes) for what that means operationally and

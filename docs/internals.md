@@ -774,11 +774,17 @@ saveMaterializedBlock(block): store(structuredClone(block));
   Taking the MAX against a *declared* size — never against the number of peers a possibly
   shrunken view happens to show — is what keeps a shrunken view of a larger cohort out of that
   relaxed branch. `repairCorroborationClusterSize` is resolved by `resolveClusterPolicy`
-  (`cluster/cluster-policy.ts`) from the operator's `clusterPolicy.assumedClusterSize`, falling
-  back to `clusterSize` when it is absent — deliberately the strict fallback, so an unconfigured
-  node keeps the floor of two. A genuine small deployment declares
-  `clusterPolicy.assumedClusterSize` to heal, which — unlike lowering `clusterSize` — does not
-  also lower its replication factor.
+  (`cluster/cluster-policy.ts`) from `clusterPolicy.repairCorroborationClusterSize`, falling back
+  to `clusterPolicy.assumedClusterSize` and then to `clusterSize` when both are absent —
+  deliberately the strict fallback, so an unconfigured node keeps the floor of two. A genuine
+  small deployment declares one of the two `clusterPolicy` fields to heal, neither of which — unlike
+  lowering `clusterSize` — lowers its replication factor.
+  `clusterPolicy.repairCorroborationClusterSize` is the one to prefer: it moves this yardstick and
+  nothing else, whereas `clusterPolicy.assumedClusterSize` also raises the membership admission
+  gate's low-confidence write floor, which can refuse writes. All of these are read once, at node
+  construction; a deployment whose machine count changes applies the new number by building a new
+  node, not through a runtime setter (see
+  [cluster.md](../packages/db-p2p/docs/cluster.md) → *Changing a size after the node is running*).
 
   **How many machines repair actually needs** (swept over `resolveClusterPolicy` +
   `corroboratorCapacity` + `quorumSize`, and pinned in `test/quorum-restore.spec.ts` under *how
@@ -794,7 +800,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   | machines | cohort size declared? | peers besides the reader | peers that must answer *that reader* | can repair (given that many holders)? |
   | --- | --- | --- | --- | --- |
   | 2 | no (falls back to `clusterSize`, default 10) | 1 | 2 | **never** |
-  | 2 | yes (`assumedClusterSize: 2`, or an honest `clusterSize: 2`) | 1 | 1 | yes, with no margin |
+  | 2 | yes (`repairCorroborationClusterSize: 2`, `assumedClusterSize: 2`, or an honest `clusterSize: 2`) | 1 | 1 | yes, with no margin |
   | 3 | either | 2 | 2 | yes, with **no margin** |
   | 4+ | either | 3+ | 2 | yes, survives one unreachable peer |
 
@@ -810,8 +816,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   on purpose, because the observed view is unauthenticated and an attacker who can shrink it must not
   be able to talk the floor down; how that squares with a second machine that arrives by a *user*
   action is settled (ticket `small-cohort-arming-rule`): the host application that performed the
-  enrollment should derive `clusterPolicy.assumedClusterSize` from its own membership records — an
-  authenticated application-level declaration, not a network observation (see
+  enrollment should derive `clusterPolicy.repairCorroborationClusterSize` from its own membership
+  records — an authenticated application-level declaration, not a network observation, and the field
+  that raises this floor *without* also raising the admission gate's write floor (see
   [cluster.md](../packages/db-p2p/docs/cluster.md) for the recommendation and its caveats). The
   *never* in the first row is also cheaper than it reads: the provably-unmeetable floor now arms the
   lazy read-repair window — one consult per window instead of one per read; see the
@@ -905,7 +912,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
       if **every** one of them answered and agreed (`requiredEvenIfAllAnswered`, reported in the
       payload, compared against how many peers the cohort has). Per the table above, that is the row
       where repair says *never*: one peer besides the reader, with the size undeclared. Remedy: more
-      machines, or an honest declared `clusterPolicy.assumedClusterSize` / `clusterSize`. This reason
+      machines, or an honest declared `clusterPolicy.repairCorroborationClusterSize` (which moves only
+      this floor), `clusterPolicy.assumedClusterSize` (which also raises the admission gate's write
+      floor), or `clusterSize`. This reason
       also **arms the lazy read-repair window** (ticket `small-cohort-arming-rule`): a decline the
       cohort provably cannot escape teaches nothing when repeated sooner than one window, so the
       block is re-consulted once per `readRepairWindowMs` instead of on every read. The verdict is

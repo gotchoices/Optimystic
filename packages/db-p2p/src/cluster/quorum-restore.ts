@@ -117,8 +117,10 @@ export function quorumSize(
  *
  * An unconfigured node resolves this to its `clusterSize` (default 10), so the floor of two binds and
  * a shrunken view gains nothing. The escape hatch for a real two-node deployment is one explicit
- * operator declaration — `clusterPolicy.assumedClusterSize: 2`, which does NOT also drop the
- * replication factor, or an honest `clusterSize: 2`.
+ * operator declaration, any of three: `clusterPolicy.repairCorroborationClusterSize: 2`, which moves
+ * only this yardstick; `clusterPolicy.assumedClusterSize: 2`, which also raises the membership
+ * admission gate's low-confidence write floor; or an honest `clusterSize: 2`. Only the last drops the
+ * replication factor.
  *
  * Shared by both restoration paths so the two can never drift apart on the rule that decides how
  * much trust a lone peer gets.

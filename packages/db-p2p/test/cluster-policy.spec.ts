@@ -6,10 +6,12 @@
  * paths. It used to be an inline literal, so nothing could assert on it without booting a libp2p
  * node, and a default that relaxed the repair corroboration floor to a single voter went unnoticed.
  *
- * These specs pin the one thing the literal could not: that the SINGLE operator field
- * (`clusterPolicy.assumedClusterSize`) resolves to two different defaults, permissive for the
- * membership admission gate and strict for the repair floor, and to one shared value the moment an
- * operator declares it.
+ * These specs pin the one thing the literal could not: that `clusterPolicy.assumedClusterSize`
+ * resolves to two different defaults, permissive for the membership admission gate and strict for the
+ * repair floor, and to one shared value the moment an operator declares it — plus (ticket
+ * `feat-declare-repair-yardstick-alone-apply-by-rebuild`) that
+ * `clusterPolicy.repairCorroborationClusterSize` moves the repair floor ALONE, so a deployment can
+ * tighten repair without also raising the low-confidence write floor.
  */
 
 import { expect } from 'chai';
@@ -78,6 +80,135 @@ describe('resolveClusterPolicy', () => {
 		});
 	});
 
+	/**
+	 * Ticket: feat-declare-repair-yardstick-alone-apply-by-rebuild.
+	 *
+	 * `assumedClusterSize` sets BOTH yardsticks, so a deployment that wanted the strict one (the
+	 * repair corroboration floor) raised had to raise the permissive one (the membership admission
+	 * gate's low-confidence write floor) with it — which can refuse writes it needs. The largest
+	 * consumer therefore pinned `assumedClusterSize: 2` at every group size and got no repair
+	 * tightening at all. `clusterPolicy.repairCorroborationClusterSize` moves the repair yardstick
+	 * alone.
+	 */
+	describe('declaring the repair yardstick on its own', () => {
+		it('moves ONLY the repair yardstick — the write floor and the replication factor stay put', () => {
+			// The downstream shape: a host that knows it enrolled 8 machines wants repair measured
+			// against 8, while the admission gate stays permissive so real writes are never refused.
+			const policy = resolveClusterPolicy({ clusterPolicy: { repairCorroborationClusterSize: 8 } });
+
+			expect(policy.repairCorroborationClusterSize).to.equal(8);
+			expect(policy.assumedClusterSize, 'the admission/write floor is untouched').to.equal(minAbsoluteClusterSize);
+			expect(policy.clusterSize, 'the replication factor is untouched').to.equal(10);
+		});
+
+		it('wins over assumedClusterSize for repair, while assumedClusterSize still sets admission', () => {
+			const policy = resolveClusterPolicy({
+				clusterSize: 10,
+				clusterPolicy: { assumedClusterSize: 3, repairCorroborationClusterSize: 8 }
+			});
+
+			expect(policy.repairCorroborationClusterSize, 'the specific field wins').to.equal(8);
+			expect(policy.assumedClusterSize, 'and does not bleed into the admission gate').to.equal(3);
+			expect(policy.clusterSize).to.equal(10);
+		});
+
+		it('is accepted above clusterSize — harmless, since the floor is capped anyway', () => {
+			const policy = resolveClusterPolicy({ clusterSize: 4, clusterPolicy: { repairCorroborationClusterSize: 32 } });
+
+			expect(policy.repairCorroborationClusterSize).to.equal(32);
+			expect(policy.clusterSize, 'never rewrites the replication factor').to.equal(4);
+			expect(policy.assumedClusterSize).to.equal(minAbsoluteClusterSize);
+		});
+
+		it('is floored at minAbsoluteClusterSize when declared below it', () => {
+			// 1 would mean "a cohort of one", which has no peer to corroborate with at all.
+			const policy = resolveClusterPolicy({ clusterPolicy: { repairCorroborationClusterSize: 1 } });
+
+			expect(policy.repairCorroborationClusterSize).to.equal(minAbsoluteClusterSize);
+		});
+
+		it('resolves to the same yardstick a hand-wired CoordinatorRepo would', () => {
+			// `CoordinatorRepo` applies its own chain to the config object it is handed:
+			// `cfg?.repairCorroborationClusterSize ?? policy.assumedClusterSize ?? policy.clusterSize`
+			// (`repo/coordinator-repo.ts`). A real node and a direct `coordinatorRepo(...)` given the
+			// SAME operator numbers must land on the same yardstick, or the two composition paths
+			// silently disagree about how much a lone peer is trusted.
+			const coordinatorChain = (cfg: { repairCorroborationClusterSize?: number, assumedClusterSize?: number, clusterSize: number }) =>
+				cfg.repairCorroborationClusterSize ?? cfg.assumedClusterSize ?? cfg.clusterSize;
+
+			for (const options of [
+				{ clusterSize: 10, clusterPolicy: { repairCorroborationClusterSize: 8 } },
+				{ clusterSize: 10, clusterPolicy: { assumedClusterSize: 3, repairCorroborationClusterSize: 8 } },
+				{ clusterSize: 10, clusterPolicy: { assumedClusterSize: 4 } },
+				{ clusterSize: 6 }
+			]) {
+				const resolved = resolveClusterPolicy(options);
+				const handWired = coordinatorChain({ clusterSize: options.clusterSize, ...options.clusterPolicy });
+
+				expect(handWired, `hand-wired cfg for ${JSON.stringify(options)}`)
+					.to.equal(resolved.repairCorroborationClusterSize);
+				// ...and the resolved policy is what `libp2p-node-base` spreads into that same factory,
+				// so on the resolved object the coordinator's chain is inert.
+				expect(coordinatorChain(resolved), JSON.stringify(options))
+					.to.equal(resolved.repairCorroborationClusterSize);
+			}
+		});
+	});
+
+	/**
+	 * Ticket: feat-declare-repair-yardstick-alone-apply-by-rebuild.
+	 *
+	 * A degenerate declared size must never land on 2 — the ONE size whose corroboration floor relaxes
+	 * to a single voter. Clamping to `minAbsoluteClusterSize` would do exactly that, turning a typo
+	 * into "trust one peer"; falling through to the next term treats nonsense as no declaration and
+	 * lands on the strict default instead.
+	 */
+	describe('degenerate declared sizes fall through rather than poisoning the floor', () => {
+		const degenerates: [string, number][] = [
+			['zero', 0],
+			['negative', -5],
+			['NaN', Number.NaN],
+			['Infinity', Number.POSITIVE_INFINITY],
+			['non-integer', 2.5]
+		];
+
+		for (const [label, value] of degenerates) {
+			it(`a ${label} repairCorroborationClusterSize falls through to clusterSize`, () => {
+				const policy = resolveClusterPolicy({ clusterSize: 10, clusterPolicy: { repairCorroborationClusterSize: value } });
+
+				expect(policy.repairCorroborationClusterSize, 'the strict default, not the relaxed 2').to.equal(10);
+			});
+
+			it(`a ${label} assumedClusterSize falls through for repair`, () => {
+				const policy = resolveClusterPolicy({ clusterSize: 10, clusterPolicy: { assumedClusterSize: value } });
+
+				expect(policy.repairCorroborationClusterSize).to.equal(10);
+			});
+
+			it(`a ${label} repairCorroborationClusterSize falls through to a DECLARED assumedClusterSize`, () => {
+				const policy = resolveClusterPolicy({
+					clusterSize: 10,
+					clusterPolicy: { assumedClusterSize: 4, repairCorroborationClusterSize: value }
+				});
+
+				expect(policy.repairCorroborationClusterSize).to.equal(4);
+			});
+		}
+
+		it('floors a degenerate clusterSize at minAbsoluteClusterSize', () => {
+			// The only input for which the trailing max() is not a no-op.
+			expect(resolveClusterPolicy({ clusterSize: 1 }).repairCorroborationClusterSize).to.equal(minAbsoluteClusterSize);
+			expect(resolveClusterPolicy({ clusterSize: 0 }).repairCorroborationClusterSize).to.equal(minAbsoluteClusterSize);
+		});
+
+		it('leaves the admission gate an unvalidated pass-through — cluster-repo floors it itself', () => {
+			// Deliberately unchanged behaviour: `cluster-repo.admissionFloor` already handles a
+			// degenerate value, and tightening it here would alter documented behaviour with no bug.
+			expect(resolveClusterPolicy({ clusterPolicy: { assumedClusterSize: 0 } }).assumedClusterSize).to.equal(0);
+			expect(resolveClusterPolicy({ clusterPolicy: { assumedClusterSize: -1 } }).assumedClusterSize).to.equal(-1);
+		});
+	});
+
 	describe('pass-through of the remaining clusterPolicy knobs', () => {
 		it('carries superMajorityThreshold, allowDownsize, sizeTolerance and the small-cluster opt-in', () => {
 			const policy = resolveClusterPolicy({
@@ -117,6 +248,7 @@ describe('resolveClusterPolicy', () => {
 			.find(args => typeof args[0] === 'string' && args[0].includes('repair-fault-tolerance'))
 			?.[1] as {
 				declaredCohortSize?: number,
+				declaredRepairSize?: number,
 				cohortUndeclared?: boolean,
 				noRepairMargin?: boolean,
 				requiredAnsweringPeers?: number,
@@ -266,6 +398,57 @@ describe('resolveClusterPolicy', () => {
 				expect(payload?.requiredAnsweringPeers).to.equal(1);
 				expect(payload?.message).to.contain('the reader has 1 cohort peer(s) and needs 1');
 			}
+		});
+
+		/**
+		 * Ticket: feat-declare-repair-yardstick-alone-apply-by-rebuild.
+		 *
+		 * Declaring `repairCorroborationClusterSize` IS a declaration. The advisory's undeclared arm
+		 * tells the reader to go and set `assumedClusterSize`, which is the wrong advice — and the
+		 * wrong field — for someone who has already declared the repair yardstick directly.
+		 */
+		it('stays silent when only the repair yardstick is declared, at a size with margin', async () => {
+			const captured = await captureLog('cluster-policy', async () => {
+				resolveClusterPolicy({ clusterSize: 10, clusterPolicy: { repairCorroborationClusterSize: 5 } });
+			});
+
+			expect(hasTag(captured, 'repair-fault-tolerance')).to.equal(false);
+		});
+
+		it('still fires the no-margin arm — but not the undeclared arm — when the repair yardstick declares a small size', async () => {
+			for (const declared of [2, 3]) {
+				const captured = await captureLog('cluster-policy', async () => {
+					resolveClusterPolicy({ clusterSize: 10, clusterPolicy: { repairCorroborationClusterSize: declared } });
+				});
+
+				const payload = advisoryPayload(captured);
+				expect(hasTag(captured, 'repair-fault-tolerance'), `declared ${declared}`).to.equal(true);
+				expect(payload?.noRepairMargin, `declared ${declared}`).to.equal(true);
+				expect(payload?.cohortUndeclared, 'the operator DID declare a size, just not that field')
+					.to.equal(false);
+				expect(payload?.message).to.contain('NO fault tolerance');
+				expect(payload?.message).to.not.contain('No clusterPolicy.assumedClusterSize declared');
+			}
+		});
+
+		it('logs which field produced the resolved number', async () => {
+			const captured = await captureLog('cluster-policy', async () => {
+				resolveClusterPolicy({ clusterSize: 10, clusterPolicy: { assumedClusterSize: 3, repairCorroborationClusterSize: 3 } });
+			});
+
+			const payload = advisoryPayload(captured);
+			expect(payload?.declaredCohortSize).to.equal(3);
+			expect(payload?.declaredRepairSize).to.equal(3);
+		});
+
+		it('names BOTH escape hatches, and which one also moves the write floor', async () => {
+			const captured = await captureLog('cluster-policy', async () => {
+				resolveClusterPolicy({ clusterSize: 10 });
+			});
+
+			const message = advisoryPayload(captured)?.message;
+			expect(message).to.contain('clusterPolicy.repairCorroborationClusterSize moves ONLY this repair yardstick');
+			expect(message).to.contain("clusterPolicy.assumedClusterSize moves it AND the membership admission gate's write floor");
 		});
 
 		it('names both problems at once when an undeclared deployment is also too small', async () => {

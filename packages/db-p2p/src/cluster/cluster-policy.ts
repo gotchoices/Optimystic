@@ -15,9 +15,9 @@ const log = createLogger('cluster-policy');
  *
  * ## Why two size yardsticks, not one
  *
- * One operator field — `clusterPolicy.assumedClusterSize`, "the smallest cohort this deployment can
- * genuinely field" — feeds two consumers whose failure modes point in opposite directions, so its
- * *default* cannot serve both:
+ * `clusterPolicy.assumedClusterSize` — "the smallest cohort this deployment can genuinely field" —
+ * feeds two consumers whose failure modes point in opposite directions, so its *default* cannot
+ * serve both:
  *
  * - **Membership admission gate** (`cluster/cluster-repo.ts`, `admitMembership`) reads it only on its
  *   fallback path, when this node has no confident network-size estimate. Too small: a
@@ -26,17 +26,32 @@ const log = createLogger('cluster-policy');
  *   two-node mesh must still be able to transact. It gets {@link minAbsoluteClusterSize} (2).
  * - **Repair corroboration floor** (`corroboratorCapacity` in `cluster/quorum-restore.ts`, called by
  *   `CoordinatorRepo.queryClusterForLatest` and `createReconcileBlock`) reads it on *every* repair,
- *   unconditionally. Too small: a shrunken — and always unauthenticated — cohort view buys a lone
- *   peer full trust. Too large: a block stays unrepaired, degraded rather than dead. It wants a
- *   *strict* default. It gets {@link ResolvedClusterPolicy.repairCorroborationClusterSize}, which
- *   falls back to `clusterSize` (the configured replication factor).
+ *   unconditionally — as the *fallback* for its own field, below. Too small: a shrunken — and always
+ *   unauthenticated — cohort view buys a lone peer full trust. Too large: a block stays unrepaired,
+ *   degraded rather than dead. It wants a *strict* default. It gets
+ *   {@link ResolvedClusterPolicy.repairCorroborationClusterSize}, which falls back in turn to
+ *   `clusterSize` (the configured replication factor).
  *
- * A single explicit `clusterPolicy.assumedClusterSize` still sets BOTH — an operator declaring their
- * real cohort size means it for both consumers. Only the unconfigured case diverges.
+ * ## The two operator fields
  *
- * So a genuine two-node mesh needs exactly one setting to self-repair: either
- * `clusterPolicy.assumedClusterSize: 2` (which does not lower the replication factor) or an honest
- * `clusterSize: 2`. Writes and voting still work with zero configuration.
+ * `clusterPolicy.repairCorroborationClusterSize` declares the **repair yardstick alone**, leaving the
+ * admission gate at its permissive default. `clusterPolicy.assumedClusterSize` remains the shared
+ * field and still sets BOTH — an operator declaring their real cohort size usually means it for both
+ * consumers — but it is now the *fallback* for the repair yardstick, not its only declared source.
+ * The repair yardstick is therefore fully declarable on its own.
+ *
+ * The split exists because the two directions cost different things. Raising the repair yardstick is
+ * a pure tightening: the worst outcome is a block that stays unrepaired. Raising the admission
+ * yardstick trades write availability — a node with no confident network-size estimate demands
+ * `ceil(membershipAdmissionFraction x assumedClusterSize)` declared peers and refuses writes below
+ * that. A host that knows its real machine count and wants only the strict yardstick raised (so a
+ * shrunken, unauthenticated cohort view cannot talk repair down to trusting one peer) declares
+ * `repairCorroborationClusterSize` and leaves `assumedClusterSize` alone.
+ *
+ * So a genuine two-node mesh needs exactly one setting to self-repair: any of
+ * `clusterPolicy.repairCorroborationClusterSize: 2`, `clusterPolicy.assumedClusterSize: 2` (neither
+ * of which lowers the replication factor), or an honest `clusterSize: 2`. Writes and voting still
+ * work with zero configuration.
  *
  * ## Future
  *
@@ -73,10 +88,11 @@ export interface ClusterPolicyOptions {
 	 * the coordinator aims for. NOT a statement about how many peers actually exist, so the
 	 * membership admission gate is never measured against it (see `cluster/cluster-repo.ts`).
 	 *
-	 * The read-repair/reconcile corroboration floor DOES fall back to it when
-	 * `clusterPolicy.assumedClusterSize` is absent — the strict direction, so an unconfigured node
-	 * cannot have its floor talked down by a shrunken cohort view. A deployment that genuinely runs
-	 * fewer peers than this should declare `clusterPolicy.assumedClusterSize`.
+	 * The read-repair/reconcile corroboration floor DOES fall back to it — last in the chain
+	 * `clusterPolicy.repairCorroborationClusterSize` -> `clusterPolicy.assumedClusterSize` ->
+	 * `clusterSize` — the strict direction, so an unconfigured node cannot have its floor talked down
+	 * by a shrunken cohort view. A deployment that genuinely runs fewer peers than this should declare
+	 * one of those two `clusterPolicy` fields.
 	 */
 	clusterSize?: number;
 	clusterPolicy?: {
@@ -106,6 +122,28 @@ export interface ClusterPolicyOptions {
 		 */
 		assumedClusterSize?: number;
 		/**
+		 * The cohort size the **repair corroboration floor alone** is measured against
+		 * (`corroboratorCapacity` in `cluster/quorum-restore.ts`, read on every read-repair and every
+		 * reconcile). Declaring it is a pure tightening: the worst cost of overstating it is a block
+		 * that stays unrepaired — degraded, not dead.
+		 *
+		 * Deliberately does NOT touch {@link assumedClusterSize}, which is the membership admission
+		 * gate's low-confidence write floor: raising that one can make a node refuse legitimate writes
+		 * while its network-size estimate is unconfident. A host that derives its machine count from
+		 * its own authenticated membership records and wants only the strict yardstick raised declares
+		 * this field. It also does not touch {@link ClusterPolicyOptions.clusterSize} (the replication
+		 * factor).
+		 *
+		 * Wins over `assumedClusterSize` for the repair yardstick when both are declared; when absent
+		 * the chain falls through to `assumedClusterSize`, then to `clusterSize`. A value above
+		 * `clusterSize` is accepted and harmless (the floor is capped at `CORROBORATION_FLOOR`).
+		 *
+		 * Applied at node construction only — there is deliberately no runtime setter. A host that
+		 * learns a new machine count applies it by building a new node; see the accepted-tradeoff
+		 * `NOTE:` in {@link resolveClusterPolicy}.
+		 */
+		repairCorroborationClusterSize?: number;
+		/**
 		 * What a validator-configured member does with a pend that carries no `validation` payload
 		 * (nothing to re-execute — the single-collection `Collection.sync` shape). Default 'accept';
 		 * see {@link UnvalidatablePendPolicy}.
@@ -123,11 +161,24 @@ export type ResolvedClusterPolicy = ClusterConsensusConfig & {
 	 * cohort view against — see `corroboratorCapacity` in `cluster/quorum-restore.ts`.
 	 *
 	 * Deliberately distinct from {@link ClusterConsensusConfig.assumedClusterSize}, which the
-	 * membership admission gate reads: the two share an operator field but not a default, because
-	 * over- and under-stating them cost opposite things. See the module doc.
+	 * membership admission gate reads: over- and under-stating the two cost opposite things, so they
+	 * share neither a default nor — since `clusterPolicy.repairCorroborationClusterSize` — a required
+	 * operator field. See the module doc.
 	 */
 	repairCorroborationClusterSize: number;
 };
+
+/**
+ * A declared cohort size, or `undefined` if the operator handed over something that is not one.
+ *
+ * `Number.isInteger` already rejects `NaN`, both infinities and every fractional value, so the extra
+ * check is only the sign. Used for both declared size fields in the repair yardstick's fall-through
+ * chain — see the `NOTE:` in {@link resolveClusterPolicy} for why a bad value falls through rather
+ * than being clamped.
+ */
+function asDeclaredSize(value: number | undefined): number | undefined {
+	return Number.isInteger(value) && (value as number) > 0 ? value : undefined;
+}
 
 /**
  * Apply every cluster-policy default a node needs. Same options in, same numbers out, so the
@@ -136,18 +187,44 @@ export type ResolvedClusterPolicy = ClusterConsensusConfig & {
  * that knows the resolution produced a combination with no repair margin — or none at all.
  */
 export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClusterPolicy {
-	// undefined here means "the operator said nothing", which is the only case where the two
-	// yardsticks below diverge.
+	// undefined on BOTH declared fields means "the operator said nothing", which is the only case
+	// where the two yardsticks below diverge.
 	//
-	// NOTE: a declared value is passed through unvalidated. The admission gate floors a degenerate one
-	// (0, negative, NaN, Infinity) itself — see `cluster-repo.admissionFloor` and its specs — but
-	// `corroboratorCapacity` does not: NaN there makes every quorum comparison false, so repair
-	// silently declines forever. Fail-safe, and unreachable through the reference-peer CLI (which
-	// rejects non-positive integers). If another composition root starts accepting unvalidated config,
-	// clamp here rather than in each consumer.
+	// NOTE: a declared repair yardstick that is not a positive finite integer is treated as NOT
+	// DECLARED and falls through to the next term, rather than being clamped. Clamping to
+	// `minAbsoluteClusterSize` would be the UNSAFE direction: 2 is the one size whose corroboration
+	// floor relaxes to a single voter, so a NaN — which today makes every quorum comparison false, and
+	// therefore declines repair forever, dead but safe — would become "trust one peer". Falling
+	// through treats a nonsense declaration as no declaration and lands on the strict `clusterSize`
+	// default instead. The trailing `max(minAbsoluteClusterSize, ...)` then only guards a `clusterSize`
+	// of 0 or 1, and is a no-op for every sane input (pinned in `test/cluster-policy.spec.ts`).
+	//
+	// The ADMISSION-gate value below stays an unvalidated pass-through on purpose:
+	// `cluster-repo.admissionFloor` already floors a degenerate one itself (see its specs), and
+	// changing that here would alter documented behaviour with no bug behind it.
+	//
+	// NOTE: accepted tradeoff — resolved once, at node construction; there is deliberately no runtime
+	// mutation of either size yardstick. A host that learns a new machine count applies it by building
+	// a new node (which every embedder already does on restart and on wake from hibernation), not
+	// through a setter: a construction-time argument is what keeps the number un-reachable from the
+	// network, and every consumer holds it as an immutable snapshot. Weighed against a
+	// live-reconfiguration API and kept. Revisit only if a deployment appears where a rebuild is
+	// measurably disruptive — for example a server-profile node holding thousands of blocks whose
+	// post-rebuild cohort-consult burst shows up in profiles.
 	const declaredCohortSize = options.clusterPolicy?.assumedClusterSize;
+	const declaredRepairSize = options.clusterPolicy?.repairCorroborationClusterSize;
 	const clusterSize = options.clusterSize ?? DEFAULT_CLUSTER_SIZE;
-	const repairCorroborationClusterSize = declaredCohortSize ?? clusterSize;
+	// NOTE: the trailing max() binds only for a `clusterSize` of 0 or 1. It does not change the repair
+	// floor there — `quorumSize` already takes `max(1, min(CORROBORATION_FLOOR, capacity))`, and
+	// `corroboratorCapacity`'s own max against visible peers absorbs the difference at every peer count
+	// — but it does shift the advisory's `availablePeers` count by one for `clusterSize: 1` (it now
+	// reads "1 cohort peer(s)" where it read "0"). Cosmetic, in a string only an operator who declared
+	// a one-node replication factor ever sees. If `clusterSize: 1` becomes a configuration real
+	// deployments write, give the advisory a solo-cohort arm rather than removing this floor.
+	const repairCorroborationClusterSize = Math.max(
+		minAbsoluteClusterSize,
+		asDeclaredSize(declaredRepairSize) ?? asDeclaredSize(declaredCohortSize) ?? clusterSize
+	);
 
 	// ## What the advisory actually claims, and why the trigger is what it is
 	//
@@ -199,7 +276,12 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 	// can honestly get. If `feat-admission-floor-from-observed-cohort-high-water-mark` ever lands
 	// (deriving the yardstick from observation), that check becomes cheap and belongs here.
 	const minimumSelfHealingDeployment = CORROBORATION_FLOOR + 1;
-	const cohortUndeclared = declaredCohortSize === undefined && clusterSize > minAbsoluteClusterSize;
+	// BOTH operator fields must be absent for this arm: declaring only
+	// `repairCorroborationClusterSize` is still a declaration, and `undeclaredAdvice` below would
+	// otherwise tell a reader who has already declared the repair yardstick directly to go and declare
+	// it — the wrong advice, pointed at the wrong field.
+	const cohortUndeclared = declaredCohortSize === undefined && declaredRepairSize === undefined
+		&& clusterSize > minAbsoluteClusterSize;
 	const noRepairMargin = repairCorroborationClusterSize <= minimumSelfHealingDeployment;
 	if (cohortUndeclared || noRepairMargin) {
 		// How many peers besides the reader must answer and agree, at the resolved size. Two once the
@@ -240,11 +322,17 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 			`reported once per affected block as cluster-fetch:repair-deadlock with reason=sole-holder, and its ` +
 			`remedy is another cohort peer holding it (commit a new revision of the block), never more machines.`;
 		const undeclaredAdvice = cohortUndeclared
-			? ` No clusterPolicy.assumedClusterSize declared, so the floor is measured against ` +
+			? ` No clusterPolicy.assumedClusterSize declared, and no clusterPolicy.repairCorroborationClusterSize ` +
+			`either, so the floor is measured against ` +
 			`repairCorroborationClusterSize=${repairCorroborationClusterSize} and never relaxes: if you actually ` +
 			`run fewer than ${minimumSelfHealingDeployment} machines, every proof-less repair declines, ` +
-			`permanently. Set clusterPolicy.assumedClusterSize to your real cohort size; it does not lower ` +
-			`clusterSize=${clusterSize} (the replication factor). Larger deployments can ignore this.`
+			`permanently. Either field declares your real cohort size and fixes this: ` +
+			`clusterPolicy.repairCorroborationClusterSize moves ONLY this repair yardstick, while ` +
+			`clusterPolicy.assumedClusterSize moves it AND the membership admission gate's write floor (which ` +
+			`refuses writes below ceil(0.75 x the declared size) while this node has no confident network-size ` +
+			`estimate) — so declare the repair field alone unless you mean to raise the write floor too. ` +
+			`Neither lowers clusterSize=${clusterSize} (the replication factor). Larger deployments can ignore ` +
+			`this.`
 			: '';
 		// The rule and both advices above constrain proof-LESS claims only — without saying so the
 		// advisory overstates the emergency: an operator reading "every repair declines, permanently"
@@ -274,6 +362,9 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 			repairCorroborationClusterSize,
 			corroborationFloor: CORROBORATION_FLOOR,
 			declaredCohortSize,
+			// Beside declaredCohortSize so a reader can tell WHICH field produced the resolved number
+			// (the repair field wins when both are declared).
+			declaredRepairSize,
 			cohortUndeclared,
 			noRepairMargin,
 			requiredAnsweringPeers,
@@ -303,9 +394,10 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 		// permissive so a two- or three-node mesh transacts unconfigured; the cost of that default is
 		// bounded to the gate, since the repair floor no longer reads this field.
 		assumedClusterSize: declaredCohortSize ?? minAbsoluteClusterSize,
-		// Repair corroboration floor, every repair. Defaults strict — to the replication factor — so an
-		// unconfigured node cannot have its floor talked down to a single voter by a shrunken cohort
-		// view. A genuinely small mesh declares its size (either field) to regain self-repair.
+		// Repair corroboration floor, every repair. Declared by `repairCorroborationClusterSize`, else
+		// `assumedClusterSize`, else strict — the replication factor — so an unconfigured node cannot
+		// have its floor talked down to a single voter by a shrunken cohort view. A genuinely small
+		// mesh declares its size (any of the three) to regain self-repair.
 		repairCorroborationClusterSize
 	};
 }

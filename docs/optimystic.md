@@ -270,12 +270,16 @@ permanence is named once per block as `cluster-fetch:repair-deadlock`.
 
 ```ts
 // A two-machine cohort: declare the size so the corroboration floor relaxes to one.
-// Does NOT lower the replication factor.
-createLibp2pNode({ /* … */ clusterPolicy: { assumedClusterSize: 2 } })
+// Moves ONLY the repair yardstick; does NOT lower the replication factor, and does NOT
+// raise the membership admission gate's low-confidence write floor.
+createLibp2pNode({ /* … */ clusterPolicy: { repairCorroborationClusterSize: 2 } })
 ```
 
-An honest `clusterSize: 2` has the same effect. One machine on its own needs nothing — it has no
-cohort to consult. Three or more needs nothing either; the default floor is already satisfiable.
+`clusterPolicy.assumedClusterSize: 2` has the same effect on repair *and* moves the admission gate's
+write floor with it; an honest `clusterSize: 2` has the same effect on repair and lowers the
+replication factor. Prefer `repairCorroborationClusterSize` unless you mean one of those side effects.
+One machine on its own needs nothing — it has no cohort to consult. Three or more needs nothing
+either; the default floor is already satisfiable.
 
 Two log lines tell you which situation you are in without reading code: `repair-fault-tolerance`
 (once per node construction, whenever the cohort size is undeclared or resolves to three or fewer)
@@ -283,16 +287,41 @@ and `cluster-fetch:repair-deadlock` (once per block, when a decline is provably 
 `reason` naming which shape). [transactions.md](transactions.md) has the full rule and
 [internals.md](internals.md) the size table.
 
-**Who declares it.** Requiring an explicit setting looks like a poor fit for a machine that joins
-because a *user* tapped "add a backup" rather than because an operator configured a deployment — but
-the setting need not come from a person. The application that offers "add a backup" performed the
-enrollment, so it knows the machine count from its own authenticated membership records: derive
-`clusterPolicy.assumedClusterSize` from those and pass it at node construction, and no end user ever
-sees the number (settled by ticket `small-cohort-arming-rule`; see
-[cluster.md](../packages/db-p2p/docs/cluster.md) for the recommendation's caveats). An undeclared
+**Who declares it, and which field.** Requiring an explicit setting looks like a poor fit for a
+machine that joins because a *user* tapped "add a backup" rather than because an operator configured a
+deployment — but the setting need not come from a person. The application that offers "add a backup"
+performed the enrollment, so it knows the machine count from its own authenticated membership records:
+derive `clusterPolicy.repairCorroborationClusterSize` from those and pass it at node construction, and
+no end user ever sees the number (settled by ticket `small-cohort-arming-rule`; see
+[cluster.md](../packages/db-p2p/docs/cluster.md) for the recommendation's caveats).
+
+Feed the machine count to *that* field rather than to `clusterPolicy.assumedClusterSize`. Both raise
+the repair corroboration floor's yardstick, but `assumedClusterSize` also raises the membership
+admission gate's low-confidence write floor — a node with no confident network-size estimate then
+demands `ceil(0.75 × the declared size)` declared peers and refuses writes below that, which can turn
+an honest count into refused writes. Raising the repair yardstick alone is a pure tightening: the
+worst outcome is a block that stays unrepaired, which is degraded rather than dead. An undeclared
 two-machine deployment is also no longer noisy while it waits for that: certified claims repair at
 any size, and a repair the cohort provably cannot satisfy now arms the lazy read-repair window —
 one consult per window instead of one per read — while still logging the deadlock once per episode.
+
+**Applying a new count: rebuild the node.** Both size yardsticks are read once, when the node is
+built, and there is no API for changing either while it runs. A group that gains or loses a machine
+applies the new number the next time its node is constructed — on restart, or on wake from
+hibernation, which host applications already do routinely. This is the design, not a missing feature:
+a construction-time argument is the thing that keeps the number reachable only by the host process
+that built the node, acting on its own authenticated membership records, and never by anything on the
+network.
+
+A rebuild is cheap and safe. Every block, every stored commit proof and every executed-transaction
+marker survives it, as does in-flight transaction state for hosts that wired a transaction state
+store (hosts that did not already lose in-flight transactions on any crash). What resets — the
+read-repair freshness window, recorded doubt about peers running ahead, and the responsibility caches
+— all resets in the cautious direction: the first read of each held block after a rebuild consults the
+cohort again, so doubt is rediscovered rather than lost. From other peers' side, a pend this node was
+coordinating is abandoned; refused pends drop immediately and live ones age out on the staleness
+window, so a departed coordinator never wedges a block. And since the direction that matters is
+raise-only, a group waiting for its next rebuild is running at exactly the value it runs at today.
 
 ## Deployment Targets
 

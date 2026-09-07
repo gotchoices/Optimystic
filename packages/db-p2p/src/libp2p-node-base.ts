@@ -508,8 +508,10 @@ export async function createLibp2pNodeBase(
 		: options.onCommitCertificate;
 
 	// Every cluster-policy default lives in `cluster/cluster-policy.ts` — including WHY the admission
-	// gate and the repair corroboration floor resolve the one operator field
-	// (`clusterPolicy.assumedClusterSize`) to different values when it is absent. Resolved ONCE, here,
+	// gate and the repair corroboration floor resolve to different values when nothing is declared,
+	// and why they take TWO operator fields (`clusterPolicy.assumedClusterSize`, which sets both, and
+	// `clusterPolicy.repairCorroborationClusterSize`, which sets the repair yardstick alone so a host
+	// can tighten repair without also raising the low-confidence write floor). Resolved ONCE, here,
 	// before anything that reads a cluster size is constructed: `networkManagerService` below,
 	// `Libp2pKeyPeerNetwork`, and the spread-on-churn monitor init must all read `consensusConfig.clusterSize`
 	// rather than `options.clusterSize` directly, or they can each apply their own fallback default and

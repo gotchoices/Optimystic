@@ -227,8 +227,11 @@ function cohortTooSmallMessage(
 		`${CORROBORATION_FLOOR} cohort peers BESIDES the reader to answer and agree, relaxed to 1 only for a ` +
 		`cohort that DECLARES it is smaller; repairCorroborationClusterSize currently resolves to ` +
 		`${repairCorroborationClusterSize}. Two things produce this, and this node cannot tell them ` +
-		`apart: (1) the deployment really does run this few machines — set clusterPolicy.assumedClusterSize ` +
-		`to the number you actually run (it does not lower clusterSize / the replication factor), or set an ` +
+		`apart: (1) the deployment really does run this few machines — set ` +
+		`clusterPolicy.repairCorroborationClusterSize to the number you actually run, which moves ONLY this ` +
+		`repair yardstick, or set clusterPolicy.assumedClusterSize, which moves it AND the membership ` +
+		`admission gate's low-confidence write floor (neither lowers clusterSize / the replication factor), ` +
+		`or set an ` +
 		`honest clusterSize, and run at least ${CORROBORATION_FLOOR + 2} machines for any tolerance of one ` +
 		`unreachable peer; or (2) this node's view of the cohort has shrunk below the real deployment — a ` +
 		`partition or a routing problem, which configuration will not fix. Check the peer count above ` +

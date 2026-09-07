@@ -76,6 +76,15 @@ class PeerSession {
 		return parsed;
 	}
 
+	private parseRepairCorroborationClusterSize(options: { repairCorroborationClusterSize?: string }): number | undefined {
+		if (options.repairCorroborationClusterSize === undefined) return undefined;
+		const parsed = Number(options.repairCorroborationClusterSize);
+		if (!Number.isInteger(parsed) || parsed <= 0) {
+			throw new Error('--repair-corroboration-cluster-size must be a positive integer');
+		}
+		return parsed;
+	}
+
 	private parseSuperMajorityThreshold(options: { superMajorityThreshold?: string }): number | undefined {
 		if (options.superMajorityThreshold === undefined) return undefined;
 		const parsed = Number(options.superMajorityThreshold);
@@ -212,6 +221,7 @@ class PeerSession {
 		storageCapacity?: string;
 		clusterSize?: string;
 		assumedClusterSize?: string;
+		repairCorroborationClusterSize?: string;
 		superMajorityThreshold?: string;
 		announceFile?: string;
 		announceAddr?: string[];
@@ -339,6 +349,11 @@ class PeerSession {
 			console.log(`🛡️  Assumed cluster size set to ${assumedClusterSize.toString()}`);
 			logDebug('assumed cluster size override set', { assumedClusterSize });
 		}
+		const repairCorroborationClusterSize = this.parseRepairCorroborationClusterSize(options);
+		if (repairCorroborationClusterSize !== undefined) {
+			console.log(`\u{1F527}  Repair corroboration cluster size set to ${repairCorroborationClusterSize.toString()}`);
+			logDebug('repair corroboration cluster size override set', { repairCorroborationClusterSize });
+		}
 		const superMajorityThreshold = this.parseSuperMajorityThreshold(options);
 		if (superMajorityThreshold !== undefined) {
 			console.log(`🎯 Super-majority threshold set to ${superMajorityThreshold.toString()}`);
@@ -352,6 +367,7 @@ class PeerSession {
 			storageCapacityBytes,
 			clusterSize,
 			assumedClusterSize,
+			repairCorroborationClusterSize,
 			superMajorityThreshold,
 			mode: options.offline ? 'offline' : 'distributed'
 		});
@@ -395,7 +411,8 @@ class PeerSession {
 			storage: createStorage,
 			clusterSize,
 			clusterPolicy: superMajorityThreshold !== undefined || assumedClusterSize !== undefined
-				? { superMajorityThreshold, assumedClusterSize }
+				|| repairCorroborationClusterSize !== undefined
+				? { superMajorityThreshold, assumedClusterSize, repairCorroborationClusterSize }
 				: undefined,
 			arachnode: {
 				enableRingZulu: true,
@@ -788,7 +805,8 @@ function withCommonPeerOptions(cmd: Command): Command {
 		.option('--storage-path <path>', 'Path for file storage')
 		.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
 		.option('--cluster-size <number>', 'Desired cluster size per key (positive integer)')
-		.option('--assumed-cluster-size <number>', 'Smallest cohort this deployment can genuinely field. Sets both the membership admission gate\'s fallback floor (used when the node has no confident network-size estimate; defaults to 2 when unset) and the read-repair/reconcile corroboration floor (defaults to --cluster-size when unset). A mesh smaller than --cluster-size needs this to repair damaged blocks')
+		.option('--assumed-cluster-size <number>', 'Smallest cohort this deployment can genuinely field. Sets both the membership admission gate\'s fallback floor (used when the node has no confident network-size estimate; defaults to 2 when unset) and the read-repair/reconcile corroboration floor (unless --repair-corroboration-cluster-size is given; falls back to --cluster-size when neither is set). A mesh smaller than --cluster-size needs this (or --repair-corroboration-cluster-size) to repair damaged blocks')
+		.option('--repair-corroboration-cluster-size <number>', 'Cohort size the read-repair/reconcile corroboration floor alone is measured against (positive integer). Unlike --assumed-cluster-size this does NOT raise the membership admission gate\'s low-confidence write floor, so it tightens repair without risking refused writes. Wins over --assumed-cluster-size for the repair floor; defaults to --assumed-cluster-size, then --cluster-size')
 		.option('--super-majority-threshold <number>', 'Super-majority threshold as a fraction in (0, 1] (default 0.75)')
 		.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
 		.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
