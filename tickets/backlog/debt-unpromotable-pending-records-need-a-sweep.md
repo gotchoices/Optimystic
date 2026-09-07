@@ -7,7 +7,7 @@ files:
 difficulty: hard
 repro: static
 severity: wrong-result
-likelihood: unusual
+likelihood: normal-use
 tradeoffs: Cleanup depends entirely on a client that may never come back, so any fix has to guess when a marker is abandoned rather than in-flight — and guessing too eagerly deletes a live write, which is worse than the leak it cures.
 
 # A node has no way to clean up an abandoned pending record
@@ -221,3 +221,42 @@ not, which is precisely the hole this ticket was filed to cover.
 abandoned marker from an in-flight one — now has a concrete shape to reason about. In this capture
 the abandoning client is still running and still writing to the same collection under a *different*
 action id, which a node-side sweep could in principle notice.
+
+## Arm, 2026-09-06 — a second, independent report of the same fingerprint; `likelihood` corrected
+
+The arm above recorded this residual being observed in the sibling `../sereus` checkout. A second
+consumer has now reported it independently, and the two do not share a codebase above this library.
+
+**GitHub issue #18**, filed by an outside consumer (VoteTorrent, on-device n=4 replication proof,
+2026-09-03, `db-p2p` 0.27.0 / cadre-core 0.12.0). Topology: two Node drones and two Android emulators
+in one control network **over circuit relays**. Three successive membership writes, each awaited to
+completion and seconds apart, each failed with:
+
+```
+sync for collection default/CadrePeer exhausted 10 retries:
+pending conflict: block(s) held by unresolved rival action(s) <actionId>
+```
+
+That is the same message, on the same collection name, as the sereus capture — from a different
+application. They also measured the cost: each failed write spent **30–34 s** burning its ten
+retries and still did not clear.
+
+**`likelihood: unusual` was wrong and is now `normal-use`.** Two independent consumers hit this on
+ordinary sequential writes that the application awaited one at a time. Nothing contrived is required.
+The relay topology in their report is consistent with the mechanism the sereus arm traced: a
+transport slow or faulty enough to outlive the client's bounded cancel effort leaves the marker
+standing, and relays make that easy.
+
+**Their reproduction attempt is a useful negative.** They could not reproduce at the `db-p2p` level:
+a probe driving `Diary.append` through `createMesh` / `buildNetworkTransactor` stayed green across
+1 node / 5 sequential, 3 nodes / 5 sequential, 3 nodes / 5 concurrent, and 3 nodes / 3 writes 4 s
+apart. They published the probe so the green result can be checked rather than trusted. That negative
+agrees with what the sereus arm found from the other side — the in-process mesh heals faster than the
+fault does, so the residual is invisible there — and it means **a fixture for this ticket must be
+able to make a peer respond late or not at all, not merely fail fast**.
+
+**Two things landed since 0.27.0 that bear on their report, neither of which closes it.**
+`complete/1-a-failed-attempt-must-discharge-its-own-pend` makes a failing attempt await its own
+cancel, and `complete/2-sync-fail-fast-on-a-stalled-revision-view` stops a hopeless sync burning the
+full ten-retry budget — which is the 30–34 s they measured. Measured effect on the sereus gate:
+0 clean of 5 before, 3 clean of 8 after. The residual this ticket owns is what remains.

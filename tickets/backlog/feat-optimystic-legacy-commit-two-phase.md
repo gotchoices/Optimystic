@@ -1,4 +1,4 @@
-description: In the default single-node mode, saving to a table and its indexes together isn't fully all-or-nothing; move the likely failure earlier so those saves either fully succeed or fully undo, shrinking the window where data can end up half-written.
+description: In the default commit mode, saving to a table and its indexes together isn't fully all-or-nothing; move the likely failure earlier so those saves either fully succeed or fully undo, shrinking the window where data can end up half-written.
 prereq:
 files: packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts, packages/db-core/src/collection/collection.ts, packages/db-core/src/transactor/transactor-source.ts, packages/db-core/src/transaction/coordinator.ts, docs/transactions.md
 difficulty: hard
@@ -104,3 +104,45 @@ Full analysis and the shipped honest-failure minimum:
 `tickets/complete/optimystic-legacy-commit-not-atomic.md` and the
 `PartialCommitError` / `commitDirtyTreesLegacy` code in
 `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`.
+
+## Arm, 2026-09-06 — reported from the field as GitHub issue #17, and the header understated who is exposed
+
+An outside consumer (VoteTorrent, on-device n=4 replication proof, `db-p2p` / plugin 0.27.0,
+cadre-core 0.12.0) hit this on an ordinary membership write:
+
+```
+Legacy multi-tree commit was not atomic: 1 tree(s) were durably committed to storage
+before the commit failed and CANNOT be rolled back.
+Persisted (now out of sync with the unpersisted trees): [default/CadrePeer].
+Not persisted (reverted in-memory only): [default/CadrePeer/index/_uniq_7.stampid].
+Underlying failure: sync for collection default/CadrePeer/index/_uniq_7.stampid
+exhausted 10 retries: pending conflict: block(s) held by unresolved rival action(s) WbVKD69Qk_UPao9R5GoQNg
+```
+
+The row persisted; the unique index enforcing that same row's uniqueness did not. They are explicit
+that the *reporting* is not the complaint — `PartialCommitError` named both sets honestly, which is
+what the shipped honest-failure half was for.
+
+**The header said "single-node mode" and that is wrong — corrected in this pass.** The branch at
+`txn-bridge.ts` selects the legacy sweep whenever `this.session` is null, and a session is created
+only when `coordinator && engine && schemaHashProvider` are all wired. That is a function of how the
+plugin was constructed, **not of how many machines are in the cohort** — which is why this report
+comes from a four-machine deployment. A reader who took "single-node" at face value would have
+dismissed it as impossible; that reading has now been removed from the `description:`.
+
+**The scope argument they make, which this ticket did not:** a unique constraint is enforced by its
+own separate tree, so **every** insert into a unique-constrained table dirties at least two trees and
+is therefore exposed to a half-applied commit. Not a narrow window — an ordinary write path. The
+consequence is a database that can no longer enforce a constraint it believes it holds: later inserts
+that should collide on the indexed column have no index to collide against, and base table and index
+disagree with no local means of reconciliation.
+
+**What triggered it here is separately owned.** The underlying failure is the pend-conflict family
+(GitHub issue #18, and `debt-unpromotable-pending-records-need-a-sweep` for the residual). That
+matters for prioritisation in both directions: fixing the trigger makes this rarer without making it
+safe, and this ticket makes the trigger survivable without making it rarer. They are independent.
+
+**They shipped a runnable reproduction** — `legacy-multi-tree-tear.test.mjs`, three tests, no mesh
+and no sockets, using only exported plugin API, deriving the index tree name via
+`uniqueEnforcementTreeName` rather than pasting a literal so an upstream rename turns it red. Whoever
+picks this up should start from that file rather than writing a fixture; it is in the issue body.
