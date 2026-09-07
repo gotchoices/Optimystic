@@ -210,6 +210,35 @@ Scores ≥ 20 trigger deprioritization; ≥ 80 trigger banning; penalties decay 
 
 ## Topology & Storage Management
 
+### Supported deployment sizes — one machine and two are ordinary, not degenerate
+
+A group of machines sharing responsibility for a block (a *cohort*; in Sereus terms, a user's
+*cadre*) may be **any** size, and small sizes are first-class rather than a development convenience:
+
+* **One machine.** Where every group starts — typically a phone. It is the sole holder of everything
+  it writes and there is nobody to corroborate with; reads are served from its own copy without a
+  cohort consult.
+* **Two machines.** The ordinary next step, reached by a *user* action rather than an operator one:
+  "add a backup" — a pod in the cloud, or a desktop or Linux box for an advanced user. Alternatively
+  a second machine arrives by joining another member's group, which may itself be a single phone.
+  Two phones cannot dial each other directly, so that pairing runs over a circuit relay.
+* **Three or more.** Groups combine: a group of any size may join up with another member's group of
+  any size, and the result is an ordinary larger cohort.
+
+Two consequences worth stating up front, because parts of the codebase were written before this was
+settled and are still catching up:
+
+* **Small does not mean local or trusted.** The second machine may be a rented pod, or a stranger's
+  phone reached through a relay. A two-machine group spans a real network with real adversaries, and
+  its safety properties matter as much as a large deployment's.
+* **A group of two has exactly one possible corroborator**, so every rule that asks two independent
+  peers to agree degenerates there. What the system does about that is documented under *Corroboration
+  floor* in [transactions.md](transactions.md) and, with the full size table, in
+  [internals.md](internals.md); the open design question is tracked as
+  `tickets/plan/1-small-cadres-are-a-first-class-topology`. Today a two-machine group must **declare**
+  its size (`clusterPolicy.assumedClusterSize: 2`) before its members can repair each other — see
+  [optimystic.md](optimystic.md#deployment-sizes) for what that means operationally.
+
 ### Arachnode — concentric storage rings
 
 Long-term storage is organized into nested DHTs where each outer ring partitions the keyspace on one more bit:

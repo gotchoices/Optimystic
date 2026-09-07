@@ -798,6 +798,21 @@ saveMaterializedBlock(block): store(structuredClone(block));
   | 3 | either | 2 | 2 | yes, with **no margin** |
   | 4+ | either | 3+ | 2 | yes, survives one unreachable peer |
 
+  **The table starts at two because one machine is not a repair question at all** — a solo cohort has
+  no peer to consult, serves its own copy, and marks the block checked on the way out
+  (`cluster-fetch:solo-self-skip`). That is not a degenerate case to be designed around: **one and two
+  are supported sizes.** A group begins as a single machine, typically a phone; the ordinary next step
+  is a second added as a backup, or a pairing with another member's group of any size (see
+  [architecture.md](architecture.md#supported-deployment-sizes--one-machine-and-two-are-ordinary-not-degenerate)).
+  So read the first row — a two-machine deployment that declared nothing and can therefore *never*
+  repair — as a rough edge on an ordinary path, not as a misconfiguration the operator should have
+  known better than to create. The size is taken from configuration rather than from the observed view
+  on purpose, because the observed view is unauthenticated and an attacker who can shrink it must not
+  be able to talk the floor down; squaring that with a second machine that arrives by a *user* action
+  is open work (`tickets/plan/1-small-cadres-are-a-first-class-topology`). Note too what the second
+  row buys and what it costs: the floor relaxes to one, so repair works — and the sole partner's
+  uncertified word is then accepted with nothing to check it against.
+
   Three consequences are worth stating plainly, because all three have cost real debugging time.
   **Three machines is the minimum that can ever repair, not a size at which repair is safe**: the
   reader has exactly two peers and needs both, so one peer unreachable *from that reader* — healthy

@@ -892,9 +892,16 @@ place `libp2p-node-base` applies these defaults — resolves the single operator
 
 Declaring `clusterPolicy.assumedClusterSize` sets both. A large deployment should declare its real
 cohort size, otherwise the admission gate cannot police a partition-induced downsize while its own size
-estimate is unconfident. A genuine two-node mesh needs one setting to *self-repair* —
+estimate is unconfident. A two-node mesh needs one setting to *self-repair* —
 `clusterPolicy.assumedClusterSize: 2` (which does not lower the replication factor) or an honest
-`clusterSize: 2` — though it transacts and votes unconfigured.
+`clusterSize: 2` — though it transacts and votes unconfigured. **One and two are supported cohort
+sizes**, not development-only ones: a group starts as a single machine and grows by a user adding a
+backup, or by pairing with another member's group of any size (see
+[architecture.md](../../../docs/architecture.md)). The declared-size requirement is therefore a rough
+edge on an ordinary path rather than a sign of a misconfigured deployment — the size is declared
+rather than observed because the observed view is unauthenticated and an attacker who can shrink it
+must not be able to lower the floor, and squaring that with a machine that joins by a *user* action
+is open work (`tickets/plan/1-small-cadres-are-a-first-class-topology`).
 
 **Every number above counts PEERS, not COPIES — and repair needs both.** `repairCorroborationClusterSize`
 and the corroboration floor it feeds are entirely about how many cohort *peers* exist and can be asked;

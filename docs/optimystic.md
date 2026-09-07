@@ -250,6 +250,41 @@ Build on `Collection` when `Tree` and `Diary` don't fit the access pattern. A cu
 
 Counters, append-only queues with metadata, specialized indexes, and CRDT-style mergers all fit here. See [`collections.md`](../packages/db-core/docs/collections.md) for the API, [`btree.md`](../packages/db-core/docs/btree.md) and [`chains.md`](../packages/db-core/docs/chains.md) for the primitives.
 
+## Deployment Sizes
+
+A cohort may be any size, and one or two machines are supported topologies — not development-only
+shapes. The expected growth path is a single phone, then a second machine added as a backup (a cloud
+pod, a desktop, a box in the basement), then joining other members' groups of whatever size they are.
+See [architecture.md](architecture.md#supported-deployment-sizes--one-machine-and-two-are-ordinary-not-degenerate).
+
+**What that costs you today, in one setting.** Block repair asks two independent peers to agree
+before it trusts a copy, and it takes the number of peers a cohort *ought* to have from configuration
+rather than from what the node can currently see — deliberately, because the observed view comes from
+unauthenticated routing and an attacker who can shrink it must not be able to talk the safety floor
+down. Undeclared, that number defaults to the replication factor (10), so **a two-machine deployment
+that declares nothing can never satisfy its own repair check**: it transacts and votes fine, but its
+members cannot repair each other, and every attempt logs `cluster-fetch:no-quorum`.
+
+```ts
+// A two-machine cohort: declare the size so the corroboration floor relaxes to one.
+// Does NOT lower the replication factor.
+createLibp2pNode({ /* … */ clusterPolicy: { assumedClusterSize: 2 } })
+```
+
+An honest `clusterSize: 2` has the same effect. One machine on its own needs nothing — it has no
+cohort to consult. Three or more needs nothing either; the default floor is already satisfiable.
+
+Two log lines tell you which situation you are in without reading code: `repair-fault-tolerance`
+(once per node construction, whenever the cohort size is undeclared or resolves to three or fewer)
+and `cluster-fetch:repair-deadlock` (once per block, when a decline is provably permanent, with a
+`reason` naming which shape). [transactions.md](transactions.md) has the full rule and
+[internals.md](internals.md) the size table.
+
+**Known rough edge.** Requiring an explicit setting is a poor fit for a machine that joins because a
+*user* tapped "add a backup" rather than because an operator configured a deployment. That mismatch
+is open work, tracked at `tickets/plan/1-small-cadres-are-a-first-class-topology`; until it is
+resolved, declare the size.
+
 ## Deployment Targets
 
 **Server / desktop (Node.js):** use `@optimystic/db-p2p-storage-fs` for disk persistence. A public-reachable node serves as a bootstrap or gateway by listening on a TCP or WebSocket port.

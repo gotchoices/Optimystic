@@ -1,9 +1,10 @@
 description: On a small deployment that never declared how many machines it runs, a machine now queries its partner about a record on every single read instead of at most once every ten seconds, and never stops, because the answer it gets back can never satisfy its own confirmation rule.
+prereq: small-cadres-are-a-first-class-topology
 files: packages/db-p2p/src/repo/coordinator-repo.ts (the "nothing corroborated" early return in `fetchBlockFromCluster`, and `reportRepairDeadlock`, which already computes the "this can never succeed" verdict), packages/db-p2p/src/cluster/quorum-restore.ts (`corroboratorCapacity`, `CORROBORATION_FLOOR`), docs/transactions.md (Lazy read-repair window)
 repro: verified
 severity: edge-case
-likelihood: unusual
-tradeoffs: The affected configuration is one the docs already call misconfigured — it cannot repair itself either, and the single setting that fixes repair also fixes this — so a maintainer may reasonably say "declare your cohort size" instead of adding a second damping rule to a path that already carries five hand-argued special cases.
+likelihood: normal-use
+tradeoffs: The single setting that fixes repair also fixes this, so a maintainer may reasonably say "declare your cohort size" rather than add a second damping rule to a path that already carries five hand-argued special cases — but see the 2026-09-06 note below, which withdraws the "the docs already call it misconfigured" half of that argument.
 ----
 
 # A check that can never succeed is repeated on every read
@@ -89,3 +90,36 @@ of evidence and can be resolved either on its own or as part of that extraction.
 - `fix/a-consult-that-asked-nobody-erases-recorded-doubt` — a different defect at the same
   function, about a check that reached nobody wrongly *clearing remembered doubt*. Distinct
   statement, distinct root cause, but the two will likely be touched together.
+
+## Promotion note, 2026-09-06 — the premise changed, and this can no longer be designed alone
+
+Moved out of `backlog/` and placed behind `1-small-cadres-are-a-first-class-topology`, which now
+gates it via `prereq:`.
+
+**What changed.** The maintainer settled `blocked/two-machine-groups-supported-or-not`: a cadre of
+two is a **supported production topology**, and so is a cadre of one. The ordinary product path is a
+user starting with a phone and then adding a second machine as a backup — a cloud pod, a desktop, a
+box in the basement — or inviting a partner's cadre, which may itself be a single relayed phone.
+
+**Two header fields changed as a result.**
+
+- `likelihood: unusual` was wrong and is now `normal-use`. The affected configuration is an
+  undeclared two-machine cadre, which is precisely what a user gets by tapping *add a backup*.
+- Half the `tradeoffs:` line does not survive. It argued the configuration "is one the docs already
+  call misconfigured", so the answer could reasonably be "declare your cohort size" — but nobody on
+  that product path edits `assumedClusterSize`. The surviving half of the argument is kept; this half
+  is withdrawn. The docs have since been updated to match the decision (`docs/architecture.md`,
+  `docs/optimystic.md`, `docs/transactions.md`, `docs/internals.md`,
+  `packages/db-p2p/docs/cluster.md`), so the sentence this ticket was quoting no longer exists in
+  that form.
+
+**Why it cannot ship on its own.** The parent ticket wants the *opposite* damping change at the same
+site: stop re-arming the read-repair window on a corroboration that came from a single voter, because
+in a cohort of two that voter is the only one there is. Taken naively alongside this ticket's fix, a
+two-machine cadre re-consults on every read when it is *correctly* configured and is quiet only when
+it is misconfigured — the declared cadre ends up worse off than the undeclared one. The parent
+carries that table; design the rule once, across both.
+
+**Nothing else here is retracted.** The measurement (6 peer queries across three reads inside one
+window; 0 with `clusterSize: 2` declared), the `cohort-too-small` versus `sole-holder` distinction,
+and the argument for owning the rule in one place rather than at five sites all stand unchanged.

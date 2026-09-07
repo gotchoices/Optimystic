@@ -1233,9 +1233,19 @@ export class CoordinatorRepo implements IRepo {
 		// NOTE: in a cohort of two, that sole peer is the only corroborator, so a lying one can park
 		// the reader here — corroborating the revision it already holds — and re-arm the lazy window
 		// on every pass, hiding a real divergence. Bounded by `readRepairWindowMs` (10s default) and
-		// no worse than the peer simply staying silent. If two-member cohorts become a supported
-		// production topology rather than a dev convenience, stop re-arming the window on a
-		// corroboration that came from a single voter.
+		// no worse than the peer simply staying silent.
+		// REVISIT CONDITION TRIPPED (2026-09-06). The condition this NOTE named — "if two-member
+		// cohorts become a supported production topology rather than a dev convenience" — has been
+		// answered: they are supported, and so is a cohort of one. A cadre starts as one machine
+		// (typically a phone) and the ordinary next step is a second as a backup, so two is a normal
+		// size reached by a user action, not an operator's. Behaviour is deliberately UNCHANGED here
+		// pending `plan/1-small-cadres-are-a-first-class-topology`, because the obvious remedy —
+		// stop arming on a single voter — collides with `plan/2-bug-a-cohort-that-cannot-corroborate-
+		// re-asks-on-every-read`, whose fix arms in the neighbouring case; applied naively the two
+		// leave a *correctly declared* two-machine cadre consulting on every read while an
+		// undeclared one stays quiet. Design them together, and cost the certified-claims path first
+		// (`cluster/certified-claims.ts`): a claim the reader verified itself is not "a single
+		// voter's word" in the sense this NOTE meant, and may already be sound here.
 		if (baselineRev !== undefined && corroborated.rev <= baselineRev) {
 			this.log('cluster-fetch:local-current', { blockId, localRev: baselineRev, clusterRev: corroborated.rev });
 			this.markBlocksSeen([blockId]);
