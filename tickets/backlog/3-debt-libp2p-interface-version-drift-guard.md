@@ -104,3 +104,41 @@ is satisfied and **the 2.x rows this ticket's enumeration assumes are gone are a
 
 Re-run the enumeration before starting; the numbers above predate the removal and are the reason this
 ticket exists, not a current measurement.
+
+## Arm, 2026-09-07 — a second instance of this class exists, and it is deliberately outside this guard's reach
+
+Recorded so that whoever builds the guard knows the boundary of what they are building, and does not
+assume the class is closed once the workspace is consistent.
+
+The sibling `../sereus` checkout ships a **standalone relay/bootstrap container**
+(`ops/docker/libp2p-infra`) which is not a member of its own workspace and does not depend on
+`@optimystic/db-p2p`. It carries its own dependency tree, and that tree is a full major behind the
+stack that dials it:
+
+| package | that relay container | `@optimystic/db-p2p` |
+| --- | --- | --- |
+| `libp2p` | `^2.9.0` | **`^3.1.3`** |
+| `@libp2p/websockets` | `^9.0.0` | **`^10.1.3`** |
+| `@libp2p/circuit-relay-v2` | `^3.0.0` | `^4.1.3` |
+| `@libp2p/tcp` | `^10.1.18` | `^11.0.10` |
+| `@libp2p/identify` | `^3.0.38` | `^4.0.10` |
+| noise / yamux | `^16.1.4` / `^7.0.4` | `^17.0.0` / `^8.0.1` |
+
+**No lockfile- or tree-shape assertion in this repository can see that.** It is a different
+repository, a different lockfile, and an image built from a Docker context — which is the point worth
+recording: this ticket's guard will make *our* packages consistent with each other and will say
+nothing at all about the version of libp2p on the other end of a live connection. Those are different
+properties, and only the second is what `bug-gossipsub-pubsub-service-cannot-work-on-libp2p-3` (the
+prereq) actually failed on.
+
+That does not widen this ticket. A cross-repository dependency audit is a different piece of work
+with a different owner, and the container's independence is a deliberate design choice on their side
+— it is a pure relay with no database in it, so depending on our storage stack would be worse.
+It is filed there as `sereus/tickets/backlog/debt-relay-container-is-a-libp2p-major-behind-its-clients`,
+which asks for a real interop check (a libp2p-3 client driven through the built image to a
+data-carrying relayed stream) rather than a version assertion.
+
+**What it should change here is the guard's stated scope.** Whatever form this takes, say in its own
+failure message or doc comment that it covers *this workspace's* packages and not the peers they talk
+to, so a future reader does not conclude from a green guard that a libp2p-major mismatch cannot reach
+them. The gossipsub failure arrived over a connection, not out of a build.
