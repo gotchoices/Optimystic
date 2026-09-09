@@ -1,6 +1,6 @@
 import { peerIdFromString } from "@libp2p/peer-id";
-import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult } from "@optimystic/db-core";
-import { CURRENT_MEMBERSHIP_VERSION, computeClusterMessageHash, membershipDigest } from "@optimystic/db-core";
+import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, StaleFailure } from "@optimystic/db-core";
+import { CURRENT_MEMBERSHIP_VERSION, computeClusterMessageHash, isConflictFailure, membershipDigest } from "@optimystic/db-core";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
 import { createLogger, verbose } from '../logger.js'
@@ -11,6 +11,37 @@ import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 
 const log = createLogger('cluster')
+
+/**
+ * Pick each peer's OWN {@link ClusterRecord.applyOutcomes} entry out of the record that peer answered
+ * with, and key it under the peer we actually asked.
+ *
+ * Taking only `response.applyOutcomes[peerId]` — rather than spreading the whole map — is what keeps
+ * one member from reporting outcomes on other members' behalf: a peer that echoes back a record full
+ * of entries contributes exactly one, its own. The field is unsigned advisory data (see its doc
+ * comment for why that is safe), so this is a shaping rule, not a security boundary.
+ *
+ * Returns `undefined` when no peer reported anything, so the common case adds no empty object to the
+ * record.
+ */
+function collectApplyOutcomes(
+	responses: ReadonlyArray<{ peerId: string; response?: ClusterRecord | null }>
+): ClusterRecord['applyOutcomes'] {
+	let collected: NonNullable<ClusterRecord['applyOutcomes']> | undefined;
+	for (const { peerId, response } of responses) {
+		const own = response?.applyOutcomes?.[peerId];
+		if (own === undefined) continue;
+		collected ??= {};
+		collected[peerId] = own;
+	}
+	return collected;
+}
+
+/** Fold collected outcomes into a record in place, later report winning per peer. No-op for `undefined`. */
+function mergeApplyOutcomes(record: ClusterRecord, collected: ClusterRecord['applyOutcomes']): void {
+	if (collected === undefined) return;
+	record.applyOutcomes = { ...record.applyOutcomes, ...collected };
+}
 
 /**
  * Consensus refused a transaction: enough members voted reject that super-majority became
@@ -274,6 +305,19 @@ export class ClusterCoordinator {
 		 * success no member durably stored.
 		 */
 		localCommitResult?: CommitResult;
+		/**
+		 * Conflict-shaped pend refusals reported by OTHER cohort members on their consensus responses
+		 * (`ClusterRecord.applyOutcomes`), keyed by peer id. This is the arm `localPendResult` cannot
+		 * cover: the refusing member is frequently not the coordinating node, and its verdict used to
+		 * stay on that member while the writer was told the pend won. Unsigned advisory data — an
+		 * entry means "retry", never "this write was invalid". Absent when nobody reported one.
+		 *
+		 * Residual: a member that reaches consensus only via the scheduled commit-retry timer applies
+		 * after this method has already resolved, so its refusal arrives too late to appear here. The
+		 * member-side commit-promise guard (`validateCommitAgainstRefusedPend`) is the backstop for
+		 * that path.
+		 */
+		cohortPendRefusals?: { [peerId: string]: StaleFailure };
 	}> {
 		// The coordinating block id is derived HERE, from the key this method is already handed, rather
 		// than being set by each caller's message builder: a member's membership admission gate derives
@@ -345,11 +389,26 @@ export class ClusterCoordinator {
 			const localExecuted = this.localCluster?.wasTransactionExecuted?.(messageHash) ?? false;
 			const localPendResult = localExecuted ? this.localCluster?.getExecutedPendResult?.(messageHash) : undefined;
 			const localCommitResult = localExecuted ? this.localCluster?.getExecutedCommitResult?.(messageHash) : undefined;
+			// Self is excluded: this node's own member verdict is already carried, more directly and
+			// without the wire round trip, by `localPendResult` — and leaving it in both places would
+			// make the coordinator's "prefer local" rule ambiguous.
+			// Re-checked here rather than trusted: members are supposed to report only conflict-shaped
+			// refusals, but the field arrives off the wire, so anything else (a success, a bare-reason
+			// fault, a malformed entry) is dropped instead of being handed to a caller that would read
+			// it as a retryable conflict.
+			const selfId = this.localCluster?.peerId.toString();
+			const cohortPendRefusals: { [peerId: string]: StaleFailure } = {};
+			for (const [peerId, outcome] of Object.entries(result.applyOutcomes ?? {})) {
+				const pend = outcome?.pend;
+				if (peerId === selfId || pend === undefined || pend.success || !isConflictFailure(pend)) continue;
+				cohortPendRefusals[peerId] = pend;
+			}
 			return {
 				record: result,
 				localExecuted,
 				...(localPendResult === undefined ? {} : { localPendResult }),
-				...(localCommitResult === undefined ? {} : { localCommitResult })
+				...(localCommitResult === undefined ? {} : { localCommitResult }),
+				...(Object.keys(cohortPendRefusals).length === 0 ? {} : { cohortPendRefusals })
 			};
 		} finally {
 			const stored = this.transactions.get(messageHash);
@@ -743,6 +802,11 @@ export class ClusterCoordinator {
 			transactionsEntry: this.transactions.get(record.messageHash)
 		});
 
+		// Members that already held super-majority promises reach consensus during THIS round rather
+		// than during the broadcast below, so their apply verdicts arrive on these responses. Collect
+		// both; the broadcast's copy wins on overlap, being the later of the two.
+		mergeApplyOutcomes(record, collectApplyOutcomes(results.map((response, idx) => ({ peerId: peerIds[idx]!, response }))));
+
 		// Merge all commits into the record
 		for (const result of results.filter(Boolean) as ClusterRecord[]) {
 			log('cluster-tx:commit-merge-input', {
@@ -788,7 +852,8 @@ export class ClusterCoordinator {
 			// so each peer can independently reach consensus and execute the operations.
 			// Without this, only the coordinator's local cluster executes — remote peers
 			// never see enough commits to reach consensus on their own.
-			const { failures: broadcastFailures } = await this.broadcastMergedRecord(record, peerIds);
+			const { failures: broadcastFailures, applyOutcomes } = await this.broadcastMergedRecord(record, peerIds);
+			mergeApplyOutcomes(record, applyOutcomes);
 			if (broadcastFailures.length > 0) {
 				this.scheduleCommitRetry(record.messageHash, record, broadcastFailures);
 			} else {
@@ -812,22 +877,31 @@ export class ClusterCoordinator {
 	 * most transient stream errors without falling back to the scheduled retry timer.
 	 * Local cluster is invoked exactly once — local failures are fatal, not transient.
 	 */
-	private async broadcastMergedRecord(record: ClusterRecord, peerIds: string[]): Promise<{ failures: string[] }> {
+	private async broadcastMergedRecord(record: ClusterRecord, peerIds: string[]): Promise<{ failures: string[]; applyOutcomes?: ClusterRecord['applyOutcomes'] }> {
 		const results = await Promise.all(peerIds.map(async peerIdStr => {
 			try {
-				await this.updateMember(peerIdStr, record, this.commitBroadcastImmediateRetries, 'commit-broadcast');
-				return { peerId: peerIdStr, success: true as const };
+				const response = await this.updateMember(peerIdStr, record, this.commitBroadcastImmediateRetries, 'commit-broadcast');
+				return { peerId: peerIdStr, success: true as const, response };
 			} catch (err) {
 				log('cluster-tx:consensus-broadcast-error', {
 					messageHash: record.messageHash,
 					peerId: peerIdStr,
 					error: err instanceof Error ? err.message : String(err)
 				});
-				return { peerId: peerIdStr, success: false as const };
+				return { peerId: peerIdStr, success: false as const, response: undefined };
 			}
 		}));
 		const failures = results.filter(r => !r.success).map(r => r.peerId);
-		return { failures };
+		// This broadcast is where members actually apply the operations, so their responses carry the
+		// only report the coordinator ever gets of what each member's OWN storage said. Collecting it
+		// here is what lets a pend refused by a non-coordinating member reach the writer as a conflict
+		// instead of the fabricated success that used to fork the block.
+		//
+		// Each peer's entry is taken from that peer's OWN response and re-keyed under the peer we
+		// asked, so a member cannot report an outcome on another member's behalf by echoing a record
+		// full of entries. Unsigned and advisory either way — see ClusterRecord.applyOutcomes.
+		const applyOutcomes = collectApplyOutcomes(results);
+		return { failures, ...(applyOutcomes === undefined ? {} : { applyOutcomes }) };
 	}
 
 	/**

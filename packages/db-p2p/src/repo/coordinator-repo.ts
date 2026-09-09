@@ -553,6 +553,8 @@ export interface ICoordinatorClusterSeam {
 		localExecuted: boolean;
 		localPendResult?: PendResult;
 		localCommitResult?: CommitResult;
+		/** Other cohort members' conflict-shaped pend refusals; see `ClusterCoordinator.executeClusterTransaction`. */
+		cohortPendRefusals?: { [peerId: string]: StaleFailure };
 	}>;
 	recoverTransactions(): Promise<void>;
 }
@@ -1976,13 +1978,20 @@ export class CoordinatorRepo implements IRepo {
 		};
 
 		try {
-			const { localExecuted, localPendResult } = await this.coordinator.executeClusterTransaction(coordinatingBlockIds[0]!, message, options);
+			const { localExecuted, localPendResult, cohortPendRefusals } = await this.coordinator.executeClusterTransaction(coordinatingBlockIds[0]!, message, options);
+			// The first cohort refusal in peer-id order, so two coordinators facing the same cohort
+			// answer with the same one. Which refusal is reported does not change the outcome — every
+			// entry is conflict-shaped and every one means "rebase and retry" — only which `pending` /
+			// `missing` lists the writer sees, and a stable choice keeps that reproducible.
+			const remoteRefusal = Object.entries(cohortPendRefusals ?? {})
+				.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)[0];
 			this.log('coordinator-repo:pend-cluster-complete', {
 				actionId: request.actionId,
 				localExecuted,
 				localVerdict: localPendResult === undefined ? 'none'
 					: localPendResult.success ? 'success'
-						: isConflictFailure(localPendResult) ? 'conflict' : 'fault'
+						: isConflictFailure(localPendResult) ? 'conflict' : 'fault',
+				cohortRefusals: Object.keys(cohortPendRefusals ?? {})
 			});
 			// Only call storageRepo if local cluster didn't already execute during consensus
 			if (!localExecuted) {
@@ -2006,7 +2015,25 @@ export class CoordinatorRepo implements IRepo {
 			// commit that reached commit-consensus IS the authoritative commit (Theorem 9), whereas a
 			// pend that reached pend-consensus may still have been stored by nobody.
 			if (localPendResult !== undefined) {
-				if (localPendResult.success || isConflictFailure(localPendResult)) {
+				// A local conflict outranks a remote one: same verdict, but this node read the storage
+				// itself rather than being told about it.
+				if (!localPendResult.success && isConflictFailure(localPendResult)) {
+					return localPendResult;
+				}
+				// A local SUCCESS does not settle it. This node's own member applying the pend cleanly
+				// says nothing about a sibling that refused it — that asymmetry is precisely what let a
+				// coordinator report a win for a write its own cohort had already refused, then commit
+				// it and fork the block at that revision. So a reported cohort refusal is answered as
+				// the retryable conflict it is, and the writer rebases before any commit round runs.
+				if (localPendResult.success && remoteRefusal !== undefined) {
+					this.log('coordinator-repo:pend-remote-refusal', {
+						actionId: request.actionId,
+						peerId: remoteRefusal[0],
+						reason: remoteRefusal[1].reason
+					});
+					return remoteRefusal[1];
+				}
+				if (localPendResult.success) {
 					return localPendResult;
 				}
 				// A bare-reason refusal (no pending/missing — e.g. a local validation-hook fault)

@@ -1,7 +1,7 @@
 import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
-import { blockIdsForTransforms, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
+import { blockIdsForTransforms, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
 import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest, clusterVoteSigningPayload, clusterVoteVerificationPayload } from "@optimystic/db-core";
 import { verifyInvalidationCertificate, type ArbitratorSetRecompute } from "../dispute/invalidation.js";
 import { buildCommitCert, invalidationActionId } from "./commit-cert.js";
@@ -297,6 +297,14 @@ export class ClusterMember implements ICluster {
 	// at apply, and without this verdict the coordinator fabricates a success no member durably
 	// stored. Pruned alongside executedTransactions (same TTL).
 	private executedCommitResults: Map<string, CommitResult> = new Map();
+	// Conflict-shaped pend refusals this member's storage produced at consensus-apply, keyed by the
+	// refused action's id rather than by messageHash. The messageHash-keyed map above cannot serve the
+	// commit-promise guard: a commit is a DIFFERENT message with a different hash, so a member holding
+	// "I refused action X's pend" has no way to find that verdict when X's commit arrives to be voted
+	// on. Keyed by actionId, it does. Same TTL, pruning and rollback discipline as its sibling —
+	// see {@link refusedPendConflictsWithLocalState} for how a stale entry is prevented from vetoing a
+	// commit the rest of the cohort holds fine. (-> refusedAt timestamp)
+	private refusedPendActions: Map<ActionId, number> = new Map();
 	// Fast in-memory dedup for applied invalidations, keyed `${invalidatedActionId}:${disputeId}`.
 	// The durable source of truth is the invalidation log entry (Log.findInvalidation, re-checked
 	// inside the sink); this map only spares redundant work when the same invalidation reaches
@@ -408,6 +416,7 @@ export class ClusterMember implements ICluster {
 		this.cleanupQueue.length = 0;
 		this.executedPendResults.clear();
 		this.executedCommitResults.clear();
+		this.refusedPendActions.clear();
 	}
 
 	/**
@@ -660,12 +669,40 @@ export class ClusterMember implements ICluster {
 		// Skip propagation - the coordinator manages distribution
 		// await this.propagateIfNeeded(currentRecord);
 
+		// Stamp our own apply verdict on the response, AFTER the phase loop has run (and therefore
+		// after any consensus apply this delivery triggered). This is the return channel that closes
+		// the non-coordinating-member hole: a member that refused the pend at apply is the only node
+		// that knows it, and until now that verdict never left the member. Attached here rather than
+		// inside the Consensus branch so a redelivery of an already-applied record answers with the
+		// same verdict instead of an empty one. Deliberately not folded into the persisted state: it
+		// is a property of this response, not of the transaction the member is holding.
+		currentRecord = this.withOwnApplyOutcome(currentRecord);
+
 		log('cluster-member:update-complete', {
 			messageHash: record.messageHash,
 			promiseCount: Object.keys(currentRecord.promises).length,
 			commitCount: Object.keys(currentRecord.commits).length
 		});
 		return currentRecord;
+	}
+
+	/**
+	 * Add this member's own conflict-shaped pend verdict to a record's {@link ClusterRecord.applyOutcomes},
+	 * when storage produced one for this transaction. A success, a bare-reason fault, or no retained
+	 * verdict at all leaves the record untouched — the coordinator's rule is "an entry means retry",
+	 * so an entry that does not mean retry must not exist.
+	 *
+	 * The member never signs this and never writes another peer's entry.
+	 */
+	private withOwnApplyOutcome(record: ClusterRecord): ClusterRecord {
+		const verdict = this.executedPendResults.get(record.messageHash);
+		if (verdict === undefined || verdict.success || !isConflictFailure(verdict)) {
+			return record;
+		}
+		return {
+			...record,
+			applyOutcomes: { ...record.applyOutcomes, [this.peerId.toString()]: { pend: verdict } }
+		};
 	}
 
 	/**
@@ -721,10 +758,18 @@ export class ClusterMember implements ICluster {
 			existing.commits, incoming.commits, 'commit', existing.messageHash
 		);
 
+		// Union the advisory apply outcomes per peer, first-seen wins. A peer only ever writes its own
+		// entry, so "first-seen wins" is per-peer idempotence, not a conflict rule. Omitted entirely
+		// when neither side carries any, so an ordinary record gains no empty object.
+		const mergedOutcomes = (existing.applyOutcomes || incoming.applyOutcomes)
+			? { ...incoming.applyOutcomes, ...existing.applyOutcomes }
+			: undefined;
+
 		return {
 			...existing,
 			promises: mergedPromises,
-			commits: mergedCommits
+			commits: mergedCommits,
+			...(mergedOutcomes === undefined ? {} : { applyOutcomes: mergedOutcomes })
 		};
 	}
 
@@ -1095,6 +1140,14 @@ export class ClusterMember implements ICluster {
 		if (!commitRevValidation.valid) {
 			return commitRevValidation;
 		}
+		// Then our own refusal history: a commit whose pend THIS member refused, where local state
+		// still corroborates the refusal. Runs after the revision check because that one is sharper
+		// (it names the rival revision) and catches the same commit whenever the rival has already
+		// applied here; this arm covers the window where it has not.
+		const refusedPendValidation = await this.validateCommitAgainstRefusedPend(record);
+		if (!refusedPendValidation.valid) {
+			return refusedPendValidation;
+		}
 		return await this.validateCommitOperations(record);
 	}
 
@@ -1461,8 +1514,10 @@ export class ClusterMember implements ICluster {
 				// moves that verdict into the phase where the cohort aggregates it, so the loser is
 				// refused with a real answer instead of burning a consensus round it cannot win. A
 				// member that has not yet applied the rival's pend has no record and simply abstains
-				// from this reason; the coordinator returning the retained apply verdict
-				// (getExecutedPendResult) catches that residual. Self is excluded so a redelivered pend
+				// from this reason; the apply-time verdict catches that residual — retained locally
+				// (getExecutedPendResult) for the coordinating node's own member, and returned to the
+				// coordinator on the response record (ClusterRecord.applyOutcomes) by every other
+				// member. Self is excluded so a redelivered pend
 				// for this same action stays approvable. An unavailable block carries no `pendings` and
 				// abstains (the rev branch above already fail-closes when a revision claim is at stake).
 				// Reason stays plain prose: it is fed to computeSigningPayload and carried as
@@ -1545,18 +1600,23 @@ export class ClusterMember implements ICluster {
 	 * abstains. Reason stays plain prose — it is fed to computeSigningPayload and carried as
 	 * Signature.rejectReason, exactly like the stale-revision pend reject.
 	 *
-	 * Residual (see the commit-tier handoff): a member that signed the winner's commit but has not
-	 * yet APPLIED it sits in a window where it holds neither the winner's record (reservation
-	 * dropped at commit-sign, `shouldPersist = false`) nor the winner's revision (storage still
-	 * behind) — it abstains here. A capability-less member, or one with history truncated below
-	 * `latest`, abstains at `latest.rev > commit.rev` too. A rival's commit can therefore still
-	 * pass the promise round if EVERY member is simultaneously in one of those states — on a fast
-	 * cohort that window is the COMMON case, not the corner. The backstop is downstream of
-	 * consensus: every member's apply then refuses the rival as stale, the coordinating node's own
-	 * member retains that refusal (`getExecutedCommitResult`), and `CoordinatorRepo.commit`
-	 * confirms the rival against local storage and answers the writer with a retryable conflict
-	 * instead of a fabricated success. `ConflictRaceLostError` conversion and classified
-	 * rejections close the re-drive route the same way.
+	 * Residual (narrowed, see below): a member that signed the winner's commit but has not yet
+	 * APPLIED it sits in a window where it holds neither the winner's record (reservation dropped at
+	 * commit-sign, `shouldPersist = false`) nor the winner's revision (storage still behind) — it
+	 * abstains here. A capability-less member, or one with history truncated below `latest`, abstains
+	 * at `latest.rev > commit.rev` too. A rival's commit can therefore still pass THIS check if every
+	 * member is simultaneously in one of those states — on a fast cohort that window is the COMMON
+	 * case, not the corner.
+	 *
+	 * What now covers it: {@link validateCommitAgainstRefusedPend} rejects the same commit from the
+	 * other direction — not "did a rival take the revision" but "did I already refuse this action's
+	 * pend" — which is precisely the state a member is left in when it lost the race in the
+	 * promise→apply window. Downstream of consensus the backstop still stands: every member's apply
+	 * refuses the rival as stale, the coordinating node's own member retains that refusal
+	 * (`getExecutedCommitResult`), and `CoordinatorRepo.commit` confirms the rival against local
+	 * storage and answers the writer with a retryable conflict instead of a fabricated success.
+	 * `ConflictRaceLostError` conversion and classified rejections close the re-drive route the same
+	 * way.
 	 */
 	private async validateCommitRevisions(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
 		for (const operation of record.message.operations) {
@@ -1630,6 +1690,94 @@ export class ClusterMember implements ICluster {
 			}
 		}
 		return { valid: true };
+	}
+
+	/**
+	 * Promise-round check that this member is not about to co-sign the commit of an action whose PEND
+	 * its own storage refused.
+	 *
+	 * The hole this closes: the commit-round vote is deliberately blind ({@link getTransactionPhase}
+	 * signs whenever promise approvals reach super-majority), and both other commit-promise checks
+	 * abstain for a member that holds no pend of the committing action — which is exactly the state a
+	 * member is in *because* it refused that pend. So a member could refuse action X's pend as
+	 * conflicting with a rival, and milliseconds later sign X's commit, letting X reach commit
+	 * consensus at a revision this member will never durably hold.
+	 *
+	 * Two conditions, both required:
+	 *  (a) this member retains a conflict-shaped pend refusal for `commit.actionId`
+	 *      ({@link refusedPendActions}), and
+	 *  (b) local storage STILL corroborates it — a rival pending action holds one of the commit's
+	 *      blocks, or a different action already took `commit.rev`.
+	 *
+	 * (b) is what keeps this from regressing the lagging-member and cohort-drift tolerances that
+	 * {@link validateCommitRevisions} documents. A member that merely *missed* the pend retains no
+	 * refusal and abstains exactly as before. A member whose refusal has since been settled — the
+	 * rival cancelled, the reservation released — abstains too, rather than vetoing a commit the rest
+	 * of the cohort is holding perfectly well. The retention is in-memory and TTL'd, so a restart also
+	 * degrades to the previous abstain behaviour rather than to a stuck veto.
+	 *
+	 * Effect on a small cohort: one reject makes super-majority unreachable, so the commit never
+	 * assembles consensus and the write fails loudly instead of forking the block. That is the
+	 * intended outcome here — a clean retryable conflict answer is {@link ClusterRecord.applyOutcomes}'
+	 * job, and this arm is the backstop for the paths that channel cannot reach (a member that applies
+	 * late, via the scheduled commit-retry timer, after the coordinator has already answered).
+	 *
+	 * Never throws out of the vote path: a read fault is an abstain, same rule as its two siblings.
+	 */
+	private async validateCommitAgainstRefusedPend(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
+		for (const operation of record.message.operations) {
+			if (!('commit' in operation)) {
+				continue;
+			}
+			const commit = operation.commit;
+			if (!this.refusedPendActions.has(commit.actionId)) {
+				continue;
+			}
+			const corroboration = await this.refusedPendConflictsWithLocalState(commit);
+			if (corroboration === undefined) {
+				continue;
+			}
+			log('cluster-member:validation-refused-pend-commit', {
+				messageHash: record.messageHash,
+				actionId: commit.actionId,
+				rev: commit.rev,
+				corroboration
+			});
+			// Prose only, for the same reason every other vote reason here is: it is fed to
+			// computeSigningPayload and carried as Signature.rejectReason.
+			return { valid: false, reason: `refused pend: this member refused action ${commit.actionId}'s pend and ${corroboration}` };
+		}
+		return { valid: true };
+	}
+
+	/**
+	 * Condition (b) of {@link validateCommitAgainstRefusedPend}: does local storage still back up a
+	 * retained pend refusal for this commit? Returns a short prose fragment naming what corroborates
+	 * it, or `undefined` for "no longer corroborated — abstain" (which a read fault also yields).
+	 */
+	private async refusedPendConflictsWithLocalState(commit: CommitRequest): Promise<string | undefined> {
+		let blockResults: Awaited<ReturnType<IRepo['get']>>;
+		try {
+			blockResults = await this.storageRepo.get({ blockIds: commit.blockIds });
+		} catch (err) {
+			log('cluster-member:refused-pend-read-error', {
+				actionId: commit.actionId,
+				error: err instanceof Error ? err.message : String(err)
+			});
+			return undefined; // a local read fault is an abstain, never an escape out of the vote path
+		}
+		for (const blockId of commit.blockIds) {
+			const state = blockResults[blockId]?.state;
+			const rivals = (state?.pendings ?? []).filter(actionId => actionId !== commit.actionId);
+			if (rivals.length > 0) {
+				return `block ${blockId} is still held by unresolved action(s) ${rivals.join(', ')}`;
+			}
+			const latest = state?.latest;
+			if (latest?.rev === commit.rev && !isOwnRevision(latest, commit.rev, commit.actionId)) {
+				return `block ${blockId} rev ${commit.rev} is already committed by a different action`;
+			}
+		}
+		return undefined;
 	}
 
 	/**
@@ -1825,9 +1973,14 @@ export class ClusterMember implements ICluster {
 			// divergence is absorbed inside applyConsensusOperation and never reaches here.
 			// A retained pend verdict rolls back with the marker: it belongs to an apply
 			// that is now considered not-executed, and a re-run will retain a fresh one.
+			// The actionId-keyed refusals for this record's pend operations go with it — leaving
+			// one behind would let a rolled-back apply veto that action's commit forever.
 			this.executedTransactions.delete(record.messageHash);
 			this.executedPendResults.delete(record.messageHash);
 			this.executedCommitResults.delete(record.messageHash);
+			for (const operation of record.message.operations) {
+				if ('pend' in operation) this.refusedPendActions.delete(operation.pend.actionId);
+			}
 			throw err;
 		}
 
@@ -1906,6 +2059,14 @@ export class ClusterMember implements ICluster {
 			// already committed) is the optimistic-concurrency verdict, and swallowing it acknowledged
 			// writes that no member stored.
 			this.executedPendResults.set(messageHash, result);
+			// Second, actionId-keyed retention for the commit tier: this same refusal must still be
+			// findable when THIS action's commit record (a different messageHash) arrives for a
+			// promise vote, so a member cannot co-sign the commit of a pend it just refused. Only
+			// conflict-shaped refusals are kept — a bare-reason fault is local trouble, not evidence
+			// that a rival holds the blocks, and must not veto the cohort's commit.
+			if (!result.success && isConflictFailure(result)) {
+				this.refusedPendActions.set(operation.pend.actionId, this.now());
+			}
 			if (!result.success) {
 				log('cluster-member:consensus-pend-diverged', {
 					messageHash,
@@ -1996,10 +2157,12 @@ export class ClusterMember implements ICluster {
 				// lets the coordinating node convert its OWN member's rival-confirmed refusal into a
 				// conflict answer — that last guard is what closes the signed-but-not-yet-applied
 				// window, where two commits for one revision both assemble consensus because signing
-				// drops each member's reservation before applying advances its storage. If
-				// consensus-without-durability is ever observed again, look at those guards' abstain
-				// residuals (non-coordinating members' verdicts are not threaded back; capability-less
-				// or history-truncated storage abstains), not at this branch.
+				// drops each member's reservation before applying advances its storage —
+				// `validateCommitAgainstRefusedPend` now refuses to sign that commit in the first
+				// place on any member that refused its pend. If consensus-without-durability is ever
+				// observed again, look at those guards' remaining abstain residuals (capability-less
+				// or history-truncated storage; a member whose refusal has aged out of retention),
+				// not at this branch.
 				if (result.missing?.length) {
 					log('cluster-member:consensus-commit-diverged', {
 						messageHash,
@@ -2366,6 +2529,12 @@ export class ClusterMember implements ICluster {
 				this.executedTransactions.delete(messageHash);
 				this.executedPendResults.delete(messageHash);
 				this.executedCommitResults.delete(messageHash);
+			}
+		}
+		// Prune actionId-keyed pend refusals on the same TTL as the verdicts they were derived from.
+		for (const [actionId, refusedAt] of Array.from(this.refusedPendActions.entries())) {
+			if (refusedAt < expirationThreshold) {
+				this.refusedPendActions.delete(actionId);
 			}
 		}
 		// Prune old applied-invalidation dedup markers on the same TTL.

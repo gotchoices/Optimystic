@@ -1,4 +1,5 @@
 import type { RepoMessage } from "../network/repo-protocol.js";
+import type { PendResult } from "../network/struct.js";
 
 /**
  * One member's vote on a cluster transaction, in either the promise or the commit map.
@@ -53,6 +54,17 @@ export type ClusterPeers = {
 	};
 };
 
+/**
+ * One member's own report of what its storage did with this transaction at consensus-apply time; see
+ * {@link ClusterRecord.applyOutcomes} for the trust rules. Only the pend arm exists today — a commit
+ * refusal is not reported this way, because a commit that reached commit-consensus is authoritative
+ * (the coordinator's own retained verdict plus the commit-promise guard cover that tier instead).
+ */
+export type MemberApplyOutcome = {
+	/** This member's storage refused the record's pend with a conflict-shaped result. */
+	pend?: PendResult;
+};
+
 export type ClusterRecord = {
 	messageHash: string;	// Serves as a unique identifier for the clustered transaction record
 	peers: ClusterPeers;
@@ -84,6 +96,28 @@ export type ClusterRecord = {
 	networkSizeHint?: number;
 	/** Confidence in the network size estimate (0-1) */
 	networkSizeConfidence?: number;
+	/**
+	 * What each member's OWN storage answered when it applied this record's operations at consensus,
+	 * keyed by peer id. Advisory and **unsigned** — no hash covers it — and deliberately so: it is
+	 * written by a member *after* the votes are cast, on the response it hands back, so no signed
+	 * payload could carry it without a further round trip.
+	 *
+	 * Members set only their own entry, and only for a *conflict-shaped* pend refusal (one carrying
+	 * `pending` or `missing`, per `isConflictFailure`) — the optimistic-concurrency verdict that a
+	 * rival holds the blocks or already took the revision. Successes and bare-reason faults are
+	 * omitted: a bare fault stays tolerated local divergence, mirroring the coordinator's own
+	 * local-verdict arm.
+	 *
+	 * Why unsigned is acceptable: a hostile entry can only *downgrade* a reported pend success into a
+	 * retryable conflict, which the writer answers by rebasing and trying again. The same member
+	 * could already force strictly worse outcomes with a signed reject or conflict vote, so this adds
+	 * no attack surface beyond retry pressure — and failing toward retry is the correct direction for
+	 * optimistic concurrency. Never treat an entry here as evidence of anything but "retry".
+	 *
+	 * Old peers never set it and old coordinators ignore it, so it is wire-compatible in both
+	 * directions.
+	 */
+	applyOutcomes?: { [peerId: string]: MemberApplyOutcome };
 	/** Transaction proceeded despite minority rejections */
 	disputed?: boolean;
 	/** Evidence of the dispute: which peers rejected and why */

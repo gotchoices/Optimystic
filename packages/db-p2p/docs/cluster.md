@@ -218,7 +218,7 @@ with `conflict: true`, never as a throw: db-core retries a thrown commit verbati
 dead commit can assemble a consensus no member will durably store), or the legacy super-majority
 error reserved for a genuinely silent cohort.
 
-**What `evaluatePromise` checks for a commit operation.** Two independent checks, both promise-round
+**What `evaluatePromise` checks for a commit operation.** Three independent checks, all promise-round
 only (the commit-round vote is deliberately blind, so a promise vote is the only one that carries "I
 checked this"):
 
@@ -227,8 +227,31 @@ checked this"):
    member is behind the requested revision, when the same action already holds it (idempotent
    redelivery), or when the member is past it and its revision index cannot name who took it
    (`IRevisionActionReader.getRevisionAction` absent, truncated, or faulting).
-2. `validateCommitOperations` — does the declared per-block content digest reproduce locally? (See
+2. `validateCommitAgainstRefusedPend` — did THIS member's own storage refuse this action's *pend*, and
+   does local state still corroborate that refusal (a rival pending still holds one of the blocks, or a
+   different action already took the revision)? Reject if so. This is the same question as check 1 asked
+   from the other end, and it covers the window check 1 cannot: a member that lost the race between the
+   promise vote and the consensus apply holds no pend of the committing action, which makes both other
+   checks abstain — so without this it would blindly co-sign the commit of a write it had just refused.
+   A member that merely *missed* the pend retains no refusal and abstains exactly as before, which is
+   what keeps the lagging-member tolerance intact; so does a member whose refusal is no longer
+   corroborated, or whose retention has aged out.
+3. `validateCommitOperations` — does the declared per-block content digest reproduce locally? (See
    `docs/correctness.md` § Content digest declaration.)
+
+**What a member reports back after applying.** Consensus apply happens inside the member's `update`
+call, so the record it answers with can carry what its own storage said. A member that refused a pend
+with a conflict-shaped result (a rival's unresolved action holds the blocks, or the revision is already
+committed) stamps that verdict onto `ClusterRecord.applyOutcomes` under its own peer id. The
+coordinator collects it off the consensus broadcast and `CoordinatorRepo.pend` answers the writer with
+that conflict rather than a fabricated success.
+
+The field is unsigned and advisory — it is written *after* the votes are cast, so no signed payload
+could carry it without another round trip. That is acceptable because an entry can only *downgrade* a
+reported success into a retryable conflict, and any member could already force strictly worse outcomes
+with a signed reject or conflict vote. Read it as "retry", never as "this write was invalid". A member
+writes only its own entry, the coordinator keys each entry by the peer it actually asked, and it
+re-checks the shape rather than trusting it.
 
 **Super-Majority Validation** (in ClusterCoordinator):
 ```typescript

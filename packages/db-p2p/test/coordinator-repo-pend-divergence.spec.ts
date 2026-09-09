@@ -75,7 +75,7 @@ const makeStorageRepo = (get: (gets: BlockGets) => Promise<GetBlockResults>): IR
  */
 const makeRepo = (
 	storageRepo: IRepo,
-	consensus: { localPendResult?: PendResult } | { throws: Error }
+	consensus: { localPendResult?: PendResult; cohortPendRefusals?: { [peerId: string]: StaleFailure } } | { throws: Error }
 ): CoordinatorRepo => {
 	const repo = new CoordinatorRepo(
 		keyNetwork,
@@ -87,7 +87,7 @@ const makeRepo = (
 		async getClusterSize(): Promise<number> { return 3; },
 		async getClusterPeerIds(): Promise<string[]> { return ['peer-1', 'peer-2', 'peer-3']; },
 		async recoverTransactions(): Promise<void> { /* unused on these paths */ },
-		async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, localPendResult?: PendResult }> {
+		async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, localPendResult?: PendResult, cohortPendRefusals?: { [peerId: string]: StaleFailure } }> {
 			if ('throws' in consensus) throw consensus.throws;
 			return { record: RECORD, localExecuted: true, ...consensus };
 		}
@@ -154,6 +154,67 @@ describe('CoordinatorRepo pend — retained storage verdict after cluster consen
 		const result = await repo.pend(REQUEST);
 
 		expect(result).to.deep.equal(verdict);
+	});
+
+	// ── Cohort members' verdicts, not just this node's own ──
+	//
+	// Ticket: cohort-pend-refusal-must-reach-the-coordinator. Threading only the coordinating node's
+	// OWN member verdict left the case that actually forked a block in the wild: the refusing member
+	// was a DIFFERENT node, its verdict never left it, and a local success was reported as a win. The
+	// cases below pin the aggregate arm.
+
+	it("returns a cohort member's refusal even when this node's own member succeeded", async () => {
+		const localSuccess: PendResult = { success: true, pending: [], blockIds: [BLOCK] };
+		const remote: StaleFailure = {
+			success: false, conflict: true, pending: [{ blockId: BLOCK, actionId: 'a-winner' }]
+		};
+		const repo = makeRepo(makeStorageRepo(emptyGet), {
+			localPendResult: localSuccess,
+			cohortPendRefusals: { 'peer-2': remote }
+		});
+
+		const result = await repo.pend(REQUEST);
+
+		expect(result.success, 'a local success does not settle it — a sibling refused').to.equal(false);
+		expect(isConflictFailure(result as StaleFailure)).to.equal(true);
+		expect(result).to.deep.equal(remote);
+	});
+
+	it("prefers this node's own refusal when both refused", async () => {
+		// Same verdict either way; the local one is preferred because this node read the storage
+		// itself rather than being told about it.
+		const local: PendResult = {
+			success: false, conflict: true, pending: [{ blockId: BLOCK, actionId: 'a-local-rival' }]
+		};
+		const remote: StaleFailure = {
+			success: false, conflict: true, pending: [{ blockId: BLOCK, actionId: 'a-remote-rival' }]
+		};
+		const repo = makeRepo(makeStorageRepo(emptyGet), { localPendResult: local, cohortPendRefusals: { 'peer-2': remote } });
+
+		expect(await repo.pend(REQUEST)).to.deep.equal(local);
+	});
+
+	it('picks the same cohort refusal every time when several members refused', async () => {
+		// Lowest peer id wins, so two coordinators facing the same cohort answer identically. Which
+		// one is reported changes nothing about the outcome — every entry means "rebase and retry".
+		const first: StaleFailure = { success: false, conflict: true, pending: [{ blockId: BLOCK, actionId: 'a-first' }] };
+		const second: StaleFailure = { success: false, conflict: true, pending: [{ blockId: BLOCK, actionId: 'a-second' }] };
+		const repo = makeRepo(makeStorageRepo(emptyGet), {
+			localPendResult: { success: true, pending: [], blockIds: [BLOCK] },
+			cohortPendRefusals: { 'peer-9': second, 'peer-2': first }
+		});
+
+		expect(await repo.pend(REQUEST)).to.deep.equal(first);
+	});
+
+	it('ignores cohort refusals when this node retained no verdict at all', async () => {
+		// No local verdict means the member predates the retention, restarted, or the TTL pruned it —
+		// the fabricated-success fallback. A cohort refusal does not change that: without a local
+		// apply there is no evidence this node's own storage even ran the pend.
+		const remote: StaleFailure = { success: false, conflict: true, pending: [{ blockId: BLOCK, actionId: 'a-winner' }] };
+		const repo = makeRepo(makeStorageRepo(emptyGet), { cohortPendRefusals: { 'peer-2': remote } });
+
+		expect((await repo.pend(REQUEST)).success).to.equal(true);
 	});
 
 	it('falls back to the fabricated success when no verdict was retained', async () => {
