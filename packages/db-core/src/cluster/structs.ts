@@ -116,6 +116,14 @@ export type ClusterRecord = {
 	 *
 	 * Old peers never set it and old coordinators ignore it, so it is wire-compatible in both
 	 * directions.
+	 *
+	 * NOTE: unlike a signed reject/conflict vote, an entry here is unattributable — nothing verifies
+	 * it came from the peer it is keyed under beyond the coordinator taking each peer's entry from
+	 * that peer's own response, and no reputation penalty can be pinned on a false one. Fine while the
+	 * worst it buys is retry pressure a signed vote could already produce. If a member is ever
+	 * observed reporting refusals it did not make — writes on a block failing their retry budget with
+	 * `coordinator-repo:pend-remote-refusal` naming one peer over and over — the fix is to make the
+	 * entry attributable (sign it on a follow-up round) rather than to start trusting it less.
 	 */
 	applyOutcomes?: { [peerId: string]: MemberApplyOutcome };
 	/** Transaction proceeded despite minority rejections */

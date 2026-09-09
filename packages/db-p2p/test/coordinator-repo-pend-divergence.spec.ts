@@ -207,14 +207,84 @@ describe('CoordinatorRepo pend — retained storage verdict after cluster consen
 		expect(await repo.pend(REQUEST)).to.deep.equal(first);
 	});
 
-	it('ignores cohort refusals when this node retained no verdict at all', async () => {
-		// No local verdict means the member predates the retention, restarted, or the TTL pruned it —
-		// the fabricated-success fallback. A cohort refusal does not change that: without a local
-		// apply there is no evidence this node's own storage even ran the pend.
+	it('returns a cohort refusal even when this node retained no verdict at all', async () => {
+		// No local verdict means the member predates the retention, restarted, or the TTL pruned it,
+		// and the fallback is a fabricated success. A restart on the coordinating node must not
+		// resurrect exactly the acknowledgement this ticket removed: a sibling that reports a refusal
+		// is positive evidence the pend lost, and it outranks a success this node never actually read.
 		const remote: StaleFailure = { success: false, conflict: true, pending: [{ blockId: BLOCK, actionId: 'a-winner' }] };
 		const repo = makeRepo(makeStorageRepo(emptyGet), { cohortPendRefusals: { 'peer-2': remote } });
 
-		expect((await repo.pend(REQUEST)).success).to.equal(true);
+		expect(await repo.pend(REQUEST)).to.deep.equal(remote);
+	});
+
+	it('returns a cohort refusal when this node’s own member never executed the pend', async () => {
+		// `localExecuted: false` sends the pend down the local-storage fallback. That storage knows
+		// nothing about the sibling that refused, so its success is subject to the same rule.
+		const remote: StaleFailure = { success: false, conflict: true, pending: [{ blockId: BLOCK, actionId: 'a-winner' }] };
+		const repo = new CoordinatorRepo(
+			keyNetwork,
+			((_p: PeerId) => ({} as unknown as ClusterClient)),
+			{
+				get: emptyGet,
+				async pend(): Promise<PendResult> { return { success: true, pending: [], blockIds: [BLOCK] }; },
+				async cancel(): Promise<void> { },
+				async commit(): Promise<CommitResult> { throw new Error('not under test'); }
+			},
+			{ clusterSize: 3 }
+		);
+		(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
+			async getClusterSize(): Promise<number> { return 3; },
+			async getClusterPeerIds(): Promise<string[]> { return ['peer-1', 'peer-2', 'peer-3']; },
+			async recoverTransactions(): Promise<void> { },
+			async executeClusterTransaction() {
+				return { record: RECORD, localExecuted: false, cohortPendRefusals: { 'peer-2': remote } };
+			}
+		};
+
+		expect(await repo.pend(REQUEST)).to.deep.equal(remote);
+	});
+
+	it('does not soften a local hard fault into a retry because a sibling raced', async () => {
+		// A bare-reason local failure on the fallback path is a real failure, not an
+		// optimistic-concurrency loss. The cohort refusal may only downgrade a SUCCESS; letting it
+		// overwrite a fault would tell the writer to retry something that will fail the same way.
+		const localFault: PendResult = { success: false, reason: 'Transaction validation failed' };
+		const remote: StaleFailure = { success: false, conflict: true, pending: [{ blockId: BLOCK, actionId: 'a-winner' }] };
+		const repo = new CoordinatorRepo(
+			keyNetwork,
+			((_p: PeerId) => ({} as unknown as ClusterClient)),
+			{
+				get: emptyGet,
+				async pend(): Promise<PendResult> { return localFault; },
+				async cancel(): Promise<void> { },
+				async commit(): Promise<CommitResult> { throw new Error('not under test'); }
+			},
+			{ clusterSize: 3 }
+		);
+		(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
+			async getClusterSize(): Promise<number> { return 3; },
+			async getClusterPeerIds(): Promise<string[]> { return ['peer-1', 'peer-2', 'peer-3']; },
+			async recoverTransactions(): Promise<void> { },
+			async executeClusterTransaction() {
+				return { record: RECORD, localExecuted: false, cohortPendRefusals: { 'peer-2': remote } };
+			}
+		};
+
+		expect(await repo.pend(REQUEST)).to.deep.equal(localFault);
+	});
+
+	it('returns a cohort refusal even when the local verdict was a bare-reason fault', async () => {
+		// The bare fault alone is tolerated as local divergence and falls through to the fabricated
+		// success — which the cohort refusal then downgrades. Local trouble must not swallow a
+		// sibling's evidence that the pend lost outright.
+		const remote: StaleFailure = { success: false, conflict: true, pending: [{ blockId: BLOCK, actionId: 'a-winner' }] };
+		const repo = makeRepo(makeStorageRepo(emptyGet), {
+			localPendResult: { success: false, reason: 'local validation hook failed' },
+			cohortPendRefusals: { 'peer-2': remote }
+		});
+
+		expect(await repo.pend(REQUEST)).to.deep.equal(remote);
 	});
 
 	it('falls back to the fabricated success when no verdict was retained', async () => {

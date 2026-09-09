@@ -34,7 +34,7 @@ import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import type {
 	ClusterRecord, ClusterPeers, ClusterConsensusConfig, IKeyNetwork, ICluster, IBlock, BlockHeader,
-	BlockId, PendRequest, RepoMessage, Signature, StaleFailure, Transforms
+	BlockId, PendRequest, PendResult, RepoMessage, Signature, StaleFailure, Transforms
 } from '@optimystic/db-core';
 import { isConflictFailure } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
@@ -301,12 +301,14 @@ describe('a member that refused a pend will not sign that action\'s commit', () 
 	 * already holds the block), leaving the member in the state the guard reads: a retained,
 	 * conflict-shaped refusal for that action.
 	 */
-	const refuseLoserPend = async (): Promise<void> => {
+	const driveLoserPendConsensus = async (nonce = 0): Promise<PendResult | undefined> => {
 		const peers = makeClusterPeers([self, other]);
 		const message: RepoMessage = {
 			operations: [{ pend: pendFor(LOSER_ACTION) }],
 			coordinatingBlockIds: [BLOCK],
-			expiration: Date.now() + 30000
+			// The nonce only exists to give a second round its own messageHash — a redelivery of the
+			// same hash short-circuits on the executed marker and never re-applies.
+			expiration: Date.now() + 30000 + nonce
 		};
 		const base: ClusterRecord = { messageHash: await computeMessageHash(message), message, peers, promises: {}, commits: {} };
 		const promised: ClusterRecord = {
@@ -319,11 +321,19 @@ describe('a member that refused a pend will not sign that action\'s commit', () 
 		// The peer's commit is already present, so the member's own commit completes the majority and
 		// the same delivery carries it straight through to consensus — where it applies the pend and
 		// its storage refuses.
-		const answer = await member.update({
+		await member.update({
 			...promised,
 			commits: { [other.peerId.toString()]: await makeSignedCommit(other.privateKey, promised) }
 		});
-		const outcome = answer.applyOutcomes?.[self.peerId.toString()]?.pend;
+		// Read the verdict off the member's OWN retention, not off the response record: this arm must
+		// not silently depend on arm 1's return channel being wired, or neutering arm 1 breaks these
+		// tests in their setup and they stop testing arm 2 at all.
+		return member.getExecutedPendResult(base.messageHash);
+	};
+
+	/** Drive the loser's pend to consensus and assert this member's storage refused it. */
+	const refuseLoserPend = async (): Promise<void> => {
+		const outcome = await driveLoserPendConsensus();
 		expect(outcome?.success, 'the member\'s storage must have refused the loser\'s pend').to.equal(false);
 	};
 
@@ -376,6 +386,24 @@ describe('a member that refused a pend will not sign that action\'s commit', () 
 		const answer = await member.update(await commitPromiseRecord());
 
 		expect(answer.promises[self.peerId.toString()]?.type, 'an uncorroborated refusal must abstain').to.equal('approve');
+	});
+
+	it('retires the refusal once the same action’s pend later succeeds here', async () => {
+		// The member refuses the loser, the rival then goes away, and a retried pend of the SAME
+		// action is accepted. A third, unrelated action now reserves the block. Without retiring the
+		// stale refusal the member would veto the commit of an action it is itself holding pended,
+		// purely because *some* rival is present — two pending actions on one block is ordinary, and
+		// the one committing legitimately won.
+		await refuseLoserPend();
+		await storage.cancel({ actionId: WINNER_ACTION, blockIds: [BLOCK] });
+		const accepted = await driveLoserPendConsensus(1);
+		expect(accepted?.success, 'the retried pend must be accepted this time').to.equal(true);
+		const unrelated = await storage.pend({ ...pendFor('a-unrelated'), policy: 'c' });
+		expect(unrelated.success).to.equal(true);
+
+		const answer = await member.update(await commitPromiseRecord());
+
+		expect(answer.promises[self.peerId.toString()]?.type, 'a retired refusal must not veto').to.equal('approve');
 	});
 
 	it('abstains for an action it simply never saw the pend of (cohort drift is not a refusal)', async () => {

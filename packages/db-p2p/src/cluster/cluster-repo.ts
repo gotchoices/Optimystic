@@ -2065,7 +2065,16 @@ export class ClusterMember implements ICluster {
 			// conflict-shaped refusals are kept — a bare-reason fault is local trouble, not evidence
 			// that a rival holds the blocks, and must not veto the cohort's commit.
 			if (!result.success && isConflictFailure(result)) {
-				this.refusedPendActions.set(operation.pend.actionId, this.now());
+				// `Date.now()`, not the injected `this.now()`: the prune sweep and the executed-marker
+				// timestamps this retention shares a TTL with are both on the wall clock, and a mixed
+				// pair would prune on the first sweep (or never) under an injected clock.
+				this.refusedPendActions.set(operation.pend.actionId, Date.now());
+			} else if (result.success) {
+				// A later apply of the SAME action that storage accepted retires the refusal: the
+				// retention means "the last thing my storage said about this action's pend was no",
+				// and a stale yes-then-no would veto the commit of an action this member now holds
+				// pended, whenever any unrelated rival happens to sit on one of its blocks.
+				this.refusedPendActions.delete(operation.pend.actionId);
 			}
 			if (!result.success) {
 				log('cluster-member:consensus-pend-diverged', {

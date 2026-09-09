@@ -1985,6 +1985,33 @@ export class CoordinatorRepo implements IRepo {
 			// `missing` lists the writer sees, and a stable choice keeps that reproducible.
 			const remoteRefusal = Object.entries(cohortPendRefusals ?? {})
 				.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)[0];
+			/**
+			 * The ONE rule every exit from this method passes through: a cohort member's reported
+			 * refusal downgrades a *success* into the retryable conflict it really is, and touches
+			 * nothing else.
+			 *
+			 * Applied at every exit deliberately. This node's own member applying the pend cleanly —
+			 * or not applying it at all, or having lost its retained verdict to a restart or the
+			 * retention TTL — says nothing about a sibling whose storage refused, and every path that
+			 * answers `success` without asking is another way to acknowledge a write the cohort
+			 * already refused. That asymmetry is exactly what forked a block at a revision only the
+			 * coordinator held.
+			 *
+			 * A non-success local answer is returned untouched, whichever kind it is: a local conflict
+			 * is the same verdict read first-hand rather than reported, and a local hard fault must not
+			 * be softened into "retry" by a sibling's unrelated race loss.
+			 */
+			const answerWithCohortRefusal = (local: PendResult): PendResult => {
+				if (!local.success || remoteRefusal === undefined) {
+					return local;
+				}
+				this.log('coordinator-repo:pend-remote-refusal', {
+					actionId: request.actionId,
+					peerId: remoteRefusal[0],
+					reason: remoteRefusal[1].reason
+				});
+				return remoteRefusal[1];
+			};
 			this.log('coordinator-repo:pend-cluster-complete', {
 				actionId: request.actionId,
 				localExecuted,
@@ -2002,7 +2029,7 @@ export class CoordinatorRepo implements IRepo {
 					hasMissing: !!(result as any).missing?.length,
 					hasPending: !!(result as any).pending?.length
 				});
-				return result;
+				return answerWithCohortRefusal(result);
 			}
 			// Local cluster already executed during consensus — return storage's own verdict rather
 			// than fabricating a success (the peerCount <= 1 path above returns storage's real result
@@ -2015,41 +2042,26 @@ export class CoordinatorRepo implements IRepo {
 			// commit that reached commit-consensus IS the authoritative commit (Theorem 9), whereas a
 			// pend that reached pend-consensus may still have been stored by nobody.
 			if (localPendResult !== undefined) {
-				// A local conflict outranks a remote one: same verdict, but this node read the storage
-				// itself rather than being told about it.
-				if (!localPendResult.success && isConflictFailure(localPendResult)) {
-					return localPendResult;
-				}
-				// A local SUCCESS does not settle it. This node's own member applying the pend cleanly
-				// says nothing about a sibling that refused it — that asymmetry is precisely what let a
-				// coordinator report a win for a write its own cohort had already refused, then commit
-				// it and fork the block at that revision. So a reported cohort refusal is answered as
-				// the retryable conflict it is, and the writer rebases before any commit round runs.
-				if (localPendResult.success && remoteRefusal !== undefined) {
-					this.log('coordinator-repo:pend-remote-refusal', {
-						actionId: request.actionId,
-						peerId: remoteRefusal[0],
-						reason: remoteRefusal[1].reason
-					});
-					return remoteRefusal[1];
-				}
-				if (localPendResult.success) {
-					return localPendResult;
+				if (localPendResult.success || isConflictFailure(localPendResult)) {
+					return answerWithCohortRefusal(localPendResult);
 				}
 				// A bare-reason refusal (no pending/missing — e.g. a local validation-hook fault)
 				// stays tolerated local divergence: consensus is authoritative and the pend may well
-				// have landed on the rest of the cohort.
+				// have landed on the rest of the cohort. It still falls through to the rule below, so
+				// a sibling's refusal is not lost just because this node also had local trouble.
 				this.log('coordinator-repo:pend-local-fault-tolerated', {
 					actionId: request.actionId,
 					reason: localPendResult.reason
 				});
 			}
-			// No verdict retained (member predates retention, restart, or TTL): the prior shape.
-			return {
+			// No verdict retained (member predates retention, restart, or TTL): the prior shape,
+			// still subject to the cohort-refusal rule — a lost local verdict must not resurrect the
+			// fabricated success this ticket exists to remove.
+			return answerWithCohortRefusal({
 				success: true,
 				pending: [],
 				blockIds: allBlockIds
-			};
+			});
 		} catch (error) {
 			this.log('coordinator-repo:pend-error', { actionId: request.actionId, error: (error as Error).message });
 			// A lost conflict race is an optimistic-concurrency loss, not a fault: surface it as the
