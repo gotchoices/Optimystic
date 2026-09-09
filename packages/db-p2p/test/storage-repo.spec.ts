@@ -2569,6 +2569,61 @@ describe('StorageRepo', () => {
 			expect((await member.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest?.rev).to.equal(5);
 			expect(await itemsOf(member)).to.deep.equal(['fresh']);
 		});
+
+		it('does not refuse the idempotent redelivery of a revision it already landed', async () => {
+			// After rev 5 lands, `latest.rev` (5) no longer equals the declared base (4) — so the
+			// guard's own comparison would refuse a redelivery of the very commit this node holds.
+			// It never sees one: commit() partitions `latest.rev >= request.rev` into the
+			// already-done arm BEFORE the per-block loop. This pins that ordering, which the guard
+			// silently depends on.
+			const { repo: member } = makeMember();
+			await seed(member);
+			expect((await apply(member, 'a2', 2, spliceItems(0, ['a']), { baseRev: 1 })).success).to.equal(true);
+			expect((await apply(member, 'a5', 5, spliceItems(1, ['b']), { baseRev: 2 })).success).to.equal(true);
+
+			const redelivered = await member.commit({
+				actionId: 'a5' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 5,
+				blockDigests: { [BLOCK]: { digest: 'declared', baseRev: 2 } }
+			});
+
+			expect(redelivered.success, 'redelivery is an idempotent no-op, never a refusal').to.equal(true);
+			expect((await member.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest?.rev).to.equal(5);
+			expect(await itemsOf(member)).to.deep.equal(['a', 'b']);
+		});
+
+		it('drops a not-yet-reached sibling’s pending when the refusal is a declared-base mismatch', async () => {
+			// The declared-base refusal is a divergence like any other, so commit() must break the
+			// per-block loop and drop the whole batch's pendings — the sibling of the no-base case
+			// in 'mixed batch (one block committable, one with no base)' above, driven by THIS
+			// refusal. A record left on the unreached sibling would be reported as a conflicting
+			// action by every later write to it, under `policy: 'f'`, forever.
+			const SIBLING = 'fork-guard-sibling' as BlockId;
+			const { repo: member } = makeMember();
+			await seed(member);
+
+			await member.pend({
+				actionId: 'a-mixed' as ActionId,
+				transforms: {
+					inserts: { [SIBLING]: makeBlock(SIBLING, { items: [] }) },
+					updates: { [BLOCK]: [['items', 0, 0, ['z']]] },
+					deletes: []
+				},
+				policy: 'c'
+			});
+			// Refusing block FIRST, so the break happens before the sibling is reached.
+			expectMissingBase(await member.commit({
+				actionId: 'a-mixed' as ActionId, blockIds: [BLOCK, SIBLING], tailId: BLOCK, rev: 5,
+				blockDigests: { [BLOCK]: { digest: 'declared', baseRev: 4 } }
+			}));
+
+			expect((await member.get({ blockIds: [SIBLING] }))[SIBLING]?.state?.latest, 'sibling not reached').to.equal(undefined);
+			const later = await member.pend({
+				actionId: 'a-later' as ActionId,
+				transforms: makeInsertTransforms(SIBLING, makeBlock(SIBLING, { items: [] })),
+				policy: 'f'
+			});
+			expect(later.success, 'no orphaned pending may remain on the unreached sibling').to.equal(true);
+		});
 	});
 
 	/**

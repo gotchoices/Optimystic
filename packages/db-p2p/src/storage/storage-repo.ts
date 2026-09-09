@@ -281,6 +281,15 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 						// Sort a COPY: when `latest` is undefined, `missing` aliases the caller's
 						// `context.committed` array, and an in-place `.sort()` would reorder the shared
 						// request context under the caller's feet.
+						//
+						// NOTE: this loop SKIPS an entry whose pending it does not hold and promotes the
+						// next one anyway — so a member missing an intermediate revision that touched THIS
+						// block forks it exactly as an un-guarded commit would. `internalCommit`'s declared-
+						// base guard cannot help here: `context.committed` is a collection-level list of
+						// (actionId, rev) with no per-block base, and "no pending for that action" is the
+						// normal case for the many actions that never touched this block. Closing it needs
+						// the authored base stored WITH the pended transform — tracked by
+						// `backlog/bug-a-pended-transform-does-not-carry-its-base`.
 						try {
 							for (const { actionId, rev } of [...missing].sort((a, b) => a.rev - b.rev)) {
 								const pending = await blockStorage.getPendingTransaction(actionId);
@@ -1230,10 +1239,19 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// writer's retry then lands on a healed base. A hostile writer declaring a junk numeric baseRev
 		// can force refusals and reconcile churn, but never a fork.
 		//
-		// NOTE: a commit whose block declares NO digest — pre-upgrade writer, undeclarable block
+		// NOTE: the AHEAD case is reported as "behind" divergence like every other missing-base
+		// refusal, so a cohort where nobody holds `rev` reconciles, fails `no-rev-quorum`, and logs
+		// that rather than a clean stale failure. Correct outcome — the writer read a base the cohort
+		// has moved past, and its retry re-reads — but the log reads as lag when it is the opposite.
+		// If those lines ever have to be triaged in volume, give the ahead arm its own reason string.
+		//
+		// NOTE: this guard only reaches what the writer declared, so two arms of the same fork still
+		// stand — both tracked by `backlog/bug-a-pended-transform-does-not-carry-its-base`:
+		// (1) a commit whose block declares NO digest — pre-upgrade writer, undeclarable block
 		// (read-far-then-update eviction, see db-core transform/digest.ts), or a delete-only transform —
-		// still gap-applies exactly as before this guard. If forked-content reports persist, the
-		// undeclared-commit arm is the residual to look at.
+		// gap-applies exactly as before; (2) the read-driven promotion in `get`, which reaches this
+		// method with no commit request at all (`declaredBaseRev` undefined) and so cannot check. If
+		// forked-content reports persist, those are the residuals to look at.
 		if (typeof declaredBaseRev === 'number' && !transform.insert && latest?.rev !== declaredBaseRev) {
 			return await this.refuseMissingBase(blockId, actionId, rev, storage, latch,
 				`local latest ${latest?.rev ?? 'none'} is not the declared base ${declaredBaseRev} of rev ${rev}`);

@@ -137,6 +137,14 @@ different base for an update-only block — abstains rather than guessing. See
 checkable/abstain rule, and `docs/correctness.md` §2 **Content digest declaration** for what an
 approval does and does not attest.
 
+**What `baseRev` does at apply time.** The declared base is not only an input to that vote. When
+the commit is applied, a member that holds a base *other* than the declared one refuses the commit
+outright rather than applying the author's edits to different bytes — which would leave it holding
+different content under the same revision number, permanently. So a declared block is protected
+from that fork and an undeclared one is not: this is a second cost of not declaring, alongside the
+replication cost in `docs/correctness.md` §"The cost of not declaring". See
+[internals.md](internals.md) "An update-only transform is applied only to the base its author read".
+
 #### Invariant P — a pending record and a committed record never coexist for one action
 
 A block never holds a pending record and a committed record for the same action id at the same

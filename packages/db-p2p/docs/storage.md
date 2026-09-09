@@ -138,6 +138,16 @@ the node can materialize". Enforced by `StorageRepo.internalCommit`'s
 missing-base refusal (`refuseMissingBase` / `MissingBaseRevisionError` in
 `packages/db-p2p/src/storage/storage-repo.ts`).
 
+The same refusal enforces a second, distinct rule: **an update-only transform is
+applied only to the base its author read.** A member holding a base other than
+the `baseRev` the writer declared in `CommitRequest.blockDigests` refuses,
+rather than applying the edits to different bytes and recording the result under
+the new revision number. Revision arithmetic cannot substitute for the
+declaration — a per-block gap under a collection-wide revision counter is
+routine, not a fault. See `docs/internals.md` "An update-only transform is
+applied only to the base its author read" for the full rule and the two arms it
+deliberately does not reach.
+
 ### 4. `promotePendingTransaction` is a cross-store atomic *move*, not a copy
 
 Documented well already — see "Shared KV Kernel" below (this file) and

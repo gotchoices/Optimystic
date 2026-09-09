@@ -207,9 +207,13 @@ commit that will take that latch), and votes reject with the signed reason
 `content-digest-mismatch` when the results disagree.
 
 A member cannot always check. `StorageRepo.commit` accepts a commit whenever
-`latest.rev < request.rev` — not only `latest.rev === request.rev - 1` — so a lagging member
-applying an update-only transform to an older base legitimately materializes different bytes.
-The checkable/abstain rule is therefore keyed on the member's own pended transform (the same
+`latest.rev < request.rev` — not only `latest.rev === request.rev - 1`, because revisions are
+allocated per collection and a block only takes one when an action touches it — so a member
+holding a base other than the declared one would be previewing against different bytes than the
+declarer used, and cannot *judge* the content. It abstains here rather than voting on a guess. It
+never goes on to materialize those bytes either: `internalCommit` refuses that same mismatch at
+apply time (see "`latest` never advances past a revision the node can materialize" below).
+The checkable/abstain rule is keyed on the member's own pended transform (the same
 payload the client authored, delivered at pend):
 
 | Member's pended transform for the id | Member behaviour |
@@ -616,6 +620,22 @@ saveMaterializedBlock(block): store(structuredClone(block));
   (`MISSING_BASE_REVISION_REASON`, matched by `isMissingBaseRevisionFailure`). The same
   refusal covers a block whose existing `latest` is itself unmaterializable, so a node
   wedged by older code recovers on the next write touching that block.
+- **An update-only transform is applied only to the base its author read.** The sibling of the
+  invariant above, for a member that holds *a* base but the wrong one. A member that missed
+  revisions which touched this block used to apply the next commit's transform to the stale copy
+  it still held and record the result under the new revision number: same revision, different
+  bytes, permanently — after which the content-digest check above rejects every later write to
+  that block from that member. Revision arithmetic cannot detect this (`latest.rev !== rev - 1`
+  is the *routine* per-collection gap and rejecting it breaks ordinary writes — see the retired
+  decision ticket `st-commit-contiguity-guard-premise`). The only sound discriminator is the
+  writer's own per-block declaration: `internalCommit` refuses when `blockDigests[blockId].baseRev`
+  is a number, the member's pended transform carries no `insert`, and `latest?.rev` is not that
+  number — behind it, ahead of it, or absent. The refusal is the same `missing-base-revision`
+  divergence as above, so it heals by the same reconcile. **Two arms are not covered**, both by
+  design and both tracked by `backlog/bug-a-pended-transform-does-not-carry-its-base`:
+  a commit that declares no digest for the block (nothing to compare, so the member abstains and
+  gap-applies as before), and the read-driven promotion in `StorageRepo.get`, which has no commit
+  request and therefore no declaration.
 - **A node that can re-check a transaction never skips the check silently.** Both validating tiers
   — a `ClusterMember` casting its promise vote and a `StorageRepo` applying a pend — run the one
   `checkPendValidation` ([`db-p2p/src/pend-validation.ts`](../packages/db-p2p/src/pend-validation.ts)),
