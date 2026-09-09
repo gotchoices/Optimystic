@@ -1527,7 +1527,10 @@ export class ClusterMember implements ICluster {
 	 * "I checked this". The four-way rule, per committed block:
 	 *  - no local `latest`, or `latest.rev < commit.rev` → abstain (approve). Preserves the
 	 *    lagging-member tolerance (`coordinator-repo-commit-divergence.spec.ts`): a member behind
-	 *    the commit cannot judge it.
+	 *    the commit cannot judge it. Abstaining is safe rather than merely tolerable: apply-time
+	 *    catches the case the vote cannot, since `StorageRepo.internalCommit` refuses an update-only
+	 *    transform whose declared `baseRev` is not this member's `latest.rev` and reconciles instead
+	 *    of forking the block's content.
 	 *  - `latest.rev === commit.rev` with the SAME action → abstain (approve). Idempotent
 	 *    redelivery of an already-durable commit; rejecting would make the writer rebase and
 	 *    re-append an action that already landed — a duplicate entry. (Storage's `alreadyDone`
@@ -1645,9 +1648,11 @@ export class ClusterMember implements ICluster {
 	 * authored, delivered at pend — a hostile declarer cannot force or dodge a check by mis-declaring
 	 * `baseRev`):
 	 *  - transform carries an `insert` → base-independent, ALWAYS check (declared `baseRev` ignored);
-	 *  - `updates` only → check iff this member's local base rev equals the declared `baseRev`
-	 *    (StorageRepo.commit accepts any `latest.rev < request.rev`, so a lagging member applying an
-	 *    update-only transform to an older base legitimately materializes different bytes);
+	 *  - `updates` only → check iff this member's local base rev equals the declared `baseRev`. A
+	 *    member whose base does not match cannot JUDGE the content — it would preview the transform
+	 *    against different bytes than the declarer used — so it abstains here. It never goes on to
+	 *    materialize those bytes: `StorageRepo.internalCommit` refuses that same mismatch at apply
+	 *    and reconciles from a cohort peer;
 	 *  - `delete` only / no base / unmaterializable base → materializes nothing to compare, abstain;
 	 *  - no pending transform for the action (this member never saw the pend) → abstain.
 	 * "Abstain" = contribute no content attestation: approve exactly as before this check existed.

@@ -4,7 +4,7 @@ import { blockWriteLatchKey, withBlockWriteLatch, type BlockWriteLatch } from '.
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockArchive, RestoreCallback, RevisionRange } from '../src/storage/struct.js';
-import type { BlockId, ActionId, ActionRev, ActionTransforms, CommitResult, PendRequest, PendSuccess, StaleFailure, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
+import type { BlockId, ActionId, ActionRev, ActionTransforms, BlockContentDigest, CommitResult, PendRequest, PendSuccess, StaleFailure, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
 import { isBlockChangeNotifier, Latches, canonicalBlockHash } from '@optimystic/db-core';
 import { delay } from '@optimystic/db-core/test';
 
@@ -2079,7 +2079,10 @@ describe('StorageRepo', () => {
 
 		it('commits across an arbitrary revision gap when a base IS held', async () => {
 			// Revisions are allocated per COLLECTION, so a block only gets one when an action
-			// touches it: local rev 1 → committing rev 7 is routine, not a gap to heal.
+			// touches it: local rev 1 → committing rev 7 is routine, not a gap to heal. The full
+			// rule after the declared-base fork guard: an arbitrary rev gap commits when the held
+			// base matches the writer's declared base — or, as here, when nothing is declared at all
+			// (pre-upgrade writer / undeclarable block), where the guard abstains.
 			await repo.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: [] })), policy: 'c' });
 			await repo.commit({ actionId: 'a1' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 1 });
 
@@ -2087,6 +2090,25 @@ describe('StorageRepo', () => {
 			const result = await repo.commit({ actionId: 'a7' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 7 });
 
 			expect(result.success, 'a held base makes any forward rev committable').to.equal(true);
+			const got = await repo.get({ blockIds: [BLOCK] });
+			expect(got[BLOCK]?.state?.latest?.rev).to.equal(7);
+			expect((got[BLOCK]?.block as unknown as { items: unknown[] }).items).to.deep.equal(['x']);
+		});
+
+		it('commits across that same gap when the writer DECLARES the base this node holds', async () => {
+			// The sibling of the test above, with the declaration present: the writer read the block
+			// at rev 1 and says so, this node holds rev 1, so the collection-level gap to rev 7 is
+			// exactly the routine case the guard must not break.
+			await repo.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: [] })), policy: 'c' });
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 1 });
+
+			await repo.pend({ actionId: 'a7' as ActionId, transforms: makeUpdateTransforms(BLOCK, [['items', 0, 0, ['x']]]), policy: 'c' });
+			const result = await repo.commit({
+				actionId: 'a7' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 7,
+				blockDigests: { [BLOCK]: { digest: 'irrelevant-here', baseRev: 1 } }
+			});
+
+			expect(result.success, 'a matching declared base makes any forward rev committable').to.equal(true);
 			const got = await repo.get({ blockIds: [BLOCK] });
 			expect(got[BLOCK]?.state?.latest?.rev).to.equal(7);
 			expect((got[BLOCK]?.block as unknown as { items: unknown[] }).items).to.deep.equal(['x']);
@@ -2357,6 +2379,195 @@ describe('StorageRepo', () => {
 				expect((await repo.get({ blockIds: [OK] }))[OK]?.state?.latest?.rev, 'already-done block untouched').to.equal(2);
 				expect(await laterExclusiveWriteAccepted(), 'and still writable').to.equal(true);
 			});
+		});
+	});
+
+	/**
+	 * Ticket: a-commit-over-a-gapped-base-forks-the-block.
+	 *
+	 * A member that missed intermediate updates to a block used to apply the next commit's transform
+	 * to the stale copy it still held, record the result under the new revision number, and carry on:
+	 * same revision number, different bytes, forever. Revisions are allocated per COLLECTION, so a
+	 * `rev - 1` check cannot tell that apart from a routine gap (see 'commits across an arbitrary
+	 * revision gap' above, which such a check would break). The discriminator is the writer's own
+	 * per-block declaration of the base it read — `CommitRequest.blockDigests[blockId].baseRev`.
+	 */
+	describe('commit — declared base revision (fork guard)', () => {
+		const BLOCK = 'forkable-block' as BlockId;
+
+		/** A repo over its OWN raw storage, so two members can drift apart independently. */
+		const makeMember = () => {
+			const raw = new MemoryRawStorage();
+			return { raw, repo: new StorageRepo((blockId) => new BlockStorage(blockId, raw)) };
+		};
+
+		/**
+		 * Pend + commit one action on `target`. `declared` (when given) rides as the block's
+		 * `blockDigests` entry; its `baseRev` is deliberately `unknown` so malformed wire values can
+		 * be exercised. The digest string itself is never read by the commit path.
+		 */
+		const apply = async (
+			target: StorageRepo,
+			actionId: string,
+			rev: number,
+			transforms: Transforms,
+			declared?: { baseRev?: unknown }
+		): Promise<CommitResult> => {
+			await target.pend({ actionId: actionId as ActionId, transforms, policy: 'c' });
+			return await target.commit({
+				actionId: actionId as ActionId,
+				blockIds: [BLOCK],
+				tailId: BLOCK,
+				rev,
+				...(declared ? { blockDigests: { [BLOCK]: { digest: 'declared', ...declared } as BlockContentDigest } } : {})
+			});
+		};
+
+		/** Splice `values` into `items` at `index` — the shape every update transform here uses. */
+		const spliceItems = (index: number, values: unknown[]): Transforms =>
+			makeUpdateTransforms(BLOCK, [['items', index, 0, values]]);
+
+		/** Asserts the result is the distinct missing-base refusal (not a generic fault). */
+		const expectMissingBase = (result: CommitResult): void => {
+			expect(result.success, 'commit must be refused').to.equal(false);
+			const reason = (result as { reason?: string }).reason ?? '';
+			expect(reason.startsWith(MISSING_BASE_REVISION_REASON),
+				`reason must be greppable as ${MISSING_BASE_REVISION_REASON}, got: ${reason}`).to.equal(true);
+		};
+
+		/** `items` of the block as this repo currently materializes it, or undefined if absent. */
+		const itemsOf = async (target: StorageRepo): Promise<unknown[] | undefined> => {
+			const block = (await target.get({ blockIds: [BLOCK] }))[BLOCK]?.block;
+			return block === undefined ? undefined : (block as unknown as { items: unknown[] }).items;
+		};
+
+		/** Seed the block at rev 1 with an empty `items` array. */
+		const seed = async (target: StorageRepo): Promise<void> => {
+			expect((await apply(target, 'a1', 1, makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: [] })))).success,
+				'seed insert must land').to.equal(true);
+		};
+
+		it('refuses the commit that would fork the block, while a caught-up member commits it', async () => {
+			const healthy = makeMember();
+			const gapped = makeMember();
+
+			// Both members see the create and the first update.
+			for (const member of [healthy.repo, gapped.repo]) {
+				await seed(member);
+				expect((await apply(member, 'a2', 2, spliceItems(0, ['a']), { baseRev: 1 })).success).to.equal(true);
+			}
+
+			// The gapped member misses revs 3 and 4 entirely.
+			expect((await apply(healthy.repo, 'a3', 3, spliceItems(1, ['b']), { baseRev: 2 })).success).to.equal(true);
+			expect((await apply(healthy.repo, 'a4', 4, spliceItems(2, ['c']), { baseRev: 3 })).success).to.equal(true);
+
+			// Rev 5: the writer read the block at rev 4 and declares it. The healthy member holds
+			// rev 4 and commits; the gapped member still holds rev 2 and must NOT apply the
+			// transform to those different bytes.
+			expect((await apply(healthy.repo, 'a5', 5, spliceItems(0, ['z']), { baseRev: 4 })).success).to.equal(true);
+			expectMissingBase(await apply(gapped.repo, 'a5', 5, spliceItems(0, ['z']), { baseRev: 4 }));
+
+			const healthyState = (await healthy.repo.get({ blockIds: [BLOCK] }))[BLOCK];
+			const gappedState = (await gapped.repo.get({ blockIds: [BLOCK] }))[BLOCK];
+			expect(healthyState?.state?.latest?.rev).to.equal(5);
+			expect(await itemsOf(healthy.repo)).to.deep.equal(['z', 'a', 'b', 'c']);
+			// The refusal's whole point: no revision 5 here at all, rather than a rev 5 holding
+			// different content from the rest of the cohort's.
+			expect(gappedState?.state?.latest?.rev, 'the gapped member must stay behind, not fork').to.equal(2);
+			expect(await itemsOf(gapped.repo)).to.deep.equal(['a']);
+			// Pre-fix, both reported rev 5 with different bytes — this is the hash that used to differ.
+			expect(canonicalBlockHash(healthyState!.block!)).to.not.equal(canonicalBlockHash(gappedState!.block!));
+		});
+
+		it('refuses when this member is AHEAD of the declared base (divergent history)', async () => {
+			// The writer read rev 2 and declares it, but this member already holds rev 4 — it saw
+			// revisions the writer never did, so applying the transform here forks just as surely.
+			const { repo: member } = makeMember();
+			await seed(member);
+			expect((await apply(member, 'a2', 2, spliceItems(0, ['a']), { baseRev: 1 })).success).to.equal(true);
+			expect((await apply(member, 'a3', 3, spliceItems(1, ['b']), { baseRev: 2 })).success).to.equal(true);
+			expect((await apply(member, 'a4', 4, spliceItems(2, ['c']), { baseRev: 3 })).success).to.equal(true);
+
+			expectMissingBase(await apply(member, 'a5', 5, spliceItems(0, ['z']), { baseRev: 2 }));
+
+			expect((await member.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest?.rev, 'latest untouched').to.equal(4);
+			expect(await itemsOf(member)).to.deep.equal(['a', 'b', 'c']);
+		});
+
+		it('drops the refused pending so it cannot block later writes to the block', async () => {
+			// Same contract as the missing-base refusal: `policy: 'f'` fails while ANY pending action
+			// is outstanding, so a record left behind would reject every later write to this block.
+			const { repo: member } = makeMember();
+			await seed(member);
+			expectMissingBase(await apply(member, 'a5', 5, spliceItems(0, ['z']), { baseRev: 4 }));
+
+			const later = await member.pend({
+				actionId: 'a-later' as ActionId,
+				transforms: spliceItems(0, ['y']),
+				policy: 'f'
+			});
+			expect(later.success, 'no orphaned pending may remain').to.equal(true);
+		});
+
+		it('abstains when the commit declares no digests at all (pre-upgrade writer)', async () => {
+			// Exactly the pre-fix behaviour, deliberately preserved: with nothing declared there is
+			// nothing to compare, so the gap-apply still happens.
+			const { repo: member } = makeMember();
+			await seed(member);
+
+			const result = await apply(member, 'a5', 5, spliceItems(0, ['z']));
+
+			expect(result.success, 'an undeclared commit must behave as before the guard').to.equal(true);
+			expect((await member.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest?.rev).to.equal(5);
+		});
+
+		it('abstains when the declared baseRev is not a number (untrusted wire data)', async () => {
+			// `blockDigests` has no ingress schema, so a malformed declaration must abstain rather
+			// than being coerced into a comparison — a string '4' is not evidence of anything.
+			const { repo: member } = makeMember();
+			await seed(member);
+
+			const result = await apply(member, 'a5', 5, spliceItems(0, ['z']), { baseRev: '4' });
+
+			expect(result.success, 'a malformed declaration must not drive a refusal').to.equal(true);
+			expect((await member.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest?.rev).to.equal(5);
+		});
+
+		it('abstains when the declared entry omits baseRev entirely', async () => {
+			// The by-design absence: an insert-carrying transform's digest entry has no baseRev.
+			const { repo: member } = makeMember();
+			await seed(member);
+
+			const result = await apply(member, 'a5', 5, spliceItems(0, ['z']), {});
+
+			expect(result.success, 'an absent declaration is an abstain, not a mismatch').to.equal(true);
+			expect((await member.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest?.rev).to.equal(5);
+		});
+
+		it('abstains for an insert-carrying transform even when a baseRev is (hostilely) declared', async () => {
+			// The arm is keyed on this member's OWN pended transform, never on the declaration: an
+			// insert is base-independent, so no attached baseRev can turn it into a refusal.
+			//
+			// Reaching this state takes the pend BEFORE the revision exists — `pend` refuses an insert
+			// over a block it already holds (stale) — so the base arrives by replication in between,
+			// which is exactly how a real member ends up pended-with-insert over a mismatching latest.
+			const { repo: member } = makeMember();
+			await member.pend({
+				actionId: 'a5' as ActionId,
+				transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: ['fresh'] })),
+				policy: 'c'
+			});
+			await member.saveReplicatedBlock(BLOCK, makeBlock(BLOCK, { items: ['seeded'] }), { actionId: 'a-repl' as ActionId, rev: 2 });
+
+			// Local latest is 2, the declaration claims 4 — a mismatch the update arm would refuse.
+			const result = await member.commit({
+				actionId: 'a5' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 5,
+				blockDigests: { [BLOCK]: { digest: 'declared', baseRev: 4 } }
+			});
+
+			expect(result.success, 'a base-independent transform is never guarded').to.equal(true);
+			expect((await member.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest?.rev).to.equal(5);
+			expect(await itemsOf(member)).to.deep.equal(['fresh']);
 		});
 	});
 

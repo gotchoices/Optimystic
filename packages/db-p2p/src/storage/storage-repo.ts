@@ -905,7 +905,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				}
 				try {
 					// internalCommit will throw if it encounters an issue
-					const collectionId = await this.internalCommit(blockId, request.actionId, request.rev, storage, latch, proof);
+					// The writer's per-block base declaration (see BlockContentDigest.baseRev) rides on the
+					// commit op and is what lets internalCommit tell a legitimate collection-level rev gap
+					// apart from a genuinely missed update to THIS block. Untrusted wire data — the guard
+					// validates it, this call site only forwards it.
+					const collectionId = await this.internalCommit(blockId, request.actionId, request.rev, storage, latch, proof, request.blockDigests?.[blockId]?.baseRev);
 					if (collectionId !== undefined) {
 						const list = collectionBlocks.get(collectionId) ?? [];
 						list.push(blockId);
@@ -1174,7 +1178,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		return await this.createBlockStorage(blockId).getBlockProof(rev);
 	}
 
-	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage, latch: BlockWriteLatch, proof?: BlockCommitProof): Promise<CollectionId | undefined> {
+	/**
+	 * @param declaredBaseRev The committed revision of the base the WRITER applied this block's
+	 * transform to, as declared in the commit op's `blockDigests[blockId].baseRev`. Untrusted wire
+	 * data, so it is typed `unknown` and validated below. Absent from the read-driven promotion in
+	 * {@link get}, which has no commit request and therefore nothing to compare against.
+	 */
+	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage, latch: BlockWriteLatch, proof?: BlockCommitProof, declaredBaseRev?: unknown): Promise<CollectionId | undefined> {
 		// Note: This method is called under the block write latch — by commit() (within its locked
 		// critical section) and by the read-driven promotion in get() (which takes the same latch);
 		// `latch` is the proof of that. So, operations like getPendingTransaction, getLatest,
@@ -1194,6 +1204,41 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 
 		// Get prior materialized block if it exists
 		const latest = await storage.getLatest();
+
+		// FORK GUARD: apply an update-only transform ONLY to the base the writer actually read.
+		// Revisions are allocated per COLLECTION, not per block, so `rev - 1` is meaningless here — a
+		// member legitimately holds block X at rev 1 and receives a commit of X at rev 7 when revs 2-6
+		// touched other blocks. The only sound discriminator is the writer's own per-block declaration:
+		// it read the block at `declaredBaseRev`, so a member holding anything else would be applying
+		// the transform to different bytes and silently forking the block's content at this revision.
+		//
+		// Each clause is deliberate:
+		// - `typeof declaredBaseRev === 'number'` — `blockDigests` is untrusted wire data with no
+		//   ingress schema (same rule as ClusterMember.validateCommitOperations). Missing, malformed,
+		//   or absent-by-design declarations ABSTAIN, preserving today's behavior for pre-upgrade
+		//   writers, undeclarable blocks, and the read-driven promotion in get().
+		// - `!transform.insert` — an insert-carrying transform is base-independent, so there is nothing
+		//   to fork. Keyed on the member's OWN pended transform (as previewCommitDigest does), never on
+		//   the declaration, so a hostile writer cannot flip the arm by attaching a bogus baseRev.
+		// - `latest?.rev !== declaredBaseRev` covers all three unsafe states: BEHIND the declared base
+		//   (missed updates — the fork case), AHEAD of it (this member holds a revision the writer
+		//   never saw — divergent history), and no local revision at all against a numeric declaration.
+		//
+		// Refusing is cheap and self-healing: refuseMissingBase throws MissingBaseRevisionError, which
+		// commit() classifies as divergence and ClusterMember.applyConsensusOperation maps to "behind",
+		// running reconcileDivergentCommit to pull the committed revision from a cohort peer. The
+		// writer's retry then lands on a healed base. A hostile writer declaring a junk numeric baseRev
+		// can force refusals and reconcile churn, but never a fork.
+		//
+		// NOTE: a commit whose block declares NO digest — pre-upgrade writer, undeclarable block
+		// (read-far-then-update eviction, see db-core transform/digest.ts), or a delete-only transform —
+		// still gap-applies exactly as before this guard. If forked-content reports persist, the
+		// undeclared-commit arm is the residual to look at.
+		if (typeof declaredBaseRev === 'number' && !transform.insert && latest?.rev !== declaredBaseRev) {
+			return await this.refuseMissingBase(blockId, actionId, rev, storage, latch,
+				`local latest ${latest?.rev ?? 'none'} is not the declared base ${declaredBaseRev} of rev ${rev}`);
+		}
+
 		const priorBlock = await this.readCommitBase(blockId, actionId, rev, storage, latest, latch);
 
 		// Apply transform and save materialized block
