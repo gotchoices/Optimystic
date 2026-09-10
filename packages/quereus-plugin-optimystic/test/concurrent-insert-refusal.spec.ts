@@ -292,6 +292,45 @@ describe('Concurrent same-key INSERT refusal (two handles, one FileRawStorage di
 		}
 	});
 
+	it('LEGACY mode, two-table transaction, refusal MID-SWEEP: PartialCommitError names the mapped UNIQUE message', async () => {
+		// The clean table stages FIRST, so its tree syncs (durably commits) before the
+		// colliding table's tree refuses — the mid-sweep exit of commitDirtyTreesLegacy,
+		// which must NOT pretend to roll back: it reports the split loudly as a
+		// PartialCommitError whose underlying failure is the mapped duplicate-key
+		// refusal. (The first-tree exit — nothing persisted, clean rollback, bare
+		// UNIQUE message — is the DETERMINISTIC legacy test above.)
+		const uriT = 'tree://race/partial-t';
+		const uriU = 'tree://race/partial-u';
+		const { db: a, plugin: pluginA } = createDb(dir);
+		const { db: b, plugin: pluginB } = createDb(dir);
+		try {
+			await a.exec(`create table T (id integer primary key, v text) using optimystic('${uriT}')`);
+			await a.exec(`create table U (id integer primary key, v text) using optimystic('${uriU}')`);
+			await b.exec(`create table T (id integer primary key, v text) using optimystic('${uriT}')`);
+			await b.exec(`create table U (id integer primary key, v text) using optimystic('${uriU}')`);
+
+			await a.exec('begin');
+			await a.exec(`insert into U (id, v) values (1, 'clean-first')`);
+			await a.exec(`insert into T (id, v) values (1, 'from-A')`);
+			await b.exec(`insert into T (id, v) values (1, 'from-B')`);
+
+			const message = await captureThrowMessage(() => a.exec('commit'));
+			expect(message, 'the split is reported loudly, not as a clean rollback').to.match(/not atomic/i);
+			expect(message, 'the underlying failure is the mapped duplicate-key refusal').to.match(UNIQUE_T_ID);
+
+			// Durable state, read via handle B (handle A latched itself degraded): the
+			// clean table's insert really persisted before the refusal, and the rival's
+			// row survives in T.
+			expect(await selectCount(b, 'select count(*) as c from U'), 'the first-swept tree durably committed').to.equal(1);
+			expect(await selectScalar(b, 'select v from T where id = 1')).to.equal('from-B');
+		} finally {
+			a.close();
+			b.close();
+			await pluginA.dispose();
+			await pluginB.dispose();
+		}
+	});
+
 	it('SESSION mode, two-table transaction: one colliding insert fails the WHOLE transaction with the UNIQUE message', async () => {
 		const uriT = 'tree://race/session-t';
 		const uriU = 'tree://race/session-u';

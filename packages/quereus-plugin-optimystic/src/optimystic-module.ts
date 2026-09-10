@@ -1161,6 +1161,14 @@ export class OptimysticVirtualTable extends VirtualTable {
         yield* this.executeTableScan(mainRead);
       }
     } catch (error) {
+      // NOTE: a live read inside a doomed transaction can surface a concurrent
+      // duplicate-key refusal EARLY — the tree.update() above replays this writer's
+      // pending actions, and a guarded insert whose key a rival committed throws
+      // TreeKeyTakenError mid-scan. It reaches the client wrapped here as
+      // `Query failed: …`, not as the mapped `UNIQUE constraint failed: …` the same
+      // refusal gets at commit (mapCommitRefusal sits only at the commit boundaries).
+      // Not silent, and the commit would refuse anyway; if clients ever need the two
+      // shapes to match, map it here via the bridge's registered message.
       const wrapped = rewrapAsQueryError('Query failed', error);
       this.setErrorMessage(wrapped.message);
       throw wrapped;
