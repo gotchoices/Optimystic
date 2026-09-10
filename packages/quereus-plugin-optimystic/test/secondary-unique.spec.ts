@@ -574,6 +574,26 @@ describe('Secondary UNIQUE constraint enforcement on the optimystic vtab', funct
 			}
 		});
 
+		it('a later IGNORE-resolved constraint swallows the whole replacement, discarding an earlier REPLACE eviction', async () => {
+			const { db } = createDb();
+			try {
+				// PK resolves REPLACE from its declaration; A would evict row 1, but B
+				// resolves IGNORE against row 2 — the write changes nothing at all (see
+				// the mixed-action NOTE on resolveSecondaryUniqueDecision).
+				await db.exec(`create table M (Id integer primary key on conflict replace,
+						A text not null unique on conflict replace, B text not null unique on conflict ignore)
+					using optimystic('tree://uniq/pkreplace-mixed')`);
+				await db.exec(`insert into M (Id, A, B) values (1, 'a1', 'b1')`);
+				await db.exec(`insert into M (Id, A, B) values (2, 'a2', 'b2')`);
+				await db.exec(`insert into M (Id, A, B) values (3, 'a3', 'b3')`);
+				const before = await rowsOf(db, `select Id, A, B from M order by Id`);
+				await db.exec(`insert into M (Id, A, B) values (3, 'a1', 'b2')`);
+				expect(await rowsOf(db, `select Id, A, B from M order by Id`)).to.deep.equal(before);
+			} finally {
+				db.close();
+			}
+		});
+
 		it('reports the evicted row so the engine runs its delete pipeline (a delete event for the rival, an update event for the replaced row)', async () => {
 			const { db } = createDb();
 			try {

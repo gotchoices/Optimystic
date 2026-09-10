@@ -92,8 +92,9 @@ the newest adopted committed state. The throw is not a `StaleFailure`, so neithe
 re-drive absorbs it; it surfaces out of the losing commit, where the Quereus bridge
 maps it to the ordinary `UNIQUE constraint failed: <table>.<col>` message
 (`mapCommitRefusal` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`),
-so a refused concurrent insert is indistinguishable from a sequential duplicate to
-clients. A key the winner *deleted* replays as absent and is legitimately reusable.
+so a refused concurrent insert carries the same message as a sequential duplicate —
+but as a plain `Error` with no status code, not the engine's `ConstraintError` (code 19)
+a sequential duplicate raises, so a client must match the message. A key the winner *deleted* replays as absent and is legitimately reusable.
 
 `absentRange` is what extends this to a UNIQUE column with no structural backing.
 Optimystic keys a secondary index tree as `frame(indexValue) ‖ frame(primaryKey)`, so
