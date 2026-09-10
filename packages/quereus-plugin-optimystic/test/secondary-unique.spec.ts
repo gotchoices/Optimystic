@@ -15,8 +15,8 @@
  */
 
 import { expect } from 'chai';
-import { Database } from '@quereus/quereus';
-import type { SqlValue } from '@quereus/quereus';
+import { ConstraintError, Database, StatusCode } from '@quereus/quereus';
+import type { DatabaseDataChangeEvent, SqlValue } from '@quereus/quereus';
 import register from '../dist/plugin.js';
 import { expectIndexAgreesWithScan } from './query-helpers.js';
 
@@ -55,6 +55,39 @@ async function expectThrows(fn: () => Promise<unknown>, match?: RegExp): Promise
 		return;
 	}
 	throw new Error('expected operation to throw, but it resolved');
+}
+
+/** Every row `sql` returns as a positional tuple (bigints as numbers), so a whole
+ *  surviving row set compares with one deep-equal. */
+async function rowsOf(db: Database, sql: string): Promise<unknown[][]> {
+	const out: unknown[][] = [];
+	for await (const row of db.eval(sql)) {
+		out.push(Object.values(row as Record<string, SqlValue>).map(v => typeof v === 'bigint' ? Number(v) : v));
+	}
+	return out;
+}
+
+/**
+ * Assert `fn` is rejected as the engine's own constraint violation — a
+ * `ConstraintError` carrying `StatusCode.CONSTRAINT` (19) — with a message matching
+ * `match`. Matching the message alone is not enough: a concurrency-guard refusal
+ * rendered with the same `UNIQUE constraint failed` wording surfaced as a bare `Error`
+ * (no code) and passed a message-only assertion unnoticed.
+ */
+async function expectConstraintError(fn: () => Promise<unknown>, match: RegExp): Promise<void> {
+	let caught: unknown;
+	try {
+		await fn();
+	} catch (e) {
+		caught = e;
+	}
+	if (caught === undefined) throw new Error('expected operation to be rejected, but it resolved');
+	const detail = caught instanceof Error
+		? `${caught.name} (code=${(caught as { code?: unknown }).code}): ${caught.message}`
+		: String(caught);
+	expect(caught, `expected the engine's ConstraintError, got ${detail}`).to.be.instanceOf(ConstraintError);
+	expect((caught as ConstraintError).code, detail).to.equal(StatusCode.CONSTRAINT);
+	expect((caught as Error).message).to.match(match);
 }
 
 describe('Secondary UNIQUE constraint enforcement on the optimystic vtab', function () {
@@ -255,14 +288,37 @@ describe('Secondary UNIQUE constraint enforcement on the optimystic vtab', funct
 	});
 
 	describe('declared conflict-action matrix (secondary UNIQUE)', () => {
-		// {ignore, replace, abort, fail, rollback} × {statement-level, constraint-level}.
+		// {ignore, replace, abort, fail, rollback} × {statement-level, constraint-level},
+		// generalized over the two INSERT write shapes that reach a secondary-UNIQUE
+		// decision and over the two kinds of enforcing tree, so every arm stays covered
+		// as the write paths are edited.
+		//
 		// Precedence under test: statement-level `insert or <action>` > the action the
 		// constraint itself declares (`unique on conflict <action>`) > ABORT. FAIL and
 		// ROLLBACK are honoured as ABORT when they resolve from the vtab's structured
 		// constraint result (parity with the engine's in-memory module — see
 		// resolveConflictAction in optimystic-module.ts), so all three rejecting
-		// actions assert the same observable outcome: statement rejected, table
-		// unchanged.
+		// actions assert the same observable outcome: statement rejected with the
+		// engine's ConstraintError, table unchanged.
+		//
+		// Write shapes:
+		//  - 'fresh insert' — the new row's PK is free; only the secondary UNIQUE collides.
+		//  - 'replace on existing PK' — the new row's PK is held by another row and that
+		//    collision resolves REPLACE, so the replacement must still clear the secondary
+		//    UNIQUE against the rival holding the value at a DIFFERENT PK. Statement-level
+		//    spelling is `insert or <action>`, which resolves the PK collision too — so
+		//    only REPLACE reaches the secondary decision, while IGNORE and the rejecting
+		//    actions settle on the PK itself (hence the `T.Id` message there).
+		//    Constraint-level spelling declares the PK `on conflict replace` and writes a
+		//    plain insert — the only way a rejecting or ignoring secondary action is
+		//    reached through this branch.
+		//
+		// Enforcing trees:
+		//  - 'synthesized' — the column-level `unique` alone, enforced through the
+		//    `_uniq_` tree the vtab builds for it;
+		//  - 'declared' — plus a plain `create index` over the same column, which becomes
+		//    the enforcing tree AND lets `where Stamp = …` route through an index seek
+		//    (checked against a full scan by expectIndexAgreesWithScan).
 		const outcomes = {
 			ignore: 'ignored',
 			replace: 'replaced',
@@ -271,39 +327,66 @@ describe('Secondary UNIQUE constraint enforcement on the optimystic vtab', funct
 			rollback: 'rejected',
 		} as const;
 
-		for (const spelling of ['statement', 'constraint'] as const) {
-			for (const [action, outcome] of Object.entries(outcomes)) {
-				it(`${spelling}-level ${action} on a secondary-UNIQUE collision is ${outcome}`, async () => {
-					const { db } = createDb();
-					try {
-						const declared = spelling === 'constraint' ? ` on conflict ${action}` : '';
-						await db.exec(`
-							create table T (Id integer primary key, Stamp text not null unique${declared})
-								using optimystic('tree://uniq/matrix-${spelling}-${action}')
-						`);
-						await db.exec(`insert into T (Id, Stamp) values (1, 'dup')`);
-						const collide = spelling === 'statement'
-							? `insert or ${action} into T (Id, Stamp) values (2, 'dup')`
-							: `insert into T (Id, Stamp) values (2, 'dup')`;
+		for (const shape of ['fresh insert', 'replace on existing PK'] as const) {
+			for (const tree of ['synthesized', 'declared'] as const) {
+				for (const spelling of ['statement', 'constraint'] as const) {
+					for (const [action, outcome] of Object.entries(outcomes)) {
+						it(`${shape}, ${tree} tree: ${spelling}-level ${action} on a secondary-UNIQUE collision is ${outcome}`, async () => {
+							const { db } = createDb();
+							try {
+								const replaceShape = shape === 'replace on existing PK';
+								const pkDeclared = replaceShape && spelling === 'constraint' ? ' on conflict replace' : '';
+								const ucDeclared = spelling === 'constraint' ? ` on conflict ${action}` : '';
+								const slug = `${replaceShape ? 'pkreplace' : 'fresh'}-${tree}-${spelling}-${action}`;
+								await db.exec(`
+									create table T (Id integer primary key${pkDeclared}, Stamp text not null unique${ucDeclared})
+										using optimystic('tree://uniq/matrix-${slug}')
+								`);
+								if (tree === 'declared') await db.exec(`create index ix_stamp on T (Stamp)`);
+								// Row 1 holds the contested value; on the replace shape row 2 is the
+								// row being replaced, holding a value of its own.
+								await db.exec(`insert into T (Id, Stamp) values (1, 'dup')`);
+								if (replaceShape) await db.exec(`insert into T (Id, Stamp) values (2, 'own')`);
+								const allRows = `select Id, Stamp from T order by Id`;
+								const before = await rowsOf(db, allRows);
 
-						if (outcome === 'rejected') {
-							await expectThrows(() => db.exec(collide), /UNIQUE constraint failed/);
-							expect(await scalar(db, `select Id as v from T where Stamp = 'dup'`)).to.equal(1);
-						} else if (outcome === 'ignored') {
-							await db.exec(collide);
-							expect(await scalar(db, `select Id as v from T where Stamp = 'dup'`)).to.equal(1);
-						} else {
-							// REPLACE against a secondary UNIQUE evicts the colliding row at
-							// its own (different) PK; the new row owns the value.
-							await db.exec(collide);
-							expect(await scalar(db, `select Id as v from T where Stamp = 'dup'`)).to.equal(2);
-							expect(await scalar(db, `select count(*) as v from T where Id = 1`)).to.equal(0);
-						}
-						expect(await scalar(db, `select count(*) as v from T`)).to.equal(1);
-					} finally {
-						db.close();
+								const collide = spelling === 'statement'
+									? `insert or ${action} into T (Id, Stamp) values (2, 'dup')`
+									: `insert into T (Id, Stamp) values (2, 'dup')`;
+
+								if (outcome === 'rejected') {
+									const violated = replaceShape && spelling === 'statement' ? 'Id' : 'Stamp';
+									await expectConstraintError(
+										() => db.exec(collide),
+										new RegExp(`^UNIQUE constraint failed: T\\.${violated}$`),
+									);
+									expect(await rowsOf(db, allRows)).to.deep.equal(before);
+								} else if (outcome === 'ignored') {
+									await db.exec(collide);
+									expect(await rowsOf(db, allRows)).to.deep.equal(before);
+								} else {
+									// REPLACE evicts the rival at its own (different) PK; on the
+									// replace shape the write also overwrites row 2 in place.
+									await db.exec(collide);
+									expect(await rowsOf(db, allRows)).to.deep.equal([[2, 'dup']]);
+								}
+
+								if (tree === 'declared') await expectIndexAgreesWithScan(db, 'T', 'Stamp');
+
+								// The enforcing tree must hold exactly the owner's entry for 'dup':
+								// once that owner is deleted the value is free, so a plain insert
+								// under a fresh PK lands. An entry an eviction left behind would make
+								// the unique guard refuse it; a second live owner would survive the
+								// delete's predicate only if the index missed it.
+								await db.exec(`delete from T where Stamp = 'dup'`);
+								await db.exec(`insert into T (Id, Stamp) values (99, 'dup')`);
+								expect(await rowsOf(db, `select Id from T where Stamp = 'dup'`)).to.deep.equal([[99]]);
+							} finally {
+								db.close();
+							}
+						});
 					}
-				});
+				}
 			}
 		}
 
@@ -320,6 +403,198 @@ describe('Secondary UNIQUE constraint enforcement on the optimystic vtab', funct
 				await db.exec(`insert or ignore into P (Id, Stamp) values (2, 'dup')`);
 				expect(await scalar(db, `select count(*) as v from P`)).to.equal(1);
 				expect(await scalar(db, `select Id as v from P where Stamp = 'dup'`)).to.equal(1);
+			} finally {
+				db.close();
+			}
+		});
+	});
+
+	describe('insert or replace on an existing primary key (secondary UNIQUE)', () => {
+		// The replacement is a new row image at an occupied PK. It must clear every
+		// secondary UNIQUE against OTHER rows exactly as a fresh insert does, while the
+		// row it overwrites — on its way out — never counts as a collision.
+		for (const tree of ['synthesized', 'declared'] as const) {
+			async function stampTable(db: Database, uri: string, columns: string): Promise<void> {
+				await db.exec(`create table T (${columns}) using optimystic('${uri}')`);
+				if (tree === 'declared') await db.exec(`create index ix_stamp on T (Stamp)`);
+				await db.exec(`insert into T (Id, Stamp) values (1, 'a')`);
+				await db.exec(`insert into T (Id, Stamp) values (2, 'b')`);
+			}
+			const checkIndex = async (db: Database) => {
+				if (tree === 'declared') await expectIndexAgreesWithScan(db, 'T', 'Stamp');
+			};
+
+			it(`${tree} tree: a value-preserving replacement (same PK, same unique value, another column changed) is admitted`, async () => {
+				const { db } = createDb();
+				try {
+					await stampTable(db, `tree://uniq/pkreplace-${tree}-preserve`,
+						'Id integer primary key, Stamp text not null unique, W text null');
+					// Statement-level REPLACE: the row's own entry for 'a' must not be
+					// probed up as a collision (it would self-evict or refuse).
+					await db.exec(`insert or replace into T (Id, Stamp, W) values (1, 'a', 'y')`);
+					expect(await rowsOf(db, `select Id, Stamp, W from T order by Id`))
+						.to.deep.equal([[1, 'a', 'y'], [2, 'b', null]]);
+					await checkIndex(db);
+					// The value is still owned — by row 1 only.
+					await expectConstraintError(
+						() => db.exec(`insert into T (Id, Stamp) values (3, 'a')`),
+						/^UNIQUE constraint failed: T\.Stamp$/,
+					);
+				} finally {
+					db.close();
+				}
+			});
+
+			it(`${tree} tree: a PK declared on conflict replace preserves its own value under a default-ABORT UNIQUE`, async () => {
+				const { db } = createDb();
+				try {
+					// The ABORT-resolving shape: a plain insert whose PK collision resolves
+					// REPLACE from the PK's declaration. Excluding the replaced row keeps
+					// the replacement from rejecting itself.
+					await stampTable(db, `tree://uniq/pkreplace-${tree}-preserve-declared`,
+						'Id integer primary key on conflict replace, Stamp text not null unique, W text null');
+					await db.exec(`insert into T (Id, Stamp, W) values (1, 'a', 'y')`);
+					expect(await rowsOf(db, `select Id, Stamp, W from T order by Id`))
+						.to.deep.equal([[1, 'a', 'y'], [2, 'b', null]]);
+					await checkIndex(db);
+				} finally {
+					db.close();
+				}
+			});
+
+			it(`${tree} tree: a PK declared on conflict replace is rejected as a ConstraintError when its new value belongs to another row`, async () => {
+				const { db } = createDb();
+				try {
+					await stampTable(db, `tree://uniq/pkreplace-${tree}-abort-default`,
+						'Id integer primary key on conflict replace, Stamp text not null unique');
+					// Previously refused by the index tree's concurrency guard at staging
+					// time: a bare Error with no code, so a client catching ConstraintError
+					// did not recognise it.
+					await expectConstraintError(
+						() => db.exec(`insert into T (Id, Stamp) values (1, 'b')`),
+						/^UNIQUE constraint failed: T\.Stamp$/,
+					);
+					expect(await rowsOf(db, `select Id, Stamp from T order by Id`)).to.deep.equal([[1, 'a'], [2, 'b']]);
+					await checkIndex(db);
+				} finally {
+					db.close();
+				}
+			});
+
+			it(`${tree} tree: a replacement moving to a free unique value drops the old entry and adds the new one`, async () => {
+				const { db } = createDb();
+				try {
+					await stampTable(db, `tree://uniq/pkreplace-${tree}-free`,
+						'Id integer primary key, Stamp text not null unique');
+					await db.exec(`insert or replace into T (Id, Stamp) values (1, 'c')`);
+					expect(await rowsOf(db, `select Id, Stamp from T order by Id`)).to.deep.equal([[1, 'c'], [2, 'b']]);
+					await checkIndex(db);
+					// 'a' is free again; 'c' is now taken.
+					await db.exec(`insert into T (Id, Stamp) values (3, 'a')`);
+					await expectConstraintError(
+						() => db.exec(`insert into T (Id, Stamp) values (4, 'c')`),
+						/^UNIQUE constraint failed: T\.Stamp$/,
+					);
+					expect(await rowsOf(db, `select Id, Stamp from T order by Id`))
+						.to.deep.equal([[1, 'c'], [2, 'b'], [3, 'a']]);
+				} finally {
+					db.close();
+				}
+			});
+
+			it(`${tree} tree: a rival staged earlier in the same open transaction is evicted`, async () => {
+				const { db } = createDb();
+				try {
+					await db.exec(`create table T (Id integer primary key, Stamp text not null unique)
+						using optimystic('tree://uniq/pkreplace-${tree}-intxn')`);
+					if (tree === 'declared') await db.exec(`create index ix_stamp on T (Stamp)`);
+					await db.exec('begin');
+					await db.exec(`insert into T (Id, Stamp) values (1, 'a')`);
+					await db.exec(`insert into T (Id, Stamp) values (2, 'b')`);
+					await db.exec(`insert or replace into T (Id, Stamp) values (1, 'b')`);
+					await db.exec('commit');
+					expect(await rowsOf(db, `select Id, Stamp from T order by Id`)).to.deep.equal([[1, 'b']]);
+					await checkIndex(db);
+				} finally {
+					db.close();
+				}
+			});
+		}
+
+		it('a UNIQUE declared by CREATE UNIQUE INDEX is resolved the same way', async () => {
+			const { db } = createDb();
+			try {
+				await db.exec(`create table S (Id integer primary key, Stamp text not null)
+					using optimystic('tree://uniq/pkreplace-unique-index')`);
+				await db.exec(`create unique index ux_stamp on S (Stamp)`);
+				await db.exec(`insert into S (Id, Stamp) values (1, 'a')`);
+				await db.exec(`insert into S (Id, Stamp) values (2, 'b')`);
+				await db.exec(`insert or replace into S (Id, Stamp) values (1, 'b')`);
+				expect(await rowsOf(db, `select Id, Stamp from S order by Id`)).to.deep.equal([[1, 'b']]);
+				await expectIndexAgreesWithScan(db, 'S', 'Stamp');
+			} finally {
+				db.close();
+			}
+		});
+
+		it('a composite table-level UNIQUE (X, Y) is resolved the same way', async () => {
+			const { db } = createDb();
+			try {
+				await db.exec(`create table C (Id integer primary key, X text not null, Y text not null, unique (X, Y))
+					using optimystic('tree://uniq/pkreplace-composite')`);
+				await db.exec(`insert into C (Id, X, Y) values (1, 'x', 'y')`);
+				await db.exec(`insert into C (Id, X, Y) values (2, 'x', 'z')`);
+				await db.exec(`insert or replace into C (Id, X, Y) values (2, 'x', 'y')`);
+				expect(await rowsOf(db, `select Id, X, Y from C order by Id`)).to.deep.equal([[2, 'x', 'y']]);
+				await expectConstraintError(
+					() => db.exec(`insert into C (Id, X, Y) values (3, 'x', 'y')`),
+					/^UNIQUE constraint failed: C\.X, C\.Y$/,
+				);
+			} finally {
+				db.close();
+			}
+		});
+
+		it('one replacement overwrites its own PK slot and evicts a different row per violated constraint', async () => {
+			const { db } = createDb();
+			try {
+				await db.exec(`create table M (Id integer primary key, A text not null unique, B text not null unique)
+					using optimystic('tree://uniq/pkreplace-multi')`);
+				await db.exec(`insert into M (Id, A, B) values (1, 'a1', 'b1')`);
+				await db.exec(`insert into M (Id, A, B) values (2, 'a2', 'b2')`);
+				await db.exec(`insert into M (Id, A, B) values (3, 'a3', 'b3')`);
+				// Replaces row 3 in place, evicts row 1 (A) and row 2 (B).
+				await db.exec(`insert or replace into M (Id, A, B) values (3, 'a1', 'b2')`);
+				expect(await rowsOf(db, `select Id, A, B from M order by Id`)).to.deep.equal([[3, 'a1', 'b2']]);
+				// Both evicted values' old owners left no entries behind.
+				await db.exec(`insert into M (Id, A, B) values (4, 'a2', 'b1')`);
+				expect(await rowsOf(db, `select Id from M order by Id`)).to.deep.equal([[3], [4]]);
+			} finally {
+				db.close();
+			}
+		});
+
+		it('reports the evicted row so the engine runs its delete pipeline (a delete event for the rival, an update event for the replaced row)', async () => {
+			const { db } = createDb();
+			try {
+				await db.exec(`create table T (Id integer primary key, Stamp text not null unique)
+					using optimystic('tree://uniq/pkreplace-events')`);
+				await db.exec(`insert into T (Id, Stamp) values (1, 'a')`);
+				await db.exec(`insert into T (Id, Stamp) values (2, 'b')`);
+
+				const events: DatabaseDataChangeEvent[] = [];
+				const unsubscribe = db.onDataChange(event => { events.push(event); });
+				try {
+					await db.exec(`insert or replace into T (Id, Stamp) values (1, 'b')`);
+				} finally {
+					unsubscribe();
+				}
+
+				// Optimystic raises no native data events, so each of these comes from
+				// the DML executor: the delete only if the vtab reported the eviction in
+				// `evictedRows`, the update from `replacedRow`.
+				expect(events.map(e => [e.type, (e.key ?? []).map(Number)]))
+					.to.deep.equal([['delete', [2]], ['update', [1]]]);
 			} finally {
 				db.close();
 			}

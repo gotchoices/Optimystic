@@ -1663,6 +1663,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    * disposition the sequential way (the call the PK-move guard already makes for
    * IGNORE; see the UPDATE arm). Every collision this snapshot CAN see is still
    * settled by the pre-stage probe, so sequential IGNORE/REPLACE semantics are untouched.
+   * That holds only because EVERY write path that stages a guarded entry runs
+   * {@link resolveSecondaryUniqueDecision} first (fresh INSERT, INSERT's PK-REPLACE
+   * arm, UPDATE). A path that stages with this guard but no probe refuses a visible
+   * collision it should have resolved — and its retry re-refuses forever.
    * NOTE: accepted tradeoff — a concurrent `insert or replace` loser sees a UNIQUE
    * error instead of displacing the rival; revisit if a cross-collection replay
    * disposition (skip/evict the rival's MAIN row from an index-tree guard) ever exists.
@@ -2033,14 +2037,15 @@ export class OptimysticVirtualTable extends VirtualTable {
    * stages once both decisions are in, so a rejection on either front leaves the
    * trees untouched.
    *
-   * NOTE: deliberate divergence from the memory module on the UPDATE path. Memory's
-   * `performUpdateWithPrimaryKeyChange` returns as soon as a PK REPLACE resolves and
-   * never checks the secondary UNIQUE constraints, so a move that also duplicates a
-   * UNIQUE value leaves the duplicate in place. Here the caller still resolves them,
-   * so the constraint holds. The INSERT path keeps memory's short-circuit (a
-   * PK-collision REPLACE there skips the secondary checks) because the engine
-   * documents that shape as the contract for `replacedRow` — see
-   * quereus's common/types.ts on `replacedRow`/`evictedRows` co-occurrence.
+   * NOTE: deliberate divergence from the memory module. Memory's
+   * `performUpdateWithPrimaryKeyChange` (UPDATE) and `performInsert`'s PK-REPLACE arm
+   * (INSERT) both return as soon as a PK REPLACE resolves and never check the
+   * secondary UNIQUE constraints, so a write that also duplicates a UNIQUE value
+   * leaves the duplicate in place. Here both paths still resolve them (SQLite's
+   * semantics), reporting `replacedRow` and `evictedRows` together when both apply —
+   * the executor handles the pair (see quereus's common/types.ts on their
+   * co-occurrence). The two modules disagree until the upstream arm lands
+   * (blocked/quereus-memory-vtab-pk-replace-skips-unique-check).
    */
   private async resolvePkMoveDecision(
     newKey: string,
@@ -2298,10 +2303,36 @@ export class OptimysticVirtualTable extends VirtualTable {
               }
 
               if (onConflict === ConflictResolution.REPLACE) {
-                // INSERT OR REPLACE: overwrite the row in place. Same PK, so
-                // only changed indexed columns restage via updateIndexEntries.
+                // INSERT OR REPLACE: overwrite the row in place. The replacement is a
+                // new row image at the SAME key, so it must clear every secondary
+                // UNIQUE constraint exactly as a fresh insert does — excluding the row
+                // it overwrites, which is on its way out and cannot conflict with its
+                // own replacement (the UPDATE arm excludes oldKey for the same reason).
+                // Decided BEFORE anything is staged: without this probe the only thing
+                // standing between the replacement and a rival holding the value is the
+                // concurrency guard below, which refuses — and re-refuses on every retry
+                // — a collision this snapshot can plainly see.
+                const uniqueDecision = await this.resolveSecondaryUniqueDecision(
+                  values, args.onConflict, new Set([insertKey]));
+                if (uniqueDecision.kind === 'blocked') {
+                  return uniqueDecision.result;
+                }
+                if (uniqueDecision.kind === 'swallow') {
+                  // A secondary constraint resolved IGNORE: the existing row at
+                  // insertKey stays as it was and nothing is staged.
+                  return { status: 'ok' };
+                }
+
                 const replacementEncoded = this.rowCodec.encodeRow(values);
                 this.markDirtyTrees();
+
+                // REPLACE-resolved secondary collisions evict first (evict-then-write),
+                // so the new entry's unique guard below finds its value range free.
+                const evictedRows = uniqueDecision.kind === 'evict'
+                  ? await this.applyUniqueEvictions(uniqueDecision.collisions, txnState?.transactor)
+                  : [];
+
+                // Same PK, so only changed indexed columns restage via updateIndexEntries.
                 await this.collection.stage([[insertKey, [insertKey, replacementEncoded]]]);
                 await this.indexManager.updateIndexEntries(
                   existingRow,
@@ -2311,7 +2342,15 @@ export class OptimysticVirtualTable extends VirtualTable {
                   txnState?.transactor,
                   this.guardedUniqueIndexes(values),
                 );
-                return { status: 'ok', row: values, replacedRow: existingRow };
+                // replacedRow (the same-PK slot) and evictedRows (rows at OTHER PKs)
+                // co-occur here; the executor runs each eviction's delete pipeline
+                // before modelling the replacement as an update of replacedRow.
+                return {
+                  status: 'ok',
+                  row: values,
+                  replacedRow: existingRow,
+                  ...(evictedRows.length > 0 ? { evictedRows } : {}),
+                };
               }
 
               // ABORT (default) / FAIL / ROLLBACK: report the violation

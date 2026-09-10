@@ -121,8 +121,14 @@ mode is already atomic across trees. IGNORE- and REPLACE-resolved constraints ar
 guarded too and *refuse* a concurrent duplicate rather than honouring their
 disposition: the rival's row lives in the main collection, which an index tree's replay
 can neither skip around nor evict, so an unguarded entry would silently commit two rows
-under one unique value; the application-level retry re-probes and honours the
-disposition sequentially. Regression suites:
+under one unique value. An application-level retry then honours the disposition
+sequentially — but only because every write path that stages a guarded entry first runs
+the vtab's pre-stage probe (`resolveSecondaryUniqueDecision`: the fresh INSERT, the
+INSERT whose primary key collides and resolves REPLACE, and UPDATE), which settles every
+collision the writer's own snapshot can see before the guard ever runs. A write path
+added without that probe is broken, not merely conservative: the guard refuses a
+visible collision the probe should have resolved (evicting under REPLACE, swallowing
+under IGNORE), and the retry re-refuses forever. Regression suites:
 `packages/db-core/test/tree-guard.spec.ts` (both exact-key and range guards, raw
 trees), `packages/quereus-plugin-optimystic/test/concurrent-insert-refusal.spec.ts`
 (PK, two `Database` handles, legacy + session) and
