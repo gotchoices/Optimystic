@@ -1,6 +1,6 @@
 {
   "name": "@optimystic/db-p2p-storage-ns",
-  "version": "1.0.0-beta.1",
+  "version": "1.0.0-beta.2",
   "type": "module",
   "description": "NativeScript SQLite storage backend for @optimystic/db-p2p",
   "main": "dist/src/index.js",

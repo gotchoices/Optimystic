@@ -1,6 +1,6 @@
 {
 	"name": "@optimystic/quereus-plugin-crypto",
-	"version": "1.0.0-beta.1",
+	"version": "1.0.0-beta.2",
 	"description": "Quereus plugin providing cryptographic functions (digest, sign, verify)",
 	"type": "module",
 	"main": "dist/index.js",
