@@ -129,6 +129,38 @@ describe('Concurrent same-VALUE refusal on a secondary UNIQUE column (two handle
 		}
 	});
 
+	for (const clause of ['or ignore', 'or replace'] as const) {
+		it(`DETERMINISTIC replay (legacy): insert ${clause} is REFUSED, not silently admitted, when a rival takes the value first`, async () => {
+			// Neither disposition can be honoured inside an index tree's replay — the rival's
+			// row lives in the MAIN collection, which the replay can neither skip around
+			// (IGNORE) nor evict (REPLACE) — so the guard refuses rather than letting two rows
+			// share the value. Before this was guarded, both rows silently committed.
+			const uri = `tree://uniq-race/${clause.replace(' ', '-')}`;
+			const handles = await twoHandles(uri);
+			const { a, b } = handles;
+			try {
+				await a.exec('begin');
+				await a.exec(`insert ${clause} into T (id, v) values (1, 'x')`);
+				await b.exec(`insert into T (id, v) values (2, 'x')`);
+
+				const message = await captureThrowMessage(() => a.exec('commit'));
+				expect(message, `an insert ${clause} loser is refused naming T.v`).to.match(UNIQUE_T_V);
+				for (const db of [a, b]) {
+					expect(await selectCount(db, 'select count(*) as c from T'), 'exactly one row holds the value').to.equal(1);
+					expect(await selectScalar(db, `select id from T where v = 'x'`)).to.equal(2);
+				}
+
+				// The sequential disposition is untouched: a retry sees the rival's row and
+				// honours it — IGNORE swallows, REPLACE evicts the rival.
+				await a.exec(`insert ${clause} into T (id, v) values (1, 'x')`);
+				expect(await selectCount(a, 'select count(*) as c from T')).to.equal(1);
+				expect(await selectScalar(a, `select id from T where v = 'x'`)).to.equal(clause === 'or ignore' ? 2 : 1);
+			} finally {
+				await handles.dispose();
+			}
+		});
+	}
+
 	it('racing: same value, different pk, same tick — exactly one fulfils, the loser is refused naming the UNIQUE column', async () => {
 		const uri = 'tree://uniq-race/same-value';
 		const handles = await twoHandles(uri);

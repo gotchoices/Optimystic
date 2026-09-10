@@ -1647,28 +1647,33 @@ export class OptimysticVirtualTable extends VirtualTable {
    * The names of this table's maintained indexes whose staged entry for a row carrying
    * `values` must carry the concurrency guard (see IndexManager.uniquePrefixGuard) —
    * every UNIQUE constraint that BINDS the row (non-partial, all columns present and
-   * non-null) and resolves to a BLOCKING action (ABORT / FAIL / ROLLBACK, honoured as
-   * ABORT). IGNORE and REPLACE are left unguarded: a REPLACE evicts the rival's row (its
-   * eviction already ran), and an IGNORE keeps last-writer-wins at replay, matching the
-   * exact-key `keepExisting` disposition and its documented index anomaly (backlog
-   * `6-debt-index-sweep-misses-update-delete-and-orphans`). Computed from action
-   * resolution alone — independent of whether this writer's own snapshot saw a collision
-   * — because the guard exists precisely for the collision this snapshot did NOT see (a
-   * rival committing the value concurrently). Returns an EMPTY set for a table with no
+   * non-null), whatever conflict action it resolves to. Computed from the row alone —
+   * independent of whether this writer's own snapshot saw a collision — because the
+   * guard exists precisely for the collision this snapshot did NOT see (a rival
+   * committing the value concurrently). Returns an EMPTY set for a table with no
    * secondary UNIQUE constraints, so the staging paths add no guard and no cost.
+   *
+   * IGNORE- and REPLACE-resolved constraints are guarded too, so a concurrent
+   * duplicate under them is REFUSED rather than honoured at replay. Neither
+   * disposition CAN be honoured there: the rival's row lives in the main collection,
+   * and an index tree's replay can neither skip this row's main entry (IGNORE) nor
+   * evict the rival's (REPLACE) — an unguarded entry would silently commit two rows
+   * under one unique value, the very violation the guard exists to prevent. Refusing
+   * is never silent, and the application-level retry re-probes and then honours the
+   * disposition the sequential way (the call the PK-move guard already makes for
+   * IGNORE; see the UPDATE arm). Every collision this snapshot CAN see is still
+   * settled by the pre-stage probe, so sequential IGNORE/REPLACE semantics are untouched.
+   * NOTE: accepted tradeoff — a concurrent `insert or replace` loser sees a UNIQUE
+   * error instead of displacing the rival; revisit if a cross-collection replay
+   * disposition (skip/evict the rival's MAIN row from an index-tree guard) ever exists.
    */
-  private guardedUniqueIndexes(
-    values: Row,
-    stmtOnConflict: ConflictResolution | undefined,
-  ): ReadonlySet<string> {
+  private guardedUniqueIndexes(values: Row): ReadonlySet<string> {
     const constraints = this.tableSchema.uniqueConstraints;
     if (!constraints || constraints.length === 0) return EMPTY_INDEX_SET;
     const guarded = new Set<string>();
     for (const uc of constraints) {
       if (uc.predicate !== undefined || uc.columns.length === 0) continue;
       if (!uc.columns.every(ci => values[ci] !== null && values[ci] !== undefined)) continue;
-      const effective = this.resolveConflictAction(stmtOnConflict, uc.defaultConflict);
-      if (effective === ConflictResolution.IGNORE || effective === ConflictResolution.REPLACE) continue;
       const enforcing = this.resolveEnforcingIndex(uc);
       if (enforcing) guarded.add(enforcing.descriptor.name);
     }
@@ -2304,6 +2309,7 @@ export class OptimysticVirtualTable extends VirtualTable {
                   insertKey,
                   insertKey,
                   txnState?.transactor,
+                  this.guardedUniqueIndexes(values),
                 );
                 return { status: 'ok', row: values, replacedRow: existingRow };
               }
@@ -2386,7 +2392,7 @@ export class OptimysticVirtualTable extends VirtualTable {
               values,
               insertKey,
               txnState?.transactor,
-              this.guardedUniqueIndexes(values, args.onConflict),
+              this.guardedUniqueIndexes(values),
             );
 
             return { status: 'ok', row: values, ...(evictedRows.length > 0 ? { evictedRows } : {}) };
@@ -2503,7 +2509,7 @@ export class OptimysticVirtualTable extends VirtualTable {
               // Guard the NEW entry on every binding, ABORT-resolved UNIQUE constraint —
               // the moving row's own OLD entry is deleted first in the same tree action, so
               // a value-preserving move never refuses itself (see updateIndexEntries).
-              this.guardedUniqueIndexes(values, args.onConflict),
+              this.guardedUniqueIndexes(values),
             );
 
             return {
@@ -2550,6 +2556,15 @@ export class OptimysticVirtualTable extends VirtualTable {
       // the INSERT and UPDATE paths return structured UpdateResults instead.
       if (error instanceof QuereusError) {
         throw error;
+      }
+      // A guard refusal at INITIAL staging: the tracker the guard scans fetched a
+      // rival's commit that the pre-stage probe's view had not (observed on a two-node
+      // mesh, never on one node). Same message a commit-time refusal carries; the
+      // statement-level savepoint discards whatever this statement staged before it.
+      const refusal = this.txnBridge.mapCommitRefusal(error);
+      if (refusal !== error && refusal instanceof Error) {
+        this.setErrorMessage(refusal.message);
+        throw refusal;
       }
       const wrapped = rewrapAsQueryError(`${operation} failed`, error);
       this.setErrorMessage(wrapped.message);

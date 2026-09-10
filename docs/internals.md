@@ -101,10 +101,14 @@ two rows sharing a unique value under different primary keys occupy *different* 
 keys inside one framed-value prefix — an exact-key `absent` guard cannot see the
 collision. The vtab attaches an `absentRange` guard (claiming the whole value prefix
 range, minus the entry's own key) to a row's entry in each UNIQUE-enforcing index tree
-whose constraint resolves to a blocking action (`OptimysticVirtualTable.guardedUniqueIndexes`
+that binds the row (`OptimysticVirtualTable.guardedUniqueIndexes`
 → `IndexManager.uniquePrefixGuard`; the same range `findByIndexIn` seeks, shared via
 `indexValueRange`). The bridge registers a per-index message so the refusal names the
-violated constraint's *columns*, not the PK. Because a UNIQUE-constrained table is
+violated constraint's *columns*, not the PK — for a commit-time refusal and for the
+rarer staging-time one (the guard also runs at initial staging, and on a mesh the
+tracker it scans can fetch a rival's commit the pre-stage probe's view had not; the
+vtab's DML catch maps that through the same `mapCommitRefusal`, and the statement-level
+savepoint discards what the statement staged before it). Because a UNIQUE-constrained table is
 backed by at least two collections (main table + index tree) and the refusal lives in
 the index tree — which flushes *after* the main table in the legacy sweep — the sweep
 now **pre-flights** a refresh of every staged tree before committing any
@@ -113,9 +117,12 @@ cleanly instead of tearing the base row from its index mid-sweep. That narrows, 
 does not close, the legacy multi-tree tear window (a rival landing between the
 pre-flight and a tree's own flush still tears loudly as a `PartialCommitError`); the
 full close is backlog `feat-optimystic-legacy-commit-two-phase`. Session (coordinator)
-mode is already atomic across trees. IGNORE and REPLACE index entries stay unguarded
-(REPLACE evicts the rival; IGNORE keeps last-writer-wins, the documented index anomaly
-in backlog `6-debt-index-sweep-misses-update-delete-and-orphans`). Regression suites:
+mode is already atomic across trees. IGNORE- and REPLACE-resolved constraints are
+guarded too and *refuse* a concurrent duplicate rather than honouring their
+disposition: the rival's row lives in the main collection, which an index tree's replay
+can neither skip around nor evict, so an unguarded entry would silently commit two rows
+under one unique value; the application-level retry re-probes and honours the
+disposition sequentially. Regression suites:
 `packages/db-core/test/tree-guard.spec.ts` (both exact-key and range guards, raw
 trees), `packages/quereus-plugin-optimystic/test/concurrent-insert-refusal.spec.ts`
 (PK, two `Database` handles, legacy + session) and

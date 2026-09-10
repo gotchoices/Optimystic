@@ -115,8 +115,8 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 								if (guard.kind === 'absentRange') {
 									// Secondary-UNIQUE: the claimed range (a unique index's framed
 									// value prefix) must hold no entry other than this action's own
-									// key. One short descent plus an early-exit walk, over the SAME
-									// store the upsert below writes to, so it sees entries earlier
+									// key. Two short descents (range start and end) plus an early-exit
+									// walk, over the SAME store the upsert below writes to, so it sees entries earlier
 									// actions of this replay already staged or deleted (an UPDATE's
 									// delete-old half runs before its guarded insert half). The guard
 									// is plain data (it is serialized into the log with its action), and

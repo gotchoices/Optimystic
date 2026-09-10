@@ -36,13 +36,20 @@ This document describes the architecture for multi-collection transactions in Op
 >   the already-committed trees in memory (that would make memory disagree with
 >   storage and falsely report a rollback). Callers must reconcile (re-run the
 >   transaction, or repair the split).
+> - **Pre-flight before the first flush** (`commitDirtyTreesLegacy`, when more than one
+>   tree is staged): every staged tree is refreshed against storage before any tree
+>   flushes, so a guarded entry a rival has already contradicted (a concurrency-refused
+>   duplicate key or unique value — `TreeKeyTakenError`, see
+>   [internals.md](internals.md)) is refused while nothing is durable and takes the
+>   first bullet's clean rollback. A rival landing between the pre-flight and a tree's
+>   own flush still takes the second bullet.
 >
 > Even the distributed coordinator commits critical blocks via `Promise.all`
 > (`coordinator.commitPhase`), so a failure *after the first block commits* is a
 > narrow-but-real residual window there too — legacy mode just has a wider window
 > because each tree is a separate pend+commit rather than one pended batch.
 >
-> **Planned narrowing (not yet implemented):** restructure legacy commit to
+> **Planned narrowing (beyond the pre-flight, not yet implemented):** restructure legacy commit to
 > pend-all-then-commit-all (mirror the coordinator) so conflict/validation
 > failures — which happen at pend — occur before any durable commit, making those
 > cases truly atomic and shrinking the residual window to the commit sweep only.

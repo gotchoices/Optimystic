@@ -256,9 +256,11 @@ describe('Two nodes writing one shared secondary-index value', function () {
 	 * stages. The concurrency guard is the backstop: the losing writer's index-tree entry
 	 * carries an `absentRange` guard (see index-manager.ts `uniquePrefixGuard`), re-checked
 	 * by the replace handler on every staging and every conflict replay against the newest
-	 * adopted revision. So the moment B's tree adopts A's committed entry — at B's own
-	 * commit-time refresh here, since this connected mock mesh propagates A's block to B —
-	 * B is REFUSED with the ordinary UNIQUE-constraint error, and only one row survives.
+	 * adopted revision. So the moment B's tree sees A's committed entry — here at B's own
+	 * INITIAL staging: this connected mock mesh has propagated A's block by the time the
+	 * guard's scan fetches it, moments after the probe's view missed it — B is REFUSED with
+	 * the ordinary UNIQUE-constraint error (the vtab maps the staging-time refusal exactly
+	 * as the bridge maps a commit-time one), and only one row survives.
 	 *
 	 * This is the ticket `concurrent-secondary-unique-guard` behavior: the previous version
 	 * of this case asserted the OPPOSITE (both rows survive), documenting the lost-uniqueness
@@ -288,9 +290,9 @@ describe('Two nodes writing one shared secondary-index value', function () {
 		expect(rejectedSameNode, 'a same-value insert on ONE node must violate the UNIQUE index').to.be.instanceOf(Error);
 		expect(String(rejectedSameNode)).to.match(/unique/i);
 
-		// Across machines it is ALSO refused now: B stages against a tree that predates A's
-		// commit (the probe admits), but the guard on B's index entry re-checks at B's
-		// commit-time refresh, which has by now adopted A's row.
+		// Across machines it is ALSO refused now: B's probe reads a view that predates A's
+		// commit (it admits), but the guard on B's index entry re-checks against the live
+		// tracker — at staging here, at commit-time replay otherwise — which sees A's row.
 		let rejectedCrossNode: unknown;
 		try {
 			await nodes.B.db.exec(insertSql(STAMP_ID.B, SHARED_TOKEN));
@@ -298,7 +300,7 @@ describe('Two nodes writing one shared secondary-index value', function () {
 			rejectedCrossNode = error;
 		}
 		expect(rejectedCrossNode, 'the cross-node duplicate is refused, not silently admitted').to.be.instanceOf(Error);
-		expect(String(rejectedCrossNode)).to.match(/unique/i);
+		expect(String(rejectedCrossNode), 'the refusal is the mapped SQL message, not the raw tree error').to.match(/UNIQUE constraint failed/);
 
 		// Only A's row survives; both nodes converge on the single winner.
 		await expectAllNodesConverged(nodes, [

@@ -458,8 +458,13 @@ export class TransactionBridge {
    * unregistered collection, or an error already carrying the mapped message (the
    * legacy sweep maps before rethrowing, and commitTransaction's catch maps again)
    * — passes through unchanged.
+   *
+   * Public because the vtab's DML catch maps through it too: a guard is enforced at
+   * INITIAL staging as well as at replay, and a staging-time refusal (the tracker
+   * fetched a rival's commit the pre-stage probe's view had not) must reach the client
+   * as the same UNIQUE message a commit-time one does.
    */
-  private mapCommitRefusal(error: unknown): unknown {
+  mapCommitRefusal(error: unknown): unknown {
     for (let cursor: unknown = error; cursor instanceof Error; cursor = cursor.cause) {
       if (cursor instanceof TreeKeyTakenError) {
         const message = this.keyTakenMessages.get(cursor.collectionId);
