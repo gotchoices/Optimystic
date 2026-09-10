@@ -6,7 +6,7 @@
  * of indexed column values.
  */
 
-import type { Tree, TreeReadView } from '@optimystic/db-core';
+import type { Tree, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import type { ITransactor } from '@optimystic/db-core';
 import type { Row, SqlValue } from '@quereus/quereus';
@@ -109,6 +109,39 @@ export type PrimaryKey = string;
  * Index entry: maps index key to primary key
  */
 export type IndexEntry = [IndexKey, PrimaryKey];
+
+/**
+ * The tree-key range holding every entry whose framed index tuple equals `indexKey`:
+ * `[indexKey, indexKey + KEY_PREFIX_END)`. Tree keys are `indexKey ‖ framedPrimaryKey`,
+ * so every match begins with the complete framed prefix; see {@link KEY_PREFIX_END} for
+ * why the terminator-successor `\x01` would wrongly also match a longer value whose
+ * escape happens to continue past the prefix.
+ *
+ * THE one definition of "the entries for this index value": the seek path
+ * ({@link IndexManager.findByIndexIn}) scans it, and the unique-index write guard
+ * ({@link uniquePrefixGuard}) claims it. A drift between the two would let a seek find a
+ * duplicate the guard never refused (or the reverse), so they must share this formula.
+ */
+export function indexValueRange(indexKey: IndexKey): KeyRange<string> {
+	return new KeyRange<string>(
+		{ key: indexKey, inclusive: true },
+		{ key: indexKey + KEY_PREFIX_END, inclusive: false },
+		true, // ascending
+	);
+}
+
+/**
+ * The entry guard a UNIQUE index's staged entry carries: no entry OTHER than its own
+ * key may occupy the value's whole prefix range ({@link indexValueRange}). Enforced by
+ * the tree's replace handler at initial staging AND at every conflict replay, which is
+ * what refuses a losing concurrent writer whose row shares a unique value with a row a
+ * rival committed under a different primary key — the sequential probe in the vtab only
+ * proves the value clear in this writer's own snapshot. The exact-key `absent` guard
+ * cannot express this: the two rows sit at different tree keys inside one prefix.
+ */
+export function uniquePrefixGuard(indexKey: IndexKey): TreeEntryGuard<IndexKey> {
+	return { kind: 'absentRange', range: indexValueRange(indexKey) };
+}
 
 /**
  * Factory function to create/get index trees
@@ -285,11 +318,18 @@ export class IndexManager {
 	 * caller is responsible for flushing the touched trees at transaction commit
 	 * (via TransactionBridge.markDirty) or discarding them on rollback, so a
 	 * deferred-constraint rejection leaves no orphaned index entries.
+	 *
+	 * `uniqueIndexes` names the maintained indexes (by name) whose entry for THIS row
+	 * must carry the {@link uniquePrefixGuard} — the trees enforcing a secondary UNIQUE
+	 * constraint that binds the row (the vtab resolves the set; see
+	 * `OptimysticVirtualTable.guardedUniqueIndexes`). Every other index stages a bare
+	 * upsert exactly as before: no guard, no extra descent, no behaviour change.
 	 */
 	async insertIndexEntries(
 		row: Row,
 		primaryKey: PrimaryKey,
-		_transactor?: ITransactor
+		_transactor?: ITransactor,
+		uniqueIndexes?: ReadonlySet<string>,
 	): Promise<void> {
 		for (const index of this.getAllMaintainedIndexes()) {
 			const indexKey = this.createIndexKey(index, row);
@@ -302,8 +342,18 @@ export class IndexManager {
 			// so plain concatenation is unambiguous). Store as [treeKey, primaryKey] so the
 			// tree's keyExtractor (entry[0]) returns the treeKey for sorting and range scans.
 			const treeKey = indexKey + primaryKey;
-			await tree.stage([[treeKey, [treeKey, primaryKey]]]);
+			await tree.stage([[treeKey, [treeKey, primaryKey], this.guardFor(index, indexKey, uniqueIndexes)]]);
 		}
+	}
+
+	/** The guard a staged entry carries: the unique prefix guard when `index` is in the
+	 * caller's unique set for this row, else none (a plain upsert). */
+	private guardFor(
+		index: StoredIndexSchema,
+		indexKey: IndexKey,
+		uniqueIndexes: ReadonlySet<string> | undefined,
+	): TreeEntryGuard<IndexKey> | undefined {
+		return uniqueIndexes?.has(index.name) ? uniquePrefixGuard(indexKey) : undefined;
 	}
 
 	/**
@@ -330,14 +380,17 @@ export class IndexManager {
 
 	/**
 	 * Stage index-entry updates when a row changes (staged, not flushed — see
-	 * {@link insertIndexEntries} for the flush/discard contract).
+	 * {@link insertIndexEntries} for the flush/discard contract). `uniqueIndexes` is the
+	 * same per-row guard set {@link insertIndexEntries} takes, applied to the NEW entry;
+	 * the old entry's delete is never guarded.
 	 */
 	async updateIndexEntries(
 		oldRow: Row,
 		newRow: Row,
 		oldPrimaryKey: PrimaryKey,
 		newPrimaryKey: PrimaryKey,
-		_transactor?: ITransactor
+		_transactor?: ITransactor,
+		uniqueIndexes?: ReadonlySet<string>,
 	): Promise<void> {
 		// For each index, check if the indexed columns changed
 		for (const index of this.getAllMaintainedIndexes()) {
@@ -353,10 +406,14 @@ export class IndexManager {
 			const newTreeKey = newIndexKey + newPrimaryKey;
 
 			if (oldTreeKey !== newTreeKey) {
-				// Index key or primary key changed - delete old, insert new
+				// Index key or primary key changed - delete old, insert new. ONE action, delete
+				// first: the replace handler runs the entries in order, so a unique guard on
+				// the new entry scans a range the old entry has already left — a PK move that
+				// keeps its unique value (old and new keys share the value prefix) must not
+				// refuse itself on its own outgoing entry.
 				await tree.stage([
 					[oldTreeKey, undefined],
-					[newTreeKey, [newTreeKey, newPrimaryKey]]
+					[newTreeKey, [newTreeKey, newPrimaryKey], this.guardFor(index, newIndexKey, uniqueIndexes)]
 				]);
 			}
 			// If both keys are the same, no update needed
@@ -396,22 +453,9 @@ export class IndexManager {
 		read: TreeReadView<IndexKey, IndexEntry>,
 		indexKey: IndexKey
 	): AsyncIterable<PrimaryKey> {
-		// Range scan for all entries whose framed index tuple equals `indexKey`.
-		// Tree keys are `indexKey ‖ framedPrimaryKey`, so every match begins with the
-		// complete framed prefix `indexKey`. Scan from `indexKey` (inclusive) to
-		// `indexKey + KEY_PREFIX_END` (exclusive) — see KEY_PREFIX_END for why the
-		// terminator-successor `\x01` would wrongly also match a longer value whose
-		// escape happens to continue past the prefix.
-		const startKey = indexKey;
-		const endKey = indexKey + KEY_PREFIX_END;
-
-		const range = new KeyRange<string>(
-			{ key: startKey, inclusive: true },
-			{ key: endKey, inclusive: false },
-			true // ascending
-		);
-
-		for await (const path of read.range(range)) {
+		// Range scan for all entries whose framed index tuple equals `indexKey` — the
+		// same range the unique-index write guard claims (see indexValueRange).
+		for await (const path of read.range(indexValueRange(indexKey))) {
 			if (!read.isValid(path)) {
 				continue;
 			}

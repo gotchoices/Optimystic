@@ -82,20 +82,45 @@ row (silent last-writer-wins, with the *loser's* row surviving). A staged tree e
 therefore carries an optional serialized guard stating the statement's intent —
 `TreeEntryGuard` in `packages/db-core/src/collections/tree/struct.ts`: `absent`
 (INSERT — a present key throws `TreeKeyTakenError`), `keepExisting` (INSERT OR
-IGNORE — skip silently), `absentRange` (reserved for secondary-unique enforcement).
-The `replace` handler (`buildInit` in `packages/db-core/src/collections/tree/tree.ts`)
-enforces the guard on **every** run — initial staging and every conflict replay — so
-the decision is always re-made against the newest adopted committed state. The throw
-is not a `StaleFailure`, so neither `Collection.sync`'s retry loop nor
-`TransactionCoordinator.commit`'s stale-loss re-drive absorbs it; it surfaces out of
-the losing commit, where the Quereus bridge maps it to the ordinary
-`UNIQUE constraint failed: <table>.<col>` message (`mapCommitRefusal` in
-`packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`), so a
-refused concurrent insert is indistinguishable from a sequential duplicate to
+IGNORE — skip silently), `absentRange` (secondary-UNIQUE — no entry OTHER than this
+entry's own key may occupy a key *range*; a foreign hit throws `TreeRangeTakenError`,
+a subclass of `TreeKeyTakenError`). The `replace` handler (`buildInit` in
+`packages/db-core/src/collections/tree/tree.ts`) enforces the guard on **every** run —
+initial staging and every conflict replay — so the decision is always re-made against
+the newest adopted committed state. The throw is not a `StaleFailure`, so neither
+`Collection.sync`'s retry loop nor `TransactionCoordinator.commit`'s stale-loss
+re-drive absorbs it; it surfaces out of the losing commit, where the Quereus bridge
+maps it to the ordinary `UNIQUE constraint failed: <table>.<col>` message
+(`mapCommitRefusal` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`),
+so a refused concurrent insert is indistinguishable from a sequential duplicate to
 clients. A key the winner *deleted* replays as absent and is legitimately reusable.
-Regression suites: `packages/db-core/test/tree-guard.spec.ts` (both write paths, raw
-trees) and `packages/quereus-plugin-optimystic/test/concurrent-insert-refusal.spec.ts`
-(two `Database` handles over one storage directory, legacy and session commit modes).
+
+`absentRange` is what extends this to a UNIQUE column with no structural backing.
+Optimystic keys a secondary index tree as `frame(indexValue) ‖ frame(primaryKey)`, so
+two rows sharing a unique value under different primary keys occupy *different* tree
+keys inside one framed-value prefix — an exact-key `absent` guard cannot see the
+collision. The vtab attaches an `absentRange` guard (claiming the whole value prefix
+range, minus the entry's own key) to a row's entry in each UNIQUE-enforcing index tree
+whose constraint resolves to a blocking action (`OptimysticVirtualTable.guardedUniqueIndexes`
+→ `IndexManager.uniquePrefixGuard`; the same range `findByIndexIn` seeks, shared via
+`indexValueRange`). The bridge registers a per-index message so the refusal names the
+violated constraint's *columns*, not the PK. Because a UNIQUE-constrained table is
+backed by at least two collections (main table + index tree) and the refusal lives in
+the index tree — which flushes *after* the main table in the legacy sweep — the sweep
+now **pre-flights** a refresh of every staged tree before committing any
+(`commitDirtyTreesLegacy`), so a refusal whose rival already committed rolls back
+cleanly instead of tearing the base row from its index mid-sweep. That narrows, but
+does not close, the legacy multi-tree tear window (a rival landing between the
+pre-flight and a tree's own flush still tears loudly as a `PartialCommitError`); the
+full close is backlog `feat-optimystic-legacy-commit-two-phase`. Session (coordinator)
+mode is already atomic across trees. IGNORE and REPLACE index entries stay unguarded
+(REPLACE evicts the rival; IGNORE keeps last-writer-wins, the documented index anomaly
+in backlog `6-debt-index-sweep-misses-update-delete-and-orphans`). Regression suites:
+`packages/db-core/test/tree-guard.spec.ts` (both exact-key and range guards, raw
+trees), `packages/quereus-plugin-optimystic/test/concurrent-insert-refusal.spec.ts`
+(PK, two `Database` handles, legacy + session) and
+`packages/quereus-plugin-optimystic/test/concurrent-secondary-unique-refusal.spec.ts`
+(secondary UNIQUE, same shape).
 
 One consequence for rollback: the refusal happens *after* the loser's refresh adopted
 the rival's committed revision, so the pre-transaction snapshot its rollback restores

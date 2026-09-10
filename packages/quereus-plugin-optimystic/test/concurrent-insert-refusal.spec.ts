@@ -292,13 +292,21 @@ describe('Concurrent same-key INSERT refusal (two handles, one FileRawStorage di
 		}
 	});
 
-	it('LEGACY mode, two-table transaction, refusal MID-SWEEP: PartialCommitError names the mapped UNIQUE message', async () => {
-		// The clean table stages FIRST, so its tree syncs (durably commits) before the
-		// colliding table's tree refuses — the mid-sweep exit of commitDirtyTreesLegacy,
-		// which must NOT pretend to roll back: it reports the split loudly as a
-		// PartialCommitError whose underlying failure is the mapped duplicate-key
-		// refusal. (The first-tree exit — nothing persisted, clean rollback, bare
-		// UNIQUE message — is the DETERMINISTIC legacy test above.)
+	it('LEGACY mode, two-table transaction, DETERMINISTIC refusal: the commit-sweep pre-flight rolls back cleanly, nothing torn', async () => {
+		// The clean table stages FIRST and the colliding table SECOND. A rival then commits
+		// the colliding key BEFORE this transaction commits (deterministic — no race).
+		//
+		// Before the secondary-unique work added it, the legacy sweep flushed U (durably
+		// committing it) and only THEN hit T's refusal — a mid-sweep split reported as a
+		// PartialCommitError. commitDirtyTreesLegacy now PRE-FLIGHTS every staged tree
+		// (`tree.update()`) before flushing any, so a refusal whose rival already committed
+		// surfaces before U reaches storage: nothing is torn, the whole transaction rolls
+		// back cleanly, and the client sees the bare mapped UNIQUE message. This is the
+		// deterministic shape moving from the honest-tear exit to the clean-rollback exit.
+		// (The genuine mid-sweep PartialCommitError — a flush that fails AFTER an earlier tree
+		// durably committed — is still covered by an injected commit failure in
+		// legacy-commit-atomicity.spec.ts; the pre-flight narrows, but cannot close, that
+		// window for a rival that lands between the pre-flight and a tree's own flush.)
 		const uriT = 'tree://race/partial-t';
 		const uriU = 'tree://race/partial-u';
 		const { db: a, plugin: pluginA } = createDb(dir);
@@ -315,13 +323,12 @@ describe('Concurrent same-key INSERT refusal (two handles, one FileRawStorage di
 			await b.exec(`insert into T (id, v) values (1, 'from-B')`);
 
 			const message = await captureThrowMessage(() => a.exec('commit'));
-			expect(message, 'the split is reported loudly, not as a clean rollback').to.match(/not atomic/i);
-			expect(message, 'the underlying failure is the mapped duplicate-key refusal').to.match(UNIQUE_T_ID);
+			expect(message, 'a deterministic refusal rolls back cleanly, no split to report').to.not.match(/not atomic/i);
+			expect(message, 'the client sees the mapped duplicate-key refusal').to.match(UNIQUE_T_ID);
 
-			// Durable state, read via handle B (handle A latched itself degraded): the
-			// clean table's insert really persisted before the refusal, and the rival's
-			// row survives in T.
-			expect(await selectCount(b, 'select count(*) as c from U'), 'the first-swept tree durably committed').to.equal(1);
+			// Durable state, read via handle B: the pre-flight refused BEFORE U reached storage,
+			// so the clean table did NOT persist, and the rival's row survives in T.
+			expect(await selectCount(b, 'select count(*) as c from U'), 'the pre-flight prevented the first-swept tree from committing').to.equal(0);
 			expect(await selectScalar(b, 'select v from T where id = 1')).to.equal('from-B');
 		} finally {
 			a.close();

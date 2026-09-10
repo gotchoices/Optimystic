@@ -2,7 +2,7 @@ import { Collection, type CollectionInitOptions, type CollectionId, type Collect
 import type { ITransactor, BlockId, BlockStore, IBlock, ActionId } from "../../index.js";
 import { BTree, type Path, type KeyRange } from "../../btree/index.js";
 import { CollectionTrunk } from "./collection-trunk.js";
-import { TreeHeaderBlockType, TreeKeyTakenError, type TreeReplaceAction } from "./struct.js";
+import { TreeHeaderBlockType, TreeKeyTakenError, TreeRangeTakenError, type TreeReplaceAction } from "./struct.js";
 
 /**
  * Read-only surface of a tree: every navigation/lookup method a reader needs, with
@@ -113,20 +113,32 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 							// A throw here discards the whole action's staged writes (Atomic wrapper).
 							if (guard !== undefined) {
 								if (guard.kind === 'absentRange') {
-									// Defined for serialization stability; enforced by the follow-up
-									// secondary-unique guard work. Refuse loudly rather than silently
-									// degrading to an upsert.
-									throw new Error(
-										`Tree collection ${id}: 'absentRange' entry guards are not enforced yet`);
-								}
-								const found = await actionTree.find(key);
-								if (found.on) {
-									if (guard.kind === 'absent') {
-										throw new TreeKeyTakenError(id, key);
+									// Secondary-UNIQUE: the claimed range (a unique index's framed
+									// value prefix) must hold no entry other than this action's own
+									// key. One short descent plus an early-exit walk, over the SAME
+									// store the upsert below writes to, so it sees entries earlier
+									// actions of this replay already staged or deleted (an UPDATE's
+									// delete-old half runs before its guarded insert half). The guard
+									// is plain data (it is serialized into the log with its action), and
+									// BTree.range reads the range's fields only — so a KeyRange that has
+									// round-tripped through JSON is scanned exactly like a live instance.
+									for await (const path of actionTree.range(guard.range)) {
+										const occupant = actionTree.at(path);
+										if (occupant === undefined) continue;
+										const occupantKey = keyFromEntry(occupant);
+										if (compare(occupantKey, key) === 0) continue;	// self-exclusion
+										throw new TreeRangeTakenError(id, key, guard.range, occupantKey);
 									}
-									// keepExisting: leave the present (rival's) entry in place and skip
-									// this entry silently — the INSERT OR IGNORE disposition.
-									continue;
+								} else {
+									const found = await actionTree.find(key);
+									if (found.on) {
+										if (guard.kind === 'absent') {
+											throw new TreeKeyTakenError(id, key);
+										}
+										// keepExisting: leave the present (rival's) entry in place and
+										// skip this entry silently — the INSERT OR IGNORE disposition.
+										continue;
+									}
 								}
 							}
 							await actionTree.upsert(entry);

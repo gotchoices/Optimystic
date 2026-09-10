@@ -21,6 +21,8 @@ import { expect } from 'chai';
 import {
 	Tree,
 	TreeKeyTakenError,
+	TreeRangeTakenError,
+	KeyRange,
 	TransactionCoordinator,
 	createTransactionStamp,
 	createTransactionId,
@@ -179,13 +181,100 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 			expect(await second.get(1)).to.deep.equal({ key: 1, name: 'original' });
 		});
 
-		it('an absentRange guard is refused loudly until the secondary-unique work wires it up', async () => {
+	});
+
+	// A UNIQUE secondary index is a Tree<string, [treeKey, pk]> keyed on `value#pk`, so two
+	// rows sharing a unique value but differing in PK occupy DIFFERENT tree keys inside one
+	// value prefix. The `absentRange` guard claims the whole prefix range minus its own key.
+	describe('absentRange guard (secondary-UNIQUE prefix enforcement)', () => {
+		type IdxEntry = [string, string]; // [treeKey, primaryKey]
+		const byTreeKey = (e: IdxEntry) => e[0];
+		// The tree-key range holding every entry for value `v`: keys are `v#<pk>`, and '#'
+		// (0x23) < '$' (0x24), so [`v#`, `v$`) brackets exactly the `v#*` family.
+		const valueRange = (v: string): KeyRange<string> =>
+			new KeyRange<string>({ key: `${v}#`, inclusive: true }, { key: `${v}$`, inclusive: false }, true);
+		const uniqueGuard = (v: string) => ({ kind: 'absentRange' as const, range: valueRange(v) });
+		const entryFor = (v: string, pk: string): IdxEntry => [`${v}#${pk}`, pk];
+		const stageUnique = (tree: Tree<string, IdxEntry>, v: string, pk: string) =>
+			tree.stage([[`${v}#${pk}`, entryFor(v, pk), uniqueGuard(v)]]);
+
+		it('refuses a losing writer whose unique VALUE a rival committed under a different PK', async () => {
 			const transactor = new TestTransactor();
-			const tree = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
-			const err = await capture(() => tree.stage([[1, { key: 1, name: 'x' },
-				{ kind: 'absentRange', range: { isAscending: true } as never }]]));
-			expect(err).to.be.instanceOf(Error);
-			expect((err as Error).message).to.match(/absentRange.*not enforced/i);
+			const winner = await Tree.createOrOpen<string, IdxEntry>(transactor, 'ux', byTreeKey);
+			const loser = await Tree.createOrOpen<string, IdxEntry>(transactor, 'ux', byTreeKey);
+
+			// Both probe an empty prefix and stage the SAME value under DIFFERENT pks.
+			await stageUnique(winner, 'v', 'a');
+			await stageUnique(loser, 'v', 'b');
+
+			await winner.sync();
+			const err = await capture(() => loser.sync());
+			expect(err, 'the loser is refused for the range, not the exact key').to.be.instanceOf(TreeRangeTakenError);
+			expect((err as TreeRangeTakenError).collectionId).to.equal('ux');
+			expect((err as TreeRangeTakenError<string>).occupant, 'the refusal names the rival key it collided with').to.equal('v#a');
+			// TreeRangeTakenError IS a TreeKeyTakenError, so a consumer refusing on the base
+			// class handles it with no new arm.
+			expect(err, 'subclass of the exact-key refusal').to.be.instanceOf(TreeKeyTakenError);
+
+			// Exactly one entry survives for value 'v' — the winner's.
+			const fresh = await Tree.createOrOpen<string, IdxEntry>(transactor, 'ux', byTreeKey);
+			const survivors: string[] = [];
+			for await (const path of fresh.range(valueRange('v'))) {
+				const e = fresh.at(path); if (e) survivors.push(e[1]);
+			}
+			expect(survivors, 'only the winning row is durable').to.deep.equal(['a']);
+		});
+
+		it('self-exclusion: a guarded entry never refuses itself on its own key (initial stage and clean sync)', async () => {
+			const transactor = new TestTransactor();
+			const tree = await Tree.createOrOpen<string, IdxEntry>(transactor, 'ux', byTreeKey);
+			// No rival — the guard scans the range, finds only its OWN key, excludes it, proceeds.
+			await stageUnique(tree, 'v', 'a');
+			await tree.sync();
+			const fresh = await Tree.createOrOpen<string, IdxEntry>(transactor, 'ux', byTreeKey);
+			expect(await fresh.get('v#a')).to.deep.equal(['v#a', 'a']);
+		});
+
+		it('does not refuse a different unique value (discriminator against over-broad ranges)', async () => {
+			const transactor = new TestTransactor();
+			const first = await Tree.createOrOpen<string, IdxEntry>(transactor, 'ux', byTreeKey);
+			const second = await Tree.createOrOpen<string, IdxEntry>(transactor, 'ux', byTreeKey);
+			await stageUnique(first, 'v1', 'a');
+			await stageUnique(second, 'v2', 'b');
+			await first.sync();
+			await second.sync(); // disjoint values — no false refusal
+			const fresh = await Tree.createOrOpen<string, IdxEntry>(transactor, 'ux', byTreeKey);
+			expect(await fresh.get('v1#a')).to.not.be.undefined;
+			expect(await fresh.get('v2#b')).to.not.be.undefined;
+		});
+
+		it('allows re-use of a unique value the winner DELETED (guard reads adopted state, not history)', async () => {
+			const transactor = new TestTransactor();
+			const older = await Tree.createOrOpen<string, IdxEntry>(transactor, 'ux', byTreeKey);
+			await older.replace([['seed#0', ['seed#0', '0']]]); // materialise the collection
+			const behind = await Tree.createOrOpen<string, IdxEntry>(transactor, 'ux', byTreeKey);
+
+			// The other writer inserts value 'v' then deletes it — two revisions behind hasn't seen.
+			await older.replace([['v#a', ['v#a', 'a']]]);
+			await older.replace([['v#a', undefined]]);
+
+			// behind probed clear (its view predates both) and stages a guarded insert of the
+			// same value under a different pk. Its refresh adopts the delete, so the replayed
+			// guard sees the prefix empty and proceeds.
+			await stageUnique(behind, 'v', 'b');
+			await behind.sync();
+			const fresh = await Tree.createOrOpen<string, IdxEntry>(transactor, 'ux', byTreeKey);
+			expect(await fresh.get('v#b'), 'a deleted unique value is reusable').to.deep.equal(['v#b', 'b']);
+		});
+
+		it('enforces the range guard at INITIAL staging over an already-visible foreign key', async () => {
+			const transactor = new TestTransactor();
+			const first = await Tree.createOrOpen<string, IdxEntry>(transactor, 'ux', byTreeKey);
+			await first.replace([['v#a', ['v#a', 'a']]]);
+			const second = await Tree.createOrOpen<string, IdxEntry>(transactor, 'ux', byTreeKey);
+			const err = await capture(() => stageUnique(second, 'v', 'b'));
+			expect(err).to.be.instanceOf(TreeRangeTakenError);
+			expect(second.hasUnsyncedChanges(), 'the refused action left nothing staged').to.be.false;
 		});
 	});
 

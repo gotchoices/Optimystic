@@ -24,6 +24,15 @@ export interface DirtyTree {
   snapshot(): unknown;
   restore(snapshot: unknown): void;
   /**
+   * Optional refresh-without-flush (a Tree forwards to `Collection.update()`): adopt the
+   * newest committed revision and replay this tree's staged actions against it. The
+   * legacy commit sweep runs it over every staged tree BEFORE flushing any — a guarded
+   * entry a rival has since contradicted is refused there, while nothing is durable, and
+   * the whole transaction rolls back cleanly. Optional so test doubles need not
+   * implement it; a tree without it is flushed without the pre-flight.
+   */
+  update?(): Promise<void>;
+  /**
    * Optional human-readable identifier (a Tree returns its collection id) used
    * only to name persisted vs. unpersisted trees in a {@link PartialCommitError}.
    * Optional so test doubles need not implement it; the bridge falls back to a
@@ -254,14 +263,16 @@ export class TransactionBridge {
    */
   private collectionRegistry = new Map<CollectionId, Collection<any>>();
   /**
-   * Per-collection SQL rendering of a concurrency-refused duplicate key: the
+   * Per-collection SQL rendering of a concurrency-refused duplicate: the
    * `UNIQUE constraint failed: <table>.<col>[, …]` message the vtab registers for its
-   * MAIN collection as it initializes (see OptimysticVirtualTable.registerCollections).
-   * A `TreeKeyTakenError` surfacing at commit — the losing writer's conflict replay
-   * refusing a key a rival already committed — is rewrapped via
-   * {@link mapCommitRefusal} so clients see the exact message shape a sequential
-   * duplicate INSERT produces, distinguishable from a transport failure with no new
-   * downstream classification arm.
+   * MAIN collection (naming the PRIMARY KEY columns) and for each UNIQUE-enforcing
+   * index tree (naming that constraint's columns) as it initializes (see
+   * OptimysticVirtualTable.registerCollections). A `TreeKeyTakenError` — or its
+   * `TreeRangeTakenError` subclass out of a unique index tree — surfacing at commit,
+   * the losing writer's conflict replay refusing a key (or a unique value) a rival
+   * already committed, is rewrapped via {@link mapCommitRefusal} so clients see the
+   * exact message shape a sequential duplicate INSERT produces, distinguishable from
+   * a transport failure with no new downstream classification arm.
    */
   private keyTakenMessages = new Map<CollectionId, string>();
   /**
@@ -429,7 +440,10 @@ export class TransactionBridge {
   /**
    * Register the SQL message a `TreeKeyTakenError` from `collectionId` maps to at
    * commit (see {@link keyTakenMessages}). Idempotent; called by the vtab as each
-   * table initializes, alongside {@link registerCollection}.
+   * table initializes, alongside {@link registerCollection} — once for the main
+   * collection (the PRIMARY KEY message) and once per UNIQUE-enforcing index tree
+   * (that constraint's columns), since a `TreeRangeTakenError` out of an index
+   * collection's replay names the violated UNIQUE constraint by its collection id.
    */
   registerKeyTakenMessage(collectionId: CollectionId, message: string): void {
     this.keyTakenMessages.set(collectionId, message);
@@ -734,6 +748,39 @@ export class TransactionBridge {
   private async commitDirtyTreesLegacy(): Promise<void> {
     const trees = [...this.dirtyTrees.keys()];
     const synced: DirtyTree[] = [];
+
+    // PRE-FLIGHT: refresh every staged tree against storage BEFORE the first flush.
+    // Each `sync()` below opens with exactly this refresh (`Collection.updateAndSync`),
+    // where a guarded entry's uniqueness decision is re-made against the newest
+    // committed state — but a refresh run at flush time fires only when that tree's
+    // turn comes, and the main table always flushes before its index trees. A
+    // secondary-UNIQUE refusal (an `absentRange` guard in a unique index tree, see
+    // TreeRangeTakenError) would therefore land MID-SWEEP: the loser's row already
+    // durable in the main table, the index entry refused, the handle latched degraded
+    // by PartialCommitError — the very tear this sweep cannot undo, with a duplicate
+    // unique value left behind in storage. Hoisting the refresh here moves the
+    // deterministic shape (the rival committed before this commit began) to the
+    // first-tree exit: nothing persisted, ordinary rollback, ordinary UNIQUE message.
+    // Same for a PK refusal in a multi-table transaction whose colliding table is not
+    // swept first. Cost: one extra header/tail read per STAGED tree per legacy commit
+    // (clean trees skip it — nothing to replay, nothing to refuse), on top of the
+    // refresh sync() repeats.
+    // NOTE: this narrows the tear window to "a rival lands between this pre-flight
+    // and the tree's own flush"; it does not close it. Closing it needs
+    // pend-all-then-commit-all (backlog `feat-optimystic-legacy-commit-two-phase`).
+    if (trees.length > 1) {
+      for (const tree of trees) {
+        if (tree.update !== undefined && tree.hasUnsyncedChanges?.() !== false) {
+          try {
+            await tree.update();
+          } catch (rawError) {
+            // Nothing persisted: map a refusal and let commitTransaction's catch run
+            // the ordinary clean rollback (same exit as a first-tree flush failure).
+            throw this.mapCommitRefusal(rawError);
+          }
+        }
+      }
+    }
 
     // Trace what this sweep is about to carry. Legacy mode's commit set is the
     // dirty set (a tree only lands here once markDirty saw DML stage into it), so

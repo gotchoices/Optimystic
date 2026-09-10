@@ -27,10 +27,13 @@ export const rootId$ = nameof<TreeCollectionHeaderBlock>("rootId");
  * - `absent` — the key must not exist (SQL INSERT): a hit throws {@link TreeKeyTakenError},
  *   discarding the whole action's staged writes.
  * - `keepExisting` — if the key exists, skip this entry silently (SQL INSERT OR IGNORE).
- * - `absentRange` — no OTHER entry may exist in `range` (secondary-UNIQUE enforcement,
- *   where uniqueness is a property of a framed key PREFIX rather than one exact key).
- *   Defined here for serialization stability; the handler arm is wired up by the
- *   secondary-unique guard work and REFUSES (throws) if encountered before then.
+ * - `absentRange` — no entry OTHER THAN this action's own key may exist in `range`
+ *   (secondary-UNIQUE enforcement, where uniqueness is a property of a framed key
+ *   PREFIX rather than one exact key: an index tree keys `indexKey ‖ primaryKey`, so
+ *   two rows sharing a unique value sit at different keys inside one prefix range). A
+ *   foreign hit throws {@link TreeRangeTakenError}. The entry being staged lands inside
+ *   its own range, so the scan excludes its exact key — otherwise every guarded
+ *   re-stage of a present key (a replay after a clean refresh) would refuse itself.
  *
  * MIXED VERSIONS: a peer running a build that predates guards destructures `[key, entry]`
  * and ignores the third slot — its replays revert to today's silent overwrite. No version
@@ -65,14 +68,49 @@ export class TreeKeyTakenError<TKey = unknown> extends Error {
 	constructor(
 		/** The collection whose tree refused the entry. */
 		public readonly collectionId: CollectionId,
-		/** The key some other writer already committed. */
+		/** The key some other writer already committed (for the `absentRange` subclass: the
+		 * key this action was staging, whose claimed range a rival occupies). */
 		public readonly key: TKey,
+		/** Subclass override of the rendered message; the default names the exact-key refusal. */
+		message?: string,
 	) {
-		// String keys render JSON-quoted so framing control bytes stay visible/escaped in
-		// logs; everything else via String() — JSON.stringify would throw on a bigint key,
-		// and an error constructor must never be the second failure.
-		super(`Tree collection ${collectionId}: key ${typeof key === 'string' ? JSON.stringify(key) : String(key)} is already taken by a committed entry`);
+		super(message ?? `Tree collection ${collectionId}: key ${renderKey(key)} is already taken by a committed entry`);
 		this.name = 'TreeKeyTakenError';
 	}
+}
+
+/**
+ * The `absentRange` refusal: the guarded entry's key is free, but some OTHER committed
+ * entry (`occupant`) sits inside the range the entry claims exclusively — for a unique
+ * index tree, a rival's row carrying the same unique value under a different primary
+ * key. A subclass of {@link TreeKeyTakenError} on purpose: every consumer that treats a
+ * key refusal as a non-retryable uniqueness failure (the sync/commit retry loops let it
+ * escape; the Quereus bridge maps it by `collectionId` to a `UNIQUE constraint failed`
+ * message) handles this one identically without a second arm. `collectionId` is the
+ * discriminator that names WHICH constraint fired — each unique index is its own
+ * collection — so the bridge needs nothing beyond it.
+ */
+export class TreeRangeTakenError<TKey = unknown> extends TreeKeyTakenError<TKey> {
+	constructor(
+		collectionId: CollectionId,
+		/** The key this action was staging (free — it is the range that is contested). */
+		key: TKey,
+		/** The range the entry claimed exclusively. */
+		public readonly range: KeyRange<TKey>,
+		/** The committed key found inside `range` that is not `key`. */
+		public readonly occupant: TKey,
+	) {
+		super(collectionId, key,
+			`Tree collection ${collectionId}: key ${renderKey(key)} is guarded unique over a key range `
+			+ `already occupied by committed entry ${renderKey(occupant)}`);
+		this.name = 'TreeRangeTakenError';
+	}
+}
+
+/** String keys render JSON-quoted so framing control bytes stay visible/escaped in logs;
+ * everything else via String() — JSON.stringify would throw on a bigint key, and an error
+ * constructor must never be the second failure. */
+function renderKey(key: unknown): string {
+	return typeof key === 'string' ? JSON.stringify(key) : String(key);
 }
 

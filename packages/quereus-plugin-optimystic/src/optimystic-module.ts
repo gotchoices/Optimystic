@@ -27,6 +27,10 @@ import { createLogger, revisionToken } from './logger.js';
 
 const log = createLogger('module');
 
+/** Shared empty guard set — returned by {@link OptimysticVirtualTable.guardedUniqueIndexes}
+ *  for the common no-secondary-UNIQUE table so the staging paths allocate nothing. */
+const EMPTY_INDEX_SET: ReadonlySet<string> = new Set<string>();
+
 /**
  * Every catch arm below that surfaces a caught error to the SQL layer funnels through
  * here, so the original error (a `BlockUnavailableError` with its `reason`, a
@@ -1611,6 +1615,64 @@ export class OptimysticVirtualTable extends VirtualTable {
         this.txnBridge.registerCollection(tree.getCollection());
       }
     }
+    this.registerUniqueKeyTakenMessages();
+  }
+
+  /**
+   * Teach the bridge how to render a `TreeRangeTakenError` (a concurrency-refused
+   * duplicate UNIQUE VALUE) fired from a UNIQUE-enforcing index tree: map that tree's
+   * collection id to `uniqueConstraintMessage(uc.columns)`, naming the violated
+   * constraint's columns rather than the PK. A row can bind several UNIQUE constraints,
+   * each enforced by its own tree, so this registers one message per resolvable
+   * constraint. Idempotent (the bridge keys by collection id); re-run after a
+   * `CREATE UNIQUE INDEX` mirrors a new constraint (see {@link addIndex}). Constraints
+   * whose enforcing tree cannot yet be resolved are skipped silently — they carry no
+   * live tree to fire a refusal from, so there is nothing to name.
+   */
+  private registerUniqueKeyTakenMessages(): void {
+    const constraints = this.tableSchema.uniqueConstraints;
+    if (!constraints || constraints.length === 0) return;
+    for (const uc of constraints) {
+      if (uc.predicate !== undefined || uc.columns.length === 0) continue;
+      const enforcing = this.resolveEnforcingIndex(uc);
+      if (!enforcing) continue;
+      this.txnBridge.registerKeyTakenMessage(
+        enforcing.tree.getCollection().id,
+        this.uniqueConstraintMessage(uc.columns),
+      );
+    }
+  }
+
+  /**
+   * The names of this table's maintained indexes whose staged entry for a row carrying
+   * `values` must carry the concurrency guard (see IndexManager.uniquePrefixGuard) —
+   * every UNIQUE constraint that BINDS the row (non-partial, all columns present and
+   * non-null) and resolves to a BLOCKING action (ABORT / FAIL / ROLLBACK, honoured as
+   * ABORT). IGNORE and REPLACE are left unguarded: a REPLACE evicts the rival's row (its
+   * eviction already ran), and an IGNORE keeps last-writer-wins at replay, matching the
+   * exact-key `keepExisting` disposition and its documented index anomaly (backlog
+   * `6-debt-index-sweep-misses-update-delete-and-orphans`). Computed from action
+   * resolution alone — independent of whether this writer's own snapshot saw a collision
+   * — because the guard exists precisely for the collision this snapshot did NOT see (a
+   * rival committing the value concurrently). Returns an EMPTY set for a table with no
+   * secondary UNIQUE constraints, so the staging paths add no guard and no cost.
+   */
+  private guardedUniqueIndexes(
+    values: Row,
+    stmtOnConflict: ConflictResolution | undefined,
+  ): ReadonlySet<string> {
+    const constraints = this.tableSchema.uniqueConstraints;
+    if (!constraints || constraints.length === 0) return EMPTY_INDEX_SET;
+    const guarded = new Set<string>();
+    for (const uc of constraints) {
+      if (uc.predicate !== undefined || uc.columns.length === 0) continue;
+      if (!uc.columns.every(ci => values[ci] !== null && values[ci] !== undefined)) continue;
+      const effective = this.resolveConflictAction(stmtOnConflict, uc.defaultConflict);
+      if (effective === ConflictResolution.IGNORE || effective === ConflictResolution.REPLACE) continue;
+      const enforcing = this.resolveEnforcingIndex(uc);
+      if (enforcing) guarded.add(enforcing.descriptor.name);
+    }
+    return guarded.size === 0 ? EMPTY_INDEX_SET : guarded;
   }
 
   /**
@@ -2316,8 +2378,16 @@ export class OptimysticVirtualTable extends VirtualTable {
             // Stage the row in the main table. Entry format: [primaryKey, encodedRow]
             await this.collection.stage([[insertKey, [insertKey, encodedRow], insertGuard]]);
 
-            // Stage into all indexes
-            await this.indexManager.insertIndexEntries(values, insertKey, txnState?.transactor);
+            // Stage into all indexes. UNIQUE-enforcing index trees whose value this row
+            // occupies carry the concurrency guard so a rival that commits the same value
+            // under a different PK refuses the loser at replay (see guardedUniqueIndexes);
+            // a REPLACE-resolved constraint's tree is unguarded, its eviction already staged.
+            await this.indexManager.insertIndexEntries(
+              values,
+              insertKey,
+              txnState?.transactor,
+              this.guardedUniqueIndexes(values, args.onConflict),
+            );
 
             return { status: 'ok', row: values, ...(evictedRows.length > 0 ? { evictedRows } : {}) };
           }
@@ -2429,7 +2499,11 @@ export class OptimysticVirtualTable extends VirtualTable {
               values,
               oldKey,
               newKey,
-              txnState?.transactor
+              txnState?.transactor,
+              // Guard the NEW entry on every binding, ABORT-resolved UNIQUE constraint —
+              // the moving row's own OLD entry is deleted first in the same tree action, so
+              // a value-preserving move never refuses itself (see updateIndexEntries).
+              this.guardedUniqueIndexes(values, args.onConflict),
             );
 
             return {
@@ -2602,6 +2676,9 @@ export class OptimysticVirtualTable extends VirtualTable {
       // final schema. No-op (no scan) when nothing was newly attached, which is the
       // warm re-declare.
       await this.backfillIndexTrees(attached);
+      // A re-declared CREATE UNIQUE INDEX mirrored its constraint above; teach the
+      // bridge that this (now open + registered) tree's refusal names those columns.
+      this.registerUniqueKeyTakenMessages();
       return;
     }
 
@@ -2652,6 +2729,9 @@ export class OptimysticVirtualTable extends VirtualTable {
     // inside reconcile), so this ONE call serves both the build path and the
     // re-attach path above — there is no second populate loop to keep in step.
     await this.backfillIndexTrees(attached);
+    // A brand-new CREATE UNIQUE INDEX: register its tree's refusal message now that the
+    // tree is open and its derived constraint is mirrored onto this.tableSchema.
+    this.registerUniqueKeyTakenMessages();
   }
 
   /**

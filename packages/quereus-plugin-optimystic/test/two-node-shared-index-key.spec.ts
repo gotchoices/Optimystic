@@ -250,53 +250,67 @@ describe('Two nodes writing one shared secondary-index value', function () {
 	});
 
 	/*
-	 * Two machines writing the SAME value into a UNIQUE index. Both admit, and both rows
-	 * survive — uniqueness here is check-then-write (`optimystic-module.ts
-	 * resolveSecondaryUniqueDecision` probes the index tree before staging), so a machine
-	 * cannot see a sibling's uncommitted row and has nothing to reject against.
+	 * Two machines writing the SAME value into a UNIQUE index. The vtab's pre-stage probe
+	 * (`optimystic-module.ts resolveSecondaryUniqueDecision`) is check-then-write against a
+	 * snapshot, so a machine that cannot yet see a sibling's committed row admits it and
+	 * stages. The concurrency guard is the backstop: the losing writer's index-tree entry
+	 * carries an `absentRange` guard (see index-manager.ts `uniquePrefixGuard`), re-checked
+	 * by the replace handler on every staging and every conflict replay against the newest
+	 * adopted revision. So the moment B's tree adopts A's committed entry — at B's own
+	 * commit-time refresh here, since this connected mock mesh propagates A's block to B —
+	 * B is REFUSED with the ordinary UNIQUE-constraint error, and only one row survives.
 	 *
-	 * This is pinned as a case rather than argued in a comment, because "both rows survive"
-	 * has two very different causes and only one of them is acceptable: over-admission by
-	 * two machines that could not see each other, or a unique constraint that is not
-	 * enforced at all. The single-node arm below separates them — the SECOND insert on one
-	 * machine must be rejected, which is what makes the cross-machine pair a statement about
-	 * visibility rather than about a dead constraint.
+	 * This is the ticket `concurrent-secondary-unique-guard` behavior: the previous version
+	 * of this case asserted the OPPOSITE (both rows survive), documenting the lost-uniqueness
+	 * bug as an accepted trade. That trade is withdrawn — a UNIQUE column now enforces
+	 * uniqueness under concurrency wherever the rival's commit is visible to the loser at
+	 * write time. The single-node arm still separates "refused for visibility" from "dead
+	 * constraint": the second same-node insert must also be rejected.
 	 *
-	 * The downstream schema takes the same trade knowingly, at its own nonce column
-	 * (`sereus/schemas/control.qsql` FormationUsage.UsageStampId): "two nodes that have not
-	 * yet converged could each admit the same nonce and both rows survive the merge". If
-	 * consensus-level constraint arbitration is ever added, this case is what says so.
+	 * RESIDUAL (not covered here, unchanged by this fix): two nodes that never observe each
+	 * other before both commit — a true partition — can still each admit the value and
+	 * converge later with two entries. Catching that needs consensus-level constraint
+	 * arbitration, the same limit the primary-key guard has; see backlog
+	 * `feat-phantom-read-protection`.
 	 */
-	it('a UNIQUE index over-admits the same value across two nodes, while rejecting it on one', async () => {
+	it('a UNIQUE index refuses the same value across two nodes once the rival commit is visible', async () => {
 		const nodes = await openTwoNodesOnEmptyIndex(createUniqueIndexSql);
 
 		// The constraint IS live: a second row with the same Token, on the machine that can
 		// already see the first, is refused.
 		await nodes.A.db.exec(insertSql(STAMP_ID.A, SHARED_TOKEN));
-		let rejected: unknown;
+		let rejectedSameNode: unknown;
 		try {
 			await nodes.A.db.exec(insertSql(STAMP_ID.C, SHARED_TOKEN));
 		} catch (error) {
-			rejected = error;
+			rejectedSameNode = error;
 		}
-		expect(rejected, 'a same-value insert on ONE node must violate the UNIQUE index').to.be.instanceOf(Error);
-		expect(String(rejected)).to.match(/unique/i);
+		expect(rejectedSameNode, 'a same-value insert on ONE node must violate the UNIQUE index').to.be.instanceOf(Error);
+		expect(String(rejectedSameNode)).to.match(/unique/i);
 
-		// Across machines it is admitted, because B's probe runs against a tree that predates
-		// A's commit. B stages before it can have observed A's row and commits afterwards.
-		await nodes.B.db.exec(insertSql(STAMP_ID.B, SHARED_TOKEN));
+		// Across machines it is ALSO refused now: B stages against a tree that predates A's
+		// commit (the probe admits), but the guard on B's index entry re-checks at B's
+		// commit-time refresh, which has by now adopted A's row.
+		let rejectedCrossNode: unknown;
+		try {
+			await nodes.B.db.exec(insertSql(STAMP_ID.B, SHARED_TOKEN));
+		} catch (error) {
+			rejectedCrossNode = error;
+		}
+		expect(rejectedCrossNode, 'the cross-node duplicate is refused, not silently admitted').to.be.instanceOf(Error);
+		expect(String(rejectedCrossNode)).to.match(/unique/i);
 
+		// Only A's row survives; both nodes converge on the single winner.
 		await expectAllNodesConverged(nodes, [
 			{ UsageStampId: STAMP_ID.A, Token: SHARED_TOKEN },
-			{ UsageStampId: STAMP_ID.B, Token: SHARED_TOKEN },
 		]);
 
 		for (const which of ['A', 'B'] as const) {
 			expect(
 				await countTreeEntries(nodes[which].plugin, INDEX_URI),
-				`committed unique-index entries seen from node ${which} — two rows share one ` +
-				`indexed value, so the "unique" index legitimately holds two entries under it`,
-			).to.equal(2);
+				`committed unique-index entries seen from node ${which} — the duplicate was refused, ` +
+				`so exactly one entry holds the shared value`,
+			).to.equal(1);
 		}
 	});
 
