@@ -2,7 +2,7 @@ import { Collection, type CollectionInitOptions, type CollectionId, type Collect
 import type { ITransactor, BlockId, BlockStore, IBlock, ActionId } from "../../index.js";
 import { BTree, type Path, type KeyRange } from "../../btree/index.js";
 import { CollectionTrunk } from "./collection-trunk.js";
-import { TreeHeaderBlockType, type TreeReplaceAction } from "./struct.js";
+import { TreeHeaderBlockType, TreeKeyTakenError, type TreeReplaceAction } from "./struct.js";
 
 /**
  * Read-only surface of a tree: every navigation/lookup method a reader needs, with
@@ -105,8 +105,30 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 						compare,
 						nodeCapacity,	// keep the write btree's fan-out in lock-step with the read btree
 					);
-					for (const [key, entry] of actions) {
+					for (const [key, entry, guard] of actions) {
 						if (entry) {
+							// Enforce the entry's guard (if any) on EVERY handler run — initial staging
+							// and every conflict replay — so the uniqueness decision is re-made against
+							// the newest adopted committed state, not just the stage-time snapshot.
+							// A throw here discards the whole action's staged writes (Atomic wrapper).
+							if (guard !== undefined) {
+								if (guard.kind === 'absentRange') {
+									// Defined for serialization stability; enforced by the follow-up
+									// secondary-unique guard work. Refuse loudly rather than silently
+									// degrading to an upsert.
+									throw new Error(
+										`Tree collection ${id}: 'absentRange' entry guards are not enforced yet`);
+								}
+								const found = await actionTree.find(key);
+								if (found.on) {
+									if (guard.kind === 'absent') {
+										throw new TreeKeyTakenError(id, key);
+									}
+									// keepExisting: leave the present (rival's) entry in place and skip
+									// this entry silently — the INSERT OR IGNORE disposition.
+									continue;
+								}
+							}
 							await actionTree.upsert(entry);
 						} else {
 							await actionTree.deleteAt((await actionTree.find(key)));

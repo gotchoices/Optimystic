@@ -72,6 +72,40 @@ rolls back. That is correct, not a leak: only the separate `committed.<Table>` p
 concurrent peer's commit is expected live-read behavior; snapshot isolation is
 opt-in via `queryCommitted()`, not the default for ordinary reads.
 
+#### Conflict replay re-makes the uniqueness decision (entry guards)
+
+The replay described above is also where a concurrent duplicate-key INSERT is
+refused. The SQL layer enforces primary-key uniqueness by a pre-stage probe against
+its own snapshot, so two concurrent writers both probe clear; without more, the
+loser's conflict replay would re-run its staged upsert over the winner's committed
+row (silent last-writer-wins, with the *loser's* row surviving). A staged tree entry
+therefore carries an optional serialized guard stating the statement's intent —
+`TreeEntryGuard` in `packages/db-core/src/collections/tree/struct.ts`: `absent`
+(INSERT — a present key throws `TreeKeyTakenError`), `keepExisting` (INSERT OR
+IGNORE — skip silently), `absentRange` (reserved for secondary-unique enforcement).
+The `replace` handler (`buildInit` in `packages/db-core/src/collections/tree/tree.ts`)
+enforces the guard on **every** run — initial staging and every conflict replay — so
+the decision is always re-made against the newest adopted committed state. The throw
+is not a `StaleFailure`, so neither `Collection.sync`'s retry loop nor
+`TransactionCoordinator.commit`'s stale-loss re-drive absorbs it; it surfaces out of
+the losing commit, where the Quereus bridge maps it to the ordinary
+`UNIQUE constraint failed: <table>.<col>` message (`mapCommitRefusal` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`), so a
+refused concurrent insert is indistinguishable from a sequential duplicate to
+clients. A key the winner *deleted* replays as absent and is legitimately reusable.
+Regression suites: `packages/db-core/test/tree-guard.spec.ts` (both write paths, raw
+trees) and `packages/quereus-plugin-optimystic/test/concurrent-insert-refusal.spec.ts`
+(two `Database` handles over one storage directory, legacy and session commit modes).
+
+One consequence for rollback: the refusal happens *after* the loser's refresh adopted
+the rival's committed revision, so the pre-transaction snapshot its rollback restores
+was captured on an older committed boundary. `Collection.restorePending`
+(`packages/db-core/src/collection/collection.ts`) detects the moved boundary and, for
+a snapshot with an empty pending queue, resets the tracker empty instead of
+reinstalling the snapshot's transforms — restoring them verbatim would shadow the
+now-committed blocks with stale structure (an invented collection's pre-commit
+header/root making the whole tree read empty being the observed case).
+
 #### Committed reads are pinned, not shared-cache
 
 `queryCommitted()` (the `committed.<Table>` / `_readCommitted` path) does **not** run

@@ -129,3 +129,21 @@ the list above is about **primary** keys and does not imply the two machines get
 keys. The sweep's `token=same-token` arm already puts both machines on one indexed value in 72 of
 its 144 orderings. A later reader mistook the one for the other and filed a ticket on it; the new
 spec's header records the refutation so it is not re-derived a third time.
+
+## New arm 2026-09-10 — a concurrency-skipped INSERT OR IGNORE can orphan index entries
+
+The concurrent-insert guard work (`concurrent-insert-guard-refuses-taken-key`) added a known,
+deliberate producer of exactly the orphan class this ticket's arm 1 exists to detect. An
+`insert or ignore` whose pre-stage probe found the key clear stages its main-table entry with a
+"keep the existing row" guard; if a rival writer commits the same key first, the loser's commit
+replay skips the main-table entry (correct IGNORE semantics — the rival's row is kept), but the
+loser's INDEX tree entries for the skipped row replay independently and cannot see the skip. The
+result is an index entry `indexKey‖pk` pointing at column values the surviving row does not have —
+a stale entry no row backs. There is a `NOTE:` at the staging site (the insert arm of the vtab's
+`update` method in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`, beside the
+`keepExisting` guard) marking this as deliberately out of scope there: cross-collection replay
+coordination is not something one collection's action handler can do. Arm 1's two-way
+index-vs-table assertion is the right detector for this shape, and a two-handle
+`insert or ignore` race on an INDEXED table is a ready-made generator for it (the existing
+concurrency spec `packages/quereus-plugin-optimystic/test/concurrent-insert-refusal.spec.ts`
+deliberately uses an index-free table for its IGNORE case).

@@ -646,8 +646,36 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** Restore the staged state captured by {@link snapshotPending}, discarding any
 	 * mutations staged since. Reads through the collection then observe exactly the
-	 * snapshot state again; storage is untouched because nothing was ever synced. */
+	 * snapshot state again; storage is untouched because nothing was ever synced.
+	 *
+	 * A snapshot is only restorable VERBATIM onto the committed boundary it was captured
+	 * on. If this collection has since ADOPTED a newer committed revision — a rival's
+	 * commit folded in by a refresh while the snapshot's transaction was in flight, e.g.
+	 * the conflict replay that refused a guarded insert (TreeKeyTakenError) — the
+	 * snapshot's transforms describe block state at the OLD boundary, and reinstalling
+	 * them would shadow committed blocks with stale structure. The observed case: an
+	 * INVENTED collection's pre-commit header/root transforms restored over the rival's
+	 * now-committed collection make every later read descend an empty tree, silently
+	 * hiding the committed rows. When the snapshot's pending queue is empty (the
+	 * transaction-rollback shape: the capture predates the transaction's first stage),
+	 * the correct restore target IS the committed state — reset the tracker empty and
+	 * let reads flow through to the adopted revision.
+	 *
+	 * NOTE: a snapshot that carries PENDING actions across a moved boundary (a
+	 * mid-transaction savepoint captured before a mid-transaction refresh adopted a
+	 * rival's commit) still restores verbatim below — rebasing it would require an async
+	 * replay this synchronous method cannot run. That shape predates this guard and
+	 * keeps its old behaviour; if it is ever observed producing stale reads, the rebase
+	 * belongs in an async caller that can replay the pending queue (see replayActions). */
 	restorePending(snapshot: CollectionSnapshot<TAction>): void {
+		const capturedRev = snapshot.context?.rev;
+		const currentRev = this.source.actionContext?.rev;
+		const boundaryMoved = currentRev !== undefined && (capturedRev === undefined || currentRev > capturedRev);
+		if (boundaryMoved && snapshot.pending.length === 0) {
+			this.tracker.reset();
+			this.pending = [];
+			return;
+		}
 		this.tracker.reset(copyTransforms(snapshot.transforms));
 		this.pending = [...snapshot.pending];
 	}

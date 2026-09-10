@@ -1,5 +1,5 @@
 import type { TransactionCoordinator, ITransactionEngine, Collection, CollectionId } from '@optimystic/db-core';
-import { TransactionSession, CoordinatorPartialCommitError } from '@optimystic/db-core';
+import { TransactionSession, CoordinatorPartialCommitError, TreeKeyTakenError } from '@optimystic/db-core';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
@@ -254,6 +254,17 @@ export class TransactionBridge {
    */
   private collectionRegistry = new Map<CollectionId, Collection<any>>();
   /**
+   * Per-collection SQL rendering of a concurrency-refused duplicate key: the
+   * `UNIQUE constraint failed: <table>.<col>[, …]` message the vtab registers for its
+   * MAIN collection as it initializes (see OptimysticVirtualTable.registerCollections).
+   * A `TreeKeyTakenError` surfacing at commit — the losing writer's conflict replay
+   * refusing a key a rival already committed — is rewrapped via
+   * {@link mapCommitRefusal} so clients see the exact message shape a sequential
+   * duplicate INSERT produces, distinguishable from a transport failure with no new
+   * downstream classification arm.
+   */
+  private keyTakenMessages = new Map<CollectionId, string>();
+  /**
    * Depth-indexed savepoint snapshots for LEGACY (staged-tracker) mode. Each
    * entry captures the staged state of EVERY registered collection (main table +
    * all index trees) at the moment the savepoint was created, keyed by the
@@ -413,6 +424,38 @@ export class TransactionBridge {
    */
   getCollectionRegistry(): Map<CollectionId, Collection<any>> {
     return this.collectionRegistry;
+  }
+
+  /**
+   * Register the SQL message a `TreeKeyTakenError` from `collectionId` maps to at
+   * commit (see {@link keyTakenMessages}). Idempotent; called by the vtab as each
+   * table initializes, alongside {@link registerCollection}.
+   */
+  registerKeyTakenMessage(collectionId: CollectionId, message: string): void {
+    this.keyTakenMessages.set(collectionId, message);
+  }
+
+  /**
+   * Rewrap a commit failure caused by a `TreeKeyTakenError` (a losing writer's
+   * conflict replay refusing a key a rival already committed) into an error whose
+   * MESSAGE is the registered `UNIQUE constraint failed: …` rendering for the
+   * refusing collection's table, keeping the structured refusal reachable via
+   * `cause`. Anything else — no TreeKeyTakenError anywhere in the cause chain, an
+   * unregistered collection, or an error already carrying the mapped message (the
+   * legacy sweep maps before rethrowing, and commitTransaction's catch maps again)
+   * — passes through unchanged.
+   */
+  private mapCommitRefusal(error: unknown): unknown {
+    for (let cursor: unknown = error; cursor instanceof Error; cursor = cursor.cause) {
+      if (cursor instanceof TreeKeyTakenError) {
+        const message = this.keyTakenMessages.get(cursor.collectionId);
+        if (message === undefined || (error instanceof Error && error.message === message)) {
+          return error;
+        }
+        return new Error(message, { cause: error });
+      }
+    }
+    return error;
   }
 
   /**
@@ -582,8 +625,13 @@ export class TransactionBridge {
       }
       // Nothing durably committed (a clean session-mode commit failure, or a legacy
       // failure on the FIRST tree): a clean snapshot-restore rollback is correct.
+      // A concurrency-refused duplicate key (TreeKeyTakenError anywhere in the cause
+      // chain — session mode surfaces it raw out of the coordinator's inter-attempt
+      // refresh; the legacy sweep has already mapped it, which mapCommitRefusal
+      // detects and passes through) is rewrapped as the ordinary UNIQUE-constraint
+      // error so the loser sees the same refusal a sequential duplicate produces.
       await this.rollbackTransaction();
-      throw error;
+      throw this.mapCommitRefusal(error);
     }
   }
 
@@ -706,7 +754,14 @@ export class TransactionBridge {
       try {
         await tree.sync();
         synced.push(tree);
-      } catch (error) {
+      } catch (rawError) {
+        // Map a concurrency-refused duplicate key (TreeKeyTakenError out of this
+        // tree's conflict replay) to its table's UNIQUE-constraint message HERE, so
+        // both exits below carry it: the first-tree rethrow reaches the client with
+        // the ordinary duplicate-key message, and a mid-sweep refusal's
+        // PartialCommitError names it as the underlying failure (the refusal stays
+        // reachable as the cause either way).
+        const error = this.mapCommitRefusal(rawError);
         if (synced.length === 0) {
           // First tree failed — nothing persisted. Let the caller roll back cleanly.
           throw error;

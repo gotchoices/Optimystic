@@ -15,7 +15,7 @@ import { ConflictResolution, QuereusError, StatusCode } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
-import type { CollectionChangeEvent, ITransactor, TreeReadView } from '@optimystic/db-core';
+import type { CollectionChangeEvent, ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
 import { SchemaManager, columnSetKey, mergeIndexLists, uniqueConstraintKey, uniqueEnforcementTreeName } from './schema/schema-manager.js';
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
@@ -1589,6 +1589,14 @@ export class OptimysticVirtualTable extends VirtualTable {
   private registerCollections(): void {
     if (this.collection) {
       this.txnBridge.registerCollection(this.collection.getCollection());
+      // Teach the bridge how to render a concurrency-refused duplicate key for THIS
+      // table (a TreeKeyTakenError surfacing at commit from the main collection's
+      // conflict replay). Registered here — after doInitialize resolved the schema,
+      // before any DML — so the rendered SQL message names the real PK columns.
+      this.txnBridge.registerKeyTakenMessage(
+        this.collection.getCollection().id,
+        this.uniqueConstraintMessage(),
+      );
     }
     if (this.indexManager) {
       for (const tree of this.indexManager.getIndexTrees()) {
@@ -2268,8 +2276,37 @@ export class OptimysticVirtualTable extends VirtualTable {
               ? await this.applyUniqueEvictions(uniqueDecision.collisions, txnState?.transactor)
               : [];
 
+            // The probe above only proves the key is clear in THIS writer's snapshot; a
+            // rival committing the same key concurrently would otherwise be silently
+            // overwritten when the losing commit's conflict replay re-runs this staged
+            // action as a bare upsert. Carry the INSERT's intent on the entry so the
+            // replace handler re-makes the uniqueness decision on every replay, against
+            // the newest adopted committed state (see TreeEntryGuard):
+            //  - resolved ABORT (default; FAIL/ROLLBACK honoured as ABORT) -> 'absent':
+            //    the loser's commit fails with the ordinary UNIQUE constraint error.
+            //    This also covers ON CONFLICT (pk) DO UPDATE whose probe found no row:
+            //    under concurrency the statement REFUSES rather than performing the
+            //    upsert the sequential path would have — safe (never silent), and an
+            //    application-level retry re-runs the statement, which then takes the
+            //    update arm. Do not try to re-run SQL semantics inside the replay.
+            //  - resolved IGNORE -> 'keepExisting': the replay skips this entry, keeping
+            //    the rival's row — the same outcome a sequential INSERT OR IGNORE gets.
+            //  - resolved REPLACE -> no guard: overwrite is the declared semantics.
+            const insertResolved = this.resolveConflictAction(args.onConflict, this.pkDeclaredConflict());
+            const insertGuard: TreeEntryGuard<string> | undefined =
+              insertResolved === ConflictResolution.REPLACE ? undefined
+              : insertResolved === ConflictResolution.IGNORE ? { kind: 'keepExisting' }
+              : { kind: 'absent' };
+            // NOTE: with 'keepExisting', a replay that skips the main-tree entry cannot
+            // also skip the INDEX tree actions staged below — they replay independently,
+            // so a concurrency-skipped INSERT OR IGNORE can leave a stale index entry
+            // (indexKey‖pk pointing at values the surviving row does not have). Cross-
+            // collection replay coordination is deliberately out of scope here; index-
+            // orphan detection owns it (see backlog ticket
+            // 6-debt-index-sweep-misses-update-delete-and-orphans).
+
             // Stage the row in the main table. Entry format: [primaryKey, encodedRow]
-            await this.collection.stage([[insertKey, [insertKey, encodedRow]]]);
+            await this.collection.stage([[insertKey, [insertKey, encodedRow], insertGuard]]);
 
             // Stage into all indexes
             await this.indexManager.insertIndexEntries(values, insertKey, txnState?.transactor);
@@ -2339,6 +2376,25 @@ export class OptimysticVirtualTable extends VirtualTable {
               ? await this.applyUniqueEvictions(uniqueDecision.collisions, txnState?.transactor)
               : [];
 
+            // A PK-moving update's insert half carries the same concurrency guard an
+            // INSERT does: the pkMove probe above only proves newKey is clear in this
+            // writer's snapshot, and a conflict replay would otherwise silently
+            // overwrite a rival's row at newKey (see the INSERT arm's guard note).
+            //  - a REPLACE-resolved move stays unguarded: displacing whatever occupies
+            //    newKey is the declared semantics ('displace' means the probe already
+            //    hit; 'clear' + resolved REPLACE means a late rival is displaced too);
+            //  - IGNORE resolves to 'absent', NOT 'keepExisting': skipping only the
+            //    insert half at replay would still apply the oldKey delete half and
+            //    lose the row entirely. Refusing is safe (never silent) — the
+            //    application-level retry re-probes and then swallows the move the way
+            //    the sequential IGNORE path does;
+            //  - ABORT (default; FAIL/ROLLBACK honoured as ABORT) -> 'absent'.
+            const moveGuard: TreeEntryGuard<string> | undefined = (() => {
+              if (oldKey === newKey || pkMove.kind === 'displace') return undefined;
+              const moveResolved = this.resolveConflictAction(args.onConflict, this.pkDeclaredConflict());
+              return moveResolved === ConflictResolution.REPLACE ? undefined : { kind: 'absent' };
+            })();
+
             // Stage the main-table change (flushed at commit / restored on
             // rollback). A PK change is staged as delete-old + insert-new so both
             // index halves revert together on rollback; staging `undefined` at
@@ -2346,7 +2402,7 @@ export class OptimysticVirtualTable extends VirtualTable {
             // displaced row in one shot, so a displacing move needs no separate
             // main-table delete.
             await this.collection.stage(oldKey !== newKey
-              ? [[oldKey, undefined], [newKey, [newKey, encodedRow]]]
+              ? [[oldKey, undefined], [newKey, [newKey, encodedRow], moveGuard]]
               : [[newKey, [newKey, encodedRow]]]);
 
             // Index maintenance for a displacing move needs both stagings, in this
