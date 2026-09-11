@@ -70,6 +70,47 @@ It fits. A block you hold takes the windowed path; a block you do not hold takes
 
 It also has a much smaller blast radius than the routing memo the superseded ticket proposed, which needed an invalidation story tied to membership change. The conservative option here needs none at all.
 
+## Measured in-process (2026-09-11) — the mechanism is confirmed and the headline number was being read wrong
+
+The section above said the design need not wait on a measurement. It has one anyway, from a real solo `CadreNode` driven through `start()` → `ensureOwnerKey()` → `foundStrand()` against the linked workspace, counting the exact `debug` tags from the device report. Repeat runs identical.
+
+### The reported 626 is not the cost of four tables
+
+| app tables in the strand schema | founding consults | founding commits |
+|---|---|---|
+| 1 | 86 | 18 |
+| 4 | **89** | **18** |
+| 24 | 109 | 18 |
+
+The slope is **1 consult per app table and 0 commits per app table**. The app's tables ride the one catalog commit the strand's schema apply already pays. So of the reporter's 4-table strand: **4 of 89 consults are his, and none of the commits are.** The rest is control-plane work.
+
+And the total does not come from founding at all. Idle, after founding, a solo node produces **~46 consults per minute forever** — 4 `Revocation` + 4 `CadrePeer` per ~15 s reconcile pass, both absent, with **zero damping**. Founding (89) plus 14 minutes of idle (~640) lands at ~730 against his 626, and the block mix his capture shows is the mix this run produces.
+
+**These counters scale with wall-clock time on a run that never converges, not with schema size.** Every reading of "626 consults to apply four tables" — ours included — had the causality backwards: the consults are not why it is slow, they are what a stalled node emits while it waits. That does not make them harmless (they are unbounded, and each is a native-bridge crossing on the reporting platform), but it does mean removing them is not by itself the fix for non-convergence.
+
+### The absent-versus-held asymmetry, isolated
+
+Same query shape, two tables, six consecutive calls:
+
+| collection | ever written? | consults |
+|---|---|---|
+| `OwnerKey` | yes, at genesis | **1** on call 1, then **0** |
+| `Revocation` | never | **2 on every call**, 6 of 6 |
+
+A held block arms the window and goes quiet. An absent one never does. That is this ticket's claim, measured directly rather than inferred from the device capture.
+
+### Why it is hot enough to matter
+
+`Revocation` is not read occasionally. It is read *before the row read* on the common path: `queryRevokedStamps` is called unconditionally by `queryCadrePeers` and `queryPeerRecord`, so every membership or address lookup pays an extra absent-block consult. `ControlDatabase.queryCadrePeers()` measures **exactly 4 consults on every call, flat across 20 consecutive calls**. Beyond the TypeScript callers, six control-plane tables carry `NotRevoked` insert checks that subquery `Revocation`, so **every control-plane insert reads an absent block too**.
+
+That half is the downstream repository's to fix, and a ticket has been filed there. This ticket owns the reason an absent read is unbounded in the first place.
+
+### The coverage gap, stated precisely
+
+Gate 4 in `cold-apply-cost.spec.ts` counts `findCluster` **per commit** — a ratio. An absent-read consult happens with **no commit at all**, so it divides into nothing and the gate is structurally incapable of seeing this class. The downstream repository's two storage budgets are blind for a different reason: they count `IRawStorage` calls *below* a write-through cache, and an absent-block consult never reaches raw storage. A regression that doubled cohort consults would leave every existing gate in both repositories green.
+
+This is why the TODO below puts the consults-per-absent-read gate before the fix rather than after it.
+
 ## What a design pass has to settle
 
 **1. The conservative option: skip a consult that provably cannot learn.** When the cohort is exactly this node, no consult of any kind — (a) or (b) — can return information this node does not already have. Short-circuit before `findCluster` rather than after it, so the cohort lookup is saved too. This carries **no staleness risk whatsoever**: there is no peer whose answer we are declining to hear, and a peer appearing is an observable event. Decide whether this ships alone, and whether it subsumes enough of the reported pain to defer the rest.
