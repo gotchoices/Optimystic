@@ -89,6 +89,14 @@ export interface MeshOptions {
 	 * than its threshold (0.5), so returning the threshold itself lands on the fail-closed side.
 	 */
 	meshConfidence?: (node: MeshNode) => number;
+	/**
+	 * Wraps the mesh's shared key network before any node, member derivation or transactor captures it —
+	 * so a wrapper here observes EVERY cohort lookup in the mesh (each node's coordinator, cluster
+	 * coordinator and admission derivation, plus `mesh.keyNetwork`), not only the transactor's.
+	 * Reassigning `mesh.keyNetwork` after `createMesh` reaches the transactor alone.
+	 * Omitted → identity.
+	 */
+	wrapKeyNetwork?: (shared: IKeyNetwork) => IKeyNetwork;
 }
 
 export interface MeshFailureConfig {
@@ -283,7 +291,14 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	// admission gate's view) needs a per-node key network in phase 1, and constructing it here beats
 	// a late-bound slot a closure could fire on before it is filled. Safe because `nodes` is captured
 	// by reference and only consulted at call time, after the array is fully populated.
-	const keyNetwork = new MockMeshKeyNetwork(nodes, options.responsibilityK, failures);
+	//
+	// `wrapKeyNetwork` is applied HERE, before `makeNodeKeyNetwork` closes over `keyNetwork` below and
+	// before phase 1 builds any `deriveExpectedCluster` closure — every one of them reads the `keyNetwork`
+	// binding, so a wrapper assigned to it here is what every node's coordinator, cluster member and the
+	// returned `Mesh.keyNetwork` all observe. Reassigning `mesh.keyNetwork` after this function returns
+	// only reaches whoever reads that property later (the transactor); it is too late for the rest.
+	const sharedKeyNetwork = new MockMeshKeyNetwork(nodes, options.responsibilityK, failures);
+	const keyNetwork = options.wrapKeyNetwork ? options.wrapKeyNetwork(sharedKeyNetwork) : sharedKeyNetwork;
 
 	/**
 	 * One node's own view of the key network — what `Libp2pKeyPeerNetwork` gives a real node:

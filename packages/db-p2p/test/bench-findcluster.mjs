@@ -3,6 +3,11 @@
  * SOLO node with zero peers, ~49% of a cold `apply schema`. Times the whole call and its two
  * plausible internals (`hashKey`, `assembleCohort`) so the fix targets the right one.
  *
+ * Historical: 13.8 ms/call before self-address memoization (`selfMultiaddrsCache`) landed in
+ * `libp2p-key-network.ts`. After: 0.009 ms/call, measured 2026-09-11 with N=2000 on this same
+ * wildcard-TCP-listener configuration (see the accepted-tradeoff NOTE at `findCluster` for why
+ * that residual cost is not memoized further).
+ *
  *   node test/bench-findcluster.mjs
  */
 import { createLibp2pNode } from '../dist/src/index.js';

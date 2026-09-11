@@ -2486,11 +2486,12 @@ export class CoordinatorRepo implements IRepo {
 			//
 			// NOTE: `getClusterSize` is a second `findCluster` for the same key that
 			// `executeClusterTransaction` is about to look up again, so a cancel over N blocks now
-			// costs 2N cohort lookups instead of N. Same shape `pend` and `commit` already pay, but
-			// they pay it once (they only ever consult `blockIds[0]`) where this scales with N. Fine
-			// while cancels span a handful of blocks; if wide multi-block cancels ever show up hot,
-			// have `executeClusterTransaction` return the cohort it already fetched (or own the
-			// short-circuit itself) rather than adding a cache here.
+			// costs 2N cohort lookups instead of N. `pend` and `commit` pay the same doubled lookup
+			// for a multi-peer cohort, but theirs is CONSTANT — they only ever consult `blockIds[0]`
+			// — where this scales with N. Fine while cancels span a handful of blocks; if wide
+			// multi-block cancels ever show up hot, have `executeClusterTransaction` return the
+			// cohort it already fetched (or own the short-circuit itself) rather than adding a cache
+			// here.
 			const results = await Promise.all(blockIds.map(async blockId => {
 				const peerCount = await this.coordinator.getClusterSize(blockId);
 				if (peerCount <= 1) return false;

@@ -38,11 +38,14 @@
  *    measured 41 / 55 / 81 for 22 / 67 / 250 objects (each created object re-read a growing
  *    catalog) while the read cache hid it at the storage seam. The batch opens the catalog once
  *    per apply, and gates 5 and 6 now pin non-growth at the transactor seam directly.
- * 4. **`findCluster` calls per commit** — the key-network seam. Its per-call COST is
- *    environment-dependent (it was 3.4 ms on a solo Node process until self-address memoization
- *    landed in `libp2p-key-network.ts`, and is device-dependent on React Native), so the cost is
- *    not assertable here. The call COUNT is, and a regression that starts consulting the cohort
- *    more often per commit is the thing that would make that cost matter again.
+ * 4. **Cohort lookups (`findCluster` calls) per object, at every seam** — the key-network seam.
+ *    Its per-call COST is environment-dependent (3.4 ms on a solo Node process before self-address
+ *    memoization landed in `libp2p-key-network.ts`; 0.009 ms/call after, measured on Node with a
+ *    wildcard TCP listener — `test/bench-findcluster.mjs`, 2026-09-11 — and still device-dependent
+ *    on React Native), so cost is not assertable here. The call COUNT is, and this counts EVERY
+ *    seam a cohort lookup can happen at — each node's own coordinator and cluster-coordinator
+ *    lookups, not only what the transactor drives — so a regression anywhere in the mesh that
+ *    starts consulting the cohort more shows up here, not only one that touches the transactor.
  * 5. **Substrate round trips per object** — EVERY `ITransactor` method call, whatever it is. The
  *    device-relevant figure: on React Native each one is a cohort consult plus a native-bridge
  *    crossing, and driver calls counted below the read cache (gate 1) cannot see a cache miss
@@ -137,26 +140,36 @@ interface ApplyCost {
 	transactorCalls: number;
 	/** The same, by method — printed so a gate 6 failure says WHICH call multiplied. */
 	transactorByMethod: Counts;
+	/** Every cohort lookup in the mesh — every node's coordinator and cluster coordinator, plus the
+	 *  transactor. What gate 4 gates. */
 	findClusterCalls: number;
+	/** The subset of {@link findClusterCalls} the TRANSACTOR drives through `mesh.keyNetwork` —
+	 *  printed for the diagnostic split, never gated on its own (see gate 4's comment). */
+	findClusterCallsTransactorSeam: number;
 	/** Per-object driver cost — the figure gate 3 compares ACROSS scales. */
 	callsPerObject: number;
 	/** Per-object transactor reads — gate 5. */
 	getsPerObject: number;
 	/** Per-object substrate round trips — gate 6. */
 	roundTripsPerObject: number;
+	/** Per-object cohort lookups, every seam — the figure gate 4 compares ACROSS scales. */
+	findClusterPerObject: number;
 }
 
 /**
  * Run one cold `APPLY SCHEMA` against a fresh 1-node mesh and return what it cost.
  *
- * Counting happens at three seams because a regression can land at any of them independently:
+ * Counting happens at four seams because a regression can land at any of them independently:
  * below the read cache (what reaches the backend), at `ITransactor` (how many coordinated
- * commits), and at `IKeyNetwork` (how often the cohort is consulted).
+ * commits), at the mesh's shared `IKeyNetwork` (how often ANY node's coordinator or cluster
+ * coordinator consults the cohort), and — as a subset of that — at the transactor's own
+ * `mesh.keyNetwork` view (how often the transactor specifically drives a lookup).
  */
 async function measureColdApply(tables: number, indexes: number): Promise<ApplyCost> {
 	const driverCounts: Counts = {};
 	const transactorCounts: Counts = {};
-	const keyNetworkCounts: Counts = {};
+	const completeKeyNetworkCounts: Counts = {};
+	const transactorSeamKeyNetworkCounts: Counts = {};
 
 	const mesh = await createMesh(1, {
 		responsibilityK: 1,
@@ -170,8 +183,17 @@ async function measureColdApply(tables: number, indexes: number): Promise<ApplyC
 				new KvRawStorage(counting<RawStoreDriver>(new MemoryStoreDriver(), driverCounts)),
 				'cold-apply-cost'
 			).storage,
+		// Wraps the mesh's SHARED key network before any node, member derivation or transactor
+		// captures it, so this sees every cohort lookup in the mesh — each node's coordinator
+		// (`isResponsibleForBlock`, `fetchBlockFromCluster`) and cluster coordinator, not only
+		// what the transactor drives. See gate 4.
+		wrapKeyNetwork: (shared: IKeyNetwork): IKeyNetwork => counting<IKeyNetwork>(shared, completeKeyNetworkCounts),
 	});
-	mesh.keyNetwork = counting<IKeyNetwork>(mesh.keyNetwork, keyNetworkCounts);
+	// The TRANSACTOR-seam count: a second, separate proxy layered on top of the already-wrapped
+	// `mesh.keyNetwork`, so its calls land in BOTH counters (see "Double counting" in the ticket
+	// `cold-apply-gate-counts-every-cohort-lookup`) — correct, since only the complete counter is
+	// gated and this one exists purely for the diagnostic split.
+	mesh.keyNetwork = counting<IKeyNetwork>(mesh.keyNetwork, transactorSeamKeyNetworkCounts);
 	const transactor = counting<ITransactor>(buildNetworkTransactor(mesh), transactorCounts);
 
 	const db = new Database();
@@ -195,6 +217,7 @@ async function measureColdApply(tables: number, indexes: number): Promise<ApplyC
 	const driverCalls = driverReads + sumOf(driverCounts, WRITE_METHODS);
 	const transactorGets = transactorCounts['get'] ?? 0;
 	const transactorCalls = sumOf(transactorCounts, Object.keys(transactorCounts));
+	const findClusterCalls = completeKeyNetworkCounts['findCluster'] ?? 0;
 
 	return {
 		objects,
@@ -204,10 +227,12 @@ async function measureColdApply(tables: number, indexes: number): Promise<ApplyC
 		transactorGets,
 		transactorCalls,
 		transactorByMethod: { ...transactorCounts },
-		findClusterCalls: keyNetworkCounts['findCluster'] ?? 0,
+		findClusterCalls,
+		findClusterCallsTransactorSeam: transactorSeamKeyNetworkCounts['findCluster'] ?? 0,
 		callsPerObject: driverCalls / objects,
 		getsPerObject: transactorGets / objects,
 		roundTripsPerObject: transactorCalls / objects,
+		findClusterPerObject: findClusterCalls / objects,
 	};
 }
 
@@ -233,11 +258,19 @@ const SMALL_X3 = { tables: 27, indexes: 39 };
  * before the deferral: driver calls 17.6 / 6.4 per object, commits 14 at both scales (`1 + I`),
  * findCluster 3.00 per commit, gets 2.5 / 1.5 per object, round trips 91 / 181 (4.1 / 2.7 per
  * object). Today: one commit at every scale, and round trips 39 / 129 / 101.
+ *
+ * Gate 4 counted only the TRANSACTOR seam until 2026-09-11 — 3 of the 54 / 144 / 142 cohort
+ * lookups a cold apply actually makes (`findCluster` calls, counted at every seam via
+ * `mesh-harness.ts`'s `wrapKeyNetwork` hook by patching the shared key network directly and
+ * attributing each call by stack frame — see ticket `cold-apply-gate-counts-every-cohort-lookup`).
+ * The other 51 / 141 / 139 are the coordinator side: `isResponsibleForBlock`'s proximity check and
+ * `fetchBlockFromCluster`'s cohort consult, both inside `CoordinatorRepo.get`, neither reachable
+ * from `mesh.keyNetwork`. Per-object cohort lookups: 54/22, 144/67, 142/66.
  */
 const MEASURED = {
-	small: { callsPerObject: 2.2, commits: 1, findClusterPerCommit: 3.00, getsPerObject: 1.3, roundTripsPerObject: 1.8 },
-	large: { callsPerObject: 1.4, commits: 1, findClusterPerCommit: 3.00, getsPerObject: 1.1, roundTripsPerObject: 1.9 },
-	scaled: { callsPerObject: 1.4, commits: 1, findClusterPerCommit: 3.00, getsPerObject: 1.1, roundTripsPerObject: 1.5 },
+	small: { callsPerObject: 2.2, commits: 1, findClusterPerObject: 2.45, findClusterTransactorSeam: 3, getsPerObject: 1.3, roundTripsPerObject: 1.8 },
+	large: { callsPerObject: 1.4, commits: 1, findClusterPerObject: 2.15, findClusterTransactorSeam: 3, getsPerObject: 1.1, roundTripsPerObject: 1.9 },
+	scaled: { callsPerObject: 1.4, commits: 1, findClusterPerObject: 2.15, findClusterTransactorSeam: 3, getsPerObject: 1.1, roundTripsPerObject: 1.5 },
 };
 
 /**
@@ -246,10 +279,10 @@ const MEASURED = {
  * slack at one scale or trip at the other.
  */
 const MAX_DRIVER_CALLS_PER_OBJECT = { small: 2.7, large: 1.7 };
-const MAX_FINDCLUSTER_PER_COMMIT = 3.6;
+const MAX_FINDCLUSTER_PER_OBJECT = { small: 2.9, large: 2.6 };
 const MAX_GETS_PER_OBJECT = { small: 1.5, large: 1.3 };
 const MAX_ROUND_TRIPS_PER_OBJECT = { small: 2.1, large: 2.3 };
-/** Gates 3, 5 and 6: per-object cost may not grow with scale, bar a few percent of noise. */
+/** Gates 3, 4, 5 and 6: per-object cost may not grow with scale, bar a few percent of noise. */
 const SCALE_GROWTH_TOLERANCE = 1.05;
 
 describe('cold `apply schema` cost through the coordinated commit path', function () {
@@ -298,28 +331,39 @@ describe('cold `apply schema` cost through the coordinated commit path', functio
 		).to.be.at.most(small.callsPerObject * SCALE_GROWTH_TOLERANCE);
 	});
 
-	it('gate 4: cohort lookups per commit stay bounded', () => {
+	it('gate 4: cohort lookups per object stay bounded across every seam, and do not grow with scale', () => {
 		// Counts, not cost: `findCluster`'s per-call cost is environment-dependent (it was 3.4 ms
-		// on a solo Node process before self-address memoization landed, and is device-dependent
-		// on React Native), so only the call count is stable enough to assert.
+		// on a solo Node process before self-address memoization landed, and measures 0.009 ms/call
+		// after — `test/bench-findcluster.mjs` — but is still device-dependent on React Native), so
+		// only the call count is stable enough to assert.
 		//
-		// SCOPE: this counts the lookups the TRANSACTOR drives, which is what the proxy over
-		// `mesh.keyNetwork` sees. Each mesh node derives its cohort from its own self-including
-		// key-network view (see `MeshOptions.deriveExpectedCluster`), so the coordinator-side
-		// `getClusterPeerIds` calls inside `CoordinatorRepo.commit` are NOT in this number. That
-		// is a stable seam, not a complete one — a regression that adds a lookup on the
-		// coordinator side needs its own gate in `db-p2p`, where that seam is reachable.
+		// SCOPE: `findClusterCalls` counts EVERY cohort lookup in the mesh, via the
+		// `wrapKeyNetwork` hook on the shared key network (`mesh-harness.ts`) — each node's own
+		// coordinator (`isResponsibleForBlock`'s proximity check, `fetchBlockFromCluster`'s cohort
+		// consult) and the cluster coordinator's commit-path lookups, not only what the transactor
+		// drives through `mesh.keyNetwork` (that subset is `findClusterCallsTransactorSeam`,
+		// printed below but not gated). This used to be a per-commit ratio gated at the transactor
+		// seam alone (3 calls / 1 commit); with one commit per apply that ratio said nothing about
+		// the part that actually scales with schema size, so gate 4 missed 51 / 141 / 139 of the
+		// 54 / 144 / 142 real lookups. See ticket `cold-apply-gate-counts-every-cohort-lookup`.
 		//
-		// The ratio ROSE from 2.40 / 2.23 to 3.00 when the catalog batch landed, while the
-		// absolute count fell (84 -> 42, 178 -> 42): the commits the batch removed were the
-		// per-DDL catalog re-commits, which touch fewer blocks (~2 lookups each) than the
-		// invented index-tree flushes that then remained (3 each). With those flushes gone too,
-		// the absolute count is 3 at every scale — the one catalog commit's own. A ratio is the
-		// right gate for a per-commit cost; just do not read a rising ratio as more cohort traffic.
-		expect(small.findClusterCalls / small.commits, `small: ${small.findClusterCalls} findCluster / ${small.commits} commits`)
-			.to.be.at.most(MAX_FINDCLUSTER_PER_COMMIT);
-		expect(large.findClusterCalls / large.commits, `large: ${large.findClusterCalls} findCluster / ${large.commits} commits`)
-			.to.be.at.most(MAX_FINDCLUSTER_PER_COMMIT);
+		// Sanity check first: if `wrapKeyNetwork` is ever dropped, or something captures the shared
+		// key network before it is applied, `findClusterCalls` silently collapses to the transactor
+		// seam's own count and gate 4 would PASS looking like a huge improvement. Mirrors gate 1's
+		// "check the cache is still attached".
+		expect(small.findClusterCalls, 'the coordinator side is no longer observed — check that ' +
+			'mesh-harness.ts createMesh still applies wrapKeyNetwork before phase 1')
+			.to.be.greaterThan(small.findClusterCallsTransactorSeam);
+
+		expect(small.findClusterPerObject, `small: ${small.findClusterCalls} findCluster / ${small.objects} objects`)
+			.to.be.at.most(MAX_FINDCLUSTER_PER_OBJECT.small);
+		expect(large.findClusterPerObject, `large: ${large.findClusterCalls} findCluster / ${large.objects} objects`)
+			.to.be.at.most(MAX_FINDCLUSTER_PER_OBJECT.large);
+		expect(
+			scaled.findClusterPerObject,
+			`cohort lookups per object rose with scale: ${small.findClusterPerObject.toFixed(2)} at ` +
+			`${small.objects} objects -> ${scaled.findClusterPerObject.toFixed(2)} at ${scaled.objects}.`
+		).to.be.at.most(small.findClusterPerObject * SCALE_GROWTH_TOLERANCE);
 	});
 
 	it('gate 5: transactor reads per object stay bounded and do not grow with scale', () => {
@@ -375,8 +419,9 @@ describe('cold `apply schema` cost through the coordinated commit path', functio
 				`${cost.driverCalls} driver calls (${cost.driverReads} reads) = ${cost.callsPerObject.toFixed(1)}/object ` +
 				`[baseline ${baseline.callsPerObject}], ` +
 				`${cost.commits} commits [baseline ${baseline.commits}], ` +
-				`${cost.findClusterCalls} findCluster = ${(cost.findClusterCalls / cost.commits).toFixed(2)}/commit ` +
-				`[baseline ${baseline.findClusterPerCommit}], ` +
+				`${cost.findClusterCalls} findCluster (${cost.findClusterCallsTransactorSeam} at the transactor seam) ` +
+				`= ${cost.findClusterPerObject.toFixed(2)}/object [baseline ${baseline.findClusterPerObject}, ` +
+				`transactor seam baseline ${baseline.findClusterTransactorSeam}], ` +
 				`${cost.transactorGets} transactor gets = ${cost.getsPerObject.toFixed(1)}/object ` +
 				`[baseline ${baseline.getsPerObject}], ` +
 				`${cost.transactorCalls} round trips = ${cost.roundTripsPerObject.toFixed(1)}/object ` +

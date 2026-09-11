@@ -966,6 +966,13 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return byPeer
 	}
 
+	// NOTE: accepted tradeoff — a node with no peers recomputes the self-only cohort on every call
+	// (~2 per distinct block read; 144 calls in a 67-object cold apply). Measured 0.009 ms/call on
+	// Node with a wildcard TCP listener (test/bench-findcluster.mjs, N=2000, 2026-09-11), so a memo
+	// would save ~1.3 ms per apply while adding an invalidation hazard: a node that gains a peer, or
+	// finishes identifying one, must stop answering self-only immediately, and read-repair recovery
+	// relies on that widening. Revisit if an on-device (React Native) profile shows findCluster as
+	// material; then memoize ONLY the solo answer, invalidated on connection:open and peer:identify.
 	async findCluster(key: Uint8Array): Promise<ClusterPeers> {
 		const t0 = Date.now();
 		const fret = this.getFret()
