@@ -3683,7 +3683,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`.toLowerCase();
     const existing = this.tables.get(tableKey);
     if (existing) {
-      // Initialization is the CALLER's job (create/resolveConnectedTable both do it,
+      // Initialization is the CALLER's job (create/resolveConnectedTable/createIndex do it,
       // each through the entry point its path requires) — initializing here would
       // force a full, transaction-joining initialize onto the committed-read path.
       return existing;
@@ -3791,13 +3791,15 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * {@link OptimysticVirtualTable.initializeForCommittedRead} (which refuses to
    * join an in-flight writer transaction) and never registers a connection.
    *
-   * NOTE: not run under the open `APPLY SCHEMA` batch's per-statement checkpoint
-   * ({@link underBatchCheckpoint} wraps create, createIndex and destroy only). A first
-   * touch of a hydrated table mid-apply whose persisted record differs from the hydrated
-   * shape re-persists it from here, and that write stays in the overlay if the statement
-   * then throws. Fine today: no plugin DDL hook reaches this mid-apply (no alter/rename
-   * hooks are implemented), and before the batch that write was committed before the throw
-   * anyway. If a mid-apply statement ever connects and can fail after initialize, wrap it too.
+   * NOTE: a connect is not run under the open `APPLY SCHEMA` batch's per-statement
+   * checkpoint ({@link underBatchCheckpoint} wraps create, createIndex and destroy — and
+   * createIndex's own first-touch initialize runs inside it — but not plain connects). A
+   * first touch of a hydrated table mid-apply whose persisted record differs from the
+   * hydrated shape re-persists it from here, and that write stays in the overlay if the
+   * statement then throws. Fine today: no plugin DDL hook reaches this mid-apply (no
+   * alter/rename hooks are implemented), and before the batch that write was committed
+   * before the throw anyway. If a mid-apply statement ever connects and can fail after
+   * initialize, wrap it too.
    */
   private async resolveConnectedTable(
     db: Database,
@@ -3806,32 +3808,50 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     committed: boolean,
     tableSchema?: TableSchema
   ): Promise<OptimysticVirtualTable> {
-    const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-    const existingTable = this.tables.get(tableKey);
-
-    if (existingTable) {
-      if (committed) {
-        await existingTable.initializeForCommittedRead();
-      } else {
-        await existingTable.initialize();
-      }
-      return existingTable;
-    }
-
-    const resolvedSchema = tableSchema ?? db.schemaManager.findTable(tableName, schemaName);
-    if (!resolvedSchema) {
+    const resolved = await this.lookupOrInstantiate(db, schemaName, tableName, tableSchema);
+    if (!resolved) {
       throw new Error(`Optimystic table definition for '${tableName}' not found. Cannot connect.`);
     }
 
-    const table = await this.instantiateTable(db, resolvedSchema);
+    const { table, fresh } = resolved;
     if (committed) {
       await table.initializeForCommittedRead();
     } else {
       await table.initialize();
-      await table.ensureConnectionRegistered();
+      if (fresh) {
+        await table.ensureConnectionRegistered();
+      }
     }
 
     return table;
+  }
+
+  /**
+   * The cached {@link OptimysticVirtualTable} for schema.table or, on this process's first
+   * touch of it (a table hydrated into Quereus's catalog that no statement has used yet), a
+   * new UNINITIALIZED instance built from `tableSchema` or else the engine's catalog entry.
+   * `fresh` says which. Initializing — and through which entry point — is the caller's job
+   * ({@link resolveConnectedTable}, {@link createIndex}). Undefined when neither the cache
+   * nor the engine's catalog knows the table. {@link destroy} deliberately does not use
+   * this: see {@link instantiateForTeardown}.
+   */
+  private async lookupOrInstantiate(
+    db: Database,
+    schemaName: string,
+    tableName: string,
+    tableSchema?: TableSchema
+  ): Promise<{ table: OptimysticVirtualTable; fresh: boolean } | undefined> {
+    const tableKey = `${schemaName}.${tableName}`.toLowerCase();
+    const cached = this.tables.get(tableKey);
+    if (cached) {
+      return { table: cached, fresh: false };
+    }
+
+    const resolvedSchema = tableSchema ?? db.schemaManager.findTable(tableName, schemaName);
+    if (!resolvedSchema) {
+      return undefined;
+    }
+    return { table: await this.instantiateTable(db, resolvedSchema), fresh: true };
   }
 
   /**
@@ -3920,20 +3940,30 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   }
 
   /**
-   * Creates an index on an Optimystic virtual table
+   * Creates an index on an Optimystic virtual table.
+   *
+   * The table need not have been touched yet: after `hydrate()` the engine's catalog lists
+   * every persisted table but no instance exists until a statement uses one, and an
+   * `apply schema` that only adds an index plans a lone CREATE INDEX. So an uncached table is
+   * instantiated from the engine's catalog entry exactly as {@link connect} would. That entry
+   * is still the PRE-index shape here — Quereus calls this hook before it appends the new
+   * index to the table schema — so the first-touch initialize cannot persist the index before
+   * its tree is built. The initialize runs inside the statement's batch checkpoint, so a
+   * record it re-persists is withdrawn with the rest of the statement if the statement throws.
    */
   async createIndex(
-    _db: Database,
+    db: Database,
     schemaName: string,
     tableName: string,
     indexSchema: IndexSchema
   ): Promise<void> {
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-    const table = this.tables.get(tableKey);
+    const resolved = await this.lookupOrInstantiate(db, schemaName, tableName);
 
-    if (!table) {
+    if (!resolved) {
       throw new Error(`Optimystic table '${tableName}' not found in schema '${schemaName}'. Cannot create index.`);
     }
+    const { table, fresh } = resolved;
 
     // Inside an `APPLY SCHEMA` batch the index trees this statement populates land at
     // endSchemaBatch, before the catalog commit that lists them, instead of one commit here.
@@ -3950,8 +3980,17 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         }
       : undefined;
 
-    // Update the stored schema with the new index
-    await this.underBatchCheckpoint(table, 'written', tableKey, () => table.addIndex(indexSchema, deferFlush));
+    // Update the stored schema with the new index. A first touch initializes and registers
+    // its connection the way connect's live path does (addIndex would initialize on its own,
+    // but not register); if that initialize throws, the instance stays cached uninitialized
+    // and the next touch retries, exactly as after a failed connect.
+    await this.underBatchCheckpoint(table, 'written', tableKey, async () => {
+      if (fresh) {
+        await table.initialize();
+        await table.ensureConnectionRegistered();
+      }
+      await table.addIndex(indexSchema, deferFlush);
+    });
   }
 
   /**

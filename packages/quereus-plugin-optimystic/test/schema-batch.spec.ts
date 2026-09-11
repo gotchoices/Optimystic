@@ -688,15 +688,11 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 			expect(await queryAll(h.db, 'select count(*) as n from t0')).to.deep.equal([{ n: 2 }]);
 			expect((await h.reopen()).hydrated, 'the recovery did not list the index').to.deep.equal({ tables: 1, indexes: 0 });
 
-			// A corrected re-apply builds it complete. It runs from a Database that has not hydrated,
-			// so its plan re-declares t0 (adopting the committed record and rows) and then creates the
-			// index. A hydrated Database would plan only the CREATE INDEX, and a hydrated table no
-			// statement has touched yet cannot take one today (fix: create-index-on-untouched-hydrated-table).
-			const clean = new Database();
-			registerPlugin(clean, h.transactor);
-			await clean.exec(`pragma default_vtab_module='optimystic'`);
-			await clean.exec(declaration(1, ['t0']));
-			const rebuilt = await queryWithSeeks(clean, `select id from t0 where name = 'bob'`);
+			// A corrected re-apply from the Database that hydrated the index-less record builds it
+			// complete. Its plan is a lone CREATE INDEX on a table no statement there has touched yet.
+			await stale.db.exec(`pragma default_vtab_module='optimystic'`);
+			await stale.db.exec(declaration(1, ['t0']));
+			const rebuilt = await queryWithSeeks(stale.db, `select id from t0 where name = 'bob'`);
 			expect(rebuilt.rows).to.deep.equal([{ id: 2 }]);
 			expect(rebuilt.seeks).to.include('t0_by_name');
 			const { db: db3, hydrated } = await h.reopen();
@@ -704,6 +700,55 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 			const fresh = await queryWithSeeks(db3, `select id from t0 where name = 'bob'`);
 			expect(fresh.rows).to.deep.equal([{ id: 2 }]);
 			expect(fresh.seeks).to.include('t0_by_name');
+		});
+
+		describe('an index added to a hydrated table that no statement has touched yet', () => {
+			/** A second Database over `h`'s storage, hydrated but otherwise untouched, its catalog tree instrumented onto `h`'s trail. */
+			async function hydratedUntouched(h: Harness): Promise<{ db: Database; catalog: ReturnType<typeof countCatalog> }> {
+				const db = new Database();
+				const plugin = registerPlugin(db, h.transactor);
+				const catalog = countCatalog(plugin, h.gate, h.trail);
+				expect(await plugin.hydrate(db)).to.deep.equal({ tables: 1, indexes: 0 });
+				return { db, catalog };
+			}
+
+			/** The index answers `name = 'bob'` with every existing row, here and in a fresh hydrated Database. */
+			async function expectIndexComplete(h: Harness, db: Database): Promise<void> {
+				const live = await queryWithSeeks(db, `select id from t0 where name = 'bob'`);
+				expect(idsOf(live.rows)).to.deep.equal([2, 3]);
+				expect(live.seeks, 'answered through the index').to.include('t0_by_name');
+				const { db: db2, hydrated } = await h.reopen();
+				expect(hydrated).to.deep.equal({ tables: 1, indexes: 1 });
+				const fresh = await queryWithSeeks(db2, `select id from t0 where name = 'bob'`);
+				expect(idsOf(fresh.rows), 'the index tree reached storage').to.deep.equal([2, 3]);
+				expect(fresh.seeks).to.include('t0_by_name');
+			}
+
+			it('apply schema: the lone CREATE INDEX builds it, the tree landing before the catalog sync', async () => {
+				const h = harness();
+				await seedT0(h, `(1, 'alice'), (2, 'bob'), (3, 'bob')`);
+				const other = await hydratedUntouched(h);
+				await other.db.exec(`pragma default_vtab_module='optimystic'`);
+				resetTrail(h);
+
+				await other.db.exec(declaration(1, ['t0']));
+
+				expect(other.catalog.commits(), 'one catalog commit').to.equal(1);
+				expect(commitsCarrying(h.trail, '/index/t0_by_name'), 'the deferred tree landed once').to.equal(1);
+				expect(h.trail.events.indexOf('index'), 'the tree landed BEFORE the catalog sync')
+					.to.be.lessThan(h.trail.events.indexOf('catalog-sync'));
+				await expectIndexComplete(h, other.db);
+			});
+
+			it('plain CREATE INDEX builds it', async () => {
+				const h = harness();
+				await seedT0(h, `(1, 'alice'), (2, 'bob'), (3, 'bob')`);
+				const other = await hydratedUntouched(h);
+
+				await other.db.exec(`create index t0_by_name on t0 (name)`);
+
+				await expectIndexComplete(h, other.db);
+			});
 		});
 
 		it('session mode: an index added to a POPULATED table lands once, before the catalog, with every existing row', async () => {
