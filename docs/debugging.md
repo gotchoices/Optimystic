@@ -639,7 +639,7 @@ optimystic:db-p2p:coordinator-repo:12D3KooWAbCd cluster-tx:read-repair-triggered
 optimystic:db-p2p:coordinator-repo:12D3KooWAbCd cluster-tx:read-repair-triggered { blockId: 'default/Strand', mode: 'lazy', ageMs: undefined, localRev: 7 }
 ```
 
-Background, in one paragraph: a node that holds a block does not re-check it with its cohort on every read. In the default `lazy` read-repair mode it stamps the time the cohort last confirmed the block — a commit whose votes were a majority of the full cohort, or a consult the cohort answered — and re-checks only once `readRepairWindowMs` (10 s by default) has passed since that stamp. The stamp is what "arms" the window. Which outcomes stamp it, and the configuration knobs, are in [docs/transactions.md §Lazy read-repair window](transactions.md#lazy-read-repair-window); this entry covers only how to read the line.
+Background, in one paragraph: a node that holds a block does not re-check it with its cohort on every read. In the default `lazy` read-repair mode it stamps the time the cohort last confirmed the block — a commit whose votes were a majority of the full cohort, or a consult that settled the block (including the no-op consult on a node that is its block's whole cohort) — and re-checks only once `readRepairWindowMs` (10 s by default) has passed since that stamp. The stamp is what "arms" the window. Which outcomes stamp it, and the configuration knobs, are in [docs/transactions.md §Lazy read-repair window](transactions.md#lazy-read-repair-window); this entry covers only how to read the line.
 
 The line fires when a read of a block this node **holds** decides to consult the cohort (`shouldReadRepair` in `packages/db-p2p/src/repo/coordinator-repo.ts`). A read of a block this node does not hold consults without ever emitting it. Fields:
 
@@ -682,7 +682,7 @@ Logged once per pend that runs through a cohort of more than one peer, after clu
 | `true` | `fault` | Tolerated local divergence: consensus is authoritative and the rest of the cohort may have stored the pend. Next line: `coordinator-repo:pend-local-fault-tolerated`, with the `reason`. The writer is then told success. |
 | `true` | `none` | This node's member applied the pend, but its verdict is gone (the member restarted, or the verdict aged out of retention). The coordinator answers success. |
 
-`cohortRefusals` lists the peer ids of **other** cohort members whose storage refused the pend with a conflict. When it is non-empty, every "success" outcome above is overridden, including a successful fallback pend. The writer gets the first refusal in peer-id order instead, and `coordinator-repo:pend-remote-refusal` names that peer. It never overrides a local `conflict` or `fault`: those reach the writer as they are.
+`cohortRefusals` lists the peer ids of **other** cohort members whose storage refused the pend with a conflict. When it is non-empty, every "success" outcome above is overridden, including a successful fallback pend. The writer gets the first refusal in peer-id order instead, and `coordinator-repo:pend-remote-refusal` names that peer. It never overrides a local `conflict`, or a fallback pend's refusal: those reach the writer as they are. A tolerated local `fault` is not one of those. Its answer to the writer is the success in the table, so a non-empty `cohortRefusals` does override it, and `pend-remote-refusal` follows `pend-local-fault-tolerated`.
 
 ### `coordinator-repo:commit-stale-classify-own-action` — how our own action was found
 
