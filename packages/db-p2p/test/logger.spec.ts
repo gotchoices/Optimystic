@@ -620,4 +620,46 @@ describe('db-p2p log-namespace guards', () => {
 		expect(duplicated, `these sub-namespaces have more than one row in docs/debugging.md: ${duplicated.join(', ')}`)
 			.to.deep.equal([]);
 	});
+
+	/**
+	 * Ticket: enable-optimystic-logging-on-every-debug-copy. Repo-wide rather than db-p2p-only, and
+	 * kept here to reuse the walker and comment stripper above.
+	 *
+	 * Each package may load its own copy of `debug`, and `enableOptimysticLogging` reaches only the
+	 * copies that registered with db-core's logger registry. A package whose `debug` import site
+	 * forgets `registerDebugModule(...)` has channels no runtime without `DEBUG=` (React Native) can
+	 * ever turn on — the silent-off failure that ticket fixed, reintroduced one package at a time.
+	 */
+	it('every `debug` import site in packages/*/src registers its copy for enableOptimysticLogging', () => {
+		const PACKAGES_DIR = fileURLToPath(new URL('../../', import.meta.url));
+		const importsDebug = /(?:^|\n)\s*import\s[^;]*?from\s*['"]debug['"]/;
+		const importSites: string[] = [];
+		const unregistered: string[] = [];
+		for (const pkg of readdirSync(PACKAGES_DIR, { withFileTypes: true })) {
+			if (!pkg.isDirectory() || !readdirSync(join(PACKAGES_DIR, pkg.name)).includes('src')) continue;
+			const src = join(PACKAGES_DIR, pkg.name, 'src');
+			for (const rel of listSourceFiles(src)) {
+				const code = stripComments(readFileSync(join(src, rel), 'utf8'));
+				if (!importsDebug.test(code)) continue;
+				const site = `${pkg.name}/src/${rel}`;
+				importSites.push(site);
+				if (!code.includes('registerDebugModule(')) unregistered.push(site);
+			}
+		}
+
+		// Guards the guard: the sites that existed when this landed (exactly the files
+		// `eslint.config.js` permits to import `debug`) must all be found, or the walk is broken.
+		expect(importSites).to.include.members([
+			'db-core/src/logger.ts',
+			'db-p2p/src/logger.ts',
+			'db-p2p-storage-fs/src/logger.ts',
+			'db-p2p-storage-ns/src/logger.ts',
+			'db-p2p-storage-rn/src/logger.ts',
+			'db-p2p-storage-web/src/logger.ts',
+			'quereus-plugin-optimystic/src/logger.ts',
+			'reference-peer/src/cli.ts',
+		]);
+		expect(unregistered, `these files import \`debug\` but never call registerDebugModule(<owner>, debug), so `
+			+ `enableOptimysticLogging cannot reach their channels: ${unregistered.join(', ')}`).to.deep.equal([]);
+	});
 });

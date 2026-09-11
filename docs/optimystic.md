@@ -340,7 +340,7 @@ raise-only, a group waiting for its next rebuild is running at exactly the value
 
 ## Operational Basics
 
-**Debug logging** is controlled via the `DEBUG` environment variable ([debugging.md](debugging.md) has the full namespace list):
+**Debug logging** is controlled via the `DEBUG` environment variable on Node, or by calling `enableOptimysticLogging` from `@optimystic/db-core` on runtimes that have no environment variables, React Native included ([debugging.md §Turning logging on](debugging.md#turning-logging-on) explains both; the rest of that file has the full namespace list):
 
 ```bash
 DEBUG='optimystic:*'                            node app.js  # everything

@@ -1,6 +1,10 @@
 import debug from 'debug'
+import { registerDebugModule } from '@optimystic/db-core'
 
 const BASE_NAMESPACE = 'optimystic:quereus-plugin'
+
+// So `enableOptimysticLogging` reaches this package's copy of `debug`, which may be no one else's.
+registerDebugModule('quereus-plugin', debug)
 
 export function createLogger(subNamespace: string): debug.Debugger {
 	return debug(`${BASE_NAMESPACE}:${subNamespace}`)

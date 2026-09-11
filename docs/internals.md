@@ -1732,7 +1732,7 @@ Transaction metrics are instrumented with `debug` logging and optional verbose t
 - **Timing**: Phase-level timings (`gather`, `pend`, `commit`, `total`) with `trxId` correlation
 - **Correlation IDs**: `trxId` in coordinator, `actionId` in network-transactor, `messageHash` in cluster-coordinator
 - **Verbose mode**: Set `OPTIMYSTIC_VERBOSE=1` for detailed batch, peer list, and FRET candidate logging
-- **Enable**: `DEBUG=optimystic:*` for standard logs, combine with `OPTIMYSTIC_VERBOSE=1` for full tracing
+- **Enable**: `DEBUG=optimystic:*` for standard logs, combine with `OPTIMYSTIC_VERBOSE=1` for full tracing. On React Native (no `DEBUG=`) call `enableOptimysticLogging('optimystic:*')` from `@optimystic/db-core` instead — see [debugging.md §Turning logging on](debugging.md#turning-logging-on)
 
 ## Common Pitfalls
 

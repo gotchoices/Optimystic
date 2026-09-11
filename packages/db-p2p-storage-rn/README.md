@@ -56,6 +56,22 @@ const libp2p = await createLibp2pNode({
 Use the Node-free `/rn` entry point of `@optimystic/db-p2p` so the Node-only
 TCP transport doesn't get bundled into the React Native app.
 
+## Debug logging
+
+`DEBUG=` does not work in React Native, and without it every `optimystic:*`
+log channel is silently off — so an empty device capture proves nothing.
+Turn logging on in code, early in your app's entry point:
+
+```ts
+import { enableOptimysticLogging } from '@optimystic/db-core';
+
+enableOptimysticLogging('optimystic:*');
+```
+
+It prints one `optimystic logging on: …` confirmation line; look for that
+first. See `docs/debugging.md` § "Turning logging on" in the repository for
+the `log` option, libp2p's separate switch, and the cost on device.
+
 ## Related packages
 
 - **[@optimystic/db-p2p](../db-p2p)** — the distributed layer this backend

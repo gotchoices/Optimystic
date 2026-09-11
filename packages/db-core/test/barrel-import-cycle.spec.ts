@@ -34,6 +34,7 @@ const SRC_DIR = fileURLToPath(new URL('../src', import.meta.url));
 const REGISTRY_FILES = [
 	resolve(SRC_DIR, 'collection/collection-type-registry.ts'),
 	resolve(SRC_DIR, 'blocks/block-types.ts'),
+	resolve(SRC_DIR, 'logger-registry.ts'),
 ];
 
 /**
@@ -117,7 +118,7 @@ describe('db-core — src modules cannot re-enter a barrel import cycle', () => 
 		expect(violations, `runtime imports must bypass the enclosing barrel (import type is fine):\n${violations.join('\n')}`).to.deep.equal([]);
 	});
 
-	it('registry modules (collection-type-registry.ts, block-types.ts) have zero runtime imports', async () => {
+	it('registry modules (collection-type-registry.ts, block-types.ts, logger-registry.ts) have zero runtime imports', async () => {
 		for (const file of REGISTRY_FILES) {
 			const text = await readFile(file, 'utf8');
 			const runtimeEdges = moduleEdges(text).filter(edge => !edge.isTypeOnly);

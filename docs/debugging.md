@@ -1,7 +1,95 @@
 # Debug Logging
 
 Optimystic uses the [debug](https://www.npmjs.com/package/debug) library for instrumentation.
-Logging is controlled via the `DEBUG` environment variable.
+Every channel is off until you turn it on, and how you turn it on depends on the runtime.
+
+## Turning logging on
+
+**An empty log proves nothing until you have confirmed that logging is on.** A channel that is off prints nothing, which is exactly what a code path that never ran prints. Turn logging on with one of the methods below, and check that it took before reasoning from a capture.
+
+### Node: the `DEBUG` environment variable
+
+```bash
+DEBUG='optimystic:*' node app.js
+```
+
+Every `DEBUG=` example on this page works as written.
+
+### React Native, and any runtime without `process.env`: `enableOptimysticLogging`
+
+**React Native cannot use `DEBUG=`, and without the call below every `optimystic:` channel is silently off — so an empty device capture proves nothing.** The build of `debug` that Metro bundles looks for its filter in `localStorage.debug` and then `process.env.DEBUG`; React Native has no `localStorage`, and Metro never sets `process.env.DEBUG`.
+
+Call `enableOptimysticLogging` from `@optimystic/db-core` early, at your app's entry point:
+
+```typescript
+import { enableOptimysticLogging } from '@optimystic/db-core';
+
+enableOptimysticLogging('optimystic:*');
+
+// Or a list: each entry is trimmed, and they are comma-joined.
+enableOptimysticLogging(['optimystic:db-core:network-transactor', 'optimystic:db-p2p:cluster*']);
+```
+
+The same call works on Node and in browsers, so it is also the way to turn logging on from code — a debug menu, a test harness — on any runtime.
+
+It writes one confirmation line immediately, **through the same output the log lines will use**. That line is the first thing to look for in a capture:
+
+```text
+optimystic logging on: "optimystic:*" across 3 debug copies [db-core | db-p2p | db-p2p-storage-rn]; libp2p:* is separate, see docs/debugging.md
+```
+
+| What the capture shows | What it means |
+|------------------------|---------------|
+| No confirmation line | The call never ran, or the output it goes to is being dropped (a device log filtered above debug level, say — see the `log` option below). Nothing else in the capture can be trusted yet. |
+| The confirmation line, then no events | Logging is on. The code you were looking for did not run, or your filter does not match its namespace — check the name against the tables below. |
+| The confirmation line, then events | It works. |
+
+Each bracketed group is one distinct copy of the `debug` library, listing the Optimystic packages that use it. One package per group is normal; see *Why not `require('debug').enable(...)`?* below.
+
+To send every line, the confirmation included, somewhere of your own, pass `log`:
+
+```typescript
+const captured: string[] = [];
+enableOptimysticLogging('optimystic:db-p2p:*', {
+	log: (...args) => captured.push(args.map(String).join(' ')),
+});
+```
+
+Without it each copy keeps its own output: stderr on Node, `console.debug` in the browser and React Native build of `debug`. Pass one when the platform hides that output, or to collect a capture in memory.
+
+Behaviour worth knowing:
+
+- It **adds** to whatever each copy already had enabled, rather than replacing it — so if your app shares a copy of `debug` with us, your own `myapp:*` channels stay on.
+- Calling it again replaces the previous call's namespaces and `log` option. It does not accumulate.
+- A package that loads after the call (a lazy import) picks up the same settings as it loads.
+- `disableOptimysticLogging()` puts every copy back to what it had enabled before, with its original output.
+- It changes only the running process. It never writes `process.env.DEBUG` or `localStorage.debug`, so nothing carries over into the next run.
+
+The implementation is `enableOptimysticLogging` in `packages/db-core/src/logger-registry.ts`.
+
+### Browsers
+
+Setting `localStorage.debug` and reloading works, but like `require('debug').enable(...)` it reaches only the copies of `debug` that read it when they loaded. Prefer `enableOptimysticLogging`.
+
+### Why not `require('debug').enable(...)`?
+
+It enables only the copy of `debug` your own code resolved, and Optimystic's packages may have resolved different ones. Whether packages share a copy depends on the package manager and bundler (Metro, pnpm and hoisting settings all differ); this repository's own install gives every package its own copy. `enableOptimysticLogging` reaches all of them because each package's `src/logger.ts` registers the copy it imported.
+
+### libp2p logging is a separate switch
+
+libp2p's own `libp2p:*` namespaces come from `@libp2p/logger`, which is built on a different library (`weald`), and `enableOptimysticLogging` does not reach them. Seeing no `libp2p:` lines after enabling ours is expected, not a bug. On Node, `DEBUG=` covers both. Elsewhere, enable libp2p's separately:
+
+```typescript
+import { enable } from '@libp2p/logger';
+
+enable('libp2p:*');
+```
+
+That reaches the copy of `@libp2p/logger` your code resolved. libp2p's packages may carry more than one, with the same caveat as above.
+
+### Cost
+
+Both reporters on GitHub issue #8 found that turning debug logging on roughly doubled their run times on device. We have not measured it ourselves. Do not benchmark with logging on, and do not ship with it on.
 
 ## Namespaces
 
@@ -768,6 +856,8 @@ Logged under `optimystic:db-p2p:cluster` when a transaction's cohort is smaller 
 
 ## Common DEBUG patterns
 
+Every filter below is also a valid `enableOptimysticLogging` argument (see *Turning logging on*) — pass the quoted string as it is.
+
 ```bash
 # Everything
 DEBUG='optimystic:*' node app.js
@@ -890,6 +980,7 @@ logger so a log line can move between the two factories unchanged:
 | `%m`      | `Uint8Array` | base64                                                 |
 
 Each renders `undefined` for a missing or nullish argument. Registration happens when
-`packages/db-p2p/src/logger.ts` is first imported and applies to the whole `debug` module, so the
-specifiers reach every package's logger in a process that loaded `db-p2p` — but only `db-p2p`
-guarantees that import, so only use them there.
+`packages/db-p2p/src/logger.ts` is first imported and applies to the copy of `debug` that file
+imports. Whether they reach other packages' loggers depends on whether the install dedupes `debug`
+into one shared copy — this repository's own install does not, giving every package its own — so
+use these specifiers only in `db-p2p`.

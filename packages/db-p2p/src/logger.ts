@@ -2,11 +2,15 @@ import { base32 } from 'multiformats/bases/base32'
 import { base58btc } from 'multiformats/bases/base58'
 import { base64 } from 'multiformats/bases/base64'
 import debug from 'debug'
+import { registerDebugModule } from '@optimystic/db-core'
 import type { PeerId } from '@libp2p/interface'
 import type { Multiaddr } from '@multiformats/multiaddr'
 import type { CID } from 'multiformats/cid'
 
 const BASE_NAMESPACE = 'optimystic:db-p2p'
+
+// So `enableOptimysticLogging` reaches this package's copy of `debug`, which may be no one else's.
+registerDebugModule('db-p2p', debug)
 
 /*
  * Format specifiers, ported from `@libp2p/logger`'s `src/index.ts` (MIT, same license as this
@@ -18,12 +22,16 @@ const BASE_NAMESPACE = 'optimystic:db-p2p'
  * loggers use `weald` (via @libp2p/logger) and carry their own copy — the two registries are
  * independent, and enabling one from test code does not enable the other.
  *
- * NOTE: `debug.formatters` is process-wide, and the other six packages' `createLogger` factories
- * import the same `debug` module — so importing this file makes `%p`/`%e`/… work from their
- * loggers too. Harmless today (no other package registers any specifier, and none of these letters
- * is a `util.format` specifier except `%c`, whose Node meaning is a no-op that swallows its
- * argument). If a second package ever registers one of these letters, last import wins silently;
- * move the registry somewhere both can share rather than racing on it.
+ * NOTE: `debug.formatters` belongs to the one copy of `debug` this file imports. Whether the other
+ * six packages' `createLogger` factories share that copy depends on whether the install dedupes
+ * `debug` — and this repo's own install does not (`nmHoistingLimits: workspaces` in `.yarnrc.yml`
+ * gives every package its own copy). So treat these specifiers as db-p2p-only; nothing outside
+ * db-p2p uses them today. Do not register them on other copies to paper over that — if another
+ * package ever needs one, move the formatters into a module both import deliberately.
+ * Where an install DOES dedupe, they reach every package sharing the copy: harmless today (no other
+ * package registers any specifier, and none of these letters is a `util.format` specifier except
+ * `%c`, whose Node meaning is a no-op that swallows its argument), but if a second package ever
+ * registers one of these letters on a shared copy, last import wins silently.
  *
  * NOTE: only `%e` is guaranteed not to throw — its call sites take a `catch`-bound `unknown`. The
  * other six call `.toString()` / an encoder on whatever they are handed, so a caller that passes

@@ -4,10 +4,13 @@ import { multiaddr } from '@multiformats/multiaddr';
 import debug from 'debug';
 import { getNetworkManager, createLibp2pNode, MemoryRawStorage, RepoClient, ArachnodeFretAdapter, type IRawStorage } from '@optimystic/db-p2p';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
-import { Diary, NetworkTransactor, BTree, type ITransactor, type BlockGets, type GetBlockResults, type ActionBlocks, type BlockActionStatus, type PendRequest, type PendResult, type CommitRequest, type CommitResult } from '@optimystic/db-core';
+import { Diary, NetworkTransactor, BTree, registerDebugModule, type ITransactor, type BlockGets, type GetBlockResults, type ActionBlocks, type BlockActionStatus, type PendRequest, type PendResult, type CommitRequest, type CommitResult } from '@optimystic/db-core';
 import * as readline from 'readline';
 import * as path from 'path';
 import * as fs from 'fs';
+
+// So `enableOptimysticLogging` reaches this package's copy of `debug`, which may be no one else's.
+registerDebugModule('ref-peer', debug);
 
 const logDebug = debug('optimystic:ref-peer');
 
