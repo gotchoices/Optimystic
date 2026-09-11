@@ -40,7 +40,7 @@ describe('mesh harness: wrapKeyNetwork', () => {
 			.to.be.greaterThan(beforeMeshLookup);
 	});
 
-	it('failure injection (findClusterFails, partitionSides) still applies through a wrapped key network', async () => {
+	it('findClusterFails still applies through a wrapped key network', async () => {
 		const wrap = (shared: IKeyNetwork): IKeyNetwork => ({
 			findCoordinator: (key, opts) => shared.findCoordinator(key, opts),
 			findCluster: (key) => shared.findCluster(key)
@@ -57,6 +57,7 @@ describe('mesh harness: wrapKeyNetwork', () => {
 
 	it('omitting wrapKeyNetwork leaves mesh.keyNetwork as the unwrapped mock', async () => {
 		const mesh = await createMesh(1, { responsibilityK: 1, clusterSize: 1 });
+		expect(mesh.keyNetwork.constructor.name).to.equal('MockMeshKeyNetwork');
 		const peers = await mesh.keyNetwork.findCluster(new TextEncoder().encode('plain-block'));
 		// The solo node's self-including view: one entry, itself.
 		expect(Object.keys(peers)).to.have.length(1);

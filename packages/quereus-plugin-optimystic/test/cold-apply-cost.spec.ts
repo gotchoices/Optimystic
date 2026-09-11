@@ -96,7 +96,7 @@ const WRITE_METHODS = [
 
 type Counts = Record<string, number>;
 
-/** Count every method call by name, then delegate. Used at three seams. */
+/** Count every method call by name, then delegate. Used at four seams. */
 function counting<T extends object>(inner: T, counts: Counts): T {
 	return new Proxy(inner, {
 		get(target, prop, receiver) {
@@ -260,12 +260,13 @@ const SMALL_X3 = { tables: 27, indexes: 39 };
  * object). Today: one commit at every scale, and round trips 39 / 129 / 101.
  *
  * Gate 4 counted only the TRANSACTOR seam until 2026-09-11 — 3 of the 54 / 144 / 142 cohort
- * lookups a cold apply actually makes (`findCluster` calls, counted at every seam via
- * `mesh-harness.ts`'s `wrapKeyNetwork` hook by patching the shared key network directly and
- * attributing each call by stack frame — see ticket `cold-apply-gate-counts-every-cohort-lookup`).
- * The other 51 / 141 / 139 are the coordinator side: `isResponsibleForBlock`'s proximity check and
- * `fetchBlockFromCluster`'s cohort consult, both inside `CoordinatorRepo.get`, neither reachable
- * from `mesh.keyNetwork`. Per-object cohort lookups: 54/22, 144/67, 142/66.
+ * lookups (`findCluster` calls) a cold apply actually makes. Those totals were first found by
+ * patching the shared key network and attributing each call by stack frame, then reproduced exactly
+ * through `mesh-harness.ts`'s `wrapKeyNetwork` hook, which is what this spec now counts with. The
+ * other 51 / 141 / 139 are almost all the coordinator side of `CoordinatorRepo.get` —
+ * `isResponsibleForBlock`'s proximity check and `fetchBlockFromCluster`'s cohort consult, one each
+ * per distinct block read — plus a fixed five on the commit path; none is reachable from
+ * `mesh.keyNetwork`. Per-object cohort lookups: 54/22, 144/67, 142/66.
  */
 const MEASURED = {
 	small: { callsPerObject: 2.2, commits: 1, findClusterPerObject: 2.45, findClusterTransactorSeam: 3, getsPerObject: 1.3, roundTripsPerObject: 1.8 },
@@ -346,6 +347,12 @@ describe('cold `apply schema` cost through the coordinated commit path', functio
 		// seam alone (3 calls / 1 commit); with one commit per apply that ratio said nothing about
 		// the part that actually scales with schema size, so gate 4 missed 51 / 141 / 139 of the
 		// 54 / 144 / 142 real lookups. See ticket `cold-apply-gate-counts-every-cohort-lookup`.
+		//
+		// TIMING: the coordinator side is two lookups per distinct block only because both are
+		// memoized within a window — the proximity check by the 60 s `responsibilityCache`, the
+		// consult of a missing block by the solo absence memo's 10 s `readRepairWindowMs`. An apply
+		// takes ~200 ms, far inside both. If this trips on a pathologically slow host with the extra
+		// lookups all in `CoordinatorRepo.get`, suspect a window expiring mid-apply, not a regression.
 		//
 		// Sanity check first: if `wrapKeyNetwork` is ever dropped, or something captures the shared
 		// key network before it is applied, `findClusterCalls` silently collapses to the transactor

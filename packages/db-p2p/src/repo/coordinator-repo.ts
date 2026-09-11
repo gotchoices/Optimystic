@@ -783,6 +783,12 @@ export class CoordinatorRepo implements IRepo {
 		// are meant to be — a rare degradation during routing churn — since routing already placed this
 		// node near the block. If they ever become routine, gate acquisition (not the serve itself) on
 		// isResponsibleForBlock.
+		//
+		// NOTE: accepted tradeoff — this check and `fetchBlockFromCluster` below each run their own
+		// `findCluster` for the same block, so a cold read costs two cohort lookups where one shared
+		// lookup would do. Declined 2026-09-11: at 0.009 ms per solo lookup there is nothing to win,
+		// and this check's future is open (blocked `writer-and-servers-disagree-on-where-a-block-lives`,
+		// option D2(b)). Revisit if a device profile shows `findCluster` as material.
 		for (const blockId of blockGets.blockIds) {
 			if (!await this.isResponsibleForBlock(blockId)) {
 				this.log('proximity:get-warning', { blockId, msg: 'serving read for non-responsible block' });
