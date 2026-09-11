@@ -232,13 +232,17 @@ describe('CoordinatorRepo solo-cohort read-repair window', () => {
 		expect(callbackInvocations).to.include(newPeer.toString());
 	});
 
-	it('does not suppress reads of a block this node does not hold', async () => {
-		// The solo exit stamps whatever block id reached it, INCLUDING one that is missing
-		// locally. That stamp is inert because `get` short-circuits on `isMissing` before it ever
-		// consults `shouldReadRepair` — a missing block is re-consulted on every read regardless
-		// of the window. Pinned here because "inert" is the only thing keeping the stamp harmless:
-		// if the missing-block bypass is ever narrowed, this case fails and says so, instead of a
-		// never-held block quietly reporting an authoritative absence for a whole window.
+	it('suppresses reads of a block this node does not hold through its OWN absence memo, not this stamp', async () => {
+		// The solo exit stamps whatever block id reached it into `lastSeenCommitMs`, INCLUDING one
+		// that is missing locally. That stamp stays inert for a missing block: `get` decides a
+		// missing block's consult by `absenceIsSettled`, which reads `settledAbsences` (armed only
+		// when a consult SETTLED the absence), never `lastSeenCommitMs` — and `shouldReadRepair` is
+		// asked only about present blocks. It has to stay that way, because `lastSeenCommitMs` is
+		// also stamped for missing blocks whose absence is NOT confirmed (a claimed revision this
+		// node could not acquire), and reading it would serve those as authoritative absents for a
+		// whole window. Here the absence genuinely is settled — on a cohort of one nobody else could
+		// hold the block — so nine reads inside the window cost one consult (ticket
+		// a-block-we-do-not-hold-is-consulted-on-every-read; this was nine before it).
 		const localPeer = await makePeerId();
 		const cluster = makeClusterPeers([localPeer]);
 		const repo = new CoordinatorRepo(
@@ -262,7 +266,7 @@ describe('CoordinatorRepo solo-cohort read-repair window', () => {
 		});
 
 		expect(countTag(captured, 'cluster-fetch:solo-self-skip'),
-			'a locally-missing block consults on every read, window or no window').to.equal(9);
+			'a settled absence consults once per window, like held content').to.equal(1);
 		// Not a stale-content decision, so it is not read-repair: the triggered/no-op pair belongs
 		// to the present-but-possibly-stale path only.
 		expect(countTag(captured, 'cluster-tx:read-repair-triggered')).to.equal(0);

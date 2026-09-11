@@ -567,6 +567,30 @@ export class CoordinatorRepo implements IRepo {
 	private readonly responsibilityCache = new LruMap<string, { inCluster: boolean, expires: number }>(1000);
 	private static readonly RESPONSIBILITY_TTL_MS = 60_000;
 	private readonly lastSeenCommitMs = new LruMap<string, number>(1000);
+	/**
+	 * Per block, when (`this.now()`) a consult last SETTLED that this node's absence of it is the
+	 * cohort's answer too — see `absenceSettled` on {@link fetchBlockFromCluster}'s result. Read only
+	 * for a block still missing locally ({@link absenceIsSettled}); cleared by any local pend or commit
+	 * of the block, by seeing it present, and by any later consult of it that does not settle.
+	 *
+	 * Deliberately its OWN map rather than `lastSeenCommitMs`: that one is also stamped for missing
+	 * blocks at exits whose verdict is NOT a confirmed absence (the `cohort-too-small` arm when a peer
+	 * claimed a revision, the post-restore arm when acquisition failed), so reading it here would turn
+	 * a `claimed-elsewhere` absence into an authoritative one for a whole window.
+	 *
+	 * NOTE: accepted tradeoff — a block created by a writer whose commit did not involve this node
+	 * (this node is outside the cohort and serving softly, or it missed the commit broadcast) is
+	 * reported absent for up to one `readRepairWindowMs` after this node settled its absence. That is
+	 * the same bound, for the same reason, that a held block's content already has: a cohort member
+	 * normally learns of a creation through the pend/commit it takes part in, and a local pend or
+	 * commit clears this memo. Revisit if a caller ever needs create-visibility across coordinators
+	 * tighter than one window — such a caller needs a revision floor (backlog
+	 * `feat-refresh-can-demand-a-revision-floor`), not a shorter window.
+	 *
+	 * NOTE: LRU-bounded like its siblings; an eviction under >1000 settled blocks loses a memo and
+	 * costs one extra consult — the safe direction.
+	 */
+	private readonly settledAbsences = new LruMap<string, number>(1000);
 	/** Per block, what earlier repair passes left unresolved — see {@link AheadClaimState}.
 	 *  Outlives the consult on purpose: the read-repair window skips consults for blocks checked
 	 *  recently, and a doubt dropped there is a stale answer served as confirmed again.
@@ -768,7 +792,10 @@ export class CoordinatorRepo implements IRepo {
 		const localResult = await this.storageRepo.get(blockGets, options);
 
 		// Decide per-block whether to consult cluster peers. Two triggers:
-		//   (a) Missing — block isn't present locally at all (legacy behavior).
+		//   (a) Missing — block isn't present locally at all. Consults unless an earlier consult
+		//       SETTLED its absence within the last `readRepairWindowMs` (see `settledAbsences` and
+		//       `absenceIsSettled`): it reached every cohort member it could ask, none claims the
+		//       block, and it rested on a real cohort view.
 		//   (b) Stale-by-policy — block is present but read-repair policy says verify.
 		// Skip cluster fetch if this is already a sync request (to prevent recursive queries).
 		// A sync read is also never marked `unavailable` here — the consult it skips is the
@@ -778,21 +805,37 @@ export class CoordinatorRepo implements IRepo {
 		const skipClusterFetch = (options as any)?.skipClusterFetch;
 		// NOTE: NetworkTransactor.get treats an authoritative "absent" ({ state: {} })
 		// as final and no longer retries it (ticket txn-perf-authoritative-notfound),
-		// relying on this cluster reconciliation to have already run. When the consult
-		// FAILS outright — or runs without ruling the block out and the block stays
-		// missing — the entry is flagged `unavailable` below with a reason naming what
-		// the consult established (see AbsenceVerdict and the mapping in the loop body),
-		// which re-enables the transactor-level retry against a different peer. If a
-		// coordinator is configured WITHOUT clusterLatestCallback, there is no cohort to
-		// consult and the local answer IS the whole truth — it stays authoritative, with
-		// no flag and no transactor-level retry to compensate. That is fine (such a
-		// coordinator has no cluster to reconcile against), but keep this coupling in
-		// mind if a partial-cluster read path is added.
+		// relying on this cluster reconciliation to have already run — within the last
+		// `readRepairWindowMs`: an unflagged absent means the cohort confirmed this absence
+		// at most one window ago (a read inside the window serves the memo of that
+		// confirmation, see `settledAbsences`), the same currency guarantee a held block's
+		// content already carries. When the consult FAILS outright — or runs without ruling
+		// the block out and the block stays missing — the entry is flagged `unavailable`
+		// below with a reason naming what the consult established (see AbsenceVerdict and
+		// the mapping in the loop body), which re-enables the transactor-level retry against
+		// a different peer; none of those outcomes is ever remembered. If a coordinator is
+		// configured WITHOUT clusterLatestCallback, there is no cohort to consult and the
+		// local answer IS the whole truth — it stays authoritative, with no flag and no
+		// transactor-level retry to compensate. That is fine (such a coordinator has no
+		// cluster to reconcile against), but keep this coupling in mind if a partial-cluster
+		// read path is added.
 		if (this.clusterLatestCallback && !skipClusterFetch) {
 			for (const blockId of blockGets.blockIds) {
 				const localEntry = localResult[blockId];
 				const localRev = localEntry?.state?.latest?.rev;
 				const isMissing = !localEntry?.state?.latest;
+				if (!isMissing) {
+					// Present: any remembered absence is dead. Dropped now rather than left to age out,
+					// so a block that vanishes again inside the same window consults instead of being
+					// served the old memo.
+					this.settledAbsences.delete(blockId);
+				} else if (this.absenceIsSettled(blockId)) {
+					// An earlier consult settled this absence within one window: serve the local entry
+					// as it stands — an authoritative absent, or pending-only content — with no flag and
+					// no log line. The held-block skip below logs nothing either, and a per-read line
+					// here would recreate the volume this skip exists to remove.
+					continue;
+				}
 				const isStale = !isMissing && this.shouldReadRepair(blockId);
 				if (!isMissing && !isStale) {
 					// No consult this pass — the read-repair window says this block was checked
@@ -815,11 +858,22 @@ export class CoordinatorRepo implements IRepo {
 				}
 
 				try {
-					const { absence, currency } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev);
+					const { absence, currency, absenceSettled } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev);
 					const refreshed = await this.storageRepo.get({ blockIds: [blockId], context: blockGets.context }, options);
 					const newRev = refreshed[blockId]?.state?.latest?.rev;
 					if (refreshed[blockId]) {
 						localResult[blockId] = refreshed[blockId];
+					}
+					// Remember a settled absence for one window; forget it after every other outcome. A
+					// consult that ended `unconfirmed`, `isolated` or `claimed`, or that rested on no real
+					// cohort view, leaves no memo, so the next read consults (and flags) exactly as before —
+					// including after a sampled or paranoid re-consult of a block whose memo was still fresh.
+					if (isMissing) {
+						if (!refreshed[blockId]?.state?.latest && absence === 'confirmed' && absenceSettled) {
+							this.settledAbsences.set(blockId, this.now());
+						} else {
+							this.settledAbsences.delete(blockId);
+						}
 					}
 					if (isStale) {
 						if (typeof newRev === 'number' && typeof localRev === 'number' && newRev > localRev) {
@@ -871,6 +925,9 @@ export class CoordinatorRepo implements IRepo {
 					// rather than return a stale cohort view, revisit — that would put the
 					// isolated case back under this vaguer reason.
 					if (isMissing) {
+						// A consult that threw settled nothing — not even a memo that was still fresh
+						// before a sampled or paranoid re-consult.
+						this.settledAbsences.delete(blockId);
 						this.flagUnconfirmedAbsence(localResult, blockId, 'peers-unreachable');
 					} else {
 						// It told us nothing, so it refutes nothing: an earlier pass's unsettled
@@ -1073,6 +1130,26 @@ export class CoordinatorRepo implements IRepo {
 		}
 	}
 
+	/**
+	 * Decide whether a block MISSING locally may skip its consult: an earlier consult settled its
+	 * absence within one read-repair window (see {@link settledAbsences}). The absence counterpart of
+	 * {@link shouldReadRepair}, giving absence the guarantee the window already gives content —
+	 * "checked with the cohort within one window" — and nothing weaker.
+	 *
+	 * Modes: `paranoid` never skips ("verify every read" means every read). `lazy` uses the window and
+	 * the sample rate, exactly as {@link shouldReadRepair} does. `off` uses the window too: `off`
+	 * disables STALE-CONTENT repair, and the absence consult is not that — it is what makes an absent
+	 * answer authoritative at all — so leaving it unbounded would make the mode meant to do less
+	 * network work do more.
+	 */
+	private absenceIsSettled(blockId: BlockId): boolean {
+		if (this.readRepairMode === 'paranoid') return false;
+		const at = this.settledAbsences.get(blockId);
+		if (at == null || this.now() - at > this.readRepairWindowMs) return false;
+		if (this.readRepairSampleRate > 0 && this.rand() < this.readRepairSampleRate) return false;
+		return true;
+	}
+
 	/** Milliseconds since we last marked this block fresh, or undefined if never. */
 	private ageMs(blockId: BlockId): number | undefined {
 		const lastSeen = this.lastSeenCommitMs.get(blockId);
@@ -1084,6 +1161,17 @@ export class CoordinatorRepo implements IRepo {
 		const now = this.now();
 		for (const id of blockIds) {
 			this.lastSeenCommitMs.set(id, now);
+		}
+	}
+
+	/**
+	 * Drop any settled-absence memo for `blockIds` ({@link settledAbsences}) — called at the top of a
+	 * local pend or commit, before routing and whatever the outcome. Clearing is always the safe
+	 * direction: the most it can cost is one extra consult.
+	 */
+	private forgetSettledAbsences(blockIds: BlockId[]): void {
+		for (const id of blockIds) {
+			this.settledAbsences.delete(id);
 		}
 	}
 
@@ -1148,9 +1236,17 @@ export class CoordinatorRepo implements IRepo {
 	 *    retire it when the memo's claimants are among the peers that answered), `no-evidence`
 	 *    leaves it standing untouched. Required, not optional, so an exit added later has to say
 	 *    which it means.
+	 *  - `absenceSettled` — whether this pass SETTLED the block's absence: it reached every cohort
+	 *    member it could ask, heard no claim, and rested on a real cohort view. `get` remembers a
+	 *    settled absence for one read-repair window ({@link settledAbsences}) and skips the consult
+	 *    while the block stays missing. `absence === 'confirmed'` alone is not enough — the
+	 *    empty-cohort exit reports `'confirmed'` without having asked anyone. Required, like
+	 *    `currency`, so an exit added later has to say which side it falls on rather than
+	 *    remembering (or forgetting) to arm something.
 	 */
-	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext, localRev?: number): Promise<{ absence: AbsenceVerdict; currency: CurrencyVerdict }> {
-		if (!this.clusterLatestCallback) return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
+	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext, localRev?: number): Promise<{ absence: AbsenceVerdict; currency: CurrencyVerdict; absenceSettled: boolean }> {
+		// Unreachable from `get` (it guards on the callback); nothing to settle against.
+		if (!this.clusterLatestCallback) return { absence: 'confirmed', currency: { kind: 'no-evidence' }, absenceSettled: false };
 
 		const blockIdBytes = new TextEncoder().encode(blockId);
 		const peers = await this.keyNetwork.findCluster(blockIdBytes);
@@ -1162,8 +1258,10 @@ export class CoordinatorRepo implements IRepo {
 		// here would suppress a genuine repair for a whole `readRepairWindowMs` after a transient
 		// blip, and re-entering costs no network work beyond the `findCluster` the read already
 		// makes. Do not "fix" this by symmetry with the solo-self exit.
+		// For the same reason it returns `absenceSettled: false`: remembering the absence would serve an
+		// authoritative absent for a whole window on the strength of a lookup that returned nobody.
 		// Currency: nobody was asked, so nothing was refuted — an earlier pass's unsettled claim stands.
-		if (peerIds.length === 0) return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
+		if (peerIds.length === 0) return { absence: 'confirmed', currency: { kind: 'no-evidence' }, absenceSettled: false };
 
 		// Solo-cluster short-circuit: the only responsible peer is us. There is no
 		// remote to sync from, so skip the callback entirely. Querying ourselves
@@ -1199,7 +1297,11 @@ export class CoordinatorRepo implements IRepo {
 			// and deliberate — the window damps repair EFFORT, not honesty — and it is the same
 			// coupling the comment at the final exit below describes. Arming the window and keeping
 			// the memo are answers to different questions; do not collapse them.
-			return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
+			// Absence: settled. Nobody else could hold the block, and re-asking inside one window learns
+			// nothing the next `findCluster` would not — the same argument, with the same one-window
+			// self-heal when a cohort appears, as the arming above. (That arming's stamp is NOT what
+			// suppresses the next read of a missing block: `get` reads `settledAbsences` for those.)
+			return { absence: 'confirmed', currency: { kind: 'no-evidence' }, absenceSettled: true };
 		}
 
 		const { corroborated, corroboration, local, silent, answered, claims, uncorroboratedRev, deadlock } = await this.queryClusterForLatest(peerIds, blockId, context);
@@ -1292,7 +1394,11 @@ export class CoordinatorRepo implements IRepo {
 			if (deadlock === 'cohort-too-small') {
 				this.markBlocksSeen([blockId]);
 			}
-			return { absence, currency };
+			// Absence settled only with no claim and no silence — every cohort member answered "I hold
+			// nothing". That covers the `cohort-too-small` arm without a claim: a cohort too small to
+			// corroborate anything has still ruled the block out when all of it answered. With a claim
+			// the verdict is `claimed` and nothing settles, even though the window was armed above.
+			return { absence, currency, absenceSettled: absence === 'confirmed' };
 		}
 
 		// The self answer is the sharper baseline (same storage, same context, read alongside the
@@ -1345,7 +1451,8 @@ export class CoordinatorRepo implements IRepo {
 			// ahead. Only reachable when a peer answered (a corroboration requires claims), so the
 			// shared verdict resolves to `nothing-ahead` and a memo whose claimants are among those
 			// answers is cleared.
-			return { absence: silenceVerdict, currency: nothingAheadVerdict };
+			// `absenceSettled` likewise: never read for a held block, stated for consistency.
+			return { absence: silenceVerdict, currency: nothingAheadVerdict, absenceSettled: silenceVerdict === 'confirmed' };
 		}
 
 		// Corroborated revision is ahead of ours — converge onto it.
@@ -1374,12 +1481,13 @@ export class CoordinatorRepo implements IRepo {
 		// unsettled claim (`recordAheadClaim`) and keeps stamping reads served below it while the
 		// window suppresses the retry — the window damps repair effort, not honesty.
 		// NOTE: that damping covers only a block this node holds at an OLDER revision. A block entirely
-		// missing locally never consults the window (`get` triggers on `isMissing` before
-		// `shouldReadRepair`), so a persistently failing acquisition — e.g. a two-node deployment that
-		// never set `assumedClusterSize`, where the content quorum can never be met — re-fetches an
-		// archive on every read of that block. Correct, and self-limiting once the cohort can agree; if
-		// it ever shows as read amplification, gate the acquisition step (not the latest-query) on the
-		// same window rather than widening `isMissing`.
+		// missing locally is suppressed only by its own absence memo (`settledAbsences`), and this exit
+		// never arms it (`absenceSettled: false` below — a failed acquisition is `claimed`). So a
+		// persistently failing acquisition — e.g. a two-node deployment that never set
+		// `assumedClusterSize`, where the content quorum can never be met — still re-fetches an archive
+		// on every read of that block. Correct, and self-limiting once the cohort can agree; if it ever
+		// shows as read amplification, gate the acquisition step (not the latest-query) on the same
+		// window rather than letting a `claimed` absence settle.
 		this.markBlocksSeen([blockId]);
 		// Converged: the corroboration is itself the evidence that nothing is ahead, and it came from
 		// peers that answered — the shared verdict resolves to `nothing-ahead`, and the memo retires
@@ -1387,7 +1495,9 @@ export class CoordinatorRepo implements IRepo {
 		const currency: CurrencyVerdict = converged
 			? nothingAheadVerdict
 			: { kind: 'unsettled-claim', rev: corroborated.rev, claimants: claimantsAtOrAbove(corroborated.rev), silent };
-		return { absence, currency };
+		// Never settles an absence: restored → the block is now present (nothing to remember); not
+		// restored → `claimed`.
+		return { absence, currency, absenceSettled: false };
 	}
 
 	/**
@@ -1948,6 +2058,12 @@ export class CoordinatorRepo implements IRepo {
 
 	async pend(request: PendRequest, options?: MessageOptions): Promise<PendResult> {
 		const allBlockIds = blockIdsForTransforms(request.transforms);
+		// Forget any settled absence of these blocks FIRST — before responsibility, routing, or the
+		// outcome is known. A pend refused because a block already exists somewhere is the strongest
+		// evidence there is that the memo was wrong, and the writer's retry re-reads: that read must
+		// consult (and restore) rather than serve the memo's authoritative absent for the rest of the
+		// window. After a success the block is present and the memo is dead anyway.
+		this.forgetSettledAbsences(allBlockIds);
 		await this.verifyResponsibility(allBlockIds);
 		const result = await this.pendThroughCluster(request, allBlockIds, options);
 		// A pend the blocks ACCEPTED is the proof that no reservation is holding them any more — the
@@ -2387,6 +2503,8 @@ export class CoordinatorRepo implements IRepo {
 
 	async commit(request: CommitRequest, options?: MessageOptions): Promise<CommitResult> {
 		const blockIds = request.blockIds;
+		// Same as `pend`: forget any settled absence of these blocks before routing, whatever the outcome.
+		this.forgetSettledAbsences(blockIds);
 		await this.verifyResponsibility(blockIds);
 
 		const cohortPeerIds = await this.coordinator.getClusterPeerIds(blockIds[0]!);
