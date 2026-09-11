@@ -3342,11 +3342,14 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * {@link endSchemaBatch}. `managers` are the SchemaManagers whose catalog writes are being
    * held (every one that existed at begin, plus any created since); `written` records, per
    * manager, the tables that created or altered their persisted schema inside the batch —
-   * the ones an end-commit failure on THAT manager leaves unpersisted.
+   * the ones an end-commit failure on THAT manager leaves unpersisted; `dropped` the tables
+   * whose DROP staged a gravestone — nothing can re-persist those, so the failure log names
+   * them.
    */
   private schemaBatch?: {
     managers: Set<SchemaManager>;
     written: Map<SchemaManager, Set<string>>;
+    dropped: Map<SchemaManager, Set<string>>;
   };
 
   constructor(
@@ -3418,7 +3421,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       manager.beginBatch();
       managers.add(manager);
     }
-    this.schemaBatch = { managers, written: new Map() };
+    this.schemaBatch = { managers, written: new Map(), dropped: new Map() };
   }
 
   /**
@@ -3443,7 +3446,11 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * through that manager is marked unpersisted ({@link OptimysticVirtualTable.markSchemaUnpersisted})
    * so its next touch re-persists it, the remaining managers still commit, and the first
    * failure is rethrown — the engine rethrows it when there was no loop error and logs and
-   * swallows it when there was.
+   * swallows it when there was. A table DROPPED inside the batch has no instance left to
+   * re-persist anything: its gravestone is lost with the commit, the catalog keeps its live
+   * record past the DROP (the next hydrate resurrects it, and a later CREATE over the same
+   * URI is not checked against it — the same failure direction as the unbatched, best-effort
+   * {@link destroy}), so the log names those tables too.
    */
   async endSchemaBatch(_db: Database, _schemaName: string, _error?: unknown): Promise<void> {
     const batch = this.schemaBatch;
@@ -3458,12 +3465,15 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         await manager.commitBatch();
       } catch (error) {
         const unpersisted = [...(batch.written.get(manager) ?? [])];
+        const dropped = [...(batch.dropped.get(manager) ?? [])];
         for (const tableKey of unpersisted) {
           this.tables.get(tableKey)?.markSchemaUnpersisted();
         }
         log(
-          'endSchemaBatch: catalog commit failed; %d table(s) will re-persist their schema on next touch (%s): %s',
-          unpersisted.length, unpersisted.join(', '), error
+          'endSchemaBatch: catalog commit failed: %s. %d table(s) will re-persist their schema on next ' +
+          'touch (%s); %d dropped table(s) keep a live catalog record past their DROP — the next hydrate ' +
+          'resurrects them and a later CREATE over the same URI is not checked against them (%s)',
+          error, unpersisted.length, unpersisted.join(', '), dropped.length, dropped.join(', ')
         );
         if (!failed) {
           failed = true;
@@ -3481,12 +3491,14 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * checkpoint: a throw withdraws every catalog write the statement staged — and only those
    * — so a refused CREATE (the storage-adoption guard, or a failure later in doInitialize
    * after the schema already reached the overlay) leaves no record for the end-of-batch
-   * commit to persist. On success `tableKey`, when given, is recorded as written through the
-   * table's manager (see the `written` field). Outside a batch this is a plain call.
+   * commit to persist. On success `tableKey` is recorded under `effect` for the table's
+   * manager (the `written` / `dropped` fields of `schemaBatch`). Outside a batch this is a
+   * plain call.
    */
   private async underBatchCheckpoint<T>(
     table: OptimysticVirtualTable,
-    tableKey: string | undefined,
+    effect: 'written' | 'dropped',
+    tableKey: string,
     work: () => Promise<T>
   ): Promise<T> {
     const batch = this.schemaBatch;
@@ -3497,11 +3509,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     const checkpoint = manager.checkpointBatch();
     try {
       const result = await work();
-      if (tableKey !== undefined) {
-        const written = batch.written.get(manager) ?? new Set<string>();
-        written.add(tableKey);
-        batch.written.set(manager, written);
-      }
+      const affected = batch[effect].get(manager) ?? new Set<string>();
+      affected.add(tableKey);
+      batch[effect].set(manager, affected);
       return result;
     } catch (error) {
       if (checkpoint) {
@@ -3609,7 +3619,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     // Initialize table and register connection before returning
     // This ensures the table is fully ready for queries and transactions
     try {
-      await this.underBatchCheckpoint(table, tableKey, async () => {
+      await this.underBatchCheckpoint(table, 'written', tableKey, async () => {
         await table.initialize();
         await table.ensureConnectionRegistered();
       });
@@ -3673,6 +3683,14 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * The committed path (`committed: true`) initializes through
    * {@link OptimysticVirtualTable.initializeForCommittedRead} (which refuses to
    * join an in-flight writer transaction) and never registers a connection.
+   *
+   * NOTE: not run under the open `APPLY SCHEMA` batch's per-statement checkpoint
+   * ({@link underBatchCheckpoint} wraps create, createIndex and destroy only). A first
+   * touch of a hydrated table mid-apply whose persisted record differs from the hydrated
+   * shape re-persists it from here, and that write stays in the overlay if the statement
+   * then throws. Fine today: no plugin DDL hook reaches this mid-apply (no alter/rename
+   * hooks are implemented), and before the batch that write was committed before the throw
+   * anyway. If a mid-apply statement ever connects and can fail after initialize, wrap it too.
    */
   private async resolveConnectedTable(
     db: Database,
@@ -3811,7 +3829,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     }
 
     // Update the stored schema with the new index
-    await this.underBatchCheckpoint(table, tableKey, () => table.addIndex(indexSchema));
+    await this.underBatchCheckpoint(table, 'written', tableKey, () => table.addIndex(indexSchema));
   }
 
   /**
@@ -4140,8 +4158,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       // so the storage listener doesn't leak past the table's lifetime.
       table.teardownChangeSubscription();
       try {
-        // Not recorded as `written`: a dropped table has no instance left to re-initialize.
-        await this.underBatchCheckpoint(table, undefined, () => table.deleteOwnSchema(tableName));
+        await this.underBatchCheckpoint(table, 'dropped', tableKey, () => table.deleteOwnSchema(tableName));
       } catch (error) {
         // Best-effort: a schema-tree write failure shouldn't stop teardown. But it
         // does leave the record LIVE past its own DROP, which blinds the

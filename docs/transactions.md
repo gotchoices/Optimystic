@@ -351,7 +351,11 @@ including the indexes it maintains, refreshed from its `IndexManager`, since
 Quereus's `CREATE INDEX` replaces the engine's `TableSchema` rather than
 mutating the copy the table holds. Nothing was cached for those tables (a batch
 seeds the schema cache only after its commit lands), so no stale hit masks the
-gap.
+gap. A table **dropped** inside the batch has no instance left to heal anything:
+its gravestone is lost with the commit and the catalog keeps its live record
+past the DROP, so the next hydrate resurrects it and a later CREATE over the
+same URI is not checked against it — the same failure direction as the
+unbatched, best-effort drop, and the failure log names those tables.
 
 **What the batch does not change.**
 

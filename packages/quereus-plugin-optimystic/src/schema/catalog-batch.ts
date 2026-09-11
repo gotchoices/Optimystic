@@ -121,11 +121,6 @@ export class CatalogBatch {
 		return this.pending.has(name);
 	}
 
-	/** Whether {@link commit} has anything to flush. */
-	hasWrites(): boolean {
-		return this.pending.size > 0;
-	}
-
 	/**
 	 * The entry under `name` as this batch sees it: the pending write when there is one,
 	 * otherwise the committed catalog's entry (undefined when absent, or when there is no

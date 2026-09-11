@@ -28,9 +28,10 @@ import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p';
-import { Tree } from '@optimystic/db-core';
+import { Tree, TransactionCoordinator } from '@optimystic/db-core';
 import type { ITransactor, CollectionId } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
+import { QuereusEngine } from '../dist/index.js';
 import { SchemaManager } from '../src/schema/schema-manager.js';
 import type { StoredTableSchema } from '../src/schema/schema-manager.js';
 import { queryAll } from './query-helpers.js';
@@ -53,6 +54,8 @@ const CATALOG_ID = 'optimystic/schema';
 interface Gate {
 	failGet?: (blockIds: string[]) => boolean;
 	failCommit?: (blockIds: string[]) => boolean;
+	/** Refuse every `sync` of the CATALOG tree (see `countCatalog`) — a warm catalog's commit carries no header id to match on. */
+	failCatalogSync?: boolean;
 }
 
 /**
@@ -127,7 +130,7 @@ function spyHooks(plugin: PluginHandle): { begin: number; end: number; endErrors
  * are counted on every catalog tree instance handed out: `replace` is stage-then-sync (the
  * unbatched write path), `sync` is the batch's end-of-apply flush.
  */
-function countCatalog(plugin: PluginHandle): { opens: () => number; commits: () => number } {
+function countCatalog(plugin: PluginHandle, gate: Gate = {}): { opens: () => number; commits: () => number } {
 	let opens = 0;
 	let commits = 0;
 	type TreeLike = { sync: () => Promise<void>; replace: (data: unknown) => Promise<void> } | undefined;
@@ -141,7 +144,11 @@ function countCatalog(plugin: PluginHandle): { opens: () => number; commits: () 
 		if (!tree) return tree;
 		const sync = tree.sync.bind(tree);
 		const replace = tree.replace.bind(tree);
-		tree.sync = async () => { commits++; return sync(); };
+		tree.sync = async () => {
+			commits++;
+			if (gate.failCatalogSync) throw new Error(`${INJECTED} syncing the catalog`);
+			return sync();
+		};
 		tree.replace = async (data) => { commits++; return replace(data); };
 		return tree;
 	};
@@ -160,7 +167,7 @@ function harness() {
 	const transactor = instrumentedTransactor(storage, gate, counts);
 	const db = new Database();
 	const plugin = registerPlugin(db, transactor);
-	const catalog = countCatalog(plugin);
+	const catalog = countCatalog(plugin, gate);
 	const hooks = spyHooks(plugin);
 	/** A fresh `Database` over the same storage, hydrated — what durably reached storage. */
 	const reopen = async () => {
@@ -170,6 +177,23 @@ function harness() {
 		return { db: other, hydrated };
 	};
 	return { storage, gate, counts, transactor, db, plugin, catalog, hooks, reopen };
+}
+
+/**
+ * Switch `db` to session mode (a `TransactionCoordinator` over the case's shared transactor),
+ * the pattern from `committed-read-conformance.spec.ts`. `warm` recomputes the engine's schema
+ * hash, which must happen OUTSIDE any statement after DDL and before the next transaction.
+ */
+async function enableSessionMode(
+	db: Database,
+	plugin: PluginHandle,
+	transactor: ITransactor
+): Promise<{ warm: () => Promise<unknown>; dispose: () => void }> {
+	const coordinator = new TransactionCoordinator(transactor, plugin.txnBridge.getCollectionRegistry());
+	const engine = new QuereusEngine(db, coordinator);
+	await engine.getSchemaHash();
+	plugin.txnBridge.configureTransactionMode(coordinator, engine, () => engine.getSchemaHash());
+	return { warm: () => engine.getSchemaHash(), dispose: () => engine.dispose() };
 }
 
 const tableBody = 'id integer primary key, name text';
@@ -432,6 +456,58 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 		const { db: db2, hydrated } = await h.reopen();
 		expect(hydrated).to.deep.equal({ tables: 1, indexes: 1 });
 		expect(await queryAll(db2, `select id from t0 where name = 'x'`)).to.deep.equal([{ id: 1 }]);
+	});
+
+	it('a failed end-of-batch commit loses the gravestone of a table dropped inside it; the next hydrate resurrects it', async () => {
+		const h = harness();
+		await h.db.exec(`pragma default_vtab_module='optimystic'`);
+		await h.db.exec(declaration(1));
+		expect((await h.reopen()).hydrated.tables, 't0 persisted').to.equal(1);
+
+		// Declaring only t1 plans `drop table t0` then `create table t1`; refuse the ONE commit
+		// that would land both the gravestone and the new record.
+		const declared = `declare schema main {\ntable t1 { ${tableBody} }\n}\napply schema main;`;
+		h.gate.failCatalogSync = true;
+		await expectRejects(h.db.exec(declared), /injected failure/);
+		h.gate.failCatalogSync = false;
+
+		// The engine dropped t0 and has t1; the catalog still says the opposite. Nothing can heal
+		// t0's side — no instance is left to re-stage its gravestone — so a fresh Database
+		// resurrects it, while t1 heals on its next touch exactly as the case above.
+		expect(h.db.schemaManager.findTable('t0', 'main'), 'the engine dropped t0').to.equal(undefined);
+		const stale = await h.reopen();
+		expect(stale.hydrated).to.deep.equal({ tables: 1, indexes: 0 });
+		expect(stale.db.schemaManager.findTable('t0', 'main'), 't0 resurrected from its live record').to.not.equal(undefined);
+		expect(stale.db.schemaManager.findTable('t1', 'main'), 't1 never reached the catalog').to.equal(undefined);
+		await h.db.exec(`insert into t1 values (1, 'x')`);
+		expect((await h.reopen()).hydrated.tables, 't1 re-persisted; t0 still described').to.equal(2);
+
+		// A Database that hydrated the stale record can drop it for real: the re-apply plans the
+		// drop again, and this time the gravestone lands.
+		await stale.db.exec(`pragma default_vtab_module='optimystic'`);
+		await stale.db.exec(declared);
+		expect((await h.reopen()).hydrated.tables).to.equal(1);
+	});
+
+	it('session mode: a cold apply still commits the catalog once, and the result hydrates and takes DML', async () => {
+		const h = harness();
+		const session = await enableSessionMode(h.db, h.plugin, h.transactor);
+		try {
+			await h.db.exec(`pragma default_vtab_module='optimystic'`);
+			await h.db.exec(declaration(2, ['t0']));
+			expect(h.hooks.begin, 'the hooks fire under the coordinator too').to.equal(1);
+			expect(h.catalog.commits(), 'one catalog commit').to.equal(1);
+			expect(h.catalog.opens(), 'one open for the batch, one to create at the end').to.be.at.most(2);
+
+			expect((await h.reopen()).hydrated).to.deep.equal({ tables: 2, indexes: 1 });
+			await session.warm();
+			await h.db.exec(`insert into t0 values (1, 'x')`);
+			expect(await queryAll(h.db, `select id from t0 where name = 'x'`)).to.deep.equal([{ id: 1 }]);
+			const { db: db2 } = await h.reopen();
+			expect(await queryAll(db2, `select name from t0 where id = 1`), 'the session commit reached shared storage').to.deep.equal([{ name: 'x' }]);
+		} finally {
+			session.dispose();
+		}
 	});
 
 	it('tables on two transactor configurations in one apply commit one catalog each', async () => {
