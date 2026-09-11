@@ -1170,9 +1170,11 @@ saveMaterializedBlock(block): store(structuredClone(block));
   coordinator's copy is a lone holder no cohort member ever reconciles from — exactly the seed of
   the "revision exists on one node that is not responsible for it" placement. A `success:false`
   with any other reason is a genuine lost race and still reaches the caller. The locally-executed
-  arm applies the same gate: its own member's retained verdict (or an own-action confirmation of
-  a refused-looking one) is this node's contribution to the count; a missing verdict is not
-  counted. Freshness arming (`markBlocksSeen`) stays tied to the *vote* count — the two quorums
+  arm applies the same gate: its own member's retained verdict is this node's contribution to the
+  count; a missing verdict is not counted, and neither is an own-action confirmation of a refused
+  verdict (`confirmCommitRivalAgainstLocal` fires on the first held block, so it clears the
+  conflict answer but does not prove every block of the commit is held — the retained verdict
+  already does when they are). Freshness arming (`markBlocksSeen`) stays tied to the *vote* count — the two quorums
   answer different questions and are not conflated.
 - **A block read has three answers, not two: present, authoritatively absent, or unavailable.**
   `GetBlockResult` carries an optional `unavailable` field

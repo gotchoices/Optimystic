@@ -307,13 +307,22 @@ describe('CoordinatorRepo commit — locally-executed consensus consults the ret
 		expect((result as StaleFailure).staleAt).to.deep.equal({ blockId: BLOCK, rev: 5 });
 	});
 
-	it('acknowledges when the refusal is our own action durable at the requested revision — this node is a holder', async () => {
+	it('answers no conflict when the refusal is our own action durable at the requested revision', async () => {
 		// Already durable under this action: a conflict answer would make the writer rebase and
-		// re-append a landed action — a duplicate entry. The confirmation also proves this node
-		// HOLDS the revision, so it completes the majority with one remote holder (2 of 3). The mesh
-		// spec's membership/uniqueness assertions are the end-to-end guard for this arm.
-		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 2, actionId: OUR_ACTION }), refusal, 1);
+		// re-append a landed action — a duplicate entry. With the rest of the cohort durable the
+		// commit is acknowledged. The mesh spec's membership/uniqueness assertions are the
+		// end-to-end guard for this arm.
+		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 2, actionId: OUR_ACTION }), refusal, 2);
 		expect((await repo.commit(REQUEST)).success).to.equal(true);
+	});
+
+	it('does not count an own-action confirmation as a durable holder', async () => {
+		// The confirmation fires on the FIRST block found held under this action; a multi-block
+		// commit torn locally holds some blocks and not others. The member's retained verdict is the
+		// per-block truth (a success whenever every block is held), so a refused verdict contributes
+		// nothing to the count even when the classification re-read finds our action: 1 of 3 here.
+		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 2, actionId: OUR_ACTION }), refusal, 1);
+		expectNotDurable(await repo.commit(REQUEST));
 	});
 
 	it('acknowledges an unconfirmed refusal (local storage behind) when the rest of the cohort holds the revision', async () => {

@@ -829,9 +829,9 @@ export class ClusterCoordinator {
 			transactionsEntry: this.transactions.get(record.messageHash)
 		});
 
-		// Members that already held super-majority promises reach consensus during THIS round rather
-		// than during the broadcast below, so their apply verdicts arrive on these responses. Collect
-		// both; the broadcast's copy wins on overlap, being the later of the two.
+		// A member can reach consensus during THIS round rather than during the broadcast below (a
+		// record that already carries commits — a retried delivery), so its apply verdicts arrive on
+		// these responses. Collect both; the broadcast's copy wins on overlap, being the later of the two.
 		mergeApplyOutcomes(record, collectApplyOutcomes(results.map((response, idx) => ({ peerId: peerIds[idx]!, response }))));
 
 		// Merge all commits into the record
@@ -914,10 +914,19 @@ export class ClusterCoordinator {
 	 * (`buildBlockCommitProof`), which `createReconcileBlock` accepts from a single holder, so a
 	 * whole cohort of behind members can heal from it. The cost is one in-process apply before the
 	 * network fan-out; no extra round trip. The commit round in `commitTransaction` may stay
-	 * parallel: the record it carries has no commit signatures yet, so no member can reach
-	 * consensus (and apply) there. A coordinator outside `record.peers` is not a reconcile target
-	 * and gains nothing from this ordering; the durability gate in `CoordinatorRepo.commit` is what
-	 * makes that shape refuse rather than acknowledge.
+	 * parallel: on the first pass the record it carries has no commit signatures yet, so no member
+	 * can reach consensus (and apply) there. The scheduled retry (`retryCommits`) does re-send a
+	 * record that already carries them, in parallel — but by then this node's member applied in the
+	 * first broadcast unless it was itself among the failed deliveries, which is the retry residual
+	 * documented on `executeClusterTransaction`. A coordinator outside `record.peers` is not a
+	 * reconcile target and gains nothing from this ordering; the durability gate in
+	 * `CoordinatorRepo.commit` is what makes that shape refuse rather than acknowledge.
+	 *
+	 * NOTE: when the coordinating member is ITSELF behind (it never saw the pend), its reconcile
+	 * runs here before any remote member has applied, finds no holder, and reports not-durable; the
+	 * remote members then apply and may carry the majority on their own. Fine while the coordinator
+	 * ordinarily saw the pend; if coordinators are routinely picked after the pend phase, deliver
+	 * local-first only when the local member holds the pend, or reconcile it once more afterwards.
 	 */
 	private async broadcastMergedRecord(record: ClusterRecord, peerIds: string[]): Promise<{ failures: string[]; applyOutcomes?: ClusterRecord['applyOutcomes'] }> {
 		const deliver = async (peerIdStr: string) => {

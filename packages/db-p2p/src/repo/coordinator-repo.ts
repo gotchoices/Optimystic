@@ -2623,9 +2623,14 @@ export class CoordinatorRepo implements IRepo {
 				// consensus when every member signs the second after signing (but before applying) the
 				// first, because signing drops the member's reservation. Confirm the rival against local
 				// storage (never the verdict's prose) and answer the writer with a retryable conflict so
-				// it re-drives at a fresh revision. An own-action confirmation means this node IS a
-				// durable holder (its verdict only looked refused); an unconfirmed refusal means it is
-				// not, and the durability gate below decides whether the rest of the cohort carries it.
+				// it re-drives at a fresh revision. An own-action confirmation only clears the conflict
+				// answer; it does NOT make this node a holder for the gate below. The confirmation fires
+				// on the FIRST block found held under this action, and a multi-block commit torn locally
+				// (`StorageRepo.commit` lands blocks in order and stops at the first refusal) holds some
+				// blocks and not others — whereas the member's retained verdict is already a success
+				// whenever EVERY block is held (`ClusterMember.durableCommitVerdict`, measured after its
+				// reconcile). So the retained verdict is the only local contribution the gate counts;
+				// a refused one, confirmed or not, leaves it to the rest of the cohort.
 				//
 				// NOTE: a CONFIRMED rival is trusted over the consensus outcome here. That is right in
 				// the window this closes (the cohort refused the loser too), but it inverts if the two
@@ -2636,11 +2641,10 @@ export class CoordinatorRepo implements IRepo {
 				// after a fork; that is partition-healing scope (docs/partition-healing.md). If forks
 				// are ever observed here, weigh the retained verdict against the cohort's votes instead
 				// of trusting the local re-read alone.
-				let localDurable = localCommitResult?.success === true;
+				const localDurable = localCommitResult?.success === true;
 				if (localCommitResult !== undefined && !localCommitResult.success) {
 					const rival = await this.confirmCommitRivalAgainstLocal(request);
 					if (typeof rival === 'object') return rival;
-					localDurable = rival === 'own-durable';
 					this.log('coordinator-repo:commit-local-refusal-tolerated', {
 						actionId: request.actionId,
 						confirmation: rival ?? 'unconfirmed',
