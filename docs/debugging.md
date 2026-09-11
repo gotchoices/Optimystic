@@ -54,7 +54,7 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 | `cluster-client`      | Record-level address learning on the client side of a cluster call — `peer-address-book:record-capped` and unparseable-peer-id warnings from records this node fetched |
 | `cluster-service`     | Errors raised while handling an inbound cluster protocol message (decode/dispatch). Default name only — `ClusterService`'s `logPrefix` init option can rename it |
 | `cluster-policy`      | The `repair-fault-tolerance` decision: the fault-tolerance/repair-cost trade the sizing policy computes |
-| `coordinator-repo`    | Coordinator-side reads and repairs: `cluster-fetch:*` quorum, sync and promote decisions, `cluster-tx:read-repair-*` outcomes, solo-cohort commits *(peer-id suffixed)* |
+| `coordinator-repo`    | Coordinator-side reads and repairs: `cluster-fetch:*` quorum, sync and promote decisions, `cluster-tx:read-repair-*` outcomes, solo-cohort commits *(peer-id suffixed)*. Several of its lines carry a field that says which case they are (`read-repair-triggered`'s `ageMs`, `pend-cluster-complete`'s `localVerdict`, …) — see *Reading the fields that tell you which case a line is* below |
 | `commit-cert`         | Originations skipped because no commit certificate was retained for the action              |
 | `certified-claims`    | Certified-claim anchoring: unanchored accepts with signer counts, anchor/cohort overlap, recompute and callback errors |
 | `reconcile-block`     | Block reconciliation after divergence: certified selection, content and revision equivocation, missing quorums, fetch and penalize errors |
@@ -621,6 +621,150 @@ sourced independently, and the node tag's validation). The `node=` and `@<action
 pinned in `test/two-node-secondary-index-convergence.spec.ts` — that two nodes are distinguishable
 on all three lines, and that a CONVERGED pair reports the same action id (so a run where the ids
 differ at one revision really is a fork).
+
+## Reading the fields that tell you which case a line is
+
+Some log lines carry a field whose value — or whose absence — already names which of several very different situations the line is describing. Read that field before reasoning from anything else. The gaps between lines, how many lines there are, and which lines sit next to each other are all weaker evidence than a value the code recorded at the moment it decided, and several of the events below look identical under every one of those other measures.
+
+**`undefined` and missing are the same case, and neither is a logging glitch.** These lines log a plain object, and some of its fields are `undefined` on purpose. The stock `debug` output on Node prints such a field with the word `undefined` (`ageMs: undefined`). A sink that serialises the object as JSON — a log shipper, a capture harness, or a `debug.log` override that calls `JSON.stringify` — drops the key entirely. Both mean the same thing. A few fields are left out of the object rather than set to `undefined`; their entries below say so.
+
+Some fields of this kind are already explained where their event is documented, and are not repeated here: `commit:solo-cohort`'s `cohortSize` and `soleIsSelf` ([docs/internals.md §Durable commit proof](internals.md#durable-commit-proof-blockcommitproof)); `cluster-fetch:repair-deadlock`, `cluster-fetch:local-current` and `cluster-fetch:claim-unrefutable` ([docs/internals.md §Consensus Execution](internals.md#consensus-execution)); `cluster-fetch:solo-self-skip` ([docs/transactions.md §Lazy read-repair window](transactions.md#lazy-read-repair-window)); and the quereus-plugin's `commit:collections` ([§Which collections did a write carry?](#which-collections-did-a-write-carry)).
+
+### `cluster-tx:read-repair-triggered` — was the read-repair window armed?
+
+Logged under `optimystic:db-p2p:coordinator-repo` (peer-id suffixed):
+
+```
+optimystic:db-p2p:coordinator-repo:12D3KooWAbCd cluster-tx:read-repair-triggered { blockId: 'default/Revocation', mode: 'lazy', ageMs: 14322, localRev: 3 }
+optimystic:db-p2p:coordinator-repo:12D3KooWAbCd cluster-tx:read-repair-triggered { blockId: 'default/Strand', mode: 'lazy', ageMs: undefined, localRev: 7 }
+```
+
+Background, in one paragraph: a node that holds a block does not re-check it with its cohort on every read. In the default `lazy` read-repair mode it stamps the time the cohort last confirmed the block — a commit whose votes were a majority of the full cohort, or a consult the cohort answered — and re-checks only once `readRepairWindowMs` (10 s by default) has passed since that stamp. The stamp is what "arms" the window. Which outcomes stamp it, and the configuration knobs, are in [docs/transactions.md §Lazy read-repair window](transactions.md#lazy-read-repair-window); this entry covers only how to read the line.
+
+The line fires when a read of a block this node **holds** decides to consult the cohort (`shouldReadRepair` in `packages/db-p2p/src/repo/coordinator-repo.ts`). A read of a block this node does not hold consults without ever emitting it. Fields:
+
+- `mode` — the `readRepairMode` in force, `lazy` or `paranoid`. Mode `off` never consults about a held block, so it never emits this line.
+- `ageMs` — milliseconds since the block was last stamped (`ageMs` in `packages/db-p2p/src/repo/coordinator-repo.ts`), or `undefined` when it has no stamp.
+- `localRev` — the revision this node holds. Always present, because the line only fires for a held block.
+
+| `mode` | `ageMs` | What it means |
+|---|---|---|
+| `paranoid` | anything | Every read consults, by design. `ageMs` tells you nothing about a defect in this mode. |
+| `lazy` | `undefined` or missing | This node has no stamp for the block. Either no outcome has stamped it yet (the window was never armed), or its stamp was **evicted**: stamps are kept for at most 1000 blocks, least recently used dropped first (`lastSeenCommitMs` in `packages/db-p2p/src/repo/coordinator-repo.ts`), so a node working across more than 1000 blocks can lose one. Absence alone is not proof the window was never armed. One such line per block, the first time it is touched, is normal. |
+| `lazy` | above `readRepairWindowMs` | The window expired. A healthy, intended re-check. |
+| `lazy` | `readRepairWindowMs` or below | Depends on `readRepairSampleRate`. Above `0`, this is a random sampled re-check, which is healthy. At its default of `0`, this is a **genuine defect**: the block re-entered repair while its window was armed. |
+
+Read the `lazy` rows only together with `mode` and `readRepairSampleRate`. "`ageMs` at or below the window" is a defect only when both of those conditions hold, and a table without them reproduces exactly the misreading this section exists to prevent.
+
+**Repeated `undefined` for one block is a defect only if the consults in between should have stamped it.** Some consult outcomes deliberately leave the window unarmed, so that the next read tries again: a corroboration decline (`cluster-fetch:no-quorum`), unless it is the permanent `cohort-too-small` kind, and an empty cohort lookup. Repeated `undefined` after either of those is correct. Repeated `undefined` after outcomes that *do* stamp — `cluster-fetch:solo-self-skip`, `cluster-fetch:local-current`, `cluster-fetch:synced` or `cluster-fetch:not-restored` — is the never-armed defect GitHub issue #8 reported against 0.27.0.
+
+#### Worked example: a "loop" that was many reads
+
+In GitHub issue #8 (September 2026), a reporter on 0.29.0 saw sub-second gaps between repeated read-repair activity on one busy block, `default/Revocation`: hundreds of repeats, some only 8 ms apart. They reported it as the window re-arming failing for that block, so that it re-entered repair while armed. Another participant, `risavian`, pointed out that the line's own `ageMs` field answers that question directly. They also noted that "window never armed" and "re-entered while still armed" cannot be told apart by gap timing at all: in their control, identical timings flipped the verdict depending only on whether `ageMs` was present.
+
+Counted by `ageMs` on the reporter's next capture, the result was 290 triggers. Eight had no stamp, one first touch per block. The other 282 were above the 10 s window, and **none** were at or below it. The reporter withdrew the claim. Their gap statistic had been counted over `cluster-fetch:solo-self-skip` lines, which fire for every consult on a node that is its block's whole cohort, including consults about a block the node does not hold. None of the 254 skips for the hot block had a trigger line before them. They were many separate reads of one frequently read block, each correctly consulting, not one read re-entering.
+
+Two lessons carry over to any capture. Classify each trigger by `ageMs`, never by the gap since the previous one. And a `cluster-fetch:solo-self-skip` with no matching `read-repair-triggered` is a consult about a block this node does not hold, not a re-entry of the window.
+
+Credit to `risavian` for noticing that the field classifies each trigger on its own.
+
+### `coordinator-repo:pend-cluster-complete` — whose verdict answered the writer?
+
+Logged once per pend that runs through a cohort of more than one peer, after cluster consensus returns (`pendThroughCluster` in `packages/db-p2p/src/repo/coordinator-repo.ts`). A cohort of one never emits it; that pend goes straight to local storage. Fields: `actionId`, `localExecuted`, `localVerdict`, `cohortRefusals`.
+
+`localExecuted` says whether this node's own cohort member applied the pend during consensus. `localVerdict` is the storage verdict that member kept: `success`; `conflict`, a retryable loss (a rival's pending action holds the blocks, or the requested revision is already committed); `fault`, any other refusal; or `none`, meaning no verdict was kept.
+
+| `localExecuted` | `localVerdict` | What happened, and what follows |
+|---|---|---|
+| `false` | `none` (the only combination) | This node's member did not apply the pend during consensus, so the coordinator pends into local storage itself. Next line: `coordinator-repo:pend-fallback-result`, with that pend's outcome. |
+| `true` | `success` | This node's member stored the pend. The writer is told success. |
+| `true` | `conflict` | A genuine retryable loss. It is returned to the writer as-is, and the writer rebases and retries. |
+| `true` | `fault` | Tolerated local divergence: consensus is authoritative and the rest of the cohort may have stored the pend. Next line: `coordinator-repo:pend-local-fault-tolerated`, with the `reason`. The writer is then told success. |
+| `true` | `none` | This node's member applied the pend, but its verdict is gone (the member restarted, or the verdict aged out of retention). The coordinator answers success. |
+
+`cohortRefusals` lists the peer ids of **other** cohort members whose storage refused the pend with a conflict. When it is non-empty, every "success" outcome above is overridden, including a successful fallback pend. The writer gets the first refusal in peer-id order instead, and `coordinator-repo:pend-remote-refusal` names that peer. It never overrides a local `conflict` or `fault`: those reach the writer as they are.
+
+### `coordinator-repo:commit-stale-classify-own-action` — how our own action was found
+
+Logged when the coordinator checks its **local** storage after a refused commit and finds the requested revision already held under this commit's own action (`confirmCommitRivalAgainstLocal` in `packages/db-p2p/src/repo/coordinator-repo.ts`). The commit has already landed here, and answering it as a conflict would make the writer re-append an action that is already durable, producing a duplicate entry. The line has two shapes, and both reach the same verdict:
+
+- **No `latestRev` key** (left out of the object, not `undefined`): the block's latest revision *is* the requested one, and it names our action id.
+- **`latestRev` present**: the block has since moved past the requested revision, to `latestRev`, and its revision history shows our action took the requested one.
+
+The check stops at the first block it finds held under our action, so on a multi-block commit the line names one block, not all of them. Which line sits next to it tells you why the check ran:
+
+- It follows `coordinator-repo:commit-error`: a cohort member rejected the commit at the promise round. The original error is then re-thrown; it is never turned into a conflict answer.
+- It precedes `coordinator-repo:commit-local-refusal-tolerated` with `confirmation: 'own-durable'`: this node's own member applied the commit during consensus, but its storage refused. See the next entry.
+
+### `coordinator-repo:commit-local-refusal-tolerated` — what could be confirmed?
+
+Logged when this node's own cohort member applied a commit during consensus, its storage refused, and the coordinator could not confirm that a rival action holds the requested revision. A *confirmed* rival never reaches this line: the writer gets a retryable conflict instead. Fields: `actionId`, `confirmation`, and `reason` (the refusal local storage gave).
+
+- `confirmation: 'own-durable'` — our own action is already at the requested revision locally, and a `commit-stale-classify-own-action` line comes just before. This clears the conflict answer. It does **not** count this node as a durable holder, because a multi-block commit can be torn locally, with some blocks held and others not.
+- `confirmation: 'unconfirmed'` — local storage could not say who holds the revision. Causes: this node is behind it, its history is truncated, a read failed (a `commit-stale-classify-read-error` or `commit-stale-classify-revision-read-error` line names the failure), or the storage cannot look up a revision's action at all.
+
+Either way, the commit then goes to the durability gate, which counts only the other members' reports. If `coordinator-repo:commit-not-durable` comes next, the commit was refused as not stored by a majority. If no refusal line follows, the rest of the cohort carried it.
+
+### `cluster-member:admission-reject` — whose problem is it?
+
+Logged under `optimystic:db-p2p:cluster-member` when a cohort member refuses to vote because the peer set the coordinator declared failed this member's membership check (`admitMembership` in `packages/db-p2p/src/cluster/cluster-repo.ts`). The `reason` field says which check failed and, which matters more, whose problem it is. The same reason travels back to the coordinator in the member's signed reject vote, as `membership-not-admitted:<reason>`.
+
+| `reason` | Whose problem | Meaning |
+|---|---|---|
+| `self-not-member` | The coordinator's view of the cohort | The declared peer set does not include this member. Always enforced, even with `allowUnvalidatedSmallCluster`. |
+| `no-coordinating-block` | The sender: a malformed record | The record names no block to derive a cohort from. No current coordinator builds such a record. A `cluster-member:coordinating-block-absent` line comes just before. |
+| `unbound-coordinating-block` | The sender: a malformed record | The record names a coordinating block that its own operations never touch. A `cluster-member:coordinating-block-unbound` line comes just before. |
+| `low-confidence-downsize` | This member's own configuration | The member could not form a confident view of the cohort. It measured the declared set against its configured `assumedClusterSize` instead, and the set fell below that floor. Fields: `declaredSize`, `floor`, `assumedClusterSize`, `confidence`. Without an `assumedClusterSize`, the member cannot tell a downsize from a small cohort, so it admits and this reason never appears. |
+| `below-floor` | The two views disagree | The member has a confident view of `kEst` peers, and the declared set is smaller than the floor derived from it. |
+| `inconsistent-with-derived-view` | The two views disagree | The size is fine but the peers are not: the declared set differs from the member's confident view by more than the tolerance (`symmetricDiff` against `maxDiff`). |
+
+On `low-confidence-downsize`, `confidence` separates three situations:
+
+- `undefined` or missing — no view could be derived at all. Either the member has no derivation wired, or the cohort lookup for the coordinating block failed.
+- A number at or below `0.5` — a view was derived, but without enough confidence to rely on.
+- A number above `0.5` — the view was confident but empty (no peers), which is treated the same as having no view.
+
+"The two views disagree" cannot tell you which side is wrong: routing churn, a coordinator with a shrunken view, and a dishonest coordinator all produce it.
+
+### `cluster-fetch:no-quorum` and `reconcile:no-rev-quorum` — who answered, and who did not?
+
+Both lines report a repair that declined because too few peers backed one revision. Neither rolls the cohort into a single "responders" count, because different splits call for different actions. "One of two responded" says wait, or fix reachability. "One holder and one confirmed non-holder" says the block has only one copy, and no amount of waiting will produce a second.
+
+**`cluster-fetch:no-quorum`** is logged under `coordinator-repo`, by the read-repair path (`queryClusterForLatest` in `packages/db-p2p/src/repo/coordinator-repo.ts`). Every count is of cohort peers **other than** this node:
+
+- `cohortPeers` — how many peers are in this node's current view of the cohort. `holders + absent + silent` add up to it.
+- `holders` — peers that answered with a revision of the block.
+- `absent` — peers that answered that they hold nothing.
+- `silent` — peers that did not answer before the deadline, or whose query failed. `cluster-fetch:peers-silent` reports the same count just before.
+- `required` — how many holders must agree on one exact revision and action for the pass to accept it. It grows with `holders`, since a majority of them is needed, and it is never below two unless the declared cohort size (`repairCorroborationClusterSize`, also logged) is small.
+
+| Shape | Meaning | What to do |
+|---|---|---|
+| `silent` above `0` | The pass did not see the whole cohort, and a silent peer may be the missing holder. | Wait, or fix reachability. |
+| `silent` is `0`, and `cohortPeers` is below `required` | The cohort is too small to ever meet the requirement, however many copies exist. | Declare the cohort's real size. `cluster-fetch:repair-deadlock` with `reason: 'cohort-too-small'` names this once per block. |
+| `silent` is `0`, and `holders` is below `required` | Everyone answered, and there are too few copies. | Another copy has to arrive, from the cohort-growth push or the next commit. `cluster-fetch:repair-deadlock` with `reason: 'sole-holder'` names the one-copy case once per block. |
+| `holders` at or above `required` | Enough holders, but they disagree: no single revision-and-action pair has `required` backers. | Compare the revisions the holders claim. A `cluster-fetch:certified-equivocation` line just before means two verified commit proofs sign different actions into one revision. That is an incident, not a shortage. |
+
+**`reconcile:no-rev-quorum`** is logged under `reconcile-block`, by the commit-side heal (`createReconcileBlock` in `packages/db-p2p/src/cluster/reconcile-block.ts`): this member committed a block it could not build locally, and asked the rest of that commit's cohort for it. Fields: `rev`, the committed revision being healed; `cohortPeers`; `holders`, peers that served the block at `rev` or later; `behind`, `noArchive` and `fetchErrors`; `required`; and `repairCorroborationClusterSize`. `holders + behind + noArchive + fetchErrors` add up to `cohortPeers`. The three shortfall counts do not map neatly onto three fixes:
+
+- `behind` — the peer served the block, but only at revisions older than `rev`, or with no action recorded at its newest one. It has not caught up yet. This usually clears on its own: the next commit, or the next churn or rebalance pass, retries.
+- `noArchive` — the peer served nothing. **This combines two cases that need different fixes:** the peer holds no copy, or the peer could not be reached in time. The production fetch (`fetchArchiveFromPeer` in `packages/db-p2p/src/libp2p-node-base.ts`) turns every dial failure, and its own one-second timeout, into the same empty answer. To tell them apart, find the read path's `cluster-fetch:no-quorum` for the same block, which reports `absent` and `silent` separately.
+- `fetchErrors` — the fetch threw. The production fetch never throws (see the previous item), so this stays `0` on a real node. A nonzero value means a custom `fetchArchive` is wired in.
+
+### `cluster-tx:complete` — is a commit retry still running?
+
+Logged under `optimystic:db-p2p:cluster` when a coordinator's cluster transaction finishes, **whether it succeeded or failed**; the line is written on the way out either way (`executeClusterTransaction` in `packages/db-p2p/src/repo/cluster-coordinator.ts`). Fields: `messageHash`, `finalPromises`, `finalCommits`, `retry`.
+
+- `retry` `undefined` or missing — no commit retry is pending. The coordinator drops the transaction's entry about 100 ms later and logs `cluster-tx:transaction-remove`.
+- `retry` present, as `{ attempt, pending }` — some cohort members missed the commit broadcast, and a background retry is still sending it to the peer ids in `pending`. **No `transaction-remove` follows yet.** It follows `cluster-tx:retry-finished`, once every pending peer has the commit. If the retry budget runs out first (`commitBroadcastRetryMaxAttempts`, default 5), the coordinator logs `cluster-tx:retry-abort` instead, and today the entry is never removed from memory (tracked as `bug-abandoned-commit-retry-never-releases-its-transaction`).
+- `finalPromises` / `finalCommits` — the peer ids whose promise and commit votes the record holds. `undefined` means the coordinator no longer had an entry for this `messageHash` when the line was written, so there was nothing to report.
+
+### `cluster-tx:small-cluster-no-confident-estimate` — admitted, or refused?
+
+Logged under `optimystic:db-p2p:cluster` when a transaction's cohort is smaller than `minAbsoluteClusterSize`, and the network-size estimate could not vouch for that size (`validateSmallCluster` in `packages/db-p2p/src/repo/cluster-coordinator.ts`). That happens when there is no estimate, reading it failed, its confidence is `0.5` or below, or its order of magnitude differs from the cohort's by more than one. When the estimate does vouch for the size, `cluster-tx:small-cluster-validated-by-fret` is logged instead.
+
+- `admit: true` — admitted only because the operator opted in with `allowUnvalidatedSmallCluster`, as a single-node or local-development setup knowingly running below the safe floor would. `cluster-tx:small-cluster-validated` follows.
+- `admit: false` — refused, failing closed. `cluster-tx:reject-too-small` follows, and the transaction throws.
 
 ## Common DEBUG patterns
 
