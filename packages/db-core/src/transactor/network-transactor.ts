@@ -155,13 +155,13 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// `isMissing` and consults cluster peers before it responds — and when that
 		// consult FAILS, the entry now says so via `unavailable` instead of posing as an
 		// authoritative absent. An unflagged absent means the cohort confirmed the absence
-		// within the last `readRepairWindowMs` (a settled absence is remembered for one
-		// window — the same currency bound a held block's content carries). So by the time
-		// an unflagged absent reaches here there is nothing left for a transactor-level
-		// retry to discover: another coordinator would find the same cohort's same answer,
-		// barring a creation the cohort has not yet told this node about (bounded by that
-		// same window). A flagged entry earns the retry against a different peer that an
-		// absent deliberately does not.
+		// within the last `readRepairWindowMs` (a coordinator that is the block's whole
+		// cohort remembers its absence for one window — the same currency bound a held
+		// block's content carries; a multi-peer cohort's absence is re-asked on every read).
+		// So by the time an unflagged absent reaches here there is nothing left for a
+		// transactor-level retry to discover: another coordinator would find the same
+		// cohort's same answer. A flagged entry earns the retry against a different peer
+		// that an absent deliberately does not.
 		// See tickets txn-perf-authoritative-notfound and repo-reports-unavailable-vs-absent.
 		const hasValidResponse = (b: CoordinatorBatch<BlockId[], GetBlockResults>) => {
 			return b.request?.isResponse === true && b.request.response != null;

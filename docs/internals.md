@@ -1168,6 +1168,15 @@ saveMaterializedBlock(block): store(structuredClone(block));
   absent, unflagged. So a consumer relying on `'cohort-unreachable'` to detect isolation must also
   tolerate the unflagged absent; the two differ only in whether FRET still remembers peers.
 
+  The unflagged rows are not all equal after the read. Only the cohort-of-one case of the second
+  row *settles* the absence: it is remembered for one `readRepairWindowMs` (not in `paranoid`
+  mode), and reads of the still-missing block inside that window serve the authoritative absent
+  without consulting (`settledAbsences` in `CoordinatorRepo`). The first row is not remembered — a
+  commit acknowledged at super-majority can still be on its way to this member — and neither is an
+  empty cohort lookup or any flagged outcome, so those keep consulting on every read. See § Lazy
+  read-repair window in [transactions.md](transactions.md) for the memo's lifetime and its
+  accepted tradeoff.
+
   When several apply the sharpest evidence wins: a claim outranks any amount of silence, and total
   silence outranks partial. A consult that *throws* (the cohort lookup itself failed) stays
   `'peers-unreachable'` even on an isolated node — a routing failure says nothing about how many

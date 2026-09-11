@@ -423,9 +423,9 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 			// "I hold nothing", so the absent stays authoritative — which is exactly why
 			// ClusterLatestCallback implementations must REJECT on transport failure rather
 			// than swallow (see the type's doc comment). Pinned so the boundary is explicit.
-			// Since ticket a-block-we-do-not-hold-is-consulted-on-every-read, that settled absence is
-			// also remembered for one read-repair window, so a swallowed failure is served as final
-			// for that long — the same boundary, held for one window.
+			// It is not remembered afterwards: only a cohort of one settles an absence for a window
+			// (ticket a-block-we-do-not-hold-is-consulted-on-every-read), so on this two-member cohort
+			// the next read asks again.
 			const swallowing: ClusterLatestCallback = async () => {
 				try {
 					throw new Error('dial failed');

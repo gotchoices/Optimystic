@@ -8,12 +8,14 @@
  * forever. (Measured in the field: a never-written `Revocation` collection cost two consults per
  * control-plane call, six calls out of six.)
  *
- * The fix gives an absence the same freshness window content already gets, with the same
- * guarantee: a missing block skips its consult only when an earlier consult, within the last
- * window, SETTLED its absence — reached every cohort member it could ask, heard no claim, and
- * rested on a real cohort view. Anything weaker (silence, a claim, a thrown consult, an empty
- * cohort) is never remembered, so those reads keep consulting and keep carrying their
- * `unavailable` flag exactly as before.
+ * The fix gives an absence the same freshness window content already gets, but only where it can
+ * carry the same guarantee: when this node is the block's whole cohort. There every acknowledged
+ * commit of the block lands in this node's storage before the writer hears success, so the block
+ * reads present and the memo dies. A multi-peer cohort's unanimous "nothing" is NOT remembered:
+ * this node takes part in other coordinators' writes as a cohort member without passing through
+ * its own coordinator, and a commit acknowledged at super-majority reaches the remaining members
+ * in the background — remembering it served a writer's own create as absent through a lagging
+ * member (fresh-node-ddl-multi Scenario B). See backlog feat-a-cohort-member-remembers-a-settled-absence.
  *
  * Consults are counted by `cluster-fetch:solo-self-skip` lines on a cohort of one (that exit
  * queries nobody, so the log line is the only trace) and by the cluster-latest callback's
@@ -145,8 +147,11 @@ const buildHarness = async (opts: {
 	const storage = makeControllableStorage({ adoptFromContext: opts.adoptFromContext });
 	const answers = new Map<string, RemoteAnswer>();
 	const calls: Array<{ peer: string; blockId: BlockId }> = [];
+	let clock = BASE_TIME;
+	let draw = 0.99;
 	let findClusterCalls = 0;
 	let findClusterThrows = false;
+	let lookupTakesMs = 0;
 
 	const keyNetwork: IKeyNetwork = {
 		async findCoordinator(_key: Uint8Array, _options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
@@ -154,6 +159,7 @@ const buildHarness = async (opts: {
 		},
 		async findCluster(_key: Uint8Array): Promise<ClusterPeers> {
 			findClusterCalls++;
+			clock += lookupTakesMs;	// a slow cohort lookup moves the clock under the read
 			if (findClusterThrows) throw new Error('cohort lookup failed');
 			return { ...cluster };
 		}
@@ -183,16 +189,16 @@ const buildHarness = async (opts: {
 		undefined,
 		callback
 	);
-	let clock = BASE_TIME;
-	let draw = 0.99;
 	repo.now = () => clock;
 	repo.rand = () => draw;
 
 	return {
 		repo, localPeer, remotes, cluster, storage, answers,
+		clock: () => clock,
 		setClock: (t: number) => { clock = t; },
 		setDraw: (r: number) => { draw = r; },
 		failFindCluster: (fails: boolean) => { findClusterThrows = fails; },
+		setLookupDuration: (ms: number) => { lookupTakesMs = ms; },
 		findClusterCalls: () => findClusterCalls,
 		/** Multi-peer consults of `blockId`: one self-addressed callback per consult. */
 		consultsOf: (blockId: BlockId) => calls.filter(c => c.peer === localPeer.toString() && c.blockId === blockId).length,
@@ -261,6 +267,23 @@ describe('CoordinatorRepo absence window (a block this node does not hold)', () 
 			expect(countTag(captured, 'cluster-fetch:solo-self-skip')).to.equal(2);
 		});
 
+		it('the window runs from when the consult started, not when it finished', async () => {
+			// The evidence is only as fresh as the consult's start, so a slow consult must not stretch
+			// "confirmed within one window" by its own duration.
+			const h = await buildHarness({ remoteCount: 0 });
+
+			const captured = await captureCoordinatorLog(async () => {
+				h.setLookupDuration(3_000);
+				await h.repo.get({ blockIds: [blockId] });		// the consult's lookup is the read's last
+				h.setLookupDuration(0);
+				const consultStartedAt = h.clock() - 3_000;
+				h.setClock(consultStartedAt + WINDOW_MS + 500);	// lapsed from the start, fresh from the end
+				await h.repo.get({ blockIds: [blockId] });
+			});
+
+			expect(countTag(captured, 'cluster-fetch:solo-self-skip')).to.equal(2);
+		});
+
 		it('paranoid mode consults on every read', async () => {
 			// "Verify every read" means every read, absences included.
 			const h = await buildHarness({ remoteCount: 0, mode: 'paranoid' });
@@ -290,6 +313,20 @@ describe('CoordinatorRepo absence window (a block this node does not hold)', () 
 			expect(countTag(captured, 'cluster-fetch:solo-self-skip')).to.equal(1);
 		});
 
+		it("'off' mode ignores the sample rate, as it does for held content", async () => {
+			const h = await buildHarness({ remoteCount: 0, mode: 'off', sampleRate: 0.5 });
+			h.setDraw(0.1);										// would force a check in 'lazy'
+
+			const captured = await captureCoordinatorLog(async () => {
+				for (let i = 0; i < 5; i++) {
+					h.setClock(BASE_TIME + i * 1_000);
+					await h.repo.get({ blockIds: [blockId] });
+				}
+			});
+
+			expect(countTag(captured, 'cluster-fetch:solo-self-skip')).to.equal(1);
+		});
+
 		it('a sample-rate draw inside the window still consults', async () => {
 			const h = await buildHarness({ remoteCount: 0, sampleRate: 0.5 });
 
@@ -304,6 +341,50 @@ describe('CoordinatorRepo absence window (a block this node does not hold)', () 
 			});
 
 			expect(countTag(captured, 'cluster-fetch:solo-self-skip')).to.equal(2);
+		});
+
+		describe('a re-consult that does not settle forgets a memo that was still fresh', () => {
+			// Only deleting the memo (not merely declining to re-stamp it) makes the next read consult,
+			// because the original stamp is still inside its window.
+			it('when it throws', async () => {
+				const h = await buildHarness({ remoteCount: 0, sampleRate: 0.5 });
+
+				const captured = await captureCoordinatorLog(async () => {
+					await h.repo.get({ blockIds: [blockId] });	// settles at BASE_TIME
+					h.setClock(BASE_TIME + 1_000);
+					h.setDraw(0.1);								// sampled: consults despite the memo
+					h.failFindCluster(true);
+					const r = await h.repo.get({ blockIds: [blockId] });
+					expect(r[blockId]?.unavailable).to.equal('peers-unreachable');
+					h.failFindCluster(false);
+					h.setClock(BASE_TIME + 2_000);
+					h.setDraw(0.9);								// not sampled: only a live memo would skip
+					await h.repo.get({ blockIds: [blockId] });
+				});
+
+				expect(countTag(captured, 'cluster-fetch:solo-self-skip')).to.equal(2);
+			});
+
+			it('when it asked a cohort that had grown past this node', async () => {
+				const h = await buildHarness({ remoteCount: 0, sampleRate: 0.5 });
+				const newPeer = await makePeerId();
+
+				const captured = await captureCoordinatorLog(async () => {
+					await h.repo.get({ blockIds: [blockId] });	// settles at BASE_TIME
+					Object.assign(h.cluster, makeClusterPeers([newPeer]));
+					h.setClock(BASE_TIME + 1_000);
+					h.setDraw(0.1);								// sampled: the two-member cohort answers "nothing"
+					expectAuthoritativeAbsent((await h.repo.get({ blockIds: [blockId] }))[blockId], 'grown cohort');
+					delete h.cluster[newPeer.toString()];		// back to a cohort of one
+					h.setClock(BASE_TIME + 2_000);
+					h.setDraw(0.9);
+					await h.repo.get({ blockIds: [blockId] });
+				});
+
+				expect(h.callsTo(newPeer), 'the sampled read asked the grown cohort').to.equal(1);
+				expect(countTag(captured, 'cluster-fetch:solo-self-skip'),
+					'a multi-peer answer settles nothing, and deleted the memo').to.equal(2);
+			});
 		});
 
 		describe('a local write of the block clears the memo, whatever its outcome', () => {
@@ -371,7 +452,7 @@ describe('CoordinatorRepo absence window (a block this node does not hold)', () 
 				'seeing the block present deleted the memo, so the next absence consults').to.equal(2);
 		});
 
-		it('a cohort that grows inside a settled window is not asked until the window lapses', async () => {
+		it('a cohort that grows inside a settled window is not asked until the window lapses (accepted tradeoff)', async () => {
 			// Mirrors the held-block solo spec's growth case, pinned so it is not rediscovered as a bug:
 			// the solo consult can only claim that re-asking sooner than one window learns nothing the
 			// next `findCluster` would not. A cohort of one about to stop being one costs one window.
@@ -422,22 +503,61 @@ describe('CoordinatorRepo absence window (a block this node does not hold)', () 
 			expect(countTag(captured, 'cluster-fetch:solo-self-skip'),
 				'a sync read left no memo behind for the plain read to skip on').to.equal(1);
 		});
+
+		it('multi-block get: only the block whose absence is unsettled consults', async () => {
+			const heldFresh: BlockId = 'block-held-fresh';
+			const settledAbsent: BlockId = 'block-settled-absent';
+			const unsettledAbsent: BlockId = 'block-unsettled-absent';
+			const h = await buildHarness({ remoteCount: 0 });
+			h.storage.hold(heldFresh, { actionId: 'local-action', rev: 1 });
+			h.repo.setLastSeenForTest(heldFresh, BASE_TIME);
+			let r: GetBlockResults = {};
+
+			const captured = await captureCoordinatorLog(async () => {
+				await h.repo.get({ blockIds: [settledAbsent] });	// settles that one alone
+				h.setClock(BASE_TIME + 1_000);
+				r = await h.repo.get({ blockIds: [heldFresh, settledAbsent, unsettledAbsent] });
+			});
+
+			expect(countTag(captured, 'cluster-fetch:solo-self-skip'),
+				'the settling read, then the unsettled block alone').to.equal(2);
+			expect(r[heldFresh]?.state?.latest?.rev).to.equal(1);
+			expectAuthoritativeAbsent(r[settledAbsent], 'settled');
+			expectAuthoritativeAbsent(r[unsettledAbsent], 'just settled by this read');
+		});
 	});
 
-	describe('three-member cohort', () => {
-		it('the whole cohort answering "nothing" settles for one window (the new-collection probe, windowed)', async () => {
+	describe('three-member cohort: an absence is never remembered', () => {
+		it('the whole cohort answering "nothing" still consults on every read', async () => {
+			// The regression gate for the multi-peer memo: this node takes part in other coordinators'
+			// writes as a cohort member without passing through its own coordinator, and a commit
+			// acknowledged at super-majority reaches the remaining members in the background. A memo
+			// here served a writer's own create as absent (fresh-node-ddl-multi Scenario B, 5 of 20).
 			const h = await buildHarness({ remoteCount: 2 });
 			for (let i = 0; i < 9; i++) {
 				h.setClock(BASE_TIME + i * 1_000);
 				const r = await h.repo.get({ blockIds: [blockId] });
 				expectAuthoritativeAbsent(r[blockId], `read ${i + 1}`);
 			}
-			expect(h.consultsOf(blockId)).to.equal(1);
+			expect(h.consultsOf(blockId)).to.equal(9);
 		});
 
-		// Everything below must NEVER settle: each is a guess, or a positive "it exists", and
-		// remembering it would let NetworkTransactor take the guess as final for a whole window.
-		const neverSettles = async (
+		it('a creation elsewhere is seen on the very next read', async () => {
+			const h = await buildHarness({ remoteCount: 2, adoptFromContext: true });
+
+			expectAuthoritativeAbsent((await h.repo.get({ blockIds: [blockId] }))[blockId], 'before the create');
+			for (const remote of h.remotes) h.answers.set(remote.toString(), { actionId: 'remote-action', rev: 2 });
+
+			h.setClock(BASE_TIME + 1_000);
+			const after = await h.repo.get({ blockIds: [blockId] });
+			expect(h.consultsOf(blockId)).to.equal(2);
+			expect(after[blockId]?.state?.latest?.rev, 'restored').to.equal(2);
+			expect('unavailable' in after[blockId]!).to.equal(false);
+		});
+
+		// Everything below is a guess, or a positive "it exists": each read consults and is flagged,
+		// exactly as before the memo existed.
+		const everyReadFlagged = async (
 			h: Awaited<ReturnType<typeof buildHarness>>,
 			expectedFlag: string,
 			reads = 5
@@ -449,43 +569,43 @@ describe('CoordinatorRepo absence window (a block this node does not hold)', () 
 			}
 		};
 
-		it('partial silence never settles: every read consults and is flagged peers-unreachable', async () => {
+		it('partial silence: every read consults and is flagged peers-unreachable', async () => {
 			const h = await buildHarness({ remoteCount: 2 });
 			h.answers.set(h.remotes[0]!.toString(), 'reject');
-			await neverSettles(h, 'peers-unreachable');
+			await everyReadFlagged(h, 'peers-unreachable');
 			expect(h.consultsOf(blockId)).to.equal(5);
 		});
 
-		it('total silence never settles: every read consults and is flagged cohort-unreachable', async () => {
+		it('total silence: every read consults and is flagged cohort-unreachable', async () => {
 			const h = await buildHarness({ remoteCount: 2 });
 			h.answers.set(h.remotes[0]!.toString(), 'reject');
 			h.answers.set(h.remotes[1]!.toString(), 'reject');
-			await neverSettles(h, 'cohort-unreachable');
+			await everyReadFlagged(h, 'cohort-unreachable');
 			expect(h.consultsOf(blockId)).to.equal(5);
 		});
 
-		it('a lone claim the quorum declines never settles: claimed-elsewhere on every read', async () => {
+		it('a lone claim the quorum declines: claimed-elsewhere on every read', async () => {
 			const h = await buildHarness({ remoteCount: 2 });
 			h.answers.set(h.remotes[0]!.toString(), { actionId: 'remote-action', rev: 2 });
-			await neverSettles(h, 'claimed-elsewhere');
+			await everyReadFlagged(h, 'claimed-elsewhere');
 			expect(h.consultsOf(blockId)).to.equal(5);
 		});
 
-		it('a corroborated claim this node cannot acquire never settles: claimed-elsewhere on every read', async () => {
+		it('a corroborated claim this node cannot acquire: claimed-elsewhere on every read', async () => {
 			const h = await buildHarness({ remoteCount: 2 });
 			for (const remote of h.remotes) h.answers.set(remote.toString(), { actionId: 'remote-action', rev: 2 });
-			await neverSettles(h, 'claimed-elsewhere');
+			await everyReadFlagged(h, 'claimed-elsewhere');
 			expect(h.consultsOf(blockId)).to.equal(5);
 		});
 
-		it('a consult that throws never settles: peers-unreachable on every read', async () => {
+		it('a consult that throws: peers-unreachable on every read', async () => {
 			const h = await buildHarness({ remoteCount: 2 });
 			h.failFindCluster(true);
-			const captured = await captureCoordinatorLog(() => neverSettles(h, 'peers-unreachable'));
+			const captured = await captureCoordinatorLog(() => everyReadFlagged(h, 'peers-unreachable'));
 			expect(countTag(captured, 'cluster-fetch:error'), 'every read attempted its consult').to.equal(5);
 		});
 
-		it('an empty cohort never settles: every read repeats its cohort lookup', async () => {
+		it('an empty cohort: every read repeats its cohort lookup', async () => {
 			// A routing failure, not an answer — same reasoning as the NOTE at that exit about not
 			// arming the read-repair window.
 			const h = await buildHarness({ remoteCount: 2 });
@@ -501,84 +621,6 @@ describe('CoordinatorRepo absence window (a block this node does not hold)', () 
 				await h.repo.get({ blockIds: [blockId] });
 			}
 			expect(h.findClusterCalls() - before, 'one consult lookup per read').to.equal(8);
-		});
-
-		it('a settled absence whose next consult (after the lapse) is unconfirmed leaves no memo', async () => {
-			const h = await buildHarness({ remoteCount: 2 });
-			const peerA = h.remotes[0]!.toString();
-
-			await h.repo.get({ blockIds: [blockId] });			// settles at BASE_TIME
-
-			h.setClock(BASE_TIME + WINDOW_MS + 1);
-			h.answers.set(peerA, 'reject');
-			const unsettled = await h.repo.get({ blockIds: [blockId] });
-			expect(unsettled[blockId]?.unavailable).to.equal('peers-unreachable');
-
-			h.answers.set(peerA, 'nothing');
-			h.setClock(BASE_TIME + WINDOW_MS + 2);				// inside the lapse-read's window
-			await h.repo.get({ blockIds: [blockId] });
-			expect(h.consultsOf(blockId), 'an unconfirmed consult stamps nothing').to.equal(3);
-		});
-
-		it('a settled absence whose sampled re-consult is unconfirmed is forgotten, not left fresh', async () => {
-			// The sharper form: here the memo from BASE_TIME would still be inside its window, so only
-			// deleting it (not merely declining to re-stamp it) makes the next read consult.
-			const h = await buildHarness({ remoteCount: 2, sampleRate: 0.5 });
-			const peerA = h.remotes[0]!.toString();
-
-			await h.repo.get({ blockIds: [blockId] });			// settles at BASE_TIME
-
-			h.setClock(BASE_TIME + 1_000);
-			h.setDraw(0.1);										// sampled: consults despite the memo
-			h.answers.set(peerA, 'reject');
-			expect((await h.repo.get({ blockIds: [blockId] }))[blockId]?.unavailable).to.equal('peers-unreachable');
-
-			h.setClock(BASE_TIME + 2_000);
-			h.setDraw(0.9);										// not sampled: only a live memo would skip
-			h.answers.set(peerA, 'nothing');
-			await h.repo.get({ blockIds: [blockId] });
-			expect(h.consultsOf(blockId), 'the unconfirmed consult deleted the memo').to.equal(3);
-		});
-
-		it('a creation elsewhere inside the window reads as absent until the window lapses (accepted tradeoff)', async () => {
-			// Pinned out loud, the way the held-block spec pins "costs at most one window when the
-			// cohort later grows": a block created by a writer whose commit did not involve this node
-			// is reported absent for up to one window after this node settled its absence. The same
-			// bound a held block's content already has.
-			const h = await buildHarness({ remoteCount: 2, adoptFromContext: true });
-
-			await h.repo.get({ blockIds: [blockId] });			// settles at BASE_TIME
-			for (const remote of h.remotes) h.answers.set(remote.toString(), { actionId: 'remote-action', rev: 2 });
-
-			h.setClock(BASE_TIME + 1_000);
-			expectAuthoritativeAbsent((await h.repo.get({ blockIds: [blockId] }))[blockId], 'inside the window');
-			expect(h.consultsOf(blockId)).to.equal(1);
-
-			h.setClock(BASE_TIME + WINDOW_MS + 1);
-			const after = await h.repo.get({ blockIds: [blockId] });
-			expect(h.consultsOf(blockId), 'past the window: consulted').to.equal(2);
-			expect(after[blockId]?.state?.latest?.rev, 'and restored').to.equal(2);
-			expect('unavailable' in after[blockId]!).to.equal(false);
-		});
-
-		it('multi-block get: only the block whose absence is unsettled consults', async () => {
-			const heldFresh: BlockId = 'block-held-fresh';
-			const settledAbsent: BlockId = 'block-settled-absent';
-			const unsettledAbsent: BlockId = 'block-unsettled-absent';
-			const h = await buildHarness({ remoteCount: 2 });
-			h.storage.hold(heldFresh, { actionId: 'local-action', rev: 1 });
-			h.repo.setLastSeenForTest(heldFresh, BASE_TIME);
-
-			await h.repo.get({ blockIds: [settledAbsent] });	// settles that one alone
-			h.setClock(BASE_TIME + 1_000);
-			const r = await h.repo.get({ blockIds: [heldFresh, settledAbsent, unsettledAbsent] });
-
-			expect(h.consultsOf(heldFresh), 'held and checked recently').to.equal(0);
-			expect(h.consultsOf(settledAbsent), 'only the settling read').to.equal(1);
-			expect(h.consultsOf(unsettledAbsent), 'never settled').to.equal(1);
-			expect(r[heldFresh]?.state?.latest?.rev).to.equal(1);
-			expectAuthoritativeAbsent(r[settledAbsent], 'settled');
-			expectAuthoritativeAbsent(r[unsettledAbsent], 'just settled by this read');
 		});
 	});
 

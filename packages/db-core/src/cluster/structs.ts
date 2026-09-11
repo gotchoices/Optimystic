@@ -219,11 +219,11 @@ export interface ClusterConsensusConfig {
 	 * single reset here would otherwise drop the peer and sink super-majority.
 	 */
 	promiseImmediateRetries?: number;
-	/** Read-repair behavior: 'off' (only fetch on missing — legacy), 'lazy' (fetch when local age > window), 'paranoid' (always verify against cluster on read). Default 'lazy'. */
+	/** Read-repair behavior: 'off' (only fetch on missing — legacy), 'lazy' (fetch when local age > window), 'paranoid' (always verify against cluster on read, missing blocks included). Default 'lazy'. In 'off' and 'lazy', a missing block whose cohort is this node alone is re-consulted at most once per `readRepairWindowMs`. */
 	readRepairMode?: 'off' | 'lazy' | 'paranoid';
-	/** For 'lazy' mode: read-repair triggers when (now - localEntry.lastSeenCommitMs) > this. Default 10000. */
+	/** For 'lazy' mode: read-repair triggers when (now - localEntry.lastSeenCommitMs) > this. In 'lazy' and 'off' it is also how long a settled absence is remembered. Default 10000. */
 	readRepairWindowMs?: number;
-	/** Per-read probability of triggering read-repair in 'lazy' mode even within the window (0..1). Default 0 (no random check). */
+	/** Per-read probability of a cohort check in 'lazy' mode even within the window — of a held block or a settled absence (0..1). Default 0 (no random check). */
 	readRepairSampleRate?: number;
 	/**
 	 * When FRET has no confident network-size estimate, allow an undersized cluster
