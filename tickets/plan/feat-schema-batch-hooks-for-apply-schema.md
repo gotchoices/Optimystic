@@ -1,4 +1,4 @@
-description: The database engine offers a way for a plugin to say "these schema changes belong together", and our plugin does not implement it, so a cold schema application is executed as many independent statements. The read amplification this caused is fixed on Node, but a downstream report has the same operation failing to finish on a phone, and we have not yet explained why.
+description: The database engine offers a way for a plugin to say "these schema changes belong together", and our plugin does not implement it, so a cold schema application is executed as many independent statements. On a desktop a cache hides the cost; on a phone it does not, and three separate app teams have now measured the same result — applying even a four-table schema takes minutes, because the number of round trips, not the cost of each one, is what grows.
 prereq:
 files:
   - packages/quereus-plugin-optimystic/src/optimystic-module.ts (the module object — neither hook is defined on it)
@@ -8,7 +8,7 @@ files:
   - packages/quereus-plugin-optimystic/test/cold-apply-cost.spec.ts (the coordinated-path gates; measured baselines live here)
   - packages/quereus-plugin-optimystic/test/repro-issue8.mjs (the diagnostic harness the figures below came from)
 difficulty: medium
-tradeoffs: On Node the read cache already removed ~96% of the redundant reads, so the remaining win there is commit-count and round-trip batching rather than the amplification that made this urgent. What stops this being a clean "leave it unimplemented" call is the on-device report: a 22-object schema that took ~3 s on the old local-transactor path did not finish in 47 minutes on the coordinated path at 0.27. That gap is unexplained, and until it is, nobody can say whether these hooks would fix it.
+tradeoffs: On Node the read cache already removed ~96% of the redundant reads, so the remaining win there is commit-count and round-trip batching rather than the amplification that made this urgent — and a reader looking only at Node figures would reasonably close this as an API-completeness item. The device evidence is what stops that: with the read-repair defect fixed and the reporters' own per-read cost cut by half, a cold apply still takes about five minutes per network create on real mid-range hardware, and one app's four-table schema does not finish at all. Building this means committing to a batch-scoped context through the plugin and the transactor, which is real surface area for a win nothing in this repo's own test environment can currently demonstrate.
 ----
 
 # `beginSchemaBatch` / `endSchemaBatch` are still unimplemented — fixed on Node, unexplained on device
@@ -75,6 +75,39 @@ declared objects, or something loops. Those are different bugs.
 The decisive datum was requested on the issue (comment 5535112952): distinct `blockId` count versus
 line count in a 60 s window of `commit:solo-cohort` deep into the run. Do not scope this ticket's
 work until that answer lands — it decides whether these hooks are even the right lever.
+
+## The device answer landed (2026-09-10), and it flips this ticket's scoping
+
+The section above says the decisive datum is distinct `blockId` count versus line count deep into a run, and instructs the next reader not to scope the work until it arrives. **It arrived.** Three independent consumers now report device captures on `@optimystic/*` 0.29.0 and 1.0.0-beta.2, on both x86_64 emulators and real arm64 hardware. The dichotomy this ticket posed — "either cadre-core's founding path does far more work than the 22 declared objects, or something loops" — is settled in favour of the first, and the second is affirmatively ruled out.
+
+### The loop hypothesis is dead, and one reporter retracted his own evidence for it
+
+`kjeib` had reported that `default/Revocation` re-entered the armed read-repair exit in sub-second loops on 0.29.0 (179/229 "sub-window" repeats, minimum gap 8 ms). He withdrew that claim on real arm64 after testing it directly: of 254 `cluster-fetch:solo-self-skip` events on that block, **zero** were preceded by a `read-repair-triggered` line, and the totals rule it out independently — 290 triggers against 626 skips. Those were separate reads of a hot block, not re-entries of an unarmed window.
+
+The retraction matters here because the measurement that produced the false claim was *gap timing between skips*, which cannot distinguish "one read re-entering because the window never armed" from "many distinct reads of the same block". `risavian` supplied the statistic that can, and both reporters now measure **zero** inside-window re-entries on 0.29.0. So nothing in the read-repair path explains the volume; the reads are real, distinct reads.
+
+### Read *count* is the lever, and read *cost* provably is not
+
+This is the strongest evidence the ticket has, and it came from an experiment nobody here would have run. `risavian` profiled their own React Native app and found Hermes ships no native `TextDecoder`, so every `KvRawStorage` read pays a JS-implemented UTF-8 decode inside `raw-store-codec.decodeJson` on top of the `JSON.parse`. Their polyfill was the single largest JS frame on device at ~25% of CPU. They rewrote it and cut that frame by **54%**.
+
+End-to-end, one network create moved **6–16%** (~404–412 s to ~349–378 s).
+
+A 54% cut in the largest identifiable per-read cost buying under a fifth of the operation says the cold-apply cost on this runtime is not dominated by how expensive each read is. It is dominated by **how many reads there are** — which is precisely what these hooks address and what a read cache structurally cannot, because a cache miss still pays a native bridge crossing and the round-trip count is what scales with schema size. Their words: "We had assumed our polyfill work would be the bigger win of the two; measured, it was not close."
+
+### The volume, at last, in numbers
+
+On 1.0.0-beta.2, applying a **four-table, zero-index** schema on real arm64: **626 cluster consults, 290 read-repair triggers, 56 commits** — with the read-repair path provably healthy on that same run. Four tables is about as small as a real schema gets.
+
+A third consumer (`risavian`, VoteTorrent) does converge on real hardware, which is the useful control: it takes **~279–309 s per network create** with both the 0.29.0 fix and their decoder fix in place. Not a hang — just five minutes of coordinated cost for one create, on a foreground user-initiated action with a spinner in front of it.
+
+### What this changes about scope
+
+The "What remains" section below concludes that on Node the hooks are a correctness-of-API item rather than a performance one, and says to scope them that way **"unless the device answer comes back saying otherwise."** It came back saying otherwise. Scope this as a performance item whose target is the coordinated path on a high-latency substrate, and treat the Node figures as the floor they are: `withReadCache` removes the amplification above the storage seam, and the per-object `ITransactor.get` growth it absorbs (41 / 55 / 81 at 22 / 67 / 250 objects) is exactly the cost that survives on a backend where every miss crosses a bridge.
+
+Two consequences for the design pass:
+
+- **A gate that measures only driver calls below a read cache will not see this.** `cold-apply-cost.spec.ts` gate 1 counts calls that reach the driver; the device cost is round trips, including cache misses that still cross into native storage. Whatever gate this work lands with needs to count substrate round trips per migration, not post-cache driver calls.
+- **The reporters asked what to plan around, and that question outlives this ticket.** Both want to know whether the coordinated path is *intended* to be cheap for a cohort that is provably just this node, or whether multi-minute cold founding is the expected cost for now. That is a roadmap answer a human owes them on the issue; it is not a blocker for designing the hooks, and the hooks are worth building whichever way it is answered.
 
 ## What remains
 
