@@ -21,7 +21,7 @@
  * observed, not what the ticket guessed.
  */
 import { expect } from 'chai';
-import { generateKeyPair } from '@libp2p/crypto/keys';
+import { generateKeyPairFromSeed } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { DigitreeStore, assembleCohort, hashKey, hashPeerId } from 'p2p-fret';
 import { Diary, blockIdToBytes, type IRepo, type BlockId, type CommitRequest, type PendRequest } from '@optimystic/db-core';
@@ -43,11 +43,19 @@ const sameSet = (a: Iterable<string>, b: Iterable<string>): boolean => {
 
 const blockIds = (n: number, prefix = 'block'): string[] => Array.from({ length: n }, (_, i) => `${prefix}-${i}`);
 
-/** A FRET ring store holding `n` freshly generated peers at their real ring coordinates. */
+/**
+ * A FRET ring store holding `n` peers at their real ring coordinates. Keys are derived from a fixed
+ * seed per `(n, i)`, so every run measures the SAME ring: the statistics below are properties of one
+ * reproducible geometry rather than a fresh random sample whose tail crosses the assertion's bound.
+ */
 async function ringOf(n: number): Promise<DigitreeStore> {
 	const store = new DigitreeStore();
 	for (let i = 0; i < n; i++) {
-		const pid = peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
+		const seed = new Uint8Array(32);
+		const view = new DataView(seed.buffer);
+		view.setUint32(0, n);
+		view.setUint32(4, i);
+		const pid = peerIdFromPrivateKey(await generateKeyPairFromSeed('Ed25519', seed));
 		store.upsert(pid.toString(), await hashPeerId(pid));
 	}
 	return store;
