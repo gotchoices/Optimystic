@@ -1,5 +1,5 @@
 import type { RepoMessage } from "../network/repo-protocol.js";
-import type { PendResult } from "../network/struct.js";
+import type { CommitResult, PendResult } from "../network/struct.js";
 
 /**
  * One member's vote on a cluster transaction, in either the promise or the commit map.
@@ -56,13 +56,29 @@ export type ClusterPeers = {
 
 /**
  * One member's own report of what its storage did with this transaction at consensus-apply time; see
- * {@link ClusterRecord.applyOutcomes} for the trust rules. Only the pend arm exists today — a commit
- * refusal is not reported this way, because a commit that reached commit-consensus is authoritative
- * (the coordinator's own retained verdict plus the commit-promise guard cover that tier instead).
+ * {@link ClusterRecord.applyOutcomes} for the trust rules. The two arms report differently, and
+ * deliberately so:
+ *
+ *  - `pend` is set ONLY for a conflict-shaped refusal. The coordinator's rule for it is "an entry
+ *    means retry", so a success must not exist there.
+ *  - `commit` is ALWAYS set once a commit applied — successes included — because the coordinator
+ *    counts durable holders (`CoordinatorRepo.commit`'s durability gate), and a count needs the
+ *    positives. Consensus votes say the cohort agreed to apply the commit; this arm says whether
+ *    this member's storage actually holds the committed revision under the record's action
+ *    afterwards, measured AFTER the member's own reconcile (a member that pulled the revision from a
+ *    cohort peer reports success). A commit that reached consensus is authoritative for ordering,
+ *    but it was never evidence of storage — which is what this arm supplies.
  */
 export type MemberApplyOutcome = {
 	/** This member's storage refused the record's pend with a conflict-shaped result. */
 	pend?: PendResult;
+	/**
+	 * Whether this member's storage durably holds the record's committed revision, for every block
+	 * the commit named, after applying and (if needed) reconciling. `success: true` is a durable
+	 * holder; a failure carries storage's refusal (or a refusal built from the missing-pend throw)
+	 * for the operator's benefit — the coordinator reads only `success`.
+	 */
+	commit?: CommitResult;
 };
 
 export type ClusterRecord = {
@@ -102,17 +118,23 @@ export type ClusterRecord = {
 	 * written by a member *after* the votes are cast, on the response it hands back, so no signed
 	 * payload could carry it without a further round trip.
 	 *
-	 * Members set only their own entry, and only for a *conflict-shaped* pend refusal (one carrying
-	 * `pending` or `missing`, per `isConflictFailure`) — the optimistic-concurrency verdict that a
-	 * rival holds the blocks or already took the revision. Successes and bare-reason faults are
-	 * omitted: a bare fault stays tolerated local divergence, mirroring the coordinator's own
-	 * local-verdict arm.
+	 * Members set only their own entry. The pend arm is set only for a *conflict-shaped* pend
+	 * refusal (one carrying `pending` or `missing`, per `isConflictFailure`) — the
+	 * optimistic-concurrency verdict that a rival holds the blocks or already took the revision.
+	 * Pend successes and bare-reason faults are omitted: a bare fault stays tolerated local
+	 * divergence, mirroring the coordinator's own local-verdict arm. The commit arm is set for every
+	 * applied commit, success or not, because the coordinator counts the successes
+	 * ({@link MemberApplyOutcome}).
 	 *
-	 * Why unsigned is acceptable: a hostile entry can only *downgrade* a reported pend success into a
-	 * retryable conflict, which the writer answers by rebasing and trying again. The same member
+	 * Why unsigned is acceptable: a hostile pend entry can only *downgrade* a reported pend success
+	 * into a retryable conflict, which the writer answers by rebasing and trying again. A hostile
+	 * commit entry is no worse: a false *success* counts one durable holder the member already
+	 * counted for with its signed approve vote (the vote is what admits it to the majority the count
+	 * is measured against), and a false *refusal* is again only retry pressure. The same member
 	 * could already force strictly worse outcomes with a signed reject or conflict vote, so this adds
 	 * no attack surface beyond retry pressure — and failing toward retry is the correct direction for
-	 * optimistic concurrency. Never treat an entry here as evidence of anything but "retry".
+	 * optimistic concurrency. Never treat an entry here as evidence of anything but "retry" (pend) or
+	 * "one more holder in a count that a signed vote already bounded" (commit).
 	 *
 	 * Old peers never set it and old coordinators ignore it, so it is wire-compatible in both
 	 * directions.

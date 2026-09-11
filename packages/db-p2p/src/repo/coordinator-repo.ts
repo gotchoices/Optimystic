@@ -12,7 +12,7 @@ import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocatio
 import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAnchoring } from "../cluster/certified-claims.js";
 import { DEFAULT_CLUSTER_SIZE, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
-import { isMissingBaseRevisionFailure, MISSING_BASE_REVISION_REASON, type ICommitProofPersister, type IRevisionActionReader } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, type ICommitProofPersister, type IRevisionActionReader } from "../storage/storage-repo.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
 import type { ReconcileBlockCallback } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
@@ -555,6 +555,8 @@ export interface ICoordinatorClusterSeam {
 		localCommitResult?: CommitResult;
 		/** Other cohort members' conflict-shaped pend refusals; see `ClusterCoordinator.executeClusterTransaction`. */
 		cohortPendRefusals?: { [peerId: string]: StaleFailure };
+		/** Other cohort members' post-reconcile commit durability reports; see `ClusterCoordinator.executeClusterTransaction`. */
+		cohortCommitOutcomes?: { [peerId: string]: CommitResult };
 	}>;
 	recoverTransactions(): Promise<void>;
 }
@@ -2578,7 +2580,7 @@ export class CoordinatorRepo implements IRepo {
 		};
 
 		try {
-			const { record, localExecuted, localCommitResult } = await this.coordinator.executeClusterTransaction(blockIds[0]!, message, options);
+			const { record, localExecuted, localCommitResult, cohortCommitOutcomes } = await this.coordinator.executeClusterTransaction(blockIds[0]!, message, options);
 			// Decided once for every success shape below (local-executed, local fallback, tolerated
 			// divergence): whether this commit's quorum is freshness evidence or merely a commit.
 			// NOTE: one verdict covers every block in `blockIds`, though it is measured against
@@ -2587,20 +2589,43 @@ export class CoordinatorRepo implements IRepo {
 			// quorum that never voted. If commits ever coordinate per-block cohorts separately (see
 			// `debt-sender-side-coordinating-block-binding-is-unchecked`), this must follow them.
 			const armFreshness = this.commitQuorumRulesOutRivals(countApprovingCommitVotes(record), peerCount);
+			// THE DURABILITY GATE. A commit is acknowledged to the writer only when more than half of
+			// the cohort it ran on (`record.peers`) reports that its storage durably holds the
+			// committed revision under this action, each member measured after its own reconcile.
+			// Consensus votes are necessary for the commit to be authoritative; they were never
+			// evidence that it was stored — every member can sign, then refuse at apply (no base for
+			// the block, a missed pend), and the coordinator used to count the votes as success. The
+			// same strict majority `clusterReachedCommitConsensus` measures votes against; the
+			// freshness verdict above stays tied to the vote count, the two quorums are not
+			// conflated. Other members' reports arrive as `cohortCommitOutcomes`; this node's own
+			// member is added per arm below — its retained verdict when it executed, its fallback
+			// commit when it did not.
+			//
+			// NOTE: a refusal here means "not confirmed durable at a quorum", never "guaranteed
+			// absent" — the two-phase ambiguity. Members that refused with `missing-base-revision`
+			// have already dropped their pending records, so the writer must cancel and re-drive at a
+			// fresh revision, which is what the `conflict: true` shape makes `Collection.syncAttempts`
+			// and the multi-collection `pendPhase` do. But a member reached only by
+			// `scheduleCommitRetry` can still land the refused revision later, and this node's own
+			// member (or its fallback commit) may hold it already. The writer's retry with the SAME
+			// action id converges either way: `isOwnRevision` in `StorageRepo.pend` and `commit`
+			// treats an already-landed own revision as satisfied, and `inFlightActionId` in
+			// `Collection.updateInternal` keeps the retry on the same action.
+			const durability = cohortDurability(record, cohortCommitOutcomes);
 			if (localExecuted) {
 				// Our own member applied this commit during consensus. Its retained storage verdict is
 				// the one honest signal we have about durability: the member-side apply tolerates an
-				// "ahead" refusal as divergence (see the NOTE in ClusterMember.applyConsensusOperation),
+				// "ahead" refusal as divergence (see the NOTE in ClusterMember.applyCommitToStorage),
 				// which is correct for a redelivered or lagging commit — but when the refusal's real
-				// cause is a RIVAL action holding the requested revision, that tolerance turns a commit
-				// no member durably stored into a fabricated success. This is the
+				// cause is a RIVAL action holding the requested revision, that tolerance would turn a
+				// commit no member durably stored into a fabricated success. This is the
 				// signed-but-not-yet-applied window: two commits for one revision can BOTH assemble
 				// consensus when every member signs the second after signing (but before applying) the
 				// first, because signing drops the member's reservation. Confirm the rival against local
 				// storage (never the verdict's prose) and answer the writer with a retryable conflict so
-				// it re-drives at a fresh revision. Own-action or unconfirmed refusals keep the
-				// prior fabricated-success shape: consensus is authoritative and this member converges
-				// via replication.
+				// it re-drives at a fresh revision. An own-action confirmation means this node IS a
+				// durable holder (its verdict only looked refused); an unconfirmed refusal means it is
+				// not, and the durability gate below decides whether the rest of the cohort carries it.
 				//
 				// NOTE: a CONFIRMED rival is trusted over the consensus outcome here. That is right in
 				// the window this closes (the cohort refused the loser too), but it inverts if the two
@@ -2611,31 +2636,52 @@ export class CoordinatorRepo implements IRepo {
 				// after a fork; that is partition-healing scope (docs/partition-healing.md). If forks
 				// are ever observed here, weigh the retained verdict against the cohort's votes instead
 				// of trusting the local re-read alone.
+				let localDurable = localCommitResult?.success === true;
 				if (localCommitResult !== undefined && !localCommitResult.success) {
 					const rival = await this.confirmCommitRivalAgainstLocal(request);
 					if (typeof rival === 'object') return rival;
+					localDurable = rival === 'own-durable';
 					this.log('coordinator-repo:commit-local-refusal-tolerated', {
 						actionId: request.actionId,
 						confirmation: rival ?? 'unconfirmed',
 						reason: localCommitResult.reason
 					});
 				}
+				// An absent verdict (a member that predates retention, a restart, the TTL) is not
+				// evidence of holding anything: it is simply not counted.
+				const durableHolders = durability.remoteHolders + (localDurable ? 1 : 0);
+				if (!isDurableMajority(durableHolders, durability.cohortSize)) {
+					return this.refuseCommitNotDurable(request, durableHolders, durability, 'local-executed');
+				}
 				if (armFreshness) this.markBlocksSeen(blockIds);
 				return { success: true };
 			}
 			// Local cluster didn't execute during consensus. Attempt a local commit, but tolerate
-			// local divergence when the cluster already reached consensus — this coordinator was
-			// likely picked for commit after missing the pend phase (unreachable during pend, fresh
-			// join, etc.). The cluster's majority is authoritative; this peer catches up via sync.
+			// local divergence when the cluster already reached consensus AND a durable majority of
+			// the cohort reports holding the revision — this coordinator was likely picked for commit
+			// after missing the pend phase (unreachable during pend, fresh join, etc.), and it catches
+			// up via replication.
 			//
-			// Divergence reaches us in BOTH shapes and both must be tolerated identically:
+			// Divergence reaches us in BOTH shapes and both are handled identically:
 			//   - a THROW ("Pending action … not found"), when we never saw the pend;
 			//   - a RETURNED `success:false` carrying `missing-base-revision`, when we saw the pend
 			//     but not the revision that created the block (see StorageRepo.internalCommit).
-			// Only the throw was tolerated before the refusal existed. Reporting the refusal to the
-			// caller instead would surface a committed transaction as a stale loss: db-core's
-			// commitPhase treats any returned `success:false` as a permanent stale failure, so the
-			// client would retry an action the cluster already landed until it exhausted its budget.
+			// Reporting a tolerated divergence to the caller as the raw refusal would surface a
+			// committed transaction as a stale loss: db-core's commitPhase treats any returned
+			// `success:false` as a permanent stale failure. So a divergence on a durable majority is
+			// reported as success, and one WITHOUT a durable majority as the durability gate's
+			// retryable refusal (`tolerateLocalCommitDivergence`).
+			//
+			// The gate is evaluated BEFORE the local fallback commit, and a failing gate skips it.
+			// This node counts toward the majority only when it is in the cohort the commit ran on;
+			// an off-cohort coordinator's copy is a lone holder no cohort member will ever reconcile
+			// from (members reconcile from `record.peers`), and a refused commit must not create one —
+			// that lone off-cohort copy is exactly the seed of the "revision exists on one node that
+			// is not responsible for it" placement the durability gate exists to prevent.
+			const selfInCohort = this.localPeerId !== undefined && this.localPeerId.toString() in record.peers;
+			if (!isDurableMajority(durability.remoteHolders + (selfInCohort ? 1 : 0), durability.cohortSize)) {
+				return this.refuseCommitNotDurable(request, durability.remoteHolders, durability, 'fallback-skipped');
+			}
 			//
 			// Deliberately NOT self-signed here (unlike the solo short-circuit above): consensus for
 			// this commit ran on the cohort, so a one-peer minted proof would be a FALSE statement
@@ -2649,16 +2695,18 @@ export class CoordinatorRepo implements IRepo {
 			try {
 				const result = await (this.storageRepo as IRepo & ICommitProofPersister).commit(request, options, consensusProof);
 				if (result.success) {
+					// The gate above already admitted this shape: the remote holders plus this node
+					// (when it is in the cohort) form the majority, and this node now holds it.
 					if (armFreshness) this.markBlocksSeen(blockIds);
 					return result;
 				}
 				if (isMissingBaseRevisionFailure(result) && clusterReachedCommitConsensus(record)) {
-					return this.tolerateLocalCommitDivergence(request, blockIds, result.reason ?? MISSING_BASE_REVISION_REASON, armFreshness);
+					return this.tolerateLocalCommitDivergence(request, blockIds, result.reason ?? MISSING_BASE_REVISION_REASON, armFreshness, durability);
 				}
 				return result;
 			} catch (err) {
 				if (clusterReachedCommitConsensus(record)) {
-					return this.tolerateLocalCommitDivergence(request, blockIds, (err as Error).message, armFreshness);
+					return this.tolerateLocalCommitDivergence(request, blockIds, (err as Error).message, armFreshness, durability);
 				}
 				throw err;
 			}
@@ -2797,19 +2845,82 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
-	 * Report success for a commit the cluster carried but this peer could not apply locally.
-	 * Convergence comes from replication (cohort reconcile, or read-driven acquisition), not from
-	 * replay here. `armFreshness` says whether the commit's quorum was strong enough
-	 * ({@link commitQuorumRulesOutRivals}) for the read path to treat the blocks as
-	 * freshness-checked; a divergence tolerated on a downsized quorum leaves the window unarmed —
-	 * this peer is known to be behind here, the last place a self-referential freshness stamp
-	 * belongs.
+	 * A commit the cluster carried but this peer could not apply locally. Reported as success only
+	 * when a durable majority of the OTHER cohort members holds it (this node, having diverged, is
+	 * not a holder) — convergence then comes from replication (cohort reconcile, or read-driven
+	 * acquisition), not from replay here. Without that majority it is the durability gate's
+	 * retryable refusal: nothing is known to hold the revision. `armFreshness` says whether the
+	 * commit's quorum was strong enough ({@link commitQuorumRulesOutRivals}) for the read path to
+	 * treat the blocks as freshness-checked; a divergence tolerated on a downsized quorum leaves the
+	 * window unarmed — this peer is known to be behind here, the last place a self-referential
+	 * freshness stamp belongs.
 	 */
-	private tolerateLocalCommitDivergence(request: CommitRequest, blockIds: BlockId[], detail: string, armFreshness: boolean): CommitResult {
+	private tolerateLocalCommitDivergence(
+		request: CommitRequest, blockIds: BlockId[], detail: string, armFreshness: boolean, durability: CohortDurability
+	): CommitResult {
+		if (!isDurableMajority(durability.remoteHolders, durability.cohortSize)) {
+			return this.refuseCommitNotDurable(request, durability.remoteHolders, durability, `fallback-diverged: ${detail}`);
+		}
 		this.log('coordinator-repo:commit-local-failed-cluster-succeeded', { actionId: request.actionId, error: detail });
 		if (armFreshness) this.markBlocksSeen(blockIds);
 		return { success: true };
 	}
+
+	/**
+	 * The durability gate's answer: a retryable refusal ({@link COMMIT_NOT_DURABLE_REASON}) naming how
+	 * many of the cohort reported holding the revision. `conflict: true` because the members that
+	 * refused have dropped their pending records, so the writer's only way forward is to cancel and
+	 * re-drive at a fresh revision — the path a conflict-shaped answer already puts it on. The
+	 * read-repair window is deliberately NOT armed: nothing about this commit is freshness evidence.
+	 */
+	private refuseCommitNotDurable(request: CommitRequest, durableHolders: number, durability: CohortDurability, arm: string): StaleFailure {
+		this.log('coordinator-repo:commit-not-durable', {
+			actionId: request.actionId,
+			rev: request.rev,
+			durableHolders,
+			cohortSize: durability.cohortSize,
+			remoteHolders: durability.remoteHolders,
+			remoteRefusals: durability.remoteRefusals,
+			arm
+		});
+		return {
+			success: false,
+			conflict: true,
+			reason: `${COMMIT_NOT_DURABLE_REASON}: ${durableHolders} of ${durability.cohortSize} cohort member(s) report holding rev ${request.rev} of action ${request.actionId} (${arm})`
+		};
+	}
+}
+
+/**
+ * What the cohort reported about durably holding a commit, read off the consensus responses
+ * (`ClusterRecord.applyOutcomes[peer].commit`, threaded as `cohortCommitOutcomes`). Self is never in
+ * it: the coordinating node adds itself per arm of `CoordinatorRepo.commit`.
+ */
+interface CohortDurability {
+	/** Members of `record.peers` — the cohort the commit ran on, and the denominator of the majority. */
+	cohortSize: number;
+	/** OTHER members whose post-reconcile verdict was a success. */
+	remoteHolders: number;
+	/** OTHER members that reported a refusal — logged for the operator, never counted. */
+	remoteRefusals: number;
+}
+
+function cohortDurability(record: ClusterRecord, outcomes: { [peerId: string]: CommitResult } | undefined): CohortDurability {
+	const reports = Object.values(outcomes ?? {});
+	return {
+		cohortSize: Object.keys(record.peers).length,
+		remoteHolders: reports.filter(report => report.success).length,
+		remoteRefusals: reports.filter(report => !report.success).length
+	};
+}
+
+/**
+ * The durability gate's rule: a STRICT majority of the cohort the commit ran on — the same majority
+ * {@link clusterReachedCommitConsensus} measures votes against, applied to durable holders instead
+ * of approving votes.
+ */
+function isDurableMajority(durableHolders: number, cohortSize: number): boolean {
+	return cohortSize > 0 && durableHolders > cohortSize / 2;
 }
 
 /** True if a simple majority of cluster peers signed an approving commit. */

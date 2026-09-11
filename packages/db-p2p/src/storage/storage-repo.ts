@@ -60,6 +60,25 @@ export function isMissingBaseRevisionFailure(result: CommitResult): boolean {
 	return !result.success && (result.reason?.startsWith(MISSING_BASE_REVISION_REASON) ?? false);
 }
 
+/**
+ * Stable, greppable prefix on the failure reason `CoordinatorRepo.commit` answers with when a commit
+ * assembled consensus but FEWER than a majority of the cohort reported durably holding the committed
+ * revision afterwards. Same convention as {@link MISSING_BASE_REVISION_REASON}: a string marker,
+ * because the reason crosses the wire as `StaleFailure.reason` prose. The refusal is retryable
+ * (`conflict: true`) and means "not confirmed durable at a quorum" — never "guaranteed absent"; see
+ * the durability gate in `CoordinatorRepo.commit` for the two-phase ambiguity that wording covers.
+ */
+export const COMMIT_NOT_DURABLE_REASON = 'commit-not-durable';
+
+/**
+ * True when a {@link CommitResult} was refused by the coordinator's durability gate — consensus was
+ * reached but no durable majority reported holding the revision. Sibling of
+ * {@link isMissingBaseRevisionFailure}, for callers that need to tell this refusal from a stale loss.
+ */
+export function isCommitNotDurableFailure(result: CommitResult): boolean {
+	return !result.success && (result.reason?.startsWith(COMMIT_NOT_DURABLE_REASON) ?? false);
+}
+
 export type StorageRepoOptions = {
 	/** Optional hook to validate transactions in PendRequests */
 	validatePend?: PendValidationHook;
@@ -630,6 +649,17 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 						}
 					}
 				}
+				// NOTE: a pend of an update-only transform for a block this node holds NO revision of
+				// falls through here and is recorded (`latest` is undefined, so there is nothing to be
+				// stale against). It can never be promoted on this node without a reconcile —
+				// `internalCommit`'s fork guard refuses it (`missing-base-revision`) and drops the
+				// record — so the pend round it wins is one this member could not honour on its own.
+				// Harmless today: the commit-tier durability gate (`CoordinatorRepo.commit`) refuses
+				// the acknowledgement unless a majority of the cohort holds the revision after
+				// reconcile, and the coordinating member's proof-carrying copy is what a behind member
+				// reconciles from. If pend-time refusals ever become worth their cost (one wasted
+				// consensus round per such write), refuse at `ClusterMember.validatePendOperations`
+				// instead of here.
 
 				// Then handle any pending actions
 				const pending = await asyncIteratorToArray(blockStorage.listPendingTransactions());

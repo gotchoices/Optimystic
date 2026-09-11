@@ -33,6 +33,7 @@ import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { CoordinatorRepo, type ICoordinatorClusterSeam } from '../src/repo/coordinator-repo.js';
 import { ConflictRaceLostError, ValidatorRejectionError } from '../src/repo/cluster-coordinator.js';
+import { isCommitNotDurableFailure } from '../src/storage/storage-repo.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 
 const BLOCK = 'block-commit-conflict' as BlockId;
@@ -215,12 +216,30 @@ describe('CoordinatorRepo commit — lost races return as retryable conflicts', 
  * this member converges via replication).
  */
 describe('CoordinatorRepo commit — locally-executed consensus consults the retained member verdict', () => {
-	const RECORD: ClusterRecord = { messageHash: 'mh', peers: {}, message: {} as RepoMessage, promises: {}, commits: {} };
+	/** A three-member cohort: `self` (the coordinating node's own member) and two remote members. */
+	const RECORD: ClusterRecord = {
+		messageHash: 'mh',
+		peers: { self: { multiaddrs: [], publicKey: '' }, 'peer-1': { multiaddrs: [], publicKey: '' }, 'peer-2': { multiaddrs: [], publicKey: '' } },
+		message: {} as RepoMessage, promises: {}, commits: {}
+	};
 	/** The ahead-shaped refusal `ClusterMember` retains when apply found the revision already taken. */
 	const refusal: CommitResult = { success: false, missing: [], reason: 'commit:stale missed=1' };
 
-	/** A repo whose stubbed consensus resolves locally-executed, optionally carrying a retained verdict. */
-	const makeLocalExecutedRepo = (storageRepo: IRepo, localCommitResult?: CommitResult): CoordinatorRepo => {
+	/**
+	 * The other two members' post-apply durability reports: the first `holders` of them report
+	 * holding the revision. Two is a majority of the cohort on its own; one needs this node to join.
+	 */
+	const remoteReports = (holders: number): { [peerId: string]: CommitResult } => ({
+		'peer-1': holders >= 1 ? { success: true } : { success: false, reason: 'behind' },
+		'peer-2': holders >= 2 ? { success: true } : { success: false, reason: 'behind' }
+	});
+
+	/**
+	 * A repo whose stubbed consensus resolves locally-executed, optionally carrying a retained
+	 * verdict, with `remoteHolders` other members reporting they hold the revision (default 2: the
+	 * rest of the cohort is durable, so only the classification is under test).
+	 */
+	const makeLocalExecutedRepo = (storageRepo: IRepo, localCommitResult?: CommitResult, remoteHolders = 2): CoordinatorRepo => {
 		const repo = new CoordinatorRepo(
 			keyNetwork,
 			((_p: PeerId) => ({} as unknown as ClusterClient)),
@@ -229,13 +248,26 @@ describe('CoordinatorRepo commit — locally-executed consensus consults the ret
 		);
 		(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 			async getClusterSize(): Promise<number> { return 3; },
-			async getClusterPeerIds(): Promise<string[]> { return ['peer-1', 'peer-2', 'peer-3']; },
+			async getClusterPeerIds(): Promise<string[]> { return Object.keys(RECORD.peers); },
 			async recoverTransactions(): Promise<void> { /* unused on these paths */ },
-			async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, localCommitResult?: CommitResult }> {
-				return { record: RECORD, localExecuted: true, ...(localCommitResult !== undefined ? { localCommitResult } : {}) };
+			async executeClusterTransaction(): Promise<{
+				record: ClusterRecord, localExecuted: boolean, localCommitResult?: CommitResult,
+				cohortCommitOutcomes?: { [peerId: string]: CommitResult }
+			}> {
+				return {
+					record: RECORD, localExecuted: true,
+					...(localCommitResult !== undefined ? { localCommitResult } : {}),
+					cohortCommitOutcomes: remoteReports(remoteHolders)
+				};
 			}
 		};
 		return repo;
+	};
+
+	const expectNotDurable = (result: CommitResult): void => {
+		expect(result.success).to.equal(false);
+		expect(isCommitNotDurableFailure(result), 'the refusal names the durability gate').to.equal(true);
+		expect(isConflictFailure(result as StaleFailure), 'the refusal must be retryable').to.equal(true);
 	};
 
 	/** Wrap a storage repo so the test can assert whether the confirmation re-read ran at all. */
@@ -275,39 +307,56 @@ describe('CoordinatorRepo commit — locally-executed consensus consults the ret
 		expect((result as StaleFailure).staleAt).to.deep.equal({ blockId: BLOCK, rev: 5 });
 	});
 
-	it('keeps the fabricated success when the refusal is our own action durable at the requested revision', async () => {
+	it('acknowledges when the refusal is our own action durable at the requested revision — this node is a holder', async () => {
 		// Already durable under this action: a conflict answer would make the writer rebase and
-		// re-append a landed action — a duplicate entry. The mesh spec's membership/uniqueness
-		// assertions are the end-to-end guard for this arm.
-		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 2, actionId: OUR_ACTION }), refusal);
+		// re-append a landed action — a duplicate entry. The confirmation also proves this node
+		// HOLDS the revision, so it completes the majority with one remote holder (2 of 3). The mesh
+		// spec's membership/uniqueness assertions are the end-to-end guard for this arm.
+		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 2, actionId: OUR_ACTION }), refusal, 1);
 		expect((await repo.commit(REQUEST)).success).to.equal(true);
 	});
 
-	it('keeps the fabricated success when local storage is behind the requested revision (unconfirmed)', async () => {
-		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 1, actionId: RIVAL_ACTION }), refusal);
+	it('acknowledges an unconfirmed refusal (local storage behind) when the rest of the cohort holds the revision', async () => {
+		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 1, actionId: RIVAL_ACTION }), refusal, 2);
 		expect((await repo.commit(REQUEST)).success).to.equal(true);
 	});
 
-	it('keeps the fabricated success when latest is past the rev and the capability is absent (unconfirmed)', async () => {
-		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 5, actionId: 'a-later' as ActionId }), refusal);
+	it('refuses an unconfirmed refusal when the rest of the cohort does not hold the revision either', async () => {
+		// This node is behind and only one other member holds it: 1 of 3. The old shape fabricated
+		// a success here — consensus was authoritative, durability was never asked.
+		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 1, actionId: RIVAL_ACTION }), refusal, 1);
+		expectNotDurable(await repo.commit(REQUEST));
+	});
+
+	it('acknowledges an unconfirmed refusal (capability absent) when the rest of the cohort holds the revision', async () => {
+		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 5, actionId: 'a-later' as ActionId }), refusal, 2);
 		expect((await repo.commit(REQUEST)).success).to.equal(true);
 	});
 
 	it('returns success without a confirmation re-read when the retained verdict is a success', async () => {
 		const { repo: storageRepo, gets } = countingGets(makeStorageRepo({ rev: 2, actionId: OUR_ACTION }));
-		const repo = makeLocalExecutedRepo(storageRepo, { success: true });
+		// A retained success is this node's own durable report: with one remote holder it is 2 of 3.
+		const repo = makeLocalExecutedRepo(storageRepo, { success: true }, 1);
 
 		expect((await repo.commit(REQUEST)).success).to.equal(true);
 		expect(gets(), 'a retained success needs no classification read').to.equal(0);
 	});
 
-	it('keeps the prior fabricated-success shape when no verdict was retained', async () => {
-		// A mock/legacy coordinator resolving localExecuted with no localCommitResult (e.g. the
-		// member restarted, or the TTL pruned the verdict) keeps the old behavior exactly.
-		const { repo: storageRepo, gets } = countingGets(makeStorageRepo({ rev: 2, actionId: RIVAL_ACTION }));
-		const repo = makeLocalExecutedRepo(storageRepo);
+	it('refuses when only this node holds the revision', async () => {
+		// The retained verdict is a success, but no other member reports holding it: 1 of 3. This
+		// is the acknowledged-but-landed-nowhere-responsible shape the durability gate exists for.
+		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 2, actionId: OUR_ACTION }), { success: true }, 0);
+		expectNotDurable(await repo.commit(REQUEST));
+	});
 
-		expect((await repo.commit(REQUEST)).success).to.equal(true);
+	it('does not count a missing local verdict, and needs no classification read for it', async () => {
+		// A coordinator resolving localExecuted with no localCommitResult (the member restarted, or
+		// the TTL pruned the verdict) holds no evidence about its own storage: the rest of the
+		// cohort must carry the majority alone.
+		const { repo: storageRepo, gets } = countingGets(makeStorageRepo({ rev: 2, actionId: RIVAL_ACTION }));
+
+		expect((await makeLocalExecutedRepo(storageRepo, undefined, 2).commit(REQUEST)).success).to.equal(true);
+		expectNotDurable(await makeLocalExecutedRepo(storageRepo, undefined, 1).commit(REQUEST));
 		expect(gets(), 'no verdict, no classification read').to.equal(0);
 	});
 });

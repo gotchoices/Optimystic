@@ -226,7 +226,9 @@ describe('CoordinatorRepo commit-side freshness (quorum-intersection gate)', () 
 		 * routing sees) and `executeClusterTransaction` yields `record` with
 		 * `localExecuted`/`localCommitResult` as given. The keyNetwork's view matches `cohort` so
 		 * the read path consults the same peers the commit saw. `clusterSize` is the declared
-		 * full-cohort yardstick.
+		 * full-cohort yardstick. Every peer of the record reports durably holding the commit, so the
+		 * durability gate (`coordinator-repo-commit-divergence.spec.ts`'s subject) admits each shape
+		 * and only the freshness verdict is under test here.
 		 */
 		const makeConsensusRepo = async (opts: {
 			clusterSize: number;
@@ -235,6 +237,8 @@ describe('CoordinatorRepo commit-side freshness (quorum-intersection gate)', () 
 			localExecuted: boolean;
 			storageCommit?: () => Promise<CommitResult>;
 		}) => {
+			const cohortCommitOutcomes: { [peerId: string]: CommitResult } =
+				Object.fromEntries(Object.keys(opts.record.peers).map(id => [id, { success: true }]));
 			const localPeer = await makePeerId();
 			const remotes = await Promise.all(Array.from({ length: opts.cohortPeers - 1 }, () => makePeerId()));
 			const cluster = makeClusterPeers([localPeer, ...remotes]);
@@ -257,8 +261,8 @@ describe('CoordinatorRepo commit-side freshness (quorum-intersection gate)', () 
 				async getClusterSize(): Promise<number> { return Object.keys(cluster).length; },
 				async getClusterPeerIds(): Promise<string[]> { return Object.keys(cluster); },
 				async recoverTransactions(): Promise<void> { /* unused */ },
-				async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean }> {
-					return { record: opts.record, localExecuted: opts.localExecuted };
+				async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, cohortCommitOutcomes: { [peerId: string]: CommitResult } }> {
+					return { record: opts.record, localExecuted: opts.localExecuted, cohortCommitOutcomes };
 				}
 			};
 			let clock = BASE_TIME;

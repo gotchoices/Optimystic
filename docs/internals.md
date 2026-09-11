@@ -672,15 +672,22 @@ saveMaterializedBlock(block): store(structuredClone(block));
 - `handleConsensus()` executes on ALL cluster peers, not just coordinator
 - `executedTransactions` map prevents duplicate execution (keyed by messageHash)
 - Different operations (pend vs commit) have DIFFERENT messageHashes
-- **Post-consensus local-execution failures are tolerated, not thrown.** Once
-  consensus is reached the operation is authoritative; a member that cannot apply
-  it locally (it is *ahead* — stale pend/commit returns `success:false` with
+- **Post-consensus local-execution failures are tolerated, not thrown — per member. The
+  acknowledgement is not.** Once consensus is reached the operation is authoritative; a member
+  that cannot apply it locally (it is *ahead* — stale pend/commit returns `success:false` with
   `missing` — or *behind* — missing the prior pend, so `StorageRepo.commit` throws
   "Pending action … not found"; or *behind with no base*, below) logs
   `cluster-member:consensus-{pend,commit}-diverged`
   and tolerates the divergence rather than throwing. Throwing would reset the
   cluster stream the coordinator awaits and surface as a spurious `StreamResetError`,
-  sinking an otherwise-successful transaction.
+  sinking an otherwise-successful transaction. But tolerating a member's divergence is not the
+  same as telling the writer its commit landed: consensus votes were never evidence of storage,
+  and a cohort in which *every* member tolerated its own divergence has stored nothing. So each
+  member also reports what its storage holds after the apply and any reconcile it triggered
+  (`ClusterRecord.applyOutcomes[peer].commit`, via `withOwnApplyOutcome` in
+  `packages/db-p2p/src/cluster/cluster-repo.ts`), and `CoordinatorRepo.commit` acknowledges a
+  commit only when a strict majority of the cohort it ran on reports holding the revision — see
+  "Commit durability reporting" in [docs/correctness.md §2 Definitions](correctness.md#2-definitions).
 - **`latest` never advances past a revision the node can materialize.** A member can hold
   the *pend* for revision N of a block yet have missed the revision that created it —
   cohort membership drifts between a collection's revisions. `applyTransform` silently
@@ -834,7 +841,15 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `missing`), or a `missing-base-revision` refusal is divergence and tolerated; any other
   mid-commit fault (`success:false` with a bare `reason`, no `missing`) is propagated so
   `handleConsensus` rolls back the executed marker and rethrows — same as an unexpected
-  *thrown* fault (`applyConsensusOperation`).
+  *thrown* fault (`applyCommitToStorage`, called from `applyConsensusOperation`). Whatever shape the
+  apply took, the member then retains ONE post-reconcile durable verdict for the commit
+  (`durableCommitVerdict`): storage's own success, or — after the reconcile a refusal triggered — a
+  fresh check that every committed block records the commit's revision under its action (the
+  revision index via `IRevisionActionReader.getRevisionAction`, so a member whose `latest` has since
+  moved on still counts). The missing-pend throw, which produces no `CommitResult` of its own, is
+  folded into the same shape as a refusal built from the throw. `getExecutedCommitResult` and the
+  response record's `applyOutcomes` entry both read that one verdict, so the coordinating node and
+  every remote member are counted by the same rule.
   **`StorageRepo.commit` makes the identical split one layer down, to decide what happens to
   the pending records the pend left behind.** A *behind* divergence (missing pend, or a
   `missing-base-revision` refusal) is followed by a reconcile that advances every block in the
@@ -846,7 +861,18 @@ saveMaterializedBlock(block): store(structuredClone(block));
   blocks, so it pulls the committed revision from the cohort (via the injected
   `reconcileBlock` callback — `SyncClient` fetch + `saveReplicatedBlock` in
   `libp2p-node-base`) and restores it locally, repairing the under-replication at the
-  moment of the commit rather than waiting for someone to read the block. The read path
+  moment of the commit rather than waiting for someone to read the block. **The reconcile
+  targets are `record.peers` minus self, and it runs during the consensus broadcast — so the
+  coordinator delivers the merged record to its own member first, awaited, and only then to the
+  remote members** (`broadcastMergedRecord` in `packages/db-p2p/src/repo/cluster-coordinator.ts`).
+  The coordinating member is the one peer guaranteed to hold the revision by the time a behind
+  member asks, and its copy carries the cohort's commit proof (`buildBlockCommitProof`), which the
+  certified single-holder rule below accepts without a second corroborator — so a whole cohort of
+  behind members can heal from it in one pass. A single parallel fan-out let the remote reconciles
+  race the local apply and decline with `reconcile:no-rev-quorum` (`holders: 0`), which is how a
+  fully-approved commit ended up on no responsible node. A coordinator *outside* `record.peers`
+  is not a reconcile target, so a cohort with no holder at all stays behind; the durability gate
+  in `CoordinatorRepo.commit` is what makes that shape refuse rather than acknowledge. The read path
   is no longer blind to it: `CoordinatorRepo` is handed the *same* callback instance and
   runs it once the cohort has corroborated a revision the reader cannot promote locally
   (see [transactions.md](transactions.md#read-consistency-and-staleness)), so the two
@@ -1126,16 +1152,28 @@ saveMaterializedBlock(block): store(structuredClone(block));
     digest that proof declared. Those bytes are dropped from the content quorum and that peer is
     penalized, while its (genuinely verified) revision claim still counts; repair continues on the
     other holders.
-- **The coordinator tolerates the same divergence, in both its shapes.** When
-  `CoordinatorRepo.commit` finds its own member did not execute during consensus, it falls back
-  to a local commit — which can diverge for reasons the caller is not responsible for. A thrown
-  missing pend and a returned `missing-base-revision` refusal are treated identically: if the
-  record shows a simple majority approved the commit, report success
-  (`coordinator-repo:commit-local-failed-cluster-succeeded`) and let replication converge this
-  peer. Returning the refusal instead would surface a *landed* transaction as a stale loss, since
-  db-core's `commitPhase` treats any returned `success:false` as a permanent stale failure and
-  retries until its budget is exhausted. A `success:false` with any other reason is a genuine
-  lost race and still reaches the caller.
+- **The coordinator tolerates the same divergence, in both its shapes — on a durable majority.**
+  When `CoordinatorRepo.commit` finds its own member did not execute during consensus, it falls
+  back to a local commit — which can diverge for reasons the caller is not responsible for. A
+  thrown missing pend and a returned `missing-base-revision` refusal are treated identically: if
+  the record shows a simple majority approved the commit **and a strict majority of the cohort
+  reports durably holding the revision** (`cohortCommitOutcomes`, the other members' post-reconcile
+  reports), report success (`coordinator-repo:commit-local-failed-cluster-succeeded`) and let
+  replication converge this peer. Returning the refusal instead would surface a *landed*
+  transaction as a stale loss, since db-core's `commitPhase` treats any returned `success:false`
+  as a permanent stale failure and retries until its budget is exhausted. Without that durable
+  majority the answer is the gate's retryable refusal (`COMMIT_NOT_DURABLE_REASON`,
+  `coordinator-repo:commit-not-durable`): nothing is known to hold the revision, and the members
+  that refused have dropped their pending records, so the writer must cancel and re-drive at a
+  fresh revision. The gate is evaluated *before* the fallback commit, and a failing gate skips it:
+  this node counts toward the majority only when it is inside `record.peers`, and an off-cohort
+  coordinator's copy is a lone holder no cohort member ever reconciles from — exactly the seed of
+  the "revision exists on one node that is not responsible for it" placement. A `success:false`
+  with any other reason is a genuine lost race and still reaches the caller. The locally-executed
+  arm applies the same gate: its own member's retained verdict (or an own-action confirmation of
+  a refused-looking one) is this node's contribution to the count; a missing verdict is not
+  counted. Freshness arming (`markBlocksSeen`) stays tied to the *vote* count — the two quorums
+  answer different questions and are not conflated.
 - **A block read has three answers, not two: present, authoritatively absent, or unavailable.**
   `GetBlockResult` carries an optional `unavailable` field
   ([`network/struct.ts`](../packages/db-core/src/network/struct.ts)) that a repo sets ONLY when it

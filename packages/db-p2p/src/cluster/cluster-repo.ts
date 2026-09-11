@@ -1,4 +1,4 @@
-import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest, MemberApplyOutcome } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
@@ -289,13 +289,17 @@ export class ClusterMember implements ICluster {
 	// a pend that every member refused (rival pending action, or the revision already taken) must
 	// reach the writer as a conflict, not a win. Pruned alongside executedTransactions (same TTL).
 	private executedPendResults: Map<string, PendResult> = new Map();
-	// Local storage's verdict for a COMMIT operation applied during consensus (messageHash ->
-	// CommitResult). Retained so the coordinator can detect when the ahead-divergence tolerance in
+	// This member's POST-RECONCILE durable verdict for a COMMIT operation applied during consensus
+	// (messageHash -> CommitResult): whether local storage holds the committed revision under the
+	// record's action once the apply — and any behind-reconcile it triggered — has run. Two readers,
+	// which must see the same answer: the coordinating node reads its own member's directly
+	// (getExecutedCommitResult), every other member's reaches the coordinator on the response record
+	// (withOwnApplyOutcome → ClusterRecord.applyOutcomes[peer].commit). Together they feed the
+	// durability gate in CoordinatorRepo.commit, which acknowledges a commit only when a majority of
+	// the cohort reports holding it — consensus votes were never evidence of storage. A retained
+	// refusal also lets the coordinator detect when the ahead-divergence tolerance in
 	// applyConsensusOperation swallowed a refusal whose real cause was a RIVAL action holding the
-	// requested revision — the commit-tier acknowledgement hole: a commit that assembled consensus
-	// inside every member's signed-but-not-yet-applied window is refused by every member's storage
-	// at apply, and without this verdict the coordinator fabricates a success no member durably
-	// stored. Pruned alongside executedTransactions (same TTL).
+	// requested revision. Pruned alongside executedTransactions (same TTL).
 	private executedCommitResults: Map<string, CommitResult> = new Map();
 	// Conflict-shaped pend refusals this member's storage produced at consensus-apply, keyed by the
 	// refused action's id rather than by messageHash. The messageHash-keyed map above cannot serve the
@@ -442,13 +446,15 @@ export class ClusterMember implements ICluster {
 	}
 
 	/**
-	 * Commit-shaped sibling of {@link getExecutedPendResult}: local storage's verdict for a commit
-	 * operation applied during consensus, when this member retained one. `CoordinatorRepo.commit`
-	 * consults it after a locally-executed commit-consensus — a retained refusal whose cause a local
-	 * re-read confirms as a rival holding the requested revision is returned to the writer as a
-	 * retryable conflict instead of the fabricated success the ahead-divergence tolerance would
-	 * otherwise imply. Same availability caveats as the pend accessor: in-memory only, absent for
-	 * pre-restart applies, pruned on the executed-transaction TTL.
+	 * Commit-shaped sibling of {@link getExecutedPendResult}: this member's post-reconcile durable
+	 * verdict for a commit operation applied during consensus, when it retained one — `success: true`
+	 * iff local storage holds the committed revision under the record's action for every block the
+	 * commit named, after the apply and any behind-reconcile it triggered. `CoordinatorRepo.commit`
+	 * reads it after a locally-executed commit-consensus, both as this node's own contribution to the
+	 * durable-holder count its durability gate needs, and — for a retained refusal whose cause a
+	 * local re-read confirms as a rival holding the requested revision — as the trigger for a
+	 * retryable conflict answer. Same availability caveats as the pend accessor: in-memory only,
+	 * absent for pre-restart applies, pruned on the executed-transaction TTL.
 	 */
 	getExecutedCommitResult(messageHash: string): CommitResult | undefined {
 		return this.executedCommitResults.get(messageHash);
@@ -687,21 +693,28 @@ export class ClusterMember implements ICluster {
 	}
 
 	/**
-	 * Add this member's own conflict-shaped pend verdict to a record's {@link ClusterRecord.applyOutcomes},
-	 * when storage produced one for this transaction. A success, a bare-reason fault, or no retained
-	 * verdict at all leaves the record untouched — the coordinator's rule is "an entry means retry",
-	 * so an entry that does not mean retry must not exist.
+	 * Add this member's own apply verdicts to a record's {@link ClusterRecord.applyOutcomes}, when
+	 * storage produced any for this transaction. The two arms follow the rules on
+	 * {@link MemberApplyOutcome}: the pend arm carries ONLY a conflict-shaped refusal (a success, a
+	 * bare-reason fault, or no retained verdict leaves it off — the coordinator's rule is "an entry
+	 * means retry", so an entry that does not mean retry must not exist); the commit arm carries the
+	 * retained durable verdict whatever it says, because the coordinator counts the successes.
 	 *
 	 * The member never signs this and never writes another peer's entry.
 	 */
 	private withOwnApplyOutcome(record: ClusterRecord): ClusterRecord {
-		const verdict = this.executedPendResults.get(record.messageHash);
-		if (verdict === undefined || verdict.success || !isConflictFailure(verdict)) {
+		const pend = this.executedPendResults.get(record.messageHash);
+		const commit = this.executedCommitResults.get(record.messageHash);
+		const own: MemberApplyOutcome = {
+			...(pend !== undefined && !pend.success && isConflictFailure(pend) ? { pend } : {}),
+			...(commit !== undefined ? { commit } : {})
+		};
+		if (Object.keys(own).length === 0) {
 			return record;
 		}
 		return {
 			...record,
-			applyOutcomes: { ...record.applyOutcomes, [this.peerId.toString()]: { pend: verdict } }
+			applyOutcomes: { ...record.applyOutcomes, [this.peerId.toString()]: own }
 		};
 	}
 
@@ -2039,6 +2052,11 @@ export class ClusterMember implements ICluster {
 	 * mid-commit `internalCommit` fault (`success:false` with a bare `reason`, no
 	 * `missing`) is propagated so {@link handleConsensus} rolls back the executed marker
 	 * and rethrows — exactly like an unexpected thrown fault.
+	 *
+	 * Tolerated is not the same as acknowledged. Whatever shape a commit's apply took, this
+	 * member retains one post-reconcile durable verdict for it ({@link durableCommitVerdict}) and
+	 * reports it to the coordinator, whose durability gate (`CoordinatorRepo.commit`) acknowledges
+	 * the writer only when a majority of the cohort reports holding the revision.
 	 */
 	private async applyConsensusOperation(record: ClusterRecord, operation: RepoMessage['operations'][number]): Promise<void> {
 		const messageHash = record.messageHash;
@@ -2120,92 +2138,152 @@ export class ClusterMember implements ICluster {
 					membershipVersion: record.membershipVersion
 				});
 			}
-			let result: CommitResult;
-			try {
-				result = await (this.storageRepo as IRepo & ICommitProofPersister).commit(commit, undefined, proof);
-			} catch (err) {
-				// `StorageRepo.commit` throws (rather than returning success:false) when
-				// the pending action is missing — the canonical "behind" signal: this
-				// member reached commit-consensus without the matching pend (cohort drift).
-				if (isMissingPendingActionError(err)) {
-					log('cluster-member:consensus-commit-diverged', {
-						messageHash,
-						actionId: commit.actionId,
-						divergence: 'behind',
-						reason: (err as Error).message
-					});
-					// We hold no revision of these blocks; pull the committed revision from a
-					// cohort peer so the block is no longer under-replicated. Best-effort:
-					// failures are logged inside, never thrown (a throw would reset the stream).
-					await this.reconcileDivergentCommit(record, commit);
-					return;
-				}
-				throw err;
-			}
-			// Retain the verdict either way (see getExecutedCommitResult): a success confirms local
-			// durability, and an ahead-shaped refusal is the only evidence the coordinator has that
-			// the tolerance below swallowed a rival's win at the requested revision. The
-			// missing-pending throw path above retains nothing — no CommitResult exists there, and
-			// the coordinator's fabricated-success fallback plus cohort reconcile is the right shape
-			// for a member that is genuinely behind.
-			this.executedCommitResults.set(messageHash, result);
-			if (!result.success) {
-				// success:false is a StaleFailure. `missing` ⇒ ahead/stale divergence
-				// (we already hold ≥ this rev): tolerate, do NOT reconcile downward. A
-				// missing-base reason ⇒ behind divergence, reconcile (below). Any other bare
-				// `reason` with no `missing` ⇒ a genuine internalCommit fault: propagate so
-				// handleConsensus rolls back the executed marker and rethrows.
-				//
-				// NOTE: this 'ahead' tolerance is what turns a rival's commit that somehow reaches
-				// consensus into a reported success no member durably stored (consensus without
-				// durability — the commit-tier acknowledgement hole). It must stay: a member
-				// genuinely ahead of a redelivered/lagging commit is the common, correct case. The
-				// guards live UPSTREAM: `validateCommitRevisions` rejects the rival at the promise
-				// round, `CoordinatorRepo.commit` returns lost races as retryable conflicts instead
-				// of re-driving them, and the verdict retained just above (getExecutedCommitResult)
-				// lets the coordinating node convert its OWN member's rival-confirmed refusal into a
-				// conflict answer — that last guard is what closes the signed-but-not-yet-applied
-				// window, where two commits for one revision both assemble consensus because signing
-				// drops each member's reservation before applying advances its storage —
-				// `validateCommitAgainstRefusedPend` now refuses to sign that commit in the first
-				// place on any member that refused its pend. If consensus-without-durability is ever
-				// observed again, look at those guards' remaining abstain residuals (capability-less
-				// or history-truncated storage; a member whose refusal has aged out of retention),
-				// not at this branch.
-				if (result.missing?.length) {
-					log('cluster-member:consensus-commit-diverged', {
-						messageHash,
-						actionId: commit.actionId,
-						divergence: 'ahead',
-						reason: result.reason,
-						hasMissing: true
-					});
-					return;
-				}
-				// This member holds no materializable base for one of the blocks, so
-				// `StorageRepo.commit` REFUSED rather than record a revision it could never serve.
-				// Same "behind" divergence as a missing pend — and the same cure: pull the committed
-				// revision from a cohort peer. Reconciling here (after commit released its per-block
-				// latches) is what makes refusing safe; fetching inside the commit path would deadlock
-				// against the latch `saveReplicatedBlock` needs to persist what it fetched.
-				if (isMissingBaseRevisionFailure(result)) {
-					log('cluster-member:consensus-commit-diverged', {
-						messageHash,
-						actionId: commit.actionId,
-						divergence: 'behind',
-						reason: result.reason
-					});
-					await this.reconcileDivergentCommit(record, commit);
-					return;
-				}
-				throw new Error(`Consensus commit for action ${commit.actionId} failed: ${result.reason ?? 'unknown reason'}`);
-			}
+			const applied = await this.applyCommitToStorage(record, commit, proof);
+			// Retain the POST-RECONCILE durable verdict (see getExecutedCommitResult and
+			// withOwnApplyOutcome): what this member's storage holds NOW, after any behind-reconcile the
+			// apply triggered — not what the first apply attempt said. A member that pulled the
+			// revision from a cohort peer is a durable holder and reports one; a member that could not
+			// is not, whichever shape its refusal took. The coordinator's durability gate counts these
+			// verdicts — its own member's through getExecutedCommitResult, every other member's off the
+			// response record — and the two readers must see the same answer, hence one verdict,
+			// computed once, retained here for both.
+			this.executedCommitResults.set(messageHash, await this.durableCommitVerdict(commit, applied));
 			return;
 		}
 		if ('invalidate' in operation) {
 			await this.applyConsensusInvalidation(record, operation.invalidate);
 			return;
 		}
+	}
+
+	/**
+	 * Apply one consensus commit to local storage, tolerating every divergence shape the way the
+	 * doc comment on {@link applyConsensusOperation} describes and reconciling the behind ones.
+	 * Returns storage's own result — or, for the thrown missing-pend shape, which produces no
+	 * `CommitResult` at all, a refusal built from the throw — so {@link durableCommitVerdict} works
+	 * from one uniform shape. Genuine faults (a bare-reason returned failure, an unrecognized throw)
+	 * propagate so {@link handleConsensus} rolls back the executed marker and rethrows.
+	 */
+	private async applyCommitToStorage(record: ClusterRecord, commit: CommitRequest, proof: BlockCommitProof | undefined): Promise<CommitResult> {
+		const messageHash = record.messageHash;
+		let result: CommitResult;
+		try {
+			result = await (this.storageRepo as IRepo & ICommitProofPersister).commit(commit, undefined, proof);
+		} catch (err) {
+			// `StorageRepo.commit` throws (rather than returning success:false) when
+			// the pending action is missing — the canonical "behind" signal: this
+			// member reached commit-consensus without the matching pend (cohort drift).
+			if (isMissingPendingActionError(err)) {
+				log('cluster-member:consensus-commit-diverged', {
+					messageHash,
+					actionId: commit.actionId,
+					divergence: 'behind',
+					reason: (err as Error).message
+				});
+				// We hold no revision of these blocks; pull the committed revision from a
+				// cohort peer so the block is no longer under-replicated. Best-effort:
+				// failures are logged inside, never thrown (a throw would reset the stream).
+				await this.reconcileDivergentCommit(record, commit);
+				return { success: false, reason: (err as Error).message };
+			}
+			throw err;
+		}
+		if (result.success) {
+			return result;
+		}
+		// success:false is a StaleFailure. `missing` ⇒ ahead/stale divergence
+		// (we already hold ≥ this rev): tolerate, do NOT reconcile downward. A
+		// missing-base reason ⇒ behind divergence, reconcile (below). Any other bare
+		// `reason` with no `missing` ⇒ a genuine internalCommit fault: propagate so
+		// handleConsensus rolls back the executed marker and rethrows.
+		//
+		// NOTE: this 'ahead' tolerance is what turns a rival's commit that somehow reaches
+		// consensus into a member-side no-op rather than a stream reset. It must stay: a member
+		// genuinely ahead of a redelivered/lagging commit is the common, correct case. What keeps
+		// the tolerance from turning into an acknowledged write no member stored is downstream:
+		// the durable verdict retained by the caller reports this member as NOT holding the
+		// revision (unless the revision index names this very action — an ahead member that did
+		// land it), and `CoordinatorRepo.commit`'s durability gate acknowledges only a majority of
+		// such reports; a retained refusal whose cause a local re-read confirms as a rival at the
+		// requested revision is answered as a retryable conflict there. Upstream,
+		// `validateCommitRevisions` rejects the rival at the promise round and
+		// `validateCommitAgainstRefusedPend` refuses to sign the commit of a pend this member
+		// refused. If consensus-without-durability is ever observed again, look at the gate's
+		// inputs (a member reporting a durable success it does not hold, or a majority that is
+		// genuinely durable on a forked lineage), not at this branch.
+		if (result.missing?.length) {
+			log('cluster-member:consensus-commit-diverged', {
+				messageHash,
+				actionId: commit.actionId,
+				divergence: 'ahead',
+				reason: result.reason,
+				hasMissing: true
+			});
+			return result;
+		}
+		// This member holds no materializable base for one of the blocks, so
+		// `StorageRepo.commit` REFUSED rather than record a revision it could never serve.
+		// Same "behind" divergence as a missing pend — and the same cure: pull the committed
+		// revision from a cohort peer. Reconciling here (after commit released its per-block
+		// latches) is what makes refusing safe; fetching inside the commit path would deadlock
+		// against the latch `saveReplicatedBlock` needs to persist what it fetched.
+		if (isMissingBaseRevisionFailure(result)) {
+			log('cluster-member:consensus-commit-diverged', {
+				messageHash,
+				actionId: commit.actionId,
+				divergence: 'behind',
+				reason: result.reason
+			});
+			await this.reconcileDivergentCommit(record, commit);
+			return result;
+		}
+		throw new Error(`Consensus commit for action ${commit.actionId} failed: ${result.reason ?? 'unknown reason'}`);
+	}
+
+	/**
+	 * The durable verdict for a consensus commit: `applied` itself when storage landed it (a
+	 * success from `StorageRepo.commit` means every block is committed, or already was, under this
+	 * action), otherwise a fresh look at what local storage holds NOW — after the reconcile the
+	 * refusal triggered. Durable means every block in `commit.blockIds` records `commit.rev` under
+	 * `commit.actionId`. A refusal that is not durable is returned as-is, so the coordinating node
+	 * can still classify its own member's ahead-shaped refusal against a rival. A read fault counts
+	 * as not durable: the gate this feeds fails toward retry.
+	 */
+	private async durableCommitVerdict(commit: CommitRequest, applied: CommitResult): Promise<CommitResult> {
+		if (applied.success) {
+			return applied;
+		}
+		try {
+			for (const blockId of commit.blockIds) {
+				if (!(await this.holdsCommittedRevision(blockId, commit))) {
+					return applied;
+				}
+			}
+		} catch (err) {
+			log('cluster-member:consensus-commit-durability-read-error', {
+				actionId: commit.actionId,
+				rev: commit.rev,
+				error: (err as Error).message
+			});
+			return applied;
+		}
+		log('cluster-member:consensus-commit-durable-after-reconcile', { actionId: commit.actionId, rev: commit.rev });
+		return { success: true };
+	}
+
+	/**
+	 * True when local storage records `commit.rev` of `blockId` under `commit.actionId`. Read from
+	 * the revision index (the {@link IRevisionActionReader} capability) so a member whose `latest` has
+	 * since moved past the revision still counts as holding it; a repo without the capability is
+	 * judged on `latest` alone.
+	 */
+	private async holdsCommittedRevision(blockId: BlockId, commit: CommitRequest): Promise<boolean> {
+		const reader = this.storageRepo as IRepo & Partial<IRevisionActionReader>;
+		if (typeof reader.getRevisionAction === 'function') {
+			return await reader.getRevisionAction(blockId, commit.rev) === commit.actionId;
+		}
+		const latest = (await this.storageRepo.get({ blockIds: [blockId] }))[blockId]?.state?.latest;
+		return latest?.rev === commit.rev && latest.actionId === commit.actionId;
 	}
 
 	/**

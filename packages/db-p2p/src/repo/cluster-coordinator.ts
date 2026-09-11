@@ -318,6 +318,22 @@ export class ClusterCoordinator {
 		 * that path.
 		 */
 		cohortPendRefusals?: { [peerId: string]: StaleFailure };
+		/**
+		 * What OTHER cohort members reported about durably holding a commit after applying it at
+		 * consensus (`ClusterRecord.applyOutcomes[peer].commit`), keyed by peer id — successes AND
+		 * refusals, because `CoordinatorRepo.commit`'s durability gate counts the successes against
+		 * the cohort the commit ran on and acknowledges only a majority. Each member's verdict is
+		 * measured after its own reconcile, so a member that pulled the revision from a cohort peer
+		 * reports success. Self is excluded for the same reason as `cohortPendRefusals` (its verdict
+		 * travels as `localCommitResult`). Unsigned advisory data: a false success is one holder the
+		 * member's signed approve vote already admitted to the majority; a false refusal is retry
+		 * pressure. Absent when nobody reported one (a pend message, or pre-upgrade members).
+		 *
+		 * Same residual as `cohortPendRefusals`: a member reached only by the scheduled commit-retry
+		 * timer applies after this method has resolved, and its report arrives too late to count —
+		 * the gate then refuses honestly and the writer re-drives.
+		 */
+		cohortCommitOutcomes?: { [peerId: string]: CommitResult };
 	}> {
 		// The coordinating block id is derived HERE, from the key this method is already handed, rather
 		// than being set by each caller's message builder: a member's membership admission gate derives
@@ -398,17 +414,28 @@ export class ClusterCoordinator {
 			// it as a retryable conflict.
 			const selfId = this.localCluster?.peerId.toString();
 			const cohortPendRefusals: { [peerId: string]: StaleFailure } = {};
+			// The commit arm is re-checked the same way, to the shape the gate reads: a plain
+			// `success: true`, or an object whose `success` is `false`. Anything else off the wire is
+			// dropped rather than counted as a holder.
+			const cohortCommitOutcomes: { [peerId: string]: CommitResult } = {};
 			for (const [peerId, outcome] of Object.entries(result.applyOutcomes ?? {})) {
+				if (peerId === selfId) continue;
 				const pend = outcome?.pend;
-				if (peerId === selfId || pend === undefined || pend.success || !isConflictFailure(pend)) continue;
-				cohortPendRefusals[peerId] = pend;
+				if (pend !== undefined && !pend.success && isConflictFailure(pend)) {
+					cohortPendRefusals[peerId] = pend;
+				}
+				const commit = outcome?.commit;
+				if (commit !== null && typeof commit === 'object' && (commit.success === true || commit.success === false)) {
+					cohortCommitOutcomes[peerId] = commit;
+				}
 			}
 			return {
 				record: result,
 				localExecuted,
 				...(localPendResult === undefined ? {} : { localPendResult }),
 				...(localCommitResult === undefined ? {} : { localCommitResult }),
-				...(Object.keys(cohortPendRefusals).length === 0 ? {} : { cohortPendRefusals })
+				...(Object.keys(cohortPendRefusals).length === 0 ? {} : { cohortPendRefusals }),
+				...(Object.keys(cohortCommitOutcomes).length === 0 ? {} : { cohortCommitOutcomes })
 			};
 		} finally {
 			const stored = this.transactions.get(messageHash);
@@ -876,9 +903,24 @@ export class ClusterCoordinator {
 	 * the prior commit phase is typically still warm, so a single immediate retry recovers
 	 * most transient stream errors without falling back to the scheduled retry timer.
 	 * Local cluster is invoked exactly once — local failures are fatal, not transient.
+	 *
+	 * **Delivery order is load-bearing: this node's own member first, awaited, then the remote
+	 * members in parallel.** This broadcast is where members apply the commit, and a member that is
+	 * behind (it never saw the pend, or holds no base for the block) reconciles the committed
+	 * revision from `record.peers` DURING its apply. The coordinator's own member is the one peer
+	 * guaranteed to hold the revision by then — provided it has actually applied, which a single
+	 * `Promise.all` over every peer did not guarantee: the remote members' reconciles raced the
+	 * local apply and found no holder. Its copy also carries the cohort's commit proof
+	 * (`buildBlockCommitProof`), which `createReconcileBlock` accepts from a single holder, so a
+	 * whole cohort of behind members can heal from it. The cost is one in-process apply before the
+	 * network fan-out; no extra round trip. The commit round in `commitTransaction` may stay
+	 * parallel: the record it carries has no commit signatures yet, so no member can reach
+	 * consensus (and apply) there. A coordinator outside `record.peers` is not a reconcile target
+	 * and gains nothing from this ordering; the durability gate in `CoordinatorRepo.commit` is what
+	 * makes that shape refuse rather than acknowledge.
 	 */
 	private async broadcastMergedRecord(record: ClusterRecord, peerIds: string[]): Promise<{ failures: string[]; applyOutcomes?: ClusterRecord['applyOutcomes'] }> {
-		const results = await Promise.all(peerIds.map(async peerIdStr => {
+		const deliver = async (peerIdStr: string) => {
 			try {
 				const response = await this.updateMember(peerIdStr, record, this.commitBroadcastImmediateRetries, 'commit-broadcast');
 				return { peerId: peerIdStr, success: true as const, response };
@@ -890,7 +932,13 @@ export class ClusterCoordinator {
 				});
 				return { peerId: peerIdStr, success: false as const, response: undefined };
 			}
-		}));
+		};
+		const selfId = this.localCluster?.peerId.toString();
+		const localFirst = peerIds.filter(id => id === selfId);
+		const remote = peerIds.filter(id => id !== selfId);
+		const localResults = await Promise.all(localFirst.map(deliver));
+		const remoteResults = await Promise.all(remote.map(deliver));
+		const results = [...localResults, ...remoteResults];
 		const failures = results.filter(r => !r.success).map(r => r.peerId);
 		// This broadcast is where members actually apply the operations, so their responses carry the
 		// only report the coordinator ever gets of what each member's OWN storage said. Collecting it

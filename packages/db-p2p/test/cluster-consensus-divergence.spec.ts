@@ -539,18 +539,63 @@ describe('ClusterMember commit-verdict retention (getExecutedCommitResult)', () 
 		expect(verdict!.success === false && !!verdict!.missing?.length, 'the retained refusal carries the ahead shape').to.equal(true);
 	});
 
-	it('retains nothing for the missing-pend behind path (fabricated success + reconcile stays)', async () => {
+	/**
+	 * Ticket: acknowledged-diary-commits-land-on-no-node.
+	 *
+	 * The retained verdict is the POST-RECONCILE durable one: what storage holds after the apply and
+	 * any behind-reconcile it triggered. The missing-pend path used to retain nothing (no
+	 * `CommitResult` existed there), which left the coordinator counting votes; it now retains a
+	 * refusal built from the throw — or a success, when the reconcile restored the revision — so
+	 * the coordinator can count durable holders. Reported to the coordinator on the response record
+	 * (`applyOutcomes[self].commit`) as well as through the accessor, and the two must agree.
+	 */
+	it('retains a not-durable refusal for the missing-pend behind path when nothing could be reconciled', async () => {
 		const storage = realStorageRepo();
 		member = clusterMember({ storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey });
 
-		// Never pended locally: storage.commit THROWS "Pending action … not found" — no
-		// CommitResult exists, so nothing is retained and the coordinator keeps its
-		// fabricated-success + cohort-reconcile shape for a member genuinely behind.
+		// Never pended locally: storage.commit THROWS "Pending action … not found", and with no
+		// reconcile callback the member still holds nothing afterwards.
 		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-missing', 'block-1', 1));
-		await member.update(record);
+		const answer = await member.update(record);
 
-		expect(member.wasTransactionExecuted(record.messageHash)).to.equal(true);
-		expect(member.getExecutedCommitResult(record.messageHash)).to.equal(undefined);
+		expect(member.wasTransactionExecuted(record.messageHash), 'the divergence is tolerated, not propagated').to.equal(true);
+		const verdict = member.getExecutedCommitResult(record.messageHash);
+		expect(verdict?.success, 'a member holding nothing is not a durable holder').to.equal(false);
+		expect(verdict?.success === false && verdict.reason).to.match(/pending action .+ not found/i);
+		expect(answer.applyOutcomes?.[self.peerId.toString()]?.commit, 'the same verdict is stamped on the response').to.deep.equal(verdict);
+	});
+
+	it('retains a durable success for the missing-pend behind path once the reconcile restored the revision', async () => {
+		// A cohort peer that saw the pend + commit holds block-1 @ rev 1; the behind member pulls it.
+		const sibling = realStorageRepo();
+		await sibling.pend({ actionId: 'a-missing', transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] }, policy: 'c' });
+		expect((await sibling.commit({ actionId: 'a-missing', blockIds: ['block-1'], tailId: 'block-1' as BlockId, rev: 1 })).success).to.equal(true);
+		const storage = realStorageRepo();
+		const reconcileBlock: ReconcileBlockCallback = async (blockId, committed) => {
+			const entry = (await sibling.get({ blockIds: [blockId] }))[blockId];
+			const latest = entry?.state?.latest;
+			if (latest && entry?.block && latest.rev >= committed.rev) {
+				await storage.saveReplicatedBlock(blockId, entry.block, latest);
+			}
+		};
+		member = clusterMember({ storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey, reconcileBlock });
+
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-missing', 'block-1', 1));
+		const answer = await member.update(record);
+
+		const verdict = member.getExecutedCommitResult(record.messageHash);
+		expect(verdict?.success, 'a member that restored the revision IS a durable holder').to.equal(true);
+		expect(answer.applyOutcomes?.[self.peerId.toString()]?.commit).to.deep.equal({ success: true });
+	});
+
+	it('stamps a clean commit success on the response record (the coordinator counts these)', async () => {
+		const storage = realStorageRepo();
+		await storage.pend({ actionId: 'a1', transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] }, policy: 'c' });
+		member = clusterMember({ storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey });
+
+		const answer = await member.update(await buildConsensusCommitRecord(self, other, makeCommitOperation('a1', 'block-1', 1)));
+
+		expect(answer.applyOutcomes?.[self.peerId.toString()]?.commit).to.deep.equal({ success: true });
 	});
 
 	it('drops the retained verdict when the apply rolls back (propagated fault)', async () => {
