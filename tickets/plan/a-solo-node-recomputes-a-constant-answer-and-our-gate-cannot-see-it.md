@@ -63,6 +63,14 @@ There is no coordinator cache to soften it either: `recordCoordinator` deliberat
 
 Also verified while there: the NOTE at `coordinator-repo.ts:2358` is true as written (the cancel path's doubling is O(N) where pend's and commit's is O(1)), but its phrasing "they pay it once" reads as though pend and commit avoid the duplicate pair, and they do not — on a multi-peer cohort both pay it for `blockIds[0]`, exactly the cancel shape, just not multiplied by N. The NOTE's own suggested remedy would fix all three. Worth correcting the wording whenever that file is next touched; not worth a ticket of its own.
 
+## Scope handed over from `a-block-we-do-not-hold-is-consulted-on-every-read`
+
+That ticket's plan pass (2026-09-11) split its work with this one. Recorded here so neither pass redoes the other's:
+
+- **That ticket (now in `implement/`) owns the consult RATE for a block this node does not hold.** A missing block now skips its consult for one `readRepairWindowMs` after a consult settled its absence. On the cold-apply trace above, that should shrink the `fetchBlockFromCluster` site (54 / 99), because repeat absent reads within one window stop consulting. Re-measure after it lands before sizing this ticket's gain; some of the growth this ticket attributes to that site may already be gone.
+- **This ticket owns the per-consult COST on a solo node:** that ticket's question 1 proposed short-circuiting "before `findCluster`, so the cohort lookup is saved too", which cannot be done without knowing the cohort is solo, and that is exactly this ticket's memo. Every consult that ticket still runs (the first per window, per block) calls `findCluster` as before.
+- The superseded ticket `every-read-re-derives-its-routing` was deleted in commit 874d87c7. Its one surviving observation, that `recordCoordinator` drops self picks, is already recorded here at `:608`.
+
 ## TODO
 
 - [ ] Fix gate 4's measurement first, and record the honest before-number in this ticket. Do not optimize against the current gate.
