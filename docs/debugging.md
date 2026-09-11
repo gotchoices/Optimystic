@@ -69,7 +69,7 @@ The implementation is `enableOptimysticLogging` in `packages/db-core/src/logger-
 
 ### Browsers
 
-Setting `localStorage.debug` and reloading works, but like `require('debug').enable(...)` it reaches only the copies of `debug` that read it when they loaded. Prefer `enableOptimysticLogging`.
+Setting `localStorage.debug` and reloading works — every copy of `debug` reads it as it loads — but it needs a reload, and it persists until you remove it, so logging stays on in every later session. `enableOptimysticLogging` needs neither, so prefer it.
 
 ### Why not `require('debug').enable(...)`?
 

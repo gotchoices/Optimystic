@@ -109,6 +109,11 @@ function withoutPersisting(module: DebugModule, fn: () => void): void {
  * `DEBUG='*,-optimystic:*'`) still wins — `debug` checks skips first. That is the user's explicit
  * exclusion, so it is left alone; if it ever confuses someone, have the confirmation line name the
  * conflicting skip rather than overriding it.
+ *
+ * NOTE: the baseline is captured once per enable/disable cycle, so an app that calls
+ * `debug.enable(...)` on a shared copy while ours are on has that change overwritten by our next
+ * enable or disable. Fine while apps set their channels once at start-up; if one ever toggles them
+ * at run time, re-derive the baseline from the copy's live set minus our contribution instead.
  */
 function apply(entry: Entry, pending: Pending): void {
 	const module = entry.module;

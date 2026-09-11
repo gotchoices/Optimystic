@@ -101,10 +101,10 @@ Set the `DEBUG` environment variable:
 
 ```bash
 # All optimystic logs
-DEBUG=optimystic:*,db-p2p:* yarn workspace @optimystic/reference-peer test:quick
+DEBUG=optimystic:* yarn workspace @optimystic/reference-peer test:quick
 
 # Specific subsystems
-DEBUG=db-p2p:repo-service,db-p2p:cluster-service yarn workspace @optimystic/reference-peer test:quick
+DEBUG=optimystic:db-p2p:repo-service,optimystic:db-p2p:cluster-service yarn workspace @optimystic/reference-peer test:quick
 
 # Include libp2p connection logs
 DEBUG=optimystic:*,libp2p:connection-manager yarn workspace @optimystic/reference-peer test:quick
