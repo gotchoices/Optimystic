@@ -98,7 +98,7 @@ describe('routing-key convention: writer H(H(id)) vs server H(id)', function () 
 			const stats = await measureRing(store, 4, blockIds(400));
 			console.log('[divergence] ring=16 k=4', stats);
 			// Fewer than 1 in 20 ids agree; the writer's coordinator pick is OUTSIDE the responsible
-			// cohort for the large majority of ids. Bounds are loose because peer ids are random per run.
+			// cohort for the large majority of ids. The ring is seeded (see `ringOf`), so these are fixed values.
 			expect(stats.divergent / stats.total).to.be.greaterThan(0.85);
 			expect(stats.coordinatorOutsideCohort / stats.total).to.be.greaterThan(0.6);
 		});
@@ -157,7 +157,9 @@ describe('routing-key convention: writer H(H(id)) vs server H(id)', function () 
 		};
 
 		before(async () => {
-			mesh = await createMesh(16, { responsibilityK: 4, clusterSize: 4 });
+			// Seeded keys, for the same reason as `ringOf`: the placement ratio below is then a property
+			// of one reproducible mesh, not a random sample whose tail crosses the bound (it did — 0.57).
+			mesh = await createMesh(16, { responsibilityK: 4, clusterSize: 4, keySeed: 16 });
 			for (const node of mesh.nodes) byPeer.set(node.peerId.toString(), node);
 		});
 

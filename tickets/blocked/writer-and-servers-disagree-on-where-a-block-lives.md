@@ -43,6 +43,8 @@ Three specs, all committed alongside this ticket. Run the first two with `yarn w
 
 **2. Mesh harness, 16 nodes, cohort width 4 (unit spec).** A direct pend and commit through `NetworkTransactor` succeed. The coordinator the transactor chose was outside the responsible cohort; it ran the cluster transaction anyway (the harness's key network, like production's, adds self to every cohort), and the block landed on **five** nodes: all four responsible ones plus the coordinator. A Diary written the same way reads back complete from another transactor.
 
+> **2026-09-11 correction:** that last sentence depends on where the random log-block id falls on the ring. On the spec's now-seeded mesh (`keySeed: 16`), about 1 run in 5–8 reads the Diary back **empty**. Revision 1 of the log block lands on one out-of-cohort node, and revisions 2 and 3 are acknowledged but stored on no node. The lost acknowledgement is a defect under any convention and is tracked in `fix/acknowledged-diary-commits-land-on-no-node`. This ticket's divergence is what sets it up.
+
 **3. Six real libp2p nodes over TCP, `clusterSize: 2`, 24 blocks (integration spec).** A `NetworkTransactor` wired exactly as `reference-peer/cli.ts` and the Quereus plugin wire it (self goes to the local coordinated repo, remote peers through `RepoClient`), driven from one node; every node's `RepoService.checkRedirect` and served repo instrumented; then all 24 blocks read back through a second node's transactor.
 
 | write-side measure | count of 24 |

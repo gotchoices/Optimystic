@@ -4,7 +4,7 @@ import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { NetworkTransactor } from '@optimystic/db-core';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
-import { generateKeyPair } from '@libp2p/crypto/keys';
+import { generateKeyPair, generateKeyPairFromSeed } from '@libp2p/crypto/keys';
 import { ClusterMember, clusterMember, type ReconcileBlockCallback, type DeriveExpectedClusterCallback, type ExpectedClusterView } from '../cluster/cluster-repo.js';
 import { createReconcileBlock } from '../cluster/reconcile-block.js';
 import { resolveClusterPolicy, type ClusterPolicyOptions, type ResolvedClusterPolicy } from '../cluster/cluster-policy.js';
@@ -97,6 +97,13 @@ export interface MeshOptions {
 	 * Omitted → identity.
 	 */
 	wrapKeyNetwork?: (shared: IKeyNetwork) => IKeyNetwork;
+	/**
+	 * Derive every node's Ed25519 key from a fixed seed `(keySeed, index)` instead of fresh
+	 * randomness, so the mesh's ring geometry is identical on every run. For specs that assert on
+	 * statistics of cohort placement: with random keys such a bound is a sample whose tail
+	 * eventually crosses it. Omitted → random keys.
+	 */
+	keySeed?: number;
 }
 
 export interface MeshFailureConfig {
@@ -246,6 +253,15 @@ export function resolveMeshPolicy(options: MeshOptions): ResolvedClusterPolicy {
 	});
 }
 
+/** The 32-byte Ed25519 seed for node `index` of a `keySeed` mesh. */
+function meshKeySeed(keySeed: number, index: number): Uint8Array {
+	const seed = new Uint8Array(32);
+	const view = new DataView(seed.buffer);
+	view.setUint32(0, keySeed);
+	view.setUint32(4, index);
+	return seed;
+}
+
 /**
  * Creates N interconnected mesh nodes with real components and mock transport.
  * ClusterClient calls route directly to target ClusterMember instances.
@@ -271,8 +287,10 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 
 	// Generate key pairs for all nodes
 	const keyPairs = await Promise.all(
-		Array.from({ length: nodeCount }, async () => {
-			const privateKey = await generateKeyPair('Ed25519');
+		Array.from({ length: nodeCount }, async (_, i) => {
+			const privateKey = options.keySeed === undefined
+				? await generateKeyPair('Ed25519')
+				: await generateKeyPairFromSeed('Ed25519', meshKeySeed(options.keySeed, i));
 			return { peerId: peerIdFromPrivateKey(privateKey), privateKey };
 		})
 	);
