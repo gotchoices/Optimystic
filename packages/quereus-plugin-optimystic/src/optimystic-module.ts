@@ -173,7 +173,7 @@ function unmaintainedIndexMessage(tableName: string, indexName: string, detail: 
   return (
     `Table '${tableName}' does not maintain index '${indexName}': ${detail}, so reading through ` +
     `it would silently return incomplete results. Re-declare the index on this connection ` +
-    `(CREATE INDEX) to re-attach it.`
+    `(CREATE INDEX) to re-attach it — DROP INDEX it first if this connection still lists it.`
   );
 }
 
@@ -3242,8 +3242,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    * would list it in the catalog over a tree missing its entries, which is exactly the
    * silently-incomplete read the batch's tree-before-catalog order exists to prevent. The
    * re-initialized table then does not maintain it, so a read the planner routes through it
-   * in THIS process refuses loudly (assertIndexMaintained) until the index is re-declared
-   * from a connection that does not list it — a fresh Database's `apply schema` rebuilds it.
+   * in THIS process refuses loudly (assertIndexMaintained) until the index is dropped and
+   * re-created (DROP INDEX, then CREATE INDEX — the engine still lists it, so a re-apply plans
+   * nothing and a bare CREATE INDEX is refused as a duplicate). A fresh Database's
+   * `apply schema` rebuilds it too.
    */
   markSchemaUnpersisted(withheldIndexes: ReadonlySet<string> = new Set()): void {
     if (this.indexManager) {
@@ -3547,6 +3549,10 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         // unbatched order — a tree failing: the planner routes seeks through a listed index
         // whose entries are missing, and gets silently wrong results. Neither order is one
         // atomic commit (`feat-cross-collection-atomic-commit`, backlog).
+        // NOTE: a tree whose table was DROPPED later in the same apply still lands here, as an
+        // unlisted orphan (destroy never deletes index trees). If a migration ever plans CREATE
+        // INDEX then DROP TABLE on one table and that sync throws, it cancels this manager's whole
+        // catalog commit, gravestone included; then have destroy remove the table's `deferred` entries.
         for (const tree of [...unlanded.keys()]) {
           if (tree.hasUnsyncedChanges()) {
             await tree.sync();

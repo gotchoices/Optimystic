@@ -706,6 +706,63 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 			expect(fresh.seeks).to.include('t0_by_name');
 		});
 
+		it('session mode: an index added to a POPULATED table lands once, before the catalog, with every existing row', async () => {
+			const h = harness();
+			const session = await enableSessionMode(h.db, h.plugin, h.transactor);
+			try {
+				await h.db.exec(`pragma default_vtab_module='optimystic'`);
+				await h.db.exec(declaration(1));
+				await session.warm();
+				await h.db.exec(`insert into t0 values (1, 'alice'), (2, 'bob'), (3, 'bob')`);
+				resetTrail(h);
+
+				await h.db.exec(declaration(1, ['t0']));
+
+				// endSchemaBatch syncs the deferred tree itself; the apply's coordinator commit must
+				// not carry it a second time.
+				expect(commitsCarrying(h.trail, '/index/t0_by_name'), 'the deferred tree landed once').to.equal(1);
+				expect(h.trail.events.indexOf('index'), 'the tree landed BEFORE the catalog sync')
+					.to.be.lessThan(h.trail.events.indexOf('catalog-sync'));
+
+				await session.warm();
+				const live = await queryWithSeeks(h.db, `select id from t0 where name = 'bob'`);
+				expect(idsOf(live.rows)).to.deep.equal([2, 3]);
+				expect(live.seeks).to.include('t0_by_name');
+				const { db: db2, hydrated } = await h.reopen();
+				expect(hydrated).to.deep.equal({ tables: 1, indexes: 1 });
+				const fresh = await queryWithSeeks(db2, `select id from t0 where name = 'bob'`);
+				expect(idsOf(fresh.rows)).to.deep.equal([2, 3]);
+				expect(fresh.seeks).to.include('t0_by_name');
+			} finally {
+				session.dispose();
+			}
+		});
+
+		it('after a deferred index tree fails to land, DROP INDEX then CREATE INDEX recovers it in the same Database', async () => {
+			const h = harness();
+			await seedT0(h, `(1, 'alice'), (2, 'bob')`);
+			h.gate.failCommit = ids => ids.some(id => id.includes('/index/'));
+			await expectRejects(h.db.exec(declaration(1, ['t0'])), /injected failure/);
+			h.gate.failCommit = undefined;
+
+			// The engine still lists the index, so a re-apply plans nothing (the read stays refused)
+			// and a bare CREATE INDEX is refused as a duplicate: the index has to be dropped first.
+			await h.db.exec(declaration(1, ['t0']));
+			await expectRejects(queryAll(h.db, `select id from t0 where name = 'bob'`), /does not maintain index 't0_by_name'/);
+			await expectRejects(h.db.exec(`create index t0_by_name on t0 (name)`), /already exists/);
+			await h.db.exec(`drop index t0_by_name`);
+			await h.db.exec(`create index t0_by_name on t0 (name)`);
+
+			const live = await queryWithSeeks(h.db, `select id from t0 where name = 'bob'`);
+			expect(live.rows).to.deep.equal([{ id: 2 }]);
+			expect(live.seeks).to.include('t0_by_name');
+			const { db: db2, hydrated } = await h.reopen();
+			expect(hydrated).to.deep.equal({ tables: 1, indexes: 1 });
+			const fresh = await queryWithSeeks(db2, `select id from t0 where name = 'bob'`);
+			expect(fresh.rows).to.deep.equal([{ id: 2 }]);
+			expect(fresh.seeks).to.include('t0_by_name');
+		});
+
 		it('a UNIQUE index over pre-existing duplicates still builds when deferred — only the flush moved', async () => {
 			const h = harness();
 			await seedT0(h, `(1, 'bob'), (2, 'bob')`);

@@ -372,8 +372,10 @@ is harmless: a later `CREATE INDEX` of the same name adopts it and re-stages
 every row. The tables are then recovered as for an end-commit failure, except
 that an index whose tree did not land is withheld from the re-persist. In the
 running process a read routed through that index refuses loudly
-(`assertIndexMaintained`) until the index is re-declared from a connection that
-does not list it.
+(`assertIndexMaintained`) until the index is dropped and re-created (`DROP
+INDEX`, then `CREATE INDEX`). The engine still lists it, so a re-apply plans
+nothing and a bare `CREATE INDEX` is refused as a duplicate. A fresh
+`Database`'s `apply schema` rebuilds it too.
 
 **What the batch does not change.**
 
