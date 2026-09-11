@@ -749,6 +749,22 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 
 				await expectIndexComplete(h, other.db);
 			});
+
+			it('a first touch that fails to initialize leaves nothing stuck: the retried CREATE INDEX builds it', async () => {
+				const h = harness();
+				await seedT0(h, `(1, 'alice'), (2, 'bob'), (3, 'bob')`);
+				const other = await hydratedUntouched(h);
+				// Refuse every read, so the table's own first-touch initialize dies.
+				h.gate.failGet = () => true;
+
+				await expectRejects(other.db.exec(`create index t0_by_name on t0 (name)`), /injected failure/);
+				h.gate.failGet = undefined;
+				expect((await h.reopen()).hydrated, 'the failed statement left no index behind').to.deep.equal({ tables: 1, indexes: 0 });
+
+				await other.db.exec(`create index t0_by_name on t0 (name)`);
+
+				await expectIndexComplete(h, other.db);
+			});
 		});
 
 		it('session mode: an index added to a POPULATED table lands once, before the catalog, with every existing row', async () => {
