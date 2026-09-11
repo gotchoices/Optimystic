@@ -9,9 +9,11 @@ import type { Tree } from '@optimystic/db-core';
 import type { TableSchema, ColumnSchema, VirtualTableModule, UniqueConstraintSchema, ConflictResolution } from '@quereus/quereus';
 import { getTypeOrDefault } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
+import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
+import type { CatalogBatchCheckpoint } from './catalog-batch.js';
 
 // IndexSchema type from TableSchema.indexes
-type IndexSchema = NonNullable<TableSchema['indexes']>[number];
+export type IndexSchema = NonNullable<TableSchema['indexes']>[number];
 
 /**
  * Order-insensitive identity for a set of column POSITIONS — sorted and joined by `_`.
@@ -468,6 +470,11 @@ export function mergePersistedSchemas(
  */
 export class SchemaManager {
 	private schemaCache = new Map<string, StoredTableSchema>();
+	/**
+	 * The open `APPLY SCHEMA` catalog batch, if any. While set, every catalog read and write
+	 * below routes through it (see {@link beginBatch}); the unbatched paths are untouched.
+	 */
+	private batch?: CatalogBatch;
 
 	/**
 	 * @param getSchemaTree resolves the plugin-global schema catalog tree. `create` selects the
@@ -479,6 +486,60 @@ export class SchemaManager {
 	constructor(
 		private readonly getSchemaTree: (transactor?: ITransactor, create?: boolean) => Promise<Tree<string, any> | undefined>
 	) {}
+
+	/**
+	 * Open a catalog batch: from here until {@link commitBatch}, writes collect in memory and
+	 * reads are served from that overlay plus one catalog tree opened once (see
+	 * {@link CatalogBatch}). Called by `OptimysticModule.beginSchemaBatch` for every manager
+	 * that exists, and by its `createSchemaManager` for one created while a batch is open.
+	 * No I/O. Throws if a batch is already open — batches never nest.
+	 */
+	beginBatch(): void {
+		if (this.batch) {
+			throw new Error('A catalog batch is already open on this SchemaManager');
+		}
+		this.batch = new CatalogBatch(this.getSchemaTree, mergePersistedSchemas);
+	}
+
+	/**
+	 * Close the open batch and flush it in ONE catalog commit — zero I/O when nothing was
+	 * written. The batch is closed whether or not the commit lands (the next apply must be
+	 * able to open a fresh one); the error propagates to the module, which re-initializes the
+	 * tables it left unpersisted. Only after the sync succeeds is the per-instance cache
+	 * seeded with the resolved live records that were actually written, and cleared for
+	 * every dropped name — the same discipline as the unbatched write path.
+	 */
+	async commitBatch(): Promise<void> {
+		const batch = this.batch;
+		if (!batch) {
+			throw new Error('No catalog batch is open on this SchemaManager');
+		}
+		this.batch = undefined;
+		const written = await batch.commit();
+		for (const [name, entry] of written) {
+			// resolveAndCache filters gravestones and tombstones exactly as every read does.
+			if (this.resolveAndCache(entry) === undefined) {
+				this.schemaCache.delete(name);
+			}
+		}
+	}
+
+	/**
+	 * Snapshot the open batch's pending writes before one DDL statement's catalog work, so a
+	 * throw can withdraw exactly that statement's changes with {@link restoreBatch}. Undefined
+	 * when no batch is open (direct DDL outside `apply schema`).
+	 */
+	checkpointBatch(): CatalogBatchCheckpoint | undefined {
+		return this.batch?.checkpoint();
+	}
+
+	/** Drop every batched write staged since `checkpoint` was taken. */
+	restoreBatch(checkpoint: CatalogBatchCheckpoint): void {
+		if (!this.batch) {
+			throw new Error('No catalog batch is open on this SchemaManager');
+		}
+		this.batch.restore(checkpoint);
+	}
 
 	/**
 	 * The schema catalog tree, brought into existence when absent. Only for write paths —
@@ -533,6 +594,9 @@ export class SchemaManager {
 	 * it was declared on, and one that drops an indexed column is refused here.
 	 */
 	async storeStoredSchema(stored: StoredTableSchema, transactor?: ITransactor): Promise<StoredTableSchema> {
+		if (this.batch) {
+			return this.storeInBatch(this.batch, stored, transactor);
+		}
 		const tree = await this.requireSchemaTree(transactor);
 
 		// Same read sequence as the read path: pull latest committed state, then
@@ -558,6 +622,39 @@ export class SchemaManager {
 	}
 
 	/**
+	 * The batched half of {@link storeStoredSchema}: the same de-resolve → union → validate →
+	 * resolve sequence against the entry as the BATCH sees it (pending first, then the
+	 * committed catalog), staged into the overlay instead of written. The cache is NOT
+	 * touched here: in-batch reads are answered by the overlay, and the cache is seeded from
+	 * what the end-of-batch commit actually lands ({@link commitBatch}) — a failed end commit
+	 * must not leave it claiming a value that never reached storage.
+	 */
+	private async storeInBatch(
+		batch: CatalogBatch,
+		stored: StoredTableSchema,
+		transactor?: ITransactor
+	): Promise<StoredTableSchema> {
+		const current = this.livePersistedEntry(await batch.readEntry(stored.name, transactor));
+		const merged = mergePersistedSchemas(toPersistedSchema(stored), current);
+		batch.write(merged.name, [merged.name, merged]);
+		return toStoredSchema(merged);
+	}
+
+	/**
+	 * The batched read behind {@link getSchema}, {@link getSchemaFresh} and
+	 * {@link readSchemaFromCatalog}: the live record as the batch sees it, resolved. Does
+	 * not populate the cache (see {@link storeInBatch} for why).
+	 */
+	private async readLiveInBatch(
+		batch: CatalogBatch,
+		tableName: string,
+		transactor?: ITransactor
+	): Promise<StoredTableSchema | undefined> {
+		const record = this.livePersistedEntry(await batch.readEntry(tableName, transactor));
+		return record ? toStoredSchema(record) : undefined;
+	}
+
+	/**
 	 * What a schema write to the catalog WOULD produce for `candidate` given the
 	 * `persisted` schema this instance has read, without writing: the same
 	 * de-resolve → union → validate → resolve sequence as {@link storeStoredSchema},
@@ -577,8 +674,7 @@ export class SchemaManager {
 	 * or plans against this unfiltered value directly.
 	 */
 	private anyPersistedEntry(entry: unknown): PersistedTableSchema | undefined {
-		const tuple = entry as [string, PersistedTableSchema | undefined] | undefined;
-		return tuple && tuple.length >= 2 && tuple[1] ? tuple[1] : undefined;
+		return recordOfEntry(entry);
 	}
 
 	/**
@@ -651,6 +747,16 @@ export class SchemaManager {
 	 * really be persisted; the write-time index union is the standing guard.
 	 */
 	async getSchema(tableName: string, transactor?: ITransactor): Promise<StoredTableSchema | undefined> {
+		if (this.batch) {
+			// While an APPLY SCHEMA batch is open the overlay IS the catalog: a table created a
+			// statement earlier is pending, not committed, and the cache is deliberately not
+			// consulted or filled until the batch commits (see storeInBatch).
+			// NOTE: a committed read running outside the engine's lock (`readCommittedSnapshot`)
+			// can reach this on a batched manager and see a pending, not-yet-committed record.
+			// Accepted: the engine's in-memory catalog already exposes those tables to the same
+			// readers, so the plugin answering consistently with it is the coherent choice.
+			return this.readLiveInBatch(this.batch, tableName, transactor);
+		}
 		const cached = this.schemaCache.get(tableName);
 		if (cached) {
 			return cached;
@@ -674,7 +780,9 @@ export class SchemaManager {
 	 * fallback.
 	 */
 	async getSchemaFresh(tableName: string, transactor?: ITransactor): Promise<StoredTableSchema | undefined> {
-		const fresh = await this.readSchemaFromCatalog(tableName, transactor);
+		const fresh = this.batch
+			? await this.readLiveInBatch(this.batch, tableName, transactor)
+			: await this.readSchemaFromCatalog(tableName, transactor);
 		if (fresh) {
 			return fresh;
 		}
@@ -723,6 +831,9 @@ export class SchemaManager {
 	async deleteSchema(tableName: string, transactor?: ITransactor): Promise<void> {
 		this.schemaCache.delete(tableName);
 
+		if (this.batch) {
+			return this.deleteInBatch(this.batch, tableName, transactor);
+		}
 		const tree = await this.getSchemaTree(transactor);
 		if (!tree) {
 			return;
@@ -751,12 +862,44 @@ export class SchemaManager {
 	}
 
 	/**
+	 * The batched half of {@link deleteSchema}: the same gravestone rules (including the
+	 * bare-tombstone fallback when the current record cannot be read), staged into the
+	 * overlay. Stays OPEN-ONLY on the catalog: with no committed catalog and no pending
+	 * entry under this name there is nothing to tombstone, and staging one would make the
+	 * end-of-batch commit invent a catalog just to hold it. A table created and dropped
+	 * within one apply on a cold database DOES stage its gravestone — the create is pending,
+	 * so the commit creates the catalog for that record exactly as two direct statements
+	 * would have.
+	 */
+	private async deleteInBatch(batch: CatalogBatch, tableName: string, transactor?: ITransactor): Promise<void> {
+		if (!batch.hasPending(tableName) && !(await batch.catalogExists(transactor))) {
+			return;
+		}
+		let gravestone: PersistedTableSchema | undefined;
+		try {
+			const record = this.anyPersistedEntry(await batch.readEntry(tableName, transactor));
+			if (record) {
+				gravestone = { ...record, droppedAt: record.droppedAt ?? new Date().toISOString() };
+			}
+		} catch {
+			gravestone = undefined;
+		}
+		batch.write(tableName, gravestone ? [tableName, gravestone] : undefined);
+	}
+
+	/**
 	 * ONE pass over every catalog entry, in key order — the shared walk behind
 	 * {@link listTables} and {@link findRecordForUri}, so the two cannot drift.
 	 * Open-only: a fresh install has no catalog at all and yields nothing rather
 	 * than inventing an empty catalog to iterate. Pulls the latest tree state
 	 * first; a fresh SchemaManager otherwise iterates an empty in-memory btree
 	 * even when storage already holds the persisted schemas.
+	 *
+	 * NOTE: deliberately NOT routed through an open catalog batch. Its only callers are
+	 * {@link listTables} (hydrate, which never runs inside an `apply schema`) and the
+	 * unbatched arm of {@link findRecordForUri}; the batched arm has its own one-walk overlay
+	 * (`CatalogBatch.recordForUri`). If hydrate ever runs mid-apply, route this through the
+	 * batch too rather than letting it open a second catalog tree.
 	 */
 	private async *catalogEntries(
 		transactor?: ITransactor
@@ -836,14 +979,19 @@ export class SchemaManager {
 		collectionUri: string,
 		transactor?: ITransactor
 	): Promise<PersistedTableSchema | undefined> {
+		if (this.batch) {
+			// Pending entries override committed ones by name, so a table dropped earlier in the
+			// same apply is seen as its gravestone here — the guard still refuses a contradicting
+			// re-declare over rows that still exist.
+			return this.batch.recordForUri(collectionUri, transactor);
+		}
 		let dropped: PersistedTableSchema | undefined;
 		for await (const entry of this.catalogEntries(transactor)) {
 			const record = this.anyPersistedEntry(entry);
 			if (!record) {
 				continue;
 			}
-			const recordUri = (record.vtabArgs?.['0'] as string | undefined) || `tree://default/${record.name}`;
-			if (recordUri !== collectionUri) {
+			if (recordUriOf(record) !== collectionUri) {
 				continue;
 			}
 			if (!record.droppedAt) {
@@ -862,6 +1010,9 @@ export class SchemaManager {
 		tableName: string,
 		transactor?: ITransactor
 	): Promise<PersistedTableSchema | undefined> {
+		if (this.batch) {
+			return this.droppedPersistedEntry(await this.batch.readEntry(tableName, transactor));
+		}
 		const tree = await this.getSchemaTree(transactor);
 		if (!tree) {
 			return undefined;
@@ -908,16 +1059,6 @@ export class SchemaManager {
 			desc: pk.desc,
 			collation: pk.collation,
 		}));
-		const indexes: IndexSchema[] = stored.indexes.map(idx => ({
-			name: idx.name,
-			columns: idx.columns.map(col => ({
-				index: col.index,
-				desc: col.desc,
-				collation: col.collation,
-			})),
-			unique: idx.unique ? true : undefined,
-			predicate: idx.predicate as IndexSchema['predicate'],
-		}));
 		return {
 			name: stored.name,
 			schemaName: stored.schemaName,
@@ -931,13 +1072,32 @@ export class SchemaManager {
 			vtabArgs: stored.vtabArgs,
 			vtabModuleName: stored.vtabModuleName,
 			isView: false,
-			indexes,
+			indexes: this.storedIndexesToIndexSchemas(stored.indexes),
 			// No `statistics`: see StoredTableSchema.estimatedRows. Absent is the honest answer —
 			// quereus reads absent as "nobody has measured this table" and applies its own
 			// fallback, whereas any value we synthesized here would claim an ANALYZE that never
 			// ran and, with no column statistics behind it, would claim it badly.
 			uniqueConstraints: this.storedToUniqueConstraints(stored),
 		};
+	}
+
+	/**
+	 * Resolved index descriptors in Quereus's `TableSchema.indexes` shape — the inverse of
+	 * {@link indexSchemaToStored}. Used by {@link storedToTableSchema} for hydrate, and by
+	 * the vtab to refresh its own `tableSchema.indexes` from what its IndexManager maintains
+	 * before a forced re-persist (`OptimysticVirtualTable.markSchemaUnpersisted`).
+	 */
+	storedIndexesToIndexSchemas(indexes: readonly StoredIndexSchema[]): IndexSchema[] {
+		return indexes.map(idx => ({
+			name: idx.name,
+			columns: idx.columns.map(col => ({
+				index: col.index,
+				desc: col.desc,
+				collation: col.collation,
+			})),
+			unique: idx.unique ? true : undefined,
+			predicate: idx.predicate as IndexSchema['predicate'],
+		}));
 	}
 
 	/**

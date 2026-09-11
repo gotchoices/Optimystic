@@ -291,6 +291,84 @@ full scan and a committed index-driven scan of the split table disagree — on t
 serialized path exactly as on the concurrent one — until the application-level
 reconciliation described in docs/correctness.md § "Partial landing".
 
+## `APPLY SCHEMA` coalesces catalog writes
+
+Quereus drives `apply schema` as a loop of ordinary DDL statements and brackets
+that loop with two optional module hooks, `beginSchemaBatch` and
+`endSchemaBatch` (`@quereus/quereus/src/vtab/module.ts`), fired inside its
+execution lock and only when the migration plan is non-empty — a no-op re-apply
+fires neither. `OptimysticModule` implements both (`beginSchemaBatch` in
+`packages/quereus-plugin-optimystic/src/optimystic-module.ts`). Between them,
+every `SchemaManager`'s catalog writes collect in an in-memory overlay
+(`CatalogBatch` in
+`packages/quereus-plugin-optimystic/src/schema/catalog-batch.ts`), and every
+catalog read — the table lookup, the gravestone lookup, the storage-adoption
+guard's walk by URI — is answered from that overlay plus **one** catalog tree
+opened and refreshed once for the whole apply. At `endSchemaBatch` each manager
+re-merges every pending live record with the latest committed one (so an index a
+sibling node added meanwhile is unioned in, exactly as the unbatched write path
+does at every write) and flushes the whole set in **one** catalog commit. A
+manager nothing wrote through does no I/O at all, and an apply whose tables all
+belong to another module touches the transactor zero times.
+
+For a cold apply of `T` tables and `I` indexes over empty tables this takes the
+catalog from `T + I` commits and a quadratic number of catalog reads (each
+`CREATE TABLE` walked the growing catalog) to one commit and one open. The
+per-index flush of each invented index tree is **not** batched here — `1 + I`
+commits remain until `schema-batch-index-tree-flush-deferral` lands.
+`packages/quereus-plugin-optimystic/test/cold-apply-cost.spec.ts` pins the
+figures at two scales;
+`packages/quereus-plugin-optimystic/test/schema-batch.spec.ts` pins the
+semantics below.
+
+**The batch is a write-coalescing buffer, not a transaction.** It commits what
+landed on **both** success and error — a deliberate deviation from the upstream
+hook doc, which says to discard the overlay on error. Quereus keeps the
+statements that landed when an apply fails part-way
+(`@quereus/quereus/test/ddl-schema-event-atomicity.spec.ts`): the created table
+stays in the engine catalog and is usable. Each of our DDL statements used to
+commit on its own, so our catalog matched the engine's; discarding the overlay
+would leave those tables in the engine's catalog, and cached in the module as
+initialized instances, with no persisted record — the next process would not
+hydrate them. Instead each `create`, `createIndex` and `destroy` runs under a
+**per-statement checkpoint** (`underBatchCheckpoint` in
+`packages/quereus-plugin-optimystic/src/optimystic-module.ts`): a throw withdraws
+exactly that statement's catalog writes, so a `CREATE TABLE` the storage-adoption
+guard refuses — or one that fails later in initialization, after its schema
+already reached the overlay — leaves no record, while everything before it
+commits at the end. Per-statement atomicity and partial-apply semantics are what
+they were.
+
+**End-commit failure.** If the one catalog commit itself fails, `endSchemaBatch`
+throws (the engine rethrows it when there was no loop error, and logs and
+swallows it when there was). The tables created or given an index inside the
+batch are then in the engine's catalog and cached as initialized, but
+unpersisted. The module marks each of them unpersisted
+(`markSchemaUnpersisted` in
+`packages/quereus-plugin-optimystic/src/optimystic-module.ts`); its next touch
+re-runs initialization, finds no persisted record, and writes the schema —
+including the indexes it maintains, refreshed from its `IndexManager`, since
+Quereus's `CREATE INDEX` replaces the engine's `TableSchema` rather than
+mutating the copy the table holds. Nothing was cached for those tables (a batch
+seeds the schema cache only after its commit lands), so no stale hit masks the
+gap.
+
+**What the batch does not change.**
+
+- **Direct DDL outside `apply schema`** commits per statement exactly as before;
+  the hooks never fire.
+- **Seed data** (`apply schema … with seed`) runs after `endSchemaBatch` as
+  ordinary DML, outside the batch.
+- **Session mode**: the catalog tree still syncs directly; it is not carried by
+  the `TransactionCoordinator`.
+- **One cross-collection atomic commit**: the catalog and each data or index
+  tree remain separate commits (`feat-cross-collection-atomic-commit`, backlog).
+- **Staleness for the length of the apply**: a sibling's catalog write during
+  the batch is not seen until the end-of-batch re-merge, which matches the
+  cached-read contract of `SchemaManager.getSchema`. A committed read running
+  outside the lock can see a pending, not-yet-committed record; the engine's
+  in-memory catalog already exposes those tables to the same readers.
+
 ## Secrets and the replicated statement record
 
 **Short answer:** passing a private key to `sign(data, key)` — as a literal or a bound

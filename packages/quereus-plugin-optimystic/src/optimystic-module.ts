@@ -3166,6 +3166,41 @@ export class OptimysticVirtualTable extends VirtualTable {
     const txnState = this.txnBridge.getCurrentTransaction();
     await this.schemaManager.deleteSchema(tableName, txnState?.transactor);
   }
+
+  /**
+   * The plugin's catalog manager this table's schema reads and writes go through (NOT
+   * Quereus's `db.schemaManager`). Exposed so the module can checkpoint the open
+   * `APPLY SCHEMA` batch around each DDL statement that touches this table.
+   */
+  get catalogManager(): SchemaManager {
+    return this.schemaManager;
+  }
+
+  /**
+   * Forget that this table's schema is persisted. Called by the module when the end-of-batch
+   * catalog commit of an `APPLY SCHEMA` failed after this table was created or gained an
+   * index inside it: the table is in Quereus's catalog and cached here as initialized, but
+   * has no persisted record. The next touch re-runs {@link doInitialize}, whose
+   * declared-columns arm finds no persisted record and writes the schema — retrying the
+   * commit that failed, with the same storage-adoption guard in front of it. Nothing was
+   * cached in the SchemaManager for this table (a batch seeds its cache only after its
+   * commit lands), so no stale hit can mask the gap.
+   *
+   * The index list is refreshed from what the IndexManager maintains first: `tableSchema`
+   * is the object CREATE TABLE handed over, and Quereus's CREATE INDEX REPLACES the engine's
+   * TableSchema (`appendIndexToTableSchema` returns a new object) rather than mutating this
+   * one — so without the refresh the re-persist would drop every index added since.
+   */
+  markSchemaUnpersisted(): void {
+    if (this.indexManager) {
+      this.tableSchema = {
+        ...this.tableSchema,
+        indexes: this.schemaManager.storedIndexesToIndexSchemas(this.indexManager.getDeclaredIndexes()),
+      };
+    }
+    this.isInitialized = false;
+    this.isProvisionallyInitialized = false;
+  }
 }
 
 /**
@@ -3302,6 +3337,17 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   // doInitialize will later consult, turning N per-table tree walks into N
   // cache hits.
   private schemaManagers = new Map<string, SchemaManager>();
+  /**
+   * The open `APPLY SCHEMA` catalog batch, between {@link beginSchemaBatch} and
+   * {@link endSchemaBatch}. `managers` are the SchemaManagers whose catalog writes are being
+   * held (every one that existed at begin, plus any created since); `written` records, per
+   * manager, the tables that created or altered their persisted schema inside the batch —
+   * the ones an end-commit failure on THAT manager leaves unpersisted.
+   */
+  private schemaBatch?: {
+    managers: Set<SchemaManager>;
+    written: Map<SchemaManager, Set<string>>;
+  };
 
   constructor(
     private collectionFactory: CollectionFactory,
@@ -3343,7 +3389,126 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         : await this.collectionFactory.getCollection(schemaOptions, txnState);
     });
     this.schemaManagers.set(fingerprint, manager);
+    // A manager created mid-apply joins the open batch: its tables' catalog writes must
+    // coalesce like every other's, and its commit runs from endSchemaBatch.
+    if (this.schemaBatch) {
+      manager.beginBatch();
+      this.schemaBatch.managers.add(manager);
+    }
     return manager;
+  }
+
+  /**
+   * `APPLY SCHEMA` is starting its migration-DDL loop (Quereus fires this only when the loop
+   * is non-empty, inside its execution lock). Open a catalog batch on every SchemaManager:
+   * from here to {@link endSchemaBatch} their catalog writes collect in memory and their
+   * catalog reads are served from that overlay plus one catalog tree opened once, instead of
+   * one commit and a growing re-read per DDL statement (see `CatalogBatch`). No I/O here.
+   *
+   * `schemaName` is ignored: the optimystic catalog (`tree://optimystic/schema`) is
+   * plugin-global, not scoped to an engine schema. Batches never nest — the engine's lock
+   * makes an overlapping apply impossible, so a second begin is a wiring bug and throws.
+   */
+  async beginSchemaBatch(_db: Database, _schemaName: string): Promise<void> {
+    if (this.schemaBatch) {
+      throw new Error('Optimystic schema batch already open: beginSchemaBatch without a matching endSchemaBatch');
+    }
+    const managers = new Set<SchemaManager>();
+    for (const manager of this.schemaManagers.values()) {
+      manager.beginBatch();
+      managers.add(manager);
+    }
+    this.schemaBatch = { managers, written: new Map() };
+  }
+
+  /**
+   * The migration loop is over: commit each joined SchemaManager's batch — ONE catalog commit
+   * per manager, zero I/O for a manager nothing wrote through — and close the batch.
+   *
+   * NOTE: commits on ERROR too, deliberately deviating from the upstream hook doc ("on error,
+   * the module should discard the in-flight overlay"). Quereus keeps the statements that
+   * landed when an apply fails part-way (`@quereus/quereus/test/ddl-schema-event-atomicity.spec.ts`,
+   * "a partially-applied schema keeps the events of the statements that landed"): the created
+   * table stays in the engine catalog and is usable. Before the batch each of our DDL
+   * statements committed on its own, so our catalog matched the engine's; discarding the
+   * overlay now would leave those tables in the engine's catalog — and cached here as
+   * initialized instances — with no persisted record, so the next process would not hydrate
+   * them and a later CREATE INDEX on them would find no schema. The batch is therefore a
+   * write-coalescing buffer, not a transaction: the per-statement checkpoint in
+   * {@link underBatchCheckpoint} already withdrew the failed statement's own catalog changes,
+   * and what landed commits here whether or not `error` is set. Per-statement atomicity and
+   * partial-apply semantics are exactly what they were.
+   *
+   * If a manager's commit itself fails, every table that created or altered its schema
+   * through that manager is marked unpersisted ({@link OptimysticVirtualTable.markSchemaUnpersisted})
+   * so its next touch re-persists it, the remaining managers still commit, and the first
+   * failure is rethrown — the engine rethrows it when there was no loop error and logs and
+   * swallows it when there was.
+   */
+  async endSchemaBatch(_db: Database, _schemaName: string, _error?: unknown): Promise<void> {
+    const batch = this.schemaBatch;
+    if (!batch) {
+      throw new Error('Optimystic schema batch is not open: endSchemaBatch without a matching beginSchemaBatch');
+    }
+    this.schemaBatch = undefined;
+    let failed = false;
+    let firstFailure: unknown;
+    for (const manager of batch.managers) {
+      try {
+        await manager.commitBatch();
+      } catch (error) {
+        const unpersisted = [...(batch.written.get(manager) ?? [])];
+        for (const tableKey of unpersisted) {
+          this.tables.get(tableKey)?.markSchemaUnpersisted();
+        }
+        log(
+          'endSchemaBatch: catalog commit failed; %d table(s) will re-persist their schema on next touch (%s): %s',
+          unpersisted.length, unpersisted.join(', '), error
+        );
+        if (!failed) {
+          failed = true;
+          firstFailure = error;
+        }
+      }
+    }
+    if (failed) {
+      throw firstFailure;
+    }
+  }
+
+  /**
+   * Run one DDL statement's work for `table` under the open schema batch's per-statement
+   * checkpoint: a throw withdraws every catalog write the statement staged — and only those
+   * — so a refused CREATE (the storage-adoption guard, or a failure later in doInitialize
+   * after the schema already reached the overlay) leaves no record for the end-of-batch
+   * commit to persist. On success `tableKey`, when given, is recorded as written through the
+   * table's manager (see the `written` field). Outside a batch this is a plain call.
+   */
+  private async underBatchCheckpoint<T>(
+    table: OptimysticVirtualTable,
+    tableKey: string | undefined,
+    work: () => Promise<T>
+  ): Promise<T> {
+    const batch = this.schemaBatch;
+    if (!batch) {
+      return work();
+    }
+    const manager = table.catalogManager;
+    const checkpoint = manager.checkpointBatch();
+    try {
+      const result = await work();
+      if (tableKey !== undefined) {
+        const written = batch.written.get(manager) ?? new Set<string>();
+        written.add(tableKey);
+        batch.written.set(manager, written);
+      }
+      return result;
+    } catch (error) {
+      if (checkpoint) {
+        manager.restoreBatch(checkpoint);
+      }
+      throw error;
+    }
   }
 
   /**
@@ -3444,8 +3609,10 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     // Initialize table and register connection before returning
     // This ensures the table is fully ready for queries and transactions
     try {
-      await table.initialize();
-      await table.ensureConnectionRegistered();
+      await this.underBatchCheckpoint(table, tableKey, async () => {
+        await table.initialize();
+        await table.ensureConnectionRegistered();
+      });
     } catch (error) {
       // A refused CREATE must leave no cached instance behind. The storage-adoption
       // guard's message tells the user to re-declare (different columns, or a
@@ -3644,7 +3811,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     }
 
     // Update the stored schema with the new index
-    await table.addIndex(indexSchema);
+    await this.underBatchCheckpoint(table, tableKey, () => table.addIndex(indexSchema));
   }
 
   /**
@@ -3973,7 +4140,8 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       // so the storage listener doesn't leak past the table's lifetime.
       table.teardownChangeSubscription();
       try {
-        await table.deleteOwnSchema(tableName);
+        // Not recorded as `written`: a dropped table has no instance left to re-initialize.
+        await this.underBatchCheckpoint(table, undefined, () => table.deleteOwnSchema(tableName));
       } catch (error) {
         // Best-effort: a schema-tree write failure shouldn't stop teardown. But it
         // does leave the record LIVE past its own DROP, which blinds the
