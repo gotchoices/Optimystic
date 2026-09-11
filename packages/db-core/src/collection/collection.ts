@@ -791,7 +791,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * process can be at different revisions at the same instant. That gap is invisible
 	 * from outside the class without this accessor, which is the whole reason it
 	 * exists: `docs/debugging.md` (§ "Which revision did a read descend?") explains
-	 * how an operator reads the difference. */
+	 * how an operator reads the difference.
+	 *
+	 * The one exception is `undefined` itself, which is a STATE rather than a revision:
+	 * "this instance invented the collection and has never adopted a committed revision".
+	 * For the same reason (only this instance moves it), it stays true until this instance
+	 * updates, syncs or records a commit, so a caller holding a freshly opened instance may
+	 * branch on it — the Quereus adapter does, to leave an invented, never-written index tree
+	 * unflushed exactly as an unwritten table tree is left. Never branch on the NUMBER. */
 	committedRevision(): number | undefined {
 		return this.source.actionContext?.rev;
 	}

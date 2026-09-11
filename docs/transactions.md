@@ -313,9 +313,15 @@ belong to another module touches the transactor zero times.
 
 For a cold apply of `T` tables and `I` indexes over empty tables this takes the
 catalog from `T + I` commits and a quadratic number of catalog reads (each
-`CREATE TABLE` walked the growing catalog) to one commit and one open. The
-per-index flush of each invented index tree is **not** batched here — `1 + I`
-commits remain until `schema-batch-index-tree-flush-deferral` lands.
+`CREATE TABLE` walked the growing catalog) to one commit and one open. Index
+trees ride the same batch (`backfillIndexTrees` in
+`packages/quereus-plugin-optimystic/src/optimystic-module.ts`). A new index
+over an **empty** table leaves its invented tree unwritten, exactly as
+`CREATE TABLE` leaves the table's own tree: a later open invents the same empty
+tree, and the first write rides the next DML commit. So the whole cold apply is
+**one** commit on the legacy commit path, however many indexes it declares. A
+new index over a **populated** table has its tree deferred and landed at
+`endSchemaBatch` *before* the catalog commit that lists it.
 `packages/quereus-plugin-optimystic/test/cold-apply-cost.spec.ts` pins the
 figures at two scales;
 `packages/quereus-plugin-optimystic/test/schema-batch.spec.ts` pins the
@@ -357,14 +363,30 @@ past the DROP, so the next hydrate resurrects it and a later CREATE over the
 same URI is not checked against it — the same failure direction as the
 unbatched, best-effort drop, and the failure log names those tables.
 
+**Index-tree failure.** A deferred index tree that fails to land cancels its
+manager's catalog commit. Trees first, catalog second is what guarantees that
+no record ever lists an index over missing entries; the opposite order (the
+unbatched one) lets the planner seek through an index whose entries never
+landed, which returns silently wrong results. What the failed tree did receive
+is harmless: a later `CREATE INDEX` of the same name adopts it and re-stages
+every row. The tables are then recovered as for an end-commit failure, except
+that an index whose tree did not land is withheld from the re-persist. In the
+running process a read routed through that index refuses loudly
+(`assertIndexMaintained`) until the index is re-declared from a connection that
+does not list it.
+
 **What the batch does not change.**
 
-- **Direct DDL outside `apply schema`** commits per statement exactly as before;
-  the hooks never fire.
+- **Direct DDL outside `apply schema`** commits per statement exactly as before,
+  including the flush of an invented index tree on an empty table; the hooks
+  never fire.
 - **Seed data** (`apply schema … with seed`) runs after `endSchemaBatch` as
   ordinary DML, outside the batch.
 - **Session mode**: the catalog tree still syncs directly; it is not carried by
-  the `TransactionCoordinator`.
+  the `TransactionCoordinator`. The apply's own coordinator transaction still
+  commits every new table's and index's invented tree when it ends, one commit
+  apiece, so a session-mode cold apply costs `1 + T + I` commits
+  (`feat-session-mode-apply-schema-tree-commits`, backlog).
 - **One cross-collection atomic commit**: the catalog and each data or index
   tree remain separate commits (`feat-cross-collection-atomic-commit`, backlog).
 - **Staleness for the length of the apply**: a sibling's catalog write during

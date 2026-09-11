@@ -525,6 +525,18 @@ export class SchemaManager {
 	}
 
 	/**
+	 * Close the open batch WITHOUT committing it: every pending write is dropped and the cache
+	 * is left untouched (a batch never seeds it before its commit lands). Called by the module
+	 * when an index tree that the batch's records list failed to land, so the catalog commit
+	 * must not happen (see `OptimysticModule.endSchemaBatch`). A no-op when no batch is open —
+	 * {@link commitBatch} closes the batch before its own commit, so discarding after a failed
+	 * commit is safe.
+	 */
+	discardBatch(): void {
+		this.batch = undefined;
+	}
+
+	/**
 	 * Snapshot the open batch's pending writes before one DDL statement's catalog work, so a
 	 * throw can withdraw exactly that statement's changes with {@link restoreBatch}. Undefined
 	 * when no batch is open (direct DDL outside `apply schema`).

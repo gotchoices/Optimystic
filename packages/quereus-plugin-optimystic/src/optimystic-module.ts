@@ -178,6 +178,14 @@ function unmaintainedIndexMessage(tableName: string, indexName: string, detail: 
 }
 
 /**
+ * Hands one populated index tree to the open `APPLY SCHEMA` batch instead of flushing it
+ * on the spot; the batch lands it at `endSchemaBatch`, before the catalog commit that lists
+ * its index. Supplied by `OptimysticModule.createIndex` only while a batch is open — its
+ * absence is what keeps every other path (direct DDL) unchanged.
+ */
+type DeferIndexFlush = (indexName: string, tree: Tree<string, IndexEntry>) => void;
+
+/**
  * Helper function to convert SqlDataType affinity to LogicalType
  */
 function affinityToLogicalType(affinity: SqlDataType): LogicalType {
@@ -2644,9 +2652,13 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Add an index to the table schema
+   * Add an index to the table schema.
+   *
+   * `deferFlush` is supplied only while an `APPLY SCHEMA` batch is open: the index trees this
+   * call populates are then handed to the batch instead of flushed here (see
+   * {@link backfillIndexTrees}). Absent, behaviour is exactly the unbatched one.
    */
-  async addIndex(indexSchema: IndexSchema): Promise<void> {
+  async addIndex(indexSchema: IndexSchema, deferFlush?: DeferIndexFlush): Promise<void> {
     // Wait for initialization if needed
     if (!this.isInitialized) {
       await this.initialize();
@@ -2729,7 +2741,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       // after the setSchema fold above so the helper resolves descriptors from the
       // final schema. No-op (no scan) when nothing was newly attached, which is the
       // warm re-declare.
-      await this.backfillIndexTrees(attached);
+      await this.backfillIndexTrees(attached, deferFlush);
       // A re-declared CREATE UNIQUE INDEX mirrored its constraint above; teach the
       // bridge that this (now open + registered) tree's refusal names those columns.
       this.registerUniqueKeyTakenMessages();
@@ -2773,7 +2785,8 @@ export class OptimysticVirtualTable extends VirtualTable {
     // fine for rollback: the coordinator re-captures newly registered collections
     // on every applyActions, not just the transaction's first. What it cannot
     // rewind is anything staged into the new tree BEFORE that next applyActions —
-    // which is why backfillIndexTrees below flushes the trees it populates instead
+    // which is why backfillIndexTrees below flushes the trees it populates (or, inside
+    // an `APPLY SCHEMA` batch, hands them to the batch's end-of-apply flush) instead
     // of leaving those entries staged for the enclosing transaction's commit.
     this.indexManager.registerIndexTree(indexSchema.name, indexTree);
     const attached = await this.reconcileMaintainedIndexes(writtenSchema, txnState?.transactor);
@@ -2782,7 +2795,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     // as newly attached (the manager carried no descriptor for it until the setSchema
     // inside reconcile), so this ONE call serves both the build path and the
     // re-attach path above — there is no second populate loop to keep in step.
-    await this.backfillIndexTrees(attached);
+    await this.backfillIndexTrees(attached, deferFlush);
     // A brand-new CREATE UNIQUE INDEX: register its tree's refusal message now that the
     // tree is open and its derived constraint is mirrored onto this.tableSchema.
     this.registerUniqueKeyTakenMessages();
@@ -2845,6 +2858,16 @@ export class OptimysticVirtualTable extends VirtualTable {
    * rows committed while this connection was detached from an index it has now
    * re-attached to.
    *
+   * Inside an `APPLY SCHEMA` batch (`deferFlush` supplied) nothing is flushed here. A tree
+   * that received entries is handed to the batch, which lands it at `endSchemaBatch` BEFORE
+   * the catalog commit that lists its index — one commit for the whole apply rather than one
+   * per index, and never a listed index whose entries are missing. A tree this instance
+   * INVENTED that received nothing (the table has no rows) is neither flushed nor deferred:
+   * it is left exactly as CREATE TABLE leaves an unwritten main tree (see the
+   * create-on-missing NOTE in doInitialize). A later open of the never-committed collection
+   * invents the same empty tree, and the first real write rides the next DML commit because
+   * {@link reconcileMaintainedIndexes} has already registered it with the transaction bridge.
+   *
    * Modelled on {@link ensureUniquePopulated}: stage into the target trees IN
    * ISOLATION and sync only those, never touching the caller's staged main-table
    * mutations. Idempotent by construction — entries are keyed `indexColumns‖primaryKey`,
@@ -2886,7 +2909,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    * memory-hungry, batch the stage calls per chunk of rows and skip rows whose entry
    * the tree already carries.
    */
-  private async backfillIndexTrees(indexNames: readonly string[]): Promise<void> {
+  private async backfillIndexTrees(indexNames: readonly string[], deferFlush?: DeferIndexFlush): Promise<void> {
     if (indexNames.length === 0) return;
     if (!this.collection || !this.rowCodec || !this.indexManager) return;
     const manager = this.indexManager;
@@ -2904,13 +2927,15 @@ export class OptimysticVirtualTable extends VirtualTable {
           `${descriptor ? 'tree' : 'descriptor'} not registered`,
         );
       }
-      return { descriptor, tree };
+      return { name, descriptor, tree };
     });
 
     // Decided ONCE per call, not per index: one scan serves every target, so the
-    // question is only ever "is there anything to copy at all". The flush below still
-    // runs when the scan is skipped — a freshly INVENTED tree holds uncommitted
-    // header/root blocks even though no row staged anything into it.
+    // question is only ever "is there anything to copy at all". Outside a batch the
+    // flush below still runs when the scan is skipped — a freshly INVENTED tree holds
+    // uncommitted header/root blocks even though no row staged anything into it.
+    // `stagedAny` is per call for the same reason: every target receives every row.
+    let stagedAny = false;
     if (!await this.hasNoRowsToBackfill()) {
       await collection.update();
       for await (const path of collection.ascending(await collection.first())) {
@@ -2923,7 +2948,20 @@ export class OptimysticVirtualTable extends VirtualTable {
           const treeKey = manager.createIndexKey(descriptor, row) + primaryKey;
           await tree.stage([[treeKey, [treeKey, primaryKey]]]);
         }
+        stagedAny = true;
       }
+    }
+
+    if (deferFlush) {
+      for (const { name, tree } of targets) {
+        // Invented and given nothing: leave it unwritten, like an unwritten main tree (see
+        // this method's doc). `committedRevision() === undefined` is the invented STATE,
+        // which that accessor documents as safe to branch on for a freshly opened instance.
+        if (!stagedAny && tree.committedRevision() === undefined) continue;
+        if (!tree.hasUnsyncedChanges()) continue;
+        deferFlush(name, tree);
+      }
+      return;
     }
 
     // Staging alone is not durable: addIndex runs outside the DML transaction's
@@ -2980,6 +3018,13 @@ export class OptimysticVirtualTable extends VirtualTable {
    * A newly built index tree that received no entries (CREATE INDEX on an empty table) is
    * still flushed when it was INVENTED, since its header/root blocks sit uncommitted in
    * the tracker and count as unsynced.
+   *
+   * NOTE: that flush is one commit per direct `CREATE INDEX` on an empty table, and it is
+   * avoidable. The skip the `APPLY SCHEMA` batch takes ({@link backfillIndexTrees}) would be
+   * just as sound here: the never-committed tree is re-invented empty on every open and its
+   * first write rides the next DML commit. It was not taken, so that direct DDL outside
+   * `apply schema` stays byte-identical to its behaviour before the batch work; take it if
+   * direct CREATE INDEX on empty tables ever shows up as a cost.
    */
   private async flushDirtyTrees(
     targets: readonly { tree: Tree<string, IndexEntry> }[],
@@ -3190,13 +3235,31 @@ export class OptimysticVirtualTable extends VirtualTable {
    * is the object CREATE TABLE handed over, and Quereus's CREATE INDEX REPLACES the engine's
    * TableSchema (`appendIndexToTableSchema` returns a new object) rather than mutating this
    * one — so without the refresh the re-persist would drop every index added since.
+   *
+   * `withheldIndexes` names indexes whose tree the batch deferred and then failed to land.
+   * They are left out of the refresh, along with any UNIQUE constraint derived from them
+   * (in memory only — derived constraints are never persisted): re-persisting such an index
+   * would list it in the catalog over a tree missing its entries, which is exactly the
+   * silently-incomplete read the batch's tree-before-catalog order exists to prevent. The
+   * re-initialized table then does not maintain it, so a read the planner routes through it
+   * in THIS process refuses loudly (assertIndexMaintained) until the index is re-declared
+   * from a connection that does not list it — a fresh Database's `apply schema` rebuilds it.
    */
-  markSchemaUnpersisted(): void {
+  markSchemaUnpersisted(withheldIndexes: ReadonlySet<string> = new Set()): void {
     if (this.indexManager) {
+      const kept = this.indexManager.getDeclaredIndexes().filter(idx => !withheldIndexes.has(idx.name));
       this.tableSchema = {
         ...this.tableSchema,
-        indexes: this.schemaManager.storedIndexesToIndexSchemas(this.indexManager.getDeclaredIndexes()),
+        indexes: this.schemaManager.storedIndexesToIndexSchemas(kept),
       };
+      if (withheldIndexes.size > 0 && this.tableSchema.uniqueConstraints) {
+        this.tableSchema = {
+          ...this.tableSchema,
+          uniqueConstraints: this.tableSchema.uniqueConstraints.filter(
+            uc => uc.derivedFromIndex === undefined || !withheldIndexes.has(uc.derivedFromIndex),
+          ),
+        };
+      }
     }
     this.isInitialized = false;
     this.isProvisionallyInitialized = false;
@@ -3344,12 +3407,15 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * manager, the tables that created or altered their persisted schema inside the batch —
    * the ones an end-commit failure on THAT manager leaves unpersisted; `dropped` the tables
    * whose DROP staged a gravestone — nothing can re-persist those, so the failure log names
-   * them.
+   * them; `deferred` the populated index trees of each manager's tables whose flush was
+   * handed to the end of the batch (keyed by tree, so a tree is flushed once however often
+   * it was deferred), with the table and index each belongs to.
    */
   private schemaBatch?: {
     managers: Set<SchemaManager>;
     written: Map<SchemaManager, Set<string>>;
     dropped: Map<SchemaManager, Set<string>>;
+    deferred: Map<SchemaManager, Map<Tree<string, IndexEntry>, { tableKey: string; indexName: string }>>;
   };
 
   constructor(
@@ -3421,12 +3487,15 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       manager.beginBatch();
       managers.add(manager);
     }
-    this.schemaBatch = { managers, written: new Map(), dropped: new Map() };
+    this.schemaBatch = { managers, written: new Map(), dropped: new Map(), deferred: new Map() };
   }
 
   /**
-   * The migration loop is over: commit each joined SchemaManager's batch — ONE catalog commit
-   * per manager, zero I/O for a manager nothing wrote through — and close the batch.
+   * The migration loop is over. For each joined SchemaManager in turn: land the populated index
+   * trees its tables deferred ({@link OptimysticVirtualTable.addIndex}'s `deferFlush`), then
+   * commit its catalog batch — ONE catalog commit per manager, zero I/O for a manager nothing
+   * wrote through. Then close the batch. A cold apply over empty tables defers no tree at all
+   * (an invented, empty index tree is left unwritten), so it costs exactly one commit.
    *
    * NOTE: commits on ERROR too, deliberately deviating from the upstream hook doc ("on error,
    * the module should discard the in-flight overlay"). Quereus keeps the statements that
@@ -3442,15 +3511,19 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * and what landed commits here whether or not `error` is set. Per-statement atomicity and
    * partial-apply semantics are exactly what they were.
    *
-   * If a manager's commit itself fails, every table that created or altered its schema
-   * through that manager is marked unpersisted ({@link OptimysticVirtualTable.markSchemaUnpersisted})
-   * so its next touch re-persists it, the remaining managers still commit, and the first
-   * failure is rethrown — the engine rethrows it when there was no loop error and logs and
-   * swallows it when there was. A table DROPPED inside the batch has no instance left to
-   * re-persist anything: its gravestone is lost with the commit, the catalog keeps its live
-   * record past the DROP (the next hydrate resurrects it, and a later CREATE over the same
-   * URI is not checked against it — the same failure direction as the unbatched, best-effort
-   * {@link destroy}), so the log names those tables too.
+   * If one of a manager's deferred index trees fails to land, that manager's catalog is NOT
+   * committed (see the ordering NOTE in the body) and its batch is discarded; if its catalog
+   * commit itself fails, likewise nothing of it lands. Either way every table that created or
+   * altered its schema through that manager is marked unpersisted
+   * ({@link OptimysticVirtualTable.markSchemaUnpersisted}) so its next touch re-persists it —
+   * WITHOUT any index whose tree did not land, since listing that index is the very failure the
+   * ordering prevents. The remaining managers still land and commit, and the first failure is
+   * rethrown — the engine rethrows it when there was no loop error and logs and swallows it when
+   * there was. A table DROPPED inside the batch has no instance left to re-persist anything: its
+   * gravestone is lost with the commit, the catalog keeps its live record past the DROP (the next
+   * hydrate resurrects it, and a later CREATE over the same URI is not checked against it — the
+   * same failure direction as the unbatched, best-effort {@link destroy}), so the log names those
+   * tables too.
    */
   async endSchemaBatch(_db: Database, _schemaName: string, _error?: unknown): Promise<void> {
     const batch = this.schemaBatch;
@@ -3461,19 +3534,47 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     let failed = false;
     let firstFailure: unknown;
     for (const manager of batch.managers) {
+      // The deferred trees of this manager's tables that have not landed yet: each is removed as
+      // it lands, so whatever remains when something throws is what the recovery must withhold.
+      const unlanded = new Map(batch.deferred.get(manager));
+      let step = 'index-tree flush';
       try {
+        // NOTE: the index trees land BEFORE the catalog commit that lists their indexes, and a
+        // tree that fails to land cancels that commit. The order is the point. Trees first, a
+        // tree failing: no catalog record lists the index, and whatever the tree did receive is
+        // harmless — a later CREATE INDEX of the same name adopts it and re-stages every row
+        // idempotently (entries are keyed indexColumns‖primaryKey). Catalog first — the
+        // unbatched order — a tree failing: the planner routes seeks through a listed index
+        // whose entries are missing, and gets silently wrong results. Neither order is one
+        // atomic commit (`feat-cross-collection-atomic-commit`, backlog).
+        for (const tree of [...unlanded.keys()]) {
+          if (tree.hasUnsyncedChanges()) {
+            await tree.sync();
+          }
+          unlanded.delete(tree);
+        }
+        step = 'catalog commit';
         await manager.commitBatch();
       } catch (error) {
+        // Closes the batch when a tree flush threw before commitBatch ran; a no-op otherwise.
+        manager.discardBatch();
+        const withheld = new Map<string, Set<string>>();
+        for (const { tableKey, indexName } of unlanded.values()) {
+          withheld.set(tableKey, (withheld.get(tableKey) ?? new Set<string>()).add(indexName));
+        }
         const unpersisted = [...(batch.written.get(manager) ?? [])];
         const dropped = [...(batch.dropped.get(manager) ?? [])];
         for (const tableKey of unpersisted) {
-          this.tables.get(tableKey)?.markSchemaUnpersisted();
+          this.tables.get(tableKey)?.markSchemaUnpersisted(withheld.get(tableKey));
         }
         log(
-          'endSchemaBatch: catalog commit failed: %s. %d table(s) will re-persist their schema on next ' +
-          'touch (%s); %d dropped table(s) keep a live catalog record past their DROP — the next hydrate ' +
-          'resurrects them and a later CREATE over the same URI is not checked against them (%s)',
-          error, unpersisted.length, unpersisted.join(', '), dropped.length, dropped.join(', ')
+          'endSchemaBatch: %s failed: %s. The catalog batch was not committed. %d table(s) will re-persist ' +
+          'their schema on next touch (%s), without the %d index(es) whose tree did not land (%s); %d dropped ' +
+          'table(s) keep a live catalog record past their DROP — the next hydrate resurrects them and a later ' +
+          'CREATE over the same URI is not checked against them (%s)',
+          step, error, unpersisted.length, unpersisted.join(', '), unlanded.size,
+          [...unlanded.values()].map(({ tableKey, indexName }) => `${tableKey}.${indexName}`).join(', '),
+          dropped.length, dropped.join(', ')
         );
         if (!failed) {
           failed = true;
@@ -3828,8 +3929,23 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       throw new Error(`Optimystic table '${tableName}' not found in schema '${schemaName}'. Cannot create index.`);
     }
 
+    // Inside an `APPLY SCHEMA` batch the index trees this statement populates land at
+    // endSchemaBatch, before the catalog commit that lists them, instead of one commit here.
+    // NOTE: the per-statement checkpoint below does NOT withdraw a tree deferred here when a
+    // later part of this statement throws — it still lands at the end, unlisted (harmless:
+    // adopted and re-staged by a later CREATE INDEX of the same name). That is today's
+    // semantics kept, not a new gap: unbatched, the tree had already flushed by then.
+    const batch = this.schemaBatch;
+    const deferFlush: DeferIndexFlush | undefined = batch
+      ? (indexName, tree) => {
+          const manager = table.catalogManager;
+          const trees = batch.deferred.get(manager) ?? new Map();
+          batch.deferred.set(manager, trees.set(tree, { tableKey, indexName }));
+        }
+      : undefined;
+
     // Update the stored schema with the new index
-    await this.underBatchCheckpoint(table, 'written', tableKey, () => table.addIndex(indexSchema));
+    await this.underBatchCheckpoint(table, 'written', tableKey, () => table.addIndex(indexSchema, deferFlush));
   }
 
   /**
