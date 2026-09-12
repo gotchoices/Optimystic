@@ -66,4 +66,4 @@ ticket.
 
 ## Partial conversion in flight
 
-`packages/db-p2p/test/multi-coordinator-write-relay.integration.spec.ts` is being rewritten by `debt-relay-cohort-spec-skips-itself-on-unlucky-layout`, which converts that one file's `keyNetwork` / `coordinatedRepo` reads to the typed surface as part of the rewrite. The other seven files listed above are untouched by it, and the guard described under "What resolving this should establish" is still entirely this ticket's job.
+`packages/db-p2p/test/multi-coordinator-write-relay.integration.spec.ts` was rewritten by `debt-relay-cohort-spec-skips-itself-on-unlucky-layout`, which has landed; that one file's `keyNetwork` / `coordinatedRepo` reads are now on the typed surface. The other seven files listed above are untouched by it, and the guard described under "What resolving this should establish" is still entirely this ticket's job.

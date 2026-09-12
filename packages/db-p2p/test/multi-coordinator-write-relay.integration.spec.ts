@@ -1,11 +1,12 @@
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import type { BlockId, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
-import { waitFor } from '@optimystic/db-core/test';
+import { waitFor, waitForValue } from '@optimystic/db-core/test';
 import { webSockets } from '@libp2p/websockets';
 import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
 import { multiaddr, type Multiaddr } from '@multiformats/multiaddr';
 import { createLibp2pNode, type Libp2pTransports } from '../src/libp2p-node.js';
+import { isLimitedConnection } from '../src/network/open-protocol-stream.js';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { spawnPlainRelayNode, pickRelayWsAddr, waitForCircuitListen } from './util/relay-topology.js';
 import { waitForPeerStoreProtocols } from './util/peer-store-wait.js';
@@ -29,15 +30,12 @@ import { waitForPeerStoreProtocols } from './util/peer-store-wait.js';
 // It is a hand-assembled libp2p node (`spawnPlainRelayNode`) that speaks identify and
 // circuit-relay-v2 and nothing else — deliberately, and the spec asserts on it below.
 //
-// This spec needs B in A's cohort, otherwise there is no second promise and nothing crossing the
-// relay. `findCluster` reserves one cohort slot for self and keeps only `clusterSize - 1` others
-// — at the `clusterSize: 2` used here, exactly ONE non-self slot — and it admits only peers it
-// has positively classified as serving this network. An Optimystic relay advertises this
-// network's `cluster`/`repo` protocols, so it classifies as `serves` and competes with B for that
-// single slot. Which of the two wins a given key is decided by the walk outward from that key's
-// coordinate, so the SHARE of the keyspace that resolves to B rather than to the relay is a
-// property of the run's random peer-id layout, fixed for the whole run. When that share is small,
-// every probe misses together.
+// This spec needs B in A's cohort, otherwise there is no second promise and nothing crosses the
+// relay. At the `clusterSize: 2` used here there is exactly ONE non-self cohort slot, and an
+// Optimystic relay serves this network's `cluster`/`repo` protocols, so it competes with B for
+// that slot — `spawnPlainRelayNode` in `test/util/relay-topology.ts` carries the `findCluster`
+// mechanics. Which of the two wins a given key follows from the run's random peer-id layout and
+// is fixed for the whole run, so on an unlucky layout every probed key misses together.
 //
 // Two earlier preconditions failed on exactly this, and neither failure was a convergence
 // problem: a captured skipping run had `serves=2 unknown=0 foreignDropped=0` and `fretCohort=3`,
@@ -112,10 +110,6 @@ async function spawnBrowserShapedCoordinator(relayWs: Multiaddr): Promise<Optimy
 	});
 }
 
-/** True for a connection that rides a circuit — the same rule as `isLimitedConnection` in `src/network/open-protocol-stream.ts`. */
-const isRelayed = (c: { limits?: unknown; remoteAddr?: { toString(): string } }): boolean =>
-	c.limits != null || (c.remoteAddr?.toString().includes('/p2p-circuit') ?? false);
-
 describe('Multi-coordinator write over a relay (limited inter-coordinator stream)', function () {
 	this.timeout(180_000);
 
@@ -163,7 +157,12 @@ describe('Multi-coordinator write over a relay (limited inter-coordinator stream
 		// becomes true the wait throws naming the condition. No skip below this line.
 		const cohortOfA = async (): Promise<string[]> =>
 			Object.keys(await nodeA.keyNetwork.findCluster(new TextEncoder().encode(BLOCK_ID)));
-		await waitFor(async () => (await cohortOfA()).includes(bId), {
+		// The poll RETURNS the cohort it accepted, so the assertion below judges that same
+		// observation rather than a second `findCluster` taken an instant later.
+		const aCohort = await waitForValue(async () => {
+			const cohort = await cohortOfA();
+			return cohort.includes(bId) ? cohort : undefined;
+		}, {
 			timeoutMs: COHORT_TIMEOUT_MS,
 			intervalMs: 500,
 			description: `A's cohort for '${BLOCK_ID}' includes the relay-only coordinator B`
@@ -172,7 +171,6 @@ describe('Multi-coordinator write over a relay (limited inter-coordinator stream
 		// Exactly {A, B} — set equality, not `includes`. `allowDownsize: true` means a self-only
 		// cohort completes a write happily, so a weaker assertion here would let the spec pass
 		// while asserting nothing about a second promise crossing anything.
-		const aCohort = await cohortOfA();
 		expect([...aCohort].sort(), `A's cohort for '${BLOCK_ID}' is exactly {A, B}`)
 			.to.deep.equal([nodeA.peerId.toString(), bId].sort());
 
@@ -192,10 +190,11 @@ describe('Multi-coordinator write over a relay (limited inter-coordinator stream
 
 		// The A↔B path must not have silently gone direct — the whole point is a promise over a
 		// limited connection. Loopback plus WS+circuit-only transports should prevent a DCUtR
-		// upgrade; assert it rather than assume it.
+		// upgrade; assert it rather than assume it, using PRODUCTION's `isLimitedConnection` so
+		// "relayed" here can never drift from what the write path itself treats as limited.
 		const aToB = nodeA.getConnections(nodeB.peerId);
 		expect(aToB.length, 'A holds at least one connection to B').to.be.greaterThan(0);
-		expect(aToB.every(isRelayed),
+		expect(aToB.every(isLimitedConnection),
 			`every A→B connection must be relayed; have: ${aToB.map(c => c.remoteAddr.toString()).join(', ')}`)
 			.to.equal(true);
 
