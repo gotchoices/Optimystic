@@ -1,11 +1,16 @@
 /**
- * Shared topology helpers for the slow circuit-relay / DCUtR integration specs
- * (`circuit-relay-long-lived.spec.ts`, `dcutr-direct-upgrade.spec.ts`,
- * `relay-address-propagation.spec.ts`).
+ * Shared topology helpers for the slow circuit-relay / DCUtR specs:
+ * `circuit-relay-long-lived.spec.ts`, `dcutr-direct-upgrade.spec.ts`,
+ * `relay-address-propagation.spec.ts`, `relay-inbound-source-address.spec.ts`,
+ * `relay-self-relay-only-dial.spec.ts`, `relay-third-party-address-gap.spec.ts`,
+ * `open-protocol-stream-relay.spec.ts` and
+ * `multi-coordinator-write-relay.integration.spec.ts`.
  *
- * Each helper spins a real libp2p node (relay or service peer) via
- * `createLibp2pNode` and/or polls multiaddr / connection state. They are only
- * used by the `RUN_LONG_TESTS`-gated specs, never by the default unit suite.
+ * Most helpers spin a real Optimystic node (relay or service peer) via
+ * `createLibp2pNode` and/or poll multiaddr / connection state. The one exception is
+ * {@link spawnPlainRelayNode}, which hand-assembles a bare libp2p relay that is NOT a
+ * participant in the Optimystic keyspace — see its doc comment for when that distinction
+ * matters.
  *
  * The `host` parameter exists so the same helpers can drive both the loopback
  * smoke topology (`127.0.0.1`, the default) and a real hole-punch topology where
@@ -13,11 +18,14 @@
  * private/loopback candidate addresses (`isPublicAndDialable`) and will never
  * upgrade a relayed connection over loopback. See `dcutr-direct-upgrade.spec.ts`.
  */
-import type { Libp2p } from 'libp2p';
+import { createLibp2p, type Libp2p } from 'libp2p';
 import type { PeerId } from '@libp2p/interface';
+import { noise } from '@chainsafe/libp2p-noise';
+import { yamux } from '@chainsafe/libp2p-yamux';
 import { webSockets } from '@libp2p/websockets';
 import { tcp } from '@libp2p/tcp';
-import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
+import { identify } from '@libp2p/identify';
+import { circuitRelayServer, circuitRelayTransport } from '@libp2p/circuit-relay-v2';
 import { multiaddr, type Multiaddr } from '@multiformats/multiaddr';
 import { createLibp2pNode, type Libp2pTransports } from '../../src/libp2p-node.js';
 import type { OptimysticNode } from '../../src/optimystic-node.js';
@@ -70,6 +78,45 @@ export async function spawnRelayNode(network: string, opts: SpawnRelayOpts = {})
 		listenAddrs: [`/ip4/${host}/tcp/0`, `/ip4/${host}/tcp/0/ws`],
 		...clusterScaffold(opts.clusterSize)
 	});
+}
+
+/**
+ * A relay that carries circuits but is NOT a participant in the Optimystic keyspace: plain
+ * libp2p, identify under this network's prefix, circuit-relay-v2 server, and no cluster/repo
+ * protocols. Use it when a spec asserts on cohort membership — an Optimystic relay
+ * ({@link spawnRelayNode}) is a serving peer and competes for cohort slots with the peers under
+ * test.
+ *
+ * Concretely: `Libp2pKeyPeerNetwork.findCluster` reserves one cohort slot for self and keeps only
+ * `clusterSize - 1` others, and it admits only peers it has positively classified as *serving*
+ * this network (`membershipOf`). An Optimystic relay advertises `/optimystic/<net>/cluster/1.0.0`
+ * and `/optimystic/<net>/repo/1.0.0`, so it classifies as `serves` and can win that single
+ * non-self slot from the peer the spec actually wants in the cohort — for whichever share of the
+ * keyspace the run's random peer ids happen to give it. This relay advertises neither id, so it
+ * classifies as `foreign` and is dropped from every cohort regardless of peer-id layout.
+ *
+ * The identify prefix is network-scoped so the relay still NEGOTIATES identify with this
+ * network's nodes. That matters: a relay whose identify never negotiated would also be kept out
+ * of the cohort, but as `unknown` (empty protocol list) rather than `foreign` — exclusion for a
+ * reason nobody chose. A spec relying on this helper should assert the intended classification.
+ *
+ * `reservations.applyDefaultLimit: false` matches `spawnRelayNode`'s default: without it the
+ * relay caps each circuit at 128 KiB / 2 min, which resets sustained traffic.
+ */
+export async function spawnPlainRelayNode(network: string, opts: { host?: string } = {}): Promise<Libp2p> {
+	const host = opts.host ?? DEFAULT_HOST;
+	return await createLibp2p({
+		addresses: { listen: [`/ip4/${host}/tcp/0/ws`] },
+		transports: [webSockets()],
+		connectionEncrypters: [noise()],
+		streamMuxers: [yamux()],
+		services: {
+			// Slash-LESS prefix: `@libp2p/identify` builds `/${protocolPrefix}/id/1.0.0` and
+			// prepends the leading slash itself. See `foreign-peer-interop.integration.spec.ts`.
+			identify: identify({ protocolPrefix: `optimystic/${network}` }),
+			relay: circuitRelayServer({ reservations: { applyDefaultLimit: false } })
+		}
+	}) as unknown as Libp2p;
 }
 
 export interface SpawnTcpPeerOpts {
