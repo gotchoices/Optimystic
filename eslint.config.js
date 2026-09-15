@@ -38,8 +38,8 @@ const NO_BUFFER_GLOBAL = {
 // `eslint .` walks the tree from root, so this single config covers every workspace —
 // no per-package fan-out (unlike the build:/test: scripts in package.json).
 //
-// SCOPE: this config is deliberately narrow — it enforces logging discipline plus one
-// React Native bundling constraint. `no-console` is the gate this config was stood up for (route
+// SCOPE: this config is deliberately narrow — it enforces logging discipline plus two
+// React Native constraints (no class static blocks, no `Buffer` global). `no-console` is the gate this config was stood up for (route
 // stray library logging through each package's `debug` logger instead of printing unconditionally),
 // and `no-restricted-syntax` is the follow-on gate that says *which* logger: the channel must
 // come from the package's own `createLogger`, never from libp2p's component logger or a
@@ -101,6 +101,11 @@ export default tseslint.config(
 		rules: {
 			'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_DIRECT_DEBUG_IMPORT, NO_STATIC_BLOCK],
 			'no-restricted-globals': ['error', NO_BUFFER_GLOBAL],
+			// `no-restricted-globals` only sees the bare identifier; close the qualified spellings too.
+			'no-restricted-properties': ['error',
+				{ object: 'globalThis', property: 'Buffer', message: NO_BUFFER_GLOBAL.message },
+				{ object: 'global', property: 'Buffer', message: NO_BUFFER_GLOBAL.message },
+			],
 		},
 	},
 	{

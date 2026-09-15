@@ -752,11 +752,16 @@ describe('block-transfer wire encoding (uint8arrays base64pad, cross-platform)',
 		expect(decoded).to.equal(json);
 	});
 
-	it("encodes to the same padded base64 Buffer's toString('base64') produces (new encoder, old decoder)", () => {
+	it("encodes to exactly the string Buffer's toString('base64') produces, at every padding length (new encoder, old decoder)", () => {
+		// Exact string equality, not a Buffer decode: Buffer's base64 decoder is lenient (it accepts
+		// unpadded or partly-invalid input), so decoding alone would not prove the wire bytes match.
+		// Suffix lengths 0..2 cover all three padding cases ('', '=', '==').
 		const json = JSON.stringify(makeBlock('block-interop-1'));
-		const encoded = u8ToString(u8FromString(json, 'utf8'), 'base64pad');
-		expect(Buffer.from(encoded, 'base64').toString('utf8'), 'a legacy Buffer-based receiver still decodes it')
-			.to.equal(json);
+		for (const suffix of ['', 'x', 'xy']) {
+			const payload = json + suffix;
+			expect(u8ToString(u8FromString(payload, 'utf8'), 'base64pad'), `payload length ${payload.length}`)
+				.to.equal(Buffer.from(payload, 'utf8').toString('base64'));
+		}
 	});
 
 	it('decodes what Buffer.from(json).toString(\'base64\') produces (old encoder, new decoder)', () => {
