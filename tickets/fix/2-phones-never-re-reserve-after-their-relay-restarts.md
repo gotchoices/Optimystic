@@ -4,6 +4,7 @@ files:
   - packages/db-p2p/test/two-phones-over-relay.integration.spec.ts (phase 5 is the reproduction and the acceptance test; `waitForReservations` reports each phone's state on failure)
   - packages/db-p2p/test/util/relay-topology.ts (`spawnRestartablePlainRelay`: stops and restarts a relay under the same key on the same address)
   - docs/architecture.md (§ Supported deployment sizes: states this gap; update it when fixed)
+  - docs/optimystic.md (§ Deployment Targets, "Relay restarts": tells mobile and browser hosts to supervise the reservation; update or remove it when fixed)
   - ../sereus/packages/cadre-core/src/relay-reservation.ts (prior art in the sibling repository: `superviseRelayReservation`, `driveRelayReservation`, `clearRelayFilterEntry`)
 repro: verified
 ----

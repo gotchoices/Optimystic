@@ -713,6 +713,10 @@ export async function createLibp2pNodeBase(
 					capacity: 2048,
 					profile: options.fretProfile ?? ((options.bootstrapNodes?.length ?? 0) > 0 ? 'core' : 'edge'),
 					networkName: options.networkName,
+					// NOTE: FRET's `seedFromBootstraps` seeds the FIRST `/p2p/` id of each entry, so a partner's circuit
+					// address (`<relay>/p2p/<relay>/p2p-circuit/p2p/<partner>`) seeds the relay, not the partner. Harmless
+					// today: the partner is learned once its connection opens, and the relay is classified foreign. If a
+					// phone ever fails to find a partner it was given only as a circuit bootstrap, fix FRET to take the last id.
 					bootstraps: options.bootstrapNodes ?? []
 				});
 				const svc = svcFactory(components) as Libp2pFretService;

@@ -82,7 +82,6 @@ async function startPhone(machine: Machine, relay: RestartablePlainRelay, partne
 	const relayAddress = relay.wsAddr.toString();
 	const partnerAddresses = await Promise.all(partners.map(circuitAddressOf));
 	const node = await startMachine(machine, {
-		port: 0,
 		bootstrapNodes: [relayAddress, ...partnerAddresses],
 		relay: false,
 		transports: [webSockets(), circuitRelayTransport()],
