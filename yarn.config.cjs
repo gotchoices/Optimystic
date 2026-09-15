@@ -56,11 +56,13 @@ module.exports = defineConfig({
 		// different ident, so internal @optimystic/* links are never touched.
 		for (const [ident, range] of Object.entries(SINGLE_RANGE)) {
 			// The blessed range has to sit inside the major the resolved-tree guard
-			// expects, or the two guards would demand contradictory things.
+			// expects, or the two guards would demand contradictory things. Reported
+			// on the root workspace, and never autofixed: `--fix` must not write it.
 			if (ident in SHARED_MAJOR && majorOf(range) !== SHARED_MAJOR[ident]) {
-				throw new Error(
+				Yarn.workspace().error(
 					`yarn.config.cjs pins ${ident} to ${range}, but scripts/shared-majors.cjs expects major ${SHARED_MAJOR[ident]}`
 				)
+				continue
 			}
 			for (const dep of Yarn.dependencies({ ident })) {
 				dep.update(range)
