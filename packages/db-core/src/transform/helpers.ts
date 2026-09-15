@@ -103,6 +103,9 @@ export function concatTransforms(...transforms: Transforms[]): Transforms {
  * the object/array reference, causing mutations (e.g. `applyTransform` mutating `insert` in place
  * when `updates` ride along) to affect the original Transforms.
  * @see docs/internals.md "Shallow Copy of Transforms" pitfall
+ *
+ * NOTE: clones unconditionally, even for read-only callers (e.g. StorageRepo.pend's classify pass);
+ * if large inserts ever show up in a pend/commit profile, add a non-cloning variant for those callers.
  */
 export function transformForBlockId(transform: Transforms, blockId: BlockId): Transform {
 	return {

@@ -1736,9 +1736,7 @@ Transaction metrics are instrumented with `debug` logging and optional verbose t
 ## Common Pitfalls
 
 ### 1. Shallow Copy of Transforms
-**Bug**: `copyTransforms()` spreads `updates` object but arrays inside are shared; the same
-applies to `inserts[blockId]` blocks, which `applyTransform` can mutate in place when `updates`
-ride along. `transformForBlockId()` deep-clones both `insert` and `updates` for this reason.
+**Bug**: `copyTransforms()` spreads `updates` object but arrays inside are shared; the same applies to `inserts[blockId]` blocks, which `applyTransform` can mutate in place when `updates` ride along. `transformForBlockId()` deep-clones both `insert` and `updates` for this reason.
 ```typescript
 // WRONG
 { updates: { ...transform.updates } }  // Arrays still shared!

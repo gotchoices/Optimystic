@@ -151,8 +151,7 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 			return undefined;                              // delete-last-wins: materializes to nothing
 		}
 		if (transform.insert) {
-			// transformForBlockId already deep-clones `insert`, so this is safe to mutate via
-			// applyTransform without corrupting the staged transform.
+			// No clone needed: transformForBlockId already deep-cloned `insert`, which applyTransform mutates.
 			const block = applyTransform(undefined, transform);
 			return block ? { block } : undefined;
 		}
