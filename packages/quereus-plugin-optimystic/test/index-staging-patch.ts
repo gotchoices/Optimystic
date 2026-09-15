@@ -63,15 +63,27 @@ export async function withIndexStagingPatched(
 	}
 }
 
-/** IndexManager's prototype, via the live IndexManager of `main.<table>`. */
-function indexManagerPrototype(plugin: Plugin, table: string): Record<IndexStagingMethod, IndexStagingImpl> {
+/** The slice of a live IndexManager a test reaches for: one index's tree, to stage into. */
+export interface LiveIndexManager {
+	getIndexTree(name: string): { stage(actions: unknown[]): Promise<void>; sync(): Promise<void> } | undefined;
+}
+
+/**
+ * The live IndexManager of `main.<table>`, through the module's table cache (the class is not
+ * exported). Throws for a table no statement has initialized yet.
+ */
+export function liveIndexManager(plugin: Plugin, table: string): LiveIndexManager {
 	const module = plugin.vtables[0]!.module as unknown as {
-		tables: Map<string, { indexManager?: object }>;
+		tables: Map<string, { indexManager?: LiveIndexManager }>;
 	};
 	const key = `main.${table}`.toLowerCase();
 	const manager = module.tables.get(key)?.indexManager;
 	if (manager === undefined) {
-		throw new Error(`withIndexStagingPatched: no initialized Optimystic table '${key}'`);
+		throw new Error(`no initialized Optimystic table '${key}'`);
 	}
-	return Object.getPrototypeOf(manager) as Record<IndexStagingMethod, IndexStagingImpl>;
+	return manager;
+}
+
+function indexManagerPrototype(plugin: Plugin, table: string): Record<IndexStagingMethod, IndexStagingImpl> {
+	return Object.getPrototypeOf(liveIndexManager(plugin, table)) as Record<IndexStagingMethod, IndexStagingImpl>;
 }

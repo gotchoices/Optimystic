@@ -58,7 +58,9 @@ export interface MissingIndexEntry extends DecodedIndexTreeKey {
  *   - `stale-value` — it resolves to a row whose current values imply a DIFFERENT tree key
  *     (the row's indexed value changed without the entry following);
  *   - `malformed` — its stored primary key is not the primary-key half of its own tree key, so
- *     where the entry sits and the row a seek resolves it to disagree.
+ *     where the entry sits and the row a seek resolves it to disagree. At a row's own tree key
+ *     it also hides that row from lookups, but the tree does hold the key, so it is reported
+ *     once, here, and not also as missing.
  */
 export type OrphanReason = 'no-row' | 'stale-value' | 'malformed';
 

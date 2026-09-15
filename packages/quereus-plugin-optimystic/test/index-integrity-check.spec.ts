@@ -16,7 +16,7 @@ import { Database } from '@quereus/quereus';
 import register from '../dist/plugin.js';
 import { encodeKeyTuple, uniqueEnforcementTreeName } from '../dist/index.js';
 import type { IndexIntegrityReport } from '../dist/index.js';
-import { stageNothing, withIndexStagingPatched } from './index-staging-patch.js';
+import { liveIndexManager, stageNothing, withIndexStagingPatched } from './index-staging-patch.js';
 
 type Plugin = ReturnType<typeof register>;
 
@@ -231,28 +231,50 @@ describe('verifyIndexes (two-way index-versus-table check)', () => {
 		expect(report!.orphaned).to.deep.equal([]);
 	});
 
-	it('reports an entry whose stored primary key is not the one its tree key encodes as malformed', async () => {
-		await createUsage();
-		// No write path produces this, so stage it straight into the tree: it sits at tok-q‖1 but
-		// resolves to row 2.
-		const module = plugin.vtables[0]!.module as unknown as {
-			tables: Map<string, {
-				indexManager?: {
-					getIndexTree(name: string): { stage(actions: unknown[]): Promise<void>; sync(): Promise<void> } | undefined;
-				};
-			}>;
-		};
-		const tree = module.tables.get('main.usage')?.indexManager?.getIndexTree('usage_by_token');
-		expect(tree, 'the usage_by_token tree').to.not.equal(undefined);
-		const treeKey = encodeKeyTuple(['tok-q']) + encodeKeyTuple(['1']);
-		const storedPrimaryKey = encodeKeyTuple(['2']);
+	/** Write one entry straight into `index`'s tree. No write path produces a malformed entry. */
+	async function stageRawEntry(table: string, index: string, treeKey: string, storedPrimaryKey: string): Promise<void> {
+		const tree = liveIndexManager(plugin, table).getIndexTree(index);
+		expect(tree, `the ${index} tree`).to.not.equal(undefined);
 		await tree!.stage([[treeKey, [treeKey, storedPrimaryKey]]]);
 		await tree!.sync();
+	}
+
+	it('reports an entry whose stored primary key is not the one its tree key encodes as malformed', async () => {
+		await createUsage();
+		// It sits at tok-q‖1 but resolves to row 2.
+		const treeKey = encodeKeyTuple(['tok-q']) + encodeKeyTuple(['1']);
+		const storedPrimaryKey = encodeKeyTuple(['2']);
+		await stageRawEntry('Usage', 'usage_by_token', treeKey, storedPrimaryKey);
 
 		const report = await usageReport();
 		expect(orphans(report)).to.deep.equal([{ reason: 'malformed', value: ['tok-q'], pk: ['1'] }]);
 		expect(report.orphaned[0]!.primaryKey).to.equal(storedPrimaryKey);
 		expect(report.missing).to.deep.equal([]);
+	});
+
+	it('reports a malformed entry at a row\'s own tree key once, as malformed and not also missing', async () => {
+		await createUsage();
+		// Overwrite row 3's entry in place: still at tok-b‖3, now resolving to row 1.
+		const treeKey = encodeKeyTuple(['tok-b']) + encodeKeyTuple(['3']);
+		await stageRawEntry('Usage', 'usage_by_token', treeKey, encodeKeyTuple(['1']));
+
+		const report = await usageReport();
+		expect(orphans(report)).to.deep.equal([{ reason: 'malformed', value: ['tok-b'], pk: ['3'] }]);
+		expect(report.missing).to.deep.equal([]);
+		expect([report.rowCount, report.entryCount]).to.deep.equal([4, 4]);
+	});
+
+	it('reports no indexes for a table with none, and an index over an empty table as clean', async () => {
+		await db.exec(`create table Bare (Id integer primary key, Token text null) using optimystic('tree://integrity/Bare')`);
+		expect(await plugin.verifyIndexes(db, 'Bare')).to.deep.equal([]);
+
+		// Its tree has never been written, so the scan finds nothing and must not throw. The table
+		// name resolves case-insensitively, as it does in SQL.
+		await db.exec(`create index bare_by_token on Bare(Token)`);
+		const reports = await plugin.verifyIndexes(db, 'bare');
+		expect(reports.map(report => report.index)).to.deep.equal(['bare_by_token']);
+		expectClean(reports);
+		expect([reports[0]!.rowCount, reports[0]!.entryCount]).to.deep.equal([0, 0]);
 	});
 
 	it('includes an open transaction\'s staged writes, and is clean before and after a rollback', async () => {

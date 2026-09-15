@@ -733,7 +733,7 @@ for (const report of reports) {
 |---|---|
 | `no-row` | No row has the entry's primary key. The row was deleted, or moved to another primary key, and its entry stayed. |
 | `stale-value` | A row has that primary key but a different value in the indexed columns; `currentRow` shows it. The row's value changed and its entry did not follow. |
-| `malformed` | The primary key stored in the entry is not the one its own position in the tree encodes. No write path produces this; suspect corruption or a key-format change. |
+| `malformed` | The primary key stored in the entry is not the one its own position in the tree encodes. No write path produces this; suspect corruption or a key-format change. Sitting at a row's own position, it also hides that row from lookups; it is reported once, here, not also under `missing`. |
 
 Every discrepancy carries `indexPayloads` and `primaryKeyPayloads`, the entry's key decoded back into values (`null` for SQL NULL), so it can be matched to a row by eye. A number reads differently in the two halves: `5.000000000000000e+0` in the index half, `5` in the primary-key half.
 
