@@ -138,7 +138,7 @@ Shared cross-package deps are version-guarded twice, and the two guards look at 
 
 Minor drift within a major is allowed and, for `@libp2p/interface` 3.1 vs 3.2, deliberate — `scripts/shared-majors.cjs` explains why, and why `multiformats` and `uint8arraylist` are left off the list. After changing any such dep, run `yarn lint:deps`. Neither guard says anything about the libp2p version a *remote* peer was built against: a relay or bootstrap node from another repository has its own lockfile, invisible to every check here.
 
-A third guard, also chained into `yarn lint:deps`, checks a different failure mode: `scripts/check-undeclared-deps.mjs` scans every workspace's `src/` and `test/` for bare imports and fails if the imported package is not declared in that workspace's own `package.json`. An import like that can build locally only because another workspace happens to hoist a copy into a shared `node_modules`, which is not guaranteed by any install layout — see `a-package-can-import-a-dependency-it-does-not-declare` for the case that prompted it.
+A third guard, also chained into `yarn lint:deps`, checks a different failure mode: `scripts/check-undeclared-deps.mjs` scans every tracked JS/TS file in each workspace (`src/`, `test/`, and root config files) for bare imports and fails if the imported package is not declared in that workspace's own `package.json`. An import like that can build locally only because another workspace happens to hoist a copy into a shared `node_modules`, which is not guaranteed by any install layout — see `a-package-can-import-a-dependency-it-does-not-declare` for the case that prompted it.
 
 ## Tickets (tess)
 

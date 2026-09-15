@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Undeclared-dependency guard — fails when a workspace's `src/` or `test/` imports a package that
- * workspace's own `package.json` never lists.
+ * Undeclared-dependency guard — fails when a workspace's source, tests or config files import a
+ * package that workspace's own `package.json` never lists.
  *
  * `packages/db-core/test/reactivity/recover.spec.ts` imported `@noble/curves/ed25519.js` while
  * `db-core`'s manifest declared only `@noble/hashes`. It built anyway, because the tree's untracked
@@ -13,8 +13,9 @@
  * TypeScript resolves through whatever `node_modules` layout it is given, and `yarn constraints`
  * only looks at declared ranges, never at what source actually imports.
  *
- * This script reads every workspace's own manifest, walks that workspace's `src/` and `test/` for
- * static import/re-export/dynamic-import/require specifiers, and flags any bare (non-relative,
+ * This script reads every workspace's own manifest, walks every tracked JS/TS file under that
+ * workspace (`src/`, `test/`, and root files like `register.mjs` or `tsup.config.ts`) for static
+ * import/re-export/dynamic-import/require specifiers, and flags any bare (non-relative,
  * non-builtin) specifier whose package name is not in that workspace's `dependencies`,
  * `devDependencies`, `peerDependencies` or `optionalDependencies`.
  *
@@ -47,10 +48,11 @@ function trackedFiles() {
 		stderr.write(`  ${err && err.message ? err.message : String(err)}\n`);
 		exit(1);
 	}
-	return raw.split('\0').filter(Boolean).map((p) => p.replace(/\\/g, '/'));
+	// A conflicted merge lists a path once per index stage; dedupe so it is not reported three times.
+	return [...new Set(raw.split('\0').filter(Boolean).map((p) => p.replace(/\\/g, '/')))];
 }
 
-const SOURCE_FILE_RE = /^packages\/([^/]+)\/(?:src|test)\/.*\.(?:ts|tsx|mts|cts|mjs|js|jsx)$/;
+const SOURCE_FILE_RE = /^packages\/([^/]+)\/.*\.(?:ts|tsx|mts|cts|mjs|cjs|js|jsx)$/;
 
 /** The Node builtins a bare specifier may legitimately name, with or without the `node:` prefix. */
 const BUILTIN_NAMES = new Set(builtinModules.filter((m) => !m.startsWith('_')));
@@ -68,24 +70,25 @@ const DYNAMIC_IMPORT_RE = /\bimport\(\s*['"]([^'"]+)['"]/g;
 // `require('x')` — this repo is ESM-first, but a stray CommonJS require is still worth catching.
 const REQUIRE_RE = /\brequire\(\s*['"]([^'"]+)['"]/g;
 
+// Quoted strings, template literals, line comments and block comments, matched in one left-to-right
+// pass so whichever opens first wins — a backtick inside a `//` comment, or `/*` inside a glob
+// string, cannot swallow the real code that follows it.
+const LEXEME_RE = /'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`|\/\/[^\n]*|\/\*[\s\S]*?\*\//g;
+
 /**
- * Blank `/* ... *\/` block comments and `` ` ... ` `` template literals, preserving line breaks and
- * length. Both host free-form prose that can accidentally read as an import statement — a JSDoc
- * `{@link import("pkg").thing}`, or a spec's fixture array of import-syntax strings used to test an
- * import-detecting regex (`packages/db-core/test/no-fret-import.spec.ts` does exactly this). Plain
- * `'...'`/`"..."` strings are left alone: that is the actual shape a real import specifier takes, so
- * blanking those would blind the check to the imports it exists to catch.
+ * Blank comments and template literals, preserving line breaks and length. Both host free-form prose
+ * that can read as an import statement — a JSDoc `{@link import("pkg").thing}`, or a spec's fixture
+ * array of import-syntax strings (`packages/db-core/test/no-fret-import.spec.ts`). Plain
+ * `'...'`/`"..."` strings are kept: that is the shape a real import specifier takes.
  *
- * Deliberately not comment/string-aware beyond this: a `//` line comment and a regex literal
- * containing quote characters (`no-fret-import.spec.ts`'s own `IMPORT_RE`) are left as plain text.
- * That is a known false-positive source, not a silent gap — it only ever adds a finding to chase
- * down, never hides an undeclared dependency.
+ * NOTE: regex literals are not recognised. One containing a quote is harmless (at worst the rest of
+ * its line reads as a string), but one containing a backtick, `//` or `/*` can blank real code after
+ * it and hide an import. None do today — the extracted specifiers matched TypeScript's
+ * `ts.preProcessFile` on every scanned file at review time; if a miss is ever suspected, re-run that
+ * comparison, or switch extraction to `ts.preProcessFile` outright.
  */
 function stripCommentsAndTemplates(text) {
-	const blank = (m) => m.replace(/[^\n]/g, ' ');
-	return text
-		.replace(/\/\*[\s\S]*?\*\//g, blank)
-		.replace(/`(?:\\.|[^`\\])*`/g, blank);
+	return text.replace(LEXEME_RE, (m) => (m[0] === "'" || m[0] === '"' ? m : m.replace(/[^\n]/g, ' ')));
 }
 
 function extractSpecifiers(text) {
@@ -121,6 +124,16 @@ function declaredNames(manifest) {
 
 // -- The check -------------------------------------------------------------------------------
 
+/** File text, or null for a path git still indexes but the working tree has deleted (not yet staged). */
+function readSource(file) {
+	try {
+		return readFileSync(file, 'utf8');
+	} catch (err) {
+		if (err.code === 'ENOENT') return null;
+		throw err;
+	}
+}
+
 function run() {
 	const tracked = trackedFiles();
 	const byPackage = new Map();
@@ -133,7 +146,7 @@ function run() {
 	}
 
 	if (byPackage.size === 0) {
-		stderr.write('check-undeclared-deps: found zero packages/*/{src,test} files to scan. That is a bug in\n');
+		stderr.write('check-undeclared-deps: found zero packages/* JS/TS files to scan. That is a bug in\n');
 		stderr.write('this script, not a clean tree — refusing to report success.\n');
 		exit(1);
 	}
@@ -153,8 +166,10 @@ function run() {
 		const declared = declaredNames(manifest);
 
 		for (const file of files) {
+			const raw = readSource(file);
+			if (raw === null) continue;
 			filesScanned++;
-			const text = stripCommentsAndTemplates(readFileSync(file, 'utf8'));
+			const text = stripCommentsAndTemplates(raw);
 			for (const specifier of extractSpecifiers(text)) {
 				const pkgName = packageNameOf(specifier);
 				if (pkgName === null || declared.has(pkgName)) continue;
@@ -178,7 +193,7 @@ function run() {
 
 if (argv.includes('--help') || argv.includes('-h')) {
 	stdout.write('Usage: node scripts/check-undeclared-deps.mjs\n\n');
-	stdout.write('Checks that every bare import in a workspace\'s src/ or test/ names a package that\n');
+	stdout.write('Checks that every bare import in a workspace\'s tracked JS/TS files names a package that\n');
 	stdout.write('workspace\'s own package.json declares, or a Node builtin. Exits non-zero, naming the\n');
 	stdout.write('offending imports, when one is not. See AGENTS.md § Dependencies.\n');
 	exit(0);
