@@ -423,9 +423,8 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 			// "I hold nothing", so the absent stays authoritative — which is exactly why
 			// ClusterLatestCallback implementations must REJECT on transport failure rather
 			// than swallow (see the type's doc comment). Pinned so the boundary is explicit.
-			// It is not remembered afterwards: only a cohort of one settles an absence for a window
-			// (ticket a-block-we-do-not-hold-is-consulted-on-every-read), so on this two-member cohort
-			// the next read asks again.
+			// It is not remembered afterwards: no absence is (ticket drop-the-settled-absence-memo),
+			// so the next read asks again.
 			const swallowing: ClusterLatestCallback = async () => {
 				try {
 					throw new Error('dial failed');

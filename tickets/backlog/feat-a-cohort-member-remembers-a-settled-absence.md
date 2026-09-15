@@ -1,6 +1,7 @@
-description: On a network of several machines, a read of a record that has not been created yet still asks the other machines every single time; a one-machine deployment now remembers the answer for ten seconds, but doing the same with several machines served a just-written record as missing, so it was switched off until a machine can tell when another machine's write reaches it.
+description: A read of a record that has not been created yet asks the other machines every single time. Remembering that answer served a just-written record as missing, first with several machines and then on one machine whose view of the network later grew, so no deployment remembers it until a machine can tell when another machine's write reaches it.
 files:
-  - packages/db-p2p/src/repo/coordinator-repo.ts (`settledAbsences`, `fetchBlockFromCluster`'s `!corroborated` exit returning `absenceSettled: false`, `forgetSettledAbsences`)
+  - packages/db-p2p/src/repo/coordinator-repo.ts (`get`'s per-block consult decision; the memo sites this ticket first named were removed by `drop-the-settled-absence-memo`)
+  - packages/db-p2p/test/coordinator-repo-absence-write-bypass.spec.ts (the gate any future memo must pass)
   - packages/db-p2p/src/cluster/cluster-repo.ts (`applyConsensusOperation` — the cohort-member write path that bypasses the coordinator)
   - packages/db-p2p/src/storage/storage-repo.ts (`get` reports a pending-only block as `{ state: {} }`, hiding the in-flight write)
   - packages/db-p2p/test/coordinator-repo-absence-window.spec.ts
@@ -37,3 +38,9 @@ A member that received neither the pend nor the commit when the writer was ackno
 
 - Scenario B of `fresh-node-ddl-multi.spec.ts` passes in a loop (say 40 runs) with the multi-peer memo armed.
 - The three-member cases in `coordinator-repo-absence-window.spec.ts` flip back to "settles for one window", plus a case where a cohort-member pend lands inside a settled window and the next read consults.
+
+## Update: the one-machine memo was removed too (GitHub issue #20)
+
+The one-machine memo this ticket's background describes no longer exists either (ticket `drop-the-settled-absence-memo`, 2026-09-15). A node whose view was self-only remembered an absence, its view then grew to include the peers another coordinator had just committed the block on, and it served that block as never created — the reporter's query opened "no such tree" 158 ms after the write. Today no deployment remembers an absence: every read of a block missing locally consults its cohort, and the code sites named in `files:` (`settledAbsences`, `absenceSettled`, `forgetSettledAbsences`) are gone; the consult decision lives in `CoordinatorRepo.get`'s per-block loop.
+
+Any future absence memo, one-machine or multi-machine, must be bound to the cohort view it was settled under (serve it only while `findCluster` still returns the same peers) and be cleared by every writer of this node's storage, the cohort-member path through `ClusterRepo.applyConsensusOperation` included. `packages/db-p2p/test/coordinator-repo-absence-write-bypass.spec.ts` is the gate it must pass, alongside Scenario B above. Note for triage: on a cohort of one the work such a memo saves is one cohort lookup per read (0.009 ms measured on the real key network), so the case for bringing one back rests on multi-machine consults, not on one-machine deployments.

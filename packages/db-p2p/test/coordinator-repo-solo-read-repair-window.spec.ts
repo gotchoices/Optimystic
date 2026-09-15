@@ -232,21 +232,23 @@ describe('CoordinatorRepo solo-cohort read-repair window', () => {
 		expect(callbackInvocations).to.include(newPeer.toString());
 	});
 
-	it('suppresses reads of a block this node does not hold through its OWN absence memo, not this stamp', async () => {
-		// The solo exit stamps whatever block id reached it into `lastSeenCommitMs`, INCLUDING one
-		// that is missing locally. That stamp stays inert for a missing block: `get` decides a
-		// missing block's consult by `absenceIsSettled`, which reads `settledAbsences` (armed only
-		// when a consult SETTLED the absence), never `lastSeenCommitMs` — and `shouldReadRepair` is
-		// asked only about present blocks. It has to stay that way, because `lastSeenCommitMs` is
-		// also stamped for missing blocks whose absence is NOT confirmed (a claimed revision this
-		// node could not acquire), and reading it would serve those as authoritative absents for a
-		// whole window. Here the absence genuinely is settled — on a cohort of one nobody else could
-		// hold the block — so nine reads inside the window cost one consult (ticket
-		// a-block-we-do-not-hold-is-consulted-on-every-read; this was nine before it).
+	it('a missing block is never suppressed by the held-block stamp', async () => {
+		// The solo exit stamps the block id that reached it into `lastSeenCommitMs`, INCLUDING one that
+		// is missing locally. That stamp is inert for a missing block: `get` asks `shouldReadRepair`
+		// only about present blocks and consults on every read of a missing one. It has to stay that
+		// way. `lastSeenCommitMs` is also stamped for missing blocks whose absence is NOT confirmed (a
+		// claimed revision this node could not acquire), and a stamp that suppressed a missing block's
+		// consult would be the absence memo GitHub issue #20 removed (ticket
+		// drop-the-settled-absence-memo) under another name.
 		const localPeer = await makePeerId();
 		const cluster = makeClusterPeers([localPeer]);
+		const mutable = makeMutableKeyNetwork(cluster);
+		let lookups = 0;
 		const repo = new CoordinatorRepo(
-			makeMutableKeyNetwork(cluster),
+			{
+				findCoordinator: (key, options) => mutable.findCoordinator(key, options),
+				findCluster: key => { lookups++; return mutable.findCluster(key); }
+			},
 			makeClusterClient,
 			makeEmptyStorageRepo(),
 			{ clusterSize: 3, readRepairMode: 'lazy', readRepairWindowMs: WINDOW_MS, readRepairSampleRate: 0 },
@@ -265,8 +267,9 @@ describe('CoordinatorRepo solo-cohort read-repair window', () => {
 			}
 		});
 
-		expect(countTag(captured, 'cluster-fetch:solo-self-skip'),
-			'a settled absence consults once per window, like held content').to.equal(1);
+		expect(lookups, 'the proximity check (cached) plus one consult lookup per read, stamp or no stamp').to.equal(1 + 9);
+		// The line itself is rate-limited to once per window for a block this node does not hold.
+		expect(countTag(captured, 'cluster-fetch:solo-self-skip')).to.equal(1);
 		// Not a stale-content decision, so it is not read-repair: the triggered/no-op pair belongs
 		// to the present-but-possibly-stale path only.
 		expect(countTag(captured, 'cluster-tx:read-repair-triggered')).to.equal(0);

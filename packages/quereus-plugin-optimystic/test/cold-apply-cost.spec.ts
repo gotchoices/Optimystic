@@ -266,12 +266,15 @@ const SMALL_X3 = { tables: 27, indexes: 39 };
  * other 51 / 141 / 139 are almost all the coordinator side of `CoordinatorRepo.get` —
  * `isResponsibleForBlock`'s proximity check and `fetchBlockFromCluster`'s cohort consult, one each
  * per distinct block read — plus a fixed five on the commit path; none is reachable from
- * `mesh.keyNetwork`. Per-object cohort lookups: 54/22, 144/67, 142/66.
+ * `mesh.keyNetwork`. Per-object cohort lookups: 54/22, 144/67, 142/66. 2026-09-15, after the
+ * absence memo was removed (ticket drop-the-settled-absence-memo): 59/22, 149/67, 147/66 — a fixed
+ * five more per apply at every scale, the repeat reads of blocks that do not exist yet, each of
+ * which now pays its consult's lookup.
  */
 const MEASURED = {
-	small: { callsPerObject: 2.2, commits: 1, findClusterPerObject: 2.45, findClusterTransactorSeam: 3, getsPerObject: 1.3, roundTripsPerObject: 1.8 },
-	large: { callsPerObject: 1.4, commits: 1, findClusterPerObject: 2.15, findClusterTransactorSeam: 3, getsPerObject: 1.1, roundTripsPerObject: 1.9 },
-	scaled: { callsPerObject: 1.4, commits: 1, findClusterPerObject: 2.15, findClusterTransactorSeam: 3, getsPerObject: 1.1, roundTripsPerObject: 1.5 },
+	small: { callsPerObject: 2.2, commits: 1, findClusterPerObject: 2.68, findClusterTransactorSeam: 3, getsPerObject: 1.3, roundTripsPerObject: 1.8 },
+	large: { callsPerObject: 1.4, commits: 1, findClusterPerObject: 2.22, findClusterTransactorSeam: 3, getsPerObject: 1.1, roundTripsPerObject: 1.9 },
+	scaled: { callsPerObject: 1.4, commits: 1, findClusterPerObject: 2.23, findClusterTransactorSeam: 3, getsPerObject: 1.1, roundTripsPerObject: 1.5 },
 };
 
 /**
@@ -348,11 +351,13 @@ describe('cold `apply schema` cost through the coordinated commit path', functio
 		// the part that actually scales with schema size, so gate 4 missed 51 / 141 / 139 of the
 		// 54 / 144 / 142 real lookups. See ticket `cold-apply-gate-counts-every-cohort-lookup`.
 		//
-		// TIMING: the coordinator side is two lookups per distinct block only because both are
-		// memoized within a window — the proximity check by the 60 s `responsibilityCache`, the
-		// consult of a missing block by the solo absence memo's 10 s `readRepairWindowMs`. An apply
-		// takes ~200 ms, far inside both. If this trips on a pathologically slow host with the extra
-		// lookups all in `CoordinatorRepo.get`, suspect a window expiring mid-apply, not a regression.
+		// TIMING: the coordinator side stays near two lookups per distinct block because the proximity
+		// check is memoized by the 60 s `responsibilityCache` and a held block's consult by the 10 s
+		// read-repair window; an apply takes ~200 ms, far inside both. A block that does not exist yet
+		// is NOT memoized — every read of it pays its consult's lookup (the absence memo was removed by
+		// ticket drop-the-settled-absence-memo, which added a fixed five lookups per apply). If this
+		// trips on a pathologically slow host with the extra lookups all in `CoordinatorRepo.get`,
+		// suspect a window expiring mid-apply, not a regression.
 		//
 		// Sanity check first: if `wrapKeyNetwork` is ever dropped, or something captures the shared
 		// key network before it is applied, `findClusterCalls` silently collapses to the transactor
