@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-09-15T05:52:51.829Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\1-block-transfer-uses-node-only-buffer-global.implement.2026-09-15T05-52-51-827Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: The code that copies blocks between machines uses a Node.js-only built-in to encode them, and that built-in does not exist in React Native unless the app happens to install it. A phone app that follows our setup guide exactly would therefore fail whenever it tries to hand a copy of its data to a backup machine or receive one. Encode with the cross-platform library we already depend on, and add a lint rule so library code cannot use that built-in again.
 files:
   - packages/db-p2p/src/cluster/block-transfer-service.ts (the three `Buffer.from` sites: encoding a pulled block to base64, decoding a pushed block, encoding pushed block bytes)
