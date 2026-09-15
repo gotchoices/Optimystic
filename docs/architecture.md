@@ -249,6 +249,11 @@ settled and are still catching up:
   [cluster.md](../packages/db-p2p/docs/cluster.md) for the recommendation's caveats, including what
   a group of two does and does not protect against (fabrication is caught; withholding is not).
 
+The ordinary growth path runs end to end over real sockets, in exactly the recommended two-machine
+configuration, in `packages/db-p2p/test/small-deployment-lifecycle.integration.spec.ts` (part of
+`yarn test:integration`): one machine writes alone and restarts, a second joins as a backup and must
+end up holding the first one's data locally, both write, one is away for a while, and both restart.
+
 ### Arachnode — concentric storage rings
 
 Long-term storage is organized into nested DHTs where each outer ring partitions the keyspace on one more bit:

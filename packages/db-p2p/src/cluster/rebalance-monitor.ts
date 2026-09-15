@@ -369,6 +369,13 @@ export class RebalanceMonitor implements Startable {
 			clearTimeout(this.debounceTimer)
 		}
 
+		// NOTE: the check samples FRET's cohort once, debounceMs after the last connection event. A joiner
+		// FRET has not admitted by then is not reported grown, and nothing re-checks until the next
+		// connection event outside minRebalanceIntervalMs — so a machine that wrote alone would not push its
+		// blocks to its new backup. Over loopback FRET admits well inside the default (the backup phase of
+		// `small-deployment-lifecycle.integration.spec.ts` lands in ~10s); if a slower link, such as a phone
+		// pair over a relay, ever shows a joiner that never receives the founder's blocks, re-check when FRET
+		// reports the peer instead of on this timer alone.
 		this.debounceTimer = setTimeout(() => {
 			this.debounceTimer = null
 			this.pendingTopologyChange = false

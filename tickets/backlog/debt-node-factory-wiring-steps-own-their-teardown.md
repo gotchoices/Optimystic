@@ -103,3 +103,7 @@ monitor plus a canned reaction result and assert all three hops. Treat that asse
 this ticket's acceptance, not as separate work.
 
 Files this arm adds: `packages/db-p2p/test/rebalance-monitor-node-wiring.spec.ts`.
+
+### Update (2026-09-15): the two-node growth test now exists, and covers only half of this arm
+
+`packages/db-p2p/test/small-deployment-lifecycle.integration.spec.ts` (phase 3) is the two-node real-libp2p growth test described above as too expensive for three lines: a backup joins a machine that wrote alone, and must end up holding that machine's blocks in its own storage. It now covers the *dispatch* half of the reaction handler: by inspection, removing the handler's call to `handleRebalanceEvent` leaves nothing that could give the backup those blocks, so that phase would time out. It does not cover the growth-feedback line: with `recordGrowthOutcome` removed, the first push still lands, so the spec stays green while the monitor quietly re-pushes on every later check. The unit-level assertion this arm asks for is still needed for that line.

@@ -538,10 +538,18 @@ export class BlockTransferCoordinator {
 		return new Promise(resolve => setTimeout(resolve, ms));
 	}
 
+	/**
+	 * Resolve `undefined` if `promise` has not settled within `ms`. The timer is cleared on either
+	 * outcome: left running, it outlived every pull, push and confirm by the full transfer timeout and
+	 * held a stopped node's process open that long (see `withDeadline` in `repo/coordinator-repo.ts`).
+	 */
 	private withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
-		return Promise.race([
-			promise,
-			new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), ms))
-		]);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<undefined>(resolve => {
+			timer = setTimeout(() => resolve(undefined), ms);
+		});
+		return Promise.race([promise, timeout]).finally(() => {
+			if (timer !== undefined) clearTimeout(timer);
+		});
 	}
 }
