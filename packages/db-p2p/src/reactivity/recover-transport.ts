@@ -19,7 +19,8 @@
  *  - {@link createRecoverRequestHandler} / {@link registerRecoverHandler} — the **inbound** serve handler.
  *    Decode (bounded) → verify the request's peer-key signature against the dialing peer → reject a
  *    replay/stale request → resolve the live `PushState` → `serveBackfill` / `serveResume` → reply. Any
- *    failure produces **no reply** (the stream aborts) rather than throwing out of the handler.
+ *    failure **declines** rather than throwing out of the handler: the member sends a zero-length reply (no
+ *    result), and the dialing transport falls through to the next cohort candidate.
  *
  * ## Dial-target encoding bridge (load-bearing)
  *
@@ -60,7 +61,7 @@ import {
 	type CorrelationReplayGuard,
 	type RotationRedirectV1,
 } from "@optimystic/db-core";
-import { requestResponse, handleRequestResponse, DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic/stream-util.js";
+import { requestResponse, handleRequestResponse, NoResultReplyError, DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic/stream-util.js";
 import { verifyPeerSig, signPeerSig } from "../cohort-topic/peer-sig.js";
 import { peerIdToBytes, bytesToPeerIdString } from "../cohort-topic/peer-codec.js";
 import { PROTOCOL_REACTIVITY_RECOVER } from "./protocols.js";
@@ -134,8 +135,12 @@ export class RotationRedirectError extends Error {
 
 /** The wire exchange seam: open the recover protocol to `target`, send `frame`, return the bounded reply. */
 export interface RecoverDialer {
-	/** Exchange one request frame for one reply frame with `target` (peer-id string). Rejects on a dial failure. */
-	exchange(target: string, frame: Uint8Array): Promise<Uint8Array>;
+	/**
+	 * Exchange one request frame for one reply frame with `target` (peer-id string). Resolves `undefined` when
+	 * the member declined (no served state, a failed signature / replay check, an undecodable request) — the
+	 * same contract as {@link requestResponse}. Rejects on a dial failure.
+	 */
+	exchange(target: string, frame: Uint8Array): Promise<Uint8Array | undefined>;
 }
 
 /** Build the production libp2p-backed {@link RecoverDialer} over {@link requestResponse}. */
@@ -162,9 +167,11 @@ export interface Libp2pReactivityRecoverTransportOptions {
 /**
  * The outbound recover transport: one instance per node, exposing the two db-core function seams against it.
  * Each returned transport dials the **sticky primary first** (one round trip after a brief flap), falling
- * back to a **cohort-walk** member on a dial failure (any member that holds the topic's gossiped `PushState`
- * can answer). A kind mismatch or all-targets-failed surfaces as a rejection so the caller's retry/escalation
- * policy (the subscription manager's backfill escalation, or `manager.resume()`'s caller) takes over.
+ * back to a **cohort-walk** member on a dial failure *or* when the dialed member declines (any member that
+ * holds the topic's gossiped `PushState` can answer, so one member with nothing to serve must not end the
+ * walk). A kind mismatch, an undecodable reply, or every target failing / declining surfaces as a rejection
+ * so the caller's retry/escalation policy (the subscription manager's backfill escalation, or
+ * `manager.resume()`'s caller) takes over.
  */
 export class Libp2pReactivityRecoverTransport {
 	private readonly dialer: RecoverDialer;
@@ -206,10 +213,13 @@ export class Libp2pReactivityRecoverTransport {
 	}
 
 	/**
-	 * Exchange one recover frame with the first reachable target: sticky primary, then each cohort-walk
-	 * member. A **dial failure** falls through to the next candidate; a successful dial is **terminal** (the
-	 * member answered for the cohort) — a `kind: "rotated"` redirect throws {@link RotationRedirectError}, and
-	 * a reply decoding to the wrong `kind` is a protocol error. Throws when no candidate succeeds.
+	 * Exchange one recover frame with the first target that answers: sticky primary, then each cohort-walk
+	 * member. A **dial failure** and a **declined** request (the member had no result — no served state, a
+	 * failed signature / replay check, an undecodable request) both fall through to the next candidate. A
+	 * reply frame is **terminal** (the member answered for the cohort): a `kind: "rotated"` redirect throws
+	 * {@link RotationRedirectError}, and a reply that fails to decode or decodes to the wrong `kind` is a
+	 * protocol error. When no candidate answers, throws the last candidate's outcome — a
+	 * {@link NoResultReplyError} if it declined, its dial error if it failed to dial.
 	 */
 	private async exchange(kind: RecoverKind, frame: Uint8Array, topicId: Uint8Array, collectionId: string): Promise<RecoverReplyV1> {
 		const targets = this.selectTargets(topicId, collectionId);
@@ -218,12 +228,21 @@ export class Libp2pReactivityRecoverTransport {
 		}
 		let lastErr: unknown;
 		for (const target of targets) {
-			let replyFrame: Uint8Array;
+			let replyFrame: Uint8Array | undefined;
 			try {
 				replyFrame = await this.dialer.exchange(target, frame);
 			} catch (err) {
 				lastErr = err; // dial failure → fall back to the next candidate (sticky → walk)
 				log("recover dial to %s failed, trying next target: %o", target, err);
+				continue;
+			}
+			if (replyFrame === undefined) {
+				// Declined → fall back to the next candidate, resending the same signed frame.
+				// NOTE: the resend is admissible only because each node's `CorrelationReplayGuard` is node-local
+				// (`RecoverServeDeps.replayGuard`). If the guard is ever shared across a cohort, the retried frame
+				// would be rejected everywhere as a replay, and each fallthrough would need a freshly signed request.
+				lastErr = new NoResultReplyError(`reactivity recover ${kind} from ${target}`);
+				log("recover %s declined by %s, trying next target", kind, target);
 				continue;
 			}
 			const reply = decodeRecoverReplyV1(replyFrame, this.maxBytes); // a decode failure here is terminal
@@ -329,7 +348,7 @@ function serveBackfillReply(deps: RecoverServeDeps, req: BackfillV1, now: number
 	}
 	const ps = deps.pushStateForCollection(req.collectionId);
 	if (ps === undefined) {
-		return undefined; // not a serving member for this collection → no reply (subscriber walks/chain-reads)
+		return undefined; // not a serving member for this collection → decline (the subscriber tries the next member)
 	}
 	const backfillReply = serveBackfill(ps.replayBuffer, req, ps.collectionId);
 	return encodeRecoverReplyV1({ v: 1, kind: "backfill", backfillReply }, maxBytes);
@@ -371,10 +390,8 @@ function serveResumeReply(deps: RecoverServeDeps, req: ResumeV1, now: number): U
  * Build the recover serve callback for {@link handleRequestResponse}: it returns the reply frame, or
  * `undefined` on a decode/verify/replay/resolve failure. It never throws out of the handler.
  *
- * NOTE: `undefined` reaches the dialer as an explicit zero-length frame, and
- * {@link Libp2pReactivityRecoverTransport.exchange} decodes that as a *terminal* protocol error rather
- * than falling through to the next cohort candidate — one member declining ends the whole recover walk.
- * Tracked as `debt-stream-reply-no-result-untyped`.
+ * `undefined` reaches the dialer as a zero-length frame, which {@link requestResponse} resolves as no result
+ * and {@link Libp2pReactivityRecoverTransport} treats as a decline — it tries the next cohort candidate.
  */
 export function createRecoverRequestHandler(deps: RecoverServeDeps): (frame: Uint8Array, fromPeer: PeerId) => Promise<Uint8Array | undefined> {
 	const maxBytes = deps.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
@@ -398,7 +415,7 @@ export function createRecoverRequestHandler(deps: RecoverServeDeps): (frame: Uin
 			return Promise.resolve(serveResumeReply(deps, r, now));
 		} catch (err) {
 			// A malformed/foreign request (decode failure, foreign collectionId from serve*) must never throw
-			// out of the stream handler: log + no reply (a zero-length reply frame; see the note above).
+			// out of the stream handler: log + decline (a zero-length reply; the dialer tries the next member).
 			log("recover serve: dropping request (no reply): %o", err);
 			return Promise.resolve(undefined);
 		}

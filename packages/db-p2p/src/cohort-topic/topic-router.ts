@@ -3,7 +3,7 @@ import { bytesToB64url, b64urlToBytes, encodeCohortMessage } from "@optimystic/d
 import type { Libp2p } from "libp2p";
 import type { FretService, RouteAndMaybeActV1, NearAnchorV1 } from "p2p-fret";
 import { bytesToPeerId } from "./peer-codec.js";
-import { requestResponse, DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
+import { requestResponse, requireReply, DEFAULT_STREAM_MAX_BYTES, type NoResultReplyError } from "./stream-util.js";
 import { PROTOCOL_COHORT_REGISTER } from "./protocols.js";
 
 /** A FRET `routeAct` result carrying a cohort reply. */
@@ -70,8 +70,18 @@ export class FretTopicRouter implements ITopicRouter {
 		return encodeCohortMessage({ v: 1, result: "no_state" }, this.maxBytes);
 	}
 
+	/**
+	 * Dial `member`'s `/register` directly and return its encoded reply.
+	 *
+	 * The `/register` responder always writes a frame, so a no-result (zero-length) reply only comes from a
+	 * non-conforming peer; it rejects with {@link NoResultReplyError}, which the walk and the renewal `send`
+	 * already treat as a failed dial. db-core's {@link ITopicRouter.dialMember} port deliberately stays
+	 * `Promise<Uint8Array>` rather than widening to `| undefined`: that would ripple through the walk and
+	 * renewal decision logic for a state only a misbehaving peer can produce, so the decision is made here.
+	 */
 	async dialMember(member: PeerRef, activity: Uint8Array): Promise<Uint8Array> {
 		const peer = bytesToPeerId(member.id);
-		return requestResponse(this.node, peer, this.registerProtocol, activity, this.maxBytes);
+		const reply = await requestResponse(this.node, peer, this.registerProtocol, activity, this.maxBytes);
+		return requireReply(reply, "cohort-topic register dial");
 	}
 }

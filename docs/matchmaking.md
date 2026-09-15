@@ -919,7 +919,7 @@ Throughout, the root cohort's load is bounded: registration storms get `Promoted
 > over `/optimystic/matchmaking/1.0.0/query`): test 5b has a **remote** node dial the routed primary with an
 > encoded `QueryV1` and asserts the decoded `QueryReplyV1` carries the provider entry (with a forwardable
 > `registrationSig` re-validated end-to-end via `verifyProviderEntry`), the cohort's `topicTraffic` snapshot,
-> and the node's single-member reply signature — plus the **no-reply** (0-byte frame) DoS-guard path for a
+> and the node's single-member reply signature — plus the **no-reply** DoS-guard path (a zero-length frame, which `requestResponse` resolves as `undefined`) for a
 > topic the dialed node serves no engine for.
 >
 > The **outbound seeker hang-out walk** is now live too (`createLibp2pMatchmakingTransport`,

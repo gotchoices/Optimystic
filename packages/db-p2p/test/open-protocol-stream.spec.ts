@@ -22,7 +22,7 @@ describe('openProtocolStream: connection selection across every entry point', ()
 	const FRAME = new Uint8Array([1]);
 
 	/** A stream that accepts a frame and yields one framed empty body (a lone `0x00` varint prefix),
-	 * so `requestResponse`'s `readFramed` resolves with an empty reply rather than a truncation error. */
+	 * so `requestResponse` resolves a no-result reply (`undefined`) rather than a truncation error. */
 	function makeStream() {
 		return {
 			send: () => {},

@@ -26,11 +26,15 @@ import {
 import { createStickyCohortHintCache } from '@optimystic/db-core';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
 import { signPeer } from '../../src/cohort-topic/peer-sig.js';
+import { NoResultReplyError } from '../../src/cohort-topic/stream-util.js';
+import { MockNode } from '../../src/testing/cohort-topic-mesh-harness.js';
 import { PROTOCOL_REACTIVITY_RECOVER } from '../../src/reactivity/protocols.js';
 import {
 	Libp2pReactivityRecoverTransport,
+	createLibp2pRecoverDialer,
 	createRecoverRequestHandler,
 	decodeCohortHintTarget,
+	registerRecoverHandler,
 	RotationRedirectError,
 	type RecoverDialer,
 	type RecoverServeDeps,
@@ -297,16 +301,16 @@ describe('reactivity recover — inbound serve handler', () => {
 });
 
 describe('reactivity recover — outbound transport', () => {
-	/** A dialer that pipes the frame straight through `handler` with `peerId` as the dialing peer. */
+	/**
+	 * A dialer that pipes the frame straight through `handler` with `peerId` as the dialing peer. A declined
+	 * request (`undefined`) passes through unchanged — exactly how `requestResponse` resolves the zero-length
+	 * reply `handleRequestResponse` sends for it.
+	 */
 	function handlerDialer(handler: ReturnType<typeof createRecoverRequestHandler>, dialed: string[] = []): RecoverDialer {
 		return {
 			async exchange(target, frame) {
 				dialed.push(target);
-				const reply = await handler(frame, peerId);
-				if (reply === undefined) {
-					throw new Error('stream aborted (no reply)'); // mirror requestResponse over a dropped reply
-				}
-				return reply;
+				return handler(frame, peerId);
 			},
 		};
 	}
@@ -370,9 +374,7 @@ describe('reactivity recover — outbound transport', () => {
 				async exchange(target, frame) {
 					dialed.push(target);
 					if (target !== walkMember) throw new Error('dial failed (stale primary)');
-					const reply = await goodHandler(frame, peerId);
-					if (reply === undefined) throw new Error('no reply');
-					return reply;
+					return goodHandler(frame, peerId);
 				},
 			},
 			selfPeerId: 'self',
@@ -395,9 +397,7 @@ describe('reactivity recover — outbound transport', () => {
 			dialer: {
 				async exchange(target, frame) {
 					dialed.push(target);
-					const reply = await createRecoverRequestHandler(serveDepsFor(ps))(frame, peerId);
-					if (reply === undefined) throw new Error('no reply');
-					return reply;
+					return createRecoverRequestHandler(serveDepsFor(ps))(frame, peerId);
 				},
 			},
 			selfPeerId: selfStr,
@@ -462,5 +462,271 @@ describe('reactivity recover — outbound transport', () => {
 
 	it('uses the configured recover protocol id for the libp2p dialer default', () => {
 		expect(PROTOCOL_REACTIVITY_RECOVER).to.equal('/optimystic/reactivity/1.0.0/recover');
+	});
+});
+
+describe('reactivity recover — a declining member falls through to the next candidate', () => {
+	/** One member node's handling of an exchanged frame: its reply, or `undefined` when it declines. */
+	type MemberServe = (frame: Uint8Array) => Promise<Uint8Array | undefined>;
+
+	/**
+	 * A dialer routing each target to its member's serve function; a target with no member fails to dial.
+	 * `dialed` records targets in dial order; `outcomes` records what each dial came to.
+	 */
+	function cohortDialer(members: ReadonlyMap<string, MemberServe>, dialed: string[], outcomes: string[]): RecoverDialer {
+		return {
+			async exchange(target, frame) {
+				dialed.push(target);
+				const serve = members.get(target);
+				if (serve === undefined) {
+					outcomes.push(`${target}:dial-failed`);
+					throw new Error(`dial to ${target} failed`);
+				}
+				const reply = await serve(frame);
+				outcomes.push(`${target}:${reply === undefined ? 'declined' : 'replied'}`);
+				return reply;
+			},
+		};
+	}
+
+	/** A member serving `ps` to the request's genuine signer. */
+	function servingMember(ps: PushState = seedPushState([10, 11, 12]), over: Partial<RecoverServeDeps> = {}): MemberServe {
+		const handler = createRecoverRequestHandler(serveDepsFor(ps, over));
+		return (frame) => handler(frame, peerId);
+	}
+
+	/** A member holding no served `PushState` for the collection. */
+	function emptyMember(): MemberServe {
+		const handler = createRecoverRequestHandler({
+			pushStateFor: () => undefined,
+			pushStateForCollection: () => undefined,
+			replayGuard: createCorrelationReplayGuard(),
+			clock: () => FIXED_NOW,
+		});
+		return (frame) => handler(frame, peerId);
+	}
+
+	/** A sticky hint cache whose primary decodes back to the dial target `target`. */
+	function stickyHintFor(target: string): StickyCohortHintCache {
+		const cache = createStickyCohortHintCache();
+		cache.set(COLLECTION, { topicId: bytesToB64url(TOPIC), primary: bytesToB64url(peerIdToBytes(target)), cohortHint: [] });
+		return cache;
+	}
+
+	function transportOver(
+		members: ReadonlyMap<string, MemberServe>,
+		opts: { primary?: string; walk: string[] },
+	): { transport: Libp2pReactivityRecoverTransport; dialed: string[]; outcomes: string[] } {
+		const dialed: string[] = [];
+		const outcomes: string[] = [];
+		const transport = new Libp2pReactivityRecoverTransport({
+			dialer: cohortDialer(members, dialed, outcomes),
+			selfPeerId: 'self',
+			cohortHintCache: opts.primary === undefined ? createStickyCohortHintCache() : stickyHintFor(opts.primary),
+			resolveCohort: () => opts.walk,
+		});
+		return { transport, dialed, outcomes };
+	}
+
+	const backfillReq = (): Promise<BackfillV1> =>
+		signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 12, timestamp: FIXED_NOW });
+
+	const rejectionOf = (p: Promise<unknown>): Promise<unknown> => p.then(() => undefined, (e: unknown) => e);
+
+	/** Every decline reason reachable from `createRecoverRequestHandler`, each built as a member that declines `req`. */
+	const declineReasons: Array<[string, (req: BackfillV1) => Promise<MemberServe>]> = [
+		['it serves no PushState for the collection', () => Promise.resolve(emptyMember())],
+		['the request signature does not verify against the peer it sees dialing', async () => {
+			const handler = createRecoverRequestHandler(serveDepsFor(seedPushState([10, 11, 12])));
+			const stranger = peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
+			return (frame) => handler(frame, stranger);
+		}],
+		['its own replay guard already admitted this exact signed request', async (req) => {
+			const handler = createRecoverRequestHandler(serveDepsFor(seedPushState([10, 11, 12])));
+			const first = await handler(encodeRecoverRequestV1({ v: 1, kind: 'backfill', backfill: req }), peerId);
+			expect(first, 'the member admitted the request once before').to.not.equal(undefined);
+			return (frame) => handler(frame, peerId);
+		}],
+		['it cannot decode the request (its frame ceiling is below the request size)', () => {
+			const handler = createRecoverRequestHandler(serveDepsFor(seedPushState([10, 11, 12]), { maxBytes: 8 }));
+			return Promise.resolve((frame: Uint8Array) => handler(frame, peerId));
+		}],
+	];
+
+	for (const [reason, makeDecliner] of declineReasons) {
+		it(`backfill: the first member declines because ${reason}; the second serves (2 dials)`, async () => {
+			const req = await backfillReq();
+			const members = new Map<string, MemberServe>([['member-a', await makeDecliner(req)], ['member-b', servingMember()]]);
+			const { transport, outcomes } = transportOver(members, { walk: ['member-a', 'member-b'] });
+
+			const reply = await transport.backfillTransport(TOPIC, COLLECTION)(req);
+
+			expect(reply.entries.map((e) => e.revision)).to.deep.equal([11, 12]);
+			expect(outcomes, 'member-a declined (not a dial failure), then member-b replied').to.deep.equal(['member-a:declined', 'member-b:replied']);
+		});
+	}
+
+	it('resume: a declining member falls through to the next, which classifies the resume', async () => {
+		const req = await signResume({ v: 1, collectionId: COLLECTION, fromRevision: 12, latestKnownTailId: TAIL, subscriberCoord: COLLECTION, timestamp: FIXED_NOW });
+		const members = new Map<string, MemberServe>([['member-a', emptyMember()], ['member-b', servingMember(seedPushState([10, 11, 12, 13, 14]))]]);
+		const { transport, outcomes } = transportOver(members, { walk: ['member-a', 'member-b'] });
+
+		const reply = await transport.resumeTransport(TOPIC, COLLECTION)(req);
+
+		expect(reply.result).to.equal('backfill');
+		expect(outcomes).to.deep.equal(['member-a:declined', 'member-b:replied']);
+	});
+
+	it('the sticky primary declines, then a cohort-walk member serves', async () => {
+		const members = new Map<string, MemberServe>([['primary', emptyMember()], ['walk-member', servingMember()]]);
+		const { transport, dialed } = transportOver(members, { primary: 'primary', walk: ['walk-member'] });
+
+		const reply = await transport.backfillTransport(TOPIC, COLLECTION)(await backfillReq());
+
+		expect(reply.entries.map((e) => e.revision)).to.deep.equal([11, 12]);
+		expect(dialed, 'the primary is dialed first, then the walk member').to.deep.equal(['primary', 'walk-member']);
+	});
+
+	it('mixed: the primary declines, walk member A fails to dial, walk member B serves (3 dials)', async () => {
+		// walk-a has no node, so its dial fails.
+		const members = new Map<string, MemberServe>([['primary', emptyMember()], ['walk-b', servingMember()]]);
+		const { transport, outcomes } = transportOver(members, { primary: 'primary', walk: ['walk-a', 'walk-b'] });
+
+		const reply = await transport.backfillTransport(TOPIC, COLLECTION)(await backfillReq());
+
+		expect(reply.entries.map((e) => e.revision)).to.deep.equal([11, 12]);
+		expect(outcomes).to.deep.equal(['primary:declined', 'walk-a:dial-failed', 'walk-b:replied']);
+	});
+
+	it('every candidate declines: rejects with NoResultReplyError after dialing each once', async () => {
+		const members = new Map<string, MemberServe>([['primary', emptyMember()], ['walk-a', emptyMember()], ['walk-b', emptyMember()]]);
+		const { transport, dialed } = transportOver(members, { primary: 'primary', walk: ['walk-a', 'walk-b'] });
+
+		const err = await rejectionOf(transport.backfillTransport(TOPIC, COLLECTION)(await backfillReq()));
+
+		expect(err).to.be.instanceOf(NoResultReplyError);
+		expect(dialed, 'each candidate dialed exactly once').to.deep.equal(['primary', 'walk-a', 'walk-b']);
+	});
+
+	it('when the last candidate failed to dial, the rejection is that dial error', async () => {
+		// walk-b has no node, so its dial fails after walk-a declines.
+		const members = new Map<string, MemberServe>([['walk-a', emptyMember()]]);
+		const { transport, dialed } = transportOver(members, { walk: ['walk-a', 'walk-b'] });
+
+		const err = await rejectionOf(transport.backfillTransport(TOPIC, COLLECTION)(await backfillReq()));
+
+		expect(err).to.not.be.instanceOf(NoResultReplyError);
+		expect((err as Error).message).to.equal('dial to walk-b failed');
+		expect(dialed).to.deep.equal(['walk-a', 'walk-b']);
+	});
+
+	it('a member declines, then the next returns kind:"rotated": the redirect stays terminal (2 dials)', async () => {
+		const redirect = rotationRedirect();
+		const members = new Map<string, MemberServe>([
+			['walk-a', emptyMember()],
+			['walk-b', servingMember(seedPushState([10, 11, 12]), { rotationFor: () => redirect })],
+			['walk-c', servingMember()],
+		]);
+		const { transport, dialed } = transportOver(members, { walk: ['walk-a', 'walk-b', 'walk-c'] });
+
+		const err = await rejectionOf(transport.backfillTransport(TOPIC, COLLECTION)(await backfillReq()));
+
+		expect(err).to.be.instanceOf(RotationRedirectError);
+		expect((err as RotationRedirectError).redirect).to.deep.equal(redirect);
+		expect(dialed, 'the redirect stopped the walk before walk-c').to.deep.equal(['walk-a', 'walk-b']);
+	});
+
+	it('a non-empty reply that fails to decode is terminal, not a decline (1 dial)', async () => {
+		const garbage = new Uint8Array([0, 0, 0, 2, 0x7b, 0x7b]);
+		const members = new Map<string, MemberServe>([['walk-a', () => Promise.resolve(garbage)], ['walk-b', servingMember()]]);
+		const { transport, dialed } = transportOver(members, { walk: ['walk-a', 'walk-b'] });
+
+		const err = await rejectionOf(transport.backfillTransport(TOPIC, COLLECTION)(await backfillReq()));
+
+		expect(err, 'the decode failure surfaces as a rejection').to.be.instanceOf(Error);
+		expect(err).to.not.be.instanceOf(NoResultReplyError);
+		expect(dialed, 'the undecodable reply did not fall through to walk-b').to.deep.equal(['walk-a']);
+	});
+
+	it('a reply of the wrong kind is terminal (1 dial)', async () => {
+		// walk-a answers the backfill with a genuine resume reply (served for a resume request).
+		const resumeReq = await signResume({ v: 1, collectionId: COLLECTION, fromRevision: 12, latestKnownTailId: TAIL, subscriberCoord: COLLECTION, timestamp: FIXED_NOW });
+		const resumeReplyFrame = await servingMember(seedPushState([10, 11, 12, 13, 14]))(encodeRecoverRequestV1({ v: 1, kind: 'resume', resume: resumeReq }));
+		expect(resumeReplyFrame, 'fixture: the resume request was served').to.not.equal(undefined);
+		const members = new Map<string, MemberServe>([['walk-a', () => Promise.resolve(resumeReplyFrame)], ['walk-b', servingMember()]]);
+		const { transport, dialed } = transportOver(members, { walk: ['walk-a', 'walk-b'] });
+
+		const err = await rejectionOf(transport.backfillTransport(TOPIC, COLLECTION)(await backfillReq()));
+
+		expect((err as Error).message).to.match(/does not match request kind/);
+		expect(dialed).to.deep.equal(['walk-a']);
+	});
+});
+
+/**
+ * The same fallthrough, end to end over the production wiring: `createLibp2pRecoverDialer` → `requestResponse`
+ * dialing in-process nodes whose `registerRecoverHandler` answers through `handleRequestResponse`. This is the
+ * path where a declining member's zero-length reply used to be decoded as a terminal protocol error.
+ */
+describe('reactivity recover — declines over the real request/response framing', () => {
+	function makeNode(id: PeerId, registry: Map<string, MockNode>): MockNode {
+		const node = new MockNode(id, registry, new Set());
+		registry.set(id.toString(), node);
+		return node;
+	}
+
+	const freshPeerId = async (): Promise<PeerId> => peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
+
+	/** Serve deps for a member with no served state, counting how often it was asked to resolve one. */
+	function decliningDeps(asked: { count: number }): RecoverServeDeps {
+		return {
+			pushStateFor: () => undefined,
+			pushStateForCollection: () => { asked.count++; return undefined; },
+			replayGuard: createCorrelationReplayGuard(),
+			clock: () => FIXED_NOW,
+		};
+	}
+
+	it('the production dialer skips a member that declines, and the next member serves', async () => {
+		const registry = new Map<string, MockNode>();
+		const subscriber = makeNode(peerId, registry); // the dialing node is the request's signer
+		const decliner = makeNode(await freshPeerId(), registry);
+		const server = makeNode(await freshPeerId(), registry);
+		const declinerAsked = { count: 0 };
+		registerRecoverHandler(decliner as never, PROTOCOL_REACTIVITY_RECOVER, decliningDeps(declinerAsked));
+		registerRecoverHandler(server as never, PROTOCOL_REACTIVITY_RECOVER, serveDepsFor(seedPushState([10, 11, 12])));
+		const transport = new Libp2pReactivityRecoverTransport({
+			dialer: createLibp2pRecoverDialer(subscriber as never),
+			selfPeerId: peerId.toString(),
+			cohortHintCache: createStickyCohortHintCache(),
+			resolveCohort: () => [decliner.peerId.toString(), server.peerId.toString()],
+		});
+
+		const reply = await transport.backfillTransport(TOPIC, COLLECTION)(await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 12, timestamp: FIXED_NOW }));
+
+		expect(declinerAsked.count, 'the first member really was reached and declined').to.equal(1);
+		expect(reply.entries.map((e) => e.revision)).to.deep.equal([11, 12]);
+	});
+
+	it('rejects with NoResultReplyError when every member declines', async () => {
+		const registry = new Map<string, MockNode>();
+		const subscriber = makeNode(peerId, registry);
+		const first = makeNode(await freshPeerId(), registry);
+		const second = makeNode(await freshPeerId(), registry);
+		const asked = { count: 0 };
+		registerRecoverHandler(first as never, PROTOCOL_REACTIVITY_RECOVER, decliningDeps(asked));
+		registerRecoverHandler(second as never, PROTOCOL_REACTIVITY_RECOVER, decliningDeps(asked));
+		const transport = new Libp2pReactivityRecoverTransport({
+			dialer: createLibp2pRecoverDialer(subscriber as never),
+			selfPeerId: peerId.toString(),
+			cohortHintCache: createStickyCohortHintCache(),
+			resolveCohort: () => [first.peerId.toString(), second.peerId.toString()],
+		});
+
+		const err = await transport.backfillTransport(TOPIC, COLLECTION)(await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 12, timestamp: FIXED_NOW }))
+			.then(() => undefined, (e: unknown) => e);
+
+		expect(asked.count, 'both members were reached').to.equal(2);
+		expect(err).to.be.instanceOf(NoResultReplyError);
 	});
 });

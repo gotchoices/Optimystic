@@ -167,7 +167,7 @@ import { createPoWVerifier, createReputationVerifier, type BootstrapReputationVi
 import { createParentReferenceVerifier, createDefaultParentTopicView, type BootstrapParentTopicView } from "./bootstrap-parent-reference.js";
 import { createBootstrapEvidenceBuilder } from "./bootstrap-evidence-builder.js";
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS, cohortTopicProtocolList, type CohortTopicProtocols } from "./protocols.js";
-import { requestResponse, DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
+import { requestResponse, requireReply, DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("cohort-topic");
@@ -697,10 +697,11 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// The real k − x assembly lives in each CoordEngine's own threshold signer (constructed per coord).
 	const verifyingSigner = createCohortSigner(createVerifyOnlyThresholdCrypto(), minSigs);
 
-	// Collect one cohort member's `/sign` endorsement over the new fifth protocol.
+	// Collect one cohort member's `/sign` endorsement over the new fifth protocol. The `/sign` responder always
+	// writes a frame, so a no-result reply is a non-conforming peer: reject, and `collectFrom` counts no signature.
 	const dialSign = async (peerIdStr: string, request: SignRequestV1): Promise<SignReplyV1> => {
 		const reply = await requestResponse(node, peerIdFromString(peerIdStr), protocols.sign, encodeCohortMessage(request, maxBytes), maxBytes);
-		return validateSignReplyV1(decodeCohortMessage(reply, maxBytes));
+		return validateSignReplyV1(decodeCohortMessage(requireReply(reply, "cohort sign"), maxBytes));
 	};
 
 	/** FRET assembly around `coord`: self prepended + deduped; epoch = H(sorted member join). */
@@ -3175,8 +3176,8 @@ async function registerCohortTopicProtocols(
  *
  * `handle` cannot return `undefined`, and that is the point. The dialer's `readFramed` treats bare
  * end-of-stream as a truncation error rather than an empty reply, so a reply-reading protocol
- * (register, membership, sign) must always put a frame on the wire — an empty one for "no result".
- * Making that a separate constructor from {@link makeOneWayHandler} puts the invariant in the type,
+ * (register, membership, sign) must always put a frame on the wire — an empty one for "no result",
+ * which the dialer's `requestResponse` resolves as `undefined`. Making that a separate constructor from {@link makeOneWayHandler} puts the invariant in the type,
  * where a later edit cannot silently opt out of it. (`stream-util.ts#handleRequestResponse` takes
  * the other route for the same reason: every consumer of it is a reply-reading protocol, so it maps
  * a handler's `undefined` onto an explicit zero-length frame itself.)

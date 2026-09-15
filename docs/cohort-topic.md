@@ -1237,8 +1237,10 @@ framed body and plays no part in stream delimiting. Two consequences are load-be
 
 - **End-of-stream is not an empty message.** A reader that reaches end-of-stream before a whole frame
   arrives raises a truncation error. A responder with no result must therefore send an explicit
-  **zero-length frame**, which the dialer resolves as empty bytes — silence on the wire now means
-  failure, not "nothing to report".
+  **zero-length frame**, which the dialer's `requestResponse` resolves as `undefined` — silence on
+  the wire now means failure, not "nothing to report". A reply the dialer does receive is never
+  empty, so each caller states what "no result" means for its protocol (try the next peer, map it
+  to a benign default, or `requireReply` where the responder always answers).
 - **One-way protocols send nothing back.** `cohort-gossip` and `promote` are fire-and-forget: the
   dialer never reads, and typically closes the stream as soon as its frame is written.
 

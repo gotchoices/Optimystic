@@ -50,7 +50,7 @@ export class FretMembershipSource implements IMembershipSource {
 		for (const peerStr of this.resolver.cohortPeers(coord, this.wants)) {
 			try {
 				const reply = await requestResponse(this.node, peerIdFromString(peerStr), this.membershipProtocol, request, this.maxBytes);
-				if (reply.length > 0) {
+				if (reply !== undefined) {
 					this.cache(coord, reply);
 					return reply;
 				}

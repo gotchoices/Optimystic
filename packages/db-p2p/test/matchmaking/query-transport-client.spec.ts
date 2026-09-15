@@ -15,17 +15,22 @@ import {
 } from '@optimystic/db-core';
 import { createLibp2pMatchmakingTransport, createLibp2pMatchmakingSeekerSession } from '../../src/matchmaking/query-transport.js';
 import { MatchmakingSeekerSession } from '../../src/matchmaking/module.js';
+import { DEFAULT_MATCHMAKING_PROTOCOLS } from '../../src/matchmaking/protocols.js';
 import { signPeer } from '../../src/cohort-topic/peer-sig.js';
+import { handleRequestResponse, NoResultReplyError } from '../../src/cohort-topic/stream-util.js';
+import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from '../../src/cohort-topic/protocols.js';
+import { MockNode } from '../../src/testing/cohort-topic-mesh-harness.js';
 
 /**
- * Client-side seeker query transport — the I/O-free branches the gated real-socket e2e (§5c of
+ * Client-side seeker query transport — the branches the gated real-socket e2e (§5c of
  * `substrate-real-libp2p`) cannot reach (its seeker is always a *remote* node with a real primary that is
- * never itself): the no-primary / self-routed-primary handling, the `d_max` estimator wiring, and the
- * per-entry verifier. The happy dial paths (register/query over real sockets) are the e2e's job.
+ * never itself, and that primary always serves): the no-primary / self-routed-primary handling, the
+ * `d_max` estimator wiring, the per-entry verifier, and a remote primary that has no result. The happy dial
+ * paths (register/query over real sockets) are the e2e's job.
  *
  * Construction derives `seekerBytes` via `peerIdFromString(selfPeerId)`, so `selfPeerId` must be a real
- * peer-id string; we generate a key and use its peer id. The branches under test never dial, so a bare
- * `node` stub suffices.
+ * peer-id string; we generate a key and use its peer id. Most branches under test never dial, so a bare
+ * `node` stub suffices; the no-result case dials an in-process {@link MockNode} peer.
  */
 const topicId = matchTopicId('capability', 'pdf-render');
 
@@ -152,6 +157,47 @@ describe('matchmaking / query transport (client side)', () => {
 		expect(probe.result).to.equal('accepted');
 		expect(probe.topicTraffic, 'accepted probe carries the cohort topicTraffic').to.not.equal(undefined);
 		expect(probe.topicTraffic!.childCohortCount).to.equal(7);
+	});
+
+	// A remote primary with no result for the seeker. A query maps it to the benign empty advisory reply (the walk
+	// keeps going); a register — whose responder always answers — rejects, naming the non-conforming reply.
+	// The server-side counter proves each dial reached the handler, so the empty reply is the no-result branch,
+	// not the dial-failure catch that also yields an empty reply.
+	it('maps a remote primary\'s no-result reply: query → empty advisory reply, register → NoResultReplyError', async () => {
+		const registry = new Map<string, MockNode>();
+		const down = new Set<string>();
+		const [seekerKey, primaryKey] = await Promise.all([generateKeyPair('Ed25519'), generateKeyPair('Ed25519')]);
+		const seeker = new MockNode(peerIdFromPrivateKey(seekerKey), registry, down);
+		const primary = new MockNode(peerIdFromPrivateKey(primaryKey), registry, down);
+		for (const node of [seeker, primary]) {
+			registry.set(node.peerId.toString(), node);
+		}
+		const served: string[] = [];
+		handleRequestResponse(primary as never, DEFAULT_MATCHMAKING_PROTOCOLS.query, () => {
+			served.push('query');
+			return Promise.resolve(undefined);
+		});
+		handleRequestResponse(primary as never, DEFAULT_COHORT_TOPIC_PROTOCOLS.register, () => {
+			served.push('register');
+			return Promise.resolve(undefined);
+		});
+		const transport = createLibp2pMatchmakingTransport({
+			node: seeker as unknown as Libp2p,
+			fret: fretStub([primary.peerId.toString()]),
+			selfPeerId: seeker.peerId.toString(),
+			key: seekerKey,
+			wantK: 4,
+		});
+
+		const oneShot = await transport.queryCohort(queryFor());
+		const walked = await transport.walkTransport(topicId).query(0);
+		const registerErr = await transport.walkTransport(topicId).register(0).then(() => undefined, (e: unknown) => e);
+
+		expect(served, 'every dial reached the primary\'s handler').to.deep.equal(['query', 'query', 'register']);
+		expect(oneShot.providers, 'a one-shot query with no result is the empty advisory reply').to.deep.equal([]);
+		expect(walked.providers, 'a walk query with no result is the empty advisory reply').to.deep.equal([]);
+		expect(registerErr, 'a register with no result rejects').to.be.instanceOf(NoResultReplyError);
+		expect((registerErr as Error).message).to.contain('matchmaking register');
 	});
 
 	// The session convenience factory is otherwise only type-checked (the e2e drives the lower-level

@@ -884,7 +884,8 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			signature: 'AA',
 		};
 		const replyFrame = await requestResponse(remote.node, matchPrimary.peerId, DEFAULT_MATCHMAKING_PROTOCOLS.query, encodeQueryV1(query), DEFAULT_STREAM_MAX_BYTES);
-		const reply = decodeQueryReplyV1(replyFrame, DEFAULT_STREAM_MAX_BYTES);
+		expect(replyFrame, 'the routed primary answers the query with a reply frame, not a no-result').to.not.equal(undefined);
+		const reply = decodeQueryReplyV1(replyFrame!, DEFAULT_STREAM_MAX_BYTES);
 
 		expect(reply.providers, 'the reply carries a providers array').to.not.equal(undefined);
 		const entry = reply.providers!.find((p) => p.participantId === provider.idStr);
@@ -904,11 +905,11 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		expect(reply.signature.length, 'the reply carries the cohort primary single-member signature').to.be.greaterThan(0);
 
 		// A query for a topic this node serves no engine for gets NO reply (the handler never instantiates an
-		// engine from an inbound query — DoS guard); requestResponse resolves the empty read as a 0-byte frame.
+		// engine from an inbound query — DoS guard); requestResponse resolves the zero-length reply as `undefined`.
 		const unknownTopic = Uint8Array.from({ length: 32 }, (_v, i) => (i * 31 + 7) & 0xff);
 		const unknownQuery: QueryV1 = { ...query, topicId: bytesToB64url(unknownTopic) };
 		const noReply = await requestResponse(remote.node, matchPrimary.peerId, DEFAULT_MATCHMAKING_PROTOCOLS.query, encodeQueryV1(unknownQuery), DEFAULT_STREAM_MAX_BYTES);
-		expect(noReply.length, 'a query for an unserved topic yields no reply frame (no engine instantiated)').to.equal(0);
+		expect(noReply, 'a query for an unserved topic yields no result (no engine instantiated)').to.equal(undefined);
 	});
 
 	// --- 5c. Matchmaking: a remote seeker walk converges to a match over real sockets (this ticket) ---
@@ -1004,7 +1005,8 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			encodeQueryV1({ v: 1, topicId: bytesToB64url(matchTopic), includeProviders: true, includeSeekers: false, limit: 256, requesterId: seeker.idStr, timestamp: Date.now(), signature: 'AA' }),
 			DEFAULT_STREAM_MAX_BYTES,
 		);
-		const rawReply = decodeQueryReplyV1(rawReplyFrame, DEFAULT_STREAM_MAX_BYTES);
+		expect(rawReplyFrame, 'the routed primary answers the raw query with a reply frame, not a no-result').to.not.equal(undefined);
+		const rawReply = decodeQueryReplyV1(rawReplyFrame!, DEFAULT_STREAM_MAX_BYTES);
 		const rawIds = (rawReply.providers ?? []).map((p) => p.participantId);
 		expect(rawIds, 'the raw cohort reply served the genuine provider').to.include(provider.idStr);
 		expect(rawIds, 'the raw cohort reply ALSO served the forged-payload provider (cohort forwards verbatim)').to.include(forged.idStr);

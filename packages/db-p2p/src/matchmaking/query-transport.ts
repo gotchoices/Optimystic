@@ -79,7 +79,7 @@ import type { CoordRegistry } from "../cohort-topic/host.js";
 import { peerIdToBytes } from "../cohort-topic/peer-codec.js";
 import { signPeer, verifyPeerSig } from "../cohort-topic/peer-sig.js";
 import { FretSizeEstimator } from "../cohort-topic/size-estimator.js";
-import { handleRequestResponse, requestResponse, DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic/stream-util.js";
+import { handleRequestResponse, requestResponse, requireReply, DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic/stream-util.js";
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from "../cohort-topic/protocols.js";
 import { handleMatchmakingQuery } from "./query-handler.js";
 import { PROTOCOL_MATCHMAKING_QUERY, DEFAULT_MATCHMAKING_PROTOCOLS } from "./protocols.js";
@@ -339,9 +339,9 @@ export function createLibp2pMatchmakingTransport(deps: Libp2pMatchmakingTranspor
 		}
 		try {
 			const frame = await requestResponse(node, peerIdFromString(primary), queryProtocol, encodeQueryV1(q, maxBytes), maxBytes);
-			// The serve handler returns no frame for a topic it does not serve; map it (and any decode/dial
-			// failure) to a benign empty reply so SeekerWalkClient.collect keeps walking rather than throwing.
-			return frame.length === 0 ? emptyReply() : decodeQueryReplyV1(frame, maxBytes);
+			// The serve handler has no result for a topic it does not serve (`undefined`); map it (and any
+			// decode/dial failure) to a benign empty reply so SeekerWalkClient.collect keeps walking rather than throwing.
+			return frame === undefined ? emptyReply() : decodeQueryReplyV1(frame, maxBytes);
 		} catch (err) {
 			log("matchmaking query: dial/decode failed for primary %s (empty reply): %o", primary, err);
 			return emptyReply();
@@ -390,7 +390,8 @@ export function createLibp2pMatchmakingTransport(deps: Libp2pMatchmakingTranspor
 			throw new Error("matchmaking register: FRET routed the cohort primary to self; provide deps.selfServe.register");
 		}
 		const frame = await requestResponse(node, peerIdFromString(primary), registerProtocol, encodeCohortMessage(reg, maxBytes), maxBytes);
-		return validateRegisterReplyV1(decodeCohortMessage(frame, maxBytes));
+		// The `/register` responder always writes a frame, so a no-result reply is a non-conforming peer: reject.
+		return validateRegisterReplyV1(decodeCohortMessage(requireReply(frame, "matchmaking register"), maxBytes));
 	};
 
 	/** Map a `RegisterReplyV1` to the walk's {@link SeekerProbeReply} (pass `result`; copy traffic/targetTier). */
