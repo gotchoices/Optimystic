@@ -139,10 +139,9 @@ const rowsFor = (prefix: string, keys: number[]): Row[] => keys.map(key => ({ ke
 /** Every block `machine` holds a committed revision of, from its own storage only. */
 async function committedBlocks(machine: Machine): Promise<Map<BlockId, number>> {
 	const { storageRepo } = running(machine);
-	const listBlockIds = machine.storage.listBlockIds;
-	if (!listBlockIds) throw new Error('MemoryRawStorage no longer enumerates block ids; the locality check needs it');
+	if (!machine.storage.listBlockIds) throw new Error('MemoryRawStorage no longer enumerates block ids; the locality check needs it');
 	const held = new Map<BlockId, number>();
-	for await (const blockId of listBlockIds()) {
+	for await (const blockId of machine.storage.listBlockIds()) {
 		const rev = (await storageRepo.get({ blockIds: [blockId] }))[blockId]?.state.latest?.rev;
 		if (rev !== undefined) held.set(blockId, rev);
 	}
@@ -285,8 +284,8 @@ describe('Small deployment lifecycle over real libp2p (solo → backup → away 
 		// anyway — is reported so a change in either shows up in the run output.
 		let outcome = `ACKNOWLEDGED after ${elapsedMs}ms`;
 		if (refusal) {
-			const onA = (await readRows(a, [whileAway!.key])).get(whileAway!.key)?.value ?? 'absent';
-			const onB = (await readRows(b, [whileAway!.key])).get(whileAway!.key)?.value ?? 'absent';
+			const onA = (await readRows(a, [whileAway.key])).get(whileAway.key)?.value ?? 'absent';
+			const onB = (await readRows(b, [whileAway.key])).get(whileAway.key)?.value ?? 'absent';
 			outcome = `REFUSED after ${elapsedMs}ms (${refusal.name}: ${refusal.message}); once B returned the refused row read as ${onA} on A, ${onB} on B`;
 		}
 		console.log(`      phase 5 observed: A's write with B away was ${outcome}`);

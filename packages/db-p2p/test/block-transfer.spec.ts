@@ -626,6 +626,39 @@ describe('BlockTransferCoordinator', () => {
 			expect(result.succeeded).to.deep.equal([]);
 			expect(result.failed).to.deep.equal(['block-1']);
 		});
+
+		it('clears the timeout timer once a transfer settles, so none outlives the transfer', async () => {
+			// Left running, each timer held a stopped node's process open for the full transfer timeout.
+			const transferTimeoutMs = 5000; // the beforeEach coordinator's
+			const armed = new Set<unknown>();
+			const cleared = new Set<unknown>();
+			const realSetTimeout = globalThis.setTimeout;
+			const realClearTimeout = globalThis.clearTimeout;
+			globalThis.setTimeout = ((fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+				const handle = realSetTimeout(fn, ms, ...args);
+				if (ms === transferTimeoutMs) armed.add(handle);
+				return handle;
+			}) as typeof setTimeout;
+			globalThis.clearTimeout = ((handle?: Parameters<typeof clearTimeout>[0]) => {
+				cleared.add(handle);
+				realClearTimeout(handle);
+			}) as typeof clearTimeout;
+
+			try {
+				repo.blocks.set('block-1', makeBlock('block-1'));
+				const ownerIdStr = (await makePeerId()).toString();
+				peerNetwork.responses.set(ownerIdStr, { blocks: { 'block-1': 'data' }, missing: [] });
+
+				const result = await coordinator.pushBlocks(['block-1'], new Map([['block-1', [ownerIdStr]]]));
+
+				expect(result.succeeded).to.deep.equal(['block-1']);
+				expect(armed.size, 'the push raced a transfer timeout').to.be.greaterThan(0);
+				expect([...armed].filter(handle => !cleared.has(handle)).length, 'timers still armed after the push').to.equal(0);
+			} finally {
+				globalThis.setTimeout = realSetTimeout;
+				globalThis.clearTimeout = realClearTimeout;
+			}
+		});
 	});
 });
 
