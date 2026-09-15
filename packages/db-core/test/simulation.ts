@@ -1,5 +1,6 @@
 import { sha256 } from 'multiformats/hashes/sha2'
-import { createEd25519PeerId } from '@libp2p/peer-id-factory';
+import { generateKeyPair } from '@libp2p/crypto/keys';
+import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { TestTransactor } from '../src/testing/test-transactor.js';
 import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork, PeerId } from '../src/index.js';
 
@@ -65,9 +66,8 @@ export class NetworkSimulation implements IKeyNetwork {
 		scenario: Scenario,
 	) {
 		const nodes = await Promise.all(Array.from({ length: scenario.nodeCount }, async () => {
-			const peerId = await createEd25519PeerId();
-			// Type assertion to bypass the type compatibility issue
-			return await NetworkNode.create(peerId as unknown as PeerId);
+			const peerId = peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
+			return await NetworkNode.create(peerId);
 		}));
 
 		return new NetworkSimulation(nodes, { clusterSize: scenario.clusterSize });
