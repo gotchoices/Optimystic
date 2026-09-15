@@ -3,8 +3,9 @@
  * `circuit-relay-long-lived.spec.ts`, `dcutr-direct-upgrade.spec.ts`,
  * `relay-address-propagation.spec.ts`, `relay-inbound-source-address.spec.ts`,
  * `relay-self-relay-only-dial.spec.ts`, `relay-third-party-address-gap.spec.ts`,
- * `open-protocol-stream-relay.spec.ts` and
- * `multi-coordinator-write-relay.integration.spec.ts`.
+ * `open-protocol-stream-relay.spec.ts`,
+ * `multi-coordinator-write-relay.integration.spec.ts` and
+ * `two-phones-over-relay.integration.spec.ts`.
  *
  * Most helpers spin a real Optimystic node (relay or service peer) via
  * `createLibp2pNode` and/or poll multiaddr / connection state. The one exception is
@@ -19,7 +20,8 @@
  * upgrade a relayed connection over loopback. See `dcutr-direct-upgrade.spec.ts`.
  */
 import { createLibp2p, type Libp2p } from 'libp2p';
-import type { PeerId } from '@libp2p/interface';
+import type { PeerId, PrivateKey } from '@libp2p/interface';
+import { generateKeyPair } from '@libp2p/crypto/keys';
 import { noise } from '@chainsafe/libp2p-noise';
 import { yamux } from '@chainsafe/libp2p-yamux';
 import { webSockets } from '@libp2p/websockets';
@@ -80,6 +82,15 @@ export async function spawnRelayNode(network: string, opts: SpawnRelayOpts = {})
 	});
 }
 
+export interface SpawnPlainRelayOpts {
+	/** Bind host for the relay's WS listener. Defaults to loopback. Ignored when `listenAddr` is given. */
+	host?: string;
+	/** Identity key. Defaults to a fresh one; pass the same key to bring a relay back as the same peer. */
+	privateKey?: PrivateKey;
+	/** Exact WS listen multiaddr, for re-binding a known port. Defaults to an ephemeral port on `host`. */
+	listenAddr?: string;
+}
+
 /**
  * A relay that carries circuits but is NOT a participant in the Optimystic keyspace: plain
  * libp2p, identify under this network's prefix, circuit-relay-v2 server, and no cluster/repo
@@ -103,10 +114,11 @@ export async function spawnRelayNode(network: string, opts: SpawnRelayOpts = {})
  * `reservations.applyDefaultLimit: false` matches `spawnRelayNode`'s default: without it the
  * relay caps each circuit at 128 KiB / 2 min, which resets sustained traffic.
  */
-export async function spawnPlainRelayNode(network: string, opts: { host?: string } = {}): Promise<Libp2p> {
+export async function spawnPlainRelayNode(network: string, opts: SpawnPlainRelayOpts = {}): Promise<Libp2p> {
 	const host = opts.host ?? DEFAULT_HOST;
 	return await createLibp2p({
-		addresses: { listen: [`/ip4/${host}/tcp/0/ws`] },
+		privateKey: opts.privateKey,
+		addresses: { listen: [opts.listenAddr ?? `/ip4/${host}/tcp/0/ws`] },
 		transports: [webSockets()],
 		connectionEncrypters: [noise()],
 		streamMuxers: [yamux()],
@@ -117,6 +129,58 @@ export async function spawnPlainRelayNode(network: string, opts: { host?: string
 			relay: circuitRelayServer({ reservations: { applyDefaultLimit: false } })
 		}
 	}) as unknown as Libp2p;
+}
+
+/**
+ * A {@link spawnPlainRelayNode} relay that can be stopped and started again as the same peer on the same
+ * WebSocket address — "the relay pod restarted" as its clients see it: every reservation and every relayed
+ * connection is gone, but the address that names the relay still works.
+ */
+export interface RestartablePlainRelay {
+	/** The running incarnation. Throws while stopped. */
+	readonly node: Libp2p;
+	readonly peerId: PeerId;
+	/** The WebSocket dial address, `/p2p/<relay>` included. The same string across restarts. */
+	readonly wsAddr: Multiaddr;
+	/** Stop the running incarnation. A no-op while stopped. */
+	stop(): Promise<void>;
+	/**
+	 * Start a new incarnation under the same key on the same address. Throws if one is already running, or if
+	 * the address was not re-bound: a relay that silently came back elsewhere would look exactly like clients
+	 * that never re-reserve, so the re-bind is verified rather than assumed.
+	 */
+	start(): Promise<void>;
+}
+
+export async function spawnRestartablePlainRelay(network: string, opts: { host?: string } = {}): Promise<RestartablePlainRelay> {
+	const privateKey = await generateKeyPair('Ed25519');
+	let node: Libp2p | undefined = await spawnPlainRelayNode(network, { ...opts, privateKey });
+	const peerId = node.peerId;
+	const wsAddr = pickRelayWsAddr(node);
+	// The OS-assigned port, re-bound verbatim by start() so `wsAddr` stays true.
+	const listenAddr = wsAddr.decapsulate(`/p2p/${peerId.toString()}`).toString();
+	return {
+		get node(): Libp2p {
+			if (!node) throw new Error('the relay is stopped');
+			return node;
+		},
+		peerId,
+		wsAddr,
+		async stop() {
+			const stopping = node;
+			node = undefined;
+			await stopping?.stop();
+		},
+		async start() {
+			if (node) throw new Error('the relay is already running');
+			const started = await spawnPlainRelayNode(network, { privateKey, listenAddr });
+			node = started;
+			const rebound = started.getMultiaddrs().map(a => a.toString());
+			if (!rebound.includes(wsAddr.toString())) {
+				throw new Error(`the relay restarted on a different address: expected ${wsAddr.toString()}, have ${rebound.join(', ') || 'none'}`);
+			}
+		}
+	};
 }
 
 export interface SpawnTcpPeerOpts {

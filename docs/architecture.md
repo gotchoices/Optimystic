@@ -253,6 +253,12 @@ The ordinary growth path runs end to end over real sockets, in exactly the recom
 configuration, in `packages/db-p2p/test/small-deployment-lifecycle.integration.spec.ts` (part of
 `yarn test:integration`): one machine writes alone and restarts, a second joins as a backup and must
 end up holding the first one's data locally, both write, one is away for a while, and both restart.
+The two-phone pairing gets the same treatment with every byte between the machines crossing a circuit
+relay, in `packages/db-p2p/test/two-phones-over-relay.integration.spec.ts`, which also restarts the relay
+itself. That last step is a known gap today: a node listening on `<relay>/p2p-circuit` does not ask for a
+new reservation after its relay restarts, so it stays unreachable until something re-drives the
+reservation or the app restarts. Sereus runs its own supervisor for this; a host without one does not
+recover.
 
 ### Arachnode — concentric storage rings
 
