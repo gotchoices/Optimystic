@@ -9,12 +9,12 @@
  * every Node test and still break either step: a class `static { }` block did, downstream, on
  * 2026-09-14.
  *
- * `main` runs, in order: refuse a Plug'n'Play install; refuse a stale or missing `dist/`; bundle
- * `entry.js` with `metro.config.cjs`; assert the bare `@optimystic/db-p2p` resolved to its React
- * Native entry; compile the bundle with `hermesc`. Nothing is executed — readme.md says what that
- * leaves unchecked, and why the toolchain versions are pinned together.
+ * `main` runs, in order: refuse an install Metro cannot resolve through; refuse a stale or missing
+ * `dist/`; bundle `entry.js` with `metro.config.cjs`; assert `@optimystic/db-p2p` and its `/rn` subpath
+ * both resolved to the React Native entry; compile the bundle with `hermesc`. Nothing is executed —
+ * readme.md says what that leaves unchecked, and why the toolchain versions are pinned together.
  *
- * `bundle`, `compile`, `createOutputDir` and `hermescBinary` are exported for `test/`.
+ * `bundle`, `compile`, `createOutputDir`, `createRouteRecorder` and `hermescBinary` are exported for `test/`.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -44,7 +44,7 @@ const OUTPUT_PARENT = join(WORKSPACE_DIR, 'node_modules', '.cache', 'rn-bundle-c
  * Where these specifiers must land when a React Native app imports them, relative to the repository
  * root. The bare specifier is the one that regresses silently: repoint or drop the `react-native`
  * condition in packages/db-p2p/package.json and React Native gets the Node entry while every Node test
- * stays green (the gap the NOTE in packages/db-p2p/test/entry-parity.spec.ts describes).
+ * stays green, packages/db-p2p/test/entry-parity.spec.ts included.
  */
 const EXPECTED_ROUTES = new Map([
 	['@optimystic/db-p2p', 'packages/db-p2p/dist/src/rn.js'],
@@ -123,7 +123,13 @@ export function compile({ bundlePath, sourceMapPath }) {
 	return { bytecodePath };
 }
 
-/** A fresh, private output directory, so concurrent runs (this check and its tests) never share a file. */
+/**
+ * A fresh, private output directory, so concurrent runs (this check and its tests) never share a file.
+ *
+ * NOTE: nothing prunes `runs/`. A run kept after a hermesc failure, or one killed mid-bundle, stays on
+ * disk (a 12 MB bundle plus its source map). Harmless while such runs are rare; if they pile up, delete
+ * old `run-*` directories here before creating a new one.
+ */
 export function createOutputDir() {
 	mkdirSync(OUTPUT_PARENT, { recursive: true });
 	return mkdtempSync(join(OUTPUT_PARENT, 'run-'));
@@ -238,6 +244,43 @@ function translateBundlePositions(text, sourceMapPath) {
 	});
 }
 
+// -- Export routing --------------------------------------------------------------------------------
+
+/**
+ * Records, through `onResolve` (pass it to `bundle`), every file each expected specifier resolved to.
+ * `expected` maps a specifier to its repository-relative target; `main` uses `EXPECTED_ROUTES`.
+ */
+export function createRouteRecorder(expected = EXPECTED_ROUTES) {
+	const routes = new Map();
+	return {
+		onResolve(specifier, filePath) {
+			if (!expected.has(specifier)) return;
+			const seen = routes.get(specifier) ?? new Set();
+			seen.add(repoRelative(filePath));
+			routes.set(specifier, seen);
+		},
+
+		/** Expected specifiers that resolved anywhere but their target. */
+		misroutes() {
+			return [...expected].flatMap(([specifier, target]) => {
+				const wrong = [...(routes.get(specifier) ?? [])].filter((path) => path !== target);
+				return wrong.length === 0 ? [] : [
+					`${specifier} resolved to ${wrong.join(', ')} instead of ${target}. A React Native app importing it ` +
+					'gets the wrong entry point. Check the `react-native` condition and the `./rn` subpath in ' +
+					'the `exports` of packages/db-p2p/package.json.',
+				];
+			});
+		},
+
+		/** Expected specifiers the bundle never resolved, so their routing went unchecked. */
+		unreached() {
+			return [...expected.keys()]
+				.filter((specifier) => !routes.has(specifier))
+				.map((specifier) => `${specifier} was never imported, so its React Native routing went unchecked. entry.js must import it.`);
+		},
+	};
+}
+
 // -- The CLI ---------------------------------------------------------------------------------------
 
 async function main() {
@@ -266,18 +309,17 @@ async function main() {
  * worth inspecting — or `undefined` when everything passed.
  */
 async function bundleAndCompile(outDir, timings) {
-	const routes = new Map();
+	const routes = createRouteRecorder();
 	let bundled;
 	try {
-		bundled = await timed(timings, 'Metro bundle', () =>
-			bundle({ entry: ENTRY_PATH, outDir, onResolve: (specifier, filePath) => recordRoute(routes, specifier, filePath) }));
+		bundled = await timed(timings, 'Metro bundle', () => bundle({ entry: ENTRY_PATH, outDir, onResolve: routes.onResolve }));
 	} catch (error) {
 		// A misrouted entry usually fails the bundle itself — the Node entry reaches `@libp2p/tcp`, which
 		// imports `net` — and Metro's message then points at a shim, not at the cause. Routing first.
-		return { message: [...misroutes(routes), messageOf(error)].join('\n\n'), keepOutput: false };
+		return { message: [...routes.misroutes(), messageOf(error)].join('\n\n'), keepOutput: false };
 	}
 
-	const routeProblems = [...misroutes(routes), ...unreachedRoutes(routes)];
+	const routeProblems = [...routes.misroutes(), ...routes.unreached()];
 	if (routeProblems.length > 0) return { message: routeProblems.join('\n'), keepOutput: false };
 
 	try {
@@ -288,13 +330,25 @@ async function bundleAndCompile(outDir, timings) {
 	return undefined;
 }
 
-/** Metro resolves through real `node_modules` directories and cannot run from a Plug'n'Play install. */
+/**
+ * Metro resolves through real `node_modules` directories, and metro.config.cjs finds portal links in
+ * each workspace's own `node_modules`, so both settings named below are needed.
+ */
 function linkerProblem() {
-	if (process.versions.pnp === undefined && existsSync(join(WORKSPACE_DIR, 'node_modules'))) return undefined;
-	return 'Metro requires Yarn\'s `nodeLinker: node-modules`, and this install uses Plug\'n\'Play.\n' +
-		'`.yarnrc.yml` is gitignored, so a fresh clone defaults to Plug\'n\'Play: create it with\n' +
-		'`nodeLinker: node-modules` and `nmHoistingLimits: workspaces`, then run `yarn install`.\n' +
+	const found = unusableInstall();
+	if (found === undefined) return undefined;
+	return `Metro needs Yarn's \`nodeLinker: node-modules\` with \`nmHoistingLimits: workspaces\`, but ${found}.\n` +
+		'`.yarnrc.yml` is gitignored, so a fresh clone defaults to Plug\'n\'Play: create it with those two\n' +
+		'settings, then run `yarn install`.\n' +
 		'Whether to commit that setting is an open decision (decide-whether-to-commit-the-yarn-linker-setting).';
+}
+
+function unusableInstall() {
+	if (process.versions.pnp !== undefined) return 'this install uses Plug\'n\'Play';
+	if (!existsSync(join(WORKSPACE_DIR, 'node_modules'))) {
+		return 'packages/rn-bundle-check has no node_modules of its own (dependencies hoisted to the root?)';
+	}
+	return undefined;
 }
 
 /** The same derivation and escape hatch as `assertBuildFresh`, worded for a bundle rather than a test run. */
@@ -307,36 +361,6 @@ function freshnessProblem() {
 	if (problems.length === 0) return undefined;
 	return 'Build first: this check bundles compiled dist/ output, and some of it is missing or stale.\n' +
 		problems.map((problem) => `  - ${problem}\n`).join('');
-}
-
-function recordRoute(routes, specifier, filePath) {
-	if (!EXPECTED_ROUTES.has(specifier)) return;
-	const seen = routes.get(specifier) ?? new Set();
-	seen.add(repoRelative(filePath));
-	routes.set(specifier, seen);
-}
-
-/** Expected specifiers that resolved anywhere but their React Native entry. */
-function misroutes(routes) {
-	const problems = [];
-	for (const [specifier, expected] of EXPECTED_ROUTES) {
-		const wrong = [...(routes.get(specifier) ?? [])].filter((path) => path !== expected);
-		if (wrong.length > 0) {
-			problems.push(
-				`${specifier} resolved to ${wrong.join(', ')} instead of ${expected}. A React Native app importing it ` +
-				'gets the wrong entry point. Check the `react-native` condition and the `./rn` subpath in ' +
-				'the `exports` of packages/db-p2p/package.json.'
-			);
-		}
-	}
-	return problems;
-}
-
-/** Expected specifiers the bundle never resolved, so their routing went unchecked. */
-function unreachedRoutes(routes) {
-	return [...EXPECTED_ROUTES.keys()]
-		.filter((specifier) => !routes.has(specifier))
-		.map((specifier) => `${specifier} was never imported, so its React Native routing went unchecked. entry.js must import it.`);
 }
 
 async function timed(timings, label, step) {

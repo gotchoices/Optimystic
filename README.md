@@ -32,6 +32,7 @@ See the following documentation:
 * **Quereus Plugin Optimystic** - packages/quereus-plugin-optimystic - Quereus plugin for Optimystic distributed tree collections
 * **Demo** - packages/demo - Hello world demo app exercising Tree and Diary collections across the full stack
 * **Substrate Simulator** - packages/substrate-simulator - Discrete-event virtual-clock engine for the design simulator (mock-only dev tooling; not shipped to runtime consumers)
+* **React Native Bundle Check** - packages/rn-bundle-check - Bundles the React Native entry with Metro and compiles it with Hermes, as a phone app's build does (`yarn check:rn`; private, never published)
 
 ## Installation
 

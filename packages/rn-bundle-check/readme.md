@@ -15,7 +15,7 @@ Code can pass every Node test and still break either step. A class `static { }` 
 
 Run it from the repository root; `yarn check` also runs it, after `yarn build`. `scripts/rn-bundle-check.mjs`:
 
-1. **Refuses a Plug'n'Play install.** Metro resolves through real `node_modules` directories, so it needs Yarn's `nodeLinker: node-modules`. `.yarnrc.yml` is gitignored, so a fresh clone does not have that setting.
+1. **Refuses an install Metro cannot use.** Metro resolves through real `node_modules` directories, and `metro.config.cjs` finds portal links in each workspace's own `node_modules`, so it needs Yarn's `nodeLinker: node-modules` with `nmHoistingLimits: workspaces`. `.yarnrc.yml` is gitignored, so a fresh clone has neither setting.
 2. **Refuses a stale or missing `dist/`** in the three `@optimystic` packages it bundles. It uses the same derivation as the test suites' guard (`buildFreshnessProblems` in `test-harness/build-freshness.mjs`) and the same `OPTIMYSTIC_SKIP_BUILD_CHECK` escape hatch.
 3. **Bundles `entry.js`** with `metro.config.cjs`: Android, production mode, the Hermes transform profile, unminified, with a source map.
 4. **Checks export routing.** `@optimystic/db-p2p` and `@optimystic/db-p2p/rn` must both resolve to `packages/db-p2p/dist/src/rn.js`. If the `react-native` export condition were repointed or dropped, a React Native app would silently get the Node entry; this step fails instead.
@@ -65,3 +65,4 @@ NOTE: once the oldest React Native version we support is on Hermes V1 (0.84+), m
 - `test/node-builtin.test.mjs`: an unshimmed Node built-in fails with a pointer to the readme's shim table.
 - `test/shim-table-parity.test.mjs`: the Metro aliases match the readme's shim table.
 - `test/hermesc-binary.test.mjs`: each supported platform's binary exists in the installed `hermes-compiler`, and other platforms are refused.
+- `test/route-recorder.test.mjs`: the routing step passes a specifier that resolves where expected, and reports one that resolves elsewhere or is never imported.

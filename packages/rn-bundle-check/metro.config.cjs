@@ -74,9 +74,14 @@ const quietReporter = {
 	},
 };
 
-module.exports = mergeConfig(getDefaultConfig(workspaceDir), {
+const defaults = getDefaultConfig(workspaceDir);
+
+module.exports = mergeConfig(defaults, {
 	watchFolders: [repoRoot, ...outOfRepoLinkTargets()],
 	resolver: {
+		// Watching `repoRoot` would otherwise crawl this check's own transform cache and run outputs, and
+		// print an ENOENT error whenever a concurrent run deletes its output directory mid-crawl.
+		blockList: [].concat(defaults.resolver.blockList, directoryPattern(cacheDir)),
 		extraNodeModules: { ...withNodeSpellings(NODE_BUILTIN_SHIMS), ...HARNESS_ONLY_ALIASES },
 		// Where Metro looks once the importing file's own `node_modules` chain comes up empty — a host
 		// app's own `node_modules`, as a monorepo host configures it. Babel's runtime transform adds
@@ -100,6 +105,12 @@ function withNodeSpellings(shims) {
 	return Object.fromEntries(
 		Object.entries(shims).flatMap(([name, target]) => [[name, target], [`node:${name}`, target]])
 	);
+}
+
+/** `dir` and everything under it, as an absolute-path pattern for `resolver.blockList`. */
+function directoryPattern(dir) {
+	const escaped = dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	return new RegExp(`^${escaped}(?:[\\\\/]|$)`);
 }
 
 /**
