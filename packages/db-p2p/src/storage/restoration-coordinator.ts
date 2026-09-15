@@ -1,4 +1,5 @@
 import type { BlockId } from '@optimystic/db-core';
+import { routingKeyForBlock } from '@optimystic/db-core';
 import { hashKey, type RingCoord } from 'p2p-fret';
 import { peerIdFromString } from '@libp2p/peer-id';
 import type { BlockArchive, RestoreCallback } from './struct.js';
@@ -46,7 +47,7 @@ export class RestorationCoordinator {
 		// (RingSelector.calculatePartition) and cohort assembly both operate on hashed
 		// coords, so restoration must filter in the same space — see getMyRingPeers and
 		// filterByPartition below, which reuse this value.
-		const blockCoord = await hashKey(new TextEncoder().encode(blockId));
+		const blockCoord = await hashKey(routingKeyForBlock(blockId));
 
 		// 1. Try my transaction ring peers first
 		const myPeers = this.getMyRingPeers(blockCoord);

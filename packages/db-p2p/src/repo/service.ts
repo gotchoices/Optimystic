@@ -1,8 +1,8 @@
 import { pipe } from 'it-pipe'
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed'
 import type { Startable, Stream, Connection, StreamHandler, PeerId, Libp2p } from '@libp2p/interface'
-import type { IRepo, RepoMessage } from '@optimystic/db-core'
-import { blockIdsForTransforms } from '@optimystic/db-core'
+import type { IRepo, RepoMessage, RoutingKey } from '@optimystic/db-core'
+import { blockIdsForTransforms, routingKeyForBlock } from '@optimystic/db-core'
 import { peersEqual } from '../peer-utils.js'
 import { encodePeers, type RedirectPayload } from './redirect.js'
 import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js'
@@ -21,7 +21,7 @@ interface BaseComponents {
 }
 
 export interface NetworkManagerLike {
-	getCluster(key: Uint8Array): Promise<PeerId[]>
+	getCluster(key: RoutingKey): Promise<PeerId[]>
 }
 
 export type RepoServiceComponents = BaseComponents & {
@@ -230,15 +230,11 @@ export class RepoService implements Startable {
 		const nm = this.getNetworkManager()
 		if (!nm) return null
 
-		// Pass the RAW encoded block-key bytes to getCluster. getCluster hashes
-		// internally (hashKey == sha256), so the responsible-set coordinate becomes
-		// hashKey(encode(blockKey)) — identical to how the cluster coordinator
-		// derives it (ClusterCoordinator.getClusterForBlock → findCluster(encode(blockId))).
-		// Pre-hashing here would double-hash (hashKey(sha256(encode(blockKey)))), placing
-		// the cohort at an unrelated ring coordinate and redirecting requests the
-		// coordinator legitimately routed to this peer.
-		const key = new TextEncoder().encode(blockKey)
-		const cluster = await nm.getCluster(key)
+		// The block's routing key — the same bytes the writer's transactor and every cohort
+		// lookup hand the key network (see `routingKeyForBlock`) — so this responsible set sits
+		// at the ring position the coordinator was chosen by, and a correctly routed request
+		// is never redirected.
+		const cluster = await nm.getCluster(routingKeyForBlock(blockKey))
 		;(message as any).cluster = cluster.map((p: PeerId) => p.toString?.() ?? String(p))
 
 		const selfId = this.getSelfId()

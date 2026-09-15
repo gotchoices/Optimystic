@@ -4,7 +4,7 @@ import { highestStaleAt } from '../src/network/stale-failure.js'
 import { NetworkSimulation } from './simulation.js'
 import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
-import { blockIdToBytes } from '../src/utility/block-id-to-bytes.js'
+import { routingKeyForBlock } from '../src/network/routing-key.js'
 import type { BlockId, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, ITransactor, BlockGets, GetBlockResults, PendResult, CommitRequest, CommitResult, StaleFailure, ActionId } from '../src/index.js'
 import { BlockUnavailableError, BlockPossiblyStaleError } from '../src/index.js'
 import type { PeerId } from '../src/index.js'
@@ -687,7 +687,7 @@ describe('NetworkTransactor', () => {
       private clusterMap = new Map<string, string[]>();
 
       async setCluster(blockId: BlockId, peerIds: string[]) {
-        const keyBytes = await blockIdToBytes(blockId);
+        const keyBytes = routingKeyForBlock(blockId);
         this.clusterMap.set(uint8ArrayToString(keyBytes, 'base64url'), peerIds);
       }
 
@@ -983,7 +983,7 @@ describe('NetworkTransactor', () => {
       const actionId = generateRandomActionId()
 
       // Find the coordinator for this block
-      const key = await blockIdToBytes(blockId)
+      const key = routingKeyForBlock(blockId)
       const closestNodes = network.findCluster(key)
 
       // Make the coordinator unavailable
@@ -1029,9 +1029,9 @@ describe('NetworkTransactor', () => {
         this.fallbackCoordinator = fallbackCoordinator;
       }
 
-      /** Register cluster peers for a blockId (pre-hashes to match findCluster lookup) */
+      /** Register cluster peers for a blockId (keyed on the routing key findCluster is handed) */
       async setCluster(blockId: BlockId, peerIds: string[]) {
-        const keyBytes = await blockIdToBytes(blockId);
+        const keyBytes = routingKeyForBlock(blockId);
         const keyStr = uint8ArrayToString(keyBytes, 'base64url');
         this.clusterMap.set(keyStr, peerIds);
       }
@@ -1279,7 +1279,7 @@ describe('NetworkTransactor', () => {
       constructor(private readonly fallbackCoordinators: string[]) {}
 
       async setCluster(blockId: BlockId, peerIds: string[]) {
-        const keyBytes = await blockIdToBytes(blockId);
+        const keyBytes = routingKeyForBlock(blockId);
         this.clusterMap.set(uint8ArrayToString(keyBytes, 'base64url'), peerIds);
       }
 
@@ -1686,7 +1686,7 @@ describe('NetworkTransactor', () => {
 
       const clusterMap = new Map<string, string[]>();
       const setCluster = async (blockId: BlockId, peerIds: string[]) => {
-        const keyBytes = await blockIdToBytes(blockId);
+        const keyBytes = routingKeyForBlock(blockId);
         clusterMap.set(uint8ArrayToString(keyBytes, 'base64url'), peerIds);
       };
       const net: IKeyNetwork = {
@@ -1845,7 +1845,7 @@ describe('NetworkTransactor', () => {
 
       const clusterMap = new Map<string, string[]>();
       const setCluster = async (blockId: BlockId, peerIds: string[]) => {
-        clusterMap.set(uint8ArrayToString(await blockIdToBytes(blockId), 'base64url'), peerIds);
+        clusterMap.set(uint8ArrayToString(routingKeyForBlock(blockId), 'base64url'), peerIds);
       };
       const net: IKeyNetwork = {
         async findCoordinator(): Promise<PeerId> { return peerIdFromString(peerA); },

@@ -1,3 +1,4 @@
+import { routingKeyForBlock } from '@optimystic/db-core';
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import type { BlockId, IBlock, BlockHeader, Transforms, IRepo } from '@optimystic/db-core';
@@ -142,7 +143,7 @@ describe('Multi-coordinator cross-network selection (two control networks, share
 		for (let i = 0; i < 4; i++) {
 			const blockId = `xnet-block-${i}`;
 			try {
-				const cohort = Object.keys(await (a1 as any).keyNetwork.findCluster(new TextEncoder().encode(blockId)));
+				const cohort = Object.keys(await (a1 as any).keyNetwork.findCluster(routingKeyForBlock(blockId)));
 				if (cohort.includes(b1Id)) {
 					failures.push(`cohort[${i}] wrongly includes B-network node ${b1Id.substring(0, 12)}`);
 					continue;

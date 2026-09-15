@@ -1,5 +1,6 @@
 import type { Startable, Libp2p } from '@libp2p/interface'
 import type { IPeerNetwork } from '@optimystic/db-core'
+import { routingKeyForBlock } from '@optimystic/db-core'
 import { hashKey } from 'p2p-fret'
 import type { FretService } from 'p2p-fret'
 import { peerIdFromString } from '@libp2p/peer-id'
@@ -208,7 +209,7 @@ export class SpreadOnChurnMonitor implements Startable {
 		const spreadResults: SpreadEvent['spread'] = []
 
 		for (const blockId of this.trackedBlocks) {
-			const key = textEncoder.encode(blockId)
+			const key = routingKeyForBlock(blockId)
 			const coord = await hashKey(key)
 
 			// Check eligibility: only middle peers spread

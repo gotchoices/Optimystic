@@ -8,7 +8,7 @@
 
 import { expect } from 'chai';
 import type { BlockId, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
-import { blockIdToBytes } from '@optimystic/db-core';
+import { routingKeyForBlock } from '@optimystic/db-core';
 import { createMesh, buildNetworkTransactor, type Mesh } from '../src/testing/mesh-harness.js';
 
 const makeHeader = (id: string): BlockHeader => ({
@@ -600,7 +600,7 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 			// Assign roles by the transactor's own routing (XOR distance over sha256(blockId)):
 			// the nearest node is the coordinator every read hits first — it stays stale; the
 			// second-nearest is the retry coordinator — it advances to rev 2; the third goes dark.
-			const routingKey = await blockIdToBytes(blockId as BlockId);
+			const routingKey = routingKeyForBlock(blockId);
 			const firstPick = await mesh.keyNetwork.findCoordinator(routingKey);
 			const secondPick = await mesh.keyNetwork.findCoordinator(routingKey, { excludedPeers: [firstPick] });
 			const staleReader = mesh.nodes.find(n => n.peerId.equals(firstPick))!;

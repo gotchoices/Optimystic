@@ -1,12 +1,12 @@
 import type { Startable, Libp2p } from '@libp2p/interface'
 import { hashKey } from 'p2p-fret'
 import type { FretService } from 'p2p-fret'
+import { routingKeyForBlock } from '@optimystic/db-core'
 import type { PartitionDetector } from './partition-detector.js'
 import type { ArachnodeFretAdapter, ArachnodeInfo } from '../storage/arachnode-fret-adapter.js'
 import { createLogger } from '../logger.js'
 
 const log = createLogger('rebalance-monitor')
-const textEncoder = new TextEncoder()
 
 export interface RebalanceEvent {
 	/** Block IDs this node has gained responsibility for */
@@ -423,7 +423,7 @@ export class RebalanceMonitor implements Startable {
 		const growthCandidates: Array<{ blockId: string; newPeers: string[]; state: BlockGrowthState }> = []
 
 		for (const blockId of this.trackedBlocks) {
-			const key = textEncoder.encode(blockId)
+			const key = routingKeyForBlock(blockId)
 			const coord = await hashKey(key)
 
 			// Get the current cohort — assembleCohort returns peer IDs sorted by distance

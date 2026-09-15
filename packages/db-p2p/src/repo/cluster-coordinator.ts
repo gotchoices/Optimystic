@@ -1,6 +1,6 @@
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, StaleFailure } from "@optimystic/db-core";
-import { CURRENT_MEMBERSHIP_VERSION, computeClusterMessageHash, isConflictFailure, membershipDigest } from "@optimystic/db-core";
+import { CURRENT_MEMBERSHIP_VERSION, computeClusterMessageHash, isConflictFailure, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
 import { createLogger, verbose } from '../logger.js'
@@ -239,9 +239,8 @@ export class ClusterCoordinator {
 	 * Gets all peers in the cluster for a specific block ID
 	 */
 	private async getClusterForBlock(blockId: BlockId): Promise<ClusterPeers> {
-		const blockIdBytes = new TextEncoder().encode(blockId);
 		try {
-			const peers = await this.keyNetwork.findCluster(blockIdBytes);
+			const peers = await this.keyNetwork.findCluster(routingKeyForBlock(blockId));
 			const peerIds = Object.keys(peers ?? {});
 			log('cluster-tx:cluster-members', { blockId, peerIds });
 			return peers;

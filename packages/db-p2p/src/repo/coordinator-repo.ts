@@ -1,5 +1,5 @@
 import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
-import { LruMap, blockIdsForTransforms, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
+import { LruMap, blockIdsForTransforms, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock } from "@optimystic/db-core";
 import { ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -719,10 +719,9 @@ export class CoordinatorRepo implements IRepo {
 			return cached.inCluster;
 		}
 
-		const blockIdBytes = new TextEncoder().encode(blockId);
 		let inCluster: boolean;
 		try {
-			const peers = await this.keyNetwork.findCluster(blockIdBytes);
+			const peers = await this.keyNetwork.findCluster(routingKeyForBlock(blockId));
 			inCluster = this.localPeerId.toString() in peers;
 		} catch (err) {
 			this.log('proximity:check-error', { blockId, error: (err as Error).message });
@@ -1199,8 +1198,7 @@ export class CoordinatorRepo implements IRepo {
 	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext, localRev?: number): Promise<{ absence: AbsenceVerdict; currency: CurrencyVerdict }> {
 		if (!this.clusterLatestCallback) return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
 
-		const blockIdBytes = new TextEncoder().encode(blockId);
-		const peers = await this.keyNetwork.findCluster(blockIdBytes);
+		const peers = await this.keyNetwork.findCluster(routingKeyForBlock(blockId));
 		const peerIds = peers ? Object.keys(peers) : [];
 		// NOTE: deliberately does NOT call `markBlocksSeen` — unlike the solo-self exit below.
 		// An empty cohort is a ROUTING FAILURE, not a settled answer, and `Libp2pKeyPeerNetwork`

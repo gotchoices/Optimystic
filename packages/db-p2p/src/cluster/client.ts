@@ -1,5 +1,5 @@
 import type { PeerId, IPeerNetwork, ICluster, ClusterRecord } from '@optimystic/db-core';
-import { blockIdToBytes, blockIdsForTransforms } from '@optimystic/db-core';
+import { blockIdsForTransforms } from '@optimystic/db-core';
 import { ProtocolClient } from '../protocol-client.js';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { isClusterErrorEnvelope, clusterErrorFromEnvelope } from './cluster-error.js';
@@ -61,7 +61,7 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 			// notice we get that this peer matters, and if it is relay-only we have no address
 			// for it at all. Merging after the dial would help only some later hop.
 			this.peerNetwork.recordPeerAddresses?.(nextId, next.addrs ?? [])
-			await this.recordCoordinatorForRecordIfSupported(record, nextId)
+			this.recordCoordinatorForRecordIfSupported(record, nextId)
 			const nextClient = ClusterClient.create(nextId, this.peerNetwork, this.protocolPrefix)
 			// Thread the caller's *original* options through the redirect hop (the
 			// recursive call re-applies its own defaults) so the deadline survives a redirect.
@@ -98,22 +98,18 @@ export class ClusterClient extends ProtocolClient implements ICluster {
    * Reading `record.message.commit`/`.pend` (the old code) always saw
    * `undefined`, so this hint was dead code and never recorded anything.
    *
-   * The key is `blockIdToBytes(<the coordinated block id>)` — the sha256 digest
-   * findCoordinator/recordCoordinator key the cache on — NOT raw utf8 of the id
-   * (which would never be retrieved). Commit anchors on blockIds[0] (where
-   * CoordinatorRepo runs consensus + verifyResponsibility), not tailId. Pend
-   * anchors on a real block id (blockIdsForTransforms), not a structural
-   * transforms field name. ClusterClient only ever carries commit/pend.
+   * Commit anchors on blockIds[0] (where CoordinatorRepo runs consensus +
+   * verifyResponsibility), not tailId. Pend anchors on a real block id
+   * (blockIdsForTransforms), not a structural transforms field name.
+   * ClusterClient only ever carries commit/pend.
    */
-  private async recordCoordinatorForRecordIfSupported(record: ClusterRecord, peerId: PeerId): Promise<void> {
+  private recordCoordinatorForRecordIfSupported(record: ClusterRecord, peerId: PeerId): void {
     const op = record.message.operations[0]
     if (!op) return
     let id: string | undefined
     if ('commit' in op) id = op.commit.blockIds[0]
     else if ('pend' in op) id = blockIdsForTransforms(op.pend.transforms)[0]
     if (id == null) return
-    const kbytes = await blockIdToBytes(id)
-    const pn: any = this.peerNetwork as any
-    if (typeof pn?.recordCoordinator === 'function') pn.recordCoordinator(kbytes, peerId)
+    this.recordCoordinatorHint(id, peerId)
   }
 }

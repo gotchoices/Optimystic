@@ -1,9 +1,9 @@
 import type {
 	IRepo, GetBlockResults, PendSuccess, StaleFailure, ActionBlocks, MessageOptions, CommitResult,
-	PendRequest, CommitRequest, BlockGets, IPeerNetwork, PeerId
+	PendRequest, CommitRequest, BlockGets, IPeerNetwork, PeerId, BlockId
 } from "@optimystic/db-core";
 import type { RepoMessage } from "@optimystic/db-core";
-import { blockIdsForTransforms, blockIdToBytes } from "@optimystic/db-core";
+import { blockIdsForTransforms } from "@optimystic/db-core";
 import { ProtocolClient } from "../protocol-client.js";
 import type { RedirectPayload } from "./redirect.js";
 import { MAX_BLOCK_MESSAGE_BYTES } from "../protocol-limits.js";
@@ -122,10 +122,9 @@ export class RepoClient extends ProtocolClient implements IRepo {
 			// notice we get that this peer matters, and if it is relay-only we have no address
 			// for it at all. Merging after the dial would help only some later hop.
 			this.peerNetwork.recordPeerAddresses?.(nextId, next.addrs ?? [])
-			// cache hint — await so the recorded key bytes match what findCoordinator
-			// later looks up (blockIdToBytes is async); deterministic ordering also
-			// keeps the hint testable. The redirect retry below is async anyway.
-			await this.recordCoordinatorForOpsIfSupported(operations, nextId)
+			// Cache hint: a follow-up op on this block can dial the target directly.
+			const coordinated = this.coordinatedBlockId(operations)
+			if (coordinated) this.recordCoordinatorHint(coordinated, nextId)
 			// single-hop retry against target peer using repo protocol
 			const nextClient = RepoClient.create(nextId, this.peerNetwork, this.protocolPrefix)
 			return await nextClient.processRepoMessage<T>(operations, options, hop + 1)
@@ -133,41 +132,22 @@ export class RepoClient extends ProtocolClient implements IRepo {
 		return response as T;
 	}
 
-	private async extractKeyFromOperations(ops: RepoMessage['operations']): Promise<Uint8Array | undefined> {
+	/**
+	 * The block a redirected op is coordinated on — the block `RepoService.deriveBlockKey` redirected
+	 * it by, and so the block its coordinator hint belongs to.
+	 */
+	private coordinatedBlockId(ops: RepoMessage['operations']): BlockId | undefined {
 		const op = ops[0];
-		// The recorded key MUST be the sha256 digest produced by blockIdToBytes — the
-		// exact bytes findCoordinator/recordCoordinator key the coordinator cache on
-		// (NetworkTransactor passes blockIdToBytes(blockId)). Raw utf8 of the id would
-		// never match, so the hint would silently never be retrieved.
-		if ('get' in op) {
-			const id = op.get.blockIds[0];
-			return id ? await blockIdToBytes(id) : undefined;
-		}
-		if ('pend' in op) {
-			// Key on a real block id the pend touches, NOT a structural transforms field
-			// name ('inserts'/'updates'/'deletes'); see RepoService.deriveBlockKey.
-			const id = blockIdsForTransforms(op.pend.transforms)[0];
-			return id ? await blockIdToBytes(id) : undefined;
-		}
-		if ('commit' in op) {
-			// Anchor on blockIds[0] (where CoordinatorRepo.commit runs consensus +
-			// verifyResponsibility), NOT tailId — they differ for a non-tail batch.
-			const id = op.commit.blockIds[0];
-			return id ? await blockIdToBytes(id) : undefined;
-		}
-		if ('cancel' in op) {
-			const id = op.cancel.actionRef.blockIds[0];
-			return id ? await blockIdToBytes(id) : undefined;
-		}
+		if (!op) return undefined;
+		if ('get' in op) return op.get.blockIds[0];
+		// Key on a real block id the pend touches, NOT a structural transforms field
+		// name ('inserts'/'updates'/'deletes'); see RepoService.deriveBlockKey.
+		if ('pend' in op) return blockIdsForTransforms(op.pend.transforms)[0];
+		// Anchor on blockIds[0] (where CoordinatorRepo.commit runs consensus +
+		// verifyResponsibility), NOT tailId — they differ for a non-tail batch.
+		if ('commit' in op) return op.commit.blockIds[0];
+		if ('cancel' in op) return op.cancel.actionRef.blockIds[0];
 		return undefined;
-	}
-
-	private async recordCoordinatorForOpsIfSupported(ops: RepoMessage['operations'], peerId: PeerId): Promise<void> {
-		const keyBytes = await this.extractKeyFromOperations(ops)
-		const pn: any = this.peerNetwork as any
-		if (keyBytes != null && typeof pn?.recordCoordinator === 'function') {
-			pn.recordCoordinator(keyBytes, peerId)
-		}
 	}
 
 }

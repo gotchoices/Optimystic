@@ -86,6 +86,7 @@ import {
 	type PushStateInit,
 	type NotificationVerifier,
 } from '@optimystic/db-core';
+import { routingKeyForBlock } from '@optimystic/db-core';
 import { PartitionDetector } from './cluster/partition-detector.js';
 import { assertSuperMajorityCoupling } from './cluster/supermajority-coupling.js';
 import { createLogger } from './logger.js';
@@ -676,9 +677,8 @@ export async function createLibp2pNodeBase(
 				// reliably resolve from inside a service at request time, so the node is
 				// injected explicitly post-construction via setLibp2p(node) below — the same
 				// mechanism networkManager/fret use — rather than forwarded here. checkRedirect
-				// keys the responsible set on the RAW encoded block id
-				// (getCluster(encode(blockKey)) → hashKey(encode(...))), matching the
-				// coordinator's findCluster(encode(blockId)) — same cohort, no spurious redirect.
+				// keys the responsible set on the block's routing key (`routingKeyForBlock`), the
+				// same bytes the coordinator's findCluster is handed — same cohort, no spurious redirect.
 				return serviceFactory({
 					registrar: components.registrar,
 					repo: repoProxy
@@ -921,7 +921,7 @@ export async function createLibp2pNodeBase(
 		// voting, so a self-shrunk minority-partition set cannot be voted into super-majority (see cluster-repo
 		// admitMembership). No FRET ⇒ confidence 0 ⇒ the gate fails closed for any downsize.
 		const deriveExpectedCluster: DeriveExpectedClusterCallback = async (blockId) => {
-			const peers = await keyNetwork.findCluster(new TextEncoder().encode(blockId));
+			const peers = await keyNetwork.findCluster(routingKeyForBlock(blockId));
 			let confidence = 0;
 			if (fretSvc) {
 				try {
@@ -1702,8 +1702,8 @@ export async function createLibp2pNodeBase(
 						return undefined; // tail-less (read-driven promotion) never originates (the gate also returns first)
 					}
 					return {
-						// MUST reuse the gate's `reactivityTailBytes` (utf8), NOT db-core's double-hashing
-						// blockIdToBytes — else origination derives a different coord than subscribers resolve.
+						// MUST reuse the gate's `reactivityTailBytes` (raw utf8, the tail's routing key), never
+						// a pre-hashed digest — else origination derives a different coord than subscribers resolve.
 						tailId: reactivityTailBytes(event.tailId),
 						deltaMaxBytes: reactivityPolicy.deltaMaxBytes,
 						// rotationHint stays undefined on a live node: the successor tail id is not knowable at the

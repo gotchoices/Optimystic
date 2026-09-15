@@ -1,3 +1,4 @@
+import { routingKeyForBlock } from '@optimystic/db-core';
 import { expect } from 'chai';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
@@ -18,11 +19,10 @@ const makeBlock = (id: string): IBlock => ({ header: { id, type: 'test', collect
 const mapKey = (key: Uint8Array): string => Array.from(key).join(',');
 
 /**
- * Compute the map key for the bytes `checkRedirect` actually passes to getCluster.
- * After the key-derivation fix the redirect path passes the RAW encoded blockKey
- * (no pre-hash), matching the coordinator's findCluster(encode(blockId)).
+ * Compute the map key for the bytes `checkRedirect` actually passes to getCluster:
+ * the block's routing key, the same bytes the coordinator's findCluster is handed.
  */
-const blockKeyMapKey = (blockKey: string): string => mapKey(new TextEncoder().encode(blockKey));
+const blockKeyMapKey = (blockKey: string): string => mapKey(routingKeyForBlock(blockKey));
 
 /**
  * Network manager that returns a different cluster per blockKey, so a test can assert

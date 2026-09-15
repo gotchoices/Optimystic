@@ -1,9 +1,10 @@
 import { expect } from 'chai';
+import { hashKey } from 'p2p-fret';
 import {
 	reactivityTopicId,
 	createTierAddressing,
 	createRingHash,
-	blockIdToBytes,
+	routingKeyForBlock,
 	type BlockId,
 	type CollectionChangeEvent,
 	type ActionId,
@@ -22,8 +23,9 @@ import { reactivityTailBytes as reactivityTailBytesFromSurface } from '../../src
  * origination silently never reaches subscribers (green tests, dead feature).
  *
  * This pins the contract BOTH ways: the subscriber-derived coord equals the origination gate's coord for
- * the same tail; and it does NOT equal the coord db-core's double-hashing `blockIdToBytes` would produce
- * (the wrong encoding the gate's JSDoc warns against).
+ * the same tail; and it does NOT equal the coord a pre-hashed digest of the tail would produce (the double
+ * hash the gate's JSDoc warns against). It also pins that the tail bytes are the block's routing key, so
+ * reactivity and cohort routing share one encoding of a block id.
  */
 describe('reactivity / topic-bytes encoding (origination ↔ subscription coord equality)', () => {
 	const addressing = createTierAddressing(createRingHash());
@@ -66,19 +68,19 @@ describe('reactivity / topic-bytes encoding (origination ↔ subscription coord 
 		expect([...subscriberCoord], 'origination and subscription resolve the SAME coord_0').to.deep.equal([...originationCoord]);
 	});
 
-	it('the double-hash blockIdToBytes encoding resolves a DIFFERENT coord (pins the regression)', async () => {
+	it('the tail bytes are the raw routing key, and a pre-hashed digest resolves a DIFFERENT coord (pins the regression)', async () => {
 		const fret = stubFret(['self']);
 		const gate = createReactivitySelfMembershipGate({ fret, selfPeerId: 'self', wantK: 16 });
 		gate(makeEvent(TAIL));
 		const originationCoord = fret.coords[0]!;
 
-		// The WRONG encoding: db-core's async blockIdToBytes sha256s the utf8 bytes first, so feeding its
-		// output to reactivityTopicId double-hashes relative to H(tailId ‖ "reactivity") → a different coord.
-		const doubleHashCoord = addressing.coord0(reactivityTopicId(await blockIdToBytes(TAIL)));
-
-		expect([...doubleHashCoord], 'the double-hash encoding must NOT match origination (would silently lose delivery)').to.not.deep.equal([...originationCoord]);
-		// And sanity: reactivityTailBytes is the raw utf8, distinct from the sha256 digest.
+		// One encoding of a block id: the reactivity tail bytes ARE the block's routing key — raw utf8 of the id.
+		expect([...reactivityTailBytes(TAIL)], 'reactivityTailBytes is routingKeyForBlock(tail)').to.deep.equal([...routingKeyForBlock(TAIL)]);
 		expect([...reactivityTailBytes(TAIL)], 'reactivityTailBytes is raw utf8(BlockId)').to.deep.equal([...new TextEncoder().encode(TAIL)]);
-		expect(reactivityTailBytes(TAIL).length, 'raw utf8 is not the fixed 32-byte sha256 digest').to.not.equal((await blockIdToBytes(TAIL)).length);
+
+		// The WRONG encoding: a sha256 digest of the id fed to reactivityTopicId double-hashes relative to
+		// H(tailId ‖ "reactivity") → a different coord, so delivery would be silently lost.
+		const digestCoord = addressing.coord0(reactivityTopicId(await hashKey(new TextEncoder().encode(TAIL))));
+		expect([...digestCoord], 'a pre-hashed encoding must NOT match origination (would silently lose delivery)').to.not.deep.equal([...originationCoord]);
 	});
 });

@@ -1,18 +1,24 @@
 /**
- * Ticket: bug-writer-and-cohort-disagree-on-where-a-block-lives — the real-socket half.
+ * Tickets: bug-writer-and-cohort-disagree-on-where-a-block-lives (the measurement) and
+ * routing-key-single-encoding (the fix) — the real-socket half.
  *
- * `routing-key-convention-divergence.spec.ts` shows the writer's coordinate (`H(H(id))`) and the
- * servers' coordinate (`H(id)`) pick different cohorts on FRET's ring, and that on the mesh harness
- * a misrouted write silently succeeds with the wrong coordinator as an extra, out-of-cohort holder.
- * The harness has no `RepoService` in front of the coordinator, so it cannot show what production
- * adds: `RepoService.checkRedirect` on every REMOTE hop (keyed on `H(id)`), and the writer's own
- * node short-circuiting to its local `coordinatedRepo` with NO redirect check when it picks itself.
+ * `routing-key-convention-divergence.spec.ts` pins that the writer and the servers route a block on one
+ * coordinate, `H(utf8(id))`, on FRET's ring and on the mesh harness. The harness has no `RepoService` in
+ * front of the coordinator, so it cannot show what production adds: `RepoService.checkRedirect` on every
+ * REMOTE hop, and the writer's own node short-circuiting to its local `coordinatedRepo` with NO redirect
+ * check when it picks itself.
  *
- * This spec stands up SIX real nodes with `clusterSize: 2` — three times more peers than the
- * cohort holds — drives a production-shaped `NetworkTransactor` (self → local coordinated repo,
- * remote → `RepoClient`) from one node, and records for every block: where the writer sent the
- * pend, whether that hop was redirected, who ended up holding the block, and whether the holders
- * match the `H(id)` cohort the servers believe is responsible.
+ * This spec stands up SIX real nodes with `clusterSize: 2` — three times more peers than the cohort holds —
+ * drives a production-shaped `NetworkTransactor` (self → local coordinated repo, remote → `RepoClient`) from
+ * one node, and records for every block: where the writer sent the pend, whether that hop was redirected, who
+ * ended up holding the block, and whether the holders match the cohort the servers believe is responsible.
+ * A second node then reads every block back, and the spec counts redirects and the replicas those reads left
+ * behind — split by whether each landed inside the responsible cohort (read repair filling a responsible
+ * peer's gap) or outside it (a soft-served read acquiring a block its node is not responsible for).
+ *
+ * Still expected to be wrong here, until `self-in-cohort-only-when-nearest` lands: the writer's node always
+ * counts itself in the cohort and coordinates its own pends, so for every block it is not responsible for it
+ * keeps a copy nobody looks for, and one responsible peer never receives the block.
  *
  * Gated on OPTIMYSTIC_INTEGRATION=1 like the other integration specs:
  *   OPTIMYSTIC_INTEGRATION=1 yarn workspace @optimystic/db-p2p test:integration -- --grep "routing-key convention"
@@ -20,7 +26,7 @@
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import type { BlockId, IBlock, BlockHeader, Transforms, IRepo, BlockContentDigests, PeerId as DbPeerId } from '@optimystic/db-core';
-import { canonicalBlockHash, blockIdToBytes, NetworkTransactor } from '@optimystic/db-core';
+import { canonicalBlockHash, routingKeyForBlock, NetworkTransactor } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import { multiaddr } from '@multiformats/multiaddr';
 import { hashKey } from 'p2p-fret';
@@ -131,7 +137,7 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 		return out;
 	};
 
-	it('a production-shaped transactor: where writes go, where they land, and what it costs', async () => {
+	it('a production-shaped transactor: where writes go, where they land, and what reads cost', async () => {
 		const a = await spawnNode();
 		const bootstrapAddr = pickLocalTcpMultiaddr(a);
 		for (let i = 1; i < NODE_COUNT; i++) await spawnNode({ bootstrapNodes: [bootstrapAddr], fretProfile: 'core' });
@@ -175,17 +181,20 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 		const nm: { getCluster(key: Uint8Array): Promise<Array<{ toString(): string }>> } = (driver as any).services.networkManager;
 
 		const rows: Array<Record<string, unknown>> = [];
+		/** The servers' responsible cohort for each block, kept for the read-side split below. */
+		const serverCohorts = new Map<string, Set<string>>();
 		let failures = 0;
 		for (let i = 0; i < BLOCKS; i++) {
 			const id = `conv-it-block-${i}`;
+			const routingKey = routingKeyForBlock(id);
 			const before = decisions.length;
 			const handledBefore = handled.length;
-			// What the writer will route on, computed the way NetworkTransactor does, BEFORE the write
-			// so no redirect-learned coordinator hint has been recorded for this key yet.
-			const writerPick = (await keyNetwork.findCoordinator(await blockIdToBytes(id as BlockId), { excludedPeers: [] })).toString();
+			// What the writer will route on, exactly as NetworkTransactor asks for it, BEFORE the write so
+			// no redirect-learned coordinator hint has been recorded for this key yet.
+			const writerPick = (await keyNetwork.findCoordinator(routingKey, { excludedPeers: [] })).toString();
 			// The writer-side cohort `consolidateCoordinators` chooses the pend coordinator from, in the
 			// order it iterates (self-first on the membership-scoped path).
-			const writerCohortOrder = Object.keys(await keyNetwork.findCluster(await blockIdToBytes(id as BlockId)));
+			const writerCohortOrder = Object.keys(await keyNetwork.findCluster(routingKey));
 			let outcome = 'ok';
 			try {
 				const pend = await transactor.pend({ actionId: `act-${i}`, transforms: makeTransforms(id), policy: 'c' });
@@ -199,10 +208,11 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 			}
 			if (outcome !== 'ok') failures++;
 
-			// The servers' answer, two ways: the redirect check's `getCluster` (FRET cohort at H(id), no
-			// self) and the coordinator's own `findCluster` (same coordinate, self always included).
-			const cohort = new Set((await nm.getCluster(utf8.encode(id))).map(p => p.toString()));
-			const coordinatorView = Object.keys(await keyNetwork.findCluster(utf8.encode(id)));
+			// The servers' answer, two ways: the redirect check's `getCluster` (FRET cohort, no self) and the
+			// coordinator's own `findCluster` (same routing key, self always included).
+			const cohort = new Set((await nm.getCluster(routingKey)).map(p => p.toString()));
+			serverCohorts.set(id, cohort);
+			const coordinatorView = Object.keys(await keyNetwork.findCluster(routingKey));
 			const holders = await holdersOf(mesh, id);
 			const mine = decisions.slice(before).filter(d => d.blockKey === id);
 			const ops = handled.slice(handledBefore).filter(h => h.blockIds.includes(id));
@@ -211,6 +221,7 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 				block: i,
 				outcome,
 				findCoordinator: writerPick.substring(8, 14),
+				pickInCohort: cohort.has(writerPick),
 				writerCohort: writerCohortOrder.map(p => p.substring(8, 14)).join(','),
 				pendHandledBy: pendBy.join(','),
 				pendLocal: ops.some(h => h.op === 'pend' && h.local),
@@ -224,11 +235,12 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 				cohortMissing: [...cohort].filter(c => !holders.includes(c)).length
 			});
 		}
-		console.log(`[divergence-it] ${NODE_COUNT} nodes, clusterSize ${CLUSTER_SIZE}, driver=${driverId.substring(8, 14)} (* = handled locally, no RepoService)`);
+		console.log(`[convention-it] ${NODE_COUNT} nodes, clusterSize ${CLUSTER_SIZE}, driver=${driverId.substring(8, 14)} (* = handled locally, no RepoService)`);
 		console.table(rows);
 		const summary = {
 			blocks: BLOCKS,
 			failures,
+			writerPickOutsideCohort: rows.filter(r => !r.pickInCohort).length,
 			pendHandledLocally: rows.filter(r => r.pendLocal).length,
 			driverInCohort: rows.filter(r => r.driverInCohort).length,
 			blocksRedirected: rows.filter(r => (r.redirects as number) > 0).length,
@@ -236,9 +248,9 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 			blocksWithPhantomHolder: rows.filter(r => (r.holdersOutside as number) > 0).length,
 			blocksWithCohortGap: rows.filter(r => (r.cohortMissing as number) > 0).length
 		};
-		console.log('[divergence-it] write summary', summary);
-		const holdersBeforeReads = new Map<string, number>();
-		for (let i = 0; i < BLOCKS; i++) holdersBeforeReads.set(`conv-it-block-${i}`, (await holdersOf(mesh, `conv-it-block-${i}`)).length);
+		console.log('[convention-it] write summary', summary);
+		const holdersBeforeReads = new Map<string, Set<string>>();
+		for (let i = 0; i < BLOCKS; i++) holdersBeforeReads.set(`conv-it-block-${i}`, new Set(await holdersOf(mesh, `conv-it-block-${i}`)));
 
 		// Reads, from a DIFFERENT client node, through its own production-shaped transactor.
 		decisions.length = 0;
@@ -262,32 +274,47 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 			} catch { readThrew++; }
 		}
 		// A read served by a node that did not hold the block acquires it (see the NOTE on
-		// `CoordinatorRepo.get`): count the replicas reads left behind.
-		let grownByReads = 0, blocksGrown = 0;
+		// `CoordinatorRepo.get`). Split the replicas reads left behind by where they landed.
+		let blocksGrownByReads = 0, replicasAddedInsideCohort = 0, replicasAddedOutsideCohort = 0;
 		for (let i = 0; i < BLOCKS; i++) {
 			const id = `conv-it-block-${i}`;
-			const delta = (await holdersOf(mesh, id)).length - holdersBeforeReads.get(id)!;
-			if (delta > 0) { blocksGrown++; grownByReads += delta; }
+			const before = holdersBeforeReads.get(id)!;
+			const added = (await holdersOf(mesh, id)).filter(h => !before.has(h));
+			if (added.length > 0) blocksGrownByReads++;
+			const cohort = serverCohorts.get(id)!;
+			for (const h of added) {
+				if (cohort.has(h)) replicasAddedInsideCohort++;
+				else replicasAddedOutsideCohort++;
+			}
 		}
 		const readSummary = {
 			readOk, readMiss, readThrew,
 			getsHandledRemotely: handled.filter(h => h.op === 'get' && !h.local).length,
 			getChecks: decisions.filter(d => d.op === 'get').length,
 			getRedirects: decisions.filter(d => d.op === 'get' && d.redirected).length,
-			blocksGrownByReads: blocksGrown,
-			replicasAddedByReads: grownByReads
+			blocksGrownByReads,
+			replicasAddedInsideCohort,
+			replicasAddedOutsideCohort
 		};
-		console.log('[divergence-it] read summary', readSummary);
+		console.log('[convention-it] read summary', readSummary);
 
-		// Pinned: the writer's own node coordinates its own pends (no RepoService, no redirect
-		// check ever sees a write), and the write is placed on the writer's node plus only
-		// (clusterSize - 1) genuinely responsible peers — so whenever the writer is not itself
-		// responsible, one responsible peer never receives the block. Writes and reads still
-		// complete. Everything else is reported above for the ticket.
+		// Pinned by routing-key-single-encoding: no read is redirected, and no read leaves a replica on a node
+		// outside the responsible cohort.
+		// `writerPickOutsideCohort` is reported, not pinned: `findCoordinator` ranks FRET `getNeighbors` while
+		// cohorts come from `assembleCohort`, and on a write it drops self — so when self heads the cohort, its
+		// pick can be the next neighbour just outside it (observed for 1 block in 24). That is a selection
+		// question, not an encoding one; it is recorded as an arm of `self-in-cohort-only-when-nearest`.
+		expect(readSummary.getRedirects, 'reads reach a responsible peer, so none is redirected').to.equal(0);
+		expect(readSummary.replicasAddedOutsideCohort, 'no read acquires a replica outside the responsible cohort').to.equal(0);
+
+		// Still pinned until self-in-cohort-only-when-nearest: the writer's own node coordinates its own pends
+		// (no RepoService, no redirect check ever sees a write), and the write is placed on the writer's node
+		// plus only (clusterSize - 1) genuinely responsible peers — so whenever the writer is not itself
+		// responsible, one responsible peer never receives the block. Writes and reads still complete.
 		expect(summary.pendHandledLocally, 'every pend is coordinated by the writer\'s own node').to.equal(BLOCKS);
 		expect(summary.blocksWithCohortGap, 'each block whose writer is not responsible leaves one responsible peer without it')
 			.to.equal(BLOCKS - summary.driverInCohort);
-		expect(failures, 'writes complete despite the misroute').to.equal(0);
-		expect(readOk, 'reads complete despite the misroute').to.equal(BLOCKS);
+		expect(failures, 'writes complete').to.equal(0);
+		expect(readOk, 'reads complete').to.equal(BLOCKS);
 	});
 });

@@ -1,3 +1,4 @@
+import { routingKeyForBlock } from '@optimystic/db-core';
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import type { BlockId, IBlock, BlockHeader, Transforms, IRepo } from '@optimystic/db-core';
@@ -127,7 +128,7 @@ describe('Multi-coordinator write (real libp2p, two same-keyspace coordinators)'
 
 		// Confirm the precondition: BOTH nodes are in the block's cohort, so this
 		// write genuinely needs an inter-coordinator promise (not the K=1 fast path).
-		const aCohort = Object.keys(await (a as any).keyNetwork.findCluster(new TextEncoder().encode(blockId)));
+		const aCohort = Object.keys(await (a as any).keyNetwork.findCluster(routingKeyForBlock(blockId)));
 		expect(aCohort.length, "A's cohort for the block has both coordinators").to.equal(2);
 
 		const aRepo = (a as any).coordinatedRepo as IRepo;
@@ -172,7 +173,7 @@ describe('Multi-coordinator write (real libp2p, two same-keyspace coordinators)'
 		// as soon as the joiner's own cohort for a probe block already has both peers,
 		// mirroring a node that writes right after join.
 		await waitFor(async () => {
-			const ids = Object.keys(await (b as any).keyNetwork.findCluster(new TextEncoder().encode('mcw-join-probe')));
+			const ids = Object.keys(await (b as any).keyNetwork.findCluster(routingKeyForBlock('mcw-join-probe')));
 			return ids.length === 2;
 		}, { timeoutMs: 30_000, intervalMs: 250, description: "joiner's cohort for the probe has both coordinators" });
 

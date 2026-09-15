@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
-import { Tree } from '@optimystic/db-core';
+import { Tree, routingKeyForBlock } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import { multiaddr } from '@multiformats/multiaddr';
 import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
@@ -80,7 +80,7 @@ describe('Two-node convergence over real libp2p', function () {
 			{ timeoutMs: 30_000, intervalMs: 250, description: 'the 2-node mesh connected' });
 		await waitFor(async () => {
 			for (const n of mesh) {
-				const ids = Object.keys(await n.keyNetwork.findCluster(new TextEncoder().encode('two-node-conv-probe')));
+				const ids = Object.keys(await n.keyNetwork.findCluster(routingKeyForBlock('two-node-conv-probe')));
 				if (ids.length !== 2) return false;
 			}
 			return true;

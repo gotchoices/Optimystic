@@ -1,6 +1,6 @@
 import { expect } from 'chai'
 import { NetworkTransactor } from '../src/transactor/network-transactor.js'
-import { blockIdToBytes } from '../src/utility/block-id-to-bytes.js'
+import { routingKeyForBlock } from '../src/network/routing-key.js'
 import { peerIdFromString } from '../src/network/types.js'
 import {
 	computeClusterMessageHash,
@@ -29,7 +29,7 @@ class MappedKeyNetwork implements IKeyNetwork {
 	private readonly routes = new Map<string, string[]>()
 
 	async route(blockId: BlockId, peers: string[]) {
-		this.routes.set(keyHex(await blockIdToBytes(blockId)), peers)
+		this.routes.set(keyHex(routingKeyForBlock(blockId)), peers)
 	}
 
 	async findCoordinator(key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {

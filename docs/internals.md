@@ -660,6 +660,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
 
 ### Block Identity
 - `blockId` = random ID (base64url; `randomBytes(32)`, `packages/db-core/src/transactor/transactor-source.ts`), immutable — not a content hash
+- A block's **routing key** is the raw utf8 of its id — `routingKeyForBlock` in `packages/db-core/src/network/routing-key.ts`, typed `RoutingKey` so the key network's `findCluster` and `findCoordinator` accept nothing else. The key network hashes it exactly once into a ring coordinate; callers never pre-hash. Every party that asks which peers are responsible for a block — the writer's `NetworkTransactor`, `CoordinatorRepo`'s responsibility check, a cluster member re-deriving its cohort, `RepoService.checkRedirect` — lands on the same ring position only because all of them hand over these bytes. While the transactor pre-hashed and the servers did not, every network wider than one cohort sent the writer to the wrong machines; no fixture no wider than its cohort can see that, which is why `packages/db-p2p/test/routing-key-convention-divergence.spec.ts` builds wider rings.
 - `actionId` = transaction identifier, unique per commit
 - `rev` = revision number, monotonically increasing per block
 

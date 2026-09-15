@@ -1,5 +1,6 @@
 import type { Startable, PeerId, Libp2p } from '@libp2p/interface'
 import { peerIdFromString } from '@libp2p/peer-id'
+import type { RoutingKey } from '@optimystic/db-core'
 import type { FretService } from 'p2p-fret'
 import { hashKey } from 'p2p-fret'
 import { toString as u8ToString } from 'uint8arrays/to-string'
@@ -258,7 +259,7 @@ export class NetworkManagerService implements Startable {
 		return this.reputation?.isBanned(peerId.toString()) ?? false
 	}
 
-	recordCoordinator(key: Uint8Array, peerId: PeerId): void {
+	recordCoordinator(key: RoutingKey, peerId: PeerId): void {
 		const k = this.toCacheKey(key)
 		this.coordinatorCache.set(k, { id: peerId, expires: Date.now() + this.cfg.cacheTTLs.coordinatorMs })
 	}
@@ -308,7 +309,7 @@ export class NetworkManagerService implements Startable {
 	/**
 	 * Compute cluster using FRET's assembleCohort for content-addressed peer selection.
 	 */
-	async getCluster(key: Uint8Array): Promise<PeerId[]> {
+	async getCluster(key: RoutingKey): Promise<PeerId[]> {
 		const ck = this.toCacheKey(key);
 		const cached = this.clusterCache.get(ck);
 		if (cached && cached.expires > Date.now()) {
@@ -359,7 +360,7 @@ export class NetworkManagerService implements Startable {
 		return ids;
 	}
 
-	async getCoordinator(key: Uint8Array): Promise<PeerId> {
+	async getCoordinator(key: RoutingKey): Promise<PeerId> {
 		const ck = this.toCacheKey(key);
 		const hit = this.coordinatorCache.get(ck);
 		if (hit) {

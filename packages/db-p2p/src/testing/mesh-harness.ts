@@ -1,8 +1,9 @@
 import type { PeerId, PrivateKey } from '@libp2p/interface';
-import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ActionRev, ITransactor, ITransactionValidator, PeerId as DbPeerId } from '@optimystic/db-core';
+import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ActionRev, ITransactor, ITransactionValidator, PeerId as DbPeerId, RoutingKey } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
-import { NetworkTransactor } from '@optimystic/db-core';
+import { NetworkTransactor, routingKeyForBlock } from '@optimystic/db-core';
+import { hashKey } from 'p2p-fret';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair, generateKeyPairFromSeed } from '@libp2p/crypto/keys';
 import { ClusterMember, clusterMember, type ReconcileBlockCallback, type DeriveExpectedClusterCallback, type ExpectedClusterView } from '../cluster/cluster-repo.js';
@@ -140,7 +141,10 @@ class MockPeerNetwork implements IPeerNetwork {
 }
 
 /**
- * Mock IKeyNetwork that returns peers based on XOR distance.
+ * Mock IKeyNetwork that ranks peers by XOR distance to the key's ring coordinate.
+ * Like `Libp2pKeyPeerNetwork`, it hashes the routing key exactly once before ranking, so the harness
+ * places a block by the same rule production does. (Ranking the raw utf8 bytes instead would XOR a
+ * short key against only the tail of each peer id, so the order would be set by the peer ids, not the key.)
  * With responsibilityK >= nodeCount, all nodes are returned.
  * Otherwise, K-nearest by XOR distance are returned.
  */
@@ -151,9 +155,9 @@ class MockMeshKeyNetwork implements IKeyNetwork {
 		private readonly failures: MeshFailureConfig = {}
 	) {}
 
-	async findCoordinator(key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+	async findCoordinator(key: RoutingKey, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
 		const excluded = new Set((options?.excludedPeers ?? []).map(p => p.toString()));
-		const sorted = this.sortedByDistance(key);
+		const sorted = await this.sortedByDistance(key);
 		const pick = sorted.find(n => !excluded.has(n.peerId.toString()));
 		if (!pick) {
 			throw new Error('No coordinator available for key (all candidates excluded)');
@@ -161,12 +165,12 @@ class MockMeshKeyNetwork implements IKeyNetwork {
 		return pick.peerId;
 	}
 
-	async findCluster(key: Uint8Array): Promise<ClusterPeers> {
+	async findCluster(key: RoutingKey): Promise<ClusterPeers> {
 		if (this.failures.findClusterFails) {
 			return {} as ClusterPeers;
 		}
 
-		const sorted = this.sortedByDistance(key);
+		const sorted = await this.sortedByDistance(key);
 		const k = Math.min(this.responsibilityK, sorted.length);
 		const selected = sorted.slice(0, k);
 
@@ -180,12 +184,13 @@ class MockMeshKeyNetwork implements IKeyNetwork {
 		return peers;
 	}
 
-	private sortedByDistance(key: Uint8Array): MeshNode[] {
+	private async sortedByDistance(key: RoutingKey): Promise<MeshNode[]> {
+		const coord = await hashKey(key);
 		const knownPeers: KnownPeer[] = this.nodes.map(n => ({
 			id: n.peerId,
 			addrs: ['/ip4/127.0.0.1/tcp/8000']
 		}));
-		const sorted = sortPeersByDistance(knownPeers, key);
+		const sorted = sortPeersByDistance(knownPeers, coord);
 		return sorted.map(kp => this.nodes.find(n => n.peerId.equals(kp.id))!);
 	}
 }
@@ -405,7 +410,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		const deriveExpectedCluster: DeriveExpectedClusterCallback = options.deriveExpectedCluster
 			? (blockId) => options.deriveExpectedCluster!(meshNode, blockId)
 			: async (blockId) => ({
-				peers: await nodeKeyNetwork.findCluster(new TextEncoder().encode(blockId)) ?? {},
+				peers: await nodeKeyNetwork.findCluster(routingKeyForBlock(blockId)) ?? {},
 				confidence: options.meshConfidence?.(meshNode) ?? 1
 			});
 
@@ -511,7 +516,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
  * needs a genuinely non-responsible node has to ask the routing layer rather than assume an index.
  */
 export async function nonResponsibleNodes(mesh: Mesh, blockId: string): Promise<MeshNode[]> {
-	const cohort = await mesh.keyNetwork.findCluster(new TextEncoder().encode(blockId));
+	const cohort = await mesh.keyNetwork.findCluster(routingKeyForBlock(blockId));
 	return mesh.nodes.filter(node => !(node.peerId.toString() in cohort));
 }
 

@@ -1,6 +1,6 @@
 import type { AbortOptions, Libp2p, PeerId, Stream } from "@libp2p/interface";
 import { toString as u8ToString } from 'uint8arrays'
-import type { ClusterPeers, CoordinatorIntent, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } from "@optimystic/db-core";
+import type { ClusterPeers, CoordinatorIntent, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork, RoutingKey } from "@optimystic/db-core";
 import { peerIdFromString } from '@libp2p/peer-id'
 import type { FretService, SerializedTable } from 'p2p-fret'
 import { hashKey } from 'p2p-fret'
@@ -605,7 +605,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * `NetworkTransactor` (it writes back whatever `findCoordinator` returned, including
 	 * self) and by `RepoClient`/`ClusterClient` on redirect responses.
 	 */
-	public recordCoordinator(key: Uint8Array, peerId: PeerId, ttlMs = 30 * 60 * 1000): void {
+	public recordCoordinator(key: RoutingKey, peerId: PeerId, ttlMs = 30 * 60 * 1000): void {
 		if (peerId.toString() === this.libp2p.peerId.toString()) {
 			this.log('coordinator-cache:self-write-ignored key=%s', this.toCacheKey(key).substring(0, 12))
 			return
@@ -633,7 +633,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		mergePeerAddresses(this.libp2p, peerId, multiaddrs, this.addressLog)
 	}
 
-	private getCachedCoordinator(key: Uint8Array): PeerId | undefined {
+	private getCachedCoordinator(key: RoutingKey): PeerId | undefined {
 		const k = this.toCacheKey(key)
 		const hit = this.coordinatorCache.get(k)
 		if (hit && hit.expires > Date.now()) return hit.id
@@ -704,14 +704,14 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return svc
 	}
 
-	private async getNeighborIdsForKey(key: Uint8Array, wants: number): Promise<string[]> {
+	private async getNeighborIdsForKey(key: RoutingKey, wants: number): Promise<string[]> {
 		const fret = this.getFret()
 		const coord = await hashKey(key)
 		const both = fret.getNeighbors(coord, 'both', wants)
 		return Array.from(new Set(both)).slice(0, wants)
 	}
 
-	async findCoordinator(key: Uint8Array, _options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+	async findCoordinator(key: RoutingKey, _options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
 		const t0 = Date.now();
 		const excludedSet = new Set<string>((_options?.excludedPeers ?? []).map(p => p.toString()))
 		// Unset means 'write' — the conservative reading, so a caller that doesn't declare an
@@ -973,9 +973,10 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	// finishes identifying one, must stop answering self-only immediately, and read-repair recovery
 	// relies on that widening. Revisit if an on-device (React Native) profile shows findCluster as
 	// material; then memoize ONLY the solo answer, invalidated on connection:open and peer:identify.
-	async findCluster(key: Uint8Array): Promise<ClusterPeers> {
+	async findCluster(key: RoutingKey): Promise<ClusterPeers> {
 		const t0 = Date.now();
 		const fret = this.getFret()
+		// The only hash between a block id and its cohort: `key` is the id's raw utf8 (`routingKeyForBlock`).
 		const coord = await hashKey(key)
 		// When membership scoping is active, over-fetch a wider proximity band so the
 		// nearest peers that SERVE this network are in the candidate pool even if cross-

@@ -18,6 +18,7 @@
  * Gated on OPTIMYSTIC_INTEGRATION=1:
  *   yarn workspace @optimystic/quereus-plugin-optimystic test:integration
  */
+import { routingKeyForBlock } from '@optimystic/db-core';
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
@@ -142,7 +143,7 @@ describe('Two-node secondary-index convergence over real libp2p', function () {
 		await waitFor(() => mesh.every(n => n.getPeers().length >= 1), 30_000, 'the 2-node mesh to connect');
 		await waitFor(async () => {
 			for (const n of mesh) {
-				const ids = Object.keys(await (n as any).keyNetwork.findCluster(new TextEncoder().encode('two-node-index-probe')));
+				const ids = Object.keys(await (n as any).keyNetwork.findCluster(routingKeyForBlock('two-node-index-probe')));
 				if (ids.length !== 2) return false;
 			}
 			return true;

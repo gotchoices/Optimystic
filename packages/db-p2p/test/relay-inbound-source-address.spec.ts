@@ -19,6 +19,7 @@
  * **Runtime.** ~2 s (two real libp2p boots over loopback plus the reservation/push round trip), so
  * like the positive cases in `relay-address-propagation.spec.ts` it is NOT env-gated.
  */
+import { routingKeyForBlock } from '@optimystic/db-core';
 import { expect } from 'chai';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { spawnRelayNode, spawnCircuitOnlyPeer, pickRelayWsAddr } from './util/relay-topology.js';
@@ -38,7 +39,7 @@ const PROPAGATION_TIMEOUT_MS = 20_000;
 /** Fine enough to take tens of samples inside the ~1 s pre-reservation window. */
 const POLL_MS = 20;
 
-const KEY = new TextEncoder().encode('inbound-source-address-key');
+const KEY = routingKeyForBlock('inbound-source-address-key');
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 

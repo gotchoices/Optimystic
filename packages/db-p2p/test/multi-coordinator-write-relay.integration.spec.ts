@@ -1,3 +1,4 @@
+import { routingKeyForBlock } from '@optimystic/db-core';
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import type { BlockId, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
@@ -156,7 +157,7 @@ describe('Multi-coordinator write over a relay (limited inter-coordinator stream
 		// identify (an unidentified peer is never admitted) and FRET convergence — and if it never
 		// becomes true the wait throws naming the condition. No skip below this line.
 		const cohortOfA = async (): Promise<string[]> =>
-			Object.keys(await nodeA.keyNetwork.findCluster(new TextEncoder().encode(BLOCK_ID)));
+			Object.keys(await nodeA.keyNetwork.findCluster(routingKeyForBlock(BLOCK_ID)));
 		// The poll RETURNS the cohort it accepted, so the assertion below judges that same
 		// observation rather than a second `findCluster` taken an instant later.
 		const aCohort = await waitForValue(async () => {

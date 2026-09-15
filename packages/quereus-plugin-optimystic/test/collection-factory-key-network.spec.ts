@@ -1,3 +1,4 @@
+import { routingKeyForBlock } from '@optimystic/db-core';
 import { expect } from 'chai';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
@@ -106,13 +107,13 @@ describe('CollectionFactory network transactor key network', () => {
 
 	it('scopes cohort selection to peers serving this network', async () => {
 		const keyNetwork = await transactorKeyNetwork();
-		const peers = await keyNetwork.findCluster(new TextEncoder().encode('block-1'));
+		const peers = await keyNetwork.findCluster(routingKeyForBlock('block-1'));
 		expect(Object.keys(peers)).to.not.include(foreign.toString());
 	});
 
 	it('assembles the cohort at the configured cluster size', async () => {
 		const keyNetwork = await transactorKeyNetwork();
-		const peers = await keyNetwork.findCluster(new TextEncoder().encode('block-1'));
+		const peers = await keyNetwork.findCluster(routingKeyForBlock('block-1'));
 		expect(Object.keys(peers)).to.have.lengthOf(CONFIGURED_CLUSTER_SIZE);
 	});
 

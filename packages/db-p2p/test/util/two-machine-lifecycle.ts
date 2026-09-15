@@ -14,7 +14,7 @@
 import { expect } from 'chai';
 import type { PrivateKey } from '@libp2p/interface';
 import type { BlockId } from '@optimystic/db-core';
-import { NetworkTransactor, Tree } from '@optimystic/db-core';
+import { NetworkTransactor, Tree, routingKeyForBlock } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { createLibp2pNode, type NodeOptions } from '../../src/libp2p-node.js';
@@ -96,7 +96,7 @@ export async function waitForPair(a: Machine, b: Machine): Promise<void> {
 		() => nodeA.getPeers().some(p => p.equals(nodeB.peerId)) && nodeB.getPeers().some(p => p.equals(nodeA.peerId)),
 		{ timeoutMs: 30_000, intervalMs: 250, description: `${a.name} and ${b.name} connected to each other` }
 	);
-	const probe = new TextEncoder().encode(`${a.networkName}-probe-${probeCounter++}`);
+	const probe = routingKeyForBlock(`${a.networkName}-probe-${probeCounter++}`);
 	await waitFor(async () => {
 		for (const node of [nodeA, nodeB]) {
 			if (Object.keys(await node.keyNetwork.findCluster(probe)).length !== 2) return false;

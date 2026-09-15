@@ -82,8 +82,8 @@ export interface ReactivitySubscriptionManagerOptions {
 	 *
 	 * **Load-bearing encoding contract.** When a production subscribe factory converts a `BlockId` tail to
 	 * these bytes it MUST use `reactivityTailBytes(tailId)` (`reactivity/topic-bytes.ts`) — the SAME function
-	 * origination's membership gate uses — NOT db-core's `blockIdToBytes` (which `sha256`s first → a double
-	 * hash). Origination derives the topic's `coord_0` cohort from `reactivityTopicId(reactivityTailBytes(
+	 * origination's membership gate uses — never a pre-hashed digest of the id, which would double-hash.
+	 * Origination derives the topic's `coord_0` cohort from `reactivityTopicId(reactivityTailBytes(
 	 * tailId))`; if this side feeds differently-encoded bytes it subscribes to a *different* coord and
 	 * origination silently never reaches it (the `topic-bytes-encoding` spec pins the coord-equality).
 	 */

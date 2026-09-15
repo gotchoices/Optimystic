@@ -1,7 +1,8 @@
 import { pipe } from 'it-pipe';
 import { encode as lpEncode, decode as lpDecode } from 'it-length-prefixed';
 import type { Stream as Libp2pStream } from '@libp2p/interface';
-import type { PeerId, IPeerNetwork } from '@optimystic/db-core';
+import type { PeerId, IPeerNetwork, IKeyNetwork, BlockId } from '@optimystic/db-core';
+import { routingKeyForBlock } from '@optimystic/db-core';
 import { first } from './it-utility.js';
 import { createLogger } from './logger.js';
 import { MAX_BLOCK_MESSAGE_BYTES } from './protocol-limits.js';
@@ -47,6 +48,17 @@ export class ProtocolClient {
 		protected readonly peerId: PeerId,
 		protected readonly peerNetwork: IPeerNetwork,
 	) { }
+
+	/**
+	 * Remember that `coordinator` coordinates `blockId`, so a follow-up op on that block dials it directly
+	 * instead of being redirected again. Only a key network keeps coordinator hints — a plain
+	 * {@link IPeerNetwork} omits `recordCoordinator`, and this is then a no-op. The hint is keyed on the
+	 * block's routing key, the key a later `findCoordinator` looks it up by.
+	 */
+	protected recordCoordinatorHint(blockId: BlockId, coordinator: PeerId): void {
+		const hints = this.peerNetwork as IPeerNetwork & Partial<Pick<IKeyNetwork, 'recordCoordinator'>>;
+		hints.recordCoordinator?.(routingKeyForBlock(blockId), coordinator);
+	}
 
 	protected async processMessage<T>(
 		message: unknown,

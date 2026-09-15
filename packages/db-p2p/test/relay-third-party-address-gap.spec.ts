@@ -35,6 +35,7 @@
  * **Runtime.** ~0.4 s for the first case, ~2 s for the joined one — the latter waits out the two
  * chained debounces described on {@link PROPAGATION_TIMEOUT_MS}. Neither is env-gated.
  */
+import { routingKeyForBlock } from '@optimystic/db-core';
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import { webSockets } from '@libp2p/websockets';
@@ -186,7 +187,7 @@ describe('Relay address propagation to a third party', function () {
 
 			// (B) the record the relay publishes for the key carries that address. Polled, because
 			// the peerStore write and the next cohort assembly settle independently.
-			const key = new TextEncoder().encode('joined-case-key');
+			const key = routingKeyForBlock('joined-case-key');
 			let published: ClusterPeers = {};
 			const deadline = Date.now() + PROPAGATION_TIMEOUT_MS;
 			for (;;) {

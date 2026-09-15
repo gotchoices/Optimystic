@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import type { BlockId, IBlock, BlockHeader, Transforms, IRepo, BlockContentDigests } from '@optimystic/db-core';
-import { canonicalBlockHash } from '@optimystic/db-core';
+import { canonicalBlockHash, routingKeyForBlock } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { multiaddr } from '@multiformats/multiaddr';
@@ -407,7 +407,7 @@ describe('Real libp2p integration', function () {
 		let chosen: { blockId: string; responsible: Libp2p; driver: Libp2p } | undefined;
 		for (let i = 0; i < 200; i++) {
 			const blockId = `redirect-rt-block-${i}`;
-			const cohort = await entryNM.getCluster(new TextEncoder().encode(blockId));
+			const cohort = await entryNM.getCluster(routingKeyForBlock(blockId));
 			const ids = cohort.map(p => p.toString());
 			if (ids.length >= 1 && !ids.includes(entry.peerId.toString())) {
 				const responsible = mesh.find(n => n !== entry && n.peerId.toString() === ids[0]);
@@ -520,7 +520,7 @@ describe('Real libp2p integration', function () {
 		let chosen: { blockId: string; members: Libp2p[]; responsible: Libp2p; driver: Libp2p; cohortIds: string[] } | undefined;
 		for (let i = 0; i < 200; i++) {
 			const blockId = `mm-redirect-block-${i}`;
-			const cohort = await entryNM.getCluster(new TextEncoder().encode(blockId));
+			const cohort = await entryNM.getCluster(routingKeyForBlock(blockId));
 			const ids = cohort.map(p => p.toString());
 			// Require the full 2-member cohort (no estimate-driven clamp) excluding the entry.
 			if (ids.length !== 2) continue;
@@ -586,7 +586,7 @@ describe('Real libp2p integration', function () {
 		// Confirm the benign-divergence property live: each member's own getCluster cohort
 		// includes itself and is a subset of the coordinator's findCluster cohort, so a
 		// redirect can never point at a non-responsible peer.
-		const keyBytes = new TextEncoder().encode(blockId);
+		const keyBytes = routingKeyForBlock(blockId);
 		for (const m of members) {
 			const mLabel = m.peerId.toString().substring(0, 12);
 			const mRepoSvc = (m as any).services.repo;
@@ -652,7 +652,7 @@ describe('Real libp2p integration', function () {
 		let chosen: { blockId: string; owner: Libp2p; nonMembers: Libp2p[] } | undefined;
 		for (let i = 0; i < 200; i++) {
 			const blockId = `spread-churn-block-${i}`;
-			const cohort = await entryNM.getCluster(new TextEncoder().encode(blockId));
+			const cohort = await entryNM.getCluster(routingKeyForBlock(blockId));
 			const ids = cohort.map(p => p.toString());
 			if (ids.length !== 2) continue;
 			const owners = mesh.filter(n => ids.includes(n.peerId.toString()));

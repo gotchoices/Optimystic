@@ -1,3 +1,4 @@
+import { routingKeyForBlock } from '@optimystic/db-core';
 import { expect } from 'chai';
 import type { IKeyNetwork } from '@optimystic/db-core';
 import { createMesh } from '../src/testing/mesh-harness.js';
@@ -35,7 +36,7 @@ describe('mesh harness: wrapKeyNetwork', () => {
 
 		const beforeMeshLookup = calls;
 		// `Mesh.keyNetwork` itself must be the SAME wrapped instance — not the raw mock.
-		await mesh.keyNetwork.findCluster(new TextEncoder().encode('wrap-hook-block'));
+		await mesh.keyNetwork.findCluster(routingKeyForBlock('wrap-hook-block'));
 		expect(calls, 'mesh.keyNetwork must be the wrapped instance too')
 			.to.be.greaterThan(beforeMeshLookup);
 	});
@@ -49,7 +50,7 @@ describe('mesh harness: wrapKeyNetwork', () => {
 		const mesh = await createMesh(3, { responsibilityK: 3, wrapKeyNetwork: wrap });
 		mesh.failures.findClusterFails = true;
 
-		const peers = await mesh.keyNetwork.findCluster(new TextEncoder().encode('wrap-hook-block-2'));
+		const peers = await mesh.keyNetwork.findCluster(routingKeyForBlock('wrap-hook-block-2'));
 		expect(Object.keys(peers)).to.have.length(0);
 
 		mesh.failures.findClusterFails = false;
@@ -58,7 +59,7 @@ describe('mesh harness: wrapKeyNetwork', () => {
 	it('omitting wrapKeyNetwork leaves mesh.keyNetwork as the unwrapped mock', async () => {
 		const mesh = await createMesh(1, { responsibilityK: 1, clusterSize: 1 });
 		expect(mesh.keyNetwork.constructor.name).to.equal('MockMeshKeyNetwork');
-		const peers = await mesh.keyNetwork.findCluster(new TextEncoder().encode('plain-block'));
+		const peers = await mesh.keyNetwork.findCluster(routingKeyForBlock('plain-block'));
 		// The solo node's self-including view: one entry, itself.
 		expect(Object.keys(peers)).to.have.length(1);
 	});

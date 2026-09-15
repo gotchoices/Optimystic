@@ -320,7 +320,7 @@ The system uses the `IKeyNetwork` interface to map blocks to clusters:
 
 ```typescript
 // Find cluster peers for a specific block
-const peers = await this.keyNetwork.findCluster(blockIdBytes);
+const peers = await this.keyNetwork.findCluster(routingKeyForBlock(blockId));
 
 // Execute transaction across the cluster
 await this.clusterManager.executeClusterTransaction(blockId, message, options);

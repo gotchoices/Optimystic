@@ -51,3 +51,11 @@ This is a plan ticket rather than an implement ticket because several paths were
 - A unit spec that on a ring no wider than `clusterSize`, every serving node is in every cohort (the small-network invariant).
 - Harness-versus-production cohort parity spec.
 - Sereus `strand-membership-closed-strand-e2e` and `harness-party-control-cohort` integration scenarios, run once against the branch.
+
+# Arm found while landing routing-key-single-encoding (2026-09-15)
+
+`findCoordinator` and `findCluster` choose from two different orderings of the same ring, so "the coordinator is inside the cohort" holds today only by coincidence. `findCluster` (and `NetworkManagerService.getCluster`, which `RepoService.checkRedirect` uses) take FRET's `assembleCohort`, which alternates successor and predecessor outward from the key's coordinate. `findCoordinator`'s FRET tier takes `getNeighborIdsForKey`, which is FRET's `getNeighbors(coord, 'both', clusterSize)`: all successors first, then predecessors, cut to `clusterSize` — so on any ring with at least `clusterSize` live members its candidates are successors only. The first entry is the same in both lists; the second is not. When self is the nearest successor and `findCoordinator` does not pick self on a write (its FRET tier drops self unless `shouldAllowSelfCoordination` allows it), the pick is the second successor, which the cohort may not contain.
+
+Observed in `packages/db-p2p/test/routing-key-convention-divergence.integration.spec.ts` (six nodes, `clusterSize` 2): the writer's `findCoordinator` pick was outside the servers' cohort for 1 of 24 blocks on one run and 0 of 24 on another (the ring is random per run). The spec reports it as `writerPickOutsideCohort` and deliberately does not pin it. Today's cost is at most one redirect hop, and only on write paths that consult `findCoordinator` (a commit with no cached pend coordinator, a cancel, the `consolidateCoordinators` fallback when `findCluster` throws), because the writer's pends still self-coordinate. Once item 2 sends pends to remote coordinators, the same mismatch sits on the main write path.
+
+Settle it with item 3: pick the coordinator from the same ordered cohort `findCluster` returns (after the same exclusions), not from a second FRET primitive, so the coordinator is inside the cohort by construction.

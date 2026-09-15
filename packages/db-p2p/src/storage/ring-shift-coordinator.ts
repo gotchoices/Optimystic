@@ -1,5 +1,6 @@
 import { hashKey } from 'p2p-fret';
 import type { FretService } from 'p2p-fret';
+import { routingKeyForBlock } from '@optimystic/db-core';
 import type { PartitionDetector } from '../cluster/partition-detector.js';
 import type { ArachnodeFretAdapter, ArachnodeInfo } from './arachnode-fret-adapter.js';
 import type { RingSelector } from './ring-selector.js';
@@ -7,7 +8,6 @@ import { partitionCovers, qualifiesForFloor } from './arachnode-partition.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('ring-shift');
-const textEncoder = new TextEncoder();
 
 /**
  * The confirm primitive the handoff gates release on. Satisfied by `BlockTransferCoordinator`; kept
@@ -199,7 +199,7 @@ export class RingShiftCoordinator {
 	): Promise<string[]> {
 		const shed: string[] = [];
 		for (const blockId of this.deps.ownedBlocks) {
-			const coord = await hashKey(textEncoder.encode(blockId));
+			const coord = await hashKey(routingKeyForBlock(blockId));
 			if (partitionCovers(oldPartition, coord) && !partitionCovers(newPartition, coord)) {
 				shed.push(blockId);
 			}
@@ -217,7 +217,7 @@ export class RingShiftCoordinator {
 		const owners = new Map<string, string[]>();
 		const want = floor + 1 + this.candidateMargin; // headroom for self + excluded movers
 		for (const blockId of shed) {
-			const coord = await hashKey(textEncoder.encode(blockId));
+			const coord = await hashKey(routingKeyForBlock(blockId));
 			const cohort = this.deps.fret.assembleCohort(coord, want);
 			const qualifying = cohort.filter(peerId => {
 				if (peerId === this.deps.selfPeerId) return false;

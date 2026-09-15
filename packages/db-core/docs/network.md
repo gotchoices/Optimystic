@@ -53,8 +53,8 @@ The architecture separates concerns through three key abstractions:
 ```typescript
 // ID addressing and cluster discovery
 interface IKeyNetwork {
-  findCoordinator(key: Uint8Array): Promise<PeerId>;
-  findCluster(key: Uint8Array): Promise<ClusterPeers>;
+  findCoordinator(key: RoutingKey): Promise<PeerId>;
+  findCluster(key: RoutingKey): Promise<ClusterPeers>;
 }
 
 // Peer communication infrastructure
@@ -69,7 +69,7 @@ interface IRepo {
 ```
 
 **Why this separation matters:**
-- **IKeyNetwork**: Abstracts away DHT implementation details and cluster topology
+- **IKeyNetwork**: Abstracts away DHT implementation details and cluster topology. Every key is a block's routing key — `routingKeyForBlock` in `packages/db-core/src/network/routing-key.ts`, the raw utf8 of the block id, branded `RoutingKey` — and the key network hashes it exactly once into a ring coordinate. Callers never pre-hash: the writer and the servers agree on a block's cluster only because they hand over the same bytes
 - **IPeerNetwork**: Isolates network transport from application logic  
 - **IRepo**: Provides uniform cluster interface regardless of internal cluster organization
 

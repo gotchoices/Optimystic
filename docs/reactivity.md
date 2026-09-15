@@ -132,7 +132,7 @@ The direct-subscriber list is the cohort-topic layer's `RegistrationRecord` set 
 > The manager's `emit` seam is now bound to live fan-out (`12.33-reactivity-notification-transport`): the
 > node assembly installs the hook and routes each built `NotificationV1` into `ReactivityForwarderHost.ingest`,
 > so origination travels over the notify protocol to subscribers. Origination derives the topic's `coord_0`
-> from `reactivityTailBytes(tailId) = utf8(tailId)` (NOT db-core's double-hashing `blockIdToBytes`); the
+> from `reactivityTailBytes(tailId) = utf8(tailId)` — the tail's routing key (`routingKeyForBlock`), never a pre-hashed digest; the
 > subscriber side MUST feed `reactivityTopicId` the **same** bytes (see §Propagation) or it resolves a
 > different coord and never receives — pinned by `topic-bytes-encoding.spec.ts`.
 

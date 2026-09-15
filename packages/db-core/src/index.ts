@@ -20,6 +20,5 @@ export * from "./utility/latches.js";
 export * from "./utility/nameof.js";
 export * from "./utility/ensured.js";
 export * from "./utility/pending.js";
-export * from "./utility/block-id-to-bytes.js";
 export * from "./utility/lru-map.js";
 export * from "./utility/backoff.js";

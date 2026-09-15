@@ -8,7 +8,7 @@ import type {
 	IPeerNetwork, PeerId as CorePeerId, ClusterRecord, RepoMessage,
 	CommitRequest, PendRequest, IBlock, BlockGets, ActionBlocks
 } from '@optimystic/db-core';
-import { blockIdToBytes } from '@optimystic/db-core';
+import { routingKeyForBlock } from '@optimystic/db-core';
 import { RepoClient } from '../src/repo/client.js';
 import { ClusterClient } from '../src/cluster/client.js';
 
@@ -74,8 +74,9 @@ const soonExpiring = () => ({ expiration: Date.now() + 2000 });
 
 describe('RepoClient coordinator-cache hint key', () => {
 	// Defect 2: commit must key on blockIds[0] (where consensus runs), not tailId.
-	// Defect 1: the key must be the sha256 digest (blockIdToBytes), not raw utf8.
-	it('records a non-tail commit under blockIdToBytes(blockIds[0]) — not tailId, not raw utf8', async () => {
+	// Defect 1: the key must be the block's routing key (routingKeyForBlock) — the exact bytes
+	// findCoordinator looks the hint up by, which are the raw utf8 of the id, never a digest of it.
+	it('records a non-tail commit under routingKeyForBlock(blockIds[0]) — not tailId', async () => {
 		const startPeer = await makePeerId();
 		const coordinator = await makePeerId();
 		const { network, recorded, dialCount } = makeRedirectNetwork(coordinator, { success: true });
@@ -93,17 +94,16 @@ describe('RepoClient coordinator-cache hint key', () => {
 		expect(recorded).to.have.length(1);
 		expect(recorded[0]!.peerId.toString()).to.equal(coordinator.toString());
 
-		const expected = await blockIdToBytes('block-A');
-		expect(bytesEqual(recorded[0]!.key, expected), 'key must be blockIdToBytes(blockIds[0])').to.equal(true);
+		expect(bytesEqual(recorded[0]!.key, routingKeyForBlock('block-A')), 'key must be routingKeyForBlock(blockIds[0])').to.equal(true);
+		expect(bytesEqual(recorded[0]!.key, new TextEncoder().encode('block-A')), 'the routing key is the raw utf8 of the id').to.equal(true);
 
-		// Prove it is NOT the old (wrong) derivations.
-		expect(bytesEqual(recorded[0]!.key, await blockIdToBytes('tail-Z')), 'must not key on tailId').to.equal(false);
-		expect(bytesEqual(recorded[0]!.key, new TextEncoder().encode('block-A')), 'must not be raw utf8').to.equal(false);
+		// Prove it is NOT the old (wrong) anchor.
+		expect(bytesEqual(recorded[0]!.key, routingKeyForBlock('tail-Z')), 'must not key on tailId').to.equal(false);
 	});
 
 	// Defect 3: pend must key on a real block id (blockIdsForTransforms), not the
 	// structural transforms field name ('inserts'/'updates'/'deletes').
-	it('records a pend under blockIdToBytes(block-A) — not the literal "inserts" field name', async () => {
+	it('records a pend under routingKeyForBlock(block-A) — not the literal "inserts" field name', async () => {
 		const startPeer = await makePeerId();
 		const coordinator = await makePeerId();
 		const { network, recorded } = makeRedirectNetwork(coordinator, { success: true, pending: [], blockIds: ['block-A'] });
@@ -117,15 +117,12 @@ describe('RepoClient coordinator-cache hint key', () => {
 		await client.pend(request, soonExpiring());
 
 		expect(recorded).to.have.length(1);
-		const expected = await blockIdToBytes('block-A');
-		expect(bytesEqual(recorded[0]!.key, expected), 'key must be blockIdToBytes(block-A)').to.equal(true);
-		expect(bytesEqual(recorded[0]!.key, new TextEncoder().encode('inserts')), 'must not key on the field name').to.equal(false);
-		expect(bytesEqual(recorded[0]!.key, await blockIdToBytes('inserts')), 'must not hash the field name').to.equal(false);
+		expect(bytesEqual(recorded[0]!.key, routingKeyForBlock('block-A')), 'key must be routingKeyForBlock(block-A)').to.equal(true);
+		expect(bytesEqual(recorded[0]!.key, routingKeyForBlock('inserts')), 'must not key on the field name').to.equal(false);
 	});
 
-	// Defect 1 (encoding) also applies to the get branch: key on blockIdToBytes(blockIds[0]),
-	// matching RepoService.deriveBlockKey('get') → blockIds[0]. Not raw utf8.
-	it('records a get under blockIdToBytes(blockIds[0]) — not raw utf8', async () => {
+	// The get branch keys on routingKeyForBlock(blockIds[0]), matching RepoService.deriveBlockKey('get') → blockIds[0].
+	it('records a get under routingKeyForBlock(blockIds[0])', async () => {
 		const startPeer = await makePeerId();
 		const coordinator = await makePeerId();
 		const { network, recorded } = makeRedirectNetwork(coordinator, {});
@@ -135,14 +132,11 @@ describe('RepoClient coordinator-cache hint key', () => {
 		await client.get(gets, soonExpiring());
 
 		expect(recorded).to.have.length(1);
-		const expected = await blockIdToBytes('block-A');
-		expect(bytesEqual(recorded[0]!.key, expected), 'key must be blockIdToBytes(blockIds[0])').to.equal(true);
-		expect(bytesEqual(recorded[0]!.key, new TextEncoder().encode('block-A')), 'must not be raw utf8').to.equal(false);
+		expect(bytesEqual(recorded[0]!.key, routingKeyForBlock('block-A')), 'key must be routingKeyForBlock(blockIds[0])').to.equal(true);
 	});
 
-	// Defect 1 (encoding) also applies to the cancel branch: key on
-	// blockIdToBytes(actionRef.blockIds[0]), matching deriveBlockKey('cancel'). Not raw utf8.
-	it('records a cancel under blockIdToBytes(actionRef.blockIds[0]) — not raw utf8', async () => {
+	// The cancel branch keys on routingKeyForBlock(actionRef.blockIds[0]), matching deriveBlockKey('cancel').
+	it('records a cancel under routingKeyForBlock(actionRef.blockIds[0])', async () => {
 		const startPeer = await makePeerId();
 		const coordinator = await makePeerId();
 		const { network, recorded } = makeRedirectNetwork(coordinator, {});
@@ -152,9 +146,7 @@ describe('RepoClient coordinator-cache hint key', () => {
 		await client.cancel(actionRef, soonExpiring());
 
 		expect(recorded).to.have.length(1);
-		const expected = await blockIdToBytes('block-A');
-		expect(bytesEqual(recorded[0]!.key, expected), 'key must be blockIdToBytes(actionRef.blockIds[0])').to.equal(true);
-		expect(bytesEqual(recorded[0]!.key, new TextEncoder().encode('block-A')), 'must not be raw utf8').to.equal(false);
+		expect(bytesEqual(recorded[0]!.key, routingKeyForBlock('block-A')), 'key must be routingKeyForBlock(actionRef.blockIds[0])').to.equal(true);
 	});
 });
 
@@ -162,7 +154,7 @@ describe('ClusterClient coordinator-cache hint key', () => {
 	// Defect 0: the old code read record.message.commit/.pend, which never exist
 	// (the op lives at record.message.operations[0]), so recordCoordinator was
 	// NEVER called. These tests prove it is now invoked at all, with the right key.
-	it('invokes recordCoordinator with blockIdToBytes(blockIds[0]) for a non-tail commit', async () => {
+	it('invokes recordCoordinator with routingKeyForBlock(blockIds[0]) for a non-tail commit', async () => {
 		const startPeer = await makePeerId();
 		const coordinator = await makePeerId();
 		const message: RepoMessage = {
@@ -184,12 +176,11 @@ describe('ClusterClient coordinator-cache hint key', () => {
 		expect(recorded, 'recordCoordinator must now be invoked (was dead code)').to.have.length(1);
 		expect(recorded[0]!.peerId.toString()).to.equal(coordinator.toString());
 
-		const expected = await blockIdToBytes('block-A');
-		expect(bytesEqual(recorded[0]!.key, expected), 'key must be blockIdToBytes(blockIds[0])').to.equal(true);
-		expect(bytesEqual(recorded[0]!.key, await blockIdToBytes('tail-Z')), 'must not key on tailId').to.equal(false);
+		expect(bytesEqual(recorded[0]!.key, routingKeyForBlock('block-A')), 'key must be routingKeyForBlock(blockIds[0])').to.equal(true);
+		expect(bytesEqual(recorded[0]!.key, routingKeyForBlock('tail-Z')), 'must not key on tailId').to.equal(false);
 	});
 
-	it('invokes recordCoordinator with blockIdToBytes(block-A) for a pend', async () => {
+	it('invokes recordCoordinator with routingKeyForBlock(block-A) for a pend', async () => {
 		const startPeer = await makePeerId();
 		const coordinator = await makePeerId();
 		const message: RepoMessage = {
@@ -208,8 +199,7 @@ describe('ClusterClient coordinator-cache hint key', () => {
 		await client.update(record);
 
 		expect(recorded, 'recordCoordinator must now be invoked (was dead code)').to.have.length(1);
-		const expected = await blockIdToBytes('block-A');
-		expect(bytesEqual(recorded[0]!.key, expected), 'key must be blockIdToBytes(block-A)').to.equal(true);
-		expect(bytesEqual(recorded[0]!.key, new TextEncoder().encode('inserts')), 'must not key on the field name').to.equal(false);
+		expect(bytesEqual(recorded[0]!.key, routingKeyForBlock('block-A')), 'key must be routingKeyForBlock(block-A)').to.equal(true);
+		expect(bytesEqual(recorded[0]!.key, routingKeyForBlock('inserts')), 'must not key on the field name').to.equal(false);
 	});
 });

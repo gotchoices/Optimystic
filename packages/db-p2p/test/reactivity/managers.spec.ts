@@ -649,7 +649,7 @@ describe('reactivity / origination manager', () => {
 			service.onLocalCommit!(eventOn('block-tail-new', 8), cert);
 			expect(calls, 'a tail-id change fires markRotated exactly once').to.have.length(1);
 			// The oldTopicId MUST be reactivityTopicId(reactivityTailBytes(oldTail)) — the SAME topic a subscriber
-			// subscribes under — NOT blockIdToBytes (double-hash). A mismatch would silently never redirect.
+			// subscribes under — never a pre-hashed digest (a double hash). A mismatch would silently never redirect.
 			expect([...calls[0]!.oldTopicId], 'oldTopicId equals the topic the subscriber subscribed under').to.deep.equal([...reactivityTopicId(reactivityTailBytes('block-tail-old'))]);
 			expect(calls[0]!.newTailId, 'redirect names the new tail (reactivityTailBytes encoding)').to.equal(bytesToB64url(reactivityTailBytes('block-tail-new')));
 			expect(calls[0]!.effectiveAtRevision, 'effective at the rev the new tail first appeared').to.equal(8);

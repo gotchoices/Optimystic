@@ -11,7 +11,7 @@ import { CacheSource } from "../transform/cache-source.js";
 import { TransactorSource } from "./transactor-source.js";
 import { Log } from "../log/log.js";
 import { groupBy } from "../utility/groupby.js";
-import { blockIdToBytes } from "../utility/block-id-to-bytes.js";
+import { routingKeyForBlock } from "../network/routing-key.js";
 import { isRecordEmpty } from "../utility/is-record-empty.js";
 import { type CoordinatorBatch, makeBatchesByPeer, incompleteBatches, everyBatch, allBatches, mergeBlocks, processBatches, createBatchesForPayload } from "../utility/batch-coordinator.js";
 import { abortableDelay, jitteredBackoffMs } from "../utility/backoff.js";
@@ -137,7 +137,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				batch => batch.payload,
 				(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(bid => bid === blockId)],
 				expiration,
-				async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), { ...options, intent: 'read' })
+				(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), { ...options, intent: 'read' })
 			);
 		} catch (e) {
 			error = e as Error;
@@ -204,7 +204,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 					b.payload,
 					(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(id => id === blockId)],
 					Array.from(excluded),
-					async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), { ...options, intent: 'read' })
+					(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), { ...options, intent: 'read' })
 				);
 				if (retries.length > 0) {
 					b.subsumedBy = [...(b.subsumedBy ?? []), ...retries];
@@ -214,7 +214,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 						batch => batch.payload,
 						(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(id => id === blockId)],
 						expiration,
-						async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), { ...options, intent: 'read' })
+						(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), { ...options, intent: 'read' })
 					);
 				}
 			}));
@@ -438,7 +438,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 
 		await Promise.all(blockIds.map(async bid => {
 			try {
-				const clusterPeers = await this.keyNetwork.findCluster(await blockIdToBytes(bid));
+				const clusterPeers = await this.keyNetwork.findCluster(routingKeyForBlock(bid));
 				blockClusterPeerIds.set(bid, new Set(Object.keys(clusterPeers)));
 			} catch {
 				fallbackBlocks.push(bid);
@@ -484,7 +484,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		const fallbackCoordinators = await Promise.all(
 			fallbackBlocks.map(async bid => ({
 				blockId: bid,
-				coordinator: await this.keyNetwork.findCoordinator(await blockIdToBytes(bid), { excludedPeers: [] })
+				coordinator: await this.keyNetwork.findCoordinator(routingKeyForBlock(bid), { excludedPeers: [] })
 			}))
 		);
 		for (const { blockId, coordinator } of fallbackCoordinators) {
@@ -556,12 +556,12 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				batch => blockIdsForTransforms(batch.payload),
 				transformForBlock,
 				expiration,
-				async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
+				(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), options)
 			);
 			// Cache resolved coordinators for follow-up commit to hit the same peers
 			try {
 				for (const b of Array.from(allBatches(batches))) {
-					this.keyNetwork.recordCoordinator?.(await blockIdToBytes(b.blockId), b.peerId);
+					this.keyNetwork.recordCoordinator?.(routingKeyForBlock(b.blockId), b.peerId);
 				}
 			} catch (e) { log('WARN: Failed to record coordinator hint %o', e); }
 		} catch (e) {
@@ -685,8 +685,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	}
 
 	async queryClusterNominees(blockId: BlockId): Promise<ClusterNomineesResult> {
-		const blockIdBytes = await blockIdToBytes(blockId);
-		const clusterPeers = await this.keyNetwork.findCluster(blockIdBytes);
+		const routingKey = routingKeyForBlock(blockId);
+		const clusterPeers = await this.keyNetwork.findCluster(routingKey);
 		const nominees = Object.keys(clusterPeers).map(idStr => peerIdFromString(idStr));
 		return { nominees };
 	}
@@ -951,7 +951,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				return cached;
 			}
 		}
-		return this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), { ...options, intent });
+		return this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), { ...options, intent });
 	}
 
 	/**
@@ -1088,7 +1088,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 					batch => batch.payload,
 					mergeBlocks,
 					deadline,
-					async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
+					(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), options)
 				);
 			} catch (e) {
 				lastError = asError(e);
