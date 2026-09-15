@@ -1,0 +1,178 @@
+#!/usr/bin/env node
+/**
+ * Undeclared-dependency guard — fails when a workspace's `src/` or `test/` imports a package that
+ * workspace's own `package.json` never lists.
+ *
+ * `packages/db-core/test/reactivity/recover.spec.ts` imported `@noble/curves/ed25519.js` while
+ * `db-core`'s manifest declared only `@noble/hashes`. It built anyway, because the tree's untracked
+ * `.yarnrc.yml` selects Yarn's `node_modules` linker, which happens to nest a copy of `@noble/curves`
+ * under `packages/db-core/node_modules` for one of db-core's libp2p dependencies. A checkout that
+ * installs with Yarn's default Plug'n'Play linker enforces declared dependencies strictly and fails
+ * immediately with `Cannot find module '@noble/curves/ed25519.js'` (gotchoices/Optimystic, filed as
+ * `a-package-can-import-a-dependency-it-does-not-declare`). Nothing else in the toolchain notices:
+ * TypeScript resolves through whatever `node_modules` layout it is given, and `yarn constraints`
+ * only looks at declared ranges, never at what source actually imports.
+ *
+ * This script reads every workspace's own manifest, walks that workspace's `src/` and `test/` for
+ * static import/re-export/dynamic-import/require specifiers, and flags any bare (non-relative,
+ * non-builtin) specifier whose package name is not in that workspace's `dependencies`,
+ * `devDependencies`, `peerDependencies` or `optionalDependencies`.
+ *
+ * Following `check-doc-citations.mjs` and `check-libp2p-majors.mjs`: plain .mjs, no dependencies,
+ * no build step. Wired into `yarn lint:deps`, chained into `yarn check`.
+ */
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { builtinModules } from 'node:module';
+import { stdout, stderr, exit, argv } from 'node:process';
+
+/** Tracked (and staged-but-uncommitted) files, straight from git — never a filesystem walk, so a
+ * stray local `node_modules` or `dist` never gets scanned as if it were source. */
+function trackedFiles() {
+	let raw;
+	try {
+		raw = execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+	} catch (err) {
+		stderr.write('check-undeclared-deps: could not run `git ls-files`. This check needs a git working\n');
+		stderr.write('tree (a tarball export will not do). Underlying error:\n');
+		stderr.write(`  ${err && err.message ? err.message : String(err)}\n`);
+		exit(1);
+	}
+	return raw.split('\0').filter(Boolean).map((p) => p.replace(/\\/g, '/'));
+}
+
+const SOURCE_FILE_RE = /^packages\/([^/]+)\/(?:src|test)\/.*\.(?:ts|tsx|mts|cts|mjs|js|jsx)$/;
+
+/** The Node builtins a bare specifier may legitimately name, with or without the `node:` prefix. */
+const BUILTIN_NAMES = new Set(builtinModules.filter((m) => !m.startsWith('_')));
+
+// -- Extracting import specifiers -------------------------------------------------------------
+
+// Static `import ... from 'x'` / `export ... from 'x'`, including multi-line named-import lists —
+// the `[^'";]*?` gap excludes quotes and semicolons, so it cannot cross into a neighbouring
+// statement, but happily spans the newlines inside a brace list.
+const FROM_IMPORT_RE = /\b(?:import|export)\b[^'";]*?\bfrom\s*['"]([^'"]+)['"]/g;
+// Side-effect-only `import 'x'` (no `from`).
+const SIDE_EFFECT_IMPORT_RE = /\bimport\s*['"]([^'"]+)['"]/g;
+// Dynamic `import('x')`.
+const DYNAMIC_IMPORT_RE = /\bimport\(\s*['"]([^'"]+)['"]/g;
+// `require('x')` — this repo is ESM-first, but a stray CommonJS require is still worth catching.
+const REQUIRE_RE = /\brequire\(\s*['"]([^'"]+)['"]/g;
+
+/**
+ * Blank `/* ... *\/` block comments and `` ` ... ` `` template literals, preserving line breaks and
+ * length. Both host free-form prose that can accidentally read as an import statement — a JSDoc
+ * `{@link import("pkg").thing}`, or a spec's fixture array of import-syntax strings used to test an
+ * import-detecting regex (`packages/db-core/test/no-fret-import.spec.ts` does exactly this). Plain
+ * `'...'`/`"..."` strings are left alone: that is the actual shape a real import specifier takes, so
+ * blanking those would blind the check to the imports it exists to catch.
+ *
+ * Deliberately not comment/string-aware beyond this: a `//` line comment and a regex literal
+ * containing quote characters (`no-fret-import.spec.ts`'s own `IMPORT_RE`) are left as plain text.
+ * That is a known false-positive source, not a silent gap — it only ever adds a finding to chase
+ * down, never hides an undeclared dependency.
+ */
+function stripCommentsAndTemplates(text) {
+	const blank = (m) => m.replace(/[^\n]/g, ' ');
+	return text
+		.replace(/\/\*[\s\S]*?\*\//g, blank)
+		.replace(/`(?:\\.|[^`\\])*`/g, blank);
+}
+
+function extractSpecifiers(text) {
+	const specifiers = new Set();
+	for (const re of [FROM_IMPORT_RE, SIDE_EFFECT_IMPORT_RE, DYNAMIC_IMPORT_RE, REQUIRE_RE]) {
+		re.lastIndex = 0;
+		let match;
+		while ((match = re.exec(text)) !== null) specifiers.add(match[1]);
+	}
+	return specifiers;
+}
+
+/** The npm package name a bare specifier names, or null for a relative path, a builtin, or another URL scheme. */
+function packageNameOf(specifier) {
+	if (specifier.startsWith('.') || specifier.startsWith('/')) return null;
+	if (specifier.startsWith('node:')) return null;
+	if (/^[a-z][a-z0-9+.-]*:/i.test(specifier)) return null; // data:, http:, etc — never an npm package
+	const match = /^(@[^/]+\/[^/]+|[^@/][^/]*)/.exec(specifier);
+	if (!match) return null;
+	if (BUILTIN_NAMES.has(match[1])) return null;
+	return match[1];
+}
+
+// -- Declared dependencies ------------------------------------------------------------------
+
+function declaredNames(manifest) {
+	const names = new Set([manifest.name]);
+	for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+		for (const name of Object.keys(manifest[field] ?? {})) names.add(name);
+	}
+	return names;
+}
+
+// -- The check -------------------------------------------------------------------------------
+
+function run() {
+	const tracked = trackedFiles();
+	const byPackage = new Map();
+	for (const path of tracked) {
+		const match = SOURCE_FILE_RE.exec(path);
+		if (!match) continue;
+		const pkgDir = `packages/${match[1]}`;
+		if (!byPackage.has(pkgDir)) byPackage.set(pkgDir, []);
+		byPackage.get(pkgDir).push(path);
+	}
+
+	if (byPackage.size === 0) {
+		stderr.write('check-undeclared-deps: found zero packages/*/{src,test} files to scan. That is a bug in\n');
+		stderr.write('this script, not a clean tree — refusing to report success.\n');
+		exit(1);
+	}
+
+	const findings = [];
+	let filesScanned = 0;
+
+	for (const [pkgDir, files] of [...byPackage].sort(([a], [b]) => a.localeCompare(b))) {
+		const manifestPath = `${pkgDir}/package.json`;
+		let manifest;
+		try {
+			manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+		} catch (err) {
+			findings.push({ file: manifestPath, message: `could not read/parse this workspace's manifest: ${err.message}` });
+			continue;
+		}
+		const declared = declaredNames(manifest);
+
+		for (const file of files) {
+			filesScanned++;
+			const text = stripCommentsAndTemplates(readFileSync(file, 'utf8'));
+			for (const specifier of extractSpecifiers(text)) {
+				const pkgName = packageNameOf(specifier);
+				if (pkgName === null || declared.has(pkgName)) continue;
+				findings.push({ file, message: `imports \`${specifier}\` — \`${pkgName}\` is not declared in ${manifestPath}` });
+			}
+		}
+	}
+
+	findings.sort((a, b) => a.file.localeCompare(b.file) || a.message.localeCompare(b.message));
+	for (const f of findings) stdout.write(`${f.file}: ${f.message}\n`);
+
+	if (findings.length) {
+		stdout.write(`\ncheck-undeclared-deps: ${findings.length} finding(s) across ${byPackage.size} packages.\n`);
+		stdout.write('Add the package to the workspace\'s own dependencies/devDependencies/peerDependencies —\n');
+		stdout.write('an import that only resolves because another workspace happens to hoist it is one\n');
+		stdout.write('install layout away from breaking (see AGENTS.md § Dependencies).\n');
+		exit(1);
+	}
+	stdout.write(`check-undeclared-deps: ${filesScanned} files across ${byPackage.size} packages — every import is declared.\n`);
+}
+
+if (argv.includes('--help') || argv.includes('-h')) {
+	stdout.write('Usage: node scripts/check-undeclared-deps.mjs\n\n');
+	stdout.write('Checks that every bare import in a workspace\'s src/ or test/ names a package that\n');
+	stdout.write('workspace\'s own package.json declares, or a Node builtin. Exits non-zero, naming the\n');
+	stdout.write('offending imports, when one is not. See AGENTS.md § Dependencies.\n');
+	exit(0);
+}
+
+run();

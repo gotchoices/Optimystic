@@ -36,6 +36,8 @@
     "quoomb:node2": "quoomb --config examples/quoomb.config.node2.env.json"
   },
   "devDependencies": {
+    "@libp2p/peer-id": "^6.0.4",
+    "@multiformats/multiaddr": "^13.0.1",
     "@optimystic/db-p2p-storage-fs": "workspace:^",
     "@quereus/quereus": "^4.19.0",
     "@types/chai": "^5.2.3",

@@ -20,7 +20,7 @@
     "build": "yarn workspaces foreach -At --exclude '@optimystic/optimystic' run build",
     "lint": "eslint .",
     "lint:docs": "node scripts/check-doc-citations.mjs",
-    "lint:deps": "yarn constraints && node scripts/check-libp2p-majors.mjs",
+    "lint:deps": "yarn constraints && node scripts/check-libp2p-majors.mjs && node scripts/check-undeclared-deps.mjs",
     "typecheck": "yarn workspaces foreach -At --exclude '@optimystic/optimystic' run typecheck",
     "test:harness": "node --test \"test-harness/*.test.mjs\"",
     "test": "yarn test:harness && yarn workspaces foreach -At --exclude '@optimystic/optimystic' run test",
