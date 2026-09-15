@@ -304,4 +304,48 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 			await service.stop();
 		}
 	});
+
+	/**
+	 * Reproduces the Hermes/React Native condition in Node: `globalThis.Buffer` does not exist
+	 * unless a host app happens to install a polyfill (see readme.md § React Native). Deletes the
+	 * global for the duration of one push AND one pull through the real handler+stream path, so a
+	 * regression that reaches for `Buffer` anywhere in that path (service, client, or the
+	 * `it-length-prefixed`/`it-pipe` framing in between) throws `ReferenceError: Buffer is not
+	 * defined` here instead of silently only failing on-device.
+	 */
+	it('completes a push and a pull with globalThis.Buffer deleted (Hermes/React Native condition)', async function () {
+		this.timeout(2000);
+		const pullBlockId = 'rt-nobuffer-pull';
+		const pushBlockId = 'rt-nobuffer-push';
+		await repo.saveReplicatedBlock(pullBlockId as BlockId, makeBlock(pullBlockId));
+
+		const { service, peerNetwork } = makeWiredNetwork(repo);
+		await service.start();
+		const savedBuffer = (globalThis as any).Buffer;
+		try {
+			delete (globalThis as any).Buffer;
+			expect(typeof (globalThis as any).Buffer, 'precondition: the global is actually gone').to.equal('undefined');
+
+			const client = new BlockTransferClient(peerId, peerNetwork as any);
+
+			const pullResponse = await client.pullBlocks([pullBlockId], 'replication');
+			expect(pullResponse.blocks).to.have.property(pullBlockId);
+			expect(pullResponse.missing).to.deep.equal([]);
+			const decoded = JSON.parse(u8ToString(u8FromString(pullResponse.blocks[pullBlockId]!, 'base64pad'), 'utf8'));
+			expect(decoded.header.id).to.equal(pullBlockId);
+
+			const pushBlock = makeBlock(pushBlockId);
+			const pushData = new TextEncoder().encode(JSON.stringify(pushBlock));
+			const pushResponse = await client.pushBlocks([pushBlockId], [pushData], 'replication');
+			expect(pushResponse.blocks).to.have.property(pushBlockId);
+			expect(pushResponse.missing).to.deep.equal([]);
+
+			const result = await repo.get({ blockIds: [pushBlockId as BlockId] });
+			expect(result[pushBlockId]?.block?.header.id, 'pushed block durably persisted with no global Buffer')
+				.to.equal(pushBlockId);
+		} finally {
+			(globalThis as any).Buffer = savedBuffer;
+			await service.stop();
+		}
+	});
 });
