@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-09-12T05:21:05.019Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\3-debt-libp2p-interface-version-drift-guard.implement.2026-09-12T05-21-05-017Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Parts of our networking stack can quietly end up built against different major versions of the same core library, which breaks them in ways nothing reports. Drop the one dependency that still does this, and add a check that fails the build if it happens again.
 files:
   - scripts/check-libp2p-majors.mjs (new — the guard)
