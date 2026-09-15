@@ -317,17 +317,17 @@ export interface RecoverServeDeps {
 /**
  * Verify the request's peer-key signature against the dialing peer, then admit it through the freshness +
  * anti-replay guard. The dialing peer's id **is** the signer (no signer-id field on the wire); the signature
- * bytes are the anti-replay key (globally unique + authenticated). Returns `false` (reject, no reply) on a
+ * bytes are the anti-replay key (globally unique + authenticated). Returns `false` (decline) on a
  * bad signature, a stale/future timestamp, or a replay.
  */
 function verifyAndAdmit(deps: RecoverServeDeps, signerId: string, payload: Uint8Array, signatureB64: string, timestamp: number, now: number): boolean {
 	const signature = b64urlToBytes(signatureB64);
 	if (!verifyPeerSig(signerId, payload, signature)) {
-		log("recover serve: signature verification failed for %s (no reply)", signerId);
+		log("recover serve: signature verification failed for %s (declined)", signerId);
 		return false;
 	}
 	if (!deps.replayGuard.accept(signature, peerIdToBytes(signerId), timestamp, now)) {
-		log("recover serve: replay/stale request from %s (no reply)", signerId);
+		log("recover serve: replay/stale request from %s (declined)", signerId);
 		return false;
 	}
 	return true;
@@ -416,7 +416,7 @@ export function createRecoverRequestHandler(deps: RecoverServeDeps): (frame: Uin
 		} catch (err) {
 			// A malformed/foreign request (decode failure, foreign collectionId from serve*) must never throw
 			// out of the stream handler: log + decline (a zero-length reply; the dialer tries the next member).
-			log("recover serve: dropping request (no reply): %o", err);
+			log("recover serve: dropping request (declined): %o", err);
 			return Promise.resolve(undefined);
 		}
 	};

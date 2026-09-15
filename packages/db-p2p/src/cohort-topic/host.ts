@@ -3177,8 +3177,9 @@ async function registerCohortTopicProtocols(
  * `handle` cannot return `undefined`, and that is the point. The dialer's `readFramed` treats bare
  * end-of-stream as a truncation error rather than an empty reply, so a reply-reading protocol
  * (register, membership, sign) must always put a frame on the wire — an empty one for "no result",
- * which the dialer's `requestResponse` resolves as `undefined`. Making that a separate constructor from {@link makeOneWayHandler} puts the invariant in the type,
- * where a later edit cannot silently opt out of it. (`stream-util.ts#handleRequestResponse` takes
+ * which the dialer's `requestResponse` resolves as `undefined`. Making that a separate constructor
+ * from {@link makeOneWayHandler} puts the invariant in the type, where a later edit cannot silently
+ * opt out of it. (`stream-util.ts#handleRequestResponse` takes
  * the other route for the same reason: every consumer of it is a reply-reading protocol, so it maps
  * a handler's `undefined` onto an explicit zero-length frame itself.)
  */

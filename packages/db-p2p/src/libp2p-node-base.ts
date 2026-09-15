@@ -1774,8 +1774,8 @@ export async function createLibp2pNodeBase(
 			});
 
 			// Inbound serve handler: decode (bounded) → verify the dialing peer's signature → freshness/replay gate →
-			// resolve the live PushState off the forwarder host → serveBackfill/serveResume → reply (no reply on any
-			// failure; the stream aborts and the subscriber walks/chain-reads). One node-level replay guard is shared
+			// resolve the live PushState off the forwarder host → serveBackfill/serveResume → reply (a decline on any
+			// failure; the subscriber's transport tries the next cohort member). One node-level replay guard is shared
 			// across all recover requests — a plain pruned-on-access map, so no new timer to tear down.
 			registerRecoverHandler(node, reactivityProtocols.recover, {
 				pushStateFor: forwarderHost.pushStateFor.bind(forwarderHost),

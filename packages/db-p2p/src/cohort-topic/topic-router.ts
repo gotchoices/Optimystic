@@ -74,8 +74,8 @@ export class FretTopicRouter implements ITopicRouter {
 	 * Dial `member`'s `/register` directly and return its encoded reply.
 	 *
 	 * The `/register` responder always writes a frame, so a no-result (zero-length) reply only comes from a
-	 * non-conforming peer; it rejects with {@link NoResultReplyError}, which the walk and the renewal `send`
-	 * already treat as a failed dial. db-core's {@link ITopicRouter.dialMember} port deliberately stays
+	 * non-conforming peer; it rejects with {@link NoResultReplyError}, reaching the caller exactly as a dial
+	 * failure does (renewal counts a failed ping; the walk's direct dial propagates the rejection). db-core's {@link ITopicRouter.dialMember} port deliberately stays
 	 * `Promise<Uint8Array>` rather than widening to `| undefined`: that would ripple through the walk and
 	 * renewal decision logic for a state only a misbehaving peer can produce, so the decision is made here.
 	 */

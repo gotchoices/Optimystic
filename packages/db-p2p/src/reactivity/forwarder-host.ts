@@ -311,7 +311,8 @@ export class ReactivityForwarderHost {
 	 * (`isDraining(now)`) returns its {@link RotationRedirectV1}; once `T_drain` closes, evicts the gate **and**
 	 * the topic's served `PushState` (the old tail originates nothing further — this also reclaims the
 	 * `served` / `ingestTails` maps the 12.31 review flagged as un-evicted on rotation) and returns `undefined`,
-	 * so the next request gets no reply and the subscriber re-walks / chain-reads.
+	 * so this member declines the next request and the subscriber's transport tries the next cohort member
+	 * (re-walking / chain-reading only once every member declines).
 	 */
 	rotationRedirectFor(oldTopicId: Uint8Array, now: number): RotationRedirectV1 | undefined {
 		const key = this.topicKey(oldTopicId);

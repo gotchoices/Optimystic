@@ -28,10 +28,9 @@
  * milestone); a *serving* tier-`d ≥ 1` query is gated on the promotion follow-ons, exactly as the seeker
  * walk is mock-tier-tagged-unimplemented. So this resolves the tier-0 engine for `coord_0(topicId)` only.
  *
- * **No-engine = no reply (anti-DoS).** A query for a topic this node holds no serving engine for produces
- * **no reply frame** — the handler never instantiates a `CoordEngine` from an inbound query (that would be
- * a DoS amplifier). The seeker maps a no-reply to a benign empty advisory result (the seeker ticket owns
- * that mapping).
+ * **No-engine = no result (anti-DoS).** A query for a topic this node holds no serving engine for gets
+ * **no result** (a zero-length reply) — the handler never instantiates a `CoordEngine` from an inbound query
+ * (that would be a DoS amplifier). The seeker maps a no-result to a benign empty advisory result.
  *
  * **Per-coord scoping.** The reply is built from exactly the `coord_0(topicId)` engine's store, nothing
  * cross-coord — matching how the register handler recomputes a served coord per frame. The serve side does
