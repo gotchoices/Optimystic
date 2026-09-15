@@ -172,8 +172,10 @@ function describeReport(report: IndexIntegrityReport): string {
  * reason, decoded value and primary key — plus the row's current values for a `stale-value`
  * orphan — and gives each index's row and entry counts.
  *
- * This is the half of index agreement no query can check: a lookup skips an entry whose row is
- * gone and re-checks the value of a row that moved, so an orphan never changes a result set.
+ * This is the half of index agreement no lookup of the table's own values can check: a lookup
+ * skips an entry whose row is gone, and an entry left under a value its row no longer holds is
+ * reached only by seeking that old value, which no row holds. (Seeking it does return the moved
+ * row today: see the NOTE in `OptimysticVirtualTable.executeIndexScan`.)
  */
 export async function expectIndexesIntact(db: Database, table: string): Promise<void> {
 	const broken = (await readIndexIntegrity(db, table))
@@ -195,12 +197,13 @@ export async function expectIndexesIntact(db: Database, table: string): Promise<
  *    `column`'s: each row has exactly its entry, and each entry belongs to exactly one row.
  *    This is the only arm that sees an orphaned entry, such as one left by an UPDATE or DELETE
  *    whose index maintenance was lost, or by a concurrent write whose index change replayed
- *    without its row change. No lookup can: `executeIndexScan` skips an entry whose row is
- *    gone, Quereus re-applies the predicate to a row whose value moved, and a value no row
- *    holds is never looked up below at all. It runs before the scan's early return, because
- *    a table emptied by DELETEs is exactly where an entry with no row lives.
- *  - Lookups: the read path's view of "an index tree that does not account for every committed
- *    row" (writes staged past a detached index, a re-attach that never backfilled). The row is
+ *    without its row change. No lookup below can: `executeIndexScan` skips an entry whose row
+ *    is gone, and the value a moved row left behind is one no row holds, so it is never
+ *    looked up. It runs before the scan's early return, because a table emptied by DELETEs is
+ *    exactly where an entry with no row lives.
+ *  - Lookups ({@link expectLookupsAgreeWithScan}): the read path's view of "an index tree that
+ *    does not account for every committed row" (writes staged past a detached index, a
+ *    re-attach that never backfilled). The row is
  *    committed and a full scan sees it, while the seek the planner routes into the index
  *    silently misses it. Any interleaving of table declaration, index declaration and writes
  *    must leave the two agreeing.
@@ -226,7 +229,15 @@ export async function expectIndexAgreesWithScan(
 	column: string,
 ): Promise<void> {
 	await expectIndexesIntact(db, table);
+	await expectLookupsAgreeWithScan(db, table, column);
+}
 
+/**
+ * The lookup arm of {@link expectIndexAgreesWithScan} alone: an index-routed lookup on `column`
+ * returns exactly the full scan's rows for every distinct value the table holds. For a test that
+ * pins a known orphan with `readIndexIntegrity`, and so cannot pass the structural arm.
+ */
+export async function expectLookupsAgreeWithScan(db: Database, table: string, column: string): Promise<void> {
 	const scanned = await queryAll(db, `select * from ${table}`) as Record<string, SqlValue>[];
 	if (scanned.length === 0) return;
 	if (!(column in scanned[0]!)) {

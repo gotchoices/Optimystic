@@ -32,8 +32,9 @@
  * groups are NOT clean under today's replay semantics, and nothing here skips, narrows or softens
  * them for it. Each racing case asserts the exact outcome a small model of those semantics
  * predicts: a clean index where it predicts clean, and otherwise exactly the predicted
- * discrepancies and no others. The test title of a case with a predicted discrepancy ends in
- * `-> pins ...`. See the NOTE on the model.
+ * discrepancies and no others, plus index lookups that still match the scan (the orphan's own
+ * value included). The test title of a case with a predicted discrepancy ends in `-> pins ...`.
+ * See the NOTE on the model.
  *
  * Running it. Every case runs on every `yarn test`; there is no narrowing switch, because a sweep
  * that only runs when someone remembers a flag cannot catch the bug it exists for. Measured on
@@ -56,7 +57,9 @@ import { expect } from 'chai';
 import type { SqlValue } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
 import type { IndexIntegrityReport } from '../dist/index.js';
-import { countIndexScans, expectIndexAgreesWithScan, queryAll, readIndexIntegrity } from './query-helpers.js';
+import {
+	countIndexScans, expectIndexAgreesWithScan, expectLookupsAgreeWithScan, queryAll, readIndexIntegrity,
+} from './query-helpers.js';
 import { createMeshDbNode, startMockMesh, type MeshDbNode as Node } from './mesh-node-harness.js';
 
 // --- schema and the committed starting state -------------------------------------
@@ -484,6 +487,10 @@ async function expectScans(nodes: Nodes, expected: readonly TableRow[], when: st
  * the other node re-declares or hydrates; A inserts its row, then B inserts its own. Both scans must
  * then hold both rows, or the comparison after the mutation could pass vacuously on a node that
  * never saw a row.
+ *
+ * A `hydrate` node therefore hydrates onto a table with no rows yet. Hydrating onto a populated
+ * table and then mutating is not covered here (the insert sweep hydrates after a committed row, but
+ * only inserts): a recorded gap, not filed as a ticket.
  */
 async function runSetup(declare: Which, open: SequentialCase['open'], nodes: Nodes): Promise<void> {
 	const [first, second] = declare === 'A' ? [nodes.A, nodes.B] : [nodes.B, nodes.A];
@@ -564,6 +571,26 @@ async function expectPrediction(nodes: Nodes, outcomes: Record<Which, Outcome>, 
 			`node ${which}: the index report must hold exactly the discrepancies the replay model predicts. ` +
 			'If it holds none, the known defect this case pins may be fixed: see the NOTE on the model',
 		).to.deep.equal([prediction.report]);
+		// The structural arm is spent on the pin, so run the lookup arm alone.
+		await expectLookupsAgreeWithScan(nodes[which].db, TABLE, 'Token');
+		await expectOrphanSeeks(nodes[which], which, prediction.report.orphaned);
+	}
+}
+
+/**
+ * Seek each orphan's own value. KNOWN DEFECT, pinned rather than skipped
+ * (`index-seek-returns-moved-rows`): a stale-value orphan's seek returns the row it points at,
+ * which no longer holds that value. A no-row orphan's seek returns nothing. When the seek is
+ * fixed, the stale-value seeks go red: every orphan's seek should then return no rows.
+ */
+async function expectOrphanSeeks(node: Node, which: Which, orphans: readonly PinnedDiscrepancy[]): Promise<void> {
+	for (const orphan of orphans) {
+		const seek = await queryAll(node.db, `select Id, Token from FormationUsage where Token = ?`, [orphan.value[0]!]);
+		const pointedAt = orphan.row === undefined ? [] : [{ Id: Number(orphan.row[0]), Token: String(orphan.row[1]) }];
+		expect(
+			seek.map(row => ({ Id: Number(row.Id), Token: String(row.Token) })),
+			`node ${which}: seeking orphaned value ${orphan.value[0]} returns the row its entry points at (known defect)`,
+		).to.deep.equal(pointedAt);
 	}
 }
 
@@ -641,9 +668,10 @@ describe(`Two-node index mutation sweep — sequential (${SEQUENTIAL_CASES.lengt
 			await expectScans(nodes, effect.rows, 'must hold the mutated rows');
 			if (testCase.mutation === 'pk-move') await expectMovedRowOnlyAtNewKey(nodes);
 
-			// THE oracle, on both nodes. Its structural arm is what sees a leftover entry: the old
-			// value's entry after an update, row 100's entry after a pk-move or a delete. Its lookup
-			// arm sees a missing one, including a shared value's second entry under to-sibling-value.
+			// THE oracle, on both nodes. Its structural arm sees a leftover entry (the old value's
+			// after an update, row 100's after a pk-move or a delete) and a missing one, including a
+			// shared value's second entry under to-sibling-value; its lookup arm sees a seek that
+			// misses a row.
 			for (const which of BOTH) {
 				await expectIndexAgreesWithScan(nodes[which].db, TABLE, 'Token');
 			}

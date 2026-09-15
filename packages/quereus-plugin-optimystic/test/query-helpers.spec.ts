@@ -137,6 +137,12 @@ describe('expectIndexAgreesWithScan (the two-node convergence oracle)', () => {
 			.to.deep.equal([3]);
 		expect((await queryAll(db, `select Id from Usage where Token = 'tok-a'`)).map(row => row.Id).sort())
 			.to.deep.equal([1, 2]);
+		// KNOWN DEFECT, pinned rather than skipped (`index-seek-returns-moved-rows`): seeking the
+		// orphan's own value returns row 3, which holds tok-z. The seek resolves tok-b's entry to
+		// row 3 and nothing re-checks the value (NOTE in executeIndexScan). When that is fixed this
+		// goes red: expect no rows here.
+		expect((await queryAll(db, `select Id from Usage where Token = 'tok-b'`)).map(row => row.Id))
+			.to.deep.equal([3]);
 
 		const error = await captureFailure(
 			() => expectIndexAgreesWithScan(db, 'Usage', 'Token'),
