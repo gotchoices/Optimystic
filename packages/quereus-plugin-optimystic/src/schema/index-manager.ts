@@ -111,6 +111,32 @@ export type PrimaryKey = string;
 export type IndexEntry = [IndexKey, PrimaryKey];
 
 /**
+ * THE tree key of one index entry: the row's framed index tuple followed by its framed
+ * primary key. Both halves are self-delimiting tuples (see {@link encodeKeyTuple}), so
+ * plain concatenation is unambiguous and needs no separator. The primary-key suffix is what
+ * lets a non-unique index hold several rows under one value, all sharing the prefix
+ * {@link indexValueRange} brackets.
+ *
+ * The one formula for it: the DML staging paths below, the vtab's index backfill and
+ * unique-tree populate, and the integrity check (`compareIndexToRows` in
+ * index-integrity.ts) all route through here, so a check cannot agree with itself while
+ * disagreeing with what maintenance wrote.
+ */
+export function indexEntryKey(indexKey: IndexKey, primaryKey: PrimaryKey): string {
+	return indexKey + primaryKey;
+}
+
+/**
+ * Whether `row` holds SQL NULL in any column `index` covers. A UNIQUE constraint exempts
+ * such a row: the probe never looks it up, and the one-time populate of a synthesized
+ * unique-enforcement tree stages no entry for it (live DML still stages one). Shared by that
+ * populate and the integrity check, which must not report the entry it skipped as missing.
+ */
+export function hasNullIndexValue(index: StoredIndexSchema, row: Row): boolean {
+	return index.columns.some(column => row[column.index] === null || row[column.index] === undefined);
+}
+
+/**
  * The tree-key range holding every entry whose framed index tuple equals `indexKey`:
  * `[indexKey, indexKey + KEY_PREFIX_END)`. Tree keys are `indexKey ‖ framedPrimaryKey`,
  * so every match begins with the complete framed prefix; see {@link KEY_PREFIX_END} for
@@ -338,10 +364,9 @@ export class IndexManager {
 				throw new Error(`Index tree not found: ${index.name}`);
 			}
 
-			// Composite tree key: indexKey + primaryKey ensures uniqueness (both framed,
-			// so plain concatenation is unambiguous). Store as [treeKey, primaryKey] so the
-			// tree's keyExtractor (entry[0]) returns the treeKey for sorting and range scans.
-			const treeKey = indexKey + primaryKey;
+			// Store as [treeKey, primaryKey] so the tree's keyExtractor (entry[0]) returns the
+			// treeKey for sorting and range scans.
+			const treeKey = indexEntryKey(indexKey, primaryKey);
 			await tree.stage([[treeKey, [treeKey, primaryKey], this.guardFor(index, indexKey, uniqueIndexes)]]);
 		}
 	}
@@ -372,8 +397,7 @@ export class IndexManager {
 				throw new Error(`Index tree not found: ${index.name}`);
 			}
 
-			// Composite tree key must match the format used in insertIndexEntries
-			const treeKey = indexKey + primaryKey;
+			const treeKey = indexEntryKey(indexKey, primaryKey);
 			await tree.stage([[treeKey, undefined]]);
 		}
 	}
@@ -402,8 +426,8 @@ export class IndexManager {
 				throw new Error(`Index tree not found: ${index.name}`);
 			}
 
-			const oldTreeKey = oldIndexKey + oldPrimaryKey;
-			const newTreeKey = newIndexKey + newPrimaryKey;
+			const oldTreeKey = indexEntryKey(oldIndexKey, oldPrimaryKey);
+			const newTreeKey = indexEntryKey(newIndexKey, newPrimaryKey);
 
 			if (oldTreeKey !== newTreeKey) {
 				// Index key or primary key changed - delete old, insert new. ONE action, delete
@@ -463,6 +487,25 @@ export class IndexManager {
 			const entry = read.at(path);
 			if (entry != null) {
 				yield entry[1];
+			}
+		}
+	}
+
+	/**
+	 * Every entry a supplied index read source holds, in ascending tree-key order. Walks the
+	 * WHOLE tree rather than the empty framed prefix {@link findByIndexIn} would bracket, so
+	 * an entry whose key is not even well framed is still returned — the integrity check
+	 * exists to see exactly those. Like findByIndexIn, it never refreshes the source.
+	 */
+	async* allEntriesIn(read: TreeReadView<IndexKey, IndexEntry>): AsyncIterable<IndexEntry> {
+		for await (const path of read.range(new KeyRange<string>(undefined, undefined, true))) {
+			if (!read.isValid(path)) {
+				continue;
+			}
+
+			const entry = read.at(path);
+			if (entry != null) {
+				yield entry;
 			}
 		}
 	}

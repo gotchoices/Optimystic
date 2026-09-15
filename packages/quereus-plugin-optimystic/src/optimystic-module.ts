@@ -21,7 +21,8 @@ import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, Stored
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { SqlDataType, PhysicalType } from '@quereus/quereus';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
-import { IndexManager, indexKeyFromValues, type IndexEntry } from './schema/index-manager.js';
+import { IndexManager, hasNullIndexValue, indexEntryKey, indexKeyFromValues, type IndexEntry } from './schema/index-manager.js';
+import { compareIndexToRows, type IndexIntegrityReport } from './schema/index-integrity.js';
 import type { PrimaryKeyTuple } from './schema/key-tuples.js';
 import { createLogger, revisionToken } from './logger.js';
 
@@ -126,6 +127,25 @@ const printableSeekKey = (key: string): string =>
       ? `%${code.toString(16).toUpperCase().padStart(2, '0')}`
       : `%u${code.toString(16).toUpperCase().padStart(4, '0')}`;
   });
+
+/**
+ * Every row a main-table collection's CURRENT view holds, decoded, with its framed primary
+ * key, in ascending key order. Never refreshes: a caller that needs the latest committed rows
+ * `update()`s the collection first. The index backfill, the unique-tree populate and the
+ * integrity check all do, and share this walk so a row reads the same to each of them.
+ */
+async function* walkDecodedRows(
+  collection: Tree<string, unknown>,
+  rowCodec: RowCodec,
+): AsyncIterable<{ row: Row; primaryKey: string }> {
+  for await (const path of collection.ascending(await collection.first())) {
+    if (!collection.isValid(path)) continue;
+    const entry = collection.at(path) as [string, EncodedRow] | undefined;
+    if (!entry || entry.length < 2) continue;
+    const row = rowCodec.decodeRow(entry[1]);
+    yield { row, primaryKey: rowCodec.extractPrimaryKey(row) };
+  }
+}
 
 /** One existing row a secondary UNIQUE constraint collides with, keyed by its
  *  primary key so a REPLACE resolution can evict it. */
@@ -1890,19 +1910,14 @@ export class OptimysticVirtualTable extends VirtualTable {
     const treeEmpty = tree.at(await tree.first()) === undefined;
     if (treeEmpty) {
       await this.collection.update();
-      for await (const path of this.collection.ascending(await this.collection.first())) {
-        if (!this.collection.isValid(path)) continue;
-        const entry = this.collection.at(path) as [string, EncodedRow] | undefined;
-        if (!entry || entry.length < 2) continue;
-        const row = this.rowCodec.decodeRow(entry[1]);
+      for await (const { row, primaryKey } of walkDecodedRows(this.collection, this.rowCodec)) {
         // NULL-bearing rows are exempt from the constraint — stage no entry, matching the
         // probe's null-exemption and keeping the all-null tree legitimately empty.
-        if (descriptor.columns.some(c => row[c.index] === null || row[c.index] === undefined)) {
+        if (hasNullIndexValue(descriptor, row)) {
           continue;
         }
-        const pk = this.rowCodec.extractPrimaryKey(row);
-        const treeKey = this.indexManager.createIndexKey(descriptor, row) + pk;
-        await tree.stage([[treeKey, [treeKey, pk]]]);
+        const treeKey = indexEntryKey(this.indexManager.createIndexKey(descriptor, row), primaryKey);
+        await tree.stage([[treeKey, [treeKey, primaryKey]]]);
       }
       await tree.sync();
     }
@@ -2423,10 +2438,10 @@ export class OptimysticVirtualTable extends VirtualTable {
             // NOTE: with 'keepExisting', a replay that skips the main-tree entry cannot
             // also skip the INDEX tree actions staged below — they replay independently,
             // so a concurrency-skipped INSERT OR IGNORE can leave a stale index entry
-            // (indexKey‖pk pointing at values the surviving row does not have). Cross-
-            // collection replay coordination is deliberately out of scope here; index-
-            // orphan detection owns it (see backlog ticket
-            // 6-debt-index-sweep-misses-update-delete-and-orphans).
+            // (indexKey‖pk pointing at values the surviving row does not have). Queries
+            // cannot see it; OptimysticModule.verifyIndexes reports it as a `stale-value`
+            // orphan. Refusing the loser instead of skipping it is ticket
+            // refuse-concurrent-row-change-loser.
 
             // Stage the row in the main table. Entry format: [primaryKey, encodedRow]
             await this.collection.stage([[insertKey, [insertKey, encodedRow], insertGuard]]);
@@ -2938,14 +2953,9 @@ export class OptimysticVirtualTable extends VirtualTable {
     let stagedAny = false;
     if (!await this.hasNoRowsToBackfill()) {
       await collection.update();
-      for await (const path of collection.ascending(await collection.first())) {
-        if (!collection.isValid(path)) continue;
-        const entry = collection.at(path) as [string, EncodedRow] | undefined;
-        if (!entry || entry.length < 2) continue;
-        const row = rowCodec.decodeRow(entry[1]);
-        const primaryKey = rowCodec.extractPrimaryKey(row);
+      for await (const { row, primaryKey } of walkDecodedRows(collection, rowCodec)) {
         for (const { descriptor, tree } of targets) {
-          const treeKey = manager.createIndexKey(descriptor, row) + primaryKey;
+          const treeKey = indexEntryKey(manager.createIndexKey(descriptor, row), primaryKey);
           await tree.stage([[treeKey, [treeKey, primaryKey]]]);
         }
         stagedAny = true;
@@ -3005,6 +3015,73 @@ export class OptimysticVirtualTable extends VirtualTable {
   private async hasNoRowsToBackfill(collection = this.collection): Promise<boolean> {
     if (!collection) return true;
     return collection.at(await collection.first()) === undefined;
+  }
+
+  /**
+   * Compare every secondary index this table maintains against the table's rows, in both
+   * directions: one {@link IndexIntegrityReport} per index, declared and unique-enforcement
+   * alike ({@link compareIndexToRows} defines missing and orphaned). Hosts reach it through
+   * `plugin.verifyIndexes`, via {@link OptimysticModule.verifyIndexes}, which resolves and
+   * initializes the table first.
+   *
+   * Reads the LIVE trees: `update()` on the main collection and every index tree, then a full
+   * walk of each. That is the view a live index seek descends (the live query arm refreshes
+   * both trees immediately before scanning too). It is deliberately not a snapshot-pinned
+   * committed read: the question is what THIS node's own seek sees, and a separately opened
+   * tree could adopt a different lineage of the same collection id than the instance this
+   * table holds (one collection id with two lineages is recorded in the blocked ticket
+   * `secondary-index-repro-exhausted-upstream`). Inside an open transaction the live trees
+   * include this connection's staged writes; a row and its index entries are staged together,
+   * so a consistent table stays consistent mid-transaction.
+   *
+   * A unique-enforcement tree that has not yet been populated for rows an older build wrote
+   * ({@link ensureUniquePopulated} runs at the first probe) reports those rows missing, which
+   * is what the tree holds.
+   *
+   * Detection only: nothing is repaired. Healing an orphan needs the explicit repair entry
+   * point the notes on {@link reconcileMaintainedIndexes} and {@link hasNoRowsToBackfill}
+   * anticipate.
+   */
+  async verifyIndexes(): Promise<IndexIntegrityReport[]> {
+    if (!this.collection || !this.rowCodec || !this.indexManager) {
+      throw new Error('Table not initialized');
+    }
+    const manager = this.indexManager;
+    const declared = new Set(manager.getDeclaredIndexes().map(index => index.name));
+    const targets = manager.getAllMaintainedIndexes().map(index => {
+      const tree = manager.getIndexTree(index.name);
+      if (!tree) {
+        throw new Error(`Index tree not found: ${index.name}`);
+      }
+      return { index, tree };
+    });
+
+    await this.collection.update();
+    for (const { tree } of targets) {
+      await tree.update();
+    }
+
+    const rows = new Map<string, Row>();
+    for await (const { row, primaryKey } of walkDecodedRows(this.collection, this.rowCodec)) {
+      rows.set(primaryKey, row);
+    }
+
+    const reports: IndexIntegrityReport[] = [];
+    for (const { index, tree } of targets) {
+      const entries: IndexEntry[] = [];
+      for await (const entry of manager.allEntriesIn(tree)) {
+        entries.push(entry);
+      }
+      reports.push(compareIndexToRows({
+        table: this.tableName,
+        index,
+        kind: declared.has(index.name) ? 'declared' : 'unique-enforcement',
+        rows,
+        entries,
+        indexKeyOf: row => manager.createIndexKey(index, row),
+      }));
+    }
+    return reports;
   }
 
   /**
@@ -3781,6 +3858,29 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       return new OptimysticCommittedTable(baseTable);
     }
     return baseTable;
+  }
+
+  /**
+   * Compare every secondary index of `schemaName.tableName` against the table's rows, in both
+   * directions; see {@link OptimysticVirtualTable.verifyIndexes} for what is read and what is
+   * reported. Resolves the table the way {@link connect} does, so a table hydrated into the
+   * catalog that no statement has touched yet is initialized first. Throws for a table neither
+   * this module's cache nor the engine's catalog knows, and for a catalog table another module
+   * owns (resolving that one would build an Optimystic instance over somebody else's table).
+   */
+  async verifyIndexes(db: Database, tableName: string, schemaName = 'main'): Promise<IndexIntegrityReport[]> {
+    const catalogEntry = db.schemaManager.findTable(tableName, schemaName);
+    if (catalogEntry) {
+      const owner = catalogEntry.vtabModule ?? db.schemaManager.getModule(catalogEntry.vtabModuleName)?.module;
+      if (owner !== this) {
+        throw new Error(
+          `Cannot verify indexes of '${schemaName}.${tableName}': it is not an Optimystic table ` +
+          `(module '${catalogEntry.vtabModuleName}').`,
+        );
+      }
+    }
+    const table = await this.resolveConnectedTable(db, schemaName, tableName, false);
+    return await table.verifyIndexes();
   }
 
   /**

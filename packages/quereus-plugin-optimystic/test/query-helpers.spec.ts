@@ -6,8 +6,10 @@
  * nothing about that on its own. The sweep's negative control was a scratch file that was
  * run once and deleted, and it tripped only the ROUTING arm (`indexScans > 0`) — the
  * row-set comparison, which is the arm that would actually catch "the index missed a
- * committed row", was never shown to fail at all. This pins both arms permanently, so a
- * later refactor of the helper cannot quietly turn every caller into a no-op.
+ * committed row", was never shown to fail at all. This pins every arm permanently (routing,
+ * the row-set comparison, and the structural index-versus-table check, which alone sees an
+ * orphaned entry), so a later refactor of the helper cannot quietly turn every caller into a
+ * no-op.
  *
  * Single-node and in-memory (`default_transactor: 'test'`) — the helper under test knows
  * nothing about meshes, so exercising it does not need one.
@@ -17,7 +19,8 @@ import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import register from '../dist/plugin.js';
 import { OptimysticVirtualTable } from '../dist/index.js';
-import { expectIndexAgreesWithScan } from './query-helpers.js';
+import { expectIndexAgreesWithScan, queryAll } from './query-helpers.js';
+import { stageNewEntryOnly, stageNothing, withIndexStagingPatched } from './index-staging-patch.js';
 
 type Plugin = ReturnType<typeof register>;
 
@@ -121,5 +124,40 @@ describe('expectIndexAgreesWithScan (the two-node convergence oracle)', () => {
 			'a typo in the column name must not read as agreement',
 		);
 		expect(error.message).to.contain(`has no column 'Missing'`);
+	});
+
+	it('fails on an entry left behind for a value no row holds any more, which no lookup can see', async () => {
+		// Row 3 moves from tok-b to tok-z and its tok-b entry stays. No row holds tok-b now, so
+		// the lookup arm never asks about it.
+		await withIndexStagingPatched(plugin, 'Usage', 'updateIndexEntries', stageNewEntryOnly, () =>
+			db.exec(`update Usage set Token = 'tok-z' where Id = 3`));
+
+		// The lookup arm alone is blind to it: every value a row holds still looks up exactly.
+		expect((await queryAll(db, `select Id from Usage where Token = 'tok-z'`)).map(row => row.Id))
+			.to.deep.equal([3]);
+		expect((await queryAll(db, `select Id from Usage where Token = 'tok-a'`)).map(row => row.Id).sort())
+			.to.deep.equal([1, 2]);
+
+		const error = await captureFailure(
+			() => expectIndexAgreesWithScan(db, 'Usage', 'Token'),
+			'an orphaned index entry must not pass the oracle',
+		);
+		expect(error.message).to.contain('index entries must correspond one-to-one with rows');
+		expect(error.message).to.contain('orphaned (stale-value): value ["tok-b"]');
+		expect(error.message, 'and must be caught by the structural arm, not by a lookup')
+			.to.not.contain('the index-routed row set must equal');
+	});
+
+	it('fails on an emptied table whose index still holds entries, rather than returning early', async () => {
+		await withIndexStagingPatched(plugin, 'Usage', 'deleteIndexEntries', stageNothing, () =>
+			db.exec(`delete from Usage`));
+
+		const error = await captureFailure(
+			() => expectIndexAgreesWithScan(db, 'Usage', 'Token'),
+			'a table with no rows must still have its index checked',
+		);
+		expect(error.message).to.contain('index entries must correspond one-to-one with rows');
+		expect(error.message).to.contain('usage_by_token (declared): 0 rows, 3 entries');
+		expect(error.message).to.contain('orphaned (no-row)');
 	});
 });

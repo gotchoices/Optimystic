@@ -711,6 +711,43 @@ pinned in `test/two-node-secondary-index-convergence.spec.ts` — that two nodes
 on all three lines, and that a CONVERGED pair reports the same action id (so a run where the ids
 differ at one revision really is a fork).
 
+#### Does an index agree with its table?
+
+The lines above say which collections a write carried and which revision a read descended. None of them can show an index entry that no row accounts for, and neither can a query. An index lookup fetches each entry's row by primary key and skips an entry whose row is gone, and the engine re-checks the value of a row that moved, so the lookup still returns the right rows. A test that looks up every value the table holds never asks about a value no row holds any more. The entry still sits in the tree, though, and in a tree enforcing a `unique` column it makes a value look taken when no row holds it.
+
+`plugin.verifyIndexes(db, table, schema?)` (`verifyIndexes` in `packages/quereus-plugin-optimystic/src/plugin.ts`) compares every secondary index of one table against the table's rows, in both directions, and returns one report per index:
+
+```typescript
+const reports = await plugin.verifyIndexes(db, 'Usage');
+for (const report of reports) {
+	if (report.missing.length > 0 || report.orphaned.length > 0) console.log(report);
+}
+```
+
+- `kind` — `declared` for an index from `CREATE INDEX`; `unique-enforcement` for the internal tree a table keeps to enforce a `unique` column that has no declared index (named like `_uniq_5.email`).
+- `rowCount` / `entryCount` — rows in the table and entries in the index tree. They are equal on a clean index, except where a `unique-enforcement` tree has no entries for NULL-bearing rows (see below).
+- `missing` — rows the index holds no entry for. An index lookup for such a row's value silently misses the row.
+- `orphaned` — entries no row accounts for, each with a `reason`:
+
+| `reason` | Meaning |
+|---|---|
+| `no-row` | No row has the entry's primary key. The row was deleted, or moved to another primary key, and its entry stayed. |
+| `stale-value` | A row has that primary key but a different value in the indexed columns; `currentRow` shows it. The row's value changed and its entry did not follow. |
+| `malformed` | The primary key stored in the entry is not the one its own position in the tree encodes. No write path produces this; suspect corruption or a key-format change. |
+
+Every discrepancy carries `indexPayloads` and `primaryKeyPayloads`, the entry's key decoded back into values (`null` for SQL NULL), so it can be matched to a row by eye. A number reads differently in the two halves: `5.000000000000000e+0` in the index half, `5` in the primary-key half.
+
+What it reads, and what it does not do:
+
+- It reads **this node's live trees**, refreshed first, which is the view an index lookup on this node descends. Run it on the node that misbehaves. Two nodes can differ until they converge.
+- Inside an open transaction it includes that transaction's uncommitted writes.
+- It **repairs nothing**.
+- In a `unique-enforcement` tree, an entry for a row with a NULL in the tree's columns is optional. Such rows are exempt from the constraint, and the tree's one-time fill for rows an older build wrote skips them, while ordinary writes add them. Neither state is reported. That fill runs the first time a write checks the constraint; until then, a tree over an older build's rows reports those rows missing.
+- A partial index (`create index … where …`) is checked as if it had no `where` clause, because index maintenance ignores the clause too.
+- It holds the table's rows and the index's entries in memory at once. It is a diagnostic; do not put it on a hot path over a large table.
+
+The comparison is `compareIndexToRows` in `packages/quereus-plugin-optimystic/src/schema/index-integrity.ts`. Every index test in the plugin runs it through `expectIndexAgreesWithScan` in `packages/quereus-plugin-optimystic/test/query-helpers.ts`.
+
 ## Reading the fields that tell you which case a line is
 
 Some log lines carry a field whose value — or whose absence — already names which of several very different situations the line is describing. Read that field before reasoning from anything else. The gaps between lines, how many lines there are, and which lines sit next to each other are all weaker evidence than a value the code recorded at the moment it decided, and several of the events below look identical under every one of those other measures.

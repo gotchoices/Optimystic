@@ -38,6 +38,17 @@ export type { StoredTableSchema, StoredColumnSchema, StoredPrimaryKeyColumn, Sto
 export type { PersistedTableSchema, PersistedIndexSchema, PersistedIndexColumn } from './schema/schema-manager.js';
 export { toPersistedSchema, toStoredSchema, uniqueEnforcementTreeName } from './schema/schema-manager.js';
 
+// Reports from the two-way index-versus-table check (`verifyIndexes` on the plugin and on
+// OptimysticModule).
+export type {
+	IndexIntegrityReport,
+	IndexKind,
+	MissingIndexEntry,
+	OrphanedIndexEntry,
+	OrphanReason,
+	DecodedIndexTreeKey,
+} from './schema/index-integrity.js';
+
 // Export the order-preserving, injective key-framing primitives (shared by the
 // primary-key and secondary-index encoders).
 export {

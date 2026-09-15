@@ -72,6 +72,22 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		 */
 		hydrate: (db: Database) => optimysticModule.hydrateCatalog(db, config, config),
 		/**
+		 * Compare every secondary index of one table against the table's rows, in both
+		 * directions, and report each disagreement: a row the index holds no entry for
+		 * (`missing`), or an entry pointing at a row that is gone or no longer holds the indexed
+		 * value (`orphaned`). One report per index the table maintains, including the internal
+		 * tree that enforces a `unique` column with no declared index. Queries cannot show an
+		 * orphaned entry (a lookup skips an entry whose row is gone, and re-checks the value of a
+		 * row that moved), so this is how to see one.
+		 *
+		 * Reads this node's live trees, including an open transaction's uncommitted writes, and
+		 * repairs nothing. `schema` defaults to `main`. Throws for a table that is not a known
+		 * Optimystic table. How to read a report: docs/debugging.md, "Does an index agree with
+		 * its table?".
+		 */
+		verifyIndexes: (db: Database, table: string, schema?: string) =>
+			optimysticModule.verifyIndexes(db, table, schema),
+		/**
 		 * Release what the plugin holds outside the `Database` — today its LEASES on the
 		 * raw-storage read caches behind `local` transactors over host-supplied storage (see
 		 * `CollectionFactory.dispose`). Call after `db.close()`. Quereus has no close hook

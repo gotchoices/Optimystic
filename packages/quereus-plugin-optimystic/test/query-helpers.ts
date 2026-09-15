@@ -1,6 +1,7 @@
 import { expect } from 'chai';
-import type { Database, SqlValue } from '@quereus/quereus';
-import { OptimysticVirtualTable } from '../dist/index.js';
+import type { Database, Row, SqlValue } from '@quereus/quereus';
+import { OptimysticModule, OptimysticVirtualTable } from '../dist/index.js';
+import type { IndexIntegrityReport, MissingIndexEntry, OrphanedIndexEntry } from '../dist/index.js';
 
 /** Collect every row `sql` returns from a node's database, finalizing the statement. */
 export async function queryAll(
@@ -100,27 +101,99 @@ function installIndexRoutingProbe(): IndexRoutingProbe {
 }
 
 /**
- * Assert that an index-routed lookup on `column` returns exactly what a full scan
- * returns, for EVERY distinct value present in `table`.
+ * The agreement report for every secondary index `table` maintains, WITHOUT asserting — for a
+ * test that pins an exact discrepancy rather than requiring none. Goes through the registered
+ * module's `verifyIndexes`, so the tree-key format stays owned by the plugin, and a table
+ * hydrated but not yet touched by any statement is initialized the way a statement would.
+ */
+export async function readIndexIntegrity(db: Database, table: string): Promise<IndexIntegrityReport[]> {
+	const module = db.schemaManager.getModule('optimystic')?.module;
+	if (!(module instanceof OptimysticModule)) {
+		throw new Error(
+			`readIndexIntegrity: ${module === undefined ? 'no module' : 'a module other than OptimysticModule'} ` +
+			`is registered as 'optimystic' on this database`,
+		);
+	}
+	return await module.verifyIndexes(db, table);
+}
+
+/** Decoded key payloads, e.g. `["tok-a"]`, or `[null,"5.000000000000000e+0"]` for NULL and 5. */
+function renderPayloads(payloads: readonly (string | null)[]): string {
+	return JSON.stringify(payloads);
+}
+
+function renderRow(row: Row): string {
+	return `[${row.map(value => canonicalValue(value)).join(', ')}]`;
+}
+
+function describeOrphan(orphan: OrphanedIndexEntry): string {
+	const detail = orphan.reason === 'stale-value' && orphan.currentRow !== undefined
+		? `, row now ${renderRow(orphan.currentRow)}`
+		: orphan.reason === 'malformed'
+			? `, but stores primary key ${JSON.stringify(orphan.primaryKey)}`
+			: '';
+	return `    orphaned (${orphan.reason}): value ${renderPayloads(orphan.indexPayloads)} ` +
+		`pk ${renderPayloads(orphan.primaryKeyPayloads)}${detail}`;
+}
+
+function describeMissing(entry: MissingIndexEntry): string {
+	return `    missing: value ${renderPayloads(entry.indexPayloads)} pk ${renderPayloads(entry.primaryKeyPayloads)}, ` +
+		`row ${renderRow(entry.row)}`;
+}
+
+function describeReport(report: IndexIntegrityReport): string {
+	return [
+		`  ${report.index} (${report.kind}): ${report.rowCount} rows, ${report.entryCount} entries`,
+		...report.orphaned.map(describeOrphan),
+		...report.missing.map(describeMissing),
+	].join('\n');
+}
+
+/**
+ * Assert that every secondary index `table` maintains (declared indexes, and the internal
+ * trees enforcing a `unique` column with no declared index) corresponds one-to-one with the
+ * table's rows: no row lacks its entry, and no entry is left pointing at a row that is gone or
+ * at a value its row no longer holds. The failure names each discrepancy by index, kind,
+ * reason, decoded value and primary key — plus the row's current values for a `stale-value`
+ * orphan — and gives each index's row and entry counts.
  *
- * This is the generalized form of the class of defect "an index tree that does not
- * account for every committed row" (writes staged past a detached index, orphaned
- * entries left by an UPDATE, a re-attach that never backfilled): the row is committed
- * and a full scan sees it, while the seek the planner routes into the index silently
- * misses it. Any interleaving of table declaration, index declaration and writes must
- * leave the two agreeing.
+ * This is the half of index agreement no query can check: a lookup skips an entry whose row is
+ * gone and re-checks the value of a row that moved, so an orphan never changes a result set.
+ */
+export async function expectIndexesIntact(db: Database, table: string): Promise<void> {
+	const broken = (await readIndexIntegrity(db, table))
+		.filter(report => report.missing.length > 0 || report.orphaned.length > 0);
+	if (broken.length === 0) return;
+	expect.fail(
+		`${table}: index entries must correspond one-to-one with rows\n${broken.map(describeReport).join('\n')}`,
+	);
+}
+
+/**
+ * Assert that `table`'s secondary indexes agree with the table in both directions, and that
+ * an index-routed lookup on `column` returns exactly what a full scan returns, for EVERY
+ * distinct value present in `column`.
  *
- * The values queried come from the SCAN, so this catches a stale/orphaned entry only
- * when its value is still present in some row (the entry then pulls an extra row into
- * that value's seek). An entry for a value no longer held by ANY row is never queried
- * and so never seen here — assert on the tree's keys directly for that. The companion
- * check that would do so does not exist yet; it is tracked, together with the
- * insert-only sweep that shares the blind spot, in
- * `debt-index-sweep-misses-update-delete-and-orphans`.
+ * Two arms, the structural one first:
  *
- * Both arms below — the routing requirement and the row-set comparison — are pinned
- * against a deliberately broken index in `query-helpers.spec.ts`, so a refactor here
- * cannot quietly turn every caller into a no-op.
+ *  - Structure ({@link expectIndexesIntact}), over EVERY index the table maintains, not only
+ *    `column`'s: each row has exactly its entry, and each entry belongs to exactly one row.
+ *    This is the only arm that sees an orphaned entry, such as one left by an UPDATE or DELETE
+ *    whose index maintenance was lost, or by a concurrent write whose index change replayed
+ *    without its row change. No lookup can: `executeIndexScan` skips an entry whose row is
+ *    gone, Quereus re-applies the predicate to a row whose value moved, and a value no row
+ *    holds is never looked up below at all. It runs before the scan's early return, because
+ *    a table emptied by DELETEs is exactly where an entry with no row lives.
+ *  - Lookups: the read path's view of "an index tree that does not account for every committed
+ *    row" (writes staged past a detached index, a re-attach that never backfilled). The row is
+ *    committed and a full scan sees it, while the seek the planner routes into the index
+ *    silently misses it. Any interleaving of table declaration, index declaration and writes
+ *    must leave the two agreeing.
+ *
+ * All three checks (structure, routing, and the row-set comparison) are pinned against a
+ * deliberately broken index in `query-helpers.spec.ts`, so a refactor here cannot quietly turn
+ * every caller into a no-op. `index-integrity-check.spec.ts` pins the structural check's
+ * report itself.
  *
  * `column` must be covered by a DECLARED secondary index whose FIRST column it is —
  * that is what makes the equality form routable. Each value-form query is required to
@@ -137,6 +210,8 @@ export async function expectIndexAgreesWithScan(
 	table: string,
 	column: string,
 ): Promise<void> {
+	await expectIndexesIntact(db, table);
+
 	const scanned = await queryAll(db, `select * from ${table}`) as Record<string, SqlValue>[];
 	if (scanned.length === 0) return;
 	if (!(column in scanned[0]!)) {
