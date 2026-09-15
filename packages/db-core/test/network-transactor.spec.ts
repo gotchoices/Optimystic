@@ -982,37 +982,29 @@ describe('NetworkTransactor', () => {
       const blockId = generateBlockId()
       const actionId = generateRandomActionId()
 
-      // Find the coordinator for this block
-      const key = routingKeyForBlock(blockId)
-      const closestNodes = network.findCluster(key)
+      // Take the block's only cluster member (clusterSize 1) down
+      const cluster = await network.findCluster(routingKeyForBlock(blockId))
+      const coordinatorId = Object.keys(cluster)[0]
+      expect(coordinatorId, 'the block has a coordinator').to.exist
+      const coordinator = network.getNode(coordinatorId!)!
+      coordinator.transactor.available = false
 
-      // Make the coordinator unavailable
-      if (closestNodes && Object.keys(closestNodes).length > 0) {
-        const coordinator = Object.values(closestNodes)[0]!
-        coordinator.transactor.available = false
-
-        // Try to pend a transaction - it should fall back to another node
-        const pendRequest: PendRequest = {
-          actionId,
-          transforms: {
-            updates: {
-              [blockId]: [createBlockOperation()]
-            },
-            inserts: {},
-            deletes: []
+      const pendRequest: PendRequest = {
+        actionId,
+        transforms: {
+          updates: {
+            [blockId]: [createBlockOperation()]
           },
-          policy: 'c' // Continue normally if there are pending transactions
-        }
+          inserts: {},
+          deletes: []
+        },
+        policy: 'c' // Continue normally if there are pending transactions
+      }
 
-        try {
-          const result = await networkTransactor.pend(pendRequest)
-          expect(result.success).to.be.true
-        } catch (error) {
-          // If it fails, that's also expected with the coordinator down
-          expect(error).to.exist
-        }
-
-        // Restore coordinator for future tests
+      try {
+        const result = await networkTransactor.pend(pendRequest)
+        expect(result.success, 'the pend falls back past the unavailable coordinator').to.be.true
+      } finally {
         coordinator.transactor.available = true
       }
     })

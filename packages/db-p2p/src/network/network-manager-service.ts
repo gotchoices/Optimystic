@@ -348,6 +348,9 @@ export class NetworkManagerService implements Startable {
 		}
 
 		// Fallback: peer-centric clustering if FRET unavailable
+		// NOTE: this ranks the raw routing key against peer multihashes, a placement no FRET node shares; fine while
+		// FRET is always registered (Libp2pKeyPeerNetwork cannot route without it); if FRET-less nodes ever answer
+		// redirect checks, rank on hashKey(key) against FRET's peer coordinates instead.
 		const anchor = await this.findNearestPeerToKey(key);
 		const anchorMh = anchor.toMultihash().bytes;
 		const connected: PeerId[] = (libp2p.getConnections?.() ?? []).map((c: any) => c.remotePeer);
