@@ -20,6 +20,15 @@
  *
  * Following `check-doc-citations.mjs` and `check-libp2p-majors.mjs`: plain .mjs, no dependencies,
  * no build step. Wired into `yarn lint:deps`, chained into `yarn check`.
+ *
+ * NOTE: accepted tradeoff — this is a standalone script, not an ESLint rule
+ * (`eslint-plugin-import`'s `no-extraneous-dependencies` is the closest fit). That plugin adds a new
+ * dependency, needs resolver configuration to follow this repo's NodeNext-style subpath specifiers
+ * (e.g. `@noble/curves/ed25519.js`), and its flat-config support has been uneven; `eslint.config.js`
+ * also deliberately stays off the `typescript-eslint`/`@eslint/js` recommended presets (see its SCOPE
+ * comment), so a plugin rule would be the first of its kind here. A standalone script matching the
+ * sibling guards' pattern was faster to get right and easier to audit. Revisit if a maintained rule
+ * later covers this cleanly without those costs.
  */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
