@@ -13,10 +13,10 @@
  *      established, so the shared group is grown, never CREATED by two machines at once. Here
  *      the shared value is brand new — in the base cases the index tree starts completely
  *      empty — so both machines create the group from nothing.
- *   2. Nothing anywhere crosses two machines with a UNIQUE index, or with an index tree big
- *      enough to span more than one block (the tree's default fan-out is 64 and every
- *      two-node case so far writes three rows). Both are listed as untested in
- *      `debt-index-sweep-misses-update-delete-and-orphans`.
+ *   2. Nothing else crosses two machines with a UNIQUE index, or with an index tree big
+ *      enough to span more than one block (the tree's default fan-out is 64 and every other
+ *      two-node insert case writes three rows). The cases below close both. Two-node UPDATE
+ *      and DELETE are closed by `two-node-index-mutation-sweep.spec.ts`.
  *
  * On the mechanism the fix ticket proposed — an index entry overwritten last-writer-wins
  * rather than merged — see `index-manager.ts insertIndexEntries`: an index tree key is

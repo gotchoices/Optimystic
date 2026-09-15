@@ -101,6 +101,21 @@ function installIndexRoutingProbe(): IndexRoutingProbe {
 }
 
 /**
+ * Run `body` and return how many secondary-index reads (`executeIndexScan` invocations) it made,
+ * across every Database sharing the vtab prototype — for a spec that must show a statement's row
+ * source went THROUGH an index, or did not, rather than trusting the planner's choice.
+ */
+export async function countIndexScans(body: () => Promise<unknown>): Promise<number> {
+	const probe = installIndexRoutingProbe();
+	try {
+		await body();
+		return probe.indexScans;
+	} finally {
+		probe.restore();
+	}
+}
+
+/**
  * The agreement report for every secondary index `table` maintains, WITHOUT asserting — for a
  * test that pins an exact discrepancy rather than requiring none. Goes through the registered
  * module's `verifyIndexes`, so the tree-key format stays owned by the plugin, and a table

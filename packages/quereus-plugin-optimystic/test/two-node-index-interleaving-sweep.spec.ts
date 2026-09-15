@@ -60,6 +60,9 @@
  *
  * Harness is the shared `mesh-node-harness.ts`: two Databases, each bound to its own
  * node's transactor over one 2-node mock mesh.
+ *
+ * Every case here only INSERTs. UPDATE and DELETE are swept in their own generator,
+ * `two-node-index-mutation-sweep.spec.ts`, rather than as a dimension here (see the NOTE above).
  */
 
 import { expect } from 'chai';
@@ -103,9 +106,9 @@ const INDEX_TIMINGS = ['index-first', 'rows-first'] as const;
 /**
  * Order the two nodes' post-setup writes land in. `a-then-b` and `b-then-a` are the two
  * sequential orders; `staged-both` is a different KIND of value — it stages both mutations
- * before either commits, and pins the commit order to A-then-B. So "both staged, B commits
- * first" is covered and "both staged, A commits second" is not; tracked with the generator's
- * other coverage gaps in `debt-index-sweep-misses-update-delete-and-orphans`.
+ * before either commits, and always commits A first. The B-first commit of two staged writes
+ * is covered for UPDATE and DELETE by `two-node-index-mutation-sweep.spec.ts` (`commit=b-first`)
+ * and remains uncovered for insert-only writes: a recorded gap, with no ticket.
  */
 const WRITE_ORDERS = ['a-then-b', 'b-then-a', 'staged-both'] as const;
 /** Whether each node index-seeks its OWN token, on its own database, before writing it. */
@@ -252,7 +255,7 @@ async function runSetup(c: Case, first: Node, second: Node): Promise<void> {
  * Note what this deliberately does NOT produce: no node ever seeks a value only the SIBLING
  * will write, so the read-only-sibling shape — a node that touches an index collection
  * exclusively through reads of someone else's value — is not covered by any case here.
- * Tracked in `debt-index-sweep-misses-update-delete-and-orphans`.
+ * That is a recorded gap, not filed as a ticket.
  */
 async function runPreReads(c: Case, nodes: Record<'A' | 'B', Node>): Promise<void> {
 	const tokens = tokensFor(c);
