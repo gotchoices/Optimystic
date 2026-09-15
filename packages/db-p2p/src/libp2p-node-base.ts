@@ -544,13 +544,23 @@ export async function createLibp2pNodeBase(
 		transports,
 		connectionEncrypters: [noise()],
 		streamMuxers: [yamux()],
-		// Narrow cast confined to the `services` field: the built-in factories (identify/dcutr/…) are
-		// typed against a SECOND copy of `@libp2p/interface` pulled in transitively (via `@libp2p/crypto`),
-		// whose `Uint8Array<ArrayBuffer>` vs `<ArrayBufferLike>` PeerId/key shapes are structurally
-		// incompatible with the top-level copy — a dependency-dedup artifact, not a real mismatch. The cast
-		// stays on this field alone so the rest of `libp2pOptions` remains fully typed as `Libp2pInit`.
-		// NOTE: this cast exists ONLY because of the duplicate @libp2p/interface install; if that dedups
-		// (or on a libp2p bump) drop `as unknown as NonNullable<Libp2pInit['services']>` and type the map directly.
+		// Narrow cast confined to the `services` field: `@libp2p/dcutr` and `@libp2p/autonat` are typed
+		// against `@libp2p/interface` 3.2.x, while this package — and `libp2p` itself, whose `Libp2pInit`
+		// this map must satisfy — resolves 3.1.x. The two minors' PeerId/key/connection shapes differ in
+		// `Uint8Array<ArrayBuffer>` vs `<ArrayBufferLike>`, so those two factories are structurally
+		// incompatible with `Libp2pInit['services']` — a type-level artifact of the minor split, not a
+		// runtime mismatch. The cast stays on this field alone so the rest of `libp2pOptions` remains
+		// fully typed as `Libp2pInit`.
+		// NOTE: accepted tradeoff — raising this package's `@libp2p/interface` pin to ^3.2.x so the copies
+		// dedupe and the cast can go was considered and declined, for two reasons. The 3.1/3.2 split is
+		// deliberate: 3.2.4 pulls uint8arraylist@^3 and multiformats@^14, and this package's
+		// it-length-prefixed / uint8arraylist@^2 stack builds only against 3.1 (scripts/shared-majors.cjs).
+		// And it would not dedupe anyway: `libp2p` and the identify, kad-dht, tcp, websockets,
+		// circuit-relay-v2, bootstrap, noise and yamux packages declare ^3.0.0 or ^3.1.0 and resolve to
+		// 3.1.0, so raising our pin alone would type this package against 3.2 while `Libp2pInit` stayed
+		// 3.1 — moving the cast, not removing it. Revisit when the libp2p release line this package
+		// depends on itself declares `@libp2p/interface@^3.2` or later; then delete
+		// `as unknown as NonNullable<Libp2pInit['services']>` and type the map directly.
 		services: ({
 			// `@libp2p/identify` is the ONE service here whose protocol id it builds itself:
 			// `Identify`/`IdentifyPush` both emit `/${protocolPrefix}/id[/push]/1.0.0`, always

@@ -19,17 +19,24 @@ const NO_DIRECT_DEBUG_IMPORT = {
 	selector: "ImportDeclaration[source.value='debug']",
 	message: 'Import `createLogger` from your package\'s src/logger.ts rather than constructing `debug` channels directly, so every namespace is rooted in the documented tree (docs/debugging.md).',
 };
+// React Native is a first-class target, and Metro's Babel preset (babel-preset-expo) does not
+// transform ES2022 `static { }` blocks: one in library source fails the whole app bundle at load.
+const NO_STATIC_BLOCK = {
+	selector: 'StaticBlock',
+	message: 'Class static blocks break React Native bundling (Metro/babel-preset-expo cannot transform them). Use a static field initializer instead.',
+};
 
 // Flat config (ESLint 9). Repo is ESM + yarn 4 workspaces + TypeScript throughout.
 // `eslint .` walks the tree from root, so this single config covers every workspace —
 // no per-package fan-out (unlike the build:/test: scripts in package.json).
 //
-// SCOPE: this config is deliberately narrow — it enforces exactly two things, both about
-// logging. `no-console` is the gate this config was stood up for (route stray library
-// logging through each package's `debug` logger instead of printing unconditionally), and
-// `no-restricted-syntax` is the follow-on gate that says *which* logger: the channel must
+// SCOPE: this config is deliberately narrow — it enforces logging discipline plus one
+// React Native bundling constraint. `no-console` is the gate this config was stood up for (route
+// stray library logging through each package's `debug` logger instead of printing unconditionally),
+// and `no-restricted-syntax` is the follow-on gate that says *which* logger: the channel must
 // come from the package's own `createLogger`, never from libp2p's component logger or a
-// hand-rolled `debug(...)` namespace. The full
+// hand-rolled `debug(...)` namespace. The same rule also bans class static blocks in library
+// source (NO_STATIC_BLOCK above), which Metro cannot bundle. The full
 // `typescript-eslint`/`@eslint/js` recommended presets are intentionally NOT enabled:
 // the codebase leans on `any` and untyped globals in many places, and turning the
 // recommended rulesets on would flood `yarn lint` red with pre-existing, unrelated
@@ -83,7 +90,7 @@ export default tseslint.config(
 		// objects with a `forComponent` property to satisfy libp2p-shaped interfaces, and
 		// `test/support/capture-log.ts` legitimately imports `debug` — that is its whole job.
 		files: ['packages/*/src/**/*.ts'],
-		rules: { 'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_DIRECT_DEBUG_IMPORT] },
+		rules: { 'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_DIRECT_DEBUG_IMPORT, NO_STATIC_BLOCK] },
 	},
 	{
 		// The sanctioned `debug` import sites: the seven per-package `createLogger` factories
@@ -95,7 +102,7 @@ export default tseslint.config(
 		// `'off'`: flat config replaces the whole rule config, and these files have no business
 		// reaching for libp2p's component logger either.
 		files: ['packages/*/src/logger.ts', 'packages/reference-peer/src/cli.ts'],
-		rules: { 'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER] },
+		rules: { 'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_STATIC_BLOCK] },
 	},
 	{
 		// Intentional terminal output — CLI, entry scripts, demo, tooling, tests.

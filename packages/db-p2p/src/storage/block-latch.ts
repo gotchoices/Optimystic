@@ -34,8 +34,9 @@ let expire!: (latch: BlockWriteLatch) => void;
 /**
  * Opaque proof that the bearer is executing inside {@link blockWriteLatchKey}`(blockId)`. Only
  * {@link acquireBlockWriteLatch} (and {@link withBlockWriteLatch} through it) can construct one:
- * the constructor is private and the module-scoped minter is assigned from a static block, where
- * the private constructor is callable — no cast, nothing outside this module can build a token.
+ * the constructor is private and the module-scoped minter is assigned from a static field
+ * initializer, where the private constructor is callable — no cast, nothing outside this module can
+ * build a token.
  *
  * A token is only valid while the latch it proves is actually held: releasing expires it, so a
  * callback that stashes its token and writes after its scope closed is rejected instead of silently
@@ -54,10 +55,12 @@ export class BlockWriteLatch {
 		return this.#live;
 	}
 
-	static {
+	// A static field initializer, not a `static { }` block: React Native's Metro/Babel bundling cannot
+	// transform static blocks, and this module ships in the RN bundle (lint enforces it).
+	static #wired = (() => {
 		mint = (blockId) => new BlockWriteLatch(blockId);
 		expire = (latch) => { latch.#live = false; };
-	}
+	})();
 }
 
 /**

@@ -23,10 +23,17 @@ It runs, in order:
 | Step | What it covers |
 |------|----------------|
 | `yarn lint` | eslint across the monorepo |
+| `yarn lint:docs` | documentation citations still point at code that exists |
+| `yarn lint:deps` | shared libp2p packages stay on one major — in declared ranges and in the installed tree |
 | `yarn build` | every package compiles |
 | `yarn typecheck` | `tsc --noEmit` for the packages whose build does not type-check |
 | `yarn test` | unit suites — fast, no sockets |
 | `yarn test:integration` | real-socket libp2p suites |
+
+`yarn lint:docs` and `yarn lint:deps` need no build, so they run first: a broken citation or a
+package installed at a second major is reported in seconds rather than after a full compile. What
+`yarn lint:deps` guards, and what it cannot see, is in
+[AGENTS.md § Dependencies](../AGENTS.md#dependencies).
 
 `yarn typecheck` exists because two packages (`quereus-plugin-optimystic`, `quereus-plugin-crypto`)
 build with **tsup/esbuild**, which strips types without checking them — every other package builds
@@ -127,7 +134,7 @@ All packages in the monorepo share the same version number. The `--recursive` fl
 
 ## Checklist
 
-- [ ] `yarn check` passes (lint + build + typecheck + test + **test:integration**)
+- [ ] `yarn check` passes (lint + lint:docs + lint:deps + build + typecheck + test + **test:integration**)
 - [ ] Clean working tree
 - [ ] `yarn release` (or `yarn bump` + `yarn pub` separately)
 - [ ] GitHub release created

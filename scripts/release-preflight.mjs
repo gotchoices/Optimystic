@@ -39,9 +39,14 @@ function report() {
 	stdout.write('\nRelease preflight\n');
 	stdout.write('─────────────────\n\n');
 	stdout.write('`yarn pub` publishes to npm. A published version cannot be replaced.\n\n');
+	// NOTE: this list mirrors the root `check` script and the table in docs/releasing.md, and has
+	// drifted from them once already. Change all three together.
 	stdout.write('Run `yarn check` first if you have not already. It covers:\n');
 	stdout.write('  • yarn lint              eslint across the monorepo\n');
+	stdout.write('  • yarn lint:docs         documentation citations still resolve\n');
+	stdout.write('  • yarn lint:deps         shared libp2p packages stay on one major (declared + installed)\n');
 	stdout.write('  • yarn build             every package compiles\n');
+	stdout.write('  • yarn typecheck         type-checks the packages whose build does not\n');
 	stdout.write('  • yarn test              unit suites (fast, always-run)\n');
 	stdout.write('  • yarn test:integration  real-socket libp2p suites (env-gated, NOT in `yarn test`)\n\n');
 

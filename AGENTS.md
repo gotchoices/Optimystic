@@ -110,8 +110,8 @@ system produces — chained ahead of the workspace fan-out in `yarn test`.
 `db-p2p` and `quereus-plugin-optimystic`) are env-gated on `OPTIMYSTIC_INTEGRATION=1` and run from a
 separate `test:integration` script — they exercise real TCP meshes, FRET cohort assembly, and
 cross-node reactivity/matchmaking over real sockets. Run `yarn test:integration` from root to fan out
-to both, or `yarn check` from root for the full gate (lint + build + typecheck + test +
-test:integration). `yarn typecheck` covers the two tsup/esbuild-built packages, whose build strips
+to both, or `yarn check` from root for the full gate (lint + lint:docs + lint:deps + build + typecheck +
+test + test:integration). `yarn typecheck` covers the two tsup/esbuild-built packages, whose build strips
 types without checking them; it must run **after** `yarn build`, since their specs import their own
 `dist/` output.
 `yarn check` is the pre-release gate; see [docs/releasing.md](docs/releasing.md).
@@ -131,7 +131,12 @@ test`, `yarn test:integration` or `yarn check` sets it, so every scripted run is
 
 ## Dependencies
 
-Shared cross-package deps are version-guarded by `yarn.config.cjs` (Yarn 4 constraints). `@libp2p/peer-id` and `uint8arrays` must declare a single blessed range everywhere; `@libp2p/interface` and `@libp2p/crypto` must stay within a shared major (minor drift is allowed and, for `@libp2p/interface` 3.1 vs 3.2, deliberate — see the comments in that file). After changing any such dep, run `yarn constraints`; single-range violations are auto-repairable with `yarn constraints --fix`, major violations are reported and need a human decision.
+Shared cross-package deps are version-guarded twice, and the two guards look at different things. Both read the one list in `scripts/shared-majors.cjs`; `yarn lint:deps` runs both, and so does `yarn check`, ahead of the build.
+
+- **Declared ranges** — `yarn.config.cjs` (Yarn 4 constraints) checks what our own workspaces' `package.json` files ask for. `@libp2p/peer-id` and `uint8arrays` must declare a single blessed range everywhere; the rest of the list must stay within its shared major. Single-range violations are auto-repairable with `yarn constraints --fix`; major violations are reported and need a human decision.
+- **The installed tree** — `scripts/check-libp2p-majors.mjs` asks Yarn what actually resolved, transitive dependencies and portal-linked sibling repositories included, and fails if any listed package is installed at a major other than its expected one, naming each offending version and what pulls it in. Constraints cannot see this side at all: when `@chainsafe/libp2p-gossipsub@14` brought a major-2 `@libp2p/interface` into a tree on major 3, the offending range lived in gossipsub's own manifest, and every declared range here was correct.
+
+Minor drift within a major is allowed and, for `@libp2p/interface` 3.1 vs 3.2, deliberate — `scripts/shared-majors.cjs` explains why, and why `multiformats` and `uint8arraylist` are left off the list. After changing any such dep, run `yarn lint:deps`. Neither guard says anything about the libp2p version a *remote* peer was built against: a relay or bootstrap node from another repository has its own lockfile, invisible to every check here.
 
 ## Tickets (tess)
 
