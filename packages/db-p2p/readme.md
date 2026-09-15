@@ -608,6 +608,13 @@ const node = await createLibp2pNode({
 });
 ```
 
+To be reachable through a relay instead, listen on `<relay address>/p2p-circuit` (the relay's
+full dial address, `/p2p/<relay id>` included). The node reserves a slot on that relay at start and
+keeps it itself afterwards, re-reserving after the relay restarts, after the connection to it drops,
+and across libp2p's routine renewal (`superviseRelayReservation` in `src/network/relay-reservation.ts`);
+node creation still rejects if the relay cannot be reserved at all. A bare `/p2p-circuit` listen
+address is left to the host, which then owns that reservation.
+
 #### React Native
 
 For React Native, import from `@optimystic/db-p2p/rn` instead of the root entrypoint.

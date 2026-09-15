@@ -89,6 +89,12 @@ export interface SpawnPlainRelayOpts {
 	privateKey?: PrivateKey;
 	/** Exact WS listen multiaddr, for re-binding a known port. Defaults to an ephemeral port on `host`. */
 	listenAddr?: string;
+	/**
+	 * Lifetime the relay grants each reservation, in ms. Defaults to libp2p's 2 hours. A client
+	 * refreshes `max(lifetime − 5 min, 30 s)` after reserving, so a lifetime under 5 min makes the
+	 * refresh happen 30 s in — the way to exercise libp2p's own renewal inside a spec.
+	 */
+	reservationTtl?: number;
 }
 
 /**
@@ -126,7 +132,12 @@ export async function spawnPlainRelayNode(network: string, opts: SpawnPlainRelay
 			// Slash-LESS prefix: `@libp2p/identify` builds `/${protocolPrefix}/id/1.0.0` and
 			// prepends the leading slash itself. See `foreign-peer-interop.integration.spec.ts`.
 			identify: identify({ protocolPrefix: `optimystic/${network}` }),
-			relay: circuitRelayServer({ reservations: { applyDefaultLimit: false } })
+			relay: circuitRelayServer({
+				reservations: {
+					applyDefaultLimit: false,
+					...(opts.reservationTtl !== undefined ? { reservationTtl: opts.reservationTtl } : {})
+				}
+			})
 		}
 	}) as unknown as Libp2p;
 }
@@ -152,7 +163,10 @@ export interface RestartablePlainRelay {
 	start(): Promise<void>;
 }
 
-export async function spawnRestartablePlainRelay(network: string, opts: { host?: string } = {}): Promise<RestartablePlainRelay> {
+export async function spawnRestartablePlainRelay(
+	network: string,
+	opts: Pick<SpawnPlainRelayOpts, 'host' | 'reservationTtl'> = {}
+): Promise<RestartablePlainRelay> {
 	const privateKey = await generateKeyPair('Ed25519');
 	let node: Libp2p | undefined = await spawnPlainRelayNode(network, { ...opts, privateKey });
 	const peerId = node.peerId;
@@ -173,7 +187,7 @@ export async function spawnRestartablePlainRelay(network: string, opts: { host?:
 		},
 		async start() {
 			if (node) throw new Error('the relay is already running');
-			const started = await spawnPlainRelayNode(network, { privateKey, listenAddr });
+			const started = await spawnPlainRelayNode(network, { privateKey, listenAddr, ...(opts.reservationTtl !== undefined ? { reservationTtl: opts.reservationTtl } : {}) });
 			node = started;
 			const rebound = started.getMultiaddrs().map(a => a.toString());
 			if (!rebound.includes(wsAddr.toString())) {

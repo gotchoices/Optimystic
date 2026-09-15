@@ -18,6 +18,8 @@
  */
 import { expect } from 'chai';
 import net from 'node:net';
+import { generateKeyPair } from '@libp2p/crypto/keys';
+import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { createLibp2pNode } from '../src/libp2p-node.js';
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from '../src/cohort-topic/protocols.js';
 
@@ -121,6 +123,25 @@ describe('createLibp2pNode post-start rollback', function () {
 		// earlier (before the cohort block) for an unrelated reason.
 		expect(rejected.name).to.equal('DuplicateProtocolHandlerError');
 		expect(rejected.message).to.contain('/optimystic/cohort-topic/1.0.0/register');
+		expect(await portIsFree(port), 'listener port released (the node was stopped)').to.equal(true);
+	});
+
+	it('a relay that cannot be reserved also rolls back (listener port released)', async () => {
+		const port = await freePort();
+		// Nothing listens on port 1, so the supervisor's dial is refused and its first drive fails. That
+		// throw comes from the very first step inside the post-start span, before any other wrapper.
+		const deadRelay = `/ip4/127.0.0.1/tcp/1/p2p/${peerIdFromPrivateKey(await generateKeyPair('Ed25519')).toString()}`;
+
+		const rejected = await rejectionFrom({
+			bootstrapNodes: [],
+			networkName: 'test-startup-rollback-relay',
+			port,
+			arachnode: { enableRingZulu: false },
+			listenAddrs: [`/ip4/0.0.0.0/tcp/${port}`, `${deadRelay}/p2p-circuit`],
+		});
+
+		expect(rejected.message).to.contain('could not reserve a circuit on relay');
+		expect(rejected.message).to.contain(deadRelay);
 		expect(await portIsFree(port), 'listener port released (the node was stopped)').to.equal(true);
 	});
 

@@ -34,6 +34,7 @@ import { ClusterClient } from './cluster/client.js';
 import type { IRepo, ICluster, ITransactionValidator, BlockId, IBlockChangeNotifier } from '@optimystic/db-core';
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
 import { networkManagerService, type NetworkManagerService } from './network/network-manager-service.js';
+import { assertCircuitRelayTransport, planRelayListenAddrs, superviseRelayReservations } from './network/relay-reservation.js';
 import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
 import { BlockTransferCoordinator } from './cluster/block-transfer.js';
 import type { RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
@@ -487,7 +488,25 @@ export async function createLibp2pNodeBase(
 
 	const nodePrivateKey = options.privateKey ?? await generateKeyPair('Ed25519');
 
-	const listenAddrs = options.listenAddrs ?? defaults.listenAddrs;
+	// A listen address naming a relay (`<relay>/p2p/<id>/p2p-circuit`, the only shape a phone or browser
+	// can take) is handed to libp2p as a bare `/p2p-circuit` and the relay is supervised by this node
+	// instead, so the reservation survives relay restarts, dropped relay connections and libp2p's own
+	// renewal. See `network/relay-reservation.ts` for why the configured shape cannot recover.
+	// NOTE: accepted tradeoff — a bare `/p2p-circuit` listener also turns on libp2p's relay discovery,
+	// whose topology handler can reserve on ANY connected peer serving the relay hop protocol (every
+	// Optimystic node started with `relay: true` does), and that reservation takes the pending slot
+	// meant for the named relay. The node then stays reachable, but through that other relay, so a
+	// partner that enrolled its circuit address through the named relay cannot dial it until that
+	// reservation drops; the supervisor reports it as `relay-reservation:slot-taken` and retries at its
+	// backoff cap. It happens only when a relay-only node is directly connected to a second relay server,
+	// and Sereus runs with the same behaviour. Revisit on a deployment that connects relay-only nodes to
+	// more than one relay server, or on the libp2p upgrade below.
+	// NOTE: circuit-relay-v2 >= 4.2 (needs @libp2p/interface ^3.3) refreshes reservations in place and
+	// re-applies a configured reservation for its own relay; when the libp2p line moves, revisit keeping
+	// the host's configured address and re-requesting with 'configured', which drops the rewrite and the
+	// discovery side effect.
+	const relayPlan = planRelayListenAddrs(options.listenAddrs ?? defaults.listenAddrs);
+	const listenAddrs = relayPlan.listenAddrs;
 	const transports = options.transports ?? defaults.transports;
 
 	// --- cohort-topic substrate activation (opt-in; default off → today's bare behavior, zero cost) ---
@@ -779,6 +798,11 @@ export async function createLibp2pNodeBase(
 	// handler is live with a resolvable node from its first request.
 	wired.repo.setLibp2p(node);
 
+	// A relay-naming listen address with no circuit-relay transport can never be reserved on. Checked
+	// here, before start(), so the caller sees the omission by name rather than libp2p's generic
+	// unsupported-listen-address error for the bare `/p2p-circuit` the plan substituted.
+	assertCircuitRelayTransport(node, relayPlan.supervisedRelays);
+
 	await node.start();
 
 	// Everything from here to the `return` runs against an ALREADY STARTED node (open transports,
@@ -787,6 +811,24 @@ export async function createLibp2pNodeBase(
 	// for the caller and enough to block the port for the next start attempt. So the whole post-start
 	// body rolls back: see the `catch` at the bottom of this function.
 	try {
+		// Keep every relay-naming listen address's reservation alive (see `relayPlan` above). Started
+		// first, with its stop wrapper installed before anything is awaited, so the rollback `catch`
+		// below stops it too. Awaiting the first drives keeps today's startup contract: a relay that
+		// cannot be reserved rejects node creation, naming the relay, exactly as libp2p's own
+		// `listen()` on the configured shape did. A host that would rather start offline and let the
+		// supervisor recover is a separate decision, not an option here.
+		if (relayPlan.supervisedRelays.length > 0) {
+			const relaySupervisors = superviseRelayReservations(node, relayPlan.supervisedRelays);
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				try {
+					relaySupervisors.stop();
+				} finally {
+					await previousStop();
+				}
+			};
+			await relaySupervisors.awaitFirstDrives();
+		}
 
 		// Initialize peer reputation service
 		const reputation = new PeerReputationService();

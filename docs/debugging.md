@@ -126,7 +126,7 @@ its own sub-namespace so a single concern can be traced in isolation:
 
 ### db-p2p sub-namespaces
 
-`db-p2p` emits 45 sub-namespaces under `optimystic:db-p2p:`. They are grouped below by subsystem;
+`db-p2p` emits 46 sub-namespaces under `optimystic:db-p2p:`. They are grouped below by subsystem;
 `DEBUG='optimystic:db-p2p:*'` turns on all of them at once. Rows marked *(peer-id suffixed)* append
 the owning node's peer id — see *Telling nodes apart in one process* below.
 
@@ -182,6 +182,7 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 | `node-wiring`           | Node construction and startup: in-factory `setLibp2p` proxy fallbacks, owned-block seeding, spread-on-churn init, rollback failures after a failed start |
 | `node-wiring:arachnode` | Arachnode ring membership during startup: ring announcements, ring transitions, ring-shift outcomes, unconfirmed cohort growth, rebalance reaction failures |
 | `reactivity-node-wiring`| Reactivity wiring at startup — currently, a rotation re-registration that fired with no subscribe factory wired |
+| `relay-reservation`     | The per-relay reservation supervisor a node runs for every listen address naming a relay: `relay-reservation:drive` (with its trigger), `relay-reservation:held`, `relay-reservation:failed` (with the reason), `relay-reservation:slot-taken` (relay discovery filled the slot through another relay; logged once), and the libp2p-internals seam going missing |
 
 #### Reactivity (change subscription and propagation)
 

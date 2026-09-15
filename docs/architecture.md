@@ -255,10 +255,9 @@ configuration, in `packages/db-p2p/test/small-deployment-lifecycle.integration.s
 end up holding the first one's data locally, both write, one is away for a while, and both restart.
 The two-phone pairing gets the same treatment with every byte between the machines crossing a circuit
 relay, in `packages/db-p2p/test/two-phones-over-relay.integration.spec.ts`, which also restarts the relay
-itself. That last step is a known gap today: a node listening on `<relay>/p2p-circuit` does not ask for a
-new reservation after its relay restarts, so it stays unreachable until something re-drives the
-reservation or the app restarts. Sereus runs its own supervisor for this; a host without one does not
-recover.
+itself. A node listening on `<relay>/p2p-circuit` keeps its reservation on that relay itself, re-reserving
+after a relay restart, a dropped relay connection, or the routine renewal of the slot (`superviseRelayReservation`
+in `packages/db-p2p/src/network/relay-reservation.ts`).
 
 ### Arachnode — concentric storage rings
 
