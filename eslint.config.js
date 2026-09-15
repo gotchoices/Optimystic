@@ -21,6 +21,9 @@ const NO_DIRECT_DEBUG_IMPORT = {
 };
 // React Native is a first-class target, and Metro's Babel preset (babel-preset-expo) does not
 // transform ES2022 `static { }` blocks: one in library source fails the whole app bundle at load.
+// This rule is instant feedback on that one known construct. `yarn check:rn` is the backstop for the
+// whole class: it bundles with Metro and compiles with legacy Hermes, so any syntax either rejects
+// fails there, whether or not a lint rule names it.
 const NO_STATIC_BLOCK = {
 	selector: 'StaticBlock',
 	message: 'Class static blocks break React Native bundling (Metro/babel-preset-expo cannot transform them). Use a static field initializer instead.',

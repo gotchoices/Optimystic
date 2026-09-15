@@ -111,10 +111,19 @@ system produces — chained ahead of the workspace fan-out in `yarn test`.
 separate `test:integration` script — they exercise real TCP meshes, FRET cohort assembly, and
 cross-node reactivity/matchmaking over real sockets. Run `yarn test:integration` from root to fan out
 to both, or `yarn check` from root for the full gate (lint + lint:docs + lint:deps + build + typecheck +
-test + test:integration). `yarn typecheck` covers the two tsup/esbuild-built packages, whose build strips
+check:rn + test + test:integration). `yarn typecheck` covers the two tsup/esbuild-built packages, whose build strips
 types without checking them; it must run **after** `yarn build`, since their specs import their own
 `dist/` output.
 `yarn check` is the pre-release gate; see [docs/releasing.md](docs/releasing.md).
+
+**Nothing above runs React Native's build.** `yarn check:rn` does: the private `rn-bundle-check`
+workspace bundles the React Native entry with Metro (React Native's bundler) and compiles the bundle
+with `hermesc` (the Hermes engine's compiler), both pinned to the React Native 0.83 toolchain, so
+syntax a phone app's build rejects fails here. It needs `dist/` — it refuses a stale build the same
+way the test guard does — and Yarn's `nodeLinker: node-modules`, which a fresh clone lacks because
+`.yarnrc.yml` is not committed. It never runs the bundle, so a green result says nothing about
+globals, polyfills, native modules or a device; see
+[packages/rn-bundle-check/readme.md](packages/rn-bundle-check/readme.md).
 
 A third tier sits below even that: individual specs that are too slow to run by default gate
 themselves on their own env var — `RUN_LONG_TESTS=1` (circuit-relay/DCUtR/substrate scale specs),

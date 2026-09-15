@@ -27,8 +27,13 @@ It runs, in order:
 | `yarn lint:deps` | shared libp2p packages stay on one major — in declared ranges and in the installed tree |
 | `yarn build` | every package compiles |
 | `yarn typecheck` | `tsc --noEmit` for the packages whose build does not type-check |
+| `yarn check:rn` | the React Native entry bundles with Metro and compiles with Hermes, as a phone app's build does |
 | `yarn test` | unit suites — fast, no sockets |
 | `yarn test:integration` | real-socket libp2p suites |
+
+`yarn check:rn` bundles compiled `dist/` output, so it runs after the build. It never runs the
+bundle: globals, polyfills, native modules and behaviour on a device stay unchecked — see
+[packages/rn-bundle-check/readme.md](../packages/rn-bundle-check/readme.md).
 
 `yarn lint:docs` and `yarn lint:deps` need no build, so they run first: a broken citation or a
 package installed at a second major is reported in seconds rather than after a full compile. What
@@ -134,7 +139,7 @@ All packages in the monorepo share the same version number. The `--recursive` fl
 
 ## Checklist
 
-- [ ] `yarn check` passes (lint + lint:docs + lint:deps + build + typecheck + test + **test:integration**)
+- [ ] `yarn check` passes (lint + lint:docs + lint:deps + build + typecheck + check:rn + test + **test:integration**)
 - [ ] Clean working tree
 - [ ] `yarn release` (or `yarn bump` + `yarn pub` separately)
 - [ ] GitHub release created

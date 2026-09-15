@@ -47,8 +47,11 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 
-/** Set to any non-empty value to skip the check entirely. See `assertBuildFresh`. */
-const SKIP_ENV = 'OPTIMYSTIC_SKIP_BUILD_CHECK';
+/**
+ * Set to any non-empty value to skip the check entirely. See `assertBuildFresh`. Exported for
+ * `packages/rn-bundle-check/scripts/rn-bundle-check.mjs`, which honours the same hatch.
+ */
+export const SKIP_ENV = 'OPTIMYSTIC_SKIP_BUILD_CHECK';
 
 /** Test files aren't build inputs — a touched spec must not mark its package stale. */
 const SOURCE_EXCLUDE = /\.(test|spec)\.[cm]?tsx?$/;

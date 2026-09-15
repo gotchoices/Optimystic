@@ -14,19 +14,18 @@ import { walkRuntimeGraph } from './support/source-graph.js';
 // The guard works at module-specifier granularity on the source text, deliberately. A runtime
 // `Object.keys(namespace)` comparison would only see *value* exports, and the sharpest reported
 // gaps — `BlockCommitProof` and `IKVStore` — are type-only, so they erase at runtime and would
-// sail straight past such a check. A "does it bundle?" check has no discriminating power either:
-// bundling the *Node* entry under react-native/browser conditions succeeds cleanly, because
-// `@libp2p/tcp` ships a `browser` field remapping to a stub that throws only when constructed.
+// sail straight past such a check. A "does it bundle?" check (`yarn check:rn`) cannot see this drift
+// either: an entry that is missing a re-export still bundles and compiles, and only a consumer that
+// imports the missing name notices.
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const NODE_ENTRY = 'src/index.ts';
 const RN_ENTRY = 'src/rn.ts';
 
-// NOTE: this spec compares the two entry *files*; it takes on faith that `package.json` still routes
-// the `react-native` condition (and the `./rn` subpath) at `rn.ts`. Repoint or drop that condition
-// and React Native silently gets the Node entry while everything here stays green. Not guarded
-// because the exports map is stable, hand-edited config; if it starts changing, assert the routing
-// here too — `testing-entry-runtime-deps.spec.ts` already parses the same manifest.
+// This spec compares the two entry *files*; it does not check that `package.json` still routes the
+// `react-native` condition (and the `./rn` subpath) at `rn.ts`. `yarn check:rn` does:
+// `EXPECTED_ROUTES` in packages/rn-bundle-check/scripts/rn-bundle-check.mjs resolves both specifiers
+// through Metro, as a React Native app does, and fails if either lands anywhere but `dist/src/rn.js`.
 
 /** Modules deliberately present on only one entry, mapped to the reason. Empty by design: every
  *  module in db-p2p is browser-safe except the libp2p transport wiring, and that asymmetry is
@@ -178,10 +177,11 @@ describe('entry point parity', () => {
 
 	// The assertions above prove the two entries expose the same *modules*. They say nothing about
 	// whether those modules run under React Native, and `NODE_ONLY` being empty is the claim that
-	// they do. This checks the half of that claim a test can actually settle: no first-party module
-	// reachable from the RN entry imports a Node builtin. Node-only third-party *packages* stay
-	// uncovered on purpose — `@libp2p/tcp` ships a browser stub that resolves and bundles cleanly
-	// and throws only on construction, so no bundle- or manifest-based check can see them.
+	// they do. This checks the half of that claim a source walk can settle: no first-party module
+	// reachable from the RN entry imports a Node builtin. Node-only third-party *packages* are left to
+	// `yarn check:rn`, which bundles the RN entry with Metro: one that imports a builtin fails there
+	// (under Metro `@libp2p/tcp` resolves to its Node code, which imports `net`), but one that bundles
+	// cleanly and fails only when called still passes both checks.
 	it('reaches no Node builtin from the React Native entry', () => {
 		const { builtins } = walkRuntimeGraph(path.join(packageRoot, RN_ENTRY));
 		const offenders = [...builtins].map(

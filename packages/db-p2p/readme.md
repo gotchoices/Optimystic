@@ -656,6 +656,7 @@ before any other imports).
 | Timer `.ref()` / `.unref()` | @optimystic/db-p2p, undici | Wrap Hermes numeric timer IDs in objects with no-op `.ref()`/`.unref()` methods; patch `clearTimeout`/`clearInterval` to unwrap |
 | `Event`, `CustomEvent`, `EventTarget` | libp2p, @libp2p/interface | Custom shim or npm `event-target-polyfill` |
 | `Intl.PluralRules` | moat-maker | English-only ordinal/cardinal shim is sufficient |
+| `TextDecoder` | @optimystic/db-core, @optimystic/db-p2p, @optimystic/db-p2p-storage-rn, multiformats, cborg | **Constructed at module load, so without it the app fails at startup.** Expo SDK 52+ provides it; bare React Native's Hermes does not. A UTF-8-only shim is sufficient |
 | `WebSocket.prototype.bufferedAmount` | @libp2p/websockets | **RN declares the field but never assigns it, so it reads `undefined`.** See below — without this every WebSocket write hangs. |
 
 **`WebSocket.bufferedAmount` deserves its own note, because the symptom does not look like a
@@ -685,9 +686,14 @@ mechanism.
 | `stream` / `node:stream` | libp2p | `readable-stream` (npm) |
 | `buffer` / `node:buffer` | libp2p, multiformats | `buffer` (npm) |
 
+These four rows are known to be enough for a React Native build to accept the code: `yarn check:rn`
+(the private `packages/rn-bundle-check` workspace) bundles the `/rn` entry with exactly these aliases
+and the React Native 0.83 toolchain, then compiles the bundle with legacy Hermes. Its
+`test/shim-table-parity.test.mjs` fails if its aliases and this table drift apart, so change them
+together. It never runs the bundle, so the global polyfills above are not verified by it.
+
 **Built-in (no polyfill needed):**
 - `TextEncoder` — built-in to Hermes
-- `TextDecoder` — built-in to Expo SDK 52+ (UTF-8 only)
 - `BigInt` — built-in to Hermes since RN 0.70
 
 Optimystic's own code does not require a global `Buffer` — it encodes with `uint8arrays`, and lint (`no-restricted-globals` in `eslint.config.js`) keeps it that way.
