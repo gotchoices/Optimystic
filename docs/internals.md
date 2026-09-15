@@ -665,8 +665,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
 - `rev` = revision number, monotonically increasing per block
 
 ### Transform Ownership
-- `Transforms.updates[blockId]` arrays must NOT be shared between consumers
-- `copyTransforms()` and `transformForBlockId()` must deep-clone arrays
+- `Transforms.updates[blockId]` arrays and `Transforms.inserts[blockId]` blocks must NOT be shared between consumers
+- `copyTransforms()` and `transformForBlockId()` must deep-clone both `insert` and `updates`
 - JSON serialization over network creates implicit deep copies
 
 ### Consensus Execution
@@ -1736,15 +1736,19 @@ Transaction metrics are instrumented with `debug` logging and optional verbose t
 ## Common Pitfalls
 
 ### 1. Shallow Copy of Transforms
-**Bug**: `copyTransforms()` spreads `updates` object but arrays inside are shared.
+**Bug**: `copyTransforms()` spreads `updates` object but arrays inside are shared; the same
+applies to `inserts[blockId]` blocks, which `applyTransform` can mutate in place when `updates`
+ride along. `transformForBlockId()` deep-clones both `insert` and `updates` for this reason.
 ```typescript
 // WRONG
 { updates: { ...transform.updates } }  // Arrays still shared!
+{ insert: transform.inserts[blockId] } // Block still shared!
 
 // CORRECT
 { updates: Object.fromEntries(
     Object.entries(transform.updates).map(([k, v]) => [k, structuredClone(v)])
 )}
+{ insert: structuredClone(transform.inserts[blockId]) }
 ```
 
 ### 2. Storage Returns References

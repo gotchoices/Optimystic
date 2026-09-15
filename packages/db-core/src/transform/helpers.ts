@@ -99,13 +99,15 @@ export function concatTransforms(...transforms: Transforms[]): Transforms {
 /**
  * Extracts the transform for a specific block from a Transforms object.
  *
- * @pitfall Updates array MUST be deep cloned - extracting without cloning shares
- * the array reference, causing mutations to affect the original Transforms.
+ * @pitfall Both `insert` and `updates` MUST be deep cloned - extracting without cloning shares
+ * the object/array reference, causing mutations (e.g. `applyTransform` mutating `insert` in place
+ * when `updates` ride along) to affect the original Transforms.
  * @see docs/internals.md "Shallow Copy of Transforms" pitfall
  */
 export function transformForBlockId(transform: Transforms, blockId: BlockId): Transform {
 	return {
-		...(transform.inserts && blockId in transform.inserts ? { insert: transform.inserts[blockId] } : {}),
+		// Clone insert to prevent applyTransform's in-place mutation from reaching the original
+		...(transform.inserts && blockId in transform.inserts ? { insert: structuredClone(transform.inserts[blockId]) } : {}),
 		// Clone updates array to prevent shared references
 		...(transform.updates && blockId in transform.updates ? { updates: structuredClone(transform.updates[blockId]) } : {}),
 		...(transform.deletes?.includes(blockId) ? { delete: true } : {})

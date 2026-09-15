@@ -793,6 +793,13 @@ function latestMaterializedAt(blockState: BlockState, maxRev: number): { block: 
 /**
  * `applyTransform` over cloned inputs, so a returned block never aliases stored state.
  *
+ * The `insert` clone here is not redundant with `transformForBlockId`'s: callers pass `Transform`
+ * values pulled straight out of `blockState.pendingActions` (a `Map<ActionId, Transform>` written
+ * once by `pend()`), which can be `get()`'d more than once and read again at commit time before
+ * being superseded. `applyTransform` mutates `transform.insert` in place when `updates` ride
+ * along, so cloning immediately before each call is what keeps that stored entry pristine across
+ * repeated reads.
+ *
  * An absent base is NOT a short circuit: an insert needs no base — `applyTransform` adopts it as
  * the block. Bailing out on `!block` made this double silently drop a pending-only insert read
  * through the pending overlay, the one shape `StorageRepo.get` serves with content but no

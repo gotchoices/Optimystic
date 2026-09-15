@@ -1,7 +1,7 @@
 import { expect } from 'chai'
 import type { BlockId, BlockOperation, IBlock, BlockType, BlockSource, Transforms } from '../src/index.js'
 import { Tracker } from '../src/transform/tracker.js'
-import { applyOperation, withOperation, blockIdsForTransforms, emptyTransforms, mergeTransforms, concatTransforms, transformForBlockId, applyTransformToStore, concatTransform, copyTransforms } from '../src/index.js'
+import { applyOperation, withOperation, blockIdsForTransforms, emptyTransforms, mergeTransforms, concatTransforms, transformForBlockId, applyTransformToStore, applyTransform, concatTransform, copyTransforms } from '../src/index.js'
 import { apply } from '../src/blocks/index.js'
 import { TestBlockStore } from './test-block-store.js'
 
@@ -185,6 +185,26 @@ describe('Transform functionality', () => {
 			expect(blockTransform.insert).to.deep.equal(testBlock)
       expect(blockTransform.updates).to.exist
       expect(blockTransform.delete).to.be.true
+    })
+
+    it('should not let applyTransform mutating the extracted insert corrupt the original Transforms', () => {
+      const op: BlockOperation = ['data', 0, 0, 'mutated']
+      const transforms: Transforms = {
+        inserts: { 'id1': testBlock },
+        updates: { 'id1': [op] },
+        deletes: []
+      }
+      const originalInsert = structuredClone(transforms.inserts!['id1'])
+
+      const blockTransform = transformForBlockId(transforms, 'id1' as BlockId)
+      // Extracted insert must be a separate object, not the same reference as the staged one.
+      expect(blockTransform.insert).to.not.equal(transforms.inserts!['id1'])
+
+      // applyTransform sets block = transform.insert, then mutates it in place via the updates.
+      applyTransform(undefined, blockTransform)
+
+      // The original staged Transforms must be untouched by that mutation.
+      expect(transforms.inserts!['id1']).to.deep.equal(originalInsert)
     })
   })
 
