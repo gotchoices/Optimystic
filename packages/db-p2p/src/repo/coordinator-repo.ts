@@ -1100,6 +1100,29 @@ export class CoordinatorRepo implements IRepo {
 		return lastSeen == null ? undefined : this.now() - lastSeen;
 	}
 
+	/**
+	 * Whether the solo-self exit of {@link fetchBlockFromCluster} has already named `blockId` inside
+	 * the current read-repair window, for a block this node does NOT hold (`localRev` undefined). Such
+	 * a block reaches that exit on every read, because `get` never remembers an absence (GitHub
+	 * issue #20). So its `cluster-fetch:solo-self-skip` line and its stamp are both skipped while the
+	 * stamp is at most one `readRepairWindowMs` old. An unconditional line would bring back issue #8's
+	 * log volume for a probed but never-written collection. Re-stamping on every read would keep the
+	 * stamp fresh and silence the line for good on a block read more often than once a window.
+	 *
+	 * Withholding the stamp never skips a consult: `get` asks {@link shouldReadRepair} only about
+	 * present blocks. A HELD block reaches the exit only when read-repair already chose to consult, so
+	 * this is always false for one. Its line and stamp are unchanged, and the line keeps pairing with
+	 * `cluster-tx:read-repair-triggered`.
+	 *
+	 * NOTE: the stamp is shared with every exit that marks a block seen, so a missing block one of
+	 * them stamped inside the window is not named until that stamp lapses. Fine for a diagnostic
+	 * line; if anything ever needs "first answer from a self-only view" exactly, give the line its own
+	 * per-block stamp.
+	 */
+	private soloAbsenceNamedThisWindow(blockId: BlockId, localRev: number | undefined): boolean {
+		return localRev === undefined && (this.ageMs(blockId) ?? Infinity) <= this.readRepairWindowMs;
+	}
+
 	/** Mark blocks as freshly observed from cluster authority (post-commit or post-fetch). */
 	private markBlocksSeen(blockIds: BlockId[]): void {
 		const now = this.now();
@@ -1198,21 +1221,9 @@ export class CoordinatorRepo implements IRepo {
 			&& this.localPeerId
 			&& peerIds[0] === this.localPeerId.toString()
 		) {
-			// A block this node does NOT hold reaches this exit on every read — `get` never remembers an
-			// absence (GitHub issue #20) — so for such a block the line and the stamp below are
-			// rate-limited to once per `readRepairWindowMs`: both are skipped while the block carries a
-			// stamp younger than one window. An unconditional line would bring back issue #8's log volume
-			// for a probed but never-written collection; re-stamping on every read would keep the stamp
-			// fresh and silence the line for good on a block read more often than once a window. The
-			// stamp is inert for a missing block (`get` asks `shouldReadRepair` only about present
-			// blocks), so withholding it never suppresses a consult. A HELD block reaches this exit only
-			// when read-repair already chose to consult, so it logs and stamps every time, and its line
-			// keeps pairing with `cluster-tx:read-repair-triggered`.
-			// NOTE: the stamp is shared with every exit that marks a block seen, so a missing block one of
-			// them stamped inside the window is not named here until that stamp lapses. Fine for a
-			// diagnostic line; if anything ever needs "first answer from a self-only view" exactly, give
-			// the line its own per-block stamp.
-			const namedThisWindow = localRev === undefined && (this.ageMs(blockId) ?? Infinity) <= this.readRepairWindowMs;
+			// The line and the stamp below go together: both are skipped for a missing block this exit
+			// already named inside the window (see `soloAbsenceNamedThisWindow`).
+			const namedThisWindow = this.soloAbsenceNamedThisWindow(blockId, localRev);
 			if (!namedThisWindow) this.log('cluster-fetch:solo-self-skip', { blockId });
 			// Arm the lazy read-repair window. Without this the window is never stamped,
 			// `shouldReadRepair` reads `lastSeen == null` forever, and every read re-enters this
