@@ -27,6 +27,7 @@
  * runs at 250 ms timings. Not env-gated.
  */
 import { expect } from 'chai';
+import net from 'node:net';
 import { createLibp2p, type Libp2p } from 'libp2p';
 import { noise } from '@chainsafe/libp2p-noise';
 import { yamux } from '@chainsafe/libp2p-yamux';
@@ -43,6 +44,7 @@ import type { OptimysticNode } from '../src/optimystic-node.js';
 import { routesThroughRelay } from '../src/peer-address-book.js';
 import {
 	CIRCUIT_SEARCH_LISTEN_ADDR,
+	DEFAULT_RELAY_DRIVE_TIMEOUT_MS,
 	DEFAULT_RELAY_MAX_BACKOFF_MS,
 	superviseRelayReservation,
 	type RelayReservationSupervisor,
@@ -70,12 +72,25 @@ async function deadRelayAddr(transportSuffix = '/ws'): Promise<string> {
 }
 
 /**
- * A relay address in RFC 5737 TEST-NET-1, which is routed nowhere: a dial to it HANGS rather than
- * being refused, so a supervisor stopped while dialing it has something to abort.
+ * A relay address whose dial HANGS rather than being refused, so a supervisor stopped while dialing
+ * it has something to abort: a local TCP server that accepts the socket and never answers the
+ * WebSocket handshake. Local on purpose — a black-holed public address hangs on most hosts but is
+ * refused at once on one with no default route, which would make the abort untested, not broken.
  */
-async function blackholeRelayAddr(): Promise<string> {
-	const key = await generateKeyPair('Ed25519');
-	return `/ip4/192.0.2.1/tcp/4001/ws/p2p/${peerIdFromPrivateKey(key).toString()}`;
+async function silentRelay(): Promise<SupervisedRelay & { close(): Promise<void> }> {
+	const sockets = new Set<net.Socket>();
+	const server = net.createServer(socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
+	await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+	const { port } = server.address() as net.AddressInfo;
+	const peerId = peerIdFromPrivateKey(await generateKeyPair('Ed25519')).toString();
+	return {
+		dialAddr: `/ip4/127.0.0.1/tcp/${port}/ws/p2p/${peerId}`,
+		peerId,
+		async close() {
+			for (const socket of sockets) socket.destroy();
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	};
 }
 
 describe('a relay-only node keeps its reservation itself (through createLibp2pNode)', function () {
@@ -232,23 +247,27 @@ describe('superviseRelayReservation (one relay, test timings)', function () {
 
 	it('stopped mid-drive: the in-flight dial is aborted and the first drive settles at once', async () => {
 		const client = track(await startSearchClient());
-		const key = await generateKeyPair('Ed25519');
-		supervisor = superviseRelayReservation(client,
-			{ dialAddr: await blackholeRelayAddr(), peerId: peerIdFromPrivateKey(key).toString() },
-			{ ...FAST, driveTimeoutMs: 20_000 });
-		await delay(300);
-		expect(supervisor.driving, 'the dial to a black-holed address is still in flight').to.equal(true);
+		const silent = await silentRelay();
+		try {
+			supervisor = superviseRelayReservation(client,
+				{ dialAddr: silent.dialAddr, peerId: silent.peerId },
+				{ ...FAST, driveTimeoutMs: 20_000 });
+			await delay(300);
+			expect(supervisor.driving, 'the dial to a server that never answers is still in flight').to.equal(true);
 
-		const stoppedAt = Date.now();
-		supervisor.stop();
-		const reason = await supervisor.firstDrive;
-		expect(Date.now() - stoppedAt, 'ms until the first drive settled after stop').to.be.lessThan(1_000);
-		expect(reason).to.be.a('string');
-		expect(supervisor.retryAtMs).to.equal(null);
-		// `firstDrive` settles on stop itself; the dial unwinds when libp2p honours the abort. Far below the
-		// 20 s drive deadline is what proves the abort reached the dial rather than the deadline ending it.
-		await waitFor(() => !supervisor!.driving, { timeoutMs: 3_000, intervalMs: 20, description: 'the aborted dial to unwind' });
-		expect(Date.now() - stoppedAt, 'ms until the in-flight dial unwound after stop').to.be.lessThan(3_000);
+			const stoppedAt = Date.now();
+			supervisor.stop();
+			const reason = await supervisor.firstDrive;
+			expect(Date.now() - stoppedAt, 'ms until the first drive settled after stop').to.be.lessThan(1_000);
+			expect(reason).to.be.a('string');
+			expect(supervisor.retryAtMs).to.equal(null);
+			// `firstDrive` settles on stop itself; the dial unwinds when libp2p honours the abort. Far below the
+			// 20 s drive deadline is what proves the abort reached the dial rather than the deadline ending it.
+			await waitFor(() => !supervisor!.driving, { timeoutMs: 3_000, intervalMs: 20, description: 'the aborted dial to unwind' });
+			expect(Date.now() - stoppedAt, 'ms until the in-flight dial unwound after stop').to.be.lessThan(3_000);
+		} finally {
+			await silent.close();
+		}
 	});
 
 	it('a slot already filled through another relay is reported, retried at the cap, and taken back once that reservation drops', async () => {
@@ -308,6 +327,16 @@ describe('startup still rejects when the named relay cannot be reserved', functi
 		const rejected = await rejectionFrom(() => spawnCircuitOnlyPeer(NETWORK, multiaddr(dead)));
 		expect(rejected.message).to.contain('could not reserve a circuit on relay');
 		expect(rejected.message).to.contain(dead);
+	});
+
+	it('a listen address naming a relay combined with announceAddrs rejects before anything is built', async () => {
+		const dead = await deadRelayAddr();
+		const startedAt = Date.now();
+		const rejected = await rejectionFrom(() => spawnCircuitOnlyPeer(NETWORK, multiaddr(dead), { announceAddrs: ['/dns4/phone.example.com/tcp/443/wss'] }));
+		expect(rejected.message).to.contain('announceAddrs');
+		expect(rejected.message).to.contain(dead);
+		// Rejected by the plan, not by a drive that waited its full deadline for an address that can never appear.
+		expect(Date.now() - startedAt, 'ms until rejection').to.be.lessThan(DEFAULT_RELAY_DRIVE_TIMEOUT_MS);
 	});
 
 	it('a listen address naming a relay with no circuit-relay transport rejects, naming the omission', async () => {

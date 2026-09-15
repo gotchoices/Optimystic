@@ -34,7 +34,7 @@ import { ClusterClient } from './cluster/client.js';
 import type { IRepo, ICluster, ITransactionValidator, BlockId, IBlockChangeNotifier } from '@optimystic/db-core';
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
 import { networkManagerService, type NetworkManagerService } from './network/network-manager-service.js';
-import { assertCircuitRelayTransport, planRelayListenAddrs, superviseRelayReservations } from './network/relay-reservation.js';
+import { assertCircuitRelayTransport, assertRelayAddrsAdvertisable, planRelayListenAddrs, superviseRelayReservations } from './network/relay-reservation.js';
 import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
 import { BlockTransferCoordinator } from './cluster/block-transfer.js';
 import type { RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
@@ -199,7 +199,13 @@ export type NodeOptions = ClusterPolicyOptions & {
 	relayServerInit?: CircuitRelayServerInit;
 	/** Storage provider - either an IRawStorage instance or a factory function. Defaults to MemoryRawStorage if not provided. See {@link RawStorageProvider} for the ownership rule. */
 	storage?: RawStorageProvider;
-	/** Override libp2p listen multiaddrs. */
+	/**
+	 * Override libp2p listen multiaddrs. An entry naming a relay (`<relay address>/p2p/<relay id>/p2p-circuit`)
+	 * is not handed to libp2p as written: the node listens on a bare `/p2p-circuit` and keeps the
+	 * reservation on that relay itself (`superviseRelayReservation` in `network/relay-reservation.ts`).
+	 * Such an entry needs a circuit-relay transport and cannot be combined with {@link NodeOptions.announceAddrs},
+	 * which would hide the circuit address; both are rejected before anything starts.
+	 */
 	listenAddrs?: string[];
 	/**
 	 * Multiaddrs to advertise INSTEAD OF the listen addrs. For a node behind a NAT / reverse proxy /
@@ -506,6 +512,7 @@ export async function createLibp2pNodeBase(
 	// the host's configured address and re-requesting with 'configured', which drops the rewrite and the
 	// discovery side effect.
 	const relayPlan = planRelayListenAddrs(options.listenAddrs ?? defaults.listenAddrs);
+	assertRelayAddrsAdvertisable(relayPlan.supervisedRelays, options.announceAddrs);
 	const listenAddrs = relayPlan.listenAddrs;
 	const transports = options.transports ?? defaults.transports;
 

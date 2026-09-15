@@ -211,6 +211,21 @@ export function assertCircuitRelayTransport(node: Libp2p, relays: readonly Super
 }
 
 /**
+ * Fail node creation, before anything is built, when a listen address names a relay but
+ * `announceAddrs` is set. libp2p advertises ONLY the announce set then (the readme's "replaces the
+ * advertised set entirely"), so the circuit address through the relay could never appear in
+ * `node.getMultiaddrs()`, nobody could learn it, and every supervisor drive would time out waiting
+ * for it: node creation would reject after a full drive deadline with a message about publishing
+ * rather than about the configuration. `appendAnnounceAddrs` keeps the listener addresses and is fine.
+ */
+export function assertRelayAddrsAdvertisable(relays: readonly SupervisedRelay[], announceAddrs: readonly string[] | undefined): void {
+	if (relays.length === 0 || announceAddrs === undefined || announceAddrs.length === 0) return;
+	throw new Error(
+		`listen address names a relay (${relays[0]!.dialAddr}) but announceAddrs replaces the advertised address set, so the circuit address through it could never be advertised — drop announceAddrs or use appendAnnounceAddrs`
+	);
+}
+
+/**
  * Forget that a relay ever failed a reservation request, so the next request is actually made
  * rather than refused with "The relay was previously invalid".
  *
@@ -292,7 +307,7 @@ export interface RelayReservationSupervisor {
  *
  * `HadEnoughRelaysError` from the reservation store means this node's pending slot was already
  * filled with a reservation on a different relay (libp2p's relay discovery, see the accepted
- * tradeoff in `libp2p-node-base.ts`); it is logged once and retried at the backoff cap, since it
+ * tradeoff in `libp2p-node-base.ts`); it is logged once per episode and retried at the backoff cap, since it
  * recovers on its own only if that other reservation drops.
  */
 export function superviseRelayReservation(
@@ -339,7 +354,7 @@ const DEADLINE_PASSED = Symbol('relay-reservation-deadline-passed');
 /** Milliseconds left until `deadline`, never negative. */
 const remaining = (deadline: number): number => Math.max(0, deadline - Date.now());
 
-const describe = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+const errorMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 /** A pending timer must not keep a stopped Node process alive; browsers and React Native have no `unref`. */
 function unref(timer: ReturnType<typeof setTimeout>): void {
@@ -465,6 +480,8 @@ class RelayReservationLoop implements RelayReservationSupervisor {
 	private onHeld(): void {
 		this.backoffMs = this.minBackoffMs;
 		this.failure = null;
+		// Once held, a later slot-taken episode is a new event and deserves its own log line.
+		this.slotTakenLogged = false;
 		this.settleFirst(null);
 		this.schedule(this.checkMs);
 	}
@@ -485,7 +502,7 @@ class RelayReservationLoop implements RelayReservationSupervisor {
 			// `drive` is fail-soft by contract, so reaching here means that contract broke. The loop
 			// must survive it anyway: an escaping rejection would leave `firstDrive` pending forever
 			// and schedule no further attempt, which is the failure this supervisor exists to prevent.
-			const message = describe(err);
+			const message = errorMessage(err);
 			log.error('relay-reservation:drive-threw relay=%s err=%s', this.relay.dialAddr, message);
 			if (!this.stopped) this.failure = message;
 		} finally {
@@ -524,7 +541,7 @@ class RelayReservationLoop implements RelayReservationSupervisor {
 			await this.node.dial(multiaddr(this.relay.dialAddr), { signal: controller.signal });
 			return null;
 		} catch (err) {
-			return `dial to relay ${this.relay.dialAddr} failed: ${describe(err)}`;
+			return `dial to relay ${this.relay.dialAddr} failed: ${errorMessage(err)}`;
 		} finally {
 			clearTimeout(timer);
 			this.dialAbort = null;
@@ -575,7 +592,7 @@ class RelayReservationLoop implements RelayReservationSupervisor {
 			case 'UnsupportedProtocolError':
 				return `the peer at ${this.relay.dialAddr} does not serve the circuit-relay hop protocol, so it is not a relay`;
 			default:
-				return `reservation request to relay ${this.relay.dialAddr} failed: ${describe(err)}`;
+				return `reservation request to relay ${this.relay.dialAddr} failed: ${errorMessage(err)}`;
 		}
 	}
 

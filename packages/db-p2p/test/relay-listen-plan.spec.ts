@@ -7,7 +7,7 @@ import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PeerId } from '@libp2p/interface';
-import { CIRCUIT_SEARCH_LISTEN_ADDR, planRelayListenAddrs } from '../src/network/relay-reservation.js';
+import { CIRCUIT_SEARCH_LISTEN_ADDR, assertRelayAddrsAdvertisable, planRelayListenAddrs } from '../src/network/relay-reservation.js';
 
 const TCP = '/ip4/0.0.0.0/tcp/4001';
 const WS = '/ip4/0.0.0.0/tcp/4002/ws';
@@ -80,5 +80,25 @@ describe('planRelayListenAddrs (relay-naming listen addresses become supervised 
 	it('returns nothing to supervise for an empty or purely direct listen set', () => {
 		expect(planRelayListenAddrs([])).to.deep.equal({ listenAddrs: [], supervisedRelays: [] });
 		expect(planRelayListenAddrs([TCP, WS])).to.deep.equal({ listenAddrs: [TCP, WS], supervisedRelays: [] });
+	});
+
+	describe('assertRelayAddrsAdvertisable (announceAddrs would hide the circuit address)', () => {
+		const ANNOUNCE = ['/dns4/node.example.com/tcp/443/wss'];
+
+		it('rejects a supervised relay combined with a non-empty announceAddrs, naming the relay and the fix', () => {
+			const { supervisedRelays } = planRelayListenAddrs([`${wsDial(relayA)}/p2p-circuit`]);
+			expect(() => assertRelayAddrsAdvertisable(supervisedRelays, ANNOUNCE))
+				.to.throw(Error)
+				.with.property('message')
+				.that.contains(wsDial(relayA))
+				.and.contains('appendAnnounceAddrs');
+		});
+
+		it('accepts an unset or empty announceAddrs (libp2p treats empty as unset), and any announceAddrs with no relay to supervise', () => {
+			const { supervisedRelays } = planRelayListenAddrs([`${wsDial(relayA)}/p2p-circuit`]);
+			expect(() => assertRelayAddrsAdvertisable(supervisedRelays, undefined)).to.not.throw();
+			expect(() => assertRelayAddrsAdvertisable(supervisedRelays, [])).to.not.throw();
+			expect(() => assertRelayAddrsAdvertisable([], ANNOUNCE)).to.not.throw();
+		});
 	});
 });

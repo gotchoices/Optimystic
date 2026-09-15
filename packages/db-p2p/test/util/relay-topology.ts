@@ -187,7 +187,7 @@ export async function spawnRestartablePlainRelay(
 		},
 		async start() {
 			if (node) throw new Error('the relay is already running');
-			const started = await spawnPlainRelayNode(network, { privateKey, listenAddr, ...(opts.reservationTtl !== undefined ? { reservationTtl: opts.reservationTtl } : {}) });
+			const started = await spawnPlainRelayNode(network, { ...opts, privateKey, listenAddr });
 			node = started;
 			const rebound = started.getMultiaddrs().map(a => a.toString());
 			if (!rebound.includes(wsAddr.toString())) {
@@ -256,6 +256,8 @@ export function pickRelayWsAddr(node: Libp2p): Multiaddr {
 export interface SpawnCircuitOnlyPeerOpts {
 	/** See {@link clusterScaffold}. Defaults to 1 (self-only cohorts). */
 	clusterSize?: number;
+	/** Passed through as `NodeOptions.announceAddrs`; a relay-only node rejects it at start (see `assertRelayAddrsAdvertisable`). */
+	announceAddrs?: string[];
 }
 
 /**
@@ -279,6 +281,7 @@ export async function spawnCircuitOnlyPeer(
 		relay: false,
 		transports,
 		listenAddrs: [`${relayAddr.toString()}/p2p-circuit`],
+		...(opts.announceAddrs !== undefined ? { announceAddrs: opts.announceAddrs } : {}),
 		...clusterScaffold(opts.clusterSize)
 	});
 }

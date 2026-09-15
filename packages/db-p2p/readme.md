@@ -390,7 +390,10 @@ const node = await createLibp2pNode({
 dropped from it, and `appendAnnounceAddrs` is ignored while it is non-empty. Use
 `appendAnnounceAddrs` alone when the automatically discovered addresses are still worth advertising.
 Both are straight passthroughs to libp2p's `addresses.announce` / `addresses.appendAnnounce`; an
-empty array means "unset".
+empty array means "unset". Because it hides relayed addresses, `announceAddrs` cannot be combined
+with a listen address naming a relay (the circuit address would never be advertised, so the
+reservation could never be confirmed); node creation rejects that combination before anything
+starts. Use `appendAnnounceAddrs` for such a node.
 
 ## Usage Examples
 
