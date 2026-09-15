@@ -680,6 +680,8 @@ mechanism.
 - `TextDecoder` — built-in to Expo SDK 52+ (UTF-8 only)
 - `BigInt` — built-in to Hermes since RN 0.70
 
+Optimystic itself does not require a global `Buffer` — its own code encodes with `uint8arrays` — so the `buffer` module alias above is only for libp2p/multiformats' own internal imports of `import { Buffer } from 'buffer'`, not a `globalThis.Buffer` assignment.
+
 See the [Sereus reference-app-rn](https://github.com/gotchoices/sereus/tree/master/packages/reference-app-rn/polyfills) for working polyfill implementations.
 
 ### Ring Transitions

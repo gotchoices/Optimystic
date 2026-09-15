@@ -2,6 +2,8 @@ import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { pushable } from 'it-pushable';
+import { fromString as u8FromString } from 'uint8arrays/from-string';
+import { toString as u8ToString } from 'uint8arrays/to-string';
 import type { PeerId } from '@libp2p/interface';
 import type { ActionId, CommitRequest, IBlock, BlockId, BlockHeader } from '@optimystic/db-core';
 import { canonicalBlockHash } from '@optimystic/db-core';

@@ -327,7 +327,7 @@ export class BlockTransferService implements Startable {
 		for (const blockId of request.blockIds) {
 			const blockResult = result[blockId];
 			if (blockResult?.block) {
-				blocks[blockId] = Buffer.from(JSON.stringify(blockResult.block)).toString('base64');
+				blocks[blockId] = u8ToString(u8FromString(JSON.stringify(blockResult.block), 'utf8'), 'base64pad');
 			} else {
 				missing.push(blockId);
 			}
@@ -370,7 +370,7 @@ export class BlockTransferService implements Startable {
 			// Decode + parse the wire payload into an IBlock.
 			let block: IBlock;
 			try {
-				block = JSON.parse(Buffer.from(data, 'base64').toString('utf8')) as IBlock;
+				block = JSON.parse(u8ToString(u8FromString(data, 'base64pad'), 'utf8')) as IBlock;
 			} catch {
 				missing.push(blockId);
 				continue;
@@ -512,7 +512,7 @@ export class BlockTransferClient extends ProtocolClient {
 	): Promise<BlockTransferResponse> {
 		const blockData: Record<string, string> = {};
 		for (let i = 0; i < blockIds.length; i++) {
-			blockData[blockIds[i]!] = Buffer.from(blockDataBuffers[i]!).toString('base64');
+			blockData[blockIds[i]!] = u8ToString(blockDataBuffers[i]!, 'base64pad');
 		}
 		const request: BlockTransferRequest = {
 			type: 'push', blockIds, reason, blockData,

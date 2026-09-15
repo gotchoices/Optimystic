@@ -25,6 +25,14 @@ const NO_STATIC_BLOCK = {
 	selector: 'StaticBlock',
 	message: 'Class static blocks break React Native bundling (Metro/babel-preset-expo cannot transform them). Use a static field initializer instead.',
 };
+// Hermes (React Native's JS engine) has no global `Buffer` unless a host app happens to install
+// one — a library that reaches for it works in Node and breaks silently on a phone. Encode with
+// `uint8arrays` instead (`toString`/`fromString`; `base64pad` matches Node's padded
+// `Buffer#toString('base64')` byte-for-byte) — see block-transfer-service.ts for the pattern.
+const NO_BUFFER_GLOBAL = {
+	name: 'Buffer',
+	message: "Buffer is a Node-only global, absent under Hermes/React Native. Encode with `uint8arrays` (toString/fromString) instead — see packages/db-p2p/src/cluster/block-transfer-service.ts.",
+};
 
 // Flat config (ESLint 9). Repo is ESM + yarn 4 workspaces + TypeScript throughout.
 // `eslint .` walks the tree from root, so this single config covers every workspace —
@@ -90,7 +98,10 @@ export default tseslint.config(
 		// objects with a `forComponent` property to satisfy libp2p-shaped interfaces, and
 		// `test/support/capture-log.ts` legitimately imports `debug` — that is its whole job.
 		files: ['packages/*/src/**/*.ts'],
-		rules: { 'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_DIRECT_DEBUG_IMPORT, NO_STATIC_BLOCK] },
+		rules: {
+			'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_DIRECT_DEBUG_IMPORT, NO_STATIC_BLOCK],
+			'no-restricted-globals': ['error', NO_BUFFER_GLOBAL],
+		},
 	},
 	{
 		// The sanctioned `debug` import sites: the seven per-package `createLogger` factories

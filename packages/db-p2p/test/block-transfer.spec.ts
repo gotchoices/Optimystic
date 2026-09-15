@@ -2,6 +2,8 @@ import { expect } from 'chai';
 import type { IRepo, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, IBlock, BlockId, BlockHeader, IPeerNetwork } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { generateKeyPair } from '@libp2p/crypto/keys';
+import { fromString as u8FromString } from 'uint8arrays/from-string';
+import { toString as u8ToString } from 'uint8arrays/to-string';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { BlockTransferCoordinator } from '../src/cluster/block-transfer.js';
@@ -730,5 +732,51 @@ describe('BlockTransferRequest/Response types', () => {
 		};
 		expect(Object.keys(resp.blocks)).to.deep.equal(['block-1']);
 		expect(resp.missing).to.deep.equal(['block-2']);
+	});
+});
+
+describe('block-transfer wire encoding (uint8arrays base64pad, cross-platform)', () => {
+	// BlockTransferService encodes/decodes block payloads with uint8arrays' 'base64pad' codec
+	// instead of the Node-only `Buffer` global, which does not exist under Hermes/React Native.
+	// These tests pin the codec directly: on-wire byte-for-byte compatibility with Buffer's
+	// padded base64 output (old senders/receivers must keep interoperating with new ones), a
+	// non-ASCII payload, an empty payload, and the malformed-input failure mode `handlePush`
+	// relies on. The full push/pull service round trip — including with `globalThis.Buffer`
+	// removed entirely — is covered in block-transfer-roundtrip.spec.ts.
+
+	it('round-trips a block whose JSON contains multi-byte UTF-8 text', () => {
+		const block = { ...makeBlock('block-utf8'), marker: 'héllo 世界 🎉' };
+		const json = JSON.stringify(block);
+		const encoded = u8ToString(u8FromString(json, 'utf8'), 'base64pad');
+		const decoded = u8ToString(u8FromString(encoded, 'base64pad'), 'utf8');
+		expect(decoded).to.equal(json);
+	});
+
+	it("encodes to the same padded base64 Buffer's toString('base64') produces (new encoder, old decoder)", () => {
+		const json = JSON.stringify(makeBlock('block-interop-1'));
+		const encoded = u8ToString(u8FromString(json, 'utf8'), 'base64pad');
+		expect(Buffer.from(encoded, 'base64').toString('utf8'), 'a legacy Buffer-based receiver still decodes it')
+			.to.equal(json);
+	});
+
+	it('decodes what Buffer.from(json).toString(\'base64\') produces (old encoder, new decoder)', () => {
+		const json = JSON.stringify(makeBlock('block-interop-2'));
+		const encoded = Buffer.from(json, 'utf8').toString('base64');
+		const decoded = u8ToString(u8FromString(encoded, 'base64pad'), 'utf8');
+		expect(decoded, 'a legacy Buffer-based sender is still understood').to.equal(json);
+	});
+
+	it('round-trips a zero-length payload', () => {
+		const encoded = u8ToString(new Uint8Array(0), 'base64pad');
+		expect(encoded).to.equal('');
+		expect(u8FromString(encoded, 'base64pad')).to.deep.equal(new Uint8Array(0));
+	});
+
+	it('throws on a malformed base64 string rather than silently ignoring the bad characters', () => {
+		// Buffer.from(str, 'base64') silently ignores invalid characters; fromString throws
+		// instead. handlePush relies on that throw landing in its existing try/catch and being
+		// reported as a missing block, exactly like any other undecodable push — see
+		// block-transfer-push-persist.spec.ts.
+		expect(() => u8FromString('!!!not-base64!!!', 'base64pad')).to.throw();
 	});
 });

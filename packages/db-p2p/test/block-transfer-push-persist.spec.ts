@@ -288,6 +288,24 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 			expect(response.missing).to.deep.equal([blockId]);
 		});
 
+		it('reports a block as missing when the wire payload is not valid base64 at all', async () => {
+			// uint8arrays' fromString throws SyntaxError on a character outside the base64
+			// alphabet (unlike Buffer.from(str, 'base64'), which silently ignores it). This pins
+			// that the throw lands in the same try/catch as an unparseable-but-valid-base64
+			// payload, above, and is reported the same way rather than as an unhandled rejection.
+			const blockId = 'block-notbase64';
+			const request: BlockTransferRequest = {
+				type: 'push',
+				blockIds: [blockId],
+				reason: 'replication',
+				blockData: { [blockId]: '!!!not-base64!!!' }
+			};
+
+			const response = await push(service, request);
+			expect(response.blocks).to.not.have.property(blockId);
+			expect(response.missing).to.deep.equal([blockId]);
+		});
+
 		it('reports missing (and does not poison storage) when the payload is valid JSON but not a block', async () => {
 			const blockId = 'block-null';
 			const request: BlockTransferRequest = {
