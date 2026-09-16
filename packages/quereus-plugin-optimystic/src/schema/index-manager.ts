@@ -450,7 +450,10 @@ export class IndexManager {
 					// and rests on the same db-core replay rule. Small trees mask it — the sibling
 					// upsert below writes a block, so when old and new entries share a leaf the
 					// resulting transform conflicts with the adopted revision and forces a replay
-					// anyway. Once the two keys land in different leaves that overlap is gone.
+					// anyway. Once the two keys land in different leaves that overlap is gone, which
+					// `packages/db-core/test/two-handle-collection-fork.spec.ts` ("a blind delete
+					// paired with an upsert in a different leaf still lands") reproduces directly on
+					// a small-fan-out tree.
 					[oldTreeKey, undefined],
 					[newTreeKey, [newTreeKey, newPrimaryKey], this.guardFor(index, newIndexKey, uniqueIndexes)]
 				]);

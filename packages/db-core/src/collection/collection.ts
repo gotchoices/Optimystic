@@ -618,22 +618,47 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// replayed so far while `pending` still lists them all; the caller's error handling is
 		// expected to abort/reset the collection rather than keep staging. If replay ever gains a
 		// routinely-throwing read path, rebuild into a scratch tracker and swap on success.
-		//
-		// The gate is deliberately NOT just `anyConflicts`. A conflict is detected by an incoming
-		// log entry naming a block this tracker already holds a transform for — so an action that
-		// changed NO block can never register one. A staged delete of a key this instance cannot
-		// see is exactly that action: the tree's `replace` handler misses on `find` and `deleteAt`
-		// returns false without writing. Gating on conflicts alone left such an action in
-		// `pending`, unapplied, until the commit wrote a log entry listing it whose transforms did
-		// nothing — and readers materialize blocks, not log entries, so the action was lost on
-		// every node, silently and permanently. The invariant that has to hold is that a pending
-		// action was applied against the revision it commits over, so replay whenever the refresh
-		// adopted a newer revision and anything is still pending.
-		const adoptedRev = this.source.actionContext?.rev;
-		const contextAdvanced = adoptedRev !== undefined && adoptedRev !== actionContext?.rev;
-		if (anyConflicts || (contextAdvanced && this.pending.length > 0)) {
+		if (this.mustReplay(anyConflicts, actionContext)) {
 			await this.replayActions();
 		}
+	}
+
+	/** Whether {@link updateInternal} must re-stage `pending` after adopting `latest`, given the
+	 * context it held BEFORE the refresh.
+	 *
+	 * The answer is deliberately NOT just "a conflict was found". A conflict is detected by an
+	 * incoming log entry naming a block this tracker already holds a transform for — so an action
+	 * that changed NO block can never register one. A staged delete of a key this instance cannot
+	 * see is exactly that action: the tree's `replace` handler misses on `find` and `deleteAt`
+	 * returns false without writing. Gated on conflicts alone, such an action stayed in `pending`
+	 * unapplied until the commit wrote a log entry listing it whose transforms did nothing — and
+	 * readers materialize blocks, not log entries, so the action was lost on every node, silently
+	 * and permanently. The invariant that has to hold is that **a pending action was applied
+	 * against the revision it commits over**, so a mere revision advance is reason enough.
+	 *
+	 * The advance test rests on {@link advanceContext} being monotonic (it refuses to lower), which
+	 * is what makes "the adopted rev differs from the held one" mean "it went up".
+	 *
+	 * The second conjunct is `pending.length` and deliberately NOT {@link hasUnsyncedChanges},
+	 * which also counts tracker transforms. A collection {@link createOrOpen} just INVENTED holds
+	 * its staged header/root in the tracker with NO pending action naming them, and
+	 * {@link replayActions} resets the tracker before re-staging — so counting transforms here
+	 * would drop those blocks and leave a brand-new collection unreadable (the same hazard
+	 * {@link snapshotPending} documents). Nothing to re-stage means nothing to replay.
+	 *
+	 * NOTE: this makes a refresh that adopts a newer revision O(pending) rather than free, so a
+	 * read taken mid-transaction while a rival keeps committing re-stages every action staged so
+	 * far, on each such read. Measured as no change to the storage-op budgets
+	 * (`index-backfill-cost.spec.ts`, `cold-apply-cost.spec.ts`), because the replay's reads are
+	 * served from `sourceCache`. If a long transaction's reads ever show up as slow, narrow the
+	 * replay to the actions whose reads the adopted entries actually invalidated — NOT back to
+	 * conflicts alone, which is the defect above. */
+	private mustReplay(anyConflicts: boolean, priorContext: ActionContext | undefined): boolean {
+		if (anyConflicts) {
+			return true;
+		}
+		const adoptedRev = this.source.actionContext?.rev;
+		return adoptedRev !== undefined && adoptedRev !== priorContext?.rev && this.pending.length > 0;
 	}
 
 	/** Capture the current staged state — tracker transforms plus the pending

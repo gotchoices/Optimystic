@@ -735,6 +735,8 @@ for (const report of reports) {
 | `stale-value` | A row has that primary key but a different value in the indexed columns; `currentRow` shows it. The row's value changed and its entry did not follow. |
 | `malformed` | The primary key stored in the entry is not the one its own position in the tree encodes. No write path produces this; suspect corruption or a key-format change. Sitting at a row's own position, it also hides that row from lookups; it is reported once, here, not also under `missing`. |
 
+One cause of `no-row` orphans is worth naming, because it produced them on every node at once rather than on one: an index delete staged against a tree copy that had never fetched the entry used to write no block, and the commit then logged an action whose transforms did nothing. Readers materialize blocks rather than log entries, so the row went and its entry stayed, everywhere. `Collection.updateInternal` now replays pending actions whenever a refresh adopts a newer revision, not only when a block conflict is detected, which rules that shape out ([docs/internals.md §Conflict replay must read at the revision it is adopting, not the one it is leaving](internals.md#conflict-replay-must-read-at-the-revision-it-is-adopting-not-the-one-it-is-leaving)). An orphan that reappears with the same all-nodes signature points at that gate.
+
 Every discrepancy carries `indexPayloads` and `primaryKeyPayloads`, the entry's key decoded back into values (`null` for SQL NULL), so it can be matched to a row by eye. A number reads differently in the two halves: `5.000000000000000e+0` in the index half, `5` in the primary-key half.
 
 What it reads, and what it does not do:

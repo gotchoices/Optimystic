@@ -870,6 +870,12 @@ export class SchemaManager {
 		} catch {
 			gravestone = undefined;
 		}
+		// NOTE: on the catch path the `tree.update()` above did NOT land, so this stages its
+		// tombstone against a possibly-stale view — blind in exactly the sense
+		// `IndexManager.deleteIndexEntries` documents, and correct for the same reason: db-core's
+		// `updateInternal` replays pending actions against the revision it adopts, so a delete that
+		// wrote no block at staging is re-applied before the commit. Untested — reaching a failed
+		// read here deliberately is awkward — so it rests on that rule, not on coverage here.
 		await tree.replace([[tableName, gravestone ? [tableName, gravestone] : undefined]]);
 	}
 

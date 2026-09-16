@@ -16,15 +16,40 @@
  */
 
 import { expect } from 'chai'
-import { Tree } from '../src/collections/tree/index.js'
+import { Tree, type TreeReplaceAction } from '../src/collections/tree/index.js'
 import { TestTransactor } from '../src/testing/test-transactor.js'
 
 type Entry = [key: string, value: string]
 
 const collectionId = 'tree://default/Table/index/ByToken'
 
-async function openHandle(network: TestTransactor): Promise<Tree<string, Entry>> {
-	return Tree.createOrOpen<string, Entry>(network, collectionId, e => e[0], (a, b) => a < b ? -1 : a > b ? 1 : 0)
+const keyOf = (entry: Entry) => entry[0]
+const compareKeys = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0
+
+/** A b-tree fan-out small enough that a dozen keys already make a MULTI-LEVEL tree, so two keys
+ * at opposite ends of the range are guaranteed to sit in different leaves. Not persisted in the
+ * header, so every handle on the same tree has to pass it (see `Tree.createOrOpen`'s
+ * `nodeCapacity`). */
+const SMALL_FANOUT = 4
+/** Twelve seeds, enough to split at {@link SMALL_FANOUT}. */
+const SPREAD = ['k-a', 'k-b', 'k-c', 'k-d', 'k-e', 'k-f', 'k-g', 'k-h', 'k-i', 'k-j', 'k-k', 'k-l']
+/** The low end of {@link SPREAD}, read to pull its leaf into the staging handle. */
+const UPSERT_NEIGHBOUR = 'k-a'
+/** Sorts next to {@link UPSERT_NEIGHBOUR}, so the upsert writes the leaf that was read. */
+const UPSERT_KEY = 'k-a1'
+/** Sorts past every seed, so the key deleted blind cannot share a leaf with {@link UPSERT_KEY}. */
+const BLIND_KEY = 'k-z'
+
+async function openHandle(network: TestTransactor, nodeCapacity?: number): Promise<Tree<string, Entry>> {
+	return Tree.createOrOpen<string, Entry>(network, collectionId, keyOf, compareKeys, nodeCapacity)
+}
+
+/** A handle over an ALREADY-COMMITTED tree, whose tracker therefore starts empty — the shape the
+ * blind-action tests below need, and the one `createOrOpen` cannot give them (see those tests). */
+async function openCommitted(network: TestTransactor, nodeCapacity?: number): Promise<Tree<string, Entry>> {
+	const tree = await Tree.open<string, Entry>(network, collectionId, keyOf, compareKeys, nodeCapacity)
+	expect(tree, 'the tree must already be committed').to.not.equal(undefined)
+	return tree!
 }
 
 async function readKeys(tree: Tree<string, Entry>): Promise<string[]> {
@@ -111,9 +136,8 @@ describe('a pending action that changed no block', () => {
 		await a.stage([['k-anchor', ['k-anchor', 'anchor']]])
 		await a.sync()
 
-		const b = await Tree.open<string, Entry>(network, collectionId, e => e[0], (x, y) => x < y ? -1 : x > y ? 1 : 0)
-		expect(b, 'B opens the committed tree').to.not.equal(undefined)
-		expect(await b!.get('k-anchor'), 'B reads the anchor').to.deep.equal(['k-anchor', 'anchor'])
+		const b = await openCommitted(network)
+		expect(await b.get('k-anchor'), 'B reads the anchor').to.deep.equal(['k-anchor', 'anchor'])
 
 		// A commits a second entry that B has never read, so nothing about it is in B's tracker.
 		await a.stage([['k-later', ['k-later', 'later']]])
@@ -121,12 +145,50 @@ describe('a pending action that changed no block', () => {
 
 		// B stages a delete of that key blind: `find` misses at B's stale context, `deleteAt`
 		// returns false, and no block is written.
-		await b!.stage([['k-later', undefined]])
-		await b!.sync()
+		await b.stage([['k-later', undefined]])
+		await b.sync()
 
-		const reader = await Tree.open<string, Entry>(network, collectionId, e => e[0], (x, y) => x < y ? -1 : x > y ? 1 : 0)
-		expect(await reader!.get('k-later'), 'the blind delete is durable').to.equal(undefined)
-		expect(await reader!.get('k-anchor'), 'the anchor is untouched').to.deep.equal(['k-anchor', 'anchor'])
+		const reader = await openCommitted(network)
+		expect(await reader.get('k-later'), 'the blind delete is durable').to.equal(undefined)
+		expect(await reader.get('k-anchor'), 'the anchor is untouched').to.deep.equal(['k-anchor', 'anchor'])
+	})
+
+	/** The same blind delete, but PAIRED with an upsert — the shape `updateIndexEntries`
+	 * (`packages/quereus-plugin-optimystic/src/schema/index-manager.ts`) stages for every UPDATE
+	 * that moves a row's indexed value: one action carrying `[oldKey, undefined]` and
+	 * `[newKey, entry]` together.
+	 *
+	 * A single-leaf tree cannot show the defect: the upsert writes the one leaf, the rival's
+	 * commit named that same leaf, and the resulting block conflict forces the replay that the
+	 * delete needed anyway. `SMALL_FANOUT` is what removes that cover — it forces a multi-level
+	 * tree from a handful of keys, so the delete and the upsert land in DIFFERENT leaves and the
+	 * upsert's transform no longer overlaps the block the rival rewrote. Then the action's only
+	 * conflict-registering half is gone and the delete is on its own again. */
+	it('a blind delete paired with an upsert in a different leaf still lands', async () => {
+		const network = new TestTransactor()
+
+		const a = await openHandle(network, SMALL_FANOUT)
+		const seeds: TreeReplaceAction<string, Entry> = SPREAD.map(key => [key, [key, 'seed']])
+		await a.stage(seeds)
+		await a.sync()
+
+		const b = await openCommitted(network, SMALL_FANOUT)
+		// Force B to materialize the leaf it will UPSERT into, and only that one, so its staged
+		// upsert has a block to rewrite while the delete's leaf stays unread.
+		expect(await b.get(UPSERT_NEIGHBOUR), 'B reads the upsert side').to.deep.equal([UPSERT_NEIGHBOUR, 'seed'])
+
+		// A commits a key at the far end of the range — a different leaf from the upsert's, and one
+		// B has never read.
+		await a.stage([[BLIND_KEY, [BLIND_KEY, 'later']]])
+		await a.sync()
+
+		await b.stage([[BLIND_KEY, undefined], [UPSERT_KEY, [UPSERT_KEY, 'upserted']]])
+		await b.sync()
+
+		const reader = await openCommitted(network, SMALL_FANOUT)
+		expect(await reader.get(BLIND_KEY), 'the blind delete is durable').to.equal(undefined)
+		expect(await reader.get(UPSERT_KEY), 'the paired upsert is durable').to.deep.equal([UPSERT_KEY, 'upserted'])
+		expect(await readKeys(reader), 'no seed was lost').to.deep.equal([...SPREAD, UPSERT_KEY].sort())
 	})
 })
 

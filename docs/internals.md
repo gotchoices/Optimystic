@@ -75,10 +75,14 @@ not log entries, so the action was lost on every node, silently and permanently.
 invariant `updateInternal` therefore enforces is that **a pending action was applied
 against the revision it commits over**: it replays whenever the refresh adopted a newer
 revision and anything is still pending, not only when a conflict was found. The
-regression test is `packages/db-core/test/two-handle-collection-fork.spec.ts` ("a blind
-delete staged against an unseen key still lands"); `deleteIndexEntries`
-(`packages/quereus-plugin-optimystic/src/schema/index-manager.ts`) is the site that
-relies on it, and it stages its deletes blind on purpose.
+regression tests are both in `packages/db-core/test/two-handle-collection-fork.spec.ts`:
+"a blind delete staged against an unseen key still lands" for the bare delete, and "a
+blind delete paired with an upsert in a different leaf still lands" for the same delete
+carried alongside an upsert — the shape `updateIndexEntries` stages for an UPDATE that
+moves an indexed value, which only escapes the conflict gate once the two keys sit in
+different leaves. Both of those sites live in
+`packages/quereus-plugin-optimystic/src/schema/index-manager.ts`, and both stage their
+deletes blind on purpose.
 
 This also settles a question about intended semantics: a **live** read (the vtab
 read path above, or any read through a collection's own `tracker`/`update()`) always
