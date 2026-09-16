@@ -1,4 +1,4 @@
-description: One file in the networking package calls a JavaScript timer function that does not exist on the engine React Native uses, so that code path would fail on a phone. A neighbouring file already avoids the same call and says why in a comment, so this looks like an oversight rather than a decision.
+description: Two files in the networking package call JavaScript functions that do not exist on the engine React Native uses. One of them is on the path a phone takes to read any block it does not already hold, so on a phone without a host-supplied workaround that read fails outright. A neighbouring file already avoids the same class of call and says why in a comment.
 prereq:
 files:
   - packages/db-p2p/src/dispute/client.ts (line 32, `sendChallenge` — `AbortSignal.timeout(timeoutMs)`; the only use left in library source)
@@ -21,8 +21,47 @@ explicit `AbortController` plus a timer instead, and its comment says so in as m
 "unreliable on Hermes". One file follows the rule and the other does not, with nothing to keep them
 in step.
 
-Verified at `0f963518`: these are the only two occurrences in `packages/*/src`. Test files use
-`AbortSignal.timeout` freely and may keep doing so — they run under Node.
+Verified at `0f963518`: those are the only two occurrences **of `AbortSignal.timeout`** in
+`packages/*/src`. Test files use it freely and may keep doing so — they run under Node.
+
+## Correction (2026-09-16 01:2x): that verification was too narrow, and the real exposure is worse
+
+The grep behind it looked for `AbortSignal.timeout`, so it could not have found anything else. The
+reporting session then found the one that matters:
+
+**`packages/db-p2p/src/repo/client.ts:91` calls `AbortSignal.any`**, which Hermes also lacks:
+
+```ts
+const combinedSignal = options?.signal
+  ? AbortSignal.any([options.signal, deadlineController.signal])
+  : deadlineController.signal
+```
+
+That is **`RepoClient`'s remote block RPC** — the path a phone takes to read anything it does not hold
+locally. Before the reference app's polyfill went in, every such call carrying a caller signal threw
+`TypeError: AbortSignal.any is not a function` on device. It is signal-conditional, which is why it
+was not the first thing to break: the dial failures masked it.
+
+The consequence to state plainly, because it is the real finding: **optimystic is not React
+Native-safe on its own.** It runs on a phone only because a host application happens to polyfill a
+web API on its behalf, and nothing declares that dependency. Either remove the dependency or declare
+it. The reporting session's recommendation, which looks right, is to use the **`any-signal`**
+package — libp2p itself uses it, it degrades where the global is missing, and it removes its
+listeners, so it also fixes a leak this call site has today. (They also corrected an earlier claim of
+theirs: libp2p does *not* call `AbortSignal.any` heavily, it uses `any-signal` — so this call site is
+the main thing driving the polyfill.)
+
+**A second, quieter one in our source:** `packages/db-p2p/src/logger.ts:115-116` tests
+`err instanceof AggregateError` before falling back to a duck-typed check. If Hermes does not provide
+the `AggregateError` global, evaluating the identifier throws a `ReferenceError` and the fallback is
+never reached — on an error-formatting path, where the diagnostics matter most. Whether Hermes
+provides it could not be settled from the tree and needs a device; the code can be made safe either
+way by ordering the duck-typed test first or guarding with `typeof`. The two `as AggregateError`
+casts in `network-transactor.ts` (585, 1149) are type-level only and safe.
+
+**Dormant, recorded so it is not rediscovered:** React Native's `crypto.subtle` provides only
+`digest`, so ECDSA/RSA import-export and `@libp2p/keychain`'s AES-GCM would throw if reached. Nothing
+reaches them today — the phone uses Ed25519 through noble.
 
 Note that `yarn check:rn` cannot catch this. It bundles the RN entry with Metro and compiles it with
 Hermes; a call to a function that does not exist compiles perfectly well and fails only when reached.
@@ -30,6 +69,10 @@ A static rule is what closes it.
 
 # What to build
 
+0. **Fix `RepoClient` first.** It is the one with a user-visible consequence — a phone that cannot
+   read a block it does not hold. Prefer `any-signal` over a hand-rolled combiner, and confirm the
+   listener cleanup, since the current call site leaks. Then `logger.ts`'s `AggregateError` test,
+   which is a two-line reordering.
 1. **Replace the call** in `sendChallenge` with the pattern `relay-reservation.ts` already uses: an
    explicit `AbortController` with a timer that is cleared on every exit path, success or throw. Keep
    the existing `timeoutMs` → `signal` contract exactly as the comment above it describes — the

@@ -75,6 +75,14 @@ Both are worth holding in mind, and neither should be assumed.
 - **The evidence is downstream and second-hand.** The stack above is from a device log in another
   repository. Treat it as a lead, not as a specification, and correct this ticket if a local
   reproduction shows something different.
+- **One failure mode can masquerade as this one in older device logs.** `RepoClient`'s remote block
+  RPC calls `AbortSignal.any` (`repo/client.ts:91`), which Hermes does not provide, so on any RN
+  build without the host app's polyfill a read carrying a caller signal fails *before* cohort
+  resolution is attempted — see `implement/2-a-library-call-that-does-not-exist-on-phones`. That is a
+  different defect with a different signature (`TypeError: AbortSignal.any is not a function`, not
+  `cohort-unreachable`). Check which one a given trace actually shows before attributing it here. The
+  report this ticket is built on shows `cohort-unreachable`, so it is not that — but an older log
+  might be.
 - **Two machines is the node count here**, which is the count the maintainer cares most about and
   also the one with an open design question next door (`backlog/more-design/6.5-partition-healing`,
   where the CRDT sync layer is recorded as the intended fix for the lone-survivor asymmetry). This
