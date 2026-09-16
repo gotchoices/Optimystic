@@ -196,7 +196,7 @@ export class RepoService implements Startable {
 	 *   - pend   → blockIdsForTransforms(transforms)[0]
 	 *   - cancel → actionRef.blockIds[0]
 	 *   - commit → blockIds[0]  (CoordinatorRepo.commit anchors consensus on
-	 *     getClusterSize(blockIds[0]) / executeClusterTransaction(blockIds[0]) and guards
+	 *     resolveCohort(blockIds[0]) / executeClusterTransaction(blockIds[0]) and guards
 	 *     with verifyResponsibility(blockIds) — NOT tailId; for a per-block commit batch
 	 *     whose blockIds[0] !== tailId, keying on tailId redirected the commit to the
 	 *     collection tail's cluster, which then fails verifyResponsibility for the non-tail block.)

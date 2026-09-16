@@ -89,7 +89,6 @@ const makeRepo = (storageRepo: IRepo, error: Error): CoordinatorRepo => {
 	);
 	(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 		async getClusterSize(): Promise<number> { return 3; },
-		async getClusterPeerIds(): Promise<string[]> { return ['peer-1', 'peer-2', 'peer-3']; },
 		async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: ['peer-1', 'peer-2', 'peer-3'] }; },
 		async recoverTransactions(): Promise<void> { /* unused on these paths */ },
 		async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean }> {
@@ -250,7 +249,6 @@ describe('CoordinatorRepo commit — locally-executed consensus consults the ret
 		);
 		(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 			async getClusterSize(): Promise<number> { return 3; },
-			async getClusterPeerIds(): Promise<string[]> { return Object.keys(RECORD.peers); },
 			async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: Object.keys(RECORD.peers) }; },
 			async recoverTransactions(): Promise<void> { /* unused on these paths */ },
 			async executeClusterTransaction(): Promise<{

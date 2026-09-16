@@ -182,6 +182,9 @@ describe('Torn commit — the blocks a sweep abandons are cancelled, never stran
 		if (commit1.success) {
 			expect(commit1.durability.quorum, 'every member of the cohort confirmed').to.equal('full');
 			expect(commit1.durability.torn, 'nothing abandoned').to.equal(undefined);
+			// The tail and the sweep are separate batches answered by the same cohort; that is one
+			// cohort's answer, not two cohorts.
+			expect(commit1.durability.otherCohorts, 'one cohort answering twice is not another cohort').to.equal(undefined);
 			expect(isFullyDurable(commit1.durability)).to.equal(true);
 		}
 		await assertPendingLifetimeInvariant(mesh, 'a1', ['T', 'S']);

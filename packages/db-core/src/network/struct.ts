@@ -71,7 +71,10 @@ export type BlockActionStatus = ActionBlocks & {
 export type DurabilityQuorum =
 	/** Every member of the resolved cohort confirmed it holds the revision. */
 	| 'full'
-	/** A strict majority confirmed — the acknowledgement bar — but at least one member did not. */
+	/** A strict majority confirmed — the acknowledgement bar — but at least one member did not.
+	 *  Also the class of a torn action whose cohort confirmed everything it was asked for
+	 *  (`withTornBlocks` clamps `full` down to this; `torn` then names the blocks, and `unconfirmed`
+	 *  may be empty). */
 	| 'majority'
 	/** The cohort resolved, and it is this node alone. Nobody else holds the revision yet. */
 	| 'local'
@@ -105,9 +108,11 @@ export type WriteDurability = {
 	/** The cohort the write ran on, by peer-id string. Absent where the answering layer has no
 	 *  cohort view at all (a bare `StorageRepo` verdict). */
 	readonly cohortPeerIds?: readonly string[];
-	/** Present only on an action-level result whose blocks ran on MORE THAN ONE cohort: the other
-	 *  cohorts' reports. The scalar fields above always describe the WEAKEST cohort, so a consumer
-	 *  that reads only them is reading the binding constraint and is never over-optimistic. */
+	/** Present only on an action-level result assembled from MORE THAN ONE distinct coordinator
+	 *  answer: the other answers. Identical answers are collapsed (`mergeDurability`), so a healthy
+	 *  single-cohort commit has none; one cohort answering differently for two batches appears
+	 *  twice. The scalar fields above always describe the WEAKEST answer, so a consumer that reads
+	 *  only them is reading the binding constraint and is never over-optimistic. */
 	readonly otherCohorts?: readonly WriteDurability[];
 	/** Blocks this action wrote that are NOT committed — a torn sweep abandoned and cancelled them
 	 *  (`NetworkTransactor.cancelAbandonedSweepBlocks`). Action-level commit results only.

@@ -64,6 +64,20 @@ describe('mergeDurability', () => {
 		expect(merged.otherCohorts).to.equal(undefined);
 	});
 
+	it('collapses identical reports — one cohort answering for the tail and the sweep is one cohort, not two', () => {
+		const cohort = report('full', 3);
+		// The second answer lists the same members in another order — `findCluster` orders a cohort by
+		// routing distance to each block's key, so this is the shape a real two-batch commit produces.
+		const reordered = { ...cohort, cohortPeerIds: [...cohort.cohortPeerIds!].reverse() };
+		const merged = mergeDurability([cohort, reordered]);
+		expect(merged).to.deep.equal(cohort);
+		expect(merged.otherCohorts, 'the same answer twice is not another cohort').to.equal(undefined);
+		// Differing answers from one cohort are both kept: the truthful shape.
+		const differing = mergeDurability([cohort, { ...cohort, quorum: 'majority', confirmed: 2, unconfirmed: ['full-peer-2'] }]);
+		expect(differing.quorum).to.equal('majority');
+		expect(differing.otherCohorts).to.deep.equal([cohort]);
+	});
+
 	it('an unrouted batch beside a full one reports unrouted — the weakest is the binding constraint', () => {
 		const merged = mergeDurability([report('full', 3), unroutedDurability()]);
 		expect(merged.quorum).to.equal('unrouted');

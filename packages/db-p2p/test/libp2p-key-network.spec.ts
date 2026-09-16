@@ -2061,7 +2061,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 	 * used to ask libp2p for them on every single call. That is not a cheap question: on Node
 	 * `getMultiaddrs()` re-derives announce addresses from `os.networkInterfaces()`, a full NIC
 	 * sweep measured at 3.19 ms of a 3.49 ms `findCluster`. Every commit calls `findCluster`
-	 * through `getClusterPeerIds`, so a cold `apply schema` paid one NIC sweep per commit — on a
+	 * through `ClusterCoordinator.resolveCohort`, so a cold `apply schema` paid one NIC sweep per commit — on a
 	 * solo node that was ~49% of the whole operation (GitHub issue #8), recomputing an identical
 	 * answer each time.
 	 *

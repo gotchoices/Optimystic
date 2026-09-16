@@ -224,7 +224,7 @@ describe('CoordinatorRepo commit-side freshness (quorum-intersection gate)', () 
 
 	describe('consensus path', () => {
 		/**
-		 * A repo whose consensus layer is a double: `getClusterPeerIds` reports `cohort` ids (what
+		 * A repo whose consensus layer is a double: `resolveCohort` reports `cohort` ids (what
 		 * routing sees) and `executeClusterTransaction` yields `record` with
 		 * `localExecuted`/`localCommitResult` as given. The keyNetwork's view matches `cohort` so
 		 * the read path consults the same peers the commit saw. `clusterSize` is the declared
@@ -261,7 +261,6 @@ describe('CoordinatorRepo commit-side freshness (quorum-intersection gate)', () 
 			);
 			(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 				async getClusterSize(): Promise<number> { return Object.keys(cluster).length; },
-				async getClusterPeerIds(): Promise<string[]> { return Object.keys(cluster); },
 				async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: Object.keys(cluster) }; },
 				async recoverTransactions(): Promise<void> { /* unused */ },
 				async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, cohortCommitOutcomes: { [peerId: string]: CommitResult } }> {

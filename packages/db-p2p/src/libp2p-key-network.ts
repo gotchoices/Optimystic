@@ -313,7 +313,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * and near-zero for a dial-only client; do not quote the headline figure at a profile that
 	 * never pays it. Every
 	 * `findCluster` builds a cluster record containing self's addresses, and every commit calls
-	 * `findCluster` through `getClusterPeerIds` — so a cold `apply schema` paid one NIC sweep per
+	 * `findCluster` through `ClusterCoordinator.resolveCohort` — so a cold `apply schema` paid one NIC sweep per
 	 * commit. On a solo node with zero peers that was ~13.8 ms per call and **49% of the whole
 	 * apply** (issue #8); the addresses it recomputed were identical every time.
 	 *

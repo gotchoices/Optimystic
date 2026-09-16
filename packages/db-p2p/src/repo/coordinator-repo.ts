@@ -546,10 +546,10 @@ export function coordinatorRepo(
  * revert to being ignored. If that field is ever renamed, grep the specs for `coordinator:`.
  */
 export interface ICoordinatorClusterSeam {
+	/** Used by `verifyResponsibility` alone; `pend` and `commit` read {@link resolveCohort}. */
 	getClusterSize(blockId: BlockId): Promise<number>;
-	getClusterPeerIds(blockId: BlockId): Promise<string[]>;
-	/** Whether the cohort could be established at all, and who it is — the primitive the two
-	 *  accessors above derive from. `pend` and `commit` classify their solo short-circuit on it. */
+	/** Whether the cohort could be established at all, and who it is — the primitive
+	 *  `getClusterSize` derives from. `pend` and `commit` classify their solo short-circuit on it. */
 	resolveCohort(blockId: BlockId): Promise<CohortResolution>;
 	executeClusterTransaction(blockId: BlockId, message: RepoMessage, options?: MessageOptions): Promise<{
 		record: ClusterRecord;
@@ -2936,13 +2936,21 @@ function cohortWriteDurability(durability: CohortDurability, selfHolds: boolean,
  * promise votes. This node's own member is added when `selfAccepted` is true, removed when it is
  * false (its member applied and refused, so its approve vote no longer describes what it holds),
  * and left to its vote when `undefined` (no retained verdict — the vote is the only evidence there
- * is). NOT comparable to the commit-tier count: accepting a pending record confers no storage
- * durability, and the field's own documentation says so.
+ * is). This node counts only when it is IN the cohort, as the commit tier counts it: a coordinator
+ * outside `record.peers` whose fallback pend landed holds a copy no cohort member will ever look
+ * for, and counting it would let `confirmed` exceed `cohort`. NOT comparable to the commit-tier
+ * count: accepting a pending record confers no storage durability, and the field's own
+ * documentation says so.
+ * NOTE: a REMOTE member's vote is never withdrawn here. The pend arm of `ClusterRecord.applyOutcomes`
+ * reports only conflict-shaped refusals (which downgrade the whole pend to a retryable conflict
+ * before this runs), so a remote member that promised and then faulted at apply keeps its approve
+ * vote and a pend's `full` can overstate by that member. Harmless while nothing reads a pend's
+ * class for repair; if that changes, widen the member's report to carry bare faults too.
  */
 function pendCohortDurability(record: ClusterRecord, selfAccepted: boolean | undefined, selfPeerId: string | undefined): WriteDurability {
 	const cohortPeerIds = Object.keys(record.peers);
 	const accepted = new Set(Object.entries(record.promises).filter(([, vote]) => vote.type === 'approve').map(([peerId]) => peerId));
-	if (selfPeerId !== undefined) {
+	if (selfPeerId !== undefined && cohortPeerIds.includes(selfPeerId)) {
 		if (selfAccepted === true) accepted.add(selfPeerId);
 		if (selfAccepted === false) accepted.delete(selfPeerId);
 	}

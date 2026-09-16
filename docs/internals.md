@@ -801,7 +801,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   retrying.** `NetworkTransactor.commit` splits the sweep's failure by shape. A *returned*
   `success:false` is a confirmed conflict and is surfaced, so the writer retries (everything below
   is about that path). A *thrown* sweep is transport-shaped: the tail is already durable, so
-  refusing would disown an acknowledged write, and commit returns `{ success:true }`. That leaves
+  refusing would disown an acknowledged write, and commit returns success — with the abandoned
+  blocks named in `durability.torn` and the class clamped below `full`, so `isFullyDurable` says
+  no (`withTornBlocks` in `packages/db-core/src/network/durability.ts`). That leaves
   nobody to retry the sweep's blocks, so `cancelAbandonedSweepBlocks` releases their pending
   records before the acknowledgement — the writer's obligation under `docs/repository.md`
   §"A pending record's lifetime is bounded by its writer". The abandoned block's transform is

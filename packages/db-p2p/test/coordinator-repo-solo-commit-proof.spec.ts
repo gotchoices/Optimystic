@@ -25,7 +25,7 @@ import { PROOF_THRESHOLDS, makeClusterPeers } from './support/commit-proof-fixtu
 // Both ways INTO that branch are exercised, because they are different production situations:
 //  - a genuine cohort of one — `findCluster` answers with exactly this node;
 //  - DEGRADED ROUTING — `findCluster` throws, so `isResponsibleForBlock` falls open ("assume
-//    responsible") while `getClusterPeerIds` reports an empty cohort. Every commit on the node then
+//    responsible") while `resolveCohort` reports an unresolved cohort. Every commit on the node then
 //    takes the solo branch for as long as routing is down, whatever the block's real cohort size is.
 
 const makeKeyNetwork = (cluster: ClusterPeers | 'unroutable'): IKeyNetwork => ({

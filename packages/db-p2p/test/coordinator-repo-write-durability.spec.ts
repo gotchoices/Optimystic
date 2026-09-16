@@ -90,7 +90,6 @@ const makeRepo = (storage: IRepo, self: PeerId | undefined, seam: SeamOptions): 
 	const repo = new CoordinatorRepo(keyNetwork, (_p: PeerId) => ({} as unknown as ClusterClient), storage, { clusterSize: 3 }, undefined, self);
 	(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 		async getClusterSize(): Promise<number> { return peerIds.length; },
-		async getClusterPeerIds(): Promise<string[]> { return [...peerIds]; },
 		async resolveCohort(): Promise<CohortResolution> { return seam.cohort; },
 		async recoverTransactions(): Promise<void> { },
 		async executeClusterTransaction() {
@@ -295,6 +294,24 @@ describe('CoordinatorRepo — a successful write says who holds it', () => {
 			expect(partial.durability.quorum).to.equal('majority');
 			expect(partial.durability.confirmed).to.equal(3);
 			expect(partial.durability.unconfirmed).to.deep.equal([quiet]);
+		});
+
+		it('a coordinator outside the cohort whose fallback pend landed is not counted — confirmed never exceeds cohort', async () => {
+			// This node coordinates for a cohort it is not a member of, and its own storage accepted the
+			// pending record on the fallback arm. That copy is on nobody's reconcile path, so it is not a
+			// confirmer: the answer is the cohort's three of three, not four of three.
+			const repo = makeRepo(storageRepo(), self, {
+				cohort: { resolved: true, peerIds: others },
+				consensus: { record: makeRecord(others), localExecuted: false }
+			});
+
+			const result = successOf(await repo.pend(PEND));
+
+			expect(result.durability.quorum).to.equal('full');
+			expect(result.durability.confirmed).to.equal(3);
+			expect(result.durability.cohort).to.equal(3);
+			expect(result.durability.unconfirmed).to.deep.equal([]);
+			expect(result.durability.cohortPeerIds).to.not.include(selfId);
 		});
 	});
 });

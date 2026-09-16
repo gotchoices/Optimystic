@@ -26,13 +26,20 @@ export function durabilityRank(q: DurabilityQuorum): number {
  * the rest become `otherCohorts`, so a consumer that reads only the scalar fields is reading the
  * binding constraint. `torn` is the union across the inputs — an abandoned block is abandoned
  * whichever cohort it ran on. Reports that already carry `otherCohorts` are flattened first, so
- * merging a merge is the same as merging its inputs.
+ * merging a merge is the same as merging its inputs. Identical reports collapse to one: a commit
+ * sends the tail and the sweep as separate batches, so ONE cohort routinely answers twice for one
+ * action, and without this a healthy single-cohort commit would list its own cohort under
+ * `otherCohorts`.
+ * NOTE: only structurally identical reports collapse. One cohort answering differently for two
+ * batches (a member confirmed one block and not the other) appears twice, once per answer, which
+ * is the truthful shape. If a consumer ever needs exactly one entry per cohort, fold same-cohort
+ * reports here by unioning `unconfirmed`; do not dedupe by `cohortPeerIds` alone.
  *
  * THROWS on an empty input: an action always ran on at least one cohort, and fabricating an answer
  * for one that ran on none is exactly the plain-success ambiguity the durability field removes.
  */
 export function mergeDurability(reports: readonly WriteDurability[]): WriteDurability {
-	const flat = reports.flatMap(flattenDurability);
+	const flat = distinctReports(reports.flatMap(flattenDurability));
 	if (flat.length === 0) {
 		throw new Error('mergeDurability: no durability reports to merge — an action always ran on at least one cohort');
 	}
@@ -93,6 +100,22 @@ function flattenDurability(d: WriteDurability): WriteDurability[] {
 function stripMergedFields(d: WriteDurability): WriteDurability {
 	const { otherCohorts: _otherCohorts, torn: _torn, ...cohortReport } = d;
 	return cohortReport;
+}
+
+/**
+ * First occurrence of each structurally identical per-cohort report, input order kept. Peer lists
+ * compare as SETS: `findCluster` orders a cohort by routing distance to the block's key, so one
+ * cohort answering for two blocks lists the same members in two orders.
+ */
+function distinctReports(reports: readonly WriteDurability[]): WriteDurability[] {
+	const seen = new Set<string>();
+	const sorted = (ids: readonly string[] | undefined): string[] | null => ids === undefined ? null : [...ids].sort();
+	return reports.filter(r => {
+		const key = JSON.stringify([r.quorum, r.confirmed, r.cohort, sorted(r.unconfirmed), sorted(r.cohortPeerIds)]);
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
 }
 
 function unionTorn(reports: readonly WriteDurability[]): BlockId[] {

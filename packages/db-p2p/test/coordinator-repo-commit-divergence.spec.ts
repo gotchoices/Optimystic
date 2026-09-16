@@ -142,7 +142,6 @@ const makeRepo = (
 	);
 	(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 		async getClusterSize(): Promise<number> { return peerIds.length; },
-		async getClusterPeerIds(): Promise<string[]> { return peerIds; },
 		async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: peerIds }; },
 		async recoverTransactions(): Promise<void> { /* unused on these paths */ },
 		async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, cohortCommitOutcomes?: { [peerId: string]: CommitResult } }> {

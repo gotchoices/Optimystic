@@ -86,7 +86,6 @@ const makeRepo = (
 	);
 	(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 		async getClusterSize(): Promise<number> { return 3; },
-		async getClusterPeerIds(): Promise<string[]> { return ['peer-1', 'peer-2', 'peer-3']; },
 		async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: ['peer-1', 'peer-2', 'peer-3'] }; },
 		async recoverTransactions(): Promise<void> { /* unused on these paths */ },
 		async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, localPendResult?: PendResult, cohortPendRefusals?: { [peerId: string]: StaleFailure } }> {
@@ -244,7 +243,6 @@ describe('CoordinatorRepo pend — retained storage verdict after cluster consen
 		);
 		(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 			async getClusterSize(): Promise<number> { return 3; },
-			async getClusterPeerIds(): Promise<string[]> { return ['peer-1', 'peer-2', 'peer-3']; },
 			async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: ['peer-1', 'peer-2', 'peer-3'] }; },
 			async recoverTransactions(): Promise<void> { },
 			async executeClusterTransaction() {
@@ -274,7 +272,6 @@ describe('CoordinatorRepo pend — retained storage verdict after cluster consen
 		);
 		(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 			async getClusterSize(): Promise<number> { return 3; },
-			async getClusterPeerIds(): Promise<string[]> { return ['peer-1', 'peer-2', 'peer-3']; },
 			async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: ['peer-1', 'peer-2', 'peer-3'] }; },
 			async recoverTransactions(): Promise<void> { },
 			async executeClusterTransaction() {
