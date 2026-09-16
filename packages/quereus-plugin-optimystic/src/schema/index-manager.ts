@@ -398,6 +398,16 @@ export class IndexManager {
 			}
 
 			const treeKey = indexEntryKey(indexKey, primaryKey);
+			// NOTE: deliberately staged BLIND — nothing here proves this handle's copy of the index
+			// tree has ever loaded the entry being deleted. When it has not, the tree's `replace`
+			// handler misses on `find`, `deleteAt` returns false, and the action writes no block at
+			// all. Its correctness therefore rests entirely on `updateInternal` in
+			// `packages/db-core/src/collection/collection.ts` replaying pending actions against the
+			// revision it adopts, not only when a block conflict was detected. Refreshing the tree
+			// first (`await tree.update()`) would make the entry visible, but costs a refresh per
+			// maintained index per deleted row and still leaves the window open for an entry a rival
+			// commits between that refresh and the sync — so the db-core rule is the whole fix and
+			// this stays blind by design.
 			await tree.stage([[treeKey, undefined]]);
 		}
 	}
@@ -436,6 +446,11 @@ export class IndexManager {
 				// keeps its unique value (old and new keys share the value prefix) must not
 				// refuse itself on its own outgoing entry.
 				await tree.stage([
+					// NOTE: the old-entry delete is blind in the same way `deleteIndexEntries` is,
+					// and rests on the same db-core replay rule. Small trees mask it — the sibling
+					// upsert below writes a block, so when old and new entries share a leaf the
+					// resulting transform conflicts with the adopted revision and forces a replay
+					// anyway. Once the two keys land in different leaves that overlap is gone.
 					[oldTreeKey, undefined],
 					[newTreeKey, [newTreeKey, newPrimaryKey], this.guardFor(index, newIndexKey, uniqueIndexes)]
 				]);

@@ -86,6 +86,50 @@ describe('two handles on one collection id', () => {
 	})
 })
 
+describe('a pending action that changed no block', () => {
+	/** The delete that writes nothing.
+	 *
+	 * A refresh detects a conflict by finding an incoming log entry that names a block this
+	 * handle already holds a transform for. An action that changed NO block holds no transform,
+	 * so it can never register one — and a staged delete of a key the staging handle cannot see
+	 * is exactly that action: the tree's `replace` handler misses on `find` and `deleteAt`
+	 * returns false without writing. Before `updateInternal` replayed on context advance, such
+	 * an action stayed in `pending` unapplied until the commit wrote a log entry listing it
+	 * whose transforms did nothing, and the delete was lost on every node.
+	 *
+	 * `Tree.open` for B is load-bearing: building BOTH handles with `createOrOpen` does not
+	 * reproduce, because the second `createOrOpen` stages its own header/root into B's tracker,
+	 * A's log entry names the root, and the resulting block conflict forces the replay anyway.
+	 * B has to open an already-committed tree so its tracker starts empty.
+	 *
+	 * The assertion reads through a THIRD, fresh `Tree.open`: reading back through B would be
+	 * satisfied by B's own tracker state and would prove nothing about what is durable. */
+	it('a blind delete staged against an unseen key still lands', async () => {
+		const network = new TestTransactor()
+
+		const a = await openHandle(network)
+		await a.stage([['k-anchor', ['k-anchor', 'anchor']]])
+		await a.sync()
+
+		const b = await Tree.open<string, Entry>(network, collectionId, e => e[0], (x, y) => x < y ? -1 : x > y ? 1 : 0)
+		expect(b, 'B opens the committed tree').to.not.equal(undefined)
+		expect(await b!.get('k-anchor'), 'B reads the anchor').to.deep.equal(['k-anchor', 'anchor'])
+
+		// A commits a second entry that B has never read, so nothing about it is in B's tracker.
+		await a.stage([['k-later', ['k-later', 'later']]])
+		await a.sync()
+
+		// B stages a delete of that key blind: `find` misses at B's stale context, `deleteAt`
+		// returns false, and no block is written.
+		await b!.stage([['k-later', undefined]])
+		await b!.sync()
+
+		const reader = await Tree.open<string, Entry>(network, collectionId, e => e[0], (x, y) => x < y ? -1 : x > y ? 1 : 0)
+		expect(await reader!.get('k-later'), 'the blind delete is durable').to.equal(undefined)
+		expect(await reader!.get('k-anchor'), 'the anchor is untouched').to.deep.equal(['k-anchor', 'anchor'])
+	})
+})
+
 describe('two handles racing one collection id', () => {
 	it('SEEDED: concurrent syncs from one committed base both survive', async () => {
 		const network = new TestTransactor()

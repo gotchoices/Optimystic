@@ -63,6 +63,23 @@ conflict replay") for the regression test, and
 `packages/quereus-plugin-optimystic/test/external-commit-visibility-after-rollback.spec.ts`
 for the end-to-end shape.
 
+**When** the replay fires is a separate question from its ordering, and the answer is
+not "on a detected block conflict". A conflict is detected by an incoming log entry
+naming a block the tracker already holds a transform for, so an action that changed
+**no** block can never register one — and a staged delete of a key the staging
+instance cannot see is exactly that action: the tree `replace` handler misses on
+`find`, and `deleteAt` on a not-found path returns false without writing. Gated on
+conflicts alone, such an action stayed in the pending queue unapplied until the commit
+wrote a log entry listing it whose transforms did nothing; readers materialize blocks,
+not log entries, so the action was lost on every node, silently and permanently. The
+invariant `updateInternal` therefore enforces is that **a pending action was applied
+against the revision it commits over**: it replays whenever the refresh adopted a newer
+revision and anything is still pending, not only when a conflict was found. The
+regression test is `packages/db-core/test/two-handle-collection-fork.spec.ts` ("a blind
+delete staged against an unseen key still lands"); `deleteIndexEntries`
+(`packages/quereus-plugin-optimystic/src/schema/index-manager.ts`) is the site that
+relies on it, and it stages its deletes blind on purpose.
+
 This also settles a question about intended semantics: a **live** read (the vtab
 read path above, or any read through a collection's own `tracker`/`update()`) always
 pulls the latest log and therefore observes a concurrent external commit — including

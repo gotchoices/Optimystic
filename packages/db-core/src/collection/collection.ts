@@ -611,14 +611,27 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 		Collection.reportShortfall(this.id, this.instanceTag, tailRev, actionContext?.rev, this.source.actionContext?.rev);
 
-		// On conflicts, re-stage the pending actions against the adopted revision. The affected
+		// Re-stage the pending actions against the adopted revision. The affected
 		// blocks were already dropped from sourceCache above (per log entry / per invalidation),
 		// so the replay's reads re-materialize from the transactor.
 		// NOTE: a throw out of replayActions leaves the tracker holding only the transforms
 		// replayed so far while `pending` still lists them all; the caller's error handling is
 		// expected to abort/reset the collection rather than keep staging. If replay ever gains a
 		// routinely-throwing read path, rebuild into a scratch tracker and swap on success.
-		if (anyConflicts) {
+		//
+		// The gate is deliberately NOT just `anyConflicts`. A conflict is detected by an incoming
+		// log entry naming a block this tracker already holds a transform for — so an action that
+		// changed NO block can never register one. A staged delete of a key this instance cannot
+		// see is exactly that action: the tree's `replace` handler misses on `find` and `deleteAt`
+		// returns false without writing. Gating on conflicts alone left such an action in
+		// `pending`, unapplied, until the commit wrote a log entry listing it whose transforms did
+		// nothing — and readers materialize blocks, not log entries, so the action was lost on
+		// every node, silently and permanently. The invariant that has to hold is that a pending
+		// action was applied against the revision it commits over, so replay whenever the refresh
+		// adopted a newer revision and anything is still pending.
+		const adoptedRev = this.source.actionContext?.rev;
+		const contextAdvanced = adoptedRev !== undefined && adoptedRev !== actionContext?.rev;
+		if (anyConflicts || (contextAdvanced && this.pending.length > 0)) {
 			await this.replayActions();
 		}
 	}

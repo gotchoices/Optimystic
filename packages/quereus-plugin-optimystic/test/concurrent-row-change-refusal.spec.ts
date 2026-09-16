@@ -94,20 +94,20 @@ describe('Concurrent same-ROW change refusal (two handles, one dir)', function (
 	 * only index is the tree enforcing a `unique` column — `null` rather than `undefined`,
 	 * which would select the default), and `seed` rows.
 	 *
-	 * The seed rows are inserted ALTERNATELY through A and B, as the two-node mutation sweep
-	 * seeds, so that each handle's index tree has synced at least once and so holds the
-	 * other's entries. That matters for the cases whose rival statement is a DELETE: an index
-	 * delete staged on a tree that has never fetched the entry is a no-op at staging, and the
-	 * commit then logs it without ever applying it to the revision it adopts — a separate,
-	 * pre-existing defect this file must not conflate with the guard (see
-	 * `fix/blind-index-delete-is-logged-but-never-applied`). B's scan is confirmed to hold
-	 * every seed row before anything races.
+	 * `seedThrough` chooses who inserts the seed rows. The default `alternate` splits them
+	 * between A and B, as the two-node mutation sweep seeds, so that each handle's index tree
+	 * has synced at least once and holds the other's entries. That keeps the racing cases
+	 * about the guard and nothing else. `a` inserts every seed row through A, which leaves B's
+	 * index tree never having fetched the entries it later deletes — the shape the blind-delete
+	 * case below is about. Either way B's scan is confirmed to hold every seed row before
+	 * anything races.
 	 */
 	async function twoHandles(
 		uri: string,
 		columns: string,
 		seed: TableRows,
 		indexSql: string | null = DECLARED_INDEX,
+		seedThrough: 'alternate' | 'a' = 'alternate',
 	): Promise<Handles> {
 		const { db: a, plugin: pluginA } = createDb(dir);
 		const { db: b, plugin: pluginB } = createDb(dir);
@@ -116,7 +116,8 @@ describe('Concurrent same-ROW change refusal (two handles, one dir)', function (
 			if (indexSql !== null) await db.exec(indexSql);
 		}
 		for (const [i, [id, v]] of seed.entries()) {
-			await (i % 2 === 0 ? a : b).exec(`insert into T (id, v) values (${id}, '${v}')`);
+			const writer = seedThrough === 'a' ? a : (i % 2 === 0 ? a : b);
+			await writer.exec(`insert into T (id, v) values (${id}, '${v}')`);
 		}
 		await expectRows(b, seed, 'B must see the seed rows before racing');
 		return {
@@ -169,6 +170,25 @@ describe('Concurrent same-ROW change refusal (two handles, one dir)', function (
 
 	const SEED: TableRows = [[1, 'seed-1'], [2, 'seed-2']];
 	const PLAIN = 'id integer primary key, v text';
+
+	/**
+	 * Not a race at all — the end-to-end shape of `blind-index-delete-is-logged-but-never-applied`.
+	 * Every seed row is written through A, so B's copy of `T_by_v` has never fetched the entry for
+	 * id 1. B's DELETE stages a delete of that entry against a tree that cannot see it: the tree's
+	 * `replace` handler misses, nothing is written, and the action reaches commit having changed no
+	 * block. Nothing conflicts, so the refresh has no conflict to detect — the fix is that
+	 * `updateInternal` replays pending actions whenever it adopts a newer revision at all. Without
+	 * it the row went but its index entry stayed behind, on both handles, permanently.
+	 */
+	it('a row deleted through a handle whose index tree never saw the entry leaves no orphan', async () => {
+		const handles = await twoHandles('tree://row-race/blind-index-delete', PLAIN, SEED, DECLARED_INDEX, 'a');
+		try {
+			await handles.b.exec('delete from T where id = 1');
+			await expectStateOnBoth(handles, [[2, 'seed-2']], 'after B deleted a row only A had written');
+		} finally {
+			await handles.dispose();
+		}
+	});
 
 	it('UPDATE vs a rival UPDATE of the same row: the loser is refused, the retry applies over the rival\'s value', async () => {
 		const handles = await twoHandles('tree://row-race/update-update', PLAIN, SEED);
