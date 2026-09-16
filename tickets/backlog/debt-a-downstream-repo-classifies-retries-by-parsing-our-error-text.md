@@ -35,23 +35,44 @@ live failure object (not a fixture — the right design) is
 `control-write-degraded-cohort-member.integration.ts`, which is failing for unrelated timing reasons.
 While it is red, nobody is checking the coupling at all.
 
-# A detail they may not have accounted for
+# What is actually load-bearing — narrower than "our error text"
 
-There are **four** renderers, not three, and the fourth cuts against the discriminator: `dischargeCancel`
-(line 1142) also renders `[block:`. So an aggregate originating in the cancel path classifies as
-get/pend under their rule. Whether that can reach an application depends on whether a cancel's own
-failure surfaces as the aggregate or rides along as `cancelError` (see `TransactorSource.transact`,
-which deliberately attaches rather than replaces) — worth establishing, and worth telling them either
-way, because it is the kind of thing a regex over prose cannot see.
+A first version of this ticket said the fourth renderer (`dischargeCancel`, line 1142, which also
+emits `[block:`) cut against their discriminator. **It does not, and the reason matters**, because it
+identifies the specific change to guard. Established by the reporting session and verified here
+against `c56c2bd4`:
+
+Their test is a **conjunction inside one message**, not a token search:
+`/Some peers did not complete:/.test(message) && message.includes('[block:')`, applied per message
+in the cause chain rather than to a flattened string. Only three sites raise that sentence — `get`
+(line 293), `pend` (583) and `commitBlocks` (931). `dischargeCancel` raises a different sentence
+entirely: `Cancel of action <id> did not discharge <n> block(s): …; peers: …` (line 1145), so it
+fails the first half of the conjunction no matter what its per-batch detail renders. A second
+mechanism excludes commit-phase failures before any matcher runs.
+
+So what sereus depends on is precisely:
+
+1. **`Some peers did not complete:` stays on the get / pend / commitBlocks aggregates, and does NOT
+   appear on the cancel aggregate.**
+2. **`[block:` and `[blocks:` stay disjoint** between the single-block paths and the commit-batch path.
+
+Rewording the cancel aggregate is free. **Giving the cancel path the `Some peers did not complete:`
+prefix — for consistency, say — would make a cancel fault classify as safe-to-retry.** That is the
+change to guard, and it is exactly the kind of tidying that looks harmless in review. It is a better
+thing to write at the sites than "don't touch the text".
 
 # What to do
 
 Two levels, and the cheap one does not depend on the other:
 
-1. **Mark the sites.** A short comment at each of the four renderers saying the token shape is parsed
-   by a downstream consumer (sereus's `control-write-retry.ts`) and must not be reformatted casually.
-   That is a comment-only change, cheap enough to fold into any ticket that touches this file. It
-   does not *prevent* the breakage, but it puts the fact in front of the person doing it.
+1. **Mark the sites** — with the specific rule, not a vague warning. At the three aggregates (293,
+   583, 931): this sentence plus the `[block:` / `[blocks:` token is how a downstream consumer
+   (sereus's `control-write-retry.ts`) tells a retry-safe get/pend failure from a commit failure. At
+   the cancel aggregate (1145): **do not give this the `Some peers did not complete:` prefix** — that
+   sentence is the consumer's discriminator, and adopting it here would make an undischarged cancel
+   classify as safe to retry. Comment-only, cheap enough to fold into any ticket that touches this
+   file. It does not *prevent* the breakage, but it puts the exact hazard in front of whoever is
+   about to cause it.
 2. **Remove the need to parse prose.** Put the phase on the aggregate as a **field** — `get` / `pend`
    / `commit` / `cancel` — so a consumer branches on a value instead of a regex over a message.
    Their session named this as the better answer and explicitly did not file it against us; it is
