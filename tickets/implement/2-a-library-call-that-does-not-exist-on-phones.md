@@ -63,6 +63,37 @@ casts in `network-transactor.ts` (585, 1149) are type-level only and safe.
 `digest`, so ECDSA/RSA import-export and `@libp2p/keychain`'s AES-GCM would throw if reached. Nothing
 reaches them today — the phone uses Ed25519 through noble.
 
+## The worst one, found by grepping the object instead of the method
+
+The lesson from the correction above is that the question "what does this platform gap touch" has to
+be asked of the **object** (`AbortSignal\.`), not the method. Applying that to every platform global
+at once, across `packages/*/src`, turns up something bigger than any single call:
+
+**`packages/db-p2p/src/storage/raw-store-codec.ts:21-22` constructs `new TextEncoder()` and
+`new TextDecoder()` at MODULE SCOPE**, and Hermes provides neither natively. That module is imported
+by `kv-raw-storage.ts` and `cached-raw-storage.ts`, and `src/rn.ts` — the React Native entry —
+exports both (lines 33 and 36), along with `storage-repo.js` (line 44).
+
+So on Hermes, without a host-supplied polyfill, **importing `@optimystic/db-p2p/rn` throws while the
+module graph is still loading**. Not a code path that fails when reached — the entry point itself.
+That is the strongest possible form of "not RN-safe on its own", and it is the same failure shape the
+device session described for `uint8arrays` touching `TextDecoder` at module scope and leaving yamux's
+default export `undefined`.
+
+Also on that entry: **`storage-repo.ts:1188` calls `structuredClone`** (twice, on the materialization
+path), which Hermes likewise does not provide. db-core's transform tracker, cache-source and
+coordinator were already known to use it.
+
+`test/entry-parity.spec.ts` cannot see any of this: it compares the two entries' module lists, which
+are identical by design. The gap is what those modules *evaluate*, not which ones they are.
+
+**This reshapes the ticket.** Fixing `RepoClient` and the dispute client leaves a phone that still
+cannot import the entry without help. Whoever takes this should decide, and say which they chose:
+either the RN entry declares its required polyfills in one documented place (with the readme and the
+reference app agreeing), or the library stops depending on them — lazy construction instead of
+module scope for the codec, `any-signal` for the combiner, an explicit clone helper instead of
+`structuredClone`. The second is more work and is the one that makes the package honest.
+
 Note that `yarn check:rn` cannot catch this. It bundles the RN entry with Metro and compiles it with
 Hermes; a call to a function that does not exist compiles perfectly well and fails only when reached.
 A static rule is what closes it.
