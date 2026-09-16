@@ -89,3 +89,37 @@ the sweep's configuration helper is the right place to build from.
 
 Credit: found by sereus's integration suite, which is the only place in this fleet where a partition
 scenario drives optimystic through a real application's read path.
+
+# Arm (2026-09-15, from the reporting session's read-only follow-up): a stale answer is not always the safe one
+
+Four things they established by reading, which narrow this considerably — and one that changes what
+any fix has to decide:
+
+1. **The application already selects the committed arm sometimes.** Sereus's `readRowsOnce` passes
+   `readConcurrency: 'committed'` when `getAutocommit()` is false, so the plumbing exists end to end.
+   Its only trigger today is "a writer's transaction is open" — a concurrency concern. Partition is a
+   second reason to want that arm, and nothing selects for it.
+2. **The two arms differ exactly as described above** (`optimystic-module.ts:1204-1221`): committed
+   pins both views inside one synchronous block; live awaits `mainTree.update()` and the index tree's.
+   That await is the frame in the stack.
+3. **The error is already discriminable without string-matching** — `reason: 'cohort-unreachable'` is
+   a field. So candidate answer 3 may largely hold today, and the work there would be documenting the
+   contract and exporting a predicate rather than changing a shape.
+4. **Retrying the live arm cannot converge.** The application's retry wrapper re-presents the same
+   attempt, which takes the live arm again against the same unreachable cohort until the budget
+   expires. The retry cannot clear the condition causing the failure, which is why this surfaces as a
+   hard error rather than a slow recovery.
+
+**The part that changes the design question.** Some of these reads gate authorization, and the table
+in the failing scenario is `Revocation`. A committed read answers from what the node already holds,
+so under partition **a revocation that has not replicated reads as "not revoked"**. A stale answer
+that wrongly *denies* is an availability bug; one that wrongly *admits* is a security bug. So
+"fall back to committed when the cohort is unreachable" must not be applied to a read funnel as a
+whole — it needs a per-caller decision about which reads may accept a local answer.
+
+That weighs directly on which of the three candidates is right. Answer 1 (it is intended) leaves the
+application to make that call, which it can — but only if it can tell the cases apart. Answer 2
+(degrade and report that the answer is local) is what would let a caller distinguish them at the call
+site instead of guessing, which makes it the strongest candidate for a security-sensitive consumer,
+and gives it the same shape as the write side's `WriteDurability`. Answer 3 alone leaves the caller
+retrying blind.
