@@ -88,11 +88,48 @@ coordinator were already known to use it.
 are identical by design. The gap is what those modules *evaluate*, not which ones they are.
 
 **This reshapes the ticket.** Fixing `RepoClient` and the dispute client leaves a phone that still
-cannot import the entry without help. Whoever takes this should decide, and say which they chose:
-either the RN entry declares its required polyfills in one documented place (with the readme and the
-reference app agreeing), or the library stops depending on them — lazy construction instead of
-module scope for the codec, `any-signal` for the combiner, an explicit clone helper instead of
-`structuredClone`. The second is more work and is the one that makes the package honest.
+cannot import the entry without help. Two branches were considered:
+
+- **Declare** the required polyfills in one documented place, readme and reference app agreeing.
+- **Remove the dependency** — lazy construction instead of module scope for the codec, `any-signal`
+  for the combiner, an explicit clone helper instead of `structuredClone`.
+
+**It is not a choice between them, and that is the point.** Even with every first-party use removed,
+the RN entry still cannot be imported on a bare Hermes runtime, because the *dependency graph* needs
+`TextDecoder` before our code runs: `multiformats` and `yamux` construct `new TextDecoder('utf8')` at
+module scope (diagnosed independently in the sereus reference app — see below), and `dial-queue.js`
+in libp2p throws `AggregateError` unconditionally. **Those we cannot fix, only require.**
+
+So the honest answer is both, with the line between them stated: fix what is ours, and declare what
+is not, as a *requirement* rather than a hope. "We will fix this" and "we cannot fix this, only
+require it" are different commitments and should not be blurred into one list. The second branch is
+still worth doing on its own merits — lazy construction and a clone helper cost almost nothing and
+remove a whole class of first-party exposure — but it should not be sold as making the package
+self-sufficient on Hermes, because it will not.
+
+## Prior art to take rather than rebuild (another repository, read before designing)
+
+The sereus reference apps have already walked this ground, and the session tending that repo offered
+the artefacts:
+
+- **`packages/reference-app-ns/src/polyfills/audit.ts`** enumerates the globals a phone runtime must
+  provide and reports each at boot as `native`, `polyfilled` or `MISSING`. Its list already contains
+  `TextEncoder`, `TextDecoder` and `structuredClone` — precisely the three this entry evaluates at
+  import time. If the declaration branch happens, that list is the natural seed, and it has the
+  advantage of being maintained against a real device rather than derived by reading imports.
+- **`polyfills/hermes.ts:63`** in that app carries the same diagnosis reached here independently: a
+  module-scope `new TextDecoder('utf8')` in the dependency graph means the polyfill must be installed
+  before that module is evaluated.
+
+Two caveats that came with the offer, worth honouring: the NS app is **ahead of the RN app** — RN's
+`index.js` gets the ordering right and says so in a comment, but nothing enforces it and there is no
+audit or import-order test, so the ordering there is a convention rather than a guarantee (their
+`implement/0-rn-polyfill-guard-and-audit` is closing that). And the NS list is what *that app* needed:
+a floor for this entry, not a ceiling.
+
+Whatever this ticket lands, the requirement belongs somewhere a consumer will actually meet it —
+`packages/db-p2p/readme.md` § React Native at minimum — and the RN checklist there should be checked
+against the audit list rather than against this ticket.
 
 Note that `yarn check:rn` cannot catch this. It bundles the RN entry with Metro and compiles it with
 Hermes; a call to a function that does not exist compiles perfectly well and fails only when reached.
