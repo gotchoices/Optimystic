@@ -31,8 +31,9 @@
  * What brings C current depends on whether anyone still owes it the commit it missed:
  *  - **short** — C returns while the writer's scheduled commit retry (`ClusterCoordinator.scheduleCommitRetry`)
  *    is still running, and that retry delivers the commit before C does anything at all;
- *  - **long** — the writer restarts while C is away, taking the retry with it (a phone asleep for longer than
- *    the retry schedule ends the same way), so C returns owed nothing and its own reads must bring it current.
+ *  - **long** — the writer restarts while C is away, taking the retry with it (the mesh wires no transaction
+ *    state store, so the restarted writer recovers no retry; a phone asleep for longer than the retry schedule
+ *    ends the same way), so C returns owed nothing and its own reads must bring it current.
  *    What does it, observed under full debug logging: no cohort consult and no fetch at all. C still holds
  *    the pending record it stored when it promised the write, and it holds the write's tail, which lists the
  *    action as committed; a read carrying that collection context promotes the pending record in C's own

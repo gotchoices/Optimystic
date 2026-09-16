@@ -220,7 +220,9 @@ export interface Mesh {
 	 *
 	 * Everything held only in memory goes with the old instance: the member's reservations and
 	 * executed-transaction memory, the coordinator's in-flight transactions and scheduled commit
-	 * retries, every read-repair stamp. The old instance is made inert rather than merely forgotten —
+	 * retries, every read-repair stamp. The harness wires no `ITransactionStateStore`, so nothing is
+	 * recovered either — a production node built with `transactionStateStore` would resume its
+	 * persisted commit retries on restart (`ClusterCoordinator.recoverTransactions`). The old instance is made inert rather than merely forgotten —
 	 * its member is disposed, and every outbound call it would still make (a commit retry whose timer
 	 * fires later, a cohort consult, an archive fetch) fails the way a stopped process's dial does — so
 	 * a retry the old process owed cannot quietly deliver after the restart and pass for healing.
