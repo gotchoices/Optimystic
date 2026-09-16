@@ -270,3 +270,13 @@ Found by `implement/1-transaction-sweep-across-node-counts` (`packages/db-p2p/te
 What this costs today, stated narrowly: in the case the sweep drives — a promise-phase shortfall — the pend never reached consensus, so no member stored a pending record and nothing is actually stranded. The cost is about a second of latency per refusal and a warning that reads like a stranded record when there is none.
 
 Where it stops being harmless: a pend that DID reach consensus, followed by a member leaving before the commit or cancel. At two or three machines the cancel then cannot discharge until that member returns, so the records stand on the reachable members for exactly as long as the absence lasts — the client-side bound in this ticket does not help, because no amount of retrying reaches the quorum. That is the shape `implement/1.5-a-member-that-leaves-mid-session-and-returns` drives.
+
+## Arm, 2026-09-16 — the "member leaves mid-commit" shape, measured at three machines
+
+Measured while building `packages/db-p2p/test/member-leaves-and-returns.spec.ts` (ticket `a-member-that-leaves-mid-session-and-returns`), on the in-process mesh with the production-shaped configuration. One run, observed and not asserted — the spec deliberately drives the other timing.
+
+A write's commit runs as two cluster transactions: the collection's tail block first, then a sweep of its other blocks (`NetworkTransactor.commit`). If the third member promises the TAIL commit and drops before voting on it, the tail still commits on the other two (the commit phase needs only two of three). The sweep then cannot collect its three promises, so the write is acknowledged with `quorum: 'majority'` and `torn` naming the swept block, and `cancelAbandonedSweepBlocks` cannot discharge the sweep's pending record either — a cancel needs the same three promises. The record stays on all three members.
+
+The cost while the member is away: the next write from another member was not refused with the ~0.9 s promise shortfall a clean absence produces. Its pend met the stranded record as a conflict (`pending conflict: block(s) held by unresolved rival action(s) <id>`), which `Collection.sync` retries, so it failed after **27.5 s** with `SyncRetryExhaustedError`. Once the member returned, writes worked again; the first took 2.5 s.
+
+So, stated narrowly: at three machines a member lost at the wrong instant of a commit costs every later writer the full sync retry budget, for as long as that member is away, and the error it gets names a rival action rather than the absent member. The spec drives the same absence one step later (after the tail), where nothing is stranded; this arm is here so a sweep design weighs the tail-step timing too.

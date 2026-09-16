@@ -572,7 +572,9 @@ gate before penalizing a `false-approval`.
 Once the tail block commits, the coordinator now tracks any peers that promised but failed to acknowledge their commit. These peers are treated as *in-doubt* participants and are retried with exponential backoff until:
 
 - The peer acknowledges the commit and the local record reflects its signature; or
-- The retry budget is exhausted (defaults: 5 attempts, growth capped at 30 s intervals).
+- The retry budget is exhausted (defaults: 5 attempts, the first 250 ms after the missed broadcast and each later one after double the previous wait, capped at 8 s — so the last attempt lands about 7.75 s after the miss).
+
+The retry lives only in the coordinator's memory: a member that stays away longer than that, or whose coordinator restarts meanwhile, is not owed anything afterwards. At three machines such a member still heals on its own reads — it holds the pending record it stored when it promised, and a read that sees the action committed in the collection's log promotes it — which `packages/db-p2p/test/member-leaves-and-returns.spec.ts` pins alongside the retry path.
 
 Retries reuse the original `ClusterRecord` so peers that missed the initial commit can still apply the operation idempotently.
 

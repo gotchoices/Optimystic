@@ -1,8 +1,9 @@
 /**
- * The in-process mesh a spec builds when it runs ONE transaction scenario at several machine counts
- * (`transaction-node-count-sweep.spec.ts`), plus the two pieces of per-node plumbing such a spec needs
- * and the harness does not provide: a transactor that is genuinely driven BY a given node, and a way to
- * make one node unreachable from everybody at once.
+ * The in-process mesh a spec builds when it runs a transaction scenario at a real deployment's machine
+ * count (`transaction-node-count-sweep.spec.ts`, `member-leaves-and-returns.spec.ts`), plus the per-node
+ * plumbing such a spec needs and the harness does not provide: a transactor that is genuinely driven BY a
+ * given node, a way to make one node unreachable from everybody at once, and a record of every pend and
+ * commit a scenario issued, checkable against each node's own storage.
  *
  * ## The configuration is the production-shaped one, deliberately
  *
@@ -18,7 +19,12 @@
  * peers — so it is the default replication factor too, and at every size the sweep covers the whole mesh
  * is in every cohort. That is asserted by the sweep rather than assumed here.
  */
-import { NetworkTransactor, routingKeyForBlock, type IKeyNetwork, type IRepo, type ITransactor, type PeerId as DbPeerId } from '@optimystic/db-core';
+import { expect } from 'chai';
+import {
+	NetworkTransactor, SyncRetryExhaustedError, routingKeyForBlock,
+	type ActionId, type BlockId, type CommitRequest, type CommitResult, type IKeyNetwork, type IRepo, type ITransactor,
+	type PendRequest, type PendResult, type PeerId as DbPeerId
+} from '@optimystic/db-core';
 import { createMesh, type Mesh, type MeshNode, type MeshOptions } from '../../src/testing/mesh-harness.js';
 import { DEFAULT_CLUSTER_SIZE } from '../../src/cluster/cluster-policy.js';
 
@@ -122,4 +128,103 @@ export function transactorDrivenBy(mesh: Mesh, driver: MeshNode, options: Driven
 			return node.coordinatorRepo as unknown as IRepo;
 		}
 	});
+}
+
+// ── What a scenario issued, and what storage holds ───────────────────────────────────────────────────
+
+/** One pend or commit the Tree layer issued through a transactor, and what came back. */
+export interface Attempt {
+	readonly kind: 'pend' | 'commit';
+	readonly actionId: ActionId;
+	readonly rev: number | undefined;
+	readonly blockIds: readonly BlockId[];
+	readonly result?: PendResult | CommitResult;
+	readonly thrown?: unknown;
+}
+
+/** Forwards every call to `inner`, recording each pend and commit with its outcome (a thrown call is
+ *  recorded and re-thrown untouched). Explicit delegation: `NetworkTransactor` is a class, so a spread
+ *  would copy none of its methods. */
+export function recording(inner: ITransactor, attempts: Attempt[]): ITransactor {
+	const record = async <TReq, TRes extends PendResult | CommitResult>(
+		kind: Attempt['kind'], request: TReq & { actionId: ActionId }, rev: number | undefined, blockIds: readonly BlockId[], run: () => Promise<TRes>
+	): Promise<TRes> => {
+		try {
+			const result = await run();
+			attempts.push({ kind, actionId: request.actionId, rev, blockIds, result });
+			return result;
+		} catch (thrown) {
+			attempts.push({ kind, actionId: request.actionId, rev, blockIds, thrown });
+			throw thrown;
+		}
+	};
+	const wrapper: ITransactor = {
+		get: gets => inner.get(gets),
+		getStatus: refs => inner.getStatus(refs),
+		cancel: ref => inner.cancel(ref),
+		pend: (request: PendRequest) => record('pend', request, request.rev, [], () => inner.pend(request)),
+		commit: (request: CommitRequest) => record('commit', request, request.rev, request.blockIds, () => inner.commit(request))
+	};
+	if (inner.queryClusterNominees) {
+		wrapper.queryClusterNominees = blockId => inner.queryClusterNominees!(blockId);
+	}
+	return wrapper;
+}
+
+export const committed = (attempts: readonly Attempt[]): Attempt[] =>
+	attempts.filter(a => a.kind === 'commit' && a.result?.success === true);
+
+/** The nodes whose OWN storage holds every block of `commit` at (at least) its revision — read from each
+ *  node's `StorageRepo` directly, so no cluster consult or read repair can manufacture the answer. */
+export async function durableHolders(nodes: readonly MeshNode[], commit: Attempt): Promise<MeshNode[]> {
+	const holders: MeshNode[] = [];
+	for (const node of nodes) {
+		let holdsAll = true;
+		for (const blockId of commit.blockIds) {
+			const entry = (await node.storageRepo.get({ blockIds: [blockId] }))[blockId];
+			const rev = entry?.state?.latest?.rev;
+			if (!entry?.block || rev === undefined || rev < commit.rev!) { holdsAll = false; break; }
+		}
+		if (holdsAll) holders.push(node);
+	}
+	return holders;
+}
+
+// ── The promise-phase refusal ────────────────────────────────────────────────────────────────────────
+
+/**
+ * The promise-phase shortfall, verbatim. This text is load-bearing wire text a downstream consumer matches
+ * byte-for-byte (see the NOTE at the throw in `ClusterCoordinator.executeTransaction`), and is what
+ * `cluster-coordinator-supermajority.spec.ts` (three peers) and `mesh-sanity.spec.ts` Suite 2 (three nodes)
+ * already pin, so the numbers an application would branch on are parsed out of it here too.
+ */
+const SUPER_MAJORITY_SHORTFALL = /^Failed to get super-majority: (\d+)\/(\d+) approvals \(needed (\d+), (\d+) rejections\)$/;
+
+export interface PromiseShortfall {
+	approvals: number;
+	peers: number;
+	needed: number;
+	rejections: number;
+}
+
+/**
+ * Assert that `refusal` — what a `Tree` write threw — is the promise-phase shortfall in the shape an
+ * application sees, and return its numbers.
+ *
+ * NOT the retry loop's `SyncRetryExhaustedError`: a promise-phase shortfall is thrown by the transactor, not
+ * returned as a conflict, so `Collection.sync` does not retry it and it surfaces from the first attempt. The
+ * transactor's aggregate carries the coordinator's own error as its `cause`.
+ */
+export function expectPromiseShortfall(refusal: unknown): PromiseShortfall {
+	expect(refusal).to.be.instanceOf(Error);
+	expect(refusal, `a promise shortfall is not retried: ${String((refusal as Error)?.message ?? refusal)}`).to.not.be.instanceOf(SyncRetryExhaustedError);
+	const error = refusal as Error & { cause?: unknown };
+	// This sentence is also a downstream consumer's retry discriminator — see backlog
+	// `debt-a-downstream-repo-classifies-retries-by-parsing-our-error-text` before rewording it.
+	expect(error.message, 'the transactor aggregate').to.match(/^Some peers did not complete: /);
+	expect(error.cause, `the aggregate carries the coordinator's error as its cause: ${error.message}`).to.be.instanceOf(Error);
+	const shortfall = SUPER_MAJORITY_SHORTFALL.exec((error.cause as Error).message);
+	expect(shortfall, `the cause is the promise-phase shortfall: ${(error.cause as Error).message}`).to.not.equal(null);
+	const [, approvals, peers, needed, rejections] = shortfall!.map(Number) as [number, number, number, number, number];
+	return { approvals, peers, needed, rejections };
 }

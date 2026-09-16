@@ -132,6 +132,18 @@ export interface MeshFailureConfig {
 	 * it declared, which is already its own side.
 	 */
 	partitionSides?: Set<string>[];
+	/**
+	 * Observes every REMOTE cluster delivery — promise round, commit round, commit broadcast and
+	 * scheduled commit retry alike — with the target's peer-id string and the record as sent, BEFORE
+	 * `failingPeers` is consulted for that delivery. It exists so a spec can change reachability at an
+	 * exact protocol step rather than between whole transactions: a member that promised and then
+	 * dropped before voting to commit is set unreachable here, on the delivery that would have carried
+	 * its commit vote, and that very delivery fails.
+	 *
+	 * A coordinator's OWN member is invoked in process, never through this path — as in production,
+	 * where `ClusterCoordinator.updateMember` calls it directly — so the hook never sees it.
+	 */
+	onClusterDelivery?: (targetPeerId: string, record: ClusterRecord) => void;
 }
 
 class MockPeerNetwork implements IPeerNetwork {
@@ -199,6 +211,23 @@ export interface Mesh {
 	nodes: MeshNode[];
 	failures: MeshFailureConfig;
 	keyNetwork: IKeyNetwork;
+	/**
+	 * Restart one node the way a stopped and relaunched process comes back: same identity, same raw
+	 * storage, and nothing else. `node`'s storage repo, cluster member and coordinator are rebuilt IN
+	 * PLACE on the same `MeshNode` object (so a spec's reference to it stays valid), over the
+	 * `IRawStorage` instance it was built with — for the default `MemoryRawStorage` that is exactly
+	 * "over its own storage"; a `rawStorageFactory` store is reused as-is, never re-requested.
+	 *
+	 * Everything held only in memory goes with the old instance: the member's reservations and
+	 * executed-transaction memory, the coordinator's in-flight transactions and scheduled commit
+	 * retries, every read-repair stamp. The old instance is made inert rather than merely forgotten —
+	 * its member is disposed, and every outbound call it would still make (a commit retry whose timer
+	 * fires later, a cohort consult, an archive fetch) fails the way a stopped process's dial does — so
+	 * a retry the old process owed cannot quietly deliver after the restart and pass for healing.
+	 *
+	 * Reachability (`failures`) is untouched: a node that was unreachable stays unreachable.
+	 */
+	restart(node: MeshNode): void;
 }
 
 /**
@@ -258,6 +287,12 @@ export function resolveMeshPolicy(options: MeshOptions): ResolvedClusterPolicy {
 	});
 }
 
+/** Whether one node INSTANCE is still running. Every outbound call the instance makes checks it, so an
+ *  instance {@link Mesh.restart} replaced goes quiet instead of acting alongside the new one. */
+interface NodeLifetime {
+	stopped: boolean;
+}
+
 /** The 32-byte Ed25519 seed for node `index` of a `keySeed` mesh. */
 function meshKeySeed(keySeed: number, index: number): Uint8Array {
 	const seed = new Uint8Array(32);
@@ -300,23 +335,27 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		})
 	);
 
-	// Build nodes array (partially — coordinatorRepo added after keyNetwork is ready)
 	const nodes: MeshNode[] = [];
 	const peerNetwork = new MockPeerNetwork();
 	// One real reconcile callback per node, shared between the member's commit-path `reconcileBlock`
 	// and the coordinator's read-path `acquireBlockFromCohort` — production shares one instance
-	// (`libp2p-node-base.ts`), and a spec must not be able to tell the two paths apart. Built in
-	// phase 1 (with the member), consumed again in phase 2 (by the coordinator), so it is stashed
-	// here keyed by peer id rather than widened onto the public `MeshNode` type.
+	// (`libp2p-node-base.ts`), and a spec must not be able to tell the two paths apart. Built with the
+	// member, consumed again by the coordinator, so it is stashed here keyed by peer id rather than
+	// widened onto the public `MeshNode` type.
 	const reconcileByPeer = new Map<string, ReconcileBlockCallback>();
+	/** What outlives a node instance, by peer id: the raw storage it was built over, and its index
+	 *  (`validatorFactory` is invoked with it again on restart). */
+	const durableByPeer = new Map<string, { rawStorage: IRawStorage; index: number }>();
+	/** The CURRENT instance's lifetime, by peer id — flipped to stopped by {@link Mesh.restart}. */
+	const lifetimeByPeer = new Map<string, NodeLifetime>();
 
 	// The mesh key network is built BEFORE the members: each member's `deriveExpectedCluster` (the
-	// admission gate's view) needs a per-node key network in phase 1, and constructing it here beats
-	// a late-bound slot a closure could fire on before it is filled. Safe because `nodes` is captured
-	// by reference and only consulted at call time, after the array is fully populated.
+	// admission gate's view) needs a per-node key network, and constructing it here beats a late-bound
+	// slot a closure could fire on before it is filled. Safe because `nodes` is captured by reference
+	// and only consulted at call time, after the array is fully populated.
 	//
 	// `wrapKeyNetwork` is applied HERE, before `makeNodeKeyNetwork` closes over `keyNetwork` below and
-	// before phase 1 builds any `deriveExpectedCluster` closure — every one of them reads the `keyNetwork`
+	// before any `deriveExpectedCluster` closure is built — every one of them reads the `keyNetwork`
 	// binding, so a wrapper assigned to it here is what every node's coordinator, cluster member and the
 	// returned `Mesh.keyNetwork` all observe. Reassigning `mesh.keyNetwork` after this function returns
 	// only reaches whoever reads that property later (the transactor); it is too late for the rest.
@@ -330,8 +369,9 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	 *  - under a simulated partition (`failures.partitionSides`), a caller inside a side sees only
 	 *    its side's members of the cohort — the caller-aware filtering lives here, in the per-node
 	 *    wrapper, precisely so `IKeyNetwork` itself needs no "who is asking" parameter.
-	 * The SAME instance serves both the member's admission derivation (phase 1) and the node's
-	 * coordinator (phase 2), so the two sides of a node can never see different topologies.
+	 * The SAME instance serves both the member's admission derivation and the node's coordinator, so
+	 * the two sides of a node can never see different topologies. It holds no state, so a restarted
+	 * node keeps it.
 	 */
 	const makeNodeKeyNetwork = (selfPeerId: PeerId): IKeyNetwork => {
 		const selfStr = selfPeerId.toString();
@@ -357,13 +397,13 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	};
 	const nodeKeyNetworkByPeer = new Map<string, IKeyNetwork>();
 
-	// Phase 1: create storage + cluster members
-	let nodeIndex = 0;
-	for (const { peerId, privateKey } of keyPairs) {
-		const index = nodeIndex++;
-		const rawStorage = options.rawStorageFactory
-			? options.rawStorageFactory(index)
-			: new MemoryRawStorage();
+	/**
+	 * Build `meshNode`'s storage repo and cluster member over its durable raw storage, assigning both
+	 * onto the node. Run once per node at assembly, and again by {@link Mesh.restart}.
+	 */
+	const buildMember = (meshNode: MeshNode, lifetime: NodeLifetime): void => {
+		const { peerId, privateKey } = meshNode;
+		const { rawStorage, index } = durableByPeer.get(peerId.toString())!;
 		const storageRepo = new StorageRepo(
 			(blockId: BlockId) => new BlockStorage(blockId, rawStorage)
 		);
@@ -374,9 +414,12 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		// distinct peers must agree on the target `(rev, actionId)` AND on the block content, or the
 		// pass declines, persisting nothing. `reputation` is omitted — no reputation subsystem in the
 		// harness.
+		const fetchArchive = makeFetchArchive(nodes, peerId.toString(), failures);
 		const reconcileBlock = createReconcileBlock({
 			selfPeerId: peerId.toString(),
-			fetchArchive: makeFetchArchive(nodes, peerId.toString(), failures),
+			// A stopped instance fetches nothing — the production fetch swallows a failed dial into
+			// the same `undefined`.
+			fetchArchive: async (peerIdStr, blockId) => lifetime.stopped ? undefined : await fetchArchive(peerIdStr, blockId),
 			// Production shape: a proof reconcile verified against the agreed bytes is persisted so
 			// the repaired replica serves it onward.
 			saveReplicatedBlock: (blockId, block, source, verifiedProof) =>
@@ -387,20 +430,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		});
 		reconcileByPeer.set(peerId.toString(), reconcileBlock);
 
-		const nodeKeyNetwork = makeNodeKeyNetwork(peerId);
-		nodeKeyNetworkByPeer.set(peerId.toString(), nodeKeyNetwork);
-
-		// The node object exists before its member so the admission derivation below can hand the
-		// finished MeshNode to spec-supplied callbacks; `clusterMember`/`coordinatorRepo` are
-		// assigned as they are built (member just below, coordinator in phase 2) and the closures
-		// only run at vote time, long after both are in place.
-		const meshNode: MeshNode = {
-			peerId,
-			privateKey,
-			storageRepo,
-			clusterMember: undefined as any,
-			coordinatorRepo: undefined as any
-		};
+		const nodeKeyNetwork = nodeKeyNetworkByPeer.get(peerId.toString())!;
 
 		// Member-side cluster derivation for the membership admission gate — the production shape
 		// (`libp2p-node-base.deriveExpectedCluster`): the SAME per-node key network the coordinator
@@ -414,6 +444,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 				confidence: options.meshConfidence?.(meshNode) ?? 1
 			});
 
+		meshNode.storageRepo = storageRepo;
 		meshNode.clusterMember = clusterMember({
 			storageRepo,
 			peerNetwork,
@@ -426,11 +457,10 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// `validatePendOperations` then skips the validation step entirely.
 			validator: options.validatorFactory?.(index, peerId)
 		});
+	};
 
-		nodes.push(meshNode);
-	}
-
-	// Phase 2: coordinator repos (needs all nodes for routing; key network built in phase 1)
+	// Cluster traffic to a node, resolved per call: a delivery always reaches the target's CURRENT
+	// member, so a restarted node answers with its new instance.
 	const createClusterClient = (targetPeerId: PeerId): ICluster => {
 		const target = nodes.find(n => n.peerId.equals(targetPeerId));
 		if (!target) {
@@ -438,6 +468,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		}
 		return {
 			async update(record: ClusterRecord): Promise<ClusterRecord> {
+				failures.onClusterDelivery?.(targetPeerId.toString(), record);
 				if (failures.failingPeers?.has(targetPeerId.toString())) {
 					throw new Error(`Peer ${targetPeerId.toString()} is unreachable`);
 				}
@@ -446,7 +477,13 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		};
 	};
 
-	for (const node of nodes) {
+	/**
+	 * Build `node`'s coordinator over its (already built) storage repo and member. It reaches the other
+	 * nodes only at call time, never at construction. Run once per node at assembly, and again by
+	 * {@link Mesh.restart}.
+	 */
+	const buildCoordinator = (node: MeshNode, lifetime: NodeLifetime): void => {
+		const stoppedError = (): Error => new Error(`${node.peerId.toString()} was restarted; this instance is stopped`);
 		// Per-node callback: reports the queried peer's latest revision, and NOTHING else. It used to
 		// also write the peer's block into local storage ("simulate data sync"), which made every
 		// read-repair assertion on this harness observe a convergence the production callback does not
@@ -454,6 +491,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		// existed to expose. Transfer now happens where it does in production: through
 		// `acquireBlockFromCohort` below, gated on a corroborated revision.
 		const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId, context?): Promise<CertifiedActionRev | undefined> => {
+			if (lifetime.stopped) throw stoppedError();
 			// Silence: the peer never answers. REJECTS, mirroring what a dial failure does to the
 			// production callback — the coordinator must count this as "did not answer", never as
 			// an absent claim (a resolved `undefined` remains the peer answering "I hold nothing").
@@ -477,19 +515,29 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			const proof = await servableProof(target.storageRepo, blockId, latest);
 			return proof ? { ...latest, proof } : latest;
 		};
-		// The node's own self-including (and partition-aware) key-network view, built in phase 1 —
-		// the SAME instance the member's admission derivation reads, matching real
-		// Libp2pKeyPeerNetwork behavior.
+		// The node's own self-including (and partition-aware) key-network view — the SAME instance the
+		// member's admission derivation reads, matching real Libp2pKeyPeerNetwork behavior.
 		const nodeKeyNetwork = nodeKeyNetworkByPeer.get(node.peerId.toString())!;
 		const factory = coordinatorRepo(
 			nodeKeyNetwork,
-			createClusterClient,
-			// The SAME resolved policy the member above was built from, spread the way
-			// `libp2p-node-base` spreads it into its coordinator factory — carrying
-			// `repairCorroborationClusterSize` (the repair floor's yardstick, DEFAULT_CLUSTER_SIZE
-			// when the mesh declared nothing), the production `minAbsoluteClusterSize` (2, not the
-			// coordinator's own fallback of 3), and the `allowUnvalidatedSmallCluster` gate —
-			// ARMED (false) unless the mesh opted out at its call site.
+			// A stopped instance's cluster traffic fails at send — checked per delivery rather than when
+			// the client is made, because `ClusterCoordinator` also sends from a commit-retry timer that
+			// can fire long after a restart.
+			(targetPeerId: PeerId): ICluster => {
+				const client = createClusterClient(targetPeerId);
+				return {
+					async update(record: ClusterRecord): Promise<ClusterRecord> {
+						if (lifetime.stopped) throw stoppedError();
+						return await client.update(record);
+					}
+				};
+			},
+			// The SAME resolved policy the member was built from, spread the way `libp2p-node-base`
+			// spreads it into its coordinator factory — carrying `repairCorroborationClusterSize` (the
+			// repair floor's yardstick, DEFAULT_CLUSTER_SIZE when the mesh declared nothing), the
+			// production `minAbsoluteClusterSize` (2, not the coordinator's own fallback of 3), and the
+			// `allowUnvalidatedSmallCluster` gate — ARMED (false) unless the mesh opted out at its call
+			// site.
 			{ ...policy }
 		);
 		node.coordinatorRepo = factory({
@@ -501,9 +549,59 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// path, mirroring how `libp2p-node-base` shares one `reconcileBlock` between both.
 			acquireBlockFromCohort: reconcileByPeer.get(node.peerId.toString())!
 		});
+	};
+
+	// Phase 1: storage + cluster members, in key-pair order (the order `validatorFactory` indexes by).
+	for (const [index, { peerId, privateKey }] of keyPairs.entries()) {
+		const peerIdStr = peerId.toString();
+		durableByPeer.set(peerIdStr, {
+			rawStorage: options.rawStorageFactory ? options.rawStorageFactory(index) : new MemoryRawStorage(),
+			index
+		});
+		nodeKeyNetworkByPeer.set(peerIdStr, makeNodeKeyNetwork(peerId));
+		const lifetime: NodeLifetime = { stopped: false };
+		lifetimeByPeer.set(peerIdStr, lifetime);
+
+		// The node object exists before its member so the admission derivation can hand the finished
+		// MeshNode to spec-supplied callbacks; `storageRepo`/`clusterMember` are assigned by
+		// `buildMember` just below and `coordinatorRepo` in phase 2, and those closures only run at
+		// vote time, long after all three are in place.
+		const meshNode: MeshNode = {
+			peerId,
+			privateKey,
+			storageRepo: undefined as any,
+			clusterMember: undefined as any,
+			coordinatorRepo: undefined as any
+		};
+		buildMember(meshNode, lifetime);
+		nodes.push(meshNode);
 	}
 
-	return { nodes, failures, keyNetwork };
+	// Phase 2: coordinator repos, once every member exists.
+	for (const node of nodes) {
+		buildCoordinator(node, lifetimeByPeer.get(node.peerId.toString())!);
+	}
+
+	const restart = (node: MeshNode): void => {
+		const peerIdStr = node.peerId.toString();
+		if (!nodes.includes(node)) {
+			throw new Error(`restart: ${peerIdStr} is not a node of this mesh`);
+		}
+		// NOTE: this severs the old instance's traffic to OTHER nodes, not its in-process path to its own
+		// member and storage repo, which still write the shared raw storage if called. After a restart
+		// between transactions only one thing could reach it: a scheduled commit retry aimed at the
+		// coordinator's OWN member, which exists only when that member threw while applying the broadcast —
+		// a local fault no spec injects today. If a spec ever does, or restarts a node MID-transaction,
+		// sever the old coordinator's local member too.
+		lifetimeByPeer.get(peerIdStr)!.stopped = true;
+		node.clusterMember.dispose();
+		const lifetime: NodeLifetime = { stopped: false };
+		lifetimeByPeer.set(peerIdStr, lifetime);
+		buildMember(node, lifetime);
+		buildCoordinator(node, lifetime);
+	};
+
+	return { nodes, failures, keyNetwork, restart };
 }
 
 /**

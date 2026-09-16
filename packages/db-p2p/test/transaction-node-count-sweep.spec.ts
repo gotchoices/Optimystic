@@ -30,12 +30,12 @@
 import { expect } from 'chai';
 import {
 	Tree, SyncRetryExhaustedError, isConflictFailure, isFullyDurable,
-	type ITransactor, type PendRequest, type CommitRequest, type PendResult, type CommitResult,
-	type StaleFailure, type WriteDurability, type BlockId, type ActionId
+	type ITransactor, type StaleFailure, type WriteDurability, type ActionId
 } from '@optimystic/db-core';
 import { resolveMeshPolicy, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
 import {
-	createProductionShapedMesh, productionShapedMeshOptions, cohortOf, setUnreachable, transactorDrivenBy
+	createProductionShapedMesh, productionShapedMeshOptions, cohortOf, setUnreachable, transactorDrivenBy,
+	recording, committed, durableHolders, expectPromiseShortfall, type Attempt
 } from './util/node-count-mesh.js';
 import { sequentialPhases } from './util/two-machine-lifecycle.js';
 
@@ -77,15 +77,7 @@ const acknowledgedWithOneAway = (n: number): boolean => {
  *  promised and then failed to store, and `commit-durability-quorum.spec.ts` pins it at a two-member cohort. */
 const DOCUMENTED_ONE_AWAY: Record<number, 'acknowledged' | 'refused'> = { 2: 'refused', 3: 'refused', 4: 'acknowledged', 5: 'acknowledged' };
 
-/**
- * The promise-phase shortfall, verbatim. This text is load-bearing wire text a downstream consumer matches
- * byte-for-byte (see the NOTE at the throw in `ClusterCoordinator.executeTransaction`), and is what
- * `cluster-coordinator-supermajority.spec.ts` (three peers) and `mesh-sanity.spec.ts` Suite 2 (three nodes)
- * already pin, so the numbers an application would branch on are parsed out of it here too.
- */
-const SUPER_MAJORITY_SHORTFALL = /^Failed to get super-majority: (\d+)\/(\d+) approvals \(needed (\d+), (\d+) rejections\)$/;
-
-// ── Rows and recording ───────────────────────────────────────────────────────────────────────────────
+// ── Rows ─────────────────────────────────────────────────────────────────────────────────────────────
 
 interface Row {
 	key: string;
@@ -94,63 +86,6 @@ interface Row {
 
 const keyOf = (row: Row): string => row.key;
 const TREE_ID = 'node-count-sweep';
-
-/** One pend or commit the Tree layer issued through a transactor, and what came back. */
-interface Attempt {
-	readonly kind: 'pend' | 'commit';
-	readonly actionId: ActionId;
-	readonly rev: number | undefined;
-	readonly blockIds: readonly BlockId[];
-	readonly result?: PendResult | CommitResult;
-	readonly thrown?: unknown;
-}
-
-/** Forwards every call to `inner`, recording each pend and commit with its outcome (a thrown call is
- *  recorded and re-thrown untouched). Explicit delegation: `NetworkTransactor` is a class, so a spread
- *  would copy none of its methods. */
-function recording(inner: ITransactor, attempts: Attempt[]): ITransactor {
-	const record = async <TReq, TRes extends PendResult | CommitResult>(
-		kind: Attempt['kind'], request: TReq & { actionId: ActionId }, rev: number | undefined, blockIds: readonly BlockId[], run: () => Promise<TRes>
-	): Promise<TRes> => {
-		try {
-			const result = await run();
-			attempts.push({ kind, actionId: request.actionId, rev, blockIds, result });
-			return result;
-		} catch (thrown) {
-			attempts.push({ kind, actionId: request.actionId, rev, blockIds, thrown });
-			throw thrown;
-		}
-	};
-	const wrapper: ITransactor = {
-		get: gets => inner.get(gets),
-		getStatus: refs => inner.getStatus(refs),
-		cancel: ref => inner.cancel(ref),
-		pend: (request: PendRequest) => record('pend', request, request.rev, [], () => inner.pend(request)),
-		commit: (request: CommitRequest) => record('commit', request, request.rev, request.blockIds, () => inner.commit(request))
-	};
-	if (inner.queryClusterNominees) {
-		wrapper.queryClusterNominees = blockId => inner.queryClusterNominees!(blockId);
-	}
-	return wrapper;
-}
-
-const committed = (attempts: readonly Attempt[]): Attempt[] =>
-	attempts.filter(a => a.kind === 'commit' && a.result?.success === true);
-
-/** How many nodes' OWN storage holds every block of `commit` at (at least) its revision. */
-async function durableHolders(nodes: readonly MeshNode[], commit: Attempt): Promise<MeshNode[]> {
-	const holders: MeshNode[] = [];
-	for (const node of nodes) {
-		let holdsAll = true;
-		for (const blockId of commit.blockIds) {
-			const entry = (await node.storageRepo.get({ blockIds: [blockId] }))[blockId];
-			const rev = entry?.state?.latest?.rev;
-			if (!entry?.block || rev === undefined || rev < commit.rev!) { holdsAll = false; break; }
-		}
-		if (holdsAll) holders.push(node);
-	}
-	return holders;
-}
 
 /** A fresh Tree handle through `transactor` — no staged or cached state from an earlier handle answers. */
 async function readRow(transactor: ITransactor, key: string): Promise<string | undefined> {
@@ -416,20 +351,8 @@ describe('Transaction sweep across node counts (one scenario at 1–5 machines)'
 						row.observedOneAway = `acknowledged (${durability!.confirmed} of ${durability!.cohort} hold it) in ${elapsedMs}ms`;
 					} else {
 						expect(refusal, `with ${size - 1} of ${size} reachable the write must be refused (it returned ${JSON.stringify(durability)})`).to.not.equal(undefined);
-						// The shape an application sees. NOT the retry loop's `SyncRetryExhaustedError`: a promise-phase
-						// shortfall is thrown by the transactor, not returned as a conflict, so `Collection.sync` does
-						// not retry it and it surfaces from the first attempt. The transactor's aggregate carries the
-						// coordinator's own error as its `cause`.
-						expect(refusal).to.be.instanceOf(Error);
-						expect(refusal).to.not.be.instanceOf(SyncRetryExhaustedError);
-						const error = refusal as Error & { cause?: unknown };
-						// This sentence is also a downstream consumer's retry discriminator — see backlog
-						// `debt-a-downstream-repo-classifies-retries-by-parsing-our-error-text` before rewording it.
-						expect(error.message, 'the transactor aggregate').to.match(/^Some peers did not complete: /);
-						expect(error.cause, `the aggregate carries the coordinator's error as its cause: ${error.message}`).to.be.instanceOf(Error);
-						const shortfall = SUPER_MAJORITY_SHORTFALL.exec((error.cause as Error).message);
-						expect(shortfall, `the cause is the promise-phase shortfall: ${(error.cause as Error).message}`).to.not.equal(null);
-						const [, approvals, peers, needed, rejections] = shortfall!.map(Number);
+						// The shape an application sees — see `expectPromiseShortfall`.
+						const { approvals, peers, needed, rejections } = expectPromiseShortfall(refusal);
 						expect({ approvals, peers, needed, rejections }, 'the numbers an application would branch on')
 							.to.deep.equal({ approvals: size - 1, peers: size, needed: promiseBar(size), rejections: 0 });
 						// Nothing committed, so no reachable node reads the refused row.
