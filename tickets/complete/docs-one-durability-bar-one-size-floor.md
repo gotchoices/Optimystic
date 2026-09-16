@@ -118,3 +118,22 @@ codebase issue.
 - The Fact 4c style inconsistency noted above (blockquote vs. inline parenthetical) is the one place
   I deviated from the ticket's literal wording, for readability reasons stated above — worth a quick
   read to confirm it's an acceptable call.
+
+## Review findings
+
+Read the implement diff (7514e2a6) first, then verified its code claims against source.
+
+**Checked and confirmed accurate:** promise-phase `Math.ceil(peerCount * superMajorityThreshold)` (`cluster-repo.ts:990`) and the n=1..4 table arithmetic; commit-round strict-majority check (`commit-proof.ts:224`); `commitSolo` dispatch (`coordinator-repo.ts:2505`); `responsibilityK ?? 1` and `smallMesh = … < responsibilityK` on both repo (`repo/service.ts:244`) and cluster (`cluster/service.ts:177`) paths; every new anchor (`#theorem-6-durability`, architecture.md supported-sizes slug, cluster.md phase headings) matches its heading; Theorem 2/3/7/14/15 references point at the right theorems. Grepped docs and package docs for leftover stale claims ("unconditionally verifiable", "rollback mechanisms", "K=3 is", "return success to the client") — none remain.
+
+**Minor, fixed inline (docs/correctness.md Theorem 6):**
+- Node-crash sentence claimed a `full`/`majority` acknowledgement "names a surviving quorum" — overclaims, since a crash can remove members of that majority. Reworded to what actually holds: a strict majority held the revision durably at answer time, so the revision survives any crash leaving one holder, and the drain restores the rest.
+- "Promise super-majority is always ≥ the acknowledgement strict majority" is only true for thresholds above one half; qualified it (threshold is configurable via `clusterPolicy.superMajorityThreshold`).
+- The n=1 paragraph omitted that `commitSolo` is also taken when the cohort never resolved (the `unrouted` case); added.
+
+**Style judgment call (cluster.md top-of-file blockquote vs inline parentheticals):** accepted — the first literal occurrence in cluster.md is a poor anchor for a definition; no change.
+
+**Major findings:** none — docs-only change, no code site involved.
+
+**Tripwires:** none new. The implementer's note that hand-verified anchors break silently if headings are renamed is an existing, accepted condition (no markdown link checker in the repo); not re-parked.
+
+**Tests/lint:** not run — no source files changed by either implement or review; nothing for the suite to exercise.

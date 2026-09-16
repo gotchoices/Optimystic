@@ -208,9 +208,9 @@ Commit writes to a log-structured chain with prior-hash linking (SHA-256 of prev
    - **Commit-phase signature majority (non-blocking).** A member signs commit once it has seen enough approving promises; a shortfall here does not throw, it just means the round has not yet accumulated enough commit signatures.
    - **The acknowledgement gate — what the coordinator actually reports to the writer.** Success is *not* reported on the strength of the commit-signature count. The coordinator requires a strict majority of the cohort to report, after each member's own storage reconcile, that it durably holds the committed revision. This mechanism is defined in full under "Commit durability reporting" in §2 above — see there for the `WriteDurability` classes and the under-replication ledger; it is not restated here. A shortfall returns a retryable conflict (`COMMIT_NOT_DURABLE_REASON`), never a false success.
 
-   The promise-phase super-majority is always ≥ the acknowledgement gate's strict majority, so a transaction that clears promise phase leaves the acknowledgement gate satisfiable absent further failures. The two remain separate checks with separate failure modes (throw vs. retryable conflict), not the same number seen twice.
+   At any `superMajorityThreshold` above one half (the default is 0.75), the promise-phase super-majority is ≥ the acknowledgement gate's strict majority, so a transaction that clears promise phase leaves the acknowledgement gate satisfiable absent further failures. The two remain separate checks with separate failure modes (throw vs. retryable conflict), not the same number seen twice.
 
-   **n = 1 is a distinct code path, not a degenerate case of the above.** `CoordinatorRepo.commitSolo` skips cluster consensus entirely — the lone member self-signs a solo proof and the write is acknowledged on that basis alone. The acknowledgement gate is never evaluated at `n = 1`.
+   **n = 1 is a distinct code path, not a degenerate case of the above.** `CoordinatorRepo.commitSolo` — taken when the resolved cohort has at most one peer, or when the cohort never resolved — skips cluster consensus entirely — the lone member self-signs a solo proof and the write is acknowledged on that basis alone. The acknowledgement gate is never evaluated at `n = 1`.
 
    | n | Promise-phase requirement (⌈0.75n⌉) | Practical consequence |
    |---|---|---|
@@ -219,7 +219,7 @@ Commit writes to a log-structured chain with prior-hash linking (SHA-256 of prev
    | 3 | 3 | all three must approve |
    | 4 | 3 | tolerates one absent |
 
-Node crash: an acknowledgement at `full` or `majority` durability names a surviving quorum that still holds the committed revision; recovering nodes sync from peers on restart (Theorem 14). An acknowledgement at `local` or `unrouted` durability names no such quorum by construction — §2 "Commit durability reporting" describes how the under-replication ledger tracks and later heals that shortfall.
+Node crash: an acknowledgement at `full` or `majority` durability means a strict majority of the cohort held the committed revision in durable storage when the writer was answered, so the revision survives any crash that leaves at least one of those holders; the under-replication drain restores the remaining copies; recovering nodes sync from peers on restart (Theorem 14). An acknowledgement at `local` or `unrouted` durability names no such quorum by construction — §2 "Commit durability reporting" describes how the under-replication ledger tracks and later heals that shortfall.
 
 **Depends on:** Promise-phase super-majority, the acknowledgement/durability gate (§2 "Commit durability reporting"), prior-hash chain integrity, batch write durability.
 
