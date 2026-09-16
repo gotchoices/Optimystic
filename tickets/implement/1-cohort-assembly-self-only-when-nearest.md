@@ -103,3 +103,7 @@ two connected parties in one strand over a relay, one collection's blocks resolv
 resolution. It is being run **before** this chain so its diagnosis is made against the current rule. If
 it concludes the cause is cohort assembly, it will name which ticket in this chain addresses it or add an
 arm here — read `tickets/complete/` for its outcome before starting.
+
+# Note from `fix/a-second-party-cannot-read-the-messages-it-just-wrote` (2026-09-16)
+
+That fix ticket was sequenced ahead of this chain in case the device report came from cohort assembly. It does not. In a two-party group every block of every collection resolves to the same cohort (both peers once identified, self alone before), so no collection can route differently from another; the report's causes were a storage-location collision between same-named tables (`implement/same-named-tables-in-two-schemas-share-storage`) and a joiner committing alone before its first sync (an arm on `backlog/more-design/6.5-partition-healing`). `packages/db-p2p/test/two-party-cohort-is-collection-independent.spec.ts` pins this over FRET's real ring and the production `findCluster`; both of its cases should still hold after this ticket, because with two serving peers and the default `clusterSize` both peers are among the nearest. If this ticket breaks it, that is a regression in the small-network regime, not a test to update.
