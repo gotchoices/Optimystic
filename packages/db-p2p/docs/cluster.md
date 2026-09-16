@@ -2,6 +2,8 @@
 
 The cluster client/service system provides the core distributed consensus mechanism for the Optimystic database, implementing a robust 2-phase commit protocol that ensures consistency across peer-to-peer networks. This document describes the architecture, components, and protocols that enable reliable distributed database operations.
 
+> **Terminology.** "Cohort" throughout this document means a block's cluster/replica-set peers (the `ClusterPeers` map on a `ClusterRecord`) — a small set, often 1-10 peers. This is a different, larger structure than the ~16-peer topic-forwarding cohort defined in [`cohort-topic.md`](../../../docs/cohort-topic.md); do not conflate the two.
+
 ## Architecture Overview
 
 The cluster system consists of three main components working together:
@@ -263,7 +265,9 @@ if (promiseCount < superMajority) {
 
 ### Phase 2: Commit Execution (Simple Majority Required)
 
-Once super-majority promises are collected, the commit phase begins. **Commits only require a simple majority (>50%)** to prove commitment. The coordinator can return success to the client as soon as majority commits are received, with remaining propagation happening in the background via the [commit retry loop](#commit-retry-loop).
+Once super-majority promises are collected, the commit phase begins. **Commits only require a simple majority (>50%)** to prove commitment, with remaining propagation happening in the background via the [commit retry loop](#commit-retry-loop).
+
+This simple majority is the *cluster-internal* commit-signature count — how many members have signed commit — not the writer-facing acknowledgement. The coordinator's answer to the writer is gated separately, by a post-reconcile storage-durability majority (the durability gate); it does not follow from commit-signature count alone. See [`docs/correctness.md` Theorem 6](../../../docs/correctness.md#theorem-6-durability) for the full three-checkpoint pipeline.
 
 Each cluster member transitions to the commit phase when it sees enough approving promises (based on its configured threshold):
 

@@ -178,22 +178,12 @@ The `ClusterCoordinator` manages the distributed transaction protocol using a 2-
 **Transaction Phases:**
 
 #### Phase 1: Promise Collection
-```typescript
-// Collect promises from all peers in the cluster
-const promiseResults = await this.collectPromises(peers, record);
 
-// Check for majority consensus
-const majority = Math.floor(Object.keys(peers).length / 2) + 1;
-if (Object.keys(promiseResults.record.promises).length < majority) {
-  throw new Error('Failed to get majority consensus');
-}
-```
+The coordinator collects promises from cluster peers and requires a **super-majority** (default 75% of peers), not a simple majority — a shortfall throws. See [`cluster.md` § Phase 1: Promise Collection (Super-Majority Required)](cluster.md#phase-1-promise-collection-super-majority-required) for the exact check, and [`docs/correctness.md` Theorem 6](../../../docs/correctness.md#theorem-6-durability) for how this composes with the later, separate durability gate.
 
 #### Phase 2: Commit Execution
-```typescript
-// Commit the transaction to all peers
-return await this.commitTransaction(promiseResults.record);
-```
+
+Once promise super-majority is reached, the coordinator drives the commit phase. See [`cluster.md` § Phase 2: Commit Execution (Simple Majority Required)](cluster.md#phase-2-commit-execution-simple-majority-required) for the commit-signature majority check — that check is cluster-internal, not the writer-facing acknowledgement rule (`docs/correctness.md` Theorem 6 has the latter).
 
 ## Protocol Specifications
 
@@ -320,37 +310,28 @@ Coordinator and cohort selection route work only to peers confirmed `serves`. A 
 the repo protocol therefore becomes routable the moment its identify exchange completes; a peer whose
 ids are misspelled stays `foreign` forever and is silently skipped.
 
+### Responsibility K and the redirect-skip check
+
+`NodeOptions.responsibilityK` (`libp2p-node-base.ts`) sets the replica-set width a node checks itself
+against before deciding whether to handle a request locally or redirect it — distinct from
+`kBucketSize` (DHT routing) and `clusterSize` (consensus quorum, the replication factor). On the repo
+path (`RepoService.checkRedirect`) and the cluster path (`ClusterService`'s equivalent check), a node
+computes `smallMesh = cluster.length < responsibilityK`: when `smallMesh` is true, or the node is a
+member of the resolved cluster, it processes the request locally; otherwise it redirects to the
+cluster's actual members.
+
+The default is `1` everywhere it is constructed (`init.responsibilityK ?? 1`). At that default,
+`smallMesh` is true only for an empty resolved cluster — which does not occur in practice — so the
+check is effectively a no-op unless an embedder explicitly raises `responsibilityK` above `1`. Raising
+it widens the band of non-member peers that skip redirecting and instead process a request locally.
+
 ## Distributed Consensus Algorithm
 
-### 2-Phase Commit Protocol
+Each cluster runs a 2-phase commit round (promise, then commit) to reach consensus on a single block's next revision. See [`cluster.md`](cluster.md) for the full protocol, the phase state machine, and the exact promise/commit thresholds — this document does not duplicate it.
 
-The system uses a 2-phase commit protocol to ensure atomicity across distributed operations:
+**What this buys a multi-collection transaction is narrower than "atomicity across distributed operations."** Collections are pended under one content-addressed transaction id (atomicity of *intent*), but each collection's commit then lands independently, and there is **no cross-collection undo**: a collection that commits stays committed even if a sibling collection's commit permanently fails. See [`docs/correctness.md`](../../../docs/correctness.md) Theorem 3 for the full statement — including what a partial landing looks like and how it is reported to the caller — and Theorem 6 for the durability guarantee once a single collection's commit succeeds.
 
-```
-Phase 1: Promise Collection
-┌─────────────────────────────────────────────────────────────┐
-│ Coordinator → All Peers: "Prepare to commit transaction X" │
-│ All Peers → Coordinator: "Promise" or "Abort"              │
-│ Coordinator: Check majority consensus                       │
-└─────────────────────────────────────────────────────────────┘
-                               │
-                               ▼
-Phase 2: Commit Execution
-┌─────────────────────────────────────────────────────────────┐
-│ Coordinator → All Peers: "Commit transaction X"            │
-│ All Peers: Apply transaction locally                        │
-│ All Peers → Coordinator: "Committed"                       │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Fault Tolerance
-
-The system handles various failure scenarios:
-
-- **Network Partitions**: Requires majority consensus to proceed
-- **Peer Failures**: Continues with remaining peers if majority available
-- **Coordinator Failures**: Peers can detect and handle coordinator failures
-- **Partial Commits**: Implements rollback mechanisms for partial failures
+**Fault tolerance**, briefly: a network partition or peer failure below the cluster's promise super-majority blocks that cluster's writes rather than risking a split decision (Theorem 2); a coordinator that fails mid-round is bounded by transaction expiration (Theorem 7), never by an unbounded lock.
 
 ## Key Network Integration
 

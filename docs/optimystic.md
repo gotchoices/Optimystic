@@ -2,6 +2,8 @@
 
 This guide is for developers writing applications on top of Optimystic — choosing a front-end, running a node, opening collections, making mutations, handling conflicts, and picking a deployment target. For the architectural overview see [architecture.md](architecture.md); for the transaction protocol spec see [transactions.md](transactions.md).
 
+Optimystic is a substrate you build *your own* network on, not a single network you join — see [architecture.md](architecture.md) for the fuller statement of what that means at small and large scale alike.
+
 ## Two Paths In
 
 You can access Optimystic through either a **native TypeScript API** or through **SQL via Quereus**. The same underlying collections back both — a Quereus table is a `Tree` with a schema-aware encoding layer.

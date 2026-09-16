@@ -41,7 +41,7 @@ The layer holds *only soft state*. Authority over any underlying truth (transact
 - **Topic anchor** — the value the layer hashes to derive tier coordinates. For most applications the anchor *is* `topicId` and is stable; for the reactivity push tree the anchor rotates with the tail block. Anchor rotation is opaque to this layer: when an application reports a new anchor, the layer treats it as a new topic.
 - **Tier** `d` — the layer of the tree, with `d = 0` at the root. Tier `d` partitions participating peers into `F^d` groups by peer-ID prefix, where `F` is the fan-out (default 16).
 - **Tier coordinate** `coord_d(P, topicId)` — the FRET ring coordinate at which the cohort responsible for tier `d` and peer-prefix sharing `P`'s first `d·log₂F` bits sits.
-- **Cohort** — the FRET two-sided cohort of `k` peers (default 16) around a tier coordinate.
+- **Cohort** — the FRET two-sided cohort of `k` peers (default 16) around a tier coordinate. (Distinct from [`cluster.md`](../packages/db-p2p/docs/cluster.md)'s use of "cohort" for a block's much smaller cluster/replica-set peers.)
 - **Forwarder cohort** — a cohort with active state for one or more topics. Cold cohorts hold nothing.
 - **Promoted cohort** — a forwarder cohort that has hit its direct-participant cap for a topic and now redirects new arrivals to tier `d+1`.
 - **Willingness** — a per-cohort-member, per-tier decision whether to personally serve a given registration. Device-specific.

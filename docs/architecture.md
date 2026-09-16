@@ -2,6 +2,8 @@
 
 Optimystic is a distributed database for peer-to-peer networks. It provides ACID transactions over versioned, replicated block storage with strong consistency guarantees, Byzantine fault tolerance, and adaptive topology management — all without centralized coordination.
 
+Optimystic is a **substrate**, not a network: independent parties each build their own network on top of it, rather than everyone joining one particular well-known network the way a public blockchain is built around its own chain. A network built on Optimystic may be tiny and private (one family's devices) or large and public (a shared registry, a voting system) — the same protocol applies unchanged at whatever scale a deployer chooses. See *Supported deployment sizes* below for the size floor and *Byzantine Fault Tolerance* / the Arachnode ring hierarchy for how the same topology scales up.
+
 This document is the top-level architectural map. It explains the layers, names the parts, and points to the deep-dive docs for each subsystem.
 
 ## Design Principles
