@@ -34,47 +34,125 @@ export const rootId$ = nameof<TreeCollectionHeaderBlock>("rootId");
  *   foreign hit throws {@link TreeRangeTakenError}. The entry being staged lands inside
  *   its own range, so the scan excludes its exact key — otherwise every guarded
  *   re-stage of a present key (a replay after a clean refresh) would refuse itself.
+ * - `unchanged` — see {@link TreeUnchangedGuard}: the only kind that says something must
+ *   still BE here, rather than that nothing may be.
  *
  * MIXED VERSIONS: a peer running a build that predates guards destructures `[key, entry]`
  * and ignores the third slot — its replays revert to today's silent overwrite. No version
  * gating exists yet (see backlog ticket `debt-mixed-version-identify-incompatibility`).
  */
-export type TreeEntryGuard<TKey> =
+export type TreeEntryGuard<TKey, TEntry = unknown> =
 	| { kind: 'absent' }
 	| { kind: 'keepExisting' }
-	| { kind: 'absentRange', range: KeyRange<TKey> };
-
-/** Represents a unit of change to a tree collection. */
-export type TreeReplaceAction<TKey, TEntry> = [
-	// The key to replace
-	key: TKey,
-	// The new entry to replace the old entry with (if not provided, the key is deleted)
-	entry?: TEntry,
-	// Optional uniqueness intent, re-checked on every handler run (see TreeEntryGuard).
-	// Absent = plain upsert, so existing callers and previously committed log entries
-	// deserialize and replay unchanged.
-	guard?: TreeEntryGuard<TKey>,
-][];
+	| { kind: 'absentRange', range: KeyRange<TKey> }
+	| TreeUnchangedGuard<TEntry>;
 
 /**
- * Thrown by the tree `replace` handler when an entry guarded `absent` finds its key
- * already present — at initial staging, or (the load-bearing case) at conflict replay
- * after a rival writer's commit was adopted. The throw discards the whole action's
- * staged writes (the handler runs inside an all-or-nothing Atomic wrapper) and
- * propagates out of the sync/commit retry loops: it is not a StaleFailure, so no
- * retry absorbs it, and it must never be downgraded to a retryable condition.
+ * "The entry I am replacing must still be exactly the one I read" — the optimistic-concurrency
+ * (lost-update) guard, and the only {@link TreeEntryGuard} kind that also applies to a DELETE.
+ * The entry at the key must be PRESENT and structurally equal to `expected` (`structuralEquals`
+ * in `packages/db-core/src/utility/structural-equals.ts`); otherwise the handler throws
+ * {@link TreeEntryChangedError}.
+ *
+ * ABSENT COUNTS AS CHANGED. The staged effect was computed from an entry image that no longer
+ * exists, so re-applying it is never right: an upsert would resurrect a row a rival deleted, and
+ * a delete would be the second of two racing deletes. Refusing both is the optimistic answer —
+ * the writer read a row that is now gone, and an application-level retry then affects zero rows
+ * sequentially. If tolerating absence on deletes is ever genuinely wanted, add a separate
+ * `unchangedOrAbsent` kind rather than weakening this one's contract.
+ *
+ * `expected` is the entry AS STORED, not a digest: a guard rides in the log beside its action
+ * under the same encoding entries already use, so a full copy round-trips by construction and no
+ * digest scheme has to be invented, versioned, or kept in sync with the entry encoding.
+ *
+ * NOTE: that choice roughly doubles the row bytes of every guarded log entry (the new entry plus
+ * a full copy of the old one). If log volume ever becomes the binding constraint, replace
+ * `expected` with a content digest — the block-digest utilities under
+ * `packages/db-core/src/transaction/` are the starting point — and accept the versioning burden
+ * that comes with it.
  */
-export class TreeKeyTakenError<TKey = unknown> extends Error {
+export type TreeUnchangedGuard<TEntry = unknown> = {
+	kind: 'unchanged',
+	/** The entry image the staged write read, as stored. */
+	expected: TEntry,
+};
+
+/** An element that writes (inserts or replaces) an entry. Any {@link TreeEntryGuard} kind is
+ *  meaningful here. */
+export type TreeUpsertElement<TKey, TEntry> = [
+	// The key to write at
+	key: TKey,
+	// The entry to write
+	entry: TEntry,
+	// Optional intent, re-checked on every handler run (see TreeEntryGuard). Absent = plain
+	// upsert, so existing callers and previously committed log entries deserialize and replay
+	// unchanged.
+	guard?: TreeEntryGuard<TKey, TEntry>,
+];
+
+/** An element that deletes the entry at a key. Only {@link TreeUnchangedGuard} says anything a
+ *  delete can act on — the other kinds all assert that nothing is present, which would make the
+ *  delete a no-op by construction. The handler rejects any other kind at runtime too, since a
+ *  replayed log entry is deserialized data that this type never policed. */
+export type TreeDeleteElement<TKey, TEntry> = [
+	// The key to delete
+	key: TKey,
+	// Always empty: the absent entry is what marks this element a delete
+	entry?: undefined,
+	// Optional lost-update guard: refuse the delete unless the entry is still the one that was read
+	guard?: TreeUnchangedGuard<TEntry>,
+];
+
+/** Represents a unit of change to a tree collection. */
+export type TreeReplaceAction<TKey, TEntry> = (
+	| TreeUpsertElement<TKey, TEntry>
+	| TreeDeleteElement<TKey, TEntry>
+)[];
+
+/**
+ * Base of every refusal a {@link TreeEntryGuard} raises out of the tree `replace` handler — at
+ * initial staging, or (the load-bearing case) at conflict replay after a rival writer's commit
+ * was adopted. One contract, stated once for every subclass:
+ *
+ * - The throw **discards the whole action's staged writes** — the handler runs inside an
+ *   all-or-nothing Atomic wrapper, so not one entry of a multi-entry action lands.
+ * - It is **not a `StaleFailure`**, so neither `Collection.sync`'s retry loop nor
+ *   `TransactionCoordinator.commit`'s stale-loss re-drive absorbs it; it propagates out of the
+ *   losing commit, and it must never be downgraded to a retryable condition.
+ *
+ * Subclasses split by WHAT was refused, because consumers map them differently: a
+ * {@link TreeKeyTakenError} is a uniqueness violation (the Quereus bridge renders it as
+ * `UNIQUE constraint failed`), while a {@link TreeEntryChangedError} is a lost update. Catch
+ * this base to treat any guard refusal uniformly; catch a subclass to say which happened.
+ */
+export class TreeGuardRefusedError<TKey = unknown> extends Error {
 	constructor(
 		/** The collection whose tree refused the entry. */
 		public readonly collectionId: CollectionId,
+		/** The key whose staged entry was refused. */
+		public readonly key: TKey,
+		message: string,
+	) {
+		super(message);
+		this.name = 'TreeGuardRefusedError';
+	}
+}
+
+/**
+ * Thrown when an entry guarded `absent` finds its key already present: a duplicate-key
+ * refusal. See {@link TreeGuardRefusedError} for the contract every guard refusal shares.
+ */
+export class TreeKeyTakenError<TKey = unknown> extends TreeGuardRefusedError<TKey> {
+	constructor(
+		collectionId: CollectionId,
 		/** The key some other writer already committed (for the `absentRange` subclass: the
 		 * key this action was staging, whose claimed range a rival occupies). */
-		public readonly key: TKey,
+		key: TKey,
 		/** Subclass override of the rendered message; the default names the exact-key refusal. */
 		message?: string,
 	) {
-		super(message ?? `Tree collection ${collectionId}: key ${renderKey(key)} is already taken by a committed entry`);
+		super(collectionId, key,
+			message ?? `Tree collection ${collectionId}: key ${renderKey(key)} is already taken by a committed entry`);
 		this.name = 'TreeKeyTakenError';
 	}
 }
@@ -107,10 +185,38 @@ export class TreeRangeTakenError<TKey = unknown> extends TreeKeyTakenError<TKey>
 	}
 }
 
+/**
+ * The {@link TreeUnchangedGuard} refusal: the entry at `key` is no longer the one the staged
+ * write read — a rival committed a different entry there, or removed it (`actual` is
+ * `undefined`). A lost update, NOT a uniqueness violation, which is why this deliberately does
+ * NOT subclass {@link TreeKeyTakenError}: the Quereus bridge renders every `TreeKeyTakenError`
+ * as that collection's registered `UNIQUE constraint failed` message (`mapCommitRefusal` in
+ * `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`), and reporting a
+ * concurrent-update refusal as a uniqueness failure would mislead every client that reads it.
+ * The shared contract lives on {@link TreeGuardRefusedError}.
+ */
+export class TreeEntryChangedError<TKey = unknown, TEntry = unknown> extends TreeGuardRefusedError<TKey> {
+	constructor(
+		collectionId: CollectionId,
+		/** The key whose entry the staged write was replacing or deleting. */
+		key: TKey,
+		/** The entry image the staged write read, as carried by its guard. */
+		public readonly expected: TEntry,
+		/** What is committed at `key` now; `undefined` when the entry is gone entirely. */
+		public readonly actual: TEntry | undefined,
+	) {
+		super(collectionId, key,
+			`Tree collection ${collectionId}: the entry at key ${renderKey(key)} was `
+			+ `${actual === undefined ? 'removed' : 'changed'} by another writer since this change read it`);
+		this.name = 'TreeEntryChangedError';
+	}
+}
+
 /** String keys render JSON-quoted so framing control bytes stay visible/escaped in logs;
  * everything else via String() — JSON.stringify would throw on a bigint key, and an error
- * constructor must never be the second failure. */
-function renderKey(key: unknown): string {
+ * constructor must never be the second failure. Shared with the `replace` handler's own
+ * guard diagnostics so every tree message renders a key the same way. */
+export function renderKey(key: unknown): string {
 	return typeof key === 'string' ? JSON.stringify(key) : String(key);
 }
 

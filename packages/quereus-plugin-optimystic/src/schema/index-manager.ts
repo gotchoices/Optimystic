@@ -165,7 +165,7 @@ export function indexValueRange(indexKey: IndexKey): KeyRange<string> {
  * proves the value clear in this writer's own snapshot. The exact-key `absent` guard
  * cannot express this: the two rows sit at different tree keys inside one prefix.
  */
-export function uniquePrefixGuard(indexKey: IndexKey): TreeEntryGuard<IndexKey> {
+export function uniquePrefixGuard(indexKey: IndexKey): TreeEntryGuard<IndexKey, IndexEntry> {
 	return { kind: 'absentRange', range: indexValueRange(indexKey) };
 }
 
@@ -377,7 +377,7 @@ export class IndexManager {
 		index: StoredIndexSchema,
 		indexKey: IndexKey,
 		uniqueIndexes: ReadonlySet<string> | undefined,
-	): TreeEntryGuard<IndexKey> | undefined {
+	): TreeEntryGuard<IndexKey, IndexEntry> | undefined {
 		return uniqueIndexes?.has(index.name) ? uniquePrefixGuard(indexKey) : undefined;
 	}
 

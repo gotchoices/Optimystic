@@ -84,7 +84,8 @@ therefore carries an optional serialized guard stating the statement's intent �
 (INSERT — a present key throws `TreeKeyTakenError`), `keepExisting` (INSERT OR
 IGNORE — skip silently), `absentRange` (secondary-UNIQUE — no entry OTHER than this
 entry's own key may occupy a key *range*; a foreign hit throws `TreeRangeTakenError`,
-a subclass of `TreeKeyTakenError`). The `replace` handler (`buildInit` in
+a subclass of `TreeKeyTakenError`), and `unchanged` (the lost-update check, below).
+The `replace` handler (`buildInit` in
 `packages/db-core/src/collections/tree/tree.ts`) enforces the guard on **every** run —
 initial staging and every conflict replay — so the decision is always re-made against
 the newest adopted committed state. The throw is not a `StaleFailure`, so neither
@@ -129,9 +130,18 @@ INSERT whose primary key collides and resolves REPLACE, and UPDATE), which settl
 collision the writer's own snapshot can see before the guard ever runs. A write path
 added without that probe is broken, not merely conservative: the guard refuses a
 visible collision the probe should have resolved (evicting under REPLACE, swallowing
-under IGNORE), and the retry re-refuses forever. Regression suites:
-`packages/db-core/test/tree-guard.spec.ts` (both exact-key and range guards, raw
-trees), `packages/quereus-plugin-optimystic/test/concurrent-insert-refusal.spec.ts`
+under IGNORE), and the retry re-refuses forever.
+
+The fourth kind, `unchanged`, is the only one that asserts something must still *be* at the key rather than that nothing may be there — the optimistic-concurrency (lost-update) check. The entry at the key must be present AND structurally equal to the image the staged write read, carried in the guard's `expected` field and compared by `structuralEquals` in `packages/db-core/src/utility/structural-equals.ts` (object key order ignored, `Uint8Array` leaves compared by bytes, an `undefined`-valued property treated as absent — so a guard that crossed an encoding boundary still matches an entry that did not). It is also the only kind a **delete** element may carry: every other kind asserts that nothing is present, which would make a delete a no-op by construction, so the handler rejects them there loudly instead of ignoring them the way it used to ignore every guard on a delete. A mismatch throws `TreeEntryChangedError`, which deliberately does **not** subclass `TreeKeyTakenError` — a lost update is not a uniqueness violation, and the bridge's `UNIQUE constraint failed` mapping would misreport it as one. Both extend `TreeGuardRefusedError`, which is where the contract every guard refusal obeys is written down once: it discards the whole action's staged writes, it is not a `StaleFailure`, and it is never downgraded to a retryable condition.
+
+**An absent entry counts as changed**, on upserts and deletes alike. The staged effect was computed from an image that no longer exists, so re-applying it is never right: an upsert would resurrect a row a rival deleted, and a delete would be the second of two racing deletes. Refusing both is the optimistic-concurrency answer — the writer read a row that is now gone — and an application-level retry then affects zero rows sequentially. `expected` holds a full copy of the entry rather than a digest, so it round-trips through the log under the same encoding entries already use and no digest scheme has to be invented or versioned; the cost is roughly double the row bytes on every guarded log entry, noted at the type for whenever log volume becomes the binding constraint.
+
+Nothing in the SQL layer stages an `unchanged` guard yet — which statements carry it, and the decision that a racing same-row UPDATE or DELETE is refused rather than resolved last-writer-wins, belong to the sibling ticket `refuse-concurrent-row-change-loser`.
+
+Regression suites:
+`packages/db-core/test/tree-guard.spec.ts` (every guard kind over raw trees),
+`packages/db-core/test/structural-equals.spec.ts` (the `unchanged` comparison itself),
+`packages/quereus-plugin-optimystic/test/concurrent-insert-refusal.spec.ts`
 (PK, two `Database` handles, legacy + session) and
 `packages/quereus-plugin-optimystic/test/concurrent-secondary-unique-refusal.spec.ts`
 (secondary UNIQUE, same shape).

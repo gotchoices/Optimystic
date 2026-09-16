@@ -2,7 +2,88 @@ import { Collection, type CollectionInitOptions, type CollectionId, type Collect
 import type { ITransactor, BlockId, BlockStore, IBlock, ActionId } from "../../index.js";
 import { BTree, type Path, type KeyRange } from "../../btree/index.js";
 import { CollectionTrunk } from "./collection-trunk.js";
-import { TreeHeaderBlockType, TreeKeyTakenError, TreeRangeTakenError, type TreeReplaceAction } from "./struct.js";
+import { structuralEquals } from "../../utility/structural-equals.js";
+import {
+	TreeHeaderBlockType, TreeEntryChangedError, TreeKeyTakenError, TreeRangeTakenError, renderKey,
+	type TreeEntryGuard, type TreeReplaceAction,
+} from "./struct.js";
+
+/**
+ * Enforce a guard carried by an UPSERT element against the CURRENT content of `actionTree` —
+ * the same Atomic store the upsert writes to, so it sees what earlier elements of this same
+ * replay already staged or deleted (an UPDATE's delete-old half runs before its guarded insert
+ * half). Throws the guard's refusal, which discards the whole action's staged writes.
+ *
+ * @returns `'skip'` when the element must be left unwritten (`keepExisting` found the key
+ * 	occupied — the INSERT OR IGNORE disposition), `'proceed'` otherwise.
+ */
+async function enforceUpsertGuard<TKey, TEntry>(
+	actionTree: BTree<TKey, TEntry>,
+	id: CollectionId,
+	key: TKey,
+	guard: TreeEntryGuard<TKey, TEntry>,
+	keyFromEntry: (entry: TEntry) => TKey,
+	compare: (a: TKey, b: TKey) => number,
+): Promise<'proceed' | 'skip'> {
+	switch (guard.kind) {
+		case 'absentRange': {
+			// Secondary-UNIQUE: the claimed range (a unique index's framed value prefix) must hold
+			// no entry other than this action's own key. Two short descents (range start and end)
+			// plus an early-exit walk. The guard is plain data (it is serialized into the log with
+			// its action), and BTree.range reads the range's fields only — so a KeyRange that has
+			// round-tripped through JSON is scanned exactly like a live instance.
+			for await (const path of actionTree.range(guard.range)) {
+				const occupant = actionTree.at(path);
+				if (occupant === undefined) continue;
+				const occupantKey = keyFromEntry(occupant);
+				if (compare(occupantKey, key) === 0) continue;	// self-exclusion
+				throw new TreeRangeTakenError(id, key, guard.range, occupantKey);
+			}
+			return 'proceed';
+		}
+		case 'unchanged': {
+			assertEntryUnchanged(id, key, guard.expected, actionTree.at(await actionTree.find(key)));
+			return 'proceed';
+		}
+		case 'absent':
+		case 'keepExisting': {
+			if (!(await actionTree.find(key)).on) return 'proceed';
+			if (guard.kind === 'absent') throw new TreeKeyTakenError(id, key);
+			// keepExisting: leave the present (rival's) entry in place and skip this element.
+			return 'skip';
+		}
+	}
+}
+
+/** The lost-update check shared by guarded upserts and guarded deletes: the committed entry must
+ *  be present AND structurally equal to what the staged write read. Absence counts as changed —
+ *  see {@link TreeUnchangedGuard} for why that is the contract on both dispositions. */
+function assertEntryUnchanged<TKey, TEntry>(
+	id: CollectionId,
+	key: TKey,
+	expected: TEntry,
+	actual: TEntry | undefined,
+): void {
+	if (actual === undefined || !structuralEquals(actual, expected)) {
+		throw new TreeEntryChangedError(id, key, expected, actual);
+	}
+}
+
+/** Narrow a DELETE element's guard to the only kind a delete can act on. The element type already
+ *  says this ({@link TreeDeleteElement}), but a replayed log entry is deserialized data that no
+ *  type policed, so the handler re-checks it and fails loudly rather than silently ignoring a
+ *  guard the writer believed was being enforced. */
+function deleteGuardExpected<TKey, TEntry>(
+	id: CollectionId,
+	key: TKey,
+	guard: TreeEntryGuard<TKey, TEntry>,
+): TEntry {
+	if (guard.kind !== 'unchanged') {
+		throw new Error(`Tree collection ${id}: the delete of key ${renderKey(key)} carries a `
+			+ `'${guard.kind}' guard; only 'unchanged' is meaningful on a delete`);
+	}
+	return guard.expected;
+}
 
 /**
  * Read-only surface of a tree: every navigation/lookup method a reader needs, with
@@ -106,44 +187,36 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 						nodeCapacity,	// keep the write btree's fan-out in lock-step with the read btree
 					);
 					for (const [key, entry, guard] of actions) {
+						// NOTE: an element is a DELETE when its entry slot is falsy, not when it is
+						// strictly `undefined`. That is deliberate and load-bearing: JSON encodes the
+						// empty slot of `[key, undefined]` as `null`, so a replayed log entry arrives
+						// as `[key, null]` and a `!== undefined` test would upsert `null` over the row.
+						// The cost is that a falsy-but-real entry (`''`, `0`, `false`) reads as a
+						// delete. No entry type in this repo is falsy today (rows encode to a non-empty
+						// string or Uint8Array; index entries are arrays); if one ever is, this needs an
+						// explicit delete marker in the tuple rather than a tighter comparison.
 						if (entry) {
 							// Enforce the entry's guard (if any) on EVERY handler run — initial staging
-							// and every conflict replay — so the uniqueness decision is re-made against
-							// the newest adopted committed state, not just the stage-time snapshot.
-							// A throw here discards the whole action's staged writes (Atomic wrapper).
-							if (guard !== undefined) {
-								if (guard.kind === 'absentRange') {
-									// Secondary-UNIQUE: the claimed range (a unique index's framed
-									// value prefix) must hold no entry other than this action's own
-									// key. Two short descents (range start and end) plus an early-exit
-									// walk, over the SAME store the upsert below writes to, so it sees entries earlier
-									// actions of this replay already staged or deleted (an UPDATE's
-									// delete-old half runs before its guarded insert half). The guard
-									// is plain data (it is serialized into the log with its action), and
-									// BTree.range reads the range's fields only — so a KeyRange that has
-									// round-tripped through JSON is scanned exactly like a live instance.
-									for await (const path of actionTree.range(guard.range)) {
-										const occupant = actionTree.at(path);
-										if (occupant === undefined) continue;
-										const occupantKey = keyFromEntry(occupant);
-										if (compare(occupantKey, key) === 0) continue;	// self-exclusion
-										throw new TreeRangeTakenError(id, key, guard.range, occupantKey);
-									}
-								} else {
-									const found = await actionTree.find(key);
-									if (found.on) {
-										if (guard.kind === 'absent') {
-											throw new TreeKeyTakenError(id, key);
-										}
-										// keepExisting: leave the present (rival's) entry in place and
-										// skip this entry silently — the INSERT OR IGNORE disposition.
-										continue;
-									}
-								}
+							// and every conflict replay — so the decision is re-made against the newest
+							// adopted committed state, not just the stage-time snapshot. A throw here
+							// discards the whole action's staged writes (Atomic wrapper).
+							// Truthiness, not `!== undefined`, for the same round-trip reason as the entry
+							// slot above: an explicitly-passed `undefined` guard (the shape every unguarded
+							// index write stages) comes back from JSON as `null`, and reading `.kind` off it
+							// would throw a TypeError mid-replay instead of meaning "no guard".
+							if (guard
+								&& await enforceUpsertGuard(actionTree, id, key, guard, keyFromEntry, compare) === 'skip') {
+								continue;
 							}
 							await actionTree.upsert(entry);
 						} else {
-							await actionTree.deleteAt((await actionTree.find(key)));
+							// The path is found once and reused: the guard check reads it and `deleteAt`
+							// consumes it, with no mutation in between to invalidate it.
+							const path = await actionTree.find(key);
+							if (guard) {
+								assertEntryUnchanged(id, key, deleteGuardExpected(id, key, guard), actionTree.at(path));
+							}
+							await actionTree.deleteAt(path);
 						}
 					}
 					// Mutations landed in `trx`, not the read btree, so its version counter never moved.

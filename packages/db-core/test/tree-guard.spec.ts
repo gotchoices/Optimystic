@@ -1,11 +1,14 @@
 /**
- * Guard-carrying tree actions (ticket `concurrent-insert-guard-refuses-taken-key`).
+ * Guard-carrying tree actions (tickets `concurrent-insert-guard-refuses-taken-key` and
+ * `tree-entry-unchanged-guard`).
  *
  * A `TreeReplaceAction` entry may carry a `TreeEntryGuard` stating the intent the SQL
  * layer's pre-stage probe otherwise discards: `absent` (INSERT — the key must not
- * exist), `keepExisting` (INSERT OR IGNORE — skip silently if it does). The `replace`
- * handler enforces the guard on EVERY run — initial staging and every conflict replay —
- * so a losing concurrent writer is REFUSED (`TreeKeyTakenError`) instead of silently
+ * exist), `keepExisting` (INSERT OR IGNORE — skip silently if it does), `absentRange`
+ * (secondary-UNIQUE — nothing foreign inside a key prefix range) and `unchanged` (the
+ * lost-update check — the entry at the key must still be exactly the one this write read).
+ * The `replace` handler enforces the guard on EVERY run — initial staging and every
+ * conflict replay — so a losing concurrent writer is REFUSED instead of silently
  * overwriting the winner's committed row when its pending action replays against the
  * adopted revision.
  *
@@ -20,6 +23,8 @@
 import { expect } from 'chai';
 import {
 	Tree,
+	TreeEntryChangedError,
+	TreeGuardRefusedError,
 	TreeKeyTakenError,
 	TreeRangeTakenError,
 	KeyRange,
@@ -30,6 +35,9 @@ import {
 	blockIdsForTransforms,
 	type Transaction,
 	type BlockId,
+	type ITransactor,
+	type TreeEntryGuard,
+	type TreeReplaceAction,
 } from '../src/index.js';
 import {
 	TestTransactor,
@@ -278,6 +286,235 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 		});
 	});
 
+	// The `unchanged` guard is the only kind that says something must still BE at the key: the
+	// optimistic-concurrency (lost-update) check. It is the one kind a DELETE can also carry, and
+	// it treats an ABSENT entry as changed — the staged effect was computed from an image that no
+	// longer exists, so re-applying it would resurrect a deleted row (upsert) or be the second of
+	// two racing deletes.
+	describe('unchanged guard (lost-update refusal)', () => {
+		const original: Entry = { key: 1, name: 'original' };
+		const unchangedGuard = (expected: Entry) => ({ kind: 'unchanged' as const, expected });
+
+		/** Commit `original` at key 1 through its own handle, so every writer below opens onto a
+		 *  collection that already holds the entry their guard names. */
+		async function seedOriginal(transactor: ITransactor): Promise<void> {
+			const seeder = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			await seeder.replace([[1, original]]);
+		}
+
+		it('commits a guarded upsert while the committed entry is still the one that was read', async () => {
+			const transactor = new TestTransactor();
+			await seedOriginal(transactor);
+
+			const writer = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			await writer.stage([[1, { key: 1, name: 'updated' }, unchangedGuard(original)]]);
+			await writer.sync();
+
+			const fresh = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			expect(await fresh.get(1), 'an uncontested guarded update lands normally').to.deep.equal({ key: 1, name: 'updated' });
+		});
+
+		it('refuses an upsert whose entry a rival CHANGED first, keeping the rival\'s entry', async () => {
+			const transactor = new TestTransactor();
+			await seedOriginal(transactor);
+			const rival = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			const loser = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+
+			// The loser stages against the image it read; the rival then lands a different one.
+			await loser.stage([[1, { key: 1, name: 'loser' }, unchangedGuard(original)]]);
+			await rival.replace([[1, { key: 1, name: 'rival' }]]);
+
+			const err = await capture(() => loser.sync());
+			expect(err, 'the loser is refused, not silently applied over the rival').to.be.instanceOf(TreeEntryChangedError);
+			const refusal = err as TreeEntryChangedError<number, Entry>;
+			expect(refusal.collectionId).to.equal('users');
+			expect(refusal.key).to.equal(1);
+			expect(refusal.expected, 'the refusal carries the image the write read').to.deep.equal(original);
+			expect(refusal.actual, 'and what is committed there now').to.deep.equal({ key: 1, name: 'rival' });
+			// A lost update is NOT a uniqueness failure: the Quereus bridge renders every
+			// TreeKeyTakenError as `UNIQUE constraint failed`, which would misreport this one.
+			expect(err, 'shares the guard-refusal contract').to.be.instanceOf(TreeGuardRefusedError);
+			expect(err, 'but is not a uniqueness refusal').to.not.be.instanceOf(TreeKeyTakenError);
+
+			const fresh = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			expect(await fresh.get(1), 'the rival\'s entry is the durable one').to.deep.equal({ key: 1, name: 'rival' });
+		});
+
+		it('refuses an upsert whose entry a rival DELETED — absence counts as changed, so no row is resurrected', async () => {
+			const transactor = new TestTransactor();
+			await seedOriginal(transactor);
+			const rival = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			const loser = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+
+			await loser.stage([[1, { key: 1, name: 'loser' }, unchangedGuard(original)]]);
+			await rival.replace([[1, undefined]]);
+
+			const err = await capture(() => loser.sync());
+			expect(err).to.be.instanceOf(TreeEntryChangedError);
+			expect((err as TreeEntryChangedError<number, Entry>).actual, 'nothing is committed at the key').to.be.undefined;
+
+			const fresh = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			expect(await fresh.get(1), 'the deleted row stays deleted').to.be.undefined;
+		});
+
+		it('commits a guarded DELETE while the entry is unchanged', async () => {
+			const transactor = new TestTransactor();
+			await seedOriginal(transactor);
+
+			const writer = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			await writer.stage([[1, undefined, unchangedGuard(original)]]);
+			await writer.sync();
+
+			const fresh = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			expect(await fresh.get(1), 'an uncontested guarded delete lands normally').to.be.undefined;
+		});
+
+		it('refuses a guarded DELETE whose entry a rival changed — the delete was decided on a stale image', async () => {
+			const transactor = new TestTransactor();
+			await seedOriginal(transactor);
+			const rival = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			const loser = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+
+			await loser.stage([[1, undefined, unchangedGuard(original)]]);
+			await rival.replace([[1, { key: 1, name: 'rival' }]]);
+
+			const err = await capture(() => loser.sync());
+			expect(err, 'the delete branch evaluates its guard too').to.be.instanceOf(TreeEntryChangedError);
+			expect((err as TreeEntryChangedError<number, Entry>).actual).to.deep.equal({ key: 1, name: 'rival' });
+
+			const fresh = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			expect(await fresh.get(1), 'the rival\'s change is not deleted out from under it').to.deep.equal({ key: 1, name: 'rival' });
+		});
+
+		it('discards the WHOLE action when only one of its entries is refused', async () => {
+			const transactor = new TestTransactor();
+			await seedOriginal(transactor);
+			const rival = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			const loser = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+
+			// One action, two entries: a guarded delete of key 1 and a clean insert of key 2.
+			await loser.stage([
+				[1, undefined, unchangedGuard(original)],
+				[2, { key: 2, name: 'sibling' }, { kind: 'absent' }],
+			]);
+			await rival.replace([[1, { key: 1, name: 'rival' }]]);
+
+			const err = await capture(() => loser.sync());
+			expect(err).to.be.instanceOf(TreeEntryChangedError);
+
+			const fresh = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			expect(await fresh.get(2), 'the sibling entry of a refused action never lands').to.be.undefined;
+			expect(await fresh.get(1), 'and the refused entry is untouched').to.deep.equal({ key: 1, name: 'rival' });
+		});
+
+		it('compares a guard that round-tripped through JSON exactly like a live one', async () => {
+			// A guard rides in the log beside its action, so by the time a conflict replay reads it
+			// back it is plain deserialized data — a different object graph than the one staged.
+			const roundTrip = (guard: TreeEntryGuard<number, Entry>) =>
+				JSON.parse(JSON.stringify(guard)) as TreeEntryGuard<number, Entry>;
+
+			const transactor = new TestTransactor();
+			await seedOriginal(transactor);
+			const writer = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			await writer.stage([[1, { key: 1, name: 'updated' }, roundTrip(unchangedGuard(original))]]);
+			await writer.sync();
+			const fresh = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			expect(await fresh.get(1), 'a round-tripped expected still compares equal').to.deep.equal({ key: 1, name: 'updated' });
+
+			// ...and still refuses a genuinely different entry.
+			const other = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			const err = await capture(() => other.stage([[1, { key: 1, name: 'stale' }, roundTrip(unchangedGuard(original))]]));
+			expect(err).to.be.instanceOf(TreeEntryChangedError);
+		});
+
+		it('compares a Uint8Array-bearing entry by BYTES, not by object identity', async () => {
+			interface BlobEntry { key: number; blob: Uint8Array }
+			const byBlobKey = (e: BlobEntry) => e.key;
+			const seed: BlobEntry = { key: 1, blob: new Uint8Array([1, 2, 3]) };
+
+			const transactor = new TestTransactor();
+			const seeder = await Tree.createOrOpen<number, BlobEntry>(transactor, 'blobs', byBlobKey);
+			await seeder.replace([[1, seed]]);
+
+			// A DIFFERENT Uint8Array instance carrying the same bytes must satisfy the guard —
+			// the entry read back out of the tree is a clone, never the object that was written.
+			const writer = await Tree.createOrOpen<number, BlobEntry>(transactor, 'blobs', byBlobKey);
+			const expected: BlobEntry = { key: 1, blob: new Uint8Array([1, 2, 3]) };
+			await writer.stage([[1, { key: 1, blob: new Uint8Array([9]) }, { kind: 'unchanged', expected }]]);
+			await writer.sync();
+			const fresh = await Tree.createOrOpen<number, BlobEntry>(transactor, 'blobs', byBlobKey);
+			expect(await fresh.get(1)).to.deep.equal({ key: 1, blob: new Uint8Array([9]) });
+
+			// One differing byte is a differing entry.
+			const other = await Tree.createOrOpen<number, BlobEntry>(transactor, 'blobs', byBlobKey);
+			const err = await capture(() => other.stage([
+				[1, { key: 1, blob: new Uint8Array([0]) }, { kind: 'unchanged', expected: { key: 1, blob: new Uint8Array([9, 9]) } }],
+			]));
+			expect(err).to.be.instanceOf(TreeEntryChangedError);
+		});
+
+		it('rejects a DELETE carrying any other guard kind — at the type level and at runtime', async () => {
+			const transactor = new TestTransactor();
+			await seedOriginal(transactor);
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+
+			// The delete element type admits only an `unchanged` guard; every other kind asserts
+			// that nothing is present, which would make the delete a no-op by construction.
+			// @ts-expect-error - 'absent' is not a TreeUnchangedGuard
+			const illTyped: TreeReplaceAction<number, Entry> = [[1, undefined, { kind: 'absent' }]];
+
+			// The handler re-checks at runtime because a replayed log entry is deserialized data
+			// no type policed: better a loud failure than a guard the writer believes is enforced.
+			const err = await capture(() => tree.stage(illTyped));
+			expect(err).to.be.instanceOf(Error);
+			expect((err as Error).message).to.match(/only 'unchanged' is meaningful on a delete/);
+			expect(tree.hasUnsyncedChanges(), 'the rejected action left nothing staged').to.be.false;
+		});
+
+		it('is not retried by the sync loop: the refusal escapes on the FIRST attempt', async () => {
+			// The rival fires inside the loser's first pend, so the refusal comes out of the
+			// stale-failure retry refresh. It must end the sync there — a TreeEntryChangedError is
+			// not a StaleFailure, so nothing may absorb it into another attempt.
+			const inner = new TestTransactor();
+			await seedOriginal(inner);
+			const transactor = new CompetingWriterTransactor(
+				inner,
+				unwrapped => commitRivalTreeWrite<number, Entry>(
+					unwrapped, 'users', byKey, [[1, { key: 1, name: 'rival' }]]),
+			);
+			const loser = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			await loser.stage([[1, { key: 1, name: 'loser' }, unchangedGuard(original)]]);
+
+			const err = await capture(() => loser.sync());
+			expect(err).to.be.instanceOf(TreeEntryChangedError);
+			expect(transactor.rivalRuns, 'the competing writer really ran').to.equal(1);
+			expect(transactor.pendCalls, 'no second attempt was made').to.equal(1);
+		});
+
+		it('reads a JSON round-tripped empty slot as "no entry" / "no guard", never as a value', async () => {
+			// JSON renders the empty slots of `[key, undefined]` and `[key, entry, undefined]` as
+			// `null` — and that is exactly what a conflict replay reads back out of the log. The
+			// delete slot must stay a delete, and the absent guard slot must stay "unguarded"
+			// rather than have `.kind` read off null mid-replay.
+			const transactor = new TestTransactor();
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			await tree.replace([[1, original], [2, { key: 2, name: 'two' }]]);
+
+			const roundTripped = JSON.parse(JSON.stringify([
+				[1, undefined],									// a delete
+				[2, { key: 2, name: 'updated' }, undefined],	// an unguarded upsert (the shape every
+			])) as TreeReplaceAction<number, Entry>;			// non-unique index write stages)
+			expect(roundTripped[0]![1], 'JSON really does produce null in the entry slot').to.be.null;
+			expect(roundTripped[1]![2], 'and in the guard slot').to.be.null;
+
+			await tree.replace(roundTripped);
+
+			const fresh = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			expect(await fresh.get(1), 'the null entry slot still means delete').to.be.undefined;
+			expect(await fresh.get(2), 'the null guard slot still means unguarded upsert').to.deep.equal({ key: 2, name: 'updated' });
+		});
+	});
+
 	describe('coordinator path (TransactionCoordinator.commit inter-attempt refresh)', () => {
 		it('a real competing commit turns the retry into a refusal, and the multi-collection transaction lands NOTHING', async () => {
 			const inner = new TestTransactor();
@@ -328,6 +565,55 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 			expect(await freshUsers.get(1)).to.deep.equal({ key: 1, name: 'rival' });
 			expect(await Tree.open<number, Entry>(inner, 'posts', byKey), 'the sibling collection never committed').to.be.undefined;
 			expect(inner.getCommittedActions().size, 'only the rival\'s action is durable').to.equal(1);
+		});
+
+		it('surfaces an unchanged-guard refusal out of the inter-attempt refresh, landing NOTHING', async () => {
+			// Same shape as the absent-guard case above, for the lost-update guard: the refusal
+			// must escape the coordinator's stale-loss re-drive rather than be absorbed into
+			// another attempt, and the sibling collection's clean write must not land either.
+			const inner = new TestTransactor();
+			const original: Entry = { key: 1, name: 'original' };
+			const seeder = await Tree.createOrOpen<number, Entry>(inner, 'users', byKey);
+			await seeder.replace([[1, original]]);
+
+			const usersBlockIds = new Set<BlockId>();
+			const transactor = new CompetingWriterTransactor(
+				inner,
+				unwrapped => commitRivalTreeWrite<number, Entry>(
+					unwrapped, 'users', byKey, [[1, { key: 1, name: 'rival' }]]),
+				{ when: request => blockIdsForTransforms(request.transforms).some(id => usersBlockIds.has(id)) },
+			);
+
+			const usersTree = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			const postsTree = await Tree.createOrOpen<number, Entry>(transactor, 'posts', byKey);
+			const coordinator = new TransactionCoordinator(transactor, new Map<string, any>([
+				['users', usersTree.getCollection()],
+				['posts', postsTree.getCollection()],
+			]));
+
+			await usersTree.stage([[1, { key: 1, name: 'loser' }, { kind: 'unchanged', expected: original }]]);
+			await postsTree.stage([[100, { key: 100, name: 'clean' }]]);
+			for (const id of blockIdsForTransforms(usersTree.getCollection().tracker.transforms)) {
+				usersBlockIds.add(id);
+			}
+
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+			const statements = ['update users 1 + insert posts 100'];
+			const transaction: Transaction = {
+				stamp, statements, reads: [],
+				id: await createTransactionId(stamp.id, statements, []),
+			};
+
+			const err = await capture(() => coordinator.commit(transaction, { baseBackoffMs: 1, maxBackoffMs: 5 }));
+			expect(err, 'the inter-attempt refresh surfaces the refusal').to.be.instanceOf(TreeEntryChangedError);
+			expect((err as TreeEntryChangedError<number, Entry>).actual).to.deep.equal({ key: 1, name: 'rival' });
+			expect(transactor.rivalRuns, 'the competing writer really ran').to.equal(1);
+
+			const freshUsers = await Tree.createOrOpen<number, Entry>(inner, 'users', byKey);
+			expect(await freshUsers.get(1), 'the rival\'s row is the durable one').to.deep.equal({ key: 1, name: 'rival' });
+			expect(await Tree.open<number, Entry>(inner, 'posts', byKey), 'the sibling collection never committed').to.be.undefined;
+			// The seeder's action plus the rival's — the refused transaction added nothing.
+			expect(inner.getCommittedActions().size, 'nothing of the refused transaction is durable').to.equal(2);
 		});
 	});
 });
