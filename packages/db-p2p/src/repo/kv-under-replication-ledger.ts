@@ -179,6 +179,10 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 	 * The eviction index, loaded once from the store: every entry's block id, oldest `recordedAt`
 	 * first. A failed load is not cached, so the next mutation retries it instead of the ledger
 	 * failing every write for the life of the process.
+	 *
+	 * NOTE: the load is one read per stored entry and runs on the first commit after start; a solo
+	 * node keeps an entry per block it writes, so that commit can stall on slow storage — see
+	 * `backlog/debt-solo-node-ledger-is-reread-whole-on-first-commit-after-restart`.
 	 */
 	private index(): Promise<Set<BlockId>> {
 		if (this.indexLoad === undefined) {

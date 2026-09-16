@@ -55,6 +55,39 @@ class GatedKVStore extends MemoryKVStore {
 	}
 }
 
+/** Counts every store call by method name. */
+class CountingKVStore extends MemoryKVStore {
+	counts: Record<string, number> = {};
+
+	reset(): void {
+		this.counts = {};
+	}
+
+	private count(method: string): void {
+		this.counts[method] = (this.counts[method] ?? 0) + 1;
+	}
+
+	override async get(key: string): Promise<string | undefined> {
+		this.count('get');
+		return super.get(key);
+	}
+
+	override async set(key: string, value: string): Promise<void> {
+		this.count('set');
+		return super.set(key, value);
+	}
+
+	override async delete(key: string): Promise<void> {
+		this.count('delete');
+		return super.delete(key);
+	}
+
+	override async list(prefix: string): Promise<string[]> {
+		this.count('list');
+		return super.list(prefix);
+	}
+}
+
 describe('KvUnderReplicationLedger', () => {
 	let kv: MemoryKVStore;
 	let ledger: KvUnderReplicationLedger;
@@ -307,6 +340,59 @@ describe('KvUnderReplicationLedger', () => {
 			await kv.set(`${UNDER_REPLICATED_KEY_PREFIX}${BLOCK_A}`, JSON.stringify({ ...entry(), quorum: 'full' }));
 
 			expect(await ledger.get(BLOCK_A)).to.equal(undefined);
+		});
+	});
+
+	/**
+	 * What each call costs the store, pinned because `CoordinatorRepo.commit` awaits the ledger before
+	 * answering: on a genuinely solo node every commit records, so these counts are commit latency.
+	 */
+	describe('store operations per call', () => {
+		let counted: CountingKVStore;
+		let countedLedger: KvUnderReplicationLedger;
+		beforeEach(() => {
+			counted = new CountingKVStore();
+			countedLedger = new KvUnderReplicationLedger(counted);
+		});
+
+		it('the first mutation loads the index: one list plus one read per stored entry', async () => {
+			await countedLedger.record(entry({ blockId: BLOCK_A }));
+			await countedLedger.record(entry({ blockId: BLOCK_B }));
+			const reopened = new KvUnderReplicationLedger(counted);
+			counted.reset();
+
+			await reopened.settle(BLOCK_C, 1);
+
+			expect(counted.counts).to.deep.equal({ list: 1, get: 2 });
+		});
+
+		it('once the index is loaded, recording a block costs one read and one write', async () => {
+			await countedLedger.settle(BLOCK_C, 1);
+			counted.reset();
+
+			await countedLedger.record(entry({ blockId: BLOCK_A, rev: 3 }));
+			await countedLedger.record(entry({ blockId: BLOCK_A, rev: 4 }));
+
+			expect(counted.counts).to.deep.equal({ get: 2, set: 2 });
+		});
+
+		it('settling a block with no entry touches the store not at all', async () => {
+			await countedLedger.record(entry({ blockId: BLOCK_A }));
+			counted.reset();
+
+			await countedLedger.settle(BLOCK_B, 3);
+
+			expect(counted.counts).to.deep.equal({});
+		});
+
+		it('recording past the cap adds one delete', async () => {
+			const capped = new KvUnderReplicationLedger(counted, { maxEntries: 1 });
+			await capped.record(entry({ blockId: BLOCK_A, recordedAt: 1 }));
+			counted.reset();
+
+			await capped.record(entry({ blockId: BLOCK_B, recordedAt: 2 }));
+
+			expect(counted.counts).to.deep.equal({ get: 1, set: 1, delete: 1 });
 		});
 	});
 
