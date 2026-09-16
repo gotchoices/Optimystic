@@ -94,3 +94,12 @@ Production has no node that registers no storage protocols today (`createLibp2pN
 - Flip the integration spec's write-side pins; run it once.
 - Restate the `fetchBlockFromCluster` NOTE; update `packages/db-p2p/docs/cluster.md` §Network-Membership Scoping and the self-coordination paragraph to the new rule.
 - Build, lint, `yarn lint:docs`, db-p2p unit suite; hand off with the integration summary and any gap stated plainly.
+
+# Sequencing note (garden tender, 2026-09-16 17:4x)
+
+`fix/1-a-second-party-cannot-read-the-messages-it-just-wrote` is a device-reported defect where, between
+two connected parties in one strand over a relay, one collection's blocks resolved and another's did not
+(`cohort-unreachable`, including a block the reader wrote itself). Its leading hypothesis is cohort
+resolution. It is being run **before** this chain so its diagnosis is made against the current rule. If
+it concludes the cause is cohort assembly, it will name which ticket in this chain addresses it or add an
+arm here — read `tickets/complete/` for its outcome before starting.

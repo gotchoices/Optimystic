@@ -95,3 +95,23 @@ Both are worth holding in mind, and neither should be assumed.
 - Diagnose from that, and either fix it or file the implement ticket the diagnosis implies.
 - Report to the sereus session whichever way it lands, since their ticket is waiting on this answer.
 - `yarn lint`, `yarn build`, `yarn workspace @optimystic/db-p2p test`.
+
+# Sequencing note (garden tender, 2026-09-16 17:4x): run this BEFORE the cohort-assembly chain
+
+`plan/self-in-cohort-only-when-nearest` has just become three implement tickets
+(`1-cohort-assembly-self-only-when-nearest`, `2-writer-and-harness-route-to-the-cohort`,
+`3-coordinator-refuses-blocks-it-is-not-responsible-for`) that change exactly the thing this ticket
+suspects: how `findCluster` / `findCoordinator` decide who is in a block's cohort, whether self is
+included, and whether the harness ranks the way production does.
+
+That makes ordering matter. The device report is against the **current** cohort rule. If the chain
+lands first and this no longer reproduces, nobody can tell whether the chain fixed it or merely changed
+its shape. So this ticket runs first, and its diagnosis should say explicitly whether the asymmetry
+comes from cohort assembly (in which case name which of the three tickets addresses it, or add an arm to
+one) or from somewhere else.
+
+A note on the earlier deferral: this was held for a quiet machine because a real-relay reproduction's
+*timing* is untrustworthy under load. But the ticket's first diagnostic step — comparing `findCluster`
+for the two collections on both parties — is a membership question, not a timing one, and is
+deterministic. Do that step first; treat any timing-dependent observation from the relay run as
+provisional if other runners were active, and say so.
