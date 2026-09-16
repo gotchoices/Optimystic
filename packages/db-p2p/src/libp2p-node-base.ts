@@ -18,6 +18,9 @@ import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
 import { withReadCache, type ResolvedReadCache } from './storage/with-read-cache.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
+import type { IKVStore } from './storage/i-kv-store.js';
+import { MemoryKVStore } from './storage/memory-kv-store.js';
+import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js';
 import { latestClaimFromArchive, servableProof, type ArchiveServingRepo } from './storage/block-archive.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
 import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
@@ -156,6 +159,9 @@ const wiringLog = createLogger('node-wiring');
  */
 export type RawStorageProvider = IRawStorage | (() => IRawStorage);
 
+/** Factory function or instance for the node's durable key-value store; see {@link NodeOptions.kvStore}. */
+export type KVStoreProvider = IKVStore | (() => IKVStore);
+
 /**
  * `ClusterPolicyOptions` is intersected in, not restated: `resolveClusterPolicy` consumes those
  * fields structurally, so a second copy of the shape here would let a newly added knob compile and
@@ -200,6 +206,15 @@ export type NodeOptions = ClusterPolicyOptions & {
 	relayServerInit?: CircuitRelayServerInit;
 	/** Storage provider - either an IRawStorage instance or a factory function. Defaults to MemoryRawStorage if not provided. See {@link RawStorageProvider} for the ownership rule. */
 	storage?: RawStorageProvider;
+	/**
+	 * Durable key-value store for node-local state that must survive a restart — today, the
+	 * under-replication ledger (which blocks this node acknowledged below full replication, and who
+	 * is still missing each). An instance or a factory, the same shape as {@link NodeOptions.storage}.
+	 * Absent → an in-memory store, with a `node-wiring` warning: the ledger still works, but what it
+	 * records is lost on restart. `FileKVStore` from `@optimystic/db-p2p-storage-fs` may share
+	 * `FileRawStorage`'s base path; see its README.
+	 */
+	kvStore?: KVStoreProvider;
 	/**
 	 * Override libp2p listen multiaddrs. An entry naming a relay (`<relay address>/p2p/<relay id>/p2p-circuit`)
 	 * is not handed to libp2p as written: the node listens on a bare `/p2p-circuit` and keeps the
@@ -403,6 +418,24 @@ function resolveStorage(provider: RawStorageProvider | undefined, networkName: s
 }
 
 /**
+ * Resolve the node's durable key-value store, beside {@link resolveStorage}. The memory fallback is
+ * LOUD on purpose: a silent one would look like the under-replication ledger works and then fail the
+ * one case it exists for — a shortfall recorded before a restart being there after it.
+ *
+ * NOTE: with a key-value store always present, `PersistentTransactionStateStore` is now
+ * constructible here from the same instance. Wiring it changes commit-retry recovery behaviour and
+ * belongs to `feat-long-lived-pend-completes-as-members-appear`, not to this resolver;
+ * `NodeOptions.transactionStateStore` stays the only way it is supplied.
+ */
+function resolveKvStore(provider: KVStoreProvider | undefined): IKVStore {
+	if (provider !== undefined) {
+		return typeof provider === 'function' ? provider() : provider;
+	}
+	wiringLog('WARN: no kvStore supplied — using an in-memory store. The under-replication ledger (blocks this node acknowledged before every cohort member held them) will NOT survive a restart, so copies owed at shutdown are never sent. Supply NodeOptions.kvStore (e.g. FileKVStore) to keep it.');
+	return new MemoryKVStore();
+}
+
+/**
  * Resolve the full FRET engine the cohort-topic host needs.
  *
  * `createCohortTopicHost` consumes the complete {@link FretService} engine surface — notably
@@ -443,6 +476,8 @@ export async function createLibp2pNodeBase(
 	}
 ): Promise<OptimysticNode> {
 	const { storage: rawStorage, lease } = resolveStorage(options.storage, options.networkName);
+	const kvStore = resolveKvStore(options.kvStore);
+	const underReplicationLedger = new KvUnderReplicationLedger(kvStore);
 
 	// Create placeholder restore callback (will be replaced after node starts)
 	let restoreCallback: RestoreCallback = async (_blockId, _rev?) => {
@@ -1047,7 +1082,10 @@ export async function createLibp2pNodeBase(
 			// funnel. `clusterLatestCallback` alone can only tell the reader WHICH revision the cohort
 			// holds; this is what moves the bytes. Only reached once a corroborated revision exists, so a
 			// genuinely absent block still costs no archive fetch.
-			acquireBlockFromCohort: reconcileBlock
+			acquireBlockFromCohort: reconcileBlock,
+			// Records who is still missing each block of a commit acknowledged below `full`. Nothing
+			// drains it yet: sending those copies is `under-replication-drain-and-full-replication-event`.
+			underReplicationLedger
 		});
 
 		// Fail-fast coupling: the cluster member (what accepts a super-majority as sufficient) and the

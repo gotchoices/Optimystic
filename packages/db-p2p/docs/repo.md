@@ -125,6 +125,28 @@ export class CoordinatorRepo implements IRepo {
 }
 ```
 
+#### The durability gate and the under-replication ledger
+
+A commit is acknowledged to the writer only when a strict majority of the cohort it ran on reports holding the committed revision — the durability gate, stated in full under "Commit durability reporting" in [docs/correctness.md §2 Definitions](../../../docs/correctness.md#2-definitions). Every acknowledgement carries a durability class (`full`, `majority`, `local` or `unrouted`; `WriteDurability` in `packages/db-core/src/network/struct.ts`) saying who holds it.
+
+Below `full`, somebody is still owed a copy, and the coordinator knows who only at the moment it answers. So every success exit of `CoordinatorRepo.commit` — solo, local-executed, local fallback, tolerated divergence — passes through `noteReplicationShortfall` in `packages/db-p2p/src/repo/coordinator-repo.ts` before the answer goes out, which writes that down in the node's under-replication ledger (`IUnderReplicationLedger` in `packages/db-p2p/src/repo/i-under-replication-ledger.ts`):
+
+| Class the commit was acknowledged at | What the ledger does, per block |
+|---|---|
+| `full` | Settles (deletes) any entry at the same or a lower revision. Records nothing. |
+| `majority` | Records the unconfirmed members by peer id. |
+| `local`, `unrouted` | Records an **empty** missing set, meaning *unknown* — no cohort could be named, so whatever drains the entry re-resolves the cohort then. |
+
+Rules the recording follows:
+
+- **Only after the gate admitted the commit.** A refused commit never reaches the ledger.
+- **Only when this node holds the bytes.** A tolerated divergence, or a local-executed commit whose own member has no durable verdict, answers success without this node holding the revision; it has nothing to push, so nothing is recorded (a `full` answer still settles).
+- **Torn blocks are skipped.** A block an abandoned sweep cancelled holds nothing to push.
+- **One entry per block, at the highest revision.** A newer revision supersedes an older one — pushing the newer materialization satisfies both — and resets the give-up counter; an older commit finishing late cannot lower or settle a newer entry. This bounds the ledger by the node's owned-block count, and a hard cap (`DEFAULT_UNDER_REPLICATION_MAX_ENTRIES` in `packages/db-p2p/src/repo/kv-under-replication-ledger.ts`) evicts oldest-recorded first as a backstop.
+- **A ledger fault never fails the commit.** The write is already durable at the class the answer states; the failure is logged as `coordinator-repo:under-replication-record-failed` and the answer goes out unchanged.
+
+`KvUnderReplicationLedger` stores entries as JSON under `under-replicated/<blockId>` in the node's `IKVStore`, supplied as `NodeOptions.kvStore`. Without one the node uses an in-memory store and logs a `node-wiring` warning, because the ledger then does not survive a restart — the one case it exists for. `FileKVStore` may share `FileRawStorage`'s base path; see `packages/db-p2p-storage-fs/README.md`. Nothing drains the ledger yet: sending the owed copies is a separate piece of work.
+
 ### 4. ClusterCoordinator
 
 The `ClusterCoordinator` manages the distributed transaction protocol using a 2-phase commit approach to ensure consistency across cluster nodes.

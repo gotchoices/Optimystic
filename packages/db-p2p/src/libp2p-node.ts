@@ -6,10 +6,11 @@ import {
 	type Libp2pTransports,
 	type NodeOptions,
 	type RawStorageProvider,
+	type KVStoreProvider,
 } from './libp2p-node-base.js';
 import type { OptimysticNode } from './optimystic-node.js';
 
-export type { Libp2pTransports, NodeOptions, RawStorageProvider };
+export type { Libp2pTransports, NodeOptions, RawStorageProvider, KVStoreProvider };
 
 export async function createLibp2pNode(options: NodeOptions): Promise<OptimysticNode> {
 	const port = options.port ?? 0;

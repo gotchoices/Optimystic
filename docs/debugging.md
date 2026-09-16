@@ -142,7 +142,7 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 | `cluster-client`      | Record-level address learning on the client side of a cluster call — `peer-address-book:record-capped` and unparseable-peer-id warnings from records this node fetched |
 | `cluster-service`     | Errors raised while handling an inbound cluster protocol message (decode/dispatch). Default name only — `ClusterService`'s `logPrefix` init option can rename it |
 | `cluster-policy`      | The `repair-fault-tolerance` decision: the fault-tolerance/repair-cost trade the sizing policy computes |
-| `coordinator-repo`    | Coordinator-side reads and repairs: `cluster-fetch:*` quorum, sync and promote decisions, `cluster-tx:read-repair-*` outcomes, solo-cohort commits *(peer-id suffixed)*. Several of its lines carry a field that says which case they are (`read-repair-triggered`'s `ageMs`, `pend-cluster-complete`'s `localVerdict`, …) — see *Reading the fields that tell you which case a line is* below |
+| `coordinator-repo`    | Coordinator-side reads and repairs: `cluster-fetch:*` quorum, sync and promote decisions, `cluster-tx:read-repair-*` outcomes, solo-cohort commits, and `under-replication-record-failed` when a ledger write failed after a commit was acknowledged (the commit still succeeded; the missing copy is then untracked) *(peer-id suffixed)*. Several of its lines carry a field that says which case they are (`read-repair-triggered`'s `ageMs`, `pend-cluster-complete`'s `localVerdict`, …) — see *Reading the fields that tell you which case a line is* below |
 | `commit-cert`         | Originations skipped because no commit certificate was retained for the action              |
 | `certified-claims`    | Certified-claim anchoring: unanchored accepts with signer counts, anchor/cohort overlap, recompute and callback errors |
 | `reconcile-block`     | Block reconciliation after divergence: certified selection, content and revision equivocation, missing quorums, fetch and penalize errors |
@@ -159,6 +159,7 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 | `block-transfer-service` | The inbound side of the same protocol: push/pull request and response sizes, certified-push accepts and rejects, persist failures, service start/stop |
 | `rebalance-monitor`   | Periodic rebalance checks: gained/lost/grown block counts, growth budget deferrals and give-ups, throttling, partition suppression |
 | `spread-on-churn`     | Replica spreading triggered by peer churn: per-block push ok/fail/rejected, blocks untracked for missing local data, partition suppression |
+| `under-replication-ledger` | The durable record of blocks acknowledged below full replication: `record:skip-lower-rev` (a slower, older commit did not overwrite a newer shortfall), `settle:keep-higher-rev`, `evict:over-cap` when the entry cap evicts the oldest entry, and on `:error` `evict:failed` plus `read:unparseable` / `read:malformed` for a stored entry read as absent |
 | `ring-shift`          | Ring-shift phases: `phaseA:advertise`, `phaseB:abort` with the ring it rolled back to, `phaseC:release` with shed counts, `moveIn:advertise` for the shed-nothing inward move, and resumed old ranges |
 
 #### Networking and routing
@@ -179,7 +180,7 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 
 | Sub-namespace           | What it covers                                                                          |
 |-------------------------|------------------------------------------------------------------------------------------|
-| `node-wiring`           | Node construction and startup: in-factory `setLibp2p` proxy fallbacks, owned-block seeding, spread-on-churn init, rollback failures after a failed start |
+| `node-wiring`           | Node construction and startup: in-factory `setLibp2p` proxy fallbacks, owned-block seeding, spread-on-churn init, rollback failures after a failed start, and a `WARN:` line when no `kvStore` was supplied (the under-replication ledger will not survive a restart) |
 | `node-wiring:arachnode` | Arachnode ring membership during startup: ring announcements, ring transitions, ring-shift outcomes, unconfirmed cohort growth, rebalance reaction failures |
 | `reactivity-node-wiring`| Reactivity wiring at startup — currently, a rotation re-registration that fired with no subscribe factory wired |
 | `relay-reservation`     | The per-relay reservation supervisor a node runs for every listen address naming a relay: `relay-reservation:drive` (with its trigger), `relay-reservation:held`, `relay-reservation:failed` (with the reason), `relay-reservation:slot-taken` (relay discovery filled the slot through another relay; logged once per episode), and the libp2p-internals seam going missing |

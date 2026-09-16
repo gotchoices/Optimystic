@@ -6,8 +6,10 @@ Node.js filesystem storage backend for Optimystic peers. Provides:
   metadata, revisions, pending transactions, committed transactions, commit
   proofs, and
   materialized blocks durably across restarts.
-- **`FileKVStore`** — implements `IKVStore` for the persistent transaction state
-  used to recover crashed two-phase commits.
+- **`FileKVStore`** — implements `IKVStore` for node-local state that must
+  survive a restart: the under-replication ledger (which blocks the node
+  acknowledged before every cohort member held them), and the persistent
+  transaction state used to recover crashed two-phase commits.
 
 This package targets plain Node.js. Use the sibling adapter for other
 environments:
@@ -34,7 +36,7 @@ const kvStore    = new FileKVStore('/var/lib/my-peer/data');
 const libp2p = await createLibp2pNode({
   bootstrapNodes: [/* … */],
   networkName: 'my-network',
-  rawStorage,
+  storage: rawStorage,
   kvStore,
 });
 ```
@@ -46,7 +48,15 @@ subdirectories (block ids are content-address hashes), while KV data lives
 under directories named by the first segment of each key (a `/`-separated key
 becomes nested subdirectories — e.g. `coordinator/key1` → `coordinator/key1.json`).
 Sharing is safe only as long as no block id equals a KV key's first segment;
-give them separate `basePath`s if you cannot guarantee that.
+give them separate `basePath`s if you cannot guarantee that. The KV keys the
+node itself writes all start with a fixed literal segment (`under-replicated/`
+for the ledger), and `FileRawStorage.listBlockIds` yields only directories that
+contain a `meta.json`, so a KV directory is never mistaken for a block. KV
+bytes do count toward `FileRawStorage.getApproximateBytesUsed` when the path is
+shared.
+
+Without a `kvStore`, the node falls back to an in-memory store and logs a
+`node-wiring` warning: what the ledger records is then lost on restart.
 
 ## On-disk layout
 

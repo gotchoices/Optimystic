@@ -2,8 +2,8 @@
 import { Command, InvalidArgumentError } from 'commander';
 import { multiaddr } from '@multiformats/multiaddr';
 import debug from 'debug';
-import { getNetworkManager, createLibp2pNode, MemoryRawStorage, RepoClient, ArachnodeFretAdapter, type IRawStorage } from '@optimystic/db-p2p';
-import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
+import { getNetworkManager, createLibp2pNode, MemoryRawStorage, MemoryKVStore, RepoClient, ArachnodeFretAdapter, type IRawStorage, type IKVStore } from '@optimystic/db-p2p';
+import { FileRawStorage, FileKVStore } from '@optimystic/db-p2p-storage-fs';
 import { Diary, NetworkTransactor, BTree, registerDebugModule, type ITransactor, type BlockGets, type GetBlockResults, type ActionBlocks, type BlockActionStatus, type PendRequest, type PendResult, type CommitRequest, type CommitResult } from '@optimystic/db-core';
 import * as readline from 'readline';
 import * as path from 'path';
@@ -383,6 +383,18 @@ class PeerSession {
 			return new MemoryRawStorage();
 		};
 
+		// Node-local state that must survive a restart (the under-replication ledger). File storage
+		// shares FileRawStorage's base path: FileRawStorage.listBlockIds yields only directories that
+		// hold a meta.json, so the ledger's `under-replicated/` directory is never read as a block.
+		// Memory storage gets a memory store explicitly — the node's own fallback would warn about
+		// losing state across a restart, which a memory-storage peer loses anyway.
+		const createKvStore = (): IKVStore => {
+			if (options.storage === 'file') {
+				return new FileKVStore(options.storagePath!);
+			}
+			return new MemoryKVStore();
+		};
+
 		const wsPortNum = options.wsPort !== undefined ? parseInt(options.wsPort, 10) : undefined;
 		if (wsPortNum !== undefined && (!Number.isFinite(wsPortNum) || wsPortNum < 0)) {
 			throw new Error('--ws-port must be a non-negative integer');
@@ -412,6 +424,7 @@ class PeerSession {
 			networkName: options.network || 'optimystic',
 			fretProfile: options.fretProfile,
 			storage: createStorage,
+			kvStore: createKvStore,
 			clusterSize,
 			clusterPolicy: superMajorityThreshold !== undefined || assumedClusterSize !== undefined
 				|| repairCorroborationClusterSize !== undefined

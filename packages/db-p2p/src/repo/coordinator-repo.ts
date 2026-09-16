@@ -1,4 +1,4 @@
-import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
+import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
 import { LruMap, blockIdsForTransforms, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability } from "@optimystic/db-core";
 import { ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
@@ -16,6 +16,7 @@ import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_R
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
 import type { ReconcileBlockCallback } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
+import type { IUnderReplicationLedger } from "./i-under-replication-ledger.js";
 
 /**
  * Acquire a block's content for a cohort-corroborated revision, from the cohort, and persist it.
@@ -492,6 +493,12 @@ interface CoordinatorRepoComponents {
 	 * acceptance internally regardless.
 	 */
 	proofAnchoring?: ProofAnchoring;
+	/**
+	 * Optional durable record of commits acknowledged below full replication, and who is still
+	 * missing each block — see {@link CoordinatorRepo.noteReplicationShortfall}. Absent → nothing is
+	 * recorded and commit behaves exactly as without it.
+	 */
+	underReplicationLedger?: IUnderReplicationLedger;
 }
 
 /**
@@ -526,7 +533,8 @@ export function coordinatorRepo(
 		reputation,
 		stateStore,
 		components.acquireBlockFromCohort,
-		components.proofAnchoring
+		components.proofAnchoring,
+		components.underReplicationLedger
 	);
 }
 
@@ -636,7 +644,8 @@ export class CoordinatorRepo implements IRepo {
 		reputation?: IPeerReputation,
 		stateStore?: ITransactionStateStore,
 		private readonly acquireBlockFromCohort?: AcquireBlockCallback,
-		private readonly proofAnchoring?: ProofAnchoring
+		private readonly proofAnchoring?: ProofAnchoring,
+		private readonly underReplicationLedger?: IUnderReplicationLedger
 	) {
 		this.localPeerId = localPeerId;
 		this.log = createLogger('coordinator-repo', localPeerId?.toString());
@@ -2583,7 +2592,7 @@ export class CoordinatorRepo implements IRepo {
 					return this.refuseCommitNotDurable(request, durableHolders, durability, 'local-executed');
 				}
 				if (armFreshness) this.markBlocksSeen(blockIds);
-				return { success: true, durability: this.cohortWriteDurability(durability, localDurable) };
+				return await this.acknowledgeCommit(request, { success: true, durability: this.cohortWriteDurability(durability, localDurable) }, localDurable);
 			}
 			// Local cluster didn't execute during consensus. Attempt a local commit, but tolerate
 			// local divergence when the cluster already reached consensus AND a durable majority of
@@ -2629,15 +2638,17 @@ export class CoordinatorRepo implements IRepo {
 					// Storage's own `local` answer is replaced by the cohort's — this node counts exactly
 					// as the gate counted it, i.e. only when it is a cohort member.
 					if (armFreshness) this.markBlocksSeen(blockIds);
-					return { ...result, durability: this.cohortWriteDurability(durability, selfInCohort) };
+					// The fallback commit landed every block, so this node holds them — whether or not
+					// it is a cohort member — and can source a push to whoever the class names as missing.
+					return await this.acknowledgeCommit(request, { ...result, durability: this.cohortWriteDurability(durability, selfInCohort) }, true);
 				}
 				if (isMissingBaseRevisionFailure(result) && clusterReachedCommitConsensus(record)) {
-					return this.tolerateLocalCommitDivergence(request, blockIds, result.reason ?? MISSING_BASE_REVISION_REASON, armFreshness, durability);
+					return await this.tolerateLocalCommitDivergence(request, blockIds, result.reason ?? MISSING_BASE_REVISION_REASON, armFreshness, durability);
 				}
 				return result;
 			} catch (err) {
 				if (clusterReachedCommitConsensus(record)) {
-					return this.tolerateLocalCommitDivergence(request, blockIds, (err as Error).message, armFreshness, durability);
+					return await this.tolerateLocalCommitDivergence(request, blockIds, (err as Error).message, armFreshness, durability);
 				}
 				throw err;
 			}
@@ -2786,9 +2797,9 @@ export class CoordinatorRepo implements IRepo {
 	 * window unarmed — this peer is known to be behind here, the last place a self-referential
 	 * freshness stamp belongs.
 	 */
-	private tolerateLocalCommitDivergence(
+	private async tolerateLocalCommitDivergence(
 		request: CommitRequest, blockIds: BlockId[], detail: string, armFreshness: boolean, durability: CohortDurability
-	): CommitResult {
+	): Promise<CommitResult> {
 		if (!isDurableMajority(durability.remoteHolders.length, durability.cohortPeerIds.length)) {
 			return this.refuseCommitNotDurable(request, durability.remoteHolders.length, durability, `fallback-diverged: ${detail}`);
 		}
@@ -2797,7 +2808,86 @@ export class CoordinatorRepo implements IRepo {
 		// This node holds nothing: it is an UNCONFIRMED member when it is in the cohort (so the class
 		// is `majority`), and simply absent from the count when it is not (so the class can be `full`
 		// when every member confirmed). Both fall out of the one rule in `cohortWriteDurability`.
-		return { success: true, durability: this.cohortWriteDurability(durability, false) };
+		// Holding nothing, it is also no source for a push, so no shortfall is recorded here.
+		return await this.acknowledgeCommit(request, { success: true, durability: this.cohortWriteDurability(durability, false) }, false);
+	}
+
+	/**
+	 * The one way a success leaves {@link commit}: record the replication shortfall the answer
+	 * describes, then return the answer unchanged. Every success exit — solo, local-executed, local
+	 * fallback, tolerated divergence — runs after the durability gate admitted it, so a refused
+	 * commit never reaches the ledger.
+	 *
+	 * `localHolds` is whether this node's own storage durably holds every block of the commit, which
+	 * is what makes it a source for the missing copies — not whether the class counted it.
+	 */
+	private async acknowledgeCommit(request: CommitRequest, answer: CommitSuccess, localHolds: boolean): Promise<CommitSuccess> {
+		await this.noteReplicationShortfall(request, answer.durability, localHolds);
+		return answer;
+	}
+
+	/**
+	 * Write down who is still missing an acknowledged commit, while this node still knows — the
+	 * cohort's answer is gone the moment the writer is answered, and the in-memory commit retry does
+	 * not survive a restart. One entry per block, all sharing this commit's one cohort answer
+	 * (consensus ran on `blockIds[0]`'s cohort for the whole request):
+	 * - `full` settles any older entry for the block, whether or not this node holds it;
+	 * - `majority` records the unconfirmed members by name;
+	 * - `local` and `unrouted` record an EMPTY missing set, meaning "unknown" — nobody could be named.
+	 * A shortfall is recorded only when `localHolds`: a node holding nothing has nothing to push, and
+	 * the remote majority that admitted the commit already holds it.
+	 *
+	 * NEVER throws, and that asymmetry is deliberate: by the time this runs the commit is already
+	 * durable at the class the answer states, so a ledger fault must not turn an acknowledged write
+	 * into a reported failure. A failure is logged per block and the answer still goes out; the
+	 * block's copy is then owed with nobody tracking it, exactly as before the ledger existed.
+	 *
+	 * NOTE: one ledger read and write per block per below-full commit, awaited before the writer is
+	 * answered — on a node that is genuinely alone that is every commit (a `full` commit settles from
+	 * the ledger's in-memory index and touches the store only when an entry exists). If it shows in
+	 * commit latency, coalesce the writes rather than answering first: an entry written after the
+	 * answer can be lost to a crash in between, which is the one case the ledger exists for.
+	 */
+	private async noteReplicationShortfall(request: CommitRequest, durability: WriteDurability, localHolds: boolean): Promise<void> {
+		const ledger = this.underReplicationLedger;
+		if (ledger === undefined) return;
+		// Blocks a torn commit abandoned were cancelled and hold nothing at this revision: there is no
+		// copy to push, and an entry would have a drain repeatedly read a block that is not there.
+		// No answer built in this class names `torn` today — the writer's transactor derives it after
+		// every coordinator has answered — so this guards against a future producer, not a current one.
+		const torn = new Set(durability.torn ?? []);
+		const blockIds = request.blockIds.filter(blockId => !torn.has(blockId));
+		const outcomes = await Promise.allSettled(blockIds.map(blockId =>
+			this.noteBlockShortfall(ledger, request, blockId, durability, localHolds)));
+		outcomes.forEach((outcome, i) => {
+			if (outcome.status === 'fulfilled') return;
+			this.log('coordinator-repo:under-replication-record-failed', {
+				actionId: request.actionId,
+				blockId: blockIds[i],
+				rev: request.rev,
+				quorum: durability.quorum,
+				error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)
+			});
+		});
+	}
+
+	private async noteBlockShortfall(
+		ledger: IUnderReplicationLedger, request: CommitRequest, blockId: BlockId, durability: WriteDurability, localHolds: boolean
+	): Promise<void> {
+		if (durability.quorum === 'full') {
+			await ledger.settle(blockId, request.rev);
+			return;
+		}
+		if (!localHolds) return;
+		await ledger.record({
+			blockId,
+			rev: request.rev,
+			actionId: request.actionId,
+			quorum: durability.quorum,
+			missingPeerIds: durability.quorum === 'majority' ? durability.unconfirmed ?? [] : [],
+			recordedAt: this.now(),
+			attempts: 0
+		});
 	}
 
 	/**
@@ -2863,7 +2953,7 @@ export class CoordinatorRepo implements IRepo {
 		// solo-self-skip exit re-arms it once per consult instead (which keeps GitHub issue #8's
 		// consult storm bounded at one per window).
 		if (this.commitQuorumRulesOutRivals(1, peerCount)) this.markBlocksSeen(blockIds);
-		return { ...result, durability: soloDurability };
+		return await this.acknowledgeCommit(request, { ...result, durability: soloDurability }, true);
 	}
 
 	/**
