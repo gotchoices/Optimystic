@@ -1,4 +1,4 @@
-import type { IBlock, BlockId, Action } from "../index.js";
+import type { IBlock, BlockId, Action, WriteDurability } from "../index.js";
 import type { IChainHeader } from "../chain/chain-nodes.js";
 import type { RandFn } from "../utility/backoff.js";
 
@@ -147,8 +147,13 @@ export interface ICollection<TAction> {
 	readonly id: CollectionId;
 	act(...actions: Action<TAction>[]): Promise<void>;
 	update(): Promise<void>;
-	sync(options?: SyncOptions): Promise<void>;
-	updateAndSync(options?: SyncOptions): Promise<void>;
+	/** Push staged changes. Resolves to who holds what was committed, or `undefined` when NOTHING WAS
+	 * WRITTEN — nothing was staged, so there was no pend and no commit and there is no durability to
+	 * report. A write that never landed throws ({@link SyncRetryExhaustedError}) rather than returning
+	 * a class. Decide "is this saved" with `isFullyDurable`, never by comparing `quorum`. */
+	sync(options?: SyncOptions): Promise<WriteDurability | undefined>;
+	/** Refresh, then {@link sync}. Same return contract. */
+	updateAndSync(options?: SyncOptions): Promise<WriteDurability | undefined>;
 	selectLog(forward?: boolean): AsyncIterableIterator<Action<TAction>>;
 }
 

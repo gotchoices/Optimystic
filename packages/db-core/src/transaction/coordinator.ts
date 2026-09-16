@@ -228,6 +228,14 @@ export class TransactionCoordinator {
 	 *
 	 * Defaults are safe out of the box: a caller that passes no options gets bounded, jittered retry.
 	 *
+	 * NOTE: this returns nothing, so a multi-collection commit reports NO durability — unlike
+	 * `Collection.sync`, which now answers with the {@link WriteDurability} of what it committed. The
+	 * gap is deliberate and tracked in `tickets/backlog/feat-multi-collection-commit-reports-durability.md`:
+	 * folding a class across collections that may individually have committed or been dropped (see
+	 * {@link CoordinatorPartialCommitError}) is its own design problem, not a pass-through. Until that
+	 * lands, a caller that needs to know whether a write is fully held has to use the single-collection
+	 * path; do not infer one here from a plain successful return.
+	 *
 	 * @param transaction - The transaction to commit
 	 * @param options - Retry knobs; shares the {@link SyncOptions} vocabulary with `Collection.sync`.
 	 */

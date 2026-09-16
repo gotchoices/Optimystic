@@ -1,5 +1,5 @@
 import { Collection } from "../../collection/collection.js";
-import type { ITransactor, Action, BlockId, BlockStore, IBlock, CollectionInitOptions, CollectionId } from "../../index.js";
+import type { ITransactor, Action, BlockId, BlockStore, IBlock, CollectionInitOptions, CollectionId, WriteDurability } from "../../index.js";
 import { registerCollectionType } from "../../collection/collection-type-registry.js";
 import { DiaryHeaderBlockType } from "./struct.js";
 
@@ -39,14 +39,16 @@ export class Diary<TEntry> {
         return collection ? new Diary<TEntry>(collection) : undefined;
     }
 
-    async append(data: TEntry): Promise<void> {
+    /** Append one entry and flush it. Forwards the collection's answer verbatim — see
+     *  {@link Collection.sync} for what `undefined` means. This layer never interprets the value. */
+    async append(data: TEntry): Promise<WriteDurability | undefined> {
         const action: Action<TEntry> = {
             type: "append",
             data: data
         };
 
         await this.collection.act(action);
-        await this.collection.updateAndSync();
+        return await this.collection.updateAndSync();
     }
 
     /** Fetch the latest state from the network */

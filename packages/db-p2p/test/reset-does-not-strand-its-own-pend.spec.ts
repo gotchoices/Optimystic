@@ -34,7 +34,7 @@
 
 import { expect } from 'chai';
 import { TransactorSource } from '@optimystic/db-core';
-import type { BlockHeader, BlockId, IBlock, Transforms, IRepo, ActionId, BlockActionState, ITransactor, StaleFailure } from '@optimystic/db-core';
+import type { BlockHeader, BlockId, IBlock, Transforms, IRepo, ActionId, BlockActionState, ITransactor, CommitResult } from '@optimystic/db-core';
 import { createMesh, buildNetworkTransactor, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
 
 const COLLECTION = 'reset-pend-collection' as BlockId;
@@ -155,12 +155,12 @@ const writeWithRetries = async (source: TransactorSource<IBlock>, rev: number, l
 		if (i > 1 && delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
 		const actionId = `${label}-${i}` as ActionId;
 		try {
-			const failure: undefined | StaleFailure = await source.transact(updatesFor(`${label}-${i}`, TAIL), actionId, rev, TAIL, TAIL);
-			if (!failure) {
+			const result: CommitResult = await source.transact(updatesFor(`${label}-${i}`, TAIL), actionId, rev, TAIL, TAIL);
+			if (result.success) {
 				attempts.push({ actionId, outcome: 'committed' });
 				return attempts;
 			}
-			attempts.push({ actionId, outcome: 'refused', detail: failure.reason ?? '' });
+			attempts.push({ actionId, outcome: 'refused', detail: result.reason ?? '' });
 		} catch (e) {
 			attempts.push({ actionId, outcome: 'threw', detail: (e as Error).message });
 		}
@@ -289,6 +289,6 @@ describe('A failed attempt discharges its own pend — a brief reset costs a ret
 		await gate.transactor.cancel({ actionId: 'armD' as ActionId, blockIds: [TAIL] });
 		await assertNoStrandedRecords(mesh, ['armD' as ActionId], TAIL);
 		const after = await source.transact(updatesFor('armD-after', TAIL), 'armD-after' as ActionId, 2, TAIL, TAIL);
-		expect(after, 'after a successful cancel the block must write cleanly').to.equal(undefined);
+		expect(after.success, 'after a successful cancel the block must write cleanly').to.equal(true);
 	});
 });

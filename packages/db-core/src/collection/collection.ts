@@ -8,6 +8,8 @@ import { computeBlockContentDigests } from "../transform/digest.js";
 import { copyTransforms, isTransformsEmpty } from "../transform/helpers.js";
 import { TransactorSource } from "../transactor/transactor-source.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
+import type { WriteDurability } from "../network/struct.js";
+import { mergeDurability } from "../network/durability.js";
 import { highestStaleAt } from "../network/stale-failure.js";
 import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions } from "./index.js";
 import { CollectionHeaderVanishedError, SyncRetryExhaustedError, SyncRevisionStalledError } from "./struct.js";
@@ -969,11 +971,17 @@ export class Collection<TAction> implements ICollection<TAction> {
 		};
 	}
 
-	/** Push our pending actions to the transactor */
-	async sync(options?: SyncOptions) {
+	/** Push our pending actions to the transactor.
+	 *
+	 * @returns who holds what this sync committed, or `undefined` when NOTHING WAS WRITTEN — a sync
+	 * with no staged changes does no pend and no commit, so there is no durability to report and none
+	 * is fabricated. That is the one case a caller must handle; every other outcome either returns a
+	 * class or throws ({@link SyncRetryExhaustedError} for a write that never landed). Present a change
+	 * as saved only via `isFullyDurable`, never by comparing `quorum`. */
+	async sync(options?: SyncOptions): Promise<WriteDurability | undefined> {
 		const release = await Latches.acquire(this.latchId);
 		try {
-			await this.syncInternal(options);
+			return await this.syncInternal(options);
 		} finally {
 			release();
 		}
@@ -984,20 +992,23 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * (see {@link inFlightActionId}). `sync()`/`updateAndSync()` hold the collection latch across
 	 * all of this, so the mark's lifetime is contained inside the latched span here; the disposer
 	 * runs on every exit, including a throw out of retry exhaustion or an abort. */
-	private async syncInternal(options?: SyncOptions) {
+	private async syncInternal(options?: SyncOptions): Promise<WriteDurability | undefined> {
 		const bytes = randomBytes(16);
 		const actionId = uint8ArrayToString(bytes, 'base64url');
 
 		const endInFlight = this.beginInFlightAction(actionId);
 		try {
-			await this.syncAttempts(actionId, options);
+			return await this.syncAttempts(actionId, options);
 		} finally {
 			endInFlight();
 		}
 	}
 
-	/** The retry loop behind {@link syncInternal}, run with `actionId` already marked in flight. */
-	private async syncAttempts(actionId: ActionId, options?: SyncOptions) {
+	/** The retry loop behind {@link syncInternal}, run with `actionId` already marked in flight.
+	 *
+	 * @returns the durability of what this sync committed, or `undefined` when the loop never ran a
+	 * commit (nothing staged). See {@link sync}. */
+	private async syncAttempts(actionId: ActionId, options?: SyncOptions): Promise<WriteDurability | undefined> {
 		const maxAttempts = options?.maxAttempts ?? DefaultMaxAttempts;
 		const baseBackoffMs = options?.baseBackoffMs ?? PendingRetryDelayMs;
 		const maxBackoffMs = options?.maxBackoffMs ?? DefaultMaxBackoffMs;
@@ -1025,6 +1036,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// The revision the PREVIOUS iteration would have requested, so the stall check can tell a
 		// refresh that moved nowhere from one that is still climbing toward the confirmed number.
 		let previousRequestedRev: number | undefined;
+		// Who holds what this sync has committed so far. Stays `undefined` while nothing has been
+		// committed, which is also the answer when the loop never runs at all — a sync with nothing
+		// staged writes nothing, and there is no durability to fabricate for it. Failed attempts never
+		// contribute: a refused attempt left nothing behind, so the answer is the committing attempt's.
+		let durability: WriteDurability | undefined;
 
 		while (this.hasUnsyncedChanges()) {
 			if (signal?.aborted) {
@@ -1121,8 +1137,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// consecutive-failure count so a sync that keeps losing concurrent races out-ranks fresh
 			// (priority-0) rivals in the cluster's resolveRace (fairness-only; capped at MaxPriority).
 			// First attempt has consecutiveFailures == 0, so priority 0 — the common pend is unchanged.
-			const staleFailure = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id, clampPriority(consecutiveFailures), blockDigests);
-			if (staleFailure) {
+			const attempt = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id, clampPriority(consecutiveFailures), blockDigests);
+			if (!attempt.success) {
+				const staleFailure = attempt;
 				consecutiveFailures++;
 				lastReason = staleFailure.reason ?? lastReason;
 				// Highest-wins, not last-wins: the next request has to clear EVERY holder, so a later
@@ -1157,6 +1174,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 				// rather than replaying it into a duplicate entry.
 				await this.updateInternal();
 			} else {
+				// This attempt's commit landed, so its durability is the one to report. A sync that
+				// commits ONCE — every sync that has a caller today — reports exactly that answer,
+				// untouched. A sync whose loop commits more than one batch (the `hasUnsyncedChanges`
+				// condition re-entering after a successful commit) folds the batches with
+				// `mergeDurability`, whose scalar answer is the WEAKEST of them: one batch that only
+				// reached the writer makes the whole sync only-on-the-writer, and reporting the last
+				// batch's class instead would show such a write as saved.
+				durability = durability === undefined ? attempt.durability : mergeDurability([durability, attempt.durability]);
 				// Forward progress: reset the no-progress budget.
 				consecutiveFailures = 0;
 				lastReason = undefined;
@@ -1184,13 +1209,16 @@ export class Collection<TAction> implements ICollection<TAction> {
 					: { committed: [{ actionId, rev: newRev }], rev: newRev };
 			}
 		}
+		return durability;
 	}
 
-	async updateAndSync(options?: SyncOptions) {
+	/** Refresh from the transactor, then push. Same return contract as {@link sync}: the durability of
+	 * what was committed, or `undefined` when nothing was staged and so nothing was written. */
+	async updateAndSync(options?: SyncOptions): Promise<WriteDurability | undefined> {
 		const release = await Latches.acquire(this.latchId);
 		try {
 			await this.updateInternal();
-			await this.syncInternal(options);
+			return await this.syncInternal(options);
 		} finally {
 			release();
 		}

@@ -145,6 +145,23 @@ Local changes are not visible to other peers until they sync. `updateAndSync()` 
 await users.updateAndSync();
 ```
 
+#### Was it really saved?
+
+A sync resolves to a `WriteDurability` (`packages/db-core/src/network/struct.ts`) saying who holds what it just committed: `full` when every machine in the block's cohort confirmed, `majority` when a strict majority did, `local` when this machine is the whole cohort, and `unrouted` when the cohort never resolved at all. That is what lets an app show a change as *pending* rather than saved.
+
+```typescript
+import { isFullyDurable } from '@optimystic/db-core';
+
+const durability = await users.updateAndSync();
+if (durability && !isFullyDurable(durability)) {
+  // Only some machines hold this yet — show the row as pending.
+}
+```
+
+Always test it with `isFullyDurable` (`packages/db-core/src/network/durability.ts`) rather than comparing `quorum` yourself: an action whose cohort reported `full` can still have abandoned blocks (listed in `WriteDurability.torn`), and only `isFullyDurable` accounts for both. A result of `undefined` means nothing was written — there was nothing staged, so there is no durability to report, and it is never a failure. `Tree.replace`, `Tree.sync` and `Diary.append` forward the same value without interpreting it.
+
+A commit spanning several collections (`TransactionSession`, below) reports no durability yet — merging a class across collections that may individually have committed or been dropped is a separate design problem.
+
 The full sync lifecycle — block mirroring, when to sync, replay on rejection — is documented in [transactions.md](transactions.md#client-synchronization).
 
 ### Handle conflicts

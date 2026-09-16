@@ -103,9 +103,9 @@ async function appendInvalidation(
 	const newRev = (ctx?.rev ?? 0) + 1
 	const reverted: RevertedBlock[] = [{ blockId: revertedBlock, fromRev: invalidatedRev, restoredContentHash: 'restored-hash' }]
 	const { tailPath } = await log.addInvalidation(invalidatedActionId, invalidatedRev, makeProof(`d-${invalidatedActionId}`), reverted, newRev)
-	const stale = await source.transact(tracker.transforms, `inv-${newRev}` as ActionId, newRev, collectionId, tailPath.block.header.id)
-	if (stale) {
-		throw new Error(`invalidation commit was stale: ${JSON.stringify(stale)}`)
+	const result = await source.transact(tracker.transforms, `inv-${newRev}` as ActionId, newRev, collectionId, tailPath.block.header.id)
+	if (!result.success) {
+		throw new Error(`invalidation commit was stale: ${JSON.stringify(result)}`)
 	}
 }
 

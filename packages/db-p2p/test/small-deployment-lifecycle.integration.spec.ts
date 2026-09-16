@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { isFullyDurable } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
@@ -129,7 +130,17 @@ describe('Small deployment lifecycle over real libp2p (solo → backup → away 
 
 		const whileAway: Row = { key: 30, value: 'B-away-30' };
 		const attempt = await attemptWrite(a, TREE_ID, [whileAway]);
-		if (!attempt.refusal) acknowledge([whileAway]);
+		if (!attempt.refusal) {
+			acknowledge([whileAway]);
+			// Conditional on purpose. Whether a lone survivor should accept at all is still under design
+			// (see the note below), so this asserts nothing about ADMISSION — only that when the write IS
+			// admitted, what comes back says truthfully that A alone holds it. That is the whole point of
+			// the durability class: an app showing this row must show it as pending, not as saved.
+			const { durability } = attempt;
+			if (!durability) throw new Error('an acknowledged write must report who holds it, but none came back');
+			expect(durability.quorum, 'a write A accepted with B away is held by A alone').to.equal('local');
+			expect(isFullyDurable(durability), 'a solo write is not fully durable').to.equal(false);
+		}
 
 		await startOnTcp(b, [a]);
 		await waitForPair(a, b);

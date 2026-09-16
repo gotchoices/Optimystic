@@ -305,6 +305,8 @@ Collection.sync()
             → StorageRepo.pend/commit  # Applies to local storage
 ```
 
+The `WriteDurability` each layer assembles on the way back up returns along this same path, unflattened: `TransactorSource.transact` hands the whole `CommitResult` to `Collection.syncAttempts`, which reports the committing attempt's class out of `sync`/`updateAndSync`, and `Tree`/`Diary` forward it. `undefined` from a sync means nothing was staged, so nothing was written — not that the write failed. `TransactionCoordinator.commit` is the one write path that reports no class; see the note on that method.
+
 #### Commit content-digest check (promise round)
 
 The client that authored a transaction declares, inside the commit request it submits for

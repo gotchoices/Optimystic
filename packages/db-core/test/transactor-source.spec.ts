@@ -5,7 +5,7 @@ import { TransactorSource } from '../src/transactor/transactor-source.js'
 import { TestTransactor } from '../src/testing/test-transactor.js'
 import { randomBytes } from '@libp2p/crypto'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
-import type { IBlock, ActionId, ActionContext, Transforms, BlockOperation, CommitRequest, CommitResult, ITransactor, BlockGets, GetBlockResults, BlockUnavailableReason } from '../src/index.js'
+import type { IBlock, ActionId, ActionContext, Transforms, BlockOperation, CommitRequest, CommitResult, CommitSuccess, StaleFailure, WriteDurability, ITransactor, BlockGets, GetBlockResults, BlockUnavailableReason } from '../src/index.js'
 import { BlockUnavailableError, BlockPossiblyStaleError, CacheSource, ReadDependencyCollector } from '../src/index.js'
 
 describe('TransactorSource', () => {
@@ -20,6 +20,20 @@ describe('TransactorSource', () => {
 
   // Helper to generate a random action ID
   const generateActionId = (): ActionId => uint8ArrayToString(randomBytes(16), 'base64url') as ActionId
+
+  /** Assert a `transact` verdict COMMITTED, and hand back who holds the write. Success carries the
+   *  durability rather than collapsing to `undefined` (ticket write-durability-reaches-the-writer),
+   *  so `result.success` — not `result === undefined` — is the test. */
+  const expectCommitted = (result: CommitResult, what = 'transact should commit'): WriteDurability => {
+    expect(result.success, result.success ? what : `${what}, but it was refused: ${result.reason ?? 'no reason given'}`).to.equal(true)
+    return (result as CommitSuccess).durability
+  }
+
+  /** Assert a `transact` verdict was REFUSED, narrowing to the refusal so its detail fields read. */
+  const expectRefused = (result: CommitResult, what = 'transact should be refused'): StaleFailure => {
+    expect(result.success, what).to.equal(false)
+    return result as StaleFailure
+  }
 
   beforeEach(() => {
     network = new TestTransactor()
@@ -104,7 +118,7 @@ describe('TransactorSource', () => {
     }
 
     const result = await source.transact(transform, actionId, 1, blockId, blockId)
-    expect(result).to.be.undefined
+    expectCommitted(result)
 
     const pendingActions = network.getPendingActions()
     expect(pendingActions.size).to.equal(0) // Should be committed
@@ -138,9 +152,7 @@ describe('TransactorSource', () => {
     }
 
     const result = await source.transact(transform, actionId2, 1, blockId, blockId)
-    expect(result).to.not.be.undefined
-    expect(result?.success).to.be.false
-    expect(result?.pending && result.pending.length === 1).to.be.true
+    expect(expectRefused(result).pending?.length).to.equal(1)
   })
 
   it('should handle failed commit operation', async () => {
@@ -176,9 +188,7 @@ describe('TransactorSource', () => {
 
     // Try to commit with a stale revision
     const result = await source.transact(transform, generateActionId(), 1, blockId, blockId)
-    expect(result).to.not.be.undefined
-    expect(result?.success).to.be.false
-    expect(result?.missing && result.missing.length === 1).to.be.true
+    expect(expectRefused(result).missing?.length).to.equal(1)
   })
 
   it('should handle action rollback', async () => {
@@ -219,7 +229,7 @@ describe('TransactorSource', () => {
     // Verify block is available for new actions
     const newActionId = generateActionId()
     const result = await source.transact(transform, newActionId, 2, 'header-id', 'tail-id')
-    expect(result).to.be.undefined
+    expectCommitted(result)
   })
 
   it('should handle concurrent actions on different blocks', async () => {
@@ -284,8 +294,8 @@ describe('TransactorSource', () => {
       source.transact(transform2, generateActionId(), 2, 'header-id', 'tail-id')
     ])
 
-    expect(result1).to.be.undefined
-    expect(result2).to.be.undefined
+    expectCommitted(result1)
+    expectCommitted(result2)
 
     const block1 = await source.tryGet(blockId1)
     const block2 = await source.tryGet(blockId2)
@@ -327,7 +337,7 @@ describe('TransactorSource', () => {
 
     // Start first action
     const result1 = await source.transact(transform1, actionId1, 2, headerId, tailId)
-    expect(result1).to.be.undefined
+    expectCommitted(result1)
 
     // Second action tries to update header and tail (should fail due to conflict)
     const actionId2 = generateActionId()
@@ -342,8 +352,7 @@ describe('TransactorSource', () => {
 
     // Start second action (using same rev=2)
     const result2 = await source.transact(transform2, actionId2, 2, headerId, tailId)
-    expect(result2).to.not.be.undefined
-    expect(result2?.success).to.be.false
+    expectRefused(result2)
 
     // Check that first action's changes are still applied
     const headerBlock = await source.tryGet(headerId)
@@ -381,11 +390,11 @@ describe('TransactorSource', () => {
     }
 
     const insertResult = await source.transact(insertTransform, generateActionId(), 1, 'header-id', 'tail-id')
-    expect(insertResult).to.be.undefined
+    expectCommitted(insertResult)
 
     // Now update the block
     const updateResult = await source.transact(updateTransform, generateActionId(), 2, 'header-id', 'tail-id')
-    expect(updateResult).to.be.undefined
+    expectCommitted(updateResult)
   })
 
 	describe('Version Conflict and Stale Read Tests (TEST-4.2.1)', () => {
@@ -416,8 +425,7 @@ describe('TransactorSource', () => {
 				deletes: [],
 			};
 			const result = await src.transact(updateTransforms, actionId, 2, blockId, blockId);
-			expect(result).to.not.be.undefined;
-			expect(result!.success).to.be.false;
+			expectRefused(result);
 
 			// FIX VERIFIED: transact() now cancels the pending action on commit failure.
 			const pending = transactor.getPendingActions();
@@ -427,7 +435,7 @@ describe('TransactorSource', () => {
 			transactor.commit = originalCommit;
 			const newActionId = generateActionId();
 			const retryResult = await src.transact(updateTransforms, newActionId, 2, blockId, blockId);
-			expect(retryResult, 'retry should succeed after clean cancel').to.be.undefined;
+			expectCommitted(retryResult, 'retry should succeed after clean cancel');
 		});
 
 		it('should return undefined from tryGet when result entry has no block (e.g. non-existent block ID in response)', async () => {
@@ -733,9 +741,7 @@ describe('TransactorSource', () => {
 				blockId,
 			);
 			// transact uses policy 'r', so it returns the pending conflicts instead of failing
-			expect(result).to.not.be.undefined;
-			expect(result!.success).to.be.false;
-			expect((result as any).pending, 'should report the untracked pending action').to.be.an('array').that.is.not.empty;
+			expect(expectRefused(result).pending, 'should report the untracked pending action').to.be.an('array').that.is.not.empty;
 		});
 	});
 })

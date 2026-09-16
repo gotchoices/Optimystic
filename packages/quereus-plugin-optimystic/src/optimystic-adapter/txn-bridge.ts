@@ -22,7 +22,15 @@ const log = createLogger('txn-bridge');
  * rollback and the collection stays readable.
  */
 export interface DirtyTree {
-  sync(): Promise<void>;
+  /**
+   * Flush this tree's staged changes. Declared as `Promise<unknown>` because a real `Tree.sync`
+   * resolves to the write's `WriteDurability` (ticket write-durability-reaches-the-writer) while a
+   * test double resolves to nothing, and this bridge consumes NEITHER — it only needs the flush to
+   * have happened. Anything here that wants to report how durable a commit was has to go through
+   * the multi-collection gap tracked in
+   * `tickets/backlog/feat-multi-collection-commit-reports-durability.md`, not by reading this back.
+   */
+  sync(): Promise<unknown>;
   snapshot(): unknown;
   restore(snapshot: unknown): void;
   /**

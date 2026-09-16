@@ -13,8 +13,8 @@
  */
 import { expect } from 'chai';
 import type { PrivateKey } from '@libp2p/interface';
-import type { BlockId } from '@optimystic/db-core';
-import { NetworkTransactor, Tree, routingKeyForBlock } from '@optimystic/db-core';
+import type { BlockId, WriteDurability } from '@optimystic/db-core';
+import { NetworkTransactor, Tree, mergeDurability, routingKeyForBlock } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { createLibp2pNode, type NodeOptions } from '../../src/libp2p-node.js';
@@ -105,12 +105,19 @@ export async function waitForPair(a: Machine, b: Machine): Promise<void> {
 	}, { timeoutMs: 40_000, intervalMs: 500, description: `${a.name} and ${b.name} each assemble the same two-member cohort` });
 }
 
-/** Write each row as its own action through the machine's NetworkTransactor; throws if any is refused. */
-export async function writeRows(machine: Machine, treeId: string, rows: Row[]): Promise<void> {
+/** Write each row as its own action through the machine's NetworkTransactor; throws if any is refused.
+ *
+ *  @returns who holds the rows: the WEAKEST of the per-row reports (`mergeDurability`), because a caller
+ *  asking about a batch is asking whether ALL of it is held — one row that reached only the writer makes
+ *  the batch only-on-the-writer. `undefined` only when no row wrote anything (an empty `rows`). */
+export async function writeRows(machine: Machine, treeId: string, rows: Row[]): Promise<WriteDurability | undefined> {
 	const tree = await Tree.createOrOpen<number, Row>(transactorFor(running(machine), machine.networkName), treeId, keyOf);
+	const reports: WriteDurability[] = [];
 	for (const row of rows) {
-		await tree.replace([[row.key, row]]);
+		const durability = await tree.replace([[row.key, row]]);
+		if (durability) reports.push(durability);
 	}
+	return reports.length === 0 ? undefined : mergeDurability(reports);
 }
 
 /** A freshly opened tree's view of `keys` — a new transactor and tree, so no staged or cached state
@@ -135,6 +142,11 @@ export async function expectReadable(machine: Machine, treeId: string, rows: Ite
 export interface WriteAttempt {
 	/** Absent when the write was acknowledged. */
 	readonly refusal?: Error;
+	/** Who holds the write, for an ACKNOWLEDGED attempt — the answer `Tree.replace` now returns. Absent
+	 *  on a refusal (nothing was written), and absent for an acknowledged attempt that wrote nothing at
+	 *  all (an empty `rows`). A lone survivor's write reads `local` here, which is how a caller tells it
+	 *  from one the whole group holds. */
+	readonly durability?: WriteDurability;
 	readonly elapsedMs: number;
 }
 
@@ -143,8 +155,8 @@ export interface WriteAttempt {
 export async function attemptWrite(machine: Machine, treeId: string, rows: Row[]): Promise<WriteAttempt> {
 	const startedAt = Date.now();
 	try {
-		await writeRows(machine, treeId, rows);
-		return { elapsedMs: Date.now() - startedAt };
+		const durability = await writeRows(machine, treeId, rows);
+		return { ...(durability === undefined ? {} : { durability }), elapsedMs: Date.now() - startedAt };
 	} catch (err) {
 		return { refusal: err as Error, elapsedMs: Date.now() - startedAt };
 	}
@@ -152,7 +164,7 @@ export async function attemptWrite(machine: Machine, treeId: string, rows: Row[]
 
 /** One line for the run output describing `attempt`; for a refusal, also what each of `readers` reads at the refused row now. */
 export async function describeWriteAttempt(attempt: WriteAttempt, row: Row, treeId: string, readers: Machine[]): Promise<string> {
-	if (!attempt.refusal) return `ACKNOWLEDGED after ${attempt.elapsedMs}ms`;
+	if (!attempt.refusal) return `ACKNOWLEDGED (${attempt.durability?.quorum ?? 'no durability reported'}) after ${attempt.elapsedMs}ms`;
 	const reads: string[] = [];
 	for (const reader of readers) {
 		const value = (await readRows(reader, treeId, [row.key])).get(row.key)?.value ?? 'absent';

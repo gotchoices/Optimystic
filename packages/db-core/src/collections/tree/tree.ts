@@ -1,5 +1,5 @@
 import { Collection, type CollectionInitOptions, type CollectionId, type CollectionSnapshot, type ReadViewOptions } from "../../collection/index.js";
-import type { ITransactor, BlockId, BlockStore, IBlock, ActionId } from "../../index.js";
+import type { ITransactor, BlockId, BlockStore, IBlock, ActionId, WriteDurability } from "../../index.js";
 import { BTree, type Path, type KeyRange } from "../../btree/index.js";
 import { CollectionTrunk } from "./collection-trunk.js";
 import { structuralEquals } from "../../utility/structural-equals.js";
@@ -262,9 +262,12 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		return new Tree<TKey, TEntry>(collection, held.btree, keyFromEntry, compare);
 	}
 
-	async replace(data: TreeReplaceAction<TKey, TEntry>): Promise<void> {
+	/** Stage a mutation and flush it. Forwards the collection's answer verbatim — see
+	 * {@link Collection.sync} for what `undefined` means and why a torn commit's `torn` list must
+	 * survive the trip. This layer never interprets the value. */
+	async replace(data: TreeReplaceAction<TKey, TEntry>): Promise<WriteDurability | undefined> {
 			await this.collection.act({ type: "replace", data });
-			await this.collection.updateAndSync();
+			return await this.collection.updateAndSync();
 	}
 
 	/** Stage a mutation into the collection's tracker WITHOUT flushing it to the
@@ -279,8 +282,8 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 
 	/** Flush all staged (and any other pending) changes to the transactor.
 	 * Equivalent to the flush half of {@link replace}. */
-	async sync(): Promise<void> {
-			await this.collection.updateAndSync();
+	async sync(): Promise<WriteDurability | undefined> {
+			return await this.collection.updateAndSync();
 	}
 
 	/** Whether {@link sync} has anything to push — see
