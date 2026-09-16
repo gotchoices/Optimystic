@@ -3,7 +3,10 @@ import { drain, type LevelDBLike } from './leveldb-like.js';
 import { kvKey, kvKeyToString, kvPrefixRange } from './keys.js';
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
+// Built on first use, not at module load: Hermes (React Native) has no native `TextDecoder`, so a
+// module-scope construction fails the import itself whenever it runs ahead of the host's polyfill.
+let textDecoderInstance: TextDecoder | undefined;
+const textDecoder = (): TextDecoder => textDecoderInstance ??= new TextDecoder();
 
 /**
  * LevelDB-backed `IKVStore` adapter for React Native peers.
@@ -24,7 +27,7 @@ export class LevelDBKVStore implements IKVStore {
 	async get(key: string): Promise<string | undefined> {
 		const bytes = await this.db.get(kvKey(this.prefix + key));
 		if (!bytes) return undefined;
-		return textDecoder.decode(bytes);
+		return textDecoder().decode(bytes);
 	}
 
 	async set(key: string, value: string): Promise<void> {

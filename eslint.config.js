@@ -71,10 +71,25 @@ const NO_DOM_EXCEPTION = {
 	selector: "NewExpression[callee.name='DOMException']",
 	message: 'DOMException construction is not guaranteed under Hermes/React Native. Throw a plain named Error instead.',
 };
-// NOTE: this Hermes-global guard is deliberately not exhaustive. `TextEncoder`/`TextDecoder`/
-// `structuredClone`/timer `.ref()`/`.unref()`/`AbortSignal.prototype.throwIfAborted` are all used
-// too pervasively (and are already required, declared polyfills per readme.md § React Native) to
-// ban outright without either breaking real call sites or demanding a repo-wide rewrite; a lint
+// Hermes has no native `TextDecoder`, and a module-scope `new TextDecoder()` runs while the module is
+// being *imported* — so it made `import '@optimystic/db-p2p/rn'` itself throw on any phone whose
+// polyfill was not yet installed, before the host app's own code could run. Using the global is fine
+// (it is a declared polyfill, readme.md § React Native); constructing it at load is what is banned.
+// Build it on first use and memoize — see `decoder()` in packages/db-p2p/src/storage/raw-store-codec.ts.
+// A per-instance class field is allowed (it runs at construction); a `static` one is not (it runs
+// with the class body). `test/module-load-globals.spec.ts` in db-p2p is the runtime backstop: it
+// loads the React Native entry in a child process and fails on any first-party load-time use.
+const NO_MODULE_SCOPE_TEXT_DECODER = {
+	selector: "NewExpression[callee.name='TextDecoder']:not(:function NewExpression, PropertyDefinition[static=false] > NewExpression)",
+	message: 'Do not construct TextDecoder at module load: Hermes/React Native has no native TextDecoder, so the import itself throws before the host polyfill runs. Construct it on first use and memoize — see decoder() in db-p2p/src/storage/raw-store-codec.ts.',
+};
+
+// NOTE: this Hermes-global guard is deliberately not exhaustive. `TextDecoder` (beyond the
+// module-scope construction banned above)/`structuredClone`/timer `.ref()`/`.unref()`/
+// `AbortSignal.prototype.throwIfAborted` are all used too pervasively (and are already required,
+// declared polyfills per readme.md § React Native) to ban outright without either breaking real
+// call sites or demanding a repo-wide rewrite. `TextEncoder` needs no rule at all — Hermes provides
+// it natively (React Native 0.74+), so module-scope `new TextEncoder()` is fine and stays common. A lint
 // rule for `ReadableStream`/`WritableStream`/`TransformStream`, `Symbol.asyncIterator`,
 // `crypto.getRandomValues`, or `crypto.subtle.digest` would currently be pure prevention (nothing
 // in `packages/*/src` reaches for them today). If any of those ever gain a first-party call site,
@@ -147,7 +162,7 @@ export default tseslint.config(
 		// `test/support/capture-log.ts` legitimately imports `debug` — that is its whole job.
 		files: ['packages/*/src/**/*.ts'],
 		rules: {
-			'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_DIRECT_DEBUG_IMPORT, NO_STATIC_BLOCK, NO_ABORT_SIGNAL_TIMEOUT, NO_ABORT_SIGNAL_ANY, NO_PROMISE_WITH_RESOLVERS, NO_DOM_EXCEPTION],
+			'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_DIRECT_DEBUG_IMPORT, NO_STATIC_BLOCK, NO_ABORT_SIGNAL_TIMEOUT, NO_ABORT_SIGNAL_ANY, NO_PROMISE_WITH_RESOLVERS, NO_DOM_EXCEPTION, NO_MODULE_SCOPE_TEXT_DECODER],
 			'no-restricted-globals': ['error', NO_BUFFER_GLOBAL],
 			// `no-restricted-globals` only sees the bare identifier; close the qualified spellings too.
 			'no-restricted-properties': ['error',

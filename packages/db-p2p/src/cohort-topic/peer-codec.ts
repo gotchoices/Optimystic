@@ -13,7 +13,10 @@ import { peerIdFromString } from "@libp2p/peer-id";
 import type { PeerId } from "@libp2p/interface";
 
 const utf8Encoder = new TextEncoder();
-const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+// Built on first use, not at module load: Hermes (React Native) has no native `TextDecoder`, so a
+// module-scope construction fails the import itself whenever it runs ahead of the host's polyfill.
+let utf8DecoderInstance: TextDecoder | undefined;
+const utf8Decoder = (): TextDecoder => utf8DecoderInstance ??= new TextDecoder("utf-8", { fatal: true });
 
 /** A cohort-member id as the substrate's opaque bytes: UTF-8 of the canonical peer-id string. */
 export function peerIdToBytes(peerId: PeerId | string): Uint8Array {
@@ -22,7 +25,7 @@ export function peerIdToBytes(peerId: PeerId | string): Uint8Array {
 
 /** Reverse of {@link peerIdToBytes}: decode member bytes back to the canonical peer-id string. */
 export function bytesToPeerIdString(bytes: Uint8Array): string {
-	return utf8Decoder.decode(bytes);
+	return utf8Decoder().decode(bytes);
 }
 
 /** Reverse of {@link peerIdToBytes}: decode member bytes back to a dialable {@link PeerId}. */

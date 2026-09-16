@@ -2978,6 +2978,27 @@ describe('StorageRepo', () => {
 			expect(await storedDigest(1), 'preview predicted the committed content').to.equal(preview!.digest);
 		});
 
+		it('previews without calling structuredClone (Hermes lacks it)', async () => {
+			// The preview used to structuredClone both base and transform unconditionally. An insert is the
+			// case db-core's applyTransform also clones nothing for, so with this repo's own call gone the
+			// whole preview runs with the global absent. (Updates still reach db-core's applyOperation,
+			// which does call it — that is db-core's polyfill requirement, not this path's.)
+			await repo.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: ['x'] })), policy: 'c' });
+
+			const native = globalThis.structuredClone;
+			globalThis.structuredClone = () => { throw new Error('structuredClone called on the preview path'); };
+			let preview;
+			try {
+				preview = await repo.previewCommitDigest(BLOCK, 'a1' as ActionId, 1);
+			} finally {
+				globalThis.structuredClone = native;
+			}
+
+			const commit = await repo.commit({ actionId: 'a1' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 1 });
+			expect(commit.success).to.equal(true);
+			expect(await storedDigest(1)).to.equal(preview!.digest);
+		});
+
 		it('previews an update against the local base and matches what internalCommit stores', async () => {
 			await repo.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: ['x'] })), policy: 'c' });
 			await repo.commit({ actionId: 'a1' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 1 });

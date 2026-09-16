@@ -40,7 +40,10 @@ import {
 } from "./wire-validate.js";
 
 const utf8Encoder = new TextEncoder();
-const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+// Built on first use, not at module load: Hermes (React Native) has no native `TextDecoder`, so a
+// module-scope construction fails the import itself whenever it runs ahead of the host's polyfill.
+let utf8DecoderInstance: TextDecoder | undefined;
+const utf8Decoder = (): TextDecoder => utf8DecoderInstance ??= new TextDecoder("utf-8", { fatal: true });
 
 /** Ceiling for an opaque subscribe app payload, guarding decode allocation. */
 export const DEFAULT_MAX_SUBSCRIBE_PAYLOAD_BYTES = 64 * 1024;
@@ -159,9 +162,12 @@ function parseJsonBytes(bytes: Uint8Array, maxBytes: number, what: string): unkn
 	if (bytes.length > maxBytes) {
 		fail(`${what}: payload ${bytes.length} exceeds max ${maxBytes} bytes`);
 	}
+	// Fetched outside the try, so a missing `TextDecoder` polyfill surfaces as itself rather than as
+	// "not valid UTF-8".
+	const decoder = utf8Decoder();
 	let text: string;
 	try {
-		text = utf8Decoder.decode(bytes);
+		text = decoder.decode(bytes);
 	} catch {
 		fail(`${what}: payload is not valid UTF-8`);
 	}

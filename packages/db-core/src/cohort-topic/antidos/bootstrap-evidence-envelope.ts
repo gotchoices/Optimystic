@@ -21,7 +21,10 @@ import { b64urlToBytes, bytesToB64url } from "../wire/codec.js";
 import type { RegisterV1 } from "../wire/types.js";
 
 const utf8 = new TextEncoder();
-const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+// Built on first use, not at module load: Hermes (React Native) has no native `TextDecoder`, so a
+// module-scope construction fails the import itself whenever it runs ahead of the host's polyfill.
+let utf8DecoderInstance: TextDecoder | undefined;
+const utf8Decoder = (): TextDecoder => utf8DecoderInstance ??= new TextDecoder("utf-8", { fatal: true });
 
 /** Proof-of-work evidence (T2/T3 path). `nonce` is base64url, bound via {@link powPreimage}. */
 export interface PowEvidenceV1 {
@@ -178,7 +181,8 @@ export function serializeBootstrapEvidenceEnvelope(env: BootstrapEvidenceEnvelop
 /**
  * Decode {@link RegisterV1.bootstrapEvidence} (base64url → JSON), structurally validate it, and return
  * the {@link BootstrapEvidenceEnvelopeV1}. **Total**: returns `undefined` on an absent/empty field, a
- * non-base64url or non-JSON body, a wrong/future `v`, or a structurally-invalid kind — never throws. A
+ * non-base64url or non-JSON body, a wrong/future `v`, or a structurally-invalid kind — never throws on its input
+ * (a host missing its `TextDecoder` polyfill does throw — a misconfiguration, not bad evidence). A
  * verifier treats `undefined` as "this kind not offered" and fails its check (fails closed).
  */
 export function parseBootstrapEvidenceEnvelope(reg: Pick<RegisterV1, "bootstrapEvidence">): BootstrapEvidenceEnvelopeV1 | undefined {
@@ -186,9 +190,12 @@ export function parseBootstrapEvidenceEnvelope(reg: Pick<RegisterV1, "bootstrapE
 	if (raw === undefined || raw === "") {
 		return undefined; // not offered
 	}
+	// Fetched outside the try: a missing `TextDecoder` polyfill is a host misconfiguration and must
+	// throw as one, not quietly read every offered envelope as "not offered".
+	const decoder = utf8Decoder();
 	let parsed: unknown;
 	try {
-		parsed = JSON.parse(utf8Decoder.decode(b64urlToBytes(raw)));
+		parsed = JSON.parse(decoder.decode(b64urlToBytes(raw)));
 	} catch {
 		return undefined; // not base64url / not UTF-8 / not JSON → fail closed
 	}

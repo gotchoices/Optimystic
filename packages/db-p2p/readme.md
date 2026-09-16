@@ -650,13 +650,13 @@ before any other imports).
 |-----|-------------|-------|
 | `crypto.getRandomValues()` | @noble/hashes, @libp2p/crypto | RN 0.76+ New Architecture provides natively; fallback via e.g. `react-native-get-random-values` |
 | `crypto.subtle.digest()` | multiformats/hashes/sha2-browser | Async SHA-256/SHA-512 — implement via @noble/hashes |
-| `structuredClone()` | @optimystic/db-core | JSON round-trip is sufficient |
+| `structuredClone()` | @optimystic/db-core | JSON round-trip is sufficient. Still required: db-core calls it on ordinary read and write paths (applying an update to a block, for one), though never while a module loads |
 | `Promise.withResolvers()` | @libp2p/utils, @chainsafe/libp2p-yamux, it-queue | ES2024 — simple shim |
 | `AbortSignal.prototype.throwIfAborted()` | libp2p, @libp2p/circuit-relay-v2, it-pushable | DOM spec addition — simple shim |
 | Timer `.ref()` / `.unref()` | @optimystic/db-p2p, undici | Wrap Hermes numeric timer IDs in objects with no-op `.ref()`/`.unref()` methods; patch `clearTimeout`/`clearInterval` to unwrap |
 | `Event`, `CustomEvent`, `EventTarget` | libp2p, @libp2p/interface | Custom shim or npm `event-target-polyfill` |
 | `Intl.PluralRules` | moat-maker | English-only ordinal/cardinal shim is sufficient |
-| `TextDecoder` | @optimystic/db-core, @optimystic/db-p2p, @optimystic/db-p2p-storage-rn, multiformats, cborg | **Constructed at module load, so without it the app fails at startup.** Expo SDK 52+ provides it; bare React Native's Hermes does not. A UTF-8-only shim is sufficient |
+| `TextDecoder` | multiformats, cborg, @optimystic/db-core, @optimystic/db-p2p, @optimystic/db-p2p-storage-rn | **multiformats and cborg construct it at module load, so without it the app fails at startup.** Optimystic's own packages construct it only on first use (see below), which does not make it optional. Expo SDK 52+ provides it; bare React Native's Hermes does not. A UTF-8-only shim is sufficient |
 | `WebSocket.prototype.bufferedAmount` | @libp2p/websockets | **RN declares the field but never assigns it, so it reads `undefined`.** See below — without this every WebSocket write hangs. |
 
 **`WebSocket.bufferedAmount` deserves its own note, because the symptom does not look like a
@@ -697,6 +697,8 @@ together. It never runs the bundle, so the global polyfills above are not verifi
 - `BigInt` — built-in to Hermes since RN 0.70
 
 Optimystic's own code does not require a global `Buffer` — it encodes with `uint8arrays`, and lint (`no-restricted-globals` in `eslint.config.js`) keeps it that way.
+
+Optimystic's own code never touches `TextDecoder` or `structuredClone` while a module is loading: each `TextDecoder` is built the first time something decodes, and then reused. So importing `@optimystic/db-p2p/rn` (or db-core, or db-p2p-storage-rn) does not throw *because of Optimystic* on a runtime whose polyfill is not installed yet. **Both are still required polyfills**, and should still be installed before any other import: the third-party dependencies in the table construct `TextDecoder` at load and fail startup without it, and Optimystic needs both as soon as it decodes or applies an update. `NO_MODULE_SCOPE_TEXT_DECODER` in `eslint.config.js` keeps it that way, and `test/module-load-globals.spec.ts` checks it at runtime. The spec loads the `/rn` entry in a fresh process and fails if any first-party module uses either global during the load.
 
 Optimystic's own code also does not call `AbortSignal.timeout` or `AbortSignal.any`, call `Promise.withResolvers`, or construct `DOMException` — none of those are guaranteed under Hermes. (It does call `signal.throwIfAborted()`, which stays a required host polyfill per the table above because libp2p needs it anyway.) Every deadline is an explicit `AbortController` plus a timer, cleared on every exit path (see `dialRelay` in `src/network/relay-reservation.ts` and `RepoClient.processRepoMessage` in `src/repo/client.ts`, which hand-rolls the "abort on any of several signals" case rather than using `AbortSignal.any` or the `any-signal` package — the code comment there explains why). `no-restricted-syntax` in `eslint.config.js` keeps it that way.
 

@@ -34,7 +34,10 @@ export const TAG_KV = 0x10;
 export const TAG_IDENTITY = 0x20;
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
+// Built on first use, not at module load: Hermes (React Native) has no native `TextDecoder`, so a
+// module-scope construction fails the import itself whenever it runs ahead of the host's polyfill.
+let textDecoderInstance: TextDecoder | undefined;
+const textDecoder = (): TextDecoder => textDecoderInstance ??= new TextDecoder();
 
 function encodeBlockEnvelope(tag: number, blockId: string): Uint8Array {
 	const blockIdBytes = textEncoder.encode(blockId);
@@ -77,7 +80,7 @@ export function metadataRange(): { gte: Uint8Array; lt: Uint8Array } {
 export function blockIdFromMetadataKey(key: Uint8Array): string {
 	const view = new DataView(key.buffer, key.byteOffset, key.byteLength);
 	const blockIdLen = view.getUint32(1, false);
-	return textDecoder.decode(key.subarray(5, 5 + blockIdLen));
+	return textDecoder().decode(key.subarray(5, 5 + blockIdLen));
 }
 
 /**
@@ -144,7 +147,7 @@ export function blockEnvelopeRange(tag: number, blockId: string): { gte: Uint8Ar
 export function actionIdFromKey(key: Uint8Array, blockId: string): string {
 	const blockIdLen = textEncoder.encode(blockId).length;
 	const suffixOffset = 1 + 4 + blockIdLen;
-	return textDecoder.decode(key.subarray(suffixOffset));
+	return textDecoder().decode(key.subarray(suffixOffset));
 }
 
 export function kvKey(key: string): Uint8Array {
@@ -170,7 +173,7 @@ export function kvPrefixRange(prefix: string): { gte: Uint8Array; lt: Uint8Array
 
 /** Strip the leading `TAG_KV` byte from a key, returning the UTF-8 string portion. */
 export function kvKeyToString(raw: Uint8Array): string {
-	return textDecoder.decode(raw.subarray(1));
+	return textDecoder().decode(raw.subarray(1));
 }
 
 export function identityKey(keyName: string): Uint8Array {

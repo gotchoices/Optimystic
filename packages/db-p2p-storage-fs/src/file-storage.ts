@@ -7,7 +7,11 @@ import { atomicWriteFile } from './atomic-write.js';
 
 const log = createLogger('storage:file');
 
-const decoder = new TextDecoder();
+// Built on first use rather than at module load, like every other `TextDecoder` in library source
+// (see NO_MODULE_SCOPE_TEXT_DECODER in eslint.config.js). Harmless on Node; kept uniform so the lint
+// rule needs no per-package exemption.
+let decoderInstance: TextDecoder | undefined;
+const decoder = (): TextDecoder => decoderInstance ??= new TextDecoder();
 
 // Colons are illegal in Windows filenames; encode them so action ids like
 // `tx:<hash>` and `stamp:<hash>` round-trip safely on all platforms.
@@ -31,7 +35,7 @@ function decodeFilenameToActionId(filename: string): ActionId {
 // path ever shows up hot, parse once and thread the parsed value through the driver.
 function isParseableJson(bytes: Uint8Array): boolean {
 	try {
-		JSON.parse(decoder.decode(bytes));
+		JSON.parse(decoder().decode(bytes));
 		return true;
 	} catch (err) {
 		if (err instanceof SyntaxError) return false;

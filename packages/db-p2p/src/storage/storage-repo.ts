@@ -17,6 +17,7 @@ import { proofDeclaredDigest, type BlockCommitProof } from "../cluster/commit-pr
 import { RevisionNotCoveredError } from "./i-block-storage.js";
 import { acquireBlockWriteLatches, withBlockWriteLatch, type BlockWriteLatch } from "./block-latch.js";
 import { createLogger } from "../logger.js";
+import { cloneDecoded } from "./raw-store-codec.js";
 import { checkPendValidation } from "../pend-validation.js";
 
 const log = createLogger('storage-repo');
@@ -1184,8 +1185,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 
 		// Clone both: applyTransform assigns `transform.insert` into the result by reference and
 		// applyOperations mutates the block in place, so materializing on live storage/pending objects
-		// would corrupt them for the real commit that follows.
-		const newBlock = applyTransform(structuredClone(base), structuredClone(transform));
+		// would corrupt them for the real commit that follows. `cloneDecoded` (a JSON round-trip) rather
+		// than `structuredClone`, which Hermes lacks; lossless here because both values were just decoded
+		// from JSON by the store (every `IRawStorage` in this repo is the JSON-coded `KvRawStorage`).
+		// NOTE: if an `IRawStorage` that hands out live, never-serialized objects is ever wired in, this
+		// preview can drift from internalCommit (which applies to the uncloned values): an update op
+		// setting a field to `undefined` clones to `null`, which canonical JSON hashes differently.
+		const newBlock = applyTransform(cloneDecoded(base), cloneDecoded(transform));
 		// `undefined` covers the tombstone (delete transform) and updates-with-no-base (applyTransform
 		// drops updates when there is no block to apply them to) — both materialize nothing.
 		const digest = newBlock ? await canonicalBlockHash(newBlock) : undefined;

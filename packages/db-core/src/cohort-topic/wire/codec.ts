@@ -53,7 +53,10 @@ export const DEFAULT_MAX_MESSAGE_BYTES = 1024 * 1024;
 const LENGTH_PREFIX_BYTES = 4;
 
 const utf8Encoder = new TextEncoder();
-const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+// Built on first use, not at module load: Hermes (React Native) has no native `TextDecoder`, so a
+// module-scope construction fails the import itself whenever it runs ahead of the host's polyfill.
+let utf8DecoderInstance: TextDecoder | undefined;
+const utf8Decoder = (): TextDecoder => utf8DecoderInstance ??= new TextDecoder("utf-8", { fatal: true });
 
 // --- base64url helpers (no padding, cross-platform) ---
 
@@ -152,9 +155,12 @@ export function decodeCohortMessage(bytes: Uint8Array, maxMessageBytes: number =
 		throw new CohortWireError(`frame length mismatch: declared ${declared}, have ${bytes.length - LENGTH_PREFIX_BYTES}`);
 	}
 	const body = bytes.subarray(LENGTH_PREFIX_BYTES, LENGTH_PREFIX_BYTES + declared);
+	// Fetched outside the try, so a missing `TextDecoder` polyfill surfaces as itself rather than as
+	// "not valid UTF-8".
+	const decoder = utf8Decoder();
 	let text: string;
 	try {
-		text = utf8Decoder.decode(body);
+		text = decoder.decode(body);
 	} catch {
 		throw new CohortWireError("frame body is not valid UTF-8");
 	}
