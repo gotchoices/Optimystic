@@ -1,5 +1,7 @@
 import type { TransactionCoordinator, ITransactionEngine, Collection, CollectionId } from '@optimystic/db-core';
-import { TransactionSession, CoordinatorPartialCommitError, TreeKeyTakenError } from '@optimystic/db-core';
+import {
+  TransactionSession, CoordinatorPartialCommitError, TreeEntryChangedError, TreeGuardRefusedError, TreeKeyTakenError,
+} from '@optimystic/db-core';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
@@ -276,6 +278,18 @@ export class TransactionBridge {
    */
   private keyTakenMessages = new Map<CollectionId, string>();
   /**
+   * Per-collection SQL rendering of a concurrency-refused ROW CHANGE: the
+   * `concurrent modification: another writer changed or removed the row in <table> at
+   * primary key (…)` message the vtab registers for its MAIN collection (see
+   * OptimysticVirtualTable.registerCollections). A `TreeEntryChangedError` surfacing at
+   * commit — the losing writer's conflict replay finding that the row image its UPDATE,
+   * DELETE, or REPLACE was computed from is no longer what the collection holds — is
+   * rewrapped via {@link mapCommitRefusal} through this renderer, which decodes the framed
+   * key into the row's logical primary-key values. A renderer rather than a fixed string
+   * because the message names the refused row, which only the error carries.
+   */
+  private entryChangedRenderers = new Map<CollectionId, (key: string) => string>();
+  /**
    * Depth-indexed savepoint snapshots for LEGACY (staged-tracker) mode. Each
    * entry captures the staged state of EVERY registered collection (main table +
    * all index trees) at the moment the savepoint was created, keyed by the
@@ -450,24 +464,41 @@ export class TransactionBridge {
   }
 
   /**
-   * Rewrap a commit failure caused by a `TreeKeyTakenError` (a losing writer's
-   * conflict replay refusing a key a rival already committed) into an error whose
-   * MESSAGE is the registered `UNIQUE constraint failed: …` rendering for the
-   * refusing collection's table, keeping the structured refusal reachable via
-   * `cause`. Anything else — no TreeKeyTakenError anywhere in the cause chain, an
-   * unregistered collection, or an error already carrying the mapped message (the
-   * legacy sweep maps before rethrowing, and commitTransaction's catch maps again)
-   * — passes through unchanged.
+   * Register how a `TreeEntryChangedError` from `collectionId` renders at commit (see
+   * {@link entryChangedRenderers}): `render` receives the refused entry's framed key and
+   * returns the SQL-facing message. Idempotent; called by the vtab for its main
+   * collection alongside {@link registerKeyTakenMessage}. Index trees register none —
+   * no index-tree write carries an `unchanged` guard, because a stale index delta can
+   * only be prevented by refusing the main-table action it was derived from, never
+   * repaired from inside the index tree.
+   */
+  registerEntryChangedRenderer(collectionId: CollectionId, render: (key: string) => string): void {
+    this.entryChangedRenderers.set(collectionId, render);
+  }
+
+  /**
+   * Rewrap a commit failure caused by a guard refusal (`TreeGuardRefusedError` anywhere
+   * in the cause chain — a losing writer's conflict replay refusing what a rival already
+   * committed) into an error whose MESSAGE is the SQL rendering registered for the
+   * refusing collection, keeping the structured refusal reachable via `cause`. The
+   * rendering is chosen by the refusal's class, because the two mean different things
+   * to a client: a `TreeKeyTakenError` (its `TreeRangeTakenError` subclass included) is a
+   * uniqueness violation and renders as the registered `UNIQUE constraint failed: …`
+   * message; a `TreeEntryChangedError` is a lost update — the row the statement read was
+   * changed or removed — and renders through the registered concurrent-modification
+   * renderer. Anything else — no guard refusal in the chain, an unregistered collection,
+   * or an error already carrying the mapped message (the legacy sweep maps before
+   * rethrowing, and commitTransaction's catch maps again) — passes through unchanged.
    *
    * Public because the vtab's DML catch maps through it too: a guard is enforced at
    * INITIAL staging as well as at replay, and a staging-time refusal (the tracker
    * fetched a rival's commit the pre-stage probe's view had not) must reach the client
-   * as the same UNIQUE message a commit-time one does.
+   * as the same message a commit-time one does.
    */
   mapCommitRefusal(error: unknown): unknown {
     for (let cursor: unknown = error; cursor instanceof Error; cursor = cursor.cause) {
-      if (cursor instanceof TreeKeyTakenError) {
-        const message = this.keyTakenMessages.get(cursor.collectionId);
+      if (cursor instanceof TreeGuardRefusedError) {
+        const message = this.renderRefusal(cursor);
         if (message === undefined || (error instanceof Error && error.message === message)) {
           return error;
         }
@@ -475,6 +506,18 @@ export class TransactionBridge {
       }
     }
     return error;
+  }
+
+  /** The registered SQL message for one guard refusal, dispatched by its class, or
+   *  `undefined` when its collection registered nothing for that class. */
+  private renderRefusal(refusal: TreeGuardRefusedError): string | undefined {
+    if (refusal instanceof TreeKeyTakenError) {
+      return this.keyTakenMessages.get(refusal.collectionId);
+    }
+    if (refusal instanceof TreeEntryChangedError) {
+      return this.entryChangedRenderers.get(refusal.collectionId)?.(String(refusal.key));
+    }
+    return undefined;
   }
 
   /**

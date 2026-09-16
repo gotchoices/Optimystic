@@ -157,6 +157,20 @@ export class RowCodec {
 	}
 
 	/**
+	 * Decode a framed primary key back into its logical values, in key order — the
+	 * rendering-only inverse of {@link createPrimaryKey}, for an error message that must
+	 * name the row a human can match back to their SQL rather than the framed tree key
+	 * (see the module's `formatKeyValues`). Each part decodes under its PRIMARY KEY
+	 * column's affinity, exactly as the comparator does. Never throws: the framing decoder
+	 * tolerates a truncated key, and a message renderer must not be the second failure.
+	 */
+	decodePrimaryKey(key: PrimaryKeyValue): SqlValue[] {
+		const elements = splitKeyTuple(key);
+		return this.schema.primaryKeyDefinition.map((pkCol, i) =>
+			this.keyElementToValue(elements[i], this.schema.columns[pkCol.index]?.affinity));
+	}
+
+	/**
 	 * Get the indices of primary key columns
 	 */
 	getPrimaryKeyIndices(): number[] {

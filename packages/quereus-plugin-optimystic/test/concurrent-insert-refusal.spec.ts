@@ -10,6 +10,12 @@
  * `UNIQUE constraint failed: <table>.<col>` message — so the loser fails exactly like a
  * sequential duplicate INSERT and existing client classifiers need no new arm.
  *
+ * The guard is `absent` under EVERY conflict disposition. INSERT OR IGNORE and INSERT OR
+ * REPLACE at a key the probe found clear are refused the same way when a rival takes the
+ * key first (ticket `refuse-concurrent-row-change-loser`): neither disposition can be
+ * honoured inside the main tree's replay without leaving the rival's or the loser's index
+ * entries orphaned, so the retry, whose probe then sees the rival's row, is what honours it.
+ *
  * These tests run two (or three) independent `Database` handles over ONE
  * `FileRawStorage` directory and one `tree://` URI — the cheap one-node repro shape the
  * fix-stage record verified fails on pre-guard builds (both fulfilled, survivor was the
@@ -232,45 +238,42 @@ describe('Concurrent same-key INSERT refusal (two handles, one FileRawStorage di
 		}
 	});
 
-	it('INSERT OR IGNORE staged before a rival commits the key: commit succeeds and keeps the rival\'s row', async () => {
-		const uri = 'tree://race/ignore';
-		const handles = await twoHandles(uri);
-		const { a, b } = handles;
-		try {
-			await a.exec('begin');
-			await a.exec(`insert or ignore into T (id, v) values (1, 'from-A')`);
-			await b.exec(`insert into T (id, v) values (1, 'from-B')`);
-			// The keepExisting guard skips the entry at replay — the same outcome a
-			// sequential INSERT OR IGNORE gets, with no error and no overwrite.
-			await a.exec('commit');
-			for (const db of [a, b]) {
-				expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
-				expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('from-B');
-			}
-		} finally {
-			await handles.dispose();
-		}
-	});
+	for (const clause of ['or ignore', 'or replace'] as const) {
+		it(`INSERT ${clause} staged before a rival commits the key: the commit is REFUSED, and a sequential retry honours the disposition`, async () => {
+			// Neither disposition can be honoured at replay. IGNORE used to stage `keepExisting`,
+			// which skipped only the main-tree entry while the statement's index entries
+			// replayed beside the rival's row; REPLACE used to stage unguarded and displaced
+			// the rival without the index deletes a sequential REPLACE stages for it. Both now
+			// stage `absent`, so the loser is refused as a duplicate key, never silently
+			// admitted. (This table has no index, so the orphan itself is pinned on the
+			// indexed table in concurrent-row-change-refusal.spec.ts; here only the refusal.)
+			const uri = `tree://race/${clause.replace(' ', '-')}`;
+			const handles = await twoHandles(uri);
+			const { a, b } = handles;
+			try {
+				await a.exec('begin');
+				await a.exec(`insert ${clause} into T (id, v) values (1, 'from-A')`);
+				await b.exec(`insert into T (id, v) values (1, 'from-B')`);
 
-	it('INSERT OR REPLACE staged before a rival commits the key: commit succeeds and overwrites (declared semantics)', async () => {
-		const uri = 'tree://race/replace';
-		const handles = await twoHandles(uri);
-		const { a, b } = handles;
-		try {
-			await a.exec('begin');
-			await a.exec(`insert or replace into T (id, v) values (1, 'from-A')`);
-			await b.exec(`insert into T (id, v) values (1, 'from-B')`);
-			// OR REPLACE stages unguarded: displacing whatever occupies the key is exactly
-			// what the statement declared, concurrently or not.
-			await a.exec('commit');
-			for (const db of [a, b]) {
-				expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
-				expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('from-A');
+				const message = await captureThrowMessage(() => a.exec('commit'));
+				expect(message, `an insert ${clause} loser is refused as a duplicate key`).to.match(UNIQUE_T_ID);
+				for (const db of [a, b]) {
+					expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+					expect(await selectScalar(db, 'select v from T where id = 1'), 'the rival\'s row survives the refusal').to.equal('from-B');
+				}
+
+				// The sequential disposition is untouched: the retry's probe sees the rival's
+				// row and honours it — IGNORE keeps the rival's row, REPLACE overwrites it.
+				await a.exec(`insert ${clause} into T (id, v) values (1, 'from-A')`);
+				for (const db of [a, b]) {
+					expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+					expect(await selectScalar(db, 'select v from T where id = 1')).to.equal(clause === 'or ignore' ? 'from-B' : 'from-A');
+				}
+			} finally {
+				await handles.dispose();
 			}
-		} finally {
-			await handles.dispose();
-		}
-	});
+		});
+	}
 
 	it('a key the winner deleted is legitimately reusable by the other handle', async () => {
 		const uri = 'tree://race/delete-reinsert';

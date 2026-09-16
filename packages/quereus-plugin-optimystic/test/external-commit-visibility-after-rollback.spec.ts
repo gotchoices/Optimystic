@@ -29,6 +29,16 @@ const collectRows = async (iter: AsyncIterable<Row>): Promise<Row[]> => {
 	return rows;
 };
 
+/** Assert that `fn` rejects and return the thrown error's message. */
+async function captureThrowMessage(fn: () => Promise<unknown>): Promise<string> {
+	try {
+		await fn();
+	} catch (err) {
+		return err instanceof Error ? err.message : String(err);
+	}
+	throw new Error('expected operation to throw, but it resolved');
+}
+
 /** Build a `local`-style transactor over the supplied raw storage, shared across
  * Database instances so each side sees the other's commits (same shape as
  * committed-read-interleave.spec.ts). */
@@ -92,11 +102,17 @@ describe('External commit visibility after a staged, then rolled-back, transacti
 			// A LIVE read INSIDE the still-open transaction: every vtab read pulls
 			// (`collection.update()`), and this is the one that must observe the pending
 			// conflict and replay it — the moment the bug re-caches pre-commit content.
-			// A's own staged value masks the result here (this SELECT is expected to
-			// return 'a-staged'), but it is what forces the replay to run while A's
-			// conflicting pending action is still in place.
-			const inTxn = await collectRows(dbA.eval(`select v from Item where k = 1`));
-			expect(inTxn.map(r => r.v)).to.deep.equal(['a-staged']);
+			// The replay re-runs A's staged UPDATE against B's committed row, and the
+			// UPDATE's `unchanged` guard (the row image A read is no longer what the
+			// collection holds) refuses it, so the read surfaces the refusal EARLY instead of
+			// returning A's staged value: the transaction is doomed either way, since its
+			// commit would refuse with the concurrent-modification message. The refusal is
+			// the proof that the replay ran while A's conflicting pending action was still in
+			// place, which is what this step exists for. A read-time refusal is wrapped as
+			// `Query failed: …` rather than mapped — see the NOTE in the read path's catch
+			// in OptimysticVirtualTable (`optimystic-module.ts`).
+			const inTxn = await captureThrowMessage(() => collectRows(dbA.eval(`select v from Item where k = 1`)));
+			expect(inTxn, 'the live read surfaces the doomed transaction\'s refusal').to.match(/changed by another writer since this change read it/);
 
 			await dbA.exec('rollback');
 

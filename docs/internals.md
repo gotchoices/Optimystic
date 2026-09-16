@@ -81,8 +81,9 @@ loser's conflict replay would re-run its staged upsert over the winner's committ
 row (silent last-writer-wins, with the *loser's* row surviving). A staged tree entry
 therefore carries an optional serialized guard stating the statement's intent —
 `TreeEntryGuard` in `packages/db-core/src/collections/tree/struct.ts`: `absent`
-(INSERT — a present key throws `TreeKeyTakenError`), `keepExisting` (INSERT OR
-IGNORE — skip silently), `absentRange` (secondary-UNIQUE — no entry OTHER than this
+(INSERT under every conflict disposition — a present key throws `TreeKeyTakenError`),
+`keepExisting` (skip silently if the key is present; no SQL statement stages it any
+more, see the `unchanged` paragraph below), `absentRange` (secondary-UNIQUE — no entry OTHER than this
 entry's own key may occupy a key *range*; a foreign hit throws `TreeRangeTakenError`,
 a subclass of `TreeKeyTakenError`), and `unchanged` (the lost-update check, below). The
 `replace` handler (`buildInit` in
@@ -138,15 +139,19 @@ A guard is plain serialized data that rides in the log beside its action, and th
 
 **An absent entry counts as changed**, on upserts and deletes alike. The staged effect was computed from an image that no longer exists, so re-applying it is never right: an upsert would resurrect a row a rival deleted, and a delete would be the second of two racing deletes. Refusing both is the optimistic-concurrency answer — the writer read a row that is now gone — and an application-level retry then affects zero rows sequentially. `expected` holds a full copy of the entry rather than a digest, so it round-trips through the log under the same encoding entries already use and no digest scheme has to be invented or versioned; the cost is roughly double the row bytes on every guarded log entry, noted at the type for whenever log volume becomes the binding constraint.
 
-Nothing in the SQL layer stages an `unchanged` guard yet — which statements carry it, and the decision that a racing same-row UPDATE or DELETE is refused rather than resolved last-writer-wins, belong to the sibling ticket `refuse-concurrent-row-change-loser`.
+**Which statements carry `unchanged`.** Every main-table entry whose staged index delta was computed from a pre-write row image carries an `unchanged` guard on the stored entry the statement read (`unchanged` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`; the image comes from `requirePreWriteRow`, from the INSERT arm's pre-stage probe, or from the secondary-UNIQUE collision and primary-key displacement probes, each of which now hands back the stored entry beside the decoded row): a same-key UPDATE; both halves of a primary-key move — the delete half on the row it leaves, the insert half `unchanged` on the displaced entry when a REPLACE lands on an occupied key and `absent` otherwise; a DELETE; an INSERT OR REPLACE over an occupied key; and each secondary-UNIQUE eviction. So a racing same-row UPDATE or DELETE **refuses the loser** at commit rather than resolving last-writer-wins. Last-writer-wins cannot be made index-coherent: the loser's index delta was computed against a row the collection no longer holds, and no commit mode replays across collections, so re-applying the main-table action would leave that delta beside the rival's row (an entry no row implies, or a deleted row resurrected). Under concurrency every conflict disposition — `or ignore`, `or replace`, `on conflict … do nothing` — resolves to refusal too: an INSERT at a key its probe found clear is guarded `absent` whatever its disposition, because `keepExisting` would skip only the main-table entry while the statement's index entries replayed beside the rival's row, and an unguarded REPLACE would displace the rival without the index deletes a sequential REPLACE stages. The sequential retry, whose probe then sees the rival's row, honours the disposition. Index trees carry no `unchanged` guard: an index entry is keyed `indexKey ‖ pk`, so a stale delta can only be *prevented* by refusing the main-table action it was derived from, never repaired from inside the index tree. The bridge renders a `TreeEntryChangedError` from the main collection through the renderer the vtab registers (`registerEntryChangedRenderer` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`) as `concurrent modification: another writer changed or removed the row in <table> at primary key (…)`, the framed key decoded back to the row's logical values by `decodePrimaryKey` in `packages/quereus-plugin-optimystic/src/schema/row-codec.ts` — a plain `Error` with `cause`, the same shape the UNIQUE mapping produces, and the same open error-type question (backlog `bug-concurrent-unique-refusal-is-not-a-constraint-error`). Within one transaction a later statement's guard expects the earlier statement's *staged* entry, which is what the pre-write read returns and what replay, re-running the actions in order, has put there; a chain such as `insert; update; delete` therefore never refuses itself. A live read inside the doomed transaction refreshes the tree and so replays the staged action too, and can surface the same refusal early, wrapped as `Query failed: …` rather than mapped — the shape the "a live read inside a doomed transaction" note in `packages/quereus-plugin-optimystic/src/optimystic-module.ts` already accepted for the insert guard, pinned by `packages/quereus-plugin-optimystic/test/external-commit-visibility-after-rollback.spec.ts`.
 
 Regression suites:
 `packages/db-core/test/tree-guard.spec.ts` (every guard kind over raw trees),
 `packages/db-core/test/structural-equals.spec.ts` (the `unchanged` comparison itself),
 `packages/quereus-plugin-optimystic/test/concurrent-insert-refusal.spec.ts`
-(PK, two `Database` handles, legacy + session) and
+(PK, two `Database` handles, legacy + session),
 `packages/quereus-plugin-optimystic/test/concurrent-secondary-unique-refusal.spec.ts`
-(secondary UNIQUE, same shape).
+(secondary UNIQUE, same shape),
+`packages/quereus-plugin-optimystic/test/concurrent-row-change-refusal.spec.ts`
+(every `unchanged` arm, same shape, plus the sequential retry after each refusal) and
+`packages/quereus-plugin-optimystic/test/two-node-index-mutation-sweep.spec.ts`
+(the racing groups on a two-node mesh, closing on the two-way index check).
 
 One consequence for rollback: the refusal happens *after* the loser's refresh adopted
 the rival's committed revision, so the pre-transaction snapshot its rollback restores

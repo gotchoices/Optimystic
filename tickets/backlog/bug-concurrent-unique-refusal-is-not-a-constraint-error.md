@@ -24,3 +24,7 @@ Things to check while fixing:
 - the vtab's DML catch rethrows `QuereusError`s verbatim before it maps, so a mapped `ConstraintError` must not be re-wrapped on a later pass;
 - the concurrent specs currently match on message only; they should also assert type and code (the `expectConstraintError` helper in `test/secondary-unique.spec.ts` does this);
 - `docs/internals.md` ("the Quereus bridge maps it to the ordinary … message") currently documents the plain-`Error` gap and should be updated with the fix.
+
+## A second refusal class through the same seam (added by `refuse-concurrent-row-change-loser`, 2026-09-15)
+
+`mapCommitRefusal` now also renders `TreeEntryChangedError` — the `unchanged` guard's refusal when a rival changed or removed the row an UPDATE, DELETE or REPLACE read — as `concurrent modification: another writer changed or removed the row in <table> at primary key (…)`, through `registerEntryChangedRenderer`. It has the same plain-`Error`-with-`cause` shape as the UNIQUE mapping. Whatever error type this ticket chooses must cover both classes at once: a lost update is not a uniqueness violation, so it should not become a `ConstraintError` carrying the UNIQUE wording, but it needs a typed error a client can catch by class rather than by message just the same. `test/concurrent-row-change-refusal.spec.ts` matches on message only, like the two specs above, and should gain a type assertion with them.
