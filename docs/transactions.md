@@ -38,8 +38,9 @@ This document describes the architecture for multi-collection transactions in Op
 >   transaction, or repair the split).
 > - **Pre-flight before the first flush** (`commitDirtyTreesLegacy`, when more than one
 >   tree is staged): every staged tree is refreshed against storage before any tree
->   flushes, so a guarded entry a rival has already contradicted (a concurrency-refused
->   duplicate key or unique value — `TreeKeyTakenError`, see
+>   flushes, so a guarded entry a rival has already contradicted (any `TreeGuardRefusedError`
+>   — a duplicate key or unique value as `TreeKeyTakenError`, a row a rival changed or
+>   removed as `TreeEntryChangedError`, see
 >   [internals.md](internals.md)) is refused while nothing is durable and takes the
 >   first bullet's clean rollback. A rival landing between the pre-flight and a tree's
 >   own flush still takes the second bullet.

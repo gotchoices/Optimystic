@@ -212,11 +212,34 @@ export class TreeEntryChangedError<TKey = unknown, TEntry = unknown> extends Tre
 	}
 }
 
+/**
+ * A DELETE element carries a guard kind no delete can act on. NOT a concurrency refusal and
+ * deliberately not a {@link TreeGuardRefusedError}: every other kind asserts that nothing is
+ * present, which would make the delete a no-op by construction, so this is a malformed action —
+ * a caller bug, or a log entry written by a build whose element types disagree with this one.
+ * The handler raises it rather than ignoring the guard (the pre-guard behaviour) so a writer
+ * never believes an unenforceable guard is being enforced.
+ */
+export class TreeDeleteGuardKindError<TKey = unknown> extends Error {
+	constructor(
+		/** The collection whose tree rejected the element. */
+		public readonly collectionId: CollectionId,
+		/** The key the malformed delete named. */
+		public readonly key: TKey,
+		/** The `kind` that was carried; only `'unchanged'` is meaningful on a delete. */
+		public readonly guardKind: string,
+	) {
+		super(`Tree collection ${collectionId}: the delete of key ${renderKey(key)} carries a `
+			+ `'${guardKind}' guard; only 'unchanged' is meaningful on a delete`);
+		this.name = 'TreeDeleteGuardKindError';
+	}
+}
+
 /** String keys render JSON-quoted so framing control bytes stay visible/escaped in logs;
  * everything else via String() — JSON.stringify would throw on a bigint key, and an error
- * constructor must never be the second failure. Shared with the `replace` handler's own
- * guard diagnostics so every tree message renders a key the same way. */
-export function renderKey(key: unknown): string {
+ * constructor must never be the second failure. Module-private on purpose: every tree message
+ * renders a key the same way because every one of them is constructed in this file. */
+function renderKey(key: unknown): string {
 	return typeof key === 'string' ? JSON.stringify(key) : String(key);
 }
 

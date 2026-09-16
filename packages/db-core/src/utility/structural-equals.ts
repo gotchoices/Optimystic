@@ -1,7 +1,7 @@
 /**
  * Deep structural equality over the JSON-shaped values this codebase stores and transports:
- * primitives, plain objects, arrays, and `Uint8Array` (compared by bytes — a byte array
- * survives `structuredClone` and dag-cbor as itself, so it is a legitimate leaf here).
+ * primitives, plain objects, arrays, and `Uint8Array` (compared by bytes — a byte array survives
+ * `structuredClone`, which is the in-process transport the test transactors use).
  *
  * Written for the tree's `unchanged` entry guard (`TreeEntryGuard` in
  * `packages/db-core/src/collections/tree/struct.ts`), which must decide whether the entry
@@ -21,6 +21,18 @@
  * `Date`s (no own properties) reports EQUAL. Entries are JSON-shaped by contract (they are
  * serialized into the log), so nothing reaches that path today; if a richer entry type is ever
  * introduced, this function needs a type tag before it can judge it.
+ *
+ * NOTE: the `Uint8Array` arm is correct but currently unreachable across the REAL transport. The
+ * peer-to-peer repo protocol is JSON both directions (`JSON.stringify` in
+ * `packages/db-p2p/src/protocol-client.ts`, `JSON.parse` in `packages/db-p2p/src/repo/service.ts`),
+ * and JSON turns a `Uint8Array` into an index-keyed object — which the arm below deliberately
+ * reports as NOT equal to the bytes it came from. So an entry type that is genuinely byte-shaped
+ * would make an `unchanged` guard refuse an honest write forever, not just once. No such entry
+ * type exists: the one candidate is the plugin's `EncodedRow` under `msgpack`, and that encoder
+ * throws `not yet implemented` (`packages/quereus-plugin-optimystic/src/schema/row-codec.ts`);
+ * under the `json` encoding BLOB columns are base64 strings before they ever reach a tree entry.
+ * If a byte-shaped entry type is ever introduced, the guard's `expected` needs a transport-stable
+ * encoding (base64, or a tagged wrapper) BEFORE this comparison can be trusted over the wire.
  */
 export function structuralEquals(a: unknown, b: unknown): boolean {
 	if (a === b) return true;	// identical reference, or identical primitive

@@ -23,6 +23,7 @@
 import { expect } from 'chai';
 import {
 	Tree,
+	TreeDeleteGuardKindError,
 	TreeEntryChangedError,
 	TreeGuardRefusedError,
 	TreeKeyTakenError,
@@ -64,6 +65,36 @@ async function capture(fn: () => Promise<unknown>): Promise<unknown> {
 
 describe('Tree entry guards (concurrent-insert refusal)', function () {
 	this.timeout(20000);
+
+	// The class lattice is dispatched on, not just thrown: the Quereus bridge walks a commit
+	// failure's cause chain and renders by class (`mapCommitRefusal`), so which refusal is a
+	// subclass of which decides what message a client sees. Pinned once here, in one place, rather
+	// than left to be inferred from the scattered `instanceOf` assertions on each thrown instance —
+	// a future subclass added to the wrong parent silently re-renders a refusal as something else.
+	describe('refusal class lattice', () => {
+		it('splits uniqueness refusals from lost-update refusals under one guard-refusal base', () => {
+			const taken = new TreeKeyTakenError<number>('c', 1);
+			const range = new TreeRangeTakenError<number>(
+				'c', 1, { first: { key: 0, inclusive: true }, isAscending: true }, 2);
+			const changed = new TreeEntryChangedError<number, Entry>('c', 1, { key: 1, name: 'x' }, undefined);
+			const malformed = new TreeDeleteGuardKindError<number>('c', 1, 'absent');
+
+			// Every concurrency refusal shares the base contract (discard the action, never retry).
+			for (const err of [taken, range, changed]) {
+				expect(err, `${err.name} is a guard refusal`).to.be.instanceOf(TreeGuardRefusedError);
+				expect(err.collectionId).to.equal('c');
+				expect(err.key).to.equal(1);
+			}
+			// A range refusal is a uniqueness refusal; a lost update is NOT, or the bridge would
+			// render it as `UNIQUE constraint failed`.
+			expect(range).to.be.instanceOf(TreeKeyTakenError);
+			expect(changed).to.not.be.instanceOf(TreeKeyTakenError);
+			expect(taken).to.not.be.instanceOf(TreeEntryChangedError);
+			// A malformed action is a caller bug, not a refusal anything should retry or map.
+			expect(malformed).to.not.be.instanceOf(TreeGuardRefusedError);
+			expect(malformed).to.be.instanceOf(Error);
+		});
+	});
 
 	describe('sync path (Tree.sync / updateAndSync)', () => {
 		it('refuses an absent-guarded insert whose key a rival committed first, keeping the winner\'s row', async () => {
@@ -466,7 +497,12 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 			// The handler re-checks at runtime because a replayed log entry is deserialized data
 			// no type policed: better a loud failure than a guard the writer believes is enforced.
 			const err = await capture(() => tree.stage(illTyped));
-			expect(err).to.be.instanceOf(Error);
+			// A malformed action, not a concurrency refusal — so deliberately NOT a
+			// TreeGuardRefusedError, whose contract ("a rival won; retry sequentially") does not
+			// describe a caller bug.
+			expect(err).to.be.instanceOf(TreeDeleteGuardKindError);
+			expect(err, 'a malformed action is not a guard refusal').to.not.be.instanceOf(TreeGuardRefusedError);
+			expect((err as TreeDeleteGuardKindError<number>).guardKind).to.equal('absent');
 			expect((err as Error).message).to.match(/only 'unchanged' is meaningful on a delete/);
 			expect(tree.hasUnsyncedChanges(), 'the rejected action left nothing staged').to.be.false;
 		});

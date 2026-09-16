@@ -90,7 +90,10 @@ describe('structuralEquals', () => {
 		});
 	});
 
-	it('survives a structuredClone round trip (the transport tree entries actually take)', () => {
+	// NOTE: `structuredClone` is the IN-PROCESS transport (what the test transactors do), not the
+	// real one — the p2p repo protocol is JSON, which does not preserve a `Uint8Array`. See the
+	// second NOTE on `structuralEquals` for why no entry type reaches that gap today.
+	it('survives a structuredClone round trip (the in-process transport the test transactors use)', () => {
 		const entry = { key: 1, name: 'a', tags: ['x', 'y'], blob: new Uint8Array([1, 2, 3]) };
 		expect(structuralEquals(entry, structuredClone(entry))).to.be.true;
 	});

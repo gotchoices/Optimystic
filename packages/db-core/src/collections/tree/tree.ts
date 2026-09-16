@@ -4,8 +4,8 @@ import { BTree, type Path, type KeyRange } from "../../btree/index.js";
 import { CollectionTrunk } from "./collection-trunk.js";
 import { structuralEquals } from "../../utility/structural-equals.js";
 import {
-	TreeHeaderBlockType, TreeEntryChangedError, TreeKeyTakenError, TreeRangeTakenError, renderKey,
-	type TreeEntryGuard, type TreeReplaceAction,
+	TreeHeaderBlockType, TreeDeleteGuardKindError, TreeEntryChangedError, TreeKeyTakenError,
+	TreeRangeTakenError, type TreeEntryGuard, type TreeReplaceAction,
 } from "./struct.js";
 
 /**
@@ -71,16 +71,15 @@ function assertEntryUnchanged<TKey, TEntry>(
 
 /** Narrow a DELETE element's guard to the only kind a delete can act on. The element type already
  *  says this ({@link TreeDeleteElement}), but a replayed log entry is deserialized data that no
- *  type policed, so the handler re-checks it and fails loudly rather than silently ignoring a
- *  guard the writer believed was being enforced. */
+ *  type policed, so the handler re-checks it and throws {@link TreeDeleteGuardKindError} rather
+ *  than silently ignoring a guard the writer believed was being enforced. */
 function deleteGuardExpected<TKey, TEntry>(
 	id: CollectionId,
 	key: TKey,
 	guard: TreeEntryGuard<TKey, TEntry>,
 ): TEntry {
 	if (guard.kind !== 'unchanged') {
-		throw new Error(`Tree collection ${id}: the delete of key ${renderKey(key)} carries a `
-			+ `'${guard.kind}' guard; only 'unchanged' is meaningful on a delete`);
+		throw new TreeDeleteGuardKindError(id, key, guard.kind);
 	}
 	return guard.expected;
 }
@@ -191,6 +190,12 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 						// strictly `undefined`. That is deliberate and load-bearing: JSON encodes the
 						// empty slot of `[key, undefined]` as `null`, so a replayed log entry arrives
 						// as `[key, null]` and a `!== undefined` test would upsert `null` over the row.
+						// JSON really is the live encoding, not just a hypothetical: the p2p repo
+						// protocol stringifies and parses every message (`protocol-client.ts` and
+						// `repo/service.ts` in `packages/db-p2p/src/`). The in-process test transactors
+						// use `structuredClone`, which preserves `undefined` — so no test that goes
+						// only through them can reach this shape; the round-trip spec below stages the
+						// JSON shape explicitly for that reason.
 						// The cost is that a falsy-but-real entry (`''`, `0`, `false`) reads as a
 						// delete. No entry type in this repo is falsy today (rows encode to a non-empty
 						// string or Uint8Array; index entries are arrays); if one ever is, this needs an
