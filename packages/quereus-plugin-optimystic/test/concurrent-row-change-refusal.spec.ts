@@ -35,7 +35,7 @@ import { TransactionCoordinator } from '@optimystic/db-core';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import register from '../dist/plugin.js';
 import { QuereusEngine } from '../dist/index.js';
-import { expectIndexAgreesWithScan, expectIndexesIntact, queryAll } from './query-helpers.js';
+import { captureThrowMessage, expectIndexAgreesWithScan, expectIndexesIntact, queryAll } from './query-helpers.js';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
@@ -55,16 +55,6 @@ function createDb(dir: string): { db: Database; plugin: Plugin } {
 	for (const vtable of plugin.vtables) db.registerModule(vtable.name, vtable.module, vtable.auxData);
 	for (const func of plugin.functions) db.registerFunction(func.schema);
 	return { db, plugin };
-}
-
-/** Assert that `fn` rejects and return the thrown error's message. */
-async function captureThrowMessage(fn: () => Promise<unknown>): Promise<string> {
-	try {
-		await fn();
-	} catch (err) {
-		return err instanceof Error ? err.message : String(err);
-	}
-	throw new Error('expected operation to throw, but it resolved');
 }
 
 /** The refusal names the TABLE and the refused row's logical primary key, never a framed tree key. */
@@ -395,6 +385,55 @@ describe('Concurrent same-ROW change refusal (two handles, one dir)', function (
 			await expectStateOnBoth(handles, [[1, 'tok-x'], [2, 'tok-b'], [4, 'tok-y']], 'after A reuses the loser\'s value');
 		} finally {
 			await handles.dispose();
+		}
+	});
+
+	describe('the refusal names the refused row by its LOGICAL primary key, whatever the key type', () => {
+		// `decodePrimaryKey` renders each framed key part under its column's affinity, so a
+		// client can match the message to their SQL: strings quoted, numbers bare, a blob by
+		// its length, composite keys in declaration order.
+		const keyShapes: readonly { name: string; columns: string; keyColumns: string; key: string; where: string; rendered: string }[] = [
+			{
+				name: 'TEXT', columns: 'id text primary key, v text',
+				keyColumns: 'id', key: `'k-1'`, where: `id = 'k-1'`, rendered: '("k-1")',
+			},
+			{
+				name: 'BLOB', columns: 'id blob primary key, v text',
+				keyColumns: 'id', key: `x'0102'`, where: `id = x'0102'`, rendered: '(<blob 2 bytes>)',
+			},
+			{
+				name: 'composite (integer, text)', columns: 'a integer, b text, v text, primary key (a, b)',
+				keyColumns: 'a, b', key: `1, 'x'`, where: `a = 1 and b = 'x'`, rendered: '(1, "x")',
+			},
+		];
+		for (const shape of keyShapes) {
+			it(`${shape.name} key: the loser's message names the row as ${shape.rendered}`, async () => {
+				const { db: a, plugin: pluginA } = createDb(dir);
+				const { db: b, plugin: pluginB } = createDb(dir);
+				try {
+					const uri = `tree://row-race/key-${shape.name.replace(/[^a-z]+/g, '-')}`;
+					for (const db of [a, b]) {
+						await db.exec(`create table T (${shape.columns}) using optimystic('${uri}')`);
+					}
+					await a.exec(`insert into T (${shape.keyColumns}, v) values (${shape.key}, 'seed')`);
+					expect((await queryAll(b, 'select v from T')).map(row => row.v), 'B must see the seed row').to.deep.equal(['seed']);
+
+					await a.exec('begin');
+					await a.exec(`update T set v = 'from-A' where ${shape.where}`);
+					await b.exec(`update T set v = 'from-B' where ${shape.where}`);
+					const message = await captureThrowMessage(() => a.exec('commit'));
+					expect(message).to.include(
+						`concurrent modification: another writer changed or removed the row in T at primary key ${shape.rendered}`);
+					for (const db of [a, b]) {
+						expect((await queryAll(db, 'select v from T')).map(row => row.v), "the rival's row survives").to.deep.equal(['from-B']);
+					}
+				} finally {
+					a.close();
+					b.close();
+					await pluginA.dispose();
+					await pluginB.dispose();
+				}
+			});
 		}
 	});
 

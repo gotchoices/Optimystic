@@ -19,6 +19,16 @@ export async function queryAll(
 	}
 }
 
+/** Assert that `fn` rejects and return the thrown error's message. */
+export async function captureThrowMessage(fn: () => Promise<unknown>): Promise<string> {
+	try {
+		await fn();
+	} catch (err) {
+		return err instanceof Error ? err.message : String(err);
+	}
+	throw new Error('expected operation to throw, but it resolved');
+}
+
 /** Run `sql` and return its single row, or `undefined` when no row matches (not ready yet). */
 export async function queryGet(db: Database, sql: string): Promise<Record<string, any> | undefined> {
 	const stmt = await db.prepare(sql);

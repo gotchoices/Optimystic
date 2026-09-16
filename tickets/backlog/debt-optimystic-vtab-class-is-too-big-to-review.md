@@ -40,6 +40,8 @@ Top-level shape (`grep -n "^export class\|^class\|^function" …`):
 | 2258–2305 | `OptimysticCommittedTable` (read-only wrapper) |
 | 2306–3000 | `OptimysticModule` (the module/factory, incl. schema-manager wiring) |
 
+Re-measured 2026-09-15 while reviewing `refuse-concurrent-row-change-loser` (which threaded the stored pre-write entry through every DML arm so each main-table action carries an `unchanged` guard): the same command now reports **4530**. Confirming that guard placement meant reading the INSERT, UPDATE, DELETE, primary-key-move and secondary-UNIQUE-eviction paths of one class in one sitting, which is the review cost this ticket exists to remove.
+
 ## Why it matters
 
 Reviews of this file are the bottleneck, not the edits. Recent tickets touching it

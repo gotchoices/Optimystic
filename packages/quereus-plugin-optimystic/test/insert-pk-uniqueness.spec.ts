@@ -25,6 +25,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { captureThrowMessage } from './query-helpers.js';
 
 function createDb(dir: string): { db: Database; plugin: ReturnType<typeof register> } {
 	const db = new Database();
@@ -62,16 +63,6 @@ async function expectThrows(fn: () => Promise<unknown>): Promise<void> {
 		await fn();
 	} catch {
 		return;
-	}
-	throw new Error('expected operation to throw, but it resolved');
-}
-
-/** Assert that `fn` rejects and return the thrown error's message for inspection. */
-async function captureThrowMessage(fn: () => Promise<unknown>): Promise<string> {
-	try {
-		await fn();
-	} catch (err) {
-		return err instanceof Error ? err.message : String(err);
 	}
 	throw new Error('expected operation to throw, but it resolved');
 }

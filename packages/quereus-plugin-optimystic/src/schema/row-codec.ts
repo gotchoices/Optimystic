@@ -365,7 +365,7 @@ export class RowCodec {
 	 * NULL sentinel here — this only ever sees present payloads. Affinity-driven decode
 	 * keeps a TEXT `"123"`, `" "`, `"1e2"`, or `"0xff"` as its exact string (the old
 	 * `Number()`-first sniff silently coerced all of those to numbers); only the numeric
-	 * affinities parse back to a number.
+	 * affinities parse back to a number, and a BLOB affinity restores its bytes from base64.
 	 */
 	private deserializeKeyPart(serialized: string, affinity?: string): SqlValue {
 		const aff = (affinity || '').toUpperCase();
@@ -382,7 +382,13 @@ export class RowCodec {
 			return serialized;
 		}
 
-		// TEXT / BLOB / unknown affinity: keep the raw string payload verbatim.
+		// BLOB column: the payload was base64 (see serializeKeyPart) — restore the bytes,
+		// as denormalizeValue does for a BLOB cell, so a rendered key names a blob as a blob.
+		if (aff === 'BLOB') {
+			return uint8FromString(serialized, 'base64');
+		}
+
+		// TEXT / unknown affinity: keep the raw string payload verbatim.
 		return serialized;
 	}
 

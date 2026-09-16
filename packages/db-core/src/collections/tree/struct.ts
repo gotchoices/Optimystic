@@ -26,7 +26,10 @@ export const rootId$ = nameof<TreeCollectionHeaderBlock>("rootId");
  *
  * - `absent` — the key must not exist (SQL INSERT): a hit throws {@link TreeKeyTakenError},
  *   discarding the whole action's staged writes.
- * - `keepExisting` — if the key exists, skip this entry silently (SQL INSERT OR IGNORE).
+ * - `keepExisting` — if the key exists, skip this entry silently. No SQL statement stages
+ *   it any more (INSERT OR IGNORE is guarded `absent`, because skipping only the main-table
+ *   entry would leave the statement's index entries beside a rival's row — see the
+ *   `unchanged` paragraph in docs/internals.md); kept as a serialized log form.
  * - `absentRange` — no entry OTHER THAN this action's own key may exist in `range`
  *   (secondary-UNIQUE enforcement, where uniqueness is a property of a framed key
  *   PREFIX rather than one exact key: an index tree keys `indexKey ‖ primaryKey`, so

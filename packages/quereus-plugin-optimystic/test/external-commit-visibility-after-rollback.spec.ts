@@ -20,6 +20,7 @@ import type { SqlValue } from '@quereus/quereus';
 import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p';
 import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
+import { captureThrowMessage } from './query-helpers.js';
 
 type Row = Record<string, SqlValue>;
 
@@ -28,16 +29,6 @@ const collectRows = async (iter: AsyncIterable<Row>): Promise<Row[]> => {
 	for await (const row of iter) rows.push(row);
 	return rows;
 };
-
-/** Assert that `fn` rejects and return the thrown error's message. */
-async function captureThrowMessage(fn: () => Promise<unknown>): Promise<string> {
-	try {
-		await fn();
-	} catch (err) {
-		return err instanceof Error ? err.message : String(err);
-	}
-	throw new Error('expected operation to throw, but it resolved');
-}
 
 /** Build a `local`-style transactor over the supplied raw storage, shared across
  * Database instances so each side sees the other's commits (same shape as

@@ -31,6 +31,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { captureThrowMessage } from './query-helpers.js';
 
 type Plugin = ReturnType<typeof register>;
 
@@ -57,16 +58,6 @@ async function selectScalar(db: Database, sql: string): Promise<SqlValue> {
 }
 
 const selectCount = async (db: Database, sql: string): Promise<number> => Number(await selectScalar(db, sql));
-
-/** Assert that `fn` rejects and return the thrown error's message. */
-async function captureThrowMessage(fn: () => Promise<unknown>): Promise<string> {
-	try {
-		await fn();
-	} catch (err) {
-		return err instanceof Error ? err.message : String(err);
-	}
-	throw new Error('expected operation to throw, but it resolved');
-}
 
 // The constraint's COLUMN is named, not the PK — that is the whole point of mapping the
 // index-tree refusal through the constraint's own message.

@@ -155,7 +155,8 @@ type StoredRowEntry = [string, EncodedRow];
  * and the stored entry itself for the `unchanged` guard (see {@link unchanged}). The
  * guard must carry the entry AS READ, never a re-encoding of the decoded row — the
  * comparison at replay is against the stored bytes, and a re-encoding is only equal to
- * them by luck.
+ * them by luck. Holding the entry by reference is safe: the btree freezes every entry at
+ * upsert and replaces, never mutates, the slot at a key.
  */
 interface PreWriteImage {
   row: Row;
@@ -2499,10 +2500,8 @@ export class OptimysticVirtualTable extends VirtualTable {
             //    under concurrency the statement REFUSES rather than performing the
             //    upsert the sequential path would have; the retry takes the update arm.
             // Do not try to re-run SQL semantics inside the replay.
-            const insertGuard: TreeEntryGuard<string> = { kind: 'absent' };
-
             // Stage the row in the main table. Entry format: [primaryKey, encodedRow]
-            await this.collection.stage([[insertKey, [insertKey, encodedRow], insertGuard]]);
+            await this.collection.stage([[insertKey, [insertKey, encodedRow], { kind: 'absent' }]]);
 
             // Stage into all indexes. UNIQUE-enforcing index trees whose value this row
             // occupies carry the concurrency guard so a rival that commits the same value
