@@ -55,3 +55,5 @@
 {"slug":"storage-invariants-undocumented-and-doc-rot","file":"storage-invariants-undocumented-and-doc-rot.md","completedAt":"2026-08-15","commit":"ecd770aa96c1c7352203bd72d19625c8cc1ff3a0","prunedAt":"2026-09-15T04:00:01.300Z"}
 {"slug":"debt-competing-writer-test-transactor","file":"1-debt-competing-writer-test-transactor.md","completedAt":"2026-08-17","commit":"f00fd0c1f75de7ad33d5ae9519e507b0b67cb55a","prunedAt":"2026-09-16T07:03:17.351Z"}
 {"slug":"debt-e2e-stale-cache-hit-read-rejected","file":"2-debt-e2e-stale-cache-hit-read-rejected.md","completedAt":"2026-08-17","commit":"c68a5a9034de0b9c6dc288e3628646ae6f65169f","prunedAt":"2026-09-16T07:03:17.351Z"}
+{"slug":"debt-txn-coordinator-cache-tests","file":"2-debt-txn-coordinator-cache-tests.md","completedAt":"2026-08-17","commit":"12eeef9bfe8bdd4ea9c4acea1a2771d045311d36","prunedAt":"2026-09-16T18:30:01.553Z"}
+{"slug":"debt-owned-block-seed-e2e-restart-test","file":"3-debt-owned-block-seed-e2e-restart-test.md","completedAt":"2026-08-17","commit":"6d30e6e30ffd256ceeaf5c5a3ae3de306ec277c7","prunedAt":"2026-09-16T18:30:01.553Z"}
