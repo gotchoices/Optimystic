@@ -139,10 +139,10 @@ Reads are captured as `ReadDependency` records (`blockId`, `revision`) and verif
 
 ### Sync
 
-Local changes are not visible to other peers until they sync. `updateAndSync()` drives the PEND → COMMIT loop, reconciles with any transactions that landed in the meantime, and replays local actions on top if needed.
+Local changes are not visible to other peers until they sync. `Tree.sync()` (and `Collection.updateAndSync()` beneath it) drives the PEND → COMMIT loop, reconciles with any transactions that landed in the meantime, and replays local actions on top if needed.
 
 ```typescript
-await users.updateAndSync();
+await users.sync();
 ```
 
 #### Was it really saved?
@@ -152,7 +152,7 @@ A sync resolves to a `WriteDurability` (`packages/db-core/src/network/struct.ts`
 ```typescript
 import { isFullyDurable } from '@optimystic/db-core';
 
-const durability = await users.updateAndSync();
+const durability = await users.sync();
 if (durability && !isFullyDurable(durability)) {
   // Only some machines hold this yet — show the row as pending.
 }

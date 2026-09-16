@@ -63,9 +63,13 @@ export async function withIndexStagingPatched(
 	}
 }
 
-/** The slice of a live IndexManager a test reaches for: one index's tree, to stage into. */
+/** The slice of a live IndexManager a test reaches for: one index's tree, to stage into.
+ *  `sync` is `Promise<unknown>` because a real `Tree.sync` resolves to the write's `WriteDurability`
+ *  (ticket write-durability-reaches-the-writer) and these tests only need the flush to have happened.
+ *  This shape is reached through an `as unknown as` cast in {@link liveIndexManager}, so nothing would
+ *  have flagged it had it kept describing the old `Promise<void>`. */
 export interface LiveIndexManager {
-	getIndexTree(name: string): { stage(actions: unknown[]): Promise<void>; sync(): Promise<void> } | undefined;
+	getIndexTree(name: string): { stage(actions: unknown[]): Promise<void>; sync(): Promise<unknown> } | undefined;
 }
 
 /**

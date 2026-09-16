@@ -1139,14 +1139,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// First attempt has consecutiveFailures == 0, so priority 0 — the common pend is unchanged.
 			const attempt = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id, clampPriority(consecutiveFailures), blockDigests);
 			if (!attempt.success) {
-				const staleFailure = attempt;
 				consecutiveFailures++;
-				lastReason = staleFailure.reason ?? lastReason;
+				lastReason = attempt.reason ?? lastReason;
 				// Highest-wins, not last-wins: the next request has to clear EVERY holder, so a later
 				// responder reporting a LOWER number understates the binding constraint. Same rule the
 				// producers and the transactor's aggregation already use.
-				lastStaleAt = highestStaleAt([lastStaleAt, staleFailure.staleAt]);
-				lastFailureConfirmedStaleAt = staleFailure.staleAt !== undefined;
+				lastStaleAt = highestStaleAt([lastStaleAt, attempt.staleAt]);
+				lastFailureConfirmedStaleAt = attempt.staleAt !== undefined;
 				// Give up once the consecutive no-progress budget is exhausted, so a transactor that
 				// persistently rejects the sync can no longer hold the collection latch forever.
 				// NOTE: this also bounds the legitimate `pending`-wait case (retrying the same action
