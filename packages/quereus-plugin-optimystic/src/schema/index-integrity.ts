@@ -8,11 +8,12 @@
  *   - a MISSING entry: a row whose implied tree key the tree does not hold, so an
  *     index-routed lookup for the row's value silently skips the row;
  *   - an ORPHANED entry: one no row implies. Queries cannot see these. `executeIndexScan`
- *     fetches each entry's row by primary key and skips an entry whose row is gone, and
- *     Quereus re-applies the predicate to a row whose value moved, so a lookup's row set
- *     still matches a full scan; and a lookup for a value no row holds is never issued by
- *     an oracle that takes its values from a scan. They still occupy the tree — in a
- *     unique-enforcement tree, a value the probe then treats as taken.
+ *     fetches each entry's row by primary key and then asks this same question of it —
+ *     {@link rowImpliesEntry} — skipping every entry the row does not imply, whether its row
+ *     is gone or its row moved off the indexed value. So a lookup returns nothing extra, and
+ *     nothing distinguishes a leftover entry from no entry at all. They still occupy the
+ *     tree — in a unique-enforcement tree, a value the probe then treats as taken (see
+ *     `bug-stale-index-entry-causes-false-unique-refusal`).
  *
  * The comparison is a set difference over tree keys, so it sees both kinds whichever values
  * rows currently hold. It is pure (no I/O): it takes the rows and entries the caller already
@@ -21,7 +22,7 @@
 
 import type { Row } from '@quereus/quereus';
 import type { StoredIndexSchema } from './schema-manager.js';
-import { hasNullIndexValue, indexEntryKey, type IndexEntry, type IndexKey, type PrimaryKey } from './index-manager.js';
+import { hasNullIndexValue, indexEntryKey, rowImpliesEntry, type IndexEntry, type IndexKey, type PrimaryKey } from './index-manager.js';
 import { encodeKeyTuple, splitKeyTuple } from './key-encoding.js';
 
 /**
@@ -102,8 +103,6 @@ export interface IndexIntegrityInput {
 	indexKeyOf: (row: Row) => IndexKey;
 }
 
-type ExpectedEntries = ReadonlyMap<string, { primaryKey: PrimaryKey; row: Row }>;
-
 /** Diff the tree keys `input.rows` imply against the tree keys `input.entries` hold. */
 export function compareIndexToRows(input: IndexIntegrityInput): IndexIntegrityReport {
 	const { index, kind, rows } = input;
@@ -130,7 +129,7 @@ export function compareIndexToRows(input: IndexIntegrityInput): IndexIntegrityRe
 	const orphaned: OrphanedIndexEntry[] = [];
 	for (const [treeKey, primaryKey] of input.entries) {
 		present.add(treeKey);
-		const orphan = classifyEntry(treeKey, primaryKey, width, expected, rows);
+		const orphan = classifyEntry(treeKey, primaryKey, width, input.indexKeyOf, rows);
 		if (orphan) orphaned.push(orphan);
 	}
 
@@ -167,11 +166,19 @@ function classifyEntry(
 	treeKey: string,
 	primaryKey: PrimaryKey,
 	width: number,
-	expected: ExpectedEntries,
+	indexKeyOf: (row: Row) => IndexKey,
 	rows: ReadonlyMap<PrimaryKey, Row>,
 ): OrphanedIndexEntry | undefined {
-	// The common case, answered without decoding: exactly the entry one row implies.
-	if (expected.get(treeKey)?.primaryKey === primaryKey) return undefined;
+	// The common case, answered without decoding: the row this entry resolves to implies
+	// exactly this entry. `rowImpliesEntry` is the same predicate the read path's seek
+	// verification applies, so an entry a seek skips is an entry this reports and vice versa.
+	// (Only one row can imply a given tree key: the key is `indexKey ‖ primaryKey` of two
+	// self-delimiting tuples, so its primary-key half is recoverable and can only be this
+	// entry's own. Looking the row up by that half therefore misses no candidate.)
+	const currentRow = rows.get(primaryKey);
+	if (currentRow !== undefined && rowImpliesEntry(currentRow, [treeKey, primaryKey], indexKeyOf)) {
+		return undefined;
+	}
 
 	const decoded = decodeTreeKey(treeKey, width);
 	const base = { treeKey, primaryKey, ...decoded };
@@ -181,7 +188,6 @@ function classifyEntry(
 	if (treeKey !== indexEntryKey(encodeKeyTuple(decoded.indexPayloads), primaryKey)) {
 		return { ...base, reason: 'malformed' };
 	}
-	const currentRow = rows.get(primaryKey);
 	return currentRow === undefined
 		? { ...base, reason: 'no-row' }
 		: { ...base, reason: 'stale-value', currentRow };

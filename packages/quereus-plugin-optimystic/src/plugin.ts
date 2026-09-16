@@ -77,8 +77,9 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		 * (`missing`), or an entry pointing at a row that is gone or no longer holds the indexed
 		 * value (`orphaned`). One report per index the table maintains, including the internal
 		 * tree that enforces a `unique` column with no declared index. Queries cannot show an
-		 * orphaned entry (a lookup skips an entry whose row is gone, and re-checks the value of a
-		 * row that moved), so this is how to see one.
+		 * orphaned entry — an index lookup checks every entry against the row it resolves to and
+		 * skips the ones that row does not imply, so a leftover entry and no entry look the same
+		 * from a query — which is why this exists.
 		 *
 		 * Reads this node's live trees, including an open transaction's uncommitted writes, and
 		 * repairs nothing. `schema` defaults to `main`. Throws for a table that is not a known

@@ -183,9 +183,9 @@ function describeReport(report: IndexIntegrityReport): string {
  * orphan — and gives each index's row and entry counts.
  *
  * This is the half of index agreement no lookup of the table's own values can check: a lookup
- * skips an entry whose row is gone, and an entry left under a value its row no longer holds is
- * reached only by seeking that old value, which no row holds. (Seeking it does return the moved
- * row today: see the NOTE in `OptimysticVirtualTable.executeIndexScan`.)
+ * verifies every entry against the row it resolves to and skips the ones that row does not imply
+ * (`executeIndexScan`), so a leftover entry returns nothing — exactly what no entry returns. No
+ * row set can tell the two apart; only reading the tree can.
  */
 export async function expectIndexesIntact(db: Database, table: string): Promise<void> {
 	const broken = (await readIndexIntegrity(db, table))
@@ -207,10 +207,11 @@ export async function expectIndexesIntact(db: Database, table: string): Promise<
  *    `column`'s: each row has exactly its entry, and each entry belongs to exactly one row.
  *    This is the only arm that sees an orphaned entry, such as one left by an UPDATE or DELETE
  *    whose index maintenance was lost, or by a concurrent write whose index change replayed
- *    without its row change. No lookup below can: `executeIndexScan` skips an entry whose row
- *    is gone, and the value a moved row left behind is one no row holds, so it is never
- *    looked up. It runs before the scan's early return, because a table emptied by DELETEs is
- *    exactly where an entry with no row lives.
+ *    without its row change. No lookup below can, because `executeIndexScan` now verifies each
+ *    entry against the row it resolves to and skips the ones no row implies: a leftover entry
+ *    returns nothing, which is what no entry returns, so no row set distinguishes them. It runs
+ *    before the scan's early return, because a table emptied by DELETEs is exactly where an
+ *    entry with no row lives.
  *  - Lookups ({@link expectLookupsAgreeWithScan}): the read path's view of "an index tree that
  *    does not account for every committed row" (writes staged past a detached index, a
  *    re-attach that never backfilled). The row is

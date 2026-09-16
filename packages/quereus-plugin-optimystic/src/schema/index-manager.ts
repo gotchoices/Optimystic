@@ -127,6 +127,35 @@ export function indexEntryKey(indexKey: IndexKey, primaryKey: PrimaryKey): strin
 }
 
 /**
+ * Does `row` — the row an entry's stored primary key resolves to — imply that entry?
+ *
+ * THE definition of "this entry belongs to this row", and the exact inverse of what
+ * {@link indexEntryKey} writes: a row implies one tree key per index, `indexKey(row) ‖ pk`,
+ * so an entry agrees with its row exactly when its tree key is that string. Decidable from
+ * the entry and the row alone — no reference to what was sought — which is why the same
+ * predicate answers both questions that need it:
+ *
+ *  - the integrity check's `classifyEntry` (index-integrity.ts), diffing the tree against
+ *    the table;
+ *  - the read path's seek verification (`OptimysticVirtualTable.executeIndexScan`), deciding
+ *    whether a fetched row may be yielded for the entry that produced it.
+ *
+ * Sharing it is the point: a check and a scan that each carried their own copy could
+ * disagree about what an entry means, so a seek could return a row the check calls an orphan.
+ *
+ * `indexKeyOf` supplies the row-to-index-key half — pass `IndexManager.createIndexKey` bound
+ * to the index, the same function maintenance stages with.
+ */
+export function rowImpliesEntry(
+	row: Row,
+	entry: IndexEntry,
+	indexKeyOf: (row: Row) => IndexKey,
+): boolean {
+	const [treeKey, primaryKey] = entry;
+	return treeKey === indexEntryKey(indexKeyOf(row), primaryKey);
+}
+
+/**
  * Whether `row` holds SQL NULL in any column `index` covers. A UNIQUE constraint exempts
  * such a row: the probe never looks it up, and the one-time populate of a synthesized
  * unique-enforcement tree stages no entry for it (live DML still stages one). Shared by that
@@ -144,7 +173,7 @@ export function hasNullIndexValue(index: StoredIndexSchema, row: Row): boolean {
  * escape happens to continue past the prefix.
  *
  * THE one definition of "the entries for this index value": the seek path
- * ({@link IndexManager.findByIndexIn}) scans it, and the unique-index write guard
+ * ({@link IndexManager.findEntriesIn}) scans it, and the unique-index write guard
  * ({@link uniquePrefixGuard}) claims it. A drift between the two would let a seek find a
  * duplicate the guard never refused (or the reverse), so they must share this formula.
  */
@@ -490,11 +519,34 @@ export class IndexManager {
 	 * view of the index tree so it excludes index entries staged by the in-flight
 	 * transaction. Shared composite-key range logic for both paths — the read source
 	 * is assumed already current (this method never refreshes it).
+	 *
+	 * A projection of {@link findEntriesIn}, for callers that need only the primary key.
+	 * One range definition serves both, so the two cannot drift apart.
 	 */
 	async* findByIndexIn(
 		read: TreeReadView<IndexKey, IndexEntry>,
 		indexKey: IndexKey
 	): AsyncIterable<PrimaryKey> {
+		for await (const entry of this.findEntriesIn(read, indexKey)) {
+			yield entry[1];
+		}
+	}
+
+	/**
+	 * Every ENTRY in the seek's prefix range, in tree order — the whole `[treeKey, primaryKey]`
+	 * pair rather than {@link findByIndexIn}'s primary key alone.
+	 *
+	 * The tree key is what makes an entry checkable: with it and the row its primary key
+	 * resolves to, {@link rowImpliesEntry} decides whether the entry belongs to that row.
+	 * `executeIndexScan` needs that, because an entry left behind by maintenance that did not
+	 * follow its row still resolves to a live row that does not satisfy the seek.
+	 *
+	 * The read source is assumed already current (this method never refreshes it).
+	 */
+	async* findEntriesIn(
+		read: TreeReadView<IndexKey, IndexEntry>,
+		indexKey: IndexKey
+	): AsyncIterable<IndexEntry> {
 		// Range scan for all entries whose framed index tuple equals `indexKey` — the
 		// same range the unique-index write guard claims (see indexValueRange).
 		for await (const path of read.range(indexValueRange(indexKey))) {
@@ -504,7 +556,7 @@ export class IndexManager {
 
 			const entry = read.at(path);
 			if (entry != null) {
-				yield entry[1];
+				yield entry;
 			}
 		}
 	}

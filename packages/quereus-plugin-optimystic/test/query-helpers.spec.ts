@@ -137,12 +137,13 @@ describe('expectIndexAgreesWithScan (the two-node convergence oracle)', () => {
 			.to.deep.equal([3]);
 		expect((await queryAll(db, `select Id from Usage where Token = 'tok-a'`)).map(row => row.Id).sort())
 			.to.deep.equal([1, 2]);
-		// KNOWN DEFECT, pinned rather than skipped (`index-seek-returns-moved-rows`): seeking the
-		// orphan's own value returns row 3, which holds tok-z. The seek resolves tok-b's entry to
-		// row 3 and nothing re-checks the value (NOTE in executeIndexScan). When that is fixed this
-		// goes red: expect no rows here.
+		// And seeking the leftover's OWN value returns nothing: the seek resolves tok-b's entry to
+		// row 3, re-derives row 3's index key, sees it no longer implies that entry, and skips it
+		// (the verification in executeIndexScan). A leftover entry is therefore indistinguishable
+		// from no entry through any query — which is exactly why the structural arm below has to
+		// exist.
 		expect((await queryAll(db, `select Id from Usage where Token = 'tok-b'`)).map(row => row.Id))
-			.to.deep.equal([3]);
+			.to.deep.equal([]);
 
 		const error = await captureFailure(
 			() => expectIndexAgreesWithScan(db, 'Usage', 'Token'),

@@ -337,7 +337,7 @@ reading that header at.
 (`optimystic:quereus-plugin:module`) answers the read side — one line per index-driven scan:
 
 ```
-optimystic:quereus-plugin:module index:seek table=Usage index=by_token collection=default/Usage/index/by_token main=default/Usage arm=committed rev=3@tx:bT1r_04c main_rev=7@tx:Kx9f-2Qa seek=%01tok-a%00 matched=0 node=A
+optimystic:quereus-plugin:module index:seek table=Usage index=by_token collection=default/Usage/index/by_token main=default/Usage arm=committed rev=3@tx:bT1r_04c main_rev=7@tx:Kx9f-2Qa seek=%01tok-a%00 matched=0 rejected=0 node=A
 ```
 
 - `arm=committed` — a pre-transaction snapshot read, which deliberately never refreshes from the
@@ -374,10 +374,17 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   that was sought; and only `A-Za-z0-9._-` survive verbatim, every other code unit becoming `%XX`
   or, above U+00FF, `%uXXXX` — which is not valid percent-encoding, so a decoder would reject or
   mangle a key carrying non-Latin-1 text.
-- `matched=` — how many **index entries** the seek produced, counted before the row fetch. Rows
-  dropped later (missing row, predicate re-applied by the engine) still count here. It is a
-  **floor**: a scan the caller abandons early (a satisfied `LIMIT`, an error mid-scan) reports what
-  it had produced when it stopped, so `matched=0` still means the descent found nothing.
+- `matched=` — how many **index entries** the seek produced, counted before the row fetch. Entries
+  dropped later still count here. It is a **floor**: a scan the caller abandons early (a satisfied
+  `LIMIT`, an error mid-scan) reports what it had produced when it stopped, so `matched=0` still
+  means the descent found nothing.
+- `rejected=` — how many of those entries the scan then dropped, because the row their primary key
+  names is gone or does not imply the entry. `matched - rejected` is what the scan returned. A
+  healthy index rejects nothing, so **any nonzero value means this node's index disagrees with its
+  table**: the rows the query returned are right and the tree is not. Run
+  `plugin.verifyIndexes(db, table)` on *this* node to see which entries — see [§Does an index agree
+  with its table?](#does-an-index-agree-with-its-table) below. It is a floor for the same reason
+  `matched=` is.
 
 **Only an index-driven plan emits this line.** A primary-key point lookup, a primary-key range
 query, and a full table scan all read without descending an index tree, so they emit nothing here.
@@ -713,7 +720,9 @@ differ at one revision really is a fork).
 
 #### Does an index agree with its table?
 
-The lines above say which collections a write carried and which revision a read descended. None of them can show an index entry that no row accounts for, and neither can a query. An index lookup fetches each entry's row by primary key and skips an entry whose row is gone, and the engine re-checks the value of a row that moved, so the lookup still returns the right rows. A test that looks up every value the table holds never asks about a value no row holds any more. The entry still sits in the tree, though, and in a tree enforcing a `unique` column it makes a value look taken when no row holds it.
+The lines above say which collections a write carried and which revision a read descended. None of them can show an index entry that no row accounts for, and neither can a query. An index lookup fetches each entry's row by primary key and then checks that the row implies the entry — the row's own indexed values, re-derived, must produce exactly the key the entry sits at — and skips every entry that fails, whether its row is gone or its row moved off the value (`executeIndexScan` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`). So the lookup returns the right rows, and a leftover entry is indistinguishable from no entry: there is nothing left for a query to see. The entry still sits in the tree, though, and in a tree enforcing a `unique` column it makes a value look taken when no row holds it — that consequence is not fixed by the read-side check and is tracked as `bug-stale-index-entry-causes-false-unique-refusal`.
+
+A seek that skips an entry this way counts it in the `rejected=` field of its own `index:seek` line, so a node whose index disagrees with its table is visible in the log rather than only through the check below.
 
 `plugin.verifyIndexes(db, table, schema?)` (`verifyIndexes` in `packages/quereus-plugin-optimystic/src/plugin.ts`) compares every secondary index of one table against the table's rows, in both directions, and returns one report per index:
 

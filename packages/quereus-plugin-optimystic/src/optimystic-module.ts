@@ -21,7 +21,7 @@ import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, Stored
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { SqlDataType, PhysicalType } from '@quereus/quereus';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
-import { IndexManager, hasNullIndexValue, indexEntryKey, indexKeyFromValues, type IndexEntry } from './schema/index-manager.js';
+import { IndexManager, hasNullIndexValue, indexEntryKey, indexKeyFromValues, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
 import { compareIndexToRows, type IndexIntegrityReport } from './schema/index-integrity.js';
 import type { PrimaryKeyTuple } from './schema/key-tuples.js';
 import { createLogger, revisionToken } from './logger.js';
@@ -83,7 +83,13 @@ interface IndexScanSource extends IndexScanTarget {
  * - `matched` — how many INDEX ENTRIES the seek produced, not how many rows the caller
  *   ended up keeping. The distinction is the point of the field: zero entries means the
  *   descent found nothing in the index tree, which is a different failure from "entries
- *   found, rows resolved, predicate rejected them later".
+ *   found, rows resolved, verification rejected them later".
+ * - `rejected` — how many of those entries the scan did NOT yield: the row their primary
+ *   key names is gone, or it is there but does not imply the entry (see the verification in
+ *   {@link OptimysticVirtualTable.executeIndexScan}). Every rejection is index damage — a
+ *   healthy tree rejects nothing — and it is otherwise invisible from the read path, which
+ *   now answers correctly over a broken tree instead of visibly wrongly. `matched - rejected`
+ *   is what the scan yielded.
  * - `key` — the framed index key the scan bracketed on, filled in once it is built.
  *   Stays `undefined` if the scan returned before framing one, which prints as `unset`
  *   rather than as an empty seek (the empty PREFIX is a legitimate key meaning
@@ -94,6 +100,7 @@ interface IndexScanSource extends IndexScanTarget {
  */
 interface IndexSeekProbe {
   matched: number;
+  rejected: number;
   key?: string;
 }
 
@@ -149,6 +156,24 @@ async function* walkDecodedRows(
 
 /** A main-table entry as the collection stores it: `[framedPrimaryKey, encodedRow]`. */
 type StoredRowEntry = [string, EncodedRow];
+
+/**
+ * The decoded row at `primaryKey` in a main-table read source, or `undefined` when the
+ * source holds no usable entry there. Shared by the two seek paths — the primary-key point
+ * lookup and the secondary-index scan — so "fetch the row this key names" has one meaning
+ * and one set of skip conditions on both. Never refreshes the source; the caller resolved it.
+ */
+async function readRowAt(
+  read: TreeReadView<string, RowData>,
+  rowCodec: RowCodec,
+  primaryKey: string,
+): Promise<Row | undefined> {
+  const path = await read.find(primaryKey);
+  if (!read.isValid(path)) return undefined;
+  const entry = read.at(path) as StoredRowEntry | undefined;
+  if (!entry || entry.length < 2) return undefined;
+  return rowCodec.decodeRow(entry[1]);
+}
 
 /**
  * The row image a write is about to replace or remove: decoded for index maintenance,
@@ -1200,7 +1225,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         // is filled in by the scan as it produces entries; the line is emitted in a
         // `finally` so a consumer that abandons the iteration (a LIMIT, an error mid-scan)
         // still reports what the seek had produced by then.
-        const seek: IndexSeekProbe | undefined = log.enabled ? { matched: 0 } : undefined;
+        const seek: IndexSeekProbe | undefined = log.enabled ? { matched: 0, rejected: 0 } : undefined;
         try {
           yield* this.executeIndexScan(mainRead, indexScan, filterInfo.args, seek);
         } finally {
@@ -1317,6 +1342,11 @@ export class OptimysticVirtualTable extends VirtualTable {
    * - `matched=` — index entries the seek produced, counted before the row fetch, so
    *   "descended a stale index" is distinguishable from "descended a current index that
    *   genuinely has no entry".
+   * - `rejected=` — how many of those entries the scan then dropped because the row they
+   *   name is gone or does not imply them. Nonzero means this index disagrees with its
+   *   table and the seek corrected for it; the rows are right, the tree is not. Run
+   *   `plugin.verifyIndexes` on this node to see which entries (docs/debugging.md, "Does an
+   *   index agree with its table?").
    *
    * `collection=` and `main=` are the same id strings `index:tree-open` and
    * `commit:collections` print, so all three lines join on them — and they name BOTH
@@ -1337,10 +1367,11 @@ export class OptimysticVirtualTable extends VirtualTable {
    * sample it (every Nth scan) or move it to a dedicated `index-seek` sub-namespace
    * rather than deleting it.
    *
-   * NOTE: `matched=` counts what the seek had produced when the iteration ENDED, which
-   * for an abandoned scan (a LIMIT satisfied early, an error mid-scan) is short of what
-   * the index holds. It is a floor, never an overcount — so `matched=0` still proves the
-   * descent found nothing, which is the reading the two-worlds decision rule turns on.
+   * NOTE: `matched=` and `rejected=` count what the seek had produced when the iteration
+   * ENDED, which for an abandoned scan (a LIMIT satisfied early, an error mid-scan) is short
+   * of what the index holds. Both are floors, never overcounts — so `matched=0` still proves
+   * the descent found nothing, which is the reading the two-worlds decision rule turns on,
+   * and `rejected>0` still proves the tree disagrees with the table.
    */
   private logIndexSeek(
     index: IndexScanSource,
@@ -1353,7 +1384,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       committedActionId(): string | undefined;
     }): string => revisionToken(tree.committedRevision() ?? 'none', tree.committedActionId() ?? 'none');
     log(
-      'index:seek table=%s index=%s collection=%s main=%s arm=%s rev=%s main_rev=%s seek=%s matched=%d node=%s',
+      'index:seek table=%s index=%s collection=%s main=%s arm=%s rev=%s main_rev=%s seek=%s matched=%d rejected=%d node=%s',
       this.tableName,
       index.schema.name,
       String(index.tree.getCollection().id),
@@ -1363,6 +1394,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       rev(mainTree),
       seek.key === undefined ? 'unset' : printableSeekKey(seek.key),
       seek.matched,
+      seek.rejected,
       this.collectionFactory.nodeTag(),
     );
   }
@@ -1448,9 +1480,10 @@ export class OptimysticVirtualTable extends VirtualTable {
     // an empty result at plan time (`isLiteralNullEquality` in
     // rule-select-access-path.ts), and leaves a dynamic value — parameter, correlated
     // binding — to a per-module runtime guard (the memory backend's `seekKeyHasNull`).
-    // getBestAccessPlan reports the PK equality filters as handledFilters=true, so
-    // there is no residual FILTER above this seek to catch a leaked row (a secondary
-    // index seek keeps one; the `_primary_` plan does not).
+    // getBestAccessPlan reports the PK equality filters as handledFilters=true, and the
+    // engine drops the residual FILTER for every constraint a module claims, so nothing
+    // above this seek would catch a leaked row. The secondary-index seek carries the
+    // same guard for the same reason (see executeIndexScan).
     //
     // Reachable since Quereus 4.14: PRIMARY KEY no longer implies NOT NULL, so
     // `x integer null primary key` stores a NULL-keyed row (quereus
@@ -1468,15 +1501,8 @@ export class OptimysticVirtualTable extends VirtualTable {
       this.rowCodec.asPrimaryKeyTuple(args as readonly SqlValue[]),
     );
 
-    const path = await read.find(key);
-    if (!read.isValid(path)) {
-      return;
-    }
-
-    const entry = read.at(path) as StoredRowEntry | undefined;
-    if (entry && entry.length >= 2) {
-      const encodedRow = entry[1];
-      const row = this.rowCodec.decodeRow(encodedRow);
+    const row = await readRowAt(read, this.rowCodec, key);
+    if (row !== undefined) {
       yield row;
     }
   }
@@ -1505,22 +1531,48 @@ export class OptimysticVirtualTable extends VirtualTable {
     args: readonly unknown[],
     seek?: IndexSeekProbe,
   ): AsyncIterable<Row> {
-    if (!this.rowCodec || !this.indexManager) return;
+    const rowCodec = this.rowCodec;
+    const indexManager = this.indexManager;
+    if (!rowCodec || !indexManager) return;
+
+    // A NULL seek arg makes the equality UNKNOWN under SQL three-valued logic, so no row
+    // matches — the same guard, for the same reason, that executePointLookup carries; read
+    // its comment for why the engine leaves a dynamic NULL to the module (it folds only a
+    // literal one, and quereus's own memory backend guards every seek path with
+    // `seekKeyHasNull`). getBestAccessPlan claims the matched equality filters as
+    // handledFilters=true, so the engine drops the residual predicate and nothing above
+    // this seek would catch a leaked row.
+    //
+    // ABOVE the key framing on purpose: indexKeyFromValues frames a NULL into a perfectly
+    // valid key — NULL has its own bare tag (key-encoding.ts) — which really does find the
+    // NULL-keyed row an INSERT stored. The verification below would not reject it either:
+    // the entry genuinely belongs to that row. Only refusing to seek at all is correct.
+    if (args.some(arg => arg === null || arg === undefined)) {
+      return;
+    }
 
     // Build the (possibly partial) framed index key from constraint values. Both this
     // and IndexManager.createIndexKey route through indexKeyFromValues, so the prefix
-    // range in findByIndexIn brackets exactly the tuple an insert stored. A partial key
+    // range in findEntriesIn brackets exactly the tuple an insert stored. A partial key
     // (fewer args than index columns) frames only the provided leading columns and
     // prefix-matches the rest; the planner may also hand over MORE constraint values
     // than the index covers, so the excess is truncated rather than rejected.
     const width = Math.min(args.length, index.schema.columns.length);
-    // Zero constraint values means the plan wants the whole index (e.g. an index-served
-    // ORDER BY): frame the empty prefix directly. asIndexColumnTuple deliberately
-    // rejects an empty tuple, so this case bypasses it rather than weakening that guard.
+    // Zero constraint values would mean the plan wants the whole index: frame the empty
+    // prefix directly, since asIndexColumnTuple deliberately rejects an empty tuple and
+    // this case must bypass it rather than weaken that guard.
+    //
+    // NOTE: no planner path reaches this branch today. The secondary-index arm of
+    // getBestAccessPlan names an index only once at least one equality filter matched, and
+    // runQuery sets `scanIndexName` on that path only for `args.length > 0`; the other way
+    // in is the legacy `filterInfo.idxNum >= 10` arm, and `idxNum` is hard-coded to `0` at
+    // every construction site in `@quereus/quereus/src/vtab/filter-info.ts`, so that arm is
+    // dead. Kept because it is the correct framing the day an index-served ORDER BY or a
+    // whole-index plan does arrive — not because something currently uses it.
     const indexKey = width === 0
       ? indexKeyFromValues([])
-      : this.indexManager.createIndexKeyFromTuple(
-          this.indexManager.asIndexColumnTuple(
+      : indexManager.createIndexKeyFromTuple(
+          indexManager.asIndexColumnTuple(
             index.schema,
             args.slice(0, width) as readonly SqlValue[],
           ),
@@ -1529,34 +1581,46 @@ export class OptimysticVirtualTable extends VirtualTable {
     // part-way still names the key it was seeking rather than reporting `unset`.
     if (seek !== undefined) seek.key = String(indexKey);
 
-    // NOTE: an entry whose row has since moved off the indexed value (a writer that was
-    // not maintaining this index UPDATEd the row; backfillIndexTrees adds the new entry on
-    // re-attach but never purges the old one) still resolves to a LIVE row, and this loop
-    // yields it although it does not match the seek key. Benign only because Quereus
-    // re-applies the predicate: over such a tree, `where token = 'tok-a'` was observed
-    // yielding row `[1, 'tok-z']` here while the statement still returned no rows.
-    // getBestAccessPlan reports those filters as handledFilters=true, so the day the engine
-    // trusts that promise — or a covering-index read lands that never fetches the row — a
-    // stale entry becomes a wrong row. Close it then by re-deriving
-    // IndexManager.createIndexKey from the fetched row and skipping entries whose key does
-    // not prefix-match `indexKey`.
-    for await (const primaryKey of this.indexManager.findByIndexIn(index.read, indexKey)) {
+    // Each entry is checked against the row it resolves to before that row is yielded, and
+    // the check is the FULL one — `rowImpliesEntry`, the same predicate the integrity check
+    // diffs on — not a prefix match against the seek key. Two things make it necessary:
+    //
+    //  - The engine is entitled to trust the seek. getBestAccessPlan claims the matched
+    //    equality filters as handledFilters=true, and `reattachUnconsumedConstraints` in
+    //    `@quereus/quereus/src/planner/rules/access/rule-select-access-path.ts` reattaches a
+    //    residual FILTER only for a claimed constraint the seek did NOT consume. A consumed
+    //    one gets none, so whatever this yields is the answer.
+    //  - An entry can outlive its row's value: a writer not maintaining this index UPDATEs
+    //    the row, and backfillIndexTrees adds the new entry on re-attach without purging the
+    //    old one. That entry resolves to a LIVE row holding a different value.
+    //
+    // Checking the whole entry rather than the seek's prefix is what also closes the
+    // duplicate: on a seek narrower than the index (`where C = 'x'` over an index on
+    // `(C, D)`), a row that moved from `('x', 2)` to `('x', 9)` has two entries, and BOTH
+    // prefix-match `'x'` — so a prefix check would return that row twice. Its full implied
+    // key can equal only one of them.
+    //
+    // NOTE: this derives the row's full index key once per entry the seek produces — one
+    // serialize-and-frame per index column, over a row the fetch above has already decoded.
+    // Small beside the tree descent that fetched it, and paid only on index-routed reads. If
+    // a hot seek path ever shows up in a profile, the derivation is the part to narrow, not
+    // the fetch: a healthy entry's own tree key already carries the answer.
+    const indexKeyOf = (row: Row): IndexKey => indexManager.createIndexKey(index.schema, row);
+    for await (const entry of indexManager.findEntriesIn(index.read, indexKey)) {
       // Counted HERE, before the row fetch: `matched` must mean "entries the index
       // descent produced", not "rows that survived". An entry whose row is missing or
-      // that a later predicate rejects still proves the index held something.
+      // that the verification rejects still proves the index held something.
       if (seek !== undefined) seek.matched++;
-      // Fetch the row from the main table using the primary key
-      const path = await mainRead.find(primaryKey);
-      if (!mainRead.isValid(path)) {
+      const row = await readRowAt(mainRead, rowCodec, entry[1]);
+      if (row === undefined || !rowImpliesEntry(row, entry, indexKeyOf)) {
+        // Both halves are index damage the read path can otherwise only correct silently:
+        // the row is gone (a `no-row` orphan), or it no longer implies this entry (a
+        // `stale-value` or `malformed` one). Counted so a seek quietly compensating for a
+        // broken tree can be SEEN on the `index:seek` line rather than inferred.
+        if (seek !== undefined) seek.rejected++;
         continue;
       }
-
-      const entry = mainRead.at(path) as [string, any];
-      if (entry && entry.length >= 2) {
-        const encodedRow = entry[1];
-        const row = this.rowCodec.decodeRow(encodedRow);
-        yield row;
-      }
+      yield row;
     }
   }
 
@@ -2982,8 +3046,11 @@ export class OptimysticVirtualTable extends VirtualTable {
    *
    * NOTE: backfill only ADDS entries, never purges. An entry a detached writer left
    * behind (its UPDATE moved the row off that indexed value, or its DELETE removed the
-   * row) survives the re-attach — see the stale-entry note in {@link executeIndexScan}
-   * for why that is benign today and what flips it.
+   * row) survives the re-attach. Queries are unaffected — {@link executeIndexScan} checks
+   * every entry against the row it resolves to and skips the ones no row implies — but the
+   * entry stays in the tree, where a unique-enforcement probe still counts it
+   * (`bug-stale-index-entry-causes-false-unique-refusal`). `plugin.verifyIndexes` is how to
+   * see it.
    *
    * NOTE: the walk stages one action per row per target index, holds them all pending
    * until the sync below, and re-stages EVERY row on every attach (an identical upsert

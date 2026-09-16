@@ -10,7 +10,8 @@
  *   resolved to.
  * - `index:seek` (`optimystic:quereus-plugin:module`) — one line per index-driven
  *   scan, naming the revision the index and main collections were read at, whether
- *   the read was allowed to refresh, and how many index entries the seek produced.
+ *   the read was allowed to refresh, how many index entries the seek produced, and how
+ *   many of those it rejected as not belonging to the row they name.
  *
  * All three carry a `node=` field naming the node that emitted them, and every revision
  * they print is `<rev>@<actionId>` — the two fields that make a merged multi-node log
@@ -209,6 +210,10 @@ export interface IndexSeekTrace {
 	/** Index entries the seek produced, counted before the row fetch. A floor: an
 	 *  abandoned iteration reports what it had produced when it stopped. */
 	matched: number;
+	/** How many of those entries the scan dropped because the row they name is gone or does
+	 *  not imply them. `matched - rejected` is what the scan returned; nonzero means this
+	 *  node's index disagrees with its table. A floor, like {@link matched}. */
+	rejected: number;
 }
 
 /** Parse every `index:seek` line out of a capture.
@@ -225,13 +230,13 @@ export interface IndexSeekTrace {
 export function indexSeekTraces(lines: readonly string[]): IndexSeekTrace[] {
 	const traces: IndexSeekTrace[] = [];
 	for (const raw of lines) {
-		const m = /index:seek table=(\S+) index=(\S+) collection=(\S+) main=(\S+) arm=(\S+) rev=([^\s@]+)@(\S+) main_rev=([^\s@]+)@(\S+) seek=(\S*) matched=(\d+) node=(\S+)/
+		const m = /index:seek table=(\S+) index=(\S+) collection=(\S+) main=(\S+) arm=(\S+) rev=([^\s@]+)@(\S+) main_rev=([^\s@]+)@(\S+) seek=(\S*) matched=(\d+) rejected=(\d+) node=(\S+)/
 			.exec(plain(raw));
 		if (m) {
 			traces.push({
 				table: m[1]!, index: m[2]!, collection: m[3]!, main: m[4]!, arm: m[5]!,
 				rev: m[6]!, action: m[7]!, mainRev: m[8]!, mainAction: m[9]!,
-				seek: m[10]!, matched: Number(m[11]), node: m[12]!,
+				seek: m[10]!, matched: Number(m[11]), rejected: Number(m[12]), node: m[13]!,
 			});
 		}
 	}
