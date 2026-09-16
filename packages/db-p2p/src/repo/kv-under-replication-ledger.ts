@@ -149,6 +149,21 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 		});
 	}
 
+	async name(blockId: BlockId, rev: number, missingPeerIds: readonly string[]): Promise<UnderReplicatedEntry | undefined> {
+		return this.serialized(blockId, async () => {
+			const existing = await this.read(blockId);
+			if (existing === undefined) return undefined;
+			if (existing.rev !== rev) {
+				log('name:keep-other-rev %o', { blockId, rev, recordedRev: existing.rev });
+				return existing;
+			}
+			if (existing.missingPeerIds.length > 0) return existing;
+			const updated: UnderReplicatedEntry = { ...existing, missingPeerIds: [...missingPeerIds] };
+			await this.kv.set(keyFor(blockId), JSON.stringify(updated));
+			return updated;
+		});
+	}
+
 	async noteAttempt(blockId: BlockId): Promise<void> {
 		await this.serialized(blockId, async () => {
 			const existing = await this.read(blockId);
@@ -203,9 +218,11 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 	 * failing every write for the life of the process.
 	 *
 	 * NOTE: the load is one read per stored entry. It runs on the first `list`, `size` or mutation
-	 * after start — the drain's start pass, when the drain is wired, otherwise the first commit; a
-	 * solo node keeps an entry per block it writes, so a commit that arrives before the load finishes
-	 * still waits on it and can stall on slow storage — see
+	 * after start. With the drain wired that is its start pass on every node — `list` when a pushable
+	 * peer is connected, otherwise the `size` that decides whether to arm its re-check — so the load
+	 * runs at boot, off the commit path; without the drain it is the first commit. A solo node keeps
+	 * an entry per block it writes, so a commit that arrives before the load finishes still waits on
+	 * it and can stall on slow storage — see
 	 * `backlog/debt-solo-node-ledger-is-reread-whole-on-first-commit-after-restart`.
 	 */
 	private index(): Promise<Set<BlockId>> {

@@ -65,9 +65,8 @@ export interface IUnderReplicationLedger {
 	 * remaining entry, or `undefined` when it was deleted or never existed.
 	 *
 	 * An entry whose missing set is UNKNOWN (empty — recorded `local` or `unrouted`) is returned
-	 * unchanged: removing named peers from an unknown set cannot prove it empty. Name its missing set
-	 * first by recording it again at the same `rev`, or `delete` it once the whole re-resolved cohort
-	 * has confirmed.
+	 * unchanged: removing named peers from an unknown set cannot prove it empty. `name` its missing
+	 * set first, or `delete` it once the whole re-resolved cohort has confirmed.
 	 *
 	 * `heldRev` is the revision the peers confirmed holding. When given, an entry recording a HIGHER
 	 * revision is returned unchanged: a copy of an older revision says nothing about a newer
@@ -75,6 +74,15 @@ export interface IUnderReplicationLedger {
 	 * entry — a later revision supersedes an earlier one — so `heldRev` above the entry's is fine.
 	 */
 	satisfy(blockId: BlockId, peerIds: readonly string[], heldRev?: number): Promise<UnderReplicatedEntry | undefined>;
+	/**
+	 * Give an entry recorded with an UNKNOWN missing set the members the drain has since resolved,
+	 * so `satisfy` has a set to shrink. Applies only to the entry as it stands — at exactly `rev`,
+	 * and still unnamed: an entry recording another revision or already naming its members is
+	 * returned unchanged, and an absent one is NOT created (a `record` here would resurrect an entry a
+	 * concurrent `settle` just removed). `recordedAt` and `attempts` are kept. Returns the entry as it
+	 * now stands, or `undefined` when there is none.
+	 */
+	name(blockId: BlockId, rev: number, missingPeerIds: readonly string[]): Promise<UnderReplicatedEntry | undefined>;
 	/** Bump the give-up counter after an unsuccessful drain round. A no-op for an absent entry. */
 	noteAttempt(blockId: BlockId): Promise<void>;
 	delete(blockId: BlockId): Promise<void>;

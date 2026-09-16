@@ -227,6 +227,13 @@ export class UnderReplicationDrain implements Startable {
 		// A peer that comes back is retried from scratch: its abandonment and give-up counts go.
 		// Only a FRESH connection counts — libp2p opens parallel connections to one peer, and a second
 		// one must not wipe the record of a peer that never went away.
+		// NOTE: "fresh" is read as "this is the peer's only connection", which relies on libp2p's
+		// connection manager having registered the new connection before this listener runs. True on
+		// libp2p 3.x: the manager subscribes to `connection:open` at its own start (before any user
+		// listener) and stores the connection synchronously, before its first await. If a libp2p
+		// upgrade ever defers that store, every parallel connection would look fresh and an abandoned
+		// peer would be retried on each one — cheap, not wrong — and the check would want the
+		// `peer:connect` event instead, which fires only for a peer's first connection.
 		const remotePeer = event?.detail?.remotePeer;
 		if (remotePeer !== undefined && this.deps.libp2p.getConnections(remotePeer).length <= 1) {
 			this.forgetPeer(remotePeer.toString());
@@ -313,6 +320,9 @@ export class UnderReplicationDrain implements Startable {
 
 	private async performPass(trigger: DrainTrigger): Promise<DrainPassResult> {
 		const counts = zeroCounts(trigger);
+		// A pass that scanned counts for the throttle however it ends — a ledger fault mid-pass must
+		// not make the next trigger an unthrottled retry. A skipped pass is free and does not count.
+		let scanned = false;
 		try {
 			if (this.deps.partitionDetector.detectPartition()) {
 				log('pass:skip trigger=%s reason=partition', trigger);
@@ -325,6 +335,7 @@ export class UnderReplicationDrain implements Startable {
 			}
 
 			const entries = await this.deps.ledger.list();
+			scanned = true;
 			this.pruneState(entries);
 			counts.entries = entries.length;
 			const examined = this.takeBudget(entries);
@@ -335,12 +346,12 @@ export class UnderReplicationDrain implements Startable {
 				if (!this.running) break;
 				await this.drainEntry(entry, pushable, counts);
 			}
-			this.lastPassAt = Date.now();
 			log('pass:done trigger=%s entries=%d examined=%d deferred=%d solo=%d waiting=%d pushed=%d cleared=%d dropped=%d abandoned=%d',
 				trigger, counts.entries, counts.examined, counts.deferred, counts.solo, counts.waiting,
 				counts.pushed, counts.cleared, counts.dropped, counts.abandoned);
 			return counts;
 		} finally {
+			if (scanned) this.lastPassAt = Date.now();
 			await this.rearmRecheck();
 		}
 	}
@@ -418,13 +429,20 @@ export class UnderReplicationDrain implements Startable {
 	 * Take the confirmed peers off the entry. An entry that could not name its members is named now,
 	 * at its own revision, with the cohort resolved for this push — so `satisfy` has a set to shrink.
 	 * Both writes carry the revision guard: a newer shortfall recorded while the push was in flight
-	 * is left alone (`record` skips a lower revision; `satisfy` keeps a higher one).
+	 * is left alone (`name` touches only its own revision; `satisfy` keeps a higher one), and neither
+	 * recreates an entry a concurrent `settle` removed mid-push.
+	 *
+	 * NOTE: an entry settled mid-push by a `full` commit at a newer revision is gone by the time
+	 * `satisfy` runs, which reports that as "gone", so the event fires here too. It is true — the block
+	 * IS fully replicated — but under the older `rev`/`actionId`, and a listener may also have heard
+	 * `full` on that commit's own result. If a host ever needs the two told apart, have `satisfy`
+	 * distinguish "deleted now" from "absent".
 	 *
 	 * @returns whether the entry is gone — its last missing member confirmed.
 	 */
 	private async recordConfirmed(entry: UnderReplicatedEntry, owed: Owed & { kind: 'peers' }, confirmed: string[], heldRev: number): Promise<boolean> {
 		if (!owed.named) {
-			await this.deps.ledger.record({ ...entry, missingPeerIds: owed.peerIds });
+			await this.deps.ledger.name(entry.blockId, entry.rev, owed.peerIds);
 		}
 		const remaining = await this.deps.ledger.satisfy(entry.blockId, confirmed, heldRev);
 		if (remaining === undefined) {

@@ -256,6 +256,31 @@ describe('KvUnderReplicationLedger', () => {
 			expect(await ledger.satisfy(BLOCK_A, ['peer-q'])).to.deep.equal(entry());
 		});
 
+		it('name gives an unknown missing set its members at the same rev, keeping recordedAt and attempts', async () => {
+			await ledger.record(entry({ quorum: 'local', missingPeerIds: [], attempts: 2 }));
+
+			const named = await ledger.name(BLOCK_A, 3, ['peer-x', 'peer-y']);
+
+			expect(named).to.deep.equal(entry({ quorum: 'local', missingPeerIds: ['peer-x', 'peer-y'], attempts: 2 }));
+			expect(await ledger.get(BLOCK_A)).to.deep.equal(named);
+			expect((await ledger.satisfy(BLOCK_A, ['peer-x'], 3))?.missingPeerIds, 'satisfy now has a set to shrink').to.deep.equal(['peer-y']);
+		});
+
+		it('name leaves an already-named entry and an entry at another rev unchanged', async () => {
+			await ledger.record(entry({ rev: 6, missingPeerIds: ['peer-x'] }));
+
+			expect(await ledger.name(BLOCK_A, 6, ['peer-q']), 'already named').to.deep.equal(entry({ rev: 6, missingPeerIds: ['peer-x'] }));
+			const captured = await captureLog('under-replication-ledger', async () => {
+				expect(await ledger.name(BLOCK_A, 5, ['peer-q']), 'another rev').to.deep.equal(entry({ rev: 6, missingPeerIds: ['peer-x'] }));
+			});
+			expect(hasTag(captured, 'name:keep-other-rev')).to.equal(true);
+		});
+
+		it('name creates nothing for an absent entry', async () => {
+			expect(await ledger.name(BLOCK_A, 3, ['peer-x'])).to.equal(undefined);
+			expect(await ledger.list()).to.deep.equal([]);
+		});
+
 		it('noteAttempt increments the give-up counter, and is a no-op for an absent entry', async () => {
 			await ledger.record(entry());
 

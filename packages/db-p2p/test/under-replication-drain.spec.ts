@@ -445,6 +445,22 @@ describe('UnderReplicationDrain', () => {
 			expect(events).to.deep.equal([]);
 		});
 
+		it('an unnamed entry settled by a full commit mid-push is not resurrected under the resolved names', async () => {
+			const drain = await startDrain();
+			await ledger.record(entryFor(BLOCK_A, { rev: 5, quorum: 'local' }));
+			keyNetwork.setCohort(BLOCK_A, [self.toString(), peerX.toString(), peerY.toString()]);
+			libp2p.connect(peerX, { emit: false }); // peerY stays away, so naming would leave it owed
+			pusher.beforeAnswer = async () => { await ledger.settle(BLOCK_A, 6); };
+			pusher.latestRev = 5;
+
+			await drain.checkNow();
+
+			expect(await ledger.get(BLOCK_A), 'the settled entry stays gone').to.equal(undefined);
+			// The block IS fully replicated (the rev-6 commit was full), so the event still fires — see
+			// the NOTE on `recordConfirmed` for why it carries the older revision.
+			expect(events.map(e => e.blockIds)).to.deep.equal([[BLOCK_A]]);
+		});
+
 		it('a copy of a NEWER revision than the entry records satisfies it', async () => {
 			const drain = await startDrain();
 			await ledger.record(entryFor(BLOCK_A, { rev: 5, missingPeerIds: [peerX.toString()] }));
@@ -499,6 +515,25 @@ describe('UnderReplicationDrain', () => {
 			await waitFor(async () => (await ledger.get(BLOCK_A)) === undefined,
 				{ timeoutMs: 2_000, intervalMs: 10, description: 'the start pass drained the entry' });
 			expect(events.length).to.equal(1);
+		});
+
+		it('the start pass loads the ledger index even when nobody is connected, so the first commit does not', async () => {
+			let scans = 0;
+			const counted = new (class extends MemoryKVStore {
+				override async list(prefix: string): Promise<string[]> {
+					scans++;
+					return super.list(prefix);
+				}
+			})();
+			await new KvUnderReplicationLedger(counted).record(entryFor(BLOCK_A, { quorum: 'local' }));
+			scans = 0;
+			deps.ledger = new KvUnderReplicationLedger(counted);
+
+			await startDrain({ recheckIntervalMs: 60_000 });
+			await waitFor(() => scans === 1, { timeoutMs: 2_000, intervalMs: 5, description: 'the start pass scanned the ledger' });
+
+			await deps.ledger.record(entryFor(BLOCK_B, { quorum: 'local' }));
+			expect(scans, 'the first mutation found the index loaded').to.equal(1);
 		});
 
 		it('runs a debounced pass when a peer connects, and when one is identified', async () => {

@@ -480,6 +480,7 @@ describe('CoordinatorRepo — an acknowledged commit below full replication reco
 			list: async () => [],
 			size: async () => 0,
 			satisfy: async () => undefined,
+			name: async () => undefined,
 			noteAttempt: async () => { },
 			delete: async () => { }
 		};
