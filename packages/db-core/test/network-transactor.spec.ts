@@ -12,6 +12,7 @@ import { peerIdFromString } from '../src/network/types.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import { generateRandomActionId } from './generate-random-action-id.js'
 import { TestTransactor, DelegatingTransactor } from '../src/testing/test-transactor.js'
+import { localDurability, isFullyDurable } from '../src/network/durability.js'
 
 describe('NetworkTransactor', () => {
   // Helper to generate block IDs
@@ -731,7 +732,7 @@ describe('NetworkTransactor', () => {
       const net = new RoutedKeyNetwork()
       await net.setCluster(tailId, [peerT])
       await net.setCluster(nonTailId, [peerN])
-      const tailRepo = makeCommitOnlyRepo(async () => ({ success: true as const }))
+      const tailRepo = makeCommitOnlyRepo(async () => ({ success: true as const, durability: localDurability() }))
       const nonTailRepo = makeCommitOnlyRepo(nonTailCommit)
       const networkTransactor = new NetworkTransactor({
         timeoutMs: 1000,
@@ -783,6 +784,65 @@ describe('NetworkTransactor', () => {
       // fault keeps the tolerance and the lagging peer converges via reconciliation.
       expect(nonTailRepo.commits, 'the non-tail commit was attempted').to.be.greaterThan(0)
       expect(result.success).to.be.true
+      // The tolerance is for the RESULT only. The acknowledgement must name the block the sweep
+      // abandoned and must not read as completely saved — those blocks are on nobody.
+      if (result.success) {
+        expect(result.durability.torn, 'the abandoned sweep block is named').to.deep.equal([nonTailId])
+        expect(isFullyDurable(result.durability), 'a torn action is never fully durable').to.equal(false)
+      }
+    })
+
+    it('a torn acknowledgement is clamped below full even when the tail\'s cohort held everything', async () => {
+      const fullCohort = { quorum: 'full' as const, confirmed: 2, cohort: 2, unconfirmed: [], cohortPeerIds: ['peer-T', 'peer-T2'] }
+      const net = new RoutedKeyNetwork()
+      await net.setCluster(tailId, [peerT])
+      await net.setCluster(nonTailId, [peerN])
+      const tailRepo = makeCommitOnlyRepo(async () => ({ success: true as const, durability: fullCohort }))
+      const nonTailRepo = makeCommitOnlyRepo(async () => { throw new Error('The stream has been reset') })
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => (peerId.toString() === peerT ? tailRepo : nonTailRepo),
+      })
+
+      const result = await networkTransactor.commit({ actionId: generateRandomActionId(), rev: 3, blockIds: [tailId, nonTailId], tailId })
+
+      expect(result.success).to.be.true
+      if (result.success) {
+        expect(result.durability.quorum, 'clamped down from full').to.equal('majority')
+        expect(result.durability.torn).to.deep.equal([nonTailId])
+        expect(isFullyDurable(result.durability)).to.equal(false)
+      }
+    })
+
+    it('merges two coordinators\' answers to the weakest, with the other cohort reported alongside', async () => {
+      // The multi-cohort shape: the tail's coordinator reports a fully-held two-member cohort, the
+      // non-tail block's coordinator answers for itself alone. The action-level answer is the
+      // weaker (`local`) and the stronger report is preserved in `otherCohorts`.
+      const fullCohort = { quorum: 'full' as const, confirmed: 2, cohort: 2, unconfirmed: [], cohortPeerIds: ['peer-T', 'peer-T2'] }
+      const net = new RoutedKeyNetwork()
+      await net.setCluster(tailId, [peerT])
+      await net.setCluster(nonTailId, [peerN])
+      const tailRepo = makeCommitOnlyRepo(async () => ({ success: true as const, durability: fullCohort }))
+      const nonTailRepo = makeCommitOnlyRepo(async () => ({ success: true as const, durability: localDurability(peerN) }))
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => (peerId.toString() === peerT ? tailRepo : nonTailRepo),
+      })
+
+      const result = await networkTransactor.commit({ actionId: generateRandomActionId(), rev: 3, blockIds: [tailId, nonTailId], tailId })
+
+      expect(result.success).to.be.true
+      if (result.success) {
+        expect(result.durability.quorum).to.equal('local')
+        expect(result.durability.cohortPeerIds).to.deep.equal([peerN])
+        expect(result.durability.otherCohorts).to.deep.equal([fullCohort])
+        expect(result.durability.torn, 'nothing was abandoned').to.equal(undefined)
+        expect(isFullyDurable(result.durability)).to.equal(false)
+      }
     })
 
     it('surfaces the conflict, not the throw, when one non-tail block conflicts and another faults', async () => {
@@ -795,7 +855,7 @@ describe('NetworkTransactor', () => {
       await net.setCluster(tailId, [peerT])
       await net.setCluster(nonTailId, [peerN])
       await net.setCluster(faultingId, [peerF])
-      const tailRepo = makeCommitOnlyRepo(async () => ({ success: true as const }))
+      const tailRepo = makeCommitOnlyRepo(async () => ({ success: true as const, durability: localDurability() }))
       const conflictRepo = makeCommitOnlyRepo(async () => ({
         success: false as const,
         conflict: true,

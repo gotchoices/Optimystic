@@ -8,8 +8,7 @@ import {
 	computeClusterMessageHash,
 	computeClusterPromiseHash,
 	computeClusterCommitHash,
-	CURRENT_MEMBERSHIP_VERSION
-} from '@optimystic/db-core';
+	CURRENT_MEMBERSHIP_VERSION, localDurability } from '@optimystic/db-core';
 import type {
 	IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult,
 	CommitRequest, CommitResult, ActionBlocks, ClusterPeers
@@ -103,8 +102,8 @@ const makeV1Record = async (peers: ClusterPeers, message: RepoMessage): Promise<
 
 class MockRepo implements IRepo {
 	async get(_blockGets: BlockGets): Promise<GetBlockResults> { return {}; }
-	async pend(_request: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [] }; }
-	async commit(_request: CommitRequest): Promise<CommitResult> { return { success: true }; }
+	async pend(_request: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [], durability: localDurability() }; }
+	async commit(_request: CommitRequest): Promise<CommitResult> { return { success: true, durability: localDurability() }; }
 	async cancel(_actionRef: ActionBlocks): Promise<void> { /* no-op */ }
 }
 

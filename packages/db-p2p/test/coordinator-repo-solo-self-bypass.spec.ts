@@ -9,6 +9,7 @@
  */
 
 import { expect } from 'chai';
+import { localDurability } from '@optimystic/db-core';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import type { PeerId } from '@libp2p/interface';
@@ -57,11 +58,11 @@ const makeMissingStorageRepo = (): IRepo => ({
 		return results;
 	},
 	async pend(_request: PendRequest, _options?: MessageOptions): Promise<PendResult> {
-		return { success: true, pending: [], blockIds: [] };
+		return { success: true, pending: [], blockIds: [], durability: localDurability() };
 	},
 	async cancel(_actionRef: ActionBlocks, _options?: MessageOptions): Promise<void> { },
 	async commit(_request: CommitRequest, _options?: MessageOptions): Promise<CommitResult> {
-		return { success: true };
+		return { success: true, durability: localDurability() };
 	}
 });
 
@@ -204,9 +205,9 @@ describe('CoordinatorRepo solo-cluster self-sync bypass', () => {
 				storageCalls.push(blockGets);
 				return { [blockId]: { state: {} } };
 			},
-			async pend() { return { success: true, pending: [], blockIds: [] }; },
+			async pend() { return { success: true, pending: [], blockIds: [], durability: localDurability() }; },
 			async cancel() { },
-			async commit() { return { success: true }; }
+			async commit() { return { success: true, durability: localDurability() }; }
 		};
 
 		const repo = new CoordinatorRepo(

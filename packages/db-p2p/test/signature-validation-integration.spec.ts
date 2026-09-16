@@ -11,6 +11,7 @@
  */
 
 import { expect } from 'chai';
+import { localDurability } from '@optimystic/db-core';
 import { clusterMember } from '../src/cluster/cluster-repo.js';
 import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
@@ -133,11 +134,11 @@ class MockRepo implements IRepo {
 	}
 	async pend(request: PendRequest): Promise<PendResult> {
 		this.pendCalls.push(request);
-		return { success: true, blockIds: [], pending: [] };
+		return { success: true, blockIds: [], pending: [], durability: localDurability() };
 	}
 	async commit(request: CommitRequest): Promise<CommitResult> {
 		this.commitCalls.push(request);
-		return { success: true };
+		return { success: true, durability: localDurability() };
 	}
 	async cancel(actionRef: ActionBlocks): Promise<void> {
 		this.cancelCalls.push(actionRef);

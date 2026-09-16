@@ -1,5 +1,6 @@
 import type { ITransactor, GetBlockResults, ActionBlocks, BlockActionStatus, PendResult, CommitResult, PendRequest, BlockId, CommitRequest, BlockGets, IBlock, ActionId, ActionRev, ActionTransforms, StaleFailure, Transform, Transforms, ClusterNomineesResult, CollectionId } from "../index.js";
 import { highestStaleAt, isOwnRevision } from "../network/stale-failure.js";
+import { localDurability } from "../network/durability.js";
 import { ensuredMap } from "../utility/ensured.js";
 import { Latches } from "../utility/latches.js";
 import { applyTransform, blockIdsForTransforms, transformForBlockId, emptyTransforms, concatTransform, transformsFromTransform } from "../transform/index.js";
@@ -276,11 +277,13 @@ export class TestTransactor implements ITransactor {
 			}
 		}
 
-		// Return success, include pending list as per StorageRepo behavior
+		// Return success, include pending list as per StorageRepo behavior. The in-memory double is one
+		// node with no cohort, so its honest class is `local` — exactly what a bare StorageRepo answers.
 		return {
 			success: true,
 			pending: conflictingPendings,
-			blockIds
+			blockIds,
+			durability: localDurability()
 		} as PendResult;
 	}
 
@@ -397,7 +400,7 @@ export class TestTransactor implements ITransactor {
 
       // --- End of Critical Section (Simulated) ---
 
-      return { success: true };
+      return { success: true, durability: localDurability() };
 
     } finally {
       // Release locks in reverse order

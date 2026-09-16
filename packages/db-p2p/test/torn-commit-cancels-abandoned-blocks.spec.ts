@@ -25,6 +25,7 @@
 
 import { expect } from 'chai';
 import type { BlockHeader, BlockId, IBlock, Transforms, IRepo, RepoCommitRequest, MessageOptions, ActionId, BlockActionState, ITransactor } from '@optimystic/db-core';
+import { isFullyDurable } from '@optimystic/db-core';
 import { createMesh, buildNetworkTransactor, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
 
 const makeHeader = (id: string): BlockHeader => ({ id: id as BlockId, type: 'test', collectionId: 'torn-commit-collection' as BlockId });
@@ -176,6 +177,13 @@ describe('Torn commit — the blocks a sweep abandons are cancelled, never stran
 		expect(pend1.success, 'seed pend must succeed').to.equal(true);
 		const commit1 = await transactor.commit({ actionId: 'a1', blockIds: ['T', 'S'] as BlockId[], tailId: 'T' as BlockId, rev: 1 });
 		expect(commit1.success, 'seed commit must succeed').to.equal(true);
+		// A healthy commit on a three-member mesh where every member confirms: the acknowledgement
+		// reads as completely saved, with nothing torn — the baseline the torn commit below departs from.
+		if (commit1.success) {
+			expect(commit1.durability.quorum, 'every member of the cohort confirmed').to.equal('full');
+			expect(commit1.durability.torn, 'nothing abandoned').to.equal(undefined);
+			expect(isFullyDurable(commit1.durability)).to.equal(true);
+		}
 		await assertPendingLifetimeInvariant(mesh, 'a1', ['T', 'S']);
 
 		// rev 2: touch both, and let every sweep RPC (the non-tail commit stage) fail in the
@@ -190,6 +198,12 @@ describe('Torn commit — the blocks a sweep abandons are cancelled, never stran
 		// tail committed durably before the sweep failed, so the commit is still acknowledged.
 		expect(sweepFailures(), 'the sweep injection must have fired').to.be.at.least(1);
 		expect(commit2.success, 'a transport-failed sweep must not disown the durably committed tail').to.equal(true);
+		// The acknowledgement must SAY the action is torn: `torn` names exactly the abandoned block
+		// (the same set the cancel below covers), and the write does not read as completely saved.
+		if (commit2.success) {
+			expect(commit2.durability.torn, 'the abandoned sweep block is named on the acknowledgement').to.deep.equal(['S']);
+			expect(isFullyDurable(commit2.durability), 'a torn action is never fully durable').to.equal(false);
+		}
 
 		// The cancel is scoped to the sweep. The TAIL must never appear in it: its commit is durable,
 		// and it is the block the acknowledgement is owed on.

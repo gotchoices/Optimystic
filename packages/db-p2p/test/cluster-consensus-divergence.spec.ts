@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { localDurability } from '@optimystic/db-core';
 import { ClusterMember, clusterMember, type ReconcileBlockCallback } from '../src/cluster/cluster-repo.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
@@ -238,7 +239,7 @@ describe('ClusterMember consensus-execution divergence (stream-reset root cause)
 		// A storage repo whose commit throws a non-divergence error must NOT be tolerated.
 		class FaultyRepo implements IRepo {
 			async get(_b: BlockGets): Promise<GetBlockResults> { return {}; }
-			async pend(_r: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [] }; }
+			async pend(_r: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [], durability: localDurability() }; }
 			async commit(_r: CommitRequest): Promise<CommitResult> { throw new Error('simulated disk I/O failure'); }
 			async cancel(_a: ActionBlocks): Promise<void> { /* no-op */ }
 		}
@@ -459,7 +460,7 @@ describe('ClusterMember consensus-execution divergence (stream-reset root cause)
 		// not a thrown fault — must NOT be tolerated and must NOT trigger reconciliation.
 		class ReturnFailRepo implements IRepo {
 			async get(_b: BlockGets): Promise<GetBlockResults> { return {}; }
-			async pend(_r: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [] }; }
+			async pend(_r: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [], durability: localDurability() }; }
 			async commit(_r: CommitRequest): Promise<CommitResult> { return { success: false, reason: 'internal commit fault' }; }
 			async cancel(_a: ActionBlocks): Promise<void> { /* no-op */ }
 		}
@@ -585,7 +586,7 @@ describe('ClusterMember commit-verdict retention (getExecutedCommitResult)', () 
 
 		const verdict = member.getExecutedCommitResult(record.messageHash);
 		expect(verdict?.success, 'a member that restored the revision IS a durable holder').to.equal(true);
-		expect(answer.applyOutcomes?.[self.peerId.toString()]?.commit).to.deep.equal({ success: true });
+		expect(answer.applyOutcomes?.[self.peerId.toString()]?.commit).to.deep.equal({ success: true, durability: localDurability() });
 	});
 
 	it('stamps a clean commit success on the response record (the coordinator counts these)', async () => {
@@ -595,7 +596,7 @@ describe('ClusterMember commit-verdict retention (getExecutedCommitResult)', () 
 
 		const answer = await member.update(await buildConsensusCommitRecord(self, other, makeCommitOperation('a1', 'block-1', 1)));
 
-		expect(answer.applyOutcomes?.[self.peerId.toString()]?.commit).to.deep.equal({ success: true });
+		expect(answer.applyOutcomes?.[self.peerId.toString()]?.commit).to.deep.equal({ success: true, durability: localDurability() });
 	});
 
 	it('drops the retained verdict when the apply rolls back (propagated fault)', async () => {
@@ -605,7 +606,7 @@ describe('ClusterMember commit-verdict retention (getExecutedCommitResult)', () 
 		// officially never ran.
 		class ReturnFailRepo implements IRepo {
 			async get(_b: BlockGets): Promise<GetBlockResults> { return {}; }
-			async pend(_r: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [] }; }
+			async pend(_r: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [], durability: localDurability() }; }
 			async commit(_r: CommitRequest): Promise<CommitResult> { return { success: false, reason: 'internal commit fault' }; }
 			async cancel(_a: ActionBlocks): Promise<void> { /* no-op */ }
 		}

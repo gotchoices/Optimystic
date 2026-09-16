@@ -157,7 +157,7 @@ describe('solo-cohort commit proof', function () {
 		expect(verdict.ok, `proof must verify: ${JSON.stringify(verdict)}`).to.equal(true);
 
 		// The operator's discriminator for a REAL cohort of one.
-		expect(soloCohortLine(harness)).to.include({ blockId: BLOCK_ID, cohortSize: 1, soleIsSelf: true });
+		expect(soloCohortLine(harness)).to.include({ blockId: BLOCK_ID, cohortSize: 1, soleIsSelf: true, quorum: 'local' });
 	});
 
 	it('the retained solo proof passes the receiver-side certified-push gate', async () => {
@@ -206,7 +206,7 @@ describe('solo-cohort commit proof', function () {
 			proof!, { blockId: BLOCK_ID, rev: 1, actionId: ACTION }, block, PROOF_THRESHOLDS);
 		expect(verdict.ok, `proof must verify: ${JSON.stringify(verdict)}`).to.equal(true);
 
-		expect(soloCohortLine(harness)).to.include({ blockId: BLOCK_ID, cohortSize: 0, soleIsSelf: false });
+		expect(soloCohortLine(harness)).to.include({ blockId: BLOCK_ID, cohortSize: 0, soleIsSelf: false, quorum: 'unrouted' });
 	});
 
 	it('still commits successfully — retaining no proof — when no local cluster is wired', async () => {

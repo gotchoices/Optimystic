@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { localDurability } from '@optimystic/db-core';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import type { PeerId } from '@libp2p/interface';
@@ -41,11 +42,11 @@ const makeStorageRepo = (): IRepo => ({
 		return {};
 	},
 	async pend(_request: PendRequest, _options?: MessageOptions): Promise<PendResult> {
-		return { success: true, pending: [], blockIds: [] };
+		return { success: true, pending: [], blockIds: [], durability: localDurability() };
 	},
 	async cancel(_actionRef: ActionBlocks, _options?: MessageOptions): Promise<void> {},
 	async commit(_request: CommitRequest, _options?: MessageOptions): Promise<CommitResult> {
-		return { success: true };
+		return { success: true, durability: localDurability() };
 	}
 });
 

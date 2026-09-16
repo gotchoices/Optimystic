@@ -2,7 +2,8 @@ import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
 import { highestStaleAt, isConflictFailure } from "../network/stale-failure.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
-import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests } from "../index.js";
+import { mergeDurability, withTornBlocks } from "../network/durability.js";
+import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, WriteDurability } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
 import { Tracker } from "../transform/tracker.js";
@@ -664,7 +665,15 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		return {
 			success: true,
 			pending: completed.flatMap(b => (b.request!.response! as PendSuccess).pending),
-			blockIds: blockIdsForTransforms(blockAction.transforms)
+			blockIds: blockIdsForTransforms(blockAction.transforms),
+			// The weakest coordinator's answer is the action's answer (`mergeDurability`). A pend has
+			// no torn case: a batch that did not succeed fails the whole pend above.
+			// NOTE: a pend naming NO blocks now throws here (`mergeDurability` refuses an empty input rather
+			// than fabricate a class), where it used to answer success. No caller produces one today —
+			// `Collection.sync` skips an empty change set, and the multi-collection coordinator pends only
+			// collections that appended a log entry. If one ever appears, decide what an empty write's
+			// durability means at that caller; do not make the merge invent one.
+			durability: mergeDurability(completed.map(b => (b.request!.response! as PendSuccess).durability))
 		};
 	}
 
@@ -708,6 +717,12 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		if (!tailResult.success) {
 			return tailResult;
 		}
+		// Every coordinator that confirmed part of this action reports who holds its part; the
+		// action-level answer is the WEAKEST of them (`mergeDurability`), so a caller reading only the
+		// scalar fields reads the binding constraint. The blocks a torn sweep abandons are on nobody,
+		// and `torn` names them: they never heal by replication, only by re-driving the action.
+		const cohortReports: WriteDurability[] = [tailResult.durability];
+		let torn: BlockId[] = [];
 
 		// Sweep every non-tail block (the header, when the action touches it, lands here too — after
 		// the tail, like any other touched block). The tail is the only exclusion needed.
@@ -721,6 +736,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		const remainingBlocks = request.blockIds.filter(bid => bid !== request.tailId);
 		if (remainingBlocks.length > 0) {
 			const { batches, error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev, tailId: request.tailId, blockDigests: request.blockDigests });
+			cohortReports.push(...confirmedDurabilities(batches));
 			if (error) {
 				// Split by the failure's NATURE, exactly as commitBlock does for the tail: a RETURNED
 				// `success:false` from a cohort coordinator is a confirmed optimistic-concurrency loss
@@ -760,12 +776,16 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				// acknowledged write — but NOT for the state the sweep abandoned, which
 				// `cancelAbandonedSweepBlocks` below repairs before this returns.
 				try { log('WARN: non-tail commit had errors; cancelling unconfirmed blocks, proceeding after tail commit: %s', error.message); } catch { /* ignore */ }
-				await this.cancelAbandonedSweepBlocks(request.actionId, remainingBlocks, batches);
+				torn = await this.cancelAbandonedSweepBlocks(request.actionId, remainingBlocks, batches);
 			}
 		}
 
-		log('commit:done actionId=%s ms=%d', request.actionId, Date.now() - t0);
-		return { success: true };
+		log('commit:done actionId=%s ms=%d torn=%d', request.actionId, Date.now() - t0, torn.length);
+		// `withTornBlocks` clamps the class below `full` when the sweep abandoned anything — a cohort
+		// can hold every block it was asked for while the action as a whole is incomplete — and never
+		// raises it. `isFullyDurable` then answers false; a consumer that needs to know WHICH blocks
+		// reads `torn`.
+		return { success: true, durability: withTornBlocks(mergeDurability(cohortReports), torn) };
 	}
 
 	/**
@@ -797,8 +817,11 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * `debt-unpromotable-pending-records-need-a-sweep`); and this covers only the sweep's abandonment
 	 * — `StorageRepo.commit`'s genuine-fault arm deliberately KEEPS a failed batch's pendings for a
 	 * retry, so it is a second producer of the same durable state whenever that retry never comes.
+	 *
+	 * @returns the abandoned block ids — exactly the set cancelled here — so {@link commit} can name
+	 * them as `torn` on the acknowledgement without re-deriving the set by a second rule.
 	 */
-	private async cancelAbandonedSweepBlocks(actionId: ActionId, sweptBlocks: BlockId[], batches: CoordinatorBatch<BlockId[], CommitResult>[]): Promise<void> {
+	private async cancelAbandonedSweepBlocks(actionId: ActionId, sweptBlocks: BlockId[], batches: CoordinatorBatch<BlockId[], CommitResult>[]): Promise<BlockId[]> {
 		// NOTE: `confirmed` is only ever non-empty when the sweep spans MORE THAN ONE batch, and it
 		// does so only when no single peer covers every swept block — `consolidateCoordinators`'
 		// greedy set cover collapses the pend onto one coordinator otherwise, and commit reuses that
@@ -815,13 +838,14 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		}
 		const abandoned = sweptBlocks.filter(bid => !confirmed.has(bid));
 		if (abandoned.length === 0) {
-			return;
+			return abandoned;
 		}
 		try {
 			await this.cancel({ actionId, blockIds: abandoned });
 		} catch (cancelError) {
 			try { log('WARN: cancel of abandoned sweep blocks failed — pending records may wedge until the node-side sweep lands: %o', cancelError); } catch { /* ignore */ }
 		}
+		return abandoned;
 	}
 
 	private async commitBlock(blockId: BlockId, actionId: ActionId, rev: number, tailId?: BlockId, blockDigests?: BlockContentDigests): Promise<CommitResult> {
@@ -838,7 +862,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			}
 			throw tailError;
 		}
-		return { success: true };
+		return { success: true, durability: mergeDurability(confirmedDurabilities(tailBatches)) };
 	}
 
 	/**
@@ -1155,6 +1179,17 @@ function dischargedBlocks(batches: CoordinatorBatch<BlockId[], void>[]): Set<Blo
 		for (const bid of b.payload) discharged.add(bid);
 	}
 	return discharged;
+}
+
+/**
+ * The durability report off every commit batch in the tree that answered `success: true` — the
+ * coordinators' own answers for the blocks they drove, one per confirmed batch. Retry batches
+ * (`subsumedBy`) are included, so a block re-homed after a failed first attempt reports through the
+ * peer that actually committed it. Batches that threw or returned a refusal contribute nothing.
+ */
+function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult>[]): WriteDurability[] {
+	return Array.from(allBatches(batches, b => b.request?.isResponse === true && b.request!.response!.success))
+		.map(b => (b.request!.response! as CommitSuccess).durability);
 }
 
 /** The subset of `all` whose ids appear in `batchBlockIds`, wrapped (via {@link blockDigestsField})

@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { localDurability } from '@optimystic/db-core';
 import { clusterMember, MEMBERSHIP_NOT_ADMITTED, type ExpectedClusterView, type DeriveExpectedClusterCallback } from '../src/cluster/cluster-repo.js';
 import type { IRepo, ClusterRecord, RepoMessage, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, ClusterConsensusConfig } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
@@ -75,8 +76,8 @@ const makeRecord = async (
 
 class MockRepo implements IRepo {
 	async get(_blockGets: BlockGets): Promise<GetBlockResults> { return {}; }
-	async pend(_request: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [] }; }
-	async commit(_request: CommitRequest): Promise<CommitResult> { return { success: true }; }
+	async pend(_request: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [], durability: localDurability() }; }
+	async commit(_request: CommitRequest): Promise<CommitResult> { return { success: true, durability: localDurability() }; }
 	async cancel(_actionRef: ActionBlocks): Promise<void> { /* no-op */ }
 }
 

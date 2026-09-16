@@ -4,7 +4,7 @@ import { resolveRace } from '../src/cluster/race-resolution.js';
 import { MemoryTransactionStateStore } from '../src/cluster/memory-transaction-state-store.js';
 import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, Transforms, IBlock, BlockId, BlockHeader, ClusterConsensusConfig } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
-import { MaxPriority } from '@optimystic/db-core';
+import { MaxPriority, localDurability } from '@optimystic/db-core';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
@@ -116,12 +116,12 @@ class MockRepo implements IRepo {
 
 	async pend(request: PendRequest): Promise<PendResult> {
 		this.pendCalls.push(request);
-		return { success: true, blockIds: [], pending: [] };
+		return { success: true, blockIds: [], pending: [], durability: localDurability() };
 	}
 
 	async commit(request: CommitRequest): Promise<CommitResult> {
 		this.commitCalls.push(request);
-		return { success: true };
+		return { success: true, durability: localDurability() };
 	}
 
 	async cancel(actionRef: ActionBlocks): Promise<void> {

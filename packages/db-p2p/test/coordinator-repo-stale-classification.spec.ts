@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { CoordinatorRepo } from '../src/repo/coordinator-repo.js';
 import { ValidatorRejectionError } from '../src/repo/cluster-coordinator.js';
-import { isConflictFailure } from '@optimystic/db-core';
+import { isConflictFailure, localDurability } from '@optimystic/db-core';
 import type { ClusterRecord, ClusterPeers, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, Signature, IRepo, PendRequest, PendResult, GetBlockResults, BlockGets, StaleFailure } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
@@ -86,7 +86,7 @@ class MockStorageRepo implements IRepo {
 
 	async pend(request: PendRequest): Promise<PendResult> {
 		this.pendCalls++;
-		return { success: true, pending: [], blockIds: Object.keys(request.transforms.updates ?? {}) };
+		return { success: true, pending: [], blockIds: Object.keys(request.transforms.updates ?? {}), durability: localDurability() };
 	}
 
 	async cancel(): Promise<void> { }

@@ -1,6 +1,6 @@
-import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
-import { LruMap, blockIdsForTransforms, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock } from "@optimystic/db-core";
-import { ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError } from "./cluster-coordinator.js";
+import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
+import { LruMap, blockIdsForTransforms, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability } from "@optimystic/db-core";
+import { ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { FretService } from "p2p-fret";
@@ -548,6 +548,9 @@ export function coordinatorRepo(
 export interface ICoordinatorClusterSeam {
 	getClusterSize(blockId: BlockId): Promise<number>;
 	getClusterPeerIds(blockId: BlockId): Promise<string[]>;
+	/** Whether the cohort could be established at all, and who it is — the primitive the two
+	 *  accessors above derive from. `pend` and `commit` classify their solo short-circuit on it. */
+	resolveCohort(blockId: BlockId): Promise<CohortResolution>;
 	executeClusterTransaction(blockId: BlockId, message: RepoMessage, options?: MessageOptions): Promise<{
 		record: ClusterRecord;
 		localExecuted: boolean;
@@ -2014,9 +2017,9 @@ export class CoordinatorRepo implements IRepo {
 	private async pendThroughCluster(request: PendRequest, allBlockIds: BlockId[], options?: MessageOptions): Promise<PendResult> {
 		const coordinatingBlockIds = options?.coordinatingBlockIds ?? allBlockIds;
 
-		const peerCount = await this.coordinator.getClusterSize(coordinatingBlockIds[0]!);
-		if (peerCount <= 1) {
-			return await this.storageRepo.pend(request, options);
+		const cohort = await this.coordinator.resolveCohort(coordinatingBlockIds[0]!);
+		if (!cohort.resolved || cohort.peerIds.length <= 1) {
+			return await this.pendSolo(request, cohort, options);
 		}
 
 		const message: RepoMessage = {
@@ -2026,7 +2029,14 @@ export class CoordinatorRepo implements IRepo {
 		};
 
 		try {
-			const { localExecuted, localPendResult, cohortPendRefusals } = await this.coordinator.executeClusterTransaction(coordinatingBlockIds[0]!, message, options);
+			const { record, localExecuted, localPendResult, cohortPendRefusals } = await this.coordinator.executeClusterTransaction(coordinatingBlockIds[0]!, message, options);
+			// Who ACCEPTED the pending record — the cohort members whose promise vote approved it, plus
+			// or minus this node's own member per exit below. A pend's `confirmed` is not a commit's:
+			// accepting a pending record confers no storage durability (a pend that reached
+			// pend-consensus may still have been stored by nobody — see the local-verdict arm below),
+			// so the two numbers are never comparable, and the field says so.
+			const pendDurability = (selfAccepted: boolean | undefined): WriteDurability =>
+				pendCohortDurability(record, selfAccepted, this.localPeerId?.toString());
 			// The first cohort refusal in peer-id order, so two coordinators facing the same cohort
 			// answer with the same one. Which refusal is reported does not change the outcome — every
 			// entry is conflict-shaped and every one means "rebase and retry" — only which `pending` /
@@ -2077,7 +2087,9 @@ export class CoordinatorRepo implements IRepo {
 					hasMissing: !!(result as any).missing?.length,
 					hasPending: !!(result as any).pending?.length
 				});
-				return answerWithCohortRefusal(result);
+				// Storage's own answer is `local`; the cohort's answer replaces it — this node accepted
+				// the record iff its fallback pend succeeded.
+				return answerWithCohortRefusal(result.success ? { ...result, durability: pendDurability(true) } : result);
 			}
 			// Local cluster already executed during consensus — return storage's own verdict rather
 			// than fabricating a success (the peerCount <= 1 path above returns storage's real result
@@ -2090,7 +2102,10 @@ export class CoordinatorRepo implements IRepo {
 			// commit that reached commit-consensus IS the authoritative commit (Theorem 9), whereas a
 			// pend that reached pend-consensus may still have been stored by nobody.
 			if (localPendResult !== undefined) {
-				if (localPendResult.success || isConflictFailure(localPendResult)) {
+				if (localPendResult.success) {
+					return answerWithCohortRefusal({ ...localPendResult, durability: pendDurability(true) });
+				}
+				if (isConflictFailure(localPendResult)) {
 					return answerWithCohortRefusal(localPendResult);
 				}
 				// A bare-reason refusal (no pending/missing — e.g. a local validation-hook fault)
@@ -2104,11 +2119,14 @@ export class CoordinatorRepo implements IRepo {
 			}
 			// No verdict retained (member predates retention, restart, or TTL): the prior shape,
 			// still subject to the cohort-refusal rule — a lost local verdict must not resurrect the
-			// fabricated success this ticket exists to remove.
+			// fabricated success this ticket exists to remove. For the durability class, a tolerated
+			// local fault means this node did NOT accept (`false`: its approve vote is withdrawn from the
+			// count), and an absent verdict says nothing either way (`undefined`: the vote stands).
 			return answerWithCohortRefusal({
 				success: true,
 				pending: [],
-				blockIds: allBlockIds
+				blockIds: allBlockIds,
+				durability: pendDurability(localPendResult === undefined ? undefined : false)
 			});
 		} catch (error) {
 			this.log('coordinator-repo:pend-error', { actionId: request.actionId, error: (error as Error).message });
@@ -2147,6 +2165,34 @@ export class CoordinatorRepo implements IRepo {
 			if (stale) return stale;
 			throw error;
 		}
+	}
+
+	/**
+	 * The solo short-circuit of {@link pend}: a cohort of at most one peer runs no consensus, and the
+	 * pend goes straight to local storage exactly as before. What changes is the answer's class —
+	 * see {@link soloCohortDurability} for the four-way split. A refusal is returned untouched.
+	 */
+	private async pendSolo(request: PendRequest, cohort: CohortResolution, options?: MessageOptions): Promise<PendResult> {
+		const result = await this.storageRepo.pend(request, options);
+		return result.success ? { ...result, durability: this.soloCohortDurability(cohort) } : result;
+	}
+
+	/**
+	 * The class of a write that took the solo short-circuit, from the cohort resolution that put it
+	 * there. Policy-free: the write already happened, this only says what it was.
+	 *  - not resolved (the lookup threw, or named nobody) → `unrouted`;
+	 *  - resolved to exactly this node → `local`, a correct and complete one-machine write;
+	 *  - resolved to exactly one peer that is NOT this node → `unrouted` — this node wrote somewhere
+	 *    the cohort does not look, which is a write whose destination is wrong, not a solo write.
+	 * With no local peer id (direct constructors, single-node and test wiring) a resolved cohort of
+	 * one reads as `local`: the same posture `isResponsibleForBlock` takes for a node with no
+	 * identity, and a node with no identity cannot be in any cohort but its own.
+	 */
+	private soloCohortDurability(cohort: CohortResolution): WriteDurability {
+		if (!cohort.resolved) return unroutedDurability();
+		const sole = cohort.peerIds[0]!;
+		if (this.localPeerId !== undefined && sole !== this.localPeerId.toString()) return unroutedDurability();
+		return localDurability(sole);
 	}
 
 	/**
@@ -2438,50 +2484,11 @@ export class CoordinatorRepo implements IRepo {
 		const blockIds = request.blockIds;
 		await this.verifyResponsibility(blockIds);
 
-		const cohortPeerIds = await this.coordinator.getClusterPeerIds(blockIds[0]!);
-		const peerCount = cohortPeerIds.length;
-		if (peerCount <= 1) {
-			// Solo cohort: consensus never runs, so no ClusterRecord exists to project a proof from —
-			// the lone member self-signs a one-peer proof instead (mintSoloCommitProof), which is what
-			// lets a block born on a cohort of one ever gain a second holder under the certified-push
-			// default (handlePush refuses a proof-less block). Minted even when peerCount is 0 or the
-			// sole peer is not self — findCluster failing (getClusterPeerIds returns []) puts the
-			// DEGRADED-ROUTING case in this same branch, and self genuinely committed these bytes
-			// either way; a proof's peer list is already not evidence of cohort membership by design
-			// (caller obligation #1 on verifyBlockCommitProofClaim), so gating the mint on cohort
-			// composition would buy no safety while opening a silent no-proof hole exactly when
-			// routing is degraded. The log line is how an operator tells a real cohort of one
-			// (cohortSize 1, soleIsSelf true) from a routing failure (cohortSize 0, or a sole peer
-			// that is not this node).
-			this.log('commit:solo-cohort', {
-				blockId: blockIds[0],
-				cohortSize: peerCount,
-				soleIsSelf: peerCount === 1 && this.localPeerId !== undefined
-					&& cohortPeerIds[0] === this.localPeerId.toString()
-			});
-			// Same message shape the multi-peer path produces — executeClusterTransaction stamps
-			// coordinatingBlockIds at its choke point, so the solo artifact must carry it too or a
-			// solo proof's message is distinguishable from every other proof's.
-			const message: RepoMessage = {
-				operations: [{ commit: request }],
-				coordinatingBlockIds: [blockIds[0]!],
-				expiration: options?.expiration ?? Date.now() + this.DEFAULT_TIMEOUT
-			};
-			// `undefined` when no local cluster is wired (direct constructors, unit-test doubles) —
-			// then the commit lands proof-less, exactly the pre-mint behavior. The cast is the named
-			// ICommitProofPersister contract; a plain IRepo double ignores the extra argument.
-			const proof = await this.localCluster?.mintSoloCommitProof?.(message);
-			const result = await (this.storageRepo as IRepo & ICommitProofPersister).commit(request, options, proof);
-			// One self-approval arms the read-repair window only where the DECLARED cohort is also one
-			// — then no rival quorum can exist to be missed. At any larger declared size (including
-			// an undeclared one, which resolves to the replication factor, and including degraded
-			// routing where peerCount is 0) this commit proves nothing about rival quorums — see
-			// commitQuorumRulesOutRivals — so the window stays unarmed and the read path's
-			// solo-self-skip exit re-arms it once per consult instead (which keeps GitHub issue #8's
-			// consult storm bounded at one per window).
-			if (result.success && this.commitQuorumRulesOutRivals(1, peerCount)) this.markBlocksSeen(blockIds);
-			return result;
+		const cohort = await this.coordinator.resolveCohort(blockIds[0]!);
+		if (!cohort.resolved || cohort.peerIds.length <= 1) {
+			return await this.commitSolo(request, blockIds, cohort, options);
 		}
+		const peerCount = cohort.peerIds.length;
 
 		const message: RepoMessage = {
 			operations: [{ commit: request }],
@@ -2561,13 +2568,14 @@ export class CoordinatorRepo implements IRepo {
 					});
 				}
 				// An absent verdict (a member that predates retention, a restart, the TTL) is not
-				// evidence of holding anything: it is simply not counted.
-				const durableHolders = durability.remoteHolders + (localDurable ? 1 : 0);
-				if (!isDurableMajority(durableHolders, durability.cohortSize)) {
+				// evidence of holding anything: it is simply not counted — so the class below reads
+				// LOWER than reality for such a member, never higher.
+				const durableHolders = durability.remoteHolders.length + (localDurable ? 1 : 0);
+				if (!isDurableMajority(durableHolders, durability.cohortPeerIds.length)) {
 					return this.refuseCommitNotDurable(request, durableHolders, durability, 'local-executed');
 				}
 				if (armFreshness) this.markBlocksSeen(blockIds);
-				return { success: true };
+				return { success: true, durability: this.cohortWriteDurability(durability, localDurable) };
 			}
 			// Local cluster didn't execute during consensus. Attempt a local commit, but tolerate
 			// local divergence when the cluster already reached consensus AND a durable majority of
@@ -2592,8 +2600,8 @@ export class CoordinatorRepo implements IRepo {
 			// that lone off-cohort copy is exactly the seed of the "revision exists on one node that
 			// is not responsible for it" placement the durability gate exists to prevent.
 			const selfInCohort = this.localPeerId !== undefined && this.localPeerId.toString() in record.peers;
-			if (!isDurableMajority(durability.remoteHolders + (selfInCohort ? 1 : 0), durability.cohortSize)) {
-				return this.refuseCommitNotDurable(request, durability.remoteHolders, durability, 'fallback-skipped');
+			if (!isDurableMajority(durability.remoteHolders.length + (selfInCohort ? 1 : 0), durability.cohortPeerIds.length)) {
+				return this.refuseCommitNotDurable(request, durability.remoteHolders.length, durability, 'fallback-skipped');
 			}
 			//
 			// Deliberately NOT self-signed here (unlike the solo short-circuit above): consensus for
@@ -2610,8 +2618,10 @@ export class CoordinatorRepo implements IRepo {
 				if (result.success) {
 					// The gate above already admitted this shape: the remote holders plus this node
 					// (when it is in the cohort) form the majority, and this node now holds it.
+					// Storage's own `local` answer is replaced by the cohort's — this node counts exactly
+					// as the gate counted it, i.e. only when it is a cohort member.
 					if (armFreshness) this.markBlocksSeen(blockIds);
-					return result;
+					return { ...result, durability: this.cohortWriteDurability(durability, selfInCohort) };
 				}
 				if (isMissingBaseRevisionFailure(result) && clusterReachedCommitConsensus(record)) {
 					return this.tolerateLocalCommitDivergence(request, blockIds, result.reason ?? MISSING_BASE_REVISION_REASON, armFreshness, durability);
@@ -2771,12 +2781,81 @@ export class CoordinatorRepo implements IRepo {
 	private tolerateLocalCommitDivergence(
 		request: CommitRequest, blockIds: BlockId[], detail: string, armFreshness: boolean, durability: CohortDurability
 	): CommitResult {
-		if (!isDurableMajority(durability.remoteHolders, durability.cohortSize)) {
-			return this.refuseCommitNotDurable(request, durability.remoteHolders, durability, `fallback-diverged: ${detail}`);
+		if (!isDurableMajority(durability.remoteHolders.length, durability.cohortPeerIds.length)) {
+			return this.refuseCommitNotDurable(request, durability.remoteHolders.length, durability, `fallback-diverged: ${detail}`);
 		}
 		this.log('coordinator-repo:commit-local-failed-cluster-succeeded', { actionId: request.actionId, error: detail });
 		if (armFreshness) this.markBlocksSeen(blockIds);
-		return { success: true };
+		// This node holds nothing: it is an UNCONFIRMED member when it is in the cohort (so the class
+		// is `majority`), and simply absent from the count when it is not (so the class can be `full`
+		// when every member confirmed). Both fall out of the one rule in `cohortWriteDurability`.
+		return { success: true, durability: this.cohortWriteDurability(durability, false) };
+	}
+
+	/**
+	 * The durability class beside the gate: derived from the SAME sets {@link isDurableMajority} was
+	 * just measured on, with this node's own contribution passed per arm exactly as the gate counted
+	 * it, so the class and the gate can never disagree. One rule for all three success exits of
+	 * {@link commit}: `full` iff every cohort member is confirmed, otherwise `majority` (the gate
+	 * already refused anything below that). Never `local` or `unrouted` here — those belong to the
+	 * solo short-circuit, where no cohort ran.
+	 */
+	private cohortWriteDurability(durability: CohortDurability, selfHolds: boolean): WriteDurability {
+		return cohortWriteDurability(durability, selfHolds, this.localPeerId?.toString());
+	}
+
+	/**
+	 * The solo short-circuit of {@link commit}: consensus never runs, so no ClusterRecord exists to
+	 * project a proof from — the lone member self-signs a one-peer proof instead (mintSoloCommitProof),
+	 * which is what lets a block born on a cohort of one ever gain a second holder under the
+	 * certified-push default (handlePush refuses a proof-less block). Minted even when the cohort did
+	 * not resolve or the sole peer is not self — a failed `findCluster` puts the DEGRADED-ROUTING case
+	 * in this same branch, and self genuinely committed these bytes either way; a proof's peer list is
+	 * already not evidence of cohort membership by design (caller obligation #1 on
+	 * verifyBlockCommitProofClaim), so gating the mint on cohort composition would buy no safety while
+	 * opening a silent no-proof hole exactly when routing is degraded.
+	 *
+	 * The policy is unchanged — every write accepted here before is accepted now. What changes is
+	 * that the answer says which situation it was: the `commit:solo-cohort` log line (how an operator
+	 * tells a real cohort of one — cohortSize 1, soleIsSelf true — from a routing failure) now also
+	 * carries the `quorum` the writer is told, and both come from {@link soloCohortDurability}, so the
+	 * log and the answer cannot disagree.
+	 */
+	private async commitSolo(request: CommitRequest, blockIds: BlockId[], cohort: CohortResolution, options?: MessageOptions): Promise<CommitResult> {
+		const cohortPeerIds = cohort.resolved ? cohort.peerIds : [];
+		const peerCount = cohortPeerIds.length;
+		const soloDurability = this.soloCohortDurability(cohort);
+		this.log('commit:solo-cohort', {
+			blockId: blockIds[0],
+			cohortSize: peerCount,
+			soleIsSelf: peerCount === 1 && this.localPeerId !== undefined
+				&& cohortPeerIds[0] === this.localPeerId.toString(),
+			quorum: soloDurability.quorum,
+			...(cohort.resolved ? {} : { reason: cohort.reason })
+		});
+		// Same message shape the multi-peer path produces — executeClusterTransaction stamps
+		// coordinatingBlockIds at its choke point, so the solo artifact must carry it too or a
+		// solo proof's message is distinguishable from every other proof's.
+		const message: RepoMessage = {
+			operations: [{ commit: request }],
+			coordinatingBlockIds: [blockIds[0]!],
+			expiration: options?.expiration ?? Date.now() + this.DEFAULT_TIMEOUT
+		};
+		// `undefined` when no local cluster is wired (direct constructors, unit-test doubles) —
+		// then the commit lands proof-less, exactly the pre-mint behavior. The cast is the named
+		// ICommitProofPersister contract; a plain IRepo double ignores the extra argument.
+		const proof = await this.localCluster?.mintSoloCommitProof?.(message);
+		const result = await (this.storageRepo as IRepo & ICommitProofPersister).commit(request, options, proof);
+		if (!result.success) return result;
+		// One self-approval arms the read-repair window only where the DECLARED cohort is also one
+		// — then no rival quorum can exist to be missed. At any larger declared size (including
+		// an undeclared one, which resolves to the replication factor, and including degraded
+		// routing where peerCount is 0) this commit proves nothing about rival quorums — see
+		// commitQuorumRulesOutRivals — so the window stays unarmed and the read path's
+		// solo-self-skip exit re-arms it once per consult instead (which keeps GitHub issue #8's
+		// consult storm bounded at one per window).
+		if (this.commitQuorumRulesOutRivals(1, peerCount)) this.markBlocksSeen(blockIds);
+		return { ...result, durability: soloDurability };
 	}
 
 	/**
@@ -2787,19 +2866,21 @@ export class CoordinatorRepo implements IRepo {
 	 * read-repair window is deliberately NOT armed: nothing about this commit is freshness evidence.
 	 */
 	private refuseCommitNotDurable(request: CommitRequest, durableHolders: number, durability: CohortDurability, arm: string): StaleFailure {
+		const cohortSize = durability.cohortPeerIds.length;
 		this.log('coordinator-repo:commit-not-durable', {
 			actionId: request.actionId,
 			rev: request.rev,
 			durableHolders,
-			cohortSize: durability.cohortSize,
+			cohortSize,
 			remoteHolders: durability.remoteHolders,
 			remoteRefusals: durability.remoteRefusals,
 			arm
 		});
+		// A failure carries no durability, and no "unknown" class stands in for one.
 		return {
 			success: false,
 			conflict: true,
-			reason: `${COMMIT_NOT_DURABLE_REASON}: ${durableHolders} of ${durability.cohortSize} cohort member(s) report holding rev ${request.rev} of action ${request.actionId} (${arm})`
+			reason: `${COMMIT_NOT_DURABLE_REASON}: ${durableHolders} of ${cohortSize} cohort member(s) report holding rev ${request.rev} of action ${request.actionId} (${arm})`
 		};
 	}
 }
@@ -2807,23 +2888,71 @@ export class CoordinatorRepo implements IRepo {
 /**
  * What the cohort reported about durably holding a commit, read off the consensus responses
  * (`ClusterRecord.applyOutcomes[peer].commit`, threaded as `cohortCommitOutcomes`). Self is never in
- * it: the coordinating node adds itself per arm of `CoordinatorRepo.commit`.
+ * it: the coordinating node adds itself per arm of `CoordinatorRepo.commit`. Carries the peer-id
+ * SETS, not counts: the durability gate needs only the sizes, but the answer to the writer names
+ * the members that did not confirm (`WriteDurability.unconfirmed`), which is what a later repair
+ * has to know.
  */
 interface CohortDurability {
 	/** Members of `record.peers` — the cohort the commit ran on, and the denominator of the majority. */
-	cohortSize: number;
+	cohortPeerIds: readonly string[];
 	/** OTHER members whose post-reconcile verdict was a success. */
-	remoteHolders: number;
+	remoteHolders: readonly string[];
 	/** OTHER members that reported a refusal — logged for the operator, never counted. */
-	remoteRefusals: number;
+	remoteRefusals: readonly string[];
 }
 
 function cohortDurability(record: ClusterRecord, outcomes: { [peerId: string]: CommitResult } | undefined): CohortDurability {
-	const reports = Object.values(outcomes ?? {});
+	const reports = Object.entries(outcomes ?? {});
 	return {
-		cohortSize: Object.keys(record.peers).length,
-		remoteHolders: reports.filter(report => report.success).length,
-		remoteRefusals: reports.filter(report => !report.success).length
+		cohortPeerIds: Object.keys(record.peers),
+		remoteHolders: reports.filter(([, report]) => report.success).map(([peerId]) => peerId),
+		remoteRefusals: reports.filter(([, report]) => !report.success).map(([peerId]) => peerId)
+	};
+}
+
+/**
+ * The commit-tier durability class, from the gate's own sets. `confirmed` is counted exactly as the
+ * gate counted it (remote holders, plus one for this node when `selfHolds`), and `unconfirmed` is
+ * every cohort member outside that set — so a `full` answer names nobody as missing, and a
+ * `majority` answer names exactly who. The class is `full` iff no cohort member is unconfirmed;
+ * anything below `majority` never reaches here (the gate refused it).
+ */
+function cohortWriteDurability(durability: CohortDurability, selfHolds: boolean, selfPeerId: string | undefined): WriteDurability {
+	const holders = new Set(durability.remoteHolders);
+	if (selfHolds && selfPeerId !== undefined) holders.add(selfPeerId);
+	const unconfirmed = durability.cohortPeerIds.filter(peerId => !holders.has(peerId));
+	return {
+		quorum: unconfirmed.length === 0 ? 'full' : 'majority',
+		confirmed: durability.remoteHolders.length + (selfHolds ? 1 : 0),
+		cohort: durability.cohortPeerIds.length,
+		unconfirmed,
+		cohortPeerIds: durability.cohortPeerIds
+	};
+}
+
+/**
+ * The pend-tier durability class: who ACCEPTED the pending record, read off the record's approving
+ * promise votes. This node's own member is added when `selfAccepted` is true, removed when it is
+ * false (its member applied and refused, so its approve vote no longer describes what it holds),
+ * and left to its vote when `undefined` (no retained verdict — the vote is the only evidence there
+ * is). NOT comparable to the commit-tier count: accepting a pending record confers no storage
+ * durability, and the field's own documentation says so.
+ */
+function pendCohortDurability(record: ClusterRecord, selfAccepted: boolean | undefined, selfPeerId: string | undefined): WriteDurability {
+	const cohortPeerIds = Object.keys(record.peers);
+	const accepted = new Set(Object.entries(record.promises).filter(([, vote]) => vote.type === 'approve').map(([peerId]) => peerId));
+	if (selfPeerId !== undefined) {
+		if (selfAccepted === true) accepted.add(selfPeerId);
+		if (selfAccepted === false) accepted.delete(selfPeerId);
+	}
+	const unconfirmed = cohortPeerIds.filter(peerId => !accepted.has(peerId));
+	return {
+		quorum: unconfirmed.length === 0 ? 'full' : 'majority',
+		confirmed: accepted.size,
+		cohort: cohortPeerIds.length,
+		unconfirmed,
+		cohortPeerIds
 	};
 }
 

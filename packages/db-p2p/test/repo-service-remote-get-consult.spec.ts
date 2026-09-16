@@ -14,6 +14,7 @@
  */
 
 import { expect } from 'chai';
+import { localDurability } from '@optimystic/db-core';
 import { pipe } from 'it-pipe';
 import { encode as lpEncode, decode as lpDecode } from 'it-length-prefixed';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
@@ -59,11 +60,11 @@ const makeClusterClient = ((_peerId: PeerId) => ({} as any)) as (peerId: PeerId)
 
 const writeStubs = {
 	async pend(_request: PendRequest, _options?: MessageOptions): Promise<PendResult> {
-		return { success: true, pending: [], blockIds: [] };
+		return { success: true, pending: [], blockIds: [], durability: localDurability() };
 	},
 	async cancel(_actionRef: ActionBlocks, _options?: MessageOptions): Promise<void> { },
 	async commit(_request: CommitRequest, _options?: MessageOptions): Promise<CommitResult> {
-		return { success: true };
+		return { success: true, durability: localDurability() };
 	}
 };
 

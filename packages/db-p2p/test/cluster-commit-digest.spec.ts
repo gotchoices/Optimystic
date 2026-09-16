@@ -5,7 +5,7 @@ import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { IRepo, ClusterRecord, RepoMessage, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, BlockId, ActionId, BlockContentDigests, IBlock } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
-import { canonicalBlockHash, computeBlockContentDigests, Tracker } from '@optimystic/db-core';
+import { canonicalBlockHash, computeBlockContentDigests, Tracker, localDurability } from '@optimystic/db-core';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
@@ -78,8 +78,8 @@ const makeCommit = (blockDigests?: BlockContentDigests, over: Partial<CommitRequ
 
 class MockRepo implements IRepo {
 	async get(_blockGets: BlockGets): Promise<GetBlockResults> { return {}; }
-	async pend(_request: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [] }; }
-	async commit(_request: CommitRequest): Promise<CommitResult> { return { success: true }; }
+	async pend(_request: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [], durability: localDurability() }; }
+	async commit(_request: CommitRequest): Promise<CommitResult> { return { success: true, durability: localDurability() }; }
 	async cancel(_actionRef: ActionBlocks): Promise<void> { /* no-op */ }
 }
 

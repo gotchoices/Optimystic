@@ -28,10 +28,11 @@ import type {
 	CommitRequest, CommitResult, ActionBlocks, MessageOptions, BlockId, ActionId, ActionRev,
 	ClusterRecord, StaleFailure, RepoMessage
 } from '@optimystic/db-core';
-import { isConflictFailure } from '@optimystic/db-core';
+import { isConflictFailure, localDurability } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { CoordinatorRepo, type ICoordinatorClusterSeam } from '../src/repo/coordinator-repo.js';
+import type { CohortResolution } from '../src/repo/cluster-coordinator.js';
 import { ConflictRaceLostError, ValidatorRejectionError } from '../src/repo/cluster-coordinator.js';
 import { isCommitNotDurableFailure } from '../src/storage/storage-repo.js';
 import type { ClusterClient } from '../src/cluster/client.js';
@@ -89,6 +90,7 @@ const makeRepo = (storageRepo: IRepo, error: Error): CoordinatorRepo => {
 	(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 		async getClusterSize(): Promise<number> { return 3; },
 		async getClusterPeerIds(): Promise<string[]> { return ['peer-1', 'peer-2', 'peer-3']; },
+		async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: ['peer-1', 'peer-2', 'peer-3'] }; },
 		async recoverTransactions(): Promise<void> { /* unused on these paths */ },
 		async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean }> {
 			throw error;
@@ -230,8 +232,8 @@ describe('CoordinatorRepo commit — locally-executed consensus consults the ret
 	 * holding the revision. Two is a majority of the cohort on its own; one needs this node to join.
 	 */
 	const remoteReports = (holders: number): { [peerId: string]: CommitResult } => ({
-		'peer-1': holders >= 1 ? { success: true } : { success: false, reason: 'behind' },
-		'peer-2': holders >= 2 ? { success: true } : { success: false, reason: 'behind' }
+		'peer-1': holders >= 1 ? { success: true, durability: localDurability() } : { success: false, reason: 'behind' },
+		'peer-2': holders >= 2 ? { success: true, durability: localDurability() } : { success: false, reason: 'behind' }
 	});
 
 	/**
@@ -249,6 +251,7 @@ describe('CoordinatorRepo commit — locally-executed consensus consults the ret
 		(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 			async getClusterSize(): Promise<number> { return 3; },
 			async getClusterPeerIds(): Promise<string[]> { return Object.keys(RECORD.peers); },
+			async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: Object.keys(RECORD.peers) }; },
 			async recoverTransactions(): Promise<void> { /* unused on these paths */ },
 			async executeClusterTransaction(): Promise<{
 				record: ClusterRecord, localExecuted: boolean, localCommitResult?: CommitResult,
@@ -345,7 +348,7 @@ describe('CoordinatorRepo commit — locally-executed consensus consults the ret
 	it('returns success without a confirmation re-read when the retained verdict is a success', async () => {
 		const { repo: storageRepo, gets } = countingGets(makeStorageRepo({ rev: 2, actionId: OUR_ACTION }));
 		// A retained success is this node's own durable report: with one remote holder it is 2 of 3.
-		const repo = makeLocalExecutedRepo(storageRepo, { success: true }, 1);
+		const repo = makeLocalExecutedRepo(storageRepo, { success: true, durability: localDurability() }, 1);
 
 		expect((await repo.commit(REQUEST)).success).to.equal(true);
 		expect(gets(), 'a retained success needs no classification read').to.equal(0);
@@ -354,7 +357,7 @@ describe('CoordinatorRepo commit — locally-executed consensus consults the ret
 	it('refuses when only this node holds the revision', async () => {
 		// The retained verdict is a success, but no other member reports holding it: 1 of 3. This
 		// is the acknowledged-but-landed-nowhere-responsible shape the durability gate exists for.
-		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 2, actionId: OUR_ACTION }), { success: true }, 0);
+		const repo = makeLocalExecutedRepo(makeStorageRepo({ rev: 2, actionId: OUR_ACTION }), { success: true, durability: localDurability() }, 0);
 		expectNotDurable(await repo.commit(REQUEST));
 	});
 

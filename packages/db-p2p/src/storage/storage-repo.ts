@@ -8,7 +8,7 @@ import type {
 } from "@optimystic/db-core";
 import {
 	transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
-	blockIdsForTransforms, transformsFromTransform, highestStaleAt, isOwnRevision, canonicalBlockHash
+	blockIdsForTransforms, transformsFromTransform, highestStaleAt, isOwnRevision, canonicalBlockHash, localDurability
 } from "@optimystic/db-core";
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
@@ -718,10 +718,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				await blockStorage.savePendingTransaction(request.actionId, blockTransform, request.rev, latches.get(blockId)!);
 			}
 
+			// This layer answers for one machine's storage and nothing else: `local`, with no cohort
+			// view. The coordinator above it replaces this with the cohort's answer on every cluster path.
 			return {
 				success: true,
 				pending: pendings,
-				blockIds
+				blockIds,
+				durability: localDurability()
 			} as PendSuccess;
 		} finally {
 			// Releases on every path, including the early returns above and the
@@ -985,7 +988,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// partitions never reach `collectionBlocks`).
 		this.emitCollectionChanges(collectionBlocks, request.actionId, request.rev, request.tailId);
 
-		return failure ? { success: false, reason: failure.reason } : { success: true };
+		// `local`, as in `pend`: a single machine's verdict about its own storage.
+		return failure ? { success: false, reason: failure.reason } : { success: true, durability: localDurability() };
 	}
 
 	/**

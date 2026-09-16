@@ -1,4 +1,4 @@
-import { routingKeyForBlock } from '@optimystic/db-core';
+import { routingKeyForBlock, localDurability } from '@optimystic/db-core';
 import { expect } from 'chai';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
@@ -39,11 +39,11 @@ const makeStubRepo = (): IRepo => ({
 		return { 'block-1': { state: { latest: { rev: 1, action: 'a' } }, transforms: {} } as any };
 	},
 	async pend(_request: PendRequest, _options?: MessageOptions): Promise<PendResult> {
-		return { success: true, pending: [], blockIds: ['block-1'] };
+		return { success: true, pending: [], blockIds: ['block-1'], durability: localDurability() };
 	},
 	async cancel(_actionRef: ActionBlocks, _options?: MessageOptions): Promise<void> {},
 	async commit(_request: CommitRequest, _options?: MessageOptions): Promise<CommitResult> {
-		return { success: true };
+		return { success: true, durability: localDurability() };
 	},
 });
 

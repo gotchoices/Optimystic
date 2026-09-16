@@ -67,12 +67,65 @@ export type BlockActionStatus = ActionBlocks & {
 	statuses: ('pending' | 'committed' | 'checkpointed' | 'aborted' | 'committed-invalidated')[];
 };
 
+/** How widely a successful write is known to be held at the moment it was acknowledged. */
+export type DurabilityQuorum =
+	/** Every member of the resolved cohort confirmed it holds the revision. */
+	| 'full'
+	/** A strict majority confirmed — the acknowledgement bar — but at least one member did not. */
+	| 'majority'
+	/** The cohort resolved, and it is this node alone. Nobody else holds the revision yet. */
+	| 'local'
+	/** The cohort did NOT resolve: the lookup threw, or named nobody, or named a single peer that
+	 *  is not this node. The write is on this node's storage and the network was never consulted.
+	 *  Deliberately NOT `local`: a genuine cohort of one is a correct, complete write, whereas this
+	 *  is a write whose correct destination is unknown. */
+	| 'unrouted';
+
+/** What the answering layer knows about who holds a successful write. Each layer refines it:
+ *  `StorageRepo` answers for itself alone, `CoordinatorRepo` answers for the cohort the write ran
+ *  on, and `NetworkTransactor` merges the per-coordinator answers into one action-level answer.
+ *  Never a policy input — read it to DISPLAY or to REPAIR, never to decide acceptance.
+ *
+ *  The only "this write is completely saved" test is `isFullyDurable` (`network/durability.ts`);
+ *  do not compare `quorum` by hand, because a `full` cohort report can still sit on an action that
+ *  abandoned blocks (`torn`). */
+export type WriteDurability = {
+	readonly quorum: DurabilityQuorum;
+	/** Cohort members confirmed to hold the write, including this node when it holds it.
+	 *  For a commit this means "reported that its storage durably holds the revision"; for a pend
+	 *  it means "accepted the pending record". The two are NOT comparable — a pend confers no
+	 *  storage durability (see the note in `CoordinatorRepo.pendThroughCluster`). */
+	readonly confirmed: number;
+	/** Size of the cohort the write ran on. Zero exactly when `quorum` is 'unrouted'. */
+	readonly cohort: number;
+	/** Cohort members that did not confirm, by peer-id string. Empty when `quorum` is 'full'.
+	 *  ABSENT (not empty) when the answering layer could not name the cohort — an empty array
+	 *  here means "named the cohort, nobody is missing". */
+	readonly unconfirmed?: readonly string[];
+	/** The cohort the write ran on, by peer-id string. Absent where the answering layer has no
+	 *  cohort view at all (a bare `StorageRepo` verdict). */
+	readonly cohortPeerIds?: readonly string[];
+	/** Present only on an action-level result whose blocks ran on MORE THAN ONE cohort: the other
+	 *  cohorts' reports. The scalar fields above always describe the WEAKEST cohort, so a consumer
+	 *  that reads only them is reading the binding constraint and is never over-optimistic. */
+	readonly otherCohorts?: readonly WriteDurability[];
+	/** Blocks this action wrote that are NOT committed — a torn sweep abandoned and cancelled them
+	 *  (`NetworkTransactor.cancelAbandonedSweepBlocks`). Action-level commit results only.
+	 *  These blocks NEVER heal by replication: their transform is gone, and only the writer
+	 *  re-driving the action puts them back. */
+	readonly torn?: readonly BlockId[];
+};
+
 export type PendSuccess = {
 	success: true;
 	/** List of already pending actions that were found on blocks touched by this pend */
 	pending: ActionPending[];
 	/** The affected blocks */
 	blockIds: BlockId[];
+	/** Who accepted the pending record. REQUIRED, not optional: an absent field would read as plain
+	 *  success, which is exactly the ambiguity this field exists to remove (a solo write, a write
+	 *  whose cohort never resolved, and a quorum write all used to answer `{ success: true }`). */
+	durability: WriteDurability;
 };
 
 export type StaleFailure = {
@@ -185,6 +238,11 @@ export type CommitSuccess = {
 	success: true;
 	/** If present, the identified collection acts as the coordinator for the multi-collection transaction */
 	coordinatorId?: CollectionId;
+	/** Who holds the committed revision. REQUIRED for the same reason as {@link PendSuccess.durability}:
+	 *  a quorum commit, a solo commit, a commit whose cohort lookup failed, and a torn multi-block
+	 *  commit all answered `{ success: true }` before this field existed, and a writer could not tell
+	 *  them apart (GitHub #19). Test it through `isFullyDurable`, never by comparing `quorum`. */
+	durability: WriteDurability;
 };
 
 export type BlockActionState = {

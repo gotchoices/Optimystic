@@ -1,7 +1,7 @@
 import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest, MemberApplyOutcome } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
-import { blockIdsForTransforms, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
+import { blockIdsForTransforms, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability } from "@optimystic/db-core";
 import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest, clusterVoteSigningPayload, clusterVoteVerificationPayload } from "@optimystic/db-core";
 import { verifyInvalidationCertificate, type ArbitratorSetRecompute } from "../dispute/invalidation.js";
 import { buildCommitCert, invalidationActionId } from "./commit-cert.js";
@@ -2268,7 +2268,10 @@ export class ClusterMember implements ICluster {
 			return applied;
 		}
 		log('cluster-member:consensus-commit-durable-after-reconcile', { actionId: commit.actionId, rev: commit.rev });
-		return { success: true };
+		// A member's own verdict about its own storage: `local`. Read by the coordinator for its
+		// `success` flag only (`cohortCommitOutcomes`, `localCommitResult`) — it never becomes the
+		// answer handed to the writer; `CoordinatorRepo.commit` computes the cohort's own on every exit.
+		return { success: true, durability: localDurability() };
 	}
 
 	/**

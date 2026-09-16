@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { localDurability } from '@optimystic/db-core';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
@@ -126,8 +127,8 @@ function invalidateOp(resolution: DisputeResolutionProof, actionId = 'a-inv'): R
 
 class MockRepo implements IRepo {
 	async get(_b: BlockGets): Promise<GetBlockResults> { return {}; }
-	async pend(_r: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [] }; }
-	async commit(_r: CommitRequest): Promise<CommitResult> { return { success: true }; }
+	async pend(_r: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [], durability: localDurability() }; }
+	async commit(_r: CommitRequest): Promise<CommitResult> { return { success: true, durability: localDurability() }; }
 	async cancel(_a: ActionBlocks): Promise<void> { /* no-op */ }
 }
 

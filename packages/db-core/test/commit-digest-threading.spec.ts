@@ -10,6 +10,7 @@ import {
 import type { Signature } from '../src/cluster/structs.js'
 import { Collection } from '../src/collection/index.js'
 import { TestTransactor } from '../src/testing/test-transactor.js'
+import { localDurability } from '../src/network/durability.js'
 import type {
 	ActionBlocks, BlockActionStatus, BlockContentDigests, BlockGets, BlockId, BlockOperation,
 	BlockStore, ClusterPeers, CommitRequest, CommitResult, FindCoordinatorOptions, GetBlockResults,
@@ -62,7 +63,7 @@ class RecordingRepo implements IRepo {
 		if (this.calls <= this.throwFirst) throw new Error('forced transient failure')
 		// Snapshot so a later mutation of the caller's object cannot rewrite history.
 		this.commits.push(structuredClone(request))
-		return { success: true }
+		return { success: true, durability: localDurability() }
 	}
 }
 

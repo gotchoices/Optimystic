@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { ClusterCoordinator } from '../src/repo/cluster-coordinator.js';
 import { ClusterMember, clusterMember } from '../src/cluster/cluster-repo.js';
-import { computeClusterMessageHash, computeClusterPromiseHash, membershipDigest } from '@optimystic/db-core';
+import { computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, localDurability } from '@optimystic/db-core';
 import type {
 	ActionBlocks, BlockGets, BlockHeader, BlockId, ClusterConsensusConfig, ClusterPeers, ClusterRecord,
 	CommitRequest, CommitResult, GetBlockResults, IBlock, IKeyNetwork, IPeerNetwork, IRepo, PendRequest,
@@ -52,8 +52,8 @@ const makePendMessage = (actionId: string, blockId: string): RepoMessage => {
 
 class MockRepo implements IRepo {
 	async get(_blockGets: BlockGets): Promise<GetBlockResults> { return {}; }
-	async pend(_request: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [] }; }
-	async commit(_request: CommitRequest): Promise<CommitResult> { return { success: true }; }
+	async pend(_request: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [], durability: localDurability() }; }
+	async commit(_request: CommitRequest): Promise<CommitResult> { return { success: true, durability: localDurability() }; }
 	async cancel(_actionRef: ActionBlocks): Promise<void> { }
 }
 

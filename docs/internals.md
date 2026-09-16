@@ -409,7 +409,11 @@ The mint is deliberately **not** gated on the sole cohort peer being this node. 
 either way; since `peerIds` is already not evidence of cohort membership (previous paragraph), the
 gate would buy no safety while opening a silent no-proof hole exactly when routing is degraded. The
 `commit:solo-cohort` log line carries `cohortSize` and `soleIsSelf` so an operator can tell a real
-cohort of one (1 / true) from a routing failure (0, or a sole peer that is not this node). A node briefly
+cohort of one (1 / true) from a routing failure (0, or a sole peer that is not this node), and
+`quorum` — the durability class the writer was told (`local` for the former, `unrouted` for the
+latter; see `WriteDurability` in `packages/db-core/src/network/struct.ts`), plus `reason` when the
+cohort did not resolve. The log and the returned answer come from the same classification
+(`soloCohortDurability` in `packages/db-p2p/src/repo/coordinator-repo.ts`), so they cannot disagree. A node briefly
 alone can still mint a proof for a revision the rest of its cohort never saw, so the repair
 selectors weigh a proof by **how many distinct peers signed it**: a one-signer proof — which is
 exactly what this branch mints — no longer out-ranks a corroborated claim at equal revision. Two or

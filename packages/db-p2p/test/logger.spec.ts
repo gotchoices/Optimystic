@@ -11,6 +11,7 @@
  */
 
 import { readFileSync, readdirSync } from 'node:fs';
+import { localDurability } from '@optimystic/db-core';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect } from 'chai';
@@ -57,9 +58,9 @@ const noopKeyNetwork: IKeyNetwork = {
 
 const noopStorageRepo: IRepo = {
 	async get() { return {}; },
-	async pend() { return { success: true, pending: [], blockIds: [] }; },
+	async pend() { return { success: true, pending: [], blockIds: [], durability: localDurability() }; },
 	async cancel() { },
-	async commit() { return { success: true }; }
+	async commit() { return { success: true, durability: localDurability() }; }
 };
 
 const makeClusterClient = (() => ({})) as unknown as (peerId: PeerId) => ClusterClient;

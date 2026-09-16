@@ -22,6 +22,7 @@
  */
 
 import { expect } from 'chai';
+import { localDurability } from '@optimystic/db-core';
 import { clusterMember } from '../src/cluster/cluster-repo.js';
 import type {
 	IRepo, ClusterRecord, RepoMessage, BlockGets, GetBlockResults, PendRequest, PendResult,
@@ -99,8 +100,8 @@ class StateRepo implements IRepo {
 	async get(gets: BlockGets): Promise<GetBlockResults> {
 		return Object.fromEntries(gets.blockIds.map(id => [id, { state: this.latest ? { latest: this.latest } : {} }]));
 	}
-	async pend(_request: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [] }; }
-	async commit(_request: CommitRequest): Promise<CommitResult> { return { success: true }; }
+	async pend(_request: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [], durability: localDurability() }; }
+	async commit(_request: CommitRequest): Promise<CommitResult> { return { success: true, durability: localDurability() }; }
 	async cancel(_actionRef: ActionBlocks): Promise<void> { /* no-op */ }
 }
 

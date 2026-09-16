@@ -140,6 +140,16 @@ interface ClusterTransactionState {
 }
 
 /** Manages distributed transactions across clusters */
+/**
+ * What a cohort lookup established about a block's cohort. `resolved: false` covers BOTH a lookup
+ * that threw and one that answered with nobody: neither names a destination for a write, and the
+ * durability class both produce is the same (`unrouted`). `reason` is for logs only — never branch
+ * on it.
+ */
+export type CohortResolution =
+	| { readonly resolved: true; readonly peerIds: readonly string[] }
+	| { readonly resolved: false; readonly reason: string };
+
 export class ClusterCoordinator {
 	private transactions: Map<string, ClusterTransactionState> = new Map();
 	private readonly retryInitialIntervalMs: number;
@@ -236,18 +246,49 @@ export class ClusterCoordinator {
 	}
 
 	/**
-	 * Gets all peers in the cluster for a specific block ID
+	 * The ONE cohort lookup every accessor on this class derives from: the raw peer map when the key
+	 * network answered, otherwise the reason it did not. A thrown `findCluster` is logged here and
+	 * nowhere else. Callers that need the map (`executeClusterTransaction`, which builds the record's
+	 * `peers`) go through {@link getClusterForBlock}; callers that need to know whether the cohort
+	 * RESOLVED go through {@link resolveCohort}.
 	 */
-	private async getClusterForBlock(blockId: BlockId): Promise<ClusterPeers> {
+	private async lookupCluster(blockId: BlockId): Promise<{ peers: ClusterPeers } | { reason: string }> {
 		try {
 			const peers = await this.keyNetwork.findCluster(routingKeyForBlock(blockId));
 			const peerIds = Object.keys(peers ?? {});
 			log('cluster-tx:cluster-members', { blockId, peerIds });
-			return peers;
+			return { peers: peers ?? {} };
 		} catch (e) {
 			log('WARN findCluster failed for %s: %o', blockId, e)
-			return {} as ClusterPeers
+			return { reason: `findCluster threw: ${(e as Error)?.message ?? String(e)}` };
 		}
+	}
+
+	/**
+	 * Gets all peers in the cluster for a specific block ID. Empty when the lookup failed — the
+	 * consensus path treats "no cohort" and "lookup failed" alike (there is nobody to run consensus
+	 * with either way); a caller that must tell them apart uses {@link resolveCohort}.
+	 */
+	private async getClusterForBlock(blockId: BlockId): Promise<ClusterPeers> {
+		const outcome = await this.lookupCluster(blockId);
+		return 'peers' in outcome ? outcome.peers : {};
+	}
+
+	/**
+	 * Whether the block's cohort could be established, and who it is. The primitive behind
+	 * {@link getClusterPeerIds} and {@link getClusterSize}: a lookup that threw and a lookup that named
+	 * nobody used to reach every caller as the same empty list, and `CoordinatorRepo`'s solo
+	 * short-circuit then acknowledged a write it had no idea where to send exactly as it acknowledged a
+	 * write to a genuine cohort of one (GitHub #19). Both shapes are still `resolved: false` here —
+	 * neither names a destination — but they are distinguishable from a resolved cohort, which is what
+	 * the write's durability class needs (`unrouted` vs `local`).
+	 */
+	async resolveCohort(blockId: BlockId): Promise<CohortResolution> {
+		const outcome = await this.lookupCluster(blockId);
+		if ('reason' in outcome) return { resolved: false, reason: outcome.reason };
+		const peerIds = Object.keys(outcome.peers);
+		if (peerIds.length === 0) return { resolved: false, reason: 'findCluster named nobody' };
+		return { resolved: true, peerIds };
 	}
 
 	private makeRecord(peers: ClusterPeers, messageHash: string, message: RepoMessage, membershipDigestValue: string): ClusterRecord {
@@ -613,14 +654,14 @@ export class ClusterCoordinator {
 	}
 
 	/**
-	 * The block's cohort peer ids as currently derivable. Empty when `findCluster` fails
-	 * (getClusterForBlock swallows the throw), so a caller branching on `length <= 1` is also taking
-	 * the degraded-routing branch; `CoordinatorRepo.commit` uses the ids to log whether a solo cohort
-	 * is genuinely just self or a routing failure.
+	 * The block's cohort peer ids as currently derivable. Empty when the cohort did not resolve
+	 * ({@link resolveCohort}: `findCluster` threw, or named nobody), so a caller branching on
+	 * `length <= 1` is also taking the degraded-routing branch. Derived from `resolveCohort` rather
+	 * than re-deriving the cohort, so there is exactly one lookup rule.
 	 */
 	async getClusterPeerIds(blockId: BlockId): Promise<string[]> {
-		const peers = await this.getClusterForBlock(blockId);
-		return Object.keys(peers ?? {});
+		const cohort = await this.resolveCohort(blockId);
+		return cohort.resolved ? [...cohort.peerIds] : [];
 	}
 
 	/** {@link getClusterPeerIds}, counted. Derived from it rather than re-deriving the cohort, so the

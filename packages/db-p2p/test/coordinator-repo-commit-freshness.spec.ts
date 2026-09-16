@@ -21,6 +21,7 @@
  */
 
 import { expect } from 'chai';
+import { localDurability } from '@optimystic/db-core';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import type { PeerId } from '@libp2p/interface';
@@ -31,6 +32,7 @@ import type {
 } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import { CoordinatorRepo, type ClusterLatestCallback, type ICoordinatorClusterSeam } from '../src/repo/coordinator-repo.js';
+import type { CohortResolution } from '../src/repo/cluster-coordinator.js';
 import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { toString as u8ToString } from 'uint8arrays';
@@ -87,10 +89,10 @@ const makeStorageRepo = (commitImpl?: () => Promise<CommitResult>): IRepo => {
 			return result;
 		},
 		async pend(_request: PendRequest, _options?: MessageOptions): Promise<PendResult> {
-			return { success: true, pending: [], blockIds: [] };
+			return { success: true, pending: [], blockIds: [], durability: localDurability() };
 		},
 		async cancel(_actionRef: ActionBlocks, _options?: MessageOptions): Promise<void> { },
-		commit: commitImpl ?? (async (): Promise<CommitResult> => ({ success: true }))
+		commit: commitImpl ?? (async (): Promise<CommitResult> => ({ success: true, durability: localDurability() }))
 	};
 };
 
@@ -238,7 +240,7 @@ describe('CoordinatorRepo commit-side freshness (quorum-intersection gate)', () 
 			storageCommit?: () => Promise<CommitResult>;
 		}) => {
 			const cohortCommitOutcomes: { [peerId: string]: CommitResult } =
-				Object.fromEntries(Object.keys(opts.record.peers).map(id => [id, { success: true }]));
+				Object.fromEntries(Object.keys(opts.record.peers).map(id => [id, { success: true, durability: localDurability() }]));
 			const localPeer = await makePeerId();
 			const remotes = await Promise.all(Array.from({ length: opts.cohortPeers - 1 }, () => makePeerId()));
 			const cluster = makeClusterPeers([localPeer, ...remotes]);
@@ -260,6 +262,7 @@ describe('CoordinatorRepo commit-side freshness (quorum-intersection gate)', () 
 			(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 				async getClusterSize(): Promise<number> { return Object.keys(cluster).length; },
 				async getClusterPeerIds(): Promise<string[]> { return Object.keys(cluster); },
+				async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: Object.keys(cluster) }; },
 				async recoverTransactions(): Promise<void> { /* unused */ },
 				async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, cohortCommitOutcomes: { [peerId: string]: CommitResult } }> {
 					return { record: opts.record, localExecuted: opts.localExecuted, cohortCommitOutcomes };

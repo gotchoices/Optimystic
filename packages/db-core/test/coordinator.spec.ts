@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { TransactionCoordinator, blockIdsForTransforms } from '../src/index.js';
+import { TransactionCoordinator, blockIdsForTransforms, localDurability } from '../src/index.js';
 import { Tracker } from '../src/transform/tracker.js';
 import type {
 	BlockSource,
@@ -97,7 +97,7 @@ class InstrumentedTransactor implements ITransactor {
 				return { success: false, reason: `forced pend failure: ${collectionId}` };
 			}
 			this.pendedCollections.push(collectionId);
-			return { success: true, pending: [], blockIds } as PendResult;
+			return { success: true, pending: [], blockIds, durability: localDurability() } as PendResult;
 		} finally {
 			this.pendInFlight--;
 		}
@@ -119,7 +119,7 @@ class InstrumentedTransactor implements ITransactor {
 				return { success: false, reason: `forced commit failure: ${collectionId}` };
 			}
 			this.committedCollections.push(collectionId);
-			return { success: true };
+			return { success: true, durability: localDurability() };
 		} finally {
 			this.commitInFlight--;
 		}

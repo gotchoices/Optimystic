@@ -28,10 +28,11 @@ import type {
 	IRepo, IKeyNetwork, ClusterPeers, BlockGets, GetBlockResults, PendRequest, PendResult,
 	CommitRequest, CommitResult, ActionBlocks, MessageOptions, BlockId, ClusterRecord, RepoMessage, StaleFailure
 } from '@optimystic/db-core';
-import { isConflictFailure } from '@optimystic/db-core';
+import { isConflictFailure, localDurability } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { CoordinatorRepo, type ICoordinatorClusterSeam } from '../src/repo/coordinator-repo.js';
+import type { CohortResolution } from '../src/repo/cluster-coordinator.js';
 import { ValidatorRejectionError } from '../src/repo/cluster-coordinator.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 
@@ -86,6 +87,7 @@ const makeRepo = (
 	(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 		async getClusterSize(): Promise<number> { return 3; },
 		async getClusterPeerIds(): Promise<string[]> { return ['peer-1', 'peer-2', 'peer-3']; },
+		async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: ['peer-1', 'peer-2', 'peer-3'] }; },
 		async recoverTransactions(): Promise<void> { /* unused on these paths */ },
 		async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, localPendResult?: PendResult, cohortPendRefusals?: { [peerId: string]: StaleFailure } }> {
 			if ('throws' in consensus) throw consensus.throws;
@@ -145,15 +147,22 @@ describe('CoordinatorRepo pend — retained storage verdict after cluster consen
 		expect(result.success).to.equal(true);
 	});
 
-	it('returns a retained success verbatim', async () => {
+	it("returns a retained success verbatim, under the cohort's durability rather than the member's", async () => {
 		const verdict: PendResult = {
-			success: true, pending: [{ blockId: BLOCK, actionId: 'a-earlier' }], blockIds: [BLOCK]
+			success: true, pending: [{ blockId: BLOCK, actionId: 'a-earlier' }], blockIds: [BLOCK], durability: localDurability()
 		};
 		const repo = makeRepo(makeStorageRepo(emptyGet), { localPendResult: verdict });
 
 		const result = await repo.pend(REQUEST);
 
-		expect(result).to.deep.equal(verdict);
+		expect(result.success).to.equal(true);
+		if (result.success) {
+			const { durability, ...rest } = result;
+			expect(rest).to.deep.equal({ success: true, pending: verdict.pending, blockIds: verdict.blockIds });
+			// The member's own `local` verdict never becomes the coordinator's answer: the cohort's does.
+			expect(durability.cohortPeerIds).to.deep.equal(Object.keys(RECORD.peers));
+			expect(durability.quorum).to.not.equal('local');
+		}
 	});
 
 	// ── Cohort members' verdicts, not just this node's own ──
@@ -164,7 +173,7 @@ describe('CoordinatorRepo pend — retained storage verdict after cluster consen
 	// cases below pin the aggregate arm.
 
 	it("returns a cohort member's refusal even when this node's own member succeeded", async () => {
-		const localSuccess: PendResult = { success: true, pending: [], blockIds: [BLOCK] };
+		const localSuccess: PendResult = { success: true, pending: [], blockIds: [BLOCK], durability: localDurability() };
 		const remote: StaleFailure = {
 			success: false, conflict: true, pending: [{ blockId: BLOCK, actionId: 'a-winner' }]
 		};
@@ -200,7 +209,7 @@ describe('CoordinatorRepo pend — retained storage verdict after cluster consen
 		const first: StaleFailure = { success: false, conflict: true, pending: [{ blockId: BLOCK, actionId: 'a-first' }] };
 		const second: StaleFailure = { success: false, conflict: true, pending: [{ blockId: BLOCK, actionId: 'a-second' }] };
 		const repo = makeRepo(makeStorageRepo(emptyGet), {
-			localPendResult: { success: true, pending: [], blockIds: [BLOCK] },
+			localPendResult: { success: true, pending: [], blockIds: [BLOCK], durability: localDurability() },
 			cohortPendRefusals: { 'peer-9': second, 'peer-2': first }
 		});
 
@@ -227,7 +236,7 @@ describe('CoordinatorRepo pend — retained storage verdict after cluster consen
 			((_p: PeerId) => ({} as unknown as ClusterClient)),
 			{
 				get: emptyGet,
-				async pend(): Promise<PendResult> { return { success: true, pending: [], blockIds: [BLOCK] }; },
+				async pend(): Promise<PendResult> { return { success: true, pending: [], blockIds: [BLOCK], durability: localDurability() }; },
 				async cancel(): Promise<void> { },
 				async commit(): Promise<CommitResult> { throw new Error('not under test'); }
 			},
@@ -236,6 +245,7 @@ describe('CoordinatorRepo pend — retained storage verdict after cluster consen
 		(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 			async getClusterSize(): Promise<number> { return 3; },
 			async getClusterPeerIds(): Promise<string[]> { return ['peer-1', 'peer-2', 'peer-3']; },
+			async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: ['peer-1', 'peer-2', 'peer-3'] }; },
 			async recoverTransactions(): Promise<void> { },
 			async executeClusterTransaction() {
 				return { record: RECORD, localExecuted: false, cohortPendRefusals: { 'peer-2': remote } };
@@ -265,6 +275,7 @@ describe('CoordinatorRepo pend — retained storage verdict after cluster consen
 		(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 			async getClusterSize(): Promise<number> { return 3; },
 			async getClusterPeerIds(): Promise<string[]> { return ['peer-1', 'peer-2', 'peer-3']; },
+			async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: ['peer-1', 'peer-2', 'peer-3'] }; },
 			async recoverTransactions(): Promise<void> { },
 			async executeClusterTransaction() {
 				return { record: RECORD, localExecuted: false, cohortPendRefusals: { 'peer-2': remote } };

@@ -30,12 +30,13 @@ import type {
 	IRepo, IKeyNetwork, ClusterPeers, BlockGets, GetBlockResults, PendRequest, PendResult,
 	CommitRequest, CommitResult, ActionBlocks, MessageOptions, BlockId, ClusterRecord, RepoMessage, StaleFailure
 } from '@optimystic/db-core';
-import { isConflictFailure } from '@optimystic/db-core';
+import { isConflictFailure, localDurability } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { CoordinatorRepo, type ICoordinatorClusterSeam } from '../src/repo/coordinator-repo.js';
+import type { CohortResolution } from '../src/repo/cluster-coordinator.js';
 import { MISSING_BASE_REVISION_REASON, isCommitNotDurableFailure, type ICommitProofPersister } from '../src/storage/storage-repo.js';
 import { buildBlockCommitProof, type BlockCommitProof } from '../src/cluster/commit-proof.js';
 import type { ClusterClient } from '../src/cluster/client.js';
@@ -79,7 +80,7 @@ const durableReports = (record: ClusterRecord, holders: number): { [peerId: stri
 	const reports: { [peerId: string]: CommitResult } = {};
 	Object.keys(record.peers).forEach((id, i) => {
 		reports[id] = i < holders
-			? { success: true }
+			? { success: true, durability: localDurability() }
 			: { success: false, reason: `${MISSING_BASE_REVISION_REASON}: block ${BLOCK} cannot materialize rev 2` };
 	});
 	return reports;
@@ -96,7 +97,7 @@ const makeStorageRepo = (commit: ICommitProofPersister['commit']): IRepo => ({
 		return Object.fromEntries(gets.blockIds.map(id => [id, { state: {} }]));
 	},
 	async pend(_r: PendRequest, _o?: MessageOptions): Promise<PendResult> {
-		return { success: true, pending: [], blockIds: [] };
+		return { success: true, pending: [], blockIds: [], durability: localDurability() };
 	},
 	async cancel(_r: ActionBlocks, _o?: MessageOptions): Promise<void> { },
 	commit
@@ -142,6 +143,7 @@ const makeRepo = (
 	(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 		async getClusterSize(): Promise<number> { return peerIds.length; },
 		async getClusterPeerIds(): Promise<string[]> { return peerIds; },
+		async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: peerIds }; },
 		async recoverTransactions(): Promise<void> { /* unused on these paths */ },
 		async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, cohortCommitOutcomes?: { [peerId: string]: CommitResult } }> {
 			return { record, localExecuted: false, ...(reports === undefined ? {} : { cohortCommitOutcomes: reports }) };
@@ -223,7 +225,7 @@ describe('CoordinatorRepo commit — the fallback arm needs a durable majority, 
 		// The observed shape: full consensus, every member's storage refused at apply, the
 		// coordinator is not in the cohort. Acknowledging would report a write that exists nowhere;
 		// committing locally would create the lone off-cohort holder that seeded the bad placement.
-		const { repo: storageRepo, commits } = countingCommits(makeStorageRepo(async () => ({ success: true })));
+		const { repo: storageRepo, commits } = countingCommits(makeStorageRepo(async () => ({ success: true, durability: localDurability() })));
 		const record = makeRecord(3, 3);
 		const repo = makeRepo(storageRepo, record, durableReports(record, 0));
 
@@ -234,7 +236,7 @@ describe('CoordinatorRepo commit — the fallback arm needs a durable majority, 
 	it('counts durable reports, not approvals', async () => {
 		// Three approvals, one holder: 1 of 3 is not a majority whatever the votes said.
 		const record = makeRecord(3, 3);
-		const repo = makeRepo(makeStorageRepo(async () => ({ success: true })), record, durableReports(record, 1));
+		const repo = makeRepo(makeStorageRepo(async () => ({ success: true, durability: localDurability() })), record, durableReports(record, 1));
 
 		expectNotDurable(await repo.commit(REQUEST));
 	});
@@ -245,7 +247,7 @@ describe('CoordinatorRepo commit — the fallback arm needs a durable majority, 
 		const self = peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
 		const record = makeRecordOver([self.toString(), 'peer-1', 'peer-2'], 3);
 		const reports = { 'peer-1': { success: true } as CommitResult, 'peer-2': { success: false, reason: 'behind' } as CommitResult };
-		const { repo: storageRepo, commits } = countingCommits(makeStorageRepo(async () => ({ success: true })));
+		const { repo: storageRepo, commits } = countingCommits(makeStorageRepo(async () => ({ success: true, durability: localDurability() })));
 		const repo = makeRepo(storageRepo, record, reports, self);
 
 		expect((await repo.commit(REQUEST)).success).to.equal(true);
@@ -265,7 +267,7 @@ describe('CoordinatorRepo commit — the fallback arm needs a durable majority, 
 	it('a coordinator inside the cohort skips the fallback commit when even its own success could not reach a majority', async () => {
 		const self = peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
 		const record = makeRecordOver([self.toString(), 'peer-1', 'peer-2'], 3);
-		const { repo: storageRepo, commits } = countingCommits(makeStorageRepo(async () => ({ success: true })));
+		const { repo: storageRepo, commits } = countingCommits(makeStorageRepo(async () => ({ success: true, durability: localDurability() })));
 		const repo = makeRepo(storageRepo, record, durableReports(record, 0), self);
 
 		expectNotDurable(await repo.commit(REQUEST));
@@ -289,7 +291,7 @@ describe('CoordinatorRepo commit — the local fallback carries the consensus re
 	const commitWithProofCapture = (record: ClusterRecord) => {
 		const proofs: (BlockCommitProof | undefined)[] = [];
 		const repo = makeRepo(
-			makeStorageRepo(async (_request, _options, proof) => { proofs.push(proof); return { success: true }; }),
+			makeStorageRepo(async (_request, _options, proof) => { proofs.push(proof); return { success: true, durability: localDurability() }; }),
 			record, durableReports(record, 3)
 		);
 		return { repo, proofs };

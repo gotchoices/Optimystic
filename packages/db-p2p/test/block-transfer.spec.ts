@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { localDurability } from '@optimystic/db-core';
 import type { IRepo, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, IBlock, BlockId, BlockHeader, IPeerNetwork } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { generateKeyPair } from '@libp2p/crypto/keys';
@@ -35,10 +36,10 @@ class MockRepo implements IRepo {
 		return result;
 	}
 	async pend(_request: PendRequest): Promise<PendResult> {
-		return { success: true, blockIds: [], pending: [] };
+		return { success: true, blockIds: [], pending: [], durability: localDurability() };
 	}
 	async commit(_request: CommitRequest): Promise<CommitResult> {
-		return { success: true };
+		return { success: true, durability: localDurability() };
 	}
 	async cancel(_actionRef: ActionBlocks): Promise<void> {}
 	async saveReplicatedBlock(blockId: string, block: IBlock): Promise<void> {
