@@ -211,8 +211,9 @@ export interface IndexSeekTrace {
 	 *  abandoned iteration reports what it had produced when it stopped. */
 	matched: number;
 	/** How many of those entries the scan dropped because the row they name is gone or does
-	 *  not imply them. `matched - rejected` is what the scan returned; nonzero means this
-	 *  node's index disagrees with its table. A floor, like {@link matched}. */
+	 *  not imply them. `matched - rejected` is what the scan returned; nonzero means the index
+	 *  and the main table disagreed as this scan read them — a damaged tree, or an `arm=live`
+	 *  read whose two views sat at different revisions. A floor, like {@link matched}. */
 	rejected: number;
 }
 

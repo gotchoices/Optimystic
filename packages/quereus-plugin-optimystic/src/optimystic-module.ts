@@ -86,14 +86,19 @@ interface IndexScanSource extends IndexScanTarget {
  *   found, rows resolved, verification rejected them later".
  * - `rejected` — how many of those entries the scan did NOT yield: the row their primary
  *   key names is gone, or it is there but does not imply the entry (see the verification in
- *   {@link OptimysticVirtualTable.executeIndexScan}). Every rejection is index damage — a
- *   healthy tree rejects nothing — and it is otherwise invisible from the read path, which
- *   now answers correctly over a broken tree instead of visibly wrongly. `matched - rejected`
- *   is what the scan yielded.
+ *   {@link OptimysticVirtualTable.executeIndexScan}). It is otherwise invisible from the read
+ *   path, which now answers correctly over a broken tree instead of visibly wrongly.
+ *   `matched - rejected` is what the scan yielded. A rejection means the index tree and the
+ *   main table DISAGREED AS THIS SCAN READ THEM, which has two causes and the same line carries
+ *   the fields that separate them: index damage (`rev`/`main_rev` consistent — confirm with
+ *   `plugin.verifyIndexes`), or the two views sitting at different moments, which rejects a
+ *   perfectly healthy entry whose row the main view has not caught up to yet (see `main_rev=`
+ *   in docs/debugging.md, and prefer `arm=committed`, where both views come from one moment).
  * - `key` — the framed index key the scan bracketed on, filled in once it is built.
- *   Stays `undefined` if the scan returned before framing one, which prints as `unset`
- *   rather than as an empty seek (the empty PREFIX is a legitimate key meaning
- *   "the whole index", and the two must not read alike).
+ *   Stays `undefined` if the scan returned before framing one — in practice the NULL-arg
+ *   refusal, which is a correct empty answer, not a fault — and prints as `unset` rather
+ *   than as an empty seek (the empty PREFIX is a legitimate key meaning "the whole index",
+ *   and the two must not read alike).
  *
  * Passed only when the trace namespace is enabled; `undefined` otherwise, so a disabled
  * namespace costs one property read per scan.
@@ -1343,10 +1348,11 @@ export class OptimysticVirtualTable extends VirtualTable {
    *   "descended a stale index" is distinguishable from "descended a current index that
    *   genuinely has no entry".
    * - `rejected=` — how many of those entries the scan then dropped because the row they
-   *   name is gone or does not imply them. Nonzero means this index disagrees with its
-   *   table and the seek corrected for it; the rows are right, the tree is not. Run
+   *   name is gone or does not imply them. Nonzero means the index and the main table
+   *   disagreed as this scan read them: either the tree is damaged — run
    *   `plugin.verifyIndexes` on this node to see which entries (docs/debugging.md, "Does an
-   *   index agree with its table?").
+   *   index agree with its table?") — or the two views are at different moments, which
+   *   `rev=`/`main_rev=` and `arm=` above are what distinguish.
    *
    * `collection=` and `main=` are the same id strings `index:tree-open` and
    * `commit:collections` print, so all three lines join on them — and they name BOTH
@@ -1599,6 +1605,15 @@ export class OptimysticVirtualTable extends VirtualTable {
     // `(C, D)`), a row that moved from `('x', 2)` to `('x', 9)` has two entries, and BOTH
     // prefix-match `'x'` — so a prefix check would return that row twice. Its full implied
     // key can equal only one of them.
+    //
+    // NOTE: the check proves the entry belongs to its ROW, not that it sits under the key
+    // SOUGHT — and those coincide only because indexValueRange is an exact byte-prefix
+    // bracket: the index tree is opened with a raw lexicographic string comparator
+    // (collection-factory.ts), so every entry the range yields has a tree key literally
+    // beginning with `indexKey`, and the framing is injective. If `debt-optimystic-true-key-ordering`
+    // ever gives the index tree a collation-aware comparator, the range can bracket entries
+    // under a DIFFERENT framed value, which their own rows imply and this check would pass —
+    // add a prefix check of the derived key against `indexKey` then.
     //
     // NOTE: this derives the row's full index key once per entry the seek produces — one
     // serialize-and-frame per index column, over a row the fetch above has already decoded.

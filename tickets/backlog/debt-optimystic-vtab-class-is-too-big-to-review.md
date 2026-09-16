@@ -42,6 +42,8 @@ Top-level shape (`grep -n "^export class\|^class\|^function" …`):
 
 Re-measured 2026-09-15 while reviewing `refuse-concurrent-row-change-loser` (which threaded the stored pre-write entry through every DML arm so each main-table action carries an `unchanged` guard): the same command now reports **4530**. Confirming that guard placement meant reading the INSERT, UPDATE, DELETE, primary-key-move and secondary-UNIQUE-eviction paths of one class in one sitting, which is the review cost this ticket exists to remove.
 
+Re-measured 2026-09-15 while reviewing `index-seek-must-verify-its-entries` (which made the index seek check every entry against the row it resolves to): the same command now reports **4611**. That review's main correctness question — does a verified seek ever reject a HEALTHY entry — needed the seek, the trace probe, the access-plan arm that decides an index is usable, and the row codec's encode/decode round-trip held in mind together, and three of those four are private members of this one class.
+
 ## Why it matters
 
 Reviews of this file are the bottleneck, not the edits. Recent tickets touching it

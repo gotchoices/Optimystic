@@ -20,10 +20,13 @@
  * partial prefix, NULL-valued), so the next instance is caught without anyone having to
  * think of it.
  *
- * Each shape runs twice: over a healthy index, and over one deliberately left holding an
- * entry its row moved off — the state a writer that was not maintaining the index produces
- * (`withIndexStagingPatched` with `stageNewEntryOnly`). The leftover's presence is asserted
- * before the seeks run, so a patch that stopped working could not make this pass vacuously.
+ * Each shape runs three times: over a healthy index, and over each of the two ways an index can
+ * be left holding an entry no row implies — a row that MOVED off the indexed value while its old
+ * entry stayed (`stageNewEntryOnly` over the update, a `stale-value` orphan), and a row that was
+ * DELETED while its entry stayed (`stageNothing` over the delete, a `no-row` orphan). Both are
+ * states a writer that was not maintaining the index produces, and the seek must reject either.
+ * The leftover's presence is asserted before the seeks run, so a patch that stopped working could
+ * not make this pass vacuously.
  *
  * Single-node and in-memory (`default_transactor: 'test'`): the read path under test knows
  * nothing about meshes.
@@ -33,7 +36,7 @@ import { expect } from 'chai';
 import { Database, type SqlValue } from '@quereus/quereus';
 import register from '../dist/plugin.js';
 import { countIndexScans, queryAll, readIndexIntegrity } from './query-helpers.js';
-import { stageNewEntryOnly, withIndexStagingPatched } from './index-staging-patch.js';
+import { stageNewEntryOnly, stageNothing, withIndexStagingPatched } from './index-staging-patch.js';
 import { captureTrace, indexSeekTraces } from './trace-helpers.js';
 
 type Plugin = ReturnType<typeof register>;
@@ -55,6 +58,9 @@ interface Shape {
 	inserts: string[];
 	/** Moves one row off its indexed value; run with index staging patched to leave the old entry. */
 	move: string;
+	/** Removes the row `move` targets; run with delete-side index staging patched away entirely,
+	 *  so its entry is left pointing at a row that is gone. */
+	remove: string;
 	seeks: Seek[];
 }
 
@@ -71,6 +77,7 @@ const SHAPES: Shape[] = [
 			`insert into SeekText (Id, Token) values (4, null)`,
 		],
 		move: `update SeekText set Token = 'tok-z' where Id = 3`,
+		remove: `delete from SeekText where Id = 3`,
 		seeks: [
 			// A value two rows share, so under-reporting changes a row SET rather than emptying it.
 			{ columns: ['Token'], values: ['tok-a'] },
@@ -95,6 +102,7 @@ const SHAPES: Shape[] = [
 			`insert into SeekNum (Id, Num) values (4, null)`,
 		],
 		move: `update SeekNum set Num = 99 where Id = 3`,
+		remove: `delete from SeekNum where Id = 3`,
 		seeks: [
 			{ columns: ['Num'], values: [10] },
 			{ columns: ['Num'], values: [20] },
@@ -116,6 +124,7 @@ const SHAPES: Shape[] = [
 			`insert into SeekPair (Id, C, D) values (4, 'x', null)`,
 		],
 		move: `update SeekPair set D = 9 where Id = 2`,
+		remove: `delete from SeekPair where Id = 2`,
 		seeks: [
 			// Partial prefix — shorter than the index. After the move, BOTH of row 2's entries
 			// prefix-match 'x', so a check that only compared the constrained prefix would
@@ -243,6 +252,17 @@ async function expectEverySeekSound(db: Database, shape: Shape): Promise<void> {
 	}
 }
 
+/**
+ * Assert the damage the caller just staged is actually in the tree, and is exactly one entry of
+ * `reason`. Without this a damaged-index run could pass over a perfectly clean index — proving
+ * nothing — the day the staging patch stops biting.
+ */
+async function expectOneOrphan(db: Database, table: string, reason: string): Promise<void> {
+	const orphans = (await readIndexIntegrity(db, table)).flatMap(report => report.orphaned);
+	expect(orphans.map(orphan => orphan.reason), `exactly one ${reason} entry must be left behind`)
+		.to.deep.equal([reason]);
+}
+
 /** A fresh in-memory database holding `shape`'s table, index and rows. */
 async function openShape(shape: Shape): Promise<{ db: Database; plugin: Plugin }> {
 	const db = new Database();
@@ -285,13 +305,14 @@ describe('an index-routed seek returns only rows that satisfy it', () => {
 			it('over an index still holding an entry its row moved off', async () => {
 				await withIndexStagingPatched(plugin, shape.table, 'updateIndexEntries', stageNewEntryOnly,
 					() => db.exec(shape.move));
+				await expectOneOrphan(db, shape.table, 'stale-value');
+				await expectEverySeekSound(db, shape);
+			});
 
-				// Without this the run below could pass over a perfectly clean index and prove
-				// nothing about the damaged case.
-				const orphans = (await readIndexIntegrity(db, shape.table)).flatMap(report => report.orphaned);
-				expect(orphans.map(orphan => orphan.reason), 'the move must leave exactly one entry behind')
-					.to.deep.equal(['stale-value']);
-
+			it('over an index still holding an entry whose row is gone', async () => {
+				await withIndexStagingPatched(plugin, shape.table, 'deleteIndexEntries', stageNothing,
+					() => db.exec(shape.remove));
+				await expectOneOrphan(db, shape.table, 'no-row');
 				await expectEverySeekSound(db, shape);
 			});
 		});

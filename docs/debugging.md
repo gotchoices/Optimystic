@@ -369,7 +369,9 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   control bytes, so a raw key would break whitespace-separated parsing). Two nodes seeking the same
   SQL value must print the same `seek=`; a difference means the key framing diverged rather than
   the tree. An empty `seek=` is the whole-index prefix (a plan that wants every entry);
-  `seek=unset` means the scan returned before framing a key at all. **Compare it, do not decode
+  `seek=unset` means the scan returned before framing a key at all — in practice a seek value that
+  arrived NULL, which the scan refuses because `col = NULL` is UNKNOWN, so `matched=0 rejected=0
+  seek=unset` is a correct empty answer and not an index fault. **Compare it, do not decode
   it** — un-escaping yields the raw tuple framing (element tags, escaped NULs), not the SQL value
   that was sought; and only `A-Za-z0-9._-` survive verbatim, every other code unit becoming `%XX`
   or, above U+00FF, `%uXXXX` — which is not valid percent-encoding, so a decoder would reject or
@@ -379,12 +381,19 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   `LIMIT`, an error mid-scan) reports what it had produced when it stopped, so `matched=0` still
   means the descent found nothing.
 - `rejected=` — how many of those entries the scan then dropped, because the row their primary key
-  names is gone or does not imply the entry. `matched - rejected` is what the scan returned. A
-  healthy index rejects nothing, so **any nonzero value means this node's index disagrees with its
-  table**: the rows the query returned are right and the tree is not. Run
-  `plugin.verifyIndexes(db, table)` on *this* node to see which entries — see [§Does an index agree
-  with its table?](#does-an-index-agree-with-its-table) below. It is a floor for the same reason
-  `matched=` is.
+  names is gone or does not imply the entry. `matched - rejected` is what the scan returned. Any
+  nonzero value means **the index tree and the main table disagreed as this scan read them**, which
+  has two causes — read `rev=`, `main_rev=` and `arm=` on the same line to tell them apart:
+  - **The tree is damaged** — it holds an entry no row accounts for. Run
+    `plugin.verifyIndexes(db, table)` on *this* node to see which entries — see [§Does an index
+    agree with its table?](#does-an-index-agree-with-its-table) below.
+  - **The two views are at different moments** — an `arm=live` scan refreshes the index and main
+    collections through different call sites, so an index ahead of the main table produces an entry
+    whose row the main view has not caught up to, and the scan rejects it. The tree is fine; the
+    read is skewed (see `main_rev=` above). `arm=committed` cannot do this — both views are taken
+    from one committed moment.
+
+  It is a floor for the same reason `matched=` is.
 
 **Only an index-driven plan emits this line.** A primary-key point lookup, a primary-key range
 query, and a full table scan all read without descending an index tree, so they emit nothing here.

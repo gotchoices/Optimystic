@@ -90,8 +90,8 @@ export type IndexKey = string;
  *
  * `values` is positional: one entry per key element, in index order. A shorter list
  * frames a leading PREFIX, which the caller can use to bracket a range (see
- * {@link IndexManager.findByIndexIn}); an empty list frames to `''`, which brackets the
- * whole index.
+ * {@link indexValueRange}, scanned by {@link IndexManager.findEntriesIn}); an empty list
+ * frames to `''`, which brackets the whole index.
  */
 export function indexKeyFromValues(values: readonly SqlValue[]): IndexKey {
 	// Frame each column payload through the shared injective tuple encoding so an
@@ -335,7 +335,7 @@ export class IndexManager {
 	 *
 	 * A PREFIX is accepted (`values.length < indexSchema.columns.length`): a partial seek
 	 * key frames the leading columns only and brackets a range over the rest, which is
-	 * how {@link findByIndexIn} serves a multi-column index constrained on its first
+	 * how {@link findEntriesIn} serves a multi-column index constrained on its first
 	 * column(s). An EMPTY tuple is rejected — it would range over the whole index, which
 	 * a caller must opt into explicitly rather than reach by accident.
 	 */
@@ -514,14 +514,17 @@ export class IndexManager {
 
 	/**
 	 * Range-scan a supplied index read source for all primary keys whose entry matches
-	 * `indexKey`. The caller chooses the source: {@link findByIndex} passes the live
-	 * index tree (after refreshing it); a committed-read seek passes a pre-transaction
-	 * view of the index tree so it excludes index entries staged by the in-flight
-	 * transaction. Shared composite-key range logic for both paths — the read source
-	 * is assumed already current (this method never refreshes it).
+	 * `indexKey` — a projection of {@link findEntriesIn}, for a caller that needs no more
+	 * than the primary key. One range definition serves both, so the two cannot drift apart.
+	 * The read source is assumed already current (this method never refreshes it).
 	 *
-	 * A projection of {@link findEntriesIn}, for callers that need only the primary key.
-	 * One range definition serves both, so the two cannot drift apart.
+	 * The query read path does NOT use this: it needs each entry's tree key to verify the
+	 * entry against its row, so it scans {@link findEntriesIn} directly. The one production
+	 * caller left is the unique-constraint write probe (`probeUniqueConstraint` in
+	 * optimystic-module.ts), which treats every primary key in the range as a live collision
+	 * and therefore still miscounts a leftover entry — see
+	 * `bug-stale-index-entry-causes-false-unique-refusal`. ({@link findByIndex} also wraps it,
+	 * and has no caller of its own.)
 	 */
 	async* findByIndexIn(
 		read: TreeReadView<IndexKey, IndexEntry>,
@@ -563,9 +566,9 @@ export class IndexManager {
 
 	/**
 	 * Every entry a supplied index read source holds, in ascending tree-key order. Walks the
-	 * WHOLE tree rather than the empty framed prefix {@link findByIndexIn} would bracket, so
+	 * WHOLE tree rather than the empty framed prefix {@link findEntriesIn} would bracket, so
 	 * an entry whose key is not even well framed is still returned — the integrity check
-	 * exists to see exactly those. Like findByIndexIn, it never refreshes the source.
+	 * exists to see exactly those. Like findEntriesIn, it never refreshes the source.
 	 */
 	async* allEntriesIn(read: TreeReadView<IndexKey, IndexEntry>): AsyncIterable<IndexEntry> {
 		for await (const path of read.range(new KeyRange<string>(undefined, undefined, true))) {
@@ -583,9 +586,10 @@ export class IndexManager {
 	/**
 	 * Scan index range.
 	 *
-	 * NOTE: no production caller today (only findByIndexIn is wired to query planning);
-	 * its framed-prefix brackets are kept consistent with findByIndexIn but are not
-	 * covered by a direct test. If this becomes live, add start/end range coverage.
+	 * NOTE: no production caller today (query planning goes through findEntriesIn, and the
+	 * unique probe through findByIndexIn); its framed-prefix brackets are kept consistent
+	 * with those but are not covered by a direct test. If this becomes live, add start/end
+	 * range coverage.
 	 */
 	async* scanIndexRange(
 		indexName: string,

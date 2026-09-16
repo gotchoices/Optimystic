@@ -354,7 +354,7 @@ describe('Optimystic Index Support', () => {
 		});
 
 		it('isolates an index value from another that has it as a prefix (framed prefix range)', async () => {
-			// End-to-end exercise of the findByIndexIn prefix-range brackets: a point
+			// End-to-end exercise of the findEntriesIn prefix-range brackets: a point
 			// lookup for 'a' must not spill into rows whose indexed value merely begins
 			// with 'a' ('aa', 'ab'). The framed range's upper bound (KEY_PREFIX_END) is
 			// what keeps these distinct index tuples out of each other's scan.
