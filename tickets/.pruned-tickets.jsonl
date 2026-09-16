@@ -53,3 +53,5 @@
 {"slug":"relay-only-cohort-member-addresses-never-reach-siblings","file":"relay-only-cohort-member-addresses-never-reach-siblings.md","completedAt":"2026-08-15","commit":"9ecb2cf988fec13e4078f939482580c3727e84f1","prunedAt":"2026-09-15T04:00:01.300Z"}
 {"slug":"shared-bounded-cache-pool-with-2q-admission","file":"shared-bounded-cache-pool-with-2q-admission.md","completedAt":"2026-08-15","commit":"d92e567982eae79ec4df1072af2b3489cbb75fba","prunedAt":"2026-09-15T04:00:01.300Z"}
 {"slug":"storage-invariants-undocumented-and-doc-rot","file":"storage-invariants-undocumented-and-doc-rot.md","completedAt":"2026-08-15","commit":"ecd770aa96c1c7352203bd72d19625c8cc1ff3a0","prunedAt":"2026-09-15T04:00:01.300Z"}
+{"slug":"debt-competing-writer-test-transactor","file":"1-debt-competing-writer-test-transactor.md","completedAt":"2026-08-17","commit":"f00fd0c1f75de7ad33d5ae9519e507b0b67cb55a","prunedAt":"2026-09-16T07:03:17.351Z"}
+{"slug":"debt-e2e-stale-cache-hit-read-rejected","file":"2-debt-e2e-stale-cache-hit-read-rejected.md","completedAt":"2026-08-17","commit":"c68a5a9034de0b9c6dc288e3628646ae6f65169f","prunedAt":"2026-09-16T07:03:17.351Z"}
