@@ -260,3 +260,13 @@ able to make a peer respond late or not at all, not merely fail fast**.
 cancel, and `complete/2-sync-fail-fast-on-a-stalled-revision-view` stops a hopeless sync burning the
 full ten-retry budget — which is the 30–34 s they measured. Measured effect on the sereus gate:
 0 clean of 5 before, 3 clean of 8 after. The residual this ticket owns is what remains.
+
+## Arm, 2026-09-16 — a cancel needs the same quorum the refused write missed
+
+Found by `implement/1-transaction-sweep-across-node-counts` (`packages/db-p2p/test/transaction-node-count-sweep.spec.ts`), measured on the in-process mesh with the production-shaped configuration.
+
+`CoordinatorRepo.cancel` runs each block's cancel as a cluster transaction, so it needs the same promise super-majority as the write it is cleaning up after. At two and three machines, one member away is enough to refuse a write (the promise bar is every member) — and therefore also enough to refuse its cancel. `NetworkTransactor.pend` then spends all six `dischargeCancel` rounds getting the same super-majority failure from every reachable coordinator, and logs `WARN: cancel after pend failure did not discharge`. Measured: the refused write takes 767–1219 ms end to end (five runs, two and three machines), almost all of it this loop; the refusal itself is a few milliseconds.
+
+What this costs today, stated narrowly: in the case the sweep drives — a promise-phase shortfall — the pend never reached consensus, so no member stored a pending record and nothing is actually stranded. The cost is about a second of latency per refusal and a warning that reads like a stranded record when there is none.
+
+Where it stops being harmless: a pend that DID reach consensus, followed by a member leaving before the commit or cancel. At two or three machines the cancel then cannot discharge until that member returns, so the records stand on the reachable members for exactly as long as the absence lasts — the client-side bound in this ticket does not help, because no amount of retrying reaches the quorum. That is the shape `implement/1.5-a-member-that-leaves-mid-session-and-returns` drives.

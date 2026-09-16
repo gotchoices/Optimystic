@@ -88,3 +88,9 @@ interface: our **operation counts** (used as a latency lever in a bring-up scena
 message text** (used as a phase discriminator). Both fail without failing anything here. The practical
 response, short of machinery, is that a handoff touching either should say so — the same way a
 breaking type change would be called out.
+
+# Arm, 2026-09-16 — our own test now parses the promise-shortfall text too
+
+`packages/db-p2p/test/transaction-node-count-sweep.spec.ts` (ticket `transaction-sweep-across-node-counts`) asserts what an application sees when a write is refused because one of two or three machines is away. There is no typed error or field for it: `Tree.replace` rejects with the transactor's plain `Error` (`Some peers did not complete: …`), whose `cause` is the coordinator's plain `Error('Failed to get super-majority: a/n approvals (needed k, r rejections)')`. It is not a `SyncRetryExhaustedError` and not a returned conflict, so `Collection.sync` does not retry it. The only way to get the numbers an application would branch on (how many approved, how many were needed) is a regex over that `cause` message, which is what the sweep does. If the phase field described above lands, give the shortfall's counts a field too and switch the sweep's assertion to it.
+
+A side effect worth knowing when weighing this ticket's `tradeoffs:` line ("no optimystic test can see the coupling"): the sweep also asserts that the pend aggregate's message starts with `Some peers did not complete: `, so rewording the `pend` sentence now turns one test in this repository red. It does not cover `get` or `commitBlocks`, and it does not check the `[block:` token.

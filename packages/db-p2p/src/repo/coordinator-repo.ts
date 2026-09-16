@@ -2147,6 +2147,14 @@ export class CoordinatorRepo implements IRepo {
 			// each member compares the rivals as IT holds them, so a member that already approved X
 			// keeps X while a member that approved Y first keeps Y, and no rival reaches a promise
 			// supermajority. (The hash tie-break is already symmetric — it cannot be the fix.)
+			// TWO contenders coordinated by different nodes reach an all-lose round by another route,
+			// and not by this catch: both collect their promises in parallel, so BOTH reach pend
+			// consensus; each coordinator's own member applies its own pend first (local-first
+			// delivery), every other member's storage refuses whichever arrived second, and each writer
+			// is downgraded by `answerWithCohortRefusal` above. Measured by
+			// `test/transaction-node-count-sweep.spec.ts` on the in-process mesh: round one lost by both
+			// writers in 20 of 20 races across two to five machines (2026-09-16). Same cost and same
+			// revisit condition as below.
 			// Fine as it stands: since the torn-action fixes landed, an all-lose round costs one
 			// retry cycle rather than wedging, and the contenders are separated next round by the
 			// jittered backoff plus the aged retry priority carried on the re-pend
