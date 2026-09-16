@@ -41,10 +41,44 @@ A static rule is what closes it.
    `1-block-transfer-uses-node-only-buffer-global`: a lint rule that fails on `AbortSignal.timeout`
    in library source, with an error message naming the replacement pattern and pointing at
    `relay-reservation.ts`. Scope it so tests are unaffected.
-3. **Check for siblings while you are there.** The same class of gap — a platform API present in Node
-   and absent in Hermes — has already produced `Buffer`, `structuredClone`, `TextDecoder` and static
-   class blocks in this repository. If the guard is cheap to extend to the ones already known and
-   documented, extend it; if that turns into a project, file it rather than doing it here.
+3. **Extend the guard to the siblings, using the list below.** The same class of gap — a platform API
+   present in Node and absent in Hermes — has already produced `Buffer`, `structuredClone`,
+   `TextDecoder` and static class blocks in this repository. The RN session has now supplied an
+   evidenced list (next section). Add the ones that are (a) statically detectable and (b) plausible
+   in this repository's library source; if extending it turns into a project, file that rather than
+   growing this ticket.
+
+# The evidenced list (2026-09-16, from the device session)
+
+Every entry below is backed by `reference-app-rn/polyfills/hermes.js` in the sereus reference app,
+where each polyfill names the consumer that needed it. That file is the artefact to read before
+writing the rule — it is a record of what actually broke on hardware, not a compatibility table.
+
+- **`AbortSignal.timeout`** — this ticket's subject, found on the device.
+- **`AbortSignal.any`** — same family, same session.
+- **`AbortSignal.prototype.throwIfAborted`**.
+- **`Promise.withResolvers`** — needed by libp2p/utils, ping, yamux, it-queue, mortice and
+  abort-error. Third-party, so a lint rule over our source will not catch it; it is a reason the RN
+  entry needs its own runtime check rather than only a static one.
+- **`structuredClone`** — used by db-core's transform tracker, cache-source and coordinator. Already
+  known here; confirm whether our source still reaches it.
+- **`TextDecoder`** — `uint8arrays` touches it at module scope, and its absence made yamux's default
+  export `undefined`, which is the kind of failure that looks like anything but a missing global.
+- **`ReadableStream` / `WritableStream` / `TransformStream`**.
+- **`Symbol.asyncIterator`** — absent on some Hermes builds.
+- **`crypto.getRandomValues`** and **`crypto.subtle.digest`**.
+- **Node-style timer handles** — Hermes returns plain numbers, so `.ref()` / `.unref()` do not exist.
+  Worth a rule of its own, since this repository clears and holds timers deliberately.
+- **`DOMException` construction** — not guaranteed under Hermes; the reference app's abort reason
+  falls back to a named `Error`. Worth banning in library source for the same reason.
+
+**One that a lint rule cannot catch, recorded so it is not forgotten:** `WebSocket.bufferedAmount` is
+a property, not a call — and per that session it is the one that actually broke every dial. A static
+rule will not see it. If the guard is to be honest about its coverage, say in its documentation that
+property-shaped gaps are out of scope and name this one as the known example.
+
+This also sharpens the `check:rn` point above: every item here bundles and compiles cleanly and fails
+only when reached, which is exactly how the device session found them.
 
 # Edge cases & interactions
 
