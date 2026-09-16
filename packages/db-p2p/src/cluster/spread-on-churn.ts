@@ -3,14 +3,12 @@ import type { IPeerNetwork } from '@optimystic/db-core'
 import { routingKeyForBlock } from '@optimystic/db-core'
 import { hashKey } from 'p2p-fret'
 import type { FretService } from 'p2p-fret'
-import { peerIdFromString } from '@libp2p/peer-id'
 import type { PartitionDetector } from './partition-detector.js'
 import type { ProofRetainingRepo } from '../storage/block-archive.js'
-import { BlockTransferClient, sourceBlockCertification } from './block-transfer-service.js'
+import { pushBlockToPeers } from './block-transfer-service.js'
 import { createLogger } from '../logger.js'
 
 const log = createLogger('spread-on-churn')
-const textEncoder = new TextEncoder()
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -225,18 +223,27 @@ export class SpreadOnChurnMonitor implements Startable {
 			const targets = expanded.filter(id => !cohortSet.has(id) && id !== selfId)
 			if (targets.length === 0) continue
 
-			// Read block data from local storage
-			const result = await this.deps.repo.get({ blockIds: [blockId] })
-			const blockResult = result[blockId]
-			if (blockResult?.unavailable !== undefined) {
+			// The shared read-certify-push loop, to every target. Both per-target deadlines are set:
+			// a target that connects but never replies would otherwise hang this sequential loop
+			// forever during churn (exactly when slow/dying peers are common). A receiver running
+			// the default `requirePushCertificate` rejects an uncertified push, so a block this node
+			// holds no proof for simply fails to spread (logged by the receiver as
+			// `push:reject-uncertified`) rather than being planted.
+			const outcome = await pushBlockToPeers(this.deps.repo, this.deps.peerNetwork, blockId, targets, {
+				reason: 'replication',
+				protocolPrefix: this.deps.protocolPrefix,
+				dialTimeoutMs: this.config.pushDialTimeoutMs,
+				responseTimeoutMs: this.config.pushResponseTimeoutMs,
+			})
+			if (outcome.status === 'unavailable') {
 				// The repo could not work out whether it still holds this block (unmaterializable
 				// history / failed restore). Untracking on that answer would silently drop the block
 				// from the spread set on a guess, and only a later re-commit would put it back — so
 				// keep it tracked and let the next sweep (or a heal) settle it.
-				log('unavailable block=%s reason=%s (keeping tracked)', blockId, blockResult.unavailable)
+				log('unavailable block=%s reason=%s (keeping tracked)', blockId, outcome.reason)
 				continue
 			}
-			if (!blockResult?.block) {
+			if (outcome.status === 'no-local-data') {
 				// The block has left local storage. No deletion event exists today to evict it
 				// from the tracked set, so prune here. Deleting the current element of a Set mid
 				// for...of is safe - it does not disturb the rest of the iteration. A later
@@ -246,50 +253,16 @@ export class SpreadOnChurnMonitor implements Startable {
 				continue
 			}
 
-			const blockData = textEncoder.encode(JSON.stringify(blockResult.block))
-
-			// Carry the source's revision metadata so the replica's `latest` matches the
-			// source instead of being fabricated as rev 1 on the receiver, plus the cohort commit
-			// proof for that same revision — a receiver running the default `requirePushCertificate`
-			// rejects an uncertified push, so a block this node holds no proof for simply fails to
-			// spread (logged by the receiver as `push:reject-uncertified`) rather than being planted.
-			const certification = await sourceBlockCertification(this.deps.repo, blockId, blockResult)
-
-			// Push to each target
-			const succeeded: string[] = []
-			const failed: string[] = []
-
-			for (const targetId of targets) {
-				try {
-					const peerId = peerIdFromString(targetId)
-					const client = new BlockTransferClient(
-						peerId,
-						this.deps.peerNetwork,
-						this.deps.protocolPrefix
-					)
-					// Bound both the dial and the response read. A target that connects but
-					// never replies would otherwise hang this sequential loop forever during
-					// churn (exactly when slow/dying peers are common); the deadline makes the
-					// push throw, which the catch below records as `failed` so the pass advances.
-					const response = await client.pushBlocks([blockId], [blockData], 'replication', certification, {
-						dialTimeoutMs: this.config.pushDialTimeoutMs,
-						responseTimeoutMs: this.config.pushResponseTimeoutMs,
-					})
-					// A round-trip that does not throw still does not mean the replica
-					// landed: handlePush reports a block in `missing` when it could not
-					// parse or persist it. Treat that as a failed push so the resilience
-					// mechanism does not falsely count the new owner as holding the block.
-					if (response.missing.includes(blockId)) {
-						failed.push(targetId)
-						log('push:rejected block=%s target=%s (receiver did not persist)', blockId, targetId)
-					} else {
-						succeeded.push(targetId)
-						log('push:ok block=%s target=%s', blockId, targetId)
-					}
-				} catch (err) {
-					failed.push(targetId)
-					log('push:fail block=%s target=%s err=%s',
-						blockId, targetId, (err as Error).message)
+			const succeeded = outcome.confirmed
+			const failed = outcome.refusals.map(refusal => refusal.peerId)
+			for (const targetId of succeeded) {
+				log('push:ok block=%s target=%s', blockId, targetId)
+			}
+			for (const refusal of outcome.refusals) {
+				if (refusal.reason === 'rejected') {
+					log('push:rejected block=%s target=%s (receiver did not persist)', blockId, refusal.peerId)
+				} else {
+					log('push:fail block=%s target=%s err=%s', blockId, refusal.peerId, refusal.error)
 				}
 			}
 

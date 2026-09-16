@@ -1770,6 +1770,12 @@ On the receiver, `BlockTransferService.handlePush` persists each pushed block in
 
 Both monitors are initialized through `NetworkManagerService.initRebalanceMonitor()` / `initSpreadOnChurnMonitor()` and stopped together in `NetworkManagerService.stop()`.
 
+### UnderReplicationDrain
+
+The third sender, and the only one driven by a durable record rather than by topology: `UnderReplicationDrain` (`packages/db-p2p/src/repo/under-replication-drain.ts`) walks the under-replication ledger — the per-block record `CoordinatorRepo.commit` writes of which cohort members still miss a block it acknowledged below `full` — and pushes each block to the owed peers that are connected and identified, on start (the entries carried across a restart), on `connection:open` / `peer:identify` (debounced, throttled), and on a re-check timer while anything is outstanding. A confirming peer is taken off the entry; when the entry empties it is deleted and `StorageRepo.emitBlockDurabilityReached` fires the full-replication event. It is constructed directly in `createLibp2pNodeBase`, outside the FRET gate, because it needs only the key network and the node's own store. The rules — who is owed, the solo case that counts no attempt, the per-(block, peer) give-up cleared on reconnect, the revision guard on `satisfy` — are in [packages/db-p2p/docs/repo.md §The under-replication drain and the full-replication event](../packages/db-p2p/docs/repo.md#the-under-replication-drain-and-the-full-replication-event).
+
+**One push loop.** All three senders — `BlockTransferCoordinator`'s push and confirm, the spread loop, the drain — go through `pushBlockToPeers` in `packages/db-p2p/src/cluster/block-transfer-service.ts`: read the block unpinned, build its certification from that read, push to each peer, and read each answer the one true way (a peer holds the block only when its response does NOT list it as missing). Retry, stopping condition (`stopAfterConfirmed`) and the two per-peer deadlines are the caller's; the helper logs nothing per peer and returns a `PushBlockOutcome` the caller's own diagnostics describe.
+
 ## Observability
 
 Transaction metrics are instrumented with `debug` logging and optional verbose tracing:

@@ -478,6 +478,7 @@ describe('CoordinatorRepo — an acknowledged commit below full replication reco
 			settle: async () => { throw new Error('ledger disk full'); },
 			get: async () => undefined,
 			list: async () => [],
+			size: async () => 0,
 			satisfy: async () => undefined,
 			noteAttempt: async () => { },
 			delete: async () => { }

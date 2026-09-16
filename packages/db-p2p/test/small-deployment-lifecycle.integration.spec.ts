@@ -1,24 +1,31 @@
 import { expect } from 'chai';
-import { isFullyDurable } from '@optimystic/db-core';
+import { isFullyDurable, type BlockId } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
 import {
-	attemptWrite, committedBlocks, createMachine, describeWriteAttempt, expectReadable, rowsFor, running,
-	sequentialPhases, startMachine, stopMachine, waitForPair, waitUntilHeldLocally, writeRows,
-	type Machine, type Row
+	attemptWrite, blocksChangedSince, committedBlocks, createMachine, describeWriteAttempt, expectReadable, ledgerOf,
+	rowsFor, running, sequentialPhases, startMachine, stopMachine, waitForPair, waitUntilHeldLocally,
+	waitUntilLedgerClear, writeRows, type Machine, type Row
 } from './util/two-machine-lifecycle.js';
 
 // The growth path every real deployment takes, end to end, over real TCP:
 //
 //   one machine writes alone → restarts → a second machine joins as a backup and must end up
-//   holding the first machine's data locally → both write → one is away for a while → both restart.
+//   holding the first machine's data locally → both write → one is away for a while → both restart
+//   → one is away again and the survivor restarts before it returns.
 //
 // Each step is covered somewhere else in isolation (solo restart in `real-libp2p.integration.spec.ts`,
 // a pair present from the start in `two-node-convergence.integration.spec.ts`, cohort growth with
-// in-process streams in `cohort-growth-heals-single-holder.spec.ts`); past defects lived at the joins
-// between them. This spec runs them as one sequence. `two-phones-over-relay.integration.spec.ts` runs
-// the same lifecycle with every byte between the machines crossing a circuit relay.
+// in-process streams in `cohort-growth-heals-single-holder.spec.ts`, the under-replication drain over a
+// push double in `under-replication-drain.spec.ts`); past defects lived at the joins between them. This
+// spec runs them as one sequence. `two-phones-over-relay.integration.spec.ts` runs the same lifecycle
+// with every byte between the machines crossing a circuit relay.
+//
+// Phases 5 and 7 are where a write acknowledged with the partner away becomes observable end to end:
+// the survivor's under-replication ledger records it, and once the partner is back the drain pushes it
+// into the partner's OWN storage and the ledger stops owing it. Phase 7 restarts the survivor in
+// between, which is the one case an in-memory retry never covered and the durable ledger exists for.
 //
 // Configuration is exactly what `docs/optimystic.md` § Deployment Sizes recommends for two machines,
 // fixed by `startMachine` in `test/util/two-machine-lifecycle.ts`.
@@ -121,15 +128,17 @@ describe('Small deployment lifecycle over real libp2p (solo → backup → away 
 	});
 
 	it('phase 5 — one away: B stops, A writes, B returns; every acknowledged row is on both', async function () {
-		this.timeout(120_000);
+		this.timeout(150_000);
 		const nodeA = running(a);
 		const bPeerId = running(b).peerId;
 		await stopMachine(b);
 		await waitFor(() => !nodeA.getPeers().some(p => p.equals(bPeerId)),
 			{ timeoutMs: 10_000, intervalMs: 100, description: 'A notices B is gone' });
 
+		const before = await committedBlocks(a);
 		const whileAway: Row = { key: 30, value: 'B-away-30' };
 		const attempt = await attemptWrite(a, TREE_ID, [whileAway]);
+		const owed = attempt.refusal ? undefined : await recordedAsOwed(a, before);
 		if (!attempt.refusal) {
 			acknowledge([whileAway]);
 			// Conditional on purpose. Whether a lone survivor should accept at all is still under design
@@ -144,6 +153,14 @@ describe('Small deployment lifecycle over real libp2p (solo → backup → away 
 
 		await startOnTcp(b, [a]);
 		await waitForPair(a, b);
+
+		// The drain, observed before any read from B could repair the rows into place: B's OWN storage
+		// gets the away write, and A's ledger stops owing it. (The rebalance growth arm may land the
+		// bytes first; only the drain clears the ledger.)
+		if (owed) {
+			await waitUntilHeldLocally(b, owed, 'B holds the blocks A wrote while it was away', 90_000);
+			await waitUntilLedgerClear(a, owed.keys(), 'A no longer owes the away write', 60_000);
+		}
 
 		await expectReadable(a, TREE_ID, acknowledged.values(), 'A after B returned');
 		await expectReadable(b, TREE_ID, acknowledged.values(), 'B after its restart');
@@ -175,4 +192,55 @@ describe('Small deployment lifecycle over real libp2p (solo → backup → away 
 		await expectReadable(b, TREE_ID, fromA, 'B reads A\'s final row');
 		await expectReadable(a, TREE_ID, fromB, 'A reads B\'s final row');
 	});
+
+	it('phase 7 — away again, survivor restarts: B stops, A writes, A restarts, B returns; the away write reaches B', async function () {
+		this.timeout(180_000);
+		const nodeA = running(a);
+		const bPeerId = running(b).peerId;
+		await stopMachine(b);
+		await waitFor(() => !nodeA.getPeers().some(p => p.equals(bPeerId)),
+			{ timeoutMs: 10_000, intervalMs: 100, description: 'A notices B is gone' });
+
+		const before = await committedBlocks(a);
+		const whileAway: Row = { key: 60, value: 'B-away-60' };
+		const attempt = await attemptWrite(a, TREE_ID, [whileAway]);
+		const owed = attempt.refusal ? undefined : await recordedAsOwed(a, before);
+		if (!attempt.refusal) acknowledge([whileAway]);
+
+		// The survivor restarts over its storage AND its key-value store, with the partner still away.
+		// Nothing in memory survives this; the ledger must, or the copy is never sent.
+		await stopMachine(a);
+		await startOnTcp(a);
+		if (owed) {
+			const listed = new Set((await ledgerOf(a).list()).map(entry => entry.blockId));
+			const forgotten = [...owed.keys()].filter(blockId => !listed.has(blockId));
+			expect(forgotten, 'blocks A\'s ledger forgot across its restart').to.deep.equal([]);
+		}
+
+		await startOnTcp(b, [a]);
+		await waitForPair(a, b);
+
+		if (owed) {
+			await waitUntilHeldLocally(b, owed, 'B holds the blocks A wrote while it was away, after A restarted', 90_000);
+			await waitUntilLedgerClear(a, owed.keys(), 'A no longer owes the away write, after its restart', 60_000);
+		}
+
+		await expectReadable(a, TREE_ID, acknowledged.values(), 'A after its restart');
+		await expectReadable(b, TREE_ID, acknowledged.values(), 'B after its return');
+
+		console.log(`      phase 7 observed: A's write with B away was ${await describeWriteAttempt(attempt, whileAway, TREE_ID, [a, b])}`);
+	});
 });
+
+/**
+ * The blocks an acknowledged away-write touched on `survivor` (what changed since `before`), asserting
+ * the survivor's ledger records every one of them as owed — the durable half the drain later sends.
+ */
+async function recordedAsOwed(survivor: Machine, before: Map<BlockId, number>): Promise<Map<BlockId, number>> {
+	const touched = await blocksChangedSince(survivor, before);
+	expect(touched.size, 'an acknowledged write touched at least one block').to.be.greaterThan(0);
+	const listed = new Set((await ledgerOf(survivor).list()).map(entry => entry.blockId));
+	const unrecorded = [...touched.keys()].filter(blockId => !listed.has(blockId));
+	expect(unrecorded, `blocks ${survivor.name}'s ledger does not record as owed`).to.deep.equal([]);
+	return touched;
+}

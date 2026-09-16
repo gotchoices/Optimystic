@@ -1,18 +1,33 @@
 import type { IPeerNetwork } from '@optimystic/db-core';
-import { peerIdFromString } from '@libp2p/peer-id';
 import type { PartitionDetector } from './partition-detector.js';
 import type { RestorationCoordinator } from '../storage/restoration-coordinator.js';
 import type { ProofRetainingRepo } from '../storage/block-archive.js';
-import { BlockTransferClient, sourceBlockCertification } from './block-transfer-service.js';
+import { pushBlockToPeers, type PushBlockOutcome, type PushRefusal } from './block-transfer-service.js';
 import type { GrowthOutcome, RebalanceEvent } from './rebalance-monitor.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('block-transfer');
 
+/** One line per peer that did not confirm, under the calling path's tag (`push` / `confirm`). */
+function logRefusals(path: 'push' | 'confirm', blockId: string, refusals: readonly PushRefusal[]): void {
+	for (const refusal of refusals) {
+		if (refusal.reason === 'unreachable') {
+			log('%s:peer-error block=%s peer=%s err=%s', path, blockId, refusal.peerId, refusal.error);
+		} else {
+			log('%s:peer-rejected block=%s peer=%s (receiver did not persist)', path, blockId, refusal.peerId);
+		}
+	}
+}
+
 export interface BlockTransferConfig {
 	/** Max concurrent transfers. Default: 4 */
 	maxConcurrency?: number;
-	/** Timeout per block transfer (ms). Default: 30000 */
+	/**
+	 * Timeout per block transfer (ms). Default: 30000. A pull is bounded as a whole. A push or
+	 * confirm is bounded PER PEER, as two deadlines of this length: one on the dial and one on the
+	 * reply (the `BlockTransferClient.pushBlocks` deadlines, which abort the dial and tear down a
+	 * silent stream rather than leaving them running).
+	 */
 	transferTimeoutMs?: number;
 	/** Retry attempts for failed transfers. Default: 2 */
 	maxRetries?: number;
@@ -347,52 +362,29 @@ export class BlockTransferCoordinator {
 		this.inFlight.add(key);
 
 		try {
+			const owners = newOwners.get(blockId);
+			if (!owners || owners.length === 0) {
+				failed.push(blockId);
+				return;
+			}
+
 			for (let attempt = 0; ; attempt++) {
 				await this.acquireSemaphore();
 				let pushed = false;
 				try {
-					const owners = newOwners.get(blockId);
-					if (!owners || owners.length === 0) {
+					// The shared read-certify-push loop, stopping at the FIRST new owner that accepts. A
+					// receiver running the default `requirePushCertificate` rejects a push with no proof,
+					// so a block whose proof this node never retained (pre-proof history, a diverged
+					// commit) simply fails to place here and is retried/kept as today.
+					const outcome = await this.pushBlock(blockId, owners, 1);
+					if (outcome.status !== 'pushed') {
+						log('push:no-local-data block=%s status=%s', blockId, outcome.status);
 						failed.push(blockId);
 						return;
 					}
-
-					// Read block data from local storage
-					const result = await this.repo.get({ blockIds: [blockId] });
-					const blockResult = result[blockId];
-					if (!blockResult?.block) {
-						log('push:no-local-data block=%s', blockId);
-						failed.push(blockId);
-						return;
-					}
-
-					const blockData = new TextEncoder().encode(JSON.stringify(blockResult.block));
-					// Revision metadata AND the cohort proof for that revision, from this one unpinned
-					// read. A receiver running the default `requirePushCertificate` rejects a push with
-					// no proof, so a block whose proof this node never retained (pre-proof history, a
-					// diverged commit) simply fails to place here and is retried/kept as today.
-					const certification = await sourceBlockCertification(this.repo, blockId, blockResult);
-
-					// Push to at least one new owner
-					for (const ownerPeerIdStr of owners) {
-						try {
-							const peerId = peerIdFromString(ownerPeerIdStr);
-							const client = new BlockTransferClient(peerId, this.peerNetwork, this.protocolPrefix);
-							const response = await this.withTimeout(
-								client.pushBlocks([blockId], [blockData], 'rebalance', certification),
-								this.transferTimeoutMs
-							);
-
-							if (response && !response.missing.includes(blockId)) {
-								pushed = true;
-								log('push:ok block=%s peer=%s', blockId, ownerPeerIdStr);
-								break;
-							}
-						} catch (err) {
-							log('push:peer-error block=%s peer=%s err=%s',
-								blockId, ownerPeerIdStr, (err as Error).message);
-						}
-					}
+					logRefusals('push', blockId, outcome.refusals);
+					pushed = outcome.confirmed.length > 0;
+					if (pushed) log('push:ok block=%s peer=%s', blockId, outcome.confirmed[0]);
 				} finally {
 					this.releaseSemaphore();
 				}
@@ -449,47 +441,28 @@ export class BlockTransferCoordinator {
 				await this.acquireSemaphore();
 				let confirmCount = 0;
 				try {
-					// Read block data from local storage once per attempt.
-					const result = await this.repo.get({ blockIds: [blockId] });
-					const blockResult = result[blockId];
-					if (!blockResult?.block) {
-						// No local bytes to prove replication with — cannot confirm; keep serving.
-						log('confirm:no-local-data block=%s', blockId);
+					// The shared read-certify-push loop, once per attempt, stopping once `floor` DISTINCT
+					// owners hold a current replica. A confirming holder either takes a certified replica
+					// or reports the block missing (see executePush).
+					const outcome = await this.pushBlock(blockId, candidateOwners, floor);
+					if (outcome.status !== 'pushed') {
+						// No local bytes to prove replication with — cannot confirm; keep serving. An
+						// `unavailable` read (this node could not find out what it holds) is folded in
+						// here as it always was: neither outcome can confirm anything.
+						log('confirm:no-local-data block=%s status=%s', blockId, outcome.status);
 						return { confirmed: false, confirmedPeers: allConfirmedPeers, noLocalData: true };
 					}
-
-					const blockData = new TextEncoder().encode(JSON.stringify(blockResult.block));
-					// See executePush: meta + proof are built together from this one unpinned read, so a
-					// confirming holder either takes a certified replica or reports the block missing.
-					const certification = await sourceBlockCertification(this.repo, blockId, blockResult);
-
-					// Count DISTINCT owners that hold a current replica; stop once the floor is reached.
-					const confirmedPeers = new Set<string>();
-					for (const ownerPeerIdStr of candidateOwners) {
-						if (confirmedPeers.size >= floor) break;
-						try {
-							const peerId = peerIdFromString(ownerPeerIdStr);
-							const client = new BlockTransferClient(peerId, this.peerNetwork, this.protocolPrefix);
-							const response = await this.withTimeout(
-								client.pushBlocks([blockId], [blockData], 'rebalance', certification),
-								this.transferTimeoutMs
-							);
-							if (response && !response.missing.includes(blockId)) {
-								confirmedPeers.add(ownerPeerIdStr);
-								// NOTE: allConfirmedPeers never un-records a peer. A holder that confirms in one
-								// round and reports `missing` in a later one stays recorded, on the reasoning that
-								// `handlePush` answers non-missing only after persisting. If the receiver ever
-								// gains a path that drops a just-persisted block (an eviction sweep, a rejected
-								// revision), the growth arm would record a peer that no longer holds a replica —
-								// intersect against the LAST round's confirmedPeers instead of unioning.
-								allConfirmedPeers.add(ownerPeerIdStr);
-							}
-						} catch (err) {
-							log('confirm:peer-error block=%s peer=%s err=%s',
-								blockId, ownerPeerIdStr, (err as Error).message);
-						}
+					logRefusals('confirm', blockId, outcome.refusals);
+					for (const peerId of outcome.confirmed) {
+						// NOTE: allConfirmedPeers never un-records a peer. A holder that confirms in one
+						// round and reports `missing` in a later one stays recorded, on the reasoning that
+						// `handlePush` answers non-missing only after persisting. If the receiver ever
+						// gains a path that drops a just-persisted block (an eviction sweep, a rejected
+						// revision), the growth arm would record a peer that no longer holds a replica —
+						// intersect against the LAST round's confirmed peers instead of unioning.
+						allConfirmedPeers.add(peerId);
 					}
-					confirmCount = confirmedPeers.size;
+					confirmCount = outcome.confirmed.length;
 				} finally {
 					this.releaseSemaphore();
 				}
@@ -509,6 +482,20 @@ export class BlockTransferCoordinator {
 		} finally {
 			this.inFlight.delete(key);
 		}
+	}
+
+	/**
+	 * This coordinator's binding of the shared push loop: rebalance reason, this node's protocol
+	 * prefix, and `transferTimeoutMs` as BOTH per-peer deadlines (see {@link BlockTransferConfig}).
+	 */
+	private pushBlock(blockId: string, peerIds: readonly string[], stopAfterConfirmed: number): Promise<PushBlockOutcome> {
+		return pushBlockToPeers(this.repo, this.peerNetwork, blockId, peerIds, {
+			reason: 'rebalance',
+			protocolPrefix: this.protocolPrefix,
+			stopAfterConfirmed,
+			dialTimeoutMs: this.transferTimeoutMs,
+			responseTimeoutMs: this.transferTimeoutMs
+		});
 	}
 
 	// --- Semaphore for concurrency limiting ---

@@ -20,6 +20,8 @@ import { generateKeyPair } from '@libp2p/crypto/keys';
 import { createLibp2pNode, type NodeOptions } from '../../src/libp2p-node.js';
 import type { OptimysticNode } from '../../src/optimystic-node.js';
 import { MemoryRawStorage } from '../../src/storage/memory-storage.js';
+import { MemoryKVStore } from '../../src/storage/memory-kv-store.js';
+import type { IUnderReplicationLedger } from '../../src/repo/i-under-replication-ledger.js';
 import { RepoClient } from '../../src/repo/client.js';
 
 /** One row of the collection the lifecycle phases write and read back. */
@@ -39,11 +41,14 @@ export interface Machine {
 	readonly networkName: string;
 	readonly privateKey: PrivateKey;
 	readonly storage: MemoryRawStorage;
+	/** The node-local key-value store — today the under-replication ledger — which, like `storage`,
+	 *  must outlive a node process for a restart to mean anything. */
+	readonly kvStore: MemoryKVStore;
 	node?: OptimysticNode;
 }
 
 export async function createMachine(name: string, networkName: string): Promise<Machine> {
-	return { name, networkName, privateKey: await generateKeyPair('Ed25519'), storage: new MemoryRawStorage() };
+	return { name, networkName, privateKey: await generateKeyPair('Ed25519'), storage: new MemoryRawStorage(), kvStore: new MemoryKVStore() };
 }
 
 export function running(machine: Machine): OptimysticNode {
@@ -52,7 +57,7 @@ export function running(machine: Machine): OptimysticNode {
 }
 
 /** How a spec's machines reach each other. The cluster configuration is not part of it — see the module header. */
-export type NetworkShape = Omit<NodeOptions, 'networkName' | 'privateKey' | 'storage' | 'clusterSize' | 'clusterPolicy'>;
+export type NetworkShape = Omit<NodeOptions, 'networkName' | 'privateKey' | 'storage' | 'kvStore' | 'clusterSize' | 'clusterPolicy'>;
 
 export async function startMachine(machine: Machine, shape: NetworkShape): Promise<OptimysticNode> {
 	const node = await createLibp2pNode({
@@ -60,10 +65,18 @@ export async function startMachine(machine: Machine, shape: NetworkShape): Promi
 		networkName: machine.networkName,
 		privateKey: machine.privateKey,
 		storage: machine.storage,
+		kvStore: machine.kvStore,
 		clusterPolicy: { repairCorroborationClusterSize: 2 }
 	});
 	machine.node = node;
 	return node;
+}
+
+/** The running node's under-replication ledger: which blocks it acknowledged before every partner held them. */
+export function ledgerOf(machine: Machine): IUnderReplicationLedger {
+	const ledger = (running(machine) as unknown as { underReplicationLedger?: IUnderReplicationLedger }).underReplicationLedger;
+	if (!ledger) throw new Error(`machine ${machine.name} exposes no under-replication ledger`);
+	return ledger;
 }
 
 export async function stopMachine(machine: Machine): Promise<void> {
@@ -184,6 +197,30 @@ export async function committedBlocks(machine: Machine): Promise<Map<BlockId, nu
 		if (rev !== undefined) held.set(blockId, rev);
 	}
 	return held;
+}
+
+/** The blocks `machine` now holds at a revision `before` did not — what a write since then touched. */
+export async function blocksChangedSince(machine: Machine, before: Map<BlockId, number>): Promise<Map<BlockId, number>> {
+	const changed = new Map<BlockId, number>();
+	for (const [blockId, rev] of await committedBlocks(machine)) {
+		if (before.get(blockId) !== rev) changed.set(blockId, rev);
+	}
+	return changed;
+}
+
+/** Wait until `machine`'s ledger no longer lists any of `blockIds`; on timeout, name the ones it still owes. */
+export async function waitUntilLedgerClear(machine: Machine, blockIds: Iterable<BlockId>, description: string, timeoutMs: number): Promise<void> {
+	const expected = [...blockIds];
+	let owed: BlockId[] = [];
+	try {
+		await waitFor(async () => {
+			const listed = new Set((await ledgerOf(machine).list()).map(entry => entry.blockId));
+			owed = expected.filter(blockId => listed.has(blockId));
+			return owed.length === 0;
+		}, { timeoutMs, intervalMs: 500, description });
+	} catch (err) {
+		throw new Error(`${(err as Error).message}; ${machine.name}'s ledger still owes: ${owed.join(', ')}`);
+	}
 }
 
 /** Which of `expected` `holder` lacks locally at (at least) the expected revision. */

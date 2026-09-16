@@ -40,6 +40,8 @@ import { networkManagerService, type NetworkManagerService } from './network/net
 import { assertCircuitRelayTransport, assertRelayAddrsAdvertisable, planRelayListenAddrs, superviseRelayReservations } from './network/relay-reservation.js';
 import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
 import { BlockTransferCoordinator } from './cluster/block-transfer.js';
+import { pushBlockToPeers } from './cluster/block-transfer-service.js';
+import { UnderReplicationDrain, type UnderReplicationDrainConfig } from './repo/under-replication-drain.js';
 import type { RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
@@ -275,6 +277,18 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * arm is currently the only mechanism that ever creates a second copy).
 	 */
 	rebalance?: Partial<RebalanceMonitorConfig> & { enabled?: boolean };
+
+	/**
+	 * Under-replication drain tuning. The drain sends the copies the under-replication ledger says
+	 * this node still owes — blocks it acknowledged below full replication — to the missing members
+	 * as they become reachable, and fires `onBlockDurabilityReached` on the node's `storageRepo` when
+	 * a block finally has every copy. It needs only the key network and the node's own storage, so it
+	 * runs whether or not arachnode/FRET rebalancing is enabled. Absent -> enabled with defaults (see
+	 * `UnderReplicationDrainConfig`). Set { enabled: false } to leave the ledger unsent on this node.
+	 * The push deadlines are separate because they bound the wire, not the pass: `pushDialTimeoutMs`
+	 * (default 3000) and `pushResponseTimeoutMs` (default 10000), the same caps spread-on-churn uses.
+	 */
+	underReplicationDrain?: Partial<UnderReplicationDrainConfig> & { enabled?: boolean; pushDialTimeoutMs?: number; pushResponseTimeoutMs?: number };
 
 	/** Transaction validator for cluster consensus */
 	validator?: ITransactionValidator;
@@ -1193,6 +1207,47 @@ export async function createLibp2pNodeBase(
 				}
 			};
 		}
+
+		// --- Under-replication drain: send the copies the ledger says this node still owes ---
+		// The coordinator repo above records, per block it acknowledged below `full`, who is still
+		// missing a copy; this pushes those copies as the missing members become reachable and fires
+		// the full-replication event on storageRepo when a block has every copy. Deliberately OUTSIDE
+		// the arachnode `if (fret)` gate below: it needs the key network (cohort re-resolution for an
+		// entry that could not name its members), the node's own store and dialer, and libp2p's
+		// connection events — not the fretAdapter or the restoration coordinator. It overlaps the
+		// rebalance growth arm and spread-on-churn on purpose: all three may push the same block to
+		// the same peer, and the receiver is idempotent, so no cross-monitor coordination is added.
+		// The sink it emits through is one method wide, so it can reach nothing else on the repo.
+		let underReplicationDrain: UnderReplicationDrain | undefined;
+		if ((options.underReplicationDrain?.enabled ?? true) !== false) {
+			const { enabled: _enabled, pushDialTimeoutMs, pushResponseTimeoutMs, ...drainConfig } = options.underReplicationDrain ?? {};
+			underReplicationDrain = new UnderReplicationDrain({
+				libp2p: node,
+				ledger: underReplicationLedger,
+				keyNetwork,
+				partitionDetector,
+				protocolPrefix,
+				pushBlock: (blockId, peerIds) => pushBlockToPeers(storageRepo, keyNetwork, blockId, peerIds, {
+					reason: 'replication',
+					protocolPrefix,
+					dialTimeoutMs: pushDialTimeoutMs ?? 3000,
+					responseTimeoutMs: pushResponseTimeoutMs ?? 10_000
+				}),
+				emit: (event) => storageRepo.emitBlockDurabilityReached(event)
+			}, drainConfig);
+			await underReplicationDrain.start();
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				try {
+					await underReplicationDrain!.stop();
+				} finally {
+					await previousStop();
+				}
+			};
+		}
+		// Expose for tests/diagnostics (mirrors node.spreadOnChurnMonitor / node.rebalanceMonitor).
+		(node as any).underReplicationDrain = underReplicationDrain;
+		(node as any).underReplicationLedger = underReplicationLedger;
 
 		// Initialize Arachnode ring membership and restoration
 		const enableArachnode = options.arachnode?.enableRingZulu ?? true;

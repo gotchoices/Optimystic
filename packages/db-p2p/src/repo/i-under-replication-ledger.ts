@@ -57,6 +57,9 @@ export interface IUnderReplicationLedger {
 	/** Every outstanding entry, oldest `recordedAt` first. The drain pages nothing today: the set is
 	 *  bounded by the node's own owned-block count and shrinks as copies land. */
 	list(): Promise<UnderReplicatedEntry[]>;
+	/** How many entries are outstanding — the drain's "is anything still owed" check between
+	 *  passes, so it must be cheap once warm: answered from memory after the first call. */
+	size(): Promise<number>;
 	/**
 	 * Remove `peerIds` from an entry's missing set, deleting the entry when it empties. Returns the
 	 * remaining entry, or `undefined` when it was deleted or never existed.
@@ -65,8 +68,13 @@ export interface IUnderReplicationLedger {
 	 * unchanged: removing named peers from an unknown set cannot prove it empty. Name its missing set
 	 * first by recording it again at the same `rev`, or `delete` it once the whole re-resolved cohort
 	 * has confirmed.
+	 *
+	 * `heldRev` is the revision the peers confirmed holding. When given, an entry recording a HIGHER
+	 * revision is returned unchanged: a copy of an older revision says nothing about a newer
+	 * shortfall recorded while that copy was in flight. A copy of a newer revision satisfies an older
+	 * entry — a later revision supersedes an earlier one — so `heldRev` above the entry's is fine.
 	 */
-	satisfy(blockId: BlockId, peerIds: readonly string[]): Promise<UnderReplicatedEntry | undefined>;
+	satisfy(blockId: BlockId, peerIds: readonly string[], heldRev?: number): Promise<UnderReplicatedEntry | undefined>;
 	/** Bump the give-up counter after an unsuccessful drain round. A no-op for an absent entry. */
 	noteAttempt(blockId: BlockId): Promise<void>;
 	delete(blockId: BlockId): Promise<void>;

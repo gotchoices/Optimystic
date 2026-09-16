@@ -9,7 +9,7 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { BlockTransferCoordinator } from '../src/cluster/block-transfer.js';
 import type { RebalanceEvent } from '../src/cluster/rebalance-monitor.js';
-import { BlockTransferService, sourceBlockMeta, type BlockTransferRequest, type BlockTransferResponse, buildBlockTransferProtocol } from '../src/cluster/block-transfer-service.js';
+import { BlockTransferService, sourceBlockMeta, pushBlockToPeers, type BlockTransferRequest, type BlockTransferResponse, buildBlockTransferProtocol } from '../src/cluster/block-transfer-service.js';
 import type { RestorationCoordinator } from '../src/storage/restoration-coordinator.js';
 import type { BlockArchive } from '../src/storage/struct.js';
 
@@ -78,10 +78,12 @@ class MockPeerNetwork implements IPeerNetwork {
 	sentRequests: BlockTransferRequest[] = [];
 	responses: Map<string, BlockTransferResponse> = new Map();
 	shouldFail = false;
+	/** Peers whose dial fails, by peer-id string — the per-peer form of `shouldFail`. */
+	failPeers = new Set<string>();
 
 	async connect(peerId: PeerId, protocol: string): Promise<any> {
 		this.connectCalls.push({ peerId, protocol });
-		if (this.shouldFail) {
+		if (this.shouldFail || this.failPeers.has(peerId.toString())) {
 			throw new Error('Connection failed');
 		}
 		// Return a mock stream
@@ -660,6 +662,101 @@ describe('BlockTransferCoordinator', () => {
 				globalThis.clearTimeout = realClearTimeout;
 			}
 		});
+	});
+});
+
+describe('pushBlockToPeers (the one push loop)', () => {
+	// The read-certify-push-interpret sequence every sender runs — `BlockTransferCoordinator`'s
+	// push and confirm, spread-on-churn, the under-replication drain — lives here once. These pin
+	// the interpretation rule (a peer holds the block only when its answer does NOT list it as
+	// missing), the stopping condition, and the two nothing-pushed outcomes.
+	let repo: MockRepo;
+	let peerNetwork: MockPeerNetwork;
+	let peerA: string;
+	let peerB: string;
+	let peerC: string;
+
+	beforeEach(async () => {
+		repo = new MockRepo();
+		peerNetwork = new MockPeerNetwork();
+		[peerA, peerB, peerC] = (await Promise.all([makePeerId(), makePeerId(), makePeerId()])).map(p => p.toString()) as [string, string, string];
+		repo.blocks.set('block-1', makeBlock('block-1'));
+	});
+
+	it('reports confirmed, rejected and unreachable peers apart, and pushes to every peer by default', async () => {
+		peerNetwork.responses.set(peerA, { blocks: { 'block-1': 'data' }, missing: [] });
+		peerNetwork.responses.set(peerB, { blocks: {}, missing: ['block-1'] });
+		peerNetwork.failPeers.add(peerC);
+
+		const outcome = await pushBlockToPeers(repo, peerNetwork, 'block-1' as BlockId, [peerA, peerB, peerC], { protocolPrefix: '/optimystic/x' });
+
+		expect(outcome.status).to.equal('pushed');
+		if (outcome.status !== 'pushed') return;
+		expect(outcome.confirmed).to.deep.equal([peerA]);
+		expect(outcome.refusals).to.deep.equal([
+			{ peerId: peerB, reason: 'rejected' },
+			{ peerId: peerC, reason: 'unreachable', error: 'Connection failed' }
+		]);
+		expect(outcome.skipped).to.deep.equal([]);
+		expect(outcome.latest, 'the revision pushed is the source latest').to.deep.equal({ rev: 1, actionId: 'a1' });
+		expect(outcome.collectionId).to.equal('col-1');
+		expect(outcome.certified, 'this repo retains no proof').to.equal(false);
+		expect(peerNetwork.connectCalls.map(c => c.protocol), 'every dial is under the configured prefix')
+			.to.deep.equal(Array(3).fill(buildBlockTransferProtocol('/optimystic/x')));
+		expect(peerNetwork.sentRequests[0]).to.include({ type: 'push', reason: 'replication' });
+		expect(peerNetwork.sentRequests[0]!.blockMeta).to.deep.equal({ 'block-1': { rev: 1, actionId: 'a1' } });
+	});
+
+	it('stops once stopAfterConfirmed distinct peers confirmed, reporting the rest skipped', async () => {
+		for (const peer of [peerA, peerB, peerC]) peerNetwork.responses.set(peer, { blocks: { 'block-1': 'data' }, missing: [] });
+
+		const outcome = await pushBlockToPeers(repo, peerNetwork, 'block-1' as BlockId, [peerA, peerB, peerC], { stopAfterConfirmed: 2, reason: 'rebalance' });
+
+		expect(outcome.status).to.equal('pushed');
+		if (outcome.status !== 'pushed') return;
+		expect(outcome.confirmed).to.deep.equal([peerA, peerB]);
+		expect(outcome.skipped).to.deep.equal([peerC]);
+		expect(peerNetwork.connectCalls.length, 'the skipped peer was never dialled').to.equal(2);
+		expect(peerNetwork.sentRequests[0]!.reason).to.equal('rebalance');
+	});
+
+	it('a refusal does not count toward the stop, so the loop keeps looking for a holder', async () => {
+		peerNetwork.responses.set(peerA, { blocks: {}, missing: ['block-1'] });
+		peerNetwork.responses.set(peerB, { blocks: { 'block-1': 'data' }, missing: [] });
+
+		const outcome = await pushBlockToPeers(repo, peerNetwork, 'block-1' as BlockId, [peerA, peerB, peerC], { stopAfterConfirmed: 1 });
+
+		expect(outcome.status).to.equal('pushed');
+		if (outcome.status !== 'pushed') return;
+		expect(outcome.confirmed).to.deep.equal([peerB]);
+		expect(outcome.skipped).to.deep.equal([peerC]);
+	});
+
+	it('pushes nothing for a block this node does not hold', async () => {
+		const outcome = await pushBlockToPeers(repo, peerNetwork, 'absent' as BlockId, [peerA]);
+
+		expect(outcome).to.deep.equal({ status: 'no-local-data' });
+		expect(peerNetwork.connectCalls).to.deep.equal([]);
+	});
+
+	it('pushes nothing, and says so distinctly, when this node could not find out what it holds', async () => {
+		repo.get = async () => ({ 'block-1': { state: {}, unavailable: 'unmaterializable' } } as any);
+
+		const outcome = await pushBlockToPeers(repo, peerNetwork, 'block-1' as BlockId, [peerA]);
+
+		expect(outcome).to.deep.equal({ status: 'unavailable', reason: 'unmaterializable' });
+		expect(peerNetwork.connectCalls).to.deep.equal([]);
+	});
+
+	it('treats a peer id that does not parse as unreachable rather than throwing', async () => {
+		peerNetwork.responses.set(peerA, { blocks: { 'block-1': 'data' }, missing: [] });
+
+		const outcome = await pushBlockToPeers(repo, peerNetwork, 'block-1' as BlockId, ['not-a-peer-id', peerA]);
+
+		expect(outcome.status).to.equal('pushed');
+		if (outcome.status !== 'pushed') return;
+		expect(outcome.refusals.map(r => [r.peerId, r.reason])).to.deep.equal([['not-a-peer-id', 'unreachable']]);
+		expect(outcome.confirmed).to.deep.equal([peerA]);
 	});
 });
 

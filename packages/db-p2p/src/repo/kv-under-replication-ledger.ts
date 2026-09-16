@@ -96,7 +96,25 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 		return this.read(blockId);
 	}
 
+	/**
+	 * A full scan. The FIRST scan after start also becomes the eviction index's load, so the drain's
+	 * start pass warms the index for free and the first commit after a restart finds it loaded
+	 * instead of paying for the scan itself.
+	 */
 	async list(): Promise<UnderReplicatedEntry[]> {
+		if (this.indexLoad === undefined) {
+			const scan = this.scan();
+			this.indexLoad = this.indexFrom(scan);
+			return scan;
+		}
+		return this.scan();
+	}
+
+	async size(): Promise<number> {
+		return (await this.index()).size;
+	}
+
+	private async scan(): Promise<UnderReplicatedEntry[]> {
 		const keys = await this.kv.list(UNDER_REPLICATED_KEY_PREFIX);
 		const entries: UnderReplicatedEntry[] = [];
 		// Sequential on purpose: a ledger at its cap under `FileKVStore` is that many files, and
@@ -108,10 +126,14 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 		return entries.sort((a, b) => a.recordedAt - b.recordedAt);
 	}
 
-	async satisfy(blockId: BlockId, peerIds: readonly string[]): Promise<UnderReplicatedEntry | undefined> {
+	async satisfy(blockId: BlockId, peerIds: readonly string[], heldRev?: number): Promise<UnderReplicatedEntry | undefined> {
 		return this.serialized(blockId, async () => {
 			const existing = await this.read(blockId);
 			if (existing === undefined) return undefined;
+			if (heldRev !== undefined && existing.rev > heldRev) {
+				log('satisfy:keep-higher-rev %o', { blockId, heldRev, recordedRev: existing.rev });
+				return existing;
+			}
 			// Unknown is not empty: see `IUnderReplicationLedger.satisfy`.
 			if (existing.missingPeerIds.length === 0) return existing;
 			const confirmed = new Set(peerIds);
@@ -180,20 +202,26 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 	 * first. A failed load is not cached, so the next mutation retries it instead of the ledger
 	 * failing every write for the life of the process.
 	 *
-	 * NOTE: the load is one read per stored entry and runs on the first commit after start; a solo
-	 * node keeps an entry per block it writes, so that commit can stall on slow storage — see
+	 * NOTE: the load is one read per stored entry. It runs on the first `list`, `size` or mutation
+	 * after start — the drain's start pass, when the drain is wired, otherwise the first commit; a
+	 * solo node keeps an entry per block it writes, so a commit that arrives before the load finishes
+	 * still waits on it and can stall on slow storage — see
 	 * `backlog/debt-solo-node-ledger-is-reread-whole-on-first-commit-after-restart`.
 	 */
 	private index(): Promise<Set<BlockId>> {
 		if (this.indexLoad === undefined) {
-			this.indexLoad = this.list()
-				.then(entries => new Set(entries.map(entry => entry.blockId)))
-				.catch((err: unknown) => {
-					this.indexLoad = undefined;
-					throw err;
-				});
+			this.indexLoad = this.indexFrom(this.scan());
 		}
 		return this.indexLoad;
+	}
+
+	private indexFrom(scan: Promise<UnderReplicatedEntry[]>): Promise<Set<BlockId>> {
+		return scan
+			.then(entries => new Set(entries.map(entry => entry.blockId)))
+			.catch((err: unknown) => {
+				this.indexLoad = undefined;
+				throw err;
+			});
 	}
 
 	private async read(blockId: BlockId): Promise<UnderReplicatedEntry | undefined> {

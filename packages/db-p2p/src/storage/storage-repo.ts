@@ -4,6 +4,7 @@ import type {
 	GetBlockResult, IBlock, ActionRev, BlockUnavailableReason,
 	PendValidationHook, UnvalidatablePendPolicy,
 	CollectionId, IBlockChangeNotifier, CollectionChangeListener, CollectionChangeEvent,
+	IBlockDurabilityNotifier, BlockDurabilityListener, BlockDurabilityReachedEvent,
 	StaleFailure
 } from "@optimystic/db-core";
 import {
@@ -158,13 +159,16 @@ export interface IRevisionActionReader {
 	getRevisionAction(blockId: BlockId, rev: number): Promise<ActionId | undefined>;
 }
 
-export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ICommitProofPersister, IRevisionActionReader {
+export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ICommitProofPersister, IRevisionActionReader {
 	private readonly validatePend?: PendValidationHook;
 	private readonly unvalidatablePendPolicy: UnvalidatablePendPolicy;
 	/** Per-collection change listeners; empty sets are pruned on unsubscribe. */
 	private readonly changeListeners = new Map<CollectionId, Set<CollectionChangeListener>>();
 	/** Catch-all change listeners — fire for EVERY collection's commit on this node. */
 	private readonly anyChangeListeners = new Set<CollectionChangeListener>();
+	/** Full-replication listeners — fire when a block this node acknowledged below `full` has
+	 *  reached every cohort member. See {@link IBlockDurabilityNotifier}. */
+	private readonly durabilityListeners = new Set<BlockDurabilityListener>();
 
 	constructor(
 		private readonly createBlockStorage: (blockId: BlockId) => IBlockStorage,
@@ -251,6 +255,33 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				listener(event);
 			} catch (err) {
 				log('onCollectionChange listener threw for collection=%s: %o', event.collectionId, err);
+			}
+		}
+	}
+
+	/** Subscribe to full-replication events. See {@link IBlockDurabilityNotifier}. */
+	onBlockDurabilityReached(listener: BlockDurabilityListener): () => void {
+		this.durabilityListeners.add(listener);
+		let unsubscribed = false;
+		return () => {
+			if (unsubscribed) return;
+			unsubscribed = true;
+			this.durabilityListeners.delete(listener);
+		};
+	}
+
+	/**
+	 * Fire one {@link BlockDurabilityReachedEvent} to every subscriber. The producer is the
+	 * under-replication drain, which reaches this through a one-method sink the node hands it and
+	 * calls it only AFTER the block's ledger entry is gone. Same listener isolation as
+	 * {@link fireChangeListeners}: a throwing listener is logged and the rest still run.
+	 */
+	emitBlockDurabilityReached(event: BlockDurabilityReachedEvent): void {
+		for (const listener of Array.from(this.durabilityListeners)) {
+			try {
+				listener(event);
+			} catch (err) {
+				log('onBlockDurabilityReached listener threw for blocks=%o: %o', event.blockIds, err);
 			}
 		}
 	}

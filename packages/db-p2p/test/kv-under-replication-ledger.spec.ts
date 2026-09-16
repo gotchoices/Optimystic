@@ -232,6 +232,24 @@ describe('KvUnderReplicationLedger', () => {
 			expect(await ledger.get(BLOCK_A)).to.not.equal(undefined);
 		});
 
+		it('a copy of an OLDER revision than the entry records satisfies nothing', async () => {
+			await ledger.record(entry({ rev: 6, missingPeerIds: ['peer-x'] }));
+
+			const captured = await captureLog('under-replication-ledger', async () => {
+				expect(await ledger.satisfy(BLOCK_A, ['peer-x'], 5)).to.deep.equal(entry({ rev: 6, missingPeerIds: ['peer-x'] }));
+			});
+
+			expect(hasTag(captured, 'satisfy:keep-higher-rev')).to.equal(true);
+			expect(await ledger.get(BLOCK_A)).to.not.equal(undefined);
+		});
+
+		it('a copy of the same or a NEWER revision than the entry records satisfies it', async () => {
+			await ledger.record(entry({ rev: 5, missingPeerIds: ['peer-x', 'peer-y'] }));
+			expect((await ledger.satisfy(BLOCK_A, ['peer-x'], 5))?.missingPeerIds).to.deep.equal(['peer-y']);
+			expect(await ledger.satisfy(BLOCK_A, ['peer-y'], 7)).to.equal(undefined);
+			expect(await ledger.get(BLOCK_A)).to.equal(undefined);
+		});
+
 		it('satisfying peers the entry never named changes nothing', async () => {
 			await ledger.record(entry());
 
@@ -353,6 +371,32 @@ describe('KvUnderReplicationLedger', () => {
 		beforeEach(() => {
 			counted = new CountingKVStore();
 			countedLedger = new KvUnderReplicationLedger(counted);
+		});
+
+		it('size answers from the index: the first call loads it, later calls read the store not at all', async () => {
+			await countedLedger.record(entry({ blockId: BLOCK_A }));
+			await countedLedger.record(entry({ blockId: BLOCK_B, recordedAt: 2_000 }));
+			const reopened = new KvUnderReplicationLedger(counted);
+			counted.reset();
+
+			expect(await reopened.size()).to.equal(2);
+			expect(counted.counts).to.deep.equal({ list: 1, get: 2 });
+			expect(await reopened.size()).to.equal(2);
+			expect(counted.counts).to.deep.equal({ list: 1, get: 2 });
+			await reopened.delete(BLOCK_A);
+			expect(await reopened.size()).to.equal(1);
+		});
+
+		it('the first list is also the index load, so a later mutation scans nothing', async () => {
+			await countedLedger.record(entry({ blockId: BLOCK_A }));
+			const reopened = new KvUnderReplicationLedger(counted);
+			counted.reset();
+
+			expect((await reopened.list()).map(e => e.blockId)).to.deep.equal([BLOCK_A]);
+			expect(counted.counts).to.deep.equal({ list: 1, get: 1 });
+			await reopened.record(entry({ blockId: BLOCK_B }));
+			expect(counted.counts, 'one read and one write for the record, no second scan').to.deep.equal({ list: 1, get: 2, set: 1 });
+			expect(await reopened.size()).to.equal(2);
 		});
 
 		it('the first mutation loads the index: one list plus one read per stored entry', async () => {

@@ -78,3 +78,52 @@ export interface IBlockChangeNotifier {
 export function isBlockChangeNotifier(x: unknown): x is IBlockChangeNotifier {
 	return !!x && typeof (x as IBlockChangeNotifier).onCollectionChange === 'function';
 }
+
+/**
+ * One or more blocks reached FULL replication: every member of their cohort is now confirmed to
+ * hold the revision. The complement of the durability class on the write's own result — a write
+ * acknowledged below `full` (`WriteDurability.quorum`) is pending until these events cover its
+ * blocks, at which point a host can move it from "pending" to "saved".
+ *
+ * **Keyed by block, deliberately, never by action.** The node's record of what is still owed (the
+ * under-replication ledger) keeps ONE entry per block, at the block's highest under-replicated
+ * revision: a block written again by a LATER action replaces the earlier entry, so the earlier
+ * action's shortfall is cleared by the later action's copies and reported under the later
+ * action's `actionId` — the earlier action never fires an event of its own. A host that keys its
+ * pending state by action alone therefore waits forever for a superseded write. Hold the block ids
+ * the write's result names (`PendSuccess.blockIds`) and clear each as an event covers it; `rev`
+ * and `actionId` say which write's copies did the covering.
+ */
+export type BlockDurabilityReachedEvent = {
+	/** Blocks that reached full replication in this round. Today's producer reports one block per
+	 *  event; the list shape lets a producer report several blocks of one action together. */
+	readonly blockIds: readonly BlockId[];
+	/** The revision every cohort member now holds — the block's highest under-replicated revision,
+	 *  which supersedes every lower one. */
+	readonly rev: number;
+	/** The action whose recorded shortfall cleared. See the note above on superseded writes. */
+	readonly actionId: ActionId;
+	/** Best-effort; absent when the collection could not be resolved from the block's header. */
+	readonly collectionId?: CollectionId;
+};
+
+export type BlockDurabilityListener = (event: BlockDurabilityReachedEvent) => void;
+
+/**
+ * The seam a host watches for "and now it is really saved": the SAME object that emits
+ * {@link CollectionChangeEvent}s for commits (`StorageRepo` implements both), so a host has one
+ * subscription point for change events, not two.
+ */
+export interface IBlockDurabilityNotifier {
+	/**
+	 * Subscribe to full-replication events. Returns an idempotent unsubscribe. Same listener
+	 * discipline as {@link IBlockChangeNotifier.onCollectionChange}: a throwing listener is logged
+	 * and the rest still run. An event fires only AFTER the node's own record of the shortfall is
+	 * gone, so a listener that re-reads that record sees a consistent picture.
+	 */
+	onBlockDurabilityReached(listener: BlockDurabilityListener): () => void;
+}
+
+export function isBlockDurabilityNotifier(x: unknown): x is IBlockDurabilityNotifier {
+	return !!x && typeof (x as IBlockDurabilityNotifier).onBlockDurabilityReached === 'function';
+}

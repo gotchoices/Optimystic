@@ -287,7 +287,9 @@ Two `Startable` monitors react to `connection:open` / `connection:close` events 
 * **RebalanceMonitor** — after topology shifts, scans tracked blocks and emits `gained` / `lost` / `newOwners` / `grown`, throttled to one scan per minute. `grown` is the cohort-*growth* arm: blocks this node keeps whose cohort acquired new co-responsible peers, which the reaction pushes a copy to — the only path that ever gives a second copy to a block written while the deployment was a single machine.
 * **SpreadOnChurnMonitor** — when peers leave, middle-ranked peers proactively push replicas outward using `BlockTransferClient.pushBlocks()`. Fan-out is bounded to `2·d` where `d` grows under rapid churn or low cluster health, capped at `clusterSize / 2`.
 
-Both monitors are suppressed during detected network partitions (`PartitionDetector`).
+A third, `UnderReplicationDrain`, reacts to the same connection events but from a different source of truth: the durable under-replication ledger, where a coordinator writes down which cohort members still miss a block it acknowledged below `full`. A write held by fewer than every member — a lone survivor's write, a member that did not confirm — is pushed to the missing members as they become reachable, including after the writer itself restarts, and the node's `storageRepo` fires `onBlockDurabilityReached` when a block finally has every copy, so a host can move a change from "pending" to "saved". So a below-full write now heals itself and reports when it has; see [packages/db-p2p/docs/repo.md §The under-replication drain and the full-replication event](../packages/db-p2p/docs/repo.md#the-under-replication-drain-and-the-full-replication-event).
+
+All three are suppressed during detected network partitions (`PartitionDetector`), and all three send blocks through the one `pushBlockToPeers` loop in `packages/db-p2p/src/cluster/block-transfer-service.ts`.
 
 ## Cohort Topics, Reactivity, and Matchmaking
 

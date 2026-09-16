@@ -1,5 +1,6 @@
 import type { Connection, Startable, Stream } from '@libp2p/interface';
-import type { IRepo, PeerId, IPeerNetwork, ActionId, ActionRev, GetBlockResult, IBlock, BlockId } from '@optimystic/db-core';
+import type { IRepo, PeerId, IPeerNetwork, ActionId, ActionRev, GetBlockResult, IBlock, BlockId, BlockUnavailableReason, CollectionId } from '@optimystic/db-core';
+import { peerIdFromString } from '@libp2p/peer-id';
 import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
@@ -521,4 +522,131 @@ export class BlockTransferClient extends ProtocolClient {
 		};
 		return await this.processMessage<BlockTransferResponse>(request, this.protocol, { ...options, maxDataLength: MAX_BLOCK_MESSAGE_BYTES });
 	}
+}
+
+// --- The one push loop ---
+
+/** Why one peer did not confirm a pushed block. */
+export type PushRefusal = {
+	peerId: string;
+	/**
+	 * `rejected`: the peer ANSWERED and listed the block as missing — it did not persist it
+	 * (uncertified under its `requirePushCertificate`, unparseable, or a persist fault; the receiver
+	 * logs which). `unreachable`: the push threw — a dial failure, a deadline, a stream error.
+	 */
+	reason: 'rejected' | 'unreachable';
+	/** The thrown error's message, for `unreachable`. */
+	error?: string;
+};
+
+/**
+ * What {@link pushBlockToPeers} found and did. `no-local-data` and `unavailable` mean nothing was
+ * pushed: the first is "this node holds no revision of the block", the second is "this node could
+ * not find out" (a failed restore, an unmaterializable history) — a caller that prunes on the first
+ * must NOT prune on the second, or it drops a block it may well hold.
+ */
+export type PushBlockOutcome =
+	| { status: 'no-local-data' }
+	| { status: 'unavailable'; reason: BlockUnavailableReason }
+	| {
+		status: 'pushed';
+		/** The revision pushed — the source's `state.latest`. Absent for a repo that reports none. */
+		latest?: ActionRev;
+		/** From the pushed block's header, when it names a collection. */
+		collectionId?: CollectionId;
+		/** Whether a cohort commit proof travelled with the block. Without one a receiver running
+		 *  the default `requirePushCertificate` rejects it, so a `false` here with every peer
+		 *  `rejected` is "cannot place", not "cannot reach". */
+		certified: boolean;
+		/** Peers that hold the block now: each answered without listing it as missing. */
+		confirmed: string[];
+		refusals: PushRefusal[];
+		/** Peers not pushed to because {@link PushBlockOptions.stopAfterConfirmed} was reached first. */
+		skipped: string[];
+	};
+
+export interface PushBlockOptions {
+	/** Default `'replication'`. */
+	reason?: BlockTransferRequest['reason'];
+	/** The `/optimystic/<networkName>` prefix the receivers register their handler under. */
+	protocolPrefix?: string;
+	/** Stop once this many distinct peers have confirmed; the rest are reported `skipped`. Default:
+	 *  every peer is pushed to. */
+	stopAfterConfirmed?: number;
+	/** Per-peer deadlines forwarded to {@link BlockTransferClient.pushBlocks}; omitted = uncapped. */
+	dialTimeoutMs?: number;
+	responseTimeoutMs?: number;
+}
+
+const textEncoder = new TextEncoder();
+
+/**
+ * Push ONE locally held block to `peerIds`, in order: read it unpinned from `repo`, build its
+ * {@link PushCertification} from that same read, push it to each peer, and read each answer the one
+ * way that is true — a peer holds the block only when its response does NOT list the block as
+ * missing, because `handlePush` omits a block from `missing` only after persisting it (or already
+ * holding that revision). A round trip that returns is not a landed replica; a round trip that
+ * throws is not a refusal.
+ *
+ * This is the whole read-certify-push-interpret sequence every sender runs — the rebalance
+ * handoff and confirm (`BlockTransferCoordinator`), spread-on-churn, and the under-replication
+ * drain — so a change to how a block is placed is made here once. Retry, stopping condition and
+ * deadlines are the caller's: `stopAfterConfirmed` for "until one owner accepts" or "until the
+ * floor", the two deadlines for a sequential loop that must not hang on a silent peer, and the
+ * caller wraps the call in its own retry. It logs nothing per peer; the outcome carries what each
+ * caller's own diagnostics say.
+ *
+ * `repo` is the node's OWN store, so the read never consults the cluster and the certification
+ * comes from the proof this node retained; a repo without a proof accessor pushes meta-only
+ * (`certified: false`), which a default-configured receiver refuses.
+ */
+export async function pushBlockToPeers(
+	repo: ArchiveServingRepo,
+	peerNetwork: IPeerNetwork,
+	blockId: BlockId,
+	peerIds: readonly string[],
+	options: PushBlockOptions = {}
+): Promise<PushBlockOutcome> {
+	const result = (await repo.get({ blockIds: [blockId] }))[blockId];
+	if (result?.unavailable !== undefined) {
+		return { status: 'unavailable', reason: result.unavailable };
+	}
+	if (!result?.block) {
+		return { status: 'no-local-data' };
+	}
+	const blockData = textEncoder.encode(JSON.stringify(result.block));
+	const certification = await sourceBlockCertification(repo, blockId, result);
+	const reason = options.reason ?? 'replication';
+	const deadlines = { dialTimeoutMs: options.dialTimeoutMs, responseTimeoutMs: options.responseTimeoutMs };
+	const stopAfter = options.stopAfterConfirmed ?? Number.POSITIVE_INFINITY;
+
+	const confirmed: string[] = [];
+	const refusals: PushRefusal[] = [];
+	const skipped: string[] = [];
+	for (const peerIdStr of peerIds) {
+		if (confirmed.length >= stopAfter) {
+			skipped.push(peerIdStr);
+			continue;
+		}
+		try {
+			const client = new BlockTransferClient(peerIdFromString(peerIdStr), peerNetwork, options.protocolPrefix);
+			const response = await client.pushBlocks([blockId], [blockData], reason, certification, deadlines);
+			if (response.missing.includes(blockId)) {
+				refusals.push({ peerId: peerIdStr, reason: 'rejected' });
+			} else {
+				confirmed.push(peerIdStr);
+			}
+		} catch (err) {
+			refusals.push({ peerId: peerIdStr, reason: 'unreachable', error: err instanceof Error ? err.message : String(err) });
+		}
+	}
+	return {
+		status: 'pushed',
+		latest: result.state?.latest,
+		collectionId: result.block.header?.collectionId,
+		certified: certification.blockProofs !== undefined,
+		confirmed,
+		refusals,
+		skipped
+	};
 }

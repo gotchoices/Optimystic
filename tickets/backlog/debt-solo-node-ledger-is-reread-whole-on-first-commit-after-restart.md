@@ -27,8 +27,12 @@ So after a restart, the first commit on a solo node with N entries under `FileKV
 
 The first commit after a restart costs about what any other commit costs, regardless of how many ledger entries survived the restart.
 
+# What the drain changed
+
+`under-replication-drain-and-full-replication-event` made the ledger's first `list` after start double as the index load (`KvUnderReplicationLedger.list` seeds the index it would otherwise build with a second scan), and the drain's start pass calls `list` as soon as the node is up whenever a pushable peer is connected — so on a node that starts connected, the scan now runs at boot, off the commit path, and the first commit finds the index loaded. A node that starts alone skips the start pass before scanning (nobody to push to), so its first commit still pays the load. The cost of the scan itself is unchanged: one `list` plus one read per stored entry.
+
 # Directions (not a plan)
 
-- Warm the index when the node starts, rather than on the first commit, so the load runs alongside libp2p boot. The first commit still waits if it arrives before the load finishes.
+- Warm the index when the node starts, rather than on the first commit, so the load runs alongside libp2p boot. The first commit still waits if it arrives before the load finishes. (Partly done by the drain — see above — but only when a pushable peer is connected at start; a `size()` call from node wiring at start would cover the solo case too.)
 - Persist what the index needs (presence and eviction order) as its own compact record, so loading it is one read.
 - Revisit whether a `local` commit on a node that has never had a partner needs a per-block entry at all, or whether one "this node has written while alone" marker plus the owned-block set would carry the same information to the drain.
