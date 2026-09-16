@@ -90,6 +90,20 @@ the sweep's configuration helper is the right place to build from.
 Credit: found by sereus's integration suite, which is the only place in this fleet where a partition
 scenario drives optimystic through a real application's read path.
 
+# Arm (2026-09-16): the same error appeared on real phones, but probably not from the same cause
+
+The React Native session's device run ended with two parties sharing one strand over a circuit relay,
+where the joining party's reads failed with `Block default/Message is unavailable
+(cohort-unreachable)` — **including a message it had just written itself** — while membership rows
+crossed the same path between the same peers without trouble.
+
+Same error, and worth cross-referencing, but **do not fold it into this ticket**: the parties were
+connected (one collection resolved while the other did not), so it is not a partition story, and a
+node failing to see its own write is a different shape again. It is filed separately as
+`fix/1-a-second-party-cannot-read-the-messages-it-just-wrote`, and that ticket's job is to find out
+which of the two families it belongs to. If it turns out to be this one, merge them then, with
+evidence; if it turns out to be cohort resolution, this ticket is untouched.
+
 # Arm (2026-09-15, from the reporting session's read-only follow-up): a stale answer is not always the safe one
 
 Four things they established by reading, which narrow this considerably — and one that changes what
