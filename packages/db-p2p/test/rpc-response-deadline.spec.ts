@@ -211,6 +211,60 @@ describe('RPC response deadline (repo, leak fix)', () => {
 		expect(lastStream()?.aborted(), 'deadline must tear down the inner read, not leak it').to.equal(true);
 	});
 
+	// The caller-signal arm of RepoClient's hand-rolled signal combinator (it replaces
+	// `AbortSignal.any`, absent on Hermes): the caller's own abort reason must survive the
+	// combine, and a long-lived caller signal must not keep one listener per call.
+	it('RepoClient forwards a caller signal abort reason and tears down the read', async function () {
+		this.timeout(2000);
+		const peerId = await makePeerId();
+		const { network, lastStream } = silentNetwork();
+		const client = RepoClient.create(peerId, network, '/optimystic/test');
+		const caller = new AbortController();
+		setTimeout(() => caller.abort(new Error('caller gave up')), 30);
+
+		let caught: unknown;
+		try {
+			await client.get({ blockIds: ['b1'] } as any, { expiration: Date.now() + 5_000, signal: caller.signal } as any);
+		} catch (e) { caught = e; }
+
+		expect((caught as Error)?.message).to.equal('caller gave up');
+		expect(lastStream()?.aborted()).to.equal(true);
+	});
+
+	it('RepoClient rejects immediately with the reason of an already-aborted caller signal', async function () {
+		this.timeout(2000);
+		const peerId = await makePeerId();
+		const { network } = silentNetwork();
+		const client = RepoClient.create(peerId, network, '/optimystic/test');
+		const caller = new AbortController();
+		caller.abort(new Error('already cancelled'));
+
+		let caught: unknown;
+		try {
+			await client.get({ blockIds: ['b1'] } as any, { expiration: Date.now() + 5_000, signal: caller.signal } as any);
+		} catch (e) { caught = e; }
+
+		expect((caught as Error)?.message).to.equal('already cancelled');
+	});
+
+	it('RepoClient removes its listener from a reused caller signal after each call', async function () {
+		this.timeout(2000);
+		const peerId = await makePeerId();
+		const blockResults = { b1: { block: { header: { id: 'b1' } } } };
+		const client = RepoClient.create(peerId, respondingNetwork(blockResults), '/optimystic/test');
+		const signal = new AbortController().signal;
+		let live = 0;
+		const add = signal.addEventListener.bind(signal);
+		const remove = signal.removeEventListener.bind(signal);
+		signal.addEventListener = ((type: string, fn: any, opts?: any) => { if (type === 'abort') live++; add(type, fn, opts); }) as any;
+		signal.removeEventListener = ((type: string, fn: any, opts?: any) => { if (type === 'abort') live--; remove(type, fn, opts); }) as any;
+
+		for (let i = 0; i < 3; i++) {
+			await client.get({ blockIds: ['b1'] } as any, { expiration: Date.now() + 5_000, signal } as any);
+		}
+		expect(live, 'listeners attached to the caller signal must all be removed').to.equal(0);
+	});
+
 	it('RepoClient succeeds when the peer replies promptly within the expiration budget', async function () {
 		this.timeout(2000);
 		const peerId = await makePeerId();

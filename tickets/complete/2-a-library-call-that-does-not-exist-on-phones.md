@@ -154,3 +154,25 @@ Also not done, and not filed as tickets (genuinely conditional, not present defe
   (`clearTimeout` in every `finally`) rather than an active-handle-count test — no precedent for
   that test style exists elsewhere in this suite, so I matched the existing convention rather than
   introducing a new one.
+
+# Review findings
+
+Read the implement diff (7e9cfbaf) first, then every touched file plus `relay-reservation.ts` (the pattern cited) and readme § React Native.
+
+**Correctness — checked, no defects.** `sendChallenge`: timer created only when `timeoutMs` is set, cleared in `finally`; dial cap unchanged. `RepoClient` combinator: handles a pre-aborted caller signal, forwards the firing source's `reason`, removes both listeners in `finally`; `once: true` plus explicit removal is harmless. `isAggregateError` `typeof` guard is correct. `any-signal` rejection reasoning is sound (it does drop the reason).
+
+**Docs — found and fixed.** The readme said Optimystic's code does not call `AbortSignal.prototype.throwIfAborted`, which contradicts both the code (`libp2p-key-network.ts`, `open-protocol-stream.ts`) and the eslint comment. Reworded to say it is called and stays a required host polyfill. Also fixed "both linked in the code comment there" (nothing is linked there).
+
+**Tests — gap found and fixed.** The implementer flagged no coverage for the caller-signal arm of the combinator. Added three cases to `test/rpc-response-deadline.spec.ts`: a caller abort's reason reaches the caller and tears down the read; an already-aborted caller signal rejects with its reason; a reused caller signal has zero net `abort` listeners after three calls. Mutation-checked the last one (deleting the `removeEventListener` in `finally` makes it fail).
+
+**Lint rules — checked.** Selectors match only the static `AbortSignal.x(...)` / `Promise.withResolvers(...)` / `new DOMException` spellings; aliased access (`const A = AbortSignal; A.any(...)`) would slip through. Not worth hardening — the rule is a guard against the natural spelling, not an adversary. No action.
+
+**Source hygiene — acceptable.** The combinator is inline in an already-long method with a long comment; extracting it to a helper would be slightly cleaner but it has one call site and the comment is the load-bearing warning against re-simplifying to `any-signal`. Left as is.
+
+**Scope follow-up — confirmed filed.** `tickets/implement/rn-entry-throws-during-import-on-a-bare-phone.md` exists for the module-scope `TextEncoder`/`TextDecoder` and `structuredClone` findings. No new tickets from this review.
+
+**Implementer-flagged `.unref()` inconsistency** (`cluster-repo.ts`, `libp2p-node-base.ts` call `.unref()` unguarded vs. `relay-reservation.ts`'s guarded helper) — not a defect: readme declares timer `.ref()/.unref()` a required host polyfill. Conditional only on that polyfill requirement being dropped; the existing eslint `NOTE:` already names timer `.unref()` in its not-banned list, so no further tripwire added.
+
+**Unverified (needs a device):** whether Hermes defines `AggregateError`; the guard is safe either way.
+
+**Validation:** `yarn lint` clean; `yarn workspace @optimystic/db-p2p build` clean; `yarn workspace @optimystic/db-p2p test` 2809 passing, 62 pending (pre-existing).
