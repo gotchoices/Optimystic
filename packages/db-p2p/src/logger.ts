@@ -113,7 +113,12 @@ function formatError(v: Error, indent = ''): string {
 }
 
 function isAggregateError(err?: any): err is AggregateError {
-	return err instanceof AggregateError || (err?.name === 'AggregateError' && Array.isArray(err.errors))
+	// `typeof` guards the bare identifier: if Hermes (React Native's JS engine) doesn't
+	// define a global `AggregateError`, `err instanceof AggregateError` would throw a
+	// ReferenceError right here on the error-formatting path — exactly where a thrown
+	// exception would otherwise go unreported. `typeof` never throws for an undeclared
+	// global, so this falls straight through to the duck-typed check either way.
+	return (typeof AggregateError !== 'undefined' && err instanceof AggregateError) || (err?.name === 'AggregateError' && Array.isArray(err.errors))
 }
 
 function printError(err: Error, indent = ''): string {

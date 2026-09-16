@@ -29,13 +29,23 @@ export class DisputeClient extends ProtocolClient {
 		// arbitrator" behavior. Also apply the default dial cap so a challenge to an
 		// unreachable arbitrator fails the dial fast even when no `timeoutMs` is given;
 		// this does not alter the response semantics (still bounded only by the signal).
-		const signal = timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined;
-		const response = await this.processMessage<{ type: 'vote'; vote: ArbitrationVote }>(
-			message,
-			this.protocol,
-			{ signal, dialTimeoutMs: DEFAULT_DIAL_TIMEOUT_MS, maxDataLength: MAX_CONTROL_MESSAGE_BYTES }
-		);
-		return response.vote;
+		//
+		// Explicit AbortController + timer rather than `AbortSignal.timeout`, which Hermes
+		// (React Native's JS engine) does not provide — same pattern as `dialRelay` in
+		// network/relay-reservation.ts. The timer is cleared on every exit path below so a
+		// finished call never holds a timer (and the node it references) alive.
+		const controller = timeoutMs ? new AbortController() : undefined;
+		const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+		try {
+			const response = await this.processMessage<{ type: 'vote'; vote: ArbitrationVote }>(
+				message,
+				this.protocol,
+				{ signal: controller?.signal, dialTimeoutMs: DEFAULT_DIAL_TIMEOUT_MS, maxDataLength: MAX_CONTROL_MESSAGE_BYTES }
+			);
+			return response.vote;
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
 	}
 
 	/** Send a resolution to a peer (broadcast) */

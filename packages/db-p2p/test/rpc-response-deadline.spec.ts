@@ -156,6 +156,35 @@ describe('RPC response deadline (cluster / sync / dispute)', () => {
 		await client.sendResolution({ disputeId: 'd1' } as any);
 		// No throw == success (sendResolution returns void).
 	});
+
+	// `sendChallenge` bounds its deadline with an explicit AbortController + timer (not
+	// `AbortSignal.timeout`, which Hermes/React Native does not provide — see
+	// dispute/client.ts). These pin the behavior the timer must reproduce: give up on a
+	// silent arbitrator within `timeoutMs`, and don't interfere with a prompt reply.
+	it('DisputeClient.sendChallenge gives up when the arbitrator goes silent (timeoutMs configured)', async function () {
+		this.timeout(2000);
+		const peerId = await makePeerId();
+		const { network } = silentNetwork();
+		const client = DisputeClient.create(peerId, network, '/optimystic/test');
+
+		const t0 = Date.now();
+		let caught: unknown;
+		try {
+			await client.sendChallenge({ disputeId: 'd1' } as any, 80);
+		} catch (e) { caught = e; }
+		const elapsed = Date.now() - t0;
+		expect(caught, 'a silent arbitrator must not hang the caller').to.be.instanceOf(Error);
+		expect(elapsed).to.be.lessThan(1500);
+	});
+
+	it('DisputeClient.sendChallenge succeeds when the arbitrator replies promptly (timeoutMs configured)', async function () {
+		this.timeout(2000);
+		const peerId = await makePeerId();
+		const vote = { type: 'vote', vote: { arbitrator: 'a1', verdict: 'agree-with-challenger' } };
+		const client = DisputeClient.create(peerId, respondingNetwork(vote), '/optimystic/test');
+		const result = await client.sendChallenge({ disputeId: 'd1' } as any, 5000);
+		expect(result).to.deep.equal(vote.vote);
+	});
 });
 
 describe('RPC response deadline (repo, leak fix)', () => {

@@ -698,6 +698,10 @@ together. It never runs the bundle, so the global polyfills above are not verifi
 
 Optimystic's own code does not require a global `Buffer` — it encodes with `uint8arrays`, and lint (`no-restricted-globals` in `eslint.config.js`) keeps it that way.
 
+Optimystic's own code also does not call `AbortSignal.timeout`, `AbortSignal.any`, `AbortSignal.prototype.throwIfAborted`, `Promise.withResolvers`, or construct `DOMException` — none of those are guaranteed under Hermes. Every deadline is an explicit `AbortController` plus a timer, cleared on every exit path (see `dialRelay` in `src/network/relay-reservation.ts` and `RepoClient.processRepoMessage` in `src/repo/client.ts`, which hand-rolls the "abort on any of several signals" case rather than using `AbortSignal.any` or the `any-signal` package — both linked in the code comment there). `no-restricted-syntax` in `eslint.config.js` keeps it that way.
+
+**Dormant, not yet reached:** `crypto.subtle` on React Native provides only `digest`. `@libp2p/crypto`'s ECDSA/RSA import-export and `@libp2p/keychain`'s AES-GCM call other `crypto.subtle` methods and would throw if a host application reached them; nothing in Optimystic's own code path does — peer identity uses Ed25519 through `@noble/curves`/`@noble/hashes`, not the platform `crypto.subtle`. Revisit if a host ever adds a feature that reaches `@libp2p/keychain` or a non-Ed25519 key type on React Native.
+
 See the [Sereus reference-app-rn](https://github.com/gotchoices/sereus/tree/master/packages/reference-app-rn/polyfills) for working polyfill implementations.
 
 ### Ring Transitions

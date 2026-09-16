@@ -36,6 +36,51 @@ const NO_BUFFER_GLOBAL = {
 	name: 'Buffer',
 	message: "Buffer is a Node-only global, absent under Hermes/React Native. Encode with `uint8arrays` (toString/fromString) instead — see packages/db-p2p/src/cluster/block-transfer-service.ts.",
 };
+// Hermes has neither `AbortSignal.timeout` nor `AbortSignal.any` — confirmed on device (see
+// tickets/complete/2-a-library-call-that-does-not-exist-on-phones.md). Use an explicit
+// `AbortController` plus a timer instead, cleared on every exit path — see `dialRelay` in
+// packages/db-p2p/src/network/relay-reservation.ts, and the combinator in
+// packages/db-p2p/src/repo/client.ts for the "any of several signals" case (NOT the
+// `any-signal` package, which discards the source signal's abort `reason` — see the comment
+// at that call site).
+const NO_ABORT_SIGNAL_TIMEOUT = {
+	selector: "CallExpression[callee.object.name='AbortSignal'][callee.property.name='timeout']",
+	message: 'AbortSignal.timeout is unreliable on Hermes/React Native. Use an explicit AbortController + timer instead — see dialRelay in network/relay-reservation.ts.',
+};
+const NO_ABORT_SIGNAL_ANY = {
+	selector: "CallExpression[callee.object.name='AbortSignal'][callee.property.name='any']",
+	message: 'AbortSignal.any is absent on Hermes/React Native, and `any-signal` (the usual replacement) drops the source reason. Use an explicit combinator instead — see repo/client.ts.',
+};
+
+// NOTE: `AbortSignal.prototype.throwIfAborted()` is NOT banned here, unlike the two static
+// methods above. `libp2p-key-network.ts` and `network/open-protocol-stream.ts` already call it
+// (as `signal?.throwIfAborted()`) on the strength of the readme's § React Native polyfill table,
+// which already lists it as required — libp2p, @libp2p/circuit-relay-v2 and it-pushable need it
+// too, so a host targeting Hermes must supply it regardless of what this package's own two call
+// sites do. Banning it here would just move the requirement into this file without removing it.
+//
+// `Promise.withResolvers`, unlike the above, has zero call sites in this repo today — this
+// package only avoids it pre-emptively. libp2p's own dependencies (yamux, it-queue, mortice,
+// ping, abort-error) use it heavily, so this rule cannot catch the class of failure it causes
+// on Hermes — only our own source reaching for it.
+const NO_PROMISE_WITH_RESOLVERS = {
+	selector: "CallExpression[callee.object.name='Promise'][callee.property.name='withResolvers']",
+	message: 'Promise.withResolvers is ES2024 and Hermes/React Native does not provide it. Build the { promise, resolve, reject } triple by hand instead.',
+};
+const NO_DOM_EXCEPTION = {
+	selector: "NewExpression[callee.name='DOMException']",
+	message: 'DOMException construction is not guaranteed under Hermes/React Native. Throw a plain named Error instead.',
+};
+// NOTE: this Hermes-global guard is deliberately not exhaustive. `TextEncoder`/`TextDecoder`/
+// `structuredClone`/timer `.ref()`/`.unref()`/`AbortSignal.prototype.throwIfAborted` are all used
+// too pervasively (and are already required, declared polyfills per readme.md § React Native) to
+// ban outright without either breaking real call sites or demanding a repo-wide rewrite; a lint
+// rule for `ReadableStream`/`WritableStream`/`TransformStream`, `Symbol.asyncIterator`,
+// `crypto.getRandomValues`, or `crypto.subtle.digest` would currently be pure prevention (nothing
+// in `packages/*/src` reaches for them today). If any of those ever gain a first-party call site,
+// that is the moment to add a rule for it here — see the evidenced list in
+// tickets/complete/2-a-library-call-that-does-not-exist-on-phones.md for the full inventory this
+// was checked against.
 
 // Flat config (ESLint 9). Repo is ESM + yarn 4 workspaces + TypeScript throughout.
 // `eslint .` walks the tree from root, so this single config covers every workspace —
@@ -102,7 +147,7 @@ export default tseslint.config(
 		// `test/support/capture-log.ts` legitimately imports `debug` — that is its whole job.
 		files: ['packages/*/src/**/*.ts'],
 		rules: {
-			'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_DIRECT_DEBUG_IMPORT, NO_STATIC_BLOCK],
+			'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_DIRECT_DEBUG_IMPORT, NO_STATIC_BLOCK, NO_ABORT_SIGNAL_TIMEOUT, NO_ABORT_SIGNAL_ANY, NO_PROMISE_WITH_RESOLVERS, NO_DOM_EXCEPTION],
 			'no-restricted-globals': ['error', NO_BUFFER_GLOBAL],
 			// `no-restricted-globals` only sees the bare identifier; close the qualified spellings too.
 			'no-restricted-properties': ['error',

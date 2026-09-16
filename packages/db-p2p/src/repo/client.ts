@@ -87,9 +87,26 @@ export class RepoClient extends ProtocolClient implements IRepo {
 			() => deadlineController.abort(new Error('RepoClient timeout')),
 			deadlineMs
 		)
-		const combinedSignal = options?.signal
-			? AbortSignal.any([options.signal, deadlineController.signal])
-			: deadlineController.signal
+		// Explicit combinator rather than the native `AbortSignal.any`, which Hermes
+		// (React Native's JS engine) does not provide. This has to forward whichever
+		// source signal's *reason* fired — that's how the caller-facing 'RepoClient
+		// timeout' message above (and any reason a caller's own `options.signal` carries)
+		// survives the combine. `any-signal` (the package libp2p itself uses for this) was
+		// tried and rejected here: it calls the composite `AbortController.abort()` with no
+		// argument, which discards the source reason and replaces it with a generic
+		// AbortError — confirmed against both Node's native `AbortSignal.any` and
+		// `any-signal@4.1.1` directly. Listeners are removed in the `finally` below so a
+		// long-lived caller `options.signal` never accumulates one per call.
+		const abortController = new AbortController()
+		const forwardAbort = (source: AbortSignal) => (): void => abortController.abort(source.reason)
+		const onCallerAbort = options?.signal ? forwardAbort(options.signal) : undefined
+		const onDeadlineAbort = forwardAbort(deadlineController.signal)
+		deadlineController.signal.addEventListener('abort', onDeadlineAbort, { once: true })
+		if (options?.signal) {
+			if (options.signal.aborted) abortController.abort(options.signal.reason)
+			else options.signal.addEventListener('abort', onCallerAbort!, { once: true })
+		}
+		const combinedSignal = abortController.signal
 		let response: any
 		try {
 			response = await super.processMessage<any>(message, preferred, {
@@ -101,6 +118,8 @@ export class RepoClient extends ProtocolClient implements IRepo {
 			})
 		} finally {
 			clearTimeout(timer)
+			deadlineController.signal.removeEventListener('abort', onDeadlineAbort)
+			if (onCallerAbort) options?.signal?.removeEventListener('abort', onCallerAbort)
 		}
 
 		// Type the redirect branch against the payload the service actually produces
