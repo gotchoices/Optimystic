@@ -44,8 +44,8 @@ const SIZES = [1, 2, 3, 4, 5] as const;
 // ── The documented arithmetic ────────────────────────────────────────────────────────────────────────
 //
 // packages/db-p2p/docs/cluster.md: the promise phase needs a super-majority, `ceil(0.75 × n)` approving
-// promises ("Phase 1: Promise Collection"); the commit phase needs a simple majority, `floor(0.51 × n) + 1`
-// commit signatures ("Phase 2: Commit Execution"). docs/correctness.md / `CoordinatorRepo.commit`: the
+// promises ("Phase 1: Promise Collection"); the commit phase needs a simple majority, ">50%" ("Phase 2: Commit
+// Execution"), which `ClusterCoordinator` computes as `floor(0.51 × n) + 1`. docs/correctness.md / `CoordinatorRepo.commit`: the
 // writer is acknowledged only when durable holders, the coordinator included, are a strict majority of the
 // cohort. A cohort of one runs none of it (the solo short-circuit).
 //
@@ -321,8 +321,14 @@ describe('Transaction sweep across node counts (one scenario at 1–5 machines)'
 					// (`CoordinatorRepo.pendThroughCluster`, `cohortPendRefusals`) — an all-lose round that the retry
 					// loop's jittered backoff separates. The guarantee is that no revision is ever won twice, and
 					// that is what is asserted; how the first round went is reported in the table.
-					const winnersOfContested = new Set(committed(all).filter(a => a.rev === contestedRev).map(a => a.actionId));
-					expect(winnersOfContested.size, `actions that committed rev ${contestedRev} (${describeAttempts(all)})`).to.equal(1);
+					const winnersByRev = new Map<number, Set<ActionId>>();
+					for (const commit of committed(all)) {
+						winnersByRev.set(commit.rev!, (winnersByRev.get(commit.rev!) ?? new Set()).add(commit.actionId));
+					}
+					expect(winnersByRev.get(contestedRev)?.size, `actions that committed rev ${contestedRev} (${describeAttempts(all)})`).to.equal(1);
+					// ...and no LATER revision either: a loser that rebased and retried must not collide again unseen.
+					const wonTwice = [...winnersByRev].filter(([, actions]) => actions.size > 1).map(([rev]) => rev);
+					expect(wonTwice, `revisions committed by more than one action (${describeAttempts(all)})`).to.deep.equal([]);
 
 					// At the application: each write either landed (the loser rebased onto the winner) or gave up with
 					// the retry loop's own typed error — nothing else.
@@ -402,7 +408,8 @@ describe('Transaction sweep across node counts (one scenario at 1–5 machines)'
 						expect(commits.length, 'the acknowledged write committed').to.be.at.least(1);
 						for (const commit of commits) {
 							const holders = await durableHolders(mesh.nodes, commit);
-							expect(holders.length, `holders of action ${commit.actionId}`).to.be.at.least(durableBar(size));
+							// At least as many as the answer claimed — the reported count is storage fact, not optimism.
+							expect(holders.length, `holders of action ${commit.actionId}`).to.be.at.least(Math.max(durableBar(size), durability!.confirmed));
 							expect(holders, 'the unreachable member cannot hold it').to.not.include(away);
 						}
 						acknowledged.set(key, value);
