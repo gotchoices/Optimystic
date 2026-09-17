@@ -19,9 +19,16 @@
  * contention that sharpens this reproducer also makes a SEPARATE defect reachable: at 8, the FIXED
  * build fails 2 executions in 3 with `ValidatorRejectionError` — "pending conflict: block … held by
  * unresolved action(s)" — which is a transient optimistic-concurrency condition being answered as a
- * permanent validator rejection, filed as `bug-a-contended-pend-refusal-is-permanent-on-a-small-cohort`.
+ * permanent validator rejection, filed as `a-contended-pend-refusal-is-permanent-on-a-small-cohort`.
  * A guard that flakes on an unrelated defect is worth less than a weaker guard that does not, so this
  * spec stays at the contention where it is stable. Raise it to 8 to reproduce either defect by hand.
+ *
+ * 4 reduces that exposure but does not remove it: a second review pass measured the same
+ * `ValidatorRejectionError` once in 15 executions at 4, on runs verified to be against an unmodified
+ * `operationsConflict`. So a red here is one of three things, in descending likelihood: that filed
+ * defect (the message says `pending conflict: block … held by unresolved action(s)`), a genuine
+ * regression of this ticket (the message says `TornActionError`), or a row unreadable from the other
+ * node. Read the message before assuming the escape broke.
  *
  * The delays are random, not seeded, so the spec samples interleavings rather than pinning three of
  * them. That asymmetry is deliberate and safe in one direction only: a random schedule can never

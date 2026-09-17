@@ -1556,8 +1556,9 @@ export class ClusterMember implements ICluster {
 				// permanent `ValidatorRejectionError` — exactly the "lost race masquerading as a
 				// validator rejection" that `ClusterCoordinator`'s vote-counting comment says must not
 				// happen. Measured on a two-member mesh under concurrent writes; see
-				// `tickets/backlog/bug-a-contended-pend-refusal-is-permanent-on-a-small-cohort.md` for
-				// the reproducer and for why neither candidate fix is a one-liner.
+				// the ticket `a-contended-pend-refusal-is-permanent-on-a-small-cohort` for the reproducer
+				// and for why neither candidate fix is a one-liner. (Named by slug, not by stage folder:
+				// it has already moved once, from `backlog/` to `fix/`.)
 				for (const blockId of blockIds) {
 					const rivals = (blockResults[blockId]?.state?.pendings ?? []).filter(actionId => actionId !== pendRequest.actionId);
 					if (rivals.length > 0) {

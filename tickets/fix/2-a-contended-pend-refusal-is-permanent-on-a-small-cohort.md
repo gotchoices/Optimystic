@@ -3,7 +3,8 @@ architecture: docs/correctness.md
 files:
   - packages/db-p2p/src/cluster/cluster-repo.ts (`validatePendOperations`, the branch that returns `pending conflict: block … held by unresolved action(s)` — it votes *reject*)
   - packages/db-p2p/src/repo/cluster-coordinator.ts (the `rejected-by-validators` branch — every reject past the threshold becomes `ValidatorRejectionError`)
-  - packages/db-p2p/test/concurrent-two-member-writes-do-not-tear.spec.ts (raise `PairsPerRun` to 8 to reproduce)
+  - packages/db-p2p/src/repo/coordinator-repo.ts (`classifyPendingConflictRejection` — the safety net that already converts this rejection into a retryable conflict, and only when it can corroborate the rival in its OWN storage)
+  - packages/db-p2p/test/concurrent-two-member-writes-do-not-tear.spec.ts (raise `PairsPerRun` to 8 to reproduce; it also fails at the shipped 4, about 1 execution in 15)
 repro: verified
 severity: wrong-result
 likelihood: normal-use
@@ -41,7 +42,34 @@ block <id> held by unresolved action(s) <actionId>
 
 surfaced to the caller as `Error: Some peers did not complete: … cause=Transaction rejected by validators`. No `TornActionError` appeared in any of them — the tearing that ticket fixed is gone; this is a different failure reaching the same user.
 
-At the shipped `PairsPerRun` of 4 the spec is green over many executions, so nothing in the committed suite currently fails on this.
+At the shipped `PairsPerRun` of 4 the spec is *mostly* green, but not reliably: in a second, independent review pass it failed **1 of 15 executions** that were each verified to have run against an unmodified `race-resolution.ts` (source hashed before and after every execution, because two agents were editing the tree concurrently). The failure was this defect, not a tear. So the committed suite does go red on this — rarely enough to read as an unexplained flake rather than as a signal, which is the worst of both.
+
+## A second candidate site: the coordinator's safety net has a hole
+
+There is already a mechanism meant to stop this rejection reaching the caller, and it is worth knowing about before choosing between the two fixes above, because it explains why the failure is *intermittent* rather than constant.
+
+`CoordinatorRepo.classifyPendingConflictRejection` catches exactly this `ValidatorRejectionError` and converts it into a retryable conflict — but it corroborates the claim only against the coordinator's **own** local storage: it re-reads the blocks and requires some block's `state.pendings` to carry a rival action id. When it cannot corroborate, the rejection stays a throw (the method's own doc comment says so: "Unconfirmed — including read errors during confirmation — stays a throw, preserving fail-fast for genuine validation faults").
+
+Under the injected latency the refusing member is routinely *ahead* of the coordinator: it has already applied the rival's pend, the coordinator has not, so the coordinator finds no rival locally and the net misses.
+
+One captured run shows both outcomes side by side, two seconds apart on the same block, same cohort, same shape of rejection:
+
+```
+18:31:47.550  coordinator-repo:<A> pend-error  actionId=i8mH6OvZHwMOvvU5IRvB0w
+   error='Transaction rejected by validators (1/2 rejected): <B>: pending conflict:
+          block hLkUSY5… held by unresolved action(s) s7RBFf3R9St7afvLJhEYKg'
+   (no pend-conflict-classified line follows — thrown, and this is the failure the spec reports)
+
+18:31:48.734  coordinator-repo:<A> pend-error  actionId=aZwpPONnjW2gqAV4DOgUFQ
+   error='… pending conflict: block hLkUSY5… held by unresolved action(s) Ho1bA41MvrFkhIuIkUtqjA'
+18:31:48.735  coordinator-repo:<A> pend-conflict-classified  rivals=[hLkUSY5…:Ho1bA41MvrFkhIuIkUtqjA, …]
+18:31:49.361  coordinator-repo:<A> pend-cluster-complete     actionId=aZwpPONnjW2gqAV4DOgUFQ  localVerdict=success
+   (corroborated, retried, landed)
+```
+
+Captured with `DEBUG='optimystic:db-p2p:coordinator-repo*,optimystic:db-core:collection*'` on the mesh spec at `PairsPerRun` 4.
+
+This does not replace either fix above — a net that catches a miscategorised refusal most of the time is still worse than not miscategorising it — but it is a third place the decision could be made, and it is the cheapest to reason about: the sibling `classifyStaleRejection` already carries a `NOTE:` anticipating exactly this ("when only remote members saw the newer revision (local storage still behind), staleness can't be confirmed locally and the rejection stays a throw. If that shows up in practice, extend confirmation with a quorum read"). **That revisit condition has now tripped**, for the pending-conflict sibling rather than the stale one. Whoever takes this ticket should settle whether the corroboration discipline changes for both classifiers or neither.
 
 # What would fix it, and what would not
 
