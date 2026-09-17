@@ -8,6 +8,13 @@ files:
   - packages/db-p2p/docs/cluster.md ("Conflict Detection Algorithm" — its code excerpt was already stale)
 difficulty: medium
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-09-17T18:11:19.665Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\cancelling-a-refused-write-blocks-another-writers-commit.review.2026-09-17T18-11-19-661Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 
 # What changed
 
