@@ -21,7 +21,7 @@ const log = createLogger('transactor-source');
  * transactor's retry round: every reachable coordinator served content it could not confirm current)
  * must not pose as an answer for a view that should CONTAIN the claimed revision. Two such views, the
  * same test the coordinator applies when it stamps: an UNPINNED read — the tail read is the one seam
- * where a lagging collection can learn the truth (Collection.bootstrapContext), and silently serving
+ * where a lagging collection can learn the truth (Collection.checkedLogTail), and silently serving
  * doubted content there is exactly how a collection view freezes forever — and a read PINNED AT OR
  * ABOVE the claim, whose snapshot is missing a revision the cohort says exists inside it. A read pinned
  * strictly BELOW the claim keeps working: it legitimately asks for an older view, which is being

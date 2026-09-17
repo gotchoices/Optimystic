@@ -90,7 +90,7 @@ describe('Collection', () => {
       commit: (req: CommitRequest) => inner.commit(req),
     })
 
-    /** The tail block id the synced header points at — the block `bootstrapContext` reads. */
+    /** The tail block id the synced header points at — the block every open and refresh reads alongside the header. */
     const syncedTailId = async (collection: Collection<TestAction>): Promise<string> => {
       await collection.updateAndSync()
       const headerEntry = (await transactor.get({ blockIds: [collectionId] }))[collectionId]
@@ -112,7 +112,7 @@ describe('Collection', () => {
     })
 
     it('open throws when the LOG TAIL is unavailable, not just the header', async () => {
-      // The tail is read straight off the transactor (bootstrapContext), bypassing
+      // The tail is read straight off the transactor (Collection.checkedLogTail), bypassing
       // TransactorSource — so it needs its own flag check. Losing it means opening with no
       // ActionContext: the chain walk cannot see pending non-tail blocks and the collection
       // reads as though they were never written.
@@ -132,6 +132,43 @@ describe('Collection', () => {
 
       wedged.add(collectionId)
       await expect(collection.update()).to.be.rejectedWith(BlockUnavailableError)
+    })
+
+    // A refresh asks for the tail in the same request as the header and may stop on that answer
+    // alone, so the tail's flags must be checked on that path too — not only at open.
+    it('update() throws when the LOG TAIL goes unavailable after the collection is open, even with nothing new', async () => {
+      const wedged = new Set<string>()
+      const flaky = makeUnavailableBlockTransactor(transactor, wedged)
+      const collection = await Collection.createOrOpen<TestAction>(flaky, collectionId, initOptions)
+      const tailId = await syncedTailId(collection)
+      await collection.update()
+
+      wedged.add(tailId)
+      await expect(collection.update()).to.be.rejectedWith(BlockUnavailableError)
+    })
+
+    it('update() throws BlockPossiblyStaleError when the LOG TAIL is doubted after open, even with nothing new', async () => {
+      const created = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      const tailId = await syncedTailId(created)
+      let doubt = false
+      const doubted: ITransactor = {
+        async get(gets: BlockGets): Promise<GetBlockResults> {
+          const res = await transactor.get(gets)
+          if (doubt && gets.context === undefined && res[tailId]) {
+            res[tailId] = { ...res[tailId]!, unconfirmedAheadRev: (res[tailId]!.state.latest?.rev ?? 0) + 1 }
+          }
+          return res
+        },
+        getStatus: (refs: ActionBlocks[]) => transactor.getStatus(refs),
+        pend: (req: PendRequest) => transactor.pend(req),
+        cancel: (ref: ActionBlocks) => transactor.cancel(ref),
+        commit: (req: CommitRequest) => transactor.commit(req),
+      }
+      const collection = (await Collection.open<TestAction>(doubted, collectionId, initOptions))!
+      await collection.update()
+
+      doubt = true
+      await expect(collection.update()).to.be.rejectedWith(BlockPossiblyStaleError)
     })
 
     // Ticket coordinator-serves-stale-data-as-if-confirmed: the tail read that seeds a
