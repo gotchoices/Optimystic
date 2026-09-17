@@ -13,7 +13,7 @@ import { buildColumnIndexMap, getTypeOrDefault, inferType } from '@quereus/quere
 import type { ITransactor } from '@optimystic/db-core';
 import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
 import type { CatalogBatchCheckpoint, CatalogEntry } from './catalog-batch.js';
-import { catalogKey, identityVtabArgs, namesOfCatalogKey } from './table-identity.js';
+import { catalogKey, identityVtabArgs, namesOfCatalogKey, sessionBindingVtabArgs } from './table-identity.js';
 import type { QualifiedTableName } from './table-identity.js';
 
 // IndexSchema type from TableSchema.indexes
@@ -1232,9 +1232,13 @@ export class SchemaManager {
 	 * everything. `hydrate-restores-declared-table.spec.ts` compares the result against a
 	 * DDL-created table key by key.
 	 *
-	 * `sessionVtabArgs` is how the CURRENT session reaches storage — its `default_vtab_args`
-	 * when this module is its default module — overlaid under the record's identity args
-	 * (see {@link identityVtabArgs}); the record itself never carries a binding.
+	 * `sessionVtabArgs` is the CURRENT session's `default_vtab_args` when this module is its
+	 * default module. Only their binding entries ({@link sessionBindingVtabArgs}) are overlaid
+	 * under the record's identity args ({@link identityVtabArgs}): the record never carries a
+	 * binding, and the session never decides a hydrated table's identity (its `encoding`).
+	 *
+	 * NOTE: this and the other record ↔ `TableSchema` conversions below (~300 lines) use no
+	 * manager state; this file is 1532 lines. If it grows again, move them to their own module.
 	 */
 	storedToTableSchema(
 		stored: StoredTableSchema,
@@ -1260,7 +1264,7 @@ export class SchemaManager {
 			foreignKeys: stored.foreignKeys?.map(fk => this.storedToForeignKey(fk)),
 			vtabModule,
 			vtabAuxData,
-			vtabArgs: { ...sessionVtabArgs, ...stored.vtabArgs },
+			vtabArgs: { ...sessionBindingVtabArgs(sessionVtabArgs), ...stored.vtabArgs },
 			vtabModuleName: stored.vtabModuleName,
 			isView: false,
 			// Absent, not `[]`, for a table with no index: CREATE TABLE sets no `indexes` and

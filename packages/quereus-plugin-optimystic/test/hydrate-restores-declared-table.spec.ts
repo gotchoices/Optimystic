@@ -78,6 +78,35 @@ function declarationView(schema: TableSchema): unknown {
 	}));
 }
 
+/** The catalog tree behind a SchemaManager — enough to walk its entries in key order. */
+interface CatalogTreeAccess {
+	requireSchemaTree(): Promise<{
+		update(): Promise<void>;
+		range(range: unknown): AsyncIterable<unknown>;
+		isValid(path: unknown): boolean;
+		at(path: unknown): unknown;
+	}>;
+}
+
+/**
+ * Every catalog entry `[key, record]` as the JSON the catalog is written with, in key order,
+ * read back from storage by a SchemaManager of its own. The unit of the byte-identity guarantee.
+ */
+async function catalogRecordBytes(plugin: PluginHandle, era: string): Promise<string[]> {
+	const module = plugin.vtables.find(v => v.name === 'optimystic')!.module as unknown as {
+		createSchemaManager(options: unknown): CatalogTreeAccess;
+		deriveDefaultOptions(config: Record<string, SqlValue>): unknown;
+	};
+	const catalog = module.createSchemaManager(module.deriveDefaultOptions({ default_transactor: 'local', default_key_network: era }));
+	const tree = await catalog.requireSchemaTree();
+	await tree.update();
+	const entries: string[] = [];
+	for await (const path of tree.range({ isAscending: true })) {
+		if (tree.isValid(path)) entries.push(JSON.stringify(tree.at(path)));
+	}
+	return entries;
+}
+
 function tableOf(db: Database, schemaName: string, tableName: string): TableSchema {
 	const table = db.schemaManager.findTable(tableName, schemaName);
 	expect(table, `${schemaName}.${tableName} in the engine catalog`).to.not.equal(undefined);
@@ -282,6 +311,59 @@ describe('Warm restart: a hydrated table is the table its declaration creates', 
 		await again.plugin.hydrate(again.db);
 		expect(tableOf(again.db, 'app', 'P').vtabArgs).to.deep.equal({ ...eraArgs('era2'), '0': 'tree://pinned/app/P' });
 		expect(await queryAll(again.db, 'select id from app.P')).to.deep.equal([{ id: 7 }]);
+	});
+
+	it('writes byte-identical catalog records for one declaration, whatever machine, era, layout or path applied it', async () => {
+		// A host writes the catalog alone on every machine before any peer contact, and that is
+		// fork-safe only while every machine writes the same bytes. So: independent storages,
+		// different eras (session binding), a reflowed declaration (parser positions), the tables
+		// in the other order, and a path that reached the declaration through an earlier version
+		// with rows written in between — all must persist exactly what a fresh apply persists.
+		// NOT covered, because it does not hold: an index added by a later version but declared
+		// BEFORE an existing one (the record lists indexes in the order they were created) —
+		// see `tickets/backlog/bug-optimystic-catalog-record-depends-on-migration-history`.
+		const applyIn = async (era: string, ...statements: string[]): Promise<string[]> => {
+			const session = await openEra(era, buildSharedLocalTransactor(new MemoryRawStorage()));
+			for (const statement of statements) await session.db.exec(statement);
+			return await catalogRecordBytes(session.plugin, era);
+		};
+		const reference = await applyIn('era1', EVERY_FEATURE);
+		expect(reference.join('\n')).to.not.include('"loc"').and.not.include('era1');
+
+		const reflowed = EVERY_FEATURE.replace(/\s+/g, '  ');
+		const tablesSwapped = EVERY_FEATURE
+			.replace('table Managers { Id text primary key }', '')
+			.replace('index ByBig', 'table Managers { Id text primary key }\n\t\tindex ByBig');
+		const withoutIndexes = EVERY_FEATURE.replace(/\n\s*(unique )?index By.*/g, '');
+		expect(withoutIndexes).to.not.include('index By');
+
+		expect(await applyIn('era2', reflowed), 'another era, reflowed').to.deep.equal(reference);
+		expect(await applyIn('era3', tablesSwapped), 'tables in the other order').to.deep.equal(reference);
+		expect(await applyIn('era4', withoutIndexes, `insert into app.Managers (Id) values ('m1')`,
+			`insert into app.Every (Id, Name, Qty, ManagerId) values (1, 'alpha', 3, 'm1')`, EVERY_FEATURE),
+			'an earlier version, rows, then this one').to.deep.equal(reference);
+		expect(await applyIn('era5', EVERY_FEATURE, `insert into app.Managers (Id) values ('m1')`, EVERY_FEATURE),
+			'applied twice').to.deep.equal(reference);
+	});
+
+	it("never takes a hydrated table's encoding from the session's default args", async () => {
+		// `encoding` in `default_vtab_args` describes tables the session creates; the bytes a
+		// hydrated table already has in storage are described by its record alone. Overlaying
+		// the session's would open the table with the wrong codec and write that into the record.
+		const store = buildSharedLocalTransactor(new MemoryRawStorage());
+		const writer = await openEra('era1', store);
+		await writer.db.exec(`declare schema app { table N { id integer primary key, v text } } apply schema app;`);
+		await writer.db.exec(`insert into app.N (id, v) values (1, 'one')`);
+
+		const { db, plugin } = await openEra('era2', store);
+		await db.exec(`pragma default_vtab_args = '${JSON.stringify({ ...eraArgs('era2'), encoding: 'msgpack' })}'`);
+		await plugin.hydrate(db);
+		expect(tableOf(db, 'app', 'N').vtabArgs).to.deep.equal(eraArgs('era2'));
+		expect(await queryAll(db, 'select id, v from app.N')).to.deep.equal([{ id: 1, v: 'one' }]);
+
+		const later = await openEra('era3', store);
+		await later.plugin.hydrate(later.db);
+		expect(await queryAll(later.db, 'select id, v from app.N'), 'the record was not re-labelled').to.deep.equal([{ id: 1, v: 'one' }]);
 	});
 
 	it('hydrate reads the catalog and writes nothing', async () => {

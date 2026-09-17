@@ -273,8 +273,8 @@ type DeferIndexFlush = (indexName: string, tree: Tree<string, IndexEntry>) => vo
  * resolves it: a `using optimystic(...)` argument (or, for a hydrated table, the session's
  * `default_vtab_args`) wins over the plugin's registration config (`default_transactor`
  * and friends, surfaced as `vtabAuxData`), which wins over the production defaults. The
- * argument names read here are exactly {@link SESSION_BINDING_VTAB_ARGS} plus `encoding`
- * and `cache`, which the callers read themselves — keep the two lists in step.
+ * argument names read here, plus `cache` (which `parseTableSchema` reads itself), are
+ * exactly {@link SESSION_BINDING_VTAB_ARGS} — keep the two lists in step.
  */
 function resolveBinding(
   args: Readonly<Record<string, SqlValue>>,

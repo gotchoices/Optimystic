@@ -44,12 +44,26 @@ export const SESSION_BINDING_VTAB_ARGS: ReadonlySet<string> = new Set(['transact
  * record whose declaration named nothing identity-bearing carries no `vtabArgs` key at all.
  */
 export function identityVtabArgs(args: Readonly<Record<string, SqlValue>> | undefined): Record<string, SqlValue> | undefined {
-	if (!args) return undefined;
-	const identity: Record<string, SqlValue> = {};
-	for (const [key, value] of Object.entries(args)) {
-		if (!SESSION_BINDING_VTAB_ARGS.has(key)) identity[key] = value;
-	}
+	const identity = pickVtabArgs(args, key => !SESSION_BINDING_VTAB_ARGS.has(key));
 	return Object.keys(identity).length > 0 ? identity : undefined;
+}
+
+/**
+ * ONLY the session-binding entries of `args` — what a hydrated table may take from the current
+ * session's `default_vtab_args`. Anything else there (a default `encoding`, say) describes tables
+ * that session CREATES, not the bytes a hydrated table already has in storage; the record alone
+ * says those, and an overlaid `encoding` would be written back into the record on first open.
+ */
+export function sessionBindingVtabArgs(args: Readonly<Record<string, SqlValue>> | undefined): Record<string, SqlValue> {
+	return pickVtabArgs(args, key => SESSION_BINDING_VTAB_ARGS.has(key));
+}
+
+function pickVtabArgs(args: Readonly<Record<string, SqlValue>> | undefined, keep: (key: string) => boolean): Record<string, SqlValue> {
+	const picked: Record<string, SqlValue> = {};
+	for (const [key, value] of Object.entries(args ?? {})) {
+		if (keep(key)) picked[key] = value;
+	}
+	return picked;
 }
 
 /** A table addressed by its engine schema and its name. */
