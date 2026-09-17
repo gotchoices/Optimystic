@@ -47,3 +47,7 @@ npm consumers do not see the portal-linked working tree.
 Committed as quereus `561195502` ("Schema diff fix", 08:33): `schema-differ.ts` plus a regression case in `differ-alter-column.spec.ts`. **That commit came after the `v4.19.2` release tag** (`a244949f8`), and no tag contains it. The maintainer's uncommitted bump of the plugin's `@quereus/quereus` range to `^4.19.2` therefore does **not** carry the fix for npm consumers. Optimystic's own tests see it now, because they resolve quereus through the portal to `../quereus`.
 
 Keep this ticket in `blocked/` until a quereus release containing `561195502` (4.19.3 or later) exists. Then raise the plugin's range to that version and delete this ticket.
+
+# Resolved (2026-09-17)
+
+Quereus `v4.19.4` contains the fix commit `561195502` (checked with `git merge-base --is-ancestor`). The maintainer raised both plugins' `@quereus/quereus` dev range to `^4.19.4` (`9060cdc0`), so npm consumers now get it too.
