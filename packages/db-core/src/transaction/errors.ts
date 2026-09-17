@@ -5,6 +5,14 @@ import type { CollectionId } from "../collection/index.js";
  * fails AFTER at least one collection has already DURABLY committed through the
  * distributed consensus path (GATHER/PEND/COMMIT).
  *
+ * A collection counts as committed whether an attempt committed it or the refresh
+ * between attempts saved it (an attempt reported a loss, but the collection's log
+ * entry was stored, and the refresh finished the rest of its blocks). Once either has
+ * happened, EVERY way the commit can still fail is reported as this error, with the
+ * failure that ended it as {@link reason} — a torn sibling (`TornActionError`), a
+ * sibling that kept losing until the retry budget ran out
+ * ({@link CoordinatorStaleLossError}), an abort, an expiry, a hard error.
+ *
  * ## Why this exists (and why we can't just "roll back")
  *
  * The COMMIT phase commits each collection's pended blocks independently (see
@@ -44,11 +52,15 @@ import type { CollectionId } from "../collection/index.js";
  */
 export class CoordinatorPartialCommitError extends Error {
 	constructor(
-		/** Collections durably committed via consensus before the failure (NOT rolled back). */
+		/** Collections durably committed before the failure (NOT rolled back) — by an attempt, or
+		 * by the refresh between attempts finishing the collection's own log entry. */
 		public readonly committedCollections: readonly CollectionId[],
-		/** Collections that never committed this attempt (local state reverted for retry). */
+		/** Collections of this transaction that never committed (local state reverted for retry —
+		 * their staged actions are still in place). Can be empty when the failure came after every
+		 * collection was already saved. */
 		public readonly failedCollections: readonly CollectionId[],
-		/** The underlying commit-phase failure that aborted the commit. */
+		/** The failure that ended the commit: the attempt's commit-phase reason (a string) when an
+		 * attempt half-landed, otherwise the error that escaped after a refresh saved a collection. */
 		public readonly reason?: unknown,
 	) {
 		super(
@@ -68,6 +80,11 @@ export class CoordinatorPartialCommitError extends Error {
  * CLEAN stale loss — an optimistic-concurrency conflict (a racing transaction advanced a log tail)
  * in which NOTHING durably committed, so every participating collection's local tracker was
  * restored to its pre-append state and the transaction is safe to re-drive.
+ *
+ * "Nothing durably committed" holds across the WHOLE commit, not only the last attempt: when a
+ * refresh between attempts has already saved one participant, the coordinator reports the budget
+ * running out as a {@link CoordinatorPartialCommitError} carrying this error as its `reason`, so
+ * this error only ever escapes bare when a re-drive is genuinely safe.
  *
  * This is the retryable counterpart to {@link CoordinatorPartialCommitError}: a partial landing
  * cannot be blindly retried (it would double-apply the durable half), but a clean loss can. The

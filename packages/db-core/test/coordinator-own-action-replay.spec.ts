@@ -8,8 +8,8 @@
  * re-appends the same actions under the same action id at a second revision.
  *
  * `Collection.sync` learned to recognise its own entry first. These cases cover the OTHER write
- * path: `TransactionCoordinator.commit`, whose inter-attempt refresh goes through the same
- * `Collection.update()` a reader calls. It can only tell the difference because the collection
+ * path: `TransactionCoordinator.commit`, whose inter-attempt refresh (`Collection.refreshInFlight`)
+ * is the same refresh a reader's `Collection.update()` runs. It can only tell the difference because the collection
  * itself remembers which of its own writes is in flight (`Collection.beginInFlightAction`, read by
  * the refresh) — the coordinator marks each participant under its latch and clears the marks in a
  * `finally` around the WHOLE retry loop, since the refresh that reads them runs between attempts,
@@ -26,12 +26,20 @@
  * `commit()` may return only once every block the entry names holds the action. The
  * `CommitLandsButReportsStale` cases cover the entry being recognised when everything did land;
  * the `TailLandsButReportsStale` cases cover the half-landed shape, which is the one that lost data.
+ *
+ * Once the refresh has saved one participant, the commit can no longer fail cleanly. The
+ * "reported as a partial commit" cases pin that every failure after that point — a sibling torn for
+ * good (whichever order the refresh visits them in), a sibling losing until the budget runs out, an
+ * abort — reaches the caller as `CoordinatorPartialCommitError` naming the saved participant, and
+ * the "nothing saved" case pins that a commit with no saved participant keeps its bare error.
  */
 
 import { expect } from 'chai';
 import {
 	ACTIONS_ENGINE_ID,
 	Collection,
+	CoordinatorPartialCommitError,
+	CoordinatorStaleLossError,
 	Log,
 	TornActionError,
 	TransactionCoordinator,
@@ -49,6 +57,7 @@ import {
 	type IBlock,
 	type PendRequest,
 	type PendResult,
+	type SyncOptions,
 	type Transaction,
 } from '../src/index.js';
 import {
@@ -145,26 +154,38 @@ async function stage(
  * Collections are told apart by block id, not call order: `createOrOpen` uses the collection id as
  * its header block id, and a first commit carries that header among its blocks. Call order across
  * `commitPhase`'s concurrent fan-out is not contractual.
+ *
+ * `losses` makes the clean loss repeat (Infinity: every commit of that collection loses), and
+ * `onLoss` runs as each one is injected — the cases that need the commit to fail in some other
+ * way AFTER the torn participant is saved hang that failure there.
  */
 class TearsOneLosesOtherTransactor extends DelegatingTransactor {
 	/** Commits that actually landed on the inner transactor (masked or not). */
 	landedCommits = 0;
+	/** Clean losses injected so far. */
+	lossesInjected = 0;
 	private tornInjected = false;
-	private lossInjected = false;
 	/** Header block id — equivalently, collection id — of the collection whose commit tears. */
 	private readonly tornCollectionId: BlockId;
 	/** Header block id of the collection whose commit is a clean loss. */
 	private readonly lostCollectionId: BlockId;
 
-	constructor(inner: TestTransactor, tornCollectionId: BlockId, lostCollectionId: BlockId) {
+	constructor(
+		inner: TestTransactor,
+		tornCollectionId: BlockId,
+		lostCollectionId: BlockId,
+		private readonly losses = 1,
+		private readonly onLoss?: (count: number) => void,
+	) {
 		super(inner);
 		this.tornCollectionId = tornCollectionId;
 		this.lostCollectionId = lostCollectionId;
 	}
 
 	override async commit(request: CommitRequest): Promise<CommitResult> {
-		if (!this.lossInjected && request.blockIds.includes(this.lostCollectionId)) {
-			this.lossInjected = true;
+		if (this.lossesInjected < this.losses && request.blockIds.includes(this.lostCollectionId)) {
+			this.lossesInjected++;
+			this.onLoss?.(this.lossesInjected);
 			// Never delegated: nothing of this collection is durable.
 			return { success: false, conflict: true, reason: 'stale commit: injected clean loss' };
 		}
@@ -348,6 +369,9 @@ describe('TransactionCoordinator: own committed action on retry', () => {
 		expect(await logValues(a)).to.deep.equal(['seed', 'local-a']);
 		expect(await logValues(b)).to.deep.equal(['seed', 'local-b']);
 		expect(a.hasUnsyncedChanges() || b.hasUnsyncedChanges(), 'nothing left staged').to.equal(false);
+		// The refresh saved the whole transaction, so the commit is over: its stamp is released just
+		// as a commit an attempt carried releases it, and the next transaction can open one.
+		await expectStampReleased(coordinator, idA);
 	});
 
 	it('refuses by name, and keeps the staged action, when a rival took the revision a half-landed commit still needed', async () => {
@@ -421,48 +445,156 @@ describe('TransactionCoordinator: own committed action on retry', () => {
 		expect(reader.committedRevision()).to.equal(2);
 	});
 
-	it('one participant finished and another torn for good: the commit rejects and neither is misreported locally', async () => {
-		const idA = 'coord-mixed-a-finished';
-		const idB = 'coord-mixed-b-torn';
+	/** Two seeded participants whose first commit lands only its log tail each, and a rival that
+	 *  then commits to `rivalTargets` — so the refresh can finish every participant NOT targeted and
+	 *  none that is. `order` is the order the collections are registered with the coordinator, which
+	 *  is the order the refresh between attempts visits them in. */
+	async function bothTornRivalOn(prefix: string, rivalTargets: ('a' | 'b')[], order: ('a' | 'b')[]) {
+		const ids = { a: `${prefix}-a`, b: `${prefix}-b` };
 		const inner = new TestTransactor();
-		await seed(inner, idA);
-		await seed(inner, idB);
-		// Both participants land only their tails. A rival then commits to B alone, so the refresh
-		// can finish A but can never finish B.
+		await seed(inner, ids.a);
+		await seed(inner, ids.b);
 		const transactor = new TailLandsButReportsStale(inner, 2, async unwrapped => {
-			const rival = await Collection.createOrOpen<SpecAction>(unwrapped, idB, init());
-			await rival.act({ type: 'set', data: { value: 'rival' } });
-			await rival.sync({ maxAttempts: 10, baseBackoffMs: 1, maxBackoffMs: 5 });
+			for (const target of rivalTargets) {
+				const rival = await Collection.createOrOpen<SpecAction>(unwrapped, ids[target], init());
+				await rival.act({ type: 'set', data: { value: 'rival' } });
+				await rival.sync({ maxAttempts: 10, baseBackoffMs: 1, maxBackoffMs: 5 });
+			}
 		});
-		const a = await Collection.createOrOpen<SpecAction>(transactor, idA, init());
-		const b = await Collection.createOrOpen<SpecAction>(transactor, idB, init());
-		const coordinator = new TransactionCoordinator(transactor, new Map([[idA, a], [idB, b]]));
+		const collections = {
+			a: await Collection.createOrOpen<SpecAction>(transactor, ids.a, init()),
+			b: await Collection.createOrOpen<SpecAction>(transactor, ids.b, init()),
+		};
+		const coordinator = new TransactionCoordinator(transactor,
+			new Map(order.map(key => [ids[key], collections[key]] as const)));
 		const transaction = await stage(coordinator, [
-			{ collectionId: idA, value: 'local-a' },
-			{ collectionId: idB, value: 'local-b' },
+			{ collectionId: ids.a, value: 'local-a' },
+			{ collectionId: ids.b, value: 'local-b' },
 		]);
+		return { idA: ids.a, idB: ids.b, inner, a: collections.a, b: collections.b, coordinator, transaction };
+	}
 
-		let thrown: unknown;
+	/** The error `commit` rejects with; fails the case if it resolves. */
+	async function commitRejection(coordinator: TransactionCoordinator, transaction: Transaction, options: SyncOptions = retryFast): Promise<unknown> {
 		try {
-			await coordinator.commit(transaction, retryFast);
+			await coordinator.commit(transaction, options);
 		} catch (err) {
-			thrown = err;
+			return err;
 		}
+		return expect.fail('the commit must not be acknowledged');
+	}
 
-		// NOTE: only the facts that hold whichever error names this outcome are pinned here. Today
-		// the torn participant's TornActionError escapes bare, which does not tell the caller that A
-		// IS saved (tickets/fix/a-half-saved-multi-collection-commit-is-reported-as-not-saved); the
-		// fix is expected to wrap it, so the torn error is looked for on the error or its `reason`.
-		expect(thrown, 'the commit is not acknowledged').to.be.instanceOf(Error);
-		const torn = thrown instanceof TornActionError ? thrown : (thrown as { reason?: unknown }).reason;
-		expect(torn, 'the torn participant is named').to.be.instanceOf(TornActionError);
-		expect((torn as TornActionError).collectionId).to.equal(idB);
-		expect((torn as TornActionError).reason).to.equal('rival-holds-revision');
+	/** A partial report cannot be cleanly rolled back, so the coordinator releases the stamp: a new
+	 *  one opens instead of throwing CoordinatorConcurrentStampError. */
+	async function expectStampReleased(coordinator: TransactionCoordinator, collectionId: string): Promise<void> {
+		await stage(coordinator, [{ collectionId, value: 'next' }]);
+	}
 
-		expect(await unlandedBlocks(inner, idA, transaction.id), 'participant A was finished').to.deep.equal([]);
-		expect(a.hasUnsyncedChanges(), 'and A holds nothing staged').to.equal(false);
-		expect(await unlandedBlocks(inner, idB, transaction.id), "participant B's block never landed").to.not.be.empty;
-		expect(b.hasUnsyncedChanges(), "and B's action is still staged").to.equal(true);
+	for (const order of [['a', 'b'], ['b', 'a']] as ('a' | 'b')[][]) {
+		it(`one participant finished and another torn for good is reported as a partial commit (refreshed ${order.join(' before ')})`, async () => {
+			const { idA, idB, inner, a, b, coordinator, transaction } =
+				await bothTornRivalOn(`coord-mixed-${order.join('')}`, ['b'], order);
+
+			const thrown = await commitRejection(coordinator, transaction);
+
+			// A IS saved, so the failure must say so by name: a bare TornActionError for B would send
+			// the Quereus bridge down its clean-rollback path, which re-stages A's durable actions.
+			expect(thrown, 'reported as a partial commit').to.be.instanceOf(CoordinatorPartialCommitError);
+			const partial = thrown as CoordinatorPartialCommitError;
+			expect(partial.committedCollections, 'the refresh-finished participant counts as committed').to.deep.equal([idA]);
+			expect(partial.failedCollections).to.deep.equal([idB]);
+			expect(partial.reason, 'the torn participant is the reason').to.be.instanceOf(TornActionError);
+			expect((partial.reason as TornActionError).collectionId).to.equal(idB);
+			expect((partial.reason as TornActionError).reason).to.equal('rival-holds-revision');
+
+			// Refreshing B first must not stop A from being finished: A's tail is stored, so leaving
+			// its other blocks unlanded would be the silent loss finishing exists to prevent.
+			expect(await unlandedBlocks(inner, idA, transaction.id), 'participant A was finished').to.deep.equal([]);
+			expect(a.hasUnsyncedChanges(), 'and A holds nothing staged').to.equal(false);
+			expect(await logValues(a), 'A is logged once').to.deep.equal(['seed', 'local-a']);
+			expect(await unlandedBlocks(inner, idB, transaction.id), "participant B's block never landed").to.not.be.empty;
+			expect(b.hasUnsyncedChanges(), "and B's action is still staged").to.equal(true);
+			await expectStampReleased(coordinator, idA);
+		});
+	}
+
+	it('nothing saved: every participant torn for good still fails with the bare torn error', async () => {
+		const { idA, idB, inner, a, b, coordinator, transaction } =
+			await bothTornRivalOn('coord-mixed-none', ['a', 'b'], ['a', 'b']);
+
+		const thrown = await commitRejection(coordinator, transaction);
+
+		// No participant is saved, so there is no partial landing to report and the error is unchanged.
+		expect(thrown).to.not.be.instanceOf(CoordinatorPartialCommitError);
+		expect(thrown).to.be.instanceOf(TornActionError);
+		expect((thrown as TornActionError).collectionId, 'the first participant refreshed').to.equal(idA);
+		expect((thrown as TornActionError).reason).to.equal('rival-holds-revision');
+		expect(await unlandedBlocks(inner, idA, transaction.id)).to.not.be.empty;
+		expect(await unlandedBlocks(inner, idB, transaction.id)).to.not.be.empty;
+		expect(a.hasUnsyncedChanges() && b.hasUnsyncedChanges(), 'both actions are still staged').to.equal(true);
+	});
+
+	/** A coordinator over two fresh collections: `torn` commits durably but is told it lost, and
+	 *  `lost` is refused every time, so the refresh saves `torn` and `lost` never commits. */
+	async function savedThenLosing(prefix: string, onLoss?: (count: number) => void) {
+		const tornId = `${prefix}-a`;
+		const lostId = `${prefix}-b`;
+		const inner = new TestTransactor();
+		const transactor = new TearsOneLosesOtherTransactor(inner, tornId, lostId, Infinity, onLoss);
+		const torn = await Collection.createOrOpen<SpecAction>(transactor, tornId, init());
+		const lost = await Collection.createOrOpen<SpecAction>(transactor, lostId, init());
+		const coordinator = new TransactionCoordinator(transactor, new Map([
+			[tornId, torn],
+			[lostId, lost],
+		]));
+		const transaction = await stage(coordinator, [
+			{ collectionId: tornId, value: 'torn' },
+			{ collectionId: lostId, value: 'lost' },
+		]);
+		return { tornId, lostId, inner, transactor, torn, lost, coordinator, transaction };
+	}
+
+	it('one participant saved by the refresh and another losing until the budget runs out is a partial commit, not a clean stale loss', async () => {
+		const { tornId, lostId, inner, transactor, torn, lost, coordinator, transaction } =
+			await savedThenLosing('coord-saved-then-exhausted');
+
+		const thrown = await commitRejection(coordinator, transaction);
+
+		// A CoordinatorStaleLossError says "nothing durably committed, safe to re-drive" — false here,
+		// and re-driving the whole transaction would log the saved participant's action twice.
+		expect(thrown).to.be.instanceOf(CoordinatorPartialCommitError);
+		const partial = thrown as CoordinatorPartialCommitError;
+		expect(partial.committedCollections).to.deep.equal([tornId]);
+		expect(partial.failedCollections).to.deep.equal([lostId]);
+		expect(partial.reason, 'the exhausted loss is the reason').to.be.instanceOf(CoordinatorStaleLossError);
+		expect(transactor.lossesInjected, 'the lost participant lost every attempt').to.equal(retryFast.maxAttempts);
+
+		expect(torn.hasUnsyncedChanges(), 'the saved participant holds nothing staged').to.equal(false);
+		expect(lost.hasUnsyncedChanges(), "the lost participant's action is still staged").to.equal(true);
+		const tornReader = await Collection.createOrOpen<SpecAction>(inner, tornId, init());
+		expect(await logValues(tornReader), 'no second log entry for the saved participant').to.deep.equal(['torn']);
+		expect(tornReader.committedRevision()).to.equal(1);
+		await expectStampReleased(coordinator, lostId);
+	});
+
+	it('an abort after a participant was saved is reported as a partial commit', async () => {
+		const controller = new AbortController();
+		// The second loss is the attempt AFTER the refresh saved the torn participant; aborting there
+		// makes the backoff before the next refresh reject.
+		const { tornId, lostId, transactor, torn, lost, coordinator, transaction } =
+			await savedThenLosing('coord-saved-then-aborted', count => { if (count === 2) controller.abort(); });
+
+		const thrown = await commitRejection(coordinator, transaction, { ...retryFast, signal: controller.signal });
+
+		expect(thrown).to.be.instanceOf(CoordinatorPartialCommitError);
+		const partial = thrown as CoordinatorPartialCommitError;
+		expect(partial.committedCollections).to.deep.equal([tornId]);
+		expect(partial.failedCollections).to.deep.equal([lostId]);
+		expect(partial.reason, 'the abort is the reason').to.be.instanceOf(Error);
+		expect(partial.reason).to.not.be.instanceOf(CoordinatorStaleLossError);
+		expect(transactor.lossesInjected).to.equal(2);
+		expect(torn.hasUnsyncedChanges()).to.equal(false);
+		expect(lost.hasUnsyncedChanges()).to.equal(true);
 	});
 
 	it('an abandoned commit leaves no in-flight mark behind for a later refresh to consume', async () => {

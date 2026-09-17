@@ -63,6 +63,26 @@ export type InFlightAttempt = {
 	blockDigests?: BlockContentDigests;
 };
 
+/** What one refresh ({@link Collection.refreshInFlight}, and the refresh inside a sync) found out
+ * about the write in flight on the instance's behalf. The caller hands in an empty report and the
+ * refresh fills it in AS IT GOES, rather than returning it at the end, so a refresh that throws
+ * after it saved the write still says so: the write is saved in storage whatever happens to this
+ * instance's local bookkeeping afterwards.
+ *
+ * NOTE: filled in, not returned, because a return value is lost on a throw — and a refresh CAN
+ * throw after finishing its own entry (the invalidation read and the replay both run later). */
+export type RefreshReport = {
+	/** Set once the refresh found the in-flight write's own log entry and FINISHED it
+	 * ({@link Collection.completeOwnEntry}): every block the entry names holds the write, so it is
+	 * saved. Left unset on every other refresh, including every reader's.
+	 *
+	 * `durability` is who holds the finished write, when the refresh learned it. It is absent when
+	 * finishing found every block already holding the write without re-sending anything (the
+	 * status-read fallback), which is still a saved write — so test the field, never `durability`,
+	 * for "saved". */
+	ownEntryFinished?: { durability?: WriteDurability };
+};
+
 /** Default base backoff (and historical fixed delay) between sync retries, in ms. */
 const PendingRetryDelayMs = 100;
 /** Default max consecutive no-progress stale-failure retries before {@link Collection.sync} gives up. */
@@ -152,12 +172,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * on behalf of a READER, the field is unset for them, and the consume branch cannot fire. Before
 	 * this was a field, `TransactionCoordinator.commit`'s inter-attempt refresh went through
 	 * `update()` and was therefore indistinguishable from a reader refresh even though the
-	 * coordinator held the very id it was retrying.
+	 * coordinator held the very id it was retrying. (It now goes through {@link refreshInFlight},
+	 * which differs from `update()` only in reporting what the refresh saved — the field, not the
+	 * method, is still what makes the refresh recognise the entry.)
 	 *
 	 * LIFETIME is the whole attempt CYCLE, not the latched span: it must survive the refresh
 	 * BETWEEN a failed attempt and its retry, which is the only moment it is ever read. In
 	 * {@link syncInternal} that cycle is contained inside the collection latch `sync()` holds; in
-	 * `TransactionCoordinator.commit` the inter-attempt `update()` runs OUTSIDE the commit latch
+	 * `TransactionCoordinator.commit` the inter-attempt refresh runs OUTSIDE the commit latch
 	 * span by design (`Latches` is non-reentrant), so the coordinator's clear necessarily runs
 	 * latch-free. That is safe: this is a single field write, {@link beginInFlightAction}'s
 	 * disposer only clears an id it still owns, and the only reader runs under the latch — so the
@@ -511,7 +533,24 @@ export class Collection<TAction> implements ICollection<TAction> {
 	async update() {
 		const release = await Latches.acquire(this.latchId);
 		try {
-			await this.updateInternal();
+			await this.updateInternal({});
+		} finally {
+			release();
+		}
+	}
+
+	/** The refresh `TransactionCoordinator.commit` runs between attempts: exactly {@link update},
+	 * plus a report of whether it finished the write in flight on this instance's behalf (see
+	 * {@link RefreshReport}). The coordinator needs that fact to tell its caller which participants
+	 * are already saved when the commit later fails; a reader's `update()` has no write in flight
+	 * and nothing to report.
+	 *
+	 * `report` is REQUIRED so a write path cannot refresh without learning what the refresh saved.
+	 * It is filled in as the refresh goes, so it is accurate when this throws too. */
+	async refreshInFlight(report: RefreshReport): Promise<void> {
+		const release = await Latches.acquire(this.latchId);
+		try {
+			await this.updateInternal(report);
 		} finally {
 			release();
 		}
@@ -568,10 +607,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 			const [status] = await this.transactor.getStatus([{ actionId: entry.actionId, blockIds: entry.blockIds }]);
 			const unlanded = entry.blockIds.filter((_, i) => status?.statuses[i] !== 'committed');
 			if (unlanded.length === 0) {
-				// NOTE: whole, but nobody told us who holds it, so a sync whose only commit was
-				// recognised here answers `undefined` — the "nothing was written" answer — for a write
-				// that is saved. Reachable only on the forked-lineage path above; if that path ever
-				// becomes ordinary, report a durability derived from the status read instead.
+				// Whole, and saved: the refresh reports it as finished (see RefreshReport), so the
+				// coordinator counts this participant as committed. Only WHO holds it is unknown.
+				// NOTE: a sync whose only commit was recognised here therefore answers `undefined` —
+				// the "nothing was written" answer — for a write that is saved, because the sync reads
+				// the report's durability, not the finished flag. Reachable only on the forked-lineage
+				// path above; if that path ever becomes ordinary, report a durability derived from the
+				// status read instead.
 				return undefined;
 			}
 			throw new TornActionError(this.id, entry.actionId, rev ?? -1, unlanded, 'transforms-not-held',
@@ -675,11 +717,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * exactly the write attempt cycles that own one (see that field). Callers cannot get this wrong
 	 * by omission.
 	 *
-	 * @returns who holds this write's own action, when the refresh found its log entry and finished
-	 * it ({@link completeOwnEntry}); `undefined` on every other refresh, including every reader's.
+	 * @param report - Filled in as the refresh goes (see {@link RefreshReport}): its
+	 * `ownEntryFinished` is set the moment the refresh has found this write's own log entry and
+	 * finished it ({@link completeOwnEntry}) — before the entry is consumed, so a later throw from
+	 * here still leaves it set. Never set on a reader's refresh. A caller with no use for it passes `{}`.
 	 * @throws TornActionError when it found that entry and could not finish the action — thrown
-	 * before anything on this instance changed. */
-	private async updateInternal(): Promise<WriteDurability | undefined> {
+	 * before anything on this instance changed, and with `report` untouched. */
+	private async updateInternal(report: RefreshReport): Promise<void> {
 		// Start with a context that can see to the end of the log
 		const source = new TransactorSource(this.id, this.transactor, undefined);
 		const tracker = new Tracker(source);
@@ -698,7 +742,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// NOTE: this aborts every caller of update(), including TransactionCoordinator's
 			// blanket refresh of ALL registered collections between commit retries — a
 			// non-participant with a momentarily-absent header now fails the whole retry rather
-			// than being skipped. That is the intended loud failure; if it ever shows up as
+			// than being skipped (the coordinator still refreshes the remaining collections first,
+			// so a participant that can be finished is). That is the intended loud failure; if it ever shows up as
 			// otherwise-healthy transactions aborting, narrow that refresh to the transaction's
 			// participants (see the note at coordinator.ts's update loop) rather than softening
 			// this throw.
@@ -734,9 +779,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// with the staged actions, the tracker and the held revision exactly as they were.
 		// The entry's revision comes from the context the same walk built; an entry older than a
 		// checkpoint is not restated there, and completeOwnEntry falls back to the attempt's own.
-		const completedDurability = ownEntry === undefined
-			? undefined
-			: await this.completeOwnEntry(ownEntry, latest?.context?.committed.find(c => c.actionId === ownEntry.actionId)?.rev);
+		if (ownEntry !== undefined) {
+			const durability = await this.completeOwnEntry(ownEntry, latest?.context?.committed.find(c => c.actionId === ownEntry.actionId)?.rev);
+			// Saved from here on, whatever below throws — record it before anything else can.
+			report.ownEntryFinished = { durability };
+		}
 
 		// Process the entries and track the blocks they affect
 		let anyConflicts = false;
@@ -786,7 +833,6 @@ export class Collection<TAction> implements ICollection<TAction> {
 		if (this.mustReplay(anyConflicts, actionContext)) {
 			await this.replayActions();
 		}
-		return completedDurability;
 	}
 
 	/** Whether {@link updateInternal} must re-stage `pending` after adopting `latest`, given the
@@ -1383,7 +1429,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 						// the refresh recognizes a log entry written by THIS action (its log tail landed but
 						// the commit answered failure), FINISHES that action from the attempt retained
 						// above, and only then consumes the entry rather than replaying it into a duplicate.
-						const completed = await this.updateInternal();
+						const report: RefreshReport = {};
+						await this.updateInternal(report);
+						const completed = report.ownEntryFinished?.durability;
 						if (completed !== undefined) {
 							// The refresh made this sync's write durable: that is a commit, and it is
 							// reported and counted exactly like one made by an attempt (see the success
@@ -1455,7 +1503,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	async updateAndSync(options?: SyncOptions): Promise<WriteDurability | undefined> {
 		const release = await Latches.acquire(this.latchId);
 		try {
-			await this.updateInternal();
+			await this.updateInternal({});
 			return await this.syncInternal(options);
 		} finally {
 			release();

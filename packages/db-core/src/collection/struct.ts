@@ -147,9 +147,11 @@ export type TornActionReason = 'rival-holds-revision' | 'completion-refused' | '
  * place on the collection; the caller decides whether to discard them or submit them again as a
  * new write, knowing the log already carries one entry for them whose data never landed.
  *
- * Raised out of {@link ICollection.sync} / {@link ICollection.updateAndSync}, and out of
- * {@link ICollection.update} when the refresh runs on behalf of a write in flight (a
- * `TransactionCoordinator.commit` retry). */
+ * Raised out of {@link ICollection.sync} / {@link ICollection.updateAndSync}, and out of the
+ * refresh `TransactionCoordinator.commit` runs between attempts (`Collection.refreshInFlight`).
+ * The coordinator passes it on bare only when no other participant of the commit is saved; when
+ * one is, it arrives as the `reason` of a `CoordinatorPartialCommitError` that names the saved
+ * participants. */
 export class TornActionError extends Error {
 	constructor(
 		readonly collectionId: CollectionId,

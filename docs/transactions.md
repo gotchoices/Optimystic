@@ -77,6 +77,15 @@ This document describes the architecture for multi-collection transactions in Op
 > cluster storage, and restores only the failed collections. It deliberately does
 > **not** uniformly roll back — doing so would re-stage the committed collections'
 > already-durable actions as still-pending, making memory disagree with storage.
+> A collection also counts as committed when it was saved *between* attempts: an
+> attempt can report a loss after a collection's log entry was already stored, and
+> the refresh before the next attempt then finishes that collection's remaining
+> blocks. From that moment `commit()` cannot fail cleanly, so **every** way it can
+> still fail — another collection torn for good, another collection losing until
+> the retry budget runs out, an abort, an expiry, a hard error — is thrown as a
+> `CoordinatorPartialCommitError` that names the saved collections as committed and
+> carries the original error as its `reason`. A commit in which nothing was saved
+> fails with exactly the error it failed with.
 > `coordinator.execute()` gives a partial landing the same local disposition on
 > its (non-retryable) path: it reports the partition as
 > `committedCollections`/`failedCollections` on the `ExecutionResult` instead of
@@ -113,7 +122,10 @@ This document describes the architecture for multi-collection transactions in Op
 >   the retry budget (`maxAttempts` / optional `deadlineMs`, tunable via the
 >   `SyncOptions` passed to `commit`/`session.commit`) is exhausted does it throw a
 >   [`CoordinatorStaleLossError`](../packages/db-core/src/transaction/errors.ts),
->   which names the `failedCollections` from the losing attempt. Defaults are safe
+>   which names the `failedCollections` from the losing attempt — unless a refresh
+>   between attempts already saved one of the collections, in which case the
+>   exhausted budget is a partial landing and is thrown as a
+>   `CoordinatorPartialCommitError` instead (see above). Defaults are safe
 >   out of the box, so a caller that passes no options gets bounded retry rather
 >   than an immediate failure.
 > - A **hard** clean failure (PEND rejected for storage/policy reasons, an expired

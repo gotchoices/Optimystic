@@ -852,30 +852,49 @@ saveMaterializedBlock(block): store(structuredClone(block));
   under a new revision on the caller's behalf (that would record the actions twice); the staged
   actions are left in place for the caller to discard or resubmit knowingly. `Collection.sync` /
   `updateAndSync` throw it, and so does `TransactionCoordinator.commit` (out of its inter-attempt
-  `update()`); a multi-collection commit in which one participant was finished and another is torn
-  surfaces the torn one as this error rather than as `CoordinatorPartialCommitError`. That is a
-  known reporting gap, not a design: the bare error does not tell the caller that the finished
-  participant IS saved, and the Quereus bridge treats anything other than
-  `CoordinatorPartialCommitError` as a clean rollback. The same gap covers any terminal failure of
-  a commit after a refresh has already finished or consumed one participant's entry
-  (`tickets/fix/a-half-saved-multi-collection-commit-is-reported-as-not-saved`).
+  refresh, `Collection.refreshInFlight`) — but bare only when no other participant of that commit
+  is saved.
   `packages/db-core/test/own-entry-completes-the-action.spec.ts` pins the rule and all three
   reasons; the test double that matters is `TailLandsButReportsStale` (only the tail lands), not
   `CommitLandsButReportsStale` (everything lands — which makes "entry visible" and "write saved"
   the same thing, and is how the missing rule went unnoticed).
+- **Once a refresh has saved one participant, every failure of the commit is a partial commit.**
+  The refresh between attempts can finish and consume one participant's own entry while another
+  participant is torn for good, keeps losing until the budget runs out, or the commit is aborted,
+  expires or hits a hard error. A bare error there would tell the caller nothing was saved — the
+  Quereus bridge treats anything other than `CoordinatorPartialCommitError` as a clean rollback,
+  and a `CoordinatorStaleLossError` explicitly invites a re-drive that would log the saved
+  participant twice. So the refresh reports what it saved (`RefreshReport.ownEntryFinished`, filled
+  in as the refresh goes, so a refresh that throws after finishing still reports it — never
+  inferred from `committedActionId()`), the coordinator keeps the set of saved participants and of
+  every participant across attempts (`CommitCycle`), and `commit()` has ONE catch that rethrows any
+  escaping error as `CoordinatorPartialCommitError`: committed = the refresh-saved participants
+  (merged with an attempt's own committed set when the failure is itself a partial commit — never
+  wrapped twice), failed = every other participant, `reason` = the original error. The stamp is
+  released, as on the attempt-level partial path. A commit in which nothing was saved fails with
+  exactly the error it failed with. The refresh visits EVERY registered collection even after one
+  throws, and only then throws the first failure: stopping at the first throw left a participant
+  later in the map with its tail stored and its other blocks never landed whenever an earlier one
+  was torn. And when a refresh has saved a participant and nothing is left staged, `commit()`
+  returns at once (releasing the stamp, which the next attempt's nothing-to-commit return never
+  did) rather than going round again, where an abort, deadline or expiry check could report a fully
+  saved transaction as failed. `packages/db-core/test/coordinator-own-action-replay.spec.ts`
+  pins each of these.
 - **The collection, not the caller, holds the in-flight id.** Which action is in flight is a field
   on the instance (`Collection.inFlightActionId`), set for the duration of a write's attempt CYCLE
   by `Collection.beginInFlightAction(actionId)` and cleared by the disposer it returns;
-  `updateInternal` reads the field and takes no parameter, so no refresh path can be correct-only-
-  by-remembering-to-pass-it. `update()` and `updateAndSync()` refresh on a READER's behalf, leave
+  `updateInternal` reads the field rather than taking the id as a parameter, so no refresh path can
+  be correct-only-by-remembering-to-pass-it. `update()` and `updateAndSync()` refresh on a READER's behalf, leave
   the field unset, and the consume branch cannot fire. Both write paths set it: `Collection.sync`
   brackets its whole retry loop, and `TransactionCoordinator.commitOnce` marks each participant
-  right after taking its latch, pushing the disposers into an array `commit` clears in a `finally`
-  around the WHOLE retry loop. The coordinator's clear cannot be latch-scoped: its inter-attempt
-  `collection.update()` — the only reader of the mark — runs after the commit span released its
-  latches, because `Latches` is non-reentrant. (Before the field, the coordinator's refresh went
-  through the same `update()` a reader calls and was indistinguishable from one, so a torn action
-  committed through the coordinator replayed into a duplicate entry.)
+  right after taking its latch, pushing the disposers into the commit's `CommitCycle`, which
+  `commit` clears in a `finally` around the WHOLE retry loop. The coordinator's clear cannot be
+  latch-scoped: its inter-attempt refresh (`collection.refreshInFlight`) — the only reader of the
+  mark — runs after the commit span released its latches, because `Latches` is non-reentrant.
+  (Before the field, the coordinator's refresh went through the same `update()` a reader calls and
+  was indistinguishable from one, so a torn action committed through the coordinator replayed into
+  a duplicate entry. `refreshInFlight` is still that same refresh; it only adds the report of what
+  it saved.)
   `packages/db-core/test/collection-own-action-replay.spec.ts` is the regression test at the
   collection tier and `packages/db-core/test/coordinator-own-action-replay.spec.ts` at the
   coordinator tier (single-collection tear, one participant tearing while another cleanly loses,
