@@ -41,3 +41,9 @@ absent feature, not a regression.
 Unblock this ticket when the fix is **committed** in quereus, and note the commit here. Delete it once a
 quereus release carrying the fix is consumed by the plugin's `@quereus/quereus` dependency range, since
 npm consumers do not see the portal-linked working tree.
+
+# Status (2026-09-17): committed in quereus, not yet released
+
+Committed as quereus `561195502` ("Schema diff fix", 08:33): `schema-differ.ts` plus a regression case in `differ-alter-column.spec.ts`. **That commit came after the `v4.19.2` release tag** (`a244949f8`), and no tag contains it. The maintainer's uncommitted bump of the plugin's `@quereus/quereus` range to `^4.19.2` therefore does **not** carry the fix for npm consumers. Optimystic's own tests see it now, because they resolve quereus through the portal to `../quereus`.
+
+Keep this ticket in `blocked/` until a quereus release containing `561195502` (4.19.3 or later) exists. Then raise the plugin's range to that version and delete this ticket.
