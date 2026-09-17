@@ -59,12 +59,22 @@ const BUILTIN_NAMES = new Set(builtinModules.filter((m) => !m.startsWith('_')));
 
 // -- Extracting import specifiers -------------------------------------------------------------
 
+// Both static forms are anchored to a statement start (file start, newline, or `;`), the way
+// `SIDE_EFFECT_RE` in `packages/db-core/test/barrel-import-cycle.spec.ts` is. Quoted strings are
+// deliberately kept by `stripCommentsAndTemplates` below, so an unanchored `\bimport` also matches
+// the tail of a string that merely ends in the word: in
+// `spawnSync(process.execPath, ['--import', './register.mjs', PROBE], …)` the `\b` before `import`
+// falls inside `'--import'`, the expected opening quote is that string's *closing* quote, and the
+// "specifier" captured is the `, ` up to the next string's opening quote — reported as an
+// undeclared package named `, `. Anchoring is what rules that out; widening the gap or the
+// whitespace class here re-admits it.
+
 // Static `import ... from 'x'` / `export ... from 'x'`, including multi-line named-import lists —
 // the `[^'";]*?` gap excludes quotes and semicolons, so it cannot cross into a neighbouring
 // statement, but happily spans the newlines inside a brace list.
-const FROM_IMPORT_RE = /\b(?:import|export)\b[^'";]*?\bfrom\s*['"]([^'"]+)['"]/g;
+const FROM_IMPORT_RE = /(?:^|[\n;])[ \t]*(?:import|export)\b[^'";]*?\bfrom\s*['"]([^'"]+)['"]/g;
 // Side-effect-only `import 'x'` (no `from`).
-const SIDE_EFFECT_IMPORT_RE = /\bimport\s*['"]([^'"]+)['"]/g;
+const SIDE_EFFECT_IMPORT_RE = /(?:^|[\n;])[ \t]*import\s*['"]([^'"]+)['"]/g;
 // Dynamic `import('x')`.
 const DYNAMIC_IMPORT_RE = /\bimport\(\s*['"]([^'"]+)['"]/g;
 // `require('x')` — this repo is ESM-first, but a stray CommonJS require is still worth catching.
@@ -124,10 +134,15 @@ function declaredNames(manifest) {
 
 // -- The check -------------------------------------------------------------------------------
 
-/** File text, or null for a path git still indexes but the working tree has deleted (not yet staged). */
+/** File text, or null for a path git still indexes but the working tree has deleted (not yet staged).
+ *
+ * A leading UTF-8 BOM is dropped. `readFileSync(_, 'utf8')` keeps it, and several first-party files
+ * carry one (`packages/db-p2p-storage-fs/src/logger.ts`, `.../src/index.ts`); left in place it sits
+ * between the start of the text and the first keyword, so the statement-start anchor on the import
+ * patterns above would not match a BOM'd file's *first* import — silently un-checking it. */
 function readSource(file) {
 	try {
-		return readFileSync(file, 'utf8');
+		return readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
 	} catch (err) {
 		if (err.code === 'ENOENT') return null;
 		throw err;
