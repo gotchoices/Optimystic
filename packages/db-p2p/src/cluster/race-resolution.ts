@@ -126,10 +126,22 @@ export function recordPriority(record: ClusterRecord): number {
 }
 
 /**
- * Whether two messages must serialize against each other: true when they touch a common block AND
- * are not the same action. The same-action escape is what lets a commit follow its own pend — both
- * name every block the action writes, so a bare overlap test would have each transaction blocking
- * its own next phase. Gates whether {@link resolveRace} runs at all.
+ * Whether two messages must serialize against each other: true when they touch a common block, are
+ * not the same action, and neither is cancel-only. The same-action escape is what lets a commit
+ * follow its own pend — both name every block the action writes, so a bare overlap test would have
+ * each transaction blocking its own next phase. Gates whether {@link resolveRace} runs at all.
+ *
+ * A cancel-only message commutes with every message of a different action, so it never conflicts.
+ * Cancelling action X only deletes X's pending records on the named blocks (`StorageRepo.cancel`); it
+ * never moves a block's revision, so it reorders nobody's history:
+ *   - a commit of Y never reads X's pending record (that was checked at Y's pend);
+ *   - a pend of Y is refused by storage and by `validatePendOperations` while X's record stands, in
+ *     either arrival order — the worst outcome is a retry of Y, never a wrong result;
+ *   - an invalidation writes compensating revisions and does not touch pending records.
+ * Counting the cancel as a rival was actively harmful: on a two-member cohort a single conflict vote
+ * makes super-majority unreachable, so a refused writer's cancel knocked out the WINNER's commit after
+ * its log tail had landed, and the winner tore. It also let a pend or commit abort a cancel's own
+ * reservation, leaving the refused pending records standing longer.
  */
 export function operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMessage['operations']): boolean {
 	// Check if one is a commit for the same action as a pend - these don't conflict
@@ -137,6 +149,10 @@ export function operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMe
 	const actionId2 = getActionId(ops2);
 	if (actionId1 && actionId2 && actionId1 === actionId2) {
 		// Same action - commit is resolving the pend, not conflicting
+		return false;
+	}
+
+	if (isCancelOnly(ops1) || isCancelOnly(ops2)) {
 		return false;
 	}
 
@@ -155,4 +171,12 @@ export function operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMe
 	}
 
 	return false;
+}
+
+/**
+ * Every operation is a cancel. Stated over the whole list, although a `RepoMessage` carries one
+ * operation in practice, so a mixed message stays conservative and keeps conflicting.
+ */
+function isCancelOnly(operations: RepoMessage['operations']): boolean {
+	return operations.length > 0 && operations.every(operation => 'cancel' in operation);
 }

@@ -418,6 +418,16 @@ private findConflict(record: ClusterRecord): { blockedBy: string } | undefined {
 }
 
 export function operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMessage['operations']): boolean {
+  // Same action: a commit is finishing its own pend, not racing it.
+  const actionId1 = getActionId(ops1);
+  const actionId2 = getActionId(ops2);
+  if (actionId1 && actionId2 && actionId1 === actionId2) return false;
+
+  // A cancel-only message commutes with every other action's message: it deletes only its own
+  // action's pending records and moves no revision. See the function's own doc comment for the
+  // per-operation argument, and why counting it as a rival tore concurrent writes.
+  if (isCancelOnly(ops1) || isCancelOnly(ops2)) return false;
+
   const blocks1 = new Set(getAffectedBlockIds(ops1));
   const blocks2 = new Set(getAffectedBlockIds(ops2));
   

@@ -51,3 +51,7 @@ Two known consumers of that outcome:
   does not help: both sides are internally consistent and neither is behind the other. Fork handling
   is owned by `backlog/more-design/6.5-partition-healing`; this ticket is the *lag* half, and the
   boundary between them needs to be stated before either is built.
+
+## Evidence added 2026-09-17 — a second consumer, and a floor that needs no wire change
+
+`fix/1-refreshed-collection-caches-a-block-older-than-its-log-entry` is a measured instance of the same gap on a *data block* read rather than the refresh's tail read: a collection walks a log entry saying revision 7 changed block X, re-reads X pinned at 7, is served X materialized at 6 (a self-coordinated read inside the read-repair window), and caches it with no expiry. There the floor is already known on the client (the entry's revision) and the answer already reports the revision it was materialized at, so the too-old answer is detectable with no protocol change. That ticket takes the client-side check; whether a floor should also travel on the request — this ticket's subject — is left open there and should be settled with it.

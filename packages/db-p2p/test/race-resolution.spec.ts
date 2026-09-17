@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { approvalCount, operationsConflict, recordPriority, resolveRace } from '../src/cluster/race-resolution.js';
 import { MaxPriority } from '@optimystic/db-core';
-import type { ActionId, BlockId, ClusterRecord, IBlock, RepoMessage, Signature, Transforms } from '@optimystic/db-core';
+import type { ActionId, BlockId, ClusterRecord, DisputeResolutionProof, IBlock, RepoMessage, Signature, Transforms } from '@optimystic/db-core';
 
 /**
  * Direct unit tests for the race arbiter's helper keys. `resolveRace` itself is covered end-to-end by
@@ -32,6 +32,20 @@ const pendOps = (
 
 const commitOps = (actionId: string, blockId: string): RepoMessage['operations'] => [{
 	commit: { actionId: actionId as ActionId, blockIds: [blockId as BlockId], tailId: 'tail' as BlockId, rev: 1 }
+}];
+
+const cancelOps = (actionId: string, blockId: string): RepoMessage['operations'] => [{
+	cancel: { actionRef: { actionId: actionId as ActionId, blockIds: [blockId as BlockId] } }
+}];
+
+const invalidateOps = (invalidatedActionId: string, blockId: string): RepoMessage['operations'] => [{
+	invalidate: {
+		invalidatedActionId: invalidatedActionId as ActionId,
+		invalidatedRev: 1,
+		blockIds: [blockId as BlockId],
+		collectionId: 'collection-1' as BlockId,
+		resolution: {} as unknown as DisputeResolutionProof
+	}
 }];
 
 const record = (
@@ -106,6 +120,35 @@ describe('race-resolution', () => {
 		it('reports no conflict for a commit resolving its own pend on the same block', () => {
 			// Same action id: the commit is finishing the pend, not racing it.
 			expect(operationsConflict(pendOps('a1', 'shared'), commitOps('a1', 'shared'))).to.be.false;
+		});
+
+		it('reports a conflict for a commit racing a different action\'s pend on the same block', () => {
+			expect(operationsConflict(pendOps('a1', 'shared'), commitOps('a2', 'shared'))).to.be.true;
+		});
+
+		describe('a cancel never competes with another action', () => {
+			// A cancel only deletes its own action's pending records; it moves no revision, so it commutes
+			// with every other action's message. Counted as a rival, a refused writer's cancel knocked the
+			// winner's commit out on a two-member cohort (one conflict vote is already enough to lose there).
+			const others: [string, RepoMessage['operations']][] = [
+				['a pend', pendOps('a2', 'shared')],
+				['a commit', commitOps('a2', 'shared')],
+				['a cancel', cancelOps('a2', 'shared')],
+				['an invalidate', invalidateOps('a2', 'shared')]
+			];
+			for (const [kind, other] of others) {
+				it(`does not conflict with ${kind} of a different action on a shared block, in either order`, () => {
+					const cancel = cancelOps('a1', 'shared');
+					expect(operationsConflict(cancel, other), 'cancel held').to.be.false;
+					expect(operationsConflict(other, cancel), 'cancel incoming').to.be.false;
+				});
+			}
+
+			it('still conflicts when a message mixes a cancel with a write', () => {
+				// RepoMessages carry one operation in practice; a mixed list must stay conservative.
+				const mixed = [...cancelOps('a1', 'shared'), ...pendOps('a1', 'shared')] as unknown as RepoMessage['operations'];
+				expect(operationsConflict(mixed, pendOps('a2', 'shared'))).to.be.true;
+			});
 		});
 
 		it('is symmetric — the arbiter must see the same answer whichever record it holds', () => {
