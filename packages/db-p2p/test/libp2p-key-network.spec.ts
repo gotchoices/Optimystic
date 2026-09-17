@@ -13,10 +13,12 @@ import {
 	PERSISTED_STATE_VERSION,
 	SelfRelayOnlyAddressesError,
 	SELF_RELAY_ONLY_ERROR_CODE,
+	type FindCoordinatorErrorCode,
 	type NetworkStatePersistence,
 	type PersistedNetworkState,
 	type SelfCoordinationConfig
 } from '../src/libp2p-key-network.js';
+import type { IPeerReputation } from '../src/reputation/types.js';
 import { captureLog, formatCaptured, hasTag } from './support/capture-log.js';
 
 const makePeerId = async (): Promise<PeerId> => {
@@ -334,7 +336,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const mockFret = {
 				exportTable: () => mockFretTable,
 				getNetworkSizeEstimate: () => ({ size_estimate: 1, confidence: 0.5 }),
-				getNeighbors: () => [],
+				assembleCohort: () => [],
 				detectPartition: () => false
 			};
 			const persistence = new MemoryPersistence();
@@ -416,7 +418,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				consecutiveIsolatedSessions: 0
 			});
 			const fret = {
-				getNeighbors: () => [],
+				assembleCohort: () => [],
 				getNetworkSizeEstimate: () => ({ size_estimate: 10, confidence: 0.5 }),
 				detectPartition: () => true,
 				exportTable: () => undefined
@@ -444,7 +446,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				consecutiveIsolatedSessions: 0
 			});
 			const fret = {
-				getNeighbors: () => [],
+				assembleCohort: () => [],
 				// 10 → 4 is a 60% drop, past the 0.5 default threshold
 				getNetworkSizeEstimate: () => ({ size_estimate: 4, confidence: 0.5 }),
 				detectPartition: () => false,
@@ -506,7 +508,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 	describe('findCoordinator() — solo/bootstrap node error codes', () => {
 		it('returns self on first call when no excludes', async () => {
 			const fret = {
-				getNeighbors: () => [],
+				assembleCohort: () => [],
 				getNetworkSizeEstimate: () => ({ size_estimate: 1, confidence: 0.5 }),
 				detectPartition: () => false,
 				exportTable: () => undefined
@@ -520,7 +522,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('throws SELF_COORDINATION_EXHAUSTED (not "all candidates excluded") when self is excluded on solo node', async () => {
 			const fret = {
-				getNeighbors: () => [],
+				assembleCohort: () => [],
 				getNetworkSizeEstimate: () => ({ size_estimate: 1, confidence: 0.5 }),
 				detectPartition: () => false,
 				exportTable: () => undefined
@@ -554,7 +556,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				consecutiveIsolatedSessions: 3 // enough for hwm-decay
 			});
 			const fret = {
-				getNeighbors: () => [],
+				assembleCohort: () => [],
 				getNetworkSizeEstimate: () => ({ size_estimate: 10, confidence: 0.5 }),
 				detectPartition: () => false,
 				exportTable: () => undefined
@@ -581,7 +583,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 	// --- Boot-time self-selection and the coordinator cache -----------------------
 	// A node that reads a key before its first dial completes has only itself in FRET,
-	// so the FRET tier legitimately picks self. That pick must NOT be memoized: the
+	// so the cohort tier legitimately picks self. That pick must NOT be memoized: the
 	// coordinator cache is consulted ahead of every other tier, so a cached boot-time
 	// self would keep serving this node's own (possibly stale) replica for the full
 	// 30-minute TTL long after real peers connected. Every tier that can select self
@@ -601,11 +603,12 @@ describe('Libp2pKeyPeerNetwork', () => {
 		}) {
 			const state = { connections: options.connections, neighbors: options.neighbors };
 			const fret = {
-				getNeighbors: () => state.neighbors,
+				// The key's proximity band, nearest first. Self listed here means self is among
+				// the nearest; omitted means self is farther than every listed peer.
+				assembleCohort: () => state.neighbors,
 				getNetworkSizeEstimate: () => ({ size_estimate: options.sizeEstimate ?? 1, confidence: 0.5 }),
 				detectPartition: () => options.partitioned ?? false,
-				exportTable: () => undefined,
-				assembleCohort: () => []
+				exportTable: () => undefined
 			};
 			const libp2p = {
 				peerId: selfPeerId,
@@ -847,18 +850,17 @@ describe('Libp2pKeyPeerNetwork', () => {
 				neighbors: options?.neighbors
 					?? (peer ? [selfPeerId.toString(), peer.toString()] : [selfPeerId.toString()])
 			};
-			// findCoordinator consults FRET exactly once per retry attempt, so this counts
+			// findCoordinator assembles the cohort exactly once per retry attempt, so this counts
 			// attempts — a clock-free stand-in for "did the lookup enter the retry loop".
 			let attempts = 0;
 			const fret = {
-				getNeighbors: () => {
+				assembleCohort: () => {
 					attempts++;
 					return state.neighbors;
 				},
 				getNetworkSizeEstimate: () => ({ size_estimate: 10, confidence: 0.5 }),
 				detectPartition: () => options?.partitioned ?? false,
-				exportTable: () => undefined,
-				assembleCohort: () => []
+				exportTable: () => undefined
 			};
 			const dialQueue: PendingDial[] = options?.dialInFlight ? [pendingDial('active')] : [];
 			const libp2p = {
@@ -1051,11 +1053,10 @@ describe('Libp2pKeyPeerNetwork', () => {
 			for (const intent of ['read', 'write'] as const) {
 				const { libp2p } = (() => {
 					const fret = {
-						getNeighbors: () => [selfPeerId.toString()],
+						assembleCohort: () => [selfPeerId.toString()],
 						getNetworkSizeEstimate: () => ({ size_estimate: 1, confidence: 0.5 }),
 						detectPartition: () => false,
-						exportTable: () => undefined,
-						assembleCohort: () => []
+						exportTable: () => undefined
 					};
 					return {
 						libp2p: {
@@ -1486,8 +1487,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				assembleCohort: () => [svcA.toString(), svcB.toString(), knownButDisconnected.toString()],
 				getNetworkSizeEstimate: () => ({ size_estimate: 5, confidence: 0.5 }),
 				detectPartition: () => false,
-				exportTable: () => undefined,
-				getNeighbors: () => []
+				exportTable: () => undefined
 			};
 
 			const remoteConnA = stubConnection(svcA, 'outbound', `/ip4/10.0.0.1/tcp/4001/ws/p2p/${svcA.toString()}`);
@@ -1547,8 +1547,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			assembleCohort: () => ids.map(id => id.toString()),
 			getNetworkSizeEstimate: () => ({ size_estimate: 5, confidence: 0.5 }),
 			detectPartition: () => false,
-			exportTable: () => undefined,
-			getNeighbors: () => []
+			exportTable: () => undefined
 		});
 
 		/** peerStore stub holding `entries` (peer id → address strings); everyone else is empty. */
@@ -1785,7 +1784,6 @@ describe('Libp2pKeyPeerNetwork', () => {
 			getNetworkSizeEstimate: () => ({ size_estimate: 5, confidence: 0.5 }),
 			detectPartition: () => false,
 			exportTable: () => undefined,
-			getNeighbors: () => [],
 			assembleCohort: () => [],
 			...extra
 		});
@@ -1794,7 +1792,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const sameNet = await makePeerId();
 			const crossNet = await makePeerId();
 			// cross-network listed FIRST so a naive pick would choose it
-			const fret = baseFret({ getNeighbors: () => [crossNet.toString(), sameNet.toString()] });
+			const fret = baseFret({ assembleCohort: () => [crossNet.toString(), sameNet.toString()] });
 			const peerStore = peerStoreOf({
 				[sameNet.toString()]: { protocols: servesProto(PREFIX) },
 				[crossNet.toString()]: { protocols: [] } // identify never completed across networks
@@ -1807,7 +1805,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('findCoordinator prefers self (serves) over a not-yet-identified cross-network peer', async () => {
 			const crossNet = await makePeerId();
-			const fret = baseFret({ getNeighbors: () => [crossNet.toString(), selfPeerId.toString()] });
+			const fret = baseFret({ assembleCohort: () => [crossNet.toString(), selfPeerId.toString()] });
 			const peerStore = peerStoreOf({ [crossNet.toString()]: { protocols: [] } });
 			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(crossNet)], fret, peerStore });
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', undefined, undefined, PREFIX);
@@ -1824,7 +1822,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				lastConnectedTimestamp: Date.now(),
 				consecutiveIsolatedSessions: 0
 			});
-			const fret = baseFret({ getNeighbors: () => [foreign.toString()] });
+			const fret = baseFret({ assembleCohort: () => [foreign.toString()] });
 			const peerStore = peerStoreOf({ [foreign.toString()]: { protocols: ['/optimystic/netB/cluster/1.0.0'] } });
 			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(foreign)], fret, peerStore });
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence, undefined, PREFIX);
@@ -1842,13 +1840,13 @@ describe('Libp2pKeyPeerNetwork', () => {
 		});
 
 		it('findCoordinator falls back to self-coordination when self is not near the key and only a connected cross-network peer remains', async () => {
-			// Self is NOT a FRET neighbor of the key (getNeighbors omits self), so it is not in
-			// the FRET-path candidate set; the only connected peer is a permanently cross-network
-			// 'unknown' (empty peerStore protocol list). Selection must NOT gamble on that peer —
-			// it falls through to last-resort self-coordination (a correct single-coordinator
-			// write under downsize), never returning the cross-network 'unknown'.
+			// The band lists only the cross-network peer, so self is farther from the key than
+			// it is — but that peer is a permanently 'unknown' (empty peerStore protocol list) and
+			// is never admitted to the cohort, which leaves self as the only serving member and
+			// therefore the cohort. Selection must NOT gamble on the cross-network peer: it
+			// self-coordinates (a correct single-coordinator write under downsize) instead.
 			const crossNet = await makePeerId();
-			const fret = baseFret({ getNeighbors: () => [crossNet.toString()] });
+			const fret = baseFret({ assembleCohort: () => [crossNet.toString()] });
 			const peerStore = peerStoreOf({ [crossNet.toString()]: { protocols: [] } });
 			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(crossNet)], fret, peerStore });
 			// 'forming' + default HWM<=1 → self-coordination allowed (bootstrap-node); self NOT excluded.
@@ -1869,7 +1867,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				lastConnectedTimestamp: Date.now(),
 				consecutiveIsolatedSessions: 0
 			});
-			const fret = baseFret({ getNeighbors: () => [crossNet.toString()] });
+			const fret = baseFret({ assembleCohort: () => [crossNet.toString()] });
 			const peerStore = peerStoreOf({ [crossNet.toString()]: { protocols: [] } }); // identify never completed across networks
 			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(crossNet)], fret, peerStore });
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence, undefined, PREFIX);
@@ -1897,7 +1895,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			// fallback), so the >2 threshold lands the flip on attempt 1's first read.
 			const flipPeer = await makePeerId();
 			let getCount = 0;
-			const fret = baseFret({ getNeighbors: () => [flipPeer.toString()] });
+			const fret = baseFret({ assembleCohort: () => [flipPeer.toString()] });
 			const peerStore: any = {
 				all: async () => [],
 				get: async (pid: { toString(): string }) => {
@@ -1931,20 +1929,19 @@ describe('Libp2pKeyPeerNetwork', () => {
 				[crossNet.toString()]: { protocols: [], addresses: [`/ip4/10.0.0.3/tcp/4001/p2p/${crossNet.toString()}`] }
 			});
 			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
-			// clusterSize 2 → self + nearest serving peer (sameNet) fills the cohort; crossNet ('unknown') is never admitted.
+			// clusterSize 2 → the nearest serving peer (sameNet) plus self, the only other serving
+			// member, fill the cohort; crossNet ('unknown') is never admitted.
 			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining', undefined, undefined, PREFIX);
 			const cluster = await network.findCluster(routingKeyForBlock('some-key'));
-			expect(cluster[selfPeerId.toString()], 'self is always kept').to.exist;
-			expect(cluster[sameNet.toString()], 'serving peer kept').to.exist;
+			expect(Object.keys(cluster), 'proximity order: the serving peer is nearer than self').to.deep.equal([sameNet.toString(), selfPeerId.toString()]);
 			expect(cluster[crossNet.toString()], 'cross-network peer excluded').to.not.exist;
 		});
 
-		it('findCluster sizes the cohort to clusterSize (self counts toward it) when more serving peers are available', async () => {
-			// Regression for the cohort off-by-one: self is ALWAYS added, so the cohort must
-			// reserve a slot for it and keep only (clusterSize - 1) serving non-self peers —
-			// otherwise a populated network produces clusterSize+1-member cohorts, which raises
-			// the super-majority promise count (ceil((clusterSize+1)*threshold)) above what the
-			// configured clusterSize intends and hurts write availability.
+		it('findCluster sizes the cohort to clusterSize, and self is not in it when that many serving peers are nearer', async () => {
+			// The cohort is exactly the nearest clusterSize SERVING members — never clusterSize+1
+			// (which would raise the super-majority promise count above what the configured
+			// clusterSize intends), and never self-plus-(clusterSize-1) (which put a copy on a
+			// node that is not responsible and left a responsible peer without one).
 			const s1 = await makePeerId();
 			const s2 = await makePeerId();
 			const s3 = await makePeerId();
@@ -1958,9 +1955,8 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
 			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining', undefined, undefined, PREFIX);
 			const cluster = await network.findCluster(routingKeyForBlock('populated-key'));
-			expect(Object.keys(cluster).length, 'cohort is exactly clusterSize (self + clusterSize-1 serving peers)').to.equal(2);
-			expect(cluster[selfPeerId.toString()], 'self is always kept').to.exist;
-			expect(cluster[s1.toString()], 'nearest serving peer kept').to.exist;
+			expect(Object.keys(cluster), 'the two nearest serving peers, in proximity order').to.deep.equal([s1.toString(), s2.toString()]);
+			expect(cluster[selfPeerId.toString()], 'self is farther than clusterSize serving peers, so it is not responsible').to.not.exist;
 		});
 
 		it('findCluster always drops a foreign cohort member (self-only cohort)', async () => {
@@ -2017,9 +2013,9 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect(cluster[crossNet.toString()], 'cross-network peer excluded').to.not.exist;
 		});
 
-		it('findCluster with clusterSize 1 yields a self-only cohort even when serving peers are nearer the key', async () => {
-			// nonSelfTarget = max(0, clusterSize - 1) = 0, so no non-self member is admitted —
-			// not even a positively-serving one. The cohort is exactly self.
+		it('findCluster with clusterSize 1 yields the single nearest serving peer, not self, when that peer is nearer the key', async () => {
+			// One responsible peer per block, and it is whoever is nearest: the serving peer here.
+			// (At HEAD this reserved the one slot for self and admitted no one else.)
 			const sameNet = await makePeerId();
 			const fret = baseFret({ assembleCohort: () => [sameNet.toString()] });
 			const peerStore = peerStoreOf({
@@ -2028,8 +2024,8 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
 			const network = new Libp2pKeyPeerNetwork(libp2p, 1, undefined, 'joining', undefined, undefined, PREFIX);
 			const cluster = await network.findCluster(routingKeyForBlock('k'));
-			expect(Object.keys(cluster)).to.deep.equal([selfPeerId.toString()]);
-			expect(cluster[sameNet.toString()], 'no slot for non-self members at clusterSize 1').to.not.exist;
+			expect(Object.keys(cluster)).to.deep.equal([sameNet.toString()]);
+			expect(cluster[selfPeerId.toString()], 'the one slot goes to the nearest serving peer').to.not.exist;
 		});
 
 		it('with protocolPrefix ABSENT, findCluster retains a cross-network member (filter disabled — regression guard)', async () => {
@@ -2047,7 +2043,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('with protocolPrefix ABSENT, findCoordinator still returns a connected FRET neighbor (filter disabled — regression guard)', async () => {
 			const peerA = await makePeerId();
-			const fret = baseFret({ getNeighbors: () => [peerA.toString()] });
+			const fret = baseFret({ assembleCohort: () => [peerA.toString()] });
 			const peerStore = peerStoreOf({ [peerA.toString()]: { protocols: [] } });
 			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(peerA)], fret, peerStore });
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
@@ -2055,6 +2051,230 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect(result.toString()).to.equal(peerA.toString());
 		});
 	});
+	// --- Self is in a block's cohort only when it is among the nearest ------------
+	/**
+	 * Ticket: cohort-assembly-self-only-when-nearest.
+	 *
+	 * A machine used to put itself into every block's cohort and pick itself as coordinator, even
+	 * when `clusterSize` nearer serving peers existed — which is exactly what fails once a network
+	 * is wider than the replication factor: the writer keeps a copy nobody looks for and a
+	 * responsible peer never receives the block. Both `findCluster` and `findCoordinator` now derive
+	 * from ONE ordered assembly: the nearest `clusterSize` serving peers, self among them only when
+	 * it genuinely is one of them.
+	 *
+	 * A mocked `assembleCohort` lists the key's proximity band nearest first. Self listed means self
+	 * is among the nearest at that position; self absent means self is farther than every listed
+	 * peer (FRET's real ring store holds this node, so a real band never omits a nearby self).
+	 */
+	describe('cohort assembly — self is in a cohort only when it is among the nearest serving peers', () => {
+		const PREFIX = '/optimystic/netA';
+		const servesProto = [`${PREFIX}/cluster/1.0.0`, `${PREFIX}/repo/1.0.0`];
+		/** What a client-only libp2p node registers: identify and ping, no storage protocol. */
+		const clientOnlyProto = ['/ipfs/id/1.0.0', '/ipfs/ping/1.0.0'];
+		const KEY = routingKeyForBlock('nearest-key');
+
+		const fretWithBand = (band: () => string[]): any => ({
+			assembleCohort: band,
+			getNetworkSizeEstimate: () => ({ size_estimate: 5, confidence: 0.5 }),
+			detectPartition: () => false,
+			exportTable: () => undefined
+		});
+		/** peerStore in which exactly `serving` advertise this network's storage protocols; everyone else is unidentified. */
+		const peerStoreServing = (serving: PeerId[]): any => ({
+			all: async () => [],
+			get: async (pid: { toString(): string }) => ({
+				protocols: serving.some(id => id.toString() === pid.toString()) ? servesProto : [],
+				addresses: [{ multiaddr: multiaddr(`/ip4/10.0.0.5/tcp/4001/p2p/${pid.toString()}`) }]
+			})
+		});
+		/** Give a libp2p double its own registered protocol list — the input to `selfServes`. */
+		const withOwnProtocols = (libp2p: Libp2p, protocols: string[]): Libp2p => {
+			(libp2p as unknown as { getProtocols: () => string[] }).getProtocols = () => protocols;
+			return libp2p;
+		};
+		const ids = (cluster: Record<string, unknown>): string[] => Object.keys(cluster);
+		const strs = (peers: PeerId[]): string[] => peers.map(p => p.toString());
+
+		async function expectCode(run: () => Promise<unknown>, code: FindCoordinatorErrorCode, label: string): Promise<FindCoordinatorError> {
+			let caught: unknown;
+			try {
+				await run();
+				expect.fail(`${label}: expected findCoordinator to throw ${code}`);
+			} catch (err) {
+				caught = err;
+			}
+			expect(caught, label).to.be.instanceOf(FindCoordinatorError);
+			expect((caught as FindCoordinatorError).code, label).to.equal(code);
+			return caught as FindCoordinatorError;
+		}
+
+		let a: PeerId;
+		let b: PeerId;
+		let c: PeerId;
+		before(async () => {
+			[a, b, c] = await Promise.all([makePeerId(), makePeerId(), makePeerId()]);
+		});
+
+		describe('findCluster', () => {
+			it('a solo node (FRET knows nobody) gets a self-only cohort, on both the scoped and the unscoped path', async () => {
+				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => []), peerStore: peerStoreServing([]) });
+				for (const prefix of [undefined, PREFIX]) {
+					const network = new Libp2pKeyPeerNetwork(libp2p, 3, undefined, 'forming', undefined, undefined, prefix);
+					expect(ids(await network.findCluster(KEY)), `prefix=${prefix}`).to.deep.equal([selfPeerId.toString()]);
+				}
+			});
+
+			it('self is excluded when clusterSize serving peers are nearer', async () => {
+				// Band [a, b, c] with self absent: farther than all three. clusterSize 2 → [a, b].
+				// At HEAD the unscoped path unioned self in and the scoped path put self FIRST.
+				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => strs([a, b, c])), peerStore: peerStoreServing([a, b, c]) });
+				for (const prefix of [undefined, PREFIX]) {
+					const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, prefix);
+					expect(ids(await network.findCluster(KEY)), `prefix=${prefix}`).to.deep.equal(strs([a, b]));
+				}
+			});
+
+			it('self is included, at its proximity position, when it is among the nearest', async () => {
+				// Band [a, self, b]: self is the second-nearest. clusterSize 2 → [a, self]; b is out.
+				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => [a.toString(), selfPeerId.toString(), b.toString()]), peerStore: peerStoreServing([a, b]) });
+				for (const prefix of [undefined, PREFIX]) {
+					const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, prefix);
+					expect(ids(await network.findCluster(KEY)), `prefix=${prefix}`).to.deep.equal([a.toString(), selfPeerId.toString()]);
+				}
+			});
+
+			it('small network: when the serving peers number at most clusterSize, every one is in the cohort, self included', async () => {
+				// Band [a, b] with self farther than both, clusterSize 3: nothing is cut, and a
+				// serving self absent from the band is appended LAST (it is the farthest member).
+				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => strs([a, b])), peerStore: peerStoreServing([a, b]) });
+				for (const prefix of [undefined, PREFIX]) {
+					const network = new Libp2pKeyPeerNetwork(libp2p, 3, undefined, 'forming', undefined, undefined, prefix);
+					expect(ids(await network.findCluster(KEY)), `prefix=${prefix}`).to.deep.equal([a.toString(), b.toString(), selfPeerId.toString()]);
+				}
+			});
+
+			it('a nearer cross-network peer does not displace self: the cohort is the nearest clusterSize SERVING members', async () => {
+				// Band [c (unidentified), a, self, b], clusterSize 2 → serving [a, self, b] → [a, self].
+				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => [c.toString(), a.toString(), selfPeerId.toString(), b.toString()]), peerStore: peerStoreServing([a, b]) });
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				expect(ids(await network.findCluster(KEY))).to.deep.equal([a.toString(), selfPeerId.toString()]);
+			});
+
+			it('a node that does not serve this network is in no cohort at any width, and its cohort may be empty', async () => {
+				const alone = withOwnProtocols(createMockLibp2p(selfPeerId, { fret: fretWithBand(() => []), peerStore: peerStoreServing([]) }), clientOnlyProto);
+				const solo = new Libp2pKeyPeerNetwork(alone, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				expect(ids(await solo.findCluster(KEY)), 'no serving peer known: an EMPTY cohort, not a self-only one').to.deep.equal([]);
+
+				// FRET's ring holds this node regardless of what it stores, so it can list self
+				// nearest; self is removed wherever it sits.
+				const near = withOwnProtocols(createMockLibp2p(selfPeerId, { fret: fretWithBand(() => [selfPeerId.toString(), a.toString()]), peerStore: peerStoreServing([a]) }), clientOnlyProto);
+				const wide = new Libp2pKeyPeerNetwork(near, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				expect(ids(await wide.findCluster(KEY)), 'self removed from the band even when FRET ranks it nearest').to.deep.equal([a.toString()]);
+			});
+
+			it('a libp2p double without getProtocols counts as serving, the convention every optional mock surface follows', async () => {
+				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => []), peerStore: peerStoreServing([]) });
+				expect((libp2p as unknown as { getProtocols?: unknown }).getProtocols, 'precondition: the double has no getProtocols').to.equal(undefined);
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				expect(ids(await network.findCluster(KEY))).to.deep.equal([selfPeerId.toString()]);
+			});
+		});
+
+		describe('findCoordinator', () => {
+			it('picks from the ordered cohort, not from FRET\'s successor-biased neighbour list', async () => {
+				// The cohort is [self, a]. FRET's `getNeighbors` (successors first, then
+				// predecessors) would list b second — the ordering the old tier ranked, which is how
+				// a write whose cohort self headed could land on a peer just outside it. With self
+				// denied by the guard, the pick must be a, the cohort's second entry, even though b
+				// is connected, serving, and listed ahead of a by getNeighbors.
+				const fret = { ...fretWithBand(() => [selfPeerId.toString(), a.toString()]), getNeighbors: () => [selfPeerId.toString(), b.toString(), a.toString()] };
+				const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(b), outboundConnTo(a)], fret, peerStore: peerStoreServing([a, b]) });
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, { allowSelfCoordination: false }, 'forming', undefined, undefined, PREFIX);
+				expect((await network.findCoordinator(KEY)).toString()).to.equal(a.toString());
+			});
+
+			it('equal reputation keeps proximity order: the nearest reachable cohort member wins', async () => {
+				// b is nearest, a next, self last; every score is 0. The reputation sort is stable, so
+				// b is picked — an unstable sort here would let two writers name different coordinators.
+				const fret = fretWithBand(() => [b.toString(), a.toString(), selfPeerId.toString()]);
+				const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(a), outboundConnTo(b)], fret, peerStore: peerStoreServing([a, b]) });
+				const network = new Libp2pKeyPeerNetwork(libp2p, 3, undefined, 'forming', undefined, undefined, PREFIX);
+				expect((await network.findCoordinator(KEY)).toString()).to.equal(b.toString());
+			});
+
+			it('a better reputation score reorders WITHIN the cohort only', async () => {
+				// b is nearest but carries a penalty; a is clean and wins. c is connected, clean, and
+				// serving — but outside the clusterSize-2 cohort, so it is never a candidate.
+				const fret = fretWithBand(() => strs([b, a, c]));
+				const reputation = { getScore: (id: string) => id === b.toString() ? 5 : 0, isBanned: () => false } as unknown as IPeerReputation;
+				const libp2p = createMockLibp2p(selfPeerId, { connections: [a, b, c].map(outboundConnTo), fret, peerStore: peerStoreServing([a, b, c]) });
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, reputation, PREFIX);
+				expect((await network.findCoordinator(KEY)).toString()).to.equal(a.toString());
+			});
+
+			it('a write from a node outside the cohort goes to a cohort member, never to self', async () => {
+				// Band [a, b], self farther, clusterSize 2. The guard ALLOWS self (bootstrap node),
+				// which is what let self win at HEAD; now a heads the cohort and self is not in it.
+				const fret = fretWithBand(() => strs([a, b]));
+				const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(a), outboundConnTo(b)], fret, peerStore: peerStoreServing([a, b]) });
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				expect(network.shouldAllowSelfCoordination().allow, 'precondition: the guard is not what keeps self out').to.equal(true);
+				expect((await network.findCoordinator(KEY)).toString()).to.equal(a.toString());
+			});
+
+			it('the connected fallback still picks an out-of-cohort connected serving peer when no cohort member is reachable', async () => {
+				// Cohort [a, self]: a is not connected and self is denied. b is connected, serving, and
+				// outside the cohort — a redirect hop rather than a placement, and still preferred
+				// over failing the caller.
+				const fret = fretWithBand(() => [a.toString(), selfPeerId.toString()]);
+				const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(b)], fret, peerStore: peerStoreServing([a, b]) });
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, { allowSelfCoordination: false }, 'forming', undefined, undefined, PREFIX);
+				expect((await network.findCoordinator(KEY)).toString()).to.equal(b.toString());
+			});
+
+			it('self is the last resort only when it is in the cohort: an outsider fails with NO_COORDINATOR_AVAILABLE', async function () {
+				// Band [a, b] (both serving, neither connected), self farther, clusterSize 2, zero
+				// connections, self neither excluded nor denied by the guard. At HEAD this returned
+				// self. The lookup still pays its retry window (a and b are peers a connection could
+				// land from), which is why this case gets a longer timeout.
+				this.timeout(5_000);
+				const fret = fretWithBand(() => strs([a, b]));
+				const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore: peerStoreServing([a, b]) });
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				expect(network.shouldAllowSelfCoordination().allow, 'precondition: the guard would allow self').to.equal(true);
+				const err = await expectCode(() => network.findCoordinator(KEY), FIND_COORDINATOR_ERROR_CODES.NO_COORDINATOR_AVAILABLE, 'outsider');
+				expect(err.message).to.match(/not among the responsible peers/);
+			});
+
+			it('a node that does not serve this network never coordinates, for a read or a write', async () => {
+				const client = (band: string[], connections: Connection[], serving: PeerId[]): Libp2p =>
+					withOwnProtocols(createMockLibp2p(selfPeerId, { connections, fret: fretWithBand(() => band), peerStore: peerStoreServing(serving) }), clientOnlyProto);
+
+				// Solo client: FRET's ring lists only self. At HEAD every tier's fallback returned self;
+				// now there is nobody responsible to route to, so the lookup fails in one attempt.
+				for (const intent of ['read', 'write'] as const) {
+					const alone = new Libp2pKeyPeerNetwork(client([selfPeerId.toString()], [], []), 2, undefined, 'forming', undefined, undefined, PREFIX);
+					await expectCode(() => alone.findCoordinator(KEY, { intent }), FIND_COORDINATOR_ERROR_CODES.NO_COORDINATOR_AVAILABLE, `solo client, intent=${intent}`);
+				}
+
+				// The only connected peer has not completed identify: dropped as unconfirmed, and the
+				// error names that as the cause rather than the generic code.
+				const unconfirmed = new Libp2pKeyPeerNetwork(client([selfPeerId.toString(), c.toString()], [outboundConnTo(c)], []), 2, undefined, 'forming', undefined, undefined, PREFIX);
+				await expectCode(() => unconfirmed.findCoordinator(KEY), FIND_COORDINATOR_ERROR_CODES.NO_NETWORK_COORDINATOR, 'unconfirmed peer only');
+
+				// A connected serving peer is picked through the cohort tier as usual.
+				const served = new Libp2pKeyPeerNetwork(client([selfPeerId.toString(), a.toString()], [outboundConnTo(a)], [a]), 2, undefined, 'forming', undefined, undefined, PREFIX);
+				expect((await served.findCoordinator(KEY)).toString()).to.equal(a.toString());
+			});
+
+			it('SELF_COORDINATION_EXHAUSTED keeps its meaning: the caller excluded self on a solo node', async () => {
+				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => [selfPeerId.toString()]), peerStore: peerStoreServing([]) });
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				await expectCode(() => network.findCoordinator(KEY, { excludedPeers: [selfPeerId] }), FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_EXHAUSTED, 'self excluded');
+			});
+		});
+	});
+
 	// --- Self-address memoization ------------------------------------------------
 	/**
 	 * `findCluster` puts this node's own addresses into every cluster record it builds, and it
@@ -2089,8 +2309,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 						assembleCohort: () => [],
 						getNetworkSizeEstimate: () => ({ size_estimate: 1, confidence: 1 }),
 						detectPartition: () => false,
-						exportTable: () => undefined,
-						getNeighbors: () => []
+						exportTable: () => undefined
 					}
 				}
 			} as unknown as Libp2p;

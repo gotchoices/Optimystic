@@ -718,9 +718,9 @@ export class CoordinatorRepo implements IRepo {
 
 	/**
 	 * Check if this node is in the cluster for a given block.
-	 * Uses findCluster membership — in the real network layer, self is always
-	 * included in the cohort when this node is responsible. This serves as a
-	 * defense-in-depth guard for requests that arrive at the wrong node.
+	 * Uses findCluster membership — in the real network layer, self is in the cohort exactly
+	 * when this node is among the nearest `clusterSize` serving peers for the block. This
+	 * serves as a defense-in-depth guard for requests that arrive at the wrong node.
 	 * Returns true if localPeerId is not set (backward compat for single-node/test setups).
 	 */
 	private async isResponsibleForBlock(blockId: BlockId): Promise<boolean> {
@@ -1213,9 +1213,11 @@ export class CoordinatorRepo implements IRepo {
 		const peers = await this.keyNetwork.findCluster(routingKeyForBlock(blockId));
 		const peerIds = peers ? Object.keys(peers) : [];
 		// NOTE: deliberately does NOT call `markBlocksSeen` — unlike the solo-self exit below.
-		// An empty cohort is a ROUTING FAILURE, not a settled answer, and `Libp2pKeyPeerNetwork`
-		// cannot even produce one (its `findCluster` always includes self); the only producer
-		// today is the mesh harness's injected `findClusterFails`. Arming the read-repair window
+		// An empty cohort is a ROUTING FAILURE, not a settled answer. A serving node's
+		// `Libp2pKeyPeerNetwork.findCluster` cannot produce one: it always holds at least this
+		// node when no nearer serving peer is known. Only a node that serves no storage (a
+		// client-only libp2p node, which runs no CoordinatorRepo today) can see an empty cohort;
+		// the only producer here is the mesh harness's injected `findClusterFails`. Arming the read-repair window
 		// here would suppress a genuine repair for a whole `readRepairWindowMs` after a transient
 		// blip, and re-entering costs no network work beyond the `findCluster` the read already
 		// makes. Do not "fix" this by symmetry with the solo-self exit.

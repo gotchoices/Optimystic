@@ -22,9 +22,12 @@
 import { expect } from 'chai';
 import { generateKeyPairFromSeed } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
+import { multiaddr } from '@multiformats/multiaddr';
+import type { Connection, Libp2p, PeerId } from '@libp2p/interface';
 import { DigitreeStore, assembleCohort, hashKey, hashPeerId } from 'p2p-fret';
 import { Diary, routingKeyForBlock, type IRepo, type BlockId, type CommitRequest, type PendRequest } from '@optimystic/db-core';
 import { createMesh, buildNetworkTransactor, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
+import { Libp2pKeyPeerNetwork } from '../src/libp2p-key-network.js';
 
 const utf8 = new TextEncoder();
 
@@ -43,20 +46,26 @@ const sameSet = (a: Iterable<string>, b: Iterable<string>): boolean => {
 const blockIds = (n: number, prefix = 'block'): string[] => Array.from({ length: n }, (_, i) => `${prefix}-${i}`);
 
 /**
- * A FRET ring store holding `n` peers at their real ring coordinates. Keys are derived from a fixed
+ * The `n` peers of the seeded ring `ringOf(n)` holds, in index order. Keys are derived from a fixed
  * seed per `(n, i)`, so every run measures the SAME ring: the statistics below are properties of one
  * reproducible geometry rather than a fresh random sample.
  */
-async function ringOf(n: number): Promise<DigitreeStore> {
-	const store = new DigitreeStore();
+async function ringPeersOf(n: number): Promise<PeerId[]> {
+	const peers: PeerId[] = [];
 	for (let i = 0; i < n; i++) {
 		const seed = new Uint8Array(32);
 		const view = new DataView(seed.buffer);
 		view.setUint32(0, n);
 		view.setUint32(4, i);
-		const pid = peerIdFromPrivateKey(await generateKeyPairFromSeed('Ed25519', seed));
-		store.upsert(pid.toString(), await hashPeerId(pid));
+		peers.push(peerIdFromPrivateKey(await generateKeyPairFromSeed('Ed25519', seed)));
 	}
+	return peers;
+}
+
+/** A FRET ring store holding `ringPeersOf(n)` at their real ring coordinates. */
+async function ringOf(n: number): Promise<DigitreeStore> {
+	const store = new DigitreeStore();
+	for (const pid of await ringPeersOf(n)) store.upsert(pid.toString(), await hashPeerId(pid));
 	return store;
 }
 
@@ -113,6 +122,143 @@ describe('routing-key convention: the writer and the servers route a block on on
 			for (const row of rows) {
 				expect(row.divergent, `n=${row.n} k=${k}: ids whose cohorts differ`).to.equal(0);
 				expect(row.coordinatorOutside, `n=${row.n} k=${k}: ids whose coordinator is outside the cohort`).to.equal(0);
+			}
+		});
+	});
+
+	/**
+	 * Ticket: cohort-assembly-self-only-when-nearest. The production key network over the same seeded
+	 * ring, from one member's point of view. Its cohort must be exactly FRET's nearest-`k` walk over that
+	 * ring — with self in it only when self is one of those `k` — at every width and on both the
+	 * membership-scoped path (production) and the unscoped one; and its coordinator pick, with self
+	 * allowed, must be that cohort's first entry. Only libp2p itself is stubbed: every other member is
+	 * connected and identified as serving, so the cohort tier always has a reachable candidate.
+	 */
+	describe('on the production key network over the same seeded ring (no I/O)', () => {
+		const k = 4;
+		const PREFIX = '/optimystic/convention';
+		const SERVES = [`${PREFIX}/cluster/1.0.0`, `${PREFIX}/repo/1.0.0`];
+		const addrOf = (pid: { toString(): string }): string => `/ip4/10.0.0.1/tcp/4001/p2p/${pid.toString()}`;
+
+		/**
+		 * `self`'s key network over `store`. Every other ring member is connected; each advertises the
+		 * storage protocols unless listed in `notServing`. `ownProtocols` is what this node registers.
+		 */
+		function keyNetworkOf(self: PeerId, peers: PeerId[], store: DigitreeStore, options: { scoped: boolean; ownProtocols?: string[]; notServing?: Set<string> }): Libp2pKeyPeerNetwork {
+			const notServing = options.notServing ?? new Set<string>();
+			const connections = peers
+				.filter(p => !p.equals(self))
+				.map(p => ({ remotePeer: p, status: 'open', direction: 'outbound', remoteAddr: { toString: () => addrOf(p) } }) as unknown as Connection);
+			const libp2p = {
+				peerId: self,
+				getConnections: () => connections,
+				getDialQueue: () => [],
+				getMultiaddrs: () => [],
+				getProtocols: () => options.ownProtocols ?? SERVES,
+				addEventListener: () => { },
+				removeEventListener: () => { },
+				peerStore: {
+					all: async () => [],
+					get: async (pid: PeerId) => ({
+						protocols: notServing.has(pid.toString()) ? ['/ipfs/id/1.0.0'] : SERVES,
+						addresses: [{ multiaddr: multiaddr(addrOf(pid)) }]
+					})
+				},
+				services: {
+					fret: {
+						assembleCohort: (coord: Uint8Array, wants: number, exclude?: Set<string>) => assembleCohort(store, coord, wants, exclude),
+						getNetworkSizeEstimate: () => ({ size_estimate: peers.length, confidence: 1 }),
+						detectPartition: () => false,
+						exportTable: () => undefined
+					}
+				}
+			} as unknown as Libp2p;
+			return new Libp2pKeyPeerNetwork(libp2p, k, undefined, 'forming', undefined, undefined, options.scoped ? PREFIX : undefined);
+		}
+
+		const cohortOf = async (network: Libp2pKeyPeerNetwork, id: string): Promise<string[]> =>
+			Object.keys(await network.findCluster(routingKeyForBlock(id)));
+
+		it('at every width, the cohort is FRET\'s nearest-k walk, self is in it exactly when it is one of the k, and the coordinator is its first entry', async () => {
+			const ids = blockIds(60);
+			const rows: Array<{ n: number; scoped: boolean; selfInCohort: number; of: number }> = [];
+			for (const n of [1, 2, 3, 4, 5, 6, 8, 12, 16, 32]) {
+				const peers = await ringPeersOf(n);
+				const store = await ringOf(n);
+				const self = peers[0]!;
+				for (const scoped of [true, false]) {
+					const network = keyNetworkOf(self, peers, store, { scoped });
+					let selfInCohort = 0;
+					for (const id of ids) {
+						const label = `n=${n} scoped=${scoped} ${id}`;
+						const expected = assembleCohort(store, await serverCoord(id), k);
+						const cohort = await cohortOf(network, id);
+						expect(cohort, `${label}: cohort (ordered)`).to.deep.equal(expected);
+						expect(cohort.length, `${label}: cohort width`).to.equal(Math.min(n, k));
+						if (cohort.includes(self.toString())) selfInCohort++;
+						const coordinator = (await network.findCoordinator(routingKeyForBlock(id))).toString();
+						expect(coordinator, `${label}: coordinator is the cohort's first entry`).to.equal(expected[0]);
+					}
+					rows.push({ n, scoped, selfInCohort, of: ids.length });
+				}
+			}
+			console.log('[convention] production key network vs FRET walk, k=4:');
+			console.table(rows);
+			// Sanity on the geometry: past k, self is in some cohorts and out of others.
+			for (const row of rows.filter(r => r.n > k)) {
+				expect(row.selfInCohort, `n=${row.n}: self in some cohorts`).to.be.greaterThan(0);
+				expect(row.selfInCohort, `n=${row.n}: self out of some cohorts`).to.be.lessThan(row.of);
+			}
+		});
+
+		it('small-network invariant: at every width from 1 to k, every serving node is in every cohort', async () => {
+			for (let n = 1; n <= k; n++) {
+				const peers = await ringPeersOf(n);
+				const store = await ringOf(n);
+				const everyone = peers.map(p => p.toString()).sort();
+				for (const self of peers) {
+					const network = keyNetworkOf(self, peers, store, { scoped: true });
+					for (const id of blockIds(20)) {
+						expect([...await cohortOf(network, id)].sort(), `n=${n} self=${self.toString().substring(0, 12)} ${id}`).to.deep.equal(everyone);
+					}
+				}
+			}
+		});
+
+		it('past k, from every member\'s point of view, self is in a block\'s cohort iff it is among the nearest k', async () => {
+			const n = 12;
+			const peers = await ringPeersOf(n);
+			const store = await ringOf(n);
+			for (const self of peers) {
+				const network = keyNetworkOf(self, peers, store, { scoped: true });
+				for (const id of blockIds(30)) {
+					const nearest = assembleCohort(store, await serverCoord(id), k);
+					const cohort = await cohortOf(network, id);
+					expect(cohort.includes(self.toString()), `self=${self.toString().substring(0, 12)} ${id}`).to.equal(nearest.includes(self.toString()));
+				}
+			}
+		});
+
+		it('a member that serves no storage is in no cohort, and its cohorts equal what a serving member computes for the same blocks', async () => {
+			// FRET's ring still holds the client-only node (it routes), so a serving peer sees it in
+			// the band and drops it as not serving; the client drops itself for the same reason.
+			// Both must land on the same nearest-k SERVING set, or the client would route writes to
+			// a set nobody else believes is responsible.
+			for (const n of [1, 2, 4, 8, 16]) {
+				const peers = await ringPeersOf(n);
+				const store = await ringOf(n);
+				const client = peers[0]!;
+				const clientNetwork = keyNetworkOf(client, peers, store, { scoped: true, ownProtocols: ['/ipfs/id/1.0.0'] });
+				const server = peers[1];
+				const serverNetwork = server ? keyNetworkOf(server, peers, store, { scoped: true, notServing: new Set([client.toString()]) }) : undefined;
+				for (const id of blockIds(30)) {
+					const fromClient = await cohortOf(clientNetwork, id);
+					expect(fromClient, `n=${n} ${id}: client never in its own cohort`).to.not.include(client.toString());
+					expect(fromClient.length, `n=${n} ${id}: width`).to.equal(Math.min(n - 1, k));
+					if (serverNetwork) {
+						expect(fromClient, `n=${n} ${id}: client and server agree`).to.deep.equal(await cohortOf(serverNetwork, id));
+					}
+				}
 			}
 		});
 	});

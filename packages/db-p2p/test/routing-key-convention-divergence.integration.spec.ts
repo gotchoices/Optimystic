@@ -16,9 +16,13 @@
  * behind — split by whether each landed inside the responsible cohort (read repair filling a responsible
  * peer's gap) or outside it (a soft-served read acquiring a block its node is not responsible for).
  *
- * Still expected to be wrong here, until `self-in-cohort-only-when-nearest` lands: the writer's node always
- * counts itself in the cohort and coordinates its own pends, so for every block it is not responsible for it
- * keeps a copy nobody looks for, and one responsible peer never receives the block.
+ * Pinned since `cohort-assembly-self-only-when-nearest`: the writer's node is in a block's cohort only when it
+ * is among the nearest `clusterSize` serving peers, and its coordinator pick comes from that same ordered
+ * cohort. So every block lands on exactly its responsible peers — no copy on the writer's node when it is not
+ * responsible, no responsible peer left without one — and the pick is never a neighbour just outside the cohort.
+ * What is NOT yet pinned is that the writer coordinates locally whenever it IS responsible: with cohorts in
+ * proximity order the transactor's first-seen tie-break can send such a pend to the nearer peer instead
+ * (`writer-and-harness-route-to-the-cohort` adds the tie-break toward self and pins equality).
  *
  * Gated on OPTIMYSTIC_INTEGRATION=1 like the other integration specs:
  *   OPTIMYSTIC_INTEGRATION=1 yarn workspace @optimystic/db-p2p test:integration -- --grep "routing-key convention"
@@ -193,7 +197,7 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 			// no redirect-learned coordinator hint has been recorded for this key yet.
 			const writerPick = (await keyNetwork.findCoordinator(routingKey, { excludedPeers: [] })).toString();
 			// The writer-side cohort `consolidateCoordinators` chooses the pend coordinator from, in the
-			// order it iterates (self-first on the membership-scoped path).
+			// order it iterates (proximity order; self present only when it is among the nearest).
 			const writerCohortOrder = Object.keys(await keyNetwork.findCluster(routingKey));
 			let outcome = 'ok';
 			try {
@@ -208,8 +212,9 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 			}
 			if (outcome !== 'ok') failures++;
 
-			// The servers' answer, two ways: the redirect check's `getCluster` (FRET cohort, no self) and the
-			// coordinator's own `findCluster` (same routing key, self always included).
+			// The servers' answer, two ways: the redirect check's `getCluster` (FRET's raw cohort) and the
+			// coordinator's own `findCluster` (same routing key, membership-scoped; the two agree when every
+			// ring member serves this network).
 			const cohort = new Set((await nm.getCluster(routingKey)).map(p => p.toString()));
 			serverCohorts.set(id, cohort);
 			const coordinatorView = Object.keys(await keyNetwork.findCluster(routingKey));
@@ -300,20 +305,19 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 
 		// Pinned by routing-key-single-encoding: no read is redirected, and no read leaves a replica on a node
 		// outside the responsible cohort.
-		// `writerPickOutsideCohort` is reported, not pinned: `findCoordinator` ranks FRET `getNeighbors` while
-		// cohorts come from `assembleCohort`, and on a write it drops self — so when self heads the cohort, its
-		// pick can be the next neighbour just outside it (observed for 1 block in 24). That is a selection
-		// question, not an encoding one; it is recorded as an arm of `self-in-cohort-only-when-nearest`.
 		expect(readSummary.getRedirects, 'reads reach a responsible peer, so none is redirected').to.equal(0);
 		expect(readSummary.replicasAddedOutsideCohort, 'no read acquires a replica outside the responsible cohort').to.equal(0);
 
-		// Still pinned until self-in-cohort-only-when-nearest: the writer's own node coordinates its own pends
-		// (no RepoService, no redirect check ever sees a write), and the write is placed on the writer's node
-		// plus only (clusterSize - 1) genuinely responsible peers — so whenever the writer is not itself
-		// responsible, one responsible peer never receives the block. Writes and reads still complete.
-		expect(summary.pendHandledLocally, 'every pend is coordinated by the writer\'s own node').to.equal(BLOCKS);
-		expect(summary.blocksWithCohortGap, 'each block whose writer is not responsible leaves one responsible peer without it')
-			.to.equal(BLOCKS - summary.driverInCohort);
+		// Pinned by cohort-assembly-self-only-when-nearest: the writer's key network puts self in a block's cohort
+		// only when self is among the nearest clusterSize serving peers, and picks the coordinator from that same
+		// ordered cohort. So no pick lands outside the cohort, every responsible peer receives every block, and no
+		// block is left on a node that is not responsible for it. A pend is coordinated locally only when the
+		// writer is responsible; `writer-and-harness-route-to-the-cohort` pins that as equality (tie-break to self).
+		expect(summary.writerPickOutsideCohort, 'the writer\'s pick is inside the responsible cohort for every block').to.equal(0);
+		expect(summary.blocksWithCohortGap, 'every responsible peer holds every block').to.equal(0);
+		expect(summary.blocksWithPhantomHolder, 'no block is held by a node outside its cohort').to.equal(0);
+		expect(summary.pendHandledLocally, 'a pend is coordinated by the writer\'s own node only when it is responsible')
+			.to.be.at.most(summary.driverInCohort);
 		expect(failures, 'writes complete').to.equal(0);
 		expect(readOk, 'reads complete').to.equal(BLOCKS);
 	});
