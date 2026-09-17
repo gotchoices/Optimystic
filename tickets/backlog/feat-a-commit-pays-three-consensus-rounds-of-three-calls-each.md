@@ -31,3 +31,7 @@ Session-mode commit → `TransactionCoordinator` → per staged collection, one 
 2. **Merge the tail and sweep commits into one round.** Send all blocks in one commit operation, and have `StorageRepo.commit` apply the tail block first. Saves a full round (another 3).
    - **Risk:** "the tail is committed before any other block" is what lets `bootstrapContext` trust the tail, and what torn-write handling assumes (`cancelAbandonedSweepBlocks`, `completeOwnEntry`: the tail's fate is known separately from the sweep). With a single round, a partial apply on one member must still never expose a non-tail block without its tail.
 3. Promise and commit folded into a single record for single-collection commits in small cohorts. This breaks the blind commit vote and content-digest-on-promise layering. Listed only as the direction a redesign would take.
+
+# Evidence, 2026-09-17: now the dominant cost (sereus remeasure at `012573a2`)
+
+After the refresh and rebalance fixes, sereus measured a two-party relay strand with 150 ms added each way. Reads take 0.6–2.5 s, but inserts still take 9–10 s, once 38 s. With no delay an insert is 9 `/cluster` streams and 40–51 exchanges on A. B's burst about 25–30 s after joining was 45 `/cluster` streams for 5 commits. Report: `../sereus/tickets/complete/relay-round-trips-remeasure-optimystic-012573a2.md`. Over a phone-grade link, commit round trips are now what an application feels.

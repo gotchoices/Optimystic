@@ -25,3 +25,7 @@ The monitor only examines blocks in its tracked set. On a live node that set is 
 ## Expected
 
 Either the pull stores what it fetches (and is aimed at a block the node is missing or behind on), or the `gained` reaction does no network work for a block the node already holds. `pulled` should mean what its documentation says.
+
+# Related observation, 2026-09-17 (sereus remeasure at `012573a2`)
+
+After the first `Message` insert of every run, A opened exactly **27 `/db-p2p/block-transfer` streams**, and never did after later inserts. That happened in 7 of 7 no-delay runs, whatever B's profile, and not in the delayed run. It is probably the first placement of a newly created collection's blocks. It is larger than the single fetch and push the review of `rebalance-pushes-freshly-committed-blocks-back-to-members-that-hold-them` left as a `NOTE:`. Whoever takes this ticket should check whether a collection's first commit reports its holders, or whether creation goes down a path that skips the report.
