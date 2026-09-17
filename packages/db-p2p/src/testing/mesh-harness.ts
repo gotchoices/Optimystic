@@ -16,6 +16,7 @@ import type { IRawStorage } from '../storage/i-raw-storage.js';
 import type { BlockArchive } from '../storage/struct.js';
 import { serveBlockArchive, servableProof } from '../storage/block-archive.js';
 import { coordinatorRepo, type ClusterLatestCallback, type CertifiedActionRev } from '../repo/coordinator-repo.js';
+import type { CommittedHolders } from '../cluster/rebalance-monitor.js';
 import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
 import { toString as u8ToString } from 'uint8arrays';
 
@@ -110,6 +111,13 @@ export interface MeshOptions {
 	 * eventually crosses it. Omitted → random keys.
 	 */
 	keySeed?: number;
+	/**
+	 * Receives each node's committed-holders reports — from its member after a durable consensus apply
+	 * and from its coordinator on acknowledging a cohort commit — the harness analogue of the sink
+	 * `libp2p-node-base` routes to the node's rebalance monitor. The harness builds no monitor; a spec
+	 * that wants one routes reports to its own. Omitted → nothing is reported.
+	 */
+	onCommittedHolders?: (node: MeshNode, committed: CommittedHolders) => void;
 }
 
 export interface MeshFailureConfig {
@@ -480,7 +488,8 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			deriveExpectedCluster,
 			// Absent by default: `undefined` here is identical to omitting the field, and
 			// `validatePendOperations` then skips the validation step entirely.
-			validator: options.validatorFactory?.(index, peerId)
+			validator: options.validatorFactory?.(index, peerId),
+			onCommittedHolders: options.onCommittedHolders && ((committed) => options.onCommittedHolders!(meshNode, committed))
 		});
 	};
 
@@ -572,7 +581,8 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			clusterLatestCallback,
 			// The read path's transfer mechanism — the SAME instance the member uses on the commit
 			// path, mirroring how `libp2p-node-base` shares one `reconcileBlock` between both.
-			acquireBlockFromCohort: reconcileByPeer.get(node.peerId.toString())!
+			acquireBlockFromCohort: reconcileByPeer.get(node.peerId.toString())!,
+			onCommittedHolders: options.onCommittedHolders && ((committed) => options.onCommittedHolders!(node, committed))
 		});
 	};
 

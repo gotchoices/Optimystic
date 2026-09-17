@@ -24,7 +24,7 @@ import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js'
 import { latestClaimFromArchive, servableProof, type ArchiveServingRepo } from './storage/block-archive.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
 import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
-import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
+import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type CommittedHoldersSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
 import { createReconcileBlock } from './cluster/reconcile-block.js';
 import { resolveClusterPolicy, type ClusterPolicyOptions } from './cluster/cluster-policy.js';
 import { assertClusterSizeCoupling } from './cluster/cluster-size-coupling.js';
@@ -983,6 +983,13 @@ export async function createLibp2pNodeBase(
 			return { peers: peers ?? {}, confidence };
 		};
 
+		// Who holds each commit this node holds, for the rebalance monitor (so it does not push freshly
+		// committed blocks back to the members that stored them). Late-bound: the member and coordinator
+		// are built here, the monitor much further down inside the arachnode gate — and not at all when
+		// rebalance or FRET is off, in which case reports go nowhere.
+		let committedHoldersTarget: CommittedHoldersSink | undefined;
+		const onCommittedHolders: CommittedHoldersSink = (committed) => committedHoldersTarget?.(committed);
+
 		clusterImpl = clusterMember({
 			storageRepo,
 			peerNetwork: keyNetwork,
@@ -997,6 +1004,7 @@ export async function createLibp2pNodeBase(
 			stateStore: options.transactionStateStore,
 			reconcileBlock,
 			onCommitCertificate,
+			onCommittedHolders,
 			deriveExpectedCluster
 			// `recomputeArbitratorSet` (invalidation layer-2) is intentionally NOT wired here yet: a live FRET
 			// recompute needs a churn-tolerance window so it does not false-reject legitimate certificates from
@@ -1100,7 +1108,8 @@ export async function createLibp2pNodeBase(
 			acquireBlockFromCohort: reconcileBlock,
 			// Records who is still missing each block of a commit acknowledged below `full`. Nothing
 			// drains it yet: sending those copies is `under-replication-drain-and-full-replication-event`.
-			underReplicationLedger
+			underReplicationLedger,
+			onCommittedHolders
 		});
 
 		// Fail-fast coupling: the cluster member (what accepts a super-majority as sufficient) and the
@@ -1355,6 +1364,7 @@ export async function createLibp2pNodeBase(
 							options.rebalance,
 						);
 						await rebalanceMonitor.start();
+						committedHoldersTarget = (committed) => rebalanceMonitor.recordCommittedHolders(committed);
 
 						// onRebalance fires synchronously from the monitor's debounced check; the coordinator's
 						// reaction (pull gained / push lost, each partition-guarded) is async, so hop it off the

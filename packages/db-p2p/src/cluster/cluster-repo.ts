@@ -23,6 +23,7 @@ import { getAffectedBlockIds } from "./record-operations.js";
 import { operationsConflict, resolveRace } from "./race-resolution.js";
 import { buildBlockCommitProof, mintSoloCommitProof, type BlockCommitProof } from "./commit-proof.js";
 import { RECONCILE_TIMEOUT_MS } from "./reconcile-block.js";
+import type { CommittedHolders } from "./rebalance-monitor.js";
 
 const log = createLogger('cluster-member')
 
@@ -90,6 +91,15 @@ export type ReconcileBlockCallback = (blockId: BlockId, committed: ActionRev, co
  * isolated + logged (it must never break consensus).
  */
 export type CommitCertificateSink = (actionId: ActionId, cert: CommitCert) => void;
+
+/**
+ * Sink for who is known to hold a commit this node's own storage durably holds — fed to the rebalance
+ * monitor so it does not push freshly committed blocks back to the members that stored them (see
+ * `RebalanceMonitor.recordCommittedHolders`). Fired by the member after applying a consensus commit,
+ * and by `CoordinatorRepo.commit` when it acknowledges one. Optional; a throwing sink is isolated +
+ * logged (it must never break consensus or the writer's answer).
+ */
+export type CommittedHoldersSink = (committed: CommittedHolders) => void;
 
 /**
  * Applies a consensus-ordered {@link InvalidateRequest} to local storage — the deterministic
@@ -205,6 +215,8 @@ interface ClusterMemberComponents {
 	reconcileBlock?: ReconcileBlockCallback;
 	/** Receives the consensus commit cert per committed action; see {@link CommitCertificateSink}. */
 	onCommitCertificate?: CommitCertificateSink;
+	/** Receives who holds each consensus commit this member durably applied; see {@link CommittedHoldersSink}. */
+	onCommittedHolders?: CommittedHoldersSink;
 	/** Applies a consensus-ordered invalidation to local storage; see {@link InvalidationApplySink}. */
 	onInvalidate?: InvalidationApplySink;
 	/** Layer-2 arbitrator-set recompute for invalidation verification; see {@link RecomputeArbitratorSetCapability}. */
@@ -244,7 +256,8 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.onInvalidate,
 		components.recomputeArbitratorSet,
 		components.deriveExpectedCluster,
-		components.now
+		components.now,
+		components.onCommittedHolders
 	);
 }
 
@@ -368,7 +381,8 @@ export class ClusterMember implements ICluster {
 		private readonly onInvalidate?: InvalidationApplySink,
 		private readonly recomputeArbitratorSet?: RecomputeArbitratorSetCapability,
 		private readonly deriveExpectedCluster?: DeriveExpectedClusterCallback,
-		now?: () => number
+		now?: () => number,
+		private readonly onCommittedHolders?: CommittedHoldersSink
 	) {
 		this.now = now ?? ((): number => Date.now());
 		this.superMajorityThreshold = consensusConfig?.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD;
@@ -2147,7 +2161,9 @@ export class ClusterMember implements ICluster {
 			// verdicts — its own member's through getExecutedCommitResult, every other member's off the
 			// response record — and the two readers must see the same answer, hence one verdict,
 			// computed once, retained here for both.
-			this.executedCommitResults.set(messageHash, await this.durableCommitVerdict(commit, applied));
+			const verdict = await this.durableCommitVerdict(commit, applied);
+			this.executedCommitResults.set(messageHash, verdict);
+			if (verdict.success) this.reportCommittedHolders(record, commit);
 			return;
 		}
 		if ('invalidate' in operation) {
@@ -2392,6 +2408,29 @@ export class ClusterMember implements ICluster {
 			this.onCommitCertificate(actionId, buildCommitCert(record, minSigs, signedPayload));
 		} catch (err) {
 			log('cluster-member:commit-cert-sink-error', { actionId, error: (err as Error).message });
+		}
+	}
+
+	/**
+	 * Tell the {@link CommittedHoldersSink} which cohort members hold a commit this member just
+	 * durably applied. A member learns nothing about the others' storage at apply time, so the
+	 * evidence is the record's approving commit signers: each is a cohort member that signed to apply
+	 * this commit. A signer that then failed to apply is wrongly recorded, which only spares it a
+	 * rebalance push; its own reconcile, read-repair, and — on the coordinating node — the
+	 * coordinator's durability-checked report (which lands after this one and overrides it) still
+	 * reach it.
+	 */
+	private reportCommittedHolders(record: ClusterRecord, commit: CommitRequest): void {
+		if (!this.onCommittedHolders) {
+			return;
+		}
+		const holders = Object.entries(record.commits)
+			.filter(([peerId, vote]) => vote.type === 'approve' && peerId in record.peers)
+			.map(([peerId]) => peerId);
+		try {
+			this.onCommittedHolders({ blockIds: commit.blockIds, holders });
+		} catch (err) {
+			log('cluster-member:committed-holders-sink-error', { actionId: commit.actionId, error: (err as Error).message });
 		}
 	}
 

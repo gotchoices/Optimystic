@@ -229,6 +229,12 @@ export class SpreadOnChurnMonitor implements Startable {
 			// the default `requirePushCertificate` rejects an uncertified push, so a block this node
 			// holds no proof for simply fails to spread (logged by the receiver as
 			// `push:reject-uncertified`) rather than being planted.
+			//
+			// NOTE: no memory of earlier spreads — every debounced departure re-pushes every eligible block
+			// to every expansion target, including targets a previous pass already confirmed. Targets are
+			// only peers OUTSIDE the cohort, so a deployment no larger than its cohort (a two-member pair)
+			// spreads nothing. If churn on a larger network shows the same (block, target) pushed pass
+			// after pass, remember confirmed targets per block the way RebalanceMonitor's `cohortPeers` does.
 			const outcome = await pushBlockToPeers(this.deps.repo, this.deps.peerNetwork, blockId, targets, {
 				reason: 'replication',
 				protocolPrefix: this.deps.protocolPrefix,

@@ -504,6 +504,121 @@ describe('RebalanceMonitor', () => {
 		});
 	});
 
+	describe('commit evidence (recordCommittedHolders)', () => {
+		// Ticket rebalance-pushes-freshly-committed-blocks-back-to-members-that-hold-them: a freshly
+		// committed block had no growth memory, so the next check reported it gained (a pull) and its
+		// whole cohort grown (a push to members that stored it as part of the commit).
+
+		it('a committed block is neither gained nor grown toward the peers that hold it', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			await monitor.start();
+			monitor.trackBlock('block-1');
+			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [selfId.toString(), peerId2.toString()] });
+
+			expect(await monitor.checkNow(), 'nothing to pull, nothing to push').to.be.null;
+			expect(await monitor.checkNow(), 'the holder stays remembered').to.be.null;
+			await monitor.stop();
+		});
+
+		it('a cohort member the commit did not name is still pushed to', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString(), peerId3.toString()]);
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			await monitor.start();
+			monitor.trackBlock('block-1');
+			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [peerId2.toString()] });
+
+			const event = await monitor.checkNow();
+			expect(event!.gained, 'this node holds the commit — no pull').to.deep.equal([]);
+			expect(event!.grown.get('block-1')).to.deep.equal([peerId3.toString()]);
+			await monitor.stop();
+		});
+
+		it('a commit naming no other holder leaves the founder case intact: the whole cohort is grown', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			await monitor.start();
+			monitor.trackBlock('block-1');
+			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [selfId.toString()] });
+
+			const event = await monitor.checkNow();
+			expect(event!.grown.get('block-1')).to.deep.equal([peerId2.toString()]);
+			await monitor.stop();
+		});
+
+		it('an unconfirmed member withdraws an earlier confirmation, so it is pushed the block', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			await monitor.start();
+			monitor.trackBlock('block-1');
+			await monitor.checkNow();
+			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [peerId2.toString()], complete: true });
+			expect(await monitor.checkNow()).to.be.null;
+
+			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [], unconfirmed: [peerId2.toString()] });
+
+			const event = await monitor.checkNow();
+			expect(event!.grown.get('block-1')).to.deep.equal([peerId2.toString()]);
+			await monitor.stop();
+		});
+
+		it('later evidence about the same peer overrides earlier evidence, in either direction', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString(), peerId3.toString()]);
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			await monitor.start();
+			monitor.trackBlock('block-1');
+			// peerId2: listed by the member as a signer, then named unconfirmed by the coordinator.
+			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [peerId2.toString(), peerId3.toString()] });
+			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [], unconfirmed: [peerId2.toString(), peerId3.toString()] });
+			// peerId3: a later commit confirms it again.
+			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [peerId3.toString()] });
+
+			const event = await monitor.checkNow();
+			expect(event!.grown.get('block-1')).to.deep.equal([peerId2.toString()]);
+			await monitor.stop();
+		});
+
+		it('evidence survives a failed cohort lookup and is consumed by the next successful check', async () => {
+			let fail = true;
+			const keyNetwork = {
+				async findCluster() {
+					if (fail) throw new Error('fret unavailable');
+					return Object.fromEntries([selfId, peerId2].map(id => [id.toString(), { multiaddrs: [], publicKey: '' }]));
+				}
+			};
+			const monitor = new RebalanceMonitor({ ...deps, keyNetwork, clusterSize: 2 }, { minRebalanceIntervalMs: 0 });
+			await monitor.start();
+			monitor.trackBlock('block-1');
+			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [peerId2.toString()] });
+
+			expect(await monitor.checkNow()).to.be.null;
+			fail = false;
+			expect(await monitor.checkNow(), 'the evidence was kept for this check').to.be.null;
+			await monitor.stop();
+		});
+
+		it('evidence for an untracked block is dropped, and evidence is ignored while stopped', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+
+			monitor.trackBlock('block-stopped');
+			monitor.recordCommittedHolders({ blockIds: ['block-stopped'], holders: [peerId2.toString()] });
+
+			await monitor.start();
+			monitor.trackBlock('block-other');
+			monitor.recordCommittedHolders({ blockIds: ['block-later', 'block-untracked'], holders: [peerId2.toString()] });
+			const first = await monitor.checkNow();
+			expect(first!.gained, 'evidence recorded while stopped was ignored').to.have.members(['block-stopped', 'block-other']);
+
+			// Tracked only after a check has passed: its evidence was dropped with the untracked block's.
+			monitor.trackBlock('block-later');
+			const second = await monitor.checkNow();
+			expect(second!.gained).to.deep.equal(['block-later']);
+			expect(second!.grown.get('block-later')).to.deep.equal([peerId2.toString()]);
+			await monitor.stop();
+		});
+	});
+
 	describe('growth re-check timer', () => {
 		it('arms while confirmation is outstanding, fires a re-check, and disarms once confirmed', async () => {
 			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);

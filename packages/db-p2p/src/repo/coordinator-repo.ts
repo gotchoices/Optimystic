@@ -14,7 +14,7 @@ import { DEFAULT_CLUSTER_SIZE, resolveRepairCorroborationClusterSize } from "../
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
 import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, type ICommitProofPersister, type IRevisionActionReader } from "../storage/storage-repo.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
-import type { ReconcileBlockCallback } from "../cluster/cluster-repo.js";
+import type { ReconcileBlockCallback, CommittedHoldersSink } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
 import type { IUnderReplicationLedger } from "./i-under-replication-ledger.js";
 import { RESPONSIBILITY_TTL_MS, ResponsibilityRefusalError } from "./responsibility.js";
@@ -500,6 +500,11 @@ interface CoordinatorRepoComponents {
 	 * recorded and commit behaves exactly as without it.
 	 */
 	underReplicationLedger?: IUnderReplicationLedger;
+	/**
+	 * Optional: told who holds each cohort commit this node acknowledges and holds — see
+	 * {@link CoordinatorRepo.reportCommittedHolders}. Absent → commit behaves exactly as without it.
+	 */
+	onCommittedHolders?: CommittedHoldersSink;
 }
 
 /**
@@ -535,7 +540,8 @@ export function coordinatorRepo(
 		stateStore,
 		components.acquireBlockFromCohort,
 		components.proofAnchoring,
-		components.underReplicationLedger
+		components.underReplicationLedger,
+		components.onCommittedHolders
 	);
 }
 
@@ -645,7 +651,8 @@ export class CoordinatorRepo implements IRepo {
 		stateStore?: ITransactionStateStore,
 		private readonly acquireBlockFromCohort?: AcquireBlockCallback,
 		private readonly proofAnchoring?: ProofAnchoring,
-		private readonly underReplicationLedger?: IUnderReplicationLedger
+		private readonly underReplicationLedger?: IUnderReplicationLedger,
+		private readonly onCommittedHolders?: CommittedHoldersSink
 	) {
 		this.localPeerId = localPeerId;
 		this.log = createLogger('coordinator-repo', localPeerId?.toString());
@@ -2633,7 +2640,7 @@ export class CoordinatorRepo implements IRepo {
 					return this.refuseCommitNotDurable(request, durableHolders, durability, 'local-executed');
 				}
 				if (armFreshness) this.markBlocksSeen(blockIds);
-				return await this.acknowledgeCommit(request, { success: true, durability: this.cohortWriteDurability(durability, localDurable) }, localDurable);
+				return await this.acknowledgeCommit(request, { success: true, durability: this.cohortWriteDurability(durability, localDurable) }, localDurable, record);
 			}
 			// Local cluster didn't execute during consensus. Attempt a local commit, but tolerate
 			// local divergence when the cluster already reached consensus AND a durable majority of
@@ -2681,7 +2688,7 @@ export class CoordinatorRepo implements IRepo {
 					if (armFreshness) this.markBlocksSeen(blockIds);
 					// The fallback commit landed every block, so this node holds them — whether or not
 					// it is a cohort member — and can source a push to whoever the class names as missing.
-					return await this.acknowledgeCommit(request, { ...result, durability: this.cohortWriteDurability(durability, selfInCohort) }, true);
+					return await this.acknowledgeCommit(request, { ...result, durability: this.cohortWriteDurability(durability, selfInCohort) }, true, record);
 				}
 				if (isMissingBaseRevisionFailure(result) && clusterReachedCommitConsensus(record)) {
 					return await this.tolerateLocalCommitDivergence(request, blockIds, result.reason ?? MISSING_BASE_REVISION_REASON, armFreshness, durability);
@@ -2860,11 +2867,38 @@ export class CoordinatorRepo implements IRepo {
 	 * commit never reaches the ledger.
 	 *
 	 * `localHolds` is whether this node's own storage durably holds every block of the commit, which
-	 * is what makes it a source for the missing copies — not whether the class counted it.
+	 * is what makes it a source for the missing copies — not whether the class counted it. `record`
+	 * is the consensus the commit ran on, absent for the solo short-circuit (no cohort ran, so no
+	 * holders to report).
 	 */
-	private async acknowledgeCommit(request: CommitRequest, answer: CommitSuccess, localHolds: boolean): Promise<CommitSuccess> {
+	private async acknowledgeCommit(request: CommitRequest, answer: CommitSuccess, localHolds: boolean, record?: ClusterRecord): Promise<CommitSuccess> {
+		if (localHolds && record !== undefined) this.reportCommittedHolders(request, answer.durability, record);
 		await this.noteReplicationShortfall(request, answer.durability, localHolds);
 		return answer;
+	}
+
+	/**
+	 * Tell the {@link CommittedHoldersSink} who holds a cohort commit this node holds, so its rebalance
+	 * monitor does not push the blocks back to members that stored them. A holder is a member the
+	 * durability class confirmed AND that signed an approving commit vote: the confirmation rests on
+	 * the member's unsigned apply report, and requiring the signature too means a member lying in that
+	 * report can only misstate its own copy — a member already trusted with the commit. The members
+	 * the class names unconfirmed are reported as such, which withdraws any earlier record of them
+	 * (including the signer list this node's own member reported at apply), so they are pushed the
+	 * block. Never throws: the commit is already acknowledged.
+	 */
+	private reportCommittedHolders(request: CommitRequest, durability: WriteDurability, record: ClusterRecord): void {
+		if (!this.onCommittedHolders) return;
+		const self = this.localPeerId?.toString();
+		const unconfirmed = durability.unconfirmed ?? [];
+		const holders = (durability.cohortPeerIds ?? [])
+			.filter(peerId => !unconfirmed.includes(peerId))
+			.filter(peerId => peerId === self || record.commits[peerId]?.type === 'approve');
+		try {
+			this.onCommittedHolders({ blockIds: request.blockIds, holders, unconfirmed });
+		} catch (err) {
+			this.log('coordinator-repo:committed-holders-sink-error', { actionId: request.actionId, error: (err as Error).message });
+		}
 	}
 
 	/**
