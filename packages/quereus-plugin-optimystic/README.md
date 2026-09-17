@@ -89,7 +89,7 @@ A table declared without a collection URI is stored at `tree://default/<schema>/
 
 Two tables that give the **same explicit** URI share storage on purpose — that is how a table is pointed at existing data — and the plugin's declaration guards judge each one against whatever record already describes that storage.
 
-Format-break caveat: plugin versions before the schema was part of the location stored defaulted tables at `tree://default/<table>` and filed catalog records under the bare table name. This version neither reads those records nor opens that storage for a defaulted table: after upgrading, `hydrate` finds no such tables and a re-declared table starts empty at its new location. Declare the table with the old location as an explicit URI (`using optimystic('tree://default/Member')`) to keep reading its rows.
+Format-break caveat: plugin versions before the schema was part of the location stored defaulted tables at `tree://default/<table>` and filed catalog records under the bare table name. This version neither reads those records nor opens that storage for a defaulted table: after upgrading, `hydrate` finds no such tables and a re-declared table starts empty at its new location. Declare the table with the old location as an explicit URI (`using optimystic('tree://default/Member')`) to keep reading its rows (covered by `test/same-named-tables-across-schemas.spec.ts`). Tables that already named an explicit URI keep their storage, but their old catalog records are skipped by `hydrate` too, so re-declare them after upgrading.
 
 ## Data Model
 

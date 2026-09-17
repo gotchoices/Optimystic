@@ -12,6 +12,11 @@
  * Names are used exactly as Quereus's `TableSchema` carries them: `schemaName` is canonical
  * (lowercase — see Quereus `SchemaManager.canonicalSchemaName`) and the table name keeps its
  * declared casing.
+ *
+ * NOTE: because the table name keeps its casing, `Member` and `member` in one schema name two
+ * locations and two records even though SQL resolves them to one table (the same was true of the
+ * earlier bare-name rule). Harmless while every declaration of a table spells it the same way;
+ * if hosts ever declare one table with varying case (say, across devices), fold the table name here.
  */
 
 import { encodeKeyTuple, splitKeyTuple } from './key-encoding.js';

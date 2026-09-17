@@ -246,4 +246,41 @@ describe('Same-named tables in two schemas of one database', function () {
 			{ member_id: 'm-1', nick: 'bob', joined: 5 },
 		]);
 	});
+
+	it('data written by a build that left the schema out is skipped by hydrate, and stays reachable through its old location as an explicit URI', async () => {
+		// Rebuild what an earlier build left in storage: rows at `tree://default/Member` and a
+		// defaulted-table record (no URI argument) filed under the bare key `Member`.
+		const transactor = buildSharedLocalTransactor(new MemoryRawStorage());
+		const legacyUri = 'tree://default/Member';
+		{
+			const { db, plugin } = await openSession(transactor);
+			await db.exec(`create table Member (id integer primary key, name text) using optimystic('${legacyUri}')`);
+			await db.exec(`insert into Member (id, name) values (1, 'alice')`);
+			const tree = await (catalogOf(plugin) as unknown as LegacyCatalogAccess).requireSchemaTree();
+			await tree.update();
+			const key = catalogKey('main', 'Member');
+			const [, record] = tree.at(await tree.find(key)) as [string, { vtabArgs?: Record<string, unknown> }];
+			const { vtabArgs: _explicitUri, ...defaulted } = record;
+			await tree.replace([[key, undefined], ['Member', ['Member', defaulted]]]);
+		}
+
+		const upgraded = await openSession(transactor);
+		expect(await upgraded.plugin.hydrate(upgraded.db), 'the bare-keyed record names no (schema, table)').to.deep.equal({ tables: 0, indexes: 0 });
+		await upgraded.db.exec(`create table Member (id integer primary key, name text)`);
+		expect(await queryAll(upgraded.db, 'select id from Member'), 'a defaulted re-declare starts empty at its new location').to.deep.equal([]);
+
+		const workaround = await openSession(transactor);
+		await workaround.db.exec(`create table Member (id integer primary key, name text) using optimystic('${legacyUri}')`);
+		expect(await queryAll(workaround.db, 'select id, name from Member')).to.deep.equal([{ id: 1, name: 'alice' }]);
+	});
 });
+
+/** The catalog tree behind a SchemaManager — only for planting a record the way an earlier build filed it. */
+interface LegacyCatalogAccess {
+	requireSchemaTree(): Promise<{
+		update(): Promise<void>;
+		find(key: string): Promise<unknown>;
+		at(path: unknown): unknown;
+		replace(entries: [string, unknown][]): Promise<void>;
+	}>;
+}
