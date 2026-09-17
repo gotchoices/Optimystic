@@ -96,3 +96,18 @@ breaking type change would be called out.
 A side effect worth knowing when weighing this ticket's `tradeoffs:` line ("no optimystic test can see the coupling"): the sweep also asserts that the pend aggregate's message starts with `Some peers did not complete: `, so rewording the `pend` sentence now turns one test in this repository red. It does not cover `get` or `commitBlocks`, and it does not check the `[block:` token.
 
 A second reader of the same text (2026-09-16): the regex and the `Some peers did not complete: ` check moved into `expectPromiseShortfall` in `packages/db-p2p/test/util/node-count-mesh.ts`, which both the sweep and `member-leaves-and-returns.spec.ts` now call. A typed field for the shortfall's counts would replace that one helper.
+
+## Arm, 2026-09-17 — a third consumer-facing distinction with no field, and this one costs a write
+
+Filed from `fix/1-a-write-gives-up-while-a-rival-still-holds-the-block`, where sereus reported it directly.
+
+`SyncRetryExhaustedError` is one error for two situations a caller should treat differently. "I lost ten races to writers I can name, and they are alive" invites re-presenting the write later. "I spent ten attempts against silence" does not. Today the only thing separating them is the prose in `lastReason` — `pending conflict: block(s) held by unresolved rival action(s) <id>`, or `Pend blocks held: n/m member(s) hold an unresolved rival action (k/m approvals)`. Sereus classifies `SyncRetryExhaustedError` as non-transient and does not re-present it, so in the runs it measured the write was simply lost.
+
+The evidence is already collected and then dropped at two named boundaries, both of which carry a `NOTE:` saying so:
+
+- `CoordinatorRepo.answerBlocksHeld` drops `BlocksHeldError.heldBy` (peer id → holding action id) because `StaleFailure` has no field for it, and its NOTE says a caller that wants to wait on the holder rather than re-race it "needs a typed field added here";
+- `StaleFailure.pending` does carry the rivals when the coordinator's own storage corroborated them, and `Collection.syncAttempts` keeps none of it — the error carries `lastReason`, `attempts` and `staleAt`, and nothing about who is holding the block.
+
+So the field work here has a third member: alongside the operation **phase** on the transactor aggregate and the shortfall's **counts**, `SyncRetryExhaustedError` wants the rival action ids (and whether any responder named one at all) as data. Same shape, same argument, same file for the first hop.
+
+One caveat for whoever sizes this. The lost write sereus measured was not caused by the missing field — it was caused by a pending record that never cleared, which is `implement/a-member-that-missed-a-commit-refuses-every-later-write`. With that fixed, re-presenting on this distinction becomes useful rather than a way to loop forever, and the two should probably be weighed in that order.
