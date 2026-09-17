@@ -48,7 +48,12 @@ export interface SyncOptions {
 
 /** Thrown by {@link ICollection.sync} / {@link ICollection.updateAndSync} when the retry budget
  * (attempt count or deadline) is exhausted while the transactor keeps returning stale failures.
- * Catchable so callers can surface a clear "gave up syncing" condition instead of hanging. */
+ * Catchable so callers can surface a clear "gave up syncing" condition instead of hanging.
+ *
+ * It says the write was NOT SAVED; it does not prove nothing was stored. A write's log tail is
+ * committed before its other blocks, and the attempt that spent the budget is not followed by a
+ * refresh, so that attempt's log entry may be standing in the log with none of its data — the state
+ * {@link TornActionError} names when a refresh does get to see it. */
 export class SyncRetryExhaustedError extends Error {
 	constructor(
 		readonly collectionId: CollectionId,

@@ -266,7 +266,12 @@ Key aspects of the sync process:
   a `SyncRetryExhaustedError` and must not be handled like one: the log already holds an entry for
   the write, its data is not saved, and the staged actions are left in place. Resubmitting them is
   a new write that will be logged a second time — a decision for the caller, never made silently.
-  `TransactionCoordinator.commit` follows the same rule and throws the same error.
+  `TransactionCoordinator.commit` follows the same rule and throws the same error. The converse
+  does not hold: a `SyncRetryExhaustedError` means the write was not saved, not that nothing was
+  stored. No refresh follows the attempt that spent the budget, so that attempt's log entry may be
+  standing in the log unnoticed. Any write a rival overtakes while it is half-landed leaves such an
+  entry behind for good; nothing marks or removes it yet
+  (`tickets/backlog/bug-a-refused-write-can-leave-its-log-entry-behind`).
 - **Pending management**: Waits (with exponential backoff) for conflicting transactions to complete
 - **State consistency**: Maintains proper revision tracking and cache coherence
 

@@ -853,7 +853,12 @@ saveMaterializedBlock(block): store(structuredClone(block));
   actions are left in place for the caller to discard or resubmit knowingly. `Collection.sync` /
   `updateAndSync` throw it, and so does `TransactionCoordinator.commit` (out of its inter-attempt
   `update()`); a multi-collection commit in which one participant was finished and another is torn
-  surfaces the torn one as this error rather than as `CoordinatorPartialCommitError`.
+  surfaces the torn one as this error rather than as `CoordinatorPartialCommitError`. That is a
+  known reporting gap, not a design: the bare error does not tell the caller that the finished
+  participant IS saved, and the Quereus bridge treats anything other than
+  `CoordinatorPartialCommitError` as a clean rollback. The same gap covers any terminal failure of
+  a commit after a refresh has already finished or consumed one participant's entry
+  (`tickets/fix/a-half-saved-multi-collection-commit-is-reported-as-not-saved`).
   `packages/db-core/test/own-entry-completes-the-action.spec.ts` pins the rule and all three
   reasons; the test double that matters is `TailLandsButReportsStale` (only the tail lands), not
   `CommitLandsButReportsStale` (everything lands — which makes "entry visible" and "write saved"

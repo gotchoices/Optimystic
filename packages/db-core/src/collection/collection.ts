@@ -568,6 +568,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 			const [status] = await this.transactor.getStatus([{ actionId: entry.actionId, blockIds: entry.blockIds }]);
 			const unlanded = entry.blockIds.filter((_, i) => status?.statuses[i] !== 'committed');
 			if (unlanded.length === 0) {
+				// NOTE: whole, but nobody told us who holds it, so a sync whose only commit was
+				// recognised here answers `undefined` — the "nothing was written" answer — for a write
+				// that is saved. Reachable only on the forked-lineage path above; if that path ever
+				// becomes ordinary, report a durability derived from the status read instead.
 				return undefined;
 			}
 			throw new TornActionError(this.id, entry.actionId, rev ?? -1, unlanded, 'transforms-not-held',
@@ -578,6 +582,16 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 		// NOTE: priority 0. The attempt's aged retry priority is a fairness hint for a race over a
 		// free revision; this revision is already this action's own, so there is no race to rank in.
+		// NOTE: this is a plain pend. When the failed attempt came from `TransactionCoordinator`, its
+		// pend carried `validation` (the transaction and its operations hash) and
+		// `superclusterNominees`; neither is retained, so the re-send carries neither. Harmless while
+		// no deployment hands members a transaction validator (and nothing reads the nominees on
+		// the receiving side at all). Once a validator is wired, members approve these
+		// blocks unchecked under `unvalidatablePendPolicy: 'accept'` and refuse them under `'reject'`
+		// (surfacing as a `completion-refused` TornActionError). Simply retaining and re-sending the
+		// pair is not obviously right either: a member re-executing the transaction after a sibling
+		// participant has landed no longer sees the state it was staged against. Tracked as an arm
+		// of tickets/backlog/feat-no-deployment-validates-transactions-at-pend.
 		const result = await this.source.transact(attempt.transforms, entry.actionId, rev, this.id, attempt.tailId, 0, attempt.blockDigests);
 		if (result.success) {
 			return result.durability;
@@ -1326,6 +1340,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 				// while another commit is in flight), which used to retry indefinitely. Default 10
 				// attempts ≈ 21s of exponential backoff. If a high-contention workload legitimately
 				// needs to wait longer for a pending commit to clear, raise maxAttempts for that caller.
+				// NOTE: no refresh follows the LAST budgeted attempt, so if that attempt's log tail
+				// landed nobody finds out: the caller gets plain exhaustion over a log that holds an
+				// entry for this write. The write is still never reported saved, which is the rule; what
+				// is lost is the more specific name (TornActionError). The leftover entry itself is
+				// tracked in tickets/backlog/bug-a-refused-write-can-leave-its-log-entry-behind.
 				if (consecutiveFailures >= maxAttempts) {
 					throw new SyncRetryExhaustedError(this.id, consecutiveFailures, lastReason, lastStaleAt);
 				}

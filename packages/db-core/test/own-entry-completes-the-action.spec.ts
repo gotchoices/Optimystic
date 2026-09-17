@@ -146,6 +146,7 @@ describe('Collection: an acknowledged write is complete, not merely logged', () 
 			commitRivalTreeWrite<string, Row>(inner, 'rival', keyOf, [['rival', { key: 'rival', value: 'Rival' }]]))
 		const joiner = await Tree.createOrOpen<string, Row>(wrapped, 'rival', keyOf)
 		await joiner.update()
+		const before = joiner.committedRevision()!
 
 		let thrown: unknown
 		try {
@@ -156,11 +157,19 @@ describe('Collection: an acknowledged write is complete, not merely logged', () 
 		expect(thrown, 'the write is refused, not acknowledged').to.be.instanceOf(TornActionError)
 		const torn = thrown as TornActionError
 		expect(torn.collectionId).to.equal('rival')
+		// Permanent, not "try again": a confirmed committed revision under another action.
+		expect(torn.reason).to.equal('rival-holds-revision')
+		expect(torn.staleAt, 'the confirmed rival revision is carried').to.not.equal(undefined)
 		expect(torn.blockIds, 'the blocks that never landed are named').to.not.be.empty
+		expect(wrapped.tears, 'refused at once — no second attempt was made to tear').to.equal(1)
 
 		const fresh = await Tree.createOrOpen<string, Row>(inner, 'rival', keyOf)
 		expect(await fresh.get('joiner'), 'the refused row is not in storage').to.equal(undefined)
 		expect(await fresh.get('rival'), "the rival's row is").to.deep.equal({ key: 'rival', value: 'Rival' })
+		// Never re-driven at a new revision: past where the joiner started, storage holds the torn
+		// tail and the rival — a re-drive would have taken a third.
+		expect(fresh.committedRevision(), 'no revision was taken for a second copy').to.equal(before + 2)
+		expect(joiner.committedRevision(), 'and the writer did not advance past its unsaved write').to.equal(before)
 	})
 })
 

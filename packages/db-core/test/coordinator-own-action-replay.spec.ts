@@ -389,6 +389,82 @@ describe('TransactionCoordinator: own committed action on retry', () => {
 			.to.deep.equal(['seed', 'local', 'rival']);
 	});
 
+	it('gives up as a TORN commit, not as a plain stale loss, when finishing keeps being refused', async () => {
+		const collectionId = 'coord-finish-refused-forever';
+		const inner = new TestTransactor();
+		await seed(inner, collectionId);
+		// Every multi-block commit lands only its tail: the first attempt tears, and so does every
+		// re-send that tries to finish it. The refresh — never a new commitOnce — is what is retried,
+		// so exactly one revision is ever taken.
+		const transactor = new TailLandsButReportsStale(inner, Infinity);
+		const collection = await Collection.createOrOpen<SpecAction>(transactor, collectionId, init());
+		const coordinator = new TransactionCoordinator(transactor, new Map([[collectionId, collection]]));
+		const transaction = await stage(coordinator, [{ collectionId, value: 'local' }]);
+
+		let thrown: unknown;
+		try {
+			await coordinator.commit(transaction, retryFast);
+		} catch (err) {
+			thrown = err;
+		}
+
+		// A CoordinatorStaleLossError would say nothing landed and invite a re-drive; the log
+		// already holds this transaction's entry.
+		expect(thrown).to.be.instanceOf(TornActionError);
+		expect((thrown as TornActionError).reason).to.equal('completion-refused');
+		expect((thrown as TornActionError).rev).to.equal(2);
+		expect(collection.hasUnsyncedChanges(), 'the unsaved action is still staged').to.equal(true);
+		expect(collection.committedRevision(), 'the writer did not advance past its unsaved write').to.equal(1);
+		const reader = await Collection.createOrOpen<SpecAction>(inner, collectionId, init());
+		expect(await logValues(reader), 'logged once — no attempt rebuilt the entry at a new revision')
+			.to.deep.equal(['seed', 'local']);
+		expect(reader.committedRevision()).to.equal(2);
+	});
+
+	it('one participant finished and another torn for good: the commit rejects and neither is misreported locally', async () => {
+		const idA = 'coord-mixed-a-finished';
+		const idB = 'coord-mixed-b-torn';
+		const inner = new TestTransactor();
+		await seed(inner, idA);
+		await seed(inner, idB);
+		// Both participants land only their tails. A rival then commits to B alone, so the refresh
+		// can finish A but can never finish B.
+		const transactor = new TailLandsButReportsStale(inner, 2, async unwrapped => {
+			const rival = await Collection.createOrOpen<SpecAction>(unwrapped, idB, init());
+			await rival.act({ type: 'set', data: { value: 'rival' } });
+			await rival.sync({ maxAttempts: 10, baseBackoffMs: 1, maxBackoffMs: 5 });
+		});
+		const a = await Collection.createOrOpen<SpecAction>(transactor, idA, init());
+		const b = await Collection.createOrOpen<SpecAction>(transactor, idB, init());
+		const coordinator = new TransactionCoordinator(transactor, new Map([[idA, a], [idB, b]]));
+		const transaction = await stage(coordinator, [
+			{ collectionId: idA, value: 'local-a' },
+			{ collectionId: idB, value: 'local-b' },
+		]);
+
+		let thrown: unknown;
+		try {
+			await coordinator.commit(transaction, retryFast);
+		} catch (err) {
+			thrown = err;
+		}
+
+		// NOTE: only the facts that hold whichever error names this outcome are pinned here. Today
+		// the torn participant's TornActionError escapes bare, which does not tell the caller that A
+		// IS saved (tickets/fix/a-half-saved-multi-collection-commit-is-reported-as-not-saved); the
+		// fix is expected to wrap it, so the torn error is looked for on the error or its `reason`.
+		expect(thrown, 'the commit is not acknowledged').to.be.instanceOf(Error);
+		const torn = thrown instanceof TornActionError ? thrown : (thrown as { reason?: unknown }).reason;
+		expect(torn, 'the torn participant is named').to.be.instanceOf(TornActionError);
+		expect((torn as TornActionError).collectionId).to.equal(idB);
+		expect((torn as TornActionError).reason).to.equal('rival-holds-revision');
+
+		expect(await unlandedBlocks(inner, idA, transaction.id), 'participant A was finished').to.deep.equal([]);
+		expect(a.hasUnsyncedChanges(), 'and A holds nothing staged').to.equal(false);
+		expect(await unlandedBlocks(inner, idB, transaction.id), "participant B's block never landed").to.not.be.empty;
+		expect(b.hasUnsyncedChanges(), "and B's action is still staged").to.equal(true);
+	});
+
 	it('an abandoned commit leaves no in-flight mark behind for a later refresh to consume', async () => {
 		const collectionId = 'coord-abandoned';
 		const inner = new TestTransactor();

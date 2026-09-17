@@ -116,3 +116,14 @@ Both are at `packages/db-p2p/src/cluster/cluster-repo.ts:1129-1200`, already in 
 list. Close them first, then do the wiring; or split them out into their own `debt-` ticket at
 promotion time and chain this one behind it with `prereq:`. Either is fine — what is not fine is
 promoting this while believing they are covered elsewhere.
+
+## Arm: the writer's "finish a half-saved write" re-send carries no transaction to re-check (review, 2026-09-16)
+
+Ticket `a-write-whose-log-entry-landed-alone-is-reported-saved` added a recovery step: when a write's history record was stored but its data blocks were not, the writer re-sends the same blocks at the same revision (`Collection.completeOwnEntry` in `packages/db-core/src/collection/collection.ts`). That re-send goes through `TransactorSource.transact`, which sends a plain pend. For a multi-collection transaction the original pend carried the `validation` pair (the transaction and its operations hash, built only in `TransactionCoordinator.pendCollection`); the re-send does not, because the pair is not retained with the failed attempt (`InFlightAttempt`).
+
+Nothing changes today, because no member holds a checker. The moment this ticket wires one:
+
+- under `unvalidatablePendPolicy: 'accept'` (the default), the finishing blocks of a transaction are approved without the re-check every other block of that transaction got;
+- under `'reject'`, the re-send is refused as `pend-not-validatable`, so a half-saved multi-collection write can never be finished in a fail-closed deployment. It fails loudly (`TornActionError`, reason `completion-refused`), never silently.
+
+Retaining the pair and re-sending it is not obviously the fix. A member re-executes the transaction against its current state, and by the time of the re-send a sibling collection of the same transaction may already be saved — so the re-execution no longer starts from the state the transaction was staged against and may legitimately produce different operations. Whoever wires validators needs to decide what a member should check for a re-send of blocks whose history record it can already read (for instance, that the re-sent blocks are exactly the ones that record names, under that action id). A `NOTE:` at the re-send site points here.
