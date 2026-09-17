@@ -75,3 +75,27 @@ All from `packages/quereus-plugin-optimystic` unless noted; Quereus rebuilt firs
 # What sereus should do next
 
 Re-run its eleven cadre-core tests (listed in sereus's `tickets/.pre-existing-error.md`) and its two restart integration scenarios, then five runs of the device-shape join scenario. Expect the `context.ManagerKey isn't a column` failure and the transactor-handover empty read to be gone. The nine `SET DATA TYPE int` failures stay red until the Quereus differ fix in `blocked/quereus-differ-treats-type-aliases-as-a-retype` is committed and consumed; nothing in this repo can clear them, and nothing here waits on that fix.
+
+# Notes for the reviewer (garden tender, 2026-09-16 night)
+
+1. **Catalog bytes must be identical across machines — test it, don't infer it.** A downstream app
+   (sereus) writes the catalog alone on every machine at every strand launch and relies on byte-identical
+   content (see `backlog/more-design/6.5-partition-healing`). This change put far more into each record:
+   declared type spellings, CHECK and default expression trees, `with context` variables, foreign keys,
+   tags, generated-column order. "Position-free and key-sorted" is the right intent. Please establish it
+   with an assertion: the same declaration applied in two independent databases, and applied in a
+   different statement order where that is legal, produces byte-identical catalog records. Watch for
+   anything that captures source positions, object identity, insertion order or session state.
+2. **Storage-operation cost on warm start.** Sereus pins cold/warm control-database start in a budget
+   spec (46 on warm start, per its report). The records are larger; the handoff says hydrate makes no
+   writes and a first-read schema rewrite was removed. State the before/after operation count on a warm
+   start so the dependent can re-measure deliberately rather than meet a red budget.
+3. **A behaviour change that other consumers may rely on.** "A per-table binding written explicitly in a
+   `using` clause now applies only to the session that runs the DDL." Session-binding arguments are no
+   longer persisted. That is defensible — the stale-binding defect was exactly this — but it changes what
+   an explicit `using optimystic(..., transactor: ...)` means after a restart. Confirm the README states
+   it where a user will meet it, and that no in-repo caller depends on the old persistence.
+4. **Quereus provenance.** The implementer rebuilt quereus's `dist` from the sibling working tree
+   (quereus HEAD `ff1c619c6` plus an **uncommitted** type-alias fix), so every run here included that
+   fix. The new spec is said not to depend on it. Verify that claim: the spec's assertions must hold
+   whether or not quereus has the alias fix, since the published plugin range will not carry it yet.
