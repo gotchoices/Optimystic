@@ -13,7 +13,6 @@ files:
   - packages/db-p2p/test/util/two-machine-lifecycle.ts, packages/quereus-plugin-optimystic/test/{distributed-quereus,distributed-transaction-validation}.spec.ts, packages/quereus-plugin-optimystic/test/two-node-secondary-index-libp2p.integration.spec.ts, packages/quereus-plugin-optimystic/test/manual-mesh-test.ts, packages/reference-peer/test/{distributed-diary.spec,quick-test}.ts (production-shaped multi-node transactors pass `localPeerId`)
   - docs/optimystic.md (§Wire up a transactor snippet rewritten; MeshHarness paragraph), packages/db-p2p/docs/cluster.md (§Network-Membership Scoping, one added passage)
   - tickets/backlog/debt-no-mesh-fixture-forces-two-coordinator-batches.md (arm appended)
-difficulty: medium
 ----
 
 # What was built
@@ -69,3 +68,17 @@ read summary   { readOk: 24, readMiss: 0, readThrew: 0, getsHandledRemotely: 24,
 - **`buildNetworkTransactors`' transactors read the shared `mesh.keyNetwork`**, not the node's partition-aware view, so under `partitionSides` a transactor still sees the unpartitioned cohort. Unchanged from before; noted because the per-node view is now public as `MeshNode.keyNetwork` and a reviewer may reasonably ask whether the transactor should read it.
 - **Sereus was not run.** A grep of `../sereus/packages` finds no `new NetworkTransactor` of its own; `cadre-core`'s control database loads the Quereus plugin, whose `collection-factory.ts` now passes `localPeerId`, so a sereus writer should regain local coordination on small networks with no change there. Not verified by running it.
 - No new tripwires or `NOTE:`s recorded.
+
+# Review findings
+
+Read the implement diff (2723cc3a) before the handoff. Checked: the tie-break's correctness across greedy rounds and against the pend→commit coordinator cache (commit reuses the pend's final assignment, so a locally pended block is committed locally too); the harness key network's ring construction, rebuild-on-size-change and restart behaviour (restart keeps the same `MeshNode` object, so node lookups stay valid); the migrated specs pick nodes by responsibility rather than index; production wiring in `cli.ts` and `collection-factory.ts`; the rewritten `docs/optimystic.md` snippet (`node.coordinatedRepo`, `node.keyNetwork` and `RepoClient.create` all exist as shown) and the `cluster.md` passage.
+
+Ran: db-core `yarn test` (1701 passing), db-p2p `yarn test` (2923 passing, 63 pending, 0 failing), root `yarn typecheck`, `yarn lint`, `yarn lint:docs`, all clean. Did not re-run the gated libp2p integration spec or the plugin/reference-peer suites; the review edits touch only a db-core spec and the harness's internal lookup.
+
+- **Minor, fixed — untested tie-break arm.** No case covered the local peer winning a tie in a *later* greedy round, or the local peer listed *first* holding against a later tied member (a `>=` slip would pass every existing case). Added "a tie in a later round still goes to the local peer…" in `packages/db-core/test/network-transactor.spec.ts`.
+- **Minor, fixed — quadratic node lookup.** `MockMeshKeyNetwork.nearest` mapped each ring id back to a node with `nodes.find`, so every `findCoordinator` (a whole-ring walk) was O(n²). The ring now carries an id→node map built alongside the store.
+- **Tripwire — partition view in per-node transactors.** `buildNetworkTransactors`' transactors read the shared unpartitioned `mesh.keyNetwork`, not `MeshNode.keyNetwork`; no spec drives a partition through them today (the one partition spec using a transactor deliberately uses the client-shaped `buildNetworkTransactor`). Parked as a `NOTE:` in `meshTransactor` in `mesh-harness.ts`.
+- **Error handling:** no new throw paths beyond `blockIdsInCohortOf`'s bounded scan, which fails loudly with the prefix and node. Nothing to change.
+- **Resource cleanup / performance:** the harness ring is built once per node count and holds no handles. Nothing to change.
+- **Type safety:** `localPeerId` is optional and stringified once at construction; absent, behaviour is unchanged (pinned by the "no local peer id" case). Nothing to change.
+- **Major findings:** none. The implementer's stated gaps stand as written: partial-failure paths on a real two-batch shape stay with `debt-no-mesh-fixture-forces-two-coordinator-batches`, the harness does not model non-serving members or reputation, and Sereus was not run.

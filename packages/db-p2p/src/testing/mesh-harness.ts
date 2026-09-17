@@ -174,7 +174,7 @@ class MockPeerNetwork implements IPeerNetwork {
 class MockMeshKeyNetwork implements IKeyNetwork {
 	/** The ring, built on first lookup (node ids hash asynchronously, and `nodes` fills after construction)
 	 *  and rebuilt only if the node count changes; a restarted node keeps its identity and so its position. */
-	private ring: { size: number; store: Promise<DigitreeStore> } | undefined;
+	private ring: { size: number; ready: Promise<{ store: DigitreeStore; byId: Map<string, MeshNode> }> } | undefined;
 
 	constructor(
 		private readonly nodes: MeshNode[],
@@ -208,24 +208,28 @@ class MockMeshKeyNetwork implements IKeyNetwork {
 
 	/** The `wants` nodes nearest `key`'s ring coordinate, nearest first. */
 	private async nearest(key: RoutingKey, wants: number): Promise<MeshNode[]> {
-		const store = await this.ringStore();
-		const ids = assembleCohort(store, await hashKey(key), Math.min(wants, this.nodes.length));
-		return ids.map(id => this.nodes.find(n => n.peerId.toString() === id)!);
+		const { store, byId } = await this.ringStore();
+		const ids = assembleCohort(store, await hashKey(key), Math.min(wants, byId.size));
+		return ids.map(id => byId.get(id)!);
 	}
 
-	private ringStore(): Promise<DigitreeStore> {
+	private ringStore(): Promise<{ store: DigitreeStore; byId: Map<string, MeshNode> }> {
 		if (this.ring?.size !== this.nodes.length) {
 			const members = [...this.nodes];
 			this.ring = {
 				size: members.length,
-				store: (async () => {
+				ready: (async () => {
 					const store = new DigitreeStore();
-					for (const node of members) store.upsert(node.peerId.toString(), await hashPeerId(node.peerId));
-					return store;
+					const byId = new Map<string, MeshNode>();
+					for (const node of members) {
+						store.upsert(node.peerId.toString(), await hashPeerId(node.peerId));
+						byId.set(node.peerId.toString(), node);
+					}
+					return { store, byId };
 				})()
 			};
 		}
-		return this.ring.store;
+		return this.ring.ready;
 	}
 }
 
@@ -717,6 +721,8 @@ function meshTransactor(mesh: Mesh, options: BuildTransactorOptions, localNode: 
 	return new NetworkTransactor({
 		timeoutMs: options.timeoutMs ?? 5_000,
 		abortOrCancelTimeoutMs: options.abortOrCancelTimeoutMs ?? 5_000,
+		// NOTE: every transactor, `localNode`'s included, reads the unpartitioned shared view, not `localNode.keyNetwork`;
+		// no spec drives `partitionSides` through a node's transactor today. If one does, pass the node's own view.
 		keyNetwork: mesh.keyNetwork,
 		getRepo: (peerId: DbPeerId) => {
 			const repo = repoByPeer.get(peerId.toString());

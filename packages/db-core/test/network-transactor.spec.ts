@@ -1317,8 +1317,10 @@ describe('NetworkTransactor', () => {
       const self = 'peer-self';
       const peerA = 'peer-A';
       const peerB = 'peer-B';
+      const peerC = 'peer-C';
       const blockId1 = 'block-1' as BlockId;
       const blockId2 = 'block-2' as BlockId;
+      const blockId3 = 'block-3' as BlockId;
 
       /** Pend one update per block in `cohorts` through a transactor whose local peer is `self`;
        *  returns every pend each peer received, in order. `failingPeers` throw on pend. */
@@ -1326,7 +1328,7 @@ describe('NetworkTransactor', () => {
         const mockNetwork = new MockKeyNetwork(options.fallbackCoordinator ?? peerA);
         for (const [blockId, peerIds] of cohorts) await mockNetwork.setCluster(blockId, peerIds);
         const pends: Array<{ peer: string; blockIds: string[] }> = [];
-        const inner = new Map([self, peerA, peerB].map(pid => [pid, new TestTransactor()]));
+        const inner = new Map([self, peerA, peerB, peerC].map(pid => [pid, new TestTransactor()]));
         const networkTransactor = new NetworkTransactor({
           timeoutMs: 1000,
           abortOrCancelTimeoutMs: 500,
@@ -1378,6 +1380,14 @@ describe('NetworkTransactor', () => {
         expect(pends).to.have.length(1);
         expect(pends[0]!.peer).to.equal(peerA);
         expect(pends[0]!.blockIds).to.have.members([blockId1, blockId2]);
+      });
+
+      it('a tie in a later round still goes to the local peer, and a later-listed member does not displace it', async () => {
+        // Round 1: A covers blocks 1 and 2. Round 2: self and C tie on block 3, self listed first.
+        const { result, pends } = await pendThroughCohorts([[blockId1, [peerA, peerB]], [blockId2, [peerA, peerB]], [blockId3, [self, peerC]]], { localPeerId: self });
+        expect(result.success).to.be.true;
+        expect(pends.map(p => p.peer)).to.have.members([peerA, self]);
+        expect(pends.find(p => p.peer === self)!.blockIds).to.deep.equal([blockId3]);
       });
 
       it('with the local peer in no cohort, a tie goes to the member listed first', async () => {
