@@ -3,13 +3,11 @@ prereq: optimystic-catalog-record-canonical-list-order
 files:
   - packages/quereus-plugin-optimystic/src/optimystic-module.ts (`OptimysticModule.alterTable` + private `addCheckConstraint`; `OptimysticVirtualTable.addCheckConstraint`; module-level `renameColumnSchemaOnly`; updated NOTE on `resolveConnectedTable`)
   - packages/quereus-plugin-optimystic/src/schema/schema-manager.ts (`SchemaManager.withCheckConstraint`)
-  - packages/quereus-plugin-optimystic/test/alter-table-arms.spec.ts (new)
-  - packages/quereus-plugin-optimystic/test/hydrate-restores-declared-table.spec.ts (`MIGRATION_PATHS`, two new tests, migrated-hydrate test looped over paths)
-  - packages/quereus-plugin-optimystic/test/schema-migration.spec.ts (one stale comment)
+  - packages/quereus-plugin-optimystic/test/alter-table-arms.spec.ts
+  - packages/quereus-plugin-optimystic/test/hydrate-restores-declared-table.spec.ts
+  - packages/quereus-plugin-optimystic/test/schema-migration.spec.ts
   - packages/quereus-plugin-optimystic/README.md ("Warm Restart")
-  - ../quereus/packages/quereus/src/runtime/emit/add-constraint.ts, alter-table.ts (read only — the engine paths this reproduces)
 ----
-
 # What was wrong
 
 Version 1 declares `table t { id integer primary key, a integer null }`; version 2 adds `constraint pos check (a > 0)`. `apply schema` runs `ALTER TABLE s.t ADD constraint pos check (a > 0)`. The optimystic module had no `alterTable` hook, so Quereus added the CHECK to its in-memory catalog only. A restart that only called `hydrate` accepted rows breaking `pos`, and the migrating machine's catalog record differed from a machine that applied version 2 fresh.
@@ -55,3 +53,20 @@ Version 1 declares `table t { id integer primary key, a integer null }`; version
 - **Quereus's materialized-view reshape paths** (`materialized-view-helpers.ts`) check `module.alterTable` and now call ours instead of raising their "inexpressible reshape" error. Optimystic doesn't host materialized views, so this was not exercised.
 - ALTER PRIMARY KEY now also logs a Quereus warning ("declined an in-place re-key") before the final rejection.
 - Not in scope, and still upstream: Quereus's schema diff never emits unnamed table-level or column-level CHECK additions (`blocked/quereus-differ-ignores-unnamed-constraint-additions`); the README now says so. Supporting UNIQUE and FOREIGN KEY: `backlog/feat-optimystic-alter-add-unique-and-foreign-key`. Saving RENAME COLUMN: `backlog/bug-optimystic-rename-column-lost-on-restart`.
+
+## Review findings
+
+Read the implement diff (33efe02d) first, then the engine paths it reproduces (`add-constraint.ts`, `alter-table.ts` RENAME COLUMN / ADD COLUMN arms, `materialized-view-helpers.ts`), then the handoff.
+
+- **Correctness vs. the engine fallbacks** — checked. The CHECK is built with the same builder, index and taken-name set as `runAddCheckEngineSide`, so minted names match. `renameColumnSchemaOnly` matches the engine's `else` branch line for line, and the engine does the same post-processing (statistics carry, propagation, event) whichever branch ran. Every other arm's refusal text matches the engine's `!module.alterTable` throws. The `switch` has no default, so a new `SchemaChangeInfo` kind fails typecheck (no implicit return) instead of silently returning undefined — good.
+- **Persistence path** — checked. `storeStoredSchema` → `mergePersistedSchemas` merges only index lists, so the incoming CHECK list wins; the case-insensitive same-name replacement therefore really reaches storage. Fresh read + batch checkpoint mirror `createIndex`/`addIndex`.
+- **Gap "same-named CHECK replacement untested"** — probed and closed: added test "an ADD CHECK whose name another writer already saved replaces that CHECK in the record" (two sessions; the later `SMALL` replaces `small`, and is enforced after a hydrate-only restart).
+- **Gap "rollback inside an explicit transaction untested"** — probed with a throwaway spec (deleted): `begin; alter table … add constraint small check …; rollback;` leaves `small` in both the engine catalog and the record. Engine and record agree, so no divergence; not a defect of this change. No ticket.
+- **Gap "materialized-view reshape paths now call the hook"** — checked: every MV path is gated on `module.getBackingHost` (create at helpers:331, attach at :1247), which optimystic does not implement, so the reshape calls are unreachable. Tripwire parked as a `NOTE:` on `OptimysticModule.alterTable` (revisit the arms if the module gains `getBackingHost`).
+- **Precedence change for refused ADD COLUMN NOT NULL / malformed UNIQUE/FK** — accepted as documented by the implementer (still refused, nothing changes, pinned by a test, `NOTE:` at the site). No action.
+- **One-row read outside the batch checkpoint** — already a `NOTE:` tripwire on `resolveConnectedTable`; agree with it. No action.
+- **Read-cost of first-touch initialize in a CHECK-only apply** — not measured; conditional perf concern only, covered by the existing first-touch reasoning on `createIndex`. No ticket.
+- **Type safety / error handling** — `RowConstraintSchema`/`AddedConstraint` derived from exported types rather than internals; instance schema updated only after the write is staged. Nothing found.
+- **DRY / modularity / file size** — `optimystic-module.ts` is 4762 lines (`wc -l`), was already large before this change (+~190 here); the new code is cohesive with `createIndex`. No new size-debt ticket filed: the addition is small and matches existing structure. The same-name filter is duplicated between `withCheckConstraint` and the instance update (one line each, commented as intentionally alike); left as is.
+- **Docs** — README "Warm Restart" paragraph reflects the new behaviour and the upstream limits; referenced tickets (`bug-optimystic-rename-column-lost-on-restart`, `feat-optimystic-alter-add-unique-and-foreign-key`, `quereus-differ-ignores-unnamed-constraint-additions`) all exist. No other docs mention optimystic ALTER.
+- **Validation** — `yarn typecheck`, `yarn build`, full `yarn test` in `packages/quereus-plugin-optimystic`: 987 passing, 13 pending, 0 failing; smoke ok. No lint script in the package.

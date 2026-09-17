@@ -4309,6 +4309,10 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * reading one row), a malformed ADD UNIQUE / FOREIGN KEY reports what is malformed. Both are
    * still refused and change nothing; only the message differs.
    *
+   * NOTE: Quereus's materialized-view reshape paths also call this hook, but only for a module
+   * with `getBackingHost`, which this one lacks. If it ever gains it, those reshapes get these
+   * refusals mid-sequence and the unsaved RENAME COLUMN — revisit the arms then.
+   *
    * Returns the engine's catalog entry with the change applied, built as the engine's own
    * fallbacks built it. Emits no schema-change event: this module has no emitter, so Quereus
    * announces the statement itself.

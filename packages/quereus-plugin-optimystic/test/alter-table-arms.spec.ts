@@ -177,6 +177,25 @@ describe('ALTER TABLE on an Optimystic table', function () {
 		expect(await queryAll(second.db, 'select id, a from main.t order by id')).to.deep.equal([{ id: 1, a: 5 }, { id: 2, a: 50 }]);
 	});
 
+	it('an ADD CHECK whose name another writer already saved replaces that CHECK in the record', async () => {
+		// `second` hydrated before `first` added `small`, so its engine accepts the same name
+		// (compared ignoring case). Local DDL wins, as on every other schema write: one CHECK of
+		// that name remains, and it is the later one.
+		const store = buildSharedLocalTransactor(new MemoryRawStorage());
+		const first = await openSession(store);
+		await first.db.exec(TABLES);
+		const second = await openSession(store);
+		await second.plugin.hydrate(second.db);
+
+		await first.db.exec('alter table main.t add constraint small check (a < 100)');
+		await second.db.exec('alter table main.t add constraint SMALL check (a < 10)');
+
+		const restarted = await openSession(store);
+		await restarted.plugin.hydrate(restarted.db);
+		expect(restarted.db.schemaManager.findTable('t', 'main')!.checkConstraints.map(check => check.name)).to.have.members(['pos', 'SMALL']);
+		expect(await captureThrowMessage(() => restarted.db.exec('insert into main.t (id, a) values (2, 50)'))).to.include('SMALL');
+	});
+
 	it('a CHECK added to a table this session already wrote through is not dropped by that table re-opening its record', async () => {
 		// The live table instance compares its own schema against the record whenever it
 		// (re-)initializes, and a mismatch rewrites the record from the instance's schema. If the
