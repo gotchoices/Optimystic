@@ -86,3 +86,14 @@ Additionally, `diff schema <name>` after hydrate should be empty for a declarati
 - Update README's warm-restart section to match what hydrate actually guarantees.
 - `yarn lint`, `yarn build`, `yarn workspace @optimystic/quereus-plugin-optimystic test`.
 - Handoff: sereus should re-run its eleven cadre-core tests (listed in sereus's `tickets/.pre-existing-error.md`) and two restart integration scenarios, then a five-run rerun of its device-shape join scenario. State plainly that the nine `SET DATA TYPE int` failures also need `blocked/quereus-differ-treats-type-aliases-as-a-retype`.
+
+# Note from the garden tender (2026-09-16 evening)
+
+The diagnosis split the nine `SET DATA TYPE int` failures onto a quereus-side fix
+(`blocked/quereus-differ-treats-type-aliases-as-a-retype`), which lives in another repository on its own
+schedule. Before accepting that sereus's nine tests stay red until quereus moves, **establish whether
+this plugin can avoid depending on it** — for example by restoring the column's *declared* type spelling
+rather than `logicalType.name`, if the catalog record can carry it without breaking byte-identical
+catalog content across machines or adding storage operations on warm start. If it can, do it and say so;
+if it cannot, say precisely why, so the maintainer knows sereus is waiting on quereus and not on us.
+Either way, the plugin fix should not *introduce* a dependency on the quereus change landing first.
