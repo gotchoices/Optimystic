@@ -16,6 +16,7 @@
  */
 
 import { expect } from 'chai';
+import { Database } from '@quereus/quereus';
 import { SchemaManager, toPersistedSchema, toStoredSchema, uniqueEnforcementTreeName } from '../src/schema/schema-manager.js';
 import type { PersistedTableSchema, StoredTableSchema } from '../src/schema/schema-manager.js';
 import { catalogKey } from '../src/schema/table-identity.js';
@@ -355,6 +356,52 @@ describe('SchemaManager write path', () => {
 				unique: true,
 				predicate: { op: 'notnull', column: 'b' },
 			});
+		});
+	});
+
+	describe('canonical list order', () => {
+		// The record must not depend on the order indexes and CHECKs were created in (a machine
+		// that migrated through earlier versions vs one that applied the last version fresh).
+		const check = (name: string | undefined, marker: number) => ({ ...(name ? { name } : {}), expr: marker, operations: 3 });
+		const orphan = (name: string) => ({ name, columns: [{ name: 'gone' }] });
+
+		it('writes indexes, orphaned indexes and CHECKs by name, unnamed CHECKs first in their own order', async () => {
+			const tree = new FakeCatalogTree();
+			// A record persisted before the rule: creation-ordered lists.
+			tree.entries.set(key('t'), [key('t'), {
+				...persistedOf(makeStored('t', ['idx_m', 'idx_a'])),
+				orphanedIndexes: [orphan('z_old'), orphan('b_old')],
+			}]);
+			const { manager } = managerOver(tree);
+
+			const written = await manager.storeStoredSchema({
+				...makeStored('t', ['idx_z', 'idx_b']),
+				checkConstraints: [check('b', 1), check(undefined, 2), check('B', 3), check(undefined, 4), check('_check_id', 5)],
+			});
+
+			const record = tree.stored('t')!;
+			expect(record.indexes.map(i => i.name)).to.deep.equal(['idx_a', 'idx_b', 'idx_m', 'idx_z']);
+			expect(record.orphanedIndexes!.map(i => i.name)).to.deep.equal(['b_old', 'z_old']);
+			// Ordinal, not locale order: uppercase before `_` before lowercase.
+			expect(record.checkConstraints!.map(c => [c.name, c.expr])).to.deep.equal([
+				[undefined, 2], [undefined, 4], ['B', 3], ['_check_id', 5], ['b', 1],
+			]);
+			expect(written.indexes.map(i => i.name), 'the returned schema is what was written').to.deep.equal(record.indexes.map(i => i.name));
+		});
+
+		it('builds a candidate from a live table in the same order, so the connect-time compare holds', async () => {
+			// Quereus's own catalog lists them as created: `zc` before `ac`, `ib` before `ia`.
+			const db = new Database();
+			await db.exec('create table t (id integer primary key, a integer, constraint zc check (a > 0), constraint ac check (a < 9))');
+			await db.exec('create index ib on t (a)');
+			await db.exec('create index ia on t (a)');
+			const table = db.schemaManager.findTable('t', 'main')!;
+			expect(table.indexes!.map(i => i.name)).to.deep.equal(['ib', 'ia']);
+
+			const { manager } = managerOver(new FakeCatalogTree());
+			const candidate = manager.tableSchemaToStored(table);
+			expect(candidate.indexes.map(i => i.name)).to.deep.equal(['ia', 'ib']);
+			expect(candidate.checkConstraints!.map(c => c.name)).to.deep.equal(['ac', 'zc']);
 		});
 	});
 

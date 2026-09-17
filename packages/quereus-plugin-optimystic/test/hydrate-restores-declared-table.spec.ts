@@ -64,13 +64,21 @@ async function openEra(era: string, shared: ITransactor): Promise<{ db: Database
 /**
  * A `TableSchema` reduced to what the declaration determines: the module instance and its aux
  * data are per-process handles (ignored); parser positions (`loc`) depend on whitespace, not
- * meaning; Maps become entry lists so they compare structurally. Everything else — including
- * any field Quereus adds to `TableSchema` later — is compared, so a new field a DDL-created
- * table carries fails this until hydrate carries it too.
+ * meaning; Maps become entry lists so they compare structurally; `indexes` and
+ * `checkConstraints` are sorted by name. Everything else — including any field Quereus adds to
+ * `TableSchema` later — is compared, so a new field a DDL-created table carries fails this
+ * until hydrate carries it too.
  */
 function declarationView(schema: TableSchema): unknown {
 	const { vtabModule: _module, vtabAuxData: _aux, ...rest } = schema;
-	return JSON.parse(JSON.stringify(rest, (key, value: unknown) => {
+	// List order is creation order in Quereus's own catalog too (a later version's index lands
+	// last), so it is history, not declaration; the plugin's record keeps one canonical order.
+	const ordered = {
+		...rest,
+		...(Array.isArray(rest.indexes) ? { indexes: byName(rest.indexes) } : {}),
+		...(Array.isArray(rest.checkConstraints) ? { checkConstraints: byName(rest.checkConstraints) } : {}),
+	};
+	return JSON.parse(JSON.stringify(ordered, (key, value: unknown) => {
 		if (key === 'loc') return undefined;
 		if (value instanceof Map) return [...value.entries()];
 		if (typeof value === 'bigint') return `${value}n`;
@@ -107,6 +115,10 @@ async function catalogRecordBytes(plugin: PluginHandle, era: string): Promise<st
 	return entries;
 }
 
+function byName<T extends { name?: string }>(items: readonly T[]): T[] {
+	return [...items].sort((a, b) => ((a.name ?? '') < (b.name ?? '') ? -1 : (a.name ?? '') > (b.name ?? '') ? 1 : 0));
+}
+
 function tableOf(db: Database, schemaName: string, tableName: string): TableSchema {
 	const table = db.schemaManager.findTable(tableName, schemaName);
 	expect(table, `${schemaName}.${tableName} in the engine catalog`).to.not.equal(undefined);
@@ -114,13 +126,25 @@ function tableOf(db: Database, schemaName: string, tableName: string): TableSche
 }
 
 /**
+ * The indexes of `app.Every`, in declaration order. `ByScore` is declared FIRST but sorts last by
+ * name, so a version that adds it to an existing table is the case where creation order and
+ * declaration order disagree.
+ */
+const EVERY_FEATURE_INDEXES = [
+	'index ByScore on Every (Score)',
+	'index ByBig on Every (Big) where Big > 0',
+	'unique index ByNote on Every (Note) where Note is not null',
+] as const;
+
+/**
  * One table exercising every declaration feature the catalog record has to carry: a non-`main`
  * schema, alias type spellings, a column collation, literal and expression defaults, named and
  * unnamed CHECKs, a stored generated column, a foreign key with an action, column and table
- * tags, a table-level UNIQUE, a `with context` variable, a partial index and a partial unique
- * index.
+ * tags, a table-level UNIQUE, a `with context` variable, a plain index, a partial index and a
+ * partial unique index. `indexes` swaps in an earlier version's index declarations.
  */
-const EVERY_FEATURE_DECLARE = `
+function everyFeatureDeclare(indexes: readonly string[] = EVERY_FEATURE_INDEXES): string {
+	return `
 	declare schema app {
 		table Managers { Id text primary key }
 		table Every {
@@ -135,10 +159,11 @@ const EVERY_FEATURE_DECLARE = `
 			constraint BigNonNegative check (Big >= 0),
 			unique (Name)
 		} with context (ManagerKey text null) with tags (owner = 'app')
-		index ByBig on Every (Big) where Big > 0
-		unique index ByNote on Every (Note) where Note is not null
+		${indexes.join('\n\t\t')}
 	}
 `;
+}
+const EVERY_FEATURE_DECLARE = everyFeatureDeclare();
 const EVERY_FEATURE = `${EVERY_FEATURE_DECLARE} apply schema app;`;
 
 /** The same shape spelled with canonical type names only — the form `diff schema` must find empty. */
@@ -148,9 +173,13 @@ const EVERY_FEATURE_CANONICAL_DECLARE = EVERY_FEATURE_DECLARE
 	.replace('Big bigint null', 'Big integer null');
 const EVERY_FEATURE_CANONICAL = `${EVERY_FEATURE_CANONICAL_DECLARE} apply schema app;`;
 
+const SEED_EVERY = [
+	`insert into app.Managers (Id) values ('m1')`,
+	`insert into app.Every (Id, Name, Big, Qty, Note, ManagerId) values (1, 'alpha', 5, 3, 'n1', 'm1')`,
+] as const;
+
 async function seedEvery(db: Database): Promise<void> {
-	await db.exec(`insert into app.Managers (Id) values ('m1')`);
-	await db.exec(`insert into app.Every (Id, Name, Big, Qty, Note, ManagerId) values (1, 'alpha', 5, 3, 'n1', 'm1')`);
+	for (const statement of SEED_EVERY) await db.exec(statement);
 }
 
 const SEEDED_ROW = { Id: 1, Name: 'alpha', Big: 5, Score: 2, Note: 'n1', Qty: 3, Total: 6, ManagerId: 'm1' };
@@ -185,6 +214,37 @@ async function expectEveryBehaves(db: Database): Promise<void> {
 	await db.exec(`insert into app.Every (Id, Name, Qty, Note) values (9, 'iota', 1, null)`);
 }
 
+/** Run `statements` in a session of `era` over its own empty storage; the catalog bytes it leaves. */
+async function catalogAfter(era: string, ...statements: string[]): Promise<string[]> {
+	const session = await openEra(era, buildSharedLocalTransactor(new MemoryRawStorage()));
+	for (const statement of statements) await session.db.exec(statement);
+	return await catalogRecordBytes(session.plugin, era);
+}
+
+/**
+ * Earlier versions of `app.Every`'s index declarations: every proper subset of
+ * {@link EVERY_FEATURE_INDEXES} in declared order (each index dropped, pairs dropped, all
+ * dropped), and every other order of the full set.
+ */
+function earlierIndexVersions(): { label: string; indexes: string[] }[] {
+	const all = [...EVERY_FEATURE_INDEXES];
+	const nameOf = (declaration: string) => /By\w+/.exec(declaration)![0];
+	const render = (indexes: readonly string[]) => `[${indexes.map(nameOf).join(', ')}]`;
+	const subsets = Array.from({ length: (1 << all.length) - 1 }, (_, mask) =>
+		all.filter((_index, bit) => (mask >> bit) & 1));
+	const orders = permutations(all).filter(order => order.some((index, i) => index !== all[i]));
+	return [
+		...subsets.map(indexes => ({ label: `earlier version with indexes ${render(indexes)}, rows, then this one`, indexes })),
+		...orders.map(indexes => ({ label: `earlier version declaring ${render(indexes)}, rows, then this one`, indexes })),
+	];
+}
+
+function permutations<T>(items: readonly T[]): T[][] {
+	if (items.length <= 1) return [[...items]];
+	return items.flatMap((item, i) =>
+		permutations([...items.slice(0, i), ...items.slice(i + 1)]).map(rest => [item, ...rest]));
+}
+
 describe('Warm restart: a hydrated table is the table its declaration creates', function () {
 	this.timeout(30_000);
 
@@ -197,7 +257,7 @@ describe('Warm restart: a hydrated table is the table its declaration creates', 
 		// A later era over the SAME storage, hydrating; and the same era over EMPTY storage,
 		// declaring — the latter is what "the table this session's declaration creates" means.
 		const hydrated = await openEra('era2', shared);
-		expect(await hydrated.plugin.hydrate(hydrated.db)).to.deep.equal({ tables: 2, indexes: 2 });
+		expect(await hydrated.plugin.hydrate(hydrated.db)).to.deep.equal({ tables: 2, indexes: EVERY_FEATURE_INDEXES.length });
 		const created = await openEra('era2', buildSharedLocalTransactor(new MemoryRawStorage()));
 		await created.db.exec(EVERY_FEATURE);
 
@@ -313,37 +373,68 @@ describe('Warm restart: a hydrated table is the table its declaration creates', 
 		expect(await queryAll(again.db, 'select id from app.P')).to.deep.equal([{ id: 7 }]);
 	});
 
-	it('writes byte-identical catalog records for one declaration, whatever machine, era, layout or path applied it', async () => {
+	it('writes byte-identical catalog records for one declaration, whatever machine, era or layout applied it', async () => {
 		// A host writes the catalog alone on every machine before any peer contact, and that is
 		// fork-safe only while every machine writes the same bytes. So: independent storages,
 		// different eras (session binding), a reflowed declaration (parser positions), the tables
-		// in the other order, and a path that reached the declaration through an earlier version
-		// with rows written in between — all must persist exactly what a fresh apply persists.
-		// NOT covered, because it does not hold: an index added by a later version but declared
-		// BEFORE an existing one (the record lists indexes in the order they were created) —
-		// see `tickets/backlog/bug-optimystic-catalog-record-depends-on-migration-history`.
-		const applyIn = async (era: string, ...statements: string[]): Promise<string[]> => {
-			const session = await openEra(era, buildSharedLocalTransactor(new MemoryRawStorage()));
-			for (const statement of statements) await session.db.exec(statement);
-			return await catalogRecordBytes(session.plugin, era);
-		};
-		const reference = await applyIn('era1', EVERY_FEATURE);
+		// in the other order, and the declaration applied twice — all must persist exactly what a
+		// fresh apply persists. Reaching it through earlier versions: the next test.
+		const reference = await catalogAfter('era1', EVERY_FEATURE);
 		expect(reference.join('\n')).to.not.include('"loc"').and.not.include('era1');
 
 		const reflowed = EVERY_FEATURE.replace(/\s+/g, '  ');
 		const tablesSwapped = EVERY_FEATURE
 			.replace('table Managers { Id text primary key }', '')
-			.replace('index ByBig', 'table Managers { Id text primary key }\n\t\tindex ByBig');
-		const withoutIndexes = EVERY_FEATURE.replace(/\n\s*(unique )?index By.*/g, '');
-		expect(withoutIndexes).to.not.include('index By');
+			.replace('index ByScore', 'table Managers { Id text primary key }\n\t\tindex ByScore');
+		expect(tablesSwapped.indexOf('table Managers')).to.be.greaterThan(tablesSwapped.indexOf('table Every'));
 
-		expect(await applyIn('era2', reflowed), 'another era, reflowed').to.deep.equal(reference);
-		expect(await applyIn('era3', tablesSwapped), 'tables in the other order').to.deep.equal(reference);
-		expect(await applyIn('era4', withoutIndexes, `insert into app.Managers (Id) values ('m1')`,
-			`insert into app.Every (Id, Name, Qty, ManagerId) values (1, 'alpha', 3, 'm1')`, EVERY_FEATURE),
-			'an earlier version, rows, then this one').to.deep.equal(reference);
-		expect(await applyIn('era5', EVERY_FEATURE, `insert into app.Managers (Id) values ('m1')`, EVERY_FEATURE),
+		expect(await catalogAfter('era2', reflowed), 'another era, reflowed').to.deep.equal(reference);
+		expect(await catalogAfter('era3', tablesSwapped), 'tables in the other order').to.deep.equal(reference);
+		expect(await catalogAfter('era4', EVERY_FEATURE, SEED_EVERY[0], EVERY_FEATURE),
 			'applied twice').to.deep.equal(reference);
+	});
+
+	it('writes the same catalog record for a declaration whichever earlier version a machine migrated from', async () => {
+		// The migration-path property: every earlier version derived from the declaration by
+		// dropping any set of its indexes, or by declaring them in another order, then rows, then
+		// the declaration itself, must persist exactly what a fresh apply persists. Index order in
+		// the record used to be creation order, so a version adding `ByScore` (declared first)
+		// to an existing table stored it last while a fresh apply stored it first.
+		const reference = await catalogAfter('era1', EVERY_FEATURE);
+		const earlier = earlierIndexVersions();
+		expect(earlier.length, 'every proper subset and every other order').to.equal(7 + 5);
+		for (const { label, indexes } of earlier) {
+			const version = `${everyFeatureDeclare(indexes)} apply schema app;`;
+			expect(await catalogAfter('era2', version, ...SEED_EVERY, EVERY_FEATURE), label).to.deep.equal(reference);
+		}
+	});
+
+	it('hydrates a migrated table as the table its declaration creates', async () => {
+		// Storage that reached the declaration through a version without `ByScore`, hydrated by a
+		// new session. One era throughout, so the session binding is not what differs.
+		const store = buildSharedLocalTransactor(new MemoryRawStorage());
+		const migrating = await openEra('era1', store);
+		await migrating.db.exec(`${everyFeatureDeclare(EVERY_FEATURE_INDEXES.slice(1))} apply schema app;`);
+		await seedEvery(migrating.db);
+		await migrating.db.exec(EVERY_FEATURE);
+
+		const hydrated = await openEra('era1', store);
+		expect(await hydrated.plugin.hydrate(hydrated.db)).to.deep.equal({ tables: 2, indexes: EVERY_FEATURE_INDEXES.length });
+		const created = await openEra('era1', buildSharedLocalTransactor(new MemoryRawStorage()));
+		await created.db.exec(EVERY_FEATURE);
+
+		const declared = declarationView(tableOf(created.db, 'app', 'Every'));
+		expect(declarationView(tableOf(hydrated.db, 'app', 'Every'))).to.deep.equal(declared);
+		expect(declarationView(tableOf(migrating.db, 'app', 'Every')), "the migrating session's own table").to.deep.equal(declared);
+
+		// A session that declares instead of hydrating finds the record already canonical, so
+		// its connect-time compare holds and nothing is rewritten.
+		const counting = countingTransactor(store);
+		const redeclaring = await openSession('era1', { 'local:era1': counting.transactor });
+		await redeclaring.db.exec(EVERY_FEATURE);
+		expect(counting.counts, 're-declaring the migrated table commits nothing').to.include({ pend: 0, commit: 0 });
+
+		await expectEveryBehaves(hydrated.db);
 	});
 
 	it("never takes a hydrated table's encoding from the session's default args", async () => {

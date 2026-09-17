@@ -395,8 +395,10 @@ export interface PersistedIndexColumn {
  * to prevent.
  *
  * Rules:
- * - An index present on either side survives. `incoming` keeps its order;
- *   indexes only `persisted` knows about are appended after it. There is no
+ * - An index present on either side survives. The result's ORDER means nothing:
+ *   every written record is put in canonical order afterwards
+ *   ({@link canonicalizeRecordOrder}), so this keeps `incoming`'s order and
+ *   appends the indexes only `persisted` knows about. There is no
  *   index-removal path in this plugin today (DROP TABLE tombstones the whole
  *   entry via deleteSchema), so "union" and "correct" coincide; if a DROP INDEX
  *   ever lands it needs a dedicated removal API, not a shrunken write here.
@@ -420,6 +422,57 @@ export function mergeIndexLists(
 		}
 	}
 	return merged;
+}
+
+/**
+ * Ordinal (UTF-16 code unit) name order, never locale-aware, so every machine sorts alike.
+ * An absent name sorts before every present one.
+ */
+function compareOptionalNames(a: string | undefined, b: string | undefined): number {
+	if (a === b) return 0;
+	if (a === undefined) return -1;
+	if (b === undefined) return 1;
+	return a < b ? -1 : 1;
+}
+
+/** `items` by name; entries with equal (or no) names keep their existing relative order. */
+function sortByName<T extends { name?: string }>(items: readonly T[]): T[] {
+	return items
+		.map((item, position) => ({ item, position }))
+		.sort((a, b) => compareOptionalNames(a.item.name, b.item.name) || a.position - b.position)
+		.map(({ item }) => item);
+}
+
+/**
+ * `record` with the lists whose order carries no meaning — `indexes`, `orphanedIndexes`,
+ * `checkConstraints` — in ONE canonical order: by name, unnamed CHECKs first in their
+ * declared order. Without it the order is creation order, so a machine
+ * that reached a declaration through earlier versions (a later version adding an index
+ * declared before an existing one) would store different bytes from a machine that applied
+ * it fresh — and a host writes the catalog on every machine before any peer contact, which
+ * is fork-safe only while those bytes agree. Applied to every record a write produces
+ * ({@link mergePersistedSchemas}) and to every candidate built from a live table
+ * ({@link SchemaManager.tableSchemaToStored}), so a compare against a persisted record sees
+ * the same order a write would land. A record persisted before this rule is rewritten in
+ * canonical order on its next schema write; nothing migrates it sooner.
+ *
+ * Index names are unique within a table. Unnamed CHECKs only ever come from one declaration
+ * (Quereus's schema differ never adds one to an existing table), so their relative order is
+ * already the same everywhere.
+ *
+ * NOTE: accepted consequence — a hydrated table lists its indexes and CHECKs in this order
+ * while a table declared in this session lists them as declared (Quereus's own catalog is
+ * creation-ordered too). `getBestAccessPlan` keeps the FIRST of two equally-costed indexes,
+ * so the two can pick different (equally good) indexes; and when several CHECKs fail on one
+ * row, which one is reported can differ. Neither changes a result.
+ */
+function canonicalizeRecordOrder<T extends StoredTableSchema | PersistedTableSchema>(record: T): T {
+	return {
+		...record,
+		indexes: sortByName<StoredIndexSchema | PersistedIndexSchema>(record.indexes),
+		...(record.orphanedIndexes ? { orphanedIndexes: sortByName(record.orphanedIndexes) } : {}),
+		...(record.checkConstraints ? { checkConstraints: sortByName(record.checkConstraints) } : {}),
+	} as T;
 }
 
 /** Column-name → position map over a record's own column list (names compare case-insensitively). */
@@ -609,6 +662,7 @@ export function mergePersistedSchemas(
 	if (orphaned.length > 0) {
 		merged = { ...merged, orphanedIndexes: orphaned };
 	}
+	merged = canonicalizeRecordOrder(merged);
 	const [miss] = unresolvedIndexColumns(merged);
 	if (miss) {
 		throw new Error(
@@ -1428,7 +1482,7 @@ export class SchemaManager {
 				.sort(([a], [b]) => a - b)
 				.map(([generated, dependencies]): [number, number[]] => [generated, [...dependencies]])
 			: undefined;
-		return {
+		return canonicalizeRecordOrder({
 			name: schema.name,
 			schemaName: schema.schemaName,
 			columns: schema.columns.map(col => this.columnSchemaToStored(col)),
@@ -1458,7 +1512,7 @@ export class SchemaManager {
 			synthesizedPrimaryKey: schema.synthesizedPrimaryKey,
 			generatedColumnDependencies: nonEmpty(generatedColumnDependencies),
 			generatedColumnTopoOrder: nonEmpty(schema.generatedColumnTopoOrder),
-		};
+		});
 	}
 
 	/**

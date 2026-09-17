@@ -650,7 +650,10 @@ export class OptimysticVirtualTable extends VirtualTable {
         // constraints (the candidate now carries `uniqueConstraints`; the
         // persisted side lacks the key). That single re-write persists them and
         // the second open short-circuits again. Constraint-free tables OMIT the
-        // key on both sides (see tableSchemaToStored) and never miss.
+        // key on both sides (see tableSchemaToStored) and never miss. Likewise a
+        // record persisted before indexes and CHECKs were kept in canonical (name)
+        // order misses once when its lists are out of that order: both the
+        // candidate and the merge come out sorted, the persisted side does not.
         const candidateStored = this.schemaManager.tableSchemaToStored(this.tableSchema);
         let mergedCandidate: StoredTableSchema = persistedSchema
           ? this.schemaManager.mergeWithPersisted(candidateStored, persistedSchema)
