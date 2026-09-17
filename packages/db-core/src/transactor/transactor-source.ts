@@ -1,6 +1,6 @@
 import { randomBytes } from '@noble/hashes/utils.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
-import type { IBlock, BlockId, BlockHeader, ITransactor, ActionId, CommitResult, ActionContext, BlockType, BlockSource, ReadPurpose, Transforms, BlockContentDigests } from "../index.js";
+import type { IBlock, BlockId, BlockHeader, ITransactor, ActionId, CommitResult, ActionContext, BlockType, BlockSource, ReadPurpose, Transforms, BlockContentDigests, GetBlockResult } from "../index.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
@@ -8,6 +8,48 @@ import { blockDigestsField } from "../transform/digest.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('transactor-source');
+
+/** The block `entry` answers for `id`, for a read at `context` (`undefined` for an unpinned "give me
+ * latest" read) — `undefined` when the block is absent — or a throw when the entry is not an answer
+ * that read may use. Every read that consumes a raw {@link GetBlockResult} goes through here, so a
+ * doubted answer cannot be treated differently depending on which path fetched it.
+ *
+ * An entry flagged `unavailable` with no block is the repo saying "I could not find out whether this
+ * exists" — an answer that must not be read as absent. A repo that omits the flag stays authoritative.
+ *
+ * A read whose surviving answer is marked possibly-behind (`unconfirmedAheadRev` outlived the
+ * transactor's retry round: every reachable coordinator served content it could not confirm current)
+ * must not pose as an answer for a view that should CONTAIN the claimed revision. Two such views, the
+ * same test the coordinator applies when it stamps: an UNPINNED read — the tail read is the one seam
+ * where a lagging collection can learn the truth (Collection.bootstrapContext), and silently serving
+ * doubted content there is exactly how a collection view freezes forever — and a read PINNED AT OR
+ * ABOVE the claim, whose snapshot is missing a revision the cohort says exists inside it. A read pinned
+ * strictly BELOW the claim keeps working: it legitimately asks for an older view, which is being
+ * served correctly.
+ *
+ * NOTE: accepted tradeoff — this converts a silent wrong answer into a loud failure. A node partitioned
+ * from every coordinator able to confirm currency used to read (stale) data indefinitely without any
+ * signal; it now raises BlockPossiblyStaleError on the reads that should contain the claim, until the
+ * partition heals or the claim is settled. Deliberate: the silent alternative is a collection view that
+ * forks and freezes with no report (ticket coordinator-serves-stale-data-as-if-confirmed). Revisit only
+ * if a degraded-read mode (serve-with-warning) becomes a product requirement. */
+export function answeredBlock(id: BlockId, entry: GetBlockResult, context: ActionContext | undefined): IBlock | undefined {
+	const { block, unavailable, unconfirmedAheadRev } = entry;
+	if (!block && unavailable) {
+		throw new BlockUnavailableError(id, unavailable);
+	}
+	if (unconfirmedAheadRev !== undefined && (context === undefined || context.rev >= unconfirmedAheadRev)) {
+		throw new BlockPossiblyStaleError(id, unconfirmedAheadRev);
+	}
+	return block;
+}
+
+/** The revision a served block's content IS: its materialized revision, falling back to the repo's
+ * latest for repos that omit the field (see {@link GetBlockResult.materialized} for why `state.latest`
+ * alone is the wrong number). */
+export function servedRevision(entry: GetBlockResult): number {
+	return entry.materialized?.rev ?? entry.state.latest?.rev ?? 0;
+}
 
 export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlock> {
 	/** Shared with this collection's CacheSource so cache hits also record dependencies.
@@ -47,37 +89,8 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 		// `result[id]` is undefined. Destructuring that would throw a TypeError.
 		const entry = result?.[id];
 		if (entry) {
-			const { block, state, materialized, unavailable, unconfirmedAheadRev } = entry;
-			// An entry flagged `unavailable` with no block is the repo saying "I could not find
-			// out whether this exists" — an answer that must not be read as absent. Throw rather
-			// than return undefined, and record no read dependency (dependencies are recorded
-			// only for blocks that actually exist). A repo that omits the flag stays authoritative.
-			if (!block && unavailable) {
-				throw new BlockUnavailableError(id, unavailable);
-			}
-			// A read whose surviving answer is marked possibly-behind (`unconfirmedAheadRev`
-			// outlived the transactor's retry round: every reachable coordinator served content it
-			// could not confirm current) must not pose as an answer for a view that should CONTAIN
-			// the claimed revision. Two such views, the same test the coordinator applies when it
-			// stamps: an UNPINNED "give me latest" read — the tail read is the one seam where a
-			// lagging collection can learn the truth (Collection.bootstrapContext), and silently
-			// serving doubted content there is exactly how a collection view freezes forever — and
-			// a read PINNED AT OR ABOVE the claim, whose snapshot is missing a revision the cohort
-			// says exists inside it. A read pinned strictly BELOW the claim keeps working: it
-			// legitimately asks for an older view, which is being served correctly.
-			// No read dependency is recorded: the throw means nothing was read.
-			// NOTE: accepted tradeoff — this converts a silent wrong answer into a loud failure. A
-			// node partitioned from every coordinator able to confirm currency used to read (stale)
-			// data indefinitely without any signal; it now raises BlockPossiblyStaleError on the
-			// reads that should contain the claim, until the partition heals or the claim is
-			// settled. Deliberate: the
-			// silent alternative is a collection view that forks and freezes with no report
-			// (ticket coordinator-serves-stale-data-as-if-confirmed). Revisit only if a
-			// degraded-read mode (serve-with-warning) becomes a product requirement.
-			if (unconfirmedAheadRev !== undefined
-				&& (this.actionContext === undefined || this.actionContext.rev >= unconfirmedAheadRev)) {
-				throw new BlockPossiblyStaleError(id, unconfirmedAheadRev);
-			}
+			// A throw here records no read dependency: it means nothing was read.
+			const block = answeredBlock(id, entry, this.actionContext);
 			// Record a read dependency only for a block that actually exists. A transactor may return a
 			// populated entry with `block: undefined` for a genuinely-missing block (TestTransactor does;
 			// the Network transactor always populates the key); recording there would add a phantom
@@ -87,13 +100,11 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 				// Record read dependency for optimistic concurrency control, carrying the caller's
 				// read purpose (default `value`) so a purely-structural navigation read can later be
 				// dropped from the conflict set (see ReadDependencyCollector / Theorem 5).
-				// Record the revision the content was MATERIALIZED at, not the newest the repo holds —
-				// see {@link GetBlockResult.materialized} for why `state.latest` is the wrong number
-				// and why the fallback preserves today's behaviour for repos that omit the field.
+				// Record the revision the content was MATERIALIZED at, not the newest the repo holds.
 				// Both sinks must take the SAME value: CacheSource learns it via getReadRevision on a
 				// miss-load and re-emits it on every later hit, so a split would stamp the cache
 				// differently from the collector.
-				const rev = materialized?.rev ?? state.latest?.rev ?? 0;
+				const rev = servedRevision(entry);
 				this.collector.record(id, rev, purpose);
 				this.readRevisions.set(id, rev);
 			}

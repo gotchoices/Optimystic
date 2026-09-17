@@ -35,6 +35,18 @@ reactive-watch / cohort-topic push paths below are opt-in), so a *write-only* pe
 must read — e.g. poll `count(*)` — to converge; that polling is the intended
 pattern, not a workaround.
 
+Because every live read pays for that pull, per tree it reads, the pull is kept cheap
+when there is nothing to pull. `Collection.updateInternal` first reads the collection
+header and the log tail block in one request (`Collection.readLogEnds`, which asks for
+the tail id the previous header named), and stops there when the tail shows nothing
+newer than the revision the collection already holds (`Collection.tailShowsNothingNewer`):
+same revision, same action, and no disagreement with the tail block's entries. Only
+otherwise does it walk the log, and that walk reads through one block cache seeded with
+the header and tail, so no block is fetched twice in one refresh. On a peer-to-peer node
+each request is a network round trip, so an idle poll costs one per tree rather than the
+seven or more it used to. The budgets are asserted in
+`packages/db-core/test/refresh-read-cost.spec.ts`.
+
 A suspected gap — that `count(*)` alone skipped the pull and so a count-only
 consumer never saw a peer's appends — was investigated and **empirically
 disproven** by `packages/quereus-plugin-optimystic/test/read-pull-mechanism.spec.ts`,
@@ -1353,8 +1365,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   dependency), so a query against a collection this node cannot read fails loudly instead of
   returning zero rows. `BlockUnavailableError` is not a `StaleFailure`: `Collection.sync` does not
   absorb or retry it. Every other consumer that reads a `GetBlockResult` directly checks the flag
-  before drawing a conclusion from an empty `state`: `Collection.bootstrapContext` (the log-tail
-  read bypasses `TransactorSource`) throws rather than opening with no `ActionContext`;
+  before drawing a conclusion from an empty `state`: `Collection.checkedLogTail` (the log-tail
+  read bypasses `TransactorSource`, because the refresh needs the tail's `state`) applies the same
+  `answeredBlock` check `TransactorSource.tryGet` does, and so throws rather than opening with no
+  `ActionContext`;
   `NetworkTransactor.getStatus` throws rather than reporting the action `aborted`;
   `ClusterMember`'s promise-phase stale-revision gate votes *reject* rather than approving a pend
   whose revision it could not check; `SpreadOnChurnMonitor` keeps the block tracked rather than
@@ -1429,7 +1443,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   for any read whose view should CONTAIN the claim — the same at/above test the coordinator applies
   when it stamps, i.e. an **unpinned** read or one pinned at/above the claim (a read pinned *below*
   the claim legitimately asks for an older view and keeps working),
-  `Collection.bootstrapContext` does the same for its direct tail read — the unpinned tail read
+  `Collection.checkedLogTail` does the same for the direct tail read — the unpinned tail read
   is the one seam where a lagging collection can learn a newer revision exists, and silently
   seeding the context from a doubted tail is exactly how a collection view froze in the field —
   and `NetworkTransactor.getStatus` throws rather than judging actions from a state it could not
@@ -1595,6 +1609,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   storage rather than a replica. `tag=` on all four lines of this namespace names the reporting *handle*
   (`Collection.instanceTag`), since one process routinely holds several over one collection id and
   their lines otherwise read as one handle contradicting itself.
+  A refresh that finds nothing new never reaches `advanceContext` (see *Quereus vtab read path*
+  above): it compares the held context only against the entries in the log tail block, and walks
+  when any of them disagree. A fork below the tail block, on a log that has not moved, is
+  therefore reported by the next refresh that finds a new entry, not by an idle one.
 - A header that reads *authoritatively absent* while the collection holds a committed revision is
   a contradiction, not an absence: the client has proof something was committed under this id.
   `updateInternal` throws `CollectionHeaderVanishedError` (naming the collection and the held

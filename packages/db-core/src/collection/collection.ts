@@ -1,13 +1,13 @@
-import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms, ActionId, BlockContentDigests, StaleFailure } from "../index.js";
+import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms, ActionId, BlockContentDigests, StaleFailure, GetBlockResult } from "../index.js";
 import { Log } from "../log/log.js";
-import type { ActionEntry } from "../log/struct.js";
+import type { LogBlock } from "../log/log.js";
+import type { ActionEntry, LogEntry } from "../log/struct.js";
 import { Atomic } from "../transform/atomic.js";
 import { Tracker } from "../transform/tracker.js";
 import { CacheSource } from "../transform/cache-source.js";
 import { computeBlockContentDigests } from "../transform/digest.js";
 import { copyTransforms, isTransformsEmpty } from "../transform/helpers.js";
-import { TransactorSource } from "../transactor/transactor-source.js";
-import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
+import { TransactorSource, answeredBlock, servedRevision } from "../transactor/transactor-source.js";
 import type { WriteDurability } from "../network/struct.js";
 import { mergeDurability } from "../network/durability.js";
 import { highestStaleAt } from "../network/stale-failure.js";
@@ -81,6 +81,16 @@ export type RefreshReport = {
 	 * status-read fallback), which is still a saved write — so test the field, never `durability`,
 	 * for "saved". */
 	ownEntryFinished?: { durability?: WriteDurability };
+};
+
+/** The two blocks every refresh starts from, as {@link Collection.readLogEnds} read them. */
+type LogEnds = {
+	header: CollectionHeaderBlock;
+	/** The repo's answer for the log tail block the header names; absent when the header names no
+	 * tail or the repo returned no entry for it. */
+	tail?: GetBlockResult;
+	/** Every block read, with the revision it was served at — the seed for the refresh's block cache. */
+	served: Array<[BlockId, IBlock, number]>;
 };
 
 /** Default base backoff (and historical fixed delay) between sync retries, in ms. */
@@ -203,6 +213,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * not land. {@link completeOwnEntry} still checks the revision and refuses on a mismatch. */
 	private inFlightAttempt?: InFlightAttempt;
 
+	/** The log tail block id the most recent header read named. A refresh asks for this block in the
+	 * same request as the header ({@link readLogEnds}): the tail id only changes when the tail block
+	 * fills, so an idle refresh is one request rather than two. A stale value costs one extra request
+	 * and nothing else. */
+	private logTailId?: BlockId;
+
 	protected constructor(
 		public readonly id: CollectionId,
 		public readonly transactor: ITransactor,
@@ -262,7 +278,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// the same way post-construction ones do.
 		const instanceTag = Collection.newInstanceTag();
 		await Collection.attachToLog<TAction>(source, transactor, tracker, id, instanceTag, header);
-		return new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict, instanceTag);
+		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict, instanceTag);
+		collection.logTailId = header.tailId;
+		return collection;
 	}
 
 	/** Open an existing collection, or stage a fresh empty one in the local tracker when the
@@ -286,7 +304,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 			await Log.open<Action<TAction>>(tracker, id);
 		}
 
-		return new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict, instanceTag);
+		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict, instanceTag);
+		collection.logTailId = header?.tailId;
+		return collection;
 	}
 
 	/** The per-instance read wiring every open path needs, plus the header probe result.
@@ -324,7 +344,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	): Promise<void> {
 		// Bootstrap ActionContext from the committed tail before walking the chain.
 		// This allows the transactor to serve pending non-tail blocks during Log.open.
-		await Collection.bootstrapContext(source, transactor, header);
+		Collection.bootstrapContext(source, header.tailId === undefined ? undefined : await Collection.readLogTail(transactor, header.tailId));
 
 		const collectionLog = await Log.open<Action<TAction>>(tracker, id);
 		if (!collectionLog) {
@@ -726,43 +746,63 @@ export class Collection<TAction> implements ICollection<TAction> {
 	private async updateInternal(report: RefreshReport): Promise<void> {
 		// Start with a context that can see to the end of the log
 		const source = new TransactorSource(this.id, this.transactor, undefined);
-		const tracker = new Tracker(source);
 
-		// Bootstrap context from committed tail so pending blocks are accessible.
-		// Read through tracker so Chain.open inside Log.open reuses the cached header.
 		// A header the storage layer could not retrieve throws BlockUnavailableError out of
 		// this read (it is not a StaleFailure, so sync's retry loop does not absorb it).
-		const header = await tracker.tryGet(this.id) as CollectionHeaderBlock | undefined;
-		if (header) {
-			await Collection.bootstrapContext(source, this.transactor, header);
-		} else if (this.source.actionContext) {
-			// An absent header is only believable for a collection that has never committed.
-			// We hold a committed revision, so the two answers contradict each other — surface it
-			// as a fault instead of no-opping into a forgotten revision and a rev-1 retry spin.
-			// NOTE: this aborts every caller of update(), including TransactionCoordinator's
-			// blanket refresh of ALL registered collections between commit retries — a
-			// non-participant with a momentarily-absent header now fails the whole retry rather
-			// than being skipped (the coordinator still refreshes the remaining collections first,
-			// so a participant that can be finished is). That is the intended loud failure; if it ever shows up as
-			// otherwise-healthy transactions aborting, narrow that refresh to the transaction's
-			// participants (see the note at coordinator.ts's update loop) rather than softening
-			// this throw.
-			throw new CollectionHeaderVanishedError(this.id, this.source.actionContext.rev);
+		const ends = await Collection.readLogEnds(this.transactor, this.id, this.logTailId);
+		if (!ends) {
+			if (this.source.actionContext) {
+				// An absent header is only believable for a collection that has never committed.
+				// We hold a committed revision, so the two answers contradict each other — surface it
+				// as a fault instead of no-opping into a forgotten revision and a rev-1 retry spin.
+				// NOTE: this aborts every caller of update(), including TransactionCoordinator's
+				// blanket refresh of ALL registered collections between commit retries — a
+				// non-participant with a momentarily-absent header now fails the whole retry rather
+				// than being skipped (the coordinator still refreshes the remaining collections first,
+				// so a participant that can be finished is). That is the intended loud failure; if it ever shows up as
+				// otherwise-healthy transactions aborting, narrow that refresh to the transaction's
+				// participants (see the note at coordinator.ts's update loop) rather than softening
+				// this throw.
+				throw new CollectionHeaderVanishedError(this.id, this.source.actionContext.rev);
+			}
+			// The header is genuinely absent AND we hold no revision: nothing was ever committed under
+			// this id, so there is no log to walk and nothing to adopt — correct here, rather than a
+			// masked failure.
+			return;
 		}
-		// Falling through means the header is genuinely absent AND we hold no revision: nothing
-		// was ever committed under this id. Log.open reads the same block id, so it too resolves
-		// undefined and everything below no-ops — correct here, rather than a masked failure.
+		this.logTailId = ends.header.tailId;
+		// Bootstrap context from committed tail so pending blocks are accessible.
+		Collection.bootstrapContext(source, ends.tail);
 
 		// The revision the committed tail just claimed, captured before anything else can touch
 		// the local source. This is the authoritative "latest committed under this id" number,
 		// read straight off the tail block's state; the chain walk below arrives at its own
 		// number by a different path, and the two disagreeing is worth saying out loud (see the
-		// {@link reportShortfall} call after advanceContext). Stays undefined when there is no header, no
-		// tail, or a tail with no `latest` — all legitimate "nothing committed yet" states.
+		// {@link reportShortfall} call after advanceContext). Stays undefined when there is no
+		// tail, or a tail with no `latest` — both legitimate "nothing committed yet" states.
 		const tailRev = source.actionContext?.rev;
 
-		// Get the latest entries from the log, starting from where we left off
 		const actionContext = this.source.actionContext;
+		// A write's retry refresh always walks. Not needed for soundness — the write's own entry would
+		// sit above the held revision, which the tail test already refuses — but losing that entry
+		// loses the write, and a retry refresh is rare enough that the walk costs nothing that matters.
+		if (this.inFlightActionId === undefined && Collection.tailShowsNothingNewer(actionContext, ends.tail)) {
+			return;
+		}
+
+		// One block cache for the whole refresh, seeded with the header and tail just read: Log.open,
+		// the entry walk and the invalidation walk each start again from the header and the tail, and
+		// would otherwise fetch both every time. The seed came from UNPINNED reads and is served to
+		// reads pinned at the tail's claim, which is sound: the tail's content at its own claimed
+		// revision is that pinned view, and the header changes only when the tail block fills, which
+		// Chain.getTail already tolerates by following `nextId` from whichever tail the header names.
+		// NOTE: the cache keeps its default size (128 blocks, about 4,000 log entries). The entry walk
+		// reads every log block back to the head (no checkpoints), newest first, so past that size
+		// the newest blocks are evicted first and the invalidation walk fetches them again. If logs
+		// get that long before checkpoints land, walk entries and invalidations in one pass.
+		const tracker = new Tracker(new CacheSource(source, undefined, undefined, ends.served));
+
+		// Get the latest entries from the log, starting from where we left off
 		const collectionLog = await Log.open<Action<TAction>>(tracker, this.id);
 		const latest = collectionLog ? await collectionLog.getFrom(actionContext?.rev ?? 0) : undefined;
 
@@ -835,6 +875,58 @@ export class Collection<TAction> implements ICollection<TAction> {
 		if (this.mustReplay(anyConflicts, actionContext)) {
 			await this.replayActions();
 		}
+	}
+
+	/** Whether the log tail a refresh just read proves the log holds nothing newer than `held` —
+	 * the test that lets a refresh with nothing to find stop after one request instead of walking
+	 * the log.
+	 *
+	 * Sound because every commit and every invalidation appends a log entry, and entries only ever
+	 * go on the tail block. A tail block that is still the end of the chain (no `nextId`), whose
+	 * newest entry is at the held revision and names the action `held` names there — and whose own
+	 * claim (`state.latest`) says the same — has nothing above `held`. The walk would then find no
+	 * entries, no invalidations, and a context {@link advanceContext} adopts at an unchanged
+	 * revision, so it would change nothing.
+	 *
+	 * Says "no" — sending the refresh down the full walk — whenever the tail and the held context
+	 * disagree in any way, so everything that walk reports still fires:
+	 * - a claim above `held` (ordinary catch-up) or below it (a lagging read);
+	 * - a newest entry that is not the claimed action, or not an action at all: the entries lag the
+	 *   claim (`collection:context-short-of-tail`, or `collection:context-not-lowered` for a handle
+	 *   pinned by an over-claiming tail), or an invalidation or checkpoint took the newest slot;
+	 * - any action entry in the tail block naming a different action than `held` names at the same
+	 *   revision (`collection:lineage-divergence`, and the walk's adoption of the log's list).
+	 *
+	 * NOTE: the lineage comparison sees only the entries the tail block holds. A fork below them, on
+	 * a log that has not moved, is not looked at again until a refresh finds something new — that
+	 * walk compares the whole list. Walking every time to look is exactly the cost this avoids.
+	 *
+	 * NOTE: an invalidation entry in the newest slot never matches (it names no action), so every
+	 * refresh after one walks the log until the next commit lands. Fine while disputes are rare; if
+	 * they are not, match an invalidation slot against the held revision too. */
+	private static tailShowsNothingNewer(held: ActionContext | undefined, tail: GetBlockResult | undefined): boolean {
+		const claim = tail?.state.latest;
+		const block = tail?.block as LogBlock<unknown> | undefined;
+		if (held === undefined || claim === undefined || !block || block.nextId !== undefined) {
+			return false;
+		}
+		const newest = block.entries[block.entries.length - 1];
+		return claim.rev === held.rev
+			&& newest?.rev === claim.rev
+			&& newest.action?.actionId === claim.actionId
+			&& actionIdAt(held, held.rev) === claim.actionId
+			&& !Collection.disagreesWithHeld(held, block.entries);
+	}
+
+	/** Whether any action entry in `entries` names a different action than `held` names at the same
+	 * revision. A revision only one side names is missing evidence, not disagreement — the rule
+	 * {@link earliestFork} applies too. */
+	private static disagreesWithHeld(held: ActionContext, entries: readonly LogEntry<unknown>[]): boolean {
+		const logged = new Map(entries.flatMap(entry => entry.action ? [[entry.rev, entry.action.actionId] as const] : []));
+		return held.committed.some(entry => {
+			const loggedAction = logged.get(entry.rev);
+			return loggedAction !== undefined && loggedAction !== entry.actionId;
+		});
 	}
 
 	/** Whether {@link updateInternal} must re-stage `pending` after adopting `latest`, given the
@@ -1552,58 +1644,96 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return this.filterConflict ? this.filterConflict(action, potential) : action;
 	}
 
+	/** The two blocks every refresh starts from — the collection header and the log tail block it
+	 * names — read unpinned ("latest"), in ONE request when `knownTailId` is the tail the header
+	 * names. Only when the header names a different tail (the known one filled, or none was known)
+	 * is that tail fetched in a second request; the out-of-date block's answer is dropped rather
+	 * than kept, because nothing proves it is current at the revision the refresh will pin to.
+	 *
+	 * Both answers pass {@link answeredBlock}'s checks as unpinned reads, header first, so a doubted
+	 * header or tail throws exactly as it would through {@link TransactorSource.tryGet}.
+	 *
+	 * NOTE: a batched get fails as a whole when any block in it gets no answer
+	 * (`NetworkTransactor.get` throws on a missing id), so an unreachable out-of-date tail fails a
+	 * refresh that would not have needed it. Harmless today: the log has no checkpoints, so a
+	 * refresh that finds a new tail walks back through the old one anyway. If checkpoints start
+	 * letting that walk stop short, read the known tail in its own request instead.
+	 *
+	 * @returns undefined when the header is authoritatively absent. */
+	private static async readLogEnds(transactor: ITransactor, id: CollectionId, knownTailId: BlockId | undefined): Promise<LogEnds | undefined> {
+		const results = await transactor.get({ blockIds: knownTailId === undefined ? [id] : [id, knownTailId] });
+		const headerEntry = results?.[id];
+		if (headerEntry === undefined) {
+			return undefined;
+		}
+		const header = answeredBlock(id, headerEntry, undefined) as CollectionHeaderBlock | undefined;
+		if (!header) {
+			return undefined;
+		}
+		const served: LogEnds['served'] = [[id, header, servedRevision(headerEntry)]];
+		const tailId = header.tailId;
+		if (tailId === undefined) {
+			return { header, served };
+		}
+		const tail = tailId === knownTailId
+			? Collection.checkedLogTail(tailId, results[tailId])
+			: await Collection.readLogTail(transactor, tailId);
+		if (tail?.block) {
+			served.push([tailId, tail.block, servedRevision(tail)]);
+		}
+		return { header, tail, served };
+	}
+
+	/** An unpinned read of the log tail block, checked as {@link checkedLogTail} describes. */
+	private static async readLogTail(transactor: ITransactor, tailId: BlockId): Promise<GetBlockResult | undefined> {
+		return Collection.checkedLogTail(tailId, (await transactor.get({ blockIds: [tailId] }))?.[tailId]);
+	}
+
+	/** The repo's answer for the log tail, once it has passed {@link answeredBlock}'s unpinned-read
+	 * checks. The raw entry, not just the block, is what a refresh needs — {@link bootstrapContext}
+	 * reads `state.latest` off it — which is why the tail is read around {@link TransactorSource}
+	 * and has to be checked here.
+	 *
+	 * Both checks matter at this seam in particular. A tail the repo could not retrieve must not
+	 * degrade into "no context", which would leave the chain walk unable to see pending non-tail
+	 * blocks and the collection reading as if they did not exist. And this unpinned tail read is
+	 * the ONE seam where a lagging collection can learn a newer revision exists — every later data
+	 * read is pinned to the context seeded from it — so seeding from a tail the repo could not
+	 * confirm is current would freeze the collection at the stale revision with nothing ever
+	 * reporting a problem. A tail with no `state.latest` and no flag is a real answer (nothing
+	 * committed yet). */
+	private static checkedLogTail(tailId: BlockId, entry: GetBlockResult | undefined): GetBlockResult | undefined {
+		if (entry) {
+			answeredBlock(tailId, entry, undefined);
+		}
+		return entry;
+	}
+
 	/** Bootstrap ActionContext from the committed tail block's state.
 	 * The tail is always committed first (commit protocol guarantee), so it's readable
 	 * with context=undefined. Its state.latest contains the ActionRev of the most recent
 	 * committed action — exactly the proof needed for the transactor to serve pending
-	 * non-tail blocks during chain walks.
+	 * non-tail blocks during chain walks. A tail with no `latest` (or no tail) no-ops.
 	 *
-	 * This read goes to the transactor directly rather than through {@link TransactorSource},
-	 * so it has to honour the `unavailable` flag itself: a tail the repo could not retrieve
-	 * must not degrade into "no context", which would leave the chain walk unable to see
-	 * pending non-tail blocks and the collection reading as if they did not exist. A tail
-	 * with no `state.latest` and NO flag is a real answer (nothing committed yet) and still
-	 * no-ops.
-	 *
-	 * The same goes for `unconfirmedAheadRev`: this unpinned tail read is the ONE seam where a
-	 * lagging collection can learn a newer revision exists — every later data read is pinned to
-	 * the context seeded here. Silently seeding from a tail the repo could not confirm is
-	 * current would freeze the collection at the stale revision with nothing ever reporting a
-	 * problem, so it throws the same way TransactorSource.tryGet does for its unpinned reads
-	 * (see the tradeoff NOTE there).
+	 * NOTE: this number is adopted on trust, and adoption is one-way (advanceContext never
+	 * lowers it). A tail that over-claims therefore pins the collection at a revision its
+	 * own log can never reach, permanently: every later refresh walks the log (the claim's newest
+	 * entry never matches, so {@link tailShowsNothingNewer} never lets it skip), reads the
+	 * real (lower) revision, and is refused — so the instance emits
+	 * `collection:context-not-lowered` forever while `collection:context-short-of-tail`
+	 * stays silent (the held revision is at or above what the tail claims). No condition
+	 * that makes a real tail over-claim has been demonstrated; this was seen only through a
+	 * test double built to lie (see collection.spec.ts, 'a refresh that lands short of the
+	 * tail it just read'). If an over-claiming tail is ever observed in the field, the fix
+	 * belongs here — validate the claim against the log before pinning — not in the refresh.
 	 */
-	private static async bootstrapContext(
-		source: TransactorSource<IBlock>,
-		transactor: ITransactor,
-		header: CollectionHeaderBlock,
-	): Promise<void> {
-		const tailId = header.tailId;
-		if (tailId) {
-			const tailResult = await transactor.get({ blockIds: [tailId] });
-			const tailEntry = tailResult?.[tailId];
-			if (tailEntry?.unavailable !== undefined && tailEntry.block == null) {
-				throw new BlockUnavailableError(tailId, tailEntry.unavailable);
-			}
-			if (tailEntry?.unconfirmedAheadRev !== undefined) {
-				throw new BlockPossiblyStaleError(tailId, tailEntry.unconfirmedAheadRev);
-			}
-			const tailState = tailEntry?.state;
-			// NOTE: this number is adopted on trust, and adoption is one-way (advanceContext never
-			// lowers it). A tail that over-claims therefore pins the collection at a revision its
-			// own log can never reach, permanently: every later refresh walks the log, reads the
-			// real (lower) revision, and is refused — so the instance emits
-			// `collection:context-not-lowered` forever while `collection:context-short-of-tail`
-			// stays silent (the held revision is at or above what the tail claims). No condition
-			// that makes a real tail over-claim has been demonstrated; this was seen only through a
-			// test double built to lie (see collection.spec.ts, 'a refresh that lands short of the
-			// tail it just read'). If an over-claiming tail is ever observed in the field, the fix
-			// belongs here — validate the claim against the log before pinning — not in the refresh.
-			if (tailState?.latest) {
-				source.actionContext = {
-					committed: [{ actionId: tailState.latest.actionId, rev: tailState.latest.rev }],
-					rev: tailState.latest.rev,
-				};
-			}
+	private static bootstrapContext(source: TransactorSource<IBlock>, tail: GetBlockResult | undefined): void {
+		const latest = tail?.state.latest;
+		if (latest) {
+			source.actionContext = {
+				committed: [{ actionId: latest.actionId, rev: latest.rev }],
+				rev: latest.rev,
+			};
 		}
 	}
 }

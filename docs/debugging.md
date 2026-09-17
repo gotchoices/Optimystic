@@ -519,8 +519,11 @@ collection id holding the same revision under different actions keep `context-sh
 silent forever. The refresh instead compares the action ids the two sides name, revision by
 revision across the range they both cover, and reports the LOWEST revision they disagree at — a
 mismatch anywhere means the local copy and the stored log are provably different lineages (see
-*Comparing action ids* below — this is that comparison, run by db-core itself on every refresh,
-without needing a second node's lines):
+*Comparing action ids* below — this is that comparison, run by db-core itself on every refresh
+that walks the log, without needing a second node's lines). A refresh that finds nothing new does
+not walk: it compares only the entries in the log tail block (up to 32) and walks if any disagree,
+so a split below those, on a collection nobody is writing to, is reported by the first refresh
+after the next commit rather than by an idle poll:
 
 ```
 optimystic:db-core:collection collection:lineage-divergence id=default/main/Usage/index/by_token tag=k3Vq_A site=refresh forkRev=1 heldAction=fR1TfGRxHLN_Icl0ZK-XIw readAction=vR5WcYtFvwoW2nYPa8BqCg heldRev=2 readRev=2
