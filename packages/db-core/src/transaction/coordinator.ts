@@ -384,8 +384,7 @@ export class TransactionCoordinator {
 					// is committed. Return now rather than go round again, where an abort, the deadline
 					// or an expiry check could still report failure for a transaction that is entirely
 					// saved. The refresh's consume and replay already gave each saved participant the
-					// success path's local treatment, so only the stamp is left to release — which the
-					// next attempt's nothing-to-commit return would not do.
+					// success path's local treatment, so only the stamp is left to release.
 					// Tested on what is still STAGED, not on "every participant saved": a participant
 					// can be saved and still hold actions staged after the attempt began, and those
 					// the next attempt must commit.
@@ -487,6 +486,10 @@ export class TransactionCoordinator {
 			for (const id of err.committedCollections) committed.add(id);
 			reason = err.reason;
 		}
+		// NOTE: a participant is in exactly one list, so one saved by a refresh that ALSO held actions
+		// staged after its attempt began (and a later attempt failed to commit them) is listed only as
+		// committed. Unreachable while a session stages and commits on one call path; if staging ever
+		// races a commit, report such a participant in both lists.
 		const failed = [...cycle.participants].filter(id => !committed.has(id));
 		log('commit:partial-after-refresh tx=%s committed=%o failed=%o reason=%s', transaction.id,
 			[...committed], failed, reason instanceof Error ? reason.name : String(reason));
@@ -526,7 +529,11 @@ export class TransactionCoordinator {
 		const collectionData = this.stagedCollections();
 
 		if (collectionData.length === 0) {
-			return; // Nothing to commit
+			// Nothing to commit is a successful commit: release the stamp as the success path does,
+			// or a read-only transaction that opened one (the empty pre-stage barrier) wedges every
+			// later stamp on this coordinator.
+			this.stampData.delete(transaction.stamp.id);
+			return;
 		}
 		for (const { collectionId } of collectionData) {
 			cycle.participants.add(collectionId);

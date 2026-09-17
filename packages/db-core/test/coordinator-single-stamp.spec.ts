@@ -357,6 +357,24 @@ describe('TransactionCoordinator: single open stamp', () => {
 		expect(accepted, 'rollback releases the wedge').to.equal(undefined);
 	});
 
+	it('committing a stamp that staged nothing releases it, so a new stamp is accepted', async () => {
+		// A read-only session transaction: the Quereus bridge's empty-actions pre-stage barrier
+		// opens a stampData entry, and the commit finds nothing staged. That is a successful
+		// commit, so it must release the stamp exactly as a commit that wrote something does.
+		const id = 'ss-commit-empty';
+		const transactor = new TestTransactor();
+		const { coordinator, collections } = await makeCoordinator(transactor, [id]);
+		// A fresh collection's header is itself staged; sync it so the commit truly finds nothing.
+		await collections.get(id)!.sync();
+
+		const readOnly = await build([]);
+		await coordinator.applyActions([], readOnly.stampId);
+		await coordinator.commit(readOnly.transaction);
+
+		const accepted = await stageRefusal(coordinator, [{ collectionId: id, value: 'next' }]);
+		expect(accepted, 'a fresh stamp is accepted after an empty commit').to.equal(undefined);
+	});
+
 	it('a partial commit drops the stamp, so a new stamp is accepted', async () => {
 		// The partial-commit branch deletes the entry (rollback of a half-landed transaction would
 		// rewind the durable winner), so the coordinator reopens even though the collection state

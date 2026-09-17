@@ -828,7 +828,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// so the replay's reads re-materialize from the transactor.
 		// NOTE: a throw out of replayActions leaves the tracker holding only the transforms
 		// replayed so far while `pending` still lists them all; the caller's error handling is
-		// expected to abort/reset the collection rather than keep staging. If replay ever gains a
+		// expected to abort/reset the collection rather than keep staging. The coordinator's partial
+		// report after a refresh-saved sibling does not (backlog: debt-a-failed-refresh-can-leave-a-
+		// collection-half-restaged). If replay ever gains a
 		// routinely-throwing read path, rebuild into a scratch tracker and swap on success.
 		if (this.mustReplay(anyConflicts, actionContext)) {
 			await this.replayActions();

@@ -876,8 +876,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   throws, and only then throws the first failure: stopping at the first throw left a participant
   later in the map with its tail stored and its other blocks never landed whenever an earlier one
   was torn. And when a refresh has saved a participant and nothing is left staged, `commit()`
-  returns at once (releasing the stamp, which the next attempt's nothing-to-commit return never
-  did) rather than going round again, where an abort, deadline or expiry check could report a fully
+  returns at once (releasing the stamp) rather than going round again, where an abort, deadline or expiry check could report a fully
   saved transaction as failed. `packages/db-core/test/coordinator-own-action-replay.spec.ts`
   pins each of these.
 - **The collection, not the caller, holds the in-flight id.** Which action is in flight is a field

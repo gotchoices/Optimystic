@@ -590,11 +590,11 @@ describe('TransactionCoordinator: own committed action on retry', () => {
 		const partial = thrown as CoordinatorPartialCommitError;
 		expect(partial.committedCollections).to.deep.equal([tornId]);
 		expect(partial.failedCollections).to.deep.equal([lostId]);
-		expect(partial.reason, 'the abort is the reason').to.be.instanceOf(Error);
-		expect(partial.reason).to.not.be.instanceOf(CoordinatorStaleLossError);
+		expect((partial.reason as Error).name, 'the abort is the reason').to.equal('AbortError');
 		expect(transactor.lossesInjected).to.equal(2);
 		expect(torn.hasUnsyncedChanges()).to.equal(false);
 		expect(lost.hasUnsyncedChanges()).to.equal(true);
+		await expectStampReleased(coordinator, lostId);
 	});
 
 	it('an abandoned commit leaves no in-flight mark behind for a later refresh to consume', async () => {
