@@ -11,8 +11,8 @@ import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-conn
 import type { ParsedOptimysticOptions, RowData } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
-import { ConflictResolution, QuereusError, StatusCode } from '@quereus/quereus';
-import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue } from '@quereus/quereus';
+import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames } from '@quereus/quereus';
+import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import type { CollectionChangeEvent, ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
@@ -266,6 +266,31 @@ function unmaintainedIndexMessage(tableName: string, indexName: string, detail: 
  * absence is what keeps every other path (direct DDL) unchanged.
  */
 type DeferIndexFlush = (indexName: string, tree: Tree<string, IndexEntry>) => void;
+
+/** Quereus's CHECK shape and its ADD CONSTRAINT AST node, reached through exported types (neither is exported by name). */
+type RowConstraintSchema = TableSchema['checkConstraints'][number];
+type AddedConstraint = Extract<SchemaChangeInfo, { type: 'addConstraint' }>['constraint'];
+
+/**
+ * Quereus's schema-only RENAME COLUMN, reproduced unchanged — the fallback its ALTER TABLE
+ * RENAME COLUMN arm runs for a module without an `alterTable` hook: the column renamed in the
+ * catalog entry, nothing written. The engine has already checked that `oldName` exists and
+ * `newName` is free.
+ *
+ * NOTE: the rename never reaches the catalog record, so a restart that only hydrates brings the
+ * old name back (tickets/backlog/bug-optimystic-rename-column-lost-on-restart). Kept exactly as
+ * the engine did it so that implementing `alterTable` changed no rename behaviour; that ticket
+ * owns persisting the rename or refusing it.
+ */
+function renameColumnSchemaOnly(tableSchema: TableSchema, oldName: string, newName: string): TableSchema {
+  const colIndex = tableSchema.columnIndexMap.get(oldName.toLowerCase());
+  const columns = tableSchema.columns.map((col, i) => (i === colIndex ? { ...col, name: newName } : col));
+  return {
+    ...tableSchema,
+    columns: Object.freeze(columns),
+    columnIndexMap: buildColumnIndexMap(columns),
+  };
+}
 
 /**
  * How a table reaches storage — the transactor and key network it goes through, the
@@ -2959,6 +2984,50 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
+   * Persist a CHECK that `ALTER TABLE … ADD CONSTRAINT` added, and carry it on this instance's
+   * own schema ({@link OptimysticModule.alterTable} builds `check` exactly as the engine
+   * registers it).
+   *
+   * Both halves are needed. The catalog record is all a restarted machine hydrates, so without
+   * the write it stops enforcing the CHECK. And this instance compares its own `tableSchema`
+   * against the record whenever it (re-)initializes, rewriting the record from `tableSchema` on
+   * a mismatch — so an instance that never learned of the CHECK would write it back out on its
+   * next re-open (after a failed `APPLY SCHEMA` batch commit, say).
+   *
+   * Schema-only, like the engine's own CHECK arm and Quereus's memory tables: existing rows are
+   * not validated against the new CHECK.
+   */
+  async addCheckConstraint(check: RowConstraintSchema): Promise<void> {
+    // Initialized first so there is a record to extend: an instance whose record never landed
+    // (see markSchemaUnpersisted) re-persists it here, through the storage-adoption guard.
+    if (!this.isInitialized) {
+      await this.initialize();
+    }
+
+    const txnState = this.txnBridge.getCurrentTransaction();
+    // MUTATING path: read the catalog fresh, for the reason addIndex does.
+    const storedSchema = await this.schemaManager.getSchemaFresh(this.schemaName, this.tableName, txnState?.transactor);
+    if (!storedSchema) {
+      throw new Error(`Schema not found for Optimystic table '${this.schemaName}.${this.tableName}'. Cannot add CHECK constraint.`);
+    }
+    await this.schemaManager.storeStoredSchema(
+      this.schemaManager.withCheckConstraint(storedSchema, check),
+      txnState?.transactor,
+    );
+
+    // Only once the write is staged, so a refused write leaves this instance as it was. Same
+    // name rule as the record's (withCheckConstraint), so the two lists stay alike.
+    const name = check.name?.toLowerCase();
+    this.tableSchema = {
+      ...this.tableSchema,
+      checkConstraints: [
+        ...this.tableSchema.checkConstraints.filter(existing => name === undefined || existing.name?.toLowerCase() !== name),
+        check,
+      ],
+    };
+  }
+
+  /**
    * The CREATE INDEX half of the rule "storage must not outlive the catalog record
    * that describes it" (the table half: {@link guardStorageAdoption}). On the build
    * path, `openIndexTree` is create-on-missing, so a leftover tree at
@@ -4019,14 +4088,15 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * join an in-flight writer transaction) and never registers a connection.
    *
    * NOTE: a connect is not run under the open `APPLY SCHEMA` batch's per-statement
-   * checkpoint ({@link underBatchCheckpoint} wraps create, createIndex and destroy — and
-   * createIndex's own first-touch initialize runs inside it — but not plain connects). A
-   * first touch of a hydrated table mid-apply whose persisted record differs from the
-   * hydrated shape re-persists it from here, and that write stays in the overlay if the
-   * statement then throws. Fine today: no plugin DDL hook reaches this mid-apply (no
-   * alter/rename hooks are implemented), and before the batch that write was committed
-   * before the throw anyway. If a mid-apply statement ever connects and can fail after
-   * initialize, wrap it too.
+   * checkpoint ({@link underBatchCheckpoint} wraps create, createIndex, alterTable's CHECK arm
+   * and destroy — and the first-touch initialize of createIndex and that arm runs inside it —
+   * but not plain connects). A first touch of a hydrated table mid-apply whose persisted record
+   * differs from the hydrated shape re-persists it from here, and that write stays in the
+   * overlay if the statement then throws. One statement does reach this today: an ADD COLUMN
+   * of a NOT NULL column with no default makes Quereus read a row before alterTable refuses
+   * the arm. Fine while that stays rare — before the batch that write was committed before the
+   * throw anyway. If a mid-apply statement that commonly fails after its connect appears, wrap
+   * it too.
    */
   private async resolveConnectedTable(
     db: Database,
@@ -4217,6 +4287,107 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       }
       await table.addIndex(indexSchema, deferFlush);
     });
+  }
+
+  /**
+   * ALTER TABLE on an Optimystic table. The hook exists for ONE arm: a CHECK added by
+   * `ADD CONSTRAINT` — what `apply schema` emits when a later schema version declares a new
+   * named table-level CHECK — which must reach the table's catalog record
+   * ({@link OptimysticVirtualTable.addCheckConstraint}). Without the hook Quereus keeps such a
+   * CHECK in its in-memory catalog only, and a restarted machine that only hydrates stops
+   * enforcing it.
+   *
+   * Having the hook takes every other arm off Quereus's path for modules without one, so each
+   * answers here as it did there: RENAME COLUMN renames schema-only
+   * ({@link renameColumnSchemaOnly}); the rest are refused as UNSUPPORTED in Quereus's own
+   * words. ALTER PRIMARY KEY's final refusal is still Quereus's: it takes UNSUPPORTED from here
+   * as "fall back to a rebuild", which it then refuses because this module has no `renameTable`.
+   *
+   * NOTE: what does change is precedence. Quereus runs an arm's pre-dispatch checks only for a
+   * module that has the hook, and those now come before these refusals — ADD COLUMN of a
+   * NOT NULL column with no default over a table with rows reports the missing default (after
+   * reading one row), a malformed ADD UNIQUE / FOREIGN KEY reports what is malformed. Both are
+   * still refused and change nothing; only the message differs.
+   *
+   * Returns the engine's catalog entry with the change applied, built as the engine's own
+   * fallbacks built it. Emits no schema-change event: this module has no emitter, so Quereus
+   * announces the statement itself.
+   */
+  async alterTable(
+    db: Database,
+    schemaName: string,
+    tableName: string,
+    change: SchemaChangeInfo
+  ): Promise<TableSchema> {
+    const tableSchema = db.schemaManager.findTable(tableName, schemaName);
+    if (!tableSchema) {
+      throw new QuereusError(`Optimystic table '${tableName}' not found in schema '${schemaName}'. Cannot alter.`, StatusCode.ERROR);
+    }
+    const refuse = (operation: string): never => {
+      throw new QuereusError(`Module for table '${tableSchema.name}' does not support ${operation}`, StatusCode.UNSUPPORTED);
+    };
+
+    switch (change.type) {
+      case 'addConstraint':
+        return change.constraint.type === 'check'
+          ? await this.addCheckConstraint(db, tableSchema, change.constraint)
+          : refuse('ADD CONSTRAINT');
+      case 'renameColumn':
+        return renameColumnSchemaOnly(tableSchema, change.oldName, change.newName);
+      case 'addColumn':
+        return refuse('ALTER TABLE ADD COLUMN');
+      case 'dropColumn':
+        return refuse('ALTER TABLE DROP COLUMN');
+      case 'dropConstraint':
+        return refuse('ALTER TABLE DROP CONSTRAINT');
+      case 'renameConstraint':
+        return refuse('ALTER TABLE RENAME CONSTRAINT');
+      case 'alterColumn':
+        return refuse('ALTER COLUMN');
+      case 'alterPrimaryKey':
+        return refuse('ALTER PRIMARY KEY');
+    }
+  }
+
+  /**
+   * The CHECK arm of {@link alterTable}. The constraint is built by Quereus's own builder over
+   * the engine's catalog entry, exactly as its CHECK arm for a module without `alterTable` did,
+   * so an unnamed CHECK gets the same minted name. The table is resolved as {@link createIndex}
+   * resolves it — a hydrated table no statement has touched yet is instantiated and, inside the
+   * statement's batch checkpoint, initialized and registered — so the persisted write lands in
+   * an open `APPLY SCHEMA` batch and commits with the rest of the apply.
+   */
+  private async addCheckConstraint(
+    db: Database,
+    tableSchema: TableSchema,
+    constraint: AddedConstraint
+  ): Promise<TableSchema> {
+    const check = buildCheckConstraintSchema(
+      constraint,
+      tableSchema.checkConstraints.length,
+      collectTableConstraintNames(tableSchema),
+    );
+
+    const { schemaName, name: tableName } = tableSchema;
+    const tableKey = `${schemaName}.${tableName}`.toLowerCase();
+    const resolved = await this.lookupOrInstantiate(db, schemaName, tableName, tableSchema);
+    if (!resolved) {
+      throw new Error(`Optimystic table '${tableName}' not found in schema '${schemaName}'. Cannot add CHECK constraint.`);
+    }
+    const { table, fresh } = resolved;
+
+    await this.underBatchCheckpoint(table, 'written', tableKey, async () => {
+      if (fresh) {
+        await table.initialize();
+        await table.ensureConnectionRegistered();
+      }
+      await table.addCheckConstraint(check);
+    });
+
+    return {
+      ...tableSchema,
+      checkConstraints: Object.freeze([...tableSchema.checkConstraints, check]),
+    };
   }
 
   /**

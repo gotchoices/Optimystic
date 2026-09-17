@@ -1538,6 +1538,20 @@ export class SchemaManager {
 		};
 	}
 
+	/**
+	 * `stored` with `check` added: the persisted half of `ALTER TABLE … ADD CONSTRAINT … CHECK`
+	 * (see `OptimysticVirtualTable.addCheckConstraint`). A CHECK already carrying that name,
+	 * compared case-insensitively as Quereus compares constraint names, is replaced rather than
+	 * doubled — the engine refuses a name its own catalog holds, so such a CHECK came from a
+	 * writer this session's declaration never saw, and local DDL wins here as it does on every
+	 * other schema write. List order is left to the write ({@link canonicalizeRecordOrder}).
+	 */
+	withCheckConstraint(stored: StoredTableSchema, check: RowConstraintSchema): StoredTableSchema {
+		const name = check.name?.toLowerCase();
+		const kept = (stored.checkConstraints ?? []).filter(existing => name === undefined || existing.name?.toLowerCase() !== name);
+		return { ...stored, checkConstraints: [...kept, this.checkConstraintToStored(check)] };
+	}
+
 	private checkConstraintToStored(check: RowConstraintSchema): StoredCheckConstraint {
 		return {
 			name: check.name,

@@ -212,7 +212,7 @@ describe('Schema Migration (TEST-7.4.1)', () => {
 		it('should detect adding a column vs original schema (via re-creation)', async () => {
 			const mockCoordinator = {} as any;
 
-			// Since virtual tables don't support ALTER TABLE, we test via drop+create
+			// Optimystic tables refuse ALTER TABLE ADD COLUMN, so we test via drop+create
 			await db.exec(`CREATE TABLE addcol (id INTEGER PRIMARY KEY, a TEXT) USING optimystic('tree://test/ac')`);
 			const engine = new QuereusEngine(db, mockCoordinator);
 			engine.invalidateSchemaCache();

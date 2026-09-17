@@ -136,14 +136,29 @@ const EVERY_FEATURE_INDEXES = [
 	'unique index ByNote on Every (Note) where Note is not null',
 ] as const;
 
+/** The named table-level CHECKs of `app.Every`, in declaration order. */
+const EVERY_FEATURE_CHECKS = ['constraint BigNonNegative check (Big >= 0)'] as const;
+
+/**
+ * Named CHECKs to declare either side of `BigNonNegative`, sorting either side of it by name too:
+ * a version that adds `BigNonNegative` between them is the case where creation order (added last)
+ * and canonical order (by name) disagree.
+ */
+const CHECK_BEFORE_BIG = 'constraint AScoreBounded check (Score < 1000000)';
+const CHECK_AFTER_BIG = 'constraint ZQtyBounded check (Qty < 1000000)';
+
 /**
  * One table exercising every declaration feature the catalog record has to carry: a non-`main`
  * schema, alias type spellings, a column collation, literal and expression defaults, named and
  * unnamed CHECKs, a stored generated column, a foreign key with an action, column and table
  * tags, a table-level UNIQUE, a `with context` variable, a plain index, a partial index and a
- * partial unique index. `indexes` swaps in an earlier version's index declarations.
+ * partial unique index. `indexes` and `checks` swap in another version's index and named
+ * table-level CHECK declarations.
  */
-function everyFeatureDeclare(indexes: readonly string[] = EVERY_FEATURE_INDEXES): string {
+function everyFeatureDeclare(
+	indexes: readonly string[] = EVERY_FEATURE_INDEXES,
+	checks: readonly string[] = EVERY_FEATURE_CHECKS,
+): string {
 	return `
 	declare schema app {
 		table Managers { Id text primary key }
@@ -156,7 +171,7 @@ function everyFeatureDeclare(indexes: readonly string[] = EVERY_FEATURE_INDEXES)
 			Qty integer not null check (Qty > 0),
 			Total integer generated always as (Qty * 2) stored,
 			ManagerId text null references Managers (Id) on delete cascade,
-			constraint BigNonNegative check (Big >= 0),
+			${checks.map(check => `${check},`).join('\n\t\t\t')}
 			unique (Name)
 		} with context (ManagerKey text null) with tags (owner = 'app')
 		${indexes.join('\n\t\t')}
@@ -238,6 +253,35 @@ function earlierIndexVersions(): { label: string; indexes: string[] }[] {
 		...orders.map(indexes => ({ label: `earlier version declaring ${render(indexes)}, rows, then this one`, indexes })),
 	];
 }
+
+/**
+ * Migrations of `app.Every` from an earlier version to a later one, each giving the existing
+ * table something new: an index that sorts before the others, the `BigNonNegative` CHECK, both in
+ * one apply, and that CHECK where it sorts between two others. Bare `declare schema` blocks;
+ * callers append `apply schema app;`.
+ */
+const MIGRATION_PATHS: readonly { label: string; from: string; to: string }[] = [
+	{
+		label: 'from a version without ByScore',
+		from: everyFeatureDeclare(EVERY_FEATURE_INDEXES.slice(1)),
+		to: EVERY_FEATURE_DECLARE,
+	},
+	{
+		label: 'from a version without BigNonNegative',
+		from: everyFeatureDeclare(EVERY_FEATURE_INDEXES, []),
+		to: EVERY_FEATURE_DECLARE,
+	},
+	{
+		label: 'from a version without ByScore or BigNonNegative',
+		from: everyFeatureDeclare(EVERY_FEATURE_INDEXES.slice(1), []),
+		to: EVERY_FEATURE_DECLARE,
+	},
+	{
+		label: 'from a version without BigNonNegative, to one declaring it between two other CHECKs',
+		from: everyFeatureDeclare(EVERY_FEATURE_INDEXES, [CHECK_BEFORE_BIG, CHECK_AFTER_BIG]),
+		to: everyFeatureDeclare(EVERY_FEATURE_INDEXES, [CHECK_BEFORE_BIG, ...EVERY_FEATURE_CHECKS, CHECK_AFTER_BIG]),
+	},
+];
 
 function permutations<T>(items: readonly T[]): T[][] {
 	if (items.length <= 1) return [[...items]];
@@ -409,32 +453,60 @@ describe('Warm restart: a hydrated table is the table its declaration creates', 
 		}
 	});
 
+	it('writes the same catalog record whichever earlier version a machine migrated from, when a later version adds a CHECK', async () => {
+		// The same property for a named table-level CHECK: `apply schema` adds it to the existing
+		// table with ALTER TABLE ADD CONSTRAINT, which used to leave it out of the record altogether.
+		for (const { label, from, to } of MIGRATION_PATHS) {
+			const reference = await catalogAfter('era1', `${to} apply schema app;`);
+			expect(await catalogAfter('era2', `${from} apply schema app;`, ...SEED_EVERY, `${to} apply schema app;`), label)
+				.to.deep.equal(reference);
+		}
+	});
+
+	it('an ALTER-added CHECK commits with the rest of its apply, in the one catalog commit', async () => {
+		// A version adding an index and a CHECK to an EMPTY table: the index tree has nothing to
+		// land, so the apply costs exactly its one catalog commit; a CHECK written outside the
+		// batch would be a second.
+		const counting = countingTransactor(buildSharedLocalTransactor(new MemoryRawStorage()));
+		const { db, plugin } = await openSession('era1', { 'local:era1': counting.transactor });
+		await db.exec(`${everyFeatureDeclare(EVERY_FEATURE_INDEXES.slice(1), [])} apply schema app;`);
+
+		counting.counts.reset();
+		await db.exec(EVERY_FEATURE);
+		expect(counting.counts.commit, 'one commit for the index and the CHECK together').to.equal(1);
+		expect(await catalogRecordBytes(plugin, 'era1')).to.deep.equal(await catalogAfter('era1', EVERY_FEATURE));
+	});
+
 	it('hydrates a migrated table as the table its declaration creates', async () => {
-		// Storage that reached the declaration through a version without `ByScore`, hydrated by a
-		// new session. One era throughout, so the session binding is not what differs.
-		const store = buildSharedLocalTransactor(new MemoryRawStorage());
-		const migrating = await openEra('era1', store);
-		await migrating.db.exec(`${everyFeatureDeclare(EVERY_FEATURE_INDEXES.slice(1))} apply schema app;`);
-		await seedEvery(migrating.db);
-		await migrating.db.exec(EVERY_FEATURE);
+		// Storage that reached the declaration through an earlier version, hydrated by a new
+		// session with no re-declaration, so whatever a later version added must come back from
+		// the record alone. One era throughout, so the session binding is not what differs.
+		for (const { label, from, to } of MIGRATION_PATHS) {
+			const store = buildSharedLocalTransactor(new MemoryRawStorage());
+			const migrating = await openEra('era1', store);
+			await migrating.db.exec(`${from} apply schema app;`);
+			await seedEvery(migrating.db);
+			await migrating.db.exec(`${to} apply schema app;`);
 
-		const hydrated = await openEra('era1', store);
-		expect(await hydrated.plugin.hydrate(hydrated.db)).to.deep.equal({ tables: 2, indexes: EVERY_FEATURE_INDEXES.length });
-		const created = await openEra('era1', buildSharedLocalTransactor(new MemoryRawStorage()));
-		await created.db.exec(EVERY_FEATURE);
+			const hydrated = await openEra('era1', store);
+			expect(await hydrated.plugin.hydrate(hydrated.db), label).to.deep.equal({ tables: 2, indexes: EVERY_FEATURE_INDEXES.length });
+			const created = await openEra('era1', buildSharedLocalTransactor(new MemoryRawStorage()));
+			await created.db.exec(`${to} apply schema app;`);
 
-		const declared = declarationView(tableOf(created.db, 'app', 'Every'));
-		expect(declarationView(tableOf(hydrated.db, 'app', 'Every'))).to.deep.equal(declared);
-		expect(declarationView(tableOf(migrating.db, 'app', 'Every')), "the migrating session's own table").to.deep.equal(declared);
+			const declared = declarationView(tableOf(created.db, 'app', 'Every'));
+			expect(declarationView(tableOf(hydrated.db, 'app', 'Every')), label).to.deep.equal(declared);
+			expect(declarationView(tableOf(migrating.db, 'app', 'Every')), `${label}: the migrating session's own table`).to.deep.equal(declared);
 
-		// A session that declares instead of hydrating finds the record already canonical, so
-		// its connect-time compare holds and nothing is rewritten.
-		const counting = countingTransactor(store);
-		const redeclaring = await openSession('era1', { 'local:era1': counting.transactor });
-		await redeclaring.db.exec(EVERY_FEATURE);
-		expect(counting.counts, 're-declaring the migrated table commits nothing').to.include({ pend: 0, commit: 0 });
+			// A session that declares instead of hydrating finds the record already canonical, so
+			// its connect-time compare holds and nothing is rewritten.
+			const counting = countingTransactor(store);
+			const redeclaring = await openSession('era1', { 'local:era1': counting.transactor });
+			await redeclaring.db.exec(`${to} apply schema app;`);
+			expect(counting.counts, `${label}: re-declaring the migrated table commits nothing`).to.include({ pend: 0, commit: 0 });
 
-		await expectEveryBehaves(hydrated.db);
+			// Enforces `BigNonNegative` among the rest, restored by hydrate alone.
+			await expectEveryBehaves(hydrated.db);
+		}
 	});
 
 	it("never takes a hydrated table's encoding from the session's default args", async () => {
