@@ -83,3 +83,15 @@ Unit level: `block-floors.spec.ts` (10), `cache-source.spec.ts` (+14: nine on an
 - `backlog/bug-a-pended-transform-does-not-carry-its-base` — new arm (the writer-side instance above).
 - `backlog/debt-three-copies-of-the-log-capture-test-helper` — progress note.
 - `implement/a-too-old-block-answer-is-retried-against-another-machine` — a "what the prerequisite landed" section naming the API to build on, and which expectation in `refresh-below-floor.spec.ts` should flip.
+
+## Also review: the triage commit that followed (`9cfa83b0`)
+
+tess's pre-existing-failure triage changed tooling and committed it without a ticket, so review it here. It is unrelated to this ticket's subject; it only rode the same run.
+
+The implementer recorded a pre-existing `yarn lint:deps` failure: the undeclared-dependency scanner reported a package named `, `. Triage found `SIDE_EFFECT_IMPORT_RE` in `scripts/check-undeclared-deps.mjs` was unanchored, so `\b` matched inside the string `'--import'` and captured text between two string literals. It anchored both static patterns to a statement start and, on finding that anchoring alone dropped two real imports from BOM-prefixed files (`packages/db-p2p-storage-fs/src/index.ts`, `logger.ts`), made `readSource` strip a leading BOM. It added `test-harness/undeclared-deps.test.mjs` (6 cases) and verified it fails against both the pre-fix script and a no-BOM-strip variant.
+
+Check in particular:
+- **No real import is now missed.** A dependency guard's false negative is worse than the false positive it fixed. Triage diffed old-vs-new extraction across all 904 scanned files and reported the only lost specifier is the bogus one. Confirm that claim, or re-run the diff.
+- **The anchors accept every real shape** — indented, after `;`, multi-line, `export … from`, and the dynamic and `require` forms that stay unanchored on purpose.
+- **BOM handling** does not change file offsets used elsewhere in the scanner.
+- Triage also flagged the same latent BOM hole in `packages/db-core/test/barrel-import-cycle.spec.ts` (`SIDE_EFFECT_RE` / `FROM_RE`), unexposed today because that spec scans only `packages/db-core/src`. Decide whether to fix it here or file it.
