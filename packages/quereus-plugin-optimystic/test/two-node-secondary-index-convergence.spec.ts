@@ -18,6 +18,7 @@
  */
 
 import { expect } from 'chai';
+import { defaultCollectionUri } from '../dist/index.js';
 import type { Database, SqlValue } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
 import { captureTrace, collectionIdOf, commitTraces, indexOpenTraces, indexSeekTraces } from './trace-helpers.js';
@@ -26,7 +27,8 @@ import { countTreeEntries, createMeshDbNode, startMockMesh } from './mesh-node-h
 
 type Row = Record<string, SqlValue>;
 
-const TABLE_URI = 'tree://default/FormationUsage';
+/** Where a `main.FormationUsage` declared without an explicit URI would live — spelled out so both nodes agree. */
+const TABLE_URI = defaultCollectionUri('main', 'FormationUsage');
 const INDEX_URI = `${TABLE_URI}/index/formation_usage_by_token`;
 
 const TABLE_COLLECTION_ID = collectionIdOf(TABLE_URI);

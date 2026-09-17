@@ -1,8 +1,10 @@
 /**
  * SchemaManager - Manages table schemas in Optimystic trees
  *
- * Stores and retrieves table schema definitions from distributed Optimystic trees.
- * Schema is stored in a dedicated tree at `tree://schema/{tableName}`.
+ * Stores and retrieves table schema definitions from distributed Optimystic trees. Every
+ * table's record lives in one plugin-global catalog tree (`tree://optimystic/schema`), filed
+ * under a key built from the table's engine schema AND its name ({@link catalogKey}), so
+ * same-named tables in different schemas keep separate records.
  */
 
 import type { Tree } from '@optimystic/db-core';
@@ -10,7 +12,9 @@ import type { TableSchema, ColumnSchema, VirtualTableModule, UniqueConstraintSch
 import { getTypeOrDefault } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
 import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
-import type { CatalogBatchCheckpoint } from './catalog-batch.js';
+import type { CatalogBatchCheckpoint, CatalogEntry } from './catalog-batch.js';
+import { catalogKey, namesOfCatalogKey } from './table-identity.js';
+import type { QualifiedTableName } from './table-identity.js';
 
 // IndexSchema type from TableSchema.indexes
 export type IndexSchema = NonNullable<TableSchema['indexes']>[number];
@@ -469,6 +473,7 @@ export function mergePersistedSchemas(
  * Manages schema storage and retrieval in Optimystic trees
  */
 export class SchemaManager {
+	/** Resolved live schemas by catalog key ({@link catalogKey}). */
 	private schemaCache = new Map<string, StoredTableSchema>();
 	/**
 	 * The open `APPLY SCHEMA` catalog batch, if any. While set, every catalog read and write
@@ -507,7 +512,7 @@ export class SchemaManager {
 	 * able to open a fresh one); the error propagates to the module, which re-initializes the
 	 * tables it left unpersisted. Only after the sync succeeds is the per-instance cache
 	 * seeded with the resolved live records that were actually written, and cleared for
-	 * every dropped name — the same discipline as the unbatched write path.
+	 * every dropped table — the same discipline as the unbatched write path.
 	 */
 	async commitBatch(): Promise<void> {
 		const batch = this.batch;
@@ -516,10 +521,10 @@ export class SchemaManager {
 		}
 		this.batch = undefined;
 		const written = await batch.commit();
-		for (const [name, entry] of written) {
+		for (const [key, entry] of written) {
 			// resolveAndCache filters gravestones and tombstones exactly as every read does.
 			if (this.resolveAndCache(entry) === undefined) {
-				this.schemaCache.delete(name);
+				this.schemaCache.delete(key);
 			}
 		}
 	}
@@ -610,26 +615,27 @@ export class SchemaManager {
 			return this.storeInBatch(this.batch, stored, transactor);
 		}
 		const tree = await this.requireSchemaTree(transactor);
+		const key = catalogKey(stored.schemaName, stored.name);
 
 		// Same read sequence as the read path: pull latest committed state, then
 		// look up this table's entry. Skip tombstones (entry[1] === undefined).
 		await tree.update();
-		const path = await tree.find(stored.name);
+		const path = await tree.find(key);
 		const persisted = tree.isValid(path) ? this.livePersistedEntry(tree.at(path)) : undefined;
 		const merged = mergePersistedSchemas(toPersistedSchema(stored), persisted);
 		const resolved = toStoredSchema(merged);
 
 		// The schema tree's keyExtractor (in collection-factory) treats entries
-		// as `[name, PersistedTableSchema]` tuples — keying on `entry[0]`. The
+		// as `[key, PersistedTableSchema]` tuples — keying on `entry[0]`. The
 		// per-table cache and read paths (getSchema, listTables) also expect
 		// the tuple shape. Storing the bare `stored` object made `entry[0]`
 		// undefined inside the btree, so cross-instance reads (and listTables)
 		// couldn't see the entries even after a clean sync.
-		await tree.replace([[merged.name, [merged.name, merged]]]);
+		await tree.replace([[key, [key, merged]]]);
 
 		// Cache what was ACTUALLY written, and only after the write succeeded — a
 		// failed replace must not leave the cache claiming the new value landed.
-		this.schemaCache.set(merged.name, resolved);
+		this.schemaCache.set(key, resolved);
 		return resolved;
 	}
 
@@ -646,9 +652,10 @@ export class SchemaManager {
 		stored: StoredTableSchema,
 		transactor?: ITransactor
 	): Promise<StoredTableSchema> {
-		const current = this.livePersistedEntry(await batch.readEntry(stored.name, transactor));
+		const key = catalogKey(stored.schemaName, stored.name);
+		const current = this.livePersistedEntry(await batch.readEntry(key, transactor));
 		const merged = mergePersistedSchemas(toPersistedSchema(stored), current);
-		batch.write(merged.name, [merged.name, merged]);
+		batch.write(key, [key, merged]);
 		return toStoredSchema(merged);
 	}
 
@@ -659,10 +666,10 @@ export class SchemaManager {
 	 */
 	private async readLiveInBatch(
 		batch: CatalogBatch,
-		tableName: string,
+		key: string,
 		transactor?: ITransactor
 	): Promise<StoredTableSchema | undefined> {
-		const record = this.livePersistedEntry(await batch.readEntry(tableName, transactor));
+		const record = this.livePersistedEntry(await batch.readEntry(key, transactor));
 		return record ? toStoredSchema(record) : undefined;
 	}
 
@@ -713,8 +720,9 @@ export class SchemaManager {
 	/**
 	 * The READ half of the catalog's shape boundary: resolve a live entry's record to
 	 * the positional {@link StoredTableSchema} every consumer expects, against the
-	 * record's own column list, and cache it under its table name. Undefined for a
-	 * tombstone. The one place a persisted record becomes a runtime schema.
+	 * record's own column list, and cache it under the catalog key it is filed under
+	 * (`entry[0]`). Undefined for a tombstone. The one place a persisted record becomes
+	 * a runtime schema.
 	 *
 	 * NOTE: {@link toStoredSchema} throws on an unresolvable record, and
 	 * {@link listTables} calls this once per catalog entry — so ONE corrupt record
@@ -732,7 +740,7 @@ export class SchemaManager {
 			return undefined;
 		}
 		const resolved = toStoredSchema(record);
-		this.schemaCache.set(resolved.name, resolved);
+		this.schemaCache.set((entry as CatalogEntry)[0], resolved);
 		return resolved;
 	}
 
@@ -758,7 +766,8 @@ export class SchemaManager {
 	 * nothing. Callers must never treat it as a licence to overwrite what might
 	 * really be persisted; the write-time index union is the standing guard.
 	 */
-	async getSchema(tableName: string, transactor?: ITransactor): Promise<StoredTableSchema | undefined> {
+	async getSchema(schemaName: string, tableName: string, transactor?: ITransactor): Promise<StoredTableSchema | undefined> {
+		const key = catalogKey(schemaName, tableName);
 		if (this.batch) {
 			// While an APPLY SCHEMA batch is open the overlay IS the catalog: a table created a
 			// statement earlier is pending, not committed, and the cache is deliberately not
@@ -767,13 +776,13 @@ export class SchemaManager {
 			// can reach this on a batched manager and see a pending, not-yet-committed record.
 			// Accepted: the engine's in-memory catalog already exposes those tables to the same
 			// readers, so the plugin answering consistently with it is the coherent choice.
-			return this.readLiveInBatch(this.batch, tableName, transactor);
+			return this.readLiveInBatch(this.batch, key, transactor);
 		}
-		const cached = this.schemaCache.get(tableName);
+		const cached = this.schemaCache.get(key);
 		if (cached) {
 			return cached;
 		}
-		return await this.readSchemaFromCatalog(tableName, transactor);
+		return await this.readSchemaFromCatalog(key, transactor);
 	}
 
 	/**
@@ -791,14 +800,15 @@ export class SchemaManager {
 	 * in {@link storeStoredSchema} still guards whatever is written after such a
 	 * fallback.
 	 */
-	async getSchemaFresh(tableName: string, transactor?: ITransactor): Promise<StoredTableSchema | undefined> {
+	async getSchemaFresh(schemaName: string, tableName: string, transactor?: ITransactor): Promise<StoredTableSchema | undefined> {
+		const key = catalogKey(schemaName, tableName);
 		const fresh = this.batch
-			? await this.readLiveInBatch(this.batch, tableName, transactor)
-			: await this.readSchemaFromCatalog(tableName, transactor);
+			? await this.readLiveInBatch(this.batch, key, transactor)
+			: await this.readSchemaFromCatalog(key, transactor);
 		if (fresh) {
 			return fresh;
 		}
-		return this.schemaCache.get(tableName);
+		return this.schemaCache.get(key);
 	}
 
 	/**
@@ -814,13 +824,13 @@ export class SchemaManager {
 	 * this, cold-start reads silently return undefined and callers re-persist a
 	 * schema that already exists.
 	 */
-	private async readSchemaFromCatalog(tableName: string, transactor?: ITransactor): Promise<StoredTableSchema | undefined> {
+	private async readSchemaFromCatalog(key: string, transactor?: ITransactor): Promise<StoredTableSchema | undefined> {
 		const tree = await this.getSchemaTree(transactor);
 		if (!tree) {
 			return undefined;
 		}
 		await tree.update();
-		const path = await tree.find(tableName);
+		const path = await tree.find(key);
 		if (!tree.isValid(path)) {
 			return undefined;
 		}
@@ -840,11 +850,12 @@ export class SchemaManager {
 	 * unreachable catalog throws, but a silently-empty cohort answer still reads as
 	 * absent). Losing one drop's tombstone is recoverable; losing the catalog is not.
 	 */
-	async deleteSchema(tableName: string, transactor?: ITransactor): Promise<void> {
-		this.schemaCache.delete(tableName);
+	async deleteSchema(schemaName: string, tableName: string, transactor?: ITransactor): Promise<void> {
+		const key = catalogKey(schemaName, tableName);
+		this.schemaCache.delete(key);
 
 		if (this.batch) {
-			return this.deleteInBatch(this.batch, tableName, transactor);
+			return this.deleteInBatch(this.batch, key, transactor);
 		}
 		const tree = await this.getSchemaTree(transactor);
 		if (!tree) {
@@ -862,7 +873,7 @@ export class SchemaManager {
 		let gravestone: PersistedTableSchema | undefined;
 		try {
 			await tree.update();
-			const path = await tree.find(tableName);
+			const path = await tree.find(key);
 			const record = tree.isValid(path) ? this.anyPersistedEntry(tree.at(path)) : undefined;
 			if (record) {
 				gravestone = { ...record, droppedAt: record.droppedAt ?? new Date().toISOString() };
@@ -876,33 +887,33 @@ export class SchemaManager {
 		// `updateInternal` replays pending actions against the revision it adopts, so a delete that
 		// wrote no block at staging is re-applied before the commit. Untested — reaching a failed
 		// read here deliberately is awkward — so it rests on that rule, not on coverage here.
-		await tree.replace([[tableName, gravestone ? [tableName, gravestone] : undefined]]);
+		await tree.replace([[key, gravestone ? [key, gravestone] : undefined]]);
 	}
 
 	/**
 	 * The batched half of {@link deleteSchema}: the same gravestone rules (including the
 	 * bare-tombstone fallback when the current record cannot be read), staged into the
 	 * overlay. Stays OPEN-ONLY on the catalog: with no committed catalog and no pending
-	 * entry under this name there is nothing to tombstone, and staging one would make the
+	 * entry under this key there is nothing to tombstone, and staging one would make the
 	 * end-of-batch commit invent a catalog just to hold it. A table created and dropped
 	 * within one apply on a cold database DOES stage its gravestone — the create is pending,
 	 * so the commit creates the catalog for that record exactly as two direct statements
 	 * would have.
 	 */
-	private async deleteInBatch(batch: CatalogBatch, tableName: string, transactor?: ITransactor): Promise<void> {
-		if (!batch.hasPending(tableName) && !(await batch.catalogExists(transactor))) {
+	private async deleteInBatch(batch: CatalogBatch, key: string, transactor?: ITransactor): Promise<void> {
+		if (!batch.hasPending(key) && !(await batch.catalogExists(transactor))) {
 			return;
 		}
 		let gravestone: PersistedTableSchema | undefined;
 		try {
-			const record = this.anyPersistedEntry(await batch.readEntry(tableName, transactor));
+			const record = this.anyPersistedEntry(await batch.readEntry(key, transactor));
 			if (record) {
 				gravestone = { ...record, droppedAt: record.droppedAt ?? new Date().toISOString() };
 			}
 		} catch {
 			gravestone = undefined;
 		}
-		batch.write(tableName, gravestone ? [tableName, gravestone] : undefined);
+		batch.write(key, gravestone ? [key, gravestone] : undefined);
 	}
 
 	/**
@@ -921,7 +932,7 @@ export class SchemaManager {
 	 */
 	private async *catalogEntries(
 		transactor?: ITransactor
-	): AsyncGenerator<[string, PersistedTableSchema | undefined]> {
+	): AsyncGenerator<CatalogEntry> {
 		const tree = await this.getSchemaTree(transactor);
 		if (!tree) {
 			return;
@@ -931,7 +942,7 @@ export class SchemaManager {
 			if (!tree.isValid(path)) {
 				continue;
 			}
-			const entry = tree.at(path) as [string, PersistedTableSchema | undefined] | undefined;
+			const entry = tree.at(path) as CatalogEntry | undefined;
 			if (entry && entry.length >= 1) {
 				yield entry;
 			}
@@ -939,11 +950,17 @@ export class SchemaManager {
 	}
 
 	/**
-	 * List every name the catalog holds an entry for — INCLUDING dropped ones. A
+	 * List every (schema, table) the catalog holds an entry for — INCLUDING dropped ones. A
 	 * gravestone is a real entry under the table's key, so a dropped table's name still
 	 * comes back here; the record behind it does not, and callers that want live tables
 	 * filter on the follow-up `getSchema`, which returns undefined for a gravestone
 	 * (`hydrateCatalog` does exactly that and skips them).
+	 *
+	 * The names are decoded from each entry's catalog key ({@link namesOfCatalogKey}), so a
+	 * bare tombstone lists too. An entry whose key is not a (schema, table) key — a record
+	 * filed by a build that keyed the catalog by bare table name — is skipped: no
+	 * `getSchema(schema, table)` can reach it, so listing it would only hand hydrate a name
+	 * it cannot read (no backwards compatibility is owed yet — AGENTS.md).
 	 *
 	 * NOTE: gravestones are immortal by design — they are what keeps the leftover
 	 * storage described — so this walk, and the one `getSchema` per name that
@@ -954,9 +971,13 @@ export class SchemaManager {
 	 * walk (the filter already exists — {@link livePersistedEntry}) rather than pruning
 	 * gravestones, which would re-open the hole they close.
 	 */
-	async listTables(transactor?: ITransactor): Promise<string[]> {
-		const tables: string[] = [];
+	async listTables(transactor?: ITransactor): Promise<QualifiedTableName[]> {
+		const tables: QualifiedTableName[] = [];
 		for await (const entry of this.catalogEntries(transactor)) {
+			const names = namesOfCatalogKey(entry[0]);
+			if (!names) {
+				continue;
+			}
 			// Seed the per-instance cache from this single traversal so the
 			// follow-up `getSchema(name)` calls (hydrateCatalog walks one
 			// listTables + one getSchema per table) hit memory instead of
@@ -965,7 +986,7 @@ export class SchemaManager {
 			// Skip tombstones and gravestones — a dropped entry must not
 			// register as a cache hit (resolveAndCache filters both).
 			this.resolveAndCache(entry);
-			tables.push(entry[0]);
+			tables.push(names);
 		}
 		return tables;
 	}
@@ -978,8 +999,9 @@ export class SchemaManager {
 	 * runs it only on the genuinely-new-table arm.
 	 *
 	 * A record's URI is its first `USING optimystic(...)` argument, defaulted the
-	 * way parseTableSchema defaults it (`tree://default/<name>`) so tables declared
-	 * without an explicit URI still match. Live records win over gravestones when
+	 * way parseTableSchema defaults it (`tree://default/<schema>/<table>` — see
+	 * {@link recordUriOf}) so tables declared without an explicit URI still match.
+	 * Live records win over gravestones when
 	 * both claim the URI — a live table's description of shared storage is the
 	 * current one, not a dropped predecessor's.
 	 *
@@ -1021,22 +1043,24 @@ export class SchemaManager {
 	}
 
 	/**
-	 * The gravestone under `tableName`, or undefined when the entry is absent, live,
-	 * or a bare (pre-gravestone) tombstone. Read by the storage-adoption guards only.
+	 * The gravestone under `schemaName`.`tableName`, or undefined when the entry is absent,
+	 * live, or a bare (pre-gravestone) tombstone. Read by the storage-adoption guards only.
 	 */
 	async getDroppedSchemaRecord(
+		schemaName: string,
 		tableName: string,
 		transactor?: ITransactor
 	): Promise<PersistedTableSchema | undefined> {
+		const key = catalogKey(schemaName, tableName);
 		if (this.batch) {
-			return this.droppedPersistedEntry(await this.batch.readEntry(tableName, transactor));
+			return this.droppedPersistedEntry(await this.batch.readEntry(key, transactor));
 		}
 		const tree = await this.getSchemaTree(transactor);
 		if (!tree) {
 			return undefined;
 		}
 		await tree.update();
-		const path = await tree.find(tableName);
+		const path = await tree.find(key);
 		return tree.isValid(path) ? this.droppedPersistedEntry(tree.at(path)) : undefined;
 	}
 

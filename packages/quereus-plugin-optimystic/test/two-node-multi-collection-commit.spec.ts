@@ -26,13 +26,15 @@
  */
 
 import { expect } from 'chai';
+import { defaultCollectionUri } from '../dist/index.js';
 import type { Database, SqlValue } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
 import { createMeshDbNode, startMockMesh } from './mesh-node-harness.js';
 
 type Row = Record<string, SqlValue>;
 
-const TABLE_URI = 'tree://default/CadrePeer';
+/** Where a `main.CadrePeer` declared without an explicit URI would live — spelled out so both nodes agree. */
+const TABLE_URI = defaultCollectionUri('main', 'CadrePeer');
 
 const createTableSql = `
 	create table CadrePeer (

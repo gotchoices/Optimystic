@@ -61,7 +61,7 @@ Options are passed in the `USING optimystic(...)` clause:
 
 | Option | Description | Default |
 |---|---|---|
-| First positional arg | Collection URI (e.g. `'tree://myapp/users'`) | `tree://default/{tableName}` |
+| First positional arg | Collection URI (e.g. `'tree://myapp/users'`) | `tree://default/{schemaName}/{tableName}` |
 | `transactor` | `'network'`, `'local'`, `'test'`, `'mesh-test'`, or custom registered name | `'network'` |
 | `keyNetwork` | `'libp2p'`, `'test'`, or custom registered name | `'libp2p'` |
 | `port` | libp2p listen port (0 = random) | `0` |
@@ -82,6 +82,14 @@ CREATE TABLE products (
   networkName='mystore'
 );
 ```
+
+### Default storage location
+
+A table declared without a collection URI is stored at `tree://default/<schema>/<table>` — the engine schema the table belongs to, lowercased the way Quereus names schemas (`main` included), then the table name as declared. `create table Member (…)` in `main` lives at `tree://default/main/Member`; `app.Member` lives at `tree://default/app/Member`. The schema is part of the location so that two tables with the same name in different schemas of one database — a built-in `strand.Member` and an app's own `app.Member` — are two tables in storage, not one. Each table's secondary indexes live under its location (`<uri>/index/<indexName>`), and its schema-catalog record is filed under its schema and name together. `defaultCollectionUri(schemaName, tableName)` is exported for hosts that need to name a table's collection directly.
+
+Two tables that give the **same explicit** URI share storage on purpose — that is how a table is pointed at existing data — and the plugin's declaration guards judge each one against whatever record already describes that storage.
+
+Format-break caveat: plugin versions before the schema was part of the location stored defaulted tables at `tree://default/<table>` and filed catalog records under the bare table name. This version neither reads those records nor opens that storage for a defaulted table: after upgrading, `hydrate` finds no such tables and a re-declared table starts empty at its new location. Declare the table with the old location as an explicit URI (`using optimystic('tree://default/Member')`) to keep reading its rows.
 
 ## Data Model
 

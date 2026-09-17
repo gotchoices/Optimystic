@@ -270,8 +270,8 @@ make that answerable from a log; enable both (`DEBUG='optimystic:quereus-plugin:
 `DEBUG='optimystic:quereus-plugin:txn-bridge,optimystic:quereus-plugin:module'` if that is noisy):
 
 ```
-optimystic:quereus-plugin:txn-bridge commit:collections mode=legacy count=2 default/Usage=staged default/Usage/index/by_token=staged revs=default/Usage:7@tx:Kx9f-2Qa,default/Usage/index/by_token:3@tx:bT1r_04c node=A
-optimystic:quereus-plugin:module index:tree-open table=Usage index=by_token uri=tree://default/Usage/index/by_token collection=default/Usage/index/by_token node=A
+optimystic:quereus-plugin:txn-bridge commit:collections mode=legacy count=2 default/main/Usage=staged default/main/Usage/index/by_token=staged revs=default/main/Usage:7@tx:Kx9f-2Qa,default/main/Usage/index/by_token:3@tx:bT1r_04c node=A
+optimystic:quereus-plugin:module index:tree-open table=Usage index=by_token uri=tree://default/main/Usage/index/by_token collection=default/main/Usage/index/by_token node=A
 ```
 
 Reading `commit:collections` — one line per commit, emitted **before** the flush:
@@ -339,7 +339,7 @@ reading that header at.
 (`optimystic:quereus-plugin:module`) answers the read side — one line per index-driven scan:
 
 ```
-optimystic:quereus-plugin:module index:seek table=Usage index=by_token collection=default/Usage/index/by_token main=default/Usage arm=committed rev=3@tx:bT1r_04c main_rev=7@tx:Kx9f-2Qa seek=%01tok-a%00 matched=0 rejected=0 node=A
+optimystic:quereus-plugin:module index:seek table=Usage index=by_token collection=default/main/Usage/index/by_token main=default/main/Usage arm=committed rev=3@tx:bT1r_04c main_rev=7@tx:Kx9f-2Qa seek=%01tok-a%00 matched=0 rejected=0 node=A
 ```
 
 - `arm=committed` — a pre-transaction snapshot read, which deliberately never refreshes from the
@@ -440,7 +440,7 @@ ran just before it *tried and failed* to advance or simply found nothing newer. 
 answers that from the inside, on the `optimystic:db-core:collection` namespace:
 
 ```
-optimystic:db-core:collection collection:context-short-of-tail id=default/Usage/index/by_token tag=k3Vq_A before=1 after=1 tail=6
+optimystic:db-core:collection collection:context-short-of-tail id=default/main/Usage/index/by_token tag=k3Vq_A before=1 after=1 tail=6
 ```
 
 A refresh reads the collection's **log tail block**, whose stored state names the most recent
@@ -486,7 +486,7 @@ Its sibling `collection:context-not-lowered` reports the opposite guard — a co
 move *backwards* because a read returned an older view than the revision it already holds:
 
 ```
-optimystic:db-core:collection collection:context-not-lowered id=default/Usage/index/by_token tag=k3Vq_A site=refresh heldRev=4 readRev=3 heldAction=fR1TfGRxHLN_Icl0ZK-XIw readAction=fR1TfGRxHLN_Icl0ZK-XIw
+optimystic:db-core:collection collection:context-not-lowered id=default/main/Usage/index/by_token tag=k3Vq_A site=refresh heldRev=4 readRev=3 heldAction=fR1TfGRxHLN_Icl0ZK-XIw readAction=fR1TfGRxHLN_Icl0ZK-XIw
 ```
 
 - `heldRev=` / `readRev=` — the revision this handle already holds, and the lower one the read
@@ -523,7 +523,7 @@ mismatch anywhere means the local copy and the stored log are provably different
 without needing a second node's lines):
 
 ```
-optimystic:db-core:collection collection:lineage-divergence id=default/Usage/index/by_token tag=k3Vq_A site=refresh forkRev=1 heldAction=fR1TfGRxHLN_Icl0ZK-XIw readAction=vR5WcYtFvwoW2nYPa8BqCg heldRev=2 readRev=2
+optimystic:db-core:collection collection:lineage-divergence id=default/main/Usage/index/by_token tag=k3Vq_A site=refresh forkRev=1 heldAction=fR1TfGRxHLN_Icl0ZK-XIw readAction=vR5WcYtFvwoW2nYPa8BqCg heldRev=2 readRev=2
 ```
 
 - `id=` — the collection id, joining to `index:seek`'s `collection=`/`main=` and to
@@ -628,7 +628,7 @@ whose refresh cannot move it is re-requesting a revision that is already taken, 
 retry is guaranteed to fail exactly as the first one did.
 
 ```
-optimystic:db-core:collection collection:sync-stalled id=default/Usage/index/by_token tag=k3Vq_A heldRev=none requestedRev=1 staleBlock=default/Usage/index/by_token/log staleRev=42 strike=1 of=2
+optimystic:db-core:collection collection:sync-stalled id=default/main/Usage/index/by_token tag=k3Vq_A heldRev=none requestedRev=1 staleBlock=default/main/Usage/index/by_token/log staleRev=42 strike=1 of=2
 ```
 
 A responder sets a *confirmed revision* on a rejection only after reading that revision out of its

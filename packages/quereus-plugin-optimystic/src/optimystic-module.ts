@@ -19,6 +19,7 @@ import type { CollectionChangeEvent, ITransactor, TreeEntryGuard, TreeReadView }
 import { SchemaManager, columnSetKey, mergeIndexLists, uniqueConstraintKey, uniqueEnforcementTreeName } from './schema/schema-manager.js';
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
+import { defaultCollectionUri, type QualifiedTableName } from './schema/table-identity.js';
 import { SqlDataType, PhysicalType } from '@quereus/quereus';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
 import { IndexManager, hasNullIndexValue, indexEntryKey, indexKeyFromValues, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
@@ -604,7 +605,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       // `this.tableSchema.columns.length` — the load arm below populates that list, so
       // reading it here would send a re-run (a retry after a failed attempt, or the
       // provisional→full upgrade) down the DDL-wins arm instead.
-      const persistedSchema = await this.schemaManager.getSchema(this.tableName, txnState?.transactor);
+      const persistedSchema = await this.schemaManager.getSchema(this.schemaName, this.tableName, txnState?.transactor);
       let storedSchema: StoredTableSchema;
 
       if (this.declaredColumns) {
@@ -846,10 +847,10 @@ export class OptimysticVirtualTable extends VirtualTable {
     transactor?: ITransactor
   ): Promise<PersistedIndexSchema[] | undefined> {
     // The record that still describes the storage this declaration adopts: the
-    // gravestone under this table's own name (DROP TABLE writes one — see
+    // gravestone under this table's own schema and name (DROP TABLE writes one — see
     // SchemaManager.deleteSchema), else any catalog record — live or gravestone —
     // declared over the same collection URI.
-    const record = await this.schemaManager.getDroppedSchemaRecord(this.tableName, transactor)
+    const record = await this.schemaManager.getDroppedSchemaRecord(this.schemaName, this.tableName, transactor)
       ?? await this.schemaManager.findRecordForUri(this.options.collectionUri, transactor);
     // "No record" also covers the bare tombstones written by builds before
     // gravestones existed: a database dropped before this landed sails through
@@ -2834,7 +2835,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     // The dedupe below and the write-back both reason from this value, so serving
     // a cached copy would let an index a sibling instance persisted since our
     // first read be silently dropped (or rebuilt from scratch).
-    const storedSchema = await this.schemaManager.getSchemaFresh(this.tableName);
+    const storedSchema = await this.schemaManager.getSchemaFresh(this.schemaName, this.tableName);
     if (!storedSchema) {
       throw new Error('Schema not found');
     }
@@ -3434,9 +3435,9 @@ export class OptimysticVirtualTable extends VirtualTable {
    * members. Best-effort by contract: the caller wraps this in a try/catch so a
    * schema-tree write failure can't stop teardown.
    */
-  async deleteOwnSchema(tableName: string): Promise<void> {
+  async deleteOwnSchema(): Promise<void> {
     const txnState = this.txnBridge.getCurrentTransaction();
-    await this.schemaManager.deleteSchema(tableName, txnState?.transactor);
+    await this.schemaManager.deleteSchema(this.schemaName, this.tableName, txnState?.transactor);
   }
 
   /**
@@ -3703,8 +3704,10 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * catalog reads are served from that overlay plus one catalog tree opened once, instead of
    * one commit and a growing re-read per DDL statement (see `CatalogBatch`). No I/O here.
    *
-   * `schemaName` is ignored: the optimystic catalog (`tree://optimystic/schema`) is
-   * plugin-global, not scoped to an engine schema. Batches never nest — the engine's lock
+   * `schemaName` is ignored: the optimystic catalog (`tree://optimystic/schema`) is ONE
+   * tree for every engine schema — each record inside it is keyed by its table's schema and
+   * name (`catalogKey`) — so the batch covers the whole catalog whichever schema is being
+   * applied, and needs no per-schema scoping of its own. Batches never nest — the engine's lock
    * makes an overlapping apply impossible, so a second begin is a wiring bug and throws.
    */
   async beginSchemaBatch(_db: Database, _schemaName: string): Promise<void> {
@@ -3865,8 +3868,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     // args override these; unset defaults fall back to production values.
     const aux = ((tableSchema as unknown as { vtabAuxData?: Record<string, unknown> }).vtabAuxData) ?? {};
 
-    // Extract collection URI from first positional argument or use default
-    const collectionUri = (args['0'] as string) || `tree://default/${tableSchema.name}`;
+    // Extract collection URI from first positional argument or use the default location,
+    // which includes the engine schema so same-named tables in two schemas never share storage.
+    const collectionUri = (args['0'] as string) || defaultCollectionUri(tableSchema.schemaName, tableSchema.name);
 
     // Extract named arguments
     const transactor = (args['transactor'] as string) || (aux['default_transactor'] as string) || 'network';
@@ -4121,7 +4125,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     const options = this.deriveDefaultOptions(config);
     const schemaManager = this.createSchemaManager(options);
 
-    let tableNames: string[];
+    let tableNames: QualifiedTableName[];
     try {
       tableNames = await schemaManager.listTables();
     } catch (error) {
@@ -4133,25 +4137,22 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       throw error;
     }
 
-    const targetSchemaName = db.schemaManager.getCurrentSchemaName();
-    const targetSchema = db.schemaManager.getSchemaOrFail(targetSchemaName);
-
     let tables = 0;
     let indexes = 0;
-    for (const tableName of tableNames) {
-      if (targetSchema.getTable(tableName)) continue;
+    for (const { schemaName, tableName } of tableNames) {
+      // Each table goes back into the engine schema it was declared in — never the host's
+      // current schema. Its schema is part of its storage location (`defaultCollectionUri`)
+      // and of its catalog key, so re-stamping it elsewhere would open a different, empty
+      // collection and file its next write under a different record. A schema that holds no
+      // tables yet in this process is created, as a later `apply schema` of it would.
+      const targetSchema = db.schemaManager.getSchema(schemaName);
+      if (targetSchema?.getTable(tableName)) continue;
 
-      const stored = await schemaManager.getSchema(tableName);
+      const stored = await schemaManager.getSchema(schemaName, tableName);
       if (!stored) continue;
 
-      const tableSchema = schemaManager.storedToTableSchema(stored, this, auxData);
-      // Re-stamp the schema name in case the host's current schema differs
-      // from whatever was persisted.
-      const hydratedSchema: TableSchema = {
-        ...tableSchema,
-        schemaName: targetSchemaName,
-      };
-      targetSchema.addTable(hydratedSchema);
+      const hydratedSchema = schemaManager.storedToTableSchema(stored, this, auxData);
+      (targetSchema ?? db.schemaManager.addSchema(schemaName)).addTable(hydratedSchema);
       tables++;
       indexes += hydratedSchema.indexes?.length ?? 0;
     }
@@ -4569,7 +4570,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       // so the storage listener doesn't leak past the table's lifetime.
       table.teardownChangeSubscription();
       try {
-        await this.underBatchCheckpoint(table, 'dropped', tableKey, () => table.deleteOwnSchema(tableName));
+        await this.underBatchCheckpoint(table, 'dropped', tableKey, () => table.deleteOwnSchema());
       } catch (error) {
         // Best-effort: a schema-tree write failure shouldn't stop teardown. But it
         // does leave the record LIVE past its own DROP, which blinds the

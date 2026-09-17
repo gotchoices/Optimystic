@@ -31,6 +31,7 @@
  */
 
 import { expect } from 'chai';
+import { defaultCollectionUri } from '../dist/index.js';
 import { NodeCapacity } from '@optimystic/db-core';
 import { expectIndexAgreesWithScan, queryAll } from './query-helpers.js';
 import {
@@ -41,7 +42,8 @@ import {
 	type MeshDbNode as Node,
 } from './mesh-node-harness.js';
 
-const TABLE_URI = 'tree://default/FormationUsage';
+/** Where a `main.FormationUsage` declared without an explicit URI would live — spelled out so both nodes agree. */
+const TABLE_URI = defaultCollectionUri('main', 'FormationUsage');
 const INDEX_NAME = 'formation_usage_by_token';
 const INDEX_URI = `${TABLE_URI}/index/${INDEX_NAME}`;
 

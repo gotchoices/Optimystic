@@ -23,11 +23,14 @@
 
 import type { ITransactor, Tree } from '@optimystic/db-core';
 import type { PersistedTableSchema } from './schema-manager.js';
+import { defaultCollectionUri } from './table-identity.js';
 
 /**
- * What the catalog tree stores under a table's name: `[name, record]` for a live record or a
- * gravestone, `[name, undefined]` for a bare tombstone (builds before gravestones existed, or
- * `deleteSchema`'s degraded fallback). The tree's key extractor reads `entry[0]`.
+ * What the catalog tree stores under a table's catalog key (`catalogKey(schema, table)` — see
+ * `table-identity.ts`): `[key, record]` for a live record or a gravestone, `[key, undefined]` for
+ * a bare tombstone (builds before gravestones existed, or `deleteSchema`'s degraded fallback).
+ * The tree's key extractor reads `entry[0]`. Every key this class handles is such a catalog key;
+ * it never derives one — the owning `SchemaManager` does.
  */
 export type CatalogEntry = [string, PersistedTableSchema | undefined];
 
@@ -42,7 +45,7 @@ export type CatalogTree = Tree<string, any>;
 export type OpenCatalogTree = (transactor?: ITransactor, create?: boolean) => Promise<CatalogTree | undefined>;
 
 /**
- * Re-merges a pending LIVE record with the latest committed live record for the same name at
+ * Re-merges a pending LIVE record with the latest committed live record for the same key at
  * commit time (`mergePersistedSchemas`), so an index a sibling node added while the batch was
  * open is unioned in rather than overwritten — the same write-time guarantee the unbatched
  * `storeStoredSchema` gives, with its window narrowed to the one end-of-batch commit.
@@ -73,12 +76,12 @@ export function recordOfEntry(entry: unknown): PersistedTableSchema | undefined 
 
 /**
  * The collection URI a catalog record describes: its first `USING optimystic(...)` argument,
- * defaulted the way `parseTableSchema` defaults it (`tree://default/<name>`) so tables declared
- * without an explicit URI still match. Shared by the batched and unbatched URI lookups so the
- * two cannot drift.
+ * defaulted by the same {@link defaultCollectionUri} rule `parseTableSchema` uses
+ * (`tree://default/<schema>/<table>`) so tables declared without an explicit URI still match.
+ * Shared by the batched and unbatched URI lookups so the two cannot drift.
  */
 export function recordUriOf(record: PersistedTableSchema): string {
-	return (record.vtabArgs?.['0'] as string | undefined) || `tree://default/${record.name}`;
+	return (record.vtabArgs?.['0'] as string | undefined) || defaultCollectionUri(record.schemaName, record.name);
 }
 
 /** Catalog changes held for one APPLY SCHEMA. Owned by one `SchemaManager`. */
@@ -95,12 +98,12 @@ export class CatalogBatch {
 	/** The transactor the first caller supplied; reused by every later open, including the commit's. */
 	private transactor?: ITransactor;
 	/**
-	 * name → the entry this batch will write. Insertion-ordered; a `has` hit with an
+	 * catalog key → the entry this batch will write. Insertion-ordered; a `has` hit with an
 	 * `undefined` value is a pending bare tombstone, distinct from "not pending".
 	 */
 	private pending = new Map<string, CatalogEntry | undefined>();
 	/**
-	 * Every committed record (live or gravestone) by name, built by ONE walk of the committed
+	 * Every committed record (live or gravestone) by catalog key, built by ONE walk of the committed
 	 * catalog the first time a URI lookup needs it. Bare tombstones are skipped: they describe
 	 * nothing. Unaffected by `pending`, so a checkpoint restore never invalidates it.
 	 */
@@ -116,36 +119,36 @@ export class CatalogBatch {
 		return (await this.committedTree(transactor)) !== null;
 	}
 
-	/** Whether this batch holds a write for `name` — a live record, a gravestone, or a tombstone. */
-	hasPending(name: string): boolean {
-		return this.pending.has(name);
+	/** Whether this batch holds a write for `key` — a live record, a gravestone, or a tombstone. */
+	hasPending(key: string): boolean {
+		return this.pending.has(key);
 	}
 
 	/**
-	 * The entry under `name` as this batch sees it: the pending write when there is one,
-	 * otherwise the committed catalog's entry (undefined when absent, or when there is no
+	 * The entry under catalog key `key` as this batch sees it: the pending write when there is
+	 * one, otherwise the committed catalog's entry (undefined when absent, or when there is no
 	 * catalog at all).
 	 */
-	async readEntry(name: string, transactor?: ITransactor): Promise<CatalogEntry | undefined> {
-		if (this.pending.has(name)) {
-			return this.pending.get(name);
+	async readEntry(key: string, transactor?: ITransactor): Promise<CatalogEntry | undefined> {
+		if (this.pending.has(key)) {
+			return this.pending.get(key);
 		}
 		const tree = await this.committedTree(transactor);
 		if (!tree) {
 			return undefined;
 		}
-		const path = await tree.find(name);
+		const path = await tree.find(key);
 		return tree.isValid(path) ? (tree.at(path) as CatalogEntry | undefined) : undefined;
 	}
 
-	/** Stage the entry to write under `name` (replacing any earlier pending write). No I/O. */
-	write(name: string, entry: CatalogEntry | undefined): void {
-		this.pending.set(name, entry);
+	/** Stage the entry to write under catalog key `key` (replacing any earlier pending write). No I/O. */
+	write(key: string, entry: CatalogEntry | undefined): void {
+		this.pending.set(key, entry);
 	}
 
 	/**
 	 * The record — live OR gravestone — describing the storage at `collectionUri`, as this
-	 * batch sees it: the committed records with the pending entries overlaid BY NAME (a
+	 * batch sees it: the committed records with the pending entries overlaid BY KEY (a
 	 * pending gravestone replaces the committed live record of the same table; a pending
 	 * tombstone removes it), then the same rule as the unbatched `findRecordForUri` — a live
 	 * record wins over a gravestone, and the first in catalog order otherwise.
@@ -157,12 +160,12 @@ export class CatalogBatch {
 	 */
 	async recordForUri(collectionUri: string, transactor?: ITransactor): Promise<PersistedTableSchema | undefined> {
 		const effective = new Map(await this.committed(transactor));
-		for (const [name, entry] of this.pending) {
+		for (const [key, entry] of this.pending) {
 			const record = recordOfEntry(entry);
 			if (record) {
-				effective.set(name, record);
+				effective.set(key, record);
 			} else {
-				effective.delete(name);
+				effective.delete(key);
 			}
 		}
 		let dropped: PersistedTableSchema | undefined;
@@ -189,12 +192,12 @@ export class CatalogBatch {
 	}
 
 	/**
-	 * Flush every pending write in ONE catalog commit and return what was written, by name.
+	 * Flush every pending write in ONE catalog commit and return what was written, by catalog key.
 	 *
 	 * Does zero I/O when nothing is pending: an apply that touched no optimystic table must
 	 * not open — let alone create — the catalog. Otherwise the committed tree is refreshed
 	 * once, each pending LIVE record is re-merged with the latest committed live record for
-	 * its name ({@link MergeLatest}), gravestones and tombstones are written as-is, and the
+	 * its key ({@link MergeLatest}), gravestones and tombstones are written as-is, and the
 	 * whole set is staged and synced together. The catalog is created (`create = true`) only
 	 * here, and only because something is pending — the same open-only rule
 	 * `SchemaManager.deleteSchema` documents.
@@ -208,15 +211,15 @@ export class CatalogBatch {
 		}
 		const tree = await this.writableTree();
 		await tree.update();
-		for (const [name, entry] of this.pending) {
+		for (const [key, entry] of this.pending) {
 			const record = recordOfEntry(entry);
 			if (record && !record.droppedAt) {
-				const path = await tree.find(name);
+				const path = await tree.find(key);
 				const latest = tree.isValid(path) ? recordOfEntry(tree.at(path)) : undefined;
 				const latestLive = latest && !latest.droppedAt ? latest : undefined;
-				written.set(name, [name, this.mergeLatest(record, latestLive)]);
+				written.set(key, [key, this.mergeLatest(record, latestLive)]);
 			} else {
-				written.set(name, entry);
+				written.set(key, entry);
 			}
 		}
 		await tree.stage([...written.entries()]);
@@ -251,7 +254,7 @@ export class CatalogBatch {
 		return created;
 	}
 
-	/** Every committed record by name — ONE walk, on first use. */
+	/** Every committed record by catalog key — ONE walk, on first use. */
 	private async committed(transactor?: ITransactor): Promise<Map<string, PersistedTableSchema>> {
 		if (!this.committedRecords) {
 			const records = new Map<string, PersistedTableSchema>();

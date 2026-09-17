@@ -18,10 +18,14 @@
 import { expect } from 'chai';
 import { SchemaManager, toPersistedSchema, toStoredSchema, uniqueEnforcementTreeName } from '../src/schema/schema-manager.js';
 import type { PersistedTableSchema, StoredTableSchema } from '../src/schema/schema-manager.js';
+import { catalogKey } from '../src/schema/table-identity.js';
 import type { Tree } from '@optimystic/db-core';
 
 /** The catalog holds the PERSISTED shape (index columns by name), never the resolved one. */
 type CatalogEntry = [string, PersistedTableSchema | undefined];
+
+/** The catalog key of `main`.`name` — every schema these cases build lives in `main`. */
+const key = (name: string): string => catalogKey('main', name);
 
 /** Minimal stand-in for the catalog tree: just the surface SchemaManager touches. */
 class FakeCatalogTree {
@@ -65,9 +69,9 @@ class FakeCatalogTree {
 		}
 	}
 
-	/** The record last written under `name`, or undefined if it was tombstoned. */
+	/** The record last written for `main`.`name`, or undefined if it was tombstoned. */
 	stored(name: string): PersistedTableSchema | undefined {
-		return this.entries.get(name)?.[1];
+		return this.entries.get(key(name))?.[1];
 	}
 }
 
@@ -131,7 +135,7 @@ describe('SchemaManager write path', () => {
 			// The caller never read the catalog — the guard is the write path's own
 			// re-read, which is what makes an index-free candidate non-destructive.
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_persisted']))]);
+			tree.entries.set(key('t'), [key('t'), persistedOf(makeStored('t', ['idx_persisted']))]);
 			const { manager } = managerOver(tree);
 
 			const written = await manager.storeStoredSchema(makeStored('t', []));
@@ -140,7 +144,7 @@ describe('SchemaManager write path', () => {
 			expect(tree.stored('t')!.indexes.map(i => i.name)).to.deep.equal(['idx_persisted']);
 		});
 
-		it('writes the [name, schema] tuple the catalog keyExtractor expects', async () => {
+		it('writes the [key, schema] tuple the catalog keyExtractor expects', async () => {
 			const tree = new FakeCatalogTree();
 			const { manager } = managerOver(tree);
 
@@ -148,7 +152,7 @@ describe('SchemaManager write path', () => {
 
 			expect(tree.writes).to.have.lengthOf(1);
 			const entry = tree.writes[0]![0]!;
-			expect(entry[0], 'entry[0] must be the table name the tree keys on').to.equal('t');
+			expect(entry[0], 'entry[0] must be the (schema, table) catalog key the tree keys on').to.equal(key('t'));
 			expect(entry[1]!.indexes.map(i => i.name)).to.deep.equal(['idx_a']);
 		});
 
@@ -156,7 +160,7 @@ describe('SchemaManager write path', () => {
 			// A dropped table's entry surfaces with an undefined payload. Merging with
 			// it would resurrect the dead schema's indexes into a re-created table.
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', undefined]);
+			tree.entries.set(key('t'), [key('t'), undefined]);
 			const { manager } = managerOver(tree);
 
 			const written = await manager.storeStoredSchema(makeStored('t', ['idx_new']));
@@ -168,7 +172,7 @@ describe('SchemaManager write path', () => {
 			// Caching before the replace would let a later read report a value that
 			// never reached storage.
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_persisted']))]);
+			tree.entries.set(key('t'), [key('t'), persistedOf(makeStored('t', ['idx_persisted']))]);
 			const { manager } = managerOver(tree);
 			tree.failNextReplace = true;
 
@@ -180,7 +184,7 @@ describe('SchemaManager write path', () => {
 			}
 			expect((thrown as Error | undefined)?.message).to.equal('replace failed');
 
-			const seen = await manager.getSchema('t');
+			const seen = await manager.getSchema('main', 't');
 			expect(seen!.indexes.map(i => i.name)).to.deep.equal(['idx_persisted']);
 		});
 
@@ -208,7 +212,7 @@ describe('SchemaManager write path', () => {
 			expect(tree.stored('t')!.indexes[0]!.columns, 'on disk: a name, no position').to.deep.equal([{ name: 'b' }]);
 
 			manager.clearCache();
-			const read = await manager.getSchema('t');
+			const read = await manager.getSchema('main', 't');
 			expect(read!.indexes[0]!.columns, 'in memory: a position, no name').to.deep.equal([{ index: 2 }]);
 		});
 
@@ -216,7 +220,7 @@ describe('SchemaManager write path', () => {
 			// The pre-fix defect: `idx_b` persisted as position 2; a re-declare with `a`
 			// and `b` swapped kept "position 2", which is now `a`.
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', persistedOf(makeStoredWide('t', ['id', 'a', 'b'], [['idx_b', 'b']]))]);
+			tree.entries.set(key('t'), [key('t'), persistedOf(makeStoredWide('t', ['id', 'a', 'b'], [['idx_b', 'b']]))]);
 			const { manager } = managerOver(tree);
 
 			const written = await manager.storeStoredSchema(makeStoredWide('t', ['id', 'b', 'a'], []));
@@ -227,7 +231,7 @@ describe('SchemaManager write path', () => {
 
 		it('matches persisted column names case-insensitively, as the SQL layer does', async () => {
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', persistedOf(makeStoredWide('t', ['id', 'Stamp'], [['idx_stamp', 'Stamp']]))]);
+			tree.entries.set(key('t'), [key('t'), persistedOf(makeStoredWide('t', ['id', 'Stamp'], [['idx_stamp', 'Stamp']]))]);
 			const { manager } = managerOver(tree);
 
 			const written = await manager.storeStoredSchema(makeStoredWide('t', ['id', 'stamp'], []));
@@ -239,7 +243,7 @@ describe('SchemaManager write path', () => {
 			// Pre-fix this wrote through silently and every later row was indexed under
 			// the NULL key (`row[2]` on a two-column row is undefined).
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', persistedOf(makeStoredWide('t', ['id', 'a', 'b'], [['idx_b', 'b']]))]);
+			tree.entries.set(key('t'), [key('t'), persistedOf(makeStoredWide('t', ['id', 'a', 'b'], [['idx_b', 'b']]))]);
 			const { manager } = managerOver(tree);
 
 			let thrown: Error | undefined;
@@ -271,12 +275,12 @@ describe('SchemaManager write path', () => {
 			// the invariant against a hand-corrupted (or future-format) record.
 			const tree = new FakeCatalogTree();
 			const corrupt = persistedOf(makeStoredWide('t', ['id', 'a', 'b'], [['idx_b', 'b']]));
-			tree.entries.set('t', ['t', { ...corrupt, columns: corrupt.columns.slice(0, 2) }]);
+			tree.entries.set(key('t'), [key('t'), { ...corrupt, columns: corrupt.columns.slice(0, 2) }]);
 			const { manager } = managerOver(tree);
 
 			let thrown: Error | undefined;
 			try {
-				await manager.getSchema('t');
+				await manager.getSchema('main', 't');
 			} catch (error) {
 				thrown = error as Error;
 			}
@@ -382,15 +386,15 @@ describe('SchemaManager write path', () => {
 	describe('getSchemaFresh', () => {
 		it('prefers the catalog over a stale cached copy', async () => {
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', persistedOf(makeStored('t', []))]);
+			tree.entries.set(key('t'), [key('t'), persistedOf(makeStored('t', []))]);
 			const { manager } = managerOver(tree);
-			expect((await manager.getSchema('t'))!.indexes).to.deep.equal([]);
+			expect((await manager.getSchema('main', 't'))!.indexes).to.deep.equal([]);
 
 			// A sibling instance persists an index behind this manager's back.
-			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_sibling']))]);
+			tree.entries.set(key('t'), [key('t'), persistedOf(makeStored('t', ['idx_sibling']))]);
 
-			expect((await manager.getSchema('t'))!.indexes, 'the cached read must stay stale by design').to.deep.equal([]);
-			const fresh = await manager.getSchemaFresh('t');
+			expect((await manager.getSchema('main', 't'))!.indexes, 'the cached read must stay stale by design').to.deep.equal([]);
+			const fresh = await manager.getSchemaFresh('main', 't');
 			expect(fresh!.indexes.map(i => i.name)).to.deep.equal(['idx_sibling']);
 		});
 
@@ -399,13 +403,13 @@ describe('SchemaManager write path', () => {
 			// entry is proof the schema existed, so reporting the table gone would be
 			// inventing certainty.
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_a']))]);
+			tree.entries.set(key('t'), [key('t'), persistedOf(makeStored('t', ['idx_a']))]);
 			const { manager } = managerOver(tree);
-			await manager.getSchema('t');
+			await manager.getSchema('main', 't');
 
-			tree.entries.delete('t');
+			tree.entries.delete(key('t'));
 
-			const fresh = await manager.getSchemaFresh('t');
+			const fresh = await manager.getSchemaFresh('main', 't');
 			expect(fresh!.indexes.map(i => i.name)).to.deep.equal(['idx_a']);
 		});
 	});
@@ -417,7 +421,7 @@ describe('SchemaManager write path', () => {
 			// every other table's entry.
 			const { manager, opens } = managerOver(undefined);
 
-			await manager.deleteSchema('t');
+			await manager.deleteSchema('main', 't');
 
 			expect(opens.map(o => o.create), 'the drop must open the catalog read-only').to.deep.equal([false]);
 		});
@@ -429,11 +433,11 @@ describe('SchemaManager write path', () => {
 			// (see optimystic-module.ts guardStorageAdoption / guardIndexAdoption). Every
 			// read/merge/hydrate path must nonetheless see the table as gone.
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_a']))]);
+			tree.entries.set(key('t'), [key('t'), persistedOf(makeStored('t', ['idx_a']))]);
 			const { manager } = managerOver(tree);
-			await manager.getSchema('t');
+			await manager.getSchema('main', 't');
 
-			await manager.deleteSchema('t');
+			await manager.deleteSchema('main', 't');
 
 			const gravestone = tree.stored('t');
 			expect(gravestone, 'the record itself must survive the drop, to describe the leftover storage')
@@ -442,20 +446,20 @@ describe('SchemaManager write path', () => {
 				.to.be.a('string');
 			expect(gravestone!.indexes.map(i => i.name), 'the index trees it describes must survive with it')
 				.to.deep.equal(['idx_a']);
-			expect(await manager.getSchemaFresh('t'), 'a gravestone must read as absent, and the cached copy must go with it')
+			expect(await manager.getSchemaFresh('main', 't'), 'a gravestone must read as absent, and the cached copy must go with it')
 				.to.equal(undefined);
-			expect(await manager.getDroppedSchemaRecord('t'), 'the guards read it through the dropped-record accessor')
+			expect(await manager.getDroppedSchemaRecord('main', 't'), 'the guards read it through the dropped-record accessor')
 				.to.not.equal(undefined);
 		});
 
 		it('keeps the ORIGINAL drop time when an already-dropped table is dropped again', async () => {
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_a']))]);
+			tree.entries.set(key('t'), [key('t'), persistedOf(makeStored('t', ['idx_a']))]);
 			const { manager } = managerOver(tree);
 
-			await manager.deleteSchema('t');
+			await manager.deleteSchema('main', 't');
 			const first = tree.stored('t')!.droppedAt;
-			await manager.deleteSchema('t');
+			await manager.deleteSchema('main', 't');
 
 			expect(tree.stored('t')!.droppedAt, 'a re-drop must not restamp the gravestone').to.equal(first);
 		});
@@ -466,15 +470,15 @@ describe('SchemaManager write path', () => {
 			// find nothing and let the next declaration through — exactly the behaviour
 			// of builds from before gravestones existed.
 			const tree = new FakeCatalogTree();
-			tree.entries.set('t', ['t', persistedOf(makeStored('t', ['idx_a']))]);
+			tree.entries.set(key('t'), [key('t'), persistedOf(makeStored('t', ['idx_a']))]);
 			const { manager } = managerOver(tree);
 			tree.failNextFind = true;
 
-			await manager.deleteSchema('t');
+			await manager.deleteSchema('main', 't');
 
 			expect(tree.stored('t'), 'a failed read degrades to the bare tombstone').to.equal(undefined);
-			expect(await manager.getSchemaFresh('t'), 'the table is still gone').to.equal(undefined);
-			expect(await manager.getDroppedSchemaRecord('t'), 'and there is no gravestone for the guards to read')
+			expect(await manager.getSchemaFresh('main', 't'), 'the table is still gone').to.equal(undefined);
+			expect(await manager.getDroppedSchemaRecord('main', 't'), 'and there is no gravestone for the guards to read')
 				.to.equal(undefined);
 		});
 	});

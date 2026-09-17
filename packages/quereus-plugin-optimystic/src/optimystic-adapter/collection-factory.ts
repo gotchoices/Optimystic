@@ -136,7 +136,7 @@ export class CollectionFactory {
     const compare = (a: string, b: string): -1 | 0 | 1 => (a < b ? -1 : a > b ? 1 : 0);
 
     // Both tree flavours key on the first tuple element: data trees hold
-    // `[primaryKey, encodedRow]`, the schema catalog holds `[tableName, StoredTableSchema]`
+    // `[primaryKey, encodedRow]`, the schema catalog holds `[catalogKey, PersistedTableSchema]`
     // (whose second element is an object, not a string — it rides through as RowData).
     const keyExtractor = (entry: RowData) => this.extractKeyFromEntry(entry);
 

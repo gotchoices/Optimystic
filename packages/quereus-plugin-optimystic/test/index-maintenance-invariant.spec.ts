@@ -264,12 +264,12 @@ describe('Index maintenance must track the declared index set', function () {
 		const optimysticModule = plugin.vtables.find(v => v.name === 'optimystic')!.module as unknown as {
 			tables: Map<string, {
 				indexManager?: { setSchema(schema: unknown): void };
-				schemaManager: { getSchema(name: string): Promise<unknown> };
+				schemaManager: { getSchema(schemaName: string, name: string): Promise<unknown> };
 			}>;
 		};
 		const vtab = optimysticModule.tables.get('main.guarded');
 		expect(vtab, 'vtab registered under main.guarded').to.not.equal(undefined);
-		const stored = await vtab!.schemaManager.getSchema('guarded') as { indexes: unknown[] };
+		const stored = await vtab!.schemaManager.getSchema('main', 'guarded') as { indexes: unknown[] };
 		expect(stored.indexes, 'persisted schema carries the index').to.have.lengthOf(1);
 		vtab!.indexManager!.setSchema({ ...stored, indexes: [] });
 

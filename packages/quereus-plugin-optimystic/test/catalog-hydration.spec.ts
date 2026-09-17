@@ -108,7 +108,7 @@ describe('Optimystic plugin catalog hydration', function () {
 
 	it('hydrateCatalog walks the schema tree once regardless of table count', async () => {
 		// Regression guard for tickets/implement/hydrate-catalog-single-tree-scan.
-		// hydrateCatalog runs `listTables()` then one `getSchema(name)` per table.
+		// hydrateCatalog runs `listTables()` then one `getSchema(schema, name)` per table.
 		// `listTables` already walks the entire schema btree via `range()`, so it
 		// seeds the per-instance schemaCache from that single pass; the follow-up
 		// getSchema calls must then hit memory and never re-walk the tree. With
@@ -292,7 +292,7 @@ describe('Optimystic plugin catalog hydration', function () {
 			schemaManagers: Map<string, {
 				storeSchema: (...args: any[]) => Promise<void>;
 				storeStoredSchema: (...args: any[]) => Promise<void>;
-				getSchema: (name: string) => Promise<{ indexes: { name: string }[] } | undefined>;
+				getSchema: (schemaName: string, name: string) => Promise<{ indexes: { name: string }[] } | undefined>;
 			}>;
 		};
 
@@ -313,7 +313,7 @@ describe('Optimystic plugin catalog hydration', function () {
 
 		// Sanity check: the persisted schema still has the index. Without the
 		// fix, the CREATE TABLE above would already have clobbered it to [].
-		const persisted = await manager.getSchema('gadgets');
+		const persisted = await manager.getSchema('main', 'gadgets');
 		expect(persisted, 'persisted schema should still exist after CREATE TABLE').to.not.equal(undefined);
 		expect(
 			persisted!.indexes.map(i => i.name),
@@ -342,7 +342,7 @@ describe('Optimystic plugin catalog hydration', function () {
 		expect(storeStoredCalls, 'storeStoredSchema should not fire either').to.equal(0);
 
 		// And the persisted index list is unchanged.
-		const after = await manager.getSchema('gadgets');
+		const after = await manager.getSchema('main', 'gadgets');
 		expect(
 			after!.indexes.map(i => i.name),
 			'persisted indexes unchanged after re-issuing CREATE INDEX',

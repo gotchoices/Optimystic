@@ -56,7 +56,7 @@ function registerWithSharedTransactor(db: Database, transactor: ITransactor) {
 type PluginHandle = ReturnType<typeof registerWithSharedTransactor>;
 
 interface SchemaManagerLike {
-	getSchema: (name: string) => Promise<StoredTableSchema | undefined>;
+	getSchema: (schemaName: string, name: string) => Promise<StoredTableSchema | undefined>;
 	storeStoredSchema: (stored: StoredTableSchema) => Promise<void>;
 	storeSchema: (...args: unknown[]) => Promise<void>;
 }
@@ -160,7 +160,7 @@ describe('Secondary UNIQUE enforcement across the hydrate warm-restart path', fu
 
 			// The persisted index must carry its uniqueness so a later hydrate can
 			// reconstruct the derived constraint.
-			const stored = await sharedSchemaManager(pluginA).getSchema('T');
+			const stored = await sharedSchemaManager(pluginA).getSchema('main', 'T');
 			expect(stored?.indexes.map(idx => ({ name: idx.name, unique: idx.unique })))
 				.to.deep.equal([{ name: 'ux_stamp', unique: true }]);
 		} finally {
@@ -204,7 +204,7 @@ describe('Secondary UNIQUE enforcement across the hydrate warm-restart path', fu
 
 			// Declared column order must round-trip — it feeds the synthesized
 			// `_uniq_` tree's key derivation, which must stay stable across restarts.
-			const stored = await sharedSchemaManager(pluginA).getSchema('C');
+			const stored = await sharedSchemaManager(pluginA).getSchema('main', 'C');
 			expect(stored?.uniqueConstraints?.map(uc => uc.columns)).to.deep.equal([[1, 2]]);
 		} finally {
 			dbA.close();
@@ -244,7 +244,7 @@ describe('Secondary UNIQUE enforcement across the hydrate warm-restart path', fu
 
 			// The persisted index must record BOTH the unique flag and the predicate;
 			// losing the predicate would silently promote it to a full constraint.
-			const stored = await sharedSchemaManager(pluginA).getSchema('P');
+			const stored = await sharedSchemaManager(pluginA).getSchema('main', 'P');
 			const idx = stored?.indexes.find(candidate => candidate.name === 'ux_val');
 			expect(idx?.unique, 'persisted partial index must be marked unique').to.equal(true);
 			expect(idx?.predicate, 'persisted partial index must keep its predicate').to.not.equal(undefined);
@@ -369,7 +369,7 @@ describe('Secondary UNIQUE enforcement across the hydrate warm-restart path', fu
 		try {
 			await pluginT.hydrate(dbT);
 			const manager = sharedSchemaManager(pluginT);
-			const stored = await manager.getSchema('T');
+			const stored = await manager.getSchema('main', 'T');
 			expect(stored?.uniqueConstraints, 'sanity: modern schema has the key').to.not.equal(undefined);
 			const { uniqueConstraints: _dropped, ...preUpgrade } = stored!;
 			await manager.storeStoredSchema(preUpgrade as StoredTableSchema);
@@ -455,7 +455,7 @@ describe('Secondary UNIQUE enforcement across the hydrate warm-restart path', fu
 		try {
 			await pluginT.hydrate(dbT);
 			const manager = sharedSchemaManager(pluginT);
-			const stored = await manager.getSchema('T');
+			const stored = await manager.getSchema('main', 'T');
 			await manager.storeStoredSchema({
 				...stored!,
 				indexes: stored!.indexes.map(idx => ({ name: idx.name, columns: idx.columns })),
@@ -476,7 +476,7 @@ describe('Secondary UNIQUE enforcement across the hydrate warm-restart path', fu
 				() => dbB.exec(`insert into T (Id, Stamp) values (2, 'a')`),
 				/UNIQUE constraint failed/,
 			);
-			const stored = await sharedSchemaManager(pluginB).getSchema('T');
+			const stored = await sharedSchemaManager(pluginB).getSchema('main', 'T');
 			expect(
 				stored?.indexes.find(idx => idx.name === 'ux_stamp')?.unique,
 				're-declare must persist the missing unique flag',
@@ -600,7 +600,7 @@ describe('Secondary UNIQUE enforcement across the hydrate warm-restart path', fu
 			declared = dbA.schemaManager.findTable('I', 'main')?.uniqueConstraints?.[0]?.defaultConflict;
 			expect(declared, 'sanity: the parsed schema carries the declared action').to.not.equal(undefined);
 
-			const stored = await sharedSchemaManager(pluginA).getSchema('I');
+			const stored = await sharedSchemaManager(pluginA).getSchema('main', 'I');
 			expect(stored?.uniqueConstraints?.[0]?.defaultConflict, 'action must be persisted')
 				.to.equal(declared);
 		} finally {
@@ -775,7 +775,7 @@ describe('Secondary UNIQUE enforcement across the hydrate warm-restart path', fu
 		try {
 			await dbA.exec(ddl);
 			await dbA.exec(`insert into K (Id, V) values (1, 'a')`);
-			const stored = await sharedSchemaManager(pluginA).getSchema('K');
+			const stored = await sharedSchemaManager(pluginA).getSchema('main', 'K');
 			expect(stored?.columns[0]?.defaultConflict, 'column-level action must be persisted')
 				.to.not.equal(undefined);
 		} finally {
@@ -789,7 +789,7 @@ describe('Secondary UNIQUE enforcement across the hydrate warm-restart path', fu
 		try {
 			await pluginT.hydrate(dbT);
 			const manager = sharedSchemaManager(pluginT);
-			const stored = await manager.getSchema('K');
+			const stored = await manager.getSchema('main', 'K');
 			const { primaryKeyDefaultConflict: _droppedPk, ...rest } = stored!;
 			await manager.storeStoredSchema({
 				...rest,
@@ -879,7 +879,7 @@ describe('Secondary UNIQUE enforcement across the hydrate warm-restart path', fu
 		try {
 			await pluginT.hydrate(dbT);
 			const manager = sharedSchemaManager(pluginT);
-			const stored = await manager.getSchema('T');
+			const stored = await manager.getSchema('main', 'T');
 			await manager.storeStoredSchema({ ...stored!, uniqueConstraints: [{ columns: [1] }] });
 		} finally {
 			dbT.close();

@@ -61,8 +61,8 @@ function registerWithSharedTransactor(db: Database, transactor: ITransactor) {
 }
 
 interface SchemaManagerLike {
-	listTables: () => Promise<string[]>;
-	getSchema: (name: string) => Promise<unknown | undefined>;
+	listTables: () => Promise<{ schemaName: string; tableName: string }[]>;
+	getSchema: (schemaName: string, name: string) => Promise<unknown | undefined>;
 }
 
 /** Reach the plugin's shared catalog manager (populated by hydrate/create). */
@@ -95,7 +95,7 @@ describe('Optimystic plugin schema catalog open-vs-create semantics', function (
 
 		const manager = sharedSchemaManager(plugin);
 		expect(await manager.listTables()).to.deep.equal([]);
-		expect(await manager.getSchema('nope')).to.equal(undefined);
+		expect(await manager.getSchema('main', 'nope')).to.equal(undefined);
 
 		// The reads must not have brought the catalog into existence.
 		expect(await catalogExists(transactor), 'reads must not create the schema catalog').to.equal(false);
@@ -118,7 +118,7 @@ describe('Optimystic plugin schema catalog open-vs-create semantics', function (
 
 		// The write path creates the catalog on demand, and the read path now sees it.
 		expect(await catalogExists(transactor), 'CREATE TABLE must persist the schema catalog').to.equal(true);
-		expect(await manager.listTables()).to.deep.equal(['t']);
+		expect(await manager.listTables()).to.deep.equal([{ schemaName: 'main', tableName: 't' }]);
 	});
 
 	it('reads a created-but-never-written table as zero rows, not as an error', async () => {
@@ -158,7 +158,7 @@ describe('Optimystic plugin schema catalog open-vs-create semantics', function (
 		`);
 		await db.exec(`INSERT INTO later (id) VALUES (7)`);
 
-		expect(await manager.listTables()).to.deep.equal(['later']);
+		expect(await manager.listTables()).to.deep.equal([{ schemaName: 'main', tableName: 'later' }]);
 		const rows = await collectRows(db.eval('SELECT id FROM later'));
 		expect(rows.map(r => Number(r['id']))).to.deep.equal([7]);
 	});
@@ -178,6 +178,6 @@ describe('Optimystic plugin schema catalog open-vs-create semantics', function (
 		const dbB = new Database();
 		const pluginB = registerWithSharedTransactor(dbB, transactor);
 		expect(await pluginB.hydrate(dbB)).to.deep.include({ tables: 1 });
-		expect(await sharedSchemaManager(pluginB).listTables()).to.deep.equal(['carried']);
+		expect(await sharedSchemaManager(pluginB).listTables()).to.deep.equal([{ schemaName: 'main', tableName: 'carried' }]);
 	});
 });

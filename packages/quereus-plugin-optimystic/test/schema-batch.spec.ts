@@ -938,10 +938,10 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 
 			// A third reader sees the union, not A's snapshot overwriting B's index.
 			const c = managerOver(transactor);
-			const committed = await c.getSchema('t');
+			const committed = await c.getSchema('main', 't');
 			expect(committed!.indexes.map(idx => idx.name)).to.have.members(['ix_a', 'ix_b']);
 			// And A's own cache was seeded with what was actually written, not with its snapshot.
-			expect((await a.getSchema('t'))!.indexes.map(idx => idx.name)).to.have.members(['ix_a', 'ix_b']);
+			expect((await a.getSchema('main', 't'))!.indexes.map(idx => idx.name)).to.have.members(['ix_a', 'ix_b']);
 		});
 
 		it('an empty batch does zero I/O, and a batch over an absent catalog creates it once', async () => {
@@ -954,13 +954,13 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 			expect(totalCalls(counts), 'nothing pending: no open, no commit').to.equal(0);
 
 			a.beginBatch();
-			expect(await a.getSchema('t'), 'a read on a cold catalog is absent, not an error').to.equal(undefined);
+			expect(await a.getSchema('main', 't'), 'a read on a cold catalog is absent, not an error').to.equal(undefined);
 			expect(counts['commit'] ?? 0, 'the read did not invent the catalog').to.equal(0);
 			await a.storeStoredSchema(stored('t', []));
 			await a.storeStoredSchema(stored('u', []));
 			await a.commitBatch();
 			expect(counts['commit'], 'two tables, one creating commit').to.equal(1);
-			expect((await managerOver(transactor).listTables()).sort()).to.deep.equal(['t', 'u']);
+			expect(await managerOver(transactor).listTables()).to.deep.equal([{ schemaName: 'main', tableName: 't' }, { schemaName: 'main', tableName: 'u' }]);
 		});
 
 		it('a checkpoint restore withdraws the writes staged after it, including a gravestone', async () => {
@@ -973,17 +973,17 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 			a.beginBatch();
 			await a.storeStoredSchema(stored('keep', []));
 			const cp = a.checkpointBatch();
-			await a.deleteSchema('t');
+			await a.deleteSchema('main', 't');
 			await a.storeStoredSchema(stored('discard', []));
-			expect(await a.getSchema('t'), 'the pending gravestone hides t inside the batch').to.equal(undefined);
+			expect(await a.getSchema('main', 't'), 'the pending gravestone hides t inside the batch').to.equal(undefined);
 			a.restoreBatch(cp!);
-			expect(await a.getSchema('t'), 'restored: t is live again').to.not.equal(undefined);
-			expect(await a.getSchema('discard')).to.equal(undefined);
+			expect(await a.getSchema('main', 't'), 'restored: t is live again').to.not.equal(undefined);
+			expect(await a.getSchema('main', 'discard')).to.equal(undefined);
 			await a.commitBatch();
 
 			const after = managerOver(transactor);
-			expect((await after.listTables()).sort()).to.deep.equal(['keep', 't']);
-			expect(await after.getSchema('t')).to.not.equal(undefined);
+			expect((await after.listTables()).map(names => names.tableName).sort()).to.deep.equal(['keep', 't']);
+			expect(await after.getSchema('main', 't')).to.not.equal(undefined);
 		});
 	});
 });

@@ -59,8 +59,8 @@ function registerWithSharedTransactor(db: Database, transactor: ITransactor) {
 }
 
 interface SchemaManagerLike {
-	getSchema: (name: string) => Promise<{ indexes: { name: string; unique?: boolean }[] } | undefined>;
-	getSchemaFresh: (name: string) => Promise<{ indexes: { name: string; unique?: boolean }[] } | undefined>;
+	getSchema: (schemaName: string, name: string) => Promise<{ indexes: { name: string; unique?: boolean }[] } | undefined>;
+	getSchemaFresh: (schemaName: string, name: string) => Promise<{ indexes: { name: string; unique?: boolean }[] } | undefined>;
 }
 
 /** Reach the plugin's shared catalog manager (populated by hydrate/create). */
@@ -78,7 +78,7 @@ async function persistedIndexNames(transactor: ITransactor, tableName: string): 
 	const db = new Database();
 	const plugin = registerWithSharedTransactor(db, transactor);
 	await plugin.hydrate(db);
-	const stored = await sharedSchemaManager(plugin).getSchema(tableName);
+	const stored = await sharedSchemaManager(plugin).getSchema('main', tableName);
 	expect(stored, `table '${tableName}' should be persisted`).to.not.equal(undefined);
 	return stored!.indexes.map(i => i.name);
 }
@@ -169,7 +169,7 @@ describe('Optimystic schema catalog index durability', function () {
 		// documented cost of the read-path cache (see SchemaManager.getSchema),
 		// and exactly why the mutating path below must not read through it.
 		// (This read is a cache hit and refreshes nothing.)
-		const cachedAtB = await sharedSchemaManager(pluginB).getSchema('parts');
+		const cachedAtB = await sharedSchemaManager(pluginB).getSchema('main', 'parts');
 		expect(
 			cachedAtB!.indexes.map(i => i.name),
 			'precondition: B\'s cached copy must be the stale pre-index one',
@@ -185,7 +185,7 @@ describe('Optimystic schema catalog index durability', function () {
 		).to.deep.equal(['idx_parts_sku', 'idx_parts_vendor']);
 
 		// And the fresh-read API B's mutating path used now reports both.
-		const freshFromB = await sharedSchemaManager(pluginB).getSchemaFresh('parts');
+		const freshFromB = await sharedSchemaManager(pluginB).getSchemaFresh('main', 'parts');
 		expect(
 			freshFromB!.indexes.map(i => i.name).sort(),
 			'a fresh read from B must see both persisted indexes',

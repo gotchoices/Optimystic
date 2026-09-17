@@ -37,6 +37,9 @@ export type { StoredTableSchema, StoredColumnSchema, StoredPrimaryKeyColumn, Sto
 // conversions — see PersistedTableSchema for why the two differ.
 export type { PersistedTableSchema, PersistedIndexSchema, PersistedIndexColumn } from './schema/schema-manager.js';
 export { toPersistedSchema, toStoredSchema, uniqueEnforcementTreeName } from './schema/schema-manager.js';
+// Where a table declared without an explicit `using optimystic('<uri>')` stores its rows
+// (`tree://default/<schema>/<table>`) and the key its catalog record is filed under.
+export { defaultCollectionUri, catalogKey, type QualifiedTableName } from './schema/table-identity.js';
 
 // Reports from the two-way index-versus-table check (`verifyIndexes` on the plugin and on
 // OptimysticModule).
