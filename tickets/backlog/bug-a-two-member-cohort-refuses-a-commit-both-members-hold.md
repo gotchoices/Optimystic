@@ -30,3 +30,24 @@ Before `implement/a-write-whose-log-entry-landed-alone-is-reported-saved` lands,
 
 - Should the coordinating member's reconcile wait for, or retry against, the peers that voted to commit, before settling its verdict? Or should the durability gate re-read the members' holdings once after all commit responses are in?
 - Why did the joiner never store the log tail block while it did store the leaf (`cluster-fetch:synced`)? If reads through a remote coordinator never acquire the block locally, every first write by a newly joined member goes through this refusal.
+
+# Further evidence: sereus headless relay run, 2026-09-17 (optimystic `ab67fa47`)
+
+From sereus's round-trip report, filed here as an arm rather than a new ticket. Two single-node parties connected only through a relay: B on sereus's `storage` profile, A on `transaction`.
+
+- **No proxy, 3 runs:** 1 failed on a concurrent insert pair with `TornActionError: collection default/app/Data: action … is torn at rev 7 — its log entry is stored but block(s) … do not hold that revision, and the write cannot be finished: stale revision`.
+- **Through a delaying TCP proxy, 4 runs:** all failed, 3 with `Failed to get super-majority: 1/2 approvals (needed 2, 0 rejections)` and 1 with `cohort-unreachable` on a read. This is weaker evidence, because a connection gater on A was also refusing direct dials to the relay port.
+
+**Likely link (repro: static, from reading the code, not reproduced here).** The torn error is what this ticket's refusal becomes when a rival write fills the gap:
+
+1. Writer X's tail commit lands at rev 7.
+2. X's sweep commit of a non-tail block is refused (for example `commit-not-durable`, as described above), and X cancels.
+3. The concurrent writer Y refreshes and commits that block at rev ≥ 7.
+4. X's refresh finds its own entry. `Collection.completeOwnEntry` re-sends at rev 7, and the member's pend validation (`cluster-repo.ts` `validatePendOperations`) answers `stale revision: block … at rev N`.
+5. `tornFromRefusal` reports that answer as a `TornActionError`.
+
+That is correct reporting of a write that really was torn. The defect sits upstream, in step 2.
+
+**To confirm:** in a two-member mesh-harness test where the coordinator lacks the base of a non-tail block, race two inserts and look for `missing-base-revision` or `commit-not-durable` on the first writer's sweep just before the torn error.
+
+The `1/2 approvals` shortfall through the delayed relay may be a separate cause: a promise or commit deadline exceeded on a slow link (see the `LATEST_QUERY_TIMEOUT_MS` NOTE in `coordinator-repo.ts` and the RPC deadlines in `db-p2p/src/rpc-deadline.ts`). Check the member's log for a late arrival before attributing it to this ticket.
