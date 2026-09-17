@@ -6,6 +6,7 @@ files:
   - packages/db-p2p/test/routing-key-convention-divergence.integration.spec.ts (write-side pins flipped; header and comments restated)
   - packages/db-p2p/src/repo/coordinator-repo.ts (comment on `isResponsibleForBlock`; the NOTE in `fetchBlockFromCluster` about an empty cohort)
   - packages/db-p2p/docs/cluster.md (§Network-Membership Scoping, §Self-Coordination Is Never Memoized)
+  - docs/transactions.md (self-coordination guard section; tier names and the read row corrected in review)
 difficulty: hard
 ----
 
@@ -37,7 +38,7 @@ Maintainer decision of 2026-09-14, arm B: a machine is in a block's cohort only 
 
 # Use cases for testing and validation
 
-Unit, `test/libp2p-key-network.spec.ts` (109 cases, all green), new describe near the end:
+Unit, `test/libp2p-key-network.spec.ts` (109 cases after review, all green), new describe near the end:
 
 - solo node → self-only cohort on both paths; self excluded when `clusterSize` serving peers are nearer; self included at its proximity position when among the nearest; small network keeps everyone; a nearer unidentified peer does not displace self; a non-serving self is in no cohort and may see an empty `findCluster`; a double without `getProtocols` counts as serving.
 - `findCoordinator` picks the cohort's second entry (A) when self is denied, even though a `getNeighbors` mock lists B second and B is connected; equal scores keep proximity order; a better score reorders within the cohort only; a write from an outsider goes to a cohort member although the guard allows self; the connected fallback still picks an out-of-cohort serving peer when no member is reachable; an outsider with nobody connected fails `NO_COORDINATOR_AVAILABLE` (this case pays the 1 s retry window and has a 5 s timeout); a non-serving self fails for both intents, `NO_NETWORK_COORDINATOR` with only an unidentified peer connected, and routes to a connected serving peer; `SELF_COORDINATION_EXHAUSTED` unchanged.
@@ -65,23 +66,35 @@ Also run: `test/two-party-cohort-is-collection-independent.spec.ts` (both cases 
 - Production reputation scores ascend with penalties (0 is clean), so the ascending sort picks the best-scored member; I did not change or test that direction.
 - The `cohort:membership` log line fires on every `findCoordinator` attempt as well as every `findCluster`, so a verbose log grows faster than before on the scoped path.
 
-# Notes for the reviewer (garden tender, 2026-09-16 evening)
+# Review findings
 
-1. **This ticket has landed without its partner, so HEAD is in a half-changed state until ticket 2
-   lands.** The plan recorded that without the writer's coverage tie-break toward self (ticket 2), a
-   single-block pend with cohort `[A, self]` goes remote on every small network — which the maintainer's
-   decision says must not happen. Establish whether that is now true at HEAD, and at which node counts.
-   If it is, say so plainly: a downstream application (sereus) runs against this repository's HEAD
-   through a linked workspace, so a half-landed routing change reaches it immediately. Recommend whether
-   ticket 2 should run next rather than wait behind the fix queue.
-2. **"A node whose FRET is missing now fails the lookup instead of degrading to self."** Confirm which
-   real deployments can have no FRET service — in particular the React Native node path
-   (`libp2p-node-rn.ts` → `libp2p-node-base.ts`) and any solo or test configuration. A phone that used to
-   work solo and now fails its lookup would be a regression on the platform the maintainer most wants
-   solid.
-3. **The `clusterSize: 1` membership case flipped** along with the named case. Confirm the one-machine
-   deployment (`n = 1` skips consensus) still commits through the solo short-circuit end to end, not just
-   in the key-network spec — the node-count sweep (`transaction-node-count-sweep.spec.ts`) N = 1 arm is
-   the natural check.
-4. **Log tags renamed `fret-*` → `cohort-*`.** `docs/debugging.md` and any downstream log filters may
-   reference the old tags; check the docs at least.
+Reviewed 2026-09-16 against the implement commit `4966acd5`, reading the diff before the handoff. Commands run from `packages/db-p2p` unless noted: `yarn test` (2916 passing, 63 pending, 0 failing, before my edits), the key-network spec alone after my edits (109 passing), `yarn typecheck` (exit 0), and from the repo root `yarn lint` (exit 0) and `yarn lint:docs` (all citations resolve). The gated six-node integration spec was not re-run; the implementer's pasted summary stands as the record.
+
+## Answers to the four questions left for the reviewer
+
+- **Is HEAD half-changed until the second ticket lands? Yes, at every network size of two or more.** `consolidateCoordinators` in `packages/db-core/src/transactor/network-transactor.ts` assigns blocks to the peer covering the most blocks and breaks ties by first-seen. Cohorts are now in proximity order, so on a small network (every node in every cohort, all tied) the write goes to whichever peer is nearest the first block, not to the writer's own node. Read from the code rather than measured, that is roughly (N-1) of every N single-block writes on an N-node network at or under `clusterSize`; the integration run shows the same effect at six nodes (3 of the 11 blocks the driver was responsible for went remote). Writes still complete (a remote cohort member coordinates, and a failed remote batch retries through `findCoordinator`, which can pick self), but each pays a network hop and depends on the partner being dialable, which the maintainer's decision says must not happen at small sizes. Sereus runs against this HEAD through a linked workspace. **Recommendation: run `writer-and-harness-route-to-the-cohort` next, ahead of the fix queue.** I did not reorder the board; that is the runner's and the maintainer's call.
+- **Can a real deployment have no FRET service? No.** `libp2p-node-base.ts` registers `fret` unconditionally in its services map, and the React Native entry builds on the same base. The only FRET-less callers are test doubles. The old code's self fallback there could not finish a write anyway, because `findCluster` throws without FRET. Now pinned by a unit case (below).
+- **Does a one-machine deployment still commit end to end? Yes.** The node-count sweep's N = 1 arm runs on the mesh harness, not the production key network, so it is not the evidence. `test/fresh-node-ddl-libp2p.spec.ts` is: a real libp2p node, `clusterSize` 1, no bootstraps, committing through `NetworkTransactor`. It passes in the full run.
+- **Renamed log tags.** No file in this repository (docs, source, tests) and nothing in the sereus checkout at `C:/projects/sereus` references `findCoordinator:fret-*` or `findCluster:membership`. Sereus's one error-text matcher (`control-write-retry.ts`) keys on the `Self-coordination blocked: grace-period-not-elapsed. No coordinator available for key.` sentence, which is unchanged.
+
+## Found and fixed in this pass (minor)
+
+- `docs/transactions.md` still described the old rule in its self-coordination section: it named a "FRET tier" where self "is a neighbour of the key", and its read row said a read is "never denied its own replica". Reworded to the cohort tier, the in-cohort condition on both self tiers, and the read row now says the guarantee holds for a responsible node only.
+- Two unit cases added to the new describe in `test/libp2p-key-network.spec.ts`: a node with no FRET service fails with `NO_COORDINATOR_AVAILABLE` ("could not be derived") yet still routes through the connected fallback when a serving peer is connected; and an isolated read from a node outside the cohort fails the same way a write does.
+
+## Tripwire recorded
+
+- An isolated read of a block the node is not responsible for now fails instead of degrading to an older local copy. No effect while the serving peers number at most `clusterSize`. Parked as a `NOTE:` at the last-resort tier in `findCoordinator`, and pinned by the new read case.
+
+## Checked and left alone
+
+- **The three deviations the implementer listed** (retry-futility fed the wide band rather than the cut cohort; failed assembly means no self last resort; `NO_NETWORK_COORDINATOR` driven only by connected candidates). Each is argued at its code site and I agree with each: the band can only keep a retry window open, never close one, and the other two avoid a misleading result.
+- **`filterByMembership` on the cohort tier can never drop anything**, because the assembly already cut the cohort to serving peers from the same records; it and the `protocolsByPeer` map exist only as a belt-and-braces check the plan asked for. Cost is one small object per lookup. Left as designed; remove both together if this path is ever trimmed.
+- **Two nodes can still derive different cohorts while one of them has not finished identifying a peer.** Pre-existing and unchanged by this ticket (unidentified peers were never admitted); the partition-healing backlog item owns it.
+- **Reputation sort direction** (ascending, 0 is clean) matches `IPeerReputation.getScore` usage elsewhere in the file; not changed.
+- **Resource cleanup, error handling, type safety:** no new listeners, timers or caches; the assembly's throw is caught per attempt in `findCoordinator` and propagates from `findCluster` exactly as the old FRET call did; no new `any`.
+- **File size:** `libp2p-key-network.ts` is 1377 lines (`wc -l`), most of it explanatory comment. Not filed: the change shrank the logic (one assembly instead of three paths), and splitting the file is outside this ticket.
+
+## Major findings
+
+None filed. The one substantial concern, the writer sending small-network writes to a remote peer, is exactly the scope of the already-written `writer-and-harness-route-to-the-cohort` ticket, so a new ticket would duplicate it; the action is sequencing, stated above.

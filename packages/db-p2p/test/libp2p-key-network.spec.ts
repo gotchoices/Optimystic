@@ -2246,6 +2246,26 @@ describe('Libp2pKeyPeerNetwork', () => {
 				expect(err.message).to.match(/not among the responsible peers/);
 			});
 
+			it('an isolated READ from a node outside the cohort fails too: the read degrade applies only to a responsible node', async function () {
+				// Same layout as the write case above, intent 'read'. Pins the NOTE at the last-resort
+				// tier: no self fallback for a block this node is not responsible for.
+				this.timeout(5_000);
+				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => strs([a, b])), peerStore: peerStoreServing([a, b]) });
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				await expectCode(() => network.findCoordinator(KEY, { intent: 'read' }), FIND_COORDINATOR_ERROR_CODES.NO_COORDINATOR_AVAILABLE, 'outsider read');
+			});
+
+			it('without a FRET service the cohort is underivable: no self last resort, but the connected fallback still routes', async () => {
+				// No production node lacks FRET (`libp2p-node-base.ts` always registers it), and such a
+				// node's findCluster throws, so a self pick could never complete a write anyway.
+				const isolated = new Libp2pKeyPeerNetwork(createMockLibp2p(selfPeerId, { peerStore: peerStoreServing([]) }), 2, undefined, 'forming', undefined, undefined, PREFIX);
+				const err = await expectCode(() => isolated.findCoordinator(KEY), FIND_COORDINATOR_ERROR_CODES.NO_COORDINATOR_AVAILABLE, 'no FRET, no peers');
+				expect(err.message).to.match(/could not be derived/);
+
+				const connected = new Libp2pKeyPeerNetwork(createMockLibp2p(selfPeerId, { connections: [outboundConnTo(a)], peerStore: peerStoreServing([a]) }), 2, undefined, 'forming', undefined, undefined, PREFIX);
+				expect((await connected.findCoordinator(KEY)).toString()).to.equal(a.toString());
+			});
+
 			it('a node that does not serve this network never coordinates, for a read or a write', async () => {
 				const client = (band: string[], connections: Connection[], serving: PeerId[]): Libp2p =>
 					withOwnProtocols(createMockLibp2p(selfPeerId, { connections, fret: fretWithBand(() => band), peerStore: peerStoreServing(serving) }), clientOnlyProto);

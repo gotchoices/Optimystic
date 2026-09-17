@@ -2377,7 +2377,8 @@ FRET already provides the necessary observability:
 
 3. **Guard self-coordination** — at two tiers, consuming the hardness classification:
    ```typescript
-   // FRET tier: self is a neighbour of the key. Admitted when allowed, or on a
+   // Cohort tier: reached only when self is in the key's cohort (among the nearest
+   // `clusterSize` serving peers). Admitted when allowed, or on a
    // deferrable denial for an ISOLATED READ (so an isolated read resolves at once
    // instead of paying the retry loop first). A write keeps dropping self here, so a
    // peer that lands during the retry window still wins the key; and a read with any
@@ -2386,7 +2387,9 @@ FRET already provides the necessary observability:
    const admit = decision.allow
      || (intent === 'read' && decision.deferrable === true && connected.length === 0);
 
-   // Last-resort tier: every better tier has already come up empty.
+   // Last-resort tier: every better tier has already come up empty. Also gated on self
+   // being in the key's cohort — a node that is not responsible for the key fails with
+   // NO_COORDINATOR_AVAILABLE / NO_NETWORK_COORDINATOR instead of coordinating it.
    const decision = this.shouldAllowSelfCoordination(intent);
    if (!decision.allow && decision.deferrable !== true) {
      throw new FindCoordinatorError('SELF_COORDINATION_BLOCKED', decision.reason);
@@ -2414,7 +2417,7 @@ Self-coordination risks differ by operation, and `findCoordinator` is told which
 
 | Operation | Risk | Behavior |
 |-----------|------|----------|
-| **Read** | Stale data | Never denied its own replica (except the `disabled` switch). Self is admitted at the FRET tier on a deferrable denial *while the node is isolated*, so an isolated read resolves at once; the reply carries the cluster's own conclusive/`unavailable` verdict. With any connection still live, self stays dropped there so a reachable neighbour wins the key — and no delay is paid, since the retry sleep only runs at zero connections. |
+| **Read** | Stale data | When this node is among the block's responsible peers, never denied its own replica (except the `disabled` switch); a node outside the block's cohort never self-coordinates it, isolated or not. Self is admitted at the cohort tier on a deferrable denial *while the node is isolated*, so an isolated read resolves at once; the reply carries the cluster's own conclusive/`unavailable` verdict. With any connection still live, self stays dropped there so a reachable neighbour wins the key — and no delay is paid, since the retry sleep only runs at zero connections. |
 | **Write (new or existing block)** | Orphaned data / fork creation | Self stays dropped for as long as the retry window is worth paying, so an arriving peer wins the key; a window nothing can arrive during is skipped (see below). Hard denial → `SELF_COORDINATION_BLOCKED`. Deferrable denial → self with a degraded-fallback warning. |
 | **Collection header lookup** | Missing data | A read; same as the read row. |
 

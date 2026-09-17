@@ -933,6 +933,11 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		// leave a copy nobody looks for and a responsible peer without one. `lastCohort` is
 		// undefined only when every attempt's assembly threw (FRET unavailable), which is read
 		// as "not known to be responsible".
+		// NOTE: this also fails an ISOLATED READ of a block this node is not responsible for, even
+		// when an older local copy exists (before the cohort rule, such a read degraded to the
+		// node's own replica). No effect while the serving peers number at most `clusterSize`,
+		// where every node is in every cohort. If offline reads on a wider network ever matter,
+		// let a read fall back to a local copy flagged as unverified rather than widening this tier.
 		const self = this.libp2p.peerId
 		const selfInCohort = lastCohort?.includes(selfStr) ?? false
 		if (!excludedSet.has(selfStr) && selfInCohort) {
