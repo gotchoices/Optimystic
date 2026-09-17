@@ -51,3 +51,11 @@ That is correct reporting of a write that really was torn. The defect sits upstr
 **To confirm:** in a two-member mesh-harness test where the coordinator lacks the base of a non-tail block, race two inserts and look for `missing-base-revision` or `commit-not-durable` on the first writer's sweep just before the torn error.
 
 The `1/2 approvals` shortfall through the delayed relay may be a separate cause: a promise or commit deadline exceeded on a slow link (see the `LATEST_QUERY_TIMEOUT_MS` NOTE in `coordinator-repo.ts` and the RPC deadlines in `db-p2p/src/rpc-deadline.ts`). Check the member's log for a late arrival before attributing it to this ticket.
+
+# Update 2026-09-17: the "Further evidence" link above is refuted
+
+The fix ticket `concurrent-inserts-from-two-members-tear-and-some-torn-writes-land` reproduced sereus's torn error in-process: a 2-member mesh, a few milliseconds of message latency, and concurrent inserts. The debug trace shows no `missing-base-revision` refusal and no `commit-not-durable` refusal before the tear. The writer's non-tail commit lost a conflict race against the *other* writer's cancel of its own refused pend. `operationsConflict` treats that cancel as a rival.
+
+- **Where it went:** the tear is now `implement/cancelling-a-refused-write-blocks-another-writers-commit`, and the "reported torn but saved" answer is `implement/a-write-reported-torn-can-already-be-saved`.
+- **What stays here:** this ticket's own defect, a commit refused as not durable while both members end up holding it. It is still open and unaffected, and its confirmation step is unchanged.
+- **The proxied relay run:** the `1/2 approvals` shortfall through the delaying proxy was not examined by that work.
