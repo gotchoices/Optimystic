@@ -28,7 +28,7 @@ describe('mesh harness: wrapKeyNetwork', () => {
 		const beforeCoordinatorGet = calls;
 		// A node's own coordinator never goes through `mesh.keyNetwork` — it closes over the
 		// per-node wrapper built in `createMesh`'s phase 1, which in turn calls the SAME shared
-		// instance `wrapKeyNetwork` wrapped. `get`'s proximity check (`isResponsibleForBlock`)
+		// instance `wrapKeyNetwork` wrapped. `get`'s proximity check (`responsibilityFor`)
 		// alone is enough to prove the hook sees it.
 		await mesh.nodes[0]!.coordinatorRepo.get({ blockIds: ['wrap-hook-block'] });
 		expect(calls, 'a node coordinator lookup must reach the wrapped shared key network')

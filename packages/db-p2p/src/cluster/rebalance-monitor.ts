@@ -537,6 +537,10 @@ export class RebalanceMonitor implements Startable {
 	 * The peers responsible for a block, nearest first. With a key network wired this is its
 	 * `findCluster` cohort (see {@link RebalanceMonitorDeps.keyNetwork}); otherwise FRET's nearest
 	 * {@link getCohortSize} ring members.
+	 *
+	 * NOTE: one `findCluster` (peer-store reads for each cohort member) per tracked block per pass, where
+	 * FRET's cohort was one synchronous call; fine under the pass throttle; if passes on nodes holding many
+	 * blocks ever show up as slow, share the lookup with the coordinator's responsibility cache.
 	 */
 	private async cohortFor(blockId: string): Promise<string[]> {
 		const key = routingKeyForBlock(blockId)

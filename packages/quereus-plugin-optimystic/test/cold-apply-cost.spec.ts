@@ -185,7 +185,7 @@ async function measureColdApply(tables: number, indexes: number): Promise<ApplyC
 			).storage,
 		// Wraps the mesh's SHARED key network before any node, member derivation or transactor
 		// captures it, so this sees every cohort lookup in the mesh — each node's coordinator
-		// (`isResponsibleForBlock`, `fetchBlockFromCluster`) and cluster coordinator, not only
+		// (`responsibilityFor`, `fetchBlockFromCluster`) and cluster coordinator, not only
 		// what the transactor drives. See gate 4.
 		wrapKeyNetwork: (shared: IKeyNetwork): IKeyNetwork => counting<IKeyNetwork>(shared, completeKeyNetworkCounts),
 	});
@@ -264,7 +264,7 @@ const SMALL_X3 = { tables: 27, indexes: 39 };
  * patching the shared key network and attributing each call by stack frame, then reproduced exactly
  * through `mesh-harness.ts`'s `wrapKeyNetwork` hook, which is what this spec now counts with. The
  * other 51 / 141 / 139 are almost all the coordinator side of `CoordinatorRepo.get` —
- * `isResponsibleForBlock`'s proximity check and `fetchBlockFromCluster`'s cohort consult, one each
+ * `responsibilityFor`'s proximity check and `fetchBlockFromCluster`'s cohort consult, one each
  * per distinct block read — plus a fixed five on the commit path; none is reachable from
  * `mesh.keyNetwork`. Per-object cohort lookups: 54/22, 144/67, 142/66. 2026-09-15, after the
  * absence memo was removed (ticket drop-the-settled-absence-memo): 59/22, 149/67, 147/66 — a fixed
@@ -343,7 +343,7 @@ describe('cold `apply schema` cost through the coordinated commit path', functio
 		//
 		// SCOPE: `findClusterCalls` counts EVERY cohort lookup in the mesh, via the
 		// `wrapKeyNetwork` hook on the shared key network (`mesh-harness.ts`) — each node's own
-		// coordinator (`isResponsibleForBlock`'s proximity check, `fetchBlockFromCluster`'s cohort
+		// coordinator (`responsibilityFor`'s proximity check, `fetchBlockFromCluster`'s cohort
 		// consult) and the cluster coordinator's commit-path lookups, not only what the transactor
 		// drives through `mesh.keyNetwork` (that subset is `findClusterCallsTransactorSeam`,
 		// printed below but not gated). This used to be a per-commit ratio gated at the transactor

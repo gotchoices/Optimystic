@@ -7,7 +7,7 @@
  * id — and the key network hashes it once (`hashKey == sha256`), so every coordinate is `sha256(utf8(id))`:
  *
  *  - db-core's `NetworkTransactor` (the writer/reader);
- *  - every server-side consumer in db-p2p (`CoordinatorRepo.isResponsibleForBlock`,
+ *  - every server-side consumer in db-p2p (`CoordinatorRepo.responsibilityFor`,
  *    `fetchBlockFromCluster`, `ClusterCoordinator.getClusterForBlock`, `RepoService.checkRedirect`,
  *    the mesh harness's own `deriveExpectedCluster`).
  *

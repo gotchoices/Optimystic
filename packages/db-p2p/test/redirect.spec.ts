@@ -6,6 +6,7 @@ import type { PeerId } from '@libp2p/interface';
 import type { IRepo, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, MessageOptions, RepoMessage, IBlock, ClusterPeers } from '@optimystic/db-core';
 import { RepoService, type RepoServiceComponents, type ClusterLookup } from '../src/repo/service.js';
 import type { RedirectPayload } from '../src/repo/redirect.js';
+import { RESPONSIBILITY_TTL_MS } from '../src/repo/responsibility.js';
 import { encodeJson, decodeJson, makeServiceStream } from './util/protocol-stream.js';
 
 const makePeerId = async (): Promise<PeerId> => {
@@ -454,6 +455,32 @@ describe('RepoService redirect logic', () => {
 
 			await service.checkRedirect('block-2', 'pend', pendMessage('block-2'));
 			expect(keyNetwork.lookups, 'a different block is its own lookup').to.equal(2);
+		});
+
+		it('looks a block up again once the TTL has passed, and acts on the new cohort', async () => {
+			const self = await makePeerId();
+			const other = await makePeerId();
+			const cohort = [self];
+			const keyNetwork = makeKeyNetwork(cohort);
+			const service = new RepoService(makeComponents({ repo: makeStubRepo(), peerId: self, keyNetwork }), { responsibilityK: 1 });
+			const realNow = Date.now;
+			let now = realNow();
+			Date.now = () => now;
+			try {
+				expect(await service.checkRedirect('block-1', 'pend', pendMessage('block-1')), 'in the cohort').to.be.null;
+				cohort.splice(0, 1, other);
+
+				now += RESPONSIBILITY_TTL_MS - 1;
+				expect(await service.checkRedirect('block-1', 'pend', pendMessage('block-1')), 'still answered from the memo').to.be.null;
+				expect(keyNetwork.lookups).to.equal(1);
+
+				now += 1;
+				const result = await service.checkRedirect('block-1', 'pend', pendMessage('block-1'));
+				expect(keyNetwork.lookups, 'expired memo is looked up again').to.equal(2);
+				expect(result?.redirect.peers.map(p => p.id), 'the new cohort excludes this node').to.deep.equal([other.toString()]);
+			} finally {
+				Date.now = realNow;
+			}
 		});
 
 		it('still attaches the responsible ids to a message answered from the memo', async () => {
