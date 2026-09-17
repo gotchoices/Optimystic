@@ -22,8 +22,7 @@ export type BelowFloorAnswer = {
 };
 
 /** What a read source needs from a collection's floors: which floor applies to a read, and whether
- * an answer fell under it. {@link BlockFloors} is the collection's own; {@link BlockFloors.checkOnly}
- * is the same judgement for a source that must not retire anything. */
+ * an answer fell under it. The narrow face of {@link BlockFloors} that `TransactorSource` holds. */
 export interface BlockFloorCheck {
 	/** The floor a read of `blockId` at `context` must meet, or `undefined` when none applies.
 	 *
@@ -46,26 +45,27 @@ export interface BlockFloorCheck {
  * source only, a view created right after a refresh would fetch the changed block through a source
  * that knows no floor.
  *
- * Raised where log entries are consumed (`Collection.updateInternal`), checked where answers arrive
- * (`TransactorSource.tryGet`), and retired when the collection's own source receives an answer that
- * meets one.
+ * Raised where log entries are consumed (`Collection.updateInternal`) and checked where answers
+ * arrive (`TransactorSource.tryGet`). A floor, once raised, STANDS for the life of the handle: an
+ * answer that meets it does not remove it.
  *
- * NOTE: a floor is retired only by an answer to a read, so one for a block this handle never reads
- * again (including a block the entry deleted) is never retired. The map is therefore bounded by the
- * distinct blocks named by entries this handle walked — the same ids, and so the same bound, as
- * `CacheSource`'s never-pruned `generations` map, which `clear(entry.blockIds)` populates beside
- * every `raise`. If that ever grows large enough to matter, prune the two together; a dropped floor
- * only forfeits the check for that block, it never serves anything wrong by itself.
+ * Why a met floor is not dropped. The source that judges an answer cannot know whether any cache
+ * went on to keep it, and "an answer met the floor" is not "the cache now holds that answer": the
+ * cache drops an answer that was overtaken while in flight (`CacheSource.stillWanted`), and evicts
+ * kept content under pressure (128 blocks). Either way the next read of the block goes back to
+ * storage, where nothing says the same machine answers twice — and with the floor gone, a too-old
+ * answer to THAT read is judged against nothing and kept for good, which is the defect floors exist
+ * to prevent. Reproduced with the floor dropped when met: a too-old answer, then a current one that
+ * the cache dropped as overtaken (but which removed the floor), then a too-old one — kept, and
+ * served after storage had caught up (`refresh-below-floor.spec.ts`, "a current answer the cache
+ * dropped..."). A standing floor costs one map lookup per fetched block and is always true of a
+ * correct answer: a block never goes back below a revision it was committed at.
  *
- * NOTE: retiring on the first answer that meets a floor is what keeps the map small for a handle
- * that re-reads what changes, and it leaves one hole: a retired floor guards nothing, so content
- * kept, then evicted under cache pressure (128 blocks), then re-read from a machine STILL behind —
- * all inside that machine's lag, one read-repair window — is kept too old again, with no report.
- * (The concurrent form, a too-old answer landing just after the one that retired the floor, is
- * closed separately by `CacheSource.stillWanted`.) Never retiring would close it, at the cost of
- * the bound above applying to every block a walked entry ever named rather than only to those not
- * re-read — the `generations` map already pays exactly that. If a stale row is ever traced to a
- * block whose floor had been met, stop retiring (and drop `checkOnly`, which then has no job). */
+ * NOTE: the map is never pruned, so it holds one small entry per distinct block named by entries
+ * this handle walked — the same ids, and so the same bound, as `CacheSource`'s never-pruned
+ * `generations` map, which `clear(entry.blockIds)` populates beside every `raise`. If that ever
+ * grows large enough to matter, prune the two together (oldest floors first); a dropped floor only
+ * forfeits the check for that block, it never serves anything wrong by itself. */
 export class BlockFloors implements BlockFloorCheck {
 	private readonly floors = new Map<BlockId, BlockFloor>();
 
@@ -90,41 +90,16 @@ export class BlockFloors implements BlockFloorCheck {
 	}
 
 	answeredBelowFloor(blockId: BlockId, context: ActionContext | undefined, servedRev: number): boolean {
-		return this.weigh(blockId, context, servedRev, true);
-	}
-
-	/** These floors for a source whose answers land somewhere SHORT-LIVED — a pinned read view's
-	 * private cache. It judges answers identically but never retires a floor.
-	 *
-	 * A floor exists to stop the collection's long-lived cache keeping a too-old answer, so its job
-	 * is done only once THAT cache holds an answer meeting it. Were a view allowed to retire it, the
-	 * collection's own next read of the block would arrive unguarded: nothing says the same machine
-	 * answers twice, and a below-floor answer to that read would be kept forever — the defect floors
-	 * exist to prevent, re-opened by whichever view happened to read first. */
-	checkOnly(): BlockFloorCheck {
-		return {
-			applicableTo: (blockId, context) => this.applicableTo(blockId, context),
-			answeredBelowFloor: (blockId, context, servedRev) => this.weigh(blockId, context, servedRev, false),
-		};
-	}
-
-	/** How many floors are outstanding. */
-	get size(): number {
-		return this.floors.size;
-	}
-
-	private weigh(blockId: BlockId, context: ActionContext | undefined, servedRev: number, retireWhenMet: boolean): boolean {
 		const floor = this.applicableTo(blockId, context);
-		if (floor === undefined) {
-			return false;
-		}
-		if (servedRev >= floor.rev) {
-			if (retireWhenMet) {
-				this.floors.delete(blockId);
-			}
+		if (floor === undefined || servedRev >= floor.rev) {
 			return false;
 		}
 		this.onBelowFloor?.({ blockId, floor, servedRev });
 		return true;
+	}
+
+	/** How many blocks have a floor. */
+	get size(): number {
+		return this.floors.size;
 	}
 }

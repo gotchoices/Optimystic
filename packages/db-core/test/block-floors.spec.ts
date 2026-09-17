@@ -47,37 +47,18 @@ describe('BlockFloors', () => {
 		expect(floors.size).to.equal(1)
 	})
 
-	it('retires a floor on an answer at or above it, silently', () => {
+	it('passes an answer at or above the floor silently, and the floor still stands', () => {
+		// "An answer met the floor" is not "a cache now holds that answer" — the cache may drop it as
+		// overtaken, or evict it later — so the next read of the block must still be judged.
 		const reported: BelowFloorAnswer[] = []
 		const floors = new BlockFloors(answer => reported.push(answer))
-		floors.raise([block, 'other' as BlockId], { rev: 7, actionId: action('seven') })
+		floors.raise([block], { rev: 7, actionId: action('seven') })
 
 		expect(floors.answeredBelowFloor(block, pinnedAt(8), 7)).to.equal(false)
-		expect(floors.applicableTo(block, undefined)).to.equal(undefined)
-		expect(floors.size, "the other block's floor is its own").to.equal(1)
 		expect(reported).to.deep.equal([])
-	})
+		expect(floors.applicableTo(block, undefined)?.rev, 'still standing').to.equal(7)
 
-	describe('checkOnly', () => {
-		it('judges and reports exactly as the floors do', () => {
-			const reported: BelowFloorAnswer[] = []
-			const floors = new BlockFloors(answer => reported.push(answer))
-			floors.raise([block], { rev: 7, actionId: action('seven') })
-			const view = floors.checkOnly()
-
-			expect(view.applicableTo(block, pinnedAt(7))?.rev).to.equal(7)
-			expect(view.applicableTo(block, pinnedAt(6))).to.equal(undefined)
-			expect(view.answeredBelowFloor(block, pinnedAt(7), 6)).to.equal(true)
-			expect(reported).to.have.length(1)
-		})
-
-		it('never retires a floor, and sees floors raised after it was made', () => {
-			const floors = new BlockFloors()
-			const view = floors.checkOnly()
-			floors.raise([block], { rev: 7, actionId: action('seven') })
-
-			expect(view.answeredBelowFloor(block, pinnedAt(7), 7), 'met').to.equal(false)
-			expect(floors.applicableTo(block, undefined)?.rev, 'and still standing').to.equal(7)
-		})
+		expect(floors.answeredBelowFloor(block, pinnedAt(8), 6), 'a later too-old answer is still caught').to.equal(true)
+		expect(reported).to.have.length(1)
 	})
 })

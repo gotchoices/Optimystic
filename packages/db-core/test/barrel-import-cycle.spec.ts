@@ -68,8 +68,12 @@ type ModuleEdge = {
  * No file in the repo is written that way and the miss is a false *negative* on a style nobody
  * uses; if that style ever appears, strip comments before matching rather than widening the
  * anchor (widening re-admits matches inside string literals).
+ *
+ * A leading UTF-8 BOM is dropped first: `readFile(_, 'utf8')` keeps it, and it would sit between
+ * the start of the text and the keyword the anchor looks for, hiding a BOM'd file's FIRST import.
  */
-function moduleEdges(text: string): ModuleEdge[] {
+function moduleEdges(source: string): ModuleEdge[] {
+	const text = source.replace(/^﻿/, '');
 	const out: ModuleEdge[] = [];
 	for (const m of text.matchAll(FROM_RE)) {
 		const [full, clause, spec] = m;
@@ -146,6 +150,7 @@ describe('db-core — src modules cannot re-enter a barrel import cycle', () => 
 			[`export * as core from "../../index.js";`, NESTED],                                         // namespace re-export
 			[`import { type BlockId } from "../../index.js";`, NESTED],                                  // inline type: emits `import {}`
 			[`import /* why */ { apply } from "../../index.js";`, NESTED],                               // comment inside the clause
+			[`﻿import { Collection } from "../../index.js";`, NESTED],                              // first statement of a BOM'd file
 			[`import { apply } from "./index.js";`, AT_SRC_ROOT],                                        // barrel sibling
 			[`import { Diary } from "./index.js";`, NESTED],                                             // own subtree barrel
 			[`import { Collection } from "../index.js";`, NESTED],                                       // intermediate subtree barrel

@@ -53,7 +53,7 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 	private revisions = new Map<BlockId, number>();
 	/** The most recent answer per id that the source served but forbade keeping — a below-floor
 	 *  answer, content older than a log entry the collection already walked says the block is (see
-	 *  {@link sourceMayRetain}). NEVER served to a read: {@link tryGet} re-asks the source every time
+	 *  {@link sourceServed}). NEVER served to a read: {@link tryGet} re-asks the source every time
 	 *  such an id is read, which is the whole point. It exists for the base probes alone
 	 *  ({@link peek} / {@link getCachedRevision}): a write staged over this content must still declare
 	 *  the base it was really built on, at the revision it was really served at. Were the block to go

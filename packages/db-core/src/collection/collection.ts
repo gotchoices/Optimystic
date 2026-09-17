@@ -1143,10 +1143,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 			seed = seed.filter(([, , revision]) => revision <= pinRev);
 		}
 		// The view shares this handle's floors, so a block the last refresh saw change is not kept
-		// too old by the view either — but it only CHECKS them (see BlockFloors.checkOnly): a view
-		// pinned below a floor is untouched by it, and no view retires a floor on the handle's behalf.
+		// too old by the view either. A view pinned below a floor is untouched by it.
 		const pinnedSource = new TransactorSource<IBlock>(
-			this.id, this.transactor, structuredClone(pinContext), collector, this.floors.checkOnly());
+			this.id, this.transactor, structuredClone(pinContext), collector, this.floors);
 		const pinnedCache = new CacheSource<IBlock>(
 			pinnedSource, undefined, collector, seed);
 		return new Tracker(pinnedCache, copyTransforms(transforms));

@@ -710,6 +710,9 @@ the lines go on is the finding:
   the writer, around the time `floorAction` was committed). The older content is then the correct
   content; the cost is that every read of the block through this handle is a storage request rather
   than a memory hit, until the block is next written or the handle is reopened.
+- **A single line, right at a refresh, with storage fully current** — a read that was already in
+  flight when the refresh adopted the new revision. It was asked at the old revision and judged at
+  the new one, so its (correctly older) answer reads as below the floor and is not kept. Harmless.
 
 Silence is not proof of freshness. A floor exists only for blocks named by entries this handle
 **walked during a refresh**, so a block first read when the handle was opened has none, and neither

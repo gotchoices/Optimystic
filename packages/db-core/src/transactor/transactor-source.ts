@@ -168,9 +168,9 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	 *
 	 * NOTE: while a floor is unmet, every read of that block costs a transactor request instead of a
 	 * memory hit — at most one read-repair window for a lagging replica, but until the block is next
-	 * written (or the handle reopened) for an abandoned entry. Unmeasured. If it ever shows up, retire
+	 * written (or the handle reopened) for an abandoned entry. Unmeasured. If it ever shows up, drop
 	 * a floor after some number of consecutive below-floor answers from a coordinator other than this
-	 * node. */
+	 * node (floors are otherwise never dropped — see `BlockFloors`). */
 	private mayRetain(id: BlockId, servedRev: number): boolean {
 		return !this.floors?.answeredBelowFloor(id, this.actionContext, servedRev);
 	}

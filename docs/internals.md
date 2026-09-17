@@ -162,10 +162,19 @@ are true of it:
 
 One `BlockFloors` is shared by every read source the handle builds, the way the
 `ReadDependencyCollector` is: a pinned read view created right after a refresh would otherwise fetch
-the changed block through a source that knows no floor. Views only *check* floors
-(`checkOnly`) — a floor is retired when the collection's **own** source receives an answer that meets
-it, because the floor's job is to keep the long-lived cache honest, and a view's good answer says
-nothing about who will answer the collection's own next read.
+the changed block through a source that knows no floor.
+
+**A floor, once raised, stands for the life of the handle; an answer that meets it does not remove
+it.** "An answer met the floor" is not "the cache now holds that answer": the cache drops an answer
+that was overtaken while in flight (`stillWanted`, below) and evicts kept content under pressure, and
+either way the next read goes back to storage, where nothing says the same machine answers twice. An
+earlier form dropped a floor on the first answer that met it, to keep the map small, and that
+re-opened the defect: a too-old answer, then a current one the cache dropped as overtaken (but which
+removed the floor), then a too-old one judged against nothing — kept, and served after storage had
+caught up (pinned in `packages/db-core/test/refresh-below-floor.spec.ts`). A standing floor is always
+true of a correct answer, costs one map lookup per fetched block, and bounds the map by the distinct
+blocks walked entries named — the bound `CacheSource`'s `generations` map already pays (`NOTE:` on
+`BlockFloors`).
 
 **The forgetting and the adopting are one synchronous step.** Floors apply at or above their own
 revision, so they say nothing about a read made at the revision the handle is *leaving* — and reads
@@ -180,17 +189,16 @@ either lands before all three and is forgotten with the rest, or lands after and
 adopted revision (`TransactorSource.tryGet` reads its context when the answer *arrives*, not when it
 was asked for). Keep it await-free.
 
-Retiring a floor on the first good answer has one consequence the cache itself has to cover. Reads
-are not serialized — the SQL layer runs reentrant scans over one handle — so two can miss on one
-block at once; the first answer meets the floor and retires it, and the second, from a machine still
-behind, then arrives unjudged. Kept, it would be kept for good. So a miss is validated after it
-lands (`stillWanted` in `packages/db-core/src/transform/cache-source.ts`): if anything happened to
-the id while the read was in flight — a concurrent load, a refresh's clear, a commit folded in, all
-of which move its generation — the answer is kept only to *replace strictly older content*, and is
-otherwise handed to its reader and dropped. The same rule closes two older races that did not need
-floors to exist: an answer requested before a refresh cleared the block used to land after the clear
-and outlive it, and one requested before the handle's own commit folded in used to overwrite the
-folded content with the older block.
+**A miss is validated again when its answer lands.** Reads are not serialized — the SQL layer runs
+reentrant scans over one handle — so two can miss on one block at once, and a refresh or a commit can
+touch the block while a read of it is in flight. Floors judge an answer only against walked log
+entries, so the cache covers the rest (`stillWanted` in
+`packages/db-core/src/transform/cache-source.ts`): if anything happened to the id while the read was
+in flight — a concurrent load, a refresh's clear, a commit folded in, all of which move its
+generation — the answer is kept only to *replace strictly older content*, and is otherwise handed to
+its reader and dropped. That closes two races floors cannot see: an answer requested before a
+refresh cleared the block used to land after the clear and outlive it, and one requested before the
+handle's own commit folded in used to overwrite the folded content with the older block.
 
 What this deliberately does not do. It does not ask another machine (one transactor request is all a
 `TransactorSource` can make; ticket `a-too-old-block-answer-is-retried-against-another-machine`
@@ -199,9 +207,7 @@ builds that on these floors), so against a single lagging coordinator the old co
 of forever. It sets no floor for a block first read at open (no entries are walked then) or for the
 blocks an invalidation entry reverts. And it narrows, without closing, the hazard of a write staged
 over a too-old read (ticket `bug-a-pended-transform-does-not-carry-its-base`): once storage catches
-up, the base under already-staged edits changes with no replay. A retired floor no longer guards
-its block, so content kept, then evicted under cache pressure, then re-read from a machine that is
-*still* behind is kept too old again; the `NOTE:` on `BlockFloors` weighs that against never retiring.
+up, the base under already-staged edits changes with no replay.
 While a floor is unmet every read of its block costs a transactor request rather than a memory hit;
 the tripwire `NOTE:` at `mayRetain` names the remedy if that ever shows up.
 

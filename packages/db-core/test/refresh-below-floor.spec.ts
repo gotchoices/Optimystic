@@ -21,7 +21,7 @@ import { TestTransactor, TailLandsButReportsStale } from '../src/testing/test-tr
 import { LogDataBlockType } from '../src/log/struct.js'
 import { Log } from '../src/log/log.js'
 import { TornActionError } from '../src/index.js'
-import type { BlockGets, BlockId, CommitRequest, CommitResult, GetBlockResults } from '../src/index.js'
+import type { BlockGets, CommitRequest, CommitResult, GetBlockResults } from '../src/index.js'
 import { captureCollectionLog } from './capture-log.js'
 
 interface Row { key: number; value: string }
@@ -57,8 +57,10 @@ class LaggingDataTransactor extends CountingTransactor {
 	laggedReads: Array<[string, number, number]> = []
 
 	override async get(gets: BlockGets): Promise<GetBlockResults> {
-		const results = await super.get(gets)
+		// Decided when the read is ASKED, so a double that answers two reads in flight differently
+		// can flip `lagAt` around the call without the other read seeing the flip.
 		const lagAt = this.lagAt
+		const results = await super.get(gets)
 		const askedRev = gets.context?.rev
 		if (lagAt === undefined || askedRev === undefined || askedRev <= lagAt) return results
 		for (const [id, entry] of Object.entries(results)) {
@@ -72,6 +74,46 @@ class LaggingDataTransactor extends CountingTransactor {
 		}
 		return results
 	}
+}
+
+/** Once `armed`, the next two pinned reads are held until both have been asked, then answered
+ *  one after the other — the first read's answer always lands first. The read numbered
+ *  `currentNth` is answered current; the other as of `lagAt`. */
+class TwoAtOnceTransactor extends LaggingDataTransactor {
+	armed = false
+	private dataReads = 0
+	private releaseBoth!: () => void
+	private readonly bothAsked = new Promise<void>(resolve => { this.releaseBoth = resolve })
+
+	constructor(private readonly currentNth: 1 | 2) { super() }
+
+	override async get(gets: BlockGets): Promise<GetBlockResults> {
+		const nth = this.armed && gets.context?.rev !== undefined ? ++this.dataReads : 0
+		const lagAt = this.lagAt
+		if (nth === this.currentNth) this.lagAt = undefined
+		const asked = super.get(gets)
+		this.lagAt = lagAt
+		const results = await asked
+		if (nth === 2) this.releaseBoth()
+		if (nth === 1 || nth === 2) await this.bothAsked
+		if (nth === 2) await new Promise(resolve => setTimeout(resolve, 5))	// after the first answer is dealt with
+		return results
+	}
+}
+
+/** `reader` has refreshed past one write; `net` lags at the revision before it and is armed. */
+async function twoReadsAtOnce(collectionId: string, currentNth: 1 | 2) {
+	const net = new TwoAtOnceTransactor(currentNth)
+	const writer = await Tree.createOrOpen<number, Row>(net, collectionId, keyOf)
+	await writer.replace([[1, OLD]])
+	const reader = await Tree.createOrOpen<number, Row>(net, collectionId, keyOf)
+	await reader.update()
+	await reader.get(1)
+	net.lagAt = reader.committedRevision()!
+	await writer.replace([[1, NEW]])
+	await reader.update()
+	net.armed = true
+	return { net, reader }
 }
 
 /** A reader that has refreshed past one write its storage has not caught up with: the log entry for
@@ -141,51 +183,11 @@ describe('a refreshed collection re-reading a block its log entry names', () => 
 		expect(after, 'silent once the answer meets the floor').to.deep.equal([])
 	})
 
-	it('retires the floor once the collection holds an answer that meets it', async () => {
-		const { net, reader } = await readerBehindOneWrite('directory-retired')
-		const floors = reader.getCollection()['floors']
-
-		await reader.get(1)
-		const [blockId] = net.laggedReads[0]! as [BlockId, number, number]
-		expect(floors.applicableTo(blockId, undefined), 'a below-floor answer leaves the floor standing').to.not.equal(undefined)
-
-		net.lagAt = undefined
-		await reader.get(1)
-		expect(floors.applicableTo(blockId, undefined), 'met, so retired').to.equal(undefined)
-	})
-
 	it('of two concurrent reads, the too-old answer arriving second is not the one kept', async () => {
 		// Reads are not serialized (the SQL layer runs reentrant scans over one handle), so two can
-		// miss on one block at once. The first answer meets the floor and retires it; the second —
-		// from a machine still behind — then arrives unjudged. Kept, it would be kept for good.
-		class CurrentThenLaggingTransactor extends LaggingDataTransactor {
-			armed = false
-			private dataReads = 0
-			private releaseBoth!: () => void
-			private readonly bothAsked = new Promise<void>(resolve => { this.releaseBoth = resolve })
-
-			override async get(gets: BlockGets): Promise<GetBlockResults> {
-				const nth = this.armed && gets.context?.rev !== undefined ? ++this.dataReads : 0
-				const lagAt = this.lagAt
-				if (nth === 1) this.lagAt = undefined			// the first read is answered current
-				const results = await super.get(gets)
-				this.lagAt = lagAt
-				if (nth === 2) this.releaseBoth()
-				if (nth === 1 || nth === 2) await this.bothAsked	// both answers land back to back
-				return results
-			}
-		}
-		const net = new CurrentThenLaggingTransactor()
-		const writer = await Tree.createOrOpen<number, Row>(net, 'two-at-once', keyOf)
-		await writer.replace([[1, OLD]])
-		const reader = await Tree.createOrOpen<number, Row>(net, 'two-at-once', keyOf)
-		await reader.update()
-		await reader.get(1)
-		net.lagAt = reader.committedRevision()!
-		await writer.replace([[1, NEW]])
-		await reader.update()
-
-		net.armed = true
+		// miss on one block at once. The first answer meets the floor and is kept; the second — from
+		// a machine still behind — must not displace it.
+		const { net, reader } = await twoReadsAtOnce('two-at-once', 1)
 		const answers = await Promise.all([reader.get(1), reader.get(1)])
 		net.armed = false
 		expect(answers, 'each reader gets the answer it was given').to.deep.equal([NEW, OLD])
@@ -194,6 +196,25 @@ describe('a refreshed collection re-reading a block its log entry names', () => 
 		expect(await net.fetchedDuring(async () => {
 			expect(await reader.get(1), 'what the collection remembers is the current row').to.deep.equal(NEW)
 		}), 'and it is remembered, not re-fetched').to.deep.equal([])
+	})
+
+	it('a current answer the cache dropped as overtaken does not leave the next too-old answer unguarded', async () => {
+		// The other order. The too-old answer lands first and is handed through; the current one
+		// lands second, meets the floor — and is DROPPED by the cache, the block having changed
+		// hands while it was in flight. So nothing is remembered and the next read asks again. Were
+		// a floor removed by the first answer to meet it, that next read, answered too old, would be
+		// judged against nothing and kept for good. (It was: this case returned OLD after storage
+		// had caught up, until floors were made to stand.)
+		const { net, reader } = await twoReadsAtOnce('two-at-once-reversed', 2)
+		const answers = await Promise.all([reader.get(1), reader.get(1)])
+		net.armed = false
+		expect(answers, 'each reader gets the answer it was given').to.deep.equal([OLD, NEW])
+
+		expect(await reader.get(1), 'storage is still behind, so the old row is what there is').to.deep.equal(OLD)
+
+		net.lagAt = undefined
+		expect(await reader.get(1), 'but it was not kept').to.deep.equal(NEW)
+		expect(await net.fetchedDuring(() => reader.get(1)), 'and the current row now is').to.deep.equal([])
 	})
 
 	it('a read that lands while the refresh is under way does not leave the old block behind', async () => {
@@ -241,9 +262,9 @@ describe('a refreshed collection re-reading a block its log entry names', () => 
 			expect(await view.get(1)).to.deep.equal(NEW)
 		})
 
-		it('a view never retires a floor on the collection\'s behalf', async () => {
+		it('a view answered well does not leave the collection\'s own read unguarded', async () => {
 			// The view is answered well; the collection's own read of the same block is then answered
-			// too old. Had the view's good answer retired the floor, that answer would be kept for good.
+			// too old. Had the view's good answer removed the floor, that answer would be kept for good.
 			const { net, reader, laggingRev } = await readerBehindOneWrite('view-retire')
 			net.lagAt = undefined
 			expect(await reader.readView(reader.snapshot()).get(1)).to.deep.equal(NEW)

@@ -777,11 +777,11 @@ describe('TransactorSource', () => {
 			expect(src.getReadDependencies(), 'the dependency is on what was actually observed').to.deep.equal([{ blockId, revision: 6 }])
 		})
 
-		it('allows keeping an answer that meets the floor, which retires it', async () => {
+		it('allows keeping an answer that meets the floor, and goes on judging the block', async () => {
 			const floors = flooredAt(7)
-			const src = new TransactorSource<IBlock>('coll', servingAt(7), pinnedAt(7), undefined, floors)
+			const src = new TransactorSource<IBlock>('coll', servingAt(7, 6), pinnedAt(7), undefined, floors)
 			expect(src.describeServed((await src.tryGet(blockId))!)).to.deep.equal({ rev: 7, mayRetain: true })
-			expect(floors.size).to.equal(0)
+			expect(src.describeServed((await src.tryGet(blockId))!), 'a too-old answer AFTER a good one').to.deep.equal({ rev: 6, mayRetain: false })
 		})
 
 		it('describes each block it returned by the answer THAT block came from', async () => {
