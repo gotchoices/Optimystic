@@ -16,11 +16,10 @@
  * fault) stays tolerated as local divergence, because there consensus is authoritative and the
  * pend may well have landed on the rest of the cohort.
  *
- * Separately, a promise-phase pending-conflict rejection (the cohort voted the pend down because
- * a rival's durable pending record holds the blocks) surfaces as a ValidatorRejectionError, and
- * `classifyPendingConflictRejection` converts it into a retryable conflict when a local re-read
- * confirms the rival — same conservative posture as the stale classifier: unconfirmed stays a
- * throw, and the signed reject text is never consulted.
+ * Separately, a promise-phase refusal because a rival's durable pending record holds the blocks
+ * surfaces as a BlocksHeldError — the cohort's signed `held` votes — and `answerBlocksHeld` returns
+ * it as a retryable conflict unconditionally, using a local re-read only to name the rivals. The
+ * signed refusal text is never consulted on either path.
  */
 
 import { expect } from 'chai';
@@ -33,7 +32,7 @@ import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { CoordinatorRepo, type ICoordinatorClusterSeam } from '../src/repo/coordinator-repo.js';
 import type { CohortResolution } from '../src/repo/cluster-coordinator.js';
-import { ValidatorRejectionError } from '../src/repo/cluster-coordinator.js';
+import { BlocksHeldError, ValidatorRejectionError } from '../src/repo/cluster-coordinator.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 
 const BLOCK = 'block-pend-divergence' as BlockId;
@@ -307,18 +306,30 @@ describe('CoordinatorRepo pend — retained storage verdict after cluster consen
 	});
 });
 
-describe('CoordinatorRepo pend — promise-phase pending-conflict rejection', () => {
-	const rejection = new ValidatorRejectionError(
-		'Transaction rejected by validators (3/3 rejected)',
-		{ 'peer-0': `pending conflict: block ${BLOCK} held by unresolved action(s) a-rival` }
+/**
+ * Ticket: a-contended-pend-refusal-is-permanent-on-a-small-cohort.
+ *
+ * A pend whose blocks are reserved by a rival's unresolved action no longer arrives as a
+ * `ValidatorRejectionError` at all: the refusing member answers with a signed `held` vote and the
+ * coordinator raises `BlocksHeldError`. The conversion here is therefore unconditional — the refusal
+ * IS the evidence — and the local re-read that used to gate it is now only an enricher.
+ *
+ * That demotion is the point of the change. Under delivery latency the refusing member is routinely
+ * ahead of the coordinator, so the corroboration missed, the rejection escaped as a throw, and a
+ * transient loss reached the writer as a permanent verdict.
+ */
+describe('CoordinatorRepo pend — blocks held by a rival unresolved action', () => {
+	const held = new BlocksHeldError(
+		'Pend blocks held: 3/3 member(s) hold an unresolved rival action (0/3 approvals)',
+		{ 'peer-0': 'a-rival' }
 	);
 
-	it('classifies the rejection as a conflict when local storage confirms a rival pending', async () => {
+	it('enriches the conflict with the rivals when local storage corroborates them', async () => {
 		const repo = makeRepo(
 			makeStorageRepo(async gets => Object.fromEntries(
 				gets.blockIds.map(id => [id, { state: { pendings: ['a-rival'] } }])
 			)),
-			{ throws: rejection }
+			{ throws: held }
 		);
 
 		const result = await repo.pend(REQUEST);
@@ -328,28 +339,49 @@ describe('CoordinatorRepo pend — promise-phase pending-conflict rejection', ()
 		expect((result as StaleFailure).pending).to.deep.equal([{ blockId: BLOCK, actionId: 'a-rival' }]);
 	});
 
-	it('does not count the request\'s own actionId as a rival', async () => {
-		// A redelivered pend for this same action must not confirm against itself; with no other
-		// pending the rejection stays a throw.
+	it('returns the conflict un-enriched when local storage cannot corroborate a rival', async () => {
+		// The shape that used to escape as a throw: only the remote members had applied the rival's
+		// pend. The vote is signed evidence, so retryability does not depend on this node's re-read —
+		// it just has no rival list to attach.
+		const repo = makeRepo(makeStorageRepo(emptyGet), { throws: held });
+
+		const result = await repo.pend(REQUEST);
+
+		expect(result.success).to.equal(false);
+		expect(isConflictFailure(result as StaleFailure)).to.equal(true);
+		expect((result as StaleFailure).pending, 'nothing corroborated, so nothing to attach').to.equal(undefined);
+		expect((result as StaleFailure).reason).to.equal(held.message);
+	});
+
+	it("does not count the request's own actionId as a rival", async () => {
+		// A redelivered pend for this same action must not corroborate against itself. Still a
+		// conflict — only the enrichment is withheld.
 		const repo = makeRepo(
 			makeStorageRepo(async gets => Object.fromEntries(
 				gets.blockIds.map(id => [id, { state: { pendings: [REQUEST.actionId] } }])
 			)),
-			{ throws: rejection }
+			{ throws: held }
 		);
 
-		try {
-			await repo.pend(REQUEST);
-			expect.fail('expected the rejection to propagate');
-		} catch (err) {
-			expect(err).to.equal(rejection);
-		}
+		const result = await repo.pend(REQUEST);
+
+		expect(isConflictFailure(result as StaleFailure)).to.equal(true);
+		expect((result as StaleFailure).pending).to.equal(undefined);
 	});
 
-	it('still throws when local storage cannot confirm any rival', async () => {
-		// Same conservative posture as the stale classifier: only the remote members saw the rival,
-		// so nothing is confirmed locally and fail-fast is preserved for genuine validation faults.
-		const repo = makeRepo(makeStorageRepo(emptyGet), { throws: rejection });
+	it('still throws a genuine validator rejection rather than retrying it forever', async () => {
+		// The distinction the whole change exists to preserve: a rejection is a permanent verdict and
+		// must not be softened just because this node happens to hold a pending record for the block.
+		const rejection = new ValidatorRejectionError(
+			'Transaction rejected by validators (3/3 rejected)',
+			{ 'peer-0': 'content-digest-mismatch' }
+		);
+		const repo = makeRepo(
+			makeStorageRepo(async gets => Object.fromEntries(
+				gets.blockIds.map(id => [id, { state: { pendings: ['a-rival'] } }])
+			)),
+			{ throws: rejection }
+		);
 
 		try {
 			await repo.pend(REQUEST);

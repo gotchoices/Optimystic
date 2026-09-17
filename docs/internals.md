@@ -1043,8 +1043,21 @@ saveMaterializedBlock(block): store(structuredClone(block));
   nobody judged the write invalid). `CoordinatorRepo.pend` returns it directly as a `StaleFailure`
   with `conflict: true` — no local re-read, because the loss is already proven by the votes and
   there is nothing local to confirm. `staleAt` stays **absent**: a rival *pend* holding the blocks
-  is not a revision claim, so there is no confirmed number to report. This is the one returned
-  rejection that is not a confirmed revision loss.
+  is not a revision claim, so there is no confirmed number to report.
+- **A pend queued behind a live reservation is returned too, on the same terms.** The other
+  transient refusal: the requested blocks are reserved by a *different* unresolved action in a
+  member's durable storage, which that member reports as a signed `held` vote naming the holder's
+  action id (`Signature.heldBy`). The coordinator raises `BlocksHeldError` — again never
+  `ValidatorRejectionError` — and `CoordinatorRepo.pend` returns it as a `StaleFailure` with
+  `conflict: true` *unconditionally*. Its local re-read is an **enricher, not a gate**: when this
+  node's own storage can corroborate the rivals they are attached as `StaleFailure.pending` and fed
+  to `CoordinatorRepo.noteStuckReservation`; when it cannot — the ordinary shape under delivery
+  latency, where the refusing member is ahead of the coordinator — the conflict is returned bare.
+  Gating on that re-read is what previously let a transient refusal escape as a permanent verdict on
+  a small cohort, where one non-approval already sinks super-majority. Together with the bullet above
+  these are the two returned refusals that are not confirmed revision losses; they are separate vote
+  kinds because each can name only what its own source holds (see
+  [correctness.md §Theorem 1](correctness.md#theorem-1-consensus-safety-no-conflicting-commits)).
 - **Pend retryability is an explicit field, not a payload shape.** `StaleFailure.conflict` says
   outright "this was a lost race, a re-read can win"; `isConflictFailure`
   ([`network/stale-failure.ts`](../packages/db-core/src/network/stale-failure.ts)) is the single

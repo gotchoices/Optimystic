@@ -92,6 +92,33 @@ export class ConflictRaceLostError extends Error {
 	}
 }
 
+/**
+ * The transaction's pend could not proceed because one or more members answered with a signed `held`
+ * vote: the requested blocks are reserved by a different unresolved action in that member's durable
+ * storage. Sibling of {@link ConflictRaceLostError} and retryable for the same reason — nobody judged
+ * this write invalid; it queued behind a reservation that disappears when the holder commits or
+ * cancels.
+ *
+ * The two are separate because they name different things. A conflict vote names the winning rival's
+ * `messageHash`, which the member holds whole; a held vote can only name the rival's **action id**,
+ * because it fires in the window where the rival has left the member's in-memory table but not yet its
+ * storage. `CoordinatorRepo.pend` converts this into a `StaleFailure` with `conflict: true` so the
+ * normal retry machinery (`isConflictFailure`) absorbs it, exactly as it does a lost race.
+ *
+ * Only a PEND record can produce it: `held` votes come from `ClusterMember.validatePendOperations`,
+ * which inspects pend operations only, so `CoordinatorRepo.commit` never meets one.
+ */
+export class BlocksHeldError extends Error {
+	constructor(
+		message: string,
+		/** peerId → actionId of the unresolved action that member's storage says holds the blocks. */
+		readonly heldBy: Record<string, string>
+	) {
+		super(message);
+		this.name = 'BlocksHeldError';
+	}
+}
+
 /** Cancel handle for an injected timer; cancels a not-yet-fired timer (safe no-op after fire/cancel). */
 export type TimerCancel = () => void;
 
@@ -561,18 +588,24 @@ export class ClusterCoordinator {
 		const promised = await this.collectPromises(peers, record);
 		const superMajority = Math.ceil(peerCount * this.cfg.superMajorityThreshold);
 
-		// Count approvals, rejections and conflict votes separately. A `conflict` vote is a member
-		// saying "not now — I hold the race winner": it must count toward NEITHER approvals NOR
-		// rejections, or a lost race would masquerade as a validator rejection (permanent) or as
-		// silence (indistinguishable from an unreachable cohort) — both wrong.
+		// Count approvals, rejections and the two RETRYABLE refusals separately. A `conflict` vote is a
+		// member saying "not now — I hold the race winner"; a `held` vote is a member saying "not now —
+		// a different unresolved action holds these blocks in my storage". Neither may count toward
+		// approvals OR rejections, or a transient refusal would masquerade as a validator rejection
+		// (permanent) or as silence (indistinguishable from an unreachable cohort) — both wrong.
 		const promises = promised.record.promises;
 		const approvalCount = Object.values(promises).filter(sig => sig.type === 'approve').length;
 		const rejectionCount = Object.values(promises).filter(sig => sig.type === 'reject').length;
 		const conflictCount = Object.values(promises).filter(sig => sig.type === 'conflict').length;
+		const heldCount = Object.values(promises).filter(sig => sig.type === 'held').length;
 
 		// Check if rejections make super-majority impossible
 		// If more than (peerCount - superMajority) nodes reject, we can never reach super-majority
 		const maxAllowedRejections = peerCount - superMajority;
+		// Whether the merged record itself PROVES super-majority unreachable — the same sum a member
+		// re-derives as `ConflictSuperseded`/`Rejected` from the signed votes, which is what makes an
+		// abandonment broadcast proof-carrying rather than an unauthenticated "forget this".
+		const refusalsProveUnreachable = rejectionCount + conflictCount + heldCount > maxAllowedRejections;
 		if (rejectionCount > maxAllowedRejections) {
 			const rejectReasonsByPeer = Object.fromEntries(Object.entries(promises)
 				.flatMap(([peerId, sig]) => sig.type === 'reject' ? [[peerId, sig.rejectReason ?? 'unknown'] as const] : []));
@@ -619,12 +652,37 @@ export class ClusterCoordinator {
 			// super-majority (members re-derive ConflictSuperseded/Rejected from the signed votes and
 			// clear their reservations immediately). Below that bar the record proves nothing and a
 			// broadcast would be the unauthenticated "forget this" the shortfall NOTE below refuses.
-			if (rejectionCount + conflictCount > maxAllowedRejections) {
+			if (refusalsProveUnreachable) {
 				this.broadcastAbandonment(promised.record, 'conflict-race-lost');
 			}
 			throw new ConflictRaceLostError(
 				`Conflict race lost: ${conflictCount}/${peerCount} member(s) hold a conflicting winner (${approvalCount}/${superMajority} approvals)`,
 				conflicts);
+		}
+
+		// A `held`-answered shortfall is the OTHER retryable refusal: the pend queued behind a rival's
+		// unresolved reservation. Checked after the conflict branch so a lost race still wins when both
+		// answer — a conflict vote names the winning transaction's messageHash, which is strictly more
+		// actionable than an action id — and, like it, before the generic shortfall, which must stay
+		// reserved for the genuinely-silent cohort.
+		if (heldCount > 0 && approvalCount < superMajority) {
+			const heldBy = Object.fromEntries(Object.entries(promises)
+				.flatMap(([peerId, sig]) => sig.type === 'held' ? [[peerId, sig.heldBy] as const] : []));
+			log('cluster-tx:pend-blocks-held', {
+				messageHash: record.messageHash,
+				peerCount,
+				approvals: approvalCount,
+				rejections: rejectionCount,
+				heldBy,
+				superMajority
+			});
+			this.updateTransactionRecord(promised.record, 'pend-blocks-held');
+			if (refusalsProveUnreachable) {
+				this.broadcastAbandonment(promised.record, 'pend-blocks-held');
+			}
+			throw new BlocksHeldError(
+				`Pend blocks held: ${heldCount}/${peerCount} member(s) hold an unresolved rival action (${approvalCount}/${superMajority} approvals)`,
+				heldBy);
 		}
 
 		if (peerCount > 1 && approvalCount < superMajority) {
@@ -645,7 +703,8 @@ export class ClusterCoordinator {
 			// their own staleness sweep instead.
 			// NOTE: the message below is load-bearing wire text — the consuming repo
 			// (sereus cadre-core control-write-retry) matches it verbatim to retry a genuinely-silent
-			// cohort. Keep it byte-identical, and never fold conflict votes into its rejection count.
+			// cohort. Keep it byte-identical, and never fold `conflict` or `held` votes into its
+			// rejection count.
 			throw new Error(`Failed to get super-majority: ${approvalCount}/${peerCount} approvals (needed ${superMajority}, ${rejectionCount} rejections)`);
 		}
 

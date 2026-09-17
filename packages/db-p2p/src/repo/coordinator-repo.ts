@@ -1,6 +1,6 @@
 import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
 import { LruMap, blockIdsForTransforms, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability } from "@optimystic/db-core";
-import { ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
+import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { FretService } from "p2p-fret";
@@ -2213,8 +2213,10 @@ export class CoordinatorRepo implements IRepo {
 			if (error instanceof ConflictRaceLostError) {
 				return { success: false, conflict: true, reason: error.message };
 			}
-			const stale = await this.classifyStaleRejection(error, request, allBlockIds)
-				?? await this.classifyPendingConflictRejection(error, request, allBlockIds);
+			if (error instanceof BlocksHeldError) {
+				return await this.answerBlocksHeld(error, request, allBlockIds);
+			}
+			const stale = await this.classifyStaleRejection(error, request, allBlockIds);
 			if (stale) return stale;
 			throw error;
 		}
@@ -2321,48 +2323,50 @@ export class CoordinatorRepo implements IRepo {
 			};
 		}
 		// NOTE: conservative — when only remote members saw the newer revision (local storage still
-		// behind), staleness can't be confirmed locally and the rejection stays a throw. If that
-		// shows up in practice, extend confirmation with a quorum read; never trust the reject text.
-		// `staleAt` is absent on this path for the same reason, and deliberately so — there is no
-		// confirmed number to report, and the field's contract forbids inferring one from that text.
+		// behind), staleness can't be confirmed locally and the rejection stays a throw. That revisit
+		// condition HAS now tripped, for this method's former sibling: the pending-conflict refusal hit
+		// exactly this window under delivery latency (the refusing member ahead of the coordinator) and
+		// escaped as a permanent-looking throw. Its cure was not the quorum read suggested here but a
+		// signed `held` vote — the member's own refusal, carried as evidence, so retryability stopped
+		// depending on a local re-read at all (see {@link answerBlocksHeld}).
+		//
+		// The stale arm is deliberately LEFT on local corroboration. Its refusal is a revision claim,
+		// and `staleAt` — the only place a losing writer learns the revision it lost to — can only be
+		// reported from a revision this node read itself. Moving it to a non-counting vote would take
+		// that number away, so it is its own ticket, not a rider on this one. Never trust the reject
+		// text; `staleAt` is absent on the unconfirmed path for the same reason, and deliberately so.
 		return undefined;
 	}
 
 	/**
-	 * Sibling of {@link classifyStaleRejection} for the OTHER optimistic-concurrency refusal shape:
-	 * the promise-phase pending-conflict vote (`validatePendOperations` rejecting a pend whose
-	 * blocks are held by a different unresolved pending action). That vote surfaces here as a
-	 * {@link ValidatorRejectionError}, and without classification it would escape as a throw —
-	 * splitting multi-tree pends mid-batch instead of taking the retry path a lost race deserves.
+	 * Answer a pend the cohort refused with signed `held` votes: the blocks are reserved by a different
+	 * unresolved action on one or more members ({@link BlocksHeldError}). Always a retryable
+	 * {@link StaleFailure} with `conflict: true`, so the caller's normal retry path
+	 * (`Collection.sync`, and the multi-collection pendPhase via `isConflictFailure`) absorbs it
+	 * instead of a thrown error escaping mid-batch and splitting multi-tree pends.
 	 *
-	 * Same confirmation discipline as the stale classifier: purely local. Re-read the affected
-	 * blocks from our own storage and require some block's `state.pendings` to carry a rival
-	 * actionId; the signed reject text is never consulted. A confirmed rival returns a
-	 * {@link StaleFailure} with `conflict: true` and the rivals as `pending` (`ActionPending`
-	 * without `transform` — the type allows it, and no consumer rebases from it). Unconfirmed —
-	 * including read errors during confirmation — stays a throw, preserving fail-fast for genuine
-	 * validation faults. Checked after `classifyStaleRejection` so a confirmed committed loss
-	 * (which carries the sharper `staleAt`) wins when both hold.
+	 * The local re-read is an ENRICHER, not a gate. It used to be the gate — this refusal arrived as a
+	 * `ValidatorRejectionError` and was only converted when the coordinator's own storage corroborated
+	 * the rival — and under latency the refusing member is routinely ahead of the coordinator, so the
+	 * corroboration missed and a transient refusal escaped as a permanent-looking throw. The `held`
+	 * vote is already signed evidence from the member that holds the rival, so retryability no longer
+	 * depends on a local re-read at all. What the re-read still buys, when it succeeds, is the concrete
+	 * rival list for {@link StaleFailure.pending} and the input {@link noteStuckReservation} needs to
+	 * name a block wedged behind a reservation that will never clear.
 	 */
-	private async classifyPendingConflictRejection(error: unknown, request: PendRequest, blockIds: BlockId[]): Promise<StaleFailure | undefined> {
-		if (!(error instanceof ValidatorRejectionError)) return undefined;
-		let results: GetBlockResults;
-		try {
-			results = await this.storageRepo.get({ blockIds });
-		} catch (readError) {
-			this.log('coordinator-repo:pend-conflict-classify-read-error', {
+	private async answerBlocksHeld(error: BlocksHeldError, request: PendRequest, blockIds: BlockId[]): Promise<StaleFailure> {
+		const pending = await this.corroborateHeldBlocks(request, blockIds);
+		if (pending.length === 0) {
+			// The member that refused is ahead of us — the normal shape under latency. Still a conflict:
+			// the refusal is signed, and the un-enriched answer is exactly the shape the lost-race arm
+			// returns. `noteStuckReservation` is deliberately not fed here; it counts refusals whose
+			// holder THIS node can name, and a guess would poison its holder comparison.
+			this.log('coordinator-repo:pend-held-uncorroborated', {
 				actionId: request.actionId,
-				error: (readError as Error).message
+				heldBy: error.heldBy
 			});
-			return undefined;
+			return { success: false, conflict: true, reason: error.message };
 		}
-		const pending: ActionPending[] = [];
-		for (const blockId of blockIds) {
-			for (const actionId of results[blockId]?.state?.pendings ?? []) {
-				if (actionId !== request.actionId) pending.push({ blockId, actionId });
-			}
-		}
-		if (pending.length === 0) return undefined;
 		// Counted as its own statement, never inside the log payload below: this call is the detection
 		// mechanism, not a formatting step, and payload expressions in this repo are fair game to wrap
 		// in an `enabled` gate (`Collection.advanceContext` does exactly that). A gate added there
@@ -2385,6 +2389,34 @@ export class CoordinatorRepo implements IRepo {
 			pending,
 			reason: `pending conflict: block(s) held by unresolved rival action(s) ${[...new Set(pending.map(p => p.actionId))].join(', ')}`
 		};
+	}
+
+	/**
+	 * The rival unresolved actions THIS node's own storage says hold `blockIds`, excluding the request's
+	 * own action (a redelivered pend must not corroborate against itself). Empty when nothing is found
+	 * — including when the read itself fails, which is reported and then treated as "nothing to add",
+	 * since the caller's answer does not depend on it.
+	 *
+	 * Carries no `transform`, which {@link ActionPending} allows and no consumer rebases from.
+	 */
+	private async corroborateHeldBlocks(request: PendRequest, blockIds: BlockId[]): Promise<ActionPending[]> {
+		let results: GetBlockResults;
+		try {
+			results = await this.storageRepo.get({ blockIds });
+		} catch (readError) {
+			this.log('coordinator-repo:pend-conflict-classify-read-error', {
+				actionId: request.actionId,
+				error: (readError as Error).message
+			});
+			return [];
+		}
+		const pending: ActionPending[] = [];
+		for (const blockId of blockIds) {
+			for (const actionId of results[blockId]?.state?.pendings ?? []) {
+				if (actionId !== request.actionId) pending.push({ blockId, actionId });
+			}
+		}
+		return pending;
 	}
 
 	/**
@@ -2419,8 +2451,8 @@ export class CoordinatorRepo implements IRepo {
 	 * classification line to carry; it saturates at the threshold once an episode has been reported,
 	 * since the ids are dropped at that point.
 	 *
-	 * NOTE: fed only by {@link classifyPendingConflictRejection}, i.e. by refusals that arrive as a
-	 * cohort-wide validator rejection. A block only PART of whose cohort holds the stranded record can
+	 * NOTE: fed only by {@link answerBlocksHeld}, i.e. by cohort-wide `held`-answered refusals that this
+	 * node's own storage can corroborate. A block only PART of whose cohort holds the stranded record can
 	 * still reach approval super-majority, and its refusal then comes back through the retained local
 	 * apply verdict (`getExecutedPendResult`) instead, which this never sees — so a partially wedged
 	 * block goes unnamed. That is the weaker condition (the write does land on the healthy members),

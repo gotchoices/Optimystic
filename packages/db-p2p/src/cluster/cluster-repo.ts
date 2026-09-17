@@ -70,6 +70,45 @@ type VerifyOutcome =
 	| { valid: false; penalize: boolean };
 
 /**
+ * This member's promise-round decision on a record: approve, or one of two *different kinds* of no.
+ *
+ * The distinction is the whole reason the type exists. `invalid` is a validity judgement — the record
+ * is wrong and will be wrong on every retry — and becomes a `reject` vote the coordinator counts
+ * toward the permanent-rejection threshold. `held` is "not right now": the pend's blocks are reserved
+ * by a different unresolved action in this member's storage, a condition that disappears the moment
+ * that rival commits or cancels, and it becomes a `held` vote counted toward neither approvals nor
+ * rejections.
+ *
+ * A boolean plus prose cannot carry that difference, and collapsing the two was a real defect rather
+ * than a tidiness question: on a cohort of three or fewer members `maxAllowedRejections` is zero at
+ * the default threshold, so one member saying "someone else is holding this right now" became a
+ * permanent `ValidatorRejectionError` for the whole transaction.
+ *
+ * `reason` stays optional on the `invalid` arm because it is signed: it is folded into the vote
+ * payload verbatim, and an absent reason and an empty one must keep producing the bytes they do today.
+ */
+type PromiseVerdict =
+	| { valid: true }
+	| { valid: false; kind: 'invalid'; reason?: string }
+	/** `heldBy` is the rival's ACTION id (storage's pending list), never a messageHash — see {@link Signature}. */
+	| { valid: false; kind: 'held'; reason: string; heldBy: ActionId };
+
+/** A refusal that judges the record invalid — the permanent kind, and every kind but the pending-conflict one. */
+function invalidVerdict(reason?: string): PromiseVerdict {
+	return { valid: false, kind: 'invalid', reason };
+}
+
+/**
+ * Widen a boolean-plus-prose check into a {@link PromiseVerdict}. Every check written this way judges
+ * validity, so its refusal is the permanent kind; only the pending-conflict branch of
+ * {@link ClusterMember.validatePendOperations} produces the transient one, and it builds its verdict
+ * directly.
+ */
+function verdictOf(result: { valid: boolean; reason?: string }): PromiseVerdict {
+	return result.valid ? { valid: true } : invalidVerdict(result.reason);
+}
+
+/**
  * Actively reconciles a block this member committed without having seen the matching
  * pend (cohort drift between the independent pend and commit cluster-transactions).
  * Pulls the committed revision from a cohort peer that holds it and restores it into
@@ -602,6 +641,15 @@ export class ClusterMember implements ICluster {
 					});
 					// Our own vote can be terminal (a reject where maxAllowedRejections is 0) or complete
 					// the super-majority — recompute rather than guess which.
+					//
+					// Deliberately NOT the conflict vote's `shouldPersist = false`, for a `held` vote or
+					// any other. A conflict vote clears the record because this member holds the WINNER
+					// in `activeTransactions` and persisting the loser would reserve the same blocks a
+					// second time. A `held` vote has no such twin: the rival lives in durable storage,
+					// not in that table, so this record's entry is the only one and dropping it would
+					// only make this member forget a transaction the rest of the cohort may still
+					// carry to super-majority. Where one `held` vote IS terminal (a small cohort), the
+					// recomputed phase is `ConflictSuperseded`, which clears the record anyway.
 					continue;
 				case TransactionPhase.OurConflictVoteNeeded:
 					currentRecord = await this.handleConflictVoteNeeded(currentRecord, phaseResult.conflictsWith);
@@ -1005,19 +1053,21 @@ export class ClusterMember implements ICluster {
 		const maxAllowedRejections = peerCount - superMajority;
 
 		// Check for rejections — rejected if too many rejections to ever reach super-majority.
-		// ONLY `reject` votes count here: a `conflict` vote is "not now", never a validity
-		// judgement, so it must not push a record into the permanent `Rejected` phase.
+		// ONLY `reject` votes count here: `conflict` and `held` both mean "not now", never a validity
+		// judgement, so neither may push a record into the permanent `Rejected` phase.
 		const rejectedPromises = Object.values(record.promises).filter(s => s.type === 'reject');
-		const conflictPromises = Object.values(record.promises).filter(s => s.type === 'conflict');
+		const retryableRefusals = Object.values(record.promises).filter(s => s.type === 'conflict' || s.type === 'held');
 		const rejectedCommits = Object.values(record.commits).filter(s => s.type === 'reject');
 		if (rejectedPromises.length > maxAllowedRejections || this.hasMajority(rejectedCommits.length, peerCount)) {
 			return { phase: TransactionPhase.Rejected };
 		}
 
-		// Conflict votes don't judge validity, but enough of them still make super-majority
+		// Retryable refusals don't judge validity, but enough of them still make super-majority
 		// unreachable — a distinct terminal outcome (retryable as a fresh transaction) so logs and
-		// reputation-adjacent paths keep meaning what they say.
-		if (conflictPromises.length > 0 && rejectedPromises.length + conflictPromises.length > maxAllowedRejections) {
+		// reputation-adjacent paths keep meaning what they say. `held` joins `conflict` here for the
+		// same reason `conflict` clears its record: a member that keeps reserving the blocks of a
+		// transaction that provably cannot win holds them against the very retry meant to win.
+		if (retryableRefusals.length > 0 && rejectedPromises.length + retryableRefusals.length > maxAllowedRejections) {
 			return { phase: TransactionPhase.ConflictSuperseded };
 		}
 
@@ -1087,21 +1137,14 @@ export class ClusterMember implements ICluster {
 		// peer set is a legitimate cluster it belongs to, and refuses (reject vote) rather than rubber-stamping
 		// a set the coordinator chose (e.g. a self-shrunk minority-partition set). On admission failure we skip
 		// pend validation entirely and emit the membership rejection.
-		const validationResult = await this.evaluatePromise(record);
+		const verdict = await this.evaluatePromise(record);
 
-		const promiseHash = await this.computePromiseHash(record);
-		const type = validationResult.valid ? 'approve' as const : 'reject' as const;
-		const rejectReason = validationResult.valid ? undefined : validationResult.reason;
-		const sig = await this.signVote(promiseHash, type, rejectReason);
-
-		const signature: Signature = validationResult.valid
-			? { type: 'approve', signature: sig }
-			: { type: 'reject', signature: sig, rejectReason };
-
-		if (!validationResult.valid) {
-			log('cluster-member:validation-rejected', {
+		if (!verdict.valid) {
+			// Two tags, because the two refusals are two different events for an operator: one says the
+			// cohort judged a write invalid, the other says a write queued behind a live reservation.
+			log(verdict.kind === 'held' ? 'cluster-member:validation-held' : 'cluster-member:validation-rejected', {
 				messageHash: record.messageHash,
-				reason: validationResult.reason
+				reason: verdict.reason
 			});
 		}
 
@@ -1109,9 +1152,26 @@ export class ClusterMember implements ICluster {
 			...record,
 			promises: {
 				...record.promises,
-				[this.peerId.toString()]: signature
+				[this.peerId.toString()]: await this.signPromiseVerdict(await this.computePromiseHash(record), verdict)
 			}
 		};
+	}
+
+	/**
+	 * Turn a {@link PromiseVerdict} into this member's signed promise vote — one vote kind per refusal
+	 * kind. The single place the mapping lives, so a new refusal kind cannot reach the wire as the
+	 * wrong vote: the coordinator's thresholds read only `Signature.type`, and until `held` existed the
+	 * transient refusal had nowhere to go but `reject`.
+	 */
+	private async signPromiseVerdict(promiseHash: string, verdict: PromiseVerdict): Promise<Signature> {
+		if (verdict.valid) {
+			return { type: 'approve', signature: await this.signVote(promiseHash, 'approve') };
+		}
+		if (verdict.kind === 'held') {
+			return { type: 'held', signature: await this.signVote(promiseHash, 'held', verdict.heldBy), heldBy: verdict.heldBy };
+		}
+		const rejectReason = verdict.reason;
+		return { type: 'reject', signature: await this.signVote(promiseHash, 'reject', rejectReason), rejectReason };
 	}
 
 	/**
@@ -1143,17 +1203,19 @@ export class ClusterMember implements ICluster {
 
 	/**
 	 * The full promise-phase decision for a record: admit the declared membership FIRST, then (only if
-	 * admitted) validate its pend operations, then its commit operations. Failing any yields a
-	 * `{ valid:false, reason }` the caller turns into a `reject` vote. Keeping the three separate keeps
+	 * admitted) validate its pend operations, then its commit operations. Failing any yields a refusal
+	 * the caller turns into a vote — a `reject` for every validity judgement here, and a `held` for the
+	 * one transient refusal {@link validatePendOperations} can make (see {@link PromiseVerdict}).
+	 * Keeping the checks separate keeps
 	 * the reason strings distinct — a `membership-not-admitted` reject is a different signal (feeds the
 	 * dispute path) than a stale-revision / custom-validator reject, which is different again from a
 	 * `content-digest-mismatch` (see {@link validateCommitOperations}). A record carries pend OR commit
 	 * operations, so in practice exactly one of the latter two has anything to inspect.
 	 */
-	private async evaluatePromise(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
+	private async evaluatePromise(record: ClusterRecord): Promise<PromiseVerdict> {
 		const admission = await this.admitMembership(record);
 		if (!admission.admit) {
-			return { valid: false, reason: admission.reason ?? MEMBERSHIP_NOT_ADMITTED };
+			return invalidVerdict(admission.reason ?? MEMBERSHIP_NOT_ADMITTED);
 		}
 		const pendValidation = await this.validatePendOperations(record);
 		if (!pendValidation.valid) {
@@ -1165,7 +1227,7 @@ export class ClusterMember implements ICluster {
 		// declared one).
 		const commitRevValidation = await this.validateCommitRevisions(record);
 		if (!commitRevValidation.valid) {
-			return commitRevValidation;
+			return verdictOf(commitRevValidation);
 		}
 		// Then our own refusal history: a commit whose pend THIS member refused, where local state
 		// still corroborates the refusal. Runs after the revision check because that one is sharper
@@ -1173,9 +1235,9 @@ export class ClusterMember implements ICluster {
 		// applied here; this arm covers the window where it has not.
 		const refusedPendValidation = await this.validateCommitAgainstRefusedPend(record);
 		if (!refusedPendValidation.valid) {
-			return refusedPendValidation;
+			return verdictOf(refusedPendValidation);
 		}
-		return await this.validateCommitOperations(record);
+		return verdictOf(await this.validateCommitOperations(record));
 	}
 
 	/**
@@ -1476,8 +1538,11 @@ export class ClusterMember implements ICluster {
 	 * Also checks for stale revisions, and for blocks held by a different unresolved pending
 	 * action, to prevent consensus on operations that storage would refuse at apply.
 	 * Returns success if no validator is configured (backwards compatibility).
+	 *
+	 * Every refusal here is a validity judgement EXCEPT the pending-conflict one, which is transient by
+	 * construction and returns the `held` kind — see {@link PromiseVerdict}.
 	 */
-	private async validatePendOperations(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
+	private async validatePendOperations(record: ClusterRecord): Promise<PromiseVerdict> {
 		// Find pend operations in the message
 		for (const operation of record.message.operations) {
 			if ('pend' in operation) {
@@ -1503,7 +1568,7 @@ export class ClusterMember implements ICluster {
 								blockId,
 								reason: blockResult.unavailable
 							});
-							return { valid: false, reason: `block ${blockId} unavailable (${blockResult.unavailable}): cannot verify revision` };
+							return invalidVerdict(`block ${blockId} unavailable (${blockResult.unavailable}): cannot verify revision`);
 						}
 						const latest = blockResult?.state?.latest;
 						if (latest !== undefined && latest.rev >= pendRequest.rev) {
@@ -1526,20 +1591,20 @@ export class ClusterMember implements ICluster {
 							// is NOT a StaleFailure producer, so StaleFailure.staleAt does not apply; the
 							// coordinator's own local re-read (CoordinatorRepo.classifyStaleRejection)
 							// supplies that number when it can confirm the revision itself.
-							return { valid: false, reason: `stale revision: block ${blockId} at rev ${latest.rev}, requested rev ${pendRequest.rev}` };
+							return invalidVerdict(`stale revision: block ${blockId} at rev ${latest.rev}, requested rev ${pendRequest.rev}`);
 						}
 					}
 				}
 
-				// Reject a pend whose blocks are held by a DIFFERENT unresolved pending action. This is
+				// Refuse a pend whose blocks are held by a DIFFERENT unresolved pending action. This is
 				// the durable reservation the in-memory table (`findConflict` / `activeTransactions`)
 				// cannot provide: that table clears the moment the rival's PEND record reaches
 				// consensus, but the rival's storage pending record — written at pend-apply, removed at
 				// commit or cancel — spans exactly the pend→commit window in which `latest.rev` has not
 				// yet advanced. Storage's own pend would refuse this request at consensus-apply for the
-				// same reason (`StorageRepo.pend`'s listPendingTransactions scan); voting reject here
-				// moves that verdict into the phase where the cohort aggregates it, so the loser is
-				// refused with a real answer instead of burning a consensus round it cannot win. A
+				// same reason (`StorageRepo.pend`'s listPendingTransactions scan); voting here moves
+				// that verdict into the phase where the cohort aggregates it, so the loser is refused
+				// with a real answer instead of burning a consensus round it cannot win. A
 				// member that has not yet applied the rival's pend has no record and simply abstains
 				// from this reason; the apply-time verdict catches that residual — retained locally
 				// (getExecutedPendResult) for the coordinating node's own member, and returned to the
@@ -1547,28 +1612,29 @@ export class ClusterMember implements ICluster {
 				// member. Self is excluded so a redelivered pend
 				// for this same action stays approvable. An unavailable block carries no `pendings` and
 				// abstains (the rev branch above already fail-closes when a revision claim is at stake).
-				// Reason stays plain prose: it is fed to computeSigningPayload and carried as
-				// Signature.rejectReason, exactly like the stale-revision reason above.
 				//
-				// NOTE: this is a *reject* vote for a condition that is purely transient, and the
-				// coordinator counts every reject alike. On a cohort of three or fewer members
-				// `maxAllowedRejections` is zero at the default threshold, so this one vote becomes a
-				// permanent `ValidatorRejectionError` — exactly the "lost race masquerading as a
-				// validator rejection" that `ClusterCoordinator`'s vote-counting comment says must not
-				// happen. Measured on a two-member mesh under concurrent writes; see
-				// the ticket `a-contended-pend-refusal-is-permanent-on-a-small-cohort` for the reproducer
-				// and for why neither candidate fix is a one-liner. (Named by slug, not by stage folder:
-				// it has already moved once, from `backlog/` to `fix/`.)
+				// This is the ONE refusal in this method that is not a validity judgement: the rival's
+				// reservation is removed the moment it commits or cancels, so the very same pend
+				// succeeds on retry. It therefore returns the `held` kind, which becomes a `held` vote
+				// the coordinator counts toward neither approvals nor rejections. `heldBy` carries the
+				// first rival as signed structured data; the prose reason names the same one, and stays
+				// prose because it is fed to computeSigningPayload exactly like the reasons above.
 				for (const blockId of blockIds) {
 					const rivals = (blockResults[blockId]?.state?.pendings ?? []).filter(actionId => actionId !== pendRequest.actionId);
-					if (rivals.length > 0) {
+					const heldBy = rivals[0];
+					if (heldBy !== undefined) {
 						log('cluster-member:validation-pending-conflict', {
 							messageHash: record.messageHash,
 							blockId,
 							actionId: pendRequest.actionId,
 							rivals
 						});
-						return { valid: false, reason: `pending conflict: block ${blockId} held by unresolved action(s) ${rivals.join(', ')}` };
+						return {
+							valid: false,
+							kind: 'held',
+							heldBy,
+							reason: `pending conflict: block ${blockId} held by unresolved action(s) ${rivals.join(', ')}`
+						};
 					}
 				}
 
@@ -1596,7 +1662,7 @@ export class ClusterMember implements ICluster {
 						})
 				);
 				if (!validation.valid) {
-					return { valid: false, reason: validation.reason };
+					return invalidVerdict(validation.reason);
 				}
 			}
 		}

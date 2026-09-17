@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError } from '../src/repo/cluster-coordinator.js';
+import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError } from '../src/repo/cluster-coordinator.js';
 import type { ClusterRecord, ClusterPeers, IKeyNetwork, RepoMessage, ClusterConsensusConfig, BlockId, Signature } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
@@ -193,21 +193,30 @@ class RecordingClusterClient {
 	}
 }
 
+/** What one mock member answers a promise request with. */
+type Answer = 'approve' | 'reject' | 'conflict' | 'held' | 'silent';
+
+/** The rival action id every `held` mock names, mirroring storage's pending list. */
+const HELD_BY_MOCK = 'a-rival-mock';
+
 /**
- * Behaviour split for a promise-phase shortfall (2-member-must-answer-a-lost-conflict-race):
+ * Behaviour split for a promise-phase shortfall (2-member-must-answer-a-lost-conflict-race, then
+ * a-contended-pend-refusal-is-permanent-on-a-small-cohort):
  *
  * - `conflict` votes present → `ConflictRaceLostError` (a retryable optimistic-concurrency loss,
  *   never `ValidatorRejectionError`), with the conflicting peers and winning hashes as data;
+ * - `held` votes present → `BlocksHeldError`, the other retryable refusal, with the holding action
+ *   ids as data — also never `ValidatorRejectionError`;
  * - no votes at all (genuinely-silent cohort) → the legacy shortfall error whose message must stay
  *   BYTE-IDENTICAL: the consuming repo (sereus cadre-core control-write-retry) matches that exact
- *   text to retry, and conflict votes must never inflate its `rejections` number.
+ *   text to retry, and neither retryable refusal may inflate its `rejections` number.
  */
 class ConflictAnsweringClient {
 	readonly received: ClusterRecord[] = [];
 
 	constructor(
 		private readonly peerIdStr: string,
-		private readonly verdict: 'approve' | 'reject' | 'conflict' | 'silent',
+		private readonly verdict: Answer,
 		private readonly winnerHash = 'winner-hash-mock'
 	) { }
 
@@ -218,9 +227,11 @@ class ConflictAnsweringClient {
 			const signature = `psig-${this.peerIdStr.substring(0, 8)}`;
 			const sig: Signature = this.verdict === 'conflict'
 				? { type: 'conflict', signature, conflictWith: this.winnerHash }
-				: this.verdict === 'reject'
-					? { type: 'reject', signature, rejectReason: 'invalid transform' }
-					: { type: 'approve', signature };
+				: this.verdict === 'held'
+					? { type: 'held', signature, heldBy: HELD_BY_MOCK }
+					: this.verdict === 'reject'
+						? { type: 'reject', signature, rejectReason: 'invalid transform' }
+						: { type: 'approve', signature };
 			return { ...record, promises: { ...record.promises, [this.peerIdStr]: sig } };
 		}
 		// Commit phase: every member that already voted signs the commit the cohort decided on —
@@ -251,7 +262,7 @@ describe('ClusterCoordinator lost conflict race (2-member-must-answer-a-lost-con
 	});
 
 	const makeCoordinator = (
-		verdicts: ('approve' | 'reject' | 'conflict' | 'silent')[],
+		verdicts: Answer[],
 		superMajorityThreshold = 0.75
 	): { coordinator: ClusterCoordinator; mocks: ConflictAnsweringClient[] } => {
 		const mocks = peerIds.map((pid, idx) => new ConflictAnsweringClient(pid.toString(), verdicts[idx]!));
@@ -345,6 +356,135 @@ describe('ClusterCoordinator lost conflict race (2-member-must-answer-a-lost-con
 
 		const { record } = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
 		expect(Object.values(record.promises).filter(s => s.type === 'conflict').length).to.equal(1);
+		expect(Object.keys(record.commits).length, 'the cohort committed').to.be.greaterThan(1);
+	});
+});
+
+describe('ClusterCoordinator blocks held by a rival action (a-contended-pend-refusal-is-permanent-on-a-small-cohort)', function () {
+	this.timeout(10000);
+
+	/**
+	 * A TWO-member cohort at 0.67 is the shape the defect was measured on: superMajority is
+	 * `ceil(2 * 0.67) = 2`, so `maxAllowedRejections` is ZERO and a single member's refusal settles the
+	 * transaction. When that refusal was a `reject` vote, "someone else is holding these blocks right
+	 * now" — a condition that clears the moment the holder commits or cancels — reached the writer as
+	 * `ValidatorRejectionError`, the answer reserved for a write that is invalid on every retry.
+	 */
+	const TwoMemberThreshold = 0.67;
+
+	let peerIds: PeerId[];
+	let clusterPeers: ClusterPeers;
+
+	const setUpPeers = async (count: number): Promise<void> => {
+		peerIds = await Promise.all(Array.from({ length: count }, makePeerId));
+		clusterPeers = {};
+		for (const pid of peerIds) {
+			clusterPeers[pid.toString()] = {
+				multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+				publicKey: u8ToString(pid.publicKey!.raw, 'base64url')
+			};
+		}
+	};
+
+	const makeCoordinator = (
+		verdicts: Answer[],
+		superMajorityThreshold: number
+	): { coordinator: ClusterCoordinator; mocks: ConflictAnsweringClient[] } => {
+		const mocks = peerIds.map((pid, idx) => new ConflictAnsweringClient(pid.toString(), verdicts[idx]!));
+		const byId = new Map(peerIds.map((pid, idx) => [pid.toString(), mocks[idx]!]));
+		const mockKeyNetwork: IKeyNetwork = {
+			async findCoordinator() { return peerIds[0]!; },
+			async findCluster() { return { ...clusterPeers }; }
+		};
+		const createClient = (peerId: PeerId) => {
+			const mock = byId.get(peerId.toString());
+			if (!mock) throw new Error(`No mock for ${peerId.toString()}`);
+			return mock;
+		};
+		const coordinator = new ClusterCoordinator(mockKeyNetwork, createClient as any, { ...baseCfg, superMajorityThreshold });
+		return { coordinator, mocks };
+	};
+
+	const runAndCatch = async (coordinator: ClusterCoordinator): Promise<unknown> => {
+		try {
+			await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+			return undefined;
+		} catch (err) {
+			return err;
+		}
+	};
+
+	it('answers one held vote on a two-member cohort with a retryable error, never a validator rejection', async () => {
+		await setUpPeers(2);
+		const { coordinator } = makeCoordinator(['approve', 'held'], TwoMemberThreshold);
+
+		const caught = await runAndCatch(coordinator);
+
+		expect(caught, 'a held pend must be its own outcome').to.be.instanceOf(BlocksHeldError);
+		expect(caught, 'and must never be the permanent verdict').to.not.be.instanceOf(ValidatorRejectionError);
+		// The holding action rides as structured data from the signed vote, never parsed from prose.
+		expect(Object.values((caught as BlocksHeldError).heldBy)).to.deep.equal([HELD_BY_MOCK]);
+		expect(Object.keys((caught as BlocksHeldError).heldBy)).to.deep.equal([peerIds[1]!.toString()]);
+	});
+
+	it('broadcasts the proof-carrying record so members free the blocks immediately', async () => {
+		await setUpPeers(2);
+		const { coordinator, mocks } = makeCoordinator(['approve', 'held'], TwoMemberThreshold);
+
+		expect(await runAndCatch(coordinator)).to.be.instanceOf(BlocksHeldError);
+
+		// One held vote at maxAllowedRejections 0 proves super-majority unreachable, so the abandonment
+		// broadcast fires (fire-and-forget — poll for arrival).
+		const sawHeld = (mock: ConflictAnsweringClient) =>
+			mock.received.some(r => Object.values(r.promises ?? {}).some(s => s.type === 'held'));
+		await waitFor(() => mocks.every(sawHeld), {
+			description: 'every member receives the held-carrying record'
+		});
+	});
+
+	it('lets a genuine validator rejection outrank a held vote', async () => {
+		// Same precedence as a conflict vote: a member calling the transaction INVALID is permanent, and
+		// the caller must hear that rather than retry forever against a write no cohort will accept.
+		await setUpPeers(3);
+		const { coordinator } = makeCoordinator(['approve', 'reject', 'held'], 0.75);
+
+		const caught = await runAndCatch(coordinator);
+
+		expect(caught).to.be.instanceOf(ValidatorRejectionError);
+		expect((caught as ValidatorRejectionError).rejectReasons[peerIds[1]!.toString()]).to.equal('invalid transform');
+	});
+
+	it('lets a lost conflict race outrank a held vote', async () => {
+		// Both are retryable, so the choice is about which names the more useful thing: a conflict vote
+		// carries the winning transaction's messageHash, a held vote only an action id.
+		await setUpPeers(3);
+		const { coordinator } = makeCoordinator(['approve', 'conflict', 'held'], 0.75);
+
+		expect(await runAndCatch(coordinator)).to.be.instanceOf(ConflictRaceLostError);
+	});
+
+	it('never inflates the genuinely-silent shortfall message with held votes', async () => {
+		// The load-bearing wire text is reached only with no retryable refusal in the record; a held vote
+		// is peeled off above it, exactly as a conflict vote is, and never counted as a rejection.
+		await setUpPeers(3);
+		const { coordinator } = makeCoordinator(['approve', 'approve', 'silent'], 0.75);
+
+		const caught = await runAndCatch(coordinator);
+
+		expect(caught).to.be.instanceOf(Error);
+		expect(caught).to.not.be.instanceOf(BlocksHeldError);
+		expect((caught as Error).message).to.equal('Failed to get super-majority: 2/3 approvals (needed 3, 0 rejections)');
+	});
+
+	it('commits a transaction that reached super-majority despite a held vote', async () => {
+		// threshold 0.51 over 3 peers ⇒ super-majority 2, so two approvals carry the transaction even
+		// though a third member's storage holds a rival. A held vote refuses; it does not veto.
+		await setUpPeers(3);
+		const { coordinator } = makeCoordinator(['approve', 'approve', 'held'], 0.51);
+
+		const { record } = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+
+		expect(Object.values(record.promises).filter(s => s.type === 'held').length).to.equal(1);
 		expect(Object.keys(record.commits).length, 'the cohort committed').to.be.greaterThan(1);
 	});
 });

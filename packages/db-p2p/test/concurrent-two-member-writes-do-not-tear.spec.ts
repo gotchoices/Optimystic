@@ -15,20 +15,15 @@
  *
  * Reproducer strength, measured against a build with the cancel escape removed from
  * `operationsConflict`: at {@link PairsPerRun} = 4 only one of the three runs tore, and at 8 all
- * three tore (8 `TornActionError`s over three runs). 4 is nonetheless what ships, because the same
- * contention that sharpens this reproducer also makes a SEPARATE defect reachable: at 8, the FIXED
- * build fails 2 executions in 3 with `ValidatorRejectionError` — "pending conflict: block … held by
- * unresolved action(s)" — which is a transient optimistic-concurrency condition being answered as a
- * permanent validator rejection, filed as `a-contended-pend-refusal-is-permanent-on-a-small-cohort`.
- * A guard that flakes on an unrelated defect is worth less than a weaker guard that does not, so this
- * spec stays at the contention where it is stable. Raise it to 8 to reproduce either defect by hand.
+ * three tore (8 `TornActionError`s over three runs). 8 is what ships. It could not until the
+ * contended-pend refusal was given its own vote kind: the same contention that sharpens this
+ * reproducer also made a pend queued behind a rival's live reservation report itself as a permanent
+ * `ValidatorRejectionError`, and at 8 that unrelated defect failed two executions in three. With the
+ * refusal now answered by a `held` vote the cohort counts as retryable, the contention this spec
+ * needs no longer trips anything but the tear it is watching for.
  *
- * 4 reduces that exposure but does not remove it: a second review pass measured the same
- * `ValidatorRejectionError` once in 15 executions at 4, on runs verified to be against an unmodified
- * `operationsConflict`. So a red here is one of three things, in descending likelihood: that filed
- * defect (the message says `pending conflict: block … held by unresolved action(s)`), a genuine
- * regression of this ticket (the message says `TornActionError`), or a row unreadable from the other
- * node. Read the message before assuming the escape broke.
+ * So a red here is one of two things: a genuine regression of this ticket (the message says
+ * `TornActionError`), or a row unreadable from the other node.
  *
  * The delays are random, not seeded, so the spec samples interleavings rather than pinning three of
  * them. That asymmetry is deliberate and safe in one direction only: a random schedule can never
@@ -50,7 +45,7 @@ interface Row {
 const keyOf = (row: Row): string => row.key;
 
 const Runs = 3;
-const PairsPerRun = 4;
+const PairsPerRun = 8;
 
 const transactorFor = (transactors: Map<string, ITransactor>, peerIdStr: string): ITransactor => {
 	const t = transactors.get(peerIdStr);

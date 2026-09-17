@@ -18,13 +18,33 @@ export type Signature =
 	 * counted toward the permanent-rejection threshold. `conflictWith` is the winning
 	 * transaction's messageHash: structured, signed, and readable without parsing prose.
 	 */
-	| { type: 'conflict'; signature: string; conflictWith: string };
+	| { type: 'conflict'; signature: string; conflictWith: string }
+	/**
+	 * This member refuses the transaction *for now* for the OTHER transient reason: the pend's blocks
+	 * are reserved by a different unresolved action in this member's durable storage. Retryable and
+	 * never counted toward the permanent-rejection threshold, exactly like `conflict`.
+	 *
+	 * Distinct from `conflict` because the two know different things, from different places:
+	 *  - `conflict` comes from the member's in-memory reservation table, where it holds the rival's
+	 *    whole {@link ClusterRecord} and can name its `messageHash`.
+	 *  - `held` comes from storage's pending list, which carries only an **action id** — and it fires
+	 *    precisely in the window where the rival has left the in-memory table (cleared at its
+	 *    pend-consensus) but not yet storage (cleared at its commit or cancel), so no `messageHash`
+	 *    exists to name.
+	 *
+	 * `heldBy` is therefore an action id, a different id space from `conflictWith`. Packing one into
+	 * the other would put two id spaces in a single unlabelled signed field, which is why this is its
+	 * own variant rather than a reused one. Where several rivals hold the blocks, `heldBy` names the
+	 * one the refusal returned on.
+	 */
+	| { type: 'held'; signature: string; heldBy: string };
 
 /**
  * The exact bytes a vote signature covers: `<hash>:<type>[:<extra>]`, where `extra` is the variant's
- * own payload — a reject's `rejectReason`, a conflict's `conflictWith`, nothing for an approve.
- * Folding the extra in is what makes it integrity-protected in transit rather than free-floating
- * prose.
+ * own payload — a reject's `rejectReason`, a conflict's `conflictWith`, a held's `heldBy`, nothing
+ * for an approve. Folding the extra in is what makes it integrity-protected in transit rather than
+ * free-floating prose. Each variant's extra is a single string, so the preimage needs no encoding
+ * scheme; a variant that ever needs two fields must define one rather than concatenating here.
  *
  * Producers and verifiers must both build the preimage here. It lives beside {@link Signature}
  * rather than in either consumer because a second copy that forgets a variant does not fail loudly:
@@ -42,6 +62,7 @@ export function clusterVoteVerificationPayload(hash: string, signature: Signatur
 	switch (signature.type) {
 		case 'reject': return clusterVoteSigningPayload(hash, 'reject', signature.rejectReason);
 		case 'conflict': return clusterVoteSigningPayload(hash, 'conflict', signature.conflictWith);
+		case 'held': return clusterVoteSigningPayload(hash, 'held', signature.heldBy);
 		default: return clusterVoteSigningPayload(hash, signature.type);
 	}
 }
