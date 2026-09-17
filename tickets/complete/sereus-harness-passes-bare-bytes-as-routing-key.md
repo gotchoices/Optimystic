@@ -29,3 +29,7 @@ Afterwards, run sereus's `strand-membership-closed-strand-e2e` and `harness-part
 # Why this is blocked
 
 The code lives in a sibling repository that this pipeline does not edit. The alternative is to decide the brand should not reach sereus's harness, for example by loosening the wrapper-facing types in db-p2p. That would reopen the class of bug the brand closes, so the recommendation is the sereus-side fix above.
+
+# Resolved (2026-09-17)
+
+Landed on the sereus side in sereus commit `fceadbc`: `CONTROL_COHORT_PROBE_KEY` is minted with `routingKeyForBlock`, and both `findCluster` wrappers (and the `forced-cluster.ts` stubs) take `RoutingKey`. `tsc -p tsconfig.typecheck.json` in `../sereus/packages/integration-tests` is clean, and the two scenarios this ticket asked for (`strand-membership-closed-strand-e2e`, `harness-party-control-cohort`) passed, 2 files / 12 tests, against a fresh db-p2p build. That run was done by the implementer of `coordinator-refuses-blocks-it-is-not-responsible-for`. The brand was not loosened here.
