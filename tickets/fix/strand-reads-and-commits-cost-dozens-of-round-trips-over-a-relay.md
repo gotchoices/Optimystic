@@ -8,6 +8,13 @@ files:
   - backlog/more-design/a-live-read-on-an-isolated-node-fails-instead-of-serving-what-it-holds.md (same live-read refresh)
 repro: verified
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-09-17T15:43:15.137Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\strand-reads-and-commits-cost-dozens-of-round-trips-over-a-relay.fix.2026-09-17T15-43-15-133Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 
 # Strand reads and commits cost dozens of round trips, which a relay turns into minutes
 
