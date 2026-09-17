@@ -64,3 +64,24 @@ Also run: `test/two-party-cohort-is-collection-independent.spec.ts` (both cases 
 - The mesh harness's key network still appends self (second ticket). `mesh-harness.ts` still says "findCluster always includes self" in its own doc comment; that statement is about the harness and is correct until the second ticket lands.
 - Production reputation scores ascend with penalties (0 is clean), so the ascending sort picks the best-scored member; I did not change or test that direction.
 - The `cohort:membership` log line fires on every `findCoordinator` attempt as well as every `findCluster`, so a verbose log grows faster than before on the scoped path.
+
+# Notes for the reviewer (garden tender, 2026-09-16 evening)
+
+1. **This ticket has landed without its partner, so HEAD is in a half-changed state until ticket 2
+   lands.** The plan recorded that without the writer's coverage tie-break toward self (ticket 2), a
+   single-block pend with cohort `[A, self]` goes remote on every small network — which the maintainer's
+   decision says must not happen. Establish whether that is now true at HEAD, and at which node counts.
+   If it is, say so plainly: a downstream application (sereus) runs against this repository's HEAD
+   through a linked workspace, so a half-landed routing change reaches it immediately. Recommend whether
+   ticket 2 should run next rather than wait behind the fix queue.
+2. **"A node whose FRET is missing now fails the lookup instead of degrading to self."** Confirm which
+   real deployments can have no FRET service — in particular the React Native node path
+   (`libp2p-node-rn.ts` → `libp2p-node-base.ts`) and any solo or test configuration. A phone that used to
+   work solo and now fails its lookup would be a regression on the platform the maintainer most wants
+   solid.
+3. **The `clusterSize: 1` membership case flipped** along with the named case. Confirm the one-machine
+   deployment (`n = 1` skips consensus) still commits through the solo short-circuit end to end, not just
+   in the key-network spec — the node-count sweep (`transaction-node-count-sweep.spec.ts`) N = 1 arm is
+   the natural check.
+4. **Log tags renamed `fret-*` → `cohort-*`.** `docs/debugging.md` and any downstream log filters may
+   reference the old tags; check the docs at least.
