@@ -811,16 +811,53 @@ saveMaterializedBlock(block): store(structuredClone(block));
   §"A pending record's lifetime is bounded by its writer". The abandoned block's transform is
   therefore dropped, not deferred: an acknowledged torn action leaves its non-tail blocks at their
   prior revision, and only the log entry the tail carries is durable.
-- **The writer's retry consumes its own committed log entry.** The carve-out above only stops the
-  *storage* side refusing the retry; the client half is that a torn action's log entry is already
-  durable when the failure is reported, because `NetworkTransactor.commit` commits the log tail
-  BEFORE sweeping the remaining blocks. A refresh taken between a failed attempt and its retry
-  therefore **consumes** (`Collection.consumeOwnEntry`) an entry carrying the
-  retry's own action id, instead of running it through the conflict filter and replaying it —
-  replaying re-appends content the committed tail already holds, leaving the same action recorded
-  twice in the log. Consuming drops the entry's actions off the head of `pending` and forces the
-  replay that resets the tracker, so `hasUnsyncedChanges()` turns false and the write reports the
-  success it is owed.
+- **The writer's retry finishes its own half-landed action, then consumes its log entry.** The
+  carve-out above only stops the *storage* side refusing the retry; the client half is that a torn
+  action's log entry can already be stored when the failure is reported, because
+  `NetworkTransactor.commit` commits the log tail BEFORE sweeping the remaining blocks. It reports
+  failure over a stored tail in two ways: a later sweep block confirms a conflict, or — the common
+  one — the tail's own commit answers `commit-not-durable` (held by fewer than a majority, not
+  "absent") and the sweep **never runs**. Either way the writer then cancels, which drops the
+  pending records of every block that did not land, so nothing else will ever land them.
+  **The rule: a write may be reported saved only if every block its log entry names holds that
+  write's revision. Finding the entry proves only that the tail landed.** Readers materialize
+  blocks, not log entries, so an entry whose blocks never landed is a write that silently never
+  happened, on every node.
+  A refresh taken between a failed attempt and its retry therefore does two things with an entry
+  carrying the retry's own action id. First it **finishes** the action
+  (`Collection.completeOwnEntry`): every failed attempt is retained verbatim
+  (`Collection.retainInFlightAttempt` — transforms, revision, tail, block digests), and the refresh
+  re-sends it at the SAME action id and revision. The own-revision carve-out turns that re-send into
+  "land exactly the blocks that are missing", and into a no-op when nothing is. The transforms are
+  retained rather than rebuilt because a rebuilt attempt re-appends the log entry with a fresh
+  timestamp, and a replica that had not yet stored the tail would then store a second, different
+  tail under the same `(action, revision)`. Only then does it **consume** the entry
+  (`Collection.consumeOwnEntry`) instead of running it through the conflict filter and replaying
+  it — replaying re-appends content the committed tail already holds, leaving the same action
+  recorded twice in the log. Consuming drops the entry's actions off the head of `pending` and
+  forces the replay that resets the tracker, so `hasUnsyncedChanges()` turns false and the write
+  reports success, with the re-send's `WriteDurability` as its answer. Finishing runs before the
+  refresh has changed anything on the instance, so when it cannot finish, the staged actions, the
+  tracker and the held revision are exactly as the failed attempt left them.
+- **A half-landed write that cannot be finished is refused by name: `TornActionError`.** It carries
+  the collection, action id, revision and the blocks left behind, and a `reason`:
+  `rival-holds-revision` — the re-send was refused with a confirmed committed revision under another
+  action (`staleAt`, or a non-empty `missing`), which is permanent; `completion-refused` — it was
+  refused for a cause that can clear (a rival merely pending, not yet durable at a majority), which
+  both write paths retry **as a refresh, never as a new attempt**, against the same budget as a lost
+  race, so seeing it means that budget ran out; `transforms-not-held` — the entry was found with
+  blocks missing and no retained attempt at its revision. It is deliberately not a
+  `SyncRetryExhaustedError`: "exhausted" says the write never landed and invites a blind retry,
+  whereas here the log already holds an entry for a write whose data is not saved. Nothing re-drives
+  under a new revision on the caller's behalf (that would record the actions twice); the staged
+  actions are left in place for the caller to discard or resubmit knowingly. `Collection.sync` /
+  `updateAndSync` throw it, and so does `TransactionCoordinator.commit` (out of its inter-attempt
+  `update()`); a multi-collection commit in which one participant was finished and another is torn
+  surfaces the torn one as this error rather than as `CoordinatorPartialCommitError`.
+  `packages/db-core/test/own-entry-completes-the-action.spec.ts` pins the rule and all three
+  reasons; the test double that matters is `TailLandsButReportsStale` (only the tail lands), not
+  `CommitLandsButReportsStale` (everything lands — which makes "entry visible" and "write saved"
+  the same thing, and is how the missing rule went unnoticed).
 - **The collection, not the caller, holds the in-flight id.** Which action is in flight is a field
   on the instance (`Collection.inFlightActionId`), set for the duration of a write's attempt CYCLE
   by `Collection.beginInFlightAction(actionId)` and cleared by the disposer it returns;
@@ -837,7 +874,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `packages/db-core/test/collection-own-action-replay.spec.ts` is the regression test at the
   collection tier and `packages/db-core/test/coordinator-own-action-replay.spec.ts` at the
   coordinator tier (single-collection tear, one participant tearing while another cleanly loses,
-  and an abandoned commit leaving no mark behind);
+  half-landed commits over one and two collections, a rival taking the revision a half-landed
+  commit needed, and an abandoned commit leaving no mark behind);
   `packages/db-p2p/test/concurrent-diary-append-acknowledgement.spec.ts` ("a torn commit — tail
   durable, a later block refused") pins the same recovery end-to-end on the mesh.
 - **A lost conflict race is returned too — and needs no confirmation.** A member holding the

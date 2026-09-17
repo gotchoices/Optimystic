@@ -717,6 +717,17 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// Commit the tail block
 		const tailResult = await this.commitBlock(request.tailId, request.actionId, request.rev, request.tailId, request.blockDigests);
 		if (!tailResult.success) {
+			// NOTE: a refused tail is NOT an absent tail. The coordinator's durability gate answers
+			// `commit-not-durable` whenever fewer than a majority hold the revision — even though
+			// some members stored it — and this return means the sweep below never runs, so every
+			// other block of the action is left uncommitted while the log entry may already be
+			// readable. This layer cannot tell "tail absent" from "tail present on a minority", so it
+			// does not sweep anyway (that would commit data blocks under a tail that may never reach
+			// a majority). The writer closes the gap instead: its retry keeps the SAME action id,
+			// and if its refresh finds this action's own log entry it re-sends this attempt — same
+			// transforms, same revision — to land what was left behind before treating the write as
+			// saved (`Collection.completeOwnEntry`). A write is saved only when every block its log
+			// entry names holds its revision; the entry alone proves nothing but the tail.
 			return tailResult;
 		}
 		// Every coordinator that confirmed part of this action reports who holds its part; the
@@ -762,16 +773,17 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				//     latest.actionId === request.actionId` (StorageRepo.pend, which also skips saving
 				//     a pending record for such a block; ClusterMember.validatePendOperations; and
 				//     CoordinatorRepo's stale classification). The retry no longer wedges.
-				//   - its retry consumes its own already-committed log entry instead of replaying it
-				//     (Collection.updateInternal's `inFlightActionId` arm, threaded by syncInternal,
-				//     which reuses one actionId across all of a sync's attempts). It no longer appends
-				//     a duplicate entry.
-				// NOTE: that second half covers the single-collection path only. The multi-collection
-				// path (TransactionCoordinator's retry loop) still refreshes without telling the
-				// collection which of its own actions is in flight, so a torn multi-collection commit
-				// can still record its entry twice — tracked as
-				// tickets/fix/refresh-must-always-know-its-own-in-flight-action, and to be fixed there
-				// rather than by tolerating the failure here.
+				//   - its retry recognises its own already-committed log entry instead of replaying it
+				//     (Collection.updateInternal's `inFlightActionId` arm, set by both write paths —
+				//     syncInternal and TransactionCoordinator.commitOnce — which reuse one action id
+				//     across all of a write's attempts). It no longer appends a duplicate entry.
+				//   - and before consuming that entry it FINISHES the action: the blocks this return
+				//     abandons are on nobody (the caller cancels their pending records next), so the
+				//     refresh re-sends the refused attempt verbatim at the same revision, which the
+				//     carve-outs above turn into "land exactly what is missing"
+				//     (Collection.completeOwnEntry). The entry alone never counts as saved. If a rival
+				//     has since taken a revision one of those blocks needed, the writer is told so by
+				//     name (TornActionError) rather than acknowledged.
 				//
 				// Transport-shaped failures (throws, no returned refusal) keep the tolerance for the
 				// RESULT — the tail committed durably, and reporting failure now would disown an

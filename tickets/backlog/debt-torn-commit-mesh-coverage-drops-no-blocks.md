@@ -78,3 +78,17 @@ failure handling have never run. It names the same "which layer does the shared 
 question this ticket's arm above raises, and its fixture would live beside the helpers discussed
 here. Whoever picks up either should read both; they are separate assertions over a shared fixture,
 not duplicates.
+
+## Arm: the tree-write mesh case now exists — this ticket is probably closable (implement, 2026-09-16)
+
+Ticket `a-write-whose-log-entry-landed-alone-is-reported-saved` added `packages/db-p2p/test/half-landed-write-is-finished.spec.ts`. It is the test this ticket asks for: a **tree** write on the 3-node mesh whose first commit lands only its log tail, asserting the abandoned-block count is greater than zero (`tears[0].dropped >= 1`), that the row is readable on the writer and on a node that never saw the tear, that the write took exactly one revision under one action id, and that the tree is still writable afterwards.
+
+Both halves are now shown to compose, and each was checked by disabling it and watching the spec fail (both checks were temporary and are not in the tree):
+
+- **Storage side.** With the own-revision carve-out in `StorageRepo.pend` disabled, the spec fails: the writer's re-send is refused by its own stored tail. (It now fails loudly, with the named `TornActionError`, rather than by exhausting the retry budget.)
+- **Writer side.** With the writer's finish-before-consume step disabled, the spec fails with the row reading back as missing after `replace()` resolved — the original data loss.
+
+Two differences from what the body describes, for whoever closes this:
+
+- The new spec tears **tail-only**, not tail-plus-header as `tearFirstCommit` does. Tail-only is the shape the network transactor really produces (the header lands in the sweep, after the tail), so it is the more faithful injection. The diary spec's `tearFirstCommit` was left as it is.
+- The tear helper (`landOnlyTheTailOnce`) lives in the new spec file, not in `packages/db-p2p/src/testing/mesh-harness.ts`. That makes it the second transactor-level tear helper in the test tree, which is the "second consumer" this ticket said should trigger moving the helper into the shared harness. That move was not done and is the only part of this ticket still open.

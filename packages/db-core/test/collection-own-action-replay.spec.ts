@@ -1,7 +1,8 @@
 import { expect } from 'chai'
 import { Collection } from '../src/collection/index.js'
-import { TestTransactor, CommitLandsButReportsStale } from '../src/testing/test-transactor.js'
-import type { Action, ActionHandler, BlockStore, IBlock } from '../src/index.js'
+import { TestTransactor, CommitLandsButReportsStale, TailLandsButReportsStale } from '../src/testing/test-transactor.js'
+import { Log } from '../src/index.js'
+import type { Action, ActionHandler, BlockId, BlockStore, IBlock } from '../src/index.js'
 
 interface TestAction {
 	value: string
@@ -37,7 +38,32 @@ describe('Collection: own committed action on retry', () => {
 		return logged
 	}
 
+	/** The blocks `actionId`'s log entry names that do NOT hold that action in durable storage, read
+	 *  through a fresh collection over the UNWRAPPED transactor. Empty is what "saved" means:
+	 *  readers materialize blocks, not log entries. */
+	async function unlandedBlocks(inner: TestTransactor, actionId: string): Promise<BlockId[]> {
+		const reader = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
+		const log = await Log.open<Action<TestAction>>(reader.tracker, collectionId)
+		const entry = (await log!.getFrom(0)).entries.find(e => e.actionId === actionId)
+		expect(entry, `the log holds an entry for action ${actionId}`).to.not.equal(undefined)
+		const [status] = await inner.getStatus([{ actionId, blockIds: entry!.blockIds }])
+		return entry!.blockIds.filter((_, i) => status!.statuses[i] !== 'committed')
+	}
+
+	/** One durable commit through the UNWRAPPED transactor, so the collection under test opens
+	 *  against a committed header. A half-landed write is only VISIBLE as one then: a first commit
+	 *  that lands nothing but its log tail leaves the header uncommitted, so the refresh cannot reach
+	 *  the log and never sees its own entry (that shape has its own case below). */
+	async function seed(inner: TestTransactor) {
+		const seeded = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
+		await seeded.act({ type: 'set', data: { value: 'seed', timestamp: 0 } })
+		await seeded.sync(retryFast)
+	}
+
 	it('consumes its own durably committed entry instead of replaying it', async () => {
+		// The WHOLE action landed and the writer was told it failed. Finishing the action has
+		// nothing left to land; what is pinned here is that the entry is recognised as the writer's
+		// own and neither replayed nor moved.
 		const inner = new TestTransactor()
 		const transactor = new CommitLandsButReportsStale(inner)
 		const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
@@ -48,8 +74,10 @@ describe('Collection: own committed action on retry', () => {
 		}
 		await collection.act(action)
 
-		// Must RESOLVE, not exhaust: the action IS durable, so the writer is owed a success.
-		await collection.sync(retryFast)
+		// Must RESOLVE, not exhaust: the action IS durable, so the writer is owed a success — and a
+		// success that says who holds it, not the `undefined` reserved for "nothing was written".
+		const durability = await collection.sync(retryFast)
+		expect(durability, 'a saved write reports its durability').to.not.equal(undefined)
 
 		const logged = await readLog(collection)
 
@@ -58,21 +86,30 @@ describe('Collection: own committed action on retry', () => {
 		expect(logged).to.have.lengthOf(1)
 		expect(logged[0]).to.deep.equal(action)
 
-		// Exactly one commit ever landed on the inner transactor — the masked one.
-		expect(transactor.landedCommits).to.equal(1)
+		// The injection fired. (Not `=== 1`: making sure the action is whole re-sends the retained
+		// attempt, and with every block already holding it that is an idempotent commit which
+		// succeeds while writing nothing. The revision below is what tells finished from replayed.)
+		expect(transactor.landedCommits).to.be.at.least(1)
 		expect(collection.hasUnsyncedChanges()).to.equal(false)
+		expect(collection.committedRevision(), 'one revision — a replay would have taken a second').to.equal(1)
 
 		// A second reader sees the same single entry (the durable log, not this instance's view).
 		const reader = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
 		expect(await readLog(reader)).to.have.lengthOf(1)
+		expect(reader.committedRevision(), 'storage agrees on the revision').to.equal(1)
 	})
 
-	it('consumes a multi-action entry without dropping or duplicating any action', async () => {
-		// The consume branch slices `entry.actions.length` off the head of `pending`, so a batch of
-		// more than one action is where an off-by-one would show: too small a slice re-commits a
-		// duplicate, too large a slice silently loses an action that never landed.
+	it('finishes a half-landed multi-action write without dropping or duplicating any action', async () => {
+		// The shape the network transactor produces: ONLY the log tail landed, and the writer's
+		// cancel dropped the pending records of the three blocks the actions inserted. The refresh
+		// must land those blocks (same action id, same revision) BEFORE consuming the entry.
+		//
+		// The consume branch then slices `entry.actions.length` off the head of `pending`, so a
+		// batch of more than one action is where an off-by-one would show: too small a slice
+		// re-commits a duplicate, too large a slice silently loses an action that never landed.
 		const inner = new TestTransactor()
-		const transactor = new CommitLandsButReportsStale(inner)
+		await seed(inner)
+		const transactor = new TailLandsButReportsStale(inner)
 		const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
 
 		const actions: Action<TestAction>[] = [
@@ -86,12 +123,16 @@ describe('Collection: own committed action on retry', () => {
 
 		await collection.sync(retryFast)
 
-		expect((await readLog(collection)).map(a => a.data.value)).to.deep.equal(['a', 'b', 'c'])
-		expect(transactor.landedCommits).to.equal(1)
+		expect(transactor.tears, 'the tail-only landing was actually injected').to.equal(1)
+		expect((await readLog(collection)).map(a => a.data.value)).to.deep.equal(['seed', 'a', 'b', 'c'])
 		expect(collection.hasUnsyncedChanges()).to.equal(false)
+		expect(collection.committedRevision(), 'finished AT the revision the tail took').to.equal(2)
+		expect(await unlandedBlocks(inner, collection.committedActionId()!),
+			'every block the entry names holds the action').to.deep.equal([])
 
 		const reader = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
-		expect((await readLog(reader)).map(a => a.data.value)).to.deep.equal(['a', 'b', 'c'])
+		expect((await readLog(reader)).map(a => a.data.value)).to.deep.equal(['seed', 'a', 'b', 'c'])
+		expect(reader.committedRevision()).to.equal(2)
 	})
 
 	it('consumes a zero-action entry (the invented collection first sync)', async () => {
@@ -108,8 +149,32 @@ describe('Collection: own committed action on retry', () => {
 		await collection.sync(retryFast)
 
 		expect(await readLog(collection)).to.have.lengthOf(0)
-		expect(transactor.landedCommits).to.equal(1)
+		expect(transactor.landedCommits).to.be.at.least(1)
 		expect(collection.hasUnsyncedChanges()).to.equal(false)
+		expect(collection.committedRevision(), 'one revision — a replay would have taken a second').to.equal(1)
+	})
+
+	it('an invented collection whose first sync lands only its log tail still ends up whole', async () => {
+		// The half-landed shape with NO committed header: the header is one of the blocks the refused
+		// commit left behind, so the refresh reads the collection as never committed and cannot see
+		// its own entry at all. Recovery here is the ordinary retry — the same action id at the same
+		// revision — which storage accepts because the tail already holds exactly that action
+		// (`isOwnRevision`). What must hold is the same contract: sync returned, so nothing the
+		// entry names was left behind.
+		const inner = new TestTransactor()
+		const transactor = new TailLandsButReportsStale(inner)
+		const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+		await collection.act({ type: 'set', data: { value: 'first', timestamp: 1 } })
+
+		await collection.sync(retryFast)
+
+		expect(transactor.tears, 'the tail-only landing was actually injected').to.equal(1)
+		expect(collection.hasUnsyncedChanges()).to.equal(false)
+		expect(collection.committedRevision()).to.equal(1)
+		expect(await unlandedBlocks(inner, collection.committedActionId()!),
+			'every block the entry names holds the action').to.deep.equal([])
+		const reader = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
+		expect((await readLog(reader)).map(a => a.data.value)).to.deep.equal(['first'])
 	})
 
 	it('still replays when the committed entry belongs to someone else', async () => {

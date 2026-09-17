@@ -2542,10 +2542,16 @@ export class CoordinatorRepo implements IRepo {
 			// fresh revision, which is what the `conflict: true` shape makes `Collection.syncAttempts`
 			// and the multi-collection `pendPhase` do. But a member reached only by
 			// `scheduleCommitRetry` can still land the refused revision later, and this node's own
-			// member (or its fallback commit) may hold it already. The writer's retry with the SAME
-			// action id converges either way: `isOwnRevision` in `StorageRepo.pend` and `commit`
-			// treats an already-landed own revision as satisfied, and `inFlightActionId` in
-			// `Collection.updateInternal` keeps the retry on the same action.
+			// member (or its fallback commit) may hold it already. When the refused block is the
+			// action's LOG TAIL, that matters beyond this block: `NetworkTransactor.commit` stops at a
+			// refused tail and never sweeps the action's other blocks, so the writer can then read
+			// its own log entry back while none of the data it describes was committed anywhere.
+			// The writer's retry with the SAME action id is what converges that, and only because it
+			// does two things: `isOwnRevision` in `StorageRepo.pend` and `commit` treats an
+			// already-landed own revision as satisfied, and `Collection.completeOwnEntry` — on
+			// finding that entry — re-sends the refused attempt at the same revision to land the
+			// blocks left behind BEFORE the write is reported saved. Seeing its own log entry is
+			// never, on its own, the writer's proof of durability.
 			const durability = cohortDurability(record, cohortCommitOutcomes);
 			if (localExecuted) {
 				// Our own member applied this commit during consensus. Its retained storage verdict is

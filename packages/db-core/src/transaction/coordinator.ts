@@ -4,9 +4,10 @@ import type { PeerId } from "../network/types.js";
 import { isConflictFailure } from "../network/stale-failure.js";
 import type { Collection, CollectionSnapshot } from "../collection/collection.js";
 import type { SyncOptions } from "../collection/index.js";
+import { TornActionError } from "../collection/struct.js";
 import { isTransactionExpired, clampPriority } from "./transaction.js";
 import { Log } from "../log/log.js";
-import { blockIdsForTransforms } from "../transform/helpers.js";
+import { blockIdsForTransforms, copyTransforms } from "../transform/helpers.js";
 import { computeBlockContentDigests, blockDigestsField } from "../transform/digest.js";
 import { collectOperations, hashOperations } from "./operations-hash.js";
 import { CoordinatorConcurrentStampError, CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./errors.js";
@@ -304,8 +305,6 @@ export class TransactionCoordinator {
 					if (staleLosses >= maxAttempts) {
 						throw err;
 					}
-					const delay = jitteredBackoffMs(staleLosses - 1, { baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
-					await abortableDelay(delay, signal);
 					// Re-read fresh state before re-attempting so the next commit pends against current
 					// revisions (mirrors how Collection.sync calls updateInternal() before retrying).
 					// NOTE: refreshes EVERY registered collection, not only the participants of this
@@ -313,8 +312,34 @@ export class TransactionCoordinator {
 					// if its header momentarily reads absent while it holds a committed revision, aborting
 					// this retry. The registered set is small today; if that (or retry latency) ever bites,
 					// narrow this to the transaction's participating collections.
-					for (const collection of this.collections.values()) {
-						await collection.update();
+					//
+					// A participant whose log tail landed despite the reported loss finds its own entry
+					// here and FINISHES that action before consuming it (Collection.completeOwnEntry,
+					// from the attempt commitOnceLatched retained). When finishing is refused for a cause
+					// that can clear, the refresh — not the commit — is what gets retried: commitOnce
+					// would rebuild the participant's log entry with a fresh timestamp and send a second
+					// version of a log tail already stored under this transaction's id and revision.
+					// Each such round counts against the same budget as a stale loss; a permanent
+					// refusal (a rival holds the revision) escapes as the named TornActionError at once.
+					// Re-running update() on collections an earlier round already refreshed is a no-op.
+					for (;;) {
+						const delay = jitteredBackoffMs(staleLosses - 1, { baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
+						await abortableDelay(delay, signal);
+						try {
+							for (const collection of this.collections.values()) {
+								await collection.update();
+							}
+							break;
+						} catch (refreshErr) {
+							if (!(refreshErr instanceof TornActionError) || refreshErr.reason !== 'completion-refused') {
+								throw refreshErr;
+							}
+							staleLosses++;
+							if (staleLosses >= maxAttempts
+								|| (deadlineMs !== undefined && Date.now() - startedAt >= deadlineMs)) {
+								throw refreshErr;
+							}
+						}
 					}
 				}
 			}
@@ -399,9 +424,10 @@ export class TransactionCoordinator {
 				latchReleases.push(await collection.acquireLatch());
 				// Mark THIS attempt's action id on each participant while its latch is held, so the
 				// inter-attempt refresh in commit() recognises a log entry this transaction itself
-				// made durable (a torn commit: header and log tail committed, a later sweep block
-				// reported the conflict) and consumes it instead of replaying it into a second entry
-				// under the same id. `transaction.id` is stable across retries, so re-marking on a
+				// stored (a torn commit: the log tail landed, and either its own answer or a later
+				// sweep block's reported failure), finishes that action's remaining blocks, and then
+				// consumes the entry instead of replaying it into a second entry under the same id
+				// (Collection.completeOwnEntry). `transaction.id` is stable across retries, so re-marking on a
 				// later attempt re-states the same fact. Only participants are marked; a registered
 				// non-participant is left unmarked and its refresh behaves exactly as a reader's.
 				inFlightDisposers.push(collection.beginInFlightAction(transaction.id));
@@ -508,6 +534,24 @@ export class TransactionCoordinator {
 
 		if (!coordResult.success) {
 			const committed = coordResult.committedCollections ?? new Set<CollectionId>();
+			// Keep exactly what each participant that did NOT commit sent, BEFORE the restores below
+			// swap its tracker out. A refused commit is not proof nothing landed: a participant's log
+			// tail is committed first and can be stored while the answer is still a failure, and
+			// cancelPhase has just dropped the pending records of every block that did not land. If
+			// the next refresh of that participant finds this transaction's own log entry, these are
+			// the transforms that finish it (Collection.completeOwnEntry) — without them the refresh
+			// can only refuse the write as torn, never save it. Copied, because until the restore
+			// this is the participant's LIVE tracker state. No block digests are retained: they are
+			// computed per commit from the live tracker (commitCollection), which is gone by the time
+			// a refresh re-sends, and an undeclared block falls back to member-side corroboration.
+			for (const { collectionId, collection } of collectionData) {
+				if (committed.has(collectionId)) continue;
+				collection.retainInFlightAttempt(transaction.id, {
+					rev: pendedRevs.get(collectionId)!,
+					transforms: copyTransforms(collectionTransforms.get(collectionId)!),
+					tailId: criticalBlocks.get(collectionId)!,
+				});
+			}
 			if (committed.size > 0) {
 				// PARTIAL COMMIT: at least one collection durably committed via consensus
 				// while another failed permanently. A uniform pre-append restore would
@@ -1040,9 +1084,10 @@ export class TransactionCoordinator {
 		// which collection's log the dependent landed in.
 		// NOTE: `allCollectionIds` names the participants of THIS attempt, and a retry's participant
 		// set can be SMALLER than the first attempt's. After a torn commit, the participant whose
-		// entry landed durably consumes that entry on the inter-attempt refresh
-		// (Collection.inFlightActionId), empties its pending queue and resets its tracker, so
-		// commitOnce's non-empty-transforms filter drops it from the next attempt. The retry's
+		// log entry landed finishes that action on the inter-attempt refresh — landing the blocks
+		// the refused commit left behind, at the same id and revision — and only then consumes the
+		// entry (Collection.completeOwnEntry), emptying its pending queue and resetting its tracker,
+		// so commitOnce's non-empty-transforms filter drops it from the next attempt. The retry's
 		// entries therefore list only the REMAINING participants, while the torn participant's
 		// already-durable entry lists them all — one transaction id, two different
 		// `allCollectionIds` values across its entries. Nothing today keys off that list for

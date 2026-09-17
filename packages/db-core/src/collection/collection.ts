@@ -1,4 +1,4 @@
-import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms, ActionId } from "../index.js";
+import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms, ActionId, BlockContentDigests, StaleFailure } from "../index.js";
 import { Log } from "../log/log.js";
 import type { ActionEntry } from "../log/struct.js";
 import { Atomic } from "../transform/atomic.js";
@@ -12,7 +12,7 @@ import type { WriteDurability } from "../network/struct.js";
 import { mergeDurability } from "../network/durability.js";
 import { highestStaleAt } from "../network/stale-failure.js";
 import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions } from "./index.js";
-import { CollectionHeaderVanishedError, SyncRetryExhaustedError, SyncRevisionStalledError } from "./struct.js";
+import { CollectionHeaderVanishedError, SyncRetryExhaustedError, SyncRevisionStalledError, TornActionError } from "./struct.js";
 import type { ActionContext } from "./action.js";
 import { actionIdAt } from "./action.js";
 import type { ReadDependency } from "../transaction/transaction.js";
@@ -46,6 +46,22 @@ type DivergenceSite = 'refresh' | 'attach';
  * there — what {@link Collection.earliestFork} reports and `collection:lineage-divergence` prints
  * as `forkRev=` / `heldAction=` / `readAction=`. */
 type LineageFork = { rev: number, heldAction: ActionId, readAction: ActionId };
+
+/** Exactly what one failed write attempt sent to the transactor — enough to send the same thing
+ * again. Retained by {@link Collection.retainInFlightAttempt} so that a refresh which then finds
+ * this attempt's own log entry can land the blocks the attempt left behind, at the same action id
+ * and revision (see {@link Collection.completeOwnEntry}). */
+export type InFlightAttempt = {
+	/** The revision the attempt's log entry was stamped with, and pended and committed at. */
+	rev: number;
+	/** Every transform the attempt pended — the log blocks included. The caller hands over a copy
+	 * it will not mutate; the collection keeps it as given. */
+	transforms: Transforms;
+	/** The attempt's log tail block, committed first. */
+	tailId: BlockId;
+	/** The per-block content declarations the attempt's commit carried, if any. */
+	blockDigests?: BlockContentDigests;
+};
 
 /** Default base backoff (and historical fixed delay) between sync retries, in ms. */
 const PendingRetryDelayMs = 100;
@@ -119,13 +135,17 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** The action id of a write currently in flight ON THIS INSTANCE'S BEHALF, or `undefined`
 	 * outside a write. Read by {@link updateInternal}: if the committed log now carries an entry
-	 * under this id, that action's work is already durable despite the failure answer that sent us
-	 * back here — `NetworkTransactor.commit` commits the collection header and log tail BEFORE
-	 * sweeping the remaining blocks, so a later sweep block confirming a conflict reports failure
-	 * over an action whose log entry already landed. Such an entry is CONSUMED
-	 * ({@link consumeOwnEntry}) rather than replayed, because replaying re-appends content the
-	 * committed tail already carries, producing a duplicate entry under one action id at two
-	 * revisions.
+	 * under this id, that action's LOG TAIL landed despite the failure answer that sent us back here
+	 * — `NetworkTransactor.commit` commits the log tail BEFORE sweeping the remaining blocks, and
+	 * reports failure both when the tail itself was refused after landing on a minority
+	 * (`commit-not-durable`, in which case the sweep never ran) and when a later sweep block
+	 * confirmed a conflict. Such an entry is never REPLAYED, because replaying re-appends content
+	 * the committed tail already carries, producing a duplicate entry under one action id at two
+	 * revisions. But it is not proof the write is saved either: the entry proves only that the tail
+	 * landed, and the writer's own cancel has since dropped the pending records of every block that
+	 * did not. So the refresh first FINISHES the action ({@link completeOwnEntry}) — landing the
+	 * remaining blocks at the same action id and revision, from {@link inFlightAttempt} — and only
+	 * then consumes the entry ({@link consumeOwnEntry}).
 	 *
 	 * The collection owns this fact rather than taking it as a `updateInternal` argument so that no
 	 * refresh path can forget to supply it — {@link update} and {@link updateAndSync} are refreshes
@@ -144,6 +164,22 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * worst a foreign concurrent refresh can see is a cleared field (it stops consuming), never a
 	 * field it should not have consumed. */
 	private inFlightActionId?: ActionId;
+
+	/** The most recent FAILED attempt made under {@link inFlightActionId} — exactly what it sent,
+	 * kept so a refresh that finds that attempt's own log entry can finish the action instead of
+	 * assuming it is finished (see {@link completeOwnEntry}). Set by {@link retainInFlightAttempt},
+	 * cleared with the mark by {@link beginInFlightAction}'s disposer, and meaningless without it.
+	 *
+	 * The transforms are retained VERBATIM, not rebuilt: a rebuilt attempt re-appends the log entry
+	 * with a fresh timestamp, so its log tail would differ byte-for-byte from the one already
+	 * stored under the same action id and revision — and any replica that had not yet stored the
+	 * tail would then store the second version, leaving two contents under one `(action, revision)`.
+	 *
+	 * Only the latest attempt is kept. An own entry can only be visible at the revision of an
+	 * attempt whose tail landed, and a later attempt at a DIFFERENT revision is only made after a
+	 * refresh adopted somebody else's entry at the earlier one — which is proof the earlier tail did
+	 * not land. {@link completeOwnEntry} still checks the revision and refuses on a mismatch. */
+	private inFlightAttempt?: InFlightAttempt;
 
 	protected constructor(
 		public readonly id: CollectionId,
@@ -481,8 +517,99 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 	}
 
-	/** Drops the pending actions this sync's OWN committed entry already made durable, instead of
-	 * replaying them into a duplicate entry (see {@link inFlightActionId}).
+	/** Finishes a half-landed write BEFORE its own log entry is consumed, so that consuming never
+	 * reports a write as saved on the strength of its log entry alone.
+	 *
+	 * THE RULE: a write may be reported saved only if EVERY block its log entry names holds that
+	 * write's revision. Finding the entry proves only that the log tail landed (see
+	 * {@link inFlightActionId} for the two ways `NetworkTransactor.commit` answers failure over a
+	 * stored tail). The writer's cancel has since removed the pending records of every block that
+	 * did not land, so nothing else will ever land them — if this does not, the entry stands in the
+	 * log, the blocks stay at their previous revision on every node, and readers materialize
+	 * blocks, not log entries: the write is silently gone.
+	 *
+	 * Finishing is a plain re-send of the retained failed attempt ({@link inFlightAttempt}) — the
+	 * SAME transforms, action id, revision and tail. Every storage tier treats a block that already
+	 * holds exactly this action at exactly this revision as satisfied rather than as a rival
+	 * (`isOwnRevision`: `StorageRepo.pend`/`.commit`, `ClusterMember`, `CoordinatorRepo`), so the
+	 * re-send rolls forward precisely the blocks that are missing and is a no-op for the rest,
+	 * including when nothing is missing at all. It is never sent at a new revision: the refresh has
+	 * already seen the entry at this one, and a second revision would record the entry twice.
+	 *
+	 * Runs at the top of {@link updateInternal}, before that method has changed anything on this
+	 * instance, so every throw from here leaves the collection exactly as the failed attempt left
+	 * it — staged actions and transforms intact, revision not advanced.
+	 *
+	 * @returns who holds the finished write, for the sync to report.
+	 * @throws TornActionError `rival-holds-revision` when a different action holds a revision one of
+	 * the blocks needed (permanent); `completion-refused` when the re-send lost for a cause that can
+	 * clear, which the write paths retry inside their own budget; `transforms-not-held` when there
+	 * is no retained attempt at the entry's revision and the entry's blocks do not all hold it.
+	 *
+	 * NOTE: the re-send costs a full pend and commit round even when every block had in fact landed
+	 * (a lost or masked success). That is deliberate — it is also the only honest source of the
+	 * durability the sync reports — and the case is rare: after a returned failure the network
+	 * transactor has, by construction, NOT swept every block. If own-entry refreshes ever show up as
+	 * a cost, check `getStatus` first and skip the re-send when every block reads `committed`. */
+	private async completeOwnEntry(entry: ActionEntry<Action<TAction>>, entryRev: number | undefined): Promise<WriteDurability | undefined> {
+		const attempt = this.inFlightAttempt;
+		const rev = entryRev ?? attempt?.rev;
+		if (attempt === undefined || rev === undefined || attempt.rev !== rev) {
+			// Nothing to finish the action WITH. That is only acceptable if there is nothing to
+			// finish: ask storage whether every block the entry names holds this action.
+			// NOTE: `getStatus` answers from each block's LATEST revision, so a block this action did
+			// land, and which a later action has since legitimately superseded, reads as not
+			// committed and this refuses a write that is in fact whole. It errs loud, never silent,
+			// and both write paths retain an attempt before any refresh can run, so production only
+			// reaches this branch when the entry sits at a revision the retained attempt was not
+			// made at — a forked lineage. If it ever fires on a healthy collection, judge each block
+			// by who holds the ENTRY's revision (a read pinned at it reports `materialized`), not by
+			// who holds the latest.
+			const [status] = await this.transactor.getStatus([{ actionId: entry.actionId, blockIds: entry.blockIds }]);
+			const unlanded = entry.blockIds.filter((_, i) => status?.statuses[i] !== 'committed');
+			if (unlanded.length === 0) {
+				return undefined;
+			}
+			throw new TornActionError(this.id, entry.actionId, rev ?? -1, unlanded, 'transforms-not-held',
+				attempt === undefined
+					? 'no failed attempt is retained for this action'
+					: `the retained attempt was made at rev ${attempt.rev}`);
+		}
+
+		// NOTE: priority 0. The attempt's aged retry priority is a fairness hint for a race over a
+		// free revision; this revision is already this action's own, so there is no race to rank in.
+		const result = await this.source.transact(attempt.transforms, entry.actionId, rev, this.id, attempt.tailId, 0, attempt.blockDigests);
+		if (result.success) {
+			return result.durability;
+		}
+		throw this.tornFromRefusal(entry, rev, result);
+	}
+
+	/** Names a refused {@link completeOwnEntry} re-send. A refusal that CONFIRMS a committed revision
+	 * under another action — `staleAt`, which every producer sets only after reading it out of its
+	 * own storage and never for this action's own revision, or a non-empty `missing` list of
+	 * committed rival transforms — is permanent. Anything else (a rival merely PENDING on a block,
+	 * a revision not yet held by a majority, a bare reason) can clear, and is retried by the caller.
+	 *
+	 * NOTE: `staleAt` is read here as "a rival committed", which is a second consumer of a field
+	 * documented as never a retryability signal (docs/internals.md). It is the same kind of use
+	 * `syncAttempts`' stall check makes: it can only END a retry, never start one. */
+	private tornFromRefusal(entry: ActionEntry<Action<TAction>>, rev: number, refusal: StaleFailure): TornActionError {
+		const rivalConfirmed = refusal.staleAt !== undefined || (refusal.missing?.length ?? 0) > 0;
+		// The refusal does not say which blocks lack the revision, so name every block the entry
+		// lists other than the tail — the entry being visible is what proves the tail holds it.
+		const attempt = this.inFlightAttempt;
+		const unlanded = entry.blockIds.filter(blockId => blockId !== attempt?.tailId);
+		return new TornActionError(this.id, entry.actionId, rev, unlanded,
+			rivalConfirmed ? 'rival-holds-revision' : 'completion-refused',
+			refusal.reason ?? (rivalConfirmed ? 'a different action holds the revision' : 'the re-send was refused'),
+			refusal.staleAt);
+	}
+
+	/** Drops the pending actions this sync's OWN committed entry made durable, instead of replaying
+	 * them into a duplicate entry (see {@link inFlightActionId}). Only ever called once
+	 * {@link completeOwnEntry} has returned for this entry — the entry alone is not proof the write
+	 * is saved.
 	 *
 	 * `addActions` wrote exactly the snapshot pending list under this action id, and the entry's
 	 * actions are therefore the LEADING `entry.actions.length` items of `this.pending` — anything
@@ -532,8 +659,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 *
 	 * Takes no in-flight action id — it reads {@link inFlightActionId} off `this`, which is set for
 	 * exactly the write attempt cycles that own one (see that field). Callers cannot get this wrong
-	 * by omission. */
-	private async updateInternal() {
+	 * by omission.
+	 *
+	 * @returns who holds this write's own action, when the refresh found its log entry and finished
+	 * it ({@link completeOwnEntry}); `undefined` on every other refresh, including every reader's.
+	 * @throws TornActionError when it found that entry and could not finish the action — thrown
+	 * before anything on this instance changed. */
+	private async updateInternal(): Promise<WriteDurability | undefined> {
 		// Start with a context that can see to the end of the log
 		const source = new TransactorSource(this.id, this.transactor, undefined);
 		const tracker = new Tracker(source);
@@ -575,10 +707,27 @@ export class Collection<TAction> implements ICollection<TAction> {
 		const collectionLog = await Log.open<Action<TAction>>(tracker, this.id);
 		const latest = collectionLog ? await collectionLog.getFrom(actionContext?.rev ?? 0) : undefined;
 
+		// This write's own entry, if its log tail landed despite the failure that sent us here.
+		// Decided ONCE, here: the mark can be cleared latch-free while the completion below is
+		// awaiting (see {@link inFlightActionId}), and an entry that was finished as our own must
+		// not then be run through the conflict filter as a stranger's and replayed.
+		const inFlightActionId = this.inFlightActionId;
+		const ownEntry = inFlightActionId === undefined
+			? undefined
+			: latest?.entries.find(entry => entry.actionId === inFlightActionId);
+		// Finish it BEFORE anything below changes this instance — see {@link completeOwnEntry}. A
+		// throw from here (the action cannot be finished, or not yet) therefore abandons the refresh
+		// with the staged actions, the tracker and the held revision exactly as they were.
+		// The entry's revision comes from the context the same walk built; an entry older than a
+		// checkpoint is not restated there, and completeOwnEntry falls back to the attempt's own.
+		const completedDurability = ownEntry === undefined
+			? undefined
+			: await this.completeOwnEntry(ownEntry, latest?.context?.committed.find(c => c.actionId === ownEntry.actionId)?.rev);
+
 		// Process the entries and track the blocks they affect
 		let anyConflicts = false;
 		for (const entry of latest?.entries ?? []) {
-			const isOwnEntry = this.inFlightActionId !== undefined && entry.actionId === this.inFlightActionId;
+			const isOwnEntry = entry === ownEntry;
 			const { after, mutated } = isOwnEntry
 				? this.consumeOwnEntry(entry)
 				: this.filterAgainstEntry(entry);
@@ -623,6 +772,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		if (this.mustReplay(anyConflicts, actionContext)) {
 			await this.replayActions();
 		}
+		return completedDurability;
 	}
 
 	/** Whether {@link updateInternal} must re-stage `pending` after adopting `latest`, given the
@@ -963,12 +1113,36 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * ever allowed to drive the SAME instance concurrently, this must become a per-attempt token (a
 	 * mark object compared by identity, refusing to replace a live one) rather than a bare id. */
 	beginInFlightAction(actionId: ActionId): () => void {
+		if (this.inFlightActionId !== actionId) {
+			// A different action's failed attempt cannot finish this one. Re-marking the SAME id (a
+			// coordinator re-marks on every attempt) keeps what the previous attempt retained — that
+			// is the attempt the next refresh may need.
+			this.inFlightAttempt = undefined;
+		}
 		this.inFlightActionId = actionId;
 		return () => {
 			if (this.inFlightActionId === actionId) {
 				this.inFlightActionId = undefined;
+				this.inFlightAttempt = undefined;
 			}
 		};
+	}
+
+	/** Keep what a FAILED attempt under `actionId` sent, so that if the refresh before its retry
+	 * finds that attempt's own log entry it can finish the action rather than assume it finished
+	 * (see {@link inFlightAttempt} and {@link completeOwnEntry}). Every write path that marks an
+	 * action in flight must call this for each attempt that fails, BEFORE the refresh that follows —
+	 * a path that does not still never reports a half-landed write as saved (the refresh then
+	 * refuses with a `transforms-not-held` {@link TornActionError}), but it cannot recover from one.
+	 *
+	 * A no-op unless `actionId` is the action currently marked, so a late call from an attempt whose
+	 * cycle has already ended cannot plant transforms under somebody else's mark. Latch-free and
+	 * synchronous, like the mark itself: `TransactionCoordinator` calls it from inside its commit
+	 * span, where it already holds this instance's latch. */
+	retainInFlightAttempt(actionId: ActionId, attempt: InFlightAttempt): void {
+		if (this.inFlightActionId === actionId) {
+			this.inFlightAttempt = attempt;
+		}
 	}
 
 	/** Push our pending actions to the transactor.
@@ -1155,23 +1329,69 @@ export class Collection<TAction> implements ICollection<TAction> {
 				if (consecutiveFailures >= maxAttempts) {
 					throw new SyncRetryExhaustedError(this.id, consecutiveFailures, lastReason, lastStaleAt);
 				}
-				// Back off before every retry (any stale failure — reason/missing/pending), growing
-				// exponentially from the base delay up to the cap, with proportional random jitter so a
-				// herd of clients that lost the same race does not re-collide on the next tick (see
-				// utility/backoff.ts). The abortable sleep lets an aborted sync reject promptly instead
-				// of finishing the sleep.
-				// NOTE: the `missing`/`reason` conflict paths now pay this backoff too (they previously
-				// retried with zero delay); that is what stops the persistent-`reason` hot spin. If a
-				// high-contention workload ever shows this base delay as recovery latency, lower
-				// baseBackoffMs for that caller rather than reintroducing the zero-delay retry.
-				const delay = jitteredBackoffMs(consecutiveFailures - 1, { baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
-				await abortableDelay(delay, signal);
-				// Fetch latest state - updateInternal() will call replayActions() if there are conflicts.
-				// This sync's actionId is marked in flight for the whole cycle (see syncInternal), so
-				// the refresh recognizes a log entry written by THIS action (a commit that landed
-				// durably but answered stale — see the entry loop in updateInternal) and consumes it
-				// rather than replaying it into a duplicate entry.
-				await this.updateInternal();
+				// Keep exactly what this attempt sent. A refused commit is not proof nothing landed:
+				// the log tail is committed first and can be stored while the answer is still a
+				// failure, and `transact` has just cancelled every block that did not land. If the
+				// refresh below finds this attempt's own entry, these are the transforms that finish
+				// the action (see completeOwnEntry). The snapshot tracker is abandoned after this
+				// iteration, so its transforms are handed over as-is, uncopied.
+				this.retainInFlightAttempt(actionId, {
+					rev: newRev,
+					transforms: tracker.transforms,
+					tailId: addResult.tailPath.block.header.id,
+					...(blockDigests === undefined ? {} : { blockDigests }),
+				});
+				// Refresh, and keep refreshing while it reports that this write's own half-landed
+				// action could not be finished YET. It must not fall through to a new attempt in that
+				// state: a new attempt rebuilds the log entry (fresh timestamp) and would send a second
+				// version of a log tail that is already stored under this action and revision. Each
+				// round is a failure against the same no-progress budget as a refused attempt.
+				for (;;) {
+					// Back off before every retry (any stale failure — reason/missing/pending), growing
+					// exponentially from the base delay up to the cap, with proportional random jitter so a
+					// herd of clients that lost the same race does not re-collide on the next tick (see
+					// utility/backoff.ts). The abortable sleep lets an aborted sync reject promptly instead
+					// of finishing the sleep.
+					// NOTE: the `missing`/`reason` conflict paths now pay this backoff too (they previously
+					// retried with zero delay); that is what stops the persistent-`reason` hot spin. If a
+					// high-contention workload ever shows this base delay as recovery latency, lower
+					// baseBackoffMs for that caller rather than reintroducing the zero-delay retry.
+					const delay = jitteredBackoffMs(consecutiveFailures - 1, { baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
+					await abortableDelay(delay, signal);
+					try {
+						// Fetch latest state - updateInternal() will call replayActions() if there are conflicts.
+						// This sync's actionId is marked in flight for the whole cycle (see syncInternal), so
+						// the refresh recognizes a log entry written by THIS action (its log tail landed but
+						// the commit answered failure), FINISHES that action from the attempt retained
+						// above, and only then consumes the entry rather than replaying it into a duplicate.
+						const completed = await this.updateInternal();
+						if (completed !== undefined) {
+							// The refresh made this sync's write durable: that is a commit, and it is
+							// reported and counted exactly like one made by an attempt (see the success
+							// branch below for why batches fold to the weakest).
+							durability = durability === undefined ? completed : mergeDurability([durability, completed]);
+							consecutiveFailures = 0;
+							lastReason = undefined;
+							lastStaleAt = undefined;
+							lastFailureConfirmedStaleAt = false;
+							consecutiveStalls = 0;
+						}
+						break;
+					} catch (err) {
+						if (!(err instanceof TornActionError) || err.reason !== 'completion-refused') {
+							throw err;
+						}
+						// Refused for a cause that can clear. The error already names the write as torn,
+						// which is the truth if the budget ends here — so it, not a plain exhaustion,
+						// is what escapes: the log holds an entry for a write that was not saved.
+						consecutiveFailures++;
+						lastReason = err.detail;
+						if (consecutiveFailures >= maxAttempts
+							|| (deadlineMs !== undefined && Date.now() - startedAt >= deadlineMs)) {
+							throw err;
+						}
+					}
+				}
 			} else {
 				// This attempt's commit landed, so its durability is the one to report. A sync that
 				// commits ONCE — every sync that has a caller today — reports exactly that answer,

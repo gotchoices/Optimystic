@@ -15,19 +15,30 @@
  * `finally` around the WHOLE retry loop, since the refresh that reads them runs between attempts,
  * outside the latched span.
  *
- * Case 3 is the other half of that invariant: a mark that outlived its commit would let a LATER,
- * unrelated refresh consume a foreign entry that happens to carry the same id — silently dropping
- * pending work that was never made durable.
+ * The last case is the other half of that invariant: a mark that outlived its commit would let a
+ * LATER, unrelated refresh consume a foreign entry that happens to carry the same id — silently
+ * dropping pending work that was never made durable.
+ *
+ * Recognising the entry is not enough on its own. The entry proves only that the LOG TAIL landed;
+ * in the shape the network transactor actually produces, the blocks after the tail did not, and
+ * the coordinator's cancel has dropped their pending records. So the refresh must FINISH the action
+ * (re-send the retained attempt at the same id and revision) before it consumes the entry, and
+ * `commit()` may return only once every block the entry names holds the action. The
+ * `CommitLandsButReportsStale` cases cover the entry being recognised when everything did land;
+ * the `TailLandsButReportsStale` cases cover the half-landed shape, which is the one that lost data.
  */
 
 import { expect } from 'chai';
 import {
 	ACTIONS_ENGINE_ID,
 	Collection,
+	Log,
+	TornActionError,
 	TransactionCoordinator,
 	createActionsStatements,
 	createTransactionId,
 	createTransactionStamp,
+	type Action,
 	type ActionHandler,
 	type BlockId,
 	type BlockStore,
@@ -43,6 +54,7 @@ import {
 import {
 	CommitLandsButReportsStale,
 	DelegatingTransactor,
+	TailLandsButReportsStale,
 	TestTransactor,
 } from '../src/testing/test-transactor.js';
 
@@ -72,6 +84,23 @@ async function logValues(collection: Collection<SpecAction>): Promise<string[]> 
 	const out: string[] = [];
 	for await (const action of collection.selectLog()) out.push(action.data.value);
 	return out;
+}
+
+/**
+ * The blocks `actionId`'s log entry names, in `collectionId`, that do NOT hold that action in
+ * durable storage. Empty is the definition of "this write is saved": readers materialize blocks,
+ * not log entries, so an entry whose blocks never landed is a write that silently never happened.
+ *
+ * Read through a fresh collection over the UNWRAPPED transactor, so this is storage's answer and
+ * not the writing instance's view of it.
+ */
+async function unlandedBlocks(inner: TestTransactor, collectionId: string, actionId: string): Promise<BlockId[]> {
+	const reader = await Collection.createOrOpen<SpecAction>(inner, collectionId, init());
+	const log = await Log.open<Action<SpecAction>>(reader.tracker, collectionId);
+	const entry = (await log!.getFrom(0)).entries.find(e => e.actionId === actionId);
+	expect(entry, `${collectionId} logs an entry for action ${actionId}`).to.not.equal(undefined);
+	const [status] = await inner.getStatus([{ actionId, blockIds: entry!.blockIds }]);
+	return entry!.blockIds.filter((_, i) => status!.statuses[i] !== 'committed');
 }
 
 /** Stage one `set` action per entry into `coordinator`'s collections and return the transaction
@@ -192,7 +221,12 @@ describe('TransactionCoordinator: own committed action on retry', () => {
 		// is spent), leaving the SAME action id recorded at two revisions.
 		expect(await logValues(collection), 'the action is logged exactly once')
 			.to.deep.equal(['local']);
-		expect(transactor.landedCommits, 'exactly one commit ever landed on storage').to.equal(1);
+		// The injection fired. (Not `=== 1`: the refresh now re-sends the retained attempt to make
+		// sure the action is whole, and with every block already holding it that re-send is an
+		// idempotent commit that writes nothing but still succeeds — so this counter cannot tell
+		// "finished" from "replayed". The revision assertions below are what can: a replay takes a
+		// SECOND revision.)
+		expect(transactor.landedCommits, 'the masked commit really landed').to.be.at.least(1);
 		expect(collection.hasUnsyncedChanges(), 'nothing left staged').to.equal(false);
 
 		// The refresh — not recordCommitted, which never ran — is what advanced the context, and it
@@ -205,6 +239,10 @@ describe('TransactionCoordinator: own committed action on retry', () => {
 		// durable log agreeing, not just this instance's view of it.
 		const reader = await Collection.createOrOpen<SpecAction>(inner, collectionId, init());
 		expect(await logValues(reader), 'the durable log agrees').to.deep.equal(['local']);
+		expect(reader.committedRevision(), 'storage holds ONE revision — a replay would have taken a second')
+			.to.equal(1);
+		// This is the case where every block really did land: finishing had nothing left to do.
+		expect(await unlandedBlocks(inner, collectionId, transaction.id)).to.deep.equal([]);
 	});
 
 	it('one participant tearing while another cleanly loses leaves each action logged once', async () => {
@@ -232,9 +270,8 @@ describe('TransactionCoordinator: own committed action on retry', () => {
 		expect(await logValues(lost), "the cleanly-lost participant's action is logged once")
 			.to.deep.equal(['lost']);
 
-		// One landing per collection: the torn one's masked commit, and the retry that carried the
-		// other. A replayed torn action would show up here as a third.
-		expect(transactor.landedCommits, 'exactly two commits landed on storage').to.equal(2);
+		expect(transactor.landedCommits, 'both injections fired: a masked landing and a real retry')
+			.to.be.at.least(2);
 		expect(torn.hasUnsyncedChanges(), 'torn participant left nothing staged').to.equal(false);
 		expect(lost.hasUnsyncedChanges(), 'lost participant left nothing staged').to.equal(false);
 
@@ -243,6 +280,113 @@ describe('TransactionCoordinator: own committed action on retry', () => {
 		const lostReader = await Collection.createOrOpen<SpecAction>(inner, lostId, init());
 		expect(await logValues(tornReader), 'durable log of the torn collection').to.deep.equal(['torn']);
 		expect(await logValues(lostReader), 'durable log of the lost collection').to.deep.equal(['lost']);
+		// One revision per collection: the torn one's masked commit, and the retry that carried the
+		// other. A replayed torn action would show up as a SECOND revision on the torn collection.
+		// (Counting successful commits no longer discriminates — the refresh's re-send of the torn
+		// participant's attempt is an idempotent commit that succeeds while writing nothing.)
+		expect(tornReader.committedRevision(), 'the torn collection took one revision').to.equal(1);
+		expect(lostReader.committedRevision(), 'the lost collection took one revision').to.equal(1);
+	});
+
+	/** One durable commit through the UNWRAPPED transactor, so the collection under test opens
+	 *  against a committed header. The half-landed shape is only observable then: a first commit
+	 *  that lands nothing but its log tail leaves the header uncommitted, so the refresh cannot
+	 *  reach the log at all and the retry is an ordinary one. */
+	async function seed(inner: TestTransactor, collectionId: string): Promise<void> {
+		const seeded = await Collection.createOrOpen<SpecAction>(inner, collectionId, init());
+		await seeded.act({ type: 'set', data: { value: 'seed' } });
+		await seeded.sync(retryFast);
+	}
+
+	it('finishes a half-landed commit rather than reporting it saved on its log entry alone (single collection)', async () => {
+		const collectionId = 'coord-tail-only-single';
+		const inner = new TestTransactor();
+		await seed(inner, collectionId);
+		// Only the LOG TAIL of the first commit lands; the block the action inserted does not, and
+		// cancelPhase then drops its pending record. This is what NetworkTransactor.commit leaves
+		// behind when the tail commit answers failure after the tail was stored.
+		const transactor = new TailLandsButReportsStale(inner);
+		const collection = await Collection.createOrOpen<SpecAction>(transactor, collectionId, init());
+		const coordinator = new TransactionCoordinator(transactor, new Map([[collectionId, collection]]));
+		const transaction = await stage(coordinator, [{ collectionId, value: 'local' }]);
+
+		await coordinator.commit(transaction, retryFast);
+
+		expect(transactor.tears, 'the tail-only landing was actually injected').to.equal(1);
+		// The contract: commit() returned, so every block the entry names holds the action.
+		expect(await unlandedBlocks(inner, collectionId, transaction.id),
+			'no block the log entry names was left behind').to.deep.equal([]);
+		expect(await logValues(collection), 'and the action is still logged exactly once')
+			.to.deep.equal(['seed', 'local']);
+		expect(collection.hasUnsyncedChanges(), 'nothing left staged').to.equal(false);
+		expect(collection.committedRevision(), 'finished AT the revision its tail took, not a new one').to.equal(2);
+		expect(collection.committedActionId()).to.equal(transaction.id);
+	});
+
+	it('finishes every half-landed participant of a multi-collection commit', async () => {
+		const idA = 'coord-tail-only-multi-a';
+		const idB = 'coord-tail-only-multi-b';
+		const inner = new TestTransactor();
+		await seed(inner, idA);
+		await seed(inner, idB);
+		// Both participants tear the same way, so neither counts as committed and the attempt is a
+		// clean stale loss — the retryable shape, whose refresh is the code under test.
+		const transactor = new TailLandsButReportsStale(inner, 2);
+		const a = await Collection.createOrOpen<SpecAction>(transactor, idA, init());
+		const b = await Collection.createOrOpen<SpecAction>(transactor, idB, init());
+		const coordinator = new TransactionCoordinator(transactor, new Map([[idA, a], [idB, b]]));
+		const transaction = await stage(coordinator, [
+			{ collectionId: idA, value: 'local-a' },
+			{ collectionId: idB, value: 'local-b' },
+		]);
+
+		await coordinator.commit(transaction, retryFast);
+
+		expect(transactor.tears, 'both participants were torn').to.equal(2);
+		expect(await unlandedBlocks(inner, idA, transaction.id), 'participant A is whole').to.deep.equal([]);
+		expect(await unlandedBlocks(inner, idB, transaction.id), 'participant B is whole').to.deep.equal([]);
+		expect(await logValues(a)).to.deep.equal(['seed', 'local-a']);
+		expect(await logValues(b)).to.deep.equal(['seed', 'local-b']);
+		expect(a.hasUnsyncedChanges() || b.hasUnsyncedChanges(), 'nothing left staged').to.equal(false);
+	});
+
+	it('refuses by name, and keeps the staged action, when a rival took the revision a half-landed commit still needed', async () => {
+		const collectionId = 'coord-tail-only-rival';
+		const inner = new TestTransactor();
+		await seed(inner, collectionId);
+		// The rival commits right after this transaction's cancel, on top of the torn log entry it
+		// can already see. The log tail now holds the rival's revision, so nothing can land this
+		// transaction's remaining block at its own revision any more.
+		const transactor = new TailLandsButReportsStale(inner, 1, async unwrapped => {
+			const rival = await Collection.createOrOpen<SpecAction>(unwrapped, collectionId, init());
+			await rival.act({ type: 'set', data: { value: 'rival' } });
+			await rival.sync(retryFast);
+		});
+		const collection = await Collection.createOrOpen<SpecAction>(transactor, collectionId, init());
+		const coordinator = new TransactionCoordinator(transactor, new Map([[collectionId, collection]]));
+		const transaction = await stage(coordinator, [{ collectionId, value: 'local' }]);
+
+		let thrown: unknown;
+		try {
+			await coordinator.commit(transaction, retryFast);
+		} catch (err) {
+			thrown = err;
+		}
+
+		expect(thrown, 'the commit is refused, never acknowledged').to.be.instanceOf(TornActionError);
+		const torn = thrown as TornActionError;
+		expect(torn.reason).to.equal('rival-holds-revision');
+		expect(torn.collectionId).to.equal(collectionId);
+		expect(torn.actionId).to.equal(transaction.id);
+		expect(torn.rev).to.equal(2);
+		// Not re-driven under a new revision (that would log the action twice), and not silently
+		// dropped either: the action is still staged for the caller to decide about.
+		expect(await unlandedBlocks(inner, collectionId, transaction.id), 'the block never landed')
+			.to.not.be.empty;
+		expect(collection.hasUnsyncedChanges(), 'the unsaved action is still staged').to.equal(true);
+		const reader = await Collection.createOrOpen<SpecAction>(inner, collectionId, init());
+		expect(await logValues(reader), 'one entry per writer — no second copy of the torn action')
+			.to.deep.equal(['seed', 'local', 'rival']);
 	});
 
 	it('an abandoned commit leaves no in-flight mark behind for a later refresh to consume', async () => {

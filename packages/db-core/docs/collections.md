@@ -254,6 +254,19 @@ Key aspects of the sync process:
   `maxStalledAttempts` to `maxAttempts` to restore the pre-existing whole-budget behaviour. This
   makes the failure fast and correctly named — it does not make the write land; `sync()` never
   adopts the confirmed revision, because it is a bare number rather than the history behind it.
+- **A half-landed write is finished before it is acknowledged**: a write's log tail is committed
+  before its other blocks, and a commit can answer "failed" after the tail was stored (the tail's
+  revision is held by fewer than a majority, or a later block lost a race). The retry's refresh then
+  finds the write's own log entry. That proves only that the tail landed, so before treating the
+  entry as its own finished work `sync()` re-sends the failed attempt — same action id, same
+  revision, same transforms — which lands exactly the blocks that are missing. **`sync()` resolves
+  only when every block the write's log entry names holds the write's revision.** When that cannot
+  be done it throws `TornActionError` (collection, action id, revision, the blocks left behind, and
+  a `reason`: `rival-holds-revision`, `completion-refused`, or `transforms-not-held`). This is *not*
+  a `SyncRetryExhaustedError` and must not be handled like one: the log already holds an entry for
+  the write, its data is not saved, and the staged actions are left in place. Resubmitting them is
+  a new write that will be logged a second time — a decision for the caller, never made silently.
+  `TransactionCoordinator.commit` follows the same rule and throws the same error.
 - **Pending management**: Waits (with exponential backoff) for conflicting transactions to complete
 - **State consistency**: Maintains proper revision tracking and cache coherence
 

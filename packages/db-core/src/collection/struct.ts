@@ -111,6 +111,66 @@ export class SyncRevisionStalledError extends SyncRetryExhaustedError {
 	}
 }
 
+/** Why a half-landed write could not be finished (see {@link TornActionError}).
+ *
+ * - `rival-holds-revision` — a DIFFERENT action holds a revision at or past the one a block needed.
+ *   Permanent: nothing can land this write's transform on that block at its revision any more.
+ * - `completion-refused` — finishing was attempted and refused for a cause that can clear on its
+ *   own (another write in flight on the block, the revision not yet held by a majority). The write
+ *   paths retry this inside their own budget, so seeing it means that budget ran out.
+ * - `transforms-not-held` — the write's own log entry was found with blocks still missing, but this
+ *   collection no longer holds the transforms that would finish them. */
+export type TornActionReason = 'rival-holds-revision' | 'completion-refused' | 'transforms-not-held';
+
+/** Thrown when a write HALF-LANDED and was not finished: its log entry is stored, but at least one
+ * of the other blocks that entry names does not hold the write's revision.
+ *
+ * A write's log tail is committed before the rest of its blocks, so a write can be refused AFTER the
+ * tail was stored (see `NetworkTransactor.commit`). The writer's retry then finds its own log entry.
+ * That entry proves only that the tail landed; the write is saved only once EVERY block the entry
+ * names holds the write's revision, so the retry finishes the remaining blocks at the same action id
+ * and revision (see `Collection.completeOwnEntry`). This error is what it raises when it could not
+ * — {@link reason} says which way.
+ *
+ * To the CALLER this is never retryable, whatever the reason, and it is deliberately not a
+ * {@link SyncRetryExhaustedError}: that error says the write never landed and invites trying again,
+ * whereas here the log already holds an entry for a write whose data is not saved. Finishing needs
+ * the original action id and the transforms it sent, and both are gone once this escapes (the one
+ * reason that CAN clear, `completion-refused`, has already been retried to the end of the budget by
+ * the write path that threw). Re-driving under a NEW revision would record the same actions in the
+ * log twice, so nothing here does that on the caller's behalf. The staged actions are left in
+ * place on the collection; the caller decides whether to discard them or submit them again as a
+ * new write, knowing the log already carries one entry for them whose data never landed.
+ *
+ * Raised out of {@link ICollection.sync} / {@link ICollection.updateAndSync}, and out of
+ * {@link ICollection.update} when the refresh runs on behalf of a write in flight (a
+ * `TransactionCoordinator.commit` retry). */
+export class TornActionError extends Error {
+	constructor(
+		readonly collectionId: CollectionId,
+		/** The half-landed write's action id. */
+		readonly actionId: string,
+		/** The revision its log entry landed at — the revision every block it names had to take. */
+		readonly rev: number,
+		/** The blocks the entry names that do not hold that revision — or, when the refusal did not
+		 * say which, every block the entry names other than ones known to hold it. */
+		readonly blockIds: BlockId[],
+		/** Which of the three ways finishing failed — see {@link TornActionReason}. */
+		readonly reason: TornActionReason,
+		/** The refusal in the responder's own words, for a log line. Never branch on it. */
+		readonly detail: string,
+		/** The confirmed revision a responder reported holding under ANOTHER action, when the refusal
+		 * carried one (see `StaleFailure.staleAt`). */
+		readonly staleAt?: { blockId: BlockId; rev: number },
+	) {
+		super(`collection ${collectionId}: action ${actionId} is torn at rev ${rev} — its log entry is stored `
+			+ `but block(s) ${blockIds.join(', ') || '(unknown)'} do not hold that revision, and the write cannot be `
+			+ `finished: ${detail}`
+			+ (staleAt ? ` (block ${staleAt.blockId} is at rev ${staleAt.rev})` : ''));
+		this.name = 'TornActionError';
+	}
+}
+
 /** Thrown when a collection that already holds a committed revision reads its own header
  * block as authoritatively absent.
  *

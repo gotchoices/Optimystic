@@ -175,12 +175,23 @@ export class TestTransactor implements ITransactor {
 		// storage is already at or past the requested revision, held by someone other than this same
 		// action. Reported as `staleAt` so a caller reading the shared harness sees the real shape.
 		const staleCandidates: StaleFailure['staleAt'][] = [];
+		// Blocks this SAME action already committed at exactly the requested revision — the durable
+		// half of a torn action, met again by its own retry. Mirrors StorageRepo.pend's `satisfied`
+		// set: such a block is neither a committed conflict nor a pending one, and no pending record
+		// is written for it (commit's own-revision arm below never promotes one, so it would never
+		// clear). It still rides in the returned `blockIds`, as in the real repo, so `cancel` covers it.
+		const satisfied = new Set<BlockId>();
 
 		// Check for conflicts (pending or committed based on rev/insert)
 		for (const blockId of blockIds) {
 			const blockState = this.blocks.get(blockId);
 			const blockTransform = transformForBlockId(transforms, blockId);
 			if (!blockTransform) continue; // Should not happen
+
+			if (blockState && isOwnRevision(latestActionRev(blockState), rev, actionId)) {
+				satisfied.add(blockId);
+				continue;
+			}
 
 			if (blockState) {
 				// Check for existing pending actions
@@ -197,8 +208,9 @@ export class TestTransactor implements ITransactor {
 						// Mirrors StorageRepo.pend exactly: only a real revision race yields a
 						// meaningful `staleAt`. A rev-less pend reaches here as an insert collision
 						// (`checkRev` degraded to 0), where the block's revision answers a question
-						// nobody asked; and our own durable half of a torn action is not a rival's win.
-						if (rev !== undefined && !isOwnRevision(latestActionRev(blockState), rev, actionId)) {
+						// nobody asked. (Our own durable half of a torn action never reaches here —
+						// it was set aside as `satisfied` above.)
+						if (rev !== undefined) {
 							staleCandidates.push({ blockId, rev: blockState.latestRev });
 						}
 						// Collect conflicting committed actions
@@ -270,6 +282,7 @@ export class TestTransactor implements ITransactor {
 
 		// No fatal conflicts found, proceed to pend
 		for (const blockId of blockIds) {
+			if (satisfied.has(blockId)) continue;
 			const blockTransform = transformForBlockId(transforms, blockId);
 			if (blockTransform) {
 				const blockState = ensuredMap(this.blocks, blockId, () => newBlockState());
@@ -313,10 +326,19 @@ export class TestTransactor implements ITransactor {
 
       // --- Start of Critical Section (Simulated) ---
 
+      // Blocks this same action already committed at exactly this revision: an idempotent no-op,
+      // mirroring StorageRepo.commit's `alreadyDone` partition. They are neither stale nor in need
+      // of a pending record (pend wrote none for them — see `satisfied` there), which is what lets
+      // a torn action's retry roll its remaining blocks forward.
+      const alreadyDone = new Set(blockIds.filter(blockId => {
+        const blockState = this.blocks.get(blockId);
+        return blockState !== undefined && isOwnRevision(latestActionRev(blockState), rev, actionId);
+      }));
+
       // Check for stale revisions
       const staleBlocks = blockIds.filter(blockId => {
         const blockState = this.blocks.get(blockId);
-        return blockState && blockState.latestRev >= rev;
+        return blockState && blockState.latestRev >= rev && !alreadyDone.has(blockId);
       });
 
       if (staleBlocks.length > 0) {
@@ -344,19 +366,17 @@ export class TestTransactor implements ITransactor {
           transforms
         }));
         // Same rule as StorageRepo.commit's missedCommits branch: report the highest confirmed
-        // revision a stale block is already at, skipping one held by this very action (the
-        // durable half of a torn action, which its own retry must not be refused by).
-        const staleAt = highestStaleAt(staleBlocks.map(blockId => {
-          const blockState = this.blocks.get(blockId)!;
-          return isOwnRevision(latestActionRev(blockState), rev, actionId)
-            ? undefined
-            : { blockId, rev: blockState.latestRev };
-        }));
+        // revision a stale block is already at. A block held by this very action never reaches
+        // here — it was partitioned out as `alreadyDone` above.
+        const staleAt = highestStaleAt(staleBlocks.map(blockId =>
+          ({ blockId, rev: this.blocks.get(blockId)!.latestRev })));
         return { success: false, missing, ...(staleAt ? { staleAt } : {}) };
       }
 
-      // Verify all blocks have the pending action
-      for (const blockId of blockIds) {
+      const toCommit = blockIds.filter(blockId => !alreadyDone.has(blockId));
+
+      // Verify all blocks that still need committing have the pending action
+      for (const blockId of toCommit) {
         const blockState = this.blocks.get(blockId);
         if (!blockState || !blockState.pendingActions.has(actionId)) {
           return {
@@ -367,7 +387,7 @@ export class TestTransactor implements ITransactor {
       }
 
       // Commit the action for each block
-      for (const blockId of blockIds) {
+      for (const blockId of toCommit) {
         const blockState = this.blocks.get(blockId)!;
         const transform = blockState.pendingActions.get(actionId)!;
 
@@ -522,11 +542,17 @@ export class FlakyCommitTransactor extends DelegatingTransactor {
 }
 
 /**
- * Commits durably on the inner {@link TestTransactor}, then reports a stale failure anyway —
- * the exact observable shape of `NetworkTransactor.commit`'s TORN ACTION: the collection's log
- * tail is committed BEFORE the sweep of the remaining blocks, so a later sweep block coming back
- * as a confirmed conflict returns a stale failure over an action whose log entry is already
- * durable.
+ * Commits the WHOLE action durably on the inner {@link TestTransactor}, then reports a stale
+ * failure anyway — a write that fully landed but whose writer was told it failed.
+ *
+ * This is NOT the shape `NetworkTransactor.commit` produces when it refuses a write whose log tail
+ * landed: there the tail is committed BEFORE the sweep of the remaining blocks, so the blocks after
+ * the tail did NOT land. That shape is {@link TailLandsButReportsStale}, and it is the one that
+ * matters in production. This double makes "my own log entry is visible" and "my action is fully
+ * durable" the same thing, so on its own it cannot tell a writer that finishes its half-landed
+ * action from one that merely assumes it is finished. Keep it for the case it does model — every
+ * block already holds the action's revision, so the writer's completion pass has nothing left to
+ * land and must not duplicate or move the entry.
  *
  * Safe against the inner transactor's bookkeeping because `TransactorSource.transact` cancels
  * the pend on the reported failure and {@link TestTransactor.cancel} only deletes PENDING records
@@ -555,6 +581,64 @@ export class CommitLandsButReportsStale extends DelegatingTransactor {
 			}
 		}
 		return result;
+	}
+}
+
+/**
+ * Lands ONLY the action's log tail on the inner {@link TestTransactor}, then reports a retryable
+ * failure — the shape `NetworkTransactor.commit` actually produces for a half-landed write. It
+ * commits the tail first and sweeps the remaining blocks only if the tail answered success, and a
+ * failed tail answer does not mean the tail is absent: the coordinator's durability gate answers
+ * `commit-not-durable` whenever fewer than a majority of the cohort hold the revision, even though
+ * some members stored it. So the writer is told "failed" over a log entry that is durable, while
+ * none of the entry's other blocks were ever committed — and the writer's own cancel then drops
+ * their pending records.
+ *
+ * A commit carrying nothing but the tail is delegated untouched (there is nothing to abandon), and
+ * does not consume an injection.
+ *
+ * `afterCancel`, when given, runs a competing writer ONCE, right after the writer's cancel of the
+ * torn attempt has been delegated. It is on `cancel` and not inside `commit` for the reason
+ * {@link CompetingWriterTransactor} documents: until that cancel lands, the torn action's data
+ * blocks still carry its pending records, a rival pending with policy `'r'` collides with them, and
+ * awaiting that rival from inside the writer's own commit is a livelock.
+ */
+export class TailLandsButReportsStale extends DelegatingTransactor {
+	/** Remaining number of commits to tear. */
+	private injections: number;
+	/** Commits torn so far: the tail landed, every other block of the action was abandoned. */
+	tears = 0;
+	/** Commits delegated whole that succeeded on the inner transactor. */
+	landedCommits = 0;
+	private rivalDue = false;
+
+	constructor(inner: TestTransactor, injections = 1, private readonly afterCancel?: RivalWrite) {
+		super(inner);
+		this.injections = injections;
+	}
+
+	override async commit(request: CommitRequest): Promise<CommitResult> {
+		if (this.injections > 0 && request.blockIds.some(blockId => blockId !== request.tailId)) {
+			const tail = await this.inner.commit({ ...request, blockIds: [request.tailId] });
+			// A tail that itself lost is an ordinary loss — nothing is torn, so report it verbatim
+			// and keep the injection for a commit that can actually tear.
+			if (!tail.success) return tail;
+			this.injections--;
+			this.tears++;
+			this.rivalDue = this.afterCancel !== undefined;
+			return { success: false, conflict: true, reason: 'commit-not-durable: injected tail-only landing' };
+		}
+		const result = await this.inner.commit(request);
+		if (result.success) this.landedCommits++;
+		return result;
+	}
+
+	override async cancel(actionRef: ActionBlocks): Promise<void> {
+		await this.inner.cancel(actionRef);
+		if (this.rivalDue) {
+			this.rivalDue = false;
+			await this.afterCancel!(this.inner);
+		}
 	}
 }
 
