@@ -1351,6 +1351,7 @@ export async function createLibp2pNodeBase(
 							partitionDetector,
 							fretAdapter,
 							ownedBlocks,
+							keyNetwork,
 							options.rebalance,
 						);
 						await rebalanceMonitor.start();

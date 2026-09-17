@@ -2,6 +2,7 @@ import type { Startable, Libp2p } from '@libp2p/interface'
 import { hashKey } from 'p2p-fret'
 import type { FretService } from 'p2p-fret'
 import { routingKeyForBlock } from '@optimystic/db-core'
+import type { IKeyNetwork } from '@optimystic/db-core'
 import type { PartitionDetector } from './partition-detector.js'
 import type { ArachnodeFretAdapter, ArachnodeInfo } from '../storage/arachnode-fret-adapter.js'
 import { createLogger } from '../logger.js'
@@ -102,6 +103,20 @@ export interface RebalanceMonitorDeps {
 	 * was-responsible memory, not owned-block tracking).
 	 */
 	trackedBlocks?: Set<string>
+	/**
+	 * The node's key network. When provided, a block's cohort is `findCluster` on its routing key —
+	 * the rule the writer routes by, the coordinator refuses writes by, and `RepoService` redirects
+	 * by — so the monitor never calls a peer responsible (and pushes it a replica) that the rest of
+	 * the node does not, nor releases a block the node is still responsible for. Omit for standalone
+	 * construction (unit tests): the cohort is then FRET's nearest {@link RebalanceMonitor.getCohortSize}.
+	 */
+	keyNetwork?: Pick<IKeyNetwork, 'findCluster'>
+	/**
+	 * The node's resolved `clusterSize`. Caps {@link RebalanceMonitor.getCohortSize}: a floor wider
+	 * than the cohort can never be confirmed (a lost block would never be released), and on the
+	 * standalone path it would assemble peers outside the configured cohort.
+	 */
+	clusterSize?: number
 }
 
 type RebalanceHandler = (event: RebalanceEvent) => void
@@ -420,14 +435,20 @@ export class RebalanceMonitor implements Startable {
 		const newOwners = new Map<string, string[]>()
 		const grown = new Map<string, string[]>()
 		let growthDeferred = 0
+		let lookupFailed = 0
 		const growthCandidates: Array<{ blockId: string; newPeers: string[]; state: BlockGrowthState }> = []
 
 		for (const blockId of this.trackedBlocks) {
-			const key = routingKeyForBlock(blockId)
-			const coord = await hashKey(key)
-
-			// Get the current cohort — assembleCohort returns peer IDs sorted by distance
-			const cohort = this.deps.fret.assembleCohort(coord, this.getCohortSize())
+			let cohort: string[]
+			try {
+				cohort = await this.cohortFor(blockId)
+			} catch (err) {
+				// Responsibility is undetermined: leave this block's state untouched (never guess lost or
+				// gained off a failed lookup) and count it as outstanding so the re-check timer retries it.
+				log('cohort lookup failed: block=%s %o', blockId, err)
+				lookupFailed++
+				continue
+			}
 			const isResponsible = cohort.includes(selfId)
 			const prior = this.responsibilitySnapshot.get(blockId)
 			const wasResponsible = prior?.responsible ?? false
@@ -489,7 +510,7 @@ export class RebalanceMonitor implements Startable {
 				growthDeferred++
 			}
 		}
-		this.lastGrowthDeferred = growthDeferred
+		this.lastGrowthDeferred = growthDeferred + lookupFailed
 
 		this.lastRebalanceAt = Date.now()
 
@@ -513,18 +534,33 @@ export class RebalanceMonitor implements Startable {
 	}
 
 	/**
-	 * The replication floor `N` — the cohort size FRET assembles for a block. Public so the ring-shift
-	 * handoff and the rebalance reaction can gate release on confirming replication to this many
-	 * holders (`docs/arachnode-ring-handoff.md` § Replication floor). Derives from FRET's network-size
-	 * estimate: `clamp(ceil(sqrt(n_est)), 1, 3)`, defaulting to 3 when no confident estimate exists.
+	 * The peers responsible for a block, nearest first. With a key network wired this is its
+	 * `findCluster` cohort (see {@link RebalanceMonitorDeps.keyNetwork}); otherwise FRET's nearest
+	 * {@link getCohortSize} ring members.
+	 */
+	private async cohortFor(blockId: string): Promise<string[]> {
+		const key = routingKeyForBlock(blockId)
+		if (this.deps.keyNetwork) {
+			return Object.keys(await this.deps.keyNetwork.findCluster(key))
+		}
+		return this.deps.fret.assembleCohort(await hashKey(key), this.getCohortSize())
+	}
+
+	/**
+	 * The replication floor `N`. Public so the ring-shift handoff and the rebalance reaction can gate
+	 * release on confirming replication to this many holders (`docs/arachnode-ring-handoff.md`
+	 * § Replication floor). Derives from FRET's network-size estimate: `clamp(ceil(sqrt(n_est)), 1, 3)`,
+	 * defaulting to 3 when no confident estimate exists — and never above the configured `clusterSize`,
+	 * since no block has more responsible holders than that to confirm on.
 	 */
 	getCohortSize(): number {
 		const diag: any = (this.deps.fret as any).getDiagnostics?.()
 		const estimate = diag?.estimate ?? diag?.n
-		if (typeof estimate === 'number' && Number.isFinite(estimate) && estimate > 0) {
-			return Math.max(1, Math.min(3, Math.ceil(Math.sqrt(estimate))))
-		}
-		return 3
+		const size = typeof estimate === 'number' && Number.isFinite(estimate) && estimate > 0
+			? Math.max(1, Math.min(3, Math.ceil(Math.sqrt(estimate))))
+			: 3
+		const cap = this.deps.clusterSize
+		return cap != null && cap >= 1 ? Math.min(size, cap) : size
 	}
 
 	private emitEvent(event: RebalanceEvent): void {

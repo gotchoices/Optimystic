@@ -6,7 +6,7 @@ import { hashKey } from 'p2p-fret'
 import { toString as u8ToString } from 'uint8arrays/to-string'
 import type { IPeerReputation } from '../reputation/types.js'
 import { PenaltyReason } from '../reputation/types.js'
-import { RebalanceMonitor, type RebalanceMonitorConfig } from '../cluster/rebalance-monitor.js'
+import { RebalanceMonitor, type RebalanceMonitorConfig, type RebalanceMonitorDeps } from '../cluster/rebalance-monitor.js'
 import { SpreadOnChurnMonitor, type SpreadOnChurnConfig, type SpreadOnChurnDeps } from '../cluster/spread-on-churn.js'
 import type { PartitionDetector } from '../cluster/partition-detector.js'
 import type { ArachnodeFretAdapter } from '../storage/arachnode-fret-adapter.js'
@@ -79,6 +79,7 @@ export class NetworkManagerService implements Startable {
 		partitionDetector: PartitionDetector,
 		fretAdapter: ArachnodeFretAdapter,
 		trackedBlocks: Set<string>,
+		keyNetwork: RebalanceMonitorDeps['keyNetwork'],
 		config?: RebalanceMonitorConfig
 	): RebalanceMonitor {
 		const libp2p = this.getLibp2p()
@@ -88,8 +89,10 @@ export class NetworkManagerService implements Startable {
 		}
 		// trackedBlocks is the shared owned-block set: the node passes the SAME Set instance into
 		// both monitor inits so spread and rebalance act on one source of truth and never drift.
+		// keyNetwork + clusterSize: the monitor decides responsibility by the same cohort rule the
+		// writer, the coordinator and the redirect check use, and caps its floor at that cohort's width.
 		this.rebalanceMonitor = new RebalanceMonitor(
-			{ libp2p, fret, partitionDetector, fretAdapter, trackedBlocks },
+			{ libp2p, fret, partitionDetector, fretAdapter, trackedBlocks, keyNetwork, clusterSize: this.cfg.clusterSize },
 			config
 		)
 		return this.rebalanceMonitor

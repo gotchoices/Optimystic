@@ -624,6 +624,81 @@ describe('RebalanceMonitor', () => {
 		});
 	});
 
+	describe('responsibility rule (the key network cohort, capped floor)', () => {
+		// FRET alone would name a wider set than the key network's `clusterSize` cohort; the monitor must
+		// follow the key network, or its growth arm pushes replicas to peers nobody else calls responsible.
+		const keyNetworkOf = (cohort: () => string[]) => {
+			const calls: Uint8Array[] = [];
+			return {
+				calls,
+				async findCluster(key: Uint8Array) {
+					calls.push(key);
+					return Object.fromEntries(cohort().map(id => [id, { multiaddrs: [], publicKey: '' }]));
+				}
+			};
+		};
+
+		it('takes a block\'s cohort from the key network, not FRET\'s wider nearest set', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString(), peerId3.toString()]);
+			const keyNetwork = keyNetworkOf(() => [selfId.toString(), peerId2.toString()]);
+
+			const monitor = new RebalanceMonitor({ ...deps, keyNetwork, clusterSize: 2 });
+			monitor.trackBlock('block-1');
+			const event = await monitor.checkNow();
+
+			expect(keyNetwork.calls.length).to.equal(1);
+			expect(mockFret.assembleCohortCalls.length, 'FRET is not consulted for the cohort').to.equal(0);
+			expect(event!.grown.get('block-1'), 'only the key network cohort peer is pushed to')
+				.to.deep.equal([peerId2.toString()]);
+		});
+
+		it('reports lost when the key network drops self, even while FRET still counts it nearest', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString(), peerId3.toString()]);
+			let cohort = [selfId.toString(), peerId2.toString()];
+			const monitor = new RebalanceMonitor({ ...deps, keyNetwork: keyNetworkOf(() => cohort), clusterSize: 2 }, { minRebalanceIntervalMs: 0 });
+			monitor.trackBlock('block-1');
+			await monitor.checkNow();
+
+			cohort = [peerId2.toString(), peerId3.toString()];
+			const event = await monitor.checkNow();
+
+			expect(event!.lost).to.deep.equal(['block-1']);
+			expect(event!.newOwners.get('block-1')).to.deep.equal([peerId2.toString(), peerId3.toString()]);
+		});
+
+		it('caps the replication floor at clusterSize', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			expect(new RebalanceMonitor(deps).getCohortSize()).to.equal(3);
+			const monitor = new RebalanceMonitor({ ...deps, clusterSize: 2 });
+			expect(monitor.getCohortSize()).to.equal(2);
+
+			monitor.trackBlock('block-1');
+			const event = await monitor.checkNow();
+			expect(event!.floor).to.equal(2);
+			expect(mockFret.assembleCohortCalls[0]!.wants, 'standalone path assembles no wider than clusterSize').to.equal(2);
+		});
+
+		it('leaves a block\'s responsibility untouched when the cohort lookup throws', async () => {
+			let fail = false;
+			const keyNetwork = {
+				async findCluster() {
+					if (fail) throw new Error('fret unavailable');
+					return { [selfId.toString()]: { multiaddrs: [], publicKey: '' } };
+				}
+			};
+			const monitor = new RebalanceMonitor({ ...deps, keyNetwork, clusterSize: 2 }, { minRebalanceIntervalMs: 0 });
+			monitor.trackBlock('block-1');
+			expect((await monitor.checkNow())!.gained).to.deep.equal(['block-1']);
+
+			fail = true;
+			expect(await monitor.checkNow(), 'a failed lookup is neither lost nor gained').to.be.null;
+
+			fail = false;
+			expect(await monitor.checkNow(), 'still responsible — no spurious regain').to.be.null;
+		});
+	});
+
 	describe('debounce behavior', () => {
 		it('rapid topology changes produce a single debounced check', async () => {
 			mockFret.setCohort('*', [selfId.toString()]);

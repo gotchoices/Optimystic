@@ -14,8 +14,8 @@ implementation builds from. Read `arachnode.md` first for the ring model.
   Moving **in** sheds nothing (the node takes on *more* keyspace), so the release protocol below
   applies only to move-**out** and to a node **leaving** storage entirely.
 - **Replication floor `N`** — the minimum number of complete, serving replicas every key must
-  have. In this codebase it is the cohort size FRET assembles for a block
-  (`RebalanceMonitor.getCohortSize()`), and the cluster admission floor
+  have. In this codebase it is `RebalanceMonitor.getCohortSize()` (FRET's `clamp(ceil(sqrt(n)), 1, 3)`,
+  never above the configured `clusterSize`), and the cluster admission floor
   (`minAbsoluteClusterSize`); the handoff must not let the *serving* replica count for any key
   fall below it.
 - **Post-move holder** — a peer that is responsible for a shed key under the *new* topology
