@@ -3,13 +3,13 @@ import type { PeerId } from "../network/types.js";
 import { highestStaleAt, isConflictFailure } from "../network/stale-failure.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import { mergeDurability, withTornBlocks } from "../network/durability.js";
-import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, WriteDurability } from "../index.js";
+import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, GetBlockResult, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, WriteDurability } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
 import { Tracker } from "../transform/tracker.js";
 import { blockDigestsField } from "../transform/digest.js";
 import { CacheSource } from "../transform/cache-source.js";
-import { TransactorSource } from "./transactor-source.js";
+import { TransactorSource, servedRevision } from "./transactor-source.js";
 import { Log } from "../log/log.js";
 import { groupBy } from "../utility/groupby.js";
 import { routingKeyForBlock } from "../network/routing-key.js";
@@ -179,20 +179,34 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			return b.request?.isResponse === true && b.request.response != null;
 		};
 
+		// Content the CALLER can prove is too old, from the floor it carried on the request
+		// (see {@link BlockGets.floors}): the caller walked a log entry saying this block changed at
+		// that revision, so anything below it is not the view the read asked for, however current
+		// the answering repo honestly believes its copy to be. Only a block-carrying entry can be
+		// below a floor — an absent answer is judged by its own rules above, and treating one as
+		// below-floor would put the one-round `createOrOpen` probe back on the retry path.
+		const belowFloor = (bid: BlockId, entry: GetBlockResult): boolean => {
+			const floor = blockGets.floors?.[bid];
+			return floor !== undefined && entry.block != null && servedRevision(entry) < floor;
+		};
+
 		// A batch is answered when its response carries an entry for EVERY requested
-		// block id and none of those entries carries a doubt marker. An entry present
-		// with only `state` (no `block`) is an authoritative "absent", which counts as
-		// answered — not a gap. An `unavailable` entry is the peer saying it could not
-		// find out whether the block EXISTS; an `unconfirmedAheadRev` entry is the peer
-		// saying it could not confirm the content it served is CURRENT (a cohort claim
-		// sits ahead of it, unsettled). Neither counts as answered, so both earn the
-		// second-chance retry against a different coordinator.
+		// block id and none of those entries carries a doubt marker or falls below the
+		// caller's floor. An entry present with only `state` (no `block`) is an
+		// authoritative "absent", which counts as answered — not a gap. An `unavailable`
+		// entry is the peer saying it could not find out whether the block EXISTS; an
+		// `unconfirmedAheadRev` entry is the peer saying it could not confirm the content
+		// it served is CURRENT (a cohort claim sits ahead of it, unsettled); a below-floor
+		// entry is the CALLER knowing the content is behind a revision it has already seen
+		// the log commit. None counts as answered, so each earns the second-chance retry
+		// against a different coordinator.
 		const isAuthoritative = (b: CoordinatorBatch<BlockId[], GetBlockResults>) => {
 			if (!hasValidResponse(b)) return false;
 			const resp = b.request!.response! as GetBlockResults;
 			return b.payload.every(bid => resp[bid] !== undefined
 				&& resp[bid]!.unavailable === undefined
-				&& resp[bid]!.unconfirmedAheadRev === undefined);
+				&& resp[bid]!.unconfirmedAheadRev === undefined
+				&& !belowFloor(bid, resp[bid]!));
 		};
 
 		// Retry only genuine no-response / partial-response batches. An authoritative
@@ -203,6 +217,13 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// today — one extra bounded consult on an already failing read. If isolated-node
 		// read latency ever matters, skip the retry for that reason rather than widening
 		// isAuthoritative.
+		// This is ONE extra round, not a loop: a below-floor answer that every reachable
+		// coordinator repeats survives the merge below as the highest revision anyone
+		// served, UNFLAGGED. Deliberate — a log entry is not proof its blocks landed, so a
+		// floor no machine can meet may simply describe an abandoned write, in which case
+		// the below-floor content is the correct content and every machine agrees on it
+		// (see the accepted-tradeoff NOTE at `TransactorSource.mayRetain`). The reader
+		// judges it again and returns it uncached.
 		const retryable = Array.from(allBatches(batches)).filter(b =>
 			!isAuthoritative(b as any)
 		) as CoordinatorBatch<BlockId[], GetBlockResults>[];
@@ -256,13 +277,20 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// — and only strictly-greater rank replaces, so first-arrival (the stale one)
 		// would win the very merge the retry exists to fix. Non-object junk ranks below
 		// everything so any real entry replaces it.
-		// NOTE: `materialized` (the revision the content actually is) is not part of the ranking, so two peers answering the same
-		// pinned get with block-carrying entries at DIFFERENT materialized revisions resolve
-		// to whichever arrived first. Not a concern today — cohort peers share the block's
-		// revision log, so they agree on the highest committed rev at or below a pin — and the
-		// failure direction is safe (a lower recorded revision spuriously stale-rejects rather
-		// than wrongly accepting). If peers are ever seen to disagree here, break the tie on
-		// the HIGHEST `materialized.rev` among top-rank entries.
+		// Rank alone does not order two peers that both served content: a confirmed block ranks 6
+		// whatever revision it is. Cohort peers were expected to agree — they share the block's
+		// revision log, so they agree on the highest committed revision at or below a pin — but a
+		// peer inside its read-repair window answers from its own copy without consulting anyone,
+		// and two cohort members answered one pinned read at revisions 6 and 7. Since only a
+		// strictly greater rank replaces, first arrival (the stale one) would win the very merge a
+		// below-floor retry exists to fix. So equally-ranked entries that BOTH carry a block break
+		// the tie on the newer content, measured by `servedRevision` — the same number the floor is
+		// judged against and the same number the reader records as its read dependency, so the
+		// merge cannot prefer one revision while the reader believes it read another. The tie-break
+		// is deliberately inside a rank rather than across ranks: a confirmed older block still
+		// beats an unconfirmed newer one, because "the peer could not confirm this is current" is
+		// a statement about the ANSWER, not about the revision, and adopting the unconfirmed one
+		// would re-open the doubt the rank split exists to resolve.
 		// `unavailable` answers rank among THEMSELVES by how much they establish, so the merged
 		// entry never presents a weaker doubt than some peer actually returned. This matters
 		// because the reason travels out verbatim on `BlockUnavailableError` and callers act on
@@ -281,6 +309,26 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			if (entry.unavailable !== undefined) return unavailableRank(entry.unavailable);
 			return entry.unconfirmedAheadRev === undefined ? 4 : 3;
 		};
+		const carriesBlock = (r: unknown): r is GetBlockResult =>
+			!!r && typeof r === 'object' && (r as GetBlockResult).block != null;
+		/** Whether `candidate` displaces the entry already held for the same block: a strictly
+		 *  better rank, or — at equal rank, both carrying content — strictly newer content.
+		 *
+		 *  NOTE: `servedRevision` falls back to `state.latest` for a producer that omits
+		 *  `materialized`, and on a PINNED read that fallback overstates — `state.latest` is the
+		 *  newest revision the repo holds, not the revision it served. Every in-tree producer
+		 *  populates `materialized` (`StorageRepo`, `TestTransactor`; `CoordinatorRepo` forwards it
+		 *  verbatim), so the fallback only reaches a third-party `IRepo`, and `belowFloor` above
+		 *  reads the same number, so the two stay consistent. If such a repo ever answers pinned
+		 *  reads beside one that does report `materialized`, it can win this tie with a number
+		 *  describing content it did not serve: cap the comparison at `blockGets.context.rev` then
+		 *  (a correct answer to a pinned read is never above the pin), in both places at once. */
+		const beats = (candidate: unknown, held: unknown): boolean => {
+			const byRank = rankOf(candidate) - rankOf(held);
+			return byRank !== 0
+				? byRank > 0
+				: carriesBlock(candidate) && carriesBlock(held) && servedRevision(candidate) > servedRevision(held);
+		};
 
 		// Create a lookup map from successful responses only
 		const resultEntries = new Map<string, any>();
@@ -288,7 +336,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			const resp = batch.request!.response! as any;
 			for (const [bid, res] of Object.entries(resp)) {
 				const existing = resultEntries.get(bid);
-				if (!existing || rankOf(res) > rankOf(existing)) {
+				if (!existing || beats(res, existing)) {
 					resultEntries.set(bid, res);
 				}
 			}

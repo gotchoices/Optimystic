@@ -69,10 +69,13 @@ describe('NetworkTransactor', () => {
     // peer — letting the test observe whether a retry round happened at all.
     class CountingKeyNetwork implements IKeyNetwork {
       findCoordinatorCalls = 0
+      /** The excluded-peer set each findCoordinator call carried, in call order. */
+      excludedPerCall: string[][] = []
       constructor(private readonly peers: string[]) {}
       async findCoordinator(_key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
         this.findCoordinatorCalls++
         const excluded = new Set((options?.excludedPeers ?? []).map(p => p.toString()))
+        this.excludedPerCall.push([...excluded])
         const pick = this.peers.find(p => !excluded.has(p))
         if (!pick) throw new Error('No coordinator found')
         return peerIdFromString(pick)
@@ -415,6 +418,151 @@ describe('NetworkTransactor', () => {
       expect(net.findCoordinatorCalls, 'initial round plus the second chance').to.equal(2)
       expect(result[blockId]!.block).to.deep.equal(block)
       expect(result[blockId]!.unconfirmedAheadRev).to.equal(2)
+    })
+
+    // Ticket a-too-old-block-answer-is-retried-against-another-machine: a FLOOR is the third thing
+    // that earns the second-chance retry, and the only one the answering peer cannot see. The caller
+    // walked a log entry saying "revision r changed this block", so an answer below r is provably
+    // not the view it asked for — however current the answering repo believes its own copy to be.
+    // The floor rides on the request as `BlockGets.floors` and never leaves this process.
+    describe('a below-floor answer', () => {
+      const pinnedAt2 = { committed: [], rev: 2 }
+      const blockAt = (blockId: BlockId, rev: number) => ({
+        block: { header: { id: blockId, type: 'T', collectionId: 'c' as BlockId }, v: `rev${rev}` },
+        state: { latest: { actionId: `a${rev}`, rev } },
+        materialized: { actionId: `a${rev}`, rev },
+      })
+      const servingRepoAt = (rev: number, count?: () => void) => makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        count?.()
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = blockAt(bid, rev)
+        return res
+      })
+
+      it('is re-asked against a different coordinator, and the newer answer wins the merge', async () => {
+        const peerA = 'peer-A', peerB = 'peer-B'
+        const net = new CountingKeyNetwork([peerA, peerB])
+        const blockId = 'lagging-block' as BlockId
+
+        let aGets = 0, bGets = 0
+        // peerA is inside its read-repair window, so it answers from its own copy — one revision
+        // behind, and honestly labelled as such. peerB holds the revision the log entry named.
+        const laggingRepo = servingRepoAt(1, () => { aGets++ })
+        const currentRepo = servingRepoAt(2, () => { bGets++ })
+
+        const networkTransactor = new NetworkTransactor({
+          timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: net,
+          getRepo: (peerId: PeerId) => (peerId.toString() === peerA ? laggingRepo : currentRepo),
+        })
+
+        const result = await networkTransactor.get({
+          blockIds: [blockId], context: pinnedAt2, floors: { [blockId]: 2 },
+        })
+
+        expect(net.findCoordinatorCalls, 'the floor earned a retry round').to.equal(2)
+        expect(net.excludedPerCall[1], 'which steered away from the peer that answered too old').to.deep.equal([peerA])
+        expect(aGets).to.equal(1)
+        expect(bGets).to.equal(1)
+        expect(result[blockId]!.materialized!.rev, 'the newer content wins the merge').to.equal(2)
+      })
+
+      it('costs an ordinary read nothing: no floor, one round, first answer stands', async () => {
+        const peerA = 'peer-A', peerB = 'peer-B'
+        const net = new CountingKeyNetwork([peerA, peerB])
+        const blockId = 'lagging-block' as BlockId
+
+        let bGets = 0
+        const laggingRepo = servingRepoAt(1)
+        const currentRepo = servingRepoAt(2, () => { bGets++ })
+
+        const networkTransactor = new NetworkTransactor({
+          timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: net,
+          getRepo: (peerId: PeerId) => (peerId.toString() === peerA ? laggingRepo : currentRepo),
+        })
+
+        // Same peers, same answers — the only difference from the case above is the missing floor.
+        const result = await networkTransactor.get({ blockIds: [blockId], context: pinnedAt2 })
+
+        expect(net.findCoordinatorCalls, 'one round').to.equal(1)
+        expect(bGets, 'the second coordinator was never consulted').to.equal(0)
+        expect(result[blockId]!.materialized!.rev).to.equal(1)
+      })
+
+      it('is returned unflagged when every reachable coordinator is below the floor', async () => {
+        // A log entry is not proof its blocks landed: a refused write can leave its entry behind
+        // while no machine ever takes that revision. The below-floor content is then the CORRECT
+        // content, so the read must come back with it rather than throwing or inventing a doubt
+        // marker — the reader (TransactorSource) judges it again and returns it uncached.
+        const net = new CountingKeyNetwork(['peer-A', 'peer-B'])
+        const blockId = 'never-landed-block' as BlockId
+
+        const networkTransactor = new NetworkTransactor({
+          timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: net,
+          getRepo: (_peerId: PeerId) => servingRepoAt(1),
+        })
+
+        const result = await networkTransactor.get({
+          blockIds: [blockId], context: pinnedAt2, floors: { [blockId]: 2 },
+        })
+
+        expect(net.findCoordinatorCalls, 'exactly one retry round, then it settles').to.equal(2)
+        expect(result[blockId]!.materialized!.rev).to.equal(1)
+        expect(result[blockId]!.block, 'the content is handed on').to.exist
+        expect(result[blockId]!.unconfirmedAheadRev, 'and carries no doubt marker of its own').to.equal(undefined)
+        expect(result[blockId]!.unavailable).to.equal(undefined)
+      })
+
+      it('retries only the batch holding the floored block', async () => {
+        // Two blocks whose coordinators differ, so they land in separate batches. Only the floored
+        // one is short of what the caller asked for; the other batch is answered and final.
+        const floored = 'floored-block' as BlockId
+        const ordinary = 'ordinary-block' as BlockId
+        const peersFor: Array<[BlockId, string[]]> = [
+          [floored, ['peer-A', 'peer-B']],
+          [ordinary, ['peer-C', 'peer-D']],
+        ]
+
+        // `routingKeyForBlock` is what the transactor hands findCoordinator; compare its bytes
+        // rather than assuming how a block id maps into one.
+        const sameKey = (key: Uint8Array, blockId: BlockId) => {
+          const expected = routingKeyForBlock(blockId)
+          return key.length === expected.length && expected.every((b, i) => key[i] === b)
+        }
+        const perBlockNet: IKeyNetwork = {
+          async findCoordinator(key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+            const entry = peersFor.find(([bid]) => sameKey(key, bid))
+            const excluded = new Set((options?.excludedPeers ?? []).map(p => p.toString()))
+            const pick = entry?.[1].find(p => !excluded.has(p))
+            if (!pick) throw new Error('No coordinator found')
+            return peerIdFromString(pick)
+          },
+          async findCluster(): Promise<ClusterPeers> { return {} },
+        }
+
+        const gets: Record<string, number> = { 'peer-A': 0, 'peer-B': 0, 'peer-C': 0, 'peer-D': 0 }
+        const repos: Record<string, IRepo> = {
+          'peer-A': servingRepoAt(1, () => { gets['peer-A']!++ }),
+          'peer-B': servingRepoAt(2, () => { gets['peer-B']!++ }),
+          'peer-C': servingRepoAt(1, () => { gets['peer-C']!++ }),
+          'peer-D': servingRepoAt(2, () => { gets['peer-D']!++ }),
+        }
+
+        const networkTransactor = new NetworkTransactor({
+          timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: perBlockNet,
+          getRepo: (peerId: PeerId) => repos[peerId.toString()]!,
+        })
+
+        const result = await networkTransactor.get({
+          blockIds: [floored, ordinary], context: pinnedAt2, floors: { [floored]: 2 },
+        })
+
+        expect(gets['peer-A'], "the floored block's first coordinator").to.equal(1)
+        expect(gets['peer-B'], 'and its retry').to.equal(1)
+        expect(gets['peer-C'], "the other block's coordinator, asked once").to.equal(1)
+        expect(gets['peer-D'], 'and never re-asked — its batch was answered').to.equal(0)
+        expect(result[floored]!.materialized!.rev).to.equal(2)
+        expect(result[ordinary]!.materialized!.rev).to.equal(1)
+      })
     })
 
     it('getStatus throws rather than judging actions from a state it could not confirm is current', async () => {

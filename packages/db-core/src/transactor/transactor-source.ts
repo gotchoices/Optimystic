@@ -100,7 +100,15 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	}
 
 	async tryGet(id: BlockId, purpose: ReadPurpose = 'value'): Promise<TBlock | undefined> {
-		const result = await this.transactor.get({ blockIds: [id], context: this.actionContext });
+		// Carry the floor that applies to THIS read, so a transactor with more than one machine to
+		// ask can re-ask when the first answers under it (`BlockGets.floors`). Advisory: the verdict
+		// that matters is still `mayRetain` below, on whatever answer comes back.
+		const floor = this.floors?.applicableTo(id, this.actionContext);
+		const result = await this.transactor.get({
+			blockIds: [id],
+			context: this.actionContext,
+			...(floor !== undefined ? { floors: { [id]: floor.rev } } : {}),
+		});
 		// Guard the per-key entry: some transactors return a sparse result that omits `id`
 		// entirely (e.g. block genuinely not found), so `result` is a truthy object but
 		// `result[id]` is undefined. Destructuring that would throw a TypeError.
@@ -167,10 +175,14 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	 * below its floor after every machine was asked should throw.
 	 *
 	 * NOTE: while a floor is unmet, every read of that block costs a transactor request instead of a
-	 * memory hit — at most one read-repair window for a lagging replica, but until the block is next
-	 * written (or the handle reopened) for an abandoned entry. Unmeasured. If it ever shows up, drop
-	 * a floor after some number of consecutive below-floor answers from a coordinator other than this
-	 * node (floors are otherwise never dropped — see `BlockFloors`). */
+	 * memory hit — and, since the floor now rides out on the request (`BlockGets.floors`), that
+	 * request costs a SECOND coordinator round too, because `NetworkTransactor.get` re-asks a
+	 * different machine for a below-floor answer. Both last at most one read-repair window for a
+	 * lagging replica, but until the block is next written (or the handle reopened) for an abandoned
+	 * entry, whose floor no machine can ever meet. Unmeasured. If it ever shows up, drop a floor
+	 * after some number of consecutive below-floor answers from a coordinator other than this node,
+	 * which retires the extra round with it (floors are otherwise never dropped — see
+	 * `BlockFloors`). */
 	private mayRetain(id: BlockId, servedRev: number): boolean {
 		return !this.floors?.answeredBelowFloor(id, this.actionContext, servedRev);
 	}

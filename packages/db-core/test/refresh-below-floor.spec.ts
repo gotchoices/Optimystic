@@ -21,6 +21,7 @@ import { TestTransactor, TailLandsButReportsStale } from '../src/testing/test-tr
 import { LogDataBlockType } from '../src/log/struct.js'
 import { Log } from '../src/log/log.js'
 import { TornActionError } from '../src/index.js'
+import { servedRevision } from '../src/transactor/transactor-source.js'
 import type { BlockGets, CommitRequest, CommitResult, GetBlockResults } from '../src/index.js'
 import { captureCollectionLog } from './capture-log.js'
 
@@ -76,6 +77,39 @@ class LaggingDataTransactor extends CountingTransactor {
 	}
 }
 
+/** Two machines with one history: the replica asked FIRST is behind (it answers as of `lagAt`, like
+ *  its base), the other has caught up. A read carrying a floor (`BlockGets.floors`) whose first
+ *  answer falls under it is re-asked against the second replica, and the newer content wins — the
+ *  second-chance round `NetworkTransactor.get` runs against a coordinator it excluded, in miniature,
+ *  so what a collection sees can be pinned without standing up a simulated network. A read carrying
+ *  no floor is one round, exactly as before. */
+class TwoReplicaTransactor extends LaggingDataTransactor {
+	/** One entry per block the second replica was asked for. */
+	reAsked: string[] = []
+
+	override async get(gets: BlockGets): Promise<GetBlockResults> {
+		const answers = await super.get(gets)
+		const tooOld = Object.entries(answers)
+			.filter(([id, entry]) => gets.floors?.[id] !== undefined && entry.block !== undefined
+				&& servedRevision(entry) < gets.floors[id]!)
+			.map(([id]) => id)
+		if (tooOld.length === 0) return answers
+		this.reAsked.push(...tooOld)
+		const behind = this.lagAt
+		this.lagAt = undefined	// the second replica, which is current
+		try {
+			const fresh = await super.get({ ...gets, blockIds: tooOld })
+			for (const id of tooOld) {
+				const entry = fresh[id]
+				if (entry && servedRevision(entry) > servedRevision(answers[id]!)) answers[id] = entry
+			}
+		} finally {
+			this.lagAt = behind
+		}
+		return answers
+	}
+}
+
 /** Once `armed`, the next two pinned reads are held until both have been asked, then answered
  *  one after the other — the first read's answer always lands first. The read numbered
  *  `currentNth` is answered current; the other as of `lagAt`. */
@@ -118,9 +152,10 @@ async function twoReadsAtOnce(collectionId: string, currentNth: 1 | 2) {
 
 /** A reader that has refreshed past one write its storage has not caught up with: the log entry for
  *  `NEW` is walked (so the row's block has a floor), while every pinned read of the block is still
- *  answered as of the revision before it. */
-async function readerBehindOneWrite(collectionId: string) {
-	const net = new LaggingDataTransactor()
+ *  answered as of the revision before it.
+ *
+ *  @param net the machines answering — one lagging replica unless the case supplies more. */
+async function readerBehindOneWrite(collectionId: string, net: LaggingDataTransactor = new LaggingDataTransactor()) {
 	const writer = await Tree.createOrOpen<number, Row>(net, collectionId, keyOf)
 	await writer.replace([[1, OLD]])
 	const reader = await Tree.createOrOpen<number, Row>(net, collectionId, keyOf)
@@ -153,9 +188,25 @@ describe('a refreshed collection re-reading a block its log entry names', () => 
 		expect(await reader.get(1), 'the reader sees the write once storage can answer').to.deep.equal({ key: 1, value: 'new' })
 	})
 
+	it('asks another machine, and returns the new row on the very first read after the refresh', async () => {
+		// The stricter half of the rule, once there is somebody better to ask: not merely "a too-old
+		// answer is not remembered" but "too-old content is not returned". The reader's own replica
+		// is behind and is asked first; the floor rides out on the read, so the answer under it is
+		// re-asked against the machine that holds the revision the log entry named.
+		const machines = new TwoReplicaTransactor()
+		const { reader } = await readerBehindOneWrite('two-replicas', machines)
+
+		expect(await reader.get(1), 'the current replica answered').to.deep.equal(NEW)
+		expect(machines.reAsked, 'the lagging answer earned exactly one re-ask').to.have.length(1)
+
+		// That answer meets the floor, so it is kept like any other good answer — the retry is paid
+		// once, not on every read.
+		expect(await machines.fetchedDuring(() => reader.get(1)), 'and is remembered').to.deep.equal([])
+	})
+
 	it('hands the too-old answer on once per read, keeps nothing, and needs no further refresh to recover', async () => {
-		// One transactor and nobody else to ask, so the old row is what each read gets for now
-		// (asking a different machine is the companion ticket). What matters is that each read ASKS.
+		// One machine and nobody else to ask, so the old row is what each read gets (contrast the
+		// two-replica case above). What matters here is that each read ASKS.
 		const { net, reader } = await readerBehindOneWrite('directory-uncached')
 
 		expect(await reader.get(1)).to.deep.equal(OLD)

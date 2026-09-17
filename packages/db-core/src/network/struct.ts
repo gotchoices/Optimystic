@@ -260,6 +260,23 @@ export type BlockActionState = {
 export type BlockGets = {
 	blockIds: BlockId[];
 	context?: ActionContext;	// Latest if this is omitted
+	/** Per block, the lowest revision the ASKER can accept for it — its floor. Omit a block that
+	 *  has none; omit the field entirely when no block does.
+	 *
+	 *  A floor is knowledge only the asker holds: a collection that walked the log entry
+	 *  "action A, committed at revision r, changed block X" knows a read of X at a context at or
+	 *  above `r` must come back materialized at `r` or later, while the repo answering may honestly
+	 *  believe its older copy is current. `TransactorSource.tryGet` fills this from the collection's
+	 *  `BlockFloors`; `NetworkTransactor.get` treats an answer under a block's floor as NOT answered,
+	 *  so it earns the same second-chance round against a different coordinator that `unavailable`
+	 *  and `unconfirmedAheadRev` earn.
+	 *
+	 *  CLIENT-SIDE HINT, never on the wire: `NetworkTransactor.get` builds its own
+	 *  `{ blockIds, context }` for each downstream `IRepo.get`, so this field reaches no peer and no
+	 *  coordinator's freshness decision. An `ITransactor` that ignores it (`TestTransactor`, the
+	 *  reference peer's) stays correct, because the reader-side check that actually enforces the
+	 *  floor runs on the merged answer either way (`TransactorSource` / `BlockFloorCheck`). */
+	floors?: Record<BlockId, number>;
 };
 
 /** Why a repo could not establish whether a block exists. Present ONLY when the repo

@@ -200,16 +200,30 @@ its reader and dropped. That closes two races floors cannot see: an answer reque
 refresh cleared the block used to land after the clear and outlive it, and one requested before the
 handle's own commit folded in used to overwrite the folded content with the older block.
 
-What this deliberately does not do. It does not ask another machine (one transactor request is all a
-`TransactorSource` can make; ticket `a-too-old-block-answer-is-retried-against-another-machine`
-builds that on these floors), so against a single lagging coordinator the old content is still
-*returned* for up to one read-repair window — the bound the storage layer already documents, instead
-of forever. It sets no floor for a block first read at open (no entries are walked then) or for the
-blocks an invalidation entry reverts. And it narrows, without closing, the hazard of a write staged
-over a too-old read (ticket `bug-a-pended-transform-does-not-carry-its-base`): once storage catches
-up, the base under already-staged edits changes with no replay.
-While a floor is unmet every read of its block costs a transactor request rather than a memory hit;
-the tripwire `NOTE:` at `mayRetain` names the remedy if that ever shows up.
+**The floor also rides out on the read, so another machine gets asked.** `TransactorSource.tryGet`
+puts the floor that applies to the read on the request it makes (`BlockGets.floors`, a per-block
+minimum revision), and `NetworkTransactor.get` treats an answer below it as *not answered* — earning
+the same single second-chance round against a different coordinator that `unavailable` and
+`unconfirmedAheadRev` earn, with the merge broken toward the newer content so the stale first answer
+cannot beat the fresh one its own retry fetched (see the currency bullet below). So the reader that
+picked itself as coordinator and served its own copy inside the read-repair window now asks the
+cohort member one hop away that holds the revision, and returns the new content on the first read
+after the refresh rather than the next one. The floor never leaves the asking process:
+`NetworkTransactor.get` builds its own `{ blockIds, context }` for each downstream `IRepo.get`, so no
+peer sees it and no coordinator's freshness decision changes (ticket
+`feat-refresh-can-demand-a-revision-floor` is where that would change), and an `ITransactor` that
+ignores the field stays correct because `TransactorSource` judges the merged answer either way.
+
+What this deliberately does not do. When *every* reachable coordinator is below the floor the old
+content is still *returned* — the highest revision anyone served, unflagged — for up to one
+read-repair window, which is the bound the storage layer already documents instead of forever. It
+sets no floor for a block first read at open (no entries are walked then) or for the blocks an
+invalidation entry reverts. And it narrows, without closing, the hazard of a write staged over a
+too-old read (ticket `bug-a-pended-transform-does-not-carry-its-base`): once storage catches up, the
+base under already-staged edits changes with no replay.
+While a floor is unmet every read of its block costs a transactor request rather than a memory hit,
+and now a second coordinator round with it; the tripwire `NOTE:` at `mayRetain` names the remedy if
+that ever shows up.
 
 #### Conflict replay re-makes the uniqueness decision (entry guards)
 
@@ -1544,7 +1558,16 @@ saveMaterializedBlock(block): store(structuredClone(block));
   **confirmed block > unconfirmed block > authoritative absent > unconfirmed absent >
   unavailable** — the confirmed-over-unconfirmed split is load-bearing, since without it the
   stale marked entry and the fresh confirmed one fetched by its own retry tie and first-arrival
-  (the stale one) wins the merge. When the marker survives the retry, every reachable coordinator
+  (the stale one) wins the merge. Rank alone does not order two peers that *both* served content,
+  because a confirmed block ranks the same whatever revision it is. Cohort peers were expected to
+  agree — they share the block's revision log, so they agree on the highest committed revision at
+  or below a pin — but a peer answering from inside its read-repair window consults nobody, and two
+  members answered one pinned read at revisions 6 and 7. So equally-ranked entries that both carry
+  a block **break the tie on the newer content**, measured by the same `servedRevision` the floor is
+  judged against and the reader records as its read dependency, so the merge cannot prefer one
+  revision while the reader believes it read another. The tie-break stays *inside* a rank: a
+  confirmed older block still beats an unconfirmed newer one, because "could not confirm this is
+  current" is a statement about the answer rather than about the revision. When the marker survives the retry, every reachable coordinator
   said the answer may be behind: `TransactorSource.tryGet` then throws `BlockPossiblyStaleError`
   for any read whose view should CONTAIN the claim — the same at/above test the coordinator applies
   when it stamps, i.e. an **unpinned** read or one pinned at/above the claim (a read pinned *below*
@@ -1600,6 +1623,23 @@ saveMaterializedBlock(block): store(structuredClone(block));
   while a floor is knowledge only the *asker* holds, so an answer the repo honestly believes current
   can still be provably too old for the read that fetched it. Being optional with that fallback is
   what let every producer that cannot report a materialized revision stay unchanged.
+- **The asker's floor rides out on the request.** `BlockGets` carries an optional
+  `floors: Record<BlockId, number>` — per block, the lowest revision the asker can accept — filled
+  by `TransactorSource.tryGet` from the collection's `BlockFloors` for whichever blocks have one.
+  It is a **client-side hint that never reaches a peer**: `NetworkTransactor.get` builds its own
+  `{ blockIds, context }` for each downstream `IRepo.get`, so nothing on the wire changed, and an
+  `ITransactor` that ignores the field (`TestTransactor`, the reference peer's) stays correct
+  because the reader-side check still judges the merged answer. What it buys is a second machine:
+  `NetworkTransactor.get` counts an entry whose `servedRevision` is below its block's floor as *not*
+  answered, so it earns the same one retry round against a different coordinator that `unavailable`
+  and `unconfirmedAheadRev` earn, and the merge's newer-content tie-break (currency bullet above)
+  keeps the retry's answer rather than the stale first arrival. Only a block-carrying entry can be
+  below a floor — an absent answer is judged by the existence rules above, and treating one as
+  below-floor would put the one-round `createOrOpen` probe back on the retry path. When every
+  reachable coordinator is below the floor, the highest revision any of them served is returned
+  **unflagged**, deliberately: a log entry is not proof its blocks landed, so a floor no machine can
+  meet may simply describe an abandoned write whose below-floor content is the correct content (see
+  the accepted-tradeoff `NOTE:` at `TransactorSource.mayRetain`).
 - **A peer asked for revision N serves revision N labelled N, or serves nothing.**
   `serveBlockArchive` ([`storage/block-archive.ts`](../packages/db-p2p/src/storage/block-archive.ts))
   answers every block-repair fetch, and labels the archive — revision number, action id, and the
