@@ -6,6 +6,7 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { toString as u8ToString } from 'uint8arrays';
 import { waitFor } from '@optimystic/db-core/test';
+import { captureLog, hasTag } from './support/capture-log.js';
 
 /**
  * Locks the super-majority threshold rounding behaviour so the next regression
@@ -440,6 +441,27 @@ describe('ClusterCoordinator blocks held by a rival action (a-contended-pend-ref
 		await waitFor(() => mocks.every(sawHeld), {
 			description: 'every member receives the held-carrying record'
 		});
+	});
+
+	it('stays silent when the held votes do not prove super-majority unreachable', async () => {
+		// Five peers at 0.75 ⇒ super-majority 4, so `maxAllowedRejections` is 1. One held vote and one
+		// member that never answers leave approvals at 3: the pend is refused, but the merged record
+		// does NOT prove the transaction dead — a member re-deriving `ConflictSuperseded` from these
+		// same votes needs rejections + retryable refusals ABOVE 1, and it has exactly 1. Below that
+		// bar an abandonment broadcast is the unauthenticated "forget this" every branch refuses to
+		// send, so `refusalsProveUnreachable` must gate the held branch as it gates the conflict one.
+		await setUpPeers(5);
+		const { coordinator } = makeCoordinator(['approve', 'approve', 'approve', 'held', 'silent'], 0.75);
+
+		let caught: unknown;
+		// Asserted off the coordinator's own log rather than off the mocks' inboxes: the broadcast is
+		// fire-and-forget, so "no record arrived" can only ever be a timing claim, while the
+		// `cluster-tx:abandon-broadcast` line is emitted synchronously at the decision itself.
+		const captured = await captureLog('cluster', async () => { caught = await runAndCatch(coordinator); });
+
+		expect(caught, 'still the retryable held answer').to.be.instanceOf(BlocksHeldError);
+		expect(hasTag(captured, 'cluster-tx:pend-blocks-held'), 'the held branch is the one that ran').to.equal(true);
+		expect(hasTag(captured, 'cluster-tx:abandon-broadcast'), 'nothing here proves the record dead').to.equal(false);
 	});
 
 	it('lets a genuine validator rejection outrank a held vote', async () => {

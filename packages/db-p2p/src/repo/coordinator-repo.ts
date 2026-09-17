@@ -2058,7 +2058,9 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/** The cluster half of {@link pend}, after responsibility is verified: consensus, the local-verdict
-	 *  arms, and the two optimistic-concurrency classifiers a rejection is run through. */
+	 *  arms, and the catch that turns each optimistic-concurrency refusal into a retryable answer —
+	 *  the two signed-evidence ones ({@link ConflictRaceLostError}, {@link BlocksHeldError}) directly,
+	 *  and a validator rejection only through {@link classifyStaleRejection}. */
 	private async pendThroughCluster(request: PendRequest, allBlockIds: BlockId[], options?: MessageOptions): Promise<PendResult> {
 		const coordinatingBlockIds = options?.coordinatingBlockIds ?? allBlockIds;
 
@@ -2353,6 +2355,13 @@ export class CoordinatorRepo implements IRepo {
 	 * depends on a local re-read at all. What the re-read still buys, when it succeeds, is the concrete
 	 * rival list for {@link StaleFailure.pending} and the input {@link noteStuckReservation} needs to
 	 * name a block wedged behind a reservation that will never clear.
+	 *
+	 * NOTE: `error.heldBy` (peerId → holding action id) is dropped at this boundary, the same deliberate
+	 * drop the {@link ConflictRaceLostError} arm of {@link pendThroughCluster} documents: `StaleFailure`
+	 * has no field for it, and the members' action ids are not the same claim as the rivals this node
+	 * read out of its own storage, so they must not be folded into `pending`. A caller that wants to
+	 * WAIT on the holder rather than re-race it needs a typed field added here; never recover the ids
+	 * by parsing `reason`.
 	 */
 	private async answerBlocksHeld(error: BlocksHeldError, request: PendRequest, blockIds: BlockId[]): Promise<StaleFailure> {
 		const pending = await this.corroborateHeldBlocks(request, blockIds);
@@ -2459,6 +2468,16 @@ export class CoordinatorRepo implements IRepo {
 	 * and instrumenting the second path would count a refusal that the cohort as a whole did not make.
 	 * If partial strands ever turn out to be the common shape in the field, the counter belongs on the
 	 * member side (`ClusterMember.validatePendOperations`), where each member sees its own votes.
+	 *
+	 * NOTE: the un-corroborated arm of {@link answerBlocksHeld} is a SECOND unfed path, and a newer one.
+	 * It used to throw, so a wedge only remote members could see surfaced loudly as an error; it now
+	 * returns a retryable conflict, which is right for the writer and silent for this counter. The
+	 * refusal is still logged per occurrence (`coordinator-repo:pend-held-uncorroborated`, carrying the
+	 * holding action ids), and a wedge that never clears still ends at the writer's retry ceiling, so
+	 * nothing is lost outright — only the say-once naming. Left unfed deliberately: this node cannot
+	 * name the holder, and feeding it a guess would poison the holder comparison above, which is what
+	 * separates a wedge from healthy contention. If wedges behind remote-only reservations show up in
+	 * the field, the fix is the same one this NOTE already names — count on the member side.
 	 */
 	private noteStuckReservation(pending: ActionPending[], refusedActionId: ActionId): number {
 		const rivalsByBlock = new Map<BlockId, ActionId[]>();

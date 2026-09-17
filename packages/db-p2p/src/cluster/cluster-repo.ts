@@ -702,7 +702,7 @@ export class ClusterMember implements ICluster {
 					shouldPersist = false;
 					break phaseLoop;
 				case TransactionPhase.Promising:
-					// We have already voted (approve, reject, or conflict); the record is still
+					// We have already voted (approve, reject, conflict, or held); the record is still
 					// collecting promises from the rest of the cohort. Nothing to add — retain the
 					// record only if our vote wasn't a conflict (`shouldPersist` already reflects that).
 					log('cluster-member:phase-promising-waiting', {
@@ -850,8 +850,9 @@ export class ClusterMember implements ICluster {
 
 	/**
 	 * Compares existing vs incoming signatures for the same peers.
-	 * If a peer's vote type changed (approve↔reject), that's equivocation:
-	 * report a penalty and keep the first-seen signature.
+	 * ANY change of vote type is equivocation — the comparison is over `Signature['type']`, so it
+	 * covers every kind without enumerating them (a new kind joins the check by existing): report a
+	 * penalty and keep the first-seen signature.
 	 * New peers are accepted normally.
 	 */
 	private detectEquivocation(
@@ -1148,11 +1149,14 @@ export class ClusterMember implements ICluster {
 			});
 		}
 
+		const promiseHash = await this.computePromiseHash(record);
+		const signature = await this.signPromiseVerdict(promiseHash, verdict);
+
 		return {
 			...record,
 			promises: {
 				...record.promises,
-				[this.peerId.toString()]: await this.signPromiseVerdict(await this.computePromiseHash(record), verdict)
+				[this.peerId.toString()]: signature
 			}
 		};
 	}

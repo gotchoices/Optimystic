@@ -300,8 +300,8 @@ function isVoteMap(value: unknown): value is Record<string, Signature> {
  * Count distinct `approve` votes over `hash` from signers inside `peerSet`, verifying each signature
  * against the Ed25519 key its peer id names. Per-entry rules (the spec's step 5/6):
  *
- * - a non-`approve` vote is ignored silently (rejects/conflicts are part of the signed record but
- *   never count toward approval);
+ * - a non-`approve` vote is ignored silently (rejects and the two transient refusals, `conflict` and
+ *   `held`, are part of the signed record but never count toward approval);
  * - a signer outside `peerSet` is skipped and noted (`sawUnknownSigner`) — the caller downgrades a
  *   failed threshold to `unknown-signer`;
  * - a signer inside `peerSet` whose id is not a valid Ed25519 peer id → immediate
