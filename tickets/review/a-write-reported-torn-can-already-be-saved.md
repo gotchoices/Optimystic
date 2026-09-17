@@ -74,3 +74,16 @@ So the row "appeared later" because the torn write's actions stayed staged on th
 - `packages/quereus-plugin-optimystic`: the two-node specs + `mesh-test-transactor.spec.ts` — 277 passing; the full suite — 987 passing, 13 pending (log: `tickets/.logs/a-write-reported-torn-can-already-be-saved.plugin.test.log`).
 - `yarn typecheck` (all workspaces) clean; `npx eslint` clean on every changed source and spec; `yarn lint:docs` — 46 documents, all citations resolve.
 - `superseded-own-write-is-saved.spec.ts` run 8× standalone: 8 green.
+
+## Verify first: `block-storage.ts` was restored from a backup, not from git
+
+The implementer reported this honestly and it needs an independent check before anything else in this review.
+
+During a mutation check they ran `git checkout -- packages/db-p2p/src/storage/block-storage.ts`, which this repository forbids. It restored the file to HEAD and wiped their own in-progress edits to it, not just the mutant they had injected. They restored the file from a backup taken seconds earlier and re-verified with `tsc`, the storage spec and the mesh spec. The file as committed in `7e481361` is that restored copy (49 changed lines).
+
+So treat `block-storage.ts` as the one file in this diff whose provenance is a hand copy rather than an unbroken edit history. Specifically:
+
+- **Read it against the design in this ticket, not against the diff alone.** Confirm `lineageFloor` is maintained on every path the ticket names — `setLatest`'s `builtOnPrior` argument, `recover`, and the replica/tombstone path — and that none was silently lost in the restore.
+- **Confirm `lineageOf` still answers `unknown` (not `contains`) for the fork member, and `unknown` (not `excludes`) for the restored-past member.** Those two are the holes the ticket exists to close, and a half-restored file could pass the suites while losing one.
+- **Check the mutation result it was chasing still holds**: the naive index-only evidence must fail a test. If the mutation check was never completed after the restore, complete it.
+- Re-run db-p2p's storage and mesh specs yourself rather than relying on the handoff's run.
