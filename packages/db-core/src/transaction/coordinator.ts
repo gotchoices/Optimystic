@@ -366,10 +366,14 @@ export class TransactionCoordinator {
 				// Each such round counts against the same budget as a stale loss; a permanent
 				// refusal (a rival holds the revision) escapes as the named TornActionError at once.
 				// Re-refreshing collections an earlier round already refreshed is a no-op.
+				// The round that would spend the last of the budget is told so, which makes each
+				// participant SETTLE a half-landed write rather than ask for another round: the
+				// error thrown below then says whether the write can still land (`final`). A
+				// deadline cannot be foreseen the same way; a write given up on it stays unsettled.
 				for (;;) {
 					const delay = jitteredBackoffMs(staleLosses - 1, { baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
 					await abortableDelay(delay, signal);
-					const refused = await this.refreshBetweenAttempts(cycle);
+					const refused = await this.refreshBetweenAttempts(cycle, staleLosses + 1 >= maxAttempts);
 					if (refused === undefined) {
 						break;
 					}
@@ -412,17 +416,20 @@ export class TransactionCoordinator {
 	 * collection rather than one. The registered set is small today; if that (or retry latency) ever
 	 * bites, narrow this to the transaction's participants.
 	 *
+	 * @param lastChance - this is the round that spends the last of the retry budget, so a
+	 * participant whose half-landed write is refused again settles it (`Collection.completeOwnEntry`)
+	 * rather than asking for a round it will not get; the error returned then carries `final`.
 	 * @returns the first `completion-refused` {@link TornActionError} when that is the only way any
 	 * refresh failed — the round is worth retrying; `undefined` when every refresh succeeded.
 	 * @throws the first other error, once every collection has been visited.
 	 */
-	private async refreshBetweenAttempts(cycle: CommitCycle): Promise<TornActionError | undefined> {
+	private async refreshBetweenAttempts(cycle: CommitCycle, lastChance: boolean): Promise<TornActionError | undefined> {
 		let terminal: { error: unknown } | undefined;
 		let refused: TornActionError | undefined;
 		for (const [collectionId, collection] of this.collections) {
 			const report: RefreshReport = {};
 			try {
-				await collection.refreshInFlight(report);
+				await collection.refreshInFlight(report, lastChance);
 			} catch (err) {
 				if (err instanceof TornActionError && err.reason === 'completion-refused') {
 					refused ??= err;

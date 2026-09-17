@@ -282,6 +282,39 @@ export type BlockGets = {
 	 *  for one block per request, so this map never holds more than one entry — but a read source
 	 *  that batches would pay it. Split the retry payload down to the failing block ids then. */
 	floors?: Record<BlockId, number>;
+	/** Ask the answering repo whether each block's CURRENT content was built from this committed
+	 *  action at this revision; it answers per block in {@link GetBlockResult.lineage}. On the wire,
+	 *  unlike `floors`. A repo that predates the field leaves `lineage` absent, which every consumer
+	 *  reads as `unknown`. Asked only by a writer deciding whether its own superseded write is saved
+	 *  (`ITransactor.getLineage`); an ordinary read never sets it. */
+	lineageOf?: ActionRev;
+};
+
+/**
+ * Whether a block's current content was BUILT FROM a given committed `(actionId, rev)` — the
+ * write's transform is part of what the block holds now, even though later actions have since
+ * taken later revisions.
+ *
+ * - `contains` — it was. Holding that exact revision as the latest counts.
+ * - `excludes` — it provably was not: another action holds that revision of the block, or the
+ *   block's history spans that revision without it. Nothing can land the write there any more.
+ * - `behind` — the block has not reached that revision (or does not exist). The write is not
+ *   there, and could only get there through one of its own pending records.
+ * - `unknown` — not established either way.
+ *
+ * One repo answers from its own records only ({@link GetBlockResult.lineage}); a transactor
+ * answers for the block's cohort ({@link ActionLineage}).
+ */
+export type BlockLineage = 'contains' | 'excludes' | 'behind' | 'unknown';
+
+/** A cohort-level answer to "is this committed write part of what these blocks hold now?" — see
+ *  `ITransactor.getLineage`. */
+export type ActionLineage = {
+	/** One answer per requested block id, in request order. */
+	blocks: BlockLineage[];
+	/** Who holds the write, present exactly when EVERY block answered `contains`: the weakest
+	 *  block's cohort report, by the same rule a commit's durability is merged. */
+	durability?: WriteDurability;
 };
 
 /** Why a repo could not establish whether a block exists. Present ONLY when the repo
@@ -347,6 +380,9 @@ export type GetBlockResult = {
 	 *  the content here is real, it may just be behind. Absent = confirmed, so every
 	 *  producer that omits it keeps its meaning. */
 	unconfirmedAheadRev?: number;
+	/** This repo's answer to {@link BlockGets.lineageOf}, from its OWN records only — no cohort
+	 *  view. Absent when the question was not asked, or the repo predates it. */
+	lineage?: BlockLineage;
 };
 
 /**

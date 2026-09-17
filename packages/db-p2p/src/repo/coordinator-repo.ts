@@ -882,7 +882,12 @@ export class CoordinatorRepo implements IRepo {
 
 				try {
 					const { absence, currency } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev);
-					const refreshed = await this.storageRepo.get({ blockIds: [blockId], context: blockGets.context }, options);
+					// `lineageOf` rides along: the refreshed entry REPLACES the local one below, and an
+					// entry that lost its lineage answer would read to the asker as "could not say".
+					const refreshed = await this.storageRepo.get({
+						blockIds: [blockId], context: blockGets.context,
+						...(blockGets.lineageOf === undefined ? {} : { lineageOf: blockGets.lineageOf })
+					}, options);
 					const newRev = refreshed[blockId]?.state?.latest?.rev;
 					if (refreshed[blockId]) {
 						localResult[blockId] = refreshed[blockId];

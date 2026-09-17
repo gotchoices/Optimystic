@@ -597,8 +597,21 @@ Semantics worth knowing:
 export type BlockMetadata = {
   ranges: RevisionRange[];    // Available revision ranges
   latest?: ActionRev;         // Latest revision info
+  lineageFloor?: number;      // Lowest revision `latest` is known to be BUILT FROM, see below
 };
 ```
+
+`lineageFloor` is what lets a node say whether the content it holds now was built from a given
+committed write — the question a writer asks when its write was superseded before it could confirm
+it (`IBlockStorage.lineageOf`, surfaced by `StorageRepo.get` on `BlockGets.lineageOf`). It is the
+lowest revision from which every later revision record was produced on this node by applying an
+update-only transform to the content of the revision before it; a replica, a forward tombstone, an
+insert-carrying commit and the block's first revision each move it up to themselves, because they
+install content this node did not derive. The revision index alone answers neither direction — a
+node that took a later revision as a replica can neither vouch for a write it names nor deny one it
+does not — so a node past the write's revision answers `unknown` unless the floor is at or below
+it. The cohort-level folding is `judgeCohortLineage` in db-core; the whole argument is in
+`docs/internals.md`, "The writer's retry finishes its own half-landed action".
 
 ### Revision Ranges
 ```typescript

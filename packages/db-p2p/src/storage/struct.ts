@@ -13,6 +13,23 @@ export type BlockMetadata = {
 	ranges: RevisionRange[];
 	/** Latest revision - present if the repo is not empty */
 	latest?: ActionRev;
+	/**
+	 * The lowest revision this node's content at `latest` is KNOWN to derive from: every revision
+	 * record above it was produced HERE, by applying an update-only transform to the content of the
+	 * revision before it. So a revision at or above the floor that the revision index names is part
+	 * of what `latest` was built from, and one the index does not name is provably not.
+	 *
+	 * Anything that installs content this node did not derive moves the floor up to that revision,
+	 * because it says nothing about what the content was built from: a replica or forward tombstone
+	 * (`saveReplica`/`saveDeletion` — cohort reconcile, churn replication, invalidation), and a
+	 * commit whose transform carries an `insert`, which replaces the block wholesale. The block's
+	 * first commit starts the floor at its own revision.
+	 *
+	 * Absent on metadata written before the field existed; the next commit then starts it at the
+	 * revision it built on, which claims nothing about the history below. Read through
+	 * `IBlockStorage.lineageOf`, never compared by hand.
+	 */
+	lineageFloor?: number;
 };
 
 export type ArchiveRevisions = Record<number, {

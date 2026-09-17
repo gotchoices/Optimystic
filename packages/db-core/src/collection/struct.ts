@@ -116,10 +116,15 @@ export class SyncRevisionStalledError extends SyncRetryExhaustedError {
 	}
 }
 
-/** Why a half-landed write could not be finished (see {@link TornActionError}).
+/** Why a half-landed write could not be finished (see {@link TornActionError}). This is the CAUSE
+ * of giving up; whether the write is then definitely not saved is a separate fact, carried by
+ * {@link TornActionError.final} — every reason can arrive with either value.
  *
- * - `rival-holds-revision` — a DIFFERENT action holds a revision at or past the one a block needed.
- *   Permanent: nothing can land this write's transform on that block at its revision any more.
+ * - `rival-holds-revision` — finishing was refused because a DIFFERENT action holds a revision past
+ *   the one the write needed on some block. That alone does NOT mean the write is lost: a later
+ *   revision is often built ON the write (a rival that read it and added to it), and a write every
+ *   block of which was built upon is reported SAVED, never by this error. It is raised only once
+ *   the blocks' own history was asked (`ITransactor.getLineage`) and did not vouch for every block.
  * - `completion-refused` — finishing was attempted and refused for a cause that can clear on its
  *   own (another write in flight on the block, the revision not yet held by a majority). The write
  *   paths retry this inside their own budget, so seeing it means that budget ran out.
@@ -128,24 +133,37 @@ export class SyncRevisionStalledError extends SyncRetryExhaustedError {
 export type TornActionReason = 'rival-holds-revision' | 'completion-refused' | 'transforms-not-held';
 
 /** Thrown when a write HALF-LANDED and was not finished: its log entry is stored, but at least one
- * of the other blocks that entry names does not hold the write's revision.
+ * of the other blocks that entry names is not known to hold the write.
  *
  * A write's log tail is committed before the rest of its blocks, so a write can be refused AFTER the
  * tail was stored (see `NetworkTransactor.commit`). The writer's retry then finds its own log entry.
  * That entry proves only that the tail landed; the write is saved only once EVERY block the entry
- * names holds the write's revision, so the retry finishes the remaining blocks at the same action id
- * and revision (see `Collection.completeOwnEntry`). This error is what it raises when it could not
- * — {@link reason} says which way.
+ * names holds the write — at the write's own revision, or at a later revision that was built from
+ * it — so the retry finishes the remaining blocks at the same action id and revision (see
+ * `Collection.completeOwnEntry`). This error is what it raises when it could not — {@link reason}
+ * says why, and {@link final} says what that leaves the caller able to do.
  *
- * To the CALLER this is never retryable, whatever the reason, and it is deliberately not a
- * {@link SyncRetryExhaustedError}: that error says the write never landed and invites trying again,
- * whereas here the log already holds an entry for a write whose data is not saved. Finishing needs
- * the original action id and the transforms it sent, and both are gone once this escapes (the one
- * reason that CAN clear, `completion-refused`, has already been retried to the end of the budget by
- * the write path that threw). Re-driving under a NEW revision would record the same actions in the
- * log twice, so nothing here does that on the caller's behalf. The staged actions are left in
- * place on the collection; the caller decides whether to discard them or submit them again as a
- * new write, knowing the log already carries one entry for them whose data never landed.
+ * **{@link final} is the field to act on.** An application's only safe reaction to a failed write
+ * is to submit it again, and that is only safe when the first one can never show up:
+ *
+ * - `final: true` — the write is NOT saved and never will be. Every block it still needed answered
+ *   for its whole cohort that it does not hold the write (its history passed the write's revision
+ *   without it, or it never reached that revision), and the write's pending records were confirmed
+ *   cancelled first, so nothing is left that could land it. Submitting the same change again stores
+ *   it once.
+ * - `final: false` — that could NOT be established. The write may already be saved, or may still
+ *   land (a block's cohort did not all answer, members contradicted each other, fewer than a
+ *   majority hold it, or the cancel could not be confirmed). Submitting again can store the change
+ *   twice; read the data back first.
+ *
+ * It is deliberately not a {@link SyncRetryExhaustedError}: that error says the write never landed,
+ * whereas here the log already holds an entry for it. Finishing needs the original action id and
+ * the transforms it sent, and both are gone once this escapes. Re-driving under a NEW revision
+ * records the same actions in the log twice, so nothing here does that on the caller's behalf. The
+ * staged actions are left in place on the collection, so at this level "submit again" is calling
+ * `sync()` again, and abandoning the write is the caller's to do (`Collection.restorePending`).
+ * `Tree.replace` and `Diary.append` do abandon it — they own both the staging and the flush, and a
+ * failed call that left its action staged would ride along, unasked, with the caller's next write.
  *
  * Raised out of {@link ICollection.sync} / {@link ICollection.updateAndSync}, and out of the
  * refresh `TransactionCoordinator.commit` runs between attempts (`Collection.refreshInFlight`).
@@ -159,11 +177,13 @@ export class TornActionError extends Error {
 		readonly actionId: string,
 		/** The revision its log entry landed at — the revision every block it names had to take. */
 		readonly rev: number,
-		/** The blocks the entry names that do not hold that revision — or, when the refusal did not
-		 * say which, every block the entry names other than ones known to hold it. */
+		/** The blocks the entry names that are not known to hold the write. */
 		readonly blockIds: BlockId[],
-		/** Which of the three ways finishing failed — see {@link TornActionReason}. */
+		/** Why finishing failed — see {@link TornActionReason}. Says nothing about {@link final}. */
 		readonly reason: TornActionReason,
+		/** Whether the write is definitely not saved and can never land — see the class comment.
+		 * `false` means "not established", never "it landed". */
+		readonly final: boolean,
 		/** The refusal in the responder's own words, for a log line. Never branch on it. */
 		readonly detail: string,
 		/** The confirmed revision a responder reported holding under ANOTHER action, when the refusal
@@ -171,9 +191,12 @@ export class TornActionError extends Error {
 		readonly staleAt?: { blockId: BlockId; rev: number },
 	) {
 		super(`collection ${collectionId}: action ${actionId} is torn at rev ${rev} — its log entry is stored `
-			+ `but block(s) ${blockIds.join(', ') || '(unknown)'} do not hold that revision, and the write cannot be `
+			+ `but block(s) ${blockIds.join(', ') || '(unknown)'} are not known to hold it, and the write cannot be `
 			+ `finished: ${detail}`
-			+ (staleAt ? ` (block ${staleAt.blockId} is at rev ${staleAt.rev})` : ''));
+			+ (staleAt ? ` (block ${staleAt.blockId} is at rev ${staleAt.rev})` : '')
+			+ (final
+				? ' — the write is not saved and cannot land; it is safe to submit again'
+				: ' — whether the write is saved could not be established; it may be saved already or land later'));
 		this.name = 'TornActionError';
 	}
 }

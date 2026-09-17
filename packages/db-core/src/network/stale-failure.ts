@@ -58,7 +58,11 @@ export function highestStaleAt(candidates: readonly StaleFailure['staleAt'][]): 
  * Deliberately `===` only. At `latest.rev > rev` this returns false even for our own action: the
  * follow-on commit is refused as stale anyway (`StorageRepo.commit`'s `missedCommits` branch), so
  * approving would only defer the refusal by a round trip, and `latest` alone can no longer name
- * who holds `rev` — that needs the revision index (see `IRevisionActionReader`).
+ * who holds `rev` — that needs the revision index (see `IRevisionActionReader`). Nor would the
+ * index settle what the writer actually needs to know there, which is whether the content now held
+ * was BUILT FROM its revision; that is a separate question with its own answer
+ * (`IBlockStorage.lineageOf`, asked by the writer through `ITransactor.getLineage` once its re-send
+ * has been refused), not a widening of this one.
  *
  * Every revision-vs-action check calls this: the pend tier (`StorageRepo.pend`,
  * `ClusterMember.validatePendOperations`, `CoordinatorRepo.classifyStaleRejection`) and the commit

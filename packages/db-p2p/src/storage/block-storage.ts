@@ -1,4 +1,4 @@
-import type { BlockId, IBlock, Transform, ActionId, ActionRev, ActionTransform } from "@optimystic/db-core";
+import type { BlockId, IBlock, Transform, ActionId, ActionRev, ActionTransform, BlockLineage } from "@optimystic/db-core";
 import { applyTransform, canonicalJson, hashString } from "@optimystic/db-core";
 import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from "./struct.js";
@@ -228,7 +228,31 @@ export class BlockStorage implements IBlockStorage {
 		await this.storage.promotePendingTransaction(this.blockId, actionId);
 	}
 
-	async setLatest(latest: ActionRev, latch: BlockWriteLatch): Promise<void> {
+	async lineageOf({ actionId, rev }: ActionRev): Promise<BlockLineage> {
+		const meta = await this.storage.getMetadata(this.blockId);
+		const latest = meta?.latest;
+		if (!latest || latest.rev < rev) {
+			return 'behind';
+		}
+		if (latest.rev === rev) {
+			return latest.actionId === actionId ? 'contains' : 'excludes';
+		}
+		const heldBy = await this.storage.getRevision(this.blockId, rev);
+		if (heldBy !== undefined && heldBy !== actionId) {
+			return 'excludes';
+		}
+		// Past the revision. The index alone cannot answer from here: holding the action at `rev`
+		// does not prove `latest` was built from it (a replica taken since may descend from a base
+		// below `rev`), and holding nothing at `rev` does not prove it was not (a replica taken since
+		// may descend from it). Only a history derived HERE across `rev` settles it either way.
+		const floor = meta.lineageFloor;
+		if (floor === undefined || floor > rev) {
+			return 'unknown';
+		}
+		return heldBy === actionId ? 'contains' : 'excludes';
+	}
+
+	async setLatest(latest: ActionRev, builtOnPrior: boolean, latch: BlockWriteLatch): Promise<void> {
 		this.assertLatch(latch);
 		const meta = await this.storage.getMetadata(this.blockId);
 		if (!meta) {
@@ -237,6 +261,7 @@ export class BlockStorage implements IBlockStorage {
 		// Capture the prior latest rev BEFORE overwriting: coverage anchors to the earliest held rev.
 		const prevRev = meta.latest?.rev;
 		meta.latest = latest;
+		meta.lineageFloor = BlockStorage.nextLineageFloor(meta.lineageFloor, prevRev, latest.rev, builtOnPrior);
 		// NOTE: re-sorts (mergeRanges) the whole ranges array on every commit; if a block ever
 		// accumulates many disjoint ranges and commits show as slow, keep a running merged structure.
 		// `getBlock(r)` is served by materializeBlock's DESCENDING walk (highest committed rev <= r).
@@ -265,6 +290,7 @@ export class BlockStorage implements IBlockStorage {
 		const currentRev = meta.latest?.rev ?? 0;
 		let maxRev = currentRev;
 		let maxActionId = meta.latest?.actionId;
+		let lineageFloor = meta.lineageFloor;
 
 		// Probe forward until we hit a gap or a revision whose action is not yet
 		// in the committed log (Crash-D2 state — retry-commit owns that advance).
@@ -273,6 +299,9 @@ export class BlockStorage implements IBlockStorage {
 			if (actionId === undefined) break;
 			const promoted = await this.storage.getTransaction(this.blockId, actionId);
 			if (promoted === undefined) break;
+			// Each recovered revision is a commit whose `setLatest` was lost, so it owes the floor
+			// exactly what that `setLatest` would have recorded.
+			lineageFloor = BlockStorage.nextLineageFloor(lineageFloor, maxRev === 0 ? undefined : maxRev, next, promoted.insert === undefined);
 			maxRev = next;
 			maxActionId = actionId;
 		}
@@ -280,6 +309,7 @@ export class BlockStorage implements IBlockStorage {
 		if (maxRev > currentRev && maxActionId !== undefined) {
 			const advanced: ActionRev = { rev: maxRev, actionId: maxActionId };
 			meta.latest = advanced;
+			meta.lineageFloor = lineageFloor;
 			// The lost setLatest would have merged each recovered revision's range; redo that
 			// here. Open-ended from currentRev+1 (see setLatest): every rev in (currentRev, maxRev]
 			// was verified present in the committed log above, and any rev > maxRev resolves via the
@@ -417,6 +447,9 @@ export class BlockStorage implements IBlockStorage {
 			meta = { latest: undefined, ranges: [] };
 		}
 		meta.latest = { rev, actionId };
+		// Content this node did not derive: nothing here says what it was built from, so the known
+		// lineage starts over at this revision (see BlockMetadata.lineageFloor).
+		meta.lineageFloor = rev;
 		// Open-ended coverage from the earliest held rev (see setLatest): the descending walk serves
 		// any rev >= the anchor. A prior latest at prevRev (< rev per the monotonic guard) is a
 		// materialized point, so anchor at prevRev; the first write (prevRev undefined) anchors at
@@ -756,6 +789,18 @@ export class BlockStorage implements IBlockStorage {
 				verified?.rev === rev ? this.storage.saveBlockProof(this.blockId, rev, verified.proof) : Promise.resolve()
 			]);
 		}
+	}
+
+	/**
+	 * The lineage floor after a COMMIT lands `rev` on top of `prevRev` (see
+	 * {@link BlockMetadata.lineageFloor}). A revision built on the prior content extends the known
+	 * lineage downwards as far as it already reached — or, for metadata that predates the field,
+	 * to the revision it was just built on, which is all this commit can vouch for. A revision that
+	 * stands on its own (an insert replaces the block wholesale), and a block's first revision,
+	 * start the lineage at themselves.
+	 */
+	private static nextLineageFloor(floor: number | undefined, prevRev: number | undefined, rev: number, builtOnPrior: boolean): number {
+		return builtOnPrior && prevRev !== undefined ? (floor ?? prevRev) : rev;
 	}
 
 	private inRanges(rev: number, ranges: RevisionRange[]): boolean {

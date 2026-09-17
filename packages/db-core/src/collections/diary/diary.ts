@@ -40,15 +40,16 @@ export class Diary<TEntry> {
     }
 
     /** Append one entry and flush it. Forwards the collection's answer verbatim — see
-     *  {@link Collection.sync} for what `undefined` means. This layer never interprets the value. */
+     *  {@link Collection.sync} for what `undefined` means. This layer never interprets the value.
+     *  An append that throws leaves nothing staged (see {@link Collection.actAndSync}), so a caller
+     *  that appends it again records it once, not twice. */
     async append(data: TEntry): Promise<WriteDurability | undefined> {
         const action: Action<TEntry> = {
             type: "append",
             data: data
         };
 
-        await this.collection.act(action);
-        return await this.collection.updateAndSync();
+        return await this.collection.actAndSync([action]);
     }
 
     /** Fetch the latest state from the network */

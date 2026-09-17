@@ -1,4 +1,4 @@
-import type { GetBlockResults, ActionBlocks, BlockActionStatus, PendResult, CommitResult, PendRequest, CommitRequest, BlockGets, BlockId } from "../index.js";
+import type { GetBlockResults, ActionBlocks, ActionLineage, BlockActionStatus, PendResult, CommitResult, PendRequest, CommitRequest, BlockGets, BlockId } from "../index.js";
 import type { PeerId } from "../network/types.js";
 
 export type ClusterNomineesResult = {
@@ -46,4 +46,16 @@ export type ITransactor = {
 		- Used to build the supercluster for multi-collection transaction consensus
 	 */
 	queryClusterNominees?(blockId: BlockId): Promise<ClusterNomineesResult>;
+
+	/** Whether a COMMITTED action is part of what each named block holds now — the question a
+		writer asks when its own write was superseded before it could confirm it (see `BlockLineage`).
+		- `getStatus` cannot answer this: it judges a block by who holds its LATEST revision, so a
+		  write that landed and was then built upon reads there as not committed.
+		- `contains` is an acknowledgement and meets the same bar as a commit's: a strict majority of
+		  the block's cohort holds content built from the action.
+		- Read-only. It promotes nothing, so asking can never be what makes a write land.
+		- Optional: a transactor (or a wrapper around one) that does not offer it leaves the writer
+		  unable to establish the outcome, which it reports as such rather than guessing either way.
+	 */
+	getLineage?(ref: ActionBlocks & { rev: number }): Promise<ActionLineage>;
 }

@@ -1,4 +1,4 @@
-import type { BlockId, IBlock, Transform, ActionId, ActionRev } from "@optimystic/db-core";
+import type { BlockId, IBlock, Transform, ActionId, ActionRev, BlockLineage } from "@optimystic/db-core";
 import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockWriteLatch } from "./block-latch.js";
 
@@ -152,8 +152,26 @@ export interface IBlockStorage {
      */
     promotePendingTransaction(actionId: ActionId, latch: BlockWriteLatch): Promise<void>;
 
-    /** Sets the latest revision information */
-    setLatest(latest: ActionRev, latch: BlockWriteLatch): Promise<void>;
+    /**
+     * Sets the latest revision information, as the last step of committing `latest` here.
+     *
+     * `builtOnPrior` says how the revision's content was produced, which is what the block's known
+     * lineage depends on (see `BlockMetadata.lineageFloor`): `true` when this node applied the
+     * revision's transform to the content of its previous revision (an update-only or delete
+     * transform); `false` when the content stands on its own because the transform carried an
+     * `insert`. Required rather than defaulted: a caller that guessed `true` for an insert would let
+     * {@link lineageOf} vouch for history the content never came from.
+     */
+    setLatest(latest: ActionRev, builtOnPrior: boolean, latch: BlockWriteLatch): Promise<void>;
+
+    /**
+     * What THIS node's records say about whether the block's content at `latest` was built from the
+     * committed `target` — see `BlockLineage` in db-core for the four answers. Local and read-only:
+     * no latch, no peer fetch, no promotion. `unknown` is the honest answer whenever this node is
+     * past `target.rev` but took later content it did not derive itself (a replica, a restore);
+     * another cohort member that applied those revisions locally can still answer.
+     */
+    lineageOf(target: ActionRev): Promise<BlockLineage>;
 
     /**
      * Persist a replica of a block received out-of-band (churn re-replication).

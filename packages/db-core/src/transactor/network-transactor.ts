@@ -3,7 +3,8 @@ import type { PeerId } from "../network/types.js";
 import { highestStaleAt, isConflictFailure } from "../network/stale-failure.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import { mergeDurability, withTornBlocks } from "../network/durability.js";
-import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, GetBlockResult, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, WriteDurability } from "../index.js";
+import { judgeCohortLineage, type CohortLineage, type MemberLineage } from "../network/lineage.js";
+import type { ActionTransforms, ActionBlocks, ActionLineage, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, GetBlockResult, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, WriteDurability } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
 import { Tracker } from "../transform/tracker.js";
@@ -497,6 +498,57 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			log('getStatus: durable invalidation lookup failed collection=%s action=%s: %o', collectionId, actionId, err);
 			return false;
 		}
+	}
+
+	/**
+	 * See {@link ITransactor.getLineage}. Asks EVERY member of each block's cohort, directly, and
+	 * folds their answers with {@link judgeCohortLineage} — not the coordinator round {@link get}
+	 * runs, because no single member can answer for the cohort: a member that took a later revision
+	 * as a replica cannot say what it was built from, while the member it came from can.
+	 *
+	 * The per-member `get` carries no context, so it pins nothing and promotes nothing; asking is
+	 * never what makes a write land.
+	 *
+	 * NOTE: one request per cohort member per block. Reached only when a writer's own half-landed
+	 * write was refused as superseded, which is rare, so the fan-out is not batched by member. If a
+	 * write path ever calls this routinely, group the blocks a member is in the cohort of into one
+	 * request per member.
+	 */
+	async getLineage(ref: ActionBlocks & { rev: number }): Promise<ActionLineage> {
+		const target = { actionId: ref.actionId, rev: ref.rev };
+		const expiration = Date.now() + this.timeoutMs;
+		const answers = await Promise.all(ref.blockIds.map(blockId => this.cohortLineage(blockId, target, expiration)));
+		const durabilities = answers.flatMap(answer => answer.durability === undefined ? [] : [answer.durability]);
+		const saved = answers.length > 0 && durabilities.length === answers.length;
+		log('getLineage actionId=%s rev=%d blocks=%o', ref.actionId, ref.rev, answers.map(answer => answer.lineage));
+		return {
+			blocks: answers.map(answer => answer.lineage),
+			...(saved ? { durability: mergeDurability(durabilities) } : {})
+		};
+	}
+
+	/** One block's cohort answer: every member asked in parallel, a member that cannot be reached
+	 *  (or whose cohort cannot be resolved at all) counted as `unknown` rather than left out. */
+	private async cohortLineage(blockId: BlockId, target: { actionId: ActionId; rev: number }, expiration: number): Promise<CohortLineage> {
+		let cohort: string[];
+		try {
+			cohort = Object.keys(await this.keyNetwork.findCluster(routingKeyForBlock(blockId)));
+		} catch (err) {
+			log('getLineage:cohort-unresolved blockId=%s error=%s', blockId, errorMessage(err));
+			return { lineage: 'unknown' };
+		}
+		const members = await Promise.all(cohort.map(async (peerId): Promise<MemberLineage> => {
+			try {
+				const results = await this.getRepo(peerIdFromString(peerId)).get(
+					{ blockIds: [blockId], lineageOf: target }, { expiration, dialTimeoutMs: this.dialTimeoutMs });
+				const entry = results?.[blockId];
+				return { peerId, lineage: entry?.lineage ?? 'unknown', ...(entry?.state?.latest ? { latest: entry.state.latest } : {}) };
+			} catch (err) {
+				log('getLineage:member-silent blockId=%s peer=%s error=%s', blockId, peerId, errorMessage(err));
+				return { peerId, lineage: 'unknown' };
+			}
+		}));
+		return judgeCohortLineage(members);
 	}
 
 	private async consolidateCoordinators(

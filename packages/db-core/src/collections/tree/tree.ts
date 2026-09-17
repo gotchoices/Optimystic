@@ -264,10 +264,13 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 
 	/** Stage a mutation and flush it. Forwards the collection's answer verbatim — see
 	 * {@link Collection.sync} for what `undefined` means and why a torn commit's `torn` list must
-	 * survive the trip. This layer never interprets the value. */
+	 * survive the trip. This layer never interprets the value.
+	 *
+	 * A call that throws leaves nothing staged (see {@link Collection.actAndSync}), so the mutation
+	 * cannot ride along with a later `replace`. Whether it reached STORAGE is what the error says:
+	 * submitting it again is safe unless that is a `TornActionError` with `final: false`. */
 	async replace(data: TreeReplaceAction<TKey, TEntry>): Promise<WriteDurability | undefined> {
-			await this.collection.act({ type: "replace", data });
-			return await this.collection.updateAndSync();
+			return await this.collection.actAndSync([{ type: "replace", data }]);
 	}
 
 	/** Stage a mutation into the collection's tracker WITHOUT flushing it to the

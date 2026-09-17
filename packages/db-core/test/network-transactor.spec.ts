@@ -5,7 +5,7 @@ import { NetworkSimulation } from './simulation.js'
 import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
 import { routingKeyForBlock } from '../src/network/routing-key.js'
-import type { BlockId, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, ITransactor, BlockGets, GetBlockResults, PendResult, CommitRequest, CommitResult, StaleFailure, ActionId } from '../src/index.js'
+import type { BlockId, BlockLineage, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, ITransactor, BlockGets, GetBlockResults, PendResult, CommitRequest, CommitResult, StaleFailure, ActionId } from '../src/index.js'
 import { BlockUnavailableError, BlockPossiblyStaleError } from '../src/index.js'
 import type { PeerId } from '../src/index.js'
 import { peerIdFromString } from '../src/network/types.js'
@@ -726,6 +726,101 @@ describe('NetworkTransactor', () => {
 
       const statuses = await networkTransactor.getStatus([{ blockIds: [blockId], actionId: 'a1' as ActionId }])
       expect(statuses[0]!.statuses).to.deep.equal(['aborted'])
+    })
+  })
+
+  describe('getLineage', () => {
+    // Every cohort member answers for itself, so the peers listed here ARE the cohort: no
+    // coordinator is picked and no second-chance round exists.
+    class CohortKeyNetwork implements IKeyNetwork {
+      constructor(private readonly peers: string[]) {}
+      async findCoordinator(): Promise<PeerId> { throw new Error('getLineage asks members directly, never a coordinator') }
+      async findCluster(_key: Uint8Array): Promise<ClusterPeers> {
+        const peers: ClusterPeers = {}
+        for (const p of this.peers) peers[p] = { multiaddrs: [], publicKey: '' }
+        return peers
+      }
+    }
+    const answering = (lineage: BlockLineage | undefined, latest: { actionId: string; rev: number } | undefined, seen?: BlockGets[]): IRepo => ({
+      async get(gets: BlockGets): Promise<GetBlockResults> {
+        seen?.push(gets)
+        const res: GetBlockResults = {}
+        for (const bid of gets.blockIds) {
+          res[bid] = { state: { latest: latest as GetBlockResults[string]['state']['latest'] }, ...(lineage === undefined ? {} : { lineage }) }
+        }
+        return res
+      },
+      async pend() { throw new Error('unused') },
+      async commit() { throw new Error('unused') },
+      async cancel() { throw new Error('unused') },
+    })
+    const rival = { actionId: 'rival', rev: 3 }
+    const ref = { actionId: 'mine' as ActionId, blockIds: ['leaf' as BlockId], rev: 2 }
+
+    it('asks every cohort member, carrying the question and no context, and folds their answers', async () => {
+      const seen: BlockGets[] = []
+      const repos: Record<string, IRepo> = {
+        'peer-A': answering('contains', rival, seen),
+        'peer-B': answering('unknown', rival, seen),		// took rev 3 as a replica: cannot say
+      }
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: new CohortKeyNetwork(Object.keys(repos)),
+        getRepo: (peerId: PeerId) => repos[peerId.toString()]!,
+      })
+
+      const answer = await networkTransactor.getLineage(ref)
+
+      expect(seen.length, 'one request per member').to.equal(2)
+      for (const gets of seen) {
+        expect(gets.lineageOf).to.deep.equal({ actionId: 'mine', rev: 2 })
+        expect(gets.context, 'no context: the question must never promote anything').to.equal(undefined)
+      }
+      expect(answer.blocks).to.deep.equal(['contains'])
+      expect(answer.durability, 'the replica holder shares the voucher\'s latest, so both hold it').to.deep.equal({
+        quorum: 'full', confirmed: 2, cohort: 2, unconfirmed: [], cohortPeerIds: ['peer-A', 'peer-B'],
+      })
+    })
+
+    it('counts a member that cannot be reached, or predates the question, as a member that could not say', async () => {
+      const repos: Record<string, IRepo> = {
+        'peer-A': answering('contains', rival),
+        'peer-B': answering(undefined, rival),		// an older build: no `lineage` field at all
+        'peer-C': { ...answering('contains', rival), async get() { throw new Error('dial failed') } },
+      }
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: new CohortKeyNetwork(Object.keys(repos)),
+        getRepo: (peerId: PeerId) => repos[peerId.toString()]!,
+      })
+
+      const answer = await networkTransactor.getLineage(ref)
+      // A alone vouches; B holds the same latest and is inferred to hold it; C said nothing.
+      expect(answer.blocks).to.deep.equal(['contains'])
+      expect(answer.durability).to.deep.equal({
+        quorum: 'majority', confirmed: 2, cohort: 3, unconfirmed: ['peer-C'], cohortPeerIds: ['peer-A', 'peer-B', 'peer-C'],
+      })
+    })
+
+    it('reports no durability unless every block is contained', async () => {
+      const repos: Record<string, IRepo> = { 'peer-A': answering('excludes', rival), 'peer-B': answering('excludes', rival) }
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: new CohortKeyNetwork(Object.keys(repos)),
+        getRepo: (peerId: PeerId) => repos[peerId.toString()]!,
+      })
+      const answer = await networkTransactor.getLineage({ ...ref, blockIds: ['leaf' as BlockId, 'other' as BlockId] })
+      expect(answer.blocks).to.deep.equal(['excludes', 'excludes'])
+      expect(answer.durability).to.equal(undefined)
+    })
+
+    it('answers unknown for a block whose cohort cannot be resolved', async () => {
+      const net: IKeyNetwork = {
+        async findCoordinator(): Promise<PeerId> { throw new Error('unused') },
+        async findCluster(): Promise<ClusterPeers> { throw new Error('routing failed') },
+      }
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: net,
+        getRepo: () => { throw new Error('unused') },
+      })
+      expect((await networkTransactor.getLineage(ref)).blocks).to.deep.equal(['unknown'])
     })
   })
 

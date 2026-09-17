@@ -1,4 +1,4 @@
-import type { ITransactor, GetBlockResults, ActionBlocks, BlockActionStatus, PendResult, CommitResult, PendRequest, BlockId, CommitRequest, BlockGets, IBlock, ActionId, ActionRev, ActionTransforms, StaleFailure, Transform, Transforms, ClusterNomineesResult, CollectionId } from "../index.js";
+import type { ITransactor, GetBlockResults, ActionBlocks, ActionLineage, BlockLineage, BlockActionStatus, PendResult, CommitResult, PendRequest, BlockId, CommitRequest, BlockGets, IBlock, ActionId, ActionRev, ActionTransforms, StaleFailure, Transform, Transforms, ClusterNomineesResult, CollectionId } from "../index.js";
 import { highestStaleAt, isOwnRevision } from "../network/stale-failure.js";
 import { localDurability } from "../network/durability.js";
 import { ensuredMap } from "../utility/ensured.js";
@@ -164,6 +164,26 @@ export class TestTransactor implements ITransactor {
       })
     }));
   }
+
+	/** One store, no replicas: every revision was applied here onto the one before it, so the
+	 *  revision index answers for lineage outright — mirroring `BlockStorage.lineageOf`, including
+	 *  the one way a later revision does NOT build on its predecessor (an insert replaces the block
+	 *  wholesale). The "cohort" is this store alone, which is what the durability says. */
+	async getLineage(ref: ActionBlocks & { rev: number }): Promise<ActionLineage> {
+		this.checkAvailable();
+		const blocks = ref.blockIds.map((blockId): BlockLineage => {
+			const blockState = this.blocks.get(blockId);
+			if (!blockState || blockState.latestRev < ref.rev) return 'behind';
+			if (blockState.revisionActions.get(ref.rev) !== ref.actionId) return 'excludes';
+			const replacedSince = Array.from(blockState.revisionActions.entries()).some(([rev, actionId]) =>
+				rev > ref.rev && blockState.committedActions.get(actionId)?.insert !== undefined);
+			return replacedSince ? 'unknown' : 'contains';
+		});
+		return {
+			blocks,
+			...(blocks.length > 0 && blocks.every(lineage => lineage === 'contains') ? { durability: localDurability() } : {})
+		};
+	}
 
   async pend(request: PendRequest): Promise<PendResult> {
 		this.checkAvailable();
@@ -503,6 +523,7 @@ export abstract class DelegatingTransactor implements ITransactor {
 	pend(r: PendRequest): Promise<PendResult> { return this.inner.pend(r); }
 	cancel(a: ActionBlocks): Promise<void> { return this.inner.cancel(a); }
 	commit(r: CommitRequest): Promise<CommitResult> { return this.inner.commit(r); }
+	getLineage(ref: ActionBlocks & { rev: number }): Promise<ActionLineage> { return this.inner.getLineage(ref); }
 
 	get queryClusterNominees(): ((blockId: BlockId) => Promise<ClusterNomineesResult>) | undefined {
 		return this.inner.queryClusterNominees?.bind(this.inner);
@@ -558,6 +579,13 @@ export class FlakyCommitTransactor extends DelegatingTransactor {
  * the pend on the reported failure and {@link TestTransactor.cancel} only deletes PENDING records
  * — the real commit already promoted them, so the cancel is a no-op.
  *
+ * `afterLanding`, when given, runs a competing writer ONCE, after the first masked commit has
+ * landed and before its failure is reported: the rival reads the landed write and commits the next
+ * revision ON TOP of it, so by the time the writer looks again every block it wrote has moved past
+ * its revision while still containing it. Safe to await from inside `commit` here (unlike
+ * {@link TailLandsButReportsStale}'s rival, which has to wait for the cancel): the whole action
+ * landed, so it left no pending record for the rival's pend to collide with.
+ *
  * Used by both write paths' own-entry regression suites (collection-own-action-replay.spec.ts and
  * coordinator-own-action-replay.spec.ts); it lives here so the two cannot drift apart.
  */
@@ -566,10 +594,12 @@ export class CommitLandsButReportsStale extends DelegatingTransactor {
 	private injections: number;
 	/** Commits that actually landed on the inner transactor (masked or not). */
 	landedCommits = 0;
+	private rivalDue: boolean;
 
-	constructor(inner: TestTransactor, injections = 1) {
+	constructor(inner: TestTransactor, injections = 1, private readonly afterLanding?: RivalWrite) {
 		super(inner);
 		this.injections = injections;
+		this.rivalDue = afterLanding !== undefined;
 	}
 
 	override async commit(request: CommitRequest): Promise<CommitResult> {
@@ -577,6 +607,10 @@ export class CommitLandsButReportsStale extends DelegatingTransactor {
 		if (result.success) {
 			this.landedCommits++;
 			if (this.injections-- > 0) {
+				if (this.rivalDue) {
+					this.rivalDue = false;
+					await this.afterLanding!(this.inner);
+				}
 				return { success: false, conflict: true, reason: 'stale commit: injected torn-action conflict' };
 			}
 		}

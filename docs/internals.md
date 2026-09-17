@@ -934,7 +934,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   lands. The carve-out is `latest.rev === request.rev` **only**: past the requested revision the
   follow-on commit is refused as stale anyway, so approving would defer the refusal by a round
   trip, and `latest` alone can no longer name who holds the requested revision. Rival behavior,
-  and the signed reject prose that carries it, are untouched.
+  and the signed reject prose that carries it, are untouched. Past the requested revision the
+  question changes from "is this mine?" to "was what is here now BUILT FROM mine?", and that is
+  answered elsewhere — see "The writer's retry" below.
 - **Not every torn action is reported as a failure — the tolerated arm cancels instead of
   retrying.** `NetworkTransactor.commit` splits the sweep's failure by shape. A *returned*
   `success:false` is a confirmed conflict and is surfaced, so the writer retries (everything below
@@ -955,10 +957,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   one — the tail's own commit answers `commit-not-durable` (held by fewer than a majority, not
   "absent") and the sweep **never runs**. Either way the writer then cancels, which drops the
   pending records of every block that did not land, so nothing else will ever land them.
-  **The rule: a write may be reported saved only if every block its log entry names holds that
-  write's revision. Finding the entry proves only that the tail landed.** Readers materialize
-  blocks, not log entries, so an entry whose blocks never landed is a write that silently never
-  happened, on every node.
+  **The rule: a write may be reported saved only if every block its log entry names holds the
+  write — at the write's own revision, or at a later revision that was built from it. Finding
+  the entry proves only that the tail landed.** Readers materialize blocks, not log entries, so an
+  entry whose blocks never landed is a write that silently never happened, on every node.
   A refresh taken between a failed attempt and its retry therefore does two things with an entry
   carrying the retry's own action id. First it **finishes** the action
   (`Collection.completeOwnEntry`): every failed attempt is retained verbatim
@@ -975,21 +977,69 @@ saveMaterializedBlock(block): store(structuredClone(block));
   reports success, with the re-send's `WriteDurability` as its answer. Finishing runs before the
   refresh has changed anything on the instance, so when it cannot finish, the staged actions, the
   tracker and the held revision are exactly as the failed attempt left them.
-- **A half-landed write that cannot be finished is refused by name: `TornActionError`.** It carries
-  the collection, action id, revision and the blocks left behind, and a `reason`:
+- **A refused re-send is not yet an answer: the blocks' own history is asked next.** Storage
+  refuses the re-send whenever any block has moved past the write's revision — and *every* later
+  commit to the collection moves the log tail past it — which says a rival was there, not whether
+  the rival built ON the write (it read the write and added to it: saved) or OVER it (lost).
+  `Collection.settleUnfinished` therefore asks `ITransactor.getLineage`, and the question has to
+  be answered per member from what that member DERIVED ITSELF, because the revision index alone
+  lies in both directions: a member that held the write and then took a later revision as a
+  replica still names the write at its revision while what it holds may descend from a base below
+  it (the fork); a member that was behind and took the later revision as a replica has no record of
+  the write while the replica may contain it (restored past the revision). Each `BlockStorage`
+  keeps a **lineage floor** in the block's metadata (`BlockMetadata.lineageFloor`,
+  [`packages/db-p2p/src/storage/struct.ts`](../packages/db-p2p/src/storage/struct.ts)): the lowest
+  revision from which every later revision record was produced on this node by applying an
+  update-only transform to the content before it. A replica, a forward tombstone, an insert-carrying
+  commit and a block's first revision each move it up to themselves. `IBlockStorage.lineageOf`
+  then answers `contains` (the index names the action at that revision and the floor is at or
+  below it, or that revision is the latest), `excludes` (another action holds the revision, or the
+  derived history spans it without it), `behind` (not reached), or `unknown` (past it, but the
+  content came from elsewhere). `StorageRepo.get` reports it on request (`BlockGets.lineageOf` →
+  `GetBlockResult.lineage`), and `NetworkTransactor.getLineage` asks EVERY cohort member directly —
+  no coordinator round, and no context, so asking never promotes anything — and folds the answers
+  with `judgeCohortLineage` ([`packages/db-core/src/network/lineage.ts`](../packages/db-core/src/network/lineage.ts)):
+  `contains` needs a strict majority of the cohort holding the write (a member that answered
+  `unknown` counts when it holds the same latest revision as a member that vouched — same
+  `(rev, actionId)`, same agreed content), the bar a commit's own acknowledgement meets; `excludes`
+  needs one member proving it and every other member accounted for; `behind` needs every member;
+  anything else, members contradicting each other included, is `unknown`. The log block itself is
+  never asked about: the refresh has just read the entry out of it. Pinned at every tier —
+  `packages/db-p2p/test/block-lineage.spec.ts` (what each real storage path leaves behind),
+  `packages/db-core/test/cohort-lineage.spec.ts` (the folding rule),
+  `packages/db-core/test/superseded-own-entry.spec.ts` and
+  `packages/db-p2p/test/superseded-own-write-is-saved.spec.ts` (both holes on a real two-member
+  mesh, built from one member missing one commit).
+- **A half-landed write that cannot be finished is refused by name: `TornActionError`, and it says
+  whether that is final.** It carries the collection, action id, revision and the blocks not known
+  to hold the write, a `reason` for giving up, and `final`. The reason:
   `rival-holds-revision` — the re-send was refused with a confirmed committed revision under another
-  action (`staleAt`, or a non-empty `missing`), which is permanent; `completion-refused` — it was
-  refused for a cause that can clear (a rival merely pending, not yet durable at a majority), which
-  both write paths retry **as a refresh, never as a new attempt**, against the same budget as a lost
-  race, so seeing it means that budget ran out; `transforms-not-held` — the entry was found with
-  blocks missing and no retained attempt at its revision. It is deliberately not a
-  `SyncRetryExhaustedError`: "exhausted" says the write never landed and invites a blind retry,
-  whereas here the log already holds an entry for a write whose data is not saved. Nothing re-drives
-  under a new revision on the caller's behalf (that would record the actions twice); the staged
-  actions are left in place for the caller to discard or resubmit knowingly. `Collection.sync` /
-  `updateAndSync` throw it, and so does `TransactionCoordinator.commit` (out of its inter-attempt
-  refresh, `Collection.refreshInFlight`) — but bare only when no other participant of that commit
-  is saved.
+  action (`staleAt`, or a non-empty `missing`) and the lineage question did not vouch for every
+  block; `completion-refused` — it was refused for a cause that can clear (a rival merely pending,
+  not yet durable at a majority), which both write paths retry **as a refresh, never as a new
+  attempt**, against the same budget as a lost race, so seeing it means that budget ran out;
+  `transforms-not-held` — the entry was found with blocks missing and no retained attempt at its
+  revision. **`final` is the field a caller acts on**, and it is the same question for every
+  reason: `true` means the write is not saved and never will be — every block still missing it
+  answered `excludes` or `behind` for its whole cohort, and the write's pending records were
+  confirmed cancelled *before* the blocks were asked (a record left standing can be promoted by any
+  later read that knows the entry is committed, so the order is what makes "not reached" mean
+  "never will be") — and submitting the change again stores it once; `false` means that could not
+  be established (a transactor or wrapper without `getLineage`, a cohort that did not all answer,
+  fewer than a majority holding it, an unconfirmed cancel) and the write may already be saved or
+  may still land. The round that would spend the last of a write path's budget is told so
+  (`lastChance` on `Collection.refreshInFlight` / `updateInternal`), and settles the write instead
+  of asking for another round, so the error that escapes on exhaustion carries an honest `final`;
+  a write given up on a deadline cannot be foreseen that way and escapes unsettled. It is
+  deliberately not a `SyncRetryExhaustedError`: "exhausted" says the write never landed, whereas
+  here the log already holds an entry for it. Nothing re-drives under a new revision on the
+  caller's behalf (that would record the actions twice). At the collection level the staged actions
+  stay in place, so "submit again" is `sync()` again; `Tree.replace` and `Diary.append`, which own
+  both halves of a write, unstage what a failed call staged (`Collection.actAndSync`) — a failed
+  call's actions used to ride along, unasked, with the caller's next write, which is how a row
+  reported torn was seen to "appear one write later". `Collection.sync` / `updateAndSync` throw
+  it, and so does `TransactionCoordinator.commit` (out of its inter-attempt refresh,
+  `Collection.refreshInFlight`) — but bare only when no other participant of that commit is saved.
   `packages/db-core/test/own-entry-completes-the-action.spec.ts` pins the rule and all three
   reasons; the test double that matters is `TailLandsButReportsStale` (only the tail lands), not
   `CommitLandsButReportsStale` (everything lands — which makes "entry visible" and "write saved"

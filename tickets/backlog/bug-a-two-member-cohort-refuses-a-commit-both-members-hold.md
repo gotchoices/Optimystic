@@ -44,7 +44,7 @@ From sereus's round-trip report, filed here as an arm rather than a new ticket. 
 2. X's sweep commit of a non-tail block is refused (for example `commit-not-durable`, as described above), and X cancels.
 3. The concurrent writer Y refreshes and commits that block at rev ≥ 7.
 4. X's refresh finds its own entry. `Collection.completeOwnEntry` re-sends at rev 7, and the member's pend validation (`cluster-repo.ts` `validatePendOperations`) answers `stale revision: block … at rev N`.
-5. `tornFromRefusal` reports that answer as a `TornActionError`.
+5. `settleUnfinished` (formerly `tornFromRefusal`) reports that answer as a `TornActionError` — since `a-write-reported-torn-can-already-be-saved` only after asking the blocks' cohort whether their content was built from the write (`ITransactor.getLineage`), and with `final` saying whether the write can still land.
 
 That is correct reporting of a write that really was torn. The defect sits upstream, in step 2.
 

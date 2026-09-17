@@ -148,7 +148,7 @@ describe('StorageRepo', () => {
 				await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock, l);
 				await blockStorage.saveRevision(1, 'initial-action' as ActionId, l);
 				await blockStorage.promotePendingTransaction('initial-action' as ActionId, l);
-				await blockStorage.setLatest({ actionId: 'initial-action' as ActionId, rev: 1 }, l);
+				await blockStorage.setLatest({ actionId: 'initial-action' as ActionId, rev: 1 }, false, l);
 			});
 
 			// Now try to pend at revision 0 - should conflict
@@ -175,7 +175,7 @@ describe('StorageRepo', () => {
 				await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock, l);
 				await blockStorage.saveRevision(1, 'initial-action' as ActionId, l);
 				await blockStorage.promotePendingTransaction('initial-action' as ActionId, l);
-				await blockStorage.setLatest({ actionId: 'initial-action' as ActionId, rev: 1 }, l);
+				await blockStorage.setLatest({ actionId: 'initial-action' as ActionId, rev: 1 }, false, l);
 			});
 
 			const result = await repo.pend({
@@ -201,7 +201,7 @@ describe('StorageRepo', () => {
 				await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock, l);
 				await blockStorage.saveRevision(1, 'initial-action' as ActionId, l);
 				await blockStorage.promotePendingTransaction('initial-action' as ActionId, l);
-				await blockStorage.setLatest({ actionId: 'initial-action' as ActionId, rev: 1 }, l);
+				await blockStorage.setLatest({ actionId: 'initial-action' as ActionId, rev: 1 }, false, l);
 			});
 
 			const result = await repo.pend({
@@ -471,7 +471,7 @@ describe('StorageRepo', () => {
 				await blockStorage.saveMaterializedBlock('setup' as ActionId, existingBlock, l);
 				await blockStorage.saveRevision(1, 'setup' as ActionId, l);
 				await blockStorage.promotePendingTransaction('setup' as ActionId, l);
-				await blockStorage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+				await blockStorage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, false, l);
 			});
 
 			// Now pend a new action
@@ -522,7 +522,7 @@ describe('StorageRepo', () => {
 				await blockStorage.saveMaterializedBlock('create' as ActionId, testBlock, l);
 				await blockStorage.saveRevision(1, 'create' as ActionId, l);
 				await blockStorage.promotePendingTransaction('create' as ActionId, l);
-				await blockStorage.setLatest({ actionId: 'create' as ActionId, rev: 1 }, l);
+				await blockStorage.setLatest({ actionId: 'create' as ActionId, rev: 1 }, false, l);
 			});
 
 			// Request same block multiple times
@@ -587,7 +587,7 @@ describe('StorageRepo', () => {
 				await blockStorage.saveMaterializedBlock('create' as ActionId, testBlock, l);
 				await blockStorage.saveRevision(1, 'create' as ActionId, l);
 				await blockStorage.promotePendingTransaction('create' as ActionId, l);
-				await blockStorage.setLatest({ actionId: 'create' as ActionId, rev: 1 }, l);
+				await blockStorage.setLatest({ actionId: 'create' as ActionId, rev: 1 }, false, l);
 			});
 
 			// Add a pending transaction
@@ -1114,7 +1114,7 @@ describe('StorageRepo', () => {
 				await blockStorage.saveMaterializedBlock('setup' as ActionId, testBlock, l);
 				await blockStorage.saveRevision(1, 'setup' as ActionId, l);
 				await blockStorage.promotePendingTransaction('setup' as ActionId, l);
-				await blockStorage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+				await blockStorage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, false, l);
 			});
 
 			await repo.pend({
@@ -1150,7 +1150,7 @@ describe('StorageRepo', () => {
 					await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 					await storage.saveRevision(1, 'setup' as ActionId, l);
 					await storage.promotePendingTransaction('setup' as ActionId, l);
-					await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+					await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, false, l);
 				});
 			}
 
@@ -1208,7 +1208,7 @@ describe('StorageRepo', () => {
 				await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 				await storage.saveRevision(1, 'setup' as ActionId, l);
 				await storage.promotePendingTransaction('setup' as ActionId, l);
-				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, false, l);
 			});
 			await repo.pend({
 				actionId: 'a2' as ActionId,
@@ -1274,13 +1274,13 @@ describe('StorageRepo', () => {
 				const storage = new BlockStorage(blockId as BlockId, rawStorage);
 				if (blockId === 'block-1') {
 					const originalSetLatest = storage.setLatest.bind(storage);
-					storage.setLatest = async (latest: ActionRev, l: BlockWriteLatch) => {
+					storage.setLatest = async (latest: ActionRev, builtOnPrior: boolean, l: BlockWriteLatch) => {
 						// Gate only the read-driven promotion's write (a2), not the commit's (a3).
 						if (latest.actionId === 'a2') {
 							reachedResolve();
 							await gate;
 						}
-						return originalSetLatest(latest, l);
+						return originalSetLatest(latest, builtOnPrior, l);
 					};
 				}
 				return storage;
@@ -1294,7 +1294,7 @@ describe('StorageRepo', () => {
 				await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 				await storage.saveRevision(1, 'setup' as ActionId, l);
 				await storage.promotePendingTransaction('setup' as ActionId, l);
-				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, false, l);
 			});
 			await gatedRepo.pend({
 				actionId: 'a2' as ActionId,
@@ -1351,7 +1351,7 @@ describe('StorageRepo', () => {
 				await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 				await storage.saveRevision(1, 'setup' as ActionId, l);
 				await storage.promotePendingTransaction('setup' as ActionId, l);
-				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, false, l);
 				// rev 2 durable but latest deliberately NOT advanced (the lost-setLatest / Crash-D3 signature).
 				await storage.savePendingTransaction('a2' as ActionId, { insert: makeBlock('block-1', { items: ['a2'] }) }, undefined, l);
 				await storage.saveMaterializedBlock('a2' as ActionId, makeBlock('block-1', { items: ['a2'] }), l);
@@ -1393,7 +1393,7 @@ describe('StorageRepo', () => {
 				await storage1.saveMaterializedBlock('setup' as ActionId, block1, l);
 				await storage1.saveRevision(1, 'setup' as ActionId, l);
 				await storage1.promotePendingTransaction('setup' as ActionId, l);
-				await storage1.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+				await storage1.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, false, l);
 			});
 
 			// Setup block-2 with a committed block
@@ -1404,7 +1404,7 @@ describe('StorageRepo', () => {
 				await storage2.saveMaterializedBlock('setup' as ActionId, block2, l);
 				await storage2.saveRevision(1, 'setup' as ActionId, l);
 				await storage2.promotePendingTransaction('setup' as ActionId, l);
-				await storage2.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+				await storage2.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, false, l);
 			});
 
 			// Pend action on both blocks
@@ -1713,7 +1713,7 @@ describe('StorageRepo', () => {
 					await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 					await storage.saveRevision(1, 'setup' as ActionId, l);
 					await storage.promotePendingTransaction('setup' as ActionId, l);
-					await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+					await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, false, l);
 				});
 			}
 
@@ -1791,7 +1791,7 @@ describe('StorageRepo', () => {
 					await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 					await storage.saveRevision(1, 'setup' as ActionId, l);
 					await storage.promotePendingTransaction('setup' as ActionId, l);
-					await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, l);
+					await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, false, l);
 				});
 			};
 			await setup('block-a', 'collection-A');

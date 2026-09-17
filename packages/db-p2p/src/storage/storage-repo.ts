@@ -286,7 +286,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		}
 	}
 
-	async get({ blockIds, context }: BlockGets, _options?: MessageOptions): Promise<GetBlockResults> {
+	async get({ blockIds, context, lineageOf }: BlockGets, _options?: MessageOptions): Promise<GetBlockResults> {
 		const distinctBlockIds = Array.from(new Set(blockIds));
 		log('get blockIds=%d', distinctBlockIds.length);
 		// Read-driven promotions that land durably here, captured so we can emit a
@@ -295,7 +295,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// parallel map closures below — safe because each push happens synchronously
 		// between awaits (single-threaded), never concurrently.
 		const promotions: { collectionId: CollectionId, blockId: BlockId, actionId: ActionId, rev: number }[] = [];
-		const results = await Promise.all(distinctBlockIds.map(async (blockId) => {
+		const results = await Promise.all(distinctBlockIds.map(async (blockId): Promise<[BlockId, GetBlockResult]> => {
 			const blockStorage = this.createBlockStorage(blockId);
 			// Set when this node KNOWS its answer for the block is a guess: the promotion
 			// below refused for a missing base, or getBlock() threw (truncated history /
@@ -482,7 +482,32 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// commit's ordering. No-op when nothing was promoted.
 		this.emitPromotions(promotions);
 
+		if (lineageOf !== undefined) {
+			await this.answerLineage(results, lineageOf);
+		}
+
 		return Object.fromEntries(results);
+	}
+
+	/**
+	 * Answers {@link BlockGets.lineageOf} on every entry, from this node's own records (see
+	 * {@link IBlockStorage.lineageOf}). Runs after the block reads, so it describes storage at least
+	 * as new as the content served beside it; every fact it reads only ever moves forward, so a
+	 * commit landing in between cannot make the answer wrong, only early.
+	 *
+	 * A read fault answers `unknown` rather than failing the batch: the asker reads that as "this
+	 * node could not say", which is exactly what happened.
+	 */
+	private async answerLineage(results: [BlockId, GetBlockResult][], target: ActionRev): Promise<void> {
+		await Promise.all(results.map(async ([blockId, entry]) => {
+			try {
+				entry.lineage = await this.createBlockStorage(blockId).lineageOf(target);
+			} catch (err) {
+				log('get:lineage-unreadable blockId=%s rev=%d error=%s', blockId, target.rev,
+					err instanceof Error ? err.message : String(err));
+				entry.lineage = 'unknown';
+			}
+		}));
 	}
 
 	/**
@@ -1356,8 +1381,9 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		await storage.saveRevision(rev, actionId, latch);
 		await storage.promotePendingTransaction(actionId, latch);
 
-		// Update latest revision *last*
-		await storage.setLatest({ actionId, rev }, latch);
+		// Update latest revision *last*. An insert replaced the block wholesale, so its content was
+		// not built on what this node held before (see BlockMetadata.lineageFloor).
+		await storage.setLatest({ actionId, rev }, transform.insert === undefined, latch);
 
 		// Persist the cohort's commit proof AFTER the commit is durably latest — the proof is
 		// evidence about a landed revision, never a precondition of landing it. The retention rule
