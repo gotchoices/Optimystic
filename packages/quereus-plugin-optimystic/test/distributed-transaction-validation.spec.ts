@@ -615,7 +615,8 @@ describe('Distributed Transaction Validation', function () {
 			keyNetwork,
 			getRepo: (peerId) => peerId.toString() === node.peerId.toString()
 				? coordinatedRepo
-				: RepoClient.create(peerId, keyNetwork, protocolPrefix)
+				: RepoClient.create(peerId, keyNetwork, protocolPrefix),
+			localPeerId: node.peerId
 		});
 
 		const db = new Database();

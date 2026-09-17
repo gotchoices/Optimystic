@@ -65,15 +65,21 @@ A `NetworkTransactor` is the bridge between collections and the network:
 
 ```typescript
 import { NetworkTransactor } from '@optimystic/db-core';
+import { RepoClient } from '@optimystic/db-p2p';
 
 const transactor = new NetworkTransactor({
-  keyNetwork,    // Peer discovery — use `node.keyNetwork`, the instance createLibp2pNode
-                 // already built with this node's cluster size and network scoping
-
-  peerNetwork,   // libp2p node
-  getRepo,       // Factory returning a local IRepo (StorageRepo for persistence)
+  timeoutMs: 30_000,
+  abortOrCancelTimeoutMs: 5_000,
+  keyNetwork: node.keyNetwork,   // the instance createLibp2pNode already built with this
+                                 // node's cluster size and network scoping
+  getRepo: peerId => peerId.equals(node.peerId)
+    ? node.coordinatedRepo       // this node: its own repo, no network hop
+    : RepoClient.create(peerId, node.keyNetwork, `/optimystic/${networkName}`),
+  localPeerId: node.peerId,      // which peer `getRepo` serves locally
 });
 ```
+
+A node is responsible for a block only when it is among the block's nearest `clusterSize` serving peers, so a writer on a network wider than that sends some writes to other machines. `localPeerId` keeps the rest local: when several responsible peers could coordinate a write equally well, the transactor picks its own node. Omit it for a transactor with no co-located repo.
 
 For tests, `TestTransactor` from `@optimystic/db-core/test` runs everything in-process with no network.
 
@@ -357,7 +363,7 @@ raise-only, a group waiting for its next rebuild is running at exactly the value
 
 **Relay restarts (mobile and browser).** A node given `<relay>/p2p-circuit` as a listen address keeps its reservation on that relay itself: it re-reserves after the relay restarts, after the connection to the relay drops, and across libp2p's routine renewal of the slot, retrying on a backoff capped at 30 s so a lone phone is reachable again within about that long of its relay coming back (`superviseRelayReservation` in `packages/db-p2p/src/network/relay-reservation.ts`). Startup still fails if the relay cannot be reserved at all. A host that listens on a bare `/p2p-circuit` itself owns that reservation and is left alone, which is how Sereus runs. One side effect to know about: a node supervised this way also runs libp2p's relay discovery, so if it is directly connected to a second relay server, that server may take the slot first and the node is then reachable through it rather than through the relay it was given. See [architecture.md](architecture.md#supported-deployment-sizes--one-machine-and-two-are-ordinary-not-degenerate).
 
-**Test harness:** `TestTransactor` runs everything in-process with no network. Two wrappers around it (all from `@optimystic/db-core/test`) drive concurrency failures deterministically: `FlakyCommitTransactor` forces a bounded number of commit-phase losses, and `CompetingWriterTransactor` runs a *real* second writer to a durable commit in the middle of a transaction, so the loser takes a genuine optimistic-concurrency loss and has to rebase. Both extend `DelegatingTransactor`, which forwards the rest of the transactor surface — extend it rather than hand-rolling a wrapper, or optional members like `queryClusterNominees` get silently dropped and the wrapped test quietly stops exercising the path it names. For multi-node integration tests, the `MeshHarness` under `packages/db-p2p/src/testing` spins up a configurable in-memory mesh.
+**Test harness:** `TestTransactor` runs everything in-process with no network. Two wrappers around it (all from `@optimystic/db-core/test`) drive concurrency failures deterministically: `FlakyCommitTransactor` forces a bounded number of commit-phase losses, and `CompetingWriterTransactor` runs a *real* second writer to a durable commit in the middle of a transaction, so the loser takes a genuine optimistic-concurrency loss and has to rebase. Both extend `DelegatingTransactor`, which forwards the rest of the transactor surface — extend it rather than hand-rolling a wrapper, or optional members like `queryClusterNominees` get silently dropped and the wrapped test quietly stops exercising the path it names. For multi-node integration tests, the `MeshHarness` under `packages/db-p2p/src/testing` spins up a configurable in-memory mesh. It places blocks by the same ring rule production uses (pinned by `packages/db-p2p/test/mesh-harness-cohort-parity.spec.ts`), so with `responsibilityK` below the node count a node's coordinator refuses writes for blocks it is not responsible for; `responsibleNodes` and `blockIdsInCohortOf` choose nodes and blocks without assuming an index.
 
 ## Operational Basics
 

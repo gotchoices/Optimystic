@@ -290,6 +290,9 @@ export class CollectionFactory {
       keyNetwork,
       getRepo,
       localChangeNotifier: blockChangeNotifier,
+      // `getRepo` serves this node from its coordinated repo, so ties among a block's responsible
+      // peers go to this node and its own writes skip the network hop.
+      localPeerId: node.peerId,
     });
   }
 

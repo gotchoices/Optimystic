@@ -481,7 +481,10 @@ class PeerSession {
 					return peerId.toString() === node.peerId.toString()
 						? coordinatedRepo  // Use coordinated repo for self to enable cluster consensus
 						: RepoClient.create(peerId, keyNetwork, `/optimystic/${options.network || 'optimystic'}`);
-				}
+				},
+				// Self is served by the co-located repo above, so a write this node is responsible for
+				// is coordinated here rather than sent to an equally responsible neighbour.
+				localPeerId: node.peerId
 			});
 		}
 

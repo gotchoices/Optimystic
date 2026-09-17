@@ -42,6 +42,17 @@ type NetworkTransactorInit = {
 	 * absent, `onCollectionChange` is a logged no-op.
 	 */
 	localChangeNotifier?: IBlockChangeNotifier;
+	/**
+	 * The peer id of the node this transactor runs on, when `getRepo` hands that id the node's own
+	 * co-located repo rather than a network client — the same "co-located node" idea as
+	 * `localChangeNotifier`. It only breaks ties when a pend's blocks are grouped onto coordinators:
+	 * among cohort members covering equally many blocks, this node wins, so a write it is responsible
+	 * for is coordinated without a network hop. It never wins over a member covering more blocks
+	 * (fewer batches come first), and it never makes this node a coordinator for a block whose cohort
+	 * does not include it. Omit when nothing is co-located; ties then go to the member seen first,
+	 * which is the nearest.
+	 */
+	localPeerId?: PeerId;
 }
 
 /**
@@ -60,6 +71,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	private readonly dialTimeoutMs: number | undefined;
 	private readonly getRepo: (peerId: PeerId) => IRepo;
 	private readonly localChangeNotifier: IBlockChangeNotifier | undefined;
+	/** `NetworkTransactorInit.localPeerId` as a string, the form cohort peer ids arrive in. */
+	private readonly localPeerId: string | undefined;
 
 	/**
 	 * Per-transaction coordinator cache: `actionId → (blockId → resolved coordinator)`.
@@ -94,6 +107,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			: (init.dialTimeoutMs > 0 ? init.dialTimeoutMs : undefined);
 		this.getRepo = init.getRepo;
 		this.localChangeNotifier = init.localChangeNotifier;
+		this.localPeerId = init.localPeerId?.toString();
 	}
 
 	/**
@@ -461,22 +475,10 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		const assignments = new Map<string, BlockId[]>(); // peerIdStr → assigned blockIds
 
 		while (uncovered.size > 0) {
-			let bestPeer: string | undefined;
-			let bestCount = 0;
-
-			for (const [peerId, blocks] of peerBlocks) {
-				const coverCount = blocks.filter(bid => uncovered.has(bid)).length;
-				if (coverCount > bestCount) {
-					bestCount = coverCount;
-					bestPeer = peerId;
-				}
-			}
-
-			if (!bestPeer || bestCount === 0) break;
-
-			const covered = peerBlocks.get(bestPeer)!.filter(bid => uncovered.has(bid));
-			assignments.set(bestPeer, covered);
-			for (const bid of covered) uncovered.delete(bid);
+			const best = bestCoveringPeer(peerBlocks, uncovered, this.localPeerId);
+			if (!best) break;
+			assignments.set(best.peerId, best.covered);
+			for (const bid of best.covered) uncovered.delete(bid);
 		}
 
 		// Step 4: Any remaining uncovered blocks fall back to findCoordinator
@@ -1166,6 +1168,28 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	}
 }
 
+
+/**
+ * One round of `consolidateCoordinators`' greedy cover: the cohort member covering the most still-uncovered
+ * blocks, with the blocks it covers, or undefined when no member covers any.
+ *
+ * A tie goes to `localPeerId` when it is among the tied members, otherwise to the member seen first. Cohorts
+ * arrive in proximity order, so "seen first" is the nearest; without the local preference a node that is in
+ * a block's cohort but not nearest would send its own write over the network, and on a network no wider than
+ * a cohort (every node in every cohort) that would be nearly every write.
+ */
+function bestCoveringPeer(peerBlocks: Map<string, BlockId[]>, uncovered: Set<BlockId>, localPeerId: string | undefined): { peerId: string; covered: BlockId[] } | undefined {
+	let best: { peerId: string; covered: BlockId[] } | undefined;
+	for (const [peerId, blocks] of peerBlocks) {
+		const covered = blocks.filter(bid => uncovered.has(bid));
+		if (covered.length === 0) continue;
+		const bestCount = best?.covered.length ?? 0;
+		if (covered.length > bestCount || (covered.length === bestCount && peerId === localPeerId)) {
+			best = { peerId, covered };
+		}
+	}
+	return best;
+}
 
 /**
  * The block ids some batch in the tree got an ANSWER for. A cancel batch that errored, or never

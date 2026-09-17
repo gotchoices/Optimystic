@@ -20,14 +20,12 @@
  * `TextEncoder` bytes, independently of the helper, so a helper that drifts from raw utf8 fails here.
  */
 import { expect } from 'chai';
-import { generateKeyPairFromSeed } from '@libp2p/crypto/keys';
-import { peerIdFromPrivateKey } from '@libp2p/peer-id';
-import { multiaddr } from '@multiformats/multiaddr';
-import type { Connection, Libp2p, PeerId } from '@libp2p/interface';
-import { DigitreeStore, assembleCohort, hashKey, hashPeerId } from 'p2p-fret';
+import type { PeerId } from '@libp2p/interface';
+import { DigitreeStore, assembleCohort, hashKey } from 'p2p-fret';
 import { Diary, routingKeyForBlock, type IRepo, type BlockId, type CommitRequest, type PendRequest } from '@optimystic/db-core';
 import { createMesh, buildNetworkTransactor, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
 import { Libp2pKeyPeerNetwork } from '../src/libp2p-key-network.js';
+import { ringOf, ringPeersOf, ringKeyNetworkOf } from './util/seeded-ring.js';
 
 const utf8 = new TextEncoder();
 
@@ -44,30 +42,6 @@ const sameSet = (a: Iterable<string>, b: Iterable<string>): boolean => {
 };
 
 const blockIds = (n: number, prefix = 'block'): string[] => Array.from({ length: n }, (_, i) => `${prefix}-${i}`);
-
-/**
- * The `n` peers of the seeded ring `ringOf(n)` holds, in index order. Keys are derived from a fixed
- * seed per `(n, i)`, so every run measures the SAME ring: the statistics below are properties of one
- * reproducible geometry rather than a fresh random sample.
- */
-async function ringPeersOf(n: number): Promise<PeerId[]> {
-	const peers: PeerId[] = [];
-	for (let i = 0; i < n; i++) {
-		const seed = new Uint8Array(32);
-		const view = new DataView(seed.buffer);
-		view.setUint32(0, n);
-		view.setUint32(4, i);
-		peers.push(peerIdFromPrivateKey(await generateKeyPairFromSeed('Ed25519', seed)));
-	}
-	return peers;
-}
-
-/** A FRET ring store holding `ringPeersOf(n)` at their real ring coordinates. */
-async function ringOf(n: number): Promise<DigitreeStore> {
-	const store = new DigitreeStore();
-	for (const pid of await ringPeersOf(n)) store.upsert(pid.toString(), await hashPeerId(pid));
-	return store;
-}
 
 interface DivergenceStats {
 	/** Cohorts at the two coordinates are not the same set. */
@@ -136,45 +110,10 @@ describe('routing-key convention: the writer and the servers route a block on on
 	 */
 	describe('on the production key network over the same seeded ring (no I/O)', () => {
 		const k = 4;
-		const PREFIX = '/optimystic/convention';
-		const SERVES = [`${PREFIX}/cluster/1.0.0`, `${PREFIX}/repo/1.0.0`];
-		const addrOf = (pid: { toString(): string }): string => `/ip4/10.0.0.1/tcp/4001/p2p/${pid.toString()}`;
 
-		/**
-		 * `self`'s key network over `store`. Every other ring member is connected; each advertises the
-		 * storage protocols unless listed in `notServing`. `ownProtocols` is what this node registers.
-		 */
-		function keyNetworkOf(self: PeerId, peers: PeerId[], store: DigitreeStore, options: { scoped: boolean; ownProtocols?: string[]; notServing?: Set<string> }): Libp2pKeyPeerNetwork {
-			const notServing = options.notServing ?? new Set<string>();
-			const connections = peers
-				.filter(p => !p.equals(self))
-				.map(p => ({ remotePeer: p, status: 'open', direction: 'outbound', remoteAddr: { toString: () => addrOf(p) } }) as unknown as Connection);
-			const libp2p = {
-				peerId: self,
-				getConnections: () => connections,
-				getDialQueue: () => [],
-				getMultiaddrs: () => [],
-				getProtocols: () => options.ownProtocols ?? SERVES,
-				addEventListener: () => { },
-				removeEventListener: () => { },
-				peerStore: {
-					all: async () => [],
-					get: async (pid: PeerId) => ({
-						protocols: notServing.has(pid.toString()) ? ['/ipfs/id/1.0.0'] : SERVES,
-						addresses: [{ multiaddr: multiaddr(addrOf(pid)) }]
-					})
-				},
-				services: {
-					fret: {
-						assembleCohort: (coord: Uint8Array, wants: number, exclude?: Set<string>) => assembleCohort(store, coord, wants, exclude),
-						getNetworkSizeEstimate: () => ({ size_estimate: peers.length, confidence: 1 }),
-						detectPartition: () => false,
-						exportTable: () => undefined
-					}
-				}
-			} as unknown as Libp2p;
-			return new Libp2pKeyPeerNetwork(libp2p, k, undefined, 'forming', undefined, undefined, options.scoped ? PREFIX : undefined);
-		}
+		/** `self`'s key network over `store` at width `k` (see `ringKeyNetworkOf`). */
+		const keyNetworkOf = (self: PeerId, peers: PeerId[], store: DigitreeStore, options: { scoped: boolean; ownProtocols?: string[]; notServing?: Set<string> }): Libp2pKeyPeerNetwork =>
+			ringKeyNetworkOf(self, peers, store, { clusterSize: k, ...options });
 
 		const cohortOf = async (network: Libp2pKeyPeerNetwork, id: string): Promise<string[]> =>
 			Object.keys(await network.findCluster(routingKeyForBlock(id)));

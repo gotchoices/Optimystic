@@ -1309,6 +1309,92 @@ describe('NetworkTransactor', () => {
       const result = await networkTransactor.pend(pendRequest);
       expect(result.success).to.be.true;
     });
+
+    // Ticket writer-and-harness-route-to-the-cohort: cohorts arrive in proximity order and hold the
+    // writer's own node only when it is among the nearest, so the greedy cover's tie-break decides
+    // whether a write the writer is responsible for costs a network hop.
+    describe('tie-break toward the local peer', () => {
+      const self = 'peer-self';
+      const peerA = 'peer-A';
+      const peerB = 'peer-B';
+      const blockId1 = 'block-1' as BlockId;
+      const blockId2 = 'block-2' as BlockId;
+
+      /** Pend one update per block in `cohorts` through a transactor whose local peer is `self`;
+       *  returns every pend each peer received, in order. `failingPeers` throw on pend. */
+      const pendThroughCohorts = async (cohorts: Array<[BlockId, string[]]>, options: { localPeerId?: string; fallbackCoordinator?: string; failingPeers?: Set<string> } = {}) => {
+        const mockNetwork = new MockKeyNetwork(options.fallbackCoordinator ?? peerA);
+        for (const [blockId, peerIds] of cohorts) await mockNetwork.setCluster(blockId, peerIds);
+        const pends: Array<{ peer: string; blockIds: string[] }> = [];
+        const inner = new Map([self, peerA, peerB].map(pid => [pid, new TestTransactor()]));
+        const networkTransactor = new NetworkTransactor({
+          timeoutMs: 1000,
+          abortOrCancelTimeoutMs: 500,
+          keyNetwork: mockNetwork,
+          localPeerId: options.localPeerId === undefined ? undefined : peerIdFromString(options.localPeerId),
+          getRepo: (peerId: PeerId) => {
+            const pid = peerId.toString();
+            const repo = inner.get(pid)!;
+            return {
+              get: gets => repo.get(gets),
+              pend: async request => {
+                pends.push({ peer: pid, blockIds: Object.keys(request.transforms.updates ?? {}) });
+                if (options.failingPeers?.has(pid)) throw new Error(`${pid} failed`);
+                return await repo.pend(request);
+              },
+              cancel: ref => repo.cancel(ref),
+              commit: async () => { throw new Error('unused'); }
+            };
+          }
+        });
+        const result = await networkTransactor.pend({
+          actionId: generateRandomActionId(),
+          transforms: {
+            updates: Object.fromEntries(cohorts.map(([blockId]) => [blockId, [createBlockOperation()]])),
+            inserts: {},
+            deletes: []
+          },
+          policy: 'c'
+        });
+        return { result, pends };
+      };
+
+      it('a single block whose cohort holds the local peer second is coordinated locally', async () => {
+        const { result, pends } = await pendThroughCohorts([[blockId1, [peerA, self]]], { localPeerId: self });
+        expect(result.success).to.be.true;
+        expect(pends).to.deep.equal([{ peer: self, blockIds: [blockId1] }]);
+      });
+
+      it('the same block without a local peer id goes to the member listed first', async () => {
+        const { result, pends } = await pendThroughCohorts([[blockId1, [peerA, self]]]);
+        expect(result.success).to.be.true;
+        expect(pends).to.deep.equal([{ peer: peerA, blockIds: [blockId1] }]);
+      });
+
+      it('never prefers the local peer over a member covering more blocks', async () => {
+        // A covers both blocks, self only one: one batch to A beats two batches.
+        const { result, pends } = await pendThroughCohorts([[blockId1, [peerA, self]], [blockId2, [peerA, peerB]]], { localPeerId: self });
+        expect(result.success).to.be.true;
+        expect(pends).to.have.length(1);
+        expect(pends[0]!.peer).to.equal(peerA);
+        expect(pends[0]!.blockIds).to.have.members([blockId1, blockId2]);
+      });
+
+      it('with the local peer in no cohort, a tie goes to the member listed first', async () => {
+        const { result, pends } = await pendThroughCohorts([[blockId1, [peerA, peerB]]], { localPeerId: self });
+        expect(result.success).to.be.true;
+        expect(pends).to.deep.equal([{ peer: peerA, blockIds: [blockId1] }]);
+      });
+
+      it('a failed local batch is retried remotely through findCoordinator with the local peer excluded', async () => {
+        // The tie-break only chooses the first attempt. The retry re-picks through `findCoordinator`
+        // with the failed peer excluded, so a failed local batch goes remote (and, the other way
+        // round, a failed remote batch may come back to the local peer when it is in the cohort).
+        const { result, pends } = await pendThroughCohorts([[blockId1, [peerA, self]]], { localPeerId: self, failingPeers: new Set([self]) });
+        expect(result.success).to.be.true;
+        expect(pends.map(p => p.peer)).to.deep.equal([self, peerA]);
+      });
+    });
   })
 
   // Per-transaction coordinator cache: a block's cluster/coordinator is resolved once per

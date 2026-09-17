@@ -64,7 +64,8 @@ async function createNode(port: number, bootstrapNodes: string[], networkName: s
 				return coordinatedRepo;
 			}
 			return RepoClient.create(peerId, keyNetwork, protocolPrefix);
-		}
+		},
+		localPeerId: node.peerId
 	});
 
 	// Create Quereus database

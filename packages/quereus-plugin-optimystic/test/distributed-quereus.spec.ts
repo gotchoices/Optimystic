@@ -402,7 +402,8 @@ describe('Distributed Quereus Operations', function () {
 				}
 				// For remote peers, create a RepoClient
 				return RepoClient.create(peerId, keyNetwork, protocolPrefix);
-			}
+			},
+			localPeerId: node.peerId
 		});
 
 		// Create Quereus database

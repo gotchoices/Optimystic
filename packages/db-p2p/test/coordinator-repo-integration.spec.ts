@@ -9,7 +9,7 @@
 import { expect } from 'chai';
 import type { BlockId, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
 import { routingKeyForBlock } from '@optimystic/db-core';
-import { createMesh, buildNetworkTransactor, type Mesh } from '../src/testing/mesh-harness.js';
+import { createMesh, buildNetworkTransactor, responsibleNodes, nonResponsibleNodes, blockIdsInCohortOf, type Mesh } from '../src/testing/mesh-harness.js';
 
 const makeHeader = (id: string): BlockHeader => ({
 	id: id as BlockId,
@@ -35,6 +35,10 @@ const makeMultiBlockTransforms = (blockIds: string[]): Transforms => {
 	return { inserts, updates: {}, deletes: [] };
 };
 
+// The `responsibilityK: 1` meshes below give each block exactly one responsible node, and a node's
+// coordinator refuses a write for a block outside its cohort. Peer ids are random per mesh, so those
+// cases ask the key network which node owns a block (or which blocks a node owns) instead of assuming
+// an index.
 describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 
 	describe('cancel operation', () => {
@@ -46,28 +50,28 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 
 		it('should cancel a pending transaction (single-node fast path)', async () => {
 			const blockId = 'block-cancel-1';
-			const node = mesh.nodes[0]!;
+			const [node] = await responsibleNodes(mesh, blockId);
 
 			// Pend a transaction
-			const pendResult = await node.coordinatorRepo.pend(
+			const pendResult = await node!.coordinatorRepo.pend(
 				{ actionId: 'a-cancel', transforms: makeTransforms(blockId), policy: 'c' }
 			);
 			expect(pendResult.success).to.equal(true);
 
 			// Cancel the pending transaction
-			await node.coordinatorRepo.cancel({ actionId: 'a-cancel', blockIds: [blockId] });
+			await node!.coordinatorRepo.cancel({ actionId: 'a-cancel', blockIds: [blockId] });
 
 			// After cancel, a new transaction with the same blockId should succeed
-			const pendResult2 = await node.coordinatorRepo.pend(
+			const pendResult2 = await node!.coordinatorRepo.pend(
 				{ actionId: 'a-after-cancel', transforms: makeTransforms(blockId), policy: 'c' }
 			);
 			expect(pendResult2.success).to.equal(true);
 		});
 
 		it('should cancel on a solo cohort without opening the small-cluster hatch', async () => {
-			// Deterministic twin of the case above, whose 3-node `responsibilityK: 1` mesh only lands
-			// on a solo cohort when node 0 happens to be the block's sole responsible peer (~1 run in
-			// 3, since peer ids are generated fresh per mesh). A one-node mesh always does.
+			// The one-machine twin of the case above: that case reaches a solo cohort by writing through
+			// the block's sole responsible node in a 3-node `responsibilityK: 1` mesh; this one is a
+			// one-node mesh, where every cohort is solo.
 			//
 			// The regression: `cancel` used to enter a cluster transaction unconditionally, so a
 			// single-peer cohort failed `minAbsoluteClusterSize` and threw `Cluster size 1 below
@@ -125,54 +129,55 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 
 		it('should succeed with sequential pend+commit at increasing revisions', async () => {
 			const node = mesh.nodes[0]!;
+			const [block1, block2] = await blockIdsInCohortOf(mesh, node, 2, 'block-seq');
 
 			// Transaction 1: rev=1
 			const pend1 = await node.coordinatorRepo.pend(
-				{ actionId: 'a1', transforms: makeTransforms('block-seq-1'), policy: 'c' }
+				{ actionId: 'a1', transforms: makeTransforms(block1!), policy: 'c' }
 			);
 			expect(pend1.success).to.equal(true);
 
 			const commit1 = await node.coordinatorRepo.commit(
-				{ actionId: 'a1', tailId: 'block-seq-1' as BlockId, rev: 1, blockIds: ['block-seq-1'] }
+				{ actionId: 'a1', tailId: block1!, rev: 1, blockIds: [block1!] }
 			);
 			expect(commit1.success).to.equal(true);
 
 			// Transaction 2: rev=2 on a different block
 			const pend2 = await node.coordinatorRepo.pend(
-				{ actionId: 'a2', transforms: makeTransforms('block-seq-2'), policy: 'c' }
+				{ actionId: 'a2', transforms: makeTransforms(block2!), policy: 'c' }
 			);
 			expect(pend2.success).to.equal(true);
 
 			const commit2 = await node.coordinatorRepo.commit(
-				{ actionId: 'a2', tailId: 'block-seq-2' as BlockId, rev: 2, blockIds: ['block-seq-2'] }
+				{ actionId: 'a2', tailId: block2!, rev: 2, blockIds: [block2!] }
 			);
 			expect(commit2.success).to.equal(true);
 
 			// Both blocks should be readable
-			const r1 = await node.coordinatorRepo.get({ blockIds: ['block-seq-1'] });
-			expect(r1['block-seq-1']?.block?.header.id).to.equal('block-seq-1');
+			const r1 = await node.coordinatorRepo.get({ blockIds: [block1!] });
+			expect(r1[block1!]?.block?.header.id).to.equal(block1);
 
-			const r2 = await node.coordinatorRepo.get({ blockIds: ['block-seq-2'] });
-			expect(r2['block-seq-2']?.block?.header.id).to.equal('block-seq-2');
+			const r2 = await node.coordinatorRepo.get({ blockIds: [block2!] });
+			expect(r2[block2!]?.block?.header.id).to.equal(block2);
 		});
 
 		it('should track revision state across multiple commits', async () => {
 			const node = mesh.nodes[0]!;
+			const blockIds = await blockIdsInCohortOf(mesh, node, 3, 'block-rev');
 
 			// Commit 3 sequential transactions
-			for (let i = 1; i <= 3; i++) {
-				const blockId = `block-rev-${i}`;
+			for (const [index, blockId] of blockIds.entries()) {
+				const rev = index + 1;
 				await node.coordinatorRepo.pend(
-					{ actionId: `a${i}`, transforms: makeTransforms(blockId), policy: 'c' }
+					{ actionId: `a${rev}`, transforms: makeTransforms(blockId), policy: 'c' }
 				);
 				await node.coordinatorRepo.commit(
-					{ actionId: `a${i}`, tailId: blockId as BlockId, rev: i, blockIds: [blockId] }
+					{ actionId: `a${rev}`, tailId: blockId, rev, blockIds: [blockId] }
 				);
 			}
 
 			// All blocks should have their data
-			for (let i = 1; i <= 3; i++) {
-				const blockId = `block-rev-${i}`;
+			for (const blockId of blockIds) {
 				const result = await node.coordinatorRepo.get({ blockIds: [blockId] });
 				expect(result[blockId]?.block).to.not.equal(undefined);
 			}
@@ -188,7 +193,7 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 
 		it('should pend a transaction with multiple block IDs', async () => {
 			const node = mesh.nodes[0]!;
-			const blockIds = ['block-multi-a', 'block-multi-b', 'block-multi-c'];
+			const blockIds = await blockIdsInCohortOf(mesh, node, 3, 'block-multi');
 
 			const pendResult = await node.coordinatorRepo.pend({
 				actionId: 'a-multi',
@@ -200,7 +205,7 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 
 		it('should commit a multi-block transaction and verify all blocks', async () => {
 			const node = mesh.nodes[0]!;
-			const blockIds = ['block-mb-1', 'block-mb-2'];
+			const blockIds = await blockIdsInCohortOf(mesh, node, 2, 'block-mb');
 
 			await node.coordinatorRepo.pend({
 				actionId: 'a-mb',
@@ -210,21 +215,21 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 
 			const commitResult = await node.coordinatorRepo.commit({
 				actionId: 'a-mb',
-				tailId: blockIds[0] as BlockId,
+				tailId: blockIds[0]!,
 				rev: 1,
-				blockIds: blockIds as BlockId[]
+				blockIds
 			});
 			expect(commitResult.success).to.equal(true);
 
 			// Both blocks should be accessible
-			const result = await node.coordinatorRepo.get({ blockIds: blockIds as BlockId[] });
+			const result = await node.coordinatorRepo.get({ blockIds });
 			expect(result[blockIds[0]!]?.block?.header.id).to.equal(blockIds[0]);
 			expect(result[blockIds[1]!]?.block?.header.id).to.equal(blockIds[1]);
 		});
 
 		it('should cancel a multi-block pending transaction', async () => {
 			const node = mesh.nodes[0]!;
-			const blockIds = ['block-mbc-1', 'block-mbc-2'];
+			const blockIds = await blockIdsInCohortOf(mesh, node, 2, 'block-mbc');
 
 			await node.coordinatorRepo.pend({
 				actionId: 'a-mbc',
@@ -235,7 +240,7 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 			// Cancel all blocks
 			await node.coordinatorRepo.cancel({
 				actionId: 'a-mbc',
-				blockIds: blockIds as BlockId[]
+				blockIds
 			});
 
 			// After cancel, new transaction on same blocks should succeed
@@ -321,23 +326,24 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 
 		it('should allow writer and reader on different nodes to see blocks', async () => {
 			const blockId = 'block-xnode';
-			const writer = mesh.nodes[0]!;
-			const reader = mesh.nodes[1]!;
+			// The writer is the block's one responsible node; the reader is any other.
+			const [writer] = await responsibleNodes(mesh, blockId);
+			const [reader] = await nonResponsibleNodes(mesh, blockId);
 
 			// Writer commits a block
-			await writer.coordinatorRepo.pend(
+			await writer!.coordinatorRepo.pend(
 				{ actionId: 'a-xn', transforms: makeTransforms(blockId), policy: 'c' }
 			);
-			await writer.coordinatorRepo.commit(
+			await writer!.coordinatorRepo.commit(
 				{ actionId: 'a-xn', tailId: blockId as BlockId, rev: 1, blockIds: [blockId] }
 			);
 
 			// Writer has the block
-			const writerResult = await writer.coordinatorRepo.get({ blockIds: [blockId] });
+			const writerResult = await writer!.coordinatorRepo.get({ blockIds: [blockId] });
 			expect(writerResult[blockId]?.block).to.not.equal(undefined);
 
 			// Reader should discover the block exists via clusterLatestCallback
-			const readerResult = await reader.coordinatorRepo.get({ blockIds: [blockId] });
+			const readerResult = await reader!.coordinatorRepo.get({ blockIds: [blockId] });
 			// The block entry should exist (even if full data sync requires restoreCallback)
 			expect(readerResult[blockId]).to.not.equal(undefined);
 		});
@@ -504,17 +510,17 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 		it('should handle commit after cancel gracefully', async () => {
 			const mesh = await createMesh(3, { responsibilityK: 1 });
 			const blockId = 'block-commit-after-cancel';
-			const node = mesh.nodes[0]!;
+			const [node] = await responsibleNodes(mesh, blockId);
 
 			// Pend, then cancel
-			await node.coordinatorRepo.pend(
+			await node!.coordinatorRepo.pend(
 				{ actionId: 'a-cac', transforms: makeTransforms(blockId), policy: 'c' }
 			);
-			await node.coordinatorRepo.cancel({ actionId: 'a-cac', blockIds: [blockId] });
+			await node!.coordinatorRepo.cancel({ actionId: 'a-cac', blockIds: [blockId] });
 
 			// Attempting to commit after cancel should fail
 			try {
-				const result = await node.coordinatorRepo.commit(
+				const result = await node!.coordinatorRepo.commit(
 					{ actionId: 'a-cac', tailId: blockId as BlockId, rev: 1, blockIds: [blockId] }
 				);
 				// If it returns a result instead of throwing, it should indicate failure
@@ -597,7 +603,7 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 				await node.storageRepo.commit({ actionId: 'old-action', tailId: blockId as BlockId, rev: 1, blockIds: [blockId] });
 			}
 
-			// Assign roles by the transactor's own routing (XOR distance over sha256(blockId)):
+			// Assign roles by the transactor's own routing (ring proximity to sha256(blockId)):
 			// the nearest node is the coordinator every read hits first — it stays stale; the
 			// second-nearest is the retry coordinator — it advances to rev 2; the third goes dark.
 			const routingKey = routingKeyForBlock(blockId);

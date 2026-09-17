@@ -94,7 +94,8 @@ export function transactorFor(node: OptimysticNode, networkName: string): Networ
 		keyNetwork: node.keyNetwork,
 		getRepo: (peerId) => peerId.equals(node.peerId)
 			? node.coordinatedRepo
-			: RepoClient.create(peerId, node.keyNetwork, `/optimystic/${networkName}`)
+			: RepoClient.create(peerId, node.keyNetwork, `/optimystic/${networkName}`),
+		localPeerId: node.peerId
 	});
 }
 

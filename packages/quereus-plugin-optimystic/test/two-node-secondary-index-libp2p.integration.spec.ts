@@ -78,6 +78,7 @@ function transactorFor(node: Libp2p): ITransactor {
 		getRepo: (peerId: DbPeerId): IRepo => peerId.toString() === node.peerId.toString()
 			? coordinatedRepo
 			: RepoClient.create(peerId as any, keyNetwork, protocolPrefix),
+		localPeerId: node.peerId,
 	});
 }
 

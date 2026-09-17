@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import type { BlockId, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
-import { createMesh, nonResponsibleNodes, type Mesh } from '../src/testing/mesh-harness.js';
+import { createMesh, nonResponsibleNodes, responsibleNodes, blockIdsInCohortOf, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
 
 const makeHeader = (id: string): BlockHeader => ({
 	id: id as BlockId,
@@ -76,6 +76,9 @@ describe('Mesh Sanity Tests', () => {
 		});
 	});
 
+	// Each block has exactly one responsible node here, and a node's coordinator refuses a write for a
+	// block outside its cohort. Peer ids are random per mesh, so every case asks the key network which
+	// node that is instead of assuming an index.
 	describe('Suite 1: 3-node mesh, responsibilityK=1', () => {
 		let mesh: Mesh;
 
@@ -83,9 +86,11 @@ describe('Mesh Sanity Tests', () => {
 			mesh = await createMesh(3, { responsibilityK: 1 });
 		});
 
+		const soleResponsible = async (blockId: string): Promise<MeshNode> => (await responsibleNodes(mesh, blockId))[0]!;
+
 		it('write on responsible node succeeds via fast path', async () => {
 			const blockId = 'block-k1-write';
-			const node = mesh.nodes[0]!;
+			const node = await soleResponsible(blockId);
 
 			const pendResult = await node.coordinatorRepo.pend(
 				{ actionId: 'a1', transforms: makeTransforms(blockId), policy: 'c' }
@@ -100,7 +105,7 @@ describe('Mesh Sanity Tests', () => {
 
 		it('read from responsible node returns written data', async () => {
 			const blockId = 'block-k1-read';
-			const node = mesh.nodes[0]!;
+			const node = await soleResponsible(blockId);
 
 			await node.coordinatorRepo.pend(
 				{ actionId: 'a1', transforms: makeTransforms(blockId), policy: 'c' }
@@ -117,7 +122,7 @@ describe('Mesh Sanity Tests', () => {
 
 		it('non-responsible node discovers revision exists via cluster callback', async () => {
 			const blockId = 'block-k1-cross';
-			const writer = mesh.nodes[0]!;
+			const writer = await soleResponsible(blockId);
 
 			await writer.coordinatorRepo.pend(
 				{ actionId: 'a1', transforms: makeTransforms(blockId), policy: 'c' }
@@ -137,13 +142,11 @@ describe('Mesh Sanity Tests', () => {
 			// clusterSize is its node count (3), so the corroboration floor stays at two and the pass
 			// declines rather than converging on one peer's word.
 			//
-			// The reader has to be a node routing keeps OUT of this block's cohort AND that is not the
-			// writer: peer ids are random per mesh, so `nodes[1]` is the block's responsible peer about a
-			// third of the time, and that peer holds the content because the commit was sent to it — not
-			// because anything repaired it.
-			const reader = (await nonResponsibleNodes(mesh, blockId)).find(n => n !== writer);
-			expect(reader, 'a 3-node K=1 mesh must have a node outside the cohort and off the write path')
-				.to.not.equal(undefined);
+			// The reader has to be a node routing keeps OUT of this block's cohort: the one responsible
+			// node is the writer, and it holds the content because it committed it — not because anything
+			// repaired it.
+			const reader = (await nonResponsibleNodes(mesh, blockId))[0];
+			expect(reader, 'a 3-node K=1 mesh must have a node outside the cohort').to.not.equal(undefined);
 			const readerResult = await reader!.coordinatorRepo.get({ blockIds: [blockId] });
 			expect(readerResult[blockId]).to.not.equal(undefined);
 			expect(readerResult[blockId]?.block, 'a lone uncorroborated holder must not repair a reader')
@@ -151,29 +154,31 @@ describe('Mesh Sanity Tests', () => {
 		});
 
 		it('pend + commit through different nodes independently', async () => {
-			// Each node can independently write different blocks via fast path (K=1)
+			// Each node independently writes a block it is the sole responsible peer for, via fast path (K=1)
 			const node0 = mesh.nodes[0]!;
 			const node1 = mesh.nodes[1]!;
+			const [blockA] = await blockIdsInCohortOf(mesh, node0, 1, 'block-a');
+			const [blockB] = await blockIdsInCohortOf(mesh, node1, 1, 'block-b');
 
 			await node0.coordinatorRepo.pend(
-				{ actionId: 'a1', transforms: makeTransforms('block-a'), policy: 'c' }
+				{ actionId: 'a1', transforms: makeTransforms(blockA!), policy: 'c' }
 			);
 			await node0.coordinatorRepo.commit(
-				{ actionId: 'a1', tailId: 'block-a' as BlockId, rev: 1, blockIds: ['block-a'] }
+				{ actionId: 'a1', tailId: blockA!, rev: 1, blockIds: [blockA!] }
 			);
 
 			await node1.coordinatorRepo.pend(
-				{ actionId: 'a2', transforms: makeTransforms('block-b'), policy: 'c' }
+				{ actionId: 'a2', transforms: makeTransforms(blockB!), policy: 'c' }
 			);
 			await node1.coordinatorRepo.commit(
-				{ actionId: 'a2', tailId: 'block-b' as BlockId, rev: 1, blockIds: ['block-b'] }
+				{ actionId: 'a2', tailId: blockB!, rev: 1, blockIds: [blockB!] }
 			);
 
-			const r0 = await node0.coordinatorRepo.get({ blockIds: ['block-a'] });
-			expect(r0['block-a']?.block?.header.id).to.equal('block-a');
+			const r0 = await node0.coordinatorRepo.get({ blockIds: [blockA!] });
+			expect(r0[blockA!]?.block?.header.id).to.equal(blockA);
 
-			const r1 = await node1.coordinatorRepo.get({ blockIds: ['block-b'] });
-			expect(r1['block-b']?.block?.header.id).to.equal('block-b');
+			const r1 = await node1.coordinatorRepo.get({ blockIds: [blockB!] });
+			expect(r1[blockB!]?.block?.header.id).to.equal(blockB);
 		});
 	});
 
@@ -320,14 +325,15 @@ describe('Mesh Sanity Tests', () => {
 			});
 
 			const blockId = 'block-dht-subset';
-			const coordinator = mesh.nodes[0]!;
+			// A node outside the two-member cohort refuses the write, so coordinate from inside it.
+			const [coordinator] = await responsibleNodes(mesh, blockId);
 
-			const pendResult = await coordinator.coordinatorRepo.pend(
+			const pendResult = await coordinator!.coordinatorRepo.pend(
 				{ actionId: 'a1', transforms: makeTransforms(blockId), policy: 'c' }
 			);
 			expect(pendResult.success).to.equal(true);
 
-			const commitResult = await coordinator.coordinatorRepo.commit(
+			const commitResult = await coordinator!.coordinatorRepo.commit(
 				{ actionId: 'a1', tailId: blockId as BlockId, rev: 1, blockIds: [blockId] }
 			);
 			expect(commitResult.success).to.equal(true);

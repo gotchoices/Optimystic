@@ -1,9 +1,9 @@
 import type { PeerId, PrivateKey } from '@libp2p/interface';
-import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ActionRev, ITransactor, ITransactionValidator, PeerId as DbPeerId, RoutingKey } from '@optimystic/db-core';
+import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ITransactor, ITransactionValidator, PeerId as DbPeerId, RoutingKey } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { NetworkTransactor, routingKeyForBlock } from '@optimystic/db-core';
-import { hashKey } from 'p2p-fret';
+import { DigitreeStore, assembleCohort, hashKey, hashPeerId } from 'p2p-fret';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair, generateKeyPairFromSeed } from '@libp2p/crypto/keys';
 import { ClusterMember, clusterMember, type ReconcileBlockCallback, type DeriveExpectedClusterCallback, type ExpectedClusterView } from '../cluster/cluster-repo.js';
@@ -17,12 +17,17 @@ import type { BlockArchive } from '../storage/struct.js';
 import { serveBlockArchive, servableProof } from '../storage/block-archive.js';
 import { coordinatorRepo, type ClusterLatestCallback, type CertifiedActionRev } from '../repo/coordinator-repo.js';
 import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
-import { sortPeersByDistance, type KnownPeer } from '../routing/responsibility.js';
 import { toString as u8ToString } from 'uint8arrays';
 
 export interface MeshNode {
 	peerId: PeerId;
 	privateKey: PrivateKey;
+	/**
+	 * This node's own view of the key network — the harness analogue of a real node's `keyNetwork`
+	 * attachment, and the instance its coordinator and its member's admission derivation both read. It
+	 * differs from `Mesh.keyNetwork` only under a simulated partition (`MeshFailureConfig.partitionSides`).
+	 */
+	keyNetwork: IKeyNetwork;
 	storageRepo: StorageRepo;
 	clusterMember: ClusterMember;
 	coordinatorRepo: CoordinatorRepo;
@@ -59,9 +64,9 @@ export interface MeshOptions {
 	/**
 	 * Per-node member-side cluster derivation for the membership admission gate — the harness
 	 * analogue of `libp2p-node-base`'s `deriveExpectedCluster` (findCluster + FRET confidence).
-	 * Omitted → each member gets the production-shaped derivation over its own self-including
-	 * key-network view (partition-aware, see `MeshFailureConfig.partitionSides`) with confidence
-	 * from `meshConfidence` (default 1).
+	 * Omitted → each member gets the production-shaped derivation over its own key-network view
+	 * (partition-aware, see `MeshFailureConfig.partitionSides`) with confidence from `meshConfidence`
+	 * (default 1).
 	 */
 	deriveExpectedCluster?: (node: MeshNode, blockId: BlockId) => Promise<ExpectedClusterView>;
 	/**
@@ -153,14 +158,24 @@ class MockPeerNetwork implements IPeerNetwork {
 }
 
 /**
- * Mock IKeyNetwork that ranks peers by XOR distance to the key's ring coordinate.
- * Like `Libp2pKeyPeerNetwork`, it hashes the routing key exactly once before ranking, so the harness
- * places a block by the same rule production does. (Ranking the raw utf8 bytes instead would XOR a
- * short key against only the tail of each peer id, so the order would be set by the peer ids, not the key.)
- * With responsibilityK >= nodeCount, all nodes are returned.
- * Otherwise, K-nearest by XOR distance are returned.
+ * Mock IKeyNetwork that places a block where production does, by construction: it ranks the mesh's nodes
+ * with FRET's own `assembleCohort` over a ring (`DigitreeStore`) holding every node at its real ring
+ * coordinate (`hashPeerId`), the walk `Libp2pKeyPeerNetwork` asks FRET for. Like production it hashes the
+ * routing key exactly once. Every mesh node serves, so the network-membership scoping production layers on
+ * top never removes anyone, and a cohort is simply the nearest `responsibilityK` in walk order.
+ * `test/mesh-harness-cohort-parity.spec.ts` pins the two answers equal.
+ *
+ * - `findCluster`: the nearest `responsibilityK` nodes, nearest first. Nothing is added: a node is in a
+ *   block's cohort only when it is among the nearest, as in production.
+ * - `findCoordinator`: the first non-excluded node of the whole ring's walk, which is the cohort's first
+ *   member unless excluded, else the next nearest node, cohort member or not. That mirrors production's
+ *   connected-peer fallback: a pick outside the cohort is a routing hop, not a placement.
  */
 class MockMeshKeyNetwork implements IKeyNetwork {
+	/** The ring, built on first lookup (node ids hash asynchronously, and `nodes` fills after construction)
+	 *  and rebuilt only if the node count changes; a restarted node keeps its identity and so its position. */
+	private ring: { size: number; store: Promise<DigitreeStore> } | undefined;
+
 	constructor(
 		private readonly nodes: MeshNode[],
 		private readonly responsibilityK: number,
@@ -169,8 +184,7 @@ class MockMeshKeyNetwork implements IKeyNetwork {
 
 	async findCoordinator(key: RoutingKey, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
 		const excluded = new Set((options?.excludedPeers ?? []).map(p => p.toString()));
-		const sorted = await this.sortedByDistance(key);
-		const pick = sorted.find(n => !excluded.has(n.peerId.toString()));
+		const pick = (await this.nearest(key, this.nodes.length)).find(n => !excluded.has(n.peerId.toString()));
 		if (!pick) {
 			throw new Error('No coordinator available for key (all candidates excluded)');
 		}
@@ -182,12 +196,8 @@ class MockMeshKeyNetwork implements IKeyNetwork {
 			return {} as ClusterPeers;
 		}
 
-		const sorted = await this.sortedByDistance(key);
-		const k = Math.min(this.responsibilityK, sorted.length);
-		const selected = sorted.slice(0, k);
-
 		const peers: ClusterPeers = {};
-		for (const node of selected) {
+		for (const node of await this.nearest(key, this.responsibilityK)) {
 			peers[node.peerId.toString()] = {
 				multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
 				publicKey: u8ToString(node.peerId.publicKey!.raw, 'base64url')
@@ -196,14 +206,26 @@ class MockMeshKeyNetwork implements IKeyNetwork {
 		return peers;
 	}
 
-	private async sortedByDistance(key: RoutingKey): Promise<MeshNode[]> {
-		const coord = await hashKey(key);
-		const knownPeers: KnownPeer[] = this.nodes.map(n => ({
-			id: n.peerId,
-			addrs: ['/ip4/127.0.0.1/tcp/8000']
-		}));
-		const sorted = sortPeersByDistance(knownPeers, coord);
-		return sorted.map(kp => this.nodes.find(n => n.peerId.equals(kp.id))!);
+	/** The `wants` nodes nearest `key`'s ring coordinate, nearest first. */
+	private async nearest(key: RoutingKey, wants: number): Promise<MeshNode[]> {
+		const store = await this.ringStore();
+		const ids = assembleCohort(store, await hashKey(key), Math.min(wants, this.nodes.length));
+		return ids.map(id => this.nodes.find(n => n.peerId.toString() === id)!);
+	}
+
+	private ringStore(): Promise<DigitreeStore> {
+		if (this.ring?.size !== this.nodes.length) {
+			const members = [...this.nodes];
+			this.ring = {
+				size: members.length,
+				store: (async () => {
+					const store = new DigitreeStore();
+					for (const node of members) store.upsert(node.peerId.toString(), await hashPeerId(node.peerId));
+					return store;
+				})()
+			};
+		}
+		return this.ring.store;
 	}
 }
 
@@ -366,11 +388,15 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 
 	/**
 	 * One node's own view of the key network — what `Libp2pKeyPeerNetwork` gives a real node:
-	 *  - `findCluster` always includes self, so a responsible member's derived view is never empty
-	 *    (see the empty-view guard in `cluster-repo.admitMembership`);
+	 *  - `findCluster` is the shared cohort, which holds this node only when it is among the block's
+	 *    nearest `responsibilityK`, so the node's coordinator judges its own responsibility as a real
+	 *    node's does;
 	 *  - under a simulated partition (`failures.partitionSides`), a caller inside a side sees only
 	 *    its side's members of the cohort — the caller-aware filtering lives here, in the per-node
-	 *    wrapper, precisely so `IKeyNetwork` itself needs no "who is asking" parameter.
+	 *    wrapper, precisely so `IKeyNetwork` itself needs no "who is asking" parameter. A side holding
+	 *    none of the cohort sees an empty view, so a node there is not responsible for the block (and
+	 *    the empty-view guard in `cluster-repo.admitMembership` treats such a view as unconfident rather
+	 *    than as a reference set).
 	 * The SAME instance serves both the member's admission derivation and the node's coordinator, so
 	 * the two sides of a node can never see different topologies. It holds no state, so a restarted
 	 * node keeps it.
@@ -387,17 +413,10 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 						if (!side.has(id)) delete peers[id];
 					}
 				}
-				if (!(selfStr in peers)) {
-					peers[selfStr] = {
-						multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-						publicKey: u8ToString(selfPeerId.publicKey!.raw, 'base64url')
-					};
-				}
 				return peers;
 			}
 		};
 	};
-	const nodeKeyNetworkByPeer = new Map<string, IKeyNetwork>();
 
 	/**
 	 * Build `meshNode`'s storage repo and cluster member over its durable raw storage, assigning both
@@ -432,12 +451,12 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		});
 		reconcileByPeer.set(peerId.toString(), reconcileBlock);
 
-		const nodeKeyNetwork = nodeKeyNetworkByPeer.get(peerId.toString())!;
+		const nodeKeyNetwork = meshNode.keyNetwork;
 
 		// Member-side cluster derivation for the membership admission gate — the production shape
 		// (`libp2p-node-base.deriveExpectedCluster`): the SAME per-node key network the coordinator
-		// selects its cohort from, plus a network-size confidence. The self-including wrapper keeps a
-		// responsible member's view non-empty; `meshConfidence` is the FRET stand-in (default 1, i.e.
+		// selects its cohort from, plus a network-size confidence. A responsible member is in its own
+		// cohort, so its view is never empty; `meshConfidence` is the FRET stand-in (default 1, i.e.
 		// confident — a partition spec collapses it per side).
 		const deriveExpectedCluster: DeriveExpectedClusterCallback = options.deriveExpectedCluster
 			? (blockId) => options.deriveExpectedCluster!(meshNode, blockId)
@@ -517,9 +536,9 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			const proof = await servableProof(target.storageRepo, blockId, latest);
 			return proof ? { ...latest, proof } : latest;
 		};
-		// The node's own self-including (and partition-aware) key-network view — the SAME instance the
-		// member's admission derivation reads, matching real Libp2pKeyPeerNetwork behavior.
-		const nodeKeyNetwork = nodeKeyNetworkByPeer.get(node.peerId.toString())!;
+		// The node's own (partition-aware) key-network view — the SAME instance the member's admission
+		// derivation reads, matching real Libp2pKeyPeerNetwork behavior.
+		const nodeKeyNetwork = node.keyNetwork;
 		const factory = coordinatorRepo(
 			nodeKeyNetwork,
 			// A stopped instance's cluster traffic fails at send — checked per delivery rather than when
@@ -560,7 +579,6 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			rawStorage: options.rawStorageFactory ? options.rawStorageFactory(index) : new MemoryRawStorage(),
 			index
 		});
-		nodeKeyNetworkByPeer.set(peerIdStr, makeNodeKeyNetwork(peerId));
 		const lifetime: NodeLifetime = { stopped: false };
 		lifetimeByPeer.set(peerIdStr, lifetime);
 
@@ -571,6 +589,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		const meshNode: MeshNode = {
 			peerId,
 			privateKey,
+			keyNetwork: makeNodeKeyNetwork(peerId),
 			storageRepo: undefined as any,
 			clusterMember: undefined as any,
 			coordinatorRepo: undefined as any
@@ -610,14 +629,46 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
  * The nodes the key network keeps OUT of `blockId`'s cohort — peers that receive none of the
  * block's cluster traffic, and so hold none of its content until something repairs them.
  *
- * Peer ids are generated fresh per mesh, so which node is responsible for a given block is random
- * from run to run: in a 3-node `responsibilityK: 1` mesh, `nodes[1]` is the block's sole responsible
- * peer about a third of the time, and then it receives the writer's commit directly. A test that
- * needs a genuinely non-responsible node has to ask the routing layer rather than assume an index.
+ * Unless the mesh is seeded (`keySeed`), peer ids are generated fresh per mesh, so which node is
+ * responsible for a given block is random from run to run: in a 3-node `responsibilityK: 1` mesh,
+ * `nodes[1]` is the block's sole responsible peer about a third of the time, and then it receives the
+ * writer's commit directly. A test that needs a genuinely non-responsible node has to ask the routing
+ * layer rather than assume an index.
  */
 export async function nonResponsibleNodes(mesh: Mesh, blockId: string): Promise<MeshNode[]> {
 	const cohort = await mesh.keyNetwork.findCluster(routingKeyForBlock(blockId));
 	return mesh.nodes.filter(node => !(node.peerId.toString() in cohort));
+}
+
+/**
+ * The nodes the key network places in `blockId`'s cohort, nearest first — the complement of
+ * {@link nonResponsibleNodes}. A node outside this list refuses a write for the block through its own
+ * coordinator (`CoordinatorRepo` checks responsibility), so a spec that writes through one node's
+ * coordinator directly picks that node from here rather than by index.
+ */
+export async function responsibleNodes(mesh: Mesh, blockId: string): Promise<MeshNode[]> {
+	const cohort = Object.keys(await mesh.keyNetwork.findCluster(routingKeyForBlock(blockId)));
+	return cohort.map(id => mesh.nodes.find(node => node.peerId.toString() === id)!);
+}
+
+/**
+ * The first `count` ids of the form `${prefix}-${i}` whose cohort includes `node` — for a spec that needs
+ * several blocks one node is responsible for (a multi-block pend through that node's coordinator, or
+ * sequential writes it coordinates alone). In a `responsibilityK: 1` mesh these are blocks the node is
+ * the SOLE responsible peer for. Throws after `maxCandidates` ids rather than looping on a node whose ring
+ * arc no id lands in.
+ */
+export async function blockIdsInCohortOf(mesh: Mesh, node: MeshNode, count: number, prefix: string, maxCandidates = 10_000): Promise<BlockId[]> {
+	const nodeId = node.peerId.toString();
+	const ids: BlockId[] = [];
+	for (let i = 0; ids.length < count && i < maxCandidates; i++) {
+		const id = `${prefix}-${i}` as BlockId;
+		if (nodeId in await mesh.keyNetwork.findCluster(routingKeyForBlock(id))) ids.push(id);
+	}
+	if (ids.length < count) {
+		throw new Error(`blockIdsInCohortOf: only ${ids.length} of ${count} ids with prefix ${prefix} place ${nodeId} in their cohort`);
+	}
+	return ids;
 }
 
 export interface BuildTransactorOptions {
@@ -634,10 +685,30 @@ export interface BuildTransactorOptions {
 /**
  * Builds a NetworkTransactor over a mesh. All nodes share the same mock
  * infrastructure so a single transactor routes to every peer via `getRepo`.
+ * It runs on no node (no `localPeerId`), so a coverage tie between cohort
+ * members goes to the nearest — a client-only writer's shape.
  * Suitable for solo-mesh tests; for multi-node tests prefer
  * `buildNetworkTransactors` to label "which node is driving".
  */
-export const buildNetworkTransactor = (mesh: Mesh, options: BuildTransactorOptions = {}): ITransactor => {
+export const buildNetworkTransactor = (mesh: Mesh, options: BuildTransactorOptions = {}): ITransactor =>
+	meshTransactor(mesh, options, undefined);
+
+/**
+ * Builds one NetworkTransactor per mesh node, keyed by peer-id string. Each
+ * transactor shares the mesh's key network and peer→repo map, and runs on its
+ * node the way a production node's transactor does (`localPeerId`): when that
+ * node is in a block's cohort and ties another member on coverage, it
+ * coordinates the write itself. Reads and retries still route by proximity.
+ */
+export const buildNetworkTransactors = (mesh: Mesh, options: BuildTransactorOptions = {}): Map<string, ITransactor> => {
+	const transactors = new Map<string, ITransactor>();
+	for (const node of mesh.nodes) {
+		transactors.set(node.peerId.toString(), meshTransactor(mesh, options, node));
+	}
+	return transactors;
+};
+
+function meshTransactor(mesh: Mesh, options: BuildTransactorOptions, localNode: MeshNode | undefined): ITransactor {
 	const repoByPeer = new Map<string, IRepo>();
 	for (const node of mesh.nodes) {
 		const repo = node.coordinatorRepo as unknown as IRepo;
@@ -651,19 +722,7 @@ export const buildNetworkTransactor = (mesh: Mesh, options: BuildTransactorOptio
 			const repo = repoByPeer.get(peerId.toString());
 			if (!repo) throw new Error(`Unknown peer ${peerId.toString()}`);
 			return repo;
-		}
+		},
+		localPeerId: localNode?.peerId
 	});
-};
-
-/**
- * Builds one NetworkTransactor per mesh node, keyed by peer-id string. Each
- * transactor shares the mesh's key network and peer→repo map — the separate
- * instances exist so tests can semantically say "driven by node A".
- */
-export const buildNetworkTransactors = (mesh: Mesh, options: BuildTransactorOptions = {}): Map<string, ITransactor> => {
-	const transactors = new Map<string, ITransactor>();
-	for (const node of mesh.nodes) {
-		transactors.set(node.peerId.toString(), buildNetworkTransactor(mesh, options));
-	}
-	return transactors;
-};
+}

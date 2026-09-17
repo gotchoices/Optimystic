@@ -81,7 +81,8 @@ async function createNode(port: number, bootstrapNodes: string[]): Promise<TestN
 			return peerId.toString() === node.peerId.toString()
 				? coordinatedRepo  // Use coordinated repo for self to enable cluster consensus
 				: RepoClient.create(peerId, keyNetwork, '/optimystic/quick-test');
-		}
+		},
+		localPeerId: node.peerId
 	});
 
 	const peerId = node.peerId.toString();

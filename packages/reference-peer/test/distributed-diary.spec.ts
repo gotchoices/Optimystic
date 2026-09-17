@@ -318,7 +318,8 @@ describe('Distributed Diary Operations', () => {
 				return peerId.toString() === node.peerId.toString()
 					? coordinatedRepo  // Use coordinated repo for self to enable cluster consensus
 					: RepoClient.create(peerId, keyNetwork, `/optimystic/${NETWORK_NAME}`);
-			}
+			},
+			localPeerId: node.peerId
 		});
 
 		return {

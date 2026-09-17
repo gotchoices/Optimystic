@@ -90,14 +90,16 @@ export interface DrivenTransactorOptions {
  * the mesh's own proximity routing only when `driver` has been excluded (it failed, or is not in the
  * block's cohort).
  *
- * Why not `buildNetworkTransactors`: its per-node transactors are identical — each routes by proximity,
- * so "node B writes" and "node A writes" reach the same coordinator and exercise the same code. A
- * size-dependent defect in the coordinating path of one particular node would never be seen. Self-first
- * routing is also a shape production takes: a node in the block's cohort may coordinate its own writes.
+ * Why not `buildNetworkTransactors`: its per-node transactors differ only in who wins a PEND's coverage
+ * tie; reads and retries route by proximity, so "node B reads" and "node A reads" reach the same
+ * coordinator and exercise the same code. A size-dependent defect in the coordinating path of one
+ * particular node would never be seen. Self-first routing is also a shape production takes: a node in the
+ * block's cohort may coordinate its own writes.
  *
- * Reordering `findCluster` is how a PEND is steered: `NetworkTransactor.consolidateCoordinators` covers a
- * pend's blocks greedily over the cohort members in the order `findCluster` lists them, so listing the
- * driver first makes it the coordinator whenever it is a member. The cohort's MEMBERSHIP is untouched.
+ * A PEND is steered the way production steers it, through `localPeerId`: among cohort members covering
+ * equally many blocks, `NetworkTransactor.consolidateCoordinators` picks the driver. At every size the
+ * sweep covers, the whole mesh is in every cohort, so the driver ties everyone and coordinates every pend.
+ * Reads and retries are steered by `findCoordinator` below. The cohort itself is untouched.
  */
 export function transactorDrivenBy(mesh: Mesh, driver: MeshNode, options: DrivenTransactorOptions = {}): ITransactor {
 	const driverId = driver.peerId.toString();
@@ -108,12 +110,7 @@ export function transactorDrivenBy(mesh: Mesh, driver: MeshNode, options: Driven
 			if (!excluded && driverId in await shared.findCluster(key)) return driver.peerId;
 			return await shared.findCoordinator(key, opts);
 		},
-		async findCluster(key) {
-			const peers = await shared.findCluster(key);
-			if (!(driverId in peers)) return peers;
-			const { [driverId]: self, ...rest } = peers;
-			return { [driverId]: self!, ...rest };
-		}
+		findCluster: key => shared.findCluster(key)
 	};
 	return new NetworkTransactor({
 		timeoutMs: options.timeoutMs ?? 5_000,
@@ -126,7 +123,8 @@ export function transactorDrivenBy(mesh: Mesh, driver: MeshNode, options: Driven
 			const node = mesh.nodes.find(n => n.peerId.toString() === peerIdStr);
 			if (!node) throw new Error(`Unknown peer ${peerIdStr}`);
 			return node.coordinatorRepo as unknown as IRepo;
-		}
+		},
+		localPeerId: driver.peerId
 	});
 }
 

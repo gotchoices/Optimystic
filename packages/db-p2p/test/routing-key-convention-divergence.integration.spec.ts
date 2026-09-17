@@ -20,9 +20,11 @@
  * is among the nearest `clusterSize` serving peers, and its coordinator pick comes from that same ordered
  * cohort. So every block lands on exactly its responsible peers — no copy on the writer's node when it is not
  * responsible, no responsible peer left without one — and the pick is never a neighbour just outside the cohort.
- * What is NOT yet pinned is that the writer coordinates locally whenever it IS responsible: with cohorts in
- * proximity order the transactor's first-seen tie-break can send such a pend to the nearer peer instead
- * (`writer-and-harness-route-to-the-cohort` adds the tie-break toward self and pins equality).
+ *
+ * Pinned since `writer-and-harness-route-to-the-cohort`: the writer coordinates a pend locally exactly when it is
+ * responsible (the transactor breaks a coverage tie toward `localPeerId`), and a multi-block write whose blocks
+ * have disjoint cohorts goes out as one batch per cohort and lands on exactly each block's cohort — the shape
+ * that became reachable in production once the writer stopped being in every cohort.
  *
  * Gated on OPTIMYSTIC_INTEGRATION=1 like the other integration specs:
  *   OPTIMYSTIC_INTEGRATION=1 yarn workspace @optimystic/db-p2p test:integration -- --grep "routing-key convention"
@@ -51,6 +53,24 @@ const makeTransforms = (blockId: string): Transforms => ({ inserts: { [blockId]:
 const makeBlockDigests = async (blockId: string): Promise<BlockContentDigests> => ({
 	[blockId]: { digest: await canonicalBlockHash(makeBlock(blockId)) }
 });
+
+const mergeTransforms = (blockIds: string[]): Transforms => ({
+	inserts: Object.fromEntries(blockIds.map(id => [id, makeBlock(id)])),
+	updates: {},
+	deletes: []
+});
+
+/** Two block ids whose cohorts, as `keyNetwork` assembles them, share no member — each with its cohort. */
+async function disjointCohortPair(keyNetwork: { findCluster(key: Uint8Array): Promise<Record<string, unknown>> }): Promise<Array<{ id: string; cohort: string[] }>> {
+	const cohortOf = async (id: string): Promise<string[]> => Object.keys(await keyNetwork.findCluster(routingKeyForBlock(id)));
+	const first = { id: 'conv-it-multi-a', cohort: await cohortOf('conv-it-multi-a') };
+	for (let i = 0; i < 200; i++) {
+		const id = `conv-it-multi-b-${i}`;
+		const cohort = await cohortOf(id);
+		if (cohort.length > 0 && !cohort.some(p => first.cohort.includes(p))) return [first, { id, cohort }];
+	}
+	throw new Error(`no block id among 200 has a cohort disjoint from ${first.cohort.join(',')}`);
+}
 
 async function fullMeshDial(meshNodes: Libp2p[]): Promise<void> {
 	const addrs = meshNodes.map(pickLocalTcpMultiaddr);
@@ -179,7 +199,8 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 			keyNetwork,
 			getRepo: (peerId: DbPeerId) => peerId.toString() === driverId
 				? localRepo
-				: RepoClient.create(peerId as any, keyNetwork, protocolPrefix)
+				: RepoClient.create(peerId as any, keyNetwork, protocolPrefix),
+			localPeerId: driver.peerId
 		});
 
 		const nm: { getCluster(key: Uint8Array): Promise<Array<{ toString(): string }>> } = (driver as any).services.networkManager;
@@ -254,6 +275,36 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 			blocksWithCohortGap: rows.filter(r => (r.cohortMissing as number) > 0).length
 		};
 		console.log('[convention-it] write summary', summary);
+
+		// One pend carrying two blocks whose cohorts share no member: no single coordinator covers both, so the
+		// write must go out as two batches, each to its own block's cohort, and commit onto exactly those cohorts.
+		const multi = await disjointCohortPair(keyNetwork);
+		const multiHandledBefore = handled.length;
+		const multiPend = await transactor.pend({ actionId: 'act-multi', transforms: mergeTransforms(multi.map(b => b.id)), policy: 'c' });
+		expect(multiPend.success, `multi-block pend: ${JSON.stringify(multiPend)}`).to.equal(true);
+		const multiCommit = await transactor.commit({
+			actionId: 'act-multi', tailId: multi[0]!.id as BlockId, rev: 1,
+			blockIds: multi.map(b => b.id as BlockId),
+			blockDigests: Object.assign({}, ...await Promise.all(multi.map(b => makeBlockDigests(b.id))))
+		});
+		expect(multiCommit.success, `multi-block commit: ${JSON.stringify(multiCommit)}`).to.equal(true);
+		const multiPends = handled.slice(multiHandledBefore).filter(h => h.op === 'pend');
+		const multiRows = await Promise.all(multi.map(async b => ({
+			block: b.id,
+			cohort: b.cohort.map(p => p.substring(8, 14)).join(','),
+			pendHandledBy: multiPends.filter(h => h.blockIds.includes(b.id)).map(h => `${h.node.substring(8, 14)}${h.local ? '*' : ''}`).join(','),
+			holders: (await holdersOf(mesh, b.id)).map(p => p.substring(8, 14)).join(',')
+		})));
+		console.log('[convention-it] multi-block write across disjoint cohorts:');
+		console.table(multiRows);
+		expect(new Set(multiPends.map(h => h.node)).size, 'the pend went out as one batch per disjoint cohort').to.equal(multi.length);
+		for (const b of multi) {
+			const coordinators = multiPends.filter(h => h.blockIds.includes(b.id)).map(h => h.node);
+			expect(coordinators, `${b.id}: pended by exactly one coordinator`).to.have.length(1);
+			expect(b.cohort, `${b.id}: its coordinator is a member of its cohort`).to.include(coordinators[0]);
+			expect((await holdersOf(mesh, b.id)).sort(), `${b.id}: held by exactly its cohort`).to.deep.equal([...b.cohort].sort());
+		}
+
 		const holdersBeforeReads = new Map<string, Set<string>>();
 		for (let i = 0; i < BLOCKS; i++) holdersBeforeReads.set(`conv-it-block-${i}`, new Set(await holdersOf(mesh, `conv-it-block-${i}`)));
 
@@ -267,7 +318,8 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 			keyNetwork: readerKeyNetwork,
 			getRepo: (peerId: DbPeerId) => peerId.toString() === readerId
 				? (reader as any).coordinatedRepo as IRepo
-				: RepoClient.create(peerId as any, readerKeyNetwork, protocolPrefix)
+				: RepoClient.create(peerId as any, readerKeyNetwork, protocolPrefix),
+			localPeerId: reader.peerId
 		});
 		handled.length = 0;
 		let readOk = 0, readMiss = 0, readThrew = 0;
@@ -311,13 +363,14 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 		// Pinned by cohort-assembly-self-only-when-nearest: the writer's key network puts self in a block's cohort
 		// only when self is among the nearest clusterSize serving peers, and picks the coordinator from that same
 		// ordered cohort. So no pick lands outside the cohort, every responsible peer receives every block, and no
-		// block is left on a node that is not responsible for it. A pend is coordinated locally only when the
-		// writer is responsible; `writer-and-harness-route-to-the-cohort` pins that as equality (tie-break to self).
+		// block is left on a node that is not responsible for it.
 		expect(summary.writerPickOutsideCohort, 'the writer\'s pick is inside the responsible cohort for every block').to.equal(0);
 		expect(summary.blocksWithCohortGap, 'every responsible peer holds every block').to.equal(0);
 		expect(summary.blocksWithPhantomHolder, 'no block is held by a node outside its cohort').to.equal(0);
-		expect(summary.pendHandledLocally, 'a pend is coordinated by the writer\'s own node only when it is responsible')
-			.to.be.at.most(summary.driverInCohort);
+		// Pinned by writer-and-harness-route-to-the-cohort: the transactor breaks a coverage tie toward its own
+		// node, so a pend is coordinated locally exactly when the writer is responsible — no hop when it need not.
+		expect(summary.pendHandledLocally, 'a pend is coordinated by the writer\'s own node exactly when it is responsible')
+			.to.equal(summary.driverInCohort);
 		expect(failures, 'writes complete').to.equal(0);
 		expect(readOk, 'reads complete').to.equal(BLOCKS);
 	});
