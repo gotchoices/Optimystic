@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { ClusterCoordinator, type TimerCancel } from '../src/repo/cluster-coordinator.js';
+import { ResponsibilityRefusalError } from '../src/repo/responsibility.js';
 import type { ITransactionStateStore, PersistedCoordinatorState, PersistedParticipantState } from '../src/cluster/i-transaction-state-store.js';
 import type { ClusterRecord, ClusterPeers, IKeyNetwork, RepoMessage, ClusterConsensusConfig, BlockId, Signature } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
@@ -584,5 +585,98 @@ describe('ClusterCoordinator recovery clock seam', function () {
 		expect(transactions.has('expired-hash'), 'expired state not recovered').to.equal(false);
 		expect(await store.getCoordinatorState('expired-hash'), 'expired state deleted from the store').to.equal(undefined);
 		expect(clock.pending, 'the recovered broadcast re-armed its retry on the injected timer seam').to.be.greaterThan(0);
+	});
+});
+
+/**
+ * Ticket: coordinator-refuses-blocks-it-is-not-responsible-for.
+ *
+ * A coordinator outside `record.peers` is not a reconcile target, so a transaction it runs for a cohort it is
+ * not in can leave that cohort with no holder. The invariant is held where the record's peers are chosen:
+ * with a local member wired, a resolved cohort that excludes it is refused before anything is hashed or sent.
+ */
+describe('ClusterCoordinator cohort-membership guard', function () {
+	const cfg: ClusterConsensusConfig & { clusterSize: number } = {
+		clusterSize: 3,
+		superMajorityThreshold: 0.75,
+		simpleMajorityThreshold: 0.51,
+		minAbsoluteClusterSize: 2,
+		allowClusterDownsize: true,
+		clusterSizeTolerance: 0.5,
+		partitionDetectionWindow: 60000
+	};
+
+	/** A coordinator whose local member is `local`, over a key network naming `cohort` for every block. */
+	const setup = async (local: PeerId, cohort: PeerId[], clock: FakeScheduler) => {
+		const clusterPeers: ClusterPeers = {};
+		const members = new Map<string, MockClusterClient>();
+		for (const pid of [local, ...cohort]) {
+			const idStr = pid.toString();
+			members.set(idStr, new MockClusterClient(idStr));
+		}
+		for (const pid of cohort) {
+			clusterPeers[pid.toString()] = {
+				multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+				publicKey: u8ToString(pid.publicKey!.raw, 'base64url')
+			};
+		}
+		const keyNetwork: IKeyNetwork = {
+			async findCoordinator() { return cohort[0]!; },
+			async findCluster() { return { ...clusterPeers }; }
+		};
+		const createClient = (peerId: PeerId) => members.get(peerId.toString())!;
+		const localMember = members.get(local.toString())!;
+		const coordinator = new ClusterCoordinator(
+			keyNetwork,
+			createClient as any,
+			cfg,
+			{ update: record => localMember.update(record), peerId: local },
+			undefined, // fretService
+			undefined, // reputation
+			undefined, // stateStore
+			clockOpts(clock)
+		);
+		const updateCalls = (): number => [...members.values()].reduce((sum, m) => sum + m.updateCalls, 0);
+		return { coordinator, localMember, updateCalls };
+	};
+
+	const makeMessage = (clock: FakeScheduler): RepoMessage => ({
+		operations: [{ get: { blockIds: ['block-1'] } }],
+		expiration: clock.now + 30000
+	});
+
+	it('refuses a resolved multi-member cohort that excludes the local member, contacting nobody', async () => {
+		const clock = new FakeScheduler();
+		const local = await makePeerId();
+		const cohort = await Promise.all([makePeerId(), makePeerId(), makePeerId()]);
+		const { coordinator, updateCalls } = await setup(local, cohort, clock);
+
+		let thrown: unknown;
+		try {
+			await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage(clock));
+		} catch (err) {
+			thrown = err;
+		}
+
+		expect(thrown).to.be.instanceOf(ResponsibilityRefusalError);
+		const refusal = thrown as ResponsibilityRefusalError;
+		expect(refusal.kind).to.equal('not-responsible');
+		expect([...refusal.blockIds]).to.deep.equal(['block-1']);
+		for (const pid of cohort) expect(refusal.message, 'the refusal names the cohort it would not join').to.include(pid.toString());
+		expect(updateCalls(), 'no member, local or remote, was asked to vote').to.equal(0);
+		expect((coordinator as any).transactions.size, 'no transaction was started').to.equal(0);
+	});
+
+	it('runs a cohort that includes the local member as before', async () => {
+		const clock = new FakeScheduler();
+		const local = await makePeerId();
+		const others = await Promise.all([makePeerId(), makePeerId()]);
+		const { coordinator, localMember } = await setup(local, [others[0]!, local, others[1]!], clock);
+
+		const { record } = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage(clock));
+
+		expect(Object.keys(record.peers)).to.have.members([local.toString(), ...others.map(p => p.toString())]);
+		expect(Object.keys(record.commits)).to.include(local.toString());
+		expect(localMember.updateCalls, 'the local member voted').to.be.greaterThan(0);
 	});
 });

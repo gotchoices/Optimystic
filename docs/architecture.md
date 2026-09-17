@@ -184,7 +184,7 @@ Every incoming record is verified end-to-end: `validateSignatures()` checks ever
 
 ### Proximity verification
 
-`CoordinatorRepo` rejects writes for blocks the local node is not responsible for (`pend`, `cancel`, `commit` throw `Not responsible for block(s)`). Reads log a warning but still serve best-effort. A 60-second, 1000-entry LRU caches cluster membership lookups to keep the check cheap. See [internals.md](internals.md#proximity-verification).
+`CoordinatorRepo` refuses writes for blocks the local node is not responsible for, and refuses them too when the cohort lookup fails (`pend`, `cancel`, `commit` throw `ResponsibilityRefusalError`, of kind `not-responsible` or `undetermined`). Reads log a warning but still serve best-effort. `RepoService` redirects a misrouted inbound request by the same rule — the node's own key network — before it reaches the repo. A 60-second, 1000-entry LRU caches each check's cohort lookups to keep them cheap. See [internals.md](internals.md#proximity-verification).
 
 ### Read dependency validation
 

@@ -407,8 +407,10 @@ approve satisfies the promise round and `1 > 1 × 0.5` the commit round. Measure
 a single-block commit with 36-character block and action ids: 968 bytes.
 
 The mint is deliberately **not** gated on the sole cohort peer being this node. A failed
-`findCluster` (cohort size 0) lands in the same branch, and self genuinely committed those bytes
-either way; since `peerIds` is already not evidence of cohort membership (previous paragraph), the
+`findCluster` (cohort size 0) lands in the same branch — reachable only when the coordinator's own
+lookup fails after the responsibility check confirmed this node from its cache, since a lookup that
+fails from the start is refused (see [Proximity Verification](#proximity-verification)) — and self
+genuinely committed those bytes either way; since `peerIds` is already not evidence of cohort membership (previous paragraph), the
 gate would buy no safety while opening a silent no-proof hole exactly when routing is degraded. The
 `commit:solo-cohort` log line carries `cohortSize` and `soleIsSelf` so an operator can tell a real
 cohort of one (1 / true) from a routing failure (0, or a sole peer that is not this node), and
@@ -1771,12 +1773,13 @@ Key design decisions:
 
 ## Proximity Verification
 
-`CoordinatorRepo` rejects write requests for blocks the node is not responsible for. FRET routing is the primary guard; proximity verification catches misrouted requests.
+`CoordinatorRepo` refuses write requests for blocks the node is not responsible for. It is the backstop, not the router: the writer's `NetworkTransactor` already picks a coordinator inside each block's cohort, and a misrouted remote request is redirected before it reaches the repo. All three — writer, redirect check and responsibility check — ask the same question the same way: the node's own key network, `findCluster` on the block's routing key.
 
-- **Write path (strict)**: `pend`, `cancel`, `commit` throw `Not responsible for block(s): ...` if any block fails the cluster membership check
-- **Read path (soft)**: `get` logs a warning but still serves — reads are best-effort
-- **Fail-open**: If `findCluster` throws (network failure), the check assumes responsible to avoid false rejections
-- **Caching**: `LruMap` with 1000 entries and 60s TTL avoids repeated `findCluster` lookups
+- **Write path (strict, fail-closed)**: `pend`, `cancel`, `commit` throw `ResponsibilityRefusalError` (`packages/db-p2p/src/repo/responsibility.ts`) when any block's cohort excludes this node (`kind: 'not-responsible'`) or when the cohort lookup throws (`kind: 'undetermined'`), naming every offending block. Accepting on a thrown lookup is how a phone once committed a write no other machine ever saw (GitHub #19). To the writer either refusal is a failed batch: its transactor excludes this peer and re-picks. A refused `cancel` leaves the pending record standing here until the writer's cancel retry reaches another cohort member; this node is discharged then too, because as a member it judges a cancel against the record's own `peers`, not against a lookup.
+- **Read path (soft, fail-open)**: `get` logs a warning for a block this node is not responsible for and serves it anyway, and serves on a thrown lookup too — reads are best-effort, and the cohort consult flags whatever it could not confirm.
+- **Redirect check (same rule)**: `RepoService.checkRedirect` redirects an inbound request whose block's cohort excludes this node to that cohort. A thrown lookup is handled locally for a `get` and propagated for a write, which aborts the stream so the writer re-picks. It used to ask `NetworkManagerService.getCluster` — FRET's raw cohort with no network-membership scoping — which could redirect a correctly routed write on machines shared by several networks.
+- **Caching**: each check memoizes its answer for `RESPONSIBILITY_TTL_MS` (60 s) in its own 1000-entry `LruMap`; a failed lookup is never cached. Inside that window a node can accept a write for a cohort it has just left. The solo branch then reports it as `unrouted` rather than `local`, and `executeClusterTransaction` in `packages/db-p2p/src/repo/cluster-coordinator.ts` refuses to run a transaction for a resolved cohort that excludes this node's own member.
+- **No identity, no check**: with no `localPeerId` (direct constructors, some test wiring) the check is skipped. Production always passes one.
 
 ## Cluster Health Monitors
 

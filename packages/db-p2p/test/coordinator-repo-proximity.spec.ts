@@ -6,6 +6,7 @@ import type { PeerId } from '@libp2p/interface';
 import type { IRepo, IKeyNetwork, ClusterPeers, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, MessageOptions } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import { CoordinatorRepo } from '../src/repo/coordinator-repo.js';
+import { ResponsibilityRefusalError, type ResponsibilityRefusalKind } from '../src/repo/responsibility.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { toString as u8ToString } from 'uint8arrays';
 
@@ -52,6 +53,34 @@ const makeStorageRepo = (): IRepo => ({
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const makeClusterClient = ((_peerId: PeerId) => ({} as any)) as (peerId: PeerId) => ClusterClient;
+
+/** Key network whose every lookup throws, as when FRET is not wired on the node; counts its calls. */
+const makeThrowingKeyNetwork = (): IKeyNetwork & { calls: number } => {
+	const net = {
+		calls: 0,
+		async findCoordinator(): Promise<PeerId> { throw new Error('not used'); },
+		async findCluster(): Promise<ClusterPeers> {
+			net.calls++;
+			throw new Error('network failure');
+		}
+	};
+	return net;
+};
+
+/** Run `op`, expecting a responsibility refusal of `kind` naming exactly `blockIds`. */
+const expectRefusal = async (op: () => Promise<unknown>, kind: ResponsibilityRefusalKind, blockIds: string[]): Promise<ResponsibilityRefusalError> => {
+	let thrown: unknown;
+	try {
+		await op();
+	} catch (err) {
+		thrown = err;
+	}
+	expect(thrown, 'the write is refused').to.be.instanceOf(ResponsibilityRefusalError);
+	const refusal = thrown as ResponsibilityRefusalError;
+	expect(refusal.kind).to.equal(kind);
+	expect([...refusal.blockIds]).to.deep.equal(blockIds);
+	return refusal;
+};
 
 describe('CoordinatorRepo proximity verification', () => {
 	const blockId = 'test-block-id-1';
@@ -143,7 +172,7 @@ describe('CoordinatorRepo proximity verification', () => {
 			expect(result).to.deep.equal({});
 		});
 
-		it('throws on pend', async () => {
+		it('refuses a pend as not-responsible', async () => {
 			const repo = new CoordinatorRepo(
 				makeKeyNetwork(cluster),
 				makeClusterClient,
@@ -153,19 +182,15 @@ describe('CoordinatorRepo proximity verification', () => {
 				localPeer
 			);
 
-			try {
-				await repo.pend({
-					actionId: 'action-1' as any,
-					transforms: { inserts: {}, updates: { [blockId]: [] }, deletes: [] },
-					blockIds: [blockId]
-				} as any);
-				expect.fail('should have thrown');
-			} catch (err: any) {
-				expect(err.message).to.include('Not responsible for block');
-			}
+			const refusal = await expectRefusal(() => repo.pend({
+				actionId: 'action-1' as any,
+				transforms: { inserts: {}, updates: { [blockId]: [] }, deletes: [] },
+				blockIds: [blockId]
+			} as any), 'not-responsible', [blockId]);
+			expect(refusal.message).to.include('Not responsible for block');
 		});
 
-		it('throws on cancel', async () => {
+		it('refuses a cancel as not-responsible', async () => {
 			const repo = new CoordinatorRepo(
 				makeKeyNetwork(cluster),
 				makeClusterClient,
@@ -175,15 +200,10 @@ describe('CoordinatorRepo proximity verification', () => {
 				localPeer
 			);
 
-			try {
-				await repo.cancel({ actionId: 'action-1' as any, blockIds: [blockId] });
-				expect.fail('should have thrown');
-			} catch (err: any) {
-				expect(err.message).to.include('Not responsible for block');
-			}
+			await expectRefusal(() => repo.cancel({ actionId: 'action-1' as any, blockIds: [blockId] }), 'not-responsible', [blockId]);
 		});
 
-		it('throws on commit', async () => {
+		it('refuses a commit as not-responsible', async () => {
 			const repo = new CoordinatorRepo(
 				makeKeyNetwork(cluster),
 				makeClusterClient,
@@ -193,15 +213,10 @@ describe('CoordinatorRepo proximity verification', () => {
 				localPeer
 			);
 
-			try {
-				await repo.commit({ actionId: 'action-1' as any, blockIds: [blockId] } as any);
-				expect.fail('should have thrown');
-			} catch (err: any) {
-				expect(err.message).to.include('Not responsible for block');
-			}
+			await expectRefusal(() => repo.commit({ actionId: 'action-1' as any, blockIds: [blockId] } as any), 'not-responsible', [blockId]);
 		});
 
-		it('lists all non-responsible block IDs in error', async () => {
+		it('names every non-responsible block in the refusal', async () => {
 			const repo = new CoordinatorRepo(
 				makeKeyNetwork(cluster),
 				makeClusterClient,
@@ -211,17 +226,13 @@ describe('CoordinatorRepo proximity verification', () => {
 				localPeer
 			);
 
-			try {
-				await repo.pend({
-					actionId: 'action-1' as any,
-					transforms: { inserts: {}, updates: { 'block-a': [], 'block-b': [] }, deletes: [] },
-					blockIds: ['block-a', 'block-b']
-				} as any);
-				expect.fail('should have thrown');
-			} catch (err: any) {
-				expect(err.message).to.include('block-a');
-				expect(err.message).to.include('block-b');
-			}
+			const refusal = await expectRefusal(() => repo.pend({
+				actionId: 'action-1' as any,
+				transforms: { inserts: {}, updates: { 'block-a': [], 'block-b': [] }, deletes: [] },
+				blockIds: ['block-a', 'block-b']
+			} as any), 'not-responsible', ['block-a', 'block-b']);
+			expect(refusal.message).to.include('block-a');
+			expect(refusal.message).to.include('block-b');
 		});
 	});
 
@@ -258,34 +269,85 @@ describe('CoordinatorRepo proximity verification', () => {
 		});
 	});
 
-	describe('error handling', () => {
-		it('assumes responsible when findCluster fails (fail-open)', async () => {
-			const localPeer = await makePeerId();
-			const keyNetwork: IKeyNetwork = {
-				async findCoordinator() { throw new Error('not used'); },
-				async findCluster() { throw new Error('network failure'); }
-			};
+	/**
+	 * A thrown lookup used to read as "responsible" everywhere — the acceptance half of GitHub #19, where a
+	 * phone whose every cohort lookup threw committed solo and answered plain success. Writes now fail
+	 * CLOSED with a refusal distinct from "not responsible"; reads stay open.
+	 */
+	describe('when the cohort lookup throws', () => {
+		const buildRepo = async (keyNetwork: IKeyNetwork): Promise<CoordinatorRepo> => new CoordinatorRepo(
+			keyNetwork,
+			makeClusterClient,
+			makeStorageRepo(),
+			{ clusterSize: 3 },
+			undefined,
+			await makePeerId()
+		);
 
-			const repo = new CoordinatorRepo(
-				keyNetwork,
-				makeClusterClient,
-				makeStorageRepo(),
-				{ clusterSize: 3 },
-				undefined,
-				localPeer
-			);
+		it('still serves a read (fail-open)', async () => {
+			const repo = await buildRepo(makeThrowingKeyNetwork());
 
-			// Should not throw — assumes responsible on error
 			const result = await repo.get({ blockIds: [blockId] });
 			expect(result).to.deep.equal({});
+		});
 
-			// Write operations should also succeed on error (fail-open)
-			const pendResult = await repo.pend({
+		it('refuses pend, cancel and commit as undetermined (fail-closed)', async () => {
+			const repo = await buildRepo(makeThrowingKeyNetwork());
+
+			const refusal = await expectRefusal(() => repo.pend({
 				actionId: 'action-1' as any,
 				transforms: { inserts: {}, updates: { [blockId]: [] }, deletes: [] },
 				blockIds: [blockId]
-			} as any);
-			expect(pendResult.success).to.equal(true);
+			} as any), 'undetermined', [blockId]);
+			expect(refusal.message, 'a routing fault reads differently from a misroute').to.not.include('Not responsible');
+			await expectRefusal(() => repo.cancel({ actionId: 'action-1' as any, blockIds: [blockId] }), 'undetermined', [blockId]);
+			await expectRefusal(() => repo.commit({ actionId: 'action-1' as any, blockIds: [blockId] } as any), 'undetermined', [blockId]);
+		});
+
+		it('never caches a failed lookup: the next write asks again', async () => {
+			const keyNetwork = makeThrowingKeyNetwork();
+			const repo = await buildRepo(keyNetwork);
+
+			await expectRefusal(() => repo.commit({ actionId: 'action-1' as any, blockIds: [blockId] } as any), 'undetermined', [blockId]);
+			await expectRefusal(() => repo.commit({ actionId: 'action-1' as any, blockIds: [blockId] } as any), 'undetermined', [blockId]);
+			expect(keyNetwork.calls).to.equal(2);
+		});
+
+		it('refuses a whole multi-block pend when one block cannot be determined, naming that block', async () => {
+			const localPeer = await makePeerId();
+			const keyNetwork: IKeyNetwork = {
+				async findCoordinator() { throw new Error('not used'); },
+				async findCluster(key: Uint8Array) {
+					if (new TextDecoder().decode(key) === 'block-lost') throw new Error('network failure');
+					return makeClusterPeers([localPeer]);
+				}
+			};
+			const repo = new CoordinatorRepo(keyNetwork, makeClusterClient, makeStorageRepo(), { clusterSize: 3 }, undefined, localPeer);
+
+			await expectRefusal(() => repo.pend({
+				actionId: 'action-1' as any,
+				transforms: { inserts: {}, updates: { 'block-fine': [], 'block-lost': [] }, deletes: [] },
+				blockIds: ['block-fine', 'block-lost']
+			} as any), 'undetermined', ['block-lost']);
+		});
+
+		it('reports not-responsible when the other blocks settle that the write is misrouted', async () => {
+			const localPeer = await makePeerId();
+			const otherPeer = await makePeerId();
+			const keyNetwork: IKeyNetwork = {
+				async findCoordinator() { throw new Error('not used'); },
+				async findCluster(key: Uint8Array) {
+					if (new TextDecoder().decode(key) === 'block-lost') throw new Error('network failure');
+					return makeClusterPeers([otherPeer]);
+				}
+			};
+			const repo = new CoordinatorRepo(keyNetwork, makeClusterClient, makeStorageRepo(), { clusterSize: 3 }, undefined, localPeer);
+
+			await expectRefusal(() => repo.pend({
+				actionId: 'action-1' as any,
+				transforms: { inserts: {}, updates: { 'block-elsewhere': [], 'block-lost': [] }, deletes: [] },
+				blockIds: ['block-elsewhere', 'block-lost']
+			} as any), 'not-responsible', ['block-elsewhere']);
 		});
 	});
 
@@ -317,24 +379,18 @@ describe('CoordinatorRepo proximity verification', () => {
 				localPeer
 			);
 
-			try {
-				await repo.pend({
-					actionId: 'action-1' as any,
-					transforms: {
-						inserts: {},
-						updates: {
-							[responsibleBlockId]: [],
-							[nonResponsibleBlockId]: []
-						},
-						deletes: []
+			await expectRefusal(() => repo.pend({
+				actionId: 'action-1' as any,
+				transforms: {
+					inserts: {},
+					updates: {
+						[responsibleBlockId]: [],
+						[nonResponsibleBlockId]: []
 					},
-					blockIds: [responsibleBlockId, nonResponsibleBlockId]
-				} as any);
-				expect.fail('should have thrown');
-			} catch (err: any) {
-				expect(err.message).to.include(nonResponsibleBlockId);
-				expect(err.message).to.not.include(responsibleBlockId);
-			}
+					deletes: []
+				},
+				blockIds: [responsibleBlockId, nonResponsibleBlockId]
+			} as any), 'not-responsible', [nonResponsibleBlockId]);
 		});
 	});
 

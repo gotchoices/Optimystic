@@ -17,6 +17,7 @@ export * from "./repo/coordinator-repo.js";
 export * from "./repo/i-under-replication-ledger.js";
 export * from "./repo/kv-under-replication-ledger.js";
 export * from "./repo/under-replication-drain.js";
+export * from "./repo/responsibility.js";
 export * from "./repo/served-repo-proxy.js";
 export * from "./repo/service.js";
 export * from "./storage/block-storage.js";

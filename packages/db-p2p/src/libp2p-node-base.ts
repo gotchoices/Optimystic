@@ -720,14 +720,14 @@ export async function createLibp2pNodeBase(
 					responsibilityK: options.responsibilityK ?? 1,
 					...inboundAuthorization
 				});
-				// RepoService.checkRedirect needs the running node (network manager for the
-				// responsible-set computation, self id for the membership check, connection
-				// addrs for redirect targets). The libp2p components.libp2p proxy does NOT
-				// reliably resolve from inside a service at request time, so the node is
-				// injected explicitly post-construction via setLibp2p(node) below — the same
-				// mechanism networkManager/fret use — rather than forwarded here. checkRedirect
-				// keys the responsible set on the block's routing key (`routingKeyForBlock`), the
-				// same bytes the coordinator's findCluster is handed — same cohort, no spurious redirect.
+				// RepoService.checkRedirect needs the running node (its `keyNetwork` attachment for
+				// the responsible set, self id for the membership check, connection addrs for
+				// redirect targets). The libp2p components.libp2p proxy does NOT reliably resolve
+				// from inside a service at request time, so the node is injected explicitly
+				// post-construction via setLibp2p(node) below — the same mechanism networkManager/fret
+				// use — rather than forwarded here. checkRedirect asks the node's own key network for
+				// the block's routing key (`routingKeyForBlock`), the same call the writer and the
+				// coordinator make — one rule, so a correctly routed request is never redirected.
 				return serviceFactory({
 					registrar: components.registrar,
 					repo: repoProxy
@@ -848,10 +848,11 @@ export async function createLibp2pNodeBase(
 	const wired = node.services as unknown as WiredServices;
 	wired.fret.setLibp2p(node);
 	wired.networkManager.setLibp2p(node);
-	// RepoService.checkRedirect resolves the network manager / self id / connection
+	// RepoService.checkRedirect resolves the key network / self id / connection
 	// addrs through this injected node (the components.libp2p proxy is unreliable
 	// from inside a service at request time). Done before start() so the protocol
-	// handler is live with a resolvable node from its first request.
+	// handler is live with a resolvable node from its first request; the `keyNetwork`
+	// attachment itself arrives after start(), and until then checkRedirect handles locally.
 	wired.repo.setLibp2p(node);
 
 	// A relay-naming listen address with no circuit-relay transport can never be reserved on. Checked

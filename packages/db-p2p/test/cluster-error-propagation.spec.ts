@@ -1,8 +1,6 @@
 import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
-import { pipe } from 'it-pipe';
-import { encode as lpEncode, decode as lpDecode } from 'it-length-prefixed';
 import type { PeerId } from '@libp2p/interface';
 import type { IPeerNetwork, PeerId as CorePeerId, ICluster, ClusterRecord, RepoMessage } from '@optimystic/db-core';
 import { ClusterClient } from '../src/cluster/client.js';
@@ -14,29 +12,11 @@ import {
 	clusterErrorFromEnvelope,
 } from '../src/cluster/cluster-error.js';
 import { captureLog, hasLine } from './support/capture-log.js';
+import { encodeJson, decodeJson, makeServiceStream } from './util/protocol-stream.js';
 
 async function makePeerId(): Promise<PeerId> {
 	const pk = await generateKeyPair('Ed25519');
 	return peerIdFromPrivateKey(pk);
-}
-
-/** Length-prefix encode a JSON value into the byte chunks a libp2p stream yields. */
-async function encodeJson(value: unknown): Promise<Uint8Array[]> {
-	const chunks: Uint8Array[] = [];
-	for await (const chunk of pipe([new TextEncoder().encode(JSON.stringify(value))], lpEncode)) {
-		chunks.push(chunk.subarray());
-	}
-	return chunks;
-}
-
-/** Decode every length-prefixed JSON object out of a set of stream chunks. */
-async function decodeJson(chunks: Uint8Array[]): Promise<unknown[]> {
-	const source = (async function* () { for (const c of chunks) yield c; })();
-	const out: unknown[] = [];
-	for await (const data of pipe(source, lpDecode)) {
-		out.push(JSON.parse(new TextDecoder().decode(data.subarray())));
-	}
-	return out;
 }
 
 const makeRecord = (): ClusterRecord => ({
@@ -61,23 +41,6 @@ function networkReturning(responseChunks: Uint8Array[]): IPeerNetwork {
 			} as unknown;
 		},
 	} as unknown as IPeerNetwork;
-}
-
-/** Build a service stream that sources `requestChunks` and captures sent/close/abort. */
-function makeServiceStream(requestChunks: Uint8Array[]) {
-	const sent: Uint8Array[] = [];
-	let aborted = false;
-	let resolveDone: () => void;
-	const done = new Promise<void>((resolve) => { resolveDone = resolve; });
-	const stream = {
-		send: (chunk: { subarray: () => Uint8Array }) => { sent.push(chunk.subarray()); },
-		close: async () => { resolveDone(); },
-		abort: (_err: unknown) => { aborted = true; resolveDone(); },
-		async *[Symbol.asyncIterator]() {
-			for (const chunk of requestChunks) yield chunk;
-		},
-	};
-	return { stream, sent, done, wasAborted: () => aborted };
 }
 
 const makeComponents = (cluster: ICluster, peerId: PeerId): ClusterServiceComponents => ({

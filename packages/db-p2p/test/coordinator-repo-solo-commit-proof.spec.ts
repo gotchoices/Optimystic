@@ -24,19 +24,26 @@ import { PROOF_THRESHOLDS, makeClusterPeers } from './support/commit-proof-fixtu
 //
 // Both ways INTO that branch are exercised, because they are different production situations:
 //  - a genuine cohort of one — `findCluster` answers with exactly this node;
-//  - DEGRADED ROUTING — `findCluster` throws, so `isResponsibleForBlock` falls open ("assume
-//    responsible") while `resolveCohort` reports an unresolved cohort. Every commit on the node then
-//    takes the solo branch for as long as routing is down, whatever the block's real cohort size is.
+//  - DEGRADED ROUTING — `findCluster` starts throwing after the write path's responsibility check
+//    confirmed this node from a lookup that still worked, so `resolveCohort` reports an unresolved
+//    cohort. Routing that is down from the start never gets here: the responsibility check fails
+//    closed and refuses the write (see `coordinator-repo-proximity.spec.ts`). What remains is the
+//    responsibility cache's staleness window, and the solo branch must still mint in it.
 
-const makeKeyNetwork = (cluster: ClusterPeers | 'unroutable'): IKeyNetwork => ({
-	async findCoordinator(_key: Uint8Array, _options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
-		throw new Error('not implemented');
-	},
-	async findCluster(_key: Uint8Array): Promise<ClusterPeers> {
-		if (cluster === 'unroutable') throw new Error('findCluster unavailable');
-		return { ...cluster };
-	}
-});
+const makeKeyNetwork = (cluster: ClusterPeers, options: { failAfterFirstLookup?: boolean } = {}): IKeyNetwork => {
+	const looked = new Set<string>();
+	return {
+		async findCoordinator(_key: Uint8Array, _options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+			throw new Error('not implemented');
+		},
+		async findCluster(key: Uint8Array): Promise<ClusterPeers> {
+			const id = new TextDecoder().decode(key);
+			if (options.failAfterFirstLookup && looked.has(id)) throw new Error('findCluster unavailable');
+			looked.add(id);
+			return { ...cluster };
+		}
+	};
+};
 
 const makeBlock = (blockId: BlockId, collectionId: BlockId, payload: string): IBlock => ({
 	header: { id: blockId, type: 'test', collectionId } as BlockHeader,
@@ -58,7 +65,7 @@ interface Harness {
 interface HarnessOptions {
 	/** Wire a real local `ClusterMember` (the key holder). Without one there is nothing to mint with. */
 	withLocalCluster?: boolean;
-	/** `findCluster` throws instead of answering — the degraded-routing entry into the solo branch. */
+	/** `findCluster` answers once per block (the responsibility check), then throws — the degraded-routing entry into the solo branch. */
 	unroutable?: boolean;
 }
 
@@ -83,7 +90,7 @@ const makeHarness = async (options: HarnessOptions = {}): Promise<Harness> => {
 		})
 		: undefined;
 	const coordinated = new CoordinatorRepo(
-		makeKeyNetwork(unroutable ? 'unroutable' : makeClusterPeers([{ peerId: selfPeerId, privateKey }])),
+		makeKeyNetwork(makeClusterPeers([{ peerId: selfPeerId, privateKey }]), { failAfterFirstLookup: unroutable }),
 		((_p: PeerId) => ({} as unknown as ClusterClient)) as never,
 		storageRepo,
 		{ allowUnvalidatedSmallCluster: true },

@@ -1,9 +1,9 @@
 import { pipe } from 'it-pipe'
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed'
 import type { Startable, Stream, Connection, StreamHandler, PeerId, Libp2p } from '@libp2p/interface'
-import type { IRepo, RepoMessage, RoutingKey } from '@optimystic/db-core'
-import { blockIdsForTransforms, routingKeyForBlock } from '@optimystic/db-core'
-import { peersEqual } from '../peer-utils.js'
+import type { IKeyNetwork, IRepo, RepoMessage } from '@optimystic/db-core'
+import { LruMap, blockIdsForTransforms, routingKeyForBlock } from '@optimystic/db-core'
+import { peerIdFromString } from '@libp2p/peer-id'
 import { encodePeers, type RedirectPayload } from './redirect.js'
 import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js'
 import type { Uint8ArrayList } from 'uint8arraylist'
@@ -11,6 +11,8 @@ import { createLogger, type Logger } from '../logger.js'
 import { publishableAddrsForPeer, type AddressLog, type DirectionalConnection } from '../peer-address-book.js'
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js'
 import { registerProtocolHandler } from '../network/register-protocol-handler.js'
+import type { OptimysticNodeAttachments } from '../optimystic-node.js'
+import { RESPONSIBILITY_TTL_MS } from './responsibility.js'
 
 // Define Components interface
 interface BaseComponents {
@@ -20,13 +22,17 @@ interface BaseComponents {
 	}
 }
 
-export interface NetworkManagerLike {
-	getCluster(key: RoutingKey): Promise<PeerId[]>
-}
+/** The one key-network call the redirect check makes. The node's own `Libp2pKeyPeerNetwork` satisfies it. */
+export type ClusterLookup = Pick<IKeyNetwork, 'findCluster'>
 
 export type RepoServiceComponents = BaseComponents & {
 	repo: IRepo
-	networkManager?: NetworkManagerLike
+	/**
+	 * Where the redirect check asks who is responsible for a block. Absent → the `keyNetwork` attachment of
+	 * the node injected by {@link RepoService.setLibp2p}, which is the production source: the same key
+	 * network the writer's transactor and this node's coordinator ask, so all three apply one rule.
+	 */
+	keyNetwork?: ClusterLookup
 	peerId?: PeerId
 	/**
 	 * Optional resolver for the addresses this node may publish for a redirect target. Async
@@ -58,12 +64,10 @@ export type RepoServiceInit = InboundStreamAuthorizationInit & {
 	logPrefix?: string,
 	kBucketSize?: number,
 	/**
-	 * Responsibility K - the replica set size for determining cluster membership.
-	 * This is distinct from kBucketSize (DHT routing).
-	 * When set, this determines how many peers (by XOR distance) are considered
-	 * responsible for a key. If this node is not in the top responsibilityK peers,
-	 * it will redirect requests to closer peers.
-	 * Default: 1 (only the closest peer handles requests)
+	 * Small-mesh bypass for the redirect check: when the block's cohort has fewer than this many peers,
+	 * the request is handled locally without a membership test (and the coordinator's own responsibility
+	 * check then decides). It does not size the cohort — the key network's `clusterSize` does.
+	 * Default: 1 (only an empty cohort bypasses)
 	 */
 	responsibilityK?: number,
 }
@@ -89,7 +93,7 @@ export class RepoService implements Startable {
 	 * The libp2p node, injected post-construction by the node wiring (see
 	 * libp2p-node-base.ts, mirroring how `networkManager`/`fret` receive theirs).
 	 * The libp2p `components.libp2p` proxy does NOT reliably resolve from inside a
-	 * service at request time, so the redirect path resolves the network manager,
+	 * service at request time, so the redirect path resolves the key network,
 	 * self identity, and connection addrs through this explicitly-set reference.
 	 */
 	private libp2pRef: Libp2p | undefined
@@ -101,6 +105,16 @@ export class RepoService implements Startable {
 	 * ingress point, instead of keeping it filterable as the single `peer-address-book` namespace.
 	 */
 	private readonly addressLog: AddressLog
+	/**
+	 * Per block key, the responsible peer ids the key network last named: one cohort lookup per block per
+	 * minute on the inbound path, instead of one per request on top of the coordinator's own.
+	 *
+	 * NOTE: same TTL as `CoordinatorRepo`'s responsibility cache, deliberately not the same cache — the two
+	 * sit on either side of the served-repo boundary. Their verdicts can therefore disagree about a block
+	 * only inside the minute after its cohort changes; a request this check wrongly lets through is refused
+	 * by the coordinator, and one it wrongly redirects is followed by the client to a member that serves it.
+	 */
+	private readonly responsibleIds = new LruMap<string, { peerIds: readonly string[], expires: number }>(1000)
 
 	constructor(components: RepoServiceComponents, init: RepoServiceInit = {}) {
 		this.components = components
@@ -159,9 +173,14 @@ export class RepoService implements Startable {
 		this.running = false
 	}
 
-	private getNetworkManager(): NetworkManagerLike | undefined {
-		if (this.components.networkManager) return this.components.networkManager
-		return (this.getLibp2p() as any)?.services?.networkManager as NetworkManagerLike | undefined
+	/**
+	 * The key network the redirect check asks. Absent only before the node attaches it, which happens after
+	 * `start()`; a request in that window is handled locally, where the served-repo proxy has no
+	 * coordinator to hand it to yet either.
+	 */
+	private getKeyNetwork(): ClusterLookup | undefined {
+		if (this.components.keyNetwork) return this.components.keyNetwork
+		return (this.getLibp2p() as Partial<OptimysticNodeAttachments> | undefined)?.keyNetwork
 	}
 
 	private getSelfId(): PeerId | undefined {
@@ -224,35 +243,57 @@ export class RepoService implements Startable {
 	/**
 	 * Check if this node should redirect the request for a given key.
 	 * Returns a RedirectPayload if not responsible, null if should handle locally.
-	 * Also attaches cluster info to the message for downstream use.
+	 * Also attaches the responsible peer ids to the message for downstream use.
+	 *
+	 * The responsible set comes from the node's own key network — `findCluster` on the block's routing
+	 * key, the same call and the same bytes the writer's transactor and this node's `CoordinatorRepo` use —
+	 * so a correctly routed request is never redirected, including on machines shared by several networks,
+	 * where FRET's raw cohort would include peers that do not serve this one.
+	 *
+	 * A lookup that THROWS splits by operation: a `get` is handled locally (a read is best-effort, and the
+	 * coordinator flags what it could not confirm); every other operation propagates the error, which
+	 * aborts the stream so the writer excludes this peer and re-picks — the posture `CoordinatorRepo` takes
+	 * on the same fault.
 	 */
 	async checkRedirect(blockKey: string, opName: string, message: RepoMessage): Promise<RedirectPayload | null> {
-		const nm = this.getNetworkManager()
-		if (!nm) return null
+		const keyNetwork = this.getKeyNetwork()
+		if (!keyNetwork) return null
 
-		// The block's routing key — the same bytes the writer's transactor and every cohort
-		// lookup hand the key network (see `routingKeyForBlock`) — so this responsible set sits
-		// at the ring position the coordinator was chosen by, and a correctly routed request
-		// is never redirected.
-		const cluster = await nm.getCluster(routingKeyForBlock(blockKey))
-		;(message as any).cluster = cluster.map((p: PeerId) => p.toString?.() ?? String(p))
+		let cluster: readonly string[]
+		try {
+			cluster = await this.responsiblePeerIds(keyNetwork, blockKey)
+		} catch (err) {
+			this.log.error('redirect lookup failed op=%s blockKey=%s - %e', opName, blockKey, err)
+			if (opName === 'get') return null
+			throw err
+		}
+		;(message as RepoMessage & { cluster?: string[] }).cluster = [...cluster]
 
-		const selfId = this.getSelfId()
+		const selfId = this.getSelfId()?.toString()
 		if (!selfId) return null
 
-		const isMember = cluster.some((p: PeerId) => peersEqual(p, selfId))
+		const isMember = cluster.includes(selfId)
 		const smallMesh = cluster.length < this.responsibilityK
 
 		if (!smallMesh && !isMember) {
-			const peers = cluster.filter((p: PeerId) => !peersEqual(p, selfId))
 			this.log('redirect op=%s blockKey=%s cluster=%d', opName, blockKey, cluster.length)
-			return encodePeers(await Promise.all(peers.map(async (pid: PeerId) => ({
-				id: pid.toString(),
-				addrs: await this.getPeerAddrs(pid)
+			return encodePeers(await Promise.all(cluster.map(async id => ({
+				id,
+				addrs: await this.getPeerAddrs(peerIdFromString(id))
 			}))))
 		}
 
 		return null
+	}
+
+	/** The block's responsible peer ids, memoized per block key for {@link RESPONSIBILITY_TTL_MS}. A throw is never memoized. */
+	private async responsiblePeerIds(keyNetwork: ClusterLookup, blockKey: string): Promise<readonly string[]> {
+		const now = Date.now()
+		const memo = this.responsibleIds.get(blockKey)
+		if (memo && memo.expires > now) return memo.peerIds
+		const peerIds = Object.keys(await keyNetwork.findCluster(routingKeyForBlock(blockKey)))
+		this.responsibleIds.set(blockKey, { peerIds, expires: now + RESPONSIBILITY_TTL_MS })
+		return peerIds
 	}
 
 	/**

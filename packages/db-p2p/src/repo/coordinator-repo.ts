@@ -17,6 +17,7 @@ import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-
 import type { ReconcileBlockCallback } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
 import type { IUnderReplicationLedger } from "./i-under-replication-ledger.js";
+import { RESPONSIBILITY_TTL_MS, ResponsibilityRefusalError } from "./responsibility.js";
 
 /**
  * Acquire a block's content for a cohort-corroborated revision, from the cohort, and persist it.
@@ -554,7 +555,7 @@ export function coordinatorRepo(
  * revert to being ignored. If that field is ever renamed, grep the specs for `coordinator:`.
  */
 export interface ICoordinatorClusterSeam {
-	/** Used by `verifyResponsibility` alone; `pend` and `commit` read {@link resolveCohort}. */
+	/** Used by `cancel` alone; `pend` and `commit` read {@link resolveCohort}. */
 	getClusterSize(blockId: BlockId): Promise<number>;
 	/** Whether the cohort could be established at all, and who it is — the primitive
 	 *  `getClusterSize` derives from. `pend` and `commit` classify their solo short-circuit on it. */
@@ -578,7 +579,6 @@ export class CoordinatorRepo implements IRepo {
 	private readonly DEFAULT_TIMEOUT = 30000; // 30 seconds default timeout
 	private readonly localPeerId?: PeerId;
 	private readonly responsibilityCache = new LruMap<string, { inCluster: boolean, expires: number }>(1000);
-	private static readonly RESPONSIBILITY_TTL_MS = 60_000;
 	private readonly lastSeenCommitMs = new LruMap<string, number>(1000);
 	/** Per block, what earlier repair passes left unresolved — see {@link AheadClaimState}.
 	 *  Outlives the consult on purpose: the read-repair window skips consults for blocks checked
@@ -717,18 +717,30 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
-	 * Check if this node is in the cluster for a given block.
-	 * Uses findCluster membership — in the real network layer, self is in the cohort exactly
-	 * when this node is among the nearest `clusterSize` serving peers for the block. This
-	 * serves as a defense-in-depth guard for requests that arrive at the wrong node.
-	 * Returns true if localPeerId is not set (backward compat for single-node/test setups).
+	 * Whether this node is in the cohort for a block. Uses `findCluster` membership — in the real network
+	 * layer, self is in the cohort exactly when this node is among the nearest `clusterSize` serving peers
+	 * for the block, so a request that reaches a node outside it was sent to the wrong machine.
+	 *
+	 * Three answers, because a lookup that THREW is not an answer: `undetermined` is never cached (routing
+	 * can recover on the next request) and never read as `responsible` — what each caller does with it is
+	 * that caller's posture (see {@link verifyResponsibility} and `get`).
+	 *
+	 * With no `localPeerId` the check is skipped and the answer is `responsible`. That bypass exists for
+	 * wiring without an identity (direct constructors, single-node and test setups), never for production,
+	 * where `libp2p-node-base` always passes the node's peer id.
+	 *
+	 * NOTE: a cached answer stands for up to {@link RESPONSIBILITY_TTL_MS} after the cohort changes, so a
+	 * node can still say `responsible` for a minute after it stops being so. {@link soloCohortDurability}'s
+	 * `unrouted` class and `ClusterCoordinator.executeClusterTransaction`'s cohort-membership guard are what
+	 * keep that window honest; if churn ever makes the window matter, shorten the TTL rather than
+	 * re-looking-up on every write.
 	 */
-	private async isResponsibleForBlock(blockId: BlockId): Promise<boolean> {
-		if (!this.localPeerId) return true;
+	private async responsibilityFor(blockId: BlockId): Promise<'responsible' | 'not-responsible' | 'undetermined'> {
+		if (!this.localPeerId) return 'responsible';
 
 		const cached = this.responsibilityCache.get(blockId);
 		if (cached && cached.expires > Date.now()) {
-			return cached.inCluster;
+			return cached.inCluster ? 'responsible' : 'not-responsible';
 		}
 
 		let inCluster: boolean;
@@ -737,40 +749,55 @@ export class CoordinatorRepo implements IRepo {
 			inCluster = this.localPeerId.toString() in peers;
 		} catch (err) {
 			this.log('proximity:check-error', { blockId, error: (err as Error).message });
-			// On failure, assume responsible to avoid false rejections
-			return true;
+			return 'undetermined';
 		}
 
-		this.responsibilityCache.set(blockId, { inCluster, expires: Date.now() + CoordinatorRepo.RESPONSIBILITY_TTL_MS });
+		this.responsibilityCache.set(blockId, { inCluster, expires: Date.now() + RESPONSIBILITY_TTL_MS });
 		this.log('proximity:checked', { blockId, inCluster });
-		return inCluster;
+		return inCluster ? 'responsible' : 'not-responsible';
 	}
 
 	/**
-	 * Verify this node is responsible for all given block IDs. Throws if not.
+	 * The write path's gate (`pend`, `cancel`, `commit`): refuse unless this node is responsible for EVERY
+	 * block, and refuse too when it cannot tell — fail CLOSED. A write accepted on a thrown lookup commits
+	 * where the network was never consulted (GitHub #19); refusing hands it back to the writer's transactor,
+	 * which excludes this peer and re-picks inside the cohort.
+	 *
+	 * Every block is checked so the error names all of them. When the blocks split between the two kinds,
+	 * `not-responsible` is the one thrown: it is a settled answer that the request is misrouted, which no
+	 * recovery of the lookup would change; the undetermined blocks are still logged.
+	 *
+	 * For `cancel`, a refusal on a transient lookup fault leaves the pending record standing on this node
+	 * until the writer's cancel retry lands on another cohort member — and this node is still discharged
+	 * then, since as a member it judges the cancel against the record's own `peers`, not against a lookup.
 	 */
 	private async verifyResponsibility(blockIds: BlockId[]): Promise<void> {
 		const notResponsible: BlockId[] = [];
+		const undetermined: BlockId[] = [];
 		for (const blockId of blockIds) {
-			if (!await this.isResponsibleForBlock(blockId)) {
-				notResponsible.push(blockId);
-			}
+			const verdict = await this.responsibilityFor(blockId);
+			if (verdict === 'not-responsible') notResponsible.push(blockId);
+			else if (verdict === 'undetermined') undetermined.push(blockId);
 		}
-		if (notResponsible.length > 0) {
-			this.log('proximity:rejected', { blockIds: notResponsible });
-			throw new Error(`Not responsible for block(s): ${notResponsible.join(', ')}`);
-		}
+		if (notResponsible.length === 0 && undetermined.length === 0) return;
+		this.log('proximity:rejected', { notResponsible, undetermined });
+		throw notResponsible.length > 0
+			? new ResponsibilityRefusalError('not-responsible', notResponsible)
+			: new ResponsibilityRefusalError('undetermined', undetermined, 'cohort lookup failed; refusing the write rather than accepting it unrouted');
 	}
 
 	async get(blockGets: BlockGets, options?: MessageOptions): Promise<GetBlockResults> {
-		// Soft proximity check — warn but still serve reads for graceful degradation
-		// NOTE: a soft-served read now also *acquires* the block durably (see restoreCorroborated), where
-		// before it could at most promote a pending this node already held. So a soft serve leaves behind
-		// a replica of a block this node is not responsible for, and nothing sweeps those: ring-shift
-		// sheds a keyspace RANGE, not "blocks outside my cohort". Fine while soft serves are what they
-		// are meant to be — a rare degradation during routing churn — since routing already placed this
-		// node near the block. If they ever become routine, gate acquisition (not the serve itself) on
-		// isResponsibleForBlock.
+		// Soft proximity check — warn but still serve reads for graceful degradation. Unlike the write
+		// path it stays OPEN when the lookup throws: a read is best-effort, and the consult below flags
+		// whatever it could not confirm (`unavailable`, `unconfirmedAheadRev`) rather than posing as sure.
+		// NOTE: a soft-served read also *acquires* the block durably (see restoreCorroborated), so a soft
+		// serve leaves behind a replica of a block this node is not responsible for, and nothing sweeps
+		// those: ring-shift sheds a keyspace RANGE, not "blocks outside my cohort". Soft serves are now
+		// confined to the responsibility caches' staleness window: a remote read for a block this node is
+		// not responsible for is redirected by `RepoService.checkRedirect` before it gets here, and this
+		// node's own transactor routes a read here only when self is in the block's cohort. If soft serves
+		// ever become routine (steady `proximity:get-warning` lines while the network's membership is not
+		// changing), gate acquisition (not the serve itself) on `responsibilityFor`.
 		//
 		// NOTE: accepted tradeoff — this check and `fetchBlockFromCluster` below each run their own
 		// `findCluster` for the same block, so a cold read costs two cohort lookups where one shared
@@ -778,7 +805,7 @@ export class CoordinatorRepo implements IRepo {
 		// and this check's future is open (blocked `writer-and-servers-disagree-on-where-a-block-lives`,
 		// option D2(b)). Revisit if a device profile shows `findCluster` as material.
 		for (const blockId of blockGets.blockIds) {
-			if (!await this.isResponsibleForBlock(blockId)) {
+			if (await this.responsibilityFor(blockId) === 'not-responsible') {
 				this.log('proximity:get-warning', { blockId, msg: 'serving read for non-responsible block' });
 			}
 		}
@@ -2204,8 +2231,14 @@ export class CoordinatorRepo implements IRepo {
 	 *  - resolved to exactly one peer that is NOT this node → `unrouted` — this node wrote somewhere
 	 *    the cohort does not look, which is a write whose destination is wrong, not a solo write.
 	 * With no local peer id (direct constructors, single-node and test wiring) a resolved cohort of
-	 * one reads as `local`: the same posture `isResponsibleForBlock` takes for a node with no
+	 * one reads as `local`: the same posture `responsibilityFor` takes for a node with no
 	 * identity, and a node with no identity cannot be in any cohort but its own.
+	 *
+	 * Both `unrouted` arms are defence in depth now, not the main guard: {@link verifyResponsibility}
+	 * refuses a write whose lookup throws and a write for a cohort that excludes this node before the
+	 * short-circuit is reached. A write lands here unrouted only inside the responsibility cache's
+	 * staleness window, or when a second lookup fails moments after the first succeeded — and then it
+	 * still reports honestly rather than posing as `local`.
 	 */
 	private soloCohortDurability(cohort: CohortResolution): WriteDurability {
 		if (!cohort.resolved) return unroutedDurability();

@@ -367,12 +367,12 @@ describe('Real libp2p integration', function () {
 	// The driver node D (≠ E, ≠ R) issues the client so neither hop is a self-dial.
 	//
 	// Block selection is FRET-derived, not hard-coded: after the 3-node ring stabilizes
-	// we probe E's NetworkManagerService.getCluster (the exact call checkRedirect makes)
+	// we probe E's key network `findCluster` (the exact call checkRedirect makes)
 	// for a block id whose size-1 cohort excludes E — guaranteeing a real redirect fires.
 	it('redirect round-trip: a repo op to a non-responsible node redirects and completes on the responsible peer', async function () {
 		this.timeout(90_000);
 
-		// clusterSize 1 → getCluster's cohort is the single FRET-nearest peer, so for any
+		// clusterSize 1 → findCluster's cohort is the single FRET-nearest serving peer, so for any
 		// block exactly one node is responsible and the other two are non-members.
 		const a = await spawnNode({ clusterSize: 1 });
 		const bootstrapAddr = pickLocalTcpMultiaddr(a);
@@ -400,15 +400,13 @@ describe('Real libp2p integration', function () {
 		}, { timeoutMs: 60_000, intervalMs: 500, description: 'FRET stabilized the 3-node ring (every node knows every peer)' });
 
 		// Probe for a block whose responsible peer is a REMOTE node (entry E = a is excluded).
-		// Fresh ids each iteration so getCluster's per-key cache never serves a pre-stable result.
+		// Fresh ids each iteration so the redirect check's per-block memo never serves a pre-stable result.
 		const entry = a;
-		const entryNM: { getCluster(key: Uint8Array): Promise<Array<{ toString(): string }>> } =
-			(entry as any).services.networkManager;
+		const entryKeyNetwork: { findCluster(key: Uint8Array): Promise<Record<string, unknown>> } = (entry as any).keyNetwork;
 		let chosen: { blockId: string; responsible: Libp2p; driver: Libp2p } | undefined;
 		for (let i = 0; i < 200; i++) {
 			const blockId = `redirect-rt-block-${i}`;
-			const cohort = await entryNM.getCluster(routingKeyForBlock(blockId));
-			const ids = cohort.map(p => p.toString());
+			const ids = Object.keys(await entryKeyNetwork.findCluster(routingKeyForBlock(blockId)));
 			if (ids.length >= 1 && !ids.includes(entry.peerId.toString())) {
 				const responsible = mesh.find(n => n !== entry && n.peerId.toString() === ids[0]);
 				if (responsible) {
@@ -458,16 +456,14 @@ describe('Real libp2p integration', function () {
 	// Multi-member cohort coverage for the repo-redirect path
 	// (optimystic-repo-redirect-multimember-coverage). The size-1 redirect test above
 	// only ever exercises a single-peer responsible group. This test proves the hand-off
-	// still works when the responsible group has TWO members, and that the two
-	// responsibility code paths (the coordinator's findCluster vs the redirect check's
-	// getCluster) diverge benignly in a real ring:
+	// still works when the responsible group has TWO members, and that the redirect check
+	// and the coordinator agree in a real ring (both ask the node's own key network):
 	//
 	//   - A repo `get` dialed to a non-member entry E redirects to the 2-peer cohort, and
 	//     the RepoClient follows the redirect to a genuine cohort member that serves the
 	//     committed block (the commit reached BOTH members via cluster consensus).
 	//   - Each cohort member, asked the same redirect question, handles locally (no
-	//     spurious redirect) — including the live prefix-subset guard that getCluster's
-	//     cohort ⊆ findCluster's cohort, so a redirect can never point at a non-member.
+	//     spurious redirect), and its own findCluster cohort includes itself.
 	//
 	// N=4, clusterSize 2: the FRET cohort for a probed block is a proper subset of
 	// membership (2 members + 2 non-members). Entry E and driver D are the two
@@ -492,9 +488,7 @@ describe('Real libp2p integration', function () {
 		await waitFor(() => mesh.every(n => n.getPeers().length >= 3), { timeoutMs: 30_000, intervalMs: 250, description: 'the 4-node mesh fully connected' });
 
 		// Wait for real FRET two-sided stabilization: every node must rank the same whole
-		// ring (assembleCohort is not cached, so this is a clean readiness probe). With the
-		// ring stabilized the estimate is >= 2, so getCluster returns the full clusterSize-2
-		// cohort with no boundary clamping — the benign-divergence assertion holds trivially.
+		// ring (assembleCohort is not cached, so this is a clean readiness probe).
 		const fretOf = (n: Libp2p): { assembleCohort(coord: Uint8Array, wants: number): string[] } =>
 			(n as any).services.fret;
 		const probeCoord = await hashKey(new TextEncoder().encode('mm-redirect-fret-probe'));
@@ -510,19 +504,17 @@ describe('Real libp2p integration', function () {
 		}, { timeoutMs: 60_000, intervalMs: 500, description: 'FRET stabilized the 4-node ring (every node knows every peer)' });
 
 		// Probe for a block whose 2-peer responsible cohort EXCLUDES entry E = a. Fresh ids
-		// each iteration so getCluster's per-key cache never serves a pre-stable cohort.
+		// each iteration so the redirect check's per-block memo never serves a pre-stable cohort.
 		// On a hit: the two cohort nodes are the responsible members; entry a and the one
 		// remaining non-member are the two non-members. The driver D is that remaining
 		// non-member — guaranteed D !== E and D not in the cohort, so neither hop self-dials.
 		const entry = a;
-		const entryNM: { getCluster(key: Uint8Array): Promise<Array<{ toString(): string }>> } =
-			(entry as any).services.networkManager;
+		const entryKeyNetwork: { findCluster(key: Uint8Array): Promise<Record<string, unknown>> } = (entry as any).keyNetwork;
 		let chosen: { blockId: string; members: Libp2p[]; responsible: Libp2p; driver: Libp2p; cohortIds: string[] } | undefined;
 		for (let i = 0; i < 200; i++) {
 			const blockId = `mm-redirect-block-${i}`;
-			const cohort = await entryNM.getCluster(routingKeyForBlock(blockId));
-			const ids = cohort.map(p => p.toString());
-			// Require the full 2-member cohort (no estimate-driven clamp) excluding the entry.
+			const ids = Object.keys(await entryKeyNetwork.findCluster(routingKeyForBlock(blockId)));
+			// Require the full 2-member cohort excluding the entry.
 			if (ids.length !== 2) continue;
 			if (ids.includes(entry.peerId.toString())) continue;
 			const members = mesh.filter(n => ids.includes(n.peerId.toString()));
@@ -583,9 +575,8 @@ describe('Real libp2p integration', function () {
 		expect(res[blockId]?.block?.header.id, 'redirected get resolved to a multi-peer cohort member and returned the committed block').to.equal(blockId);
 
 		// --- Assertion 2: every cohort member handles locally (no spurious redirect) ---
-		// Confirm the benign-divergence property live: each member's own getCluster cohort
-		// includes itself and is a subset of the coordinator's findCluster cohort, so a
-		// redirect can never point at a non-responsible peer.
+		// The redirect check and the coordinator ask the same key network, so each member's own
+		// findCluster cohort includes itself and its redirect check agrees.
 		const keyBytes = routingKeyForBlock(blockId);
 		for (const m of members) {
 			const mLabel = m.peerId.toString().substring(0, 12);
@@ -593,15 +584,10 @@ describe('Real libp2p integration', function () {
 			const mDecision = await mRepoSvc.checkRedirect(blockId, 'get', { operations: [{ get: { blockIds: [blockId], context: { committed: [], rev: 0 } } }] });
 			expect(mDecision, `cohort member ${mLabel} handles locally (no redirect)`).to.be.null;
 
-			const mGetCluster = await (m as any).services.networkManager.getCluster(keyBytes) as Array<{ toString(): string }>;
-			const getClusterIds = mGetCluster.map(p => p.toString());
-			expect(getClusterIds, `member ${mLabel} getCluster includes itself`).to.include(m.peerId.toString());
-
 			const mFindCluster = await (m as any).keyNetwork.findCluster(keyBytes) as Record<string, unknown>;
-			const findClusterIds = new Set(Object.keys(mFindCluster));
-			for (const id of getClusterIds) {
-				expect(findClusterIds.has(id), `member ${mLabel}: getCluster cohort member ${id.substring(0, 12)} is in findCluster cohort (benign divergence)`).to.equal(true);
-			}
+			const findClusterIds = Object.keys(mFindCluster);
+			expect(findClusterIds, `member ${mLabel} findCluster includes itself`).to.include(m.peerId.toString());
+			expect([...findClusterIds].sort(), `member ${mLabel} sees the cohort the entry node redirected to`).to.deep.equal([...cohortIds].sort());
 		}
 	});
 
@@ -647,13 +633,12 @@ describe('Real libp2p integration', function () {
 
 		// Find a block whose 2-peer cohort is a proper subset of the ring. The cohort nodes are the
 		// owners; the other two are the expansion-cohort non-members the spread must reach.
-		const entryNM: { getCluster(key: Uint8Array): Promise<Array<{ toString(): string }>> } =
-			(a as any).services.networkManager;
+		// The cohort comes from the key network, the rule the owner's coordinator checks responsibility by.
+		const entryKeyNetwork: { findCluster(key: Uint8Array): Promise<Record<string, unknown>> } = (a as any).keyNetwork;
 		let chosen: { blockId: string; owner: Libp2p; nonMembers: Libp2p[] } | undefined;
 		for (let i = 0; i < 200; i++) {
 			const blockId = `spread-churn-block-${i}`;
-			const cohort = await entryNM.getCluster(routingKeyForBlock(blockId));
-			const ids = cohort.map(p => p.toString());
+			const ids = Object.keys(await entryKeyNetwork.findCluster(routingKeyForBlock(blockId)));
 			if (ids.length !== 2) continue;
 			const owners = mesh.filter(n => ids.includes(n.peerId.toString()));
 			if (owners.length !== 2) continue;

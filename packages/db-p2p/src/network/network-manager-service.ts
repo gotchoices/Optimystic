@@ -308,6 +308,10 @@ export class NetworkManagerService implements Startable {
 
 	/**
 	 * Compute cluster using FRET's assembleCohort for content-addressed peer selection.
+	 *
+	 * No production caller: `RepoService.checkRedirect` asks the node's key network instead, whose cohort is
+	 * network-membership scoped and matches what the writer routes by. See backlog
+	 * `debt-network-manager-coordinator-selection-is-a-stale-duplicate` before giving this a caller.
 	 */
 	async getCluster(key: RoutingKey): Promise<PeerId[]> {
 		const ck = this.toCacheKey(key);
@@ -349,8 +353,8 @@ export class NetworkManagerService implements Startable {
 
 		// Fallback: peer-centric clustering if FRET unavailable
 		// NOTE: this ranks the raw routing key against peer multihashes, a placement no FRET node shares; fine while
-		// FRET is always registered (Libp2pKeyPeerNetwork cannot route without it); if FRET-less nodes ever answer
-		// redirect checks, rank on hashKey(key) against FRET's peer coordinates instead.
+		// FRET is always registered (Libp2pKeyPeerNetwork cannot route without it); if this method ever regains a caller
+		// on a FRET-less node, rank on hashKey(key) against FRET's peer coordinates instead.
 		const anchor = await this.findNearestPeerToKey(key);
 		const anchorMh = anchor.toMultihash().bytes;
 		const connected: PeerId[] = (libp2p.getConnections?.() ?? []).map((c: any) => c.remotePeer);

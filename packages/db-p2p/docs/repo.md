@@ -318,7 +318,10 @@ against before deciding whether to handle a request locally or redirect it — d
 path (`RepoService.checkRedirect`) and the cluster path (`ClusterService`'s equivalent check), a node
 computes `smallMesh = cluster.length < responsibilityK`: when `smallMesh` is true, or the node is a
 member of the resolved cluster, it processes the request locally; otherwise it redirects to the
-cluster's actual members.
+cluster's actual members. On the repo path the resolved cluster is the node's own key network's
+`findCluster` for the block's routing key — the same answer the writer and `CoordinatorRepo` act on —
+memoized per block for 60 seconds. If that lookup throws, a `get` is handled locally and a write
+propagates the error, aborting the stream so the writer re-picks.
 
 The default is `1` everywhere it is constructed (`init.responsibilityK ?? 1`). At that default,
 `smallMesh` is true only for an empty resolved cluster — which does not occur in practice — so the

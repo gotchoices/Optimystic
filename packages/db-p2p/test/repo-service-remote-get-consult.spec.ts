@@ -15,8 +15,6 @@
 
 import { expect } from 'chai';
 import { localDurability } from '@optimystic/db-core';
-import { pipe } from 'it-pipe';
-import { encode as lpEncode, decode as lpDecode } from 'it-length-prefixed';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import type { PeerId } from '@libp2p/interface';
@@ -30,6 +28,7 @@ import { CoordinatorRepo, type ClusterLatestCallback } from '../src/repo/coordin
 import type { ClusterClient } from '../src/cluster/client.js';
 import { RepoService, type RepoServiceComponents } from '../src/repo/service.js';
 import { toString as u8ToString } from 'uint8arrays';
+import { encodeJson, decodeJson, makeServiceStream } from './util/protocol-stream.js';
 
 const makePeerId = async (): Promise<PeerId> => {
 	const key = await generateKeyPair('Ed25519');
@@ -84,47 +83,11 @@ const makeStorageRepo = (entry: GetBlockResult = { state: {} }): { repo: IRepo, 
 	return { repo, calls };
 };
 
-/** Length-prefix encode a JSON value into the byte chunks a libp2p stream yields. */
-async function encodeJson(value: unknown): Promise<Uint8Array[]> {
-	const chunks: Uint8Array[] = [];
-	for await (const chunk of pipe([new TextEncoder().encode(JSON.stringify(value))], lpEncode)) {
-		chunks.push(chunk.subarray());
-	}
-	return chunks;
-}
-
-/** Decode every length-prefixed JSON object out of a set of stream chunks. */
-async function decodeJson(chunks: Uint8Array[]): Promise<unknown[]> {
-	const source = (async function* () { for (const c of chunks) yield c; })();
-	const out: unknown[] = [];
-	for await (const data of pipe(source, lpDecode)) {
-		out.push(JSON.parse(new TextDecoder().decode(data.subarray())));
-	}
-	return out;
-}
-
-/** Build a service stream that sources `requestChunks` and captures sent/close/abort. */
-function makeServiceStream(requestChunks: Uint8Array[]) {
-	const sent: Uint8Array[] = [];
-	let aborted = false;
-	let resolveDone: () => void;
-	const done = new Promise<void>((resolve) => { resolveDone = resolve; });
-	const stream = {
-		send: (chunk: { subarray: () => Uint8Array }) => { sent.push(chunk.subarray()); },
-		close: async () => { resolveDone(); },
-		abort: (_err: unknown) => { aborted = true; resolveDone(); },
-		async *[Symbol.asyncIterator]() {
-			for (const chunk of requestChunks) yield chunk;
-		},
-	};
-	return { stream, sent, done, wasAborted: () => aborted };
-}
-
 const makeServiceComponents = (repo: IRepo, peerId: PeerId): RepoServiceComponents => ({
 	registrar: { handle: async () => { }, unhandle: async () => { } },
 	repo,
 	peerId,
-	// No networkManager: checkRedirect short-circuits to null, so the op is handled
+	// No keyNetwork: checkRedirect short-circuits to null, so the op is handled
 	// locally — exactly the state of a node the client already routed to.
 });
 

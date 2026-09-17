@@ -9,6 +9,7 @@ import type { FretService } from "p2p-fret";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
+import { ResponsibilityRefusalError } from "./responsibility.js";
 
 const log = createLogger('cluster')
 
@@ -291,6 +292,31 @@ export class ClusterCoordinator {
 		return { resolved: true, peerIds };
 	}
 
+	/**
+	 * A node never runs a cluster transaction for a cohort it is not in. Behind members reconcile from the
+	 * coordinator's own proof-carrying copy (its member applies before the merged record fans out), and a
+	 * coordinator outside `record.peers` is not a reconcile target — so a cohort with no holder would stay
+	 * behind and the commit durability gate would refuse, having first put this node's vote and storage
+	 * where the cohort does not look. The invariant is held here, at the one place a record's `peers` is
+	 * chosen, rather than left to the routing convention.
+	 *
+	 * Fires only on a RESOLVED cohort (at least one peer) that excludes the wired local member. An empty
+	 * cohort is a failed lookup, not a cohort this node is outside of, so it is left to `executeTransaction`'s
+	 * size checks; `CoordinatorRepo`'s solo short-circuit keeps unresolved and single-peer cohorts away from
+	 * this method altogether in any case. After its responsibility check, what remains is a multi-member
+	 * cohort that changed inside the responsibility cache's staleness window. With no local member wired the guard does not apply: that
+	 * bypass exists for wiring without an identity (direct constructors, some tests), never for production.
+	 */
+	private assertLocalMemberInCohort(blockId: BlockId, peers: ClusterPeers): void {
+		if (!this.localCluster) return;
+		const peerIds = Object.keys(peers);
+		const selfId = this.localCluster.peerId.toString();
+		if (peerIds.length === 0 || peerIds.includes(selfId)) return;
+		log('cluster-tx:not-in-cohort', { blockId, selfId, peerIds });
+		throw new ResponsibilityRefusalError('not-responsible', [blockId],
+			`refusing to coordinate a cluster transaction for a cohort this node is not in: ${peerIds.join(', ')}`);
+	}
+
 	private makeRecord(peers: ClusterPeers, messageHash: string, message: RepoMessage, membershipDigestValue: string): ClusterRecord {
 		const peerCount = Object.keys(peers ?? {}).length;
 		const record: ClusterRecord = {
@@ -396,6 +422,7 @@ export class ClusterCoordinator {
 
 		// Get the cluster peers for this block
 		const peers = await this.getClusterForBlock(blockId);
+		this.assertLocalMemberInCohort(blockId, peers);
 
 		// Bind the responsible membership into the transaction identity (v2): the digest is folded into
 		// the messageHash below, so two different peer sets produce two different messageHashes rather

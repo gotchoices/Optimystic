@@ -72,3 +72,9 @@ Pick one and make it true — the decision of *which* is part of the work:
 Either way the end state is: exactly one place in `db-p2p` decides who coordinates a key.
 Whichever route is taken, a test should pin it, so a future re-divergence fails the suite
 rather than sitting dormant again.
+
+## Arm: `getCluster` has no production caller either (2026-09-17)
+
+Appended by `coordinator-refuses-blocks-it-is-not-responsible-for`. The Background above says `getCluster` is live because `RepoService.checkRedirect` uses it. That is no longer true: the redirect check now asks the node's own key network (`Libp2pKeyPeerNetwork.findCluster` through the node's `keyNetwork` attachment), because `getCluster` answered with a different rule from the one the writer routes by (FRET's raw cohort sized to the network estimate, no network-membership scoping, its own five-minute cache), and on machines shared by several networks that could redirect a correctly routed write. `NetworkManagerService.getCluster` now joins `getCoordinator` with no production caller; nothing in `src/` calls either, and the integration specs that used to probe `getCluster` now probe the key network.
+
+So "the class as a whole cannot simply be deleted" no longer holds on that ground. What still reads the service: `getNetworkManager(node)` (public helper), the `networkManager` service registration in `libp2p-node-base.ts` (which also receives the reputation view), and `assertClusterSizeCoupling`, which compares its `clusterSize` with the key network's. Whoever resolves this ticket should decide the fate of `getCluster` alongside `getCoordinator`, and check what else on the class is still used before choosing between trimming the methods and removing the service.

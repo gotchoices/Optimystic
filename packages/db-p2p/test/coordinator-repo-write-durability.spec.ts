@@ -73,24 +73,24 @@ interface SeamOptions {
 }
 
 /**
- * A `CoordinatorRepo` over a consensus double. `cohort` is what the cohort lookup establishes;
- * `consensus` is what a cluster transaction (when one runs) hands back. The key network mirrors the
- * cohort so the responsibility check passes the same way production does — and THROWS when the
- * cohort did not resolve, which is the shape #19 reported (`isResponsibleForBlock` then assumes
- * responsible, exactly as it did on that deployment). It throws for the same reason when the cohort
- * resolved to a single peer that is not this node: that is the only way such a write reaches the
- * solo branch at all — the responsibility check's own lookup failed and fell open, and the
- * coordinator's later lookup answered with somebody else.
+ * A `CoordinatorRepo` over a consensus double. `cohort` is what the coordinator's cohort lookup
+ * establishes; `consensus` is what a cluster transaction (when one runs) hands back. The key network
+ * the responsibility check reads mirrors the cohort when this node is in it. When the cohort did not
+ * resolve, or resolved without this node, it still answers with a view that INCLUDES this node: the
+ * responsibility check fails closed on a thrown lookup and refuses a cohort that excludes this node,
+ * so the only way such a write reaches the solo branch now is the responsibility cache's staleness
+ * window — the check answered from a view taken before routing broke (the shape #19 reported) or
+ * before the cohort moved, and the coordinator's later lookup failed or answered with somebody else.
+ * The pin here is that the answer stays honest in that window.
  */
 const makeRepo = (storage: IRepo, self: PeerId | undefined, seam: SeamOptions): CoordinatorRepo => {
 	const peerIds: readonly string[] = seam.cohort.resolved ? seam.cohort.peerIds : [];
 	const selfInCohort = self === undefined || peerIds.includes(self.toString());
+	const responsibilityView = selfInCohort ? peerIds : [self.toString()];
 	const keyNetwork: IKeyNetwork = {
 		async findCoordinator(_key: Uint8Array, _o?: Partial<FindCoordinatorOptions>): Promise<PeerId> { throw new Error('not implemented'); },
 		async findCluster(_key: Uint8Array): Promise<ClusterPeers> {
-			if (!seam.cohort.resolved) throw new Error(seam.cohort.reason);
-			if (!selfInCohort) throw new Error('responsibility lookup failed (degraded routing)');
-			return Object.fromEntries(peerIds.map(id => [id, { multiaddrs: [], publicKey: '' }]));
+			return Object.fromEntries(responsibilityView.map(id => [id, { multiaddrs: [], publicKey: '' }]));
 		}
 	};
 	const repo = coordinatorRepo(keyNetwork, (_p: PeerId) => ({} as unknown as ClusterClient), { clusterSize: 3 })({
@@ -126,7 +126,8 @@ describe('CoordinatorRepo — a successful write says who holds it', () => {
 
 	describe('the solo short-circuit (GitHub #19)', () => {
 		it('a commit that reached no resolved cohort is still acknowledged, and reads unrouted with a cohort of zero', async () => {
-			// Every cohort lookup throws — the routing failure the four-machine deployment hit.
+			// The coordinator's cohort lookup throws — the routing failure the four-machine deployment hit — after
+			// the responsibility check confirmed this node from a view taken before routing broke.
 			const repo = makeRepo(storageRepo(), self, { cohort: { resolved: false, reason: 'findCluster threw: no route' } });
 
 			const result = successOf(await repo.commit(COMMIT));
@@ -309,7 +310,9 @@ describe('CoordinatorRepo — a successful write says who holds it', () => {
 		it('a coordinator outside the cohort whose fallback pend landed is not counted — confirmed never exceeds cohort', async () => {
 			// This node coordinates for a cohort it is not a member of, and its own storage accepted the
 			// pending record on the fallback arm. That copy is on nobody's reconcile path, so it is not a
-			// confirmer: the answer is the cohort's three of three, not four of three.
+			// confirmer: the answer is the cohort's three of three, not four of three. Reachable only inside
+			// the responsibility cache's staleness window, and against this consensus double: the real
+			// `ClusterCoordinator` refuses a cohort that excludes its local member before any vote.
 			const repo = makeRepo(storageRepo(), self, {
 				cohort: { resolved: true, peerIds: others },
 				consensus: { record: makeRecord(others), localExecuted: false }

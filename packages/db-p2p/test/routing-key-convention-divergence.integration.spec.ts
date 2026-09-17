@@ -26,6 +26,10 @@
  * have disjoint cohorts goes out as one batch per cohort and lands on exactly each block's cohort — the shape
  * that became reachable in production once the writer stopped being in every cohort.
  *
+ * Pinned since `coordinator-refuses-blocks-it-is-not-responsible-for`: every server's redirect check asks its own
+ * key network, the rule the writer routes by, so no write is redirected — the writer already picked inside the
+ * cohort, and a second rule no longer second-guesses it.
+ *
  * Gated on OPTIMYSTIC_INTEGRATION=1 like the other integration specs:
  *   OPTIMYSTIC_INTEGRATION=1 yarn workspace @optimystic/db-p2p test:integration -- --grep "routing-key convention"
  */
@@ -203,8 +207,6 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 			localPeerId: driver.peerId
 		});
 
-		const nm: { getCluster(key: Uint8Array): Promise<Array<{ toString(): string }>> } = (driver as any).services.networkManager;
-
 		const rows: Array<Record<string, unknown>> = [];
 		/** The servers' responsible cohort for each block, kept for the read-side split below. */
 		const serverCohorts = new Map<string, Set<string>>();
@@ -233,12 +235,12 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 			}
 			if (outcome !== 'ok') failures++;
 
-			// The servers' answer, two ways: the redirect check's `getCluster` (FRET's raw cohort) and the
-			// coordinator's own `findCluster` (same routing key, membership-scoped; the two agree when every
-			// ring member serves this network).
-			const cohort = new Set((await nm.getCluster(routingKey)).map(p => p.toString()));
-			serverCohorts.set(id, cohort);
+			// The responsible cohort: `findCluster` on the routing key, the one question the writer, every server's
+			// redirect check and every coordinator's responsibility check ask. Asked after the write, so it is the
+			// cohort the write had to land on.
 			const coordinatorView = Object.keys(await keyNetwork.findCluster(routingKey));
+			const cohort = new Set(coordinatorView);
+			serverCohorts.set(id, cohort);
 			const holders = await holdersOf(mesh, id);
 			const mine = decisions.slice(before).filter(d => d.blockKey === id);
 			const ops = handled.slice(handledBefore).filter(h => h.blockIds.includes(id));
@@ -253,8 +255,7 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 				pendLocal: ops.some(h => h.op === 'pend' && h.local),
 				remoteChecks: mine.length,
 				redirects: mine.filter(d => d.redirected).length,
-				serverCohort: [...cohort].map(p => p.substring(8, 14)).join(','),
-				coordinatorView: coordinatorView.map(p => p.substring(8, 14)).join(','),
+				serverCohort: coordinatorView.map(p => p.substring(8, 14)).join(','),
 				driverInCohort: cohort.has(driverId),
 				holders: holders.length,
 				holdersOutside: holders.filter(h => !cohort.has(h)).length,
@@ -371,6 +372,9 @@ describe('routing-key convention over real libp2p (6 nodes, clusterSize 2)', fun
 		// node, so a pend is coordinated locally exactly when the writer is responsible — no hop when it need not.
 		expect(summary.pendHandledLocally, 'a pend is coordinated by the writer\'s own node exactly when it is responsible')
 			.to.equal(summary.driverInCohort);
+		// Pinned by coordinator-refuses-blocks-it-is-not-responsible-for: the servers' redirect check applies the writer's
+		// rule, so a write the writer routed inside the cohort is never sent elsewhere.
+		expect(summary.blocksRedirected, 'no write is redirected').to.equal(0);
 		expect(failures, 'writes complete').to.equal(0);
 		expect(readOk, 'reads complete').to.equal(BLOCKS);
 	});
