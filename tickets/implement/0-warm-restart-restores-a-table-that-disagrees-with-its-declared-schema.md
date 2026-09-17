@@ -97,3 +97,15 @@ rather than `logicalType.name`, if the catalog record can carry it without break
 catalog content across machines or adding storage operations on warm start. If it can, do it and say so;
 if it cannot, say precisely why, so the maintainer knows sereus is waiting on quereus and not on us.
 Either way, the plugin fix should not *introduce* a dependency on the quereus change landing first.
+
+# Second note: this repo builds against quereus's WORKING TREE, which currently holds an uncommitted fix
+
+Root `package.json` resolves `@quereus/quereus` as `portal:../quereus/packages/quereus`, so this
+repository's tests run against whatever is in that sibling tree. As of this evening it holds an
+**uncommitted** fix for the type-alias false-positive (see `blocked/quereus-differ-treats-type-aliases-as-a-retype`).
+That can make problem 1 look solved here while the fix is neither committed nor released — the plugin's
+published range (`@quereus/quereus` `^4.19.0`) would not carry it.
+
+So: record `git -C ../quereus rev-parse HEAD` and whether `../quereus` has uncommitted changes when you run
+tests, and **do not count a green result on problem 1 as the plugin's fix** unless it holds with the
+quereus working tree at its committed HEAD. The plugin-side question in the note above still stands.

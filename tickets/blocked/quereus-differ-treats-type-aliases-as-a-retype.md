@@ -27,3 +27,17 @@ The declaration was just applied, so the diff should be empty. `computeColumnAtt
 - Carry `declaredType` into the catalog table and compare it when present, falling back to the logical type. Keeps the spelling exact, but an `int` → `bigint` edit would still emit a retype a module like Optimystic cannot run.
 
 Recommendation: the first. Add a differ test that re-applying a declaration using alias types yields an empty diff.
+
+# Status (2026-09-16 evening): fixed in quereus's working tree, NOT committed
+
+The quereus session (`quereus-08`) reports the fix done but uncommitted, pending its user:
+`computeColumnAttributeChange` now resolves the declared spelling through `inferType()` before comparing
+to the catalog's canonical `logicalType.name` (the same approach `extractDeclaredCollation` already uses
+nearby), so `int`/`INTEGER` and `varchar(20)`/`TEXT` compare equal. Verified against the repro above
+(two spurious rows before, empty diff after), regression spec in `differ-alter-column.spec.ts`, quereus
+`yarn test` 10399 passing, lint clean. Length/precision is not tracked by the catalog at all — a separate,
+absent feature, not a regression.
+
+Unblock this ticket when the fix is **committed** in quereus, and note the commit here. Delete it once a
+quereus release carrying the fix is consumed by the plugin's `@quereus/quereus` dependency range, since
+npm consumers do not see the portal-linked working tree.
