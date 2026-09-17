@@ -142,26 +142,33 @@ async update() {
     const mutated = after.length !== before.length || after.some((a, i) => a !== before[i]);
     this.pending = after;
 
-    // Invalidate cache for affected blocks; force a replay when filtering mutated pending
-    this.sourceCache.clear(entry.blockIds);
-    anyConflicts = anyConflicts || mutated || tracker.conflicts(new Set(entry.blockIds)).length > 0;
+    // Force a replay when filtering mutated pending, or an entry touched a block we staged over
+    anyConflicts = anyConflicts || mutated || this.tracker.conflicts(new Set(entry.blockIds)).length > 0;
   }
-  
-  // 4. If conflicts detected, replay local actions on updated state
+
+  // 4. In ONE synchronous step (no await inside it): forget the affected blocks, remember the
+  //    revision each must now be at least as new as, and adopt the log's revision
+  for (const entry of latest?.entries ?? []) {
+    this.sourceCache.clear(entry.blockIds);
+    this.raiseFloors(entry, revisionOf(entry));
+  }
+  this.source.actionContext = latest?.context;   // monotonic in the real code (advanceContext)
+
+  // 5. Replay local actions on the ADOPTED state — after step 4, never before it
   if (anyConflicts) {
     await this.replayActions();
   }
-  
-  // 5. Update our snapshot's revision context
-  this.source.actionContext = latest?.context;
 }
 ```
+
+This listing is a sketch: the real `updateInternal` also stops after one request when the log tail shows nothing new, finishes a half-landed write of its own before consuming its log entry, reacts to invalidation entries, and replays whenever it adopted a newer revision with anything still pending. The ordering of steps 4 and 5 is the part that is load-bearing — see "Conflict replay must read at the revision it is adopting" and the section after it in [internals.md](../../../docs/internals.md#conflict-replay-must-read-at-the-revision-it-is-adopting-not-the-one-it-is-leaving).
 
 Key aspects of the update process:
 
 - **Incremental**: Only fetches changes since the last known revision
 - **Conflict-aware**: Detects when local and remote changes affect the same blocks
 - **Selective caching**: Only invalidates cache for affected blocks
+- **Too-old answers are not kept**: Each invalidated block is remembered with the revision of the log entry that changed it. If the re-read is then answered with older content — a storage node that has not caught up — the reader still gets it, but the cache does not keep it, so the next read asks again (see "A block re-read after a refresh can be answered too old" in [internals.md](../../../docs/internals.md#a-block-re-read-after-a-refresh-can-be-answered-too-old-and-is-never-remembered))
 - **Action replay**: Re-applies local actions on the updated state to resolve conflicts
 
 ### Sync Process

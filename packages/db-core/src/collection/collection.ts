@@ -1,13 +1,14 @@
 import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms, ActionId, BlockContentDigests, StaleFailure, GetBlockResult } from "../index.js";
 import { Log } from "../log/log.js";
 import type { LogBlock } from "../log/log.js";
-import type { ActionEntry, LogEntry } from "../log/struct.js";
+import type { ActionEntry, GetFromResult, LogEntry } from "../log/struct.js";
 import { Atomic } from "../transform/atomic.js";
 import { Tracker } from "../transform/tracker.js";
 import { CacheSource } from "../transform/cache-source.js";
 import { computeBlockContentDigests } from "../transform/digest.js";
 import { copyTransforms, isTransformsEmpty } from "../transform/helpers.js";
 import { TransactorSource, answeredBlock, servedRevision } from "../transactor/transactor-source.js";
+import { BlockFloors } from "../transactor/block-floors.js";
 import type { WriteDurability } from "../network/struct.js";
 import { mergeDurability } from "../network/durability.js";
 import { highestStaleAt } from "../network/stale-failure.js";
@@ -228,6 +229,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 		private readonly sourceCache: CacheSource<IBlock>,
 		/** Tracked Changes */
 		public readonly tracker: Tracker<IBlock>,
+		/** What each block named by a walked log entry must be at least as new as — raised by
+		 * {@link updateInternal}, and shared with every read source this handle builds (see
+		 * {@link BlockFloors}). */
+		private readonly floors: BlockFloors,
 		private readonly filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined,
 		/** Short random tag naming THIS instance (see {@link newInstanceTag}). Open paths generate
 		 * it BEFORE construction (so pre-construction diagnostics such as attachToLog can carry it);
@@ -268,17 +273,18 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * would instead stage a fresh empty collection, and reads through it would report an
 	 * absent dataset as a legitimately empty one. */
 	static async open<TAction>(transactor: ITransactor, id: CollectionId, init: CollectionInitOptions<TAction>): Promise<Collection<TAction> | undefined> {
-		const { source, sourceCache, tracker, header } = await Collection.probeHeader(transactor, id);
+		// Generated BEFORE anything reads, so every diagnostic of this handle — the floors the probe
+		// wires up and the log-attach-time lines included — names the instance the same way
+		// post-construction ones do.
+		const instanceTag = Collection.newInstanceTag();
+		const { source, sourceCache, tracker, floors, header } = await Collection.probeHeader(transactor, id, instanceTag);
 		if (!header) {
 			// Return before anything is staged: the tracker's transforms stay empty, so a caller
 			// that ignores the undefined cannot later sync a phantom collection into existence.
 			return undefined;
 		}
-		// Generated BEFORE attachToLog so log-attach-time diagnostics can name the instance
-		// the same way post-construction ones do.
-		const instanceTag = Collection.newInstanceTag();
 		await Collection.attachToLog<TAction>(source, transactor, tracker, id, instanceTag, header);
-		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict, instanceTag);
+		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, instanceTag);
 		collection.logTailId = header.tailId;
 		return collection;
 	}
@@ -290,10 +296,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * bootstrap path. The create branch logs `collection:invented`; prefer {@link open} on
 	 * any pure read path. */
 	static async createOrOpen<TAction>(transactor: ITransactor, id: CollectionId, init: CollectionInitOptions<TAction>): Promise<Collection<TAction>> {
-		const { source, sourceCache, tracker, header } = await Collection.probeHeader(transactor, id);
-
 		// Pre-construction for the same reason as in open(): see the comment there.
 		const instanceTag = Collection.newInstanceTag();
+		const { source, sourceCache, tracker, floors, header } = await Collection.probeHeader(transactor, id, instanceTag);
+
 		if (header) {	// Collection already exists
 			await Collection.attachToLog<TAction>(source, transactor, tracker, id, instanceTag, header);
 		} else {	// Collection does not exist
@@ -304,28 +310,43 @@ export class Collection<TAction> implements ICollection<TAction> {
 			await Log.open<Action<TAction>>(tracker, id);
 		}
 
-		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict, instanceTag);
+		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, instanceTag);
 		collection.logTailId = header?.tailId;
 		return collection;
 	}
 
 	/** The per-instance read wiring every open path needs, plus the header probe result.
 	 * Shared by {@link open} and {@link createOrOpen} so the two cannot drift. */
-	private static async probeHeader(transactor: ITransactor, id: CollectionId): Promise<{
+	private static async probeHeader(transactor: ITransactor, id: CollectionId, instanceTag: string): Promise<{
 		source: TransactorSource<IBlock>,
 		sourceCache: CacheSource<IBlock>,
 		tracker: Tracker<IBlock>,
+		floors: BlockFloors,
 		header: CollectionHeaderBlock | undefined,
 	}> {
 		// Start with a context that has an infinite revision number to ensure that we always fetch the latest log information.
 		// One shared read-dependency collector feeds both the source (direct structural reads) and the cache (every
 		// cache hit/miss), so a block read from either layer records a dependency — cache hits included.
 		const collector = new ReadDependencyCollector();
-		const source = new TransactorSource(id, transactor, undefined, collector);
+		const floors = Collection.newFloors(id, instanceTag);
+		const source = new TransactorSource(id, transactor, undefined, collector, floors);
 		const sourceCache = new CacheSource(source, undefined, collector);
 		const tracker = new Tracker(sourceCache);
 		const header = await source.tryGet(id) as CollectionHeaderBlock | undefined;
-		return { source, sourceCache, tracker, header };
+		return { source, sourceCache, tracker, floors, header };
+	}
+
+	/** A new handle's floors: none yet (opening walks no entries), wired to report every below-floor
+	 * answer any of the handle's read sources receives. The line is the only trace such an answer
+	 * leaves — the read itself succeeds (see the accepted-tradeoff NOTE at
+	 * `TransactorSource.mayRetain`) — so repeated lines for one block with `servedRev` short of
+	 * `floorRev` are how an operator sees a machine that has not caught up, and lines that never
+	 * stop are how they see a log entry whose blocks never landed. */
+	private static newFloors(id: CollectionId, instanceTag: string): BlockFloors {
+		return new BlockFloors(({ blockId, floor, servedRev }) => {
+			log('collection:block-below-floor id=%s tag=%s block=%s floorRev=%d floorAction=%s servedRev=%d',
+				id, instanceTag, blockId, floor.rev, floor.actionId, servedRev);
+		});
 	}
 
 	/** Walk an existing collection's log and point the source at its latest action context.
@@ -819,8 +840,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// with the staged actions, the tracker and the held revision exactly as they were.
 		// The entry's revision comes from the context the same walk built; an entry older than a
 		// checkpoint is not restated there, and completeOwnEntry falls back to the attempt's own.
+		const entryRevs = Collection.revisionsByAction(latest?.context);
 		if (ownEntry !== undefined) {
-			const durability = await this.completeOwnEntry(ownEntry, latest?.context?.committed.find(c => c.actionId === ownEntry.actionId)?.rev);
+			const durability = await this.completeOwnEntry(ownEntry, entryRevs.get(ownEntry.actionId));
 			// Saved from here on, whatever below throws — record it before anything else can.
 			report.ownEntryFinished = { durability };
 		}
@@ -833,7 +855,6 @@ export class Collection<TAction> implements ICollection<TAction> {
 				? this.consumeOwnEntry(entry)
 				: this.filterAgainstEntry(entry);
 			this.pending = after;
-			this.sourceCache.clear(entry.blockIds);
 			anyConflicts = anyConflicts || mutated || this.tracker.conflicts(new Set(entry.blockIds)).length > 0;
 		}
 
@@ -844,22 +865,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// base (docs/right-is-right.md §Client notification). De-duped across cascade children by reverted
 		// block; over-inclusive by design (over-invalidation just resubmits — it never wrongly retains).
 		const invalidations = collectionLog ? await collectionLog.getInvalidationsFrom(actionContext?.rev ?? 0) : [];
-		if (invalidations.length > 0) {
-			const revertedBlockIds = [...new Set(invalidations.flatMap(inv => inv.reverted.map(r => r.blockId)))];
-			this.sourceCache.clear(revertedBlockIds);
-			if (this.pending.length > 0) {
-				anyConflicts = true;
-			}
+		const revertedBlockIds = [...new Set(invalidations.flatMap(inv => inv.reverted.map(r => r.blockId)))];
+		if (invalidations.length > 0 && this.pending.length > 0) {
+			anyConflicts = true;
 		}
 
-		// Update our context to the latest — monotonically. An empty/unopenable log yields no
-		// context at all, and a log read that lags what we already committed yields an older one;
-		// neither is grounds for forgetting the revision we hold. This must happen BEFORE
-		// replayActions below: replay re-reads blocks through this.source, which materializes
-		// content at this.actionContext.rev — if the cursor hasn't advanced yet, replay re-reads
-		// at the revision we're leaving and refills the cache with stale content that nothing
-		// will invalidate again (the log entry that would have cleared it was already consumed).
-		Collection.advanceContext(this.source, this.id, this.instanceTag, 'refresh', latest?.context);
+		this.forgetAndAdopt(latest, entryRevs, revertedBlockIds);
 
 		Collection.reportShortfall(this.id, this.instanceTag, tailRev, actionContext?.rev, this.source.actionContext?.rev);
 
@@ -874,6 +885,60 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// routinely-throwing read path, rebuild into a scratch tracker and swap on success.
 		if (this.mustReplay(anyConflicts, actionContext)) {
 			await this.replayActions();
+		}
+	}
+
+	/** Forget every block the refresh saw change, floor the ones a log entry names, and adopt the
+	 * revision the log is at — ONE synchronous step, which must stay free of any `await`.
+	 *
+	 * Reads are not latched, so one can run while a refresh is under way. Forgetting a block while
+	 * this handle still reads at the revision it is LEAVING invites exactly the wrong re-read: the
+	 * block comes back as it was at that revision (correctly — that is what was asked for, and no
+	 * floor applies to a read below it), the cache keeps it, and the advance that follows turns it
+	 * into old content nothing will ever clear, the entry that named it having been consumed. That
+	 * needs no lagging machine; storage can be perfectly current. With no gap between the forgetting
+	 * and the adopting, a concurrent read either lands before both and is forgotten with the rest,
+	 * or lands after both and is judged at the adopted revision — against the floor
+	 * ({@link TransactorSource.tryGet} reads its context when the answer arrives, not when it was
+	 * asked for) and against the generation the clear moved (`CacheSource.stillWanted`).
+	 *
+	 * The advance is monotonic (see {@link advanceContext}): an empty or unopenable log yields no
+	 * context at all, and a log read that lags what this handle already committed yields an older
+	 * one; neither is grounds for forgetting the revision held. It also has to precede
+	 * {@link replayActions}, which re-reads blocks through `this.source` at whatever revision the
+	 * context names — replaying first would refill the cache at the revision being left. */
+	private forgetAndAdopt(
+		latest: GetFromResult<Action<TAction>> | undefined,
+		entryRevs: ReadonlyMap<ActionId, number>,
+		revertedBlockIds: BlockId[],
+	): void {
+		for (const entry of latest?.entries ?? []) {
+			this.sourceCache.clear(entry.blockIds);
+			this.raiseFloors(entry, entryRevs.get(entry.actionId));
+		}
+		this.sourceCache.clear(revertedBlockIds);
+		Collection.advanceContext(this.source, this.id, this.instanceTag, 'refresh', latest?.context);
+	}
+
+	/** The revision each action in `context` committed at, keyed by action id. `Log.getFrom` returns
+	 * entries without their revisions; the context the same walk built is where they are restated. */
+	private static revisionsByAction(context: ActionContext | undefined): Map<ActionId, number> {
+		return new Map((context?.committed ?? []).map(({ actionId, rev }) => [actionId, rev]));
+	}
+
+	/** Records that the walked `entry` changed the blocks it names, so a later answer for one of
+	 * them that is older than the entry is recognised and never remembered (see {@link BlockFloors}).
+	 * Beside the cache clear on purpose (see {@link forgetAndAdopt}): the clear is what sends the next
+	 * read of these blocks back to storage, and that read is the one a lagging machine can answer too
+	 * old — after which nothing would clear the block again, this entry having been consumed.
+	 *
+	 * NOTE: an entry whose revision the walk did not restate sets no floor. That is an entry older
+	 * than the log's most recent checkpoint, and no checkpoint is written today
+	 * (tickets/backlog/debt-the-collection-log-never-writes-a-checkpoint). Once they are, such an
+	 * entry's blocks go unguarded unless `Log.getFrom` starts returning each entry's revision. */
+	private raiseFloors(entry: ActionEntry<Action<TAction>>, rev: number | undefined): void {
+		if (rev !== undefined) {
+			this.floors.raise(entry.blockIds, { rev, actionId: entry.actionId });
 		}
 	}
 
@@ -1077,8 +1142,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// pin does not occur on the paths that reach here.
 			seed = seed.filter(([, , revision]) => revision <= pinRev);
 		}
+		// The view shares this handle's floors, so a block the last refresh saw change is not kept
+		// too old by the view either — but it only CHECKS them (see BlockFloors.checkOnly): a view
+		// pinned below a floor is untouched by it, and no view retires a floor on the handle's behalf.
 		const pinnedSource = new TransactorSource<IBlock>(
-			this.id, this.transactor, structuredClone(pinContext), collector);
+			this.id, this.transactor, structuredClone(pinContext), collector, this.floors.checkOnly());
 		const pinnedCache = new CacheSource<IBlock>(
 			pinnedSource, undefined, collector, seed);
 		return new Tracker(pinnedCache, copyTransforms(transforms));

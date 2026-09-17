@@ -2,6 +2,7 @@ import { use, expect } from 'chai'
 import chaiAsPromised from 'chai-as-promised'
 use(chaiAsPromised)
 import { TransactorSource } from '../src/transactor/transactor-source.js'
+import { BlockFloors } from '../src/transactor/block-floors.js'
 import { TestTransactor } from '../src/testing/test-transactor.js'
 import { randomBytes } from '@libp2p/crypto'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
@@ -744,4 +745,64 @@ describe('TransactorSource', () => {
 			expect(expectRefused(result).pending, 'should report the untracked pending action').to.be.an('array').that.is.not.empty;
 		});
 	});
+
+	describe('answers under a floor (ticket refreshed-collection-caches-a-block-older-than-its-log-entry)', () => {
+		const blockId = 'floored-block'
+		const block: IBlock = { header: { id: blockId, type: 'T', collectionId: 'coll' } }
+		/** Answers every read with a fresh copy of `block` materialized at the next revision in
+		 *  `servedRevs` (the last one repeating), whatever was asked for — a machine that has not
+		 *  caught up past it. */
+		const servingAt = (...servedRevs: number[]): ITransactor => {
+			let reads = 0
+			return {
+				async get(gets: BlockGets): Promise<GetBlockResults> {
+					const servedRev = servedRevs[Math.min(reads++, servedRevs.length - 1)]!
+					const at = { actionId: `a${servedRev}` as ActionId, rev: servedRev }
+					return Object.fromEntries(gets.blockIds.map(id => [id, { block: structuredClone(block), materialized: at, state: { latest: at } }]))
+				},
+			} as unknown as ITransactor
+		}
+		const pinnedAt = (rev: number): ActionContext => ({ committed: [], rev })
+		const flooredAt = (rev: number) => {
+			const floors = new BlockFloors()
+			floors.raise([blockId], { rev, actionId: `a${rev}` as ActionId })
+			return floors
+		}
+
+		it('serves a below-floor answer rather than refusing it, but forbids keeping it', async () => {
+			const src = new TransactorSource<IBlock>('coll', servingAt(6), pinnedAt(7), undefined, flooredAt(7))
+			const served = await src.tryGet(blockId)
+			expect(served).to.deep.equal(block)
+			expect(src.describeServed(served!)).to.deep.equal({ rev: 6, mayRetain: false })
+			expect(src.getReadDependencies(), 'the dependency is on what was actually observed').to.deep.equal([{ blockId, revision: 6 }])
+		})
+
+		it('allows keeping an answer that meets the floor, which retires it', async () => {
+			const floors = flooredAt(7)
+			const src = new TransactorSource<IBlock>('coll', servingAt(7), pinnedAt(7), undefined, floors)
+			expect(src.describeServed((await src.tryGet(blockId))!)).to.deep.equal({ rev: 7, mayRetain: true })
+			expect(floors.size).to.equal(0)
+		})
+
+		it('describes each block it returned by the answer THAT block came from', async () => {
+			// A cache asks after an await. With two reads of one id in flight, a by-id record would
+			// describe whichever answer was processed last, pairing one answer's content with the
+			// other's revision and verdict.
+			const src = new TransactorSource<IBlock>('coll', servingAt(6, 7), pinnedAt(7), undefined, flooredAt(7))
+			const [tooOld, current] = await Promise.all([src.tryGet(blockId), src.tryGet(blockId)])
+			expect(src.describeServed(tooOld!)).to.deep.equal({ rev: 6, mayRetain: false })
+			expect(src.describeServed(current!)).to.deep.equal({ rev: 7, mayRetain: true })
+			expect(src.describeServed(structuredClone(current!)), 'an object it did not return').to.equal(undefined)
+		})
+
+		it('a source pinned below the floor may keep the older content it asked for', async () => {
+			const src = new TransactorSource<IBlock>('coll', servingAt(6), pinnedAt(6), undefined, flooredAt(7))
+			expect(src.describeServed((await src.tryGet(blockId))!)).to.deep.equal({ rev: 6, mayRetain: true })
+		})
+
+		it('a source given no floors may keep everything, as before', async () => {
+			const src = new TransactorSource<IBlock>('coll', servingAt(6), pinnedAt(7))
+			expect(src.describeServed((await src.tryGet(blockId))!)).to.deep.equal({ rev: 6, mayRetain: true })
+		})
+	})
 })

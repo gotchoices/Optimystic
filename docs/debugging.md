@@ -106,7 +106,7 @@ Both reporters on GitHub issue #8 found that turning debug logging on roughly do
 | `network-transactor`  | Batch creation sizes, retries, stale/missing, cancel triggers |
 | `batch-coordinator`   | Batch creation, retry paths, excluded peers       |
 | `cache`               | Block cache hit/miss                              |
-| `collection`          | `collection:invented` (`createOrOpen` found no committed header and staged a fresh empty collection), plus the read path's `collection:context-short-of-tail` / `collection:context-not-lowered` / `collection:lineage-divergence` and the write path's `collection:sync-stalled` |
+| `collection`          | `collection:invented` (`createOrOpen` found no committed header and staged a fresh empty collection), plus the read path's `collection:context-short-of-tail` / `collection:context-not-lowered` / `collection:lineage-divergence` / `collection:block-below-floor` and the write path's `collection:sync-stalled` |
 
 ### cohort-topic sub-namespaces
 
@@ -676,6 +676,44 @@ land.
 of a fork: the write is not behind the cluster, it is on a different history from it. Silence on
 this line during a slow sync means the opposite — the refresh *is* moving, and the sync is losing
 races rather than re-requesting a taken number.
+
+#### Did a re-read come back older than the log says?
+
+The lines above are all about the **log**: did the handle learn that it moved. This one is about the
+**blocks** the log names, read afterwards. A handle can refresh perfectly — adopt the newest
+revision, report no shortfall — and still be handed a changed block as it was before the change,
+because the machine that answers that block's read has not caught up yet.
+
+```
+optimystic:db-core:collection collection:block-below-floor id=control/CadrePeer tag=k3Vq_A block=lzv2jLqP7Uitsyn8Km0HEeoJlPe9tkUKEklo-2UPRo8 floorRev=7 floorAction=WwAYdCxUKgm-nyUOH4rw-A servedRev=6
+```
+
+- `id=` / `tag=` — the collection id and the reporting handle, as on the lines above. A pinned read
+  view reports under the tag of the handle that built it.
+- `block=` — the block that was read.
+- `floorRev=` / `floorAction=` — the block's *floor*: the revision and action id of the newest log
+  entry this handle has walked that names the block. The block's content must be at least this new
+  for any read at or above that revision.
+- `servedRev=` — the revision the returned content actually is (the answer's `materialized`
+  revision). Always below `floorRev` on this line.
+
+The read **succeeds** and returns the older content; what the line records is that the handle did
+not keep it, so the next read of the block asks storage again. One line per such answer, so how long
+the lines go on is the finding:
+
+- **They stop within about one read-repair window** (`readRepairWindowMs`, 10 s by default) — a
+  machine serving its own copy of the block had not caught up, and then did. This is the bound
+  `docs/transactions.md` § Lazy read-repair window describes, showing through. Pair it with the
+  answering node's `cluster-tx:read-repair-triggered` lines to see the repair land.
+- **They never stop, always at the same `servedRev`** — no machine holds the block at `floorRev`,
+  because the write the log entry describes never finished landing (look for a `TornActionError` on
+  the writer, around the time `floorAction` was committed). The older content is then the correct
+  content; the cost is that every read of the block through this handle is a storage request rather
+  than a memory hit, until the block is next written or the handle is reopened.
+
+Silence is not proof of freshness. A floor exists only for blocks named by entries this handle
+**walked during a refresh**, so a block first read when the handle was opened has none, and neither
+do the blocks an invalidation entry reverts.
 
 #### Comparing action ids
 

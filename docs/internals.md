@@ -105,6 +105,106 @@ rolls back. That is correct, not a leak: only the separate `committed.<Table>` p
 concurrent peer's commit is expected live-read behavior; snapshot isolation is
 opt-in via `queryCommitted()`, not the default for ordinary reads.
 
+#### A block re-read after a refresh can be answered too old, and is never remembered
+
+The trap the replay-ordering rule above closes — the read cache refilled with old content that no
+log entry will ever clear again — has a second door, and this one needs no replay and no pending
+work. A refresh that walks a log entry drops the blocks the entry names from the collection's read
+cache, so the next read of each goes back to storage pinned at the adopted revision. Nothing
+guarantees the machine that answers has caught up: a coordinator serving its own copy inside the
+lazy read-repair window (see
+[transactions.md § Lazy read-repair window](transactions.md#lazy-read-repair-window)) returns the
+block as it was, honestly labelled with a `materialized` revision below the one the entry committed
+at. The cache used to keep that answer — permanently, because the entry that would have cleared it
+had just been consumed, the cache has no expiry, and every later refresh correctly stops after one
+request when the log has not moved. Seen downstream as a reader polling four times a second and
+returning the old row for 45 s, more than 30 s after its own disk had been repaired.
+
+The reader already holds both numbers it needs to notice. The walked entry says *revision r changed
+block X* (every block an action changes is committed at that action's revision), and the answer
+says what revision its content is (`servedRevision` in
+`packages/db-core/src/transactor/transactor-source.ts`). `BlockFloors`
+(`packages/db-core/src/transactor/block-floors.ts`) keeps, per block, the revision and action id of
+the newest walked entry naming it — the block's **floor** — raised by `raiseFloors` in
+`packages/db-core/src/collection/collection.ts`, beside the cache clear. `TransactorSource.tryGet`
+weighs every served block against the floor that applies to its read: a floor applies to an unpinned
+read and to one pinned at or above it, never to a view pinned below it, which asked for older content
+and gets it exactly as before. An answer under its floor is a **below-floor answer**, and four things
+are true of it:
+
+- **It is returned, not refused.** A log entry is not proof its blocks landed: a refused write can
+  leave its entry in the log while the blocks it names never take that revision on any machine
+  (ticket `bug-a-refused-write-can-leave-its-log-entry-behind`). For such an entry the below-floor
+  content is the *correct* content and no machine can ever meet the floor, so a throw would make the
+  block unreadable — and therefore unwritable — through every handle that refreshed past the entry.
+  The accepted-tradeoff `NOTE:` at `mayRetain` in
+  `packages/db-core/src/transactor/transactor-source.ts` records this with its revisit condition.
+- **It is never remembered.** The source describes each block it returns (`describeServed`: the
+  revision its content is, and whether it may be kept), and for a below-floor answer `CacheSource.tryGet`
+  hands the block through without caching it (`handThrough` in
+  `packages/db-core/src/transform/cache-source.ts`), so the next read asks storage again and sees it
+  the moment it catches up. The description is keyed by the block **object**, not its id: the cache
+  reads it after an `await`, and with two reads of one block in flight a by-id record would pair one
+  answer's content with the other's revision and verdict. The `Tracker` has to cooperate: it memoizes *source block + staged ops*
+  and stamps the memo with the cache generation read **after** the load, so no bump the cache makes
+  while handing an answer through can stop that memo being served. It therefore memoizes only over a
+  base its source `retains` (`sourceRetains` in `packages/db-core/src/transform/tracker.ts`).
+- **It stays describable to a write staged over it.** The cache keeps the last handed-through answer
+  for `peek` and `getCachedRevision` alone — never for a read. Without that, a block updated over a
+  below-floor base would go undeclared at commit, and the storage-side guard that refuses a transform
+  whose declared base is not the one the member holds (`internalCommit` in
+  `packages/db-p2p/src/storage/storage-repo.ts`) would abstain: edits computed against the old
+  content applied over the newer content silently, where declaring the revision actually served gets
+  a loud refusal and a retry.
+- **It is reported**, as `collection:block-below-floor` (fields in
+  [debugging.md](debugging.md#did-a-re-read-come-back-older-than-the-log-says)), which is the only
+  trace it leaves.
+
+One `BlockFloors` is shared by every read source the handle builds, the way the
+`ReadDependencyCollector` is: a pinned read view created right after a refresh would otherwise fetch
+the changed block through a source that knows no floor. Views only *check* floors
+(`checkOnly`) — a floor is retired when the collection's **own** source receives an answer that meets
+it, because the floor's job is to keep the long-lived cache honest, and a view's good answer says
+nothing about who will answer the collection's own next read.
+
+**The forgetting and the adopting are one synchronous step.** Floors apply at or above their own
+revision, so they say nothing about a read made at the revision the handle is *leaving* — and reads
+are not latched, so one can run while a refresh is under way. The refresh used to forget each changed
+block as it walked the log, then `await` the invalidation read, and only then adopt the new revision.
+A read landing in that gap re-fetched the just-forgotten block at the old revision — correctly old,
+under no floor — the cache kept it, and the advance that followed turned it into old content nothing
+would ever clear. No lagging machine is needed for that; storage can be perfectly current.
+`forgetAndAdopt` in `packages/db-core/src/collection/collection.ts` now drops the changed blocks,
+raises their floors and adopts the revision with no `await` between them, so a concurrent read
+either lands before all three and is forgotten with the rest, or lands after and is judged at the
+adopted revision (`TransactorSource.tryGet` reads its context when the answer *arrives*, not when it
+was asked for). Keep it await-free.
+
+Retiring a floor on the first good answer has one consequence the cache itself has to cover. Reads
+are not serialized — the SQL layer runs reentrant scans over one handle — so two can miss on one
+block at once; the first answer meets the floor and retires it, and the second, from a machine still
+behind, then arrives unjudged. Kept, it would be kept for good. So a miss is validated after it
+lands (`stillWanted` in `packages/db-core/src/transform/cache-source.ts`): if anything happened to
+the id while the read was in flight — a concurrent load, a refresh's clear, a commit folded in, all
+of which move its generation — the answer is kept only to *replace strictly older content*, and is
+otherwise handed to its reader and dropped. The same rule closes two older races that did not need
+floors to exist: an answer requested before a refresh cleared the block used to land after the clear
+and outlive it, and one requested before the handle's own commit folded in used to overwrite the
+folded content with the older block.
+
+What this deliberately does not do. It does not ask another machine (one transactor request is all a
+`TransactorSource` can make; ticket `a-too-old-block-answer-is-retried-against-another-machine`
+builds that on these floors), so against a single lagging coordinator the old content is still
+*returned* for up to one read-repair window — the bound the storage layer already documents, instead
+of forever. It sets no floor for a block first read at open (no entries are walked then) or for the
+blocks an invalidation entry reverts. And it narrows, without closing, the hazard of a write staged
+over a too-old read (ticket `bug-a-pended-transform-does-not-carry-its-base`): once storage catches
+up, the base under already-staged edits changes with no replay. A retired floor no longer guards
+its block, so content kept, then evicted under cache pressure, then re-read from a machine that is
+*still* behind is kept too old again; the `NOTE:` on `BlockFloors` weighs that against never retiring.
+While a floor is unmet every read of its block costs a transactor request rather than a memory hit;
+the tripwire `NOTE:` at `mayRetain` names the remedy if that ever shows up.
+
 #### Conflict replay re-makes the uniqueness decision (entry guards)
 
 The replay described above is also where a concurrent duplicate-key INSERT is
@@ -1486,8 +1586,14 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `state.latest` there claimed the reader had observed content it never read, and the validator's
   stale-read check — exact equality against the block's current revision — then wrongly passed);
   `serveBlockArchive` labels the archive it serves with it; and `sourceBlockMeta` drops a push's
-  metadata when it disagrees with `state.latest`. Being optional with that fallback is what let
-  every producer that cannot report a materialized revision stay unchanged.
+  metadata when it disagrees with `state.latest`. `TransactorSource.tryGet` also weighs the same
+  number against the block's **floor** — the revision of the newest log entry the collection has
+  walked that names the block — and forbids any cache to keep an answer under it (see § A block
+  re-read after a refresh can be answered too old, and is never remembered, above). That check is
+  the reader-side counterpart of `unconfirmedAheadRev`: the repo stamps doubt it formed itself,
+  while a floor is knowledge only the *asker* holds, so an answer the repo honestly believes current
+  can still be provably too old for the read that fetched it. Being optional with that fallback is
+  what let every producer that cannot report a materialized revision stay unchanged.
 - **A peer asked for revision N serves revision N labelled N, or serves nothing.**
   `serveBlockArchive` ([`storage/block-archive.ts`](../packages/db-p2p/src/storage/block-archive.ts))
   answers every block-repair fetch, and labels the archive — revision number, action id, and the

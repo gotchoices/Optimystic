@@ -69,6 +69,19 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 		return typeof src.getGeneration === 'function' ? src.getGeneration(id) : undefined;
 	}
 
+	/** Whether the source will answer the next read of `id` from memory with the base it just served.
+	 * A source that cannot say is taken to — the behaviour before the probe, and right for every
+	 * source but a CacheSource handing an answer through unkept.
+	 *
+	 * The generation cannot carry this. A memo is stamped with the generation read AFTER the load
+	 * (see {@link tryGet}), so however the source bumps while handing an unkept answer through, the
+	 * stamp matches on the next read and the memo is served — freezing, under this tracker's staged
+	 * ops, exactly the base the source declined to freeze. */
+	private sourceRetains(id: BlockId): boolean {
+		const src = this.source as { retains?: (id: BlockId) => boolean };
+		return typeof src.retains !== 'function' || src.retains(id);
+	}
+
 	/** The drift generation from the same authority {@link probeBase} pins from — the base source,
 	 * so an Atomic validates its pins against the collection's read cache rather than against the
 	 * drift-blind tracker in between. */
@@ -119,9 +132,13 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 				// Memoize only when the source can report drift, and stamp with the generation read
 				// AFTER the load — the source may bump during tryGet (a cache miss-load), and stamping
 				// with the pre-load generation would force a needless reload on the very next read.
+				// And only over a base the source kept: one it will re-ask for must be re-asked for
+				// here too, or this memo outlives the source's own refusal to remember it.
 				const freshGen = this.sourceGeneration(id);
-				if (freshGen !== undefined) {
+				if (freshGen !== undefined && this.sourceRetains(id)) {
 					this.materialized.set(id, { block, gen: freshGen });
+				} else {
+					this.materialized.delete(id);
 				}
 				return structuredClone(block);              // clone so callers can't mutate the memo
 			}

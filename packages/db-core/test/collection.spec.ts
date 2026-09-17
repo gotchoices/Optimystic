@@ -7,29 +7,11 @@ import { waitFor } from '../src/testing/async-wait.js'
 import type { Action, ActionHandler, BlockId, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult, StaleFailure } from '../src/index.js'
 import { BlockUnavailableError, BlockPossiblyStaleError } from '../src/index.js'
 import debug from 'debug'
-import { format } from 'node:util'
+import { captureCollectionLog } from './capture-log.js'
 
 interface TestAction {
   value: string
   timestamp: number
-}
-
-/** Capture what the `db-core:collection` namespace emits while `fn` runs, fully substituted
- *  (`debug` leaves `%s`/`%d` for the downstream sink, so the raw args are not the text). */
-const captureCollectionLog = async (fn: () => Promise<void>): Promise<string[]> => {
-  const lines: string[] = []
-  const previousNamespaces = debug.disable()
-  const previousLog = debug.log
-  debug.enable('optimystic:db-core:collection')
-  debug.log = (...args: unknown[]): void => { lines.push(format(...args)) }
-  try {
-    await fn()
-  } finally {
-    debug.log = previousLog
-    debug.disable()
-    if (previousNamespaces) debug.enable(previousNamespaces)
-  }
-  return lines
 }
 
 describe('Collection', () => {

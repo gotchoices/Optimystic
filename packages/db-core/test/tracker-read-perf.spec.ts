@@ -235,4 +235,56 @@ describe('Tracker read-path memo', () => {
 			expect(src.tryGetCalls).to.equal(2);
 		});
 	});
+
+	describe('a base the source declines to keep (retains)', () => {
+		/** A generation-reporting source that says it does not keep what it serves for `unkept`
+		 * ids — a CacheSource handing a below-floor answer through. `replace` swaps content WITHOUT
+		 * bumping the generation: the tracker stamps a memo with the generation read after the load,
+		 * so no bump the source makes while serving can be what stops the memo. */
+		class DecliningSource extends FakeSource {
+			unkept = new Set<string>();
+			private replaced = new Map<string, TestBlock>();
+
+			replace(id: string, block: TestBlock) { this.replaced.set(id, block); }
+			retains(id: BlockId): boolean { return !this.unkept.has(id); }
+
+			override async tryGet(id: BlockId): Promise<TestBlock | undefined> {
+				const replaced = this.replaced.get(id);
+				if (replaced) {
+					this.tryGetCalls++;
+					return structuredClone(replaced);
+				}
+				return super.tryGet(id);
+			}
+		}
+
+		it('is not memoized under staged ops, so the next read asks the source again', async () => {
+			const src = new DecliningSource();
+			src.set('h', makeBlock('h', 'too-old', []));
+			src.unkept.add('h');
+			const tracker = new Tracker<TestBlock>(src);
+			tracker.update('h' as BlockId, appendOp('op'));
+
+			expect((await tracker.tryGet('h' as BlockId))!.data).to.equal('too-old');
+			src.replace('h', makeBlock('h', 'caught-up', []));
+			const second = await tracker.tryGet('h' as BlockId);
+			expect(second!.data, 'the source was asked again').to.equal('caught-up');
+			expect(second!.items, 'and the staged op rides on the new base').to.deep.equal(['op']);
+			expect(src.tryGetCalls).to.equal(2);
+		});
+
+		it('is memoized again once the source keeps it', async () => {
+			const src = new DecliningSource();
+			src.set('h', makeBlock('h', 'too-old', []));
+			src.unkept.add('h');
+			const tracker = new Tracker<TestBlock>(src);
+			tracker.update('h' as BlockId, appendOp('op'));
+			await tracker.tryGet('h' as BlockId);
+
+			src.unkept.delete('h');
+			await tracker.tryGet('h' as BlockId);
+			await tracker.tryGet('h' as BlockId);
+			expect(src.tryGetCalls, 'the third read is served from the memo').to.equal(2);
+		});
+	});
 });

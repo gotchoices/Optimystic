@@ -52,6 +52,12 @@ the text. Confirm that before writing it — if it turns out the shared helper g
 `node:util`, then whether the `@optimystic/db-core/test` subpath is allowed to depend on Node is a
 question worth settling deliberately rather than in passing, since that subpath is published.
 
+## Progress, 2026-09-17: the `collection.spec.ts` copy is now a module, not a fourth copy
+
+Ticket `refreshed-collection-caches-a-block-older-than-its-log-entry` needed to assert on a new `collection:*` log line from a second spec file. Rather than paste the helper again, it lifted the inline copy out of `packages/db-core/test/collection.spec.ts` **verbatim** into `packages/db-core/test/capture-log.ts` (`captureLog(namespace, fn)`, plus `captureCollectionLog`), and both `collection.spec.ts` and `refresh-below-floor.spec.ts` import it. So the count is still three, and the first entry in `files:` above should now read `packages/db-core/test/capture-log.ts`.
+
+This deliberately decides nothing this ticket left open. The module sits at the db-core test root beside the other shared test plumbing already there (`source-scan.ts`, `test-block-store.ts`, `test-log-store.ts`) — unpublished, so its use of Node's `util.format` raises no question about the published `@optimystic/db-core/test` subpath, and it is not reachable from db-p2p. It still returns formatted strings, where the other two copies return raw argument lists; that drift is unchanged. Whoever does the real consolidation should treat this file as one of the three inputs, not as the chosen home.
+
 ## Related shared-fixture work (backlog gardening, 2026-09-01)
 
 `debt-transaction-spec-oversized` carries an arm with the identical shape one directory over: the

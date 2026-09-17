@@ -5,6 +5,7 @@ import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struc
 import type { ReadDependency } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 import { blockDigestsField } from "../transform/digest.js";
+import type { BlockFloorCheck } from "./block-floors.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('transactor-source');
@@ -51,6 +52,14 @@ export function servedRevision(entry: GetBlockResult): number {
 	return entry.materialized?.rev ?? entry.state.latest?.rev ?? 0;
 }
 
+/** What a source knows about one block it returned — see {@link TransactorSource.describeServed}. */
+export type ServedBlock = {
+	/** The revision the content is ({@link servedRevision} of the answer it came from). */
+	rev: number;
+	/** Whether a cache may keep the block and serve it again without re-asking. */
+	mayRetain: boolean;
+};
+
 export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlock> {
 	/** Shared with this collection's CacheSource so cache hits also record dependencies.
 	 *  Defaults to a private instance so internal log-walk sources (which never need a
@@ -59,12 +68,20 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	/** Last revision observed per id, so CacheSource can learn the revision on a miss-load
 	 *  (it calls {@link getReadRevision} right after this source serves the block). */
 	private readRevisions = new Map<BlockId, number>();
+	/** What this source knows about each block OBJECT it returned, for {@link describeServed}. Keyed
+	 *  by the object rather than by id because a cache reads it after an `await`: with two reads of
+	 *  one id in flight, a by-id record holds whichever answer was processed last, and would pair one
+	 *  answer's content with the other's revision and verdict. Weak, so it holds nothing alive. */
+	private served = new WeakMap<IBlock, ServedBlock>();
 
 	constructor(
 		private readonly collectionId: BlockId,
 		private readonly transactor: ITransactor,
 		public actionContext: ActionContext | undefined,
 		collector?: ReadDependencyCollector,
+		/** The owning collection's floors, shared with every other read source it builds. Omitted by
+		 *  sources that walk the log or are built standalone: their answers are judged against nothing. */
+		private readonly floors?: BlockFloorCheck,
 	) {
 		this.collector = collector ?? new ReadDependencyCollector();
 	}
@@ -107,6 +124,7 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 				const rev = servedRevision(entry);
 				this.collector.record(id, rev, purpose);
 				this.readRevisions.set(id, rev);
+				this.served.set(block, { rev, mayRetain: this.mayRetain(id, rev) });
 			}
 			// TODO: if the state reports that there is a pending action, record this so that we are sure to update before syncing
 			//state.pendings
@@ -119,6 +137,42 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	 *  miss-load to learn the revision to record and store. */
 	getReadRevision(id: BlockId): number | undefined {
 		return this.readRevisions.get(id);
+	}
+
+	/** What this source knows about `block`, an object it returned from {@link tryGet}: the revision
+	 *  its content is, and whether a cache may keep it. `undefined` for any other object. CacheSource
+	 *  asks this on a miss-load, in preference to the by-id {@link getReadRevision}. */
+	describeServed(block: IBlock): ServedBlock | undefined {
+		return this.served.get(block);
+	}
+
+	/** Whether a cache may keep the block just served for `id` and serve it again without re-asking:
+	 * `false` exactly for a below-floor answer — content older than a log entry the collection has
+	 * already walked says the block is (see {@link BlockFloorCheck}). The block is handed to the
+	 * reader either way.
+	 *
+	 * NOTE: accepted tradeoff — a below-floor answer is RETURNED (uncached, and reported through the
+	 * floors as `collection:block-below-floor`), not refused with BlockPossiblyStaleError. A log entry
+	 * is not proof its blocks landed: a refused write can leave its entry in the log while the blocks
+	 * it names never take that revision on any machine
+	 * (tickets/backlog/bug-a-refused-write-can-leave-its-log-entry-behind). For such an entry the
+	 * below-floor content is the CORRECT content and no machine can ever meet the floor, so a throw
+	 * would make the block unreadable through every handle that refreshed past the entry — until the
+	 * block is next written, which cannot happen through a handle that cannot read it. A throw would
+	 * also land inside `Collection.updateInternal`'s replay and leave the tracker half re-staged.
+	 * Returning uncached instead restores the bound the storage layer already documents
+	 * (docs/transactions.md § Lazy read-repair window): the next read re-asks, so a lagging replica is
+	 * seen through within one read-repair window rather than never. Revisit if log entries ever become
+	 * proof that their blocks landed (abandoned entries made distinguishable): then an answer still
+	 * below its floor after every machine was asked should throw.
+	 *
+	 * NOTE: while a floor is unmet, every read of that block costs a transactor request instead of a
+	 * memory hit — at most one read-repair window for a lagging replica, but until the block is next
+	 * written (or the handle reopened) for an abandoned entry. Unmeasured. If it ever shows up, retire
+	 * a floor after some number of consecutive below-floor answers from a coordinator other than this
+	 * node. */
+	private mayRetain(id: BlockId, servedRev: number): boolean {
+		return !this.floors?.answeredBelowFloor(id, this.actionContext, servedRev);
 	}
 
 	getReadDependencies(): ReadDependency[] {

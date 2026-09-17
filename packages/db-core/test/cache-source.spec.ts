@@ -402,6 +402,218 @@ describe('CacheSource', () => {
 			expect(hit!.data).to.equal('alpha');
 		});
 	});
+
+	describe('an answer the source forbids keeping (describeServed)', () => {
+		/** A source that describes each block OBJECT it returns — its revision, and whether it may be
+		 *  kept — the duck-typed `describeServed` a floor-checking TransactorSource exposes. Verdict and
+		 *  revision are fixed when the block is served, as they are there. Counts fetches. */
+		function makeForbiddingSource(revs: Map<string, number>, forbidden: Set<string>) {
+			const served = new WeakMap<object, { rev: number; mayRetain: boolean }>();
+			const inner = makeSource(blocks).tryGet;
+			const src = {
+				...makeSource(blocks),
+				fetches: 0,
+				tryGet: async (id: BlockId) => {
+					src.fetches++;
+					const block = await inner(id);
+					if (block) served.set(block, { rev: revs.get(id) ?? 0, mayRetain: !forbidden.has(id) });
+					return block;
+				},
+				describeServed: (block: object) => served.get(block),
+			};
+			return src;
+		}
+
+		it('hands it to the reader but asks the source again on every read', async () => {
+			const src = makeForbiddingSource(new Map([['a', 6]]), new Set(['a']));
+			const c = new CacheSource(src as BlockSource<TestBlock>);
+
+			expect((await c.tryGet('a' as BlockId))!.data).to.equal('alpha');
+			blocks.set('a', makeBlock('a', 'caught-up'));
+			expect((await c.tryGet('a' as BlockId))!.data, 'not served from memory').to.equal('caught-up');
+			expect(src.fetches).to.equal(2);
+			expect(c.retains('a' as BlockId)).to.equal(false);
+			expect(c.snapshotEntries(), 'and never seeds a read view').to.deep.equal([]);
+		});
+
+		it('bumps the generation on every pass, so nothing built on the last answer survives', async () => {
+			const c = new CacheSource(makeForbiddingSource(new Map([['a', 6]]), new Set(['a'])) as BlockSource<TestBlock>);
+			await c.tryGet('a' as BlockId);
+			const afterFirst = c.getGeneration('a' as BlockId);
+			await c.tryGet('a' as BlockId);
+			expect(c.getGeneration('a' as BlockId)).to.be.greaterThan(afterFirst);
+		});
+
+		it('still describes it to the base probes, at the revision it was served at', async () => {
+			// A write staged over this content has to declare the base it was really built on.
+			const revs = new Map([['a', 6]]);
+			const c = new CacheSource(makeForbiddingSource(revs, new Set(['a'])) as BlockSource<TestBlock>);
+			await c.tryGet('a' as BlockId);
+			expect(c.peek('a' as BlockId)!.data).to.equal('alpha');
+			expect(c.getCachedRevision('a' as BlockId)).to.equal(6);
+		});
+
+		it('a leftover revision from an evicted load does not outrank the revision it was served at', async () => {
+			const revs = new Map([['a', 9], ['b', 1]]);
+			const forbidden = new Set<string>();
+			const tiny = new CacheSource(makeForbiddingSource(revs, forbidden) as BlockSource<TestBlock>, 1);
+			await tiny.tryGet('a' as BlockId);          // kept at 9
+			await tiny.tryGet('b' as BlockId);          // evicts 'a'; its revision entry lingers
+			forbidden.add('a');
+			revs.set('a', 6);
+			await tiny.tryGet('a' as BlockId);
+			expect(tiny.getCachedRevision('a' as BlockId)).to.equal(6);
+		});
+
+		it('records the read dependency at the served revision all the same', async () => {
+			const collector = new ReadDependencyCollector();
+			const c = new CacheSource(makeForbiddingSource(new Map([['a', 6]]), new Set(['a'])) as BlockSource<TestBlock>, undefined, collector);
+			await c.tryGet('a' as BlockId);
+			expect(collector.getReadDependencies()).to.deep.equal([{ blockId: 'a', revision: 6 }]);
+		});
+
+		it('keeps the next answer the source allows, and forgets the unkept one', async () => {
+			const revs = new Map([['a', 6]]);
+			const forbidden = new Set(['a']);
+			const src = makeForbiddingSource(revs, forbidden);
+			const c = new CacheSource(src as BlockSource<TestBlock>);
+			await c.tryGet('a' as BlockId);
+
+			forbidden.delete('a');
+			revs.set('a', 7);
+			blocks.set('a', makeBlock('a', 'caught-up'));
+			await c.tryGet('a' as BlockId);
+			expect(c.retains('a' as BlockId)).to.equal(true);
+			expect(c.getCachedRevision('a' as BlockId)).to.equal(7);
+			expect(c.peek('a' as BlockId)!.data).to.equal('caught-up');
+
+			await c.tryGet('a' as BlockId);
+			expect(src.fetches, 'now a hit').to.equal(2);
+		});
+
+		it('clear forgets the unkept answer too', async () => {
+			const c = new CacheSource(makeForbiddingSource(new Map([['a', 6]]), new Set(['a'])) as BlockSource<TestBlock>);
+			await c.tryGet('a' as BlockId);
+			const gen = c.getGeneration('a' as BlockId);
+			c.clear(['a' as BlockId]);
+			expect(c.peek('a' as BlockId)).to.be.undefined;
+			expect(c.getCachedRevision('a' as BlockId)).to.be.undefined;
+			expect(c.getGeneration('a' as BlockId)).to.be.greaterThan(gen);
+
+			await c.tryGet('a' as BlockId);
+			c.clear();
+			expect(c.peek('a' as BlockId)).to.be.undefined;
+		});
+
+		it('a committed update drops the unkept base instead of folding into it', async () => {
+			const c = new CacheSource(makeForbiddingSource(new Map([['a', 6]]), new Set(['a'])) as BlockSource<TestBlock>);
+			await c.tryGet('a' as BlockId);
+			const gen = c.getGeneration('a' as BlockId);
+
+			const appended: BlockOperation = ['items', 2, 0, ['z']];
+			c.transformCache({ updates: { a: [appended] } } as Transforms, 8);
+			expect(c.peek('a' as BlockId), 'never trusted as the content, so neither is the result').to.be.undefined;
+			expect(c.retains('a' as BlockId)).to.equal(false);
+			expect(c.getGeneration('a' as BlockId)).to.be.greaterThan(gen);
+		});
+
+		it('a source that cannot say is kept from, as before', async () => {
+			await cache.tryGet('a' as BlockId);
+			expect(cache.retains('a' as BlockId)).to.equal(true);
+		});
+	});
+
+	describe('an answer overtaken while it was in flight', () => {
+		/** A source whose reads park until released, each answering with its own content and
+		 *  revision — so a test decides the ORDER answers arrive in, independently of the order they
+		 *  were asked for. */
+		function makeGatedSource() {
+			const served = new WeakMap<object, { rev: number; mayRetain: boolean }>();
+			const waiting: Array<(block: TestBlock) => void> = [];
+			return {
+				...makeSource(blocks),
+				tryGet: (_id: BlockId) => new Promise<TestBlock | undefined>(resolve => { waiting.push(resolve); }),
+				describeServed: (block: object) => served.get(block),
+				/** Answer the OLDEST waiting read with a block 'a' holding `data`, served at `rev`. */
+				answer(data: string, rev: number, mayRetain = true) {
+					const block = makeBlock('a', data);
+					served.set(block, { rev, mayRetain });
+					waiting.shift()!(block);
+				},
+			};
+		}
+		const settle = () => new Promise<void>(resolve => setImmediate(resolve));
+
+		it('the older of two concurrent answers, arriving second, is not what the cache remembers', async () => {
+			// The shape that would re-open the too-old-forever defect: nothing clears a block but a
+			// log entry naming it, so whichever answer is kept last is kept for good.
+			const src = makeGatedSource();
+			const c = new CacheSource(src as unknown as BlockSource<TestBlock>);
+			const first = c.tryGet('a' as BlockId);
+			const second = c.tryGet('a' as BlockId);
+			src.answer('current', 7);
+			src.answer('too-old', 6);
+
+			expect((await first)!.data).to.equal('current');
+			expect((await second)!.data, 'the reader that fetched it still gets it').to.equal('too-old');
+			expect(c.peek('a' as BlockId)!.data).to.equal('current');
+			expect(c.getCachedRevision('a' as BlockId)).to.equal(7);
+		});
+
+		it('the newer of two concurrent answers, arriving second, replaces the older', async () => {
+			const src = makeGatedSource();
+			const c = new CacheSource(src as unknown as BlockSource<TestBlock>);
+			const first = c.tryGet('a' as BlockId);
+			const second = c.tryGet('a' as BlockId);
+			src.answer('too-old', 6);
+			src.answer('current', 7);
+			await Promise.all([first, second]);
+
+			expect(c.peek('a' as BlockId)!.data).to.equal('current');
+			expect(c.getCachedRevision('a' as BlockId)).to.equal(7);
+		});
+
+		it('an answer asked for before the id was cleared is not kept after it', async () => {
+			// A refresh clears a block because a log entry says it changed; an answer requested
+			// before that describes the block as it was, and would otherwise outlive the clear.
+			const src = makeGatedSource();
+			const c = new CacheSource(src as unknown as BlockSource<TestBlock>);
+			const read = c.tryGet('a' as BlockId);
+			c.clear(['a' as BlockId]);
+			src.answer('before-the-clear', 6);
+
+			expect((await read)!.data).to.equal('before-the-clear');
+			expect(c.retains('a' as BlockId)).to.equal(false);
+			expect(c.peek('a' as BlockId)).to.be.undefined;
+		});
+
+		it('an answer asked for before a commit folded in does not replace the folded content', async () => {
+			const src = makeGatedSource();
+			const c = new CacheSource(src as unknown as BlockSource<TestBlock>);
+			const read = c.tryGet('a' as BlockId);
+			c.transformCache({ inserts: { a: makeBlock('a', 'committed') } } as Transforms, 8);
+			src.answer('before-the-commit', 6);
+			await read;
+
+			expect(c.peek('a' as BlockId)!.data).to.equal('committed');
+			expect(c.getCachedRevision('a' as BlockId)).to.equal(8);
+		});
+
+		it('an unkeepable answer arriving over content a concurrent read kept leaves that content alone', async () => {
+			const src = makeGatedSource();
+			const c = new CacheSource(src as unknown as BlockSource<TestBlock>);
+			const first = c.tryGet('a' as BlockId);
+			const second = c.tryGet('a' as BlockId);
+			src.answer('current', 7);
+			await settle();
+			src.answer('too-old', 6, false);
+			await Promise.all([first, second]);
+
+			expect(c.retains('a' as BlockId)).to.equal(true);
+			expect(c.peek('a' as BlockId)!.data).to.equal('current');
+			expect(c.getCachedRevision('a' as BlockId)).to.equal(7);
+		});
+	});
 });
 
 describe('ReadDependencyCollector', () => {
