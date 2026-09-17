@@ -68,3 +68,15 @@ read summary   { readOk: 24, readMiss: 0, readThrew: 0, getsHandledRemotely: 21,
 - **The redirect memo's TTL expiry is not tested.** There is no clock seam in `RepoService`, so only "one lookup inside the TTL" is pinned, not the re-lookup after it.
 - **Phantom copies from the old rule are not swept.** Existing deployments may still hold copies of blocks outside their current cohort. Nothing in this ticket removes them, and the project makes no compatibility promise yet.
 - **Tripwires recorded as `NOTE:`** — on `responsibilityFor`: if churn makes the one-minute window matter, shorten the TTL rather than look up on every write. On `RepoService.responsibleIds`: why the two caches share a TTL but not storage. The soft-serve NOTE in `get` was restated with a new revisit condition.
+
+## Also review: the triage commit that followed (`bbb04a26`)
+
+After this ticket's implement run, tess's pre-existing-failure triage changed production code, not just tests, and committed it without a ticket, so review it here — it is the same responsibility rule this ticket enforces.
+
+The implementer's full integration run had one failure: the six-node "no read acquires a replica outside the responsible cohort" failed on slow runs (~8 s) and passed on fast ones (~4 s). Cause: `RebalanceMonitor` chose responsible peers by its own rule (FRET nearest `clamp(ceil(√n),1,3)`), ignoring `clusterSize` and the same-network filter used by `findCluster`, the writer, the coordinator's refusal and the redirect check. Triage wired `keyNetwork` and `clusterSize` into the monitor (`rebalance-monitor.ts`, `network-manager-service.ts`, `libp2p-node-base.ts`), capped the floor at `clusterSize`, and left block state alone when a lookup throws.
+
+Check in particular:
+- **Default `clusterSize` 10:** a node now stays responsible while among the nearest 10 serving peers, not the nearest 3. Confirm this cannot leave blocks held forever that were previously released, and that storage growth on mid-size networks is acceptable. The floor of 3 is unchanged for copying.
+- **Small networks (1–3 nodes):** confirm the capped floor never makes a node release a block the writer still counts as durable, and that hand-off still completes when `clusterSize` is below 3.
+- **Failed lookup:** the retry-on-timer path when `findCluster` throws. Confirm it can't spin or starve.
+- Triage's evidence: a forced-rebalance copy of the spec failed with the fix off (22 outside-cohort replicas) and passed with it on; db-p2p unit 2943 / integration 44 passing.
