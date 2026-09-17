@@ -531,6 +531,10 @@ export class RebalanceMonitor implements Startable {
 			const prior = this.responsibilitySnapshot.get(blockId)
 			const wasResponsible = prior?.responsible ?? false
 			// Consumed only once the lookup succeeded, so a failed lookup leaves it for the next check.
+			// NOTE: a block enters trackedBlocks at storage apply, but its evidence arrives only after the
+			// durable verdict (member) or cohort acknowledgement (coordinator); a check landing in that
+			// window still reports it gained + grown, the pre-evidence behaviour. If relay traces show
+			// post-commit transfers surviving, skip a block's first check while a commit touching it is in flight.
 			const evidence = this.commitEvidence.get(blockId)
 			this.commitEvidence.delete(blockId)
 

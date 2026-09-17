@@ -138,6 +138,18 @@ describe('rebalance after a commit (committed holders seed the growth memory)', 
 		await stopAll(rig);
 	});
 
+	it('a solo commit reports no holders, so the founder still pushes once peers appear', async () => {
+		const reports: unknown[] = [];
+		const mesh = await createMesh(1, {
+			responsibilityK: 1,
+			clusterSize: 1,
+			onCommittedHolders: (_node, committed) => reports.push(committed)
+		});
+		const [founder] = mesh.nodes as [MeshNode];
+		await commitThrough(founder, 'a-solo', BLOCKS);
+		expect(reports, 'no cohort ran, so nothing is evidenced').to.deep.equal([]);
+	});
+
 	it('a cohort member that never confirmed the commit is still pushed the blocks', async () => {
 		// Three members, one unreachable for the whole transaction: the commit lands on a majority, and
 		// the unreachable member is the only peer either holder should push to.
