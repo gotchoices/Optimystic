@@ -19,7 +19,38 @@
  * if hosts ever declare one table with varying case (say, across devices), fold the table name here.
  */
 
+import type { SqlValue } from '@quereus/quereus';
 import { encodeKeyTuple, splitKeyTuple } from './key-encoding.js';
+
+/**
+ * The `using optimystic(…)` arguments that say how THIS PROCESS reaches storage, not what the
+ * table is: the transactor and key network it goes through, the network's name and port, and
+ * whether to cache. They are never written to the catalog record. Two reasons: the record must
+ * be the same bytes on every machine that runs one declaration (a host compares catalogs across
+ * machines), and a table hydrated by a later session must open storage the way THAT session
+ * does — the writer's transactor and network name are how the previous era reached it. Hydrate
+ * fills them the way a fresh `create table` would: from the session's `default_vtab_args` when
+ * this module is the session's default module, then from the plugin's registration config
+ * (`resolveBinding` in `optimystic-module.ts` reads exactly these names).
+ *
+ * Everything else in the clause is identity and stays in the record — above all the collection
+ * URI (`'0'`), and the row `encoding`, which describes the bytes already in storage.
+ */
+export const SESSION_BINDING_VTAB_ARGS: ReadonlySet<string> = new Set(['transactor', 'keyNetwork', 'port', 'networkName', 'cache']);
+
+/**
+ * `args` without its session-binding entries ({@link SESSION_BINDING_VTAB_ARGS}) — the part of
+ * a table's `using` clause that is the table's identity. Undefined when nothing is left, so a
+ * record whose declaration named nothing identity-bearing carries no `vtabArgs` key at all.
+ */
+export function identityVtabArgs(args: Readonly<Record<string, SqlValue>> | undefined): Record<string, SqlValue> | undefined {
+	if (!args) return undefined;
+	const identity: Record<string, SqlValue> = {};
+	for (const [key, value] of Object.entries(args)) {
+		if (!SESSION_BINDING_VTAB_ARGS.has(key)) identity[key] = value;
+	}
+	return Object.keys(identity).length > 0 ? identity : undefined;
+}
 
 /** A table addressed by its engine schema and its name. */
 export interface QualifiedTableName {

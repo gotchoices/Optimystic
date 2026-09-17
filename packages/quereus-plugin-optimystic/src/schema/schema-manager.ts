@@ -8,16 +8,21 @@
  */
 
 import type { Tree } from '@optimystic/db-core';
-import type { TableSchema, ColumnSchema, VirtualTableModule, UniqueConstraintSchema, ConflictResolution } from '@quereus/quereus';
-import { getTypeOrDefault } from '@quereus/quereus';
+import type { TableSchema, ColumnSchema, VirtualTableModule, UniqueConstraintSchema, ConflictResolution, ForeignKeyConstraintSchema, SqlValue } from '@quereus/quereus';
+import { buildColumnIndexMap, getTypeOrDefault, inferType } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
 import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
 import type { CatalogBatchCheckpoint, CatalogEntry } from './catalog-batch.js';
-import { catalogKey, namesOfCatalogKey } from './table-identity.js';
+import { catalogKey, identityVtabArgs, namesOfCatalogKey } from './table-identity.js';
 import type { QualifiedTableName } from './table-identity.js';
 
 // IndexSchema type from TableSchema.indexes
 export type IndexSchema = NonNullable<TableSchema['indexes']>[number];
+/** Quereus's CHECK / mutation-context / expression shapes, reached through `TableSchema` (not exported by name). */
+type RowConstraintSchema = TableSchema['checkConstraints'][number];
+type MutationContextDefinition = NonNullable<TableSchema['mutationContext']>[number];
+type Expression = NonNullable<ColumnSchema['defaultValue']>;
+type ForeignKeyAction = ForeignKeyConstraintSchema['onDelete'];
 
 /**
  * Order-insensitive identity for a set of column POSITIONS — sorted and joined by `_`.
@@ -102,7 +107,41 @@ export interface StoredTableSchema {
 	primaryKeyDefaultConflict?: ConflictResolution;
 	indexes: StoredIndexSchema[];
 	vtabModuleName: string;
-	vtabArgs?: Record<string, any>;
+	/**
+	 * The table's `using optimystic(…)` arguments MINUS the session-binding ones
+	 * ({@link identityVtabArgs}): the collection URI (`'0'`) and anything else that
+	 * describes the table rather than the process reaching it. OMITTED when nothing is
+	 * left. Hydrate overlays the current session's binding on top of these.
+	 */
+	vtabArgs?: Record<string, SqlValue>;
+	/**
+	 * CHECK constraints as declared, named as Quereus minted them (`_check_<col>` for an
+	 * unnamed column CHECK). Like every table-level field below: OMITTED when the table has
+	 * none, so a table without the feature persists the same bytes as before the field
+	 * existed; rewritten from the local declaration on every write, next to the column
+	 * list it was computed against.
+	 */
+	checkConstraints?: StoredCheckConstraint[];
+	/** FOREIGN KEY constraints as declared; `columns` are positions into `columns`. */
+	foreignKeys?: StoredForeignKey[];
+	/** `with context (…)` variables. */
+	mutationContext?: StoredMutationContextVar[];
+	/** Table-level `with tags (…)`. */
+	tags?: Record<string, SqlValue>;
+	/** `TableSchema.synthesizedPrimaryKey`: the key is the all-columns fallback, not a declared one. */
+	synthesizedPrimaryKey?: boolean;
+	/**
+	 * `TableSchema.generatedColumnDependencies` as `[generated column, columns its
+	 * expression reads]` entries in ascending column order, and
+	 * `TableSchema.generatedColumnTopoOrder`, both exactly as Quereus computed them at
+	 * CREATE time. Persisted rather than recomputed on hydrate: the INSERT / UPDATE
+	 * planners iterate the topo order to compute generated columns AT ALL (a hydrated
+	 * table without it stores nothing in a generated column), and Quereus does not
+	 * export the dependency analysis. Positional, so {@link assertPositionsInRange}
+	 * checks them on every read and write.
+	 */
+	generatedColumnDependencies?: [number, number[]][];
+	generatedColumnTopoOrder?: number[];
 	/**
 	 * Catalog row count slot in our stored format. **Nothing populates it and nothing reads it
 	 * back into a live schema** — it is retained only so a schema persisted by an older build
@@ -158,30 +197,51 @@ export interface StoredTableSchema {
 
 /**
  * NOTE: a deliberate subset of Quereus's `UniqueConstraintSchema` — the fields that
- * drive enforcement. `coveringStructureName`, `tags` and `exposedIndexTags` are NOT
- * persisted (nor is `IndexSchema.tags`); they are informational or describe covering
- * materialized views, which optimystic-backed tables do not use. If a covering MV or
- * an exposed implicit index is ever pointed at an optimystic table, they must be
- * persisted too — otherwise hydrate silently drops the link.
+ * drive enforcement, plus the declared `tags`. `coveringStructureName` and
+ * `exposedIndexTags` are NOT persisted; they describe covering materialized views and
+ * exposed implicit indexes, which optimystic-backed tables do not use. If a covering
+ * MV or an exposed implicit index is ever pointed at an optimystic table, they must
+ * be persisted too — otherwise hydrate silently drops the link.
  */
 export interface StoredUniqueConstraint {
 	name?: string;
 	/** Column indices in declared order (order matters for the synthesized tree's key). */
 	columns: number[];
 	defaultConflict?: ConflictResolution;
-	/** Partial-constraint predicate AST (presence excludes it from point enforcement). */
+	/** Partial-constraint predicate AST ({@link persistExpression}; presence excludes it from point enforcement). */
 	predicate?: unknown;
+	/** Constraint `with tags (…)`; OMITTED when none. */
+	tags?: Record<string, SqlValue>;
 }
 
 export interface StoredColumnSchema {
 	name: string;
+	/**
+	 * The canonical logical type name (`INTEGER`, `TEXT`, …) the column's rows are stored
+	 * under — `logicalType.name`. What the storage-adoption guard and the row codec key on.
+	 */
 	affinity: string;
+	/**
+	 * The type spelling the declaration used (`int`, `varchar(20)`, `timestamp`), verbatim
+	 * — `ColumnSchema.declaredType`. Restored on hydrate so the rebuilt column carries
+	 * what the DDL-created one carries (the logical type is re-inferred from it, exactly as
+	 * CREATE TABLE does); `affinity` is what that inference flattens it to. OMITTED when the
+	 * declaration named no type.
+	 */
+	declaredType?: string;
 	notNull: boolean;
 	primaryKey: boolean;
 	pkOrder: number;
-	defaultValue?: any;
+	/** DEFAULT expression AST ({@link persistExpression}). OMITTED when none. */
+	defaultValue?: unknown;
 	collation: string;
+	/** Present (true) only for a user-written `COLLATE` clause — `ColumnSchema.collationExplicit`. */
+	collationExplicit?: true;
 	generated: boolean;
+	/** `GENERATED ALWAYS AS` expression AST ({@link persistExpression}); OMITTED unless generated. */
+	generatedExpr?: unknown;
+	/** Whether the generated value is STORED rather than computed on read; OMITTED unless generated. */
+	generatedStored?: boolean;
 	pkDirection?: 'asc' | 'desc';
 	/**
 	 * Column-level `on conflict <action>` (from `… primary key on conflict X` /
@@ -191,6 +251,50 @@ export interface StoredColumnSchema {
 	 * discipline.
 	 */
 	defaultConflict?: ConflictResolution;
+	/** Column `with tags (…)`; OMITTED when none. */
+	tags?: Record<string, SqlValue>;
+}
+
+/**
+ * A CHECK constraint as declared — Quereus's `RowConstraintSchema` minus the fields it
+ * sets only on a write-plan-time constraint (`violationMessage`, `messageValued`, the
+ * `referencedWriteRow*` lens bookkeeping), which never appear on a catalog table.
+ */
+export interface StoredCheckConstraint {
+	name?: string;
+	/** Constraint expression AST ({@link persistExpression}). */
+	expr: unknown;
+	/** `RowConstraintSchema.operations`: the insert / update / delete bitmask the CHECK applies to. */
+	operations: number;
+	deferrable?: boolean;
+	initiallyDeferred?: boolean;
+	defaultConflict?: ConflictResolution;
+	tags?: Record<string, SqlValue>;
+}
+
+/**
+ * A FOREIGN KEY as declared — Quereus's `ForeignKeyConstraintSchema`. `columns` are
+ * POSITIONS into the record's own column list; the referenced side is by name, as
+ * Quereus keeps it (the parent is resolved at enforcement time).
+ */
+export interface StoredForeignKey {
+	name?: string;
+	columns: number[];
+	referencedTable: string;
+	referencedSchema?: string;
+	referencedColumnNames?: string[];
+	onDelete: ForeignKeyAction;
+	onUpdate: ForeignKeyAction;
+	deferred: boolean;
+	defaultConflict?: ConflictResolution;
+	tags?: Record<string, SqlValue>;
+}
+
+/** One `with context (<name> <type> [null])` variable; `type` is the logical type name. */
+export interface StoredMutationContextVar {
+	name: string;
+	type: string;
+	notNull: boolean;
 }
 
 export interface StoredPrimaryKeyColumn {
@@ -206,8 +310,10 @@ export interface StoredIndexSchema {
 	/** Set (to true) only for a unique index; omitted otherwise so plain indexes
 	 *  stay byte-identical with schemas persisted before this field was wired. */
 	unique?: boolean;
-	/** Partial-index predicate AST (`CREATE UNIQUE INDEX … WHERE …`), if any. */
+	/** Partial-index predicate AST (`CREATE UNIQUE INDEX … WHERE …`; {@link persistExpression}), if any. */
 	predicate?: unknown;
+	/** Index `with tags (…)`; OMITTED when none. */
+	tags?: Record<string, SqlValue>;
 }
 
 /** Resolved index column: `index` is a position into the owning schema's `columns`. */
@@ -231,17 +337,19 @@ export interface StoredIndexColumn {
  * loudly. {@link SchemaManager} owns the ONLY conversions between the two shapes:
  * {@link toStoredSchema} on every read, {@link toPersistedSchema} on every write.
  *
- * `primaryKeyDefinition` and `uniqueConstraints` stay positional: both are re-written
- * from the local declaration on every write, always alongside the column list from
- * the same declaration, so they cannot drift — and {@link assertPositionsInRange}
- * checks that invariant at every write so the day one of them is preserved across
- * writes the way `indexes` is, the drift is caught instead of persisted.
+ * `primaryKeyDefinition`, `uniqueConstraints`, `foreignKeys` and the generated-column
+ * fields stay positional: all are re-written from the local declaration on every write,
+ * always alongside the column list from the same declaration, so they cannot drift — and
+ * {@link assertPositionsInRange} checks that invariant at every write so the day one of
+ * them is preserved across writes the way `indexes` is, the drift is caught instead of
+ * persisted.
  *
- * The partial-index / partial-constraint `predicate` ASTs are persisted verbatim and
- * need no conversion: they are Quereus parser `Expression` trees, whose every column
- * reference (`ColumnExpr`, `IdentifierExpr`) carries a column NAME — the union has no
- * positional column node at all — so a predicate cannot outlive its column list the
- * way a positional index descriptor could. Audited against Quereus 4.17.
+ * The expression ASTs (partial-index / partial-constraint `predicate`, column
+ * `defaultValue` and `generatedExpr`, CHECK `expr`) are persisted as Quereus parser
+ * `Expression` trees ({@link persistExpression}) and need no positional conversion:
+ * every column reference (`ColumnExpr`, `IdentifierExpr`) carries a column NAME — the
+ * union has no positional column node at all — so an expression cannot outlive its
+ * column list the way a positional index descriptor could. Audited against Quereus 4.17.
  */
 export interface PersistedTableSchema extends Omit<StoredTableSchema, 'indexes'> {
 	indexes: PersistedIndexSchema[];
@@ -365,6 +473,49 @@ function assertPositionsInRange(record: PersistedTableSchema): void {
 	for (const uc of record.uniqueConstraints ?? []) {
 		for (const position of uc.columns) check(position, `unique constraint ${uc.name ? `'${uc.name}' ` : ''}column`);
 	}
+	for (const fk of record.foreignKeys ?? []) {
+		for (const position of fk.columns) check(position, `foreign key ${fk.name ? `'${fk.name}' ` : ''}column`);
+	}
+	for (const [generated, dependencies] of record.generatedColumnDependencies ?? []) {
+		check(generated, 'generated column');
+		for (const position of dependencies) check(position, `generated column ${generated} dependency`);
+	}
+	for (const position of record.generatedColumnTopoOrder ?? []) check(position, 'generated column order');
+}
+
+/**
+ * An expression AST as the catalog stores it: the same nodes Quereus's parser produced,
+ * with every `loc` (a parser position — whitespace, not meaning) removed and keys in
+ * sorted order, so one declaration persists the same bytes on every machine that runs it
+ * and a hydrated table's expressions compare equal to the declared ones. Nothing is
+ * re-encoded: the result IS a valid `Expression`, and hydrate hands it back as is.
+ * Applied to every expression the record carries — defaults, generated expressions,
+ * CHECK bodies, partial predicates.
+ *
+ * NOTE: a blob literal's `Uint8Array` is passed through untouched, and the JSON catalog
+ * encoding cannot represent it (nor a bigint literal). No declaration in use defaults to
+ * or checks against a blob literal; if one ever does, encode literal values here explicitly.
+ */
+export function persistExpression(node: unknown): unknown {
+	if (Array.isArray(node)) return node.map(persistExpression);
+	if (node === null || typeof node !== 'object' || node instanceof Uint8Array) return node;
+	const persisted: Record<string, unknown> = {};
+	for (const key of Object.keys(node).sort()) {
+		if (key === 'loc') continue;
+		const value = (node as Record<string, unknown>)[key];
+		if (value !== undefined) persisted[key] = persistExpression(value);
+	}
+	return persisted;
+}
+
+/** `items` when it has any, else undefined — so an empty list is OMITTED from the record. */
+function nonEmpty<T>(items: readonly T[] | undefined): T[] | undefined {
+	return items && items.length > 0 ? [...items] : undefined;
+}
+
+/** A copy of `tags` when it has any, else undefined — so tag-free objects carry no key. */
+function copyTags(tags: Readonly<Record<string, SqlValue>> | undefined): Record<string, SqlValue> | undefined {
+	return tags && Object.keys(tags).length > 0 ? { ...tags } : undefined;
 }
 
 /**
@@ -1072,30 +1223,26 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Build a Quereus TableSchema from a persisted StoredTableSchema. Used
-	 * during catalog hydration so Quereus's in-memory catalog can short-circuit
-	 * `apply schema` diffs against tables already present in storage.
+	 * Build a Quereus TableSchema from a persisted StoredTableSchema — the table the
+	 * declaration would create in THIS session, field for field. Used during catalog
+	 * hydration so Quereus's in-memory catalog can short-circuit `apply schema` diffs
+	 * against tables already present in storage; what hydrate leaves out of the rebuilt
+	 * table is not diffed back in (mutation contexts are never compared) or surfaces as a
+	 * spurious ALTER (a type spelling), so the record carries everything and this restores
+	 * everything. `hydrate-restores-declared-table.spec.ts` compares the result against a
+	 * DDL-created table key by key.
+	 *
+	 * `sessionVtabArgs` is how the CURRENT session reaches storage — its `default_vtab_args`
+	 * when this module is its default module — overlaid under the record's identity args
+	 * (see {@link identityVtabArgs}); the record itself never carries a binding.
 	 */
 	storedToTableSchema(
 		stored: StoredTableSchema,
 		vtabModule: VirtualTableModule<any, any>,
-		vtabAuxData?: unknown
+		vtabAuxData?: unknown,
+		sessionVtabArgs: Readonly<Record<string, SqlValue>> = {}
 	): TableSchema {
-		const columns: ColumnSchema[] = stored.columns.map(col => ({
-			name: col.name,
-			logicalType: getTypeOrDefault(col.affinity),
-			notNull: col.notNull,
-			primaryKey: col.primaryKey,
-			pkOrder: col.pkOrder,
-			defaultValue: col.defaultValue ?? null,
-			collation: col.collation,
-			generated: col.generated,
-			pkDirection: col.pkDirection,
-			defaultConflict: col.defaultConflict,
-		}));
-		const columnIndexMap = new Map<string, number>(
-			columns.map((col, index) => [col.name.toLowerCase(), index])
-		);
+		const columns = stored.columns.map(col => this.storedToColumnSchema(col));
 		const primaryKeyDefinition = stored.primaryKeyDefinition.map(pk => ({
 			index: pk.index,
 			desc: pk.desc,
@@ -1105,21 +1252,93 @@ export class SchemaManager {
 			name: stored.name,
 			schemaName: stored.schemaName,
 			columns,
-			columnIndexMap,
+			columnIndexMap: buildColumnIndexMap(columns),
 			primaryKeyDefinition,
 			primaryKeyDefaultConflict: stored.primaryKeyDefaultConflict,
-			checkConstraints: [],
+			synthesizedPrimaryKey: stored.synthesizedPrimaryKey,
+			checkConstraints: (stored.checkConstraints ?? []).map(check => this.storedToCheckConstraint(check)),
+			foreignKeys: stored.foreignKeys?.map(fk => this.storedToForeignKey(fk)),
 			vtabModule,
 			vtabAuxData,
-			vtabArgs: stored.vtabArgs,
+			vtabArgs: { ...sessionVtabArgs, ...stored.vtabArgs },
 			vtabModuleName: stored.vtabModuleName,
 			isView: false,
-			indexes: this.storedIndexesToIndexSchemas(stored.indexes),
+			// Absent, not `[]`, for a table with no index: CREATE TABLE sets no `indexes` and
+			// the first CREATE INDEX starts the list, so that is the shape a declared table has.
+			indexes: stored.indexes.length > 0 ? this.storedIndexesToIndexSchemas(stored.indexes) : undefined,
 			// No `statistics`: see StoredTableSchema.estimatedRows. Absent is the honest answer —
 			// quereus reads absent as "nobody has measured this table" and applies its own
 			// fallback, whereas any value we synthesized here would claim an ANALYZE that never
 			// ran and, with no column statistics behind it, would claim it badly.
 			uniqueConstraints: this.storedToUniqueConstraints(stored),
+			mutationContext: stored.mutationContext?.map(variable => this.storedToMutationContextVar(variable)),
+			generatedColumnDependencies: stored.generatedColumnDependencies
+				? new Map(stored.generatedColumnDependencies.map(([generated, dependencies]) => [generated, [...dependencies]]))
+				: undefined,
+			generatedColumnTopoOrder: stored.generatedColumnTopoOrder ? [...stored.generatedColumnTopoOrder] : undefined,
+			tags: copyTags(stored.tags),
+		};
+	}
+
+	/**
+	 * One column of a hydrated table — the inverse of {@link columnSchemaToStored}. The
+	 * logical type is re-inferred from the declared spelling by the same rule CREATE TABLE
+	 * uses (`inferType`), falling back to the stored canonical name for a column declared
+	 * without a type. Also used by the vtab's own load arm (a `connect` whose caller
+	 * supplied no columns), so the two never rebuild a column differently.
+	 */
+	storedToColumnSchema(col: StoredColumnSchema): ColumnSchema {
+		return {
+			name: col.name,
+			logicalType: col.declaredType !== undefined ? inferType(col.declaredType) : getTypeOrDefault(col.affinity),
+			declaredType: col.declaredType,
+			notNull: col.notNull,
+			primaryKey: col.primaryKey,
+			pkOrder: col.pkOrder,
+			defaultValue: (col.defaultValue as Expression | undefined) ?? null,
+			collation: col.collation,
+			collationExplicit: col.collationExplicit,
+			generated: col.generated,
+			generatedExpr: col.generatedExpr as Expression | undefined,
+			generatedStored: col.generatedStored,
+			pkDirection: col.pkDirection,
+			defaultConflict: col.defaultConflict,
+			tags: copyTags(col.tags),
+		};
+	}
+
+	private storedToCheckConstraint(check: StoredCheckConstraint): RowConstraintSchema {
+		return {
+			name: check.name,
+			expr: check.expr as Expression,
+			operations: check.operations as RowConstraintSchema['operations'],
+			deferrable: check.deferrable,
+			initiallyDeferred: check.initiallyDeferred,
+			defaultConflict: check.defaultConflict,
+			tags: copyTags(check.tags),
+		};
+	}
+
+	private storedToForeignKey(fk: StoredForeignKey): ForeignKeyConstraintSchema {
+		return {
+			name: fk.name,
+			columns: [...fk.columns],
+			referencedTable: fk.referencedTable,
+			referencedSchema: fk.referencedSchema,
+			referencedColumnNames: fk.referencedColumnNames ? [...fk.referencedColumnNames] : undefined,
+			onDelete: fk.onDelete,
+			onUpdate: fk.onUpdate,
+			deferred: fk.deferred,
+			defaultConflict: fk.defaultConflict,
+			tags: copyTags(fk.tags),
+		};
+	}
+
+	private storedToMutationContextVar(variable: StoredMutationContextVar): MutationContextDefinition {
+		return {
+			name: variable.name,
+			logicalType: getTypeOrDefault(variable.type),
+			notNull: variable.notNull,
 		};
 	}
 
@@ -1139,6 +1358,7 @@ export class SchemaManager {
 			})),
 			unique: idx.unique ? true : undefined,
 			predicate: idx.predicate as IndexSchema['predicate'],
+			tags: copyTags(idx.tags),
 		}));
 	}
 
@@ -1147,7 +1367,8 @@ export class SchemaManager {
 	 * the persisted non-derived constraints, plus one derived constraint per
 	 * persisted `unique` index (mirroring what Quereus's
 	 * `appendIndexToTableSchema` synthesizes when the `CREATE UNIQUE INDEX` DDL
-	 * actually runs — which it does not on the hydrate path). Deduped by
+	 * actually runs — which it does not on the hydrate path — down to the
+	 * constraint being named after its index). Deduped by
 	 * {@link uniqueConstraintKey}, so a unique index over columns already carrying
 	 * a table-level UNIQUE contributes no second constraint, while a partial index
 	 * never dedupes away the full constraint it shares columns with. Returns
@@ -1159,11 +1380,13 @@ export class SchemaManager {
 			columns: [...uc.columns],
 			defaultConflict: uc.defaultConflict,
 			predicate: uc.predicate as UniqueConstraintSchema['predicate'],
+			tags: copyTags(uc.tags),
 		}));
 		const seen = new Set(constraints.map(uniqueConstraintKey));
 		for (const idx of stored.indexes) {
 			if (!idx.unique) continue;
 			const derived: UniqueConstraintSchema = {
+				name: idx.name,
 				columns: idx.columns.map(col => col.index),
 				predicate: idx.predicate as UniqueConstraintSchema['predicate'],
 				derivedFromIndex: idx.name,
@@ -1193,8 +1416,14 @@ export class SchemaManager {
 				name: uc.name,
 				columns: [...uc.columns],
 				defaultConflict: uc.defaultConflict,
-				predicate: uc.predicate,
+				predicate: uc.predicate ? persistExpression(uc.predicate) : undefined,
+				tags: copyTags(uc.tags),
 			}));
+		const generatedColumnDependencies = schema.generatedColumnDependencies
+			? [...schema.generatedColumnDependencies.entries()]
+				.sort(([a], [b]) => a - b)
+				.map(([generated, dependencies]): [number, number[]] => [generated, [...dependencies]])
+			: undefined;
 		return {
 			name: schema.name,
 			schemaName: schema.schemaName,
@@ -1209,36 +1438,81 @@ export class SchemaManager {
 			primaryKeyDefaultConflict: schema.primaryKeyDefaultConflict,
 			indexes: (schema.indexes || []).map(idx => this.indexSchemaToStored(idx)),
 			vtabModuleName: schema.vtabModuleName,
-			vtabArgs: schema.vtabArgs as Record<string, any>,
+			vtabArgs: identityVtabArgs(schema.vtabArgs),
 			// `estimatedRows` is deliberately not emitted: see StoredTableSchema.estimatedRows.
 			// Omitting it keeps this byte-identical with every schema persisted before quereus
 			// 4.19 moved the row count onto `statistics`, so the migration costs no rewrites.
-			uniqueConstraints: uniqueConstraints.length > 0 ? uniqueConstraints : undefined,
+			uniqueConstraints: nonEmpty(uniqueConstraints),
+			checkConstraints: nonEmpty(schema.checkConstraints.map(check => this.checkConstraintToStored(check))),
+			foreignKeys: nonEmpty(schema.foreignKeys?.map(fk => this.foreignKeyToStored(fk))),
+			mutationContext: nonEmpty(schema.mutationContext?.map(variable => ({
+				name: variable.name,
+				type: variable.logicalType.name,
+				notNull: variable.notNull,
+			}))),
+			tags: copyTags(schema.tags),
+			synthesizedPrimaryKey: schema.synthesizedPrimaryKey,
+			generatedColumnDependencies: nonEmpty(generatedColumnDependencies),
+			generatedColumnTopoOrder: nonEmpty(schema.generatedColumnTopoOrder),
 		};
 	}
 
 	/**
-	 * Convert ColumnSchema to storable format
+	 * Convert ColumnSchema to storable format — the inverse of {@link storedToColumnSchema}.
 	 */
 	private columnSchemaToStored(col: ColumnSchema): StoredColumnSchema {
 		return {
 			name: col.name,
-			affinity: col.logicalType.name, // Use logicalType.name for storage
+			affinity: col.logicalType.name,
+			declaredType: col.declaredType,
 			notNull: col.notNull,
 			primaryKey: col.primaryKey,
 			pkOrder: col.pkOrder,
-			defaultValue: col.defaultValue ? this.serializeExpression(col.defaultValue) : undefined,
+			defaultValue: col.defaultValue ? persistExpression(col.defaultValue) : undefined,
 			collation: col.collation,
+			collationExplicit: col.collationExplicit ? true : undefined,
 			generated: col.generated,
+			generatedExpr: col.generatedExpr ? persistExpression(col.generatedExpr) : undefined,
+			generatedStored: col.generatedStored,
 			pkDirection: col.pkDirection,
 			defaultConflict: col.defaultConflict,
+			tags: copyTags(col.tags),
+		};
+	}
+
+	private checkConstraintToStored(check: RowConstraintSchema): StoredCheckConstraint {
+		return {
+			name: check.name,
+			expr: persistExpression(check.expr),
+			operations: check.operations,
+			deferrable: check.deferrable,
+			initiallyDeferred: check.initiallyDeferred,
+			defaultConflict: check.defaultConflict,
+			tags: copyTags(check.tags),
+		};
+	}
+
+	private foreignKeyToStored(fk: ForeignKeyConstraintSchema): StoredForeignKey {
+		return {
+			name: fk.name,
+			columns: [...fk.columns],
+			referencedTable: fk.referencedTable,
+			referencedSchema: fk.referencedSchema,
+			referencedColumnNames: fk.referencedColumnNames ? [...fk.referencedColumnNames] : undefined,
+			onDelete: fk.onDelete,
+			onUpdate: fk.onUpdate,
+			deferred: fk.deferred,
+			defaultConflict: fk.defaultConflict,
+			tags: copyTags(fk.tags),
 		};
 	}
 
 	/**
-	 * Convert IndexSchema to storable format
+	 * Convert IndexSchema to storable format — the ONE place an index descriptor takes its
+	 * persisted shape, used by {@link tableSchemaToStored} and by the vtab's `addIndex`
+	 * when it appends or upgrades a persisted index, so the two cannot drift.
 	 */
-	private indexSchemaToStored(idx: IndexSchema): StoredIndexSchema {
+	indexSchemaToStored(idx: IndexSchema): StoredIndexSchema {
 		return {
 			name: idx.name,
 			columns: idx.columns.map((col: { index: number; desc?: boolean; collation?: string }) => ({
@@ -1249,25 +1523,9 @@ export class SchemaManager {
 			// Normalize false → omitted so a plain index round-trips byte-identical
 			// with schemas persisted before uniqueness metadata was wired through.
 			unique: idx.unique ? true : undefined,
-			predicate: idx.predicate,
+			predicate: idx.predicate ? persistExpression(idx.predicate) : undefined,
+			tags: copyTags(idx.tags),
 		};
-	}
-
-	/**
-	 * Serialize an expression for storage
-	 * For now, we'll store a simplified representation
-	 */
-	private serializeExpression(expr: any): any {
-		// TODO: Implement proper expression serialization
-		// For now, just store the expression as-is if it's a simple value
-		if (typeof expr === 'object' && expr !== null) {
-			if ('type' in expr && expr.type === 'literal') {
-				return { type: 'literal', value: expr.value };
-			}
-			// For complex expressions, we'll need to implement full serialization
-			return { type: 'complex', raw: JSON.stringify(expr) };
-		}
-		return expr;
 	}
 }
 

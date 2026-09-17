@@ -13,9 +13,10 @@
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
-import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p';
+import { MemoryRawStorage } from '@optimystic/db-p2p';
 import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
+import { buildSharedLocalTransactor } from './shared-local-transactor.js';
 
 type Row = Record<string, SqlValue>;
 
@@ -24,22 +25,6 @@ const collectRows = async (iter: AsyncIterable<Row>): Promise<Row[]> => {
 	for await (const row of iter) rows.push(row);
 	return rows;
 };
-
-/** Build a `local`-style transactor over the supplied raw storage. Constructed
- * once so both plugin instances can share a single transactor and Trees opened
- * by either side see the other's writes. (CollectionFactory normally caches
- * transactors per-instance, so two plugin instances would otherwise build two
- * transactors with two independent trackers.) */
-function buildSharedLocalTransactor(storage: MemoryRawStorage): ITransactor {
-	const repo = new StorageRepo((blockId) => new BlockStorage(blockId, storage));
-	return {
-		async get(blockGets) { return await repo.get(blockGets); },
-		async getStatus(_trxRefs) { throw new Error('getStatus not implemented in test transactor'); },
-		async pend(request) { return await repo.pend(request); },
-		async commit(request) { return await repo.commit(request); },
-		async cancel(trxRef) { return await repo.cancel(trxRef); },
-	} as ITransactor;
-}
 
 function registerWithSharedTransactor(db: Database, transactor: ITransactor) {
 	const plugin = register(db, {

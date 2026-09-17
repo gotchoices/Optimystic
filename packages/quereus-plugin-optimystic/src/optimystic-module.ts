@@ -20,8 +20,7 @@ import { SchemaManager, columnSetKey, mergeIndexLists, uniqueConstraintKey, uniq
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { defaultCollectionUri, type QualifiedTableName } from './schema/table-identity.js';
-import { SqlDataType, PhysicalType } from '@quereus/quereus';
-import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
+import { PhysicalType } from '@quereus/quereus';
 import { IndexManager, hasNullIndexValue, indexEntryKey, indexKeyFromValues, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
 import { compareIndexToRows, type IndexIntegrityReport } from './schema/index-integrity.js';
 import type { PrimaryKeyTuple } from './schema/key-tuples.js';
@@ -269,27 +268,36 @@ function unmaintainedIndexMessage(tableName: string, indexName: string, detail: 
 type DeferIndexFlush = (indexName: string, tree: Tree<string, IndexEntry>) => void;
 
 /**
- * Helper function to convert SqlDataType affinity to LogicalType
+ * How a table reaches storage — the transactor and key network it goes through, the
+ * network's name and port, and the raw-storage factory — resolved the one way every path
+ * resolves it: a `using optimystic(...)` argument (or, for a hydrated table, the session's
+ * `default_vtab_args`) wins over the plugin's registration config (`default_transactor`
+ * and friends, surfaced as `vtabAuxData`), which wins over the production defaults. The
+ * argument names read here are exactly {@link SESSION_BINDING_VTAB_ARGS} plus `encoding`
+ * and `cache`, which the callers read themselves — keep the two lists in step.
  */
-function affinityToLogicalType(affinity: SqlDataType): LogicalType {
-	switch (affinity) {
-		case SqlDataType.NULL:
-			return NULL_TYPE;
-		case SqlDataType.INTEGER:
-			return INTEGER_TYPE;
-		case SqlDataType.REAL:
-			return REAL_TYPE;
-		case SqlDataType.TEXT:
-			return TEXT_TYPE;
-		case SqlDataType.BLOB:
-			return BLOB_TYPE;
-		case SqlDataType.NUMERIC:
-			return NUMERIC_TYPE;
-		case SqlDataType.BOOLEAN:
-			return BOOLEAN_TYPE;
-		default:
-			return BLOB_TYPE; // Default fallback
-	}
+function resolveBinding(
+  args: Readonly<Record<string, SqlValue>>,
+  aux: Readonly<Record<string, unknown>>,
+): Pick<ParsedOptimysticOptions, 'transactor' | 'keyNetwork' | 'libp2pOptions' | 'rawStorageFactory'> {
+  const transactor = (args['transactor'] as string) || (aux['default_transactor'] as string) || 'network';
+  const keyNetwork = (args['keyNetwork'] as string) || (aux['default_key_network'] as string) || 'libp2p';
+  const port = typeof args['port'] === 'number' ? args['port'] : (typeof aux['default_port'] === 'number' ? aux['default_port'] as number : 0);
+  const networkName = (args['networkName'] as string) || (aux['default_network_name'] as string) || 'optimystic';
+  // Plugin-level only (not exposed via per-table USING args because it's a function reference).
+  const rawStorageFactory = typeof aux['rawStorageFactory'] === 'function'
+    ? (aux['rawStorageFactory'] as () => IRawStorage)
+    : undefined;
+  return {
+    transactor,
+    keyNetwork,
+    libp2pOptions: {
+      port,
+      networkName,
+      bootstrapNodes: [],
+    },
+    rawStorageFactory,
+  };
 }
 
 /**
@@ -703,17 +711,8 @@ export class OptimysticVirtualTable extends VirtualTable {
         }
       } else if (persistedSchema) {
         this.tableSchema.columns = persistedSchema.columns.map((col, index) => ({
-          name: col.name,
+          ...this.schemaManager.storedToColumnSchema(col),
           affinity: col.affinity as any,
-          logicalType: affinityToLogicalType(col.affinity as any),
-          notNull: col.notNull,
-          primaryKey: col.primaryKey,
-          pkOrder: col.pkOrder,
-          defaultValue: col.defaultValue,
-          collation: col.collation,
-          generated: col.generated,
-          pkDirection: col.pkDirection,
-          defaultConflict: col.defaultConflict,
           index,
         }));
         this.tableSchema.columnIndexMap = new Map(
@@ -2865,11 +2864,12 @@ export class OptimysticVirtualTable extends VirtualTable {
       // write; subsequent re-declares see them present and skip).
       let effective = storedSchema;
       if (indexSchema.unique && !existing.unique) {
+        const { unique, predicate } = this.schemaManager.indexSchemaToStored(indexSchema);
         const upgraded: StoredTableSchema = {
           ...storedSchema,
           indexes: storedSchema.indexes.map(idx =>
             idx.name === indexSchema.name
-              ? { ...idx, unique: true, predicate: indexSchema.predicate }
+              ? { ...idx, unique, predicate }
               : idx,
           ),
         };
@@ -2915,16 +2915,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     // later hydrate-only open can reconstruct the derived UNIQUE constraint.
     const updatedSchema: StoredTableSchema = {
       ...storedSchema,
-      indexes: [...storedSchema.indexes, {
-        name: indexSchema.name,
-        columns: indexSchema.columns.map((col: { index: number; desc?: boolean; collation?: string }) => ({
-          index: col.index,
-          desc: col.desc,
-          collation: col.collation,
-        })),
-        unique: indexSchema.unique ? true : undefined,
-        predicate: indexSchema.predicate,
-      }],
+      indexes: [...storedSchema.indexes, this.schemaManager.indexSchemaToStored(indexSchema)],
     };
 
     // Save the updated schema. Persist the merged stored form directly — the old
@@ -3872,33 +3863,12 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     // which includes the engine schema so same-named tables in two schemas never share storage.
     const collectionUri = (args['0'] as string) || defaultCollectionUri(tableSchema.schemaName, tableSchema.name);
 
-    // Extract named arguments
-    const transactor = (args['transactor'] as string) || (aux['default_transactor'] as string) || 'network';
-    const keyNetwork = (args['keyNetwork'] as string) || (aux['default_key_network'] as string) || 'libp2p';
-    const port = typeof args['port'] === 'number' ? args['port'] : (typeof aux['default_port'] === 'number' ? aux['default_port'] as number : 0);
-    const networkName = (args['networkName'] as string) || (aux['default_network_name'] as string) || 'optimystic';
-    const cache = args['cache'] !== false;
-    const encoding = (args['encoding'] as 'json' | 'msgpack') || 'json';
-    // Plugin-level only (not exposed via per-table USING args because it's a function reference).
-    const rawStorageFactory = typeof aux['rawStorageFactory'] === 'function'
-      ? (aux['rawStorageFactory'] as () => IRawStorage)
-      : undefined;
-
-    const options: ParsedOptimysticOptions = {
+    return {
       collectionUri,
-      transactor,
-      keyNetwork,
-      libp2pOptions: {
-        port,
-        networkName,
-        bootstrapNodes: [],
-      },
-      cache,
-      encoding,
-      rawStorageFactory,
+      ...resolveBinding(args, aux),
+      cache: args['cache'] !== false,
+      encoding: (args['encoding'] as 'json' | 'msgpack') || 'json',
     };
-
-    return options;
   }
 
   /**
@@ -4122,7 +4092,11 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     config: Record<string, SqlValue> = {},
     auxData?: unknown
   ): Promise<{ tables: number; indexes: number }> {
-    const options = this.deriveDefaultOptions(config);
+    // How THIS session reaches storage. The record carries no binding (see
+    // `identityVtabArgs`), so a hydrated table gets the session's, the way a `create table`
+    // without a `using` clause would — and the catalog is opened through the same one.
+    const sessionVtabArgs = this.sessionDefaultVtabArgs(db);
+    const options = this.deriveDefaultOptions(config, sessionVtabArgs);
     const schemaManager = this.createSchemaManager(options);
 
     let tableNames: QualifiedTableName[];
@@ -4151,7 +4125,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       const stored = await schemaManager.getSchema(schemaName, tableName);
       if (!stored) continue;
 
-      const hydratedSchema = schemaManager.storedToTableSchema(stored, this, auxData);
+      const hydratedSchema = schemaManager.storedToTableSchema(stored, this, auxData, sessionVtabArgs);
       (targetSchema ?? db.schemaManager.addSchema(schemaName)).addTable(hydratedSchema);
       tables++;
       indexes += hydratedSchema.indexes?.length ?? 0;
@@ -4161,32 +4135,30 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   }
 
   /**
-   * Mirror parseTableSchema's default-resolution against the plugin's
-   * registration config so hydrateCatalog can open the schema tree using the
-   * same transactor/network the tables themselves will use.
+   * The session's `default_vtab_args` when THIS module is the session's default module —
+   * the arguments a `create table` without a `using` clause would run with — else nothing.
+   * A different default module's arguments say nothing about how optimystic tables bind.
    */
-  private deriveDefaultOptions(config: Record<string, SqlValue>): ParsedOptimysticOptions {
-    const aux = config as Record<string, unknown>;
-    const transactor = (aux['default_transactor'] as string) || 'network';
-    const keyNetwork = (aux['default_key_network'] as string) || 'libp2p';
-    const port = typeof aux['default_port'] === 'number' ? (aux['default_port'] as number) : 0;
-    const networkName = (aux['default_network_name'] as string) || 'optimystic';
-    const rawStorageFactory = typeof aux['rawStorageFactory'] === 'function'
-      ? (aux['rawStorageFactory'] as () => IRawStorage)
-      : undefined;
+  private sessionDefaultVtabArgs(db: Database): Readonly<Record<string, SqlValue>> {
+    const { name, args } = db.schemaManager.getDefaultVTabModule();
+    return db.schemaManager.getModule(name)?.module === this ? args : {};
+  }
 
+  /**
+   * The options the plugin-global schema catalog is opened with: the same binding
+   * resolution a table goes through ({@link resolveBinding}) over the session's default
+   * args and the plugin's registration config, so hydrateCatalog reaches the catalog
+   * through the transactor and network the tables themselves will use.
+   */
+  private deriveDefaultOptions(
+    config: Record<string, SqlValue>,
+    sessionVtabArgs: Readonly<Record<string, SqlValue>> = {},
+  ): ParsedOptimysticOptions {
     return {
       collectionUri: 'tree://optimystic/schema',
-      transactor,
-      keyNetwork,
-      libp2pOptions: {
-        port,
-        networkName,
-        bootstrapNodes: [],
-      },
+      ...resolveBinding(sessionVtabArgs, config as Record<string, unknown>),
       cache: true,
       encoding: 'json',
-      rawStorageFactory,
     };
   }
 

@@ -18,25 +18,15 @@
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
-import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p';
+import { MemoryRawStorage } from '@optimystic/db-p2p';
 import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
 import { defaultCollectionUri } from '../dist/index.js';
 import { catalogKey, namesOfCatalogKey } from '../src/schema/table-identity.js';
+import { buildSharedLocalTransactor } from './shared-local-transactor.js';
 import { queryAll } from './query-helpers.js';
 
 type PluginHandle = ReturnType<typeof register>;
-
-function buildSharedLocalTransactor(storage: MemoryRawStorage): ITransactor {
-	const repo = new StorageRepo((blockId) => new BlockStorage(blockId, storage));
-	return {
-		async get(blockGets) { return await repo.get(blockGets); },
-		async getStatus(_trxRefs) { throw new Error('getStatus not implemented in test transactor'); },
-		async pend(request) { return await repo.pend(request); },
-		async commit(request) { return await repo.commit(request); },
-		async cancel(trxRef) { return await repo.cancel(trxRef); },
-	} as ITransactor;
-}
 
 async function openSession(transactor: ITransactor): Promise<{ db: Database; plugin: PluginHandle }> {
 	const db = new Database();
