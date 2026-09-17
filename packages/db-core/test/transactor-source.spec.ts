@@ -804,5 +804,52 @@ describe('TransactorSource', () => {
 			const src = new TransactorSource<IBlock>('coll', servingAt(6), pinnedAt(7))
 			expect(src.describeServed((await src.tryGet(blockId))!)).to.deep.equal({ rev: 6, mayRetain: true })
 		})
+
+		// The seam between the two halves of ticket a-too-old-block-answer-is-retried-against-another-
+		// machine: the floor is knowledge the COLLECTION holds, and a transactor with more than one
+		// machine to ask can only act on it if the read carries it. Asserted on the request itself,
+		// because every other test of the retry hands `floors` to the transactor already built.
+		describe('carries the applicable floor out on the request', () => {
+			/** Answers like `servingAt`, keeping every `BlockGets` it was handed. */
+			const recording = () => {
+				const seen: BlockGets[] = []
+				const at = { actionId: 'a6' as ActionId, rev: 6 }
+				const transactor = {
+					async get(gets: BlockGets): Promise<GetBlockResults> {
+						seen.push(gets)
+						return Object.fromEntries(gets.blockIds.map(id => [id, { block: structuredClone(block), materialized: at, state: { latest: at } }]))
+					},
+				} as unknown as ITransactor
+				return { seen, transactor }
+			}
+
+			it('as a per-block minimum revision, when one applies', async () => {
+				const { seen, transactor } = recording()
+				await new TransactorSource<IBlock>('coll', transactor, pinnedAt(7), undefined, flooredAt(7)).tryGet(blockId)
+				expect(seen[0]!.floors, 'the revision the walked log entry committed at').to.deep.equal({ [blockId]: 7 })
+			})
+
+			it('and leaves the field off entirely when none does, so an ordinary read asks exactly what it always did', async () => {
+				// Three ways to have no applicable floor: no floors at all, a floor for another block,
+				// and a read pinned BELOW the floor — which legitimately asks for the older view and
+				// must not drag a retry along with it.
+				const floorsElsewhere = new BlockFloors()
+				floorsElsewhere.raise(['other-block'], { rev: 7, actionId: 'a7' as ActionId })
+				const sourceWith = (floors: BlockFloors | undefined, pinnedRev: number) => {
+					const { seen, transactor } = recording()
+					return { seen, src: new TransactorSource<IBlock>('coll', transactor, pinnedAt(pinnedRev), undefined, floors) }
+				}
+				const cases = [
+					['no floors at all', sourceWith(undefined, 7)],
+					['a floor on another block', sourceWith(floorsElsewhere, 7)],
+					['pinned below the floor', sourceWith(flooredAt(7), 6)],
+				] as const
+
+				for (const [label, { seen, src }] of cases) {
+					await src.tryGet(blockId)
+					expect(Object.keys(seen[0]!).sort(), label).to.deep.equal(['blockIds', 'context'])
+				}
+			})
+		})
 	})
 })

@@ -420,25 +420,27 @@ describe('NetworkTransactor', () => {
       expect(result[blockId]!.unconfirmedAheadRev).to.equal(2)
     })
 
+    // A block served at revision `rev`, shaped the way every in-tree repo answers: the content, the
+    // newest revision the repo holds, and the revision the content actually IS.
+    const pinnedAt2 = { committed: [], rev: 2 }
+    const blockAt = (blockId: BlockId, rev: number) => ({
+      block: { header: { id: blockId, type: 'T', collectionId: 'c' as BlockId }, v: `rev${rev}` },
+      state: { latest: { actionId: `a${rev}`, rev } },
+      materialized: { actionId: `a${rev}`, rev },
+    })
+    const servingRepoAt = (rev: number, count?: () => void) => makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+      count?.()
+      const res: GetBlockResults = {}
+      for (const bid of blockIds) res[bid] = blockAt(bid, rev)
+      return res
+    })
+
     // Ticket a-too-old-block-answer-is-retried-against-another-machine: a FLOOR is the third thing
     // that earns the second-chance retry, and the only one the answering peer cannot see. The caller
     // walked a log entry saying "revision r changed this block", so an answer below r is provably
     // not the view it asked for — however current the answering repo believes its own copy to be.
     // The floor rides on the request as `BlockGets.floors` and never leaves this process.
     describe('a below-floor answer', () => {
-      const pinnedAt2 = { committed: [], rev: 2 }
-      const blockAt = (blockId: BlockId, rev: number) => ({
-        block: { header: { id: blockId, type: 'T', collectionId: 'c' as BlockId }, v: `rev${rev}` },
-        state: { latest: { actionId: `a${rev}`, rev } },
-        materialized: { actionId: `a${rev}`, rev },
-      })
-      const servingRepoAt = (rev: number, count?: () => void) => makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
-        count?.()
-        const res: GetBlockResults = {}
-        for (const bid of blockIds) res[bid] = blockAt(bid, rev)
-        return res
-      })
-
       it('is re-asked against a different coordinator, and the newer answer wins the merge', async () => {
         const peerA = 'peer-A', peerB = 'peer-B'
         const net = new CountingKeyNetwork([peerA, peerB])
@@ -563,6 +565,89 @@ describe('NetworkTransactor', () => {
         expect(result[floored]!.materialized!.rev).to.equal(2)
         expect(result[ordinary]!.materialized!.rev).to.equal(1)
       })
+
+      it('never reaches a repo: the field is consumed inside this process', async () => {
+        // `BlockGets.floors` is a client-side hint, and the whole claim that nothing on the wire
+        // changed rests on this: every downstream `IRepo.get` — the retry's included — must see the
+        // request an UNFLOORED read would have made. Otherwise a coordinator's freshness decision
+        // silently starts depending on a number the repo protocol never agreed to honour, which is
+        // the deliberate, separate step `feat-refresh-can-demand-a-revision-floor` describes.
+        const peerA = 'peer-A', peerB = 'peer-B'
+        const net = new CountingKeyNetwork([peerA, peerB])
+        const blockId = 'lagging-block' as BlockId
+
+        const seen: BlockGets[] = []
+        const recordingRepoAt = (rev: number) => makeGetOnlyRepo(async (gets: BlockGets) => {
+          seen.push(gets)
+          const res: GetBlockResults = {}
+          for (const bid of gets.blockIds) res[bid] = blockAt(bid, rev)
+          return res
+        })
+
+        const networkTransactor = new NetworkTransactor({
+          timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: net,
+          getRepo: (peerId: PeerId) => recordingRepoAt(peerId.toString() === peerA ? 1 : 2),
+        })
+
+        await networkTransactor.get({ blockIds: [blockId], context: pinnedAt2, floors: { [blockId]: 2 } })
+
+        expect(seen, 'the first round and the retry it earned').to.have.length(2)
+        for (const gets of seen) {
+          expect(Object.keys(gets).sort(), 'exactly the fields an unfloored read sends').to.deep.equal(['blockIds', 'context'])
+        }
+      })
+
+      it('is still returned when the retry can find no other coordinator to ask', async () => {
+        // The lone-machine deployment of the case above: a floor no machine can meet and nobody
+        // else to ask, so the retry's coordinator lookup fails outright. That failure must stay
+        // swallowed — the read WAS answered, and raising it would make a block under an abandoned
+        // log entry unreadable, and so unwritable, through every handle that refreshed past it.
+        const net = new CountingKeyNetwork(['peer-A'])	// the retry excludes peer-A, leaving nobody
+        const blockId = 'never-landed-block' as BlockId
+
+        const networkTransactor = new NetworkTransactor({
+          timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: net,
+          getRepo: (_peerId: PeerId) => servingRepoAt(1),
+        })
+
+        const result = await networkTransactor.get({
+          blockIds: [blockId], context: pinnedAt2, floors: { [blockId]: 2 },
+        })
+
+        expect(net.findCoordinatorCalls, 'the retry was attempted').to.equal(2)
+        expect(result[blockId]!.materialized!.rev, 'and the only answer there was stands').to.equal(1)
+        expect(result[blockId]!.block, 'with its content').to.exist
+      })
+    })
+
+    // The merge's newer-content tie-break arrived with below-floor retries but is not conditional on
+    // one: it decides EVERY get in which two peers answer the same block with content. Pinned here
+    // on the retry reason that needs no floor at all, so a regression cannot hide behind the floors.
+    it('breaks a tie on the newer content when a partial response earned the retry', async () => {
+      const peerA = 'peer-A', peerB = 'peer-B'
+      const net = new CountingKeyNetwork([peerA, peerB])
+      const answered = 'answered-block' as BlockId
+      const dropped = 'dropped-block' as BlockId
+
+      // peerA answers one of the two blocks and omits the other, so the batch is short of what was
+      // asked and earns the retry — and peerB then re-answers BOTH, the already-answered one at a
+      // newer revision. Rank alone ties the two answers for `answered`, so before the tie-break the
+      // older first arrival won.
+      const partialRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) if (bid === answered) res[bid] = blockAt(bid, 1)
+        return res
+      })
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: net,
+        getRepo: (peerId: PeerId) => (peerId.toString() === peerA ? partialRepo : servingRepoAt(2)),
+      })
+
+      const result = await networkTransactor.get({ blockIds: [answered, dropped], context: pinnedAt2 })
+
+      expect(result[answered]!.materialized!.rev, 'the newer of the two answers wins').to.equal(2)
+      expect(result[dropped]!.materialized!.rev, 'and the gap the retry existed to fill is filled').to.equal(2)
     })
 
     it('getStatus throws rather than judging actions from a state it could not confirm is current', async () => {

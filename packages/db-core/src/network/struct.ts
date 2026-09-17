@@ -275,7 +275,12 @@ export type BlockGets = {
 	 *  `{ blockIds, context }` for each downstream `IRepo.get`, so this field reaches no peer and no
 	 *  coordinator's freshness decision. An `ITransactor` that ignores it (`TestTransactor`, the
 	 *  reference peer's) stays correct, because the reader-side check that actually enforces the
-	 *  floor runs on the merged answer either way (`TransactorSource` / `BlockFloorCheck`). */
+	 *  floor runs on the merged answer either way (`TransactorSource` / `BlockFloorCheck`).
+	 *
+	 *  NOTE: the retry `NetworkTransactor.get` runs is per BATCH, not per block, so one below-floor
+	 *  block re-asks every block that shared its coordinator. Costs nothing today — `tryGet` asks
+	 *  for one block per request, so this map never holds more than one entry — but a read source
+	 *  that batches would pay it. Split the retry payload down to the failing block ids then. */
 	floors?: Record<BlockId, number>;
 };
 

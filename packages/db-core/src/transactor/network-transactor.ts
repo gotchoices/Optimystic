@@ -185,9 +185,16 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// the answering repo honestly believes its copy to be. Only a block-carrying entry can be
 		// below a floor — an absent answer is judged by its own rules above, and treating one as
 		// below-floor would put the one-round `createOrOpen` probe back on the retry path.
+		// Reported here rather than left to the reader: `TransactorSource` reports
+		// `collection:block-below-floor` from the MERGED answer, so a read the retry below repaired
+		// is the one case that leaves no trace anywhere else — the extra round would show up in a
+		// field log as an unexplained second consult. Costs nothing on an unfloored read, which
+		// leaves on the first clause.
 		const belowFloor = (bid: BlockId, entry: GetBlockResult): boolean => {
 			const floor = blockGets.floors?.[bid];
-			return floor !== undefined && entry.block != null && servedRevision(entry) < floor;
+			if (floor === undefined || entry.block == null || servedRevision(entry) >= floor) return false;
+			log('get:below-floor blockId=%s served=%d floor=%d', bid, servedRevision(entry), floor);
+			return true;
 		};
 
 		// A batch is answered when its response carries an entry for EVERY requested
@@ -322,7 +329,14 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		 *  reads the same number, so the two stay consistent. If such a repo ever answers pinned
 		 *  reads beside one that does report `materialized`, it can win this tie with a number
 		 *  describing content it did not serve: cap the comparison at `blockGets.context.rev` then
-		 *  (a correct answer to a pinned read is never above the pin), in both places at once. */
+		 *  (a correct answer to a pinned read is never above the pin), in both places at once.
+		 *
+		 *  NOTE: `servedRevision` also reads `state`, which the type requires but a decoded wire
+		 *  response could still omit. Ranking never touched it, so an entry like that used to fault
+		 *  only the reader of ITS block; it now faults the whole `get`, siblings included. Left
+		 *  alone because the reader called `servedRevision` on such an entry anyway — this widens
+		 *  the blast radius, it does not create the fault. If a third-party `IRepo` ever makes it
+		 *  real, make `servedRevision` tolerate a missing `state` rather than guarding here. */
 		const beats = (candidate: unknown, held: unknown): boolean => {
 			const byRank = rankOf(candidate) - rankOf(held);
 			return byRank !== 0

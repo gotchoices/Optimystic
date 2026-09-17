@@ -215,9 +215,11 @@ peer sees it and no coordinator's freshness decision changes (ticket
 ignores the field stays correct because `TransactorSource` judges the merged answer either way.
 
 What this deliberately does not do. When *every* reachable coordinator is below the floor the old
-content is still *returned* — the highest revision anyone served, unflagged — for up to one
-read-repair window, which is the bound the storage layer already documents instead of forever. It
-sets no floor for a block first read at open (no entries are walked then) or for the blocks an
+content is still *returned* — the highest revision anyone served, unflagged. How long that lasts
+depends on why they are all behind: a lagging replica catches up within one read-repair window, the
+bound the storage layer already documents instead of forever, while a log entry whose blocks never
+landed sets a floor no machine can ever meet, and there the below-floor content is the *correct*
+content (the accepted-tradeoff `NOTE:` at `mayRetain`). It sets no floor for a block first read at open (no entries are walked then) or for the blocks an
 invalidation entry reverts. And it narrows, without closing, the hazard of a write staged over a
 too-old read (ticket `bug-a-pended-transform-does-not-carry-its-base`): once storage catches up, the
 base under already-staged edits changes with no replay.
