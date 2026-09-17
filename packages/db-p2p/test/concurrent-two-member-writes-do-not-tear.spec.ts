@@ -11,8 +11,23 @@
  * winner eventually reported `TornActionError` for a half-saved write.
  *
  * The plain mesh delivers cluster messages synchronously and never interleaves them tightly enough to
- * reach this; a few milliseconds of latency on each remote delivery does (4 of 8 pairs failed before
- * the fix).
+ * reach this; a few milliseconds of latency on each remote delivery does.
+ *
+ * Reproducer strength, measured against a build with the cancel escape removed from
+ * `operationsConflict`: at {@link PairsPerRun} = 4 only one of the three runs tore, and at 8 all
+ * three tore (8 `TornActionError`s over three runs). 4 is nonetheless what ships, because the same
+ * contention that sharpens this reproducer also makes a SEPARATE defect reachable: at 8, the FIXED
+ * build fails 2 executions in 3 with `ValidatorRejectionError` — "pending conflict: block … held by
+ * unresolved action(s)" — which is a transient optimistic-concurrency condition being answered as a
+ * permanent validator rejection, filed as `bug-a-contended-pend-refusal-is-permanent-on-a-small-cohort`.
+ * A guard that flakes on an unrelated defect is worth less than a weaker guard that does not, so this
+ * spec stays at the contention where it is stable. Raise it to 8 to reproduce either defect by hand.
+ *
+ * The delays are random, not seeded, so the spec samples interleavings rather than pinning three of
+ * them. That asymmetry is deliberate and safe in one direction only: a random schedule can never
+ * FAIL this spec spuriously (it fails only when a write genuinely tears or a row is unreadable from
+ * the other node), it can only miss a regression. If it ever does go red, the failure message names
+ * the torn action but the schedule that produced it is gone — re-run rather than trying to replay.
  */
 
 import { expect } from 'chai';
@@ -43,11 +58,18 @@ const deliveryLatencyMs = (): number => 2 + Math.floor(Math.random() * 15);
  * Delays every REMOTE cluster delivery, on the way in and on the way back. The mesh's cluster client
  * resolves `target.clusterMember` per call, while each coordinator holds the member it was built with
  * and calls its own member directly — so a node's in-process traffic stays synchronous, as in
- * production. The wrapper inherits from the real member so `dispose` and everything else still reach it.
+ * production.
+ *
+ * NOTE: the wrapper delegates by prototype, which is only safe because `update` is the one method the
+ * mesh routes through it (the mesh's other call is `restart`'s `dispose`, and this spec never
+ * restarts). Every other method reached on the wrapper would run with `this` bound to the WRAPPER, so
+ * any `this.field = …` inside it would land on the wrapper and the real member would never see the
+ * write. `update` is exempt because it is delegated explicitly, with `inner` as the receiver.
  *
  * NOTE: spec-local on purpose — it is the only latency injection in the suite today. If a second spec
  * needs one, promote it to a `MeshFailureConfig` knob (beside `onClusterDelivery`) rather than copying
- * this, so a restarted node keeps its latency too.
+ * this, so a restarted node keeps its latency too (a restart rebuilds `clusterMember` and drops this
+ * wrapper outright) and so the delegation hazard above stops being a thing a reader has to re-derive.
  */
 const addDeliveryLatency = (mesh: Mesh): void => {
 	for (const node of mesh.nodes) {

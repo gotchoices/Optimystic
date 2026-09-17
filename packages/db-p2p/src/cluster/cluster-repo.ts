@@ -1549,6 +1549,15 @@ export class ClusterMember implements ICluster {
 				// abstains (the rev branch above already fail-closes when a revision claim is at stake).
 				// Reason stays plain prose: it is fed to computeSigningPayload and carried as
 				// Signature.rejectReason, exactly like the stale-revision reason above.
+				//
+				// NOTE: this is a *reject* vote for a condition that is purely transient, and the
+				// coordinator counts every reject alike. On a cohort of three or fewer members
+				// `maxAllowedRejections` is zero at the default threshold, so this one vote becomes a
+				// permanent `ValidatorRejectionError` — exactly the "lost race masquerading as a
+				// validator rejection" that `ClusterCoordinator`'s vote-counting comment says must not
+				// happen. Measured on a two-member mesh under concurrent writes; see
+				// `tickets/backlog/bug-a-contended-pend-refusal-is-permanent-on-a-small-cohort.md` for
+				// the reproducer and for why neither candidate fix is a one-liner.
 				for (const blockId of blockIds) {
 					const rivals = (blockResults[blockId]?.state?.pendings ?? []).filter(actionId => actionId !== pendRequest.actionId);
 					if (rivals.length > 0) {
