@@ -807,6 +807,13 @@ export class TransactionCoordinator {
 					// landing it is (reportSaved), and the next attempt commits only what is still
 					// staged (stagedCollections) — the durable half is never re-logged. The stamp stays
 					// open for the retry; reportSaved or the success path releases it.
+					// The committed siblings keep their in-flight mark until the cycle ends, so the
+					// blanket refresh between attempts WALKS their log (the mark disables the tail
+					// shortcut) but cannot find their own entry: recordCommitted above advanced each
+					// one's held revision to the entry's own, and Log.getFrom returns only entries
+					// ABOVE the held revision. Collection.consumeOwnEntry is therefore unreachable for
+					// a sibling committed here, and no attempt was retained for it (the loop above
+					// skips committed participants) — the refresh is a reader's, at a cost of one walk.
 					for (const collectionId of committed) cycle.saved.add(collectionId);
 					log('commit:partial-retry tx=%s committed=%o failed=%o reason=%s', transaction.id, [...committed], failed, coordResult.error);
 					throw new CoordinatorStaleLossError(failed, coordResult.error);
@@ -1181,6 +1188,14 @@ export class TransactionCoordinator {
 				// unsafe all-or-nothing undo handle survives (rollback() would rewind the winner).
 				// Kept await-free for the same reason the success fold is — restorePending is
 				// synchronous and latch-free by contract, so it is safe inside this latched span.
+				// NOTE: execute() has no retry loop at all, so a returned refusal after a sibling
+				// committed is reported here at once, where commit() would re-drive the refused
+				// collection forward (the partial-retry branch of commitOnceLatched). No production
+				// caller reaches this today — the plugin's session mode stages through applyActions
+				// and commits through commit() — so the split window is documented, not closed
+				// (docs/transactions.md). If a host ever commits multi-collection transactions
+				// through execute(), route its coordination through commit()'s retry rather than
+				// duplicating that recovery here.
 				const committed = coordResult.committedCollections ?? new Set<CollectionId>();
 				if (committed.size > 0) {
 					for (const collectionId of batches.keys()) {
@@ -1729,7 +1744,11 @@ export class TransactionCoordinator {
 				// mark it retryable at the coordinator level (after a re-read advances the rev).
 				// NOTE: deliberately does NOT consult `isConflictFailure` / `StaleFailure.conflict`
 				// like the pend path does. Once the pend succeeded, a returned commit failure means
-				// the revision slot moved. One commit producer DOES set `conflict` now —
+				// the revision slot moved, or a member behind on the base refused — the durability
+				// gate's `commit-not-durable` (which does set `conflict`) or a solo StorageRepo's
+				// `missing-base-revision` (a bare `reason`, no `conflict`). All of these clear on a
+				// re-drive, so gating on `conflict` here would fail the last of them fast. One commit
+				// producer DOES set `conflict` now —
 				// db-p2p's CoordinatorRepo.commit returns lost commit-consensus races and classified
 				// stale-commit rejections as `{ success:false, conflict:true }` (returning, not
 				// throwing, is what keeps them out of the verbatim retry above) — but every returned

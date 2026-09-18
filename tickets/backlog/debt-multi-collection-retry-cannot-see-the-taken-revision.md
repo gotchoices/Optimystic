@@ -78,3 +78,10 @@ Making the wedged write *succeed*. That is reconciliation, tracked under
 `backlog/more-design/6.5-partition-healing` (see its "sync now fails fast on a wedged revision view"
 section) and `backlog/feat-refresh-can-demand-a-revision-floor`. This ticket only brings the
 multi-collection path up to the single-collection path's standard of failing quickly and honestly.
+
+## Update from the review of `a-multi-collection-commit-half-lands-when-the-writers-replica-lags` (2026-09-18)
+
+Two facts above have moved; the ticket's aim stands.
+
+- **The seam no longer drops the fact.** `NetworkTransactor.staleFromBatches` now carries the producer's `reason`, its `conflict` classification and `staleAt` through the rebuilt commit failure (pinned by `network-transactor.spec.ts` "carries reason, conflict and staleAt through a rebuilt commit failure"). The stall detector this ticket asks for can read `staleAt` off the failure the coordinator already receives; what is still missing is the coordinator-side rule, not the data.
+- **A second shape now spends the whole budget on a permanent refusal.** A commit that lands some collections and is refused on another is retried forward under the same budget (the partial-retry branch of `TransactionCoordinator.commitOnceLatched`), where it used to be reported at once. `transaction.spec.ts` "a PARTIAL landing whose loser is refused forever is reported as CoordinatorPartialCommitError once the budget ends" pins that a refusal that never clears costs every attempt (about 21 s at the defaults) before the split is reported. The fail-fast rule this ticket describes must cover that branch too: a confirmed `staleAt` at or above the re-read revision on the refused collection is the same wedge, and the retry is not gated on `conflict` on purpose — a bare-reason `commit-not-durable` refusal from a lagging member has no `conflict` flag and does clear (the NOTE in `commitCollection` says where the gate would go).
