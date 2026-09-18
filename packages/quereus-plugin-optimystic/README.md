@@ -336,18 +336,19 @@ string:
 import { PartialCommitError } from '@optimystic/quereus-plugin-optimystic';
 ```
 
-It is also exported from the `./plugin` entry — the one most hosts load the plugin through — so
-you can import it from wherever you already load the plugin, with no cross-entry assumption. Both
-entries export the same class object, so `instanceof` matches regardless of which one you import
-from:
+It is also exported from the `./plugin` entry, the one most hosts load the plugin through, so you
+can import it from wherever you already load the plugin. Both entries export the same class
+object, so `instanceof` matches whichever one you import from:
 
 ```typescript
 import { PartialCommitError } from '@optimystic/quereus-plugin-optimystic/plugin';
 ```
 
-The `./plugin` entry also re-exports the coordinator-side errors the same retry guidance tells you
-to classify on: `CoordinatorPartialCommitError`, `SyncRetryExhaustedError`, and `TornActionError`
-(all from `@optimystic/db-core`).
+Both entries also re-export the `@optimystic/db-core` errors a caller classifies commit and write
+failures by — `CoordinatorPartialCommitError` (a coordinated commit that landed on some trees but
+not others), `SyncRetryExhaustedError`, and `TornActionError` — so a host needs no direct
+`@optimystic/db-core` import to catch them. See [docs/transactions.md](../../docs/transactions.md)
+for the partial-commit pair and [docs/internals.md](../../docs/internals.md) for the other two.
 
 ## Limitations
 

@@ -20,8 +20,11 @@ export { OptimysticModule, OptimysticVirtualTable } from './optimystic-module.js
 
 // Error raised when a legacy (no-coordinator) multi-tree commit fails after at
 // least one tree was already durably persisted — i.e. the commit was NOT atomic
-// across trees. Exported so hosts can catch it and reconcile the split.
+// across trees. Exported so hosts can catch it and reconcile the split. It and the
+// db-core errors callers classify commit failures by are exported from `./plugin`
+// too; test/entry-identity.spec.ts holds both entries to the same objects.
 export { PartialCommitError } from './optimystic-adapter/txn-bridge.js';
+export { CoordinatorPartialCommitError, SyncRetryExhaustedError, TornActionError } from '@optimystic/db-core';
 
 // Export schema utilities
 export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } from './schema/row-codec.js';

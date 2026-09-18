@@ -59,7 +59,8 @@ This document describes the architecture for multi-collection transactions in Op
 >   URI in one Database — one id-keyed batch cannot hold both, and would silently drop
 >   one; `test/legacy-batch-shared-collection-id.spec.ts`), or test doubles with no
 >   collection. A caller catching partial commits by class
->   must handle both `CoordinatorPartialCommitError` and `PartialCommitError`.
+>   must handle both `CoordinatorPartialCommitError` and `PartialCommitError`; the
+>   plugin exports both from its root entry and from `./plugin`, as the same objects.
 >
 > Log-entry shape: a batched commit's entries carry the participant list and a reads
 > field (empty), as session mode's do; a single-tree commit's entries carry neither.

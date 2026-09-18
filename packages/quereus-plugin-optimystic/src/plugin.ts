@@ -15,24 +15,13 @@ import { createLogger } from './logger.js';
 
 const log = createLogger('plugin');
 
-// Error classes callers are told to classify commit failures against (see docs/transactions.md,
-// "Legacy (single-node) commit" and its coordinator counterpart), re-exported here so a host that
-// loads the plugin through THIS entry can import them from where it loads, with no assumption that
-// the root entry (`./index.js`) shares a build chunk with this one — see the `splitting` comment in
-// tsup.config.ts and the identity check in test/browser-bundle.spec.ts.
-//
-// `PartialCommitError` is the plugin's own class, defined in this package, so re-exporting it here
-// is exactly the same object `TransactionBridge` throws — no copy is possible.
-//
-// The db-core classes are safe to re-export too, unlike a class this package itself defines: db-core
-// is `external` in tsup.config.ts, so neither entry bundles it — both just `import` the package, and
-// Node's module resolution hands out the one instance already loaded for the process (the classic
-// "dual package hazard" would still apply if two different copies of `@optimystic/db-core` end up
-// installed, but that is a generic node_modules concern, not something this package's own build can
-// cause).
+// The error classes a caller classifies commit and write failures by (see docs/transactions.md).
+// Exported from this entry as well as the root so a host that loads the plugin here can import them
+// here, without relying on the two entries sharing a build chunk (test/entry-identity.spec.ts checks
+// that they do anyway). The db-core classes are safe to re-export: db-core is `external` in
+// tsup.config.ts, so this package never bundles its own copy of them.
 export { PartialCommitError } from './optimystic-adapter/txn-bridge.js';
-export { CoordinatorPartialCommitError } from '@optimystic/db-core';
-export { SyncRetryExhaustedError, TornActionError } from '@optimystic/db-core';
+export { CoordinatorPartialCommitError, SyncRetryExhaustedError, TornActionError } from '@optimystic/db-core';
 
 /**
  * Plugin registration function
