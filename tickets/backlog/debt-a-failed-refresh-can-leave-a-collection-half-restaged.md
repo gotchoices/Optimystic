@@ -23,3 +23,7 @@ Static reading only (`repro: static`). A db-core test could confirm it: two part
 ## Expected
 
 The mismatched state should not be representable. A collection's tracker and `pending` list should always agree, whoever catches the error. The fix the existing NOTE already names, re-applying into a scratch tracker and swapping it in only when every action succeeded, does that for every caller, not just this path. A replay that throws then leaves B exactly as it was before the refresh, which is what `failedCollections` promises.
+
+## Arm, 2026-09-17 — default (legacy) mode will reach this too
+
+`implement/legacy-multi-tree-commit-pends-everything-before-committing-anything` routes every legacy commit that touches more than one tree (a table plus its indexes, or two tables) through `TransactionCoordinator.commit`, to stop a same-instant unique-value race from storing the loser's row. After it lands, the `tradeoffs:` line above ("only session-mode commits reach it, no host in this repository turns session mode on") no longer holds: any default-mode write to a table with an index can take the refresh-between-attempts path this ticket describes. Re-weigh the priority once that ticket completes.
