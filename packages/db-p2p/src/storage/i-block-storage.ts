@@ -169,6 +169,10 @@ export interface IBlockStorage {
     /**
      * Sets the latest revision information, as the last step of committing `latest` here.
      *
+     * Call it only after {@link promotePendingTransaction} has moved `latest.actionId`'s record: it
+     * drops that action's claim without deleting a record, so a caller that skipped promotion would
+     * leave a claim-less pending record behind (see `BlockMetadata.pendingRevs`).
+     *
      * `builtOnPrior` says how the revision's content was produced, which is what the block's known
      * lineage depends on (see `BlockMetadata.lineageFloor`): `true` when this node applied the
      * revision's transform to the content of its previous revision (an update-only or delete

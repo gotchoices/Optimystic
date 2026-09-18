@@ -351,7 +351,6 @@ export class BlockStorage implements IBlockStorage {
 		let maxRev = currentRev;
 		let maxActionId = meta.latest?.actionId;
 		let lineageFloor = meta.lineageFloor;
-		const recoveredIds: ActionId[] = [];
 
 		// Probe forward until we hit a gap or a revision whose action is not yet
 		// in the committed log (Crash-D2 state — retry-commit owns that advance).
@@ -365,7 +364,6 @@ export class BlockStorage implements IBlockStorage {
 			lineageFloor = BlockStorage.nextLineageFloor(lineageFloor, maxRev === 0 ? undefined : maxRev, next, promoted.insert === undefined);
 			maxRev = next;
 			maxActionId = actionId;
-			recoveredIds.push(actionId);
 		}
 
 		if (maxRev > currentRev && maxActionId !== undefined) {
@@ -379,18 +377,12 @@ export class BlockStorage implements IBlockStorage {
 			// the prior [E, currentRev+1) (from the earlier setLatest) into one open-ended [E, +inf).
 			meta.ranges.unshift([currentRev + 1]);
 			meta.ranges = mergeRanges(meta.ranges);
-			// Each recovered revision's lost `setLatest` also owed this sweep, and, like `setLatest`, drops
-			// the recovered action's own claim without a delete: the probe above accepted only actions
-			// holding a committed record, and promotion MOVES the record atomically, so none has a
-			// pending record left. That rests on the raw backend's atomic move (pinned by the raw-storage
-			// conformance test); a backend that broke it would leave a claim-less pending record here,
-			// which readers treat as the strongest kind of reservation.
-			// NOTE: a pend only checks `latest`, so a same-action re-pend landing while a lost `setLatest`
-			// is still owed re-creates a pending record beside the committed one. `StorageRepo.commit`
-			// runs recover only when the committing action's own record is absent, so reaching this with
-			// such a record takes a second lost `setLatest` above it; if that ever becomes reachable,
-			// delete the recovered actions' records here too (recover is rare; the op is cheap here).
-			for (const id of recoveredIds) BlockStorage.recordClaim(meta, id, undefined);
+			// Each recovered revision's lost `setLatest` also owed this sweep. Unlike `setLatest`, it
+			// DELETES each recovered action's record rather than just dropping its claim: a pend checks
+			// only `latest`, so a same-action retry re-pended while the `setLatest` was owed leaves a
+			// pending record beside the committed one (reachable through `StorageRepo.recoverBlock`).
+			// Dropping only its claim would leave a claim-less record, the strongest kind of reservation,
+			// that nothing ever removes. Recover runs only after a crash, so the extra op costs nothing.
 			await this.sweepDeadClaims(meta, maxRev);
 			await this.storage.saveMetadata(this.blockId, meta);
 			log('recover blockId=%s advanced latest from rev=%d to rev=%d', this.blockId, currentRev, maxRev);

@@ -150,10 +150,17 @@ export function recordPriority(record: ClusterRecord): number {
  * pend's record); the commit only promotes that record, so there is no contest left for it to lose:
  *   - a pend of Y: storage and `validatePendOperations` refuse it while X's record claims the slot Y
  *     asks for or a later one (`isReservationAgainst`), and refuse it as stale once X has committed
- *     there — the worst outcome is a retry of Y. A Y asking PAST X's slot was built on X (it read the
- *     block, and `StorageRepo.get` promotes X's record for a reader whose log names X), so both land,
- *     X first: Y's commit declares X's revision as its base, and a member X has not reached yet
- *     refuses Y as behind (the fork guard) and reconciles, rather than applying Y over the older base;
+ *     there — the worst outcome is a retry of Y. A Y asking PAST X's slot normally built on X (it read
+ *     the block, and `StorageRepo.get` promotes X's record for a reader whose log names X), so both
+ *     land, X first: Y's commit declares X's revision as its base, and a member X has not reached yet
+ *     refuses Y as behind (the fork guard in `StorageRepo.internalCommit`) and reconciles, rather than
+ *     applying Y over the older base. That guard compares only against the base Y DECLARED, so it
+ *     misses two shapes, both arms of backlog `bug-a-pended-transform-does-not-carry-its-base`: a Y
+ *     commit that declares no base for the block, and (from four members up) a Y that read the block
+ *     from a member that never received X's pend and so declares the pre-X base. In both, Y can land
+ *     over X's change. Counting the commit as a rival never closed them: it only fired while X's commit
+ *     was still in its own promise round at a member, and when the race went Y's way it tore X instead;
+ *     carrying the base with the pend is the fix;
  *   - a commit of Y: `StorageRepo.commit` never looks at another action's pending record; its own
  *     stale and fork checks, and `validateCommitRevisions` at the vote, order the two under the block
  *     latch.

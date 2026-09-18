@@ -245,7 +245,9 @@ A record claiming a revision the block has **already reached** can never be prom
 (`BlockStorage.sweepDeadClaims`, from `setLatest`, `recover` and `saveForwardRevision`): the loser
 of a same-slot race whose cancel never arrived, and the missed commit above once the block moves past
 it — including a replica landing under a *different* action, the reconcile shape that used to leave
-the missed action's record standing forever. A record with no claim on file is never swept, because
+the missed action's record standing forever. The committing action's own claim is dropped by `setLatest`
+with no delete, since promotion already moved its record; `recover` still deletes each recovered action's
+record, since a retry may have re-pended it while the lost `setLatest` was owed. A record with no claim on file is never swept, because
 its death cannot be proved. This is the locally decidable half of what backlog
 `debt-unpromotable-pending-records-need-a-sweep` asks for; a record whose slot the block has not
 reached and whose writer never came back is the half that ticket still owns.

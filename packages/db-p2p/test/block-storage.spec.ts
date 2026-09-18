@@ -1837,8 +1837,9 @@ describe('BlockStorage.savePendingTransaction — unpromotable-record refusal', 
  *    and every path that advances `latest` sweeps it, including a replica landing under a DIFFERENT
  *    action (the cohort reconcile of a block this node fell behind on), which used to leave the
  *    missed action's record standing forever;
- *  - the committing action's OWN claim is dropped without a delete, on commit and on recover alike:
- *    promotion already moved its record, so a delete there is a wasted raw-storage op per commit.
+ *  - on commit, the committing action's OWN claim is dropped without a delete: promotion already moved
+ *    its record, so a delete there is a wasted raw-storage op per commit. Recover, which runs only
+ *    after a crash, still deletes each recovered action's record, since a retry may have re-pended it.
  */
 describe('BlockStorage pending claims — a record claims the slot it was pended at', () => {
 	/** Records every raw pending-record delete, so a test can pin which records a path paid to delete. */
@@ -1947,7 +1948,7 @@ describe('BlockStorage pending claims — a record claims the slot it was pended
 		raw.deletedPending.length = 0;
 		const recovered = await withBlockWriteLatch(blockId, l => storage.recover(l));
 		expect(recovered).to.deep.equal({ reconciled: true, latest: { rev: 2, actionId: winner } });
-		expect(raw.deletedPending, 'one delete, for the rival: the recovered winner\'s record was moved').to.deep.equal(['a-loser']);
+		expect(raw.deletedPending, 'recover pays a delete per recovered action as well as the rival (see the re-pend test below)').to.have.members([winner, 'a-loser']);
 		expect(await storage.getPendingTransaction('a-loser' as ActionId), 'swept as the lost setLatest would have').to.equal(undefined);
 		expect((await raw.getMetadata(blockId))!.pendingRevs).to.equal(undefined);
 	});
@@ -1978,7 +1979,7 @@ describe('BlockStorage pending claims — a record claims the slot it was pended
 		expect((await raw.getMetadata(blockId))!.pendingRevs, 'its claim is dropped, and the empty map is not kept').to.equal(undefined);
 	});
 
-	it('recover after lost setLatests deletes no pending record for any recovered action', async () => {
+	it('recover advances over stacked lost setLatests and drops every recovered claim', async () => {
 		const blockId = 'block-solo-recover' as BlockId;
 		const storage = new BlockStorage(blockId, raw);
 		const first = 'a-first' as ActionId;
@@ -1997,11 +1998,37 @@ describe('BlockStorage pending claims — a record claims the slot it was pended
 			await storage.promotePendingTransaction(second, l);
 		});
 		expect((await raw.getMetadata(blockId))!.pendingRevs, 'both claims outlive the lost setLatests').to.deep.equal({ 'a-first': 2, 'a-second': 3 });
-		raw.deletedPending.length = 0;
 
 		const recovered = await withBlockWriteLatch(blockId, l => storage.recover(l));
 		expect(recovered).to.deep.equal({ reconciled: true, latest: { rev: 3, actionId: second } });
-		expect(raw.deletedPending, 'no delete is issued for records promotion already moved').to.deep.equal([]);
 		expect((await raw.getMetadata(blockId))!.pendingRevs, 'every recovered claim is dropped').to.equal(undefined);
+		expect(await raw.getTransaction(blockId, first), 'the recovered commits stay committed').to.not.equal(undefined);
+		expect(await raw.getTransaction(blockId, second)).to.not.equal(undefined);
+	});
+
+	it('recover deletes a same-action record re-pended while its setLatest was owed', async () => {
+		// A pend checks only `latest`, which the lost setLatest left behind, so a retry of the committed
+		// action can re-pend its own slot. Were recover to drop only the claim, that record would stand
+		// claim-less (the strongest reservation) beside its own commit, refusing every later writer.
+		const blockId = 'block-recover-repend' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+		const actionId = 'a-retried' as ActionId;
+
+		await withBlockWriteLatch(blockId, async (l) => {
+			await storage.saveReplica(makeBlock('block-recover-repend', { items: [] }), { rev: 1, actionId: 'r1' as ActionId }, undefined, l);
+			await storage.savePendingTransaction(actionId, { updates: [['items', 0, 0, ['x']]] }, 2, l);
+			await storage.saveMaterializedBlock(actionId, makeBlock('block-recover-repend', { items: ['x'] }), l);
+			await storage.saveRevision(2, actionId, l);
+			await storage.promotePendingTransaction(actionId, l);
+			// setLatest lost; the writer's retry re-pends the same slot.
+			await storage.savePendingTransaction(actionId, { updates: [['items', 0, 0, ['x']]] }, 2, l);
+		});
+		expect(await storage.getPendingTransaction(actionId), 'the re-pend stands beside the commit').to.not.equal(undefined);
+
+		const recovered = await withBlockWriteLatch(blockId, l => storage.recover(l));
+		expect(recovered).to.deep.equal({ reconciled: true, latest: { rev: 2, actionId } });
+		expect(await storage.getPendingTransaction(actionId), 'the stray record is deleted, not left claim-less').to.equal(undefined);
+		expect(await storage.listPendingClaims()).to.deep.equal([]);
+		expect(await raw.getTransaction(blockId, actionId), 'the commit itself is untouched').to.not.equal(undefined);
 	});
 });
