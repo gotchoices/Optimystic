@@ -1,5 +1,5 @@
 import type { BlockId, IBlock } from "../index.js";
-import type { BlockContentDigests } from "../network/struct.js";
+import type { BlockBaseRevs, BlockContentDigests } from "../network/struct.js";
 import { canonicalBlockHash } from "../blocks/helpers.js";
 import { createLogger } from "../logger.js";
 import { isRecordEmpty } from "../utility/is-record-empty.js";
@@ -50,6 +50,14 @@ export async function computeBlockContentDigests<T extends IBlock>(
  * did before this field existed. Every producer of the field goes through here. */
 export function blockDigestsField(digests: BlockContentDigests | undefined): { blockDigests?: BlockContentDigests } {
 	return digests && !isRecordEmpty(digests) ? { blockDigests: digests } : {};
+}
+
+/** The pend-side sibling of {@link blockDigestsField}: wraps `PendRequest.baseRevs` so it spreads
+ * onto a request only when some block names a base. Same reason — the pend is hashed verbatim into
+ * every cohort signature preimage, so a pend that names no base must serialize exactly as it did
+ * before the field existed. Every producer of the field goes through here. */
+export function baseRevsField(baseRevs: BlockBaseRevs | undefined): { baseRevs?: BlockBaseRevs } {
+	return baseRevs && !isRecordEmpty(baseRevs) ? { baseRevs } : {};
 }
 
 /** {@link Tracker.peekMaterialized}, degraded to "undeclared" when materializing throws.

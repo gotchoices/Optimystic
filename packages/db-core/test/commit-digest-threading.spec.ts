@@ -12,11 +12,12 @@ import { Collection } from '../src/collection/index.js'
 import { TestTransactor } from '../src/testing/test-transactor.js'
 import { localDurability } from '../src/network/durability.js'
 import type {
-	ActionBlocks, BlockActionStatus, BlockContentDigests, BlockGets, BlockId, BlockOperation,
+	ActionBlocks, BlockActionStatus, BlockBaseRevs, BlockContentDigests, BlockGets, BlockId, BlockOperation,
 	BlockStore, ClusterPeers, CommitRequest, CommitResult, FindCoordinatorOptions, GetBlockResults,
 	IBlock, IKeyNetwork, IRepo, ITransactor, PendRequest, PendResult, PeerId, RepoCommitRequest,
-	RepoMessage,
+	RepoMessage, Transforms,
 } from '../src/index.js'
+import { blockIdsForTransforms } from '../src/index.js'
 import { generateRandomActionId } from './generate-random-action-id.js'
 
 /** Stable text key for a coordinator-lookup key so a test can pin block -> peer explicitly. */
@@ -28,6 +29,14 @@ const keyHex = (key: Uint8Array): string =>
 class MappedKeyNetwork implements IKeyNetwork {
 	/** hex(coordinator key) -> ordered peer-id strings */
 	private readonly routes = new Map<string, string[]>()
+
+	/** `singleMemberClusters` reports each block's cluster as its FIRST route entry alone. The pend
+	 *  path batches by a greedy set cover over `findCluster` (`consolidateCoordinators`), so with
+	 *  full route lists one well-connected peer would swallow every block into a single batch; with
+	 *  single-member clusters each block batches onto its primary, and the retry (which goes through
+	 *  `findCoordinator`) still walks the full preference list. The commit path batches through
+	 *  `findCoordinator` alone and is unaffected either way. */
+	constructor(private readonly singleMemberClusters = false) { }
 
 	async route(blockId: BlockId, peers: string[]) {
 		this.routes.set(keyHex(routingKeyForBlock(blockId)), peers)
@@ -42,21 +51,30 @@ class MappedKeyNetwork implements IKeyNetwork {
 
 	async findCluster(key: Uint8Array): Promise<ClusterPeers> {
 		const peers: ClusterPeers = {}
-		for (const p of this.routes.get(keyHex(key)) ?? []) peers[p] = { multiaddrs: [], publicKey: '' }
+		const route = this.routes.get(keyHex(key)) ?? []
+		for (const p of this.singleMemberClusters ? route.slice(0, 1) : route) peers[p] = { multiaddrs: [], publicKey: '' }
 		return peers
 	}
 }
 
-/** Records every RepoCommitRequest it receives; optionally throws on the first N commits so a test
- *  can drive the re-batch-onto-another-coordinator retry in `processBatches`. */
+/** Records every RepoCommitRequest and PendRequest it receives; optionally throws on the first N
+ *  commits (or pends) so a test can drive the re-batch-onto-another-coordinator retry in
+ *  `processBatches`. */
 class RecordingRepo implements IRepo {
 	readonly commits: RepoCommitRequest[] = []
+	readonly pends: PendRequest[] = []
 	private calls = 0
+	private pendCalls = 0
 
-	constructor(private readonly throwFirst = 0) { }
+	constructor(private readonly throwFirst = 0, private readonly throwFirstPends = 0) { }
 
 	async get(): Promise<GetBlockResults> { return {} }
-	async pend(): Promise<PendResult> { throw new Error('unused on the commit path') }
+	async pend(request: PendRequest): Promise<PendResult> {
+		this.pendCalls++
+		if (this.pendCalls <= this.throwFirstPends) throw new Error('forced transient failure')
+		this.pends.push(structuredClone(request))
+		return { success: true, pending: [], blockIds: blockIdsForTransforms(request.transforms), durability: localDurability() }
+	}
 	async cancel(): Promise<void> { }
 	async commit(request: RepoCommitRequest): Promise<CommitResult> {
 		this.calls++
@@ -76,6 +94,12 @@ const hasDigestsKey = (request: object) =>
 const fakeDigest = (id: string, baseRev?: number) =>
 	baseRev === undefined ? { digest: `d:${id}` } : { digest: `d:${id}`, baseRev }
 
+const baseKeys = (request: { baseRevs?: BlockBaseRevs }) => sorted(Object.keys(request.baseRevs ?? {}))
+const hasBasesKey = (request: object) => Object.prototype.hasOwnProperty.call(request, 'baseRevs')
+/** One splice per id — the update-only shape a base is named for. */
+const updatesOf = (ids: BlockId[]): Transforms =>
+	({ inserts: {}, updates: Object.fromEntries(ids.map(id => [id, [['items', 0, 0, ['v']]]])), deletes: [] })
+
 describe('commit content digest threading', () => {
 	describe('NetworkTransactor per-batch subsetting', () => {
 		/** Five routable blocks over three peers; the preference lists also pin where a retry lands.
@@ -83,7 +107,7 @@ describe('commit content digest threading', () => {
 		 *  they assert the header and tail land as SEPARATE commits on peer-A, which only holds while
 		 *  the other swept block (b2) prefers a different peer. Re-pointing b2 at peer-A would merge
 		 *  them into one batch and quietly stop exercising that; keep the split if you retune routes. */
-		async function setup(throwFirstOnB = 0) {
+		async function setup(throwFirstOnB = 0, throwFirstPendsOnB = 0) {
 			const ids = {
 				header: 'blk-header' as BlockId,
 				tail: 'blk-tail' as BlockId,
@@ -100,7 +124,7 @@ describe('commit content digest threading', () => {
 
 			const repos: Record<string, RecordingRepo> = {
 				'peer-A': new RecordingRepo(),
-				'peer-B': new RecordingRepo(throwFirstOnB),
+				'peer-B': new RecordingRepo(throwFirstOnB, throwFirstPendsOnB),
 				'peer-C': new RecordingRepo(),
 			}
 
@@ -244,16 +268,125 @@ describe('commit content digest threading', () => {
 		})
 	})
 
+	// The pend-side sibling of the commit subsetting above: `PendRequest.baseRevs` is narrowed to
+	// each per-coordinator batch at send time, for the same reasons (retries re-split batches, and
+	// no cohort may sign for a block it is not responsible for).
+	describe('NetworkTransactor per-batch subsetting of pend bases', () => {
+		/** Same five blocks and routes as the commit suite. Single-member clusters, so the pend's
+		 *  set-cover batching lands header+tail on A, b1+b3 on B and b2 on C (see MappedKeyNetwork). */
+		async function setup(throwFirstPendsOnB = 0) {
+			const ids = {
+				header: 'blk-header' as BlockId,
+				tail: 'blk-tail' as BlockId,
+				b1: 'blk-one' as BlockId,
+				b2: 'blk-two' as BlockId,
+				b3: 'blk-three' as BlockId,
+			}
+			const net = new MappedKeyNetwork(true)
+			await net.route(ids.header, ['peer-A', 'peer-C'])
+			await net.route(ids.tail, ['peer-A', 'peer-C'])
+			await net.route(ids.b1, ['peer-B', 'peer-C'])
+			await net.route(ids.b2, ['peer-C', 'peer-A'])
+			await net.route(ids.b3, ['peer-B', 'peer-A'])
+			const repos: Record<string, RecordingRepo> = {
+				'peer-A': new RecordingRepo(),
+				'peer-B': new RecordingRepo(0, throwFirstPendsOnB),
+				'peer-C': new RecordingRepo(),
+			}
+			const networkTransactor = new NetworkTransactor({
+				timeoutMs: 1000,
+				abortOrCancelTimeoutMs: 500,
+				keyNetwork: net,
+				getRepo: (peerId: PeerId) => {
+					const repo = repos[peerId.toString()]
+					if (!repo) throw new Error(`no repo for ${peerId.toString()}`)
+					return repo
+				},
+			})
+			return { ids, repos, networkTransactor }
+		}
+
+		it('gives each peer only the bases for the blocks in its own batch', async () => {
+			const { ids, repos, networkTransactor } = await setup()
+			const baseRevs: BlockBaseRevs = { [ids.tail]: 7, [ids.b1]: 7, [ids.b2]: 7 }
+			const transforms: Transforms = {
+				...updatesOf([ids.tail, ids.b1, ids.b2]),
+				inserts: { [ids.header]: { header: { id: ids.header, type: 'T', collectionId: 'c' as BlockId } } },
+			}
+
+			const result = await networkTransactor.pend({ actionId: generateRandomActionId(), rev: 8, policy: 'r', transforms, baseRevs })
+			expect(result.success).to.be.true
+
+			for (const [peer, repo] of Object.entries(repos)) {
+				for (const request of repo.pends) {
+					const expected = sorted(blockIdsForTransforms(request.transforms).filter(id => baseRevs[id] !== undefined))
+					expect(baseKeys(request), `${peer} batch ${blockIdsForTransforms(request.transforms).join(',')}`).to.deep.equal(expected)
+				}
+			}
+			expect(repos['peer-B']!.pends.flatMap(baseKeys)).to.deep.equal([ids.b1])
+			expect(repos['peer-C']!.pends.flatMap(baseKeys)).to.deep.equal([ids.b2])
+			expect(repos['peer-A']!.pends.flatMap(baseKeys), 'the inserted header rides beside the tail with no base').to.deep.equal([ids.tail])
+			expect(repos['peer-A']!.pends.length + repos['peer-B']!.pends.length + repos['peer-C']!.pends.length, 'three batches, one per peer').to.equal(3)
+		})
+
+		it('omits the field entirely on a batch none of whose blocks names a base', async () => {
+			const { ids, repos, networkTransactor } = await setup()
+			const result = await networkTransactor.pend({
+				actionId: generateRandomActionId(), rev: 8, policy: 'r',
+				transforms: updatesOf([ids.tail, ids.b1, ids.b2]),
+				baseRevs: { [ids.b2]: 7 },
+			})
+			expect(result.success).to.be.true
+			for (const peer of ['peer-A', 'peer-B']) {
+				expect(repos[peer]!.pends.length, `${peer} received its batch`).to.equal(1)
+				for (const request of repos[peer]!.pends) {
+					expect(hasBasesKey(request), `${peer} must omit baseRevs entirely, not send the action-wide map`).to.be.false
+				}
+			}
+			expect(repos['peer-C']!.pends.flatMap(baseKeys)).to.deep.equal([ids.b2])
+		})
+
+		it('omits the field entirely when the pend names no base', async () => {
+			const { ids, repos, networkTransactor } = await setup()
+			await networkTransactor.pend({ actionId: generateRandomActionId(), rev: 8, policy: 'r', transforms: updatesOf([ids.tail, ids.b1]) })
+			for (const repo of Object.values(repos)) {
+				for (const request of repo.pends) expect(hasBasesKey(request)).to.be.false
+			}
+		})
+
+		it('subsets at send time, so a retry onto another coordinator still gets its own subset', async () => {
+			// peer-B throws its first pend. b1 and b3 both batch onto B first; the retry excludes B,
+			// and b1 re-resolves to peer-C while b3 re-resolves to peer-A — a SPLIT of the failed batch.
+			const { ids, repos, networkTransactor } = await setup(1)
+			await networkTransactor.pend({
+				actionId: generateRandomActionId(), rev: 8, policy: 'r',
+				transforms: updatesOf([ids.tail, ids.b1, ids.b3]),
+				baseRevs: { [ids.b1]: 7, [ids.b3]: 7 },
+			})
+			expect(repos['peer-B']!.pends, 'the failed first attempt recorded nothing').to.deep.equal([])
+			const cPend = repos['peer-C']!.pends.find(p => blockIdsForTransforms(p.transforms).includes(ids.b1))
+			const aPend = repos['peer-A']!.pends.find(p => blockIdsForTransforms(p.transforms).includes(ids.b3))
+			expect(cPend, 'b1 retried onto peer-C').to.exist
+			expect(aPend, 'b3 retried onto peer-A').to.exist
+			expect(baseKeys(cPend!)).to.deep.equal([ids.b1])
+			expect(baseKeys(aPend!)).to.deep.equal([ids.b3])
+		})
+	})
+
 	describe('Collection.sync declares its blocks', () => {
 		interface TestAction { id?: string; op?: BlockOperation }
 
-		/** Captures every CommitRequest reaching the transactor, delegating everything else. */
+		/** Captures every CommitRequest and PendRequest reaching the transactor, delegating everything else. */
 		class CapturingTransactor implements ITransactor {
 			readonly commits: CommitRequest[] = []
+			readonly pends: PendRequest[] = []
 			constructor(private readonly inner: TestTransactor) { }
 			get(b: BlockGets): Promise<GetBlockResults> { return this.inner.get(b) }
 			getStatus(a: ActionBlocks[]): Promise<BlockActionStatus[]> { return this.inner.getStatus(a) }
-			pend(r: PendRequest): Promise<PendResult> { return this.inner.pend(r) }
+			pend(r: PendRequest): Promise<PendResult> {
+				this.pends.push(structuredClone(r))
+				return this.inner.pend(r)
+			}
 			cancel(a: ActionBlocks): Promise<void> { return this.inner.cancel(a) }
 			async commit(r: CommitRequest): Promise<CommitResult> {
 				this.commits.push(structuredClone(r))
@@ -323,6 +456,39 @@ describe('commit content digest threading', () => {
 			// An update digest names the committed revision of the base it was computed from.
 			expect(second.blockDigests!['block-keep']!.baseRev).to.be.a('number')
 			expect(second.blockDigests!['block-new']!.baseRev).to.be.undefined
+		})
+
+		it('names a base on the pend for every update-only block, and never for an inserted or deleted one', async () => {
+			const inner = new TestTransactor()
+			const transactor = new CapturingTransactor(inner)
+			const collection = await Collection.createOrOpen<TestAction>(transactor, 'base-collection', initOptions)
+
+			// Round 1: everything is an insert (the collection itself included) — no base anywhere.
+			await collection.act({ type: 'insert', data: { id: 'block-keep' } }, { type: 'insert', data: { id: 'block-drop' } })
+			await collection.sync()
+			const first = transactor.pends.at(-1)!
+			expect(hasBasesKey(first), 'a pend naming no base omits the field entirely').to.be.false
+
+			// Round 2: update one block, delete the other, insert a third. The log tail is updated too.
+			await collection.act(
+				{ type: 'update', data: { id: 'block-keep', op: ['items', 0, 0, ['v']] } },
+				{ type: 'remove', data: { id: 'block-drop' } },
+				{ type: 'insert', data: { id: 'block-new' } },
+			)
+			await collection.sync()
+			const pend = transactor.pends.at(-1)!
+			const commit = transactor.commits.at(-1)!
+			expect(commit.actionId, 'the pend and commit of one attempt').to.equal(pend.actionId)
+
+			const keys = baseKeys(pend)
+			expect(keys, 'the updated block names its base').to.include('block-keep')
+			expect(keys, 'so does the log tail, which this attempt updates').to.include(commit.tailId)
+			expect(keys, 'a deleted block is base-independent').to.not.include('block-drop')
+			expect(keys, 'an inserted block is base-independent').to.not.include('block-new')
+			expect(blockIdsForTransforms(pend.transforms), 'every named id is one the pend carries').to.include.members(keys)
+			// The pend names exactly the base the commit's digest was computed from.
+			expect(pend.baseRevs!['block-keep' as BlockId]).to.equal(commit.blockDigests!['block-keep' as BlockId]!.baseRev)
+			expect(pend.baseRevs!['block-keep' as BlockId]).to.be.a('number')
 		})
 
 		it('declares the collection log tail it appends to', async () => {
@@ -406,6 +572,35 @@ describe('commit content digest threading', () => {
 			expect(declaredHash, 'declaring content must not hash like declaring nothing').to.not.equal(bareHash)
 			expect(await computeClusterMessageHash(altered), 'a different declaration must hash differently')
 				.to.not.equal(declaredHash)
+		})
+
+		it('hashes a pend message identically after a JSON round-trip by an unaware peer, and folds baseRevs into the hash', async () => {
+			const transforms = updatesOf(['b1' as BlockId, 'b2' as BlockId])
+			const pend: PendRequest = { actionId: 'action-1', rev: 4, policy: 'r', transforms }
+			const declared: RepoMessage = {
+				operations: [{ pend: { ...pend, baseRevs: { ['b1' as BlockId]: 3 } } }],
+				expiration: 1_700_000_000_000,
+			}
+			const asUnawarePeerSeesIt = JSON.parse(JSON.stringify(declared)) as RepoMessage
+			const membership = 'membership-digest'
+			const promises: Record<string, Signature> = { 'peer-A': { type: 'approve', signature: 'sig' } }
+
+			const mine = await computeClusterMessageHash(declared, membership)
+			const theirs = await computeClusterMessageHash(asUnawarePeerSeesIt, membership)
+			expect(theirs, 'messageHash').to.equal(mine)
+			expect(await computeClusterPromiseHash(theirs, asUnawarePeerSeesIt, membership))
+				.to.equal(await computeClusterPromiseHash(mine, declared, membership))
+			expect(await computeClusterCommitHash(theirs, asUnawarePeerSeesIt, promises, membership))
+				.to.equal(await computeClusterCommitHash(mine, declared, promises, membership))
+
+			const bare: RepoMessage = { operations: [{ pend }], expiration: 1_700_000_000_000 }
+			const altered: RepoMessage = {
+				operations: [{ pend: { ...pend, baseRevs: { ['b1' as BlockId]: 2 } } }],
+				expiration: 1_700_000_000_000,
+			}
+			const declaredHash = await computeClusterMessageHash(declared)
+			expect(declaredHash, 'naming a base must not hash like naming none').to.not.equal(await computeClusterMessageHash(bare))
+			expect(await computeClusterMessageHash(altered), 'a different base must hash differently').to.not.equal(declaredHash)
 		})
 	})
 })

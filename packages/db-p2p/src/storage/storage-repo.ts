@@ -1,6 +1,6 @@
 import type {
 	IRepo, MessageOptions, BlockId, CommitRequest, CommitResult, GetBlockResults, PendRequest, PendResult, ActionBlocks,
-	ActionId, BlockGets, ActionPending, PendSuccess, ActionTransform, ActionTransforms,
+	ActionId, BlockGets, ActionPending, PendSuccess, ActionTransform, ActionTransforms, Transform,
 	GetBlockResult, IBlock, ActionRev, BlockUnavailableReason,
 	PendValidationHook, UnvalidatablePendPolicy,
 	CollectionId, IBlockChangeNotifier, CollectionChangeListener, CollectionChangeEvent,
@@ -348,22 +348,37 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 						// `context.committed` array, and an in-place `.sort()` would reorder the shared
 						// request context under the caller's feet.
 						//
-						// NOTE: this loop SKIPS an entry whose pending it does not hold and promotes the
-						// next one anyway — so a member missing an intermediate revision that touched THIS
-						// block forks it exactly as an un-guarded commit would. `internalCommit`'s declared-
-						// base guard cannot help here: `context.committed` is a collection-level list of
-						// (actionId, rev) with no per-block base, and "no pending for that action" is the
-						// normal case for the many actions that never touched this block. Closing it needs
-						// the authored base stored WITH the pended transform — tracked by
-						// `backlog/bug-a-pended-transform-does-not-carry-its-base`.
+						// The loop skips an entry whose pending record it does not hold — the normal case
+						// for the many actions that never touched this block — so on its own it would
+						// promote the record after a missed change straight over the stale copy. What
+						// stops that is the base each record's pend carried (`PendingClaim.baseRev`):
+						// `mayPromoteOnRead` applies a record only to the exact revision its operations
+						// were computed against and DECLINES otherwise, leaving the record and `latest`
+						// untouched and ending the walk for this block (each later entry builds on this
+						// one). No commit declaration is needed, which is the point: there is no commit
+						// request on this path.
 						try {
 							for (const { actionId, rev } of [...missing].sort((a, b) => a.rev - b.rev)) {
 								const pending = await blockStorage.getPendingTransaction(actionId);
-								if (pending) {
-									const collectionId = await this.internalCommit(blockId, actionId, rev, blockStorage, latch);
-									if (collectionId !== undefined) {
-										promotions.push({ collectionId, blockId, actionId, rev });
+								if (!pending) {
+									continue;
+								}
+								const latest = await blockStorage.getLatest();
+								if (!(await this.mayPromoteOnRead(blockId, blockStorage, actionId, pending, latest))) {
+									// A decline is not a refusal: the record stays, and the committed content
+									// served below is real, merely behind — the reader's floors and the
+									// coordinator's read-repair own "behind", so no flag. The one exception is
+									// a block this node holds NO committed revision of: the answer below would
+									// be an absent that this node's own record contradicts, so it is flagged as
+									// a guess rather than posing as "never existed".
+									if (latest === undefined) {
+										unavailable = 'unmaterializable';
 									}
+									break;
+								}
+								const collectionId = await this.internalCommit(blockId, actionId, rev, blockStorage, latch);
+								if (collectionId !== undefined) {
+									promotions.push({ collectionId, blockId, actionId, rev });
 								}
 							}
 						} catch (err) {
@@ -371,7 +386,9 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 							// can be promoted here (each builds on the one before). Leave `latest` where it
 							// is — the invariant internalCommit just enforced — and let the commit-path
 							// healing supply the content; a read must not fail for it. Every other fault
-							// still propagates.
+							// still propagates. Reached only by a base-independent record now (an update-only
+							// one is declined above, never refused here): a delete over no committed
+							// revision, or an insert whose held `latest` is unmaterializable.
 							if (!(err instanceof MissingBaseRevisionError)) {
 								throw err;
 							}
@@ -440,6 +457,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 					// tickets/blocked/repo-pending-overlay-has-no-producer.
 					throw new Error(`Pending action ${context.actionId} not found`);
 				}
+				// A record the promotion above DECLINED (its base not reached here) is still present, so
+				// it is overlaid on whatever committed content this node holds — content older than the
+				// base its operations were computed against. Tolerated on this branch alone: the caller
+				// asserted its own pending, no production code sets `actionId` (the blocked ticket
+				// above), and the no-base case is still flagged by the clauses below.
 				const block = applyTransform(blockRev?.block, pendingTransform);
 				return [blockId, {
 					block,
@@ -797,7 +819,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				}
 				const blockStorage = this.createBlockStorage(blockId);
 				const blockTransform = transformForBlockId(request.transforms, blockId);
-				await blockStorage.savePendingTransaction(request.actionId, blockTransform, request.rev, latches.get(blockId)!);
+				await blockStorage.savePendingTransaction(request.actionId, blockTransform, request.rev,
+					declaredBaseFor(request.baseRevs, blockId, blockTransform), latches.get(blockId)!);
 			}
 
 			// This layer answers for one machine's storage and nothing else: `local`, with no cohort
@@ -1316,8 +1339,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	/**
 	 * @param declaredBaseRev The committed revision of the base the WRITER applied this block's
 	 * transform to, as declared in the commit op's `blockDigests[blockId].baseRev`. Untrusted wire
-	 * data, so it is typed `unknown` and validated below. Absent from the read-driven promotion in
-	 * {@link get}, which has no commit request and therefore nothing to compare against.
+	 * data, so it is typed `unknown` and validated in {@link guardCommitBase} — where it is the
+	 * FALLBACK, not the primary check: the base the record's own pend carried (`PendingClaim.baseRev`)
+	 * is read first. Absent from the read-driven promotion in {@link get}, which has no commit request
+	 * and has already judged the stored base (`mayPromoteOnRead`).
 	 */
 	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage, latch: BlockWriteLatch, proof?: BlockCommitProof, declaredBaseRev?: unknown): Promise<CollectionId | undefined> {
 		// Note: This method is called under the block write latch — by commit() (within its locked
@@ -1340,48 +1365,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// Get prior materialized block if it exists
 		const latest = await storage.getLatest();
 
-		// FORK GUARD: apply an update-only transform ONLY to the base the writer actually read.
-		// Revisions are allocated per COLLECTION, not per block, so `rev - 1` is meaningless here — a
-		// member legitimately holds block X at rev 1 and receives a commit of X at rev 7 when revs 2-6
-		// touched other blocks. The only sound discriminator is the writer's own per-block declaration:
-		// it read the block at `declaredBaseRev`, so a member holding anything else would be applying
-		// the transform to different bytes and silently forking the block's content at this revision.
-		//
-		// Each clause is deliberate:
-		// - `typeof declaredBaseRev === 'number'` — `blockDigests` is untrusted wire data with no
-		//   ingress schema (same rule as ClusterMember.validateCommitOperations). Missing, malformed,
-		//   or absent-by-design declarations ABSTAIN, preserving today's behavior for pre-upgrade
-		//   writers, undeclarable blocks, and the read-driven promotion in get().
-		// - `!transform.insert` — an insert-carrying transform is base-independent, so there is nothing
-		//   to fork. Keyed on the member's OWN pended transform (as previewCommitDigest does), never on
-		//   the declaration, so a hostile writer cannot flip the arm by attaching a bogus baseRev.
-		// - `latest?.rev !== declaredBaseRev` covers all three unsafe states: BEHIND the declared base
-		//   (missed updates — the fork case), AHEAD of it (this member holds a revision the writer
-		//   never saw — divergent history), and no local revision at all against a numeric declaration.
-		//
-		// Refusing is cheap and self-healing: refuseMissingBase throws MissingBaseRevisionError, which
-		// commit() classifies as divergence and ClusterMember.applyConsensusOperation maps to "behind",
-		// running reconcileDivergentCommit to pull the committed revision from a cohort peer. The
-		// writer's retry then lands on a healed base. A hostile writer declaring a junk numeric baseRev
-		// can force refusals and reconcile churn, but never a fork.
-		//
-		// NOTE: the AHEAD case is reported as "behind" divergence like every other missing-base
-		// refusal, so a cohort where nobody holds `rev` reconciles, fails `no-rev-quorum`, and logs
-		// that rather than a clean stale failure. Correct outcome — the writer read a base the cohort
-		// has moved past, and its retry re-reads — but the log reads as lag when it is the opposite.
-		// If those lines ever have to be triaged in volume, give the ahead arm its own reason string.
-		//
-		// NOTE: this guard only reaches what the writer declared, so two arms of the same fork still
-		// stand — both tracked by `backlog/bug-a-pended-transform-does-not-carry-its-base`:
-		// (1) a commit whose block declares NO digest — pre-upgrade writer, undeclarable block
-		// (read-far-then-update eviction, see db-core transform/digest.ts), or a delete-only transform —
-		// gap-applies exactly as before; (2) the read-driven promotion in `get`, which reaches this
-		// method with no commit request at all (`declaredBaseRev` undefined) and so cannot check. If
-		// forked-content reports persist, those are the residuals to look at.
-		if (typeof declaredBaseRev === 'number' && !transform.insert && latest?.rev !== declaredBaseRev) {
-			return await this.refuseMissingBase(blockId, actionId, rev, storage, latch,
-				`local latest ${latest?.rev ?? 'none'} is not the declared base ${declaredBaseRev} of rev ${rev}`);
-		}
+		// FORK GUARD: apply an update-only transform ONLY to the base its author computed it against.
+		await this.guardCommitBase(blockId, actionId, rev, storage, latch, transform, latest, declaredBaseRev);
 
 		const priorBlock = await this.readCommitBase(blockId, actionId, rev, storage, latest, latch);
 
@@ -1445,6 +1430,111 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// Either may be absent only for a malformed/headerless block — return
 		// undefined so the caller skips it rather than emitting a bogus event.
 		return newBlock?.header.collectionId ?? priorBlock?.header.collectionId;
+	}
+
+	/**
+	 * The fork guard: an update-only transform is applied ONLY to the base its author computed it
+	 * against. Revisions are allocated per COLLECTION, not per block, so `rev - 1` is meaningless here —
+	 * a member legitimately holds block X at rev 1 and receives a commit of X at rev 7 when revs 2-6
+	 * touched other blocks (the retired decision `st-commit-contiguity-guard-premise`). The only sound
+	 * discriminator is what the author said the base was, and the author says it twice:
+	 *
+	 * - `stored` — the base the record's own PEND carried for this block (`PendRequest.baseRevs`, kept
+	 *   as `PendingClaim.baseRev`). PRIMARY, because it was recorded with the very operations it
+	 *   describes and is present on every path that applies the record, commit message or not.
+	 * - `declared` — `blockDigests[blockId].baseRev` on the commit. The FALLBACK, for a record whose
+	 *   pend named no base: a sender running older code, or a drift-blind source (test doubles).
+	 *   Untrusted wire data with no ingress schema (same rule as ClusterMember.validateCommitOperations):
+	 *   anything but a number abstains rather than being coerced into a comparison.
+	 *
+	 * Three steps, in order:
+	 *
+	 * 1. Both present and unequal → refuse, with its own detail and log line. An honest writer never
+	 *    does this (the base pinned at staging is the one pended and the one declared — `Tracker`), so
+	 *    the shape it closes is a member holding a STALE pending record from an earlier attempt of a
+	 *    retried action — the retry's pend never reached this member — that receives the retry's
+	 *    commit: the old record's operations were computed against a different base, and a guard that
+	 *    read only the declaration would apply them wherever this member's latest happened to equal
+	 *    the new declaration.
+	 * 2. `effective = stored ?? declared`; a number, and `latest?.rev !== effective` → refuse. Covers
+	 *    all three unsafe states: BEHIND the base (missed updates — the fork case), AHEAD of it (this
+	 *    member holds a revision the writer never saw — divergent history), and no local revision at
+	 *    all against a numeric base.
+	 * 3. Neither present → apply as before the guard existed, logged as `commit:base-undeclared` so the
+	 *    residual is countable. This is the one arm left open, BY CHOICE, for senders that name no
+	 *    base anywhere: refusing a base-less pend outright would turn every such writer's write into a
+	 *    hard failure on a release that may run mixed versions for a while.
+	 *
+	 * Base-independent transforms — an insert (replaces the block wholesale) or a delete (materializes
+	 * to nothing) — are never guarded, keyed on the member's OWN pended transform and never on a
+	 * declaration, so a hostile writer cannot flip the arm by attaching a bogus base.
+	 *
+	 * Refusing is cheap and self-healing: refuseMissingBase throws MissingBaseRevisionError, which
+	 * commit() classifies as divergence and ClusterMember.applyConsensusOperation maps to "behind",
+	 * running reconcileDivergentCommit to pull the committed revision from a cohort peer. The writer's
+	 * retry then lands on a healed base. A hostile writer naming a junk numeric base — on the pend or
+	 * on the commit — can force refusals and reconcile churn, but never a fork.
+	 *
+	 * NOTE: the AHEAD case is reported as "behind" divergence like every other missing-base refusal, so
+	 * a cohort where nobody holds `rev` reconciles, fails `no-rev-quorum`, and logs that rather than a
+	 * clean stale failure. Correct outcome — the writer read a base the cohort has moved past, and its
+	 * retry re-reads — but the log reads as lag when it is the opposite. If those lines ever have to be
+	 * triaged in volume, give the ahead arm its own reason string.
+	 */
+	private async guardCommitBase(
+		blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage, latch: BlockWriteLatch,
+		transform: Transform, latest: ActionRev | undefined, declaredBaseRev: unknown
+	): Promise<void> {
+		if (isBaseIndependent(transform)) {
+			return;
+		}
+		const stored = (await storage.pendingClaimOf(actionId))?.baseRev;
+		const declared = typeof declaredBaseRev === 'number' ? declaredBaseRev : undefined;
+		if (stored !== undefined && declared !== undefined && stored !== declared) {
+			log('commit:base-disagreement blockId=%s rev=%d actionId=%s stored=%d declared=%d', blockId, rev, actionId, stored, declared);
+			return await this.refuseMissingBase(blockId, actionId, rev, storage, latch,
+				`stored base ${stored} disagrees with declared base ${declared} of rev ${rev}`);
+		}
+		const effective = stored ?? declared;
+		if (effective === undefined) {
+			log('commit:base-undeclared blockId=%s rev=%d actionId=%s latest=%s', blockId, rev, actionId, latest?.rev ?? 'none');
+			return;
+		}
+		if (latest?.rev !== effective) {
+			return await this.refuseMissingBase(blockId, actionId, rev, storage, latch,
+				`local latest ${latest?.rev ?? 'none'} is not the ${stored !== undefined ? 'stored' : 'declared'} base ${effective} of rev ${rev}`);
+		}
+	}
+
+	/**
+	 * Whether the read-driven promotion in {@link get} may apply `actionId`'s pending record here: a
+	 * base-independent record (an insert or a delete) always; an update-only one only when the base
+	 * its pend carried (`PendingClaim.baseRev`) is a number equal to this node's `latest`. Anything
+	 * else — a base this node has not reached, one it is past, or none stored at all — DECLINES, and
+	 * the caller leaves the record and `latest` untouched.
+	 *
+	 * Declining is deliberately distinct from {@link refuseMissingBase}, which deletes the record
+	 * because it can never be promoted here. A declined record is not dead: this node's latest reaches
+	 * the stored base only through a replica or reconcile, and when that lands `sweepDeadClaims`
+	 * removes the record if its slot is passed, or a later context read promotes it if not. A record
+	 * whose pend named no base is declined too — the promotion must not apply a change whose base it
+	 * cannot establish, and block repair supplies the version instead. The cost falls on base-less
+	 * senders alone: their held-but-missed records no longer come current on a read, only through the
+	 * next commit's reconcile or the coordinator's read-repair.
+	 *
+	 * {@link guardCommitBase} still runs inside `internalCommit` afterwards; under the latch the
+	 * caller holds, this check is exactly what makes it pass.
+	 */
+	private async mayPromoteOnRead(blockId: BlockId, storage: IBlockStorage, actionId: ActionId, pending: Transform, latest: ActionRev | undefined): Promise<boolean> {
+		if (isBaseIndependent(pending)) {
+			return true;
+		}
+		const stored = (await storage.pendingClaimOf(actionId))?.baseRev;
+		if (stored !== undefined && latest?.rev === stored) {
+			return true;
+		}
+		log('get:promote-declined blockId=%s actionId=%s storedBase=%s latest=%s', blockId, actionId, stored ?? 'none', latest?.rev ?? 'none');
+		return false;
 	}
 
 	/**
@@ -1622,6 +1712,42 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		log('commit:missing-base blockId=%s rev=%d actionId=%s detail=%s', blockId, rev, actionId, detail);
 		throw new MissingBaseRevisionError(blockId, rev, detail);
 	}
+}
+
+/**
+ * Whether `transform`'s result does not depend on the block's prior content: an insert replaces the
+ * block wholesale and a delete materializes to nothing (delete-last-wins in `applyTransform`), so
+ * neither can fork on a different base, and no base is ever named for them (`Tracker.stagedBaseRevs`
+ * names update-only blocks alone). Every base check here keys on this, on the member's OWN pended
+ * transform, never on what a request declares.
+ */
+function isBaseIndependent(transform: Transform): boolean {
+	return Boolean(transform.insert) || Boolean(transform.delete);
+}
+
+/**
+ * The base a pend declares for `blockId`, as storage will keep it: `baseRevs[blockId]` when it is a
+ * number and the block's transform is update-only, else nothing. Untrusted wire data with no ingress
+ * schema (the posture `validateCommitOperations` takes toward `blockDigests`): a malformed or surplus
+ * entry is ignored for that id, never thrown on; an entry for an inserted or deleted block — which no
+ * producer sends — is dropped, so a base-independent record can never read as base-dependent later.
+ *
+ * NOTE: the base is stored AS TOLD, and the pend never refuses on it — not when it is behind this
+ * member's latest, and not when it is ahead. A member has no grounds to second-guess the author's
+ * claim about the author's own computation (the client is what makes an honest claim correct:
+ * `Tracker` pins the base at the first staged update and re-stages over a moved one). Refusing here
+ * would also be the wrong tier: a member holding a torn or abandoned HIGHER revision would cast a
+ * reject that, at three members, fails every honest retry — the writer re-reads the majority's
+ * revision and declares it again — whereas the same mismatch at commit time is one member's refusal
+ * (`StorageRepo.internalCommit`), heals by reconcile, and the cohort still commits on majority
+ * durability.
+ */
+function declaredBaseFor(baseRevs: PendRequest['baseRevs'], blockId: BlockId, transform: Transform): number | undefined {
+	if (isBaseIndependent(transform)) {
+		return undefined;
+	}
+	const declared = baseRevs?.[blockId];
+	return typeof declared === 'number' ? declared : undefined;
 }
 
 /**

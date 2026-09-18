@@ -140,13 +140,17 @@ missing-base refusal (`refuseMissingBase` / `MissingBaseRevisionError` in
 
 The same refusal enforces a second, distinct rule: **an update-only transform is
 applied only to the base its author read.** A member holding a base other than
-the `baseRev` the writer declared in `CommitRequest.blockDigests` refuses,
-rather than applying the edits to different bytes and recording the result under
-the new revision number. Revision arithmetic cannot substitute for the
-declaration — a per-block gap under a collection-wide revision counter is
-routine, not a fault. See `docs/internals.md` "An update-only transform is
-applied only to the base its author read" for the full rule and the two arms it
-deliberately does not reach.
+the one the record's pend carried for the block (`PendRequest.baseRevs`, kept
+as `BlockMetadata.pendingBases`) — or, for a record whose pend named none, the
+`baseRev` the writer declared in `CommitRequest.blockDigests` — refuses, rather
+than applying the edits to different bytes and recording the result under the
+new revision number; and the read-driven promotion in `StorageRepo.get` declines
+to apply a record whose stored base is not the revision it holds. Revision
+arithmetic cannot substitute for the author's word — a per-block gap under a
+collection-wide revision counter is routine, not a fault. See `docs/internals.md`
+"An update-only transform is applied only to the base its author read" for the
+full rule and the one arm (a sender that names no base anywhere) left open by
+choice.
 
 ### 4. `promotePendingTransaction` is a cross-store atomic *move*, not a copy
 
@@ -598,8 +602,21 @@ export type BlockMetadata = {
   ranges: RevisionRange[];    // Available revision ranges
   latest?: ActionRev;         // Latest revision info
   lineageFloor?: number;      // Lowest revision `latest` is known to be BUILT FROM, see below
+  pendingRevs?: Record<ActionId, number>;   // Per pending record, the revision its pend claimed
+  pendingBases?: Record<ActionId, number>;  // Per pending record, the base its operations were computed against
 };
 ```
+
+`pendingRevs` and `pendingBases` describe the block's pending records — the slot each one claims
+and the committed revision its update operations were computed against — and are written, dropped
+and swept together with the record (`BlockStorage.recordClaim`), never on their own. They live here
+rather than inside the record because a promotion moves the record's bytes into the committed store
+unchanged. An entry whose record is gone is inert (every reader joins against the pending
+namespace), and a record with no entry reads as unknown: an unknown slot is the strongest kind of
+reservation, an unknown base is simply nothing to compare. Read through
+`IBlockStorage.listPendingClaims` and `IBlockStorage.pendingClaimOf`; the rules that consume them
+are in `docs/repository.md`, "A pending record claims a slot, and reserves the block only for that
+slot".
 
 `lineageFloor` is what lets a node say whether the content it holds now was built from a given
 committed write — the question a writer asks when its write was superseded before it could confirm

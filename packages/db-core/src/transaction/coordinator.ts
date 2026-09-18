@@ -8,7 +8,7 @@ import { TornActionError } from "../collection/struct.js";
 import { isTransactionExpired, clampPriority } from "./transaction.js";
 import { Log } from "../log/log.js";
 import { blockIdsForTransforms, copyTransforms } from "../transform/helpers.js";
-import { computeBlockContentDigests, blockDigestsField } from "../transform/digest.js";
+import { computeBlockContentDigests, blockDigestsField, baseRevsField } from "../transform/digest.js";
 import { collectOperations, hashOperations } from "./operations-hash.js";
 import { CoordinatorConcurrentStampError, CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./errors.js";
 import { jitteredBackoffMs, abortableDelay, makeAbortError } from "../utility/backoff.js";
@@ -1607,6 +1607,11 @@ export class TransactionCoordinator {
 		// at 0, exactly as the single-collection path sends it (TransactorSource.transact), so
 		// the common first-attempt pend is indistinguishable from a Collection.sync pend.
 		const priority = clampPriority(transaction.priority);
+		// The base each update-only block's operations were computed against, read from the same
+		// tracker the commit side digests (commitCollection); it still holds this transaction's staged
+		// transforms and pins. Storage keeps it with the pending record so the record is never applied
+		// to a different version of the block (see PendRequest.baseRevs). Omitted when empty.
+		const baseRevs = collection.tracker.stagedBaseRevs(blockIdsForTransforms(transforms));
 		const pendRequest: PendRequest = {
 			actionId,
 			rev,
@@ -1615,6 +1620,7 @@ export class TransactionCoordinator {
 			...(validation === undefined
 				? (priority > 0 ? { priority } : {})
 				: { validation }),
+			...baseRevsField(baseRevs),
 			superclusterNominees: nominees
 		};
 

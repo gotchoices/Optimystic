@@ -223,8 +223,9 @@ content (the accepted-tradeoff `NOTE:` at `mayRetain`). It sets no floor for a b
 invalidation entry reverts. A write staged over a too-old read keeps the revision it was really
 computed against: once storage catches up, the base under the staged edits is re-judged as moved and
 the edits are re-staged before they are pended, never re-described at the newer revision (see
-[Staged Edits Keep Their Base](#staged-edits-keep-their-base); the storage side of the same defect,
-a pend that does not carry its base, is ticket `bug-a-pended-transform-does-not-carry-its-base`).
+[Staged Edits Keep Their Base](#staged-edits-keep-their-base); the storage side of the same defect
+is closed by the pend carrying that base and storage keeping it with the record — see the invariant
+*An update-only transform is applied only to the base its author read* under Key Invariants).
 While a floor is unmet every read of its block costs a transactor request rather than a memory hit,
 and now a second coordinator round with it; the tripwire `NOTE:` at `mayRetain` names the remedy if
 that ever shows up.
@@ -924,15 +925,33 @@ saveMaterializedBlock(block): store(structuredClone(block));
   bytes, permanently — after which the content-digest check above rejects every later write to
   that block from that member. Revision arithmetic cannot detect this (`latest.rev !== rev - 1`
   is the *routine* per-collection gap and rejecting it breaks ordinary writes — see the retired
-  decision ticket `st-commit-contiguity-guard-premise`). The only sound discriminator is the
-  writer's own per-block declaration: `internalCommit` refuses when `blockDigests[blockId].baseRev`
-  is a number, the member's pended transform carries no `insert`, and `latest?.rev` is not that
-  number — behind it, ahead of it, or absent. The refusal is the same `missing-base-revision`
-  divergence as above, so it heals by the same reconcile. **Two arms are not covered**, both by
-  design and both tracked by `backlog/bug-a-pended-transform-does-not-carry-its-base`:
-  a commit that declares no digest for the block (nothing to compare, so the member abstains and
-  gap-applies as before), and the read-driven promotion in `StorageRepo.get`, which has no commit
-  request and therefore no declaration.
+  decision ticket `st-commit-contiguity-guard-premise`). The only sound discriminator is what the
+  author says the base was, and the base now **travels with the change**: the pend names, per
+  update-only block, the committed revision its operations were computed against
+  (`PendRequest.baseRevs`, from the tracker's pins — see
+  [Staged Edits Keep Their Base](#staged-edits-keep-their-base)), and storage keeps it beside the
+  pending record (`BlockMetadata.pendingBases`, read back as `PendingClaim.baseRev`), so every step
+  that applies the record has the base to hand, commit message or not. At commit,
+  `StorageRepo.internalCommit` (its `guardCommitBase`) reads the stored base first and the commit's
+  own `blockDigests[blockId].baseRev` only as a fallback: both present and unequal is refused
+  outright (a stale record from an earlier attempt of a retried action, met by the retry's commit);
+  otherwise the effective base must equal `latest.rev` — behind it, ahead of it, or absent all
+  refuse. The refusal is the same `missing-base-revision` divergence as above, so it heals by the
+  same reconcile. The read-driven promotion in `StorageRepo.get` (`mayPromoteOnRead`) applies a
+  record only when its stored base equals `latest.rev` and otherwise **declines**: the record and
+  `latest` stay as they are, the walk stops for that block, and the committed content served is
+  real content merely behind — which the reader's floors and the coordinator's read-repair own —
+  except that a block with no committed revision here is flagged `unavailable`, since an absent
+  answer would contradict the record the node holds. A declined record is not dead: a replica or
+  reconcile brings the base, after which a later context read promotes it or the dead-claim sweep
+  removes it. An inserted or deleted block is base-independent and is never named or guarded.
+  **One arm stays open by choice**, for senders that name no base at all (a build before the field
+  existed, or a drift-blind source such as the test doubles): storage accepts and keeps their pend
+  without a base, the commit guard falls back to the declaration and then abstains — logged
+  `commit:base-undeclared` so the residual is countable — and the read-driven promotion declines
+  their held-but-missed records, which then come current only through the next commit's reconcile
+  or read-repair. Refusing a base-less pend was rejected because it would turn every such writer's
+  write into a hard failure on a release that may run mixed versions for a while.
 - **A node that can re-check a transaction never skips the check silently.** Both validating tiers
   — a `ClusterMember` casting its promise vote and a `StorageRepo` applying a pend — run the one
   `checkPendValidation` ([`db-p2p/src/pend-validation.ts`](../packages/db-p2p/src/pend-validation.ts)),

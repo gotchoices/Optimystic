@@ -115,21 +115,39 @@ export interface IBlockStorage {
      *
      * The revision is also KEPT, in the block's metadata (`BlockMetadata.pendingRevs`), so the record
      * can later be read as a claim on a specific slot — see {@link listPendingClaims}.
+     *
+     * `baseRev` is the committed revision the record's update operations were computed against — the
+     * pend's `baseRevs[blockId]` — or `undefined` when the pend named none for this block (an
+     * inserted or deleted block, or a base the author did not know). Kept beside the revision
+     * (`BlockMetadata.pendingBases`), in the same metadata write, so that every later step that
+     * applies the record can refuse to apply it to a different version of the block — see
+     * {@link pendingClaimOf}. Stored as told: whether it matches this node's `latest` is decided
+     * where the record is APPLIED (`StorageRepo.internalCommit`, and the read-driven promotion in
+     * `StorageRepo.get`), never here.
      */
-    savePendingTransaction(actionId: ActionId, transform: Transform, rev: number | undefined, latch: BlockWriteLatch): Promise<void>;
+    savePendingTransaction(actionId: ActionId, transform: Transform, rev: number | undefined, baseRev: number | undefined, latch: BlockWriteLatch): Promise<void>;
 
-    /** Deletes a pending action, and the revision it was recorded as claiming. */
+    /** Deletes a pending action, and the revision and base it was recorded as claiming. */
     deletePendingTransaction(actionId: ActionId, latch: BlockWriteLatch): Promise<void>;
 
     /**
-     * Every pending record on this block, each with the revision it was pended at when that is
-     * known — the pending namespace joined against `BlockMetadata.pendingRevs`. This is the view the
-     * rival-pend checks read (`StorageRepo.pend`'s apply-time scan and
-     * `ClusterMember.validatePendOperations`' promise vote), because whether a record reserves the
-     * block against a given pend depends on the slot it claims (`isReservationAgainst`), not on its
-     * mere presence. Read-only; no latch.
+     * Every pending record on this block, each with the revision it was pended at and the base it
+     * was computed against when those are known — the pending namespace joined against
+     * `BlockMetadata.pendingRevs` and `pendingBases`. This is the view the rival-pend checks read
+     * (`StorageRepo.pend`'s apply-time scan and `ClusterMember.validatePendOperations`' promise
+     * vote), because whether a record reserves the block against a given pend depends on the slot
+     * it claims (`isReservationAgainst`), not on its mere presence. Read-only; no latch.
      */
     listPendingClaims(): Promise<PendingClaim[]>;
+
+    /**
+     * The claim of ONE pending record — `actionId`'s entry of {@link listPendingClaims} — or
+     * `undefined` when this block holds no pending record for the action. For the two apply sites
+     * (`StorageRepo.internalCommit` and the read-driven promotion in `StorageRepo.get`), which need
+     * one record's base on the hot commit path and must not enumerate every record to get it.
+     * Read-only; no latch of its own: both callers already hold the block's write latch.
+     */
+    pendingClaimOf(actionId: ActionId): Promise<PendingClaim | undefined>;
 
     /** Lists revisions in ascending or descending order between startRev and endRev (inclusive) */
     listRevisions(startRev: number, endRev: number): AsyncIterable<ActionRev>;

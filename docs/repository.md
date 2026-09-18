@@ -138,11 +138,17 @@ checkable/abstain rule, and `docs/correctness.md` §2 **Content digest declarati
 approval does and does not attest.
 
 **What `baseRev` does at apply time.** The declared base is not only an input to that vote. When
-the commit is applied, a member that holds a base *other* than the declared one refuses the commit
-outright rather than applying the author's edits to different bytes — which would leave it holding
-different content under the same revision number, permanently. So a declared block is protected
-from that fork and an undeclared one is not: this is a second cost of not declaring, alongside the
-replication cost in `docs/correctness.md` §"The cost of not declaring". See
+the commit is applied, a member that holds a base *other* than the one the author computed against
+refuses the commit outright rather than applying the author's edits to different bytes — which
+would leave it holding different content under the same revision number, permanently. The base the
+member compares against comes first from the *pend*: `PendRequest.baseRevs` names, per update-only
+block, the committed revision the operations were computed against, and storage keeps it with the
+pending record (see *A pending record claims a slot* below). The commit's `baseRev` is the fallback
+for a record whose pend named none, and a commit whose declaration disagrees with the stored base is
+refused too. So the fork protection no longer depends on declaring content: a block whose pend named
+its base is protected whether or not its digest was declared, and only a sender that names no base
+anywhere is left unprotected — by choice, so that older builds keep committing. What not declaring
+still costs is the replication cost in `docs/correctness.md` §"The cost of not declaring". See
 [internals.md](internals.md) "An update-only transform is applied only to the base its author read".
 
 #### Invariant P — a pending record and a committed record never coexist for one action
@@ -205,10 +211,22 @@ A pending record is not a bare "someone is writing this block"; it is a reservat
 revision its pend asked for. Storage keeps that revision beside `latest` (`BlockMetadata.pendingRevs`
 in `packages/db-p2p/src/storage/struct.ts`, written by `BlockStorage.savePendingTransaction` in the
 same metadata write that seeds a fresh block, dropped with the record by `deletePendingTransaction`)
-and hands it back joined onto the record as a claim (`IBlockStorage.listPendingClaims`). It lives in
-the metadata rather than in the record because the raw drivers promote a record by moving its bytes
-into the committed store unchanged — a rename on the filesystem backend — so the record's value has
-to stay a plain transform.
+and hands it back joined onto the record as a claim (`IBlockStorage.listPendingClaims`, or one
+record's claim through `IBlockStorage.pendingClaimOf`). Beside it — written, dropped and swept in
+the same metadata writes — storage keeps the **base** each record's update operations were computed
+against: the pend's `PendRequest.baseRevs` entry for the block, kept as `BlockMetadata.pendingBases`
+and read back as `PendingClaim.baseRev`, so that whatever later applies the record can refuse to
+apply it to a different version of the block. A record whose pend named no base for the block (an
+inserted or deleted block, or a sender that names none) simply has no entry, as does one written
+before the field existed; the two maps are siblings rather than one map of pairs so that older
+metadata reads without a migration. The base is stored as told and never checked at pend time: a
+member has no grounds to second-guess the author's claim about its own computation, and a pend-time
+refusal on a mismatch would be the wrong tier — a member holding a torn or abandoned higher revision
+would veto every honest retry, whereas the same mismatch at commit is one member's refusal that
+heals by reconcile (the `NOTE:` at `declaredBaseFor` in `packages/db-p2p/src/storage/storage-repo.ts`).
+Both maps live in the metadata rather than in the record because the raw drivers promote a record
+by moving its bytes into the committed store unchanged — a rename on the filesystem backend — so
+the record's value has to stay a plain transform.
 
 Both rival scans — `StorageRepo.pend` at apply and `ClusterMember.validatePendOperations` at the
 promise vote — read a record through one rule, `isReservationAgainst` in
@@ -232,8 +250,9 @@ collection had moved when the incoming writer read it:
   re-asked once elsewhere, `BlockGets.floors`, the second line). The one shape that does not cover —
   from four members up, a member that never received the rival's pend serving a handle with no floor
   for the block while the rival's non-tail commit is in flight — is written up at
-  `isReservationAgainst` and owned by backlog `bug-a-pended-transform-does-not-carry-its-base`. The
-  member comes current when the admitted
+  `isReservationAgainst` and owned by ticket
+  `a-rival-pend-is-superseded-only-by-a-writer-that-built-on-it`, which reads the stored base at
+  that rule. The member comes current when the admitted
   pend's own commit applies — through `StorageRepo.internalCommit`, or through the behind-reconcile
   its fork guard triggers.
 - a record with **no** claim on file — pended without a revision, or written before the revision was

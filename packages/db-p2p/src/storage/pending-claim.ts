@@ -13,6 +13,16 @@ import type { ActionId } from "@optimystic/db-core";
 export interface PendingClaim {
 	actionId: ActionId;
 	rev?: number;
+	/**
+	 * The committed revision the record's update operations were computed against — the pend's
+	 * `baseRevs[blockId]`, kept in `BlockMetadata.pendingBases`. Absent for a record whose pend
+	 * carried no base for this block (inserted, deleted, or unknown to the author) and for a record
+	 * written before the field existed; both read as "base unknown". Unlike an unknown `rev`, an
+	 * unknown base is NOT the strongest kind of anything: it is simply nothing to compare, and each
+	 * apply site decides what that means for it (`StorageRepo.internalCommit` falls back to the
+	 * commit's own declaration; the read-driven promotion in `StorageRepo.get` declines).
+	 */
+	baseRev?: number;
 }
 
 /**
@@ -57,11 +67,13 @@ export interface PendingClaim {
  * rival's record now approve where they used to hold; their commit then applies the newcomer's
  * transform over the same base the newcomer read (the fork guard passes) and sweeps the rival's
  * record, so the rival's change to that block is lost while the log names it. Three members are
- * not exposed (everyone holds every pend). The pend does not carry the base each block's transform
- * was computed against; when it does (backlog `bug-a-pended-transform-does-not-carry-its-base`),
- * the rule here becomes "superseded only if the incoming base is at or past the claim", which
- * closes the hole at the site that has the facts. Not a tripwire to wait on if a deployment runs
- * four or more members per cohort — that is the condition, and it is a lost update, not a wedge.
+ * not exposed (everyone holds every pend). The pend now carries the base each block's transform
+ * was computed against (`PendRequest.baseRevs`, kept here as {@link PendingClaim.baseRev}), but this
+ * rule does not read it yet; when it does (ticket
+ * `a-rival-pend-is-superseded-only-by-a-writer-that-built-on-it`), the rule becomes "superseded
+ * only if the incoming base is at or past the claim", which closes the hole at the site that has
+ * the facts. Not a tripwire to wait on if a deployment runs four or more members per cohort — that
+ * is the condition, and it is a lost update, not a wedge.
  */
 export function isReservationAgainst(claim: PendingClaim, requestedRev: number | undefined): boolean {
 	return claim.rev === undefined || requestedRev === undefined || claim.rev >= requestedRev;
