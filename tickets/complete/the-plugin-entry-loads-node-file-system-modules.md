@@ -1,4 +1,4 @@
-description: The Quereus plugin's main entry used to read a file from disk when it loaded, which broke browser and React Native builds of any app importing from it. The Quereus version it needed is now fixed when the plugin is built, and a new test fails if the main entry stops bundling for a browser. Review the change.
+description: The Quereus plugin's main entry used to read a file from disk when it loaded, which broke browser and React Native builds of any app importing from it. The Quereus version it needs is now fixed when the plugin is built, and a test fails if the main entry stops bundling for a browser. Reviewed and complete.
 architecture: docs/correctness.md
 files:
   - packages/quereus-plugin-optimystic/src/transaction/quereus-engine.ts (`QUEREUS_ENGINE_ID` and its comment; the Node imports and `resolveQuereusVersion()` are gone)
@@ -57,8 +57,38 @@ The version is now fixed when the plugin is built:
 
 Once this ships in a release, sereus can drop the `no-restricted-imports` rule in `eslint.config.mjs` that keeps the plugin's root entry out. They can also drop the `LEGACY_PARTIAL_COMMIT_ERROR_NAME` name match in `cadre-core/src/control-write-retry.ts` and use `import { PartialCommitError } from '@optimystic/quereus-plugin-optimystic'` with `instanceof`. That change is theirs to make, not this repo's.
 
-# Review checklist
+# Reviewer checklist (from the implement handoff; answered below)
 
 - Read `browser-bundle.spec.ts`. Does `logOverride` really promote `import.meta` from `node_modules`? To confirm, add `export const u = import.meta.url;` to any file in the graph and run the spec.
 - Is the new wording of Theorem 4 step 1 in `docs/correctness.md` accurate against `TransactionValidator.validate` in `packages/db-core/src/transaction/validator.ts` (the `Unknown engine` refusal and the operations-hash comparison)?
 - Confirm that `yarn pub` publishes `src/transaction/quereus-version.ts` (`files` includes `src`) and never needs `scripts/` at install time (it does not: `scripts/` is build-time only and is not in `files`).
+
+## Review findings
+
+Read the implement diff (`9dc9de24`) first, then the handoff.
+
+**Checked, confirmed correct**
+
+- **The `import.meta` guard really covers `node_modules`.** I built a scratch fixture with a local entry and a `node_modules/dep` package, both using `import.meta`. I bundled it with the spec's exact esbuild options, via the plugin's installed esbuild 0.27. Three errors came back: one from the entry and two from `node_modules/dep/index.js`. So the `logOverride` promotes the warning in dependency code too, as the handoff said. I deleted the fixture afterwards.
+- **Theorem 4 step 1 in `docs/correctness.md` matches `TransactionValidator.validate`** (`packages/db-core/src/transaction/validator.ts`). Step 1 refuses an unregistered `stamp.engineId` with `Unknown engine: …` (lines 84–89). Re-execution comes next, then `computedHash !== operationsHash` refuses a different result (line 170). That comparison is Theorem 4's step 5, which is what the new wording cites. The README § Transaction Engine paragraph says the same thing.
+- **Publishing.** The `files` list includes `src` (so the generated `quereus-version.ts` ships) and `dist`, but not `scripts/`. Nothing a consumer installs runs `scripts/`: it is used only by `build`, `dev` and `test:smoke`. `yarn pub` runs `yarn build` first, which regenerates the version.
+- **Build leaves the tree clean.** After `yarn workspace @optimystic/quereus-plugin-optimystic build`, `git status` stayed clean because the generated file was unchanged. The script's "is this the main module" check also held when invoked with a lowercase drive letter (`c:/…`) and from both the repo root and the package directory. Each run printed its line.
+- **Stale references.** I searched every `.md` for `resolveQuereusVersion`, `import.meta.resolve`, `ENGINE_ID` and "installed @quereus". The only remaining hits are the updated `docs/transactions.md` sample, `docs/correctness.md` and the README. `db-core`'s `transaction.ts` comment example (`'quereus@0.5.3'`) is only a format illustration. I left `docs/review.html` alone for the reason the handoff gives: it is a dated record.
+- **Type safety and error handling.** `render()` puts the version into TypeScript source without escaping. A semver string cannot contain a quote, so that is fine. The spec's `.catch(failure => failure)` assumes esbuild throws a `BuildFailure`. Any other throw would still fail the test, only with a less helpful message. That is acceptable for a guard test.
+
+**Considered and left as is**
+
+- **Duplicate version lookup (DRY).** `test/quereus-engine.spec.ts` keeps its own copy of the walk-up lookup instead of importing `installedQuereusVersion` from the build script. I left it: the spec's comment says it resolves the version *independently*, so it acts as a separate check of the value the build script writes. `smoke.mjs` does reuse the script's function. That is fine, because the spec's copy already covers a bug in the shared lookup.
+- **`engines.node >=20.6.0`.** I agree with keeping it, per the ticket's instruction. The build script and `register.mjs` still need Node 20.6. Dropping the field is a separate call about what `engines` should promise consumers, and that is not this ticket's to make.
+- **The build script decides whether to run by comparing `import.meta.url` with `process.argv[1]`.** If the two ever disagree, for example when the script is launched through a path alias like a junction, it would quietly write nothing. The engine spec and the smoke check would still catch a stale version. It works for every invocation I tried, so I did not restructure it.
+
+**Found and fixed inline:** none. The diff is small and scoped, the comments explain reasons rather than narrate the code, and file sizes are small (the largest new file is 74 lines).
+
+**Tickets filed / tripwires added:** none. The one open gap, that `yarn check:rn` does not cover the plugin yet, is already tracked by `rn-bundle-check-covers-the-quereus-plugin`, and the implementer appended a no-stubs measurement to it.
+
+**Validation run (review)**
+
+- `yarn workspace @optimystic/quereus-plugin-optimystic build`: ok. The generated file was unchanged.
+- `yarn workspace @optimystic/quereus-plugin-optimystic test`: 993 passing, 13 pending, `smoke ok quereus@4.19.4`. That includes the new `browser bundle` spec.
+- `yarn workspace @optimystic/quereus-plugin-optimystic typecheck`, `yarn lint`, `yarn lint:deps`, `yarn lint:docs`: all clean.
+- Not run: the full `yarn check`, `yarn check:rn` (it does not cover the plugin yet) and `yarn test:integration`. The change is limited to this package's version constant and its guards.
