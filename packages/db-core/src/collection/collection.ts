@@ -696,6 +696,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// documented as never a retryability signal (docs/internals.md). It is the same kind of use
 		// `syncAttempts`' stall check makes: it can only END a retry, never start one.
 		const rivalConfirmed = result.staleAt !== undefined || (result.missing?.length ?? 0) > 0;
+		// NOTE: a confirmed rival settles at once, even with retry budget left: re-sending is
+		// pointless, but the lineage question is asked only this once, so a member that is silent
+		// just now makes the answer `final: false`. If unsettled outcomes ever show up often under
+		// contention, spend the remaining rounds re-asking `getLineage` before giving up.
 		if (!rivalConfirmed && !lastChance) {
 			// The refusal does not say which blocks lack the revision, so name every block the entry
 			// lists other than the tail — the entry being visible is what proves the tail holds it.
@@ -1822,6 +1826,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * moved those transforms describe blocks at a revision this handle has left, so what remains is
 	 * re-staged against the adopted one, exactly as a refresh would have done. */
 	private async unstage(actions: Action<TAction>[], stagedBefore: Transforms, revBefore: number | undefined): Promise<void> {
+		// NOTE: matched by identity, which is what `filterAgainstEntry` promises for a kept action.
+		// A `filterConflict` hook that answers a REPLACEMENT instance for one of these actions would
+		// leave the replacement staged here. No collection installs such a hook today (`Tree` and
+		// `Diary` install none); if one ever does, carry a per-call token on the staged actions and
+		// match on that instead.
 		this.pending = this.pending.filter(staged => !actions.includes(staged));
 		if (this.source.actionContext?.rev === revBefore) {
 			this.tracker.reset(stagedBefore);

@@ -268,7 +268,10 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 	 *
 	 * A call that throws leaves nothing staged (see {@link Collection.actAndSync}), so the mutation
 	 * cannot ride along with a later `replace`. Whether it reached STORAGE is what the error says:
-	 * submitting it again is safe unless that is a `TornActionError` with `final: false`. */
+	 * a `TornActionError` with `final: true` means it did not and submitting it again stores it
+	 * once; `final: false` means that could not be established. A `SyncRetryExhaustedError` is not
+	 * a promise either way — the write path's last budgeted attempt, and a deadline, are not
+	 * followed by the refresh that would have settled it (see `Collection.syncAttempts`). */
 	async replace(data: TreeReplaceAction<TKey, TEntry>): Promise<WriteDurability | undefined> {
 			return await this.collection.actAndSync([{ type: "replace", data }]);
 	}
