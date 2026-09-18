@@ -83,6 +83,10 @@ export interface DrivenTransactorOptions {
 	/** Called with the peer-id string of every repo the transactor reaches for, reachable or not — so a spec
 	 *  can assert that the driver, and only the driver, coordinated what it claims to. */
 	onRoute?: (peerIdStr: string) => void;
+	/** Wraps each reachable node's coordinator repo before the transactor calls it — for a spec that has to
+	 *  hold or observe one step of a write from the writer's side, such as a commit between its tail stage
+	 *  and its data-block stage (`NetworkTransactor.commit` sends them as separate repo calls). */
+	wrapRepo?: (peerIdStr: string, repo: IRepo) => IRepo;
 }
 
 /**
@@ -122,7 +126,8 @@ export function transactorDrivenBy(mesh: Mesh, driver: MeshNode, options: Driven
 			if (isUnreachable(mesh, peerIdStr)) return unreachableRepo(peerIdStr);
 			const node = mesh.nodes.find(n => n.peerId.toString() === peerIdStr);
 			if (!node) throw new Error(`Unknown peer ${peerIdStr}`);
-			return node.coordinatorRepo as unknown as IRepo;
+			const repo = node.coordinatorRepo as unknown as IRepo;
+			return options.wrapRepo ? options.wrapRepo(peerIdStr, repo) : repo;
 		},
 		localPeerId: driver.peerId
 	});

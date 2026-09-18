@@ -13,7 +13,7 @@ import {
 } from "@optimystic/db-core";
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
-import { isReservationAgainst, type PendingClaim } from "./pending-claim.js";
+import { isReservationAgainst, reservationRequestFor, isBaseIndependent, declaredBaseFor, type PendingClaim } from "./pending-claim.js";
 import type { IBlockReplicaStore } from "../cluster/block-transfer-service.js";
 import { proofDeclaredDigest, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { RevisionNotCoveredError } from "./i-block-storage.js";
@@ -161,17 +161,22 @@ export interface IRevisionActionReader {
 }
 
 /**
- * The capability that answers "which pending records hold this block, and for which slot?" — the
- * question the promise-round rival check needs (`ClusterMember.validatePendOperations`), because a
- * record claiming a revision the incoming pend has already moved past is not a reservation against
- * it (`isReservationAgainst`). `GetBlockResult.state.pendings` carries only action ids, so the vote
- * asks this on the refusal path instead. Named for the same reason as {@link IRevisionActionReader}:
- * a repo that lacks it degrades the vote to "every rival reserves" — today's behaviour — rather
- * than to silently admitting one.
+ * The capability that answers "which pending records hold this block, and for which slot and
+ * base?" — the questions the promise-round votes need. The rival check
+ * (`ClusterMember.validatePendOperations`) lists every record's claim, because a record the incoming
+ * writer has built on is not a reservation against it (`isReservationAgainst`), and
+ * `GetBlockResult.state.pendings` carries only action ids; the commit vote
+ * (`ClusterMember.validateCommitBaseDeclarations`) reads one record's claim, to compare the base its
+ * pend carried with the one the commit declares. Named for the same reason as
+ * {@link IRevisionActionReader}: a repo that lacks `listPendingClaims` degrades the pend vote to
+ * "every rival reserves" rather than to silently admitting one, and one that lacks `pendingClaimOf`
+ * makes the commit vote abstain — each method is probed on its own.
  */
 export interface IPendingClaimReader {
 	/** See `IBlockStorage.listPendingClaims`. Read-only; never takes the block write latch. */
 	listPendingClaims(blockId: BlockId): Promise<PendingClaim[]>;
+	/** See `IBlockStorage.pendingClaimOf`. Read-only; never takes the block write latch. */
+	pendingClaimOf(blockId: BlockId, actionId: ActionId): Promise<PendingClaim | undefined>;
 }
 
 export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ICommitProofPersister, IRevisionActionReader, IPendingClaimReader {
@@ -756,17 +761,24 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				// consensus round per such write), refuse at `ClusterMember.validatePendOperations`
 				// instead of here.
 
-				// Then the pending records that RESERVE the block against this request. A record claiming a
-				// slot the collection has already moved past is not one of them (see `isReservationAgainst`):
-				// counting it refused every later writer on the strength of a commit this node merely
-				// missed. The promise vote (`ClusterMember.validatePendOperations`) applies the same rule,
-				// so a pend the cohort approved is not then refused here at apply.
+				// Then the pending records that RESERVE the block against this request. A record this
+				// request's writer has built on — its declared base for the block is at or past the
+				// record's slot, or, with no base, the collection has moved past that slot — is not one of
+				// them (see `isReservationAgainst`): counting it refused every later writer on the strength
+				// of a commit this node merely missed. The promise vote
+				// (`ClusterMember.validatePendOperations`) applies the same rule to the same base, so a
+				// pend the cohort approved is not then refused here at apply.
+				const { request: reservation, ignoredBase } = reservationRequestFor(request, blockId, transforms);
+				if (ignoredBase !== undefined) {
+					log('pend:base-ignored actionId=%s blockId=%s requestedRev=%s base=%o',
+						request.actionId, blockId, request.rev, ignoredBase);
+				}
 				for (const claim of await blockStorage.listPendingClaims()) {
-					if (isReservationAgainst(claim, request.rev)) {
+					if (isReservationAgainst(claim, reservation)) {
 						pendings.push({ blockId, actionId: claim.actionId });
 					} else {
-						log('pend:superseded-claim actionId=%s blockId=%s rival=%s claimedRev=%d requestedRev=%d',
-							request.actionId, blockId, claim.actionId, claim.rev, request.rev);
+						log('pend:superseded-claim actionId=%s blockId=%s rival=%s claimedRev=%d requestedRev=%d base=%s',
+							request.actionId, blockId, claim.actionId, claim.rev, request.rev, reservation.baseRev ?? 'none');
 					}
 				}
 			}
@@ -1321,6 +1333,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		return await this.createBlockStorage(blockId).listPendingClaims();
 	}
 
+	/** See {@link IPendingClaimReader}. */
+	async pendingClaimOf(blockId: BlockId, actionId: ActionId): Promise<PendingClaim | undefined> {
+		return await this.createBlockStorage(blockId).pendingClaimOf(actionId);
+	}
+
 	/**
 	 * The {@link BlockCommitProof} this node retained for `blockId` at `rev`, or `undefined` when it
 	 * kept none — a revision committed before proofs were persisted, a member whose materialization
@@ -1720,42 +1737,6 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		log('commit:missing-base blockId=%s rev=%d actionId=%s detail=%s', blockId, rev, actionId, detail);
 		throw new MissingBaseRevisionError(blockId, rev, detail);
 	}
-}
-
-/**
- * Whether `transform`'s result does not depend on the block's prior content: an insert replaces the
- * block wholesale and a delete materializes to nothing (delete-last-wins in `applyTransform`), so
- * neither can fork on a different base, and no base is ever named for them (`Tracker.stagedBaseRevs`
- * names update-only blocks alone). Every base check here keys on this, on the member's OWN pended
- * transform, never on what a request declares.
- */
-function isBaseIndependent(transform: Transform): boolean {
-	return Boolean(transform.insert) || Boolean(transform.delete);
-}
-
-/**
- * The base a pend declares for `blockId`, as storage will keep it: `baseRevs[blockId]` when it is a
- * number and the block's transform is update-only, else nothing. Untrusted wire data with no ingress
- * schema (the posture `validateCommitOperations` takes toward `blockDigests`): a malformed or surplus
- * entry is ignored for that id, never thrown on; an entry for an inserted or deleted block — which no
- * producer sends — is dropped, so a base-independent record can never read as base-dependent later.
- *
- * NOTE: the base is stored AS TOLD, and the pend never refuses on it — not when it is behind this
- * member's latest, and not when it is ahead. A member has no grounds to second-guess the author's
- * claim about the author's own computation (the client is what makes an honest claim correct:
- * `Tracker` pins the base at the first staged update and re-stages over a moved one). Refusing here
- * would also be the wrong tier: a member holding a torn or abandoned HIGHER revision would cast a
- * reject that, at three members, fails every honest retry — the writer re-reads the majority's
- * revision and declares it again — whereas the same mismatch at commit time is one member's refusal
- * (`StorageRepo.internalCommit`), heals by reconcile, and the cohort still commits on majority
- * durability.
- */
-function declaredBaseFor(baseRevs: PendRequest['baseRevs'], blockId: BlockId, transform: Transform): number | undefined {
-	if (isBaseIndependent(transform)) {
-		return undefined;
-	}
-	const declared = baseRevs?.[blockId];
-	return typeof declared === 'number' ? declared : undefined;
 }
 
 /**

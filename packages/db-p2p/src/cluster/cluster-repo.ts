@@ -1,7 +1,7 @@
 import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, PendRequest, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest, MemberApplyOutcome } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
-import { blockIdsForTransforms, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability } from "@optimystic/db-core";
+import { blockIdsForTransforms, transformForBlockId, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability } from "@optimystic/db-core";
 import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest, clusterVoteSigningPayload, clusterVoteVerificationPayload } from "@optimystic/db-core";
 import { verifyInvalidationCertificate, type ArbitratorSetRecompute } from "../dispute/invalidation.js";
 import { buildCommitCert, invalidationActionId } from "./commit-cert.js";
@@ -18,7 +18,7 @@ import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
 import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister, type IRevisionActionReader, type IPendingClaimReader } from "../storage/storage-repo.js";
-import { isReservationAgainst, type PendingClaim } from "../storage/pending-claim.js";
+import { isReservationAgainst, reservationRequestFor, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
 import { StuckReservationTracker } from "../repo/stuck-reservation.js";
 import { checkPendValidation } from "../pend-validation.js";
 import { getAffectedBlockIds } from "./record-operations.js";
@@ -229,6 +229,14 @@ export const MEMBERSHIP_NOT_ADMITTED = 'membership-not-admitted';
  * so the rejection itself is integrity-protected.
  */
 export const CONTENT_DIGEST_MISMATCH = 'content-digest-mismatch';
+
+/**
+ * Stable reject reason a member emits when a commit declares, for a block, a base revision
+ * (`CommitRequest.blockDigests[id].baseRev`) other than the one the same action's pend carried to
+ * this member (`PendRequest.baseRevs`, kept with the pending record) — see
+ * `ClusterMember.validateCommitBaseDeclarations`. Signed like its sibling above.
+ */
+export const BASE_DECLARATION_DISAGREES = 'base-declaration-disagrees';
 
 /**
  * The two stable reject reasons a validator-configured member emits from the shared
@@ -1251,6 +1259,13 @@ export class ClusterMember implements ICluster {
 		if (!refusedPendValidation.valid) {
 			return verdictOf(refusedPendValidation);
 		}
+		// The declared base before the declared content: it needs no materialization, and when the two
+		// disagree the digest check would be previewing operations computed against a different base
+		// than the one declared — its verdict names the symptom, this one names the cause.
+		const baseDeclarationValidation = await this.validateCommitBaseDeclarations(record);
+		if (!baseDeclarationValidation.valid) {
+			return verdictOf(baseDeclarationValidation);
+		}
 		return verdictOf(await this.validateCommitOperations(record));
 	}
 
@@ -1641,19 +1656,20 @@ export class ClusterMember implements ICluster {
 				// first rival as signed structured data; the prose reason names the same one, and stays
 				// prose because it is fed to computeSigningPayload exactly like the reasons above.
 				//
-				// Which rivals reserve is decided by the slot each record claims, not by its presence
-				// (`reservingRivals`): a record claiming a revision below the one requested belongs to
-				// a commit this member missed or a race its holder lost, and would never clear on its
-				// own — refusing on it wedged the block for every writer (ticket
-				// `a-member-that-missed-a-commit-refuses-every-later-write`). Approving over it is safe
-				// because the incoming writer read the collection past that slot, so it built on that
-				// commit's outcome: its read context named the action, and `StorageRepo.get` promotes a
-				// held record for a named action before serving the block (a block floor is the second
-				// line, `BlockGets.floors`). This member comes current when the approved pend's own
-				// commit applies here — through `internalCommit`, or through the behind-reconcile its
-				// fork guard triggers. The one shape that argument does not cover — a member above
-				// three that never held the rival's pend, serving a floor-less handle — is at
-				// `isReservationAgainst`.
+				// Which rivals reserve is decided by the slot each record claims against what the
+				// incoming writer built on, not by the record's presence (`reservingRivals`): a record
+				// whose slot is at or below the base this pend declares for the block — or, for a pend
+				// naming no base, below the revision it requests — belongs to a commit this member missed
+				// or a race its holder lost, and would never clear on its own; refusing on it wedged the
+				// block for every writer (ticket `a-member-that-missed-a-commit-refuses-every-later-write`).
+				// Approving over it is safe because the incoming writer's operations were computed
+				// against a version of the block that already holds that record's change. This member
+				// comes current when the approved pend's own commit applies here — through
+				// `internalCommit`, or through the behind-reconcile its fork guard triggers. A record
+				// claiming a slot PAST the declared base still reserves even when the requested revision
+				// has moved beyond it: that is a writer that read the block without the record's change
+				// — from four members up, a member that never held the rival's pend can serve it — and
+				// admitting it would lose the change. See `isReservationAgainst`.
 				for (const blockId of blockIds) {
 					const rivalIds = (blockResults[blockId]?.state?.pendings ?? []).filter(actionId => actionId !== pendRequest.actionId);
 					const rivals = rivalIds.length === 0 ? [] : await this.reservingRivals(record, blockId, rivalIds, pendRequest);
@@ -1714,11 +1730,13 @@ export class ClusterMember implements ICluster {
 
 	/**
 	 * Of the rival pending records `get` listed on `blockId`, the ones that RESERVE the block against
-	 * `pendRequest` — see `isReservationAgainst` for the rule. Asks storage's {@link IPendingClaimReader}
-	 * for the slot each record claims; a repo without that capability (a plain `IRepo` mock) or a
-	 * read that fails degrades to "every rival reserves", which is the refusal this member cast before
-	 * claims were recorded — never to silently admitting one. A rival that `get` listed but that is
-	 * gone by the time the claims are read has resolved in between, and is not a rival any more.
+	 * `pendRequest` — see `isReservationAgainst` for the rule, fed the pend's revision and the base it
+	 * declares for this block (`reservationRequestFor`, the same reading storage applies at apply).
+	 * Asks storage's {@link IPendingClaimReader} for the slot each record claims; a repo without that
+	 * capability (a plain `IRepo` mock) or a read that fails degrades to "every rival reserves", which
+	 * is the refusal this member cast before claims were recorded — never to silently admitting one. A
+	 * rival that `get` listed but that is gone by the time the claims are read has resolved in
+	 * between, and is not a rival any more.
 	 */
 	private async reservingRivals(record: ClusterRecord, blockId: BlockId, rivalIds: ActionId[], pendRequest: PendRequest): Promise<ActionId[]> {
 		const reader = this.storageRepo as IRepo & Partial<IPendingClaimReader>;
@@ -1732,12 +1750,13 @@ export class ClusterMember implements ICluster {
 			log('cluster-member:pending-claims-read-error', { messageHash: record.messageHash, blockId, error: (err as Error).message });
 			return rivalIds;
 		}
+		const reservation = this.reservationRequestOf(record, pendRequest, blockId);
 		const claimOf = new Map(claims.map(claim => [claim.actionId, claim]));
 		const reserving: ActionId[] = [];
 		for (const actionId of rivalIds) {
 			const claim = claimOf.get(actionId);
 			if (claim === undefined) continue;
-			if (isReservationAgainst(claim, pendRequest.rev)) {
+			if (isReservationAgainst(claim, reservation)) {
 				reserving.push(actionId);
 			} else {
 				log('cluster-member:validation-pending-superseded', {
@@ -1745,12 +1764,30 @@ export class ClusterMember implements ICluster {
 					blockId,
 					actionId: pendRequest.actionId,
 					requestedRev: pendRequest.rev,
+					baseRev: reservation.baseRev,
 					rival: actionId,
 					claimedRev: claim.rev
 				});
 			}
 		}
 		return reserving;
+	}
+
+	/** `pendRequest`'s {@link ReservationRequest} for `blockId`, logging a base the rule cannot read —
+	 *  never a refusal: `baseRevs` is untrusted wire data, and a malformed entry only drops that block
+	 *  back to the revision rule. */
+	private reservationRequestOf(record: ClusterRecord, pendRequest: PendRequest, blockId: BlockId): ReservationRequest {
+		const { request, ignoredBase } = reservationRequestFor(pendRequest, blockId, transformForBlockId(pendRequest.transforms, blockId));
+		if (ignoredBase !== undefined) {
+			log('cluster-member:pend-base-ignored', {
+				messageHash: record.messageHash,
+				blockId,
+				actionId: pendRequest.actionId,
+				requestedRev: pendRequest.rev,
+				base: ignoredBase
+			});
+		}
+		return request;
 	}
 
 	/**
@@ -1978,6 +2015,86 @@ export class ClusterMember implements ICluster {
 			}
 		}
 		return undefined;
+	}
+
+	/**
+	 * Promise-round check that a commit declares, for each block, the base revision the same action's
+	 * PEND carried to this member. The author says the base twice — `PendRequest.baseRevs[id]`, kept
+	 * with this member's pending record as `PendingClaim.baseRev`, and
+	 * `CommitRequest.blockDigests[id].baseRev` — and an honest author says the same thing both times
+	 * (`Tracker` pins the base at staging; the pend and the digest both read that pin). When they
+	 * differ, this member's record holds operations computed against a base other than the one the
+	 * commit is about to be applied as, so vote reject with {@link BASE_DECLARATION_DISAGREES}.
+	 * `StorageRepo.internalCommit` refuses the same shape at apply (`guardCommitBase`); refusing here
+	 * too puts a signed verdict on the record one round earlier, and when the cohort's records agree
+	 * with each other but not with the commit (a writer whose commit contradicts its own pend) the
+	 * whole cohort refuses at the vote, where the apply-time refusal alone would have every member
+	 * refuse after consensus and reconcile against a revision nobody holds.
+	 *
+	 * Needs no preview, so it runs on a repo that can read one record's claim
+	 * ({@link IPendingClaimReader}`.pendingClaimOf`) whether or not it can materialize. Abstains — votes
+	 * as it would without the check — whenever it cannot compare: the commit declares nothing, an entry
+	 * is surplus to `blockIds` or carries no numeric `baseRev` (untrusted wire data, same posture as the
+	 * digest check), this member holds no record for the action on the block, the record carries no
+	 * base (an inserted or deleted block, a base-less sender, or a record written before bases were
+	 * kept), or the read fails.
+	 *
+	 * NOTE: the one shape an HONEST writer can meet here is a stale record from an earlier attempt of a
+	 * retried action (same action id) meeting the retry's commit, when the retry's pend — which would
+	 * have overwritten the record — never reached this member. At three members one reject sinks the
+	 * commit record (the default super-majority allows none), where the apply-time refusal alone would
+	 * let the other two commit and this member reconcile. When this member's latest equals the declared
+	 * base, the digest check below already rejects that shape whenever the stale operations materialize
+	 * differently over it, so what this adds is mostly the behind-member case; it heals when the
+	 * writer's cancel of the failed commit removes the record, or its torn-entry re-send re-pends over
+	 * it. If three-member cohorts show `rejected-by-validators` with this reason for honest retries,
+	 * abstain here when this member's latest is not the declared base and leave that case to
+	 * `guardCommitBase`.
+	 */
+	private async validateCommitBaseDeclarations(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
+		const reader = this.storageRepo as IRepo & Partial<IPendingClaimReader>;
+		if (typeof reader.pendingClaimOf !== 'function') {
+			return { valid: true };
+		}
+		for (const operation of record.message.operations) {
+			if (!('commit' in operation)) {
+				continue;
+			}
+			const commit = operation.commit;
+			if (!commit.blockDigests) {
+				continue;
+			}
+			const committedIds = new Set<string>(commit.blockIds);
+			for (const [blockId, declared] of Object.entries(commit.blockDigests)) {
+				const declaredBaseRev: unknown = declared?.baseRev;
+				if (!committedIds.has(blockId) || typeof declaredBaseRev !== 'number') {
+					continue;
+				}
+				let storedBaseRev: number | undefined;
+				try {
+					storedBaseRev = (await reader.pendingClaimOf(blockId as BlockId, commit.actionId))?.baseRev;
+				} catch (err) {
+					log('cluster-member:base-declaration-read-error', {
+						messageHash: record.messageHash,
+						blockId,
+						error: err instanceof Error ? err.message : String(err)
+					});
+					continue; // a local read fault is an abstain, never a verdict
+				}
+				if (storedBaseRev !== undefined && storedBaseRev !== declaredBaseRev) {
+					log('cluster-member:base-declaration-disagrees', {
+						messageHash: record.messageHash,
+						blockId,
+						actionId: commit.actionId,
+						rev: commit.rev,
+						storedBaseRev,
+						declaredBaseRev
+					});
+					return { valid: false, reason: BASE_DECLARATION_DISAGREES };
+				}
+			}
+		}
+		return { valid: true };
 	}
 
 	/**

@@ -1,4 +1,4 @@
-import type { ActionId } from "@optimystic/db-core";
+import type { ActionId, BlockId, PendRequest, Transform } from "@optimystic/db-core";
 
 /**
  * One pending record on a block, with the revision its pend asked for.
@@ -26,55 +26,149 @@ export interface PendingClaim {
 }
 
 /**
- * Whether a rival's pending record is a RESERVATION against a pend requesting `requestedRev` of the
- * same block — the one question both rival scans ask (`StorageRepo.pend` at apply,
+ * What {@link isReservationAgainst} reads of an incoming pend, for one block: the revision it
+ * requests, and the committed base the block's update operations were computed against — built from
+ * the pend by {@link reservationRequestFor}, so the rule reads exactly the base storage would keep.
+ */
+export interface ReservationRequest {
+	rev?: number;
+	baseRev?: number;
+}
+
+/**
+ * Whether a rival's pending record is a RESERVATION against an incoming pend for the same block —
+ * the one question both rival scans ask (`StorageRepo.pend` at apply,
  * `ClusterMember.validatePendOperations` at the promise vote).
  *
  * A pending record reserves the block for the revision it claims: it says "I am about to commit
  * this block at revision `rev`", and it holds that slot from pend-apply until its commit or cancel.
- * Revisions are allocated per COLLECTION, and a writer pends at one past the collection revision it
- * read, so the requested revision says how far the collection had moved when the incoming writer
- * read it:
+ * It stops reserving only once the incoming writer has BUILT ON it — read the block with that
+ * change in it — because then admitting the newcomer cannot lose the change, whatever became of the
+ * record's action. The rule, first match wins:
  *
- *  - `claim.rev >= requestedRev` — the record claims the slot the pend wants, or a later one. A live
- *    rival inside its pend-to-commit window looks exactly like this, and letting the pend through
- *    would admit two writers to one slot (the lost update the reservation exists to prevent). It
- *    reserves; the pend is refused and retries once the rival commits or cancels.
- *  - `claim.rev < requestedRev` — the collection has already moved PAST the slot this record claims.
- *    Whatever became of the record's action, it can no longer be a rival for the slot being
- *    requested: either it committed at its slot (the log names it, and the incoming writer built on
- *    it — a member holding this record merely missed that commit, and the incoming pend's own commit
- *    brings it current), or it lost that slot to another action and its record is dead. Either way
- *    the record is SUPERSEDED and does not reserve. Treating it as live was the wedge this predicate
- *    replaces: a member that missed one commit refused every later write to the block, from every
- *    writer, until something happened to read the block through it.
- *  - An unknown claim (no `rev` on either side) reserves, so a record predating revision recording
- *    keeps today's behaviour rather than silently admitting a rival.
+ *  - Either side's revision unknown → reserves. A record predating revision recording keeps the
+ *    old behaviour rather than silently admitting a rival, and a rev-less request cannot be placed
+ *    past anything.
+ *  - The request carries a usable base for the block ({@link usableBase}: a number below the
+ *    requested revision) → reserves iff `claim.rev > baseRev`. A base at or past the claimed slot
+ *    means the newcomer's operations were computed against a version of the block that already
+ *    holds the record's change (it committed there, and this member merely missed the commit — the
+ *    newcomer's own commit brings it current), or against a version past a slot the record lost.
+ *    A base below it means the newcomer read the block without that change, and admitting it would
+ *    let its commit apply over the stale base and sweep the record — the rival's change lost while
+ *    the log names it.
+ *  - Otherwise (no base: an inserted or deleted block, a sender that names none, or a malformed
+ *    one) → reserves iff `claim.rev >= rev`. Revisions are allocated per COLLECTION and a writer
+ *    pends at one past the collection revision it read, so a claim below the requested revision is
+ *    one the collection has moved past, which is taken as having been built on. That inference is
+ *    the one the base replaces: it is sound when the newcomer read the block from a member that
+ *    held the record (`StorageRepo.get` promotes a record for any action the reader's context
+ *    names, with the block floor, `BlockGets.floors`, as the second line), and false in exactly one
+ *    shape, from four members up — a member that never received the rival's pend serving a
+ *    floor-less handle while the rival's data-block commit is still in flight. It remains the rule
+ *    for base-less requests, where there is nothing sharper to read.
  *
- * "The incoming writer built on it" is what makes admitting the pend safe, and it rests on the
- * read side, not on this predicate: every collection handle carries, in its read context, every
- * action the log has committed since the last checkpoint (`Log.getFrom` collects them all, and no
- * checkpoint is written today), and `StorageRepo.get` promotes a pending record for any of those
- * actions before it serves the block. So a read answered by a member that HOLDS the superseded
- * record is served at or past that slot. A block floor (`BlockGets.floors`) is the second line,
- * for a handle that walked the entry: a below-floor answer is re-asked once elsewhere.
+ * The base arm is never more permissive than the revision arm: an honest base is at most `rev - 1`,
+ * so a claim at or below the base is also below the requested revision. It can only hold more,
+ * which is why the safety argument of Theorem 1 does not weaken. It closes the four-member shape
+ * wherever the members still holding the rival's record are enough to deny the newcomer a
+ * super-majority — one member missing the pend leaves every other one holding it — and a member
+ * that has meanwhile taken the rival's change refuses the newcomer's commit at the fork guard
+ * (`StorageRepo.internalCommit`) instead. Liveness for the missed-commit
+ * shape (`a-member-that-missed-a-commit-refuses-every-later-write`) is preserved: a writer that read
+ * the block from a member that applied the rival's change declares at least that revision as its
+ * base, and one served by the missed-commit member itself is served after that member promotes the
+ * record, which it does whenever the record's stored base equals its latest.
  *
- * NOTE: that argument has one hole, open only above three members. A member that never received
- * the rival's pend (the promise bar is a super-majority, so from four members up one can miss it)
- * holds no record to promote, and while the rival's non-tail commit is still in flight it serves
- * the block one revision short. A handle with no floor for the block (a freshly opened one walks
- * no entries) accepts that answer, pends past the rival's slot, and the members that DO hold the
- * rival's record now approve where they used to hold; their commit then applies the newcomer's
- * transform over the same base the newcomer read (the fork guard passes) and sweeps the rival's
- * record, so the rival's change to that block is lost while the log names it. Three members are
- * not exposed (everyone holds every pend). The pend now carries the base each block's transform
- * was computed against (`PendRequest.baseRevs`, kept here as {@link PendingClaim.baseRev}), but this
- * rule does not read it yet; when it does (ticket
- * `a-rival-pend-is-superseded-only-by-a-writer-that-built-on-it`), the rule becomes "superseded
- * only if the incoming base is at or past the claim", which closes the hole at the site that has
- * the facts. Not a tripwire to wait on if a deployment runs four or more members per cohort — that
- * is the condition, and it is a lost update, not a wedge.
+ * NOTE: holding more has two residuals, both liveness, never safety. (1) A newcomer that read the
+ * block one change short — from a member that never held the rival's record, or one that holds it
+ * and cannot promote it (a base-less record from an older sender, or one whose stored base the
+ * member has not reached) — declares a base below the claim and is held until the rival commits or
+ * that member comes current. Its retries do not re-read the block today, so it then re-pends on the
+ * stale base and the fork guard refuses its commit: refused, never acknowledged over the rival
+ * (backlog `bug-a-writer-held-by-a-change-it-never-saw-retries-on-its-stale-copy`). (2) A record
+ * whose change no member will ever take used to be superseded as soon as the collection moved past
+ * its slot, and now holds every newcomer until something sweeps it, which today nothing does: an
+ * abandoned action whose data-block pend landed, whose log-tail pend did not, and whose cancel never
+ * arrived, on a block no later write touched; or a BASE-LESS record (older sender) whose data-block
+ * commit never ran anywhere, which no member can promote. Backlog
+ * `debt-unpromotable-pending-records-need-a-sweep` owns abandoned records, and both stuck-reservation
+ * lines name the block. Locally the member cannot tell (2) from the lost-update shape above: both
+ * are a record claiming a slot past the block's latest, met by a newcomer whose base is that latest.
+ * If (2) shows up in the field, the cure is that sweep, not a looser rule here.
  */
-export function isReservationAgainst(claim: PendingClaim, requestedRev: number | undefined): boolean {
-	return claim.rev === undefined || requestedRev === undefined || claim.rev >= requestedRev;
+export function isReservationAgainst(claim: PendingClaim, request: ReservationRequest): boolean {
+	if (claim.rev === undefined || request.rev === undefined) {
+		return true;
+	}
+	const base = usableBase(request);
+	return base === undefined ? claim.rev >= request.rev : claim.rev > base;
+}
+
+/**
+ * `request.baseRev` when {@link isReservationAgainst} can read it: a number strictly below the
+ * requested revision. Anything else — absent, not a number (untrusted wire data), or at or past
+ * `rev`, which no honest writer sends since its base is a revision it read and it pends past what it
+ * read — is `undefined`, and the rule falls back to the requested revision alone.
+ */
+export function usableBase(request: ReservationRequest): number | undefined {
+	const { rev, baseRev } = request;
+	return typeof baseRev === 'number' && rev !== undefined && baseRev < rev ? baseRev : undefined;
+}
+
+/**
+ * The {@link ReservationRequest} `pend` makes of `blockId`, whose transform within the pend is
+ * `transform`: the pend's revision, and the base {@link declaredBaseFor} keeps for the block — so a
+ * base on an inserted or deleted block, or a malformed one, is read by the rule exactly as storage
+ * keeps it: not at all. `ignoredBase` carries a base the pend named for the block that the rule does
+ * not read (malformed, not below the revision, or on a base-independent transform), for the caller's
+ * log line; no producer sends one.
+ */
+export function reservationRequestFor(
+	pend: Pick<PendRequest, 'rev' | 'baseRevs'>, blockId: BlockId, transform: Transform
+): { request: ReservationRequest; ignoredBase?: unknown } {
+	const request: ReservationRequest = { rev: pend.rev };
+	const baseRev = declaredBaseFor(pend.baseRevs, blockId, transform);
+	if (baseRev !== undefined) {
+		request.baseRev = baseRev;
+	}
+	const named: unknown = pend.baseRevs?.[blockId];
+	return named !== undefined && usableBase(request) === undefined ? { request, ignoredBase: named } : { request };
+}
+
+/**
+ * Whether `transform`'s result does not depend on the block's prior content: an insert replaces the
+ * block wholesale and a delete materializes to nothing (delete-last-wins in `applyTransform`), so
+ * neither can fork on a different base, and no base is ever named for them (`Tracker.stagedBaseRevs`
+ * names update-only blocks alone). Every base check keys on this, on the member's OWN pended
+ * transform (or the incoming pend's own transform, at the rival scans), never on what a request
+ * declares.
+ */
+export function isBaseIndependent(transform: Transform): boolean {
+	return Boolean(transform.insert) || Boolean(transform.delete);
+}
+
+/**
+ * The base a pend declares for `blockId`, as storage will keep it: `baseRevs[blockId]` when it is a
+ * number and the block's transform is update-only, else nothing. Untrusted wire data with no ingress
+ * schema (the posture `validateCommitOperations` takes toward `blockDigests`): a malformed or surplus
+ * entry is ignored for that id, never thrown on; an entry for an inserted or deleted block — which no
+ * producer sends — is dropped, so a base-independent record can never read as base-dependent later.
+ *
+ * NOTE: the base is stored AS TOLD, and the pend never refuses on it — not when it is behind this
+ * member's latest, and not when it is ahead. A member has no grounds to second-guess the author's
+ * claim about the author's own computation (the client is what makes an honest claim correct:
+ * `Tracker` pins the base at the first staged update and re-stages over a moved one). Refusing here
+ * would also be the wrong tier: a member holding a torn or abandoned HIGHER revision would cast a
+ * reject that, at three members, fails every honest retry — the writer re-reads the majority's
+ * revision and declares it again — whereas the same mismatch at commit time is one member's refusal
+ * (`StorageRepo.internalCommit`), heals by reconcile, and the cohort still commits on majority
+ * durability.
+ */
+export function declaredBaseFor(baseRevs: PendRequest['baseRevs'], blockId: BlockId, transform: Transform): number | undefined {
+	if (isBaseIndependent(transform)) {
+		return undefined;
+	}
+	const declared = baseRevs?.[blockId];
+	return typeof declared === 'number' ? declared : undefined;
 }

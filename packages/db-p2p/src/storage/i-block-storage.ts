@@ -136,7 +136,8 @@ export interface IBlockStorage {
      * `BlockMetadata.pendingRevs` and `pendingBases`. This is the view the rival-pend checks read
      * (`StorageRepo.pend`'s apply-time scan and `ClusterMember.validatePendOperations`' promise
      * vote), because whether a record reserves the block against a given pend depends on the slot
-     * it claims (`isReservationAgainst`), not on its mere presence. Read-only; no latch.
+     * it claims measured against the pend's base and revision (`isReservationAgainst`), not on its
+     * mere presence. Read-only; no latch.
      */
     listPendingClaims(): Promise<PendingClaim[]>;
 

@@ -3567,6 +3567,79 @@ describe('StorageRepo.pend — a pending record claiming a superseded slot is no
 });
 
 /**
+ * Ticket: a-rival-pend-is-superseded-only-by-a-writer-that-built-on-it.
+ *
+ * The apply-time rival scan now reads the base the incoming pend declares for the block
+ * (`PendRequest.baseRevs`): a rival record is superseded only when that base is at or past the
+ * record's slot. The shape it closes: the collection has moved past the rival's slot, but the
+ * newcomer read the block WITHOUT the rival's change (from four members up, a member that never
+ * received the rival's pend can serve it while the rival's data-block commit is in flight). Under the
+ * revision rule this node admitted the newcomer, and its commit then applied over the stale base and
+ * swept the rival's record — the rival's change lost while the log names it.
+ */
+describe('StorageRepo.pend — a rival record is superseded only by a pend that built on it', () => {
+	const B = 'block-built-on' as BlockId;
+	let raw: MemoryRawStorage;
+	let repo: StorageRepo;
+
+	const newcomer = (over: Partial<PendRequest> = {}): PendRequest => ({
+		actionId: 'a-newcomer' as ActionId,
+		transforms: makeUpdateTransforms(B, [['items', 0, 0, ['n']]]),
+		rev: 6,
+		policy: 'r',
+		...over
+	});
+
+	beforeEach(async () => {
+		raw = new MemoryRawStorage();
+		repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		// The block at revision 4, and a rival pended at revision 5 over it whose commit has not landed here.
+		await repo.saveReplicatedBlock(B, makeBlock(B, { items: [] }), { actionId: 'r4' as ActionId, rev: 4 });
+		const rival = await repo.pend({
+			actionId: 'a-rival' as ActionId, transforms: makeUpdateTransforms(B, [['items', 0, 0, ['r']]]),
+			rev: 5, baseRevs: { [B]: 4 }, policy: 'r'
+		});
+		expect(rival.success, 'the rival pend is recorded').to.equal(true);
+	});
+
+	it('refuses, as held, a pend past the record\'s slot whose declared base is below it', async () => {
+		const result = await repo.pend(newcomer({ baseRevs: { [B]: 4 } }));
+		expect(result.success, 'the newcomer did not read the rival\'s change').to.equal(false);
+		expect((result as StaleFailure).pending?.map(p => p.actionId)).to.deep.equal(['a-rival']);
+		expect(await raw.getPendingTransaction(B, 'a-newcomer' as ActionId), 'and wrote no record').to.equal(undefined);
+		expect(await raw.getPendingTransaction(B, 'a-rival' as ActionId), 'the rival\'s record stands').to.not.equal(undefined);
+	});
+
+	it('admits the same pend when its declared base is the record\'s slot', async () => {
+		const result = await repo.pend(newcomer({ baseRevs: { [B]: 5 } }));
+		expect(result.success, JSON.stringify(result)).to.equal(true);
+		expect((result as PendSuccess).pending, 'and reports no rival').to.deep.equal([]);
+	});
+
+	it('admits the same pend when it names no base — the revision rule, pinned as unchanged', async () => {
+		const result = await repo.pend(newcomer());
+		expect(result.success, JSON.stringify(result)).to.equal(true);
+		expect((result as PendSuccess).pending).to.deep.equal([]);
+	});
+
+	it('falls back to the revision rule on a base it cannot read, never refusing on it', async () => {
+		for (const bad of ['4', 6, 9]) {
+			const actionId = `a-bad-${String(bad)}` as ActionId;
+			const result = await repo.pend(newcomer({ actionId, baseRevs: { [B]: bad as number } }));
+			expect(result.success, `base ${JSON.stringify(bad)}: ${JSON.stringify(result)}`).to.equal(true);
+			// Each admitted pend claims slot 6 itself; clear it so the next case meets only the rival.
+			await repo.cancel({ actionId, blockIds: [B] });
+		}
+	});
+
+	it('still holds a pend for the record\'s own slot whatever base it declares', async () => {
+		const result = await repo.pend(newcomer({ rev: 5, baseRevs: { [B]: 4 } }));
+		expect(result.success).to.equal(false);
+		expect((result as StaleFailure).pending?.map(p => p.actionId)).to.deep.equal(['a-rival']);
+	});
+});
+
+/**
  * Ticket: bug-a-pended-transform-does-not-carry-its-base (second of three).
  *
  * The read-driven promotion in `StorageRepo.get` has no commit message to consult, and it walks the

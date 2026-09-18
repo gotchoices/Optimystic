@@ -148,22 +148,22 @@ export function recordPriority(record: ClusterRecord): number {
  * A commit-only message competes with nothing but an invalidation. A commit is only ever sent for an
  * action whose pend already WON its slot (the race above ran at the pend, and storage holds that
  * pend's record); the commit only promotes that record, so there is no contest left for it to lose:
- *   - a pend of Y: storage and `validatePendOperations` refuse it while X's record claims the slot Y
- *     asks for or a later one (`isReservationAgainst`), and refuse it as stale once X has committed
- *     there — the worst outcome is a retry of Y. A Y asking PAST X's slot normally built on X (it read
- *     the block, and `StorageRepo.get` promotes X's record for a reader whose log names X), so both
- *     land, X first: Y's commit declares X's revision as its base, and a member X has not reached yet
- *     refuses Y as behind (the fork guard in `StorageRepo.internalCommit`) and reconciles, rather than
- *     applying Y over the older base. That guard reads the base Y's pend carried for the block
- *     (`PendRequest.baseRevs`, stored with the record) and falls back to the base Y's commit
- *     declared, so a Y that named its base cannot land over X's change on a member that missed X. It
- *     still misses two shapes: a Y from a sender that names no base at all (an older build; accepted
- *     as the residual, see docs/internals.md "An update-only transform is applied only to the base
- *     its author read"), and (from four members up) a Y that read the block from a member that never
- *     received X's pend and so honestly names the pre-X base — the rival rule's arm, ticket
- *     `a-rival-pend-is-superseded-only-by-a-writer-that-built-on-it`. Counting the commit as a rival
- *     never closed either: it only fired while X's commit was still in its own promise round at a
- *     member, and when the race went Y's way it tore X instead;
+ *   - a pend of Y: storage and `validatePendOperations` refuse it while X's record stands and Y has
+ *     not built on it (`isReservationAgainst`: the base Y declares for the block is below X's slot, or,
+ *     with no base, Y asks for X's slot or an earlier one), and refuse it as stale once X has committed
+ *     there — the worst outcome is a retry of Y. A Y that built on X (it read the block, and
+ *     `StorageRepo.get` promotes X's record for a reader whose log names X) lands after X: Y's pend
+ *     declares X's revision as its base, and a member X has not reached yet refuses Y as behind (the
+ *     fork guard in `StorageRepo.internalCommit`) and reconciles, rather than applying Y over the older
+ *     base. That guard reads the base Y's pend carried for the block (`PendRequest.baseRevs`, stored
+ *     with the record) and falls back to the base Y's commit declared. A Y that read the block WITHOUT
+ *     X's change — from four members up, from a member that never received X's pend — declares the
+ *     pre-X base, and every member still holding X's record holds it, however far past X's slot Y
+ *     asks. What neither closes is a Y from a sender that names no base at all (an older build;
+ *     accepted as the residual, see docs/internals.md "An update-only transform is applied only to
+ *     the base its author read"). Counting the commit as a rival never closed any of these: it only
+ *     fired while X's commit was still in its own promise round at a member, and when the race went
+ *     Y's way it tore X instead;
  *   - a commit of Y: `StorageRepo.commit` never looks at another action's pending record; its own
  *     stale and fork checks, and `validateCommitRevisions` at the vote, order the two under the block
  *     latch.

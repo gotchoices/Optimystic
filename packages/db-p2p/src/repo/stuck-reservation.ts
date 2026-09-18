@@ -138,9 +138,10 @@ export interface StuckReservationEpisode {
  * says nothing; and "the block already passed this pending record's revision" catches a different
  * orphan class entirely — in the verified instance the wedged block sat at revision 1 while the
  * orphaned record was for revision 2, still nominally promotable. (That second class is now handled
- * at its own site — a record claiming a slot the collection has moved past no longer refuses at all,
- * see `isReservationAgainst` — so what reaches this counter is the same-slot residue: a holder
- * whose slot is still the one every later writer wants.)
+ * at its own site — a record the incoming writer has built on no longer refuses at all, see
+ * `isReservationAgainst` — so what reaches this counter is a holder whose change the block has not
+ * taken: one whose slot every later writer still wants, or one past the base every later writer
+ * declares, such as an abandoned action's record on a block no later write touched.)
  *
  * **Never a control path.** This classifies and reports; it never refuses, expires, or deletes
  * anything. Deciding when a durable pending record may be removed is precisely the hard problem

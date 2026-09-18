@@ -1,5 +1,5 @@
 import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
-import { LruMap, blockIdsForTransforms, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability } from "@optimystic/db-core";
+import { LruMap, blockIdsForTransforms, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability } from "@optimystic/db-core";
 import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -13,7 +13,7 @@ import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAn
 import { DEFAULT_CLUSTER_SIZE, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
 import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, type ICommitProofPersister, type IRevisionActionReader, type IPendingClaimReader } from "../storage/storage-repo.js";
-import { isReservationAgainst, type PendingClaim } from "../storage/pending-claim.js";
+import { isReservationAgainst, reservationRequestFor, type PendingClaim } from "../storage/pending-claim.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
 import type { ReconcileBlockCallback, CommittedHoldersSink } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
@@ -2308,17 +2308,25 @@ export class CoordinatorRepo implements IRepo {
 	 * since the caller's answer does not depend on it.
 	 *
 	 * Carries no `transform`, which {@link ActionPending} allows and no consumer rebases from.
+	 *
+	 * Diagnostic enrichment only, never a gate: the refusal it corroborates was already cast and signed
+	 * by a member, and nothing here can turn an admission into a refusal or the reverse.
 	 */
 	private async corroborateHeldBlocks(request: PendRequest, blockIds: BlockId[]): Promise<ActionPending[]> {
 		const pending: ActionPending[] = [];
 		try {
 			for (const blockId of blockIds) {
+				// The request's base for the block, read exactly as the refusing member read it (the
+				// malformed-base log line is that member's, so none is repeated here).
+				const { request: reservation } = reservationRequestFor(request, blockId, transformForBlockId(request.transforms, blockId));
 				for (const claim of await this.pendingClaimsOf(blockId)) {
-					// The same rule the refusing member applied (`isReservationAgainst`): a record claiming
-					// a slot this request has already moved past is not the rival it was refused on, and
+					// The same rule, on the same inputs, as the refusing member (`isReservationAgainst`): a
+					// record this request's writer has built on is not the rival it was refused on, and
 					// naming it would feed a superseded action into the writer's `pending` list and into
-					// the stuck-reservation holder comparison.
-					if (claim.actionId !== request.actionId && isReservationAgainst(claim, request.rev)) {
+					// the stuck-reservation holder comparison; and a record claiming a slot past the
+					// request's declared base IS one, even when the requested revision has moved beyond it —
+					// the revision rule alone would leave that refusal uncorroborated.
+					if (claim.actionId !== request.actionId && isReservationAgainst(claim, reservation)) {
 						pending.push({ blockId, actionId: claim.actionId });
 					}
 				}

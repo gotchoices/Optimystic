@@ -615,8 +615,8 @@ unchanged. An entry whose record is gone is inert (every reader joins against th
 namespace), and a record with no entry reads as unknown: an unknown slot is the strongest kind of
 reservation, an unknown base is simply nothing to compare. Read through
 `IBlockStorage.listPendingClaims` and `IBlockStorage.pendingClaimOf`; the rules that consume them
-are in `docs/repository.md`, "A pending record claims a slot, and reserves the block only for that
-slot".
+are in `docs/repository.md`, "A pending record claims a slot, and reserves the block until a writer
+builds on it".
 
 `lineageFloor` is what lets a node say whether the content it holds now was built from a given
 committed write — the question a writer asks when its write was superseded before it could confirm
