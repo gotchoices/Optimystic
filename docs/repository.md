@@ -226,8 +226,14 @@ collection had moved when the incoming writer read it:
   write and missed its commit kept the record, nothing would ever remove it (its writer believed the
   write succeeded, and it had), and the member vetoed every later write to the block, from every
   writer, until it happened to read the block itself. Admitting the pend is safe because the incoming
-  writer read the collection past that slot and so built on that commit's outcome (a read under a
-  block's floor is re-asked, `BlockGets.floors`), and the member comes current when the admitted
+  writer read the collection past that slot and so built on that commit's outcome: its read context
+  names every action the log has committed since the last checkpoint, and `StorageRepo.get` promotes
+  a held record for any named action before it serves the block (a read under a block's floor is
+  re-asked once elsewhere, `BlockGets.floors`, the second line). The one shape that does not cover —
+  from four members up, a member that never received the rival's pend serving a handle with no floor
+  for the block while the rival's non-tail commit is in flight — is written up at
+  `isReservationAgainst` and owned by backlog `bug-a-pended-transform-does-not-carry-its-base`. The
+  member comes current when the admitted
   pend's own commit applies — through `StorageRepo.internalCommit`, or through the behind-reconcile
   its fork guard triggers.
 - a record with **no** claim on file — pended without a revision, or written before the revision was

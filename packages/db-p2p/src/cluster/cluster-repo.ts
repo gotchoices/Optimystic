@@ -1647,9 +1647,13 @@ export class ClusterMember implements ICluster {
 				// own — refusing on it wedged the block for every writer (ticket
 				// `a-member-that-missed-a-commit-refuses-every-later-write`). Approving over it is safe
 				// because the incoming writer read the collection past that slot, so it built on that
-				// commit's outcome (a read under a block's floor is re-asked, `BlockGets.floors`), and
-				// this member comes current when the approved pend's own commit applies here — through
-				// `internalCommit`, or through the behind-reconcile its fork guard triggers.
+				// commit's outcome: its read context named the action, and `StorageRepo.get` promotes a
+				// held record for a named action before serving the block (a block floor is the second
+				// line, `BlockGets.floors`). This member comes current when the approved pend's own
+				// commit applies here — through `internalCommit`, or through the behind-reconcile its
+				// fork guard triggers. The one shape that argument does not cover — a member above
+				// three that never held the rival's pend, serving a floor-less handle — is at
+				// `isReservationAgainst`.
 				for (const blockId of blockIds) {
 					const rivalIds = (blockResults[blockId]?.state?.pendings ?? []).filter(actionId => actionId !== pendRequest.actionId);
 					const rivals = rivalIds.length === 0 ? [] : await this.reservingRivals(record, blockId, rivalIds, pendRequest);

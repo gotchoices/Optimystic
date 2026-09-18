@@ -20,9 +20,11 @@
  *  3. **Nobody owes C the commit.** A restarts while C is away, taking its scheduled commit retry
  *     (`ClusterCoordinator.scheduleCommitRetry`) with it — the mesh wires no transaction state store, so the
  *     restarted A recovers nothing. C returns owed nothing, still behind, still holding the record.
- *  4. **B writes, and it lands.** This is the fixed behaviour: the pend's promise round is what brings C
- *     current. C's vote finds a pending record whose claimed revision the incoming pend has already moved
- *     past, reconciles the block from the cohort, and votes on the healed state. The write is acknowledged
+ *  4. **B writes, and it lands.** This is the fixed behaviour. C's vote finds a pending record whose claimed
+ *     revision the incoming pend has already moved past (`isReservationAgainst`) and approves instead of
+ *     holding; no network I/O happens in the vote. C comes current when the pend's own COMMIT applies: the
+ *     fork guard in `StorageRepo.internalCommit` refuses the base C does not hold, the behind-reconcile
+ *     lands the block from the cohort, and the dead record is swept with it. The write is acknowledged
  *     fully durable, C's OWN storage holds the revision it missed, the stale record is gone, and no repo call
  *     was routed through C (`onRoute` is asserted, not assumed).
  *  5. **Everything reads everywhere,** and a further write from each machine is fully durable.
@@ -40,7 +42,7 @@ import {
 import { sequentialPhases } from './util/two-machine-lifecycle.js';
 
 const MACHINES = 3;
-const TREE_ID = 'member-missed-commit-heals-at-vote';
+const TREE_ID = 'member-missed-commit-heals-at-commit';
 
 interface Row {
 	key: string;
@@ -57,7 +59,7 @@ interface MissedCommit {
 	blockIds: readonly BlockId[];
 }
 
-describe('A member that missed a commit is brought current by the next pend it votes on (three machines)', function () {
+describe('A member that missed a commit is brought current by the commit of the next pend it approves (three machines)', function () {
 	this.timeout(90_000);
 	sequentialPhases();
 
@@ -75,7 +77,7 @@ describe('A member that missed a commit is brought current by the next pend it v
 	let healMs: number | undefined;
 
 	after(() => {
-		console.log(`\nA member that missed a commit (three machines): B's first write after C returned ${healMs === undefined ? 'did not land' : `landed in ${healMs}ms, healing C at its vote`}\n`);
+		console.log(`\nA member that missed a commit (three machines): B's first write after C returned ${healMs === undefined ? 'did not land' : `landed in ${healMs}ms, healing C at its commit`}\n`);
 	});
 
 	const label = (node: MeshNode): string => 'ABC'[mesh.nodes.indexOf(node)]!;
@@ -170,7 +172,7 @@ describe('A member that missed a commit is brought current by the next pend it v
 		expect((await tailOn(c)).pendings, 'the record is still there').to.include(missed.actionId);
 	});
 
-	it('phase 4 — B writes: the write lands fully durable, and C\'s own storage comes current at its vote, without any repo call through C', async () => {
+	it('phase 4 — B writes: the write lands fully durable, and C\'s own storage comes current when the commit applies, without any repo call through C', async () => {
 		routed = new Set();
 		const started = Date.now();
 		const durability = await write(b, 'written-after-C-returned', 'acknowledged-by-all-three');
