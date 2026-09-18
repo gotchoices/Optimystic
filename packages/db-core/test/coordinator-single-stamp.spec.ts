@@ -376,9 +376,10 @@ describe('TransactionCoordinator: single open stamp', () => {
 	});
 
 	it('a partial commit drops the stamp, so a new stamp is accepted', async () => {
-		// The partial-commit branch deletes the entry (rollback of a half-landed transaction would
-		// rewind the durable winner), so the coordinator reopens even though the collection state
-		// is degraded — refusing reads there is the bridge's degraded latch, not this guard.
+		// The loser is refused forever, so the split is reported once the retry budget ends, and the
+		// report deletes the entry (rollback of a half-landed transaction would rewind the durable
+		// winner), so the coordinator reopens even though the collection state is degraded —
+		// refusing reads there is the bridge's degraded latch, not this guard.
 		const [winner, loser] = ['ss-partial-win', 'ss-partial-lose'];
 		const inner = new TestTransactor();
 		const transactor = new PartialLossTransactor(inner, loser);
@@ -390,7 +391,7 @@ describe('TransactionCoordinator: single open stamp', () => {
 		]);
 		let err: unknown;
 		try {
-			await coordinator.commit(staged.transaction);
+			await coordinator.commit(staged.transaction, { maxAttempts: 2, baseBackoffMs: 1, maxBackoffMs: 5 });
 		} catch (e) { err = e; }
 		expect(err, 'the split surfaced as a partial commit').to.be.instanceOf(CoordinatorPartialCommitError);
 

@@ -955,10 +955,11 @@ describe('NetworkTransactor', () => {
       }
     })
 
-    // commitBlock rebuilds its failure from the per-batch responses the same way pend does, and
-    // deliberately drops the free-form `reason`. The one machine-readable fact inside that prose —
-    // which block sits at which revision — must survive the rebuild.
-    it('carries staleAt through a rebuilt commit failure even though the reason is dropped', async () => {
+    // commitBlock rebuilds its failure from the per-batch responses the same way pend does. The
+    // producer's `reason` (the only diagnostic that reaches the coordinator's error text — a
+    // `commit-not-durable` refusal must not read as a rival's "stale commit"), its `conflict`
+    // classification and `staleAt` (which block sits at which revision) must all survive the rebuild.
+    it('carries reason, conflict and staleAt through a rebuilt commit failure', async () => {
       const peerA = 'peer-A'
       const net: IKeyNetwork = {
         async findCoordinator() { return peerIdFromString(peerA) },
@@ -995,8 +996,8 @@ describe('NetworkTransactor', () => {
       expect(result.success).to.be.false
       if (!result.success) {
         expect(result.staleAt).to.deep.equal({ blockId: 'hot', rev: 12 })
-        // Unchanged behaviour: the prose is still dropped by this branch.
-        expect(result.reason).to.equal(undefined)
+        expect(result.reason).to.equal('stale revision: block hot at rev 12, requested rev 11')
+        expect(result.conflict).to.equal(true)
       }
     })
   })

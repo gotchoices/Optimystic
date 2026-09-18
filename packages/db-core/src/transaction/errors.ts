@@ -60,7 +60,9 @@ export class CoordinatorPartialCommitError extends Error {
 		 * collection was already saved. */
 		public readonly failedCollections: readonly CollectionId[],
 		/** The failure that ended the commit: the attempt's commit-phase reason (a string) when an
-		 * attempt half-landed, otherwise the error that escaped after a refresh saved a collection. */
+		 * attempt half-landed on a hard failure, otherwise the error that escaped after a collection
+		 * was committed or saved — a {@link CoordinatorStaleLossError} when the failed collection's
+		 * refusal never cleared within the retry budget (its own `reason` names the last refusal). */
 		public readonly reason?: unknown,
 	) {
 		super(
@@ -81,16 +83,20 @@ export class CoordinatorPartialCommitError extends Error {
  * in which NOTHING durably committed, so every participating collection's local tracker was
  * restored to its pre-append state and the transaction is safe to re-drive.
  *
- * "Nothing durably committed" holds across the WHOLE commit, not only the last attempt: when a
- * refresh between attempts has already saved one participant, the coordinator reports the budget
- * running out as a {@link CoordinatorPartialCommitError} carrying this error as its `reason`, so
- * this error only ever escapes bare when a re-drive is genuinely safe.
+ * "Nothing durably committed" holds across the WHOLE commit, not only the last attempt. Inside
+ * the coordinator this is also the signal for a retryable ATTEMPT: one that half-landed on
+ * returned refusals (a lagging member, a rival that took a revision slot) throws it after
+ * recording its committed siblings as saved, and one whose refresh saved a participant carries on
+ * under the same budget. In both cases the coordinator reports the budget running out as a
+ * {@link CoordinatorPartialCommitError} carrying this error as its `reason`, so this error only
+ * ever escapes bare when a re-drive is genuinely safe.
  *
  * This is the retryable counterpart to {@link CoordinatorPartialCommitError}: a partial landing
- * cannot be blindly retried (it would double-apply the durable half), but a clean loss can. The
- * coordinator's built-in backoff+jitter retry catches this internally and re-drives after re-reading
- * fresh revisions; it only escapes to the caller once the retry budget (`maxAttempts` / `deadlineMs`)
- * is exhausted, at which point it signals "gave up after a clean loss" rather than a partial split.
+ * cannot be blindly retried by a CALLER (it would double-apply the durable half), but a clean loss
+ * can, and the coordinator's own retry re-drives only what is still staged. Its built-in
+ * backoff+jitter retry catches this internally and re-drives after re-reading fresh revisions; it
+ * only escapes to the caller once the retry budget (`maxAttempts` / `deadlineMs`) is exhausted, at
+ * which point it signals "gave up after a clean loss" rather than a partial split.
  */
 export class CoordinatorStaleLossError extends Error {
 	constructor(
@@ -99,9 +105,11 @@ export class CoordinatorStaleLossError extends Error {
 		/** The underlying stale/conflict reason surfaced by the failed pend/commit phase. */
 		public readonly reason?: string,
 	) {
+		// Deliberately does not assert that nothing committed: this is also the internal signal a
+		// half-landed attempt retries on, and it then surfaces as a partial error's `reason`.
 		super(
-			`Multi-collection commit failed on a clean stale loss (no collection durably committed) ` +
-			`for [${failedCollections.join(', ')}]` + (reason ? ` — ${reason}` : '')
+			`Multi-collection commit lost a stale race for [${failedCollections.join(', ')}]` +
+			(reason ? ` — ${reason}` : '')
 		);
 		this.name = 'CoordinatorStaleLossError';
 	}

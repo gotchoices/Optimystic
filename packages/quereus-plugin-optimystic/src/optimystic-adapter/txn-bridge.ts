@@ -941,20 +941,25 @@ export class TransactionBridge {
    *   tracker to its pre-append state and threw; the bridge rolls the trees back to their
    *   pre-transaction snapshots and maps a guard refusal to the ordinary constraint message.
    * - **A commit-phase split** (`CoordinatorPartialCommitError`: some collections committed
-   *   durably, one lost permanently after every pend succeeded): the coordinator gave the
-   *   committed collections the success-path fold and left the failed ones holding their
-   *   staged DML; THIS method then restores the failed trees to their pre-transaction
-   *   snapshots — memory mirrors storage for both halves, exactly as the fallback sweep
-   *   leaves a torn commit — and the catch latches the degraded state. Nothing rolls the
-   *   committed half back.
+   *   durably after every pend succeeded, and one was still refused when the coordinator's
+   *   retry budget ended — a returned refusal, such as this node's own replica being behind
+   *   on that tree, is retried forward by the coordinator, re-driving the refused tree alone,
+   *   so only a refusal that never clears or a hard failure after a sibling committed reaches
+   *   here): the coordinator gave the committed collections the success-path fold and left
+   *   the failed ones holding their staged DML; THIS method then restores the failed trees to
+   *   their pre-transaction snapshots — memory mirrors storage for both halves, exactly as
+   *   the fallback sweep leaves a torn commit — and the catch latches the degraded state.
+   *   Nothing rolls the committed half back.
    */
   private async commitBatchLegacy({ collections, transactor }: LegacyBatch): Promise<void> {
     // NOTE: the batch pends each tree at the revision this handle currently holds for it — the
     // coordinator does not refresh before its first attempt, where the sweep's `updateAndSync`
     // did. A tree a rival advanced since this handle last refreshed it therefore costs one
-    // refused attempt plus the first backoff (about 50–100 ms) before the retry pends fresh.
-    // Fine at current scale; if contended legacy commits ever show that latency, refresh the
-    // batch's collections here before committing.
+    // refused attempt plus the first backoff (about 50–100 ms) before the retry pends fresh; a
+    // tree this node's own replica is behind on is accepted at pend and costs a refused commit
+    // plus a retry round instead, which the coordinator finishes forward. Fine at current
+    // scale; if contended legacy commits ever show that latency, refresh the batch's
+    // collections here before committing.
     const coordinator = new TransactionCoordinator(
       transactor,
       new Map(collections.map(collection => [collection.id, collection])),

@@ -2112,12 +2112,18 @@ describe('Transaction', () => {
 			const cancelledActions: { actionId: string; blockIds: string[] }[] = [];
 			let commitCallCount = 0;
 
+			// The first commit call lands (one collection); every later one is refused (the other
+			// collection, on every attempt). Which blocks each side owns is recorded off the requests.
+			const committedBlockIds = new Set<string>();
+			const refusedBlockIds = new Set<string>();
 			const originalCommit = transactor.commit.bind(transactor);
 			transactor.commit = async (request) => {
 				commitCallCount++;
 				if (commitCallCount >= 2) {
+					for (const id of request.blockIds) refusedBlockIds.add(id);
 					return { success: false, reason: 'Commit rejected by peer' };
 				}
+				for (const id of request.blockIds) committedBlockIds.add(id);
 				return originalCommit(request);
 			};
 
@@ -2164,15 +2170,24 @@ describe('Transaction', () => {
 
 			await applyViaEngine(coordinator, actionsEngine, tx);
 
+			let err: unknown;
 			try {
-				await coordinator.commit(tx);
-				expect.fail('Should have thrown');
+				await coordinator.commit(tx, { maxAttempts: 3, baseBackoffMs: 1, maxBackoffMs: 5 });
 			} catch (e) {
-				expect((e as Error).message).to.include('failed');
+				err = e;
 			}
+			// The refused collection is retried forward once per attempt (its sibling is durable, so
+			// the coordinator finishes the transaction rather than abandon it); the small budget ends
+			// the retries, and the split is then reported as the partial landing it is.
+			expect(err).to.be.instanceOf(CoordinatorPartialCommitError);
 
-			// Cancel phase should have been invoked for the affected collections
-			expect(cancelledActions.length).to.be.greaterThan(0);
+			// Cancel phase ran on every attempt for the refused collection's pended blocks, and never
+			// for the committed one.
+			expect(cancelledActions.length, 'one cancel per attempt').to.equal(3);
+			for (const { blockIds } of cancelledActions) {
+				expect(blockIds.every(id => refusedBlockIds.has(id)), 'cancel targets the refused collection').to.be.true;
+				expect(blockIds.some(id => committedBlockIds.has(id)), 'the committed collection is never cancelled').to.be.false;
+			}
 		});
 
 		it('should call cancel on pend failure partway through multi-collection pend', async () => {
@@ -2249,7 +2264,9 @@ describe('Transaction', () => {
 			};
 
 			// Make cancel throw to simulate unavailability during cancel
+			let cancelCalls = 0;
 			transactor.cancel = async () => {
+				cancelCalls++;
 				throw new Error('Cancel also failed');
 			};
 
@@ -2287,14 +2304,18 @@ describe('Transaction', () => {
 
 			await applyViaEngine(coordinator, actionsEngine, tx);
 
-			// Cancel phase throws, which should propagate as an error
+			// The cancel fault is logged and swallowed (it must not mask the commit refusal that
+			// triggered it); the refused collection is retried forward until the small budget ends,
+			// and the split is then reported as the partial landing it is.
+			let err: unknown;
 			try {
-				await coordinator.commit(tx);
-				expect.fail('Should have thrown');
+				await coordinator.commit(tx, { maxAttempts: 3, baseBackoffMs: 1, maxBackoffMs: 5 });
 			} catch (e) {
-				// The cancel failure propagates through the commit path
-				expect(e).to.be.instanceOf(Error);
+				err = e;
 			}
+			expect(err).to.be.instanceOf(CoordinatorPartialCommitError);
+			expect((err as Error).message, 'the cancel fault does not replace the commit refusal').to.not.include('Cancel also failed');
+			expect(cancelCalls, 'cancel was attempted').to.be.greaterThanOrEqual(1);
 		});
 	});
 
@@ -3036,9 +3057,9 @@ describe('Transaction', () => {
 			const originalCommit = transactor.commit.bind(transactor);
 			transactor.commit = async (request) => {
 				commitCallCount++;
-				// First call succeeds (collection A); the second returns a stale failure
-				// (collection B). A returned failure is a permanent stale loss, so it is
-				// attempted exactly once — not retried.
+				// First call succeeds (collection A); every later call returns a refusal (collection
+				// B, on every attempt). commitCollection never retries a returned refusal verbatim;
+				// the coordinator's retry loop re-drives collection B alone, once per attempt.
 				if (commitCallCount >= 2) {
 					return { success: false, reason: 'Commit rejected' };
 				}
@@ -3075,26 +3096,29 @@ describe('Transaction', () => {
 
 			await applyViaEngine(coordinator, actionsEngine, tx);
 
+			let err: unknown;
 			try {
-				await coordinator.commit(tx);
-				expect.fail('Should have thrown');
+				await coordinator.commit(tx, { maxAttempts: 3, baseBackoffMs: 1, maxBackoffMs: 5 });
 			} catch (e) {
-				expect((e as Error).message).to.include('failed');
+				err = e;
 			}
+			expect(err, 'the split is reported once the budget ends').to.be.instanceOf(CoordinatorPartialCommitError);
 
 			// Forward recovery: 1st collection committed (unavoidable once commit succeeds)
 			const committed = transactor.getCommittedActions();
 			expect(committed.size, 'forward recovery: 1st collection committed after successful commit').to.equal(1);
 
-			// Targeted cancel: only the still-pending (failed) collection was cancelled, not the committed one
-			expect(cancelledCollectionBlockIds.length, 'cancel called only for the non-committed collection').to.equal(1);
+			// Targeted cancel: on every attempt only the still-pending (refused) collection was
+			// cancelled, never the committed one — one cancel per attempt.
+			expect(cancelledCollectionBlockIds.length, 'cancel called once per attempt, for the refused collection only').to.equal(3);
 
 			// No orphaned pending actions remain
 			const pending = transactor.getPendingActions();
 			expect(pending.size, 'no orphaned pending actions').to.equal(0);
 
-			// Stale failure is NOT retried: 1 success (collection A) + 1 attempt (collection B) = 2 total.
-			expect(commitCallCount, 'stale commit attempted once per collection, no retry').to.equal(2);
+			// The refusal is re-driven at the coordinator level, once per attempt, for the refused
+			// collection only: 1 (collection A) + 3 attempts (collection B) = 4 total.
+			expect(commitCallCount, 'refused commit re-driven once per attempt for the loser only').to.equal(4);
 		});
 
 		it('should retry and succeed when commit transiently fails', async () => {
@@ -3888,9 +3912,12 @@ describe('Transaction', () => {
 			const preUsers = usersCollection.snapshotPending();
 			const prePosts = postsCollection.snapshotPending();
 
+			// The refused collection is retried forward (its sibling is durable, so the coordinator
+			// finishes the transaction rather than abandon it); the small budget ends the retries,
+			// and the split is then reported as the partial landing it is.
 			let caught: unknown;
 			try {
-				await session.commit();
+				await session.commit({ maxAttempts: 2, baseBackoffMs: 1, maxBackoffMs: 5 });
 			} catch (e) {
 				caught = e;
 			}
@@ -3917,9 +3944,46 @@ describe('Transaction', () => {
 			expect(postsCollection.getPendingActions()).to.deep.equal(prePosts.pending,
 				'failed collection pending queue should be restored');
 
-			// 4. stampData for the half-committed transaction was cleared.
+			// 4. stampData for the half-committed transaction was cleared — by the report, once the
+			//    budget ended (the stamp stays open while the refused collection is retried).
 			expect((coordinator as any).stampData.has(stampId), 'stampData should be cleared for a partial commit')
 				.to.be.false;
+		});
+
+		it('session commit: a collection refused once then accepted lands the whole transaction, the winner logged once', async () => {
+			const inner = new TestTransactor();
+			// 'posts' is refused on the first attempt, then accepted; 'users' commits at once. The
+			// coordinator does not surface the split: it records 'users' as saved, re-drives 'posts'
+			// alone, and the transaction lands whole — the shape of a writer whose own replica was
+			// behind on one collection and caught up a moment later.
+			const transactor = new FailCollectionNTimesTransactor(inner, 'posts', 1);
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', e => e.key);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(transactor, 'posts', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const postsCollection = (postsTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection], ['posts', postsCollection]]);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const engine = new ActionsEngine();
+			const session = await TransactionSession.create(coordinator, engine, 'peer1', 'schema1');
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[100, { key: 100, userId: 1, title: 'First' }]] }] },
+			];
+			await session.execute(createActionsStatements(actions)[0]!, actions);
+			const stampId = session.getStampId();
+
+			await session.commit({ baseBackoffMs: 1, maxBackoffMs: 5 });
+
+			// The winner landed exactly once, on the first attempt; the loser on the retry.
+			expect(transactor.durableCommits, 'the retry commits only the refused collection').to.deep.equal(['users', 'posts']);
+			expect(await usersTree.get(1)).to.deep.equal({ key: 1, name: 'Alice' });
+			expect(await postsTree.get(100)).to.deep.equal({ key: 100, userId: 1, title: 'First' });
+			expect(usersCollection.getPendingActions(), 'nothing left staged on the winner').to.deep.equal([]);
+			expect(postsCollection.getPendingActions(), 'nothing left staged on the loser').to.deep.equal([]);
+			expect((coordinator as any).stampData.has(stampId), 'the success path released the stamp').to.be.false;
 		});
 
 		it('empty-committed failure (every collection fails) throws a clean stale-loss error (not the partial signal) and restores every tracker', async () => {
@@ -4283,9 +4347,9 @@ describe('Transaction', () => {
 			expect(inner.getCommittedActions().size, 'nothing durably committed').to.equal(0);
 		});
 
-		it('re-driving commit() after a partial landing re-attempts only the failed collection (no double-apply on the winner)', async () => {
+		it("the coordinator's own retry after a partial landing re-attempts only the failed collection (no double-apply on the winner)", async () => {
 			const inner = new TestTransactor();
-			// 'posts' loses its FIRST commit permanently, then succeeds on the retry; 'users' commits
+			// 'posts' is refused on its FIRST commit, then succeeds on the retry; 'users' commits
 			// durably on the first attempt.
 			const transactor = new FailCollectionNTimesTransactor(inner, 'posts', 1);
 
@@ -4310,30 +4374,18 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, statements, []),
 			};
 
-			// Stage the actions (mirrors a session), then drive commit() directly so it can be
-			// re-driven — a TransactionSession forbids a second commit().
+			// Stage the actions (mirrors a session), then drive commit() directly.
 			await coordinator.applyActions(actions, stamp.id);
 
-			// First commit: 'users' lands durably, 'posts' loses permanently → partial-commit throw.
-			let firstError: unknown;
-			try {
-				await coordinator.commit(transaction);
-			} catch (e) {
-				firstError = e;
-			}
-			expect(firstError, 'first commit throws the partial signal').to.be.instanceOf(CoordinatorPartialCommitError);
-			expect([...(firstError as CoordinatorPartialCommitError).committedCollections]).to.deep.equal(['users']);
-			expect([...(firstError as CoordinatorPartialCommitError).failedCollections]).to.deep.equal(['posts']);
-			expect(transactor.durableCommits, 'only users landed on the first attempt').to.deep.equal(['users']);
+			// Attempt 1: 'users' lands durably, 'posts' is refused. The coordinator does not surface
+			// that split: it records 'users' as saved and re-drives. Attempt 2 re-attempts ONLY the
+			// restored 'posts' — 'users' had its pending CLEARED (durable), so it is excluded from
+			// the retry: no re-append, no re-commit — and now succeeds.
+			await coordinator.commit(transaction, { baseBackoffMs: 1, maxBackoffMs: 5 });
 
-			// Second commit (retry) of the SAME transaction: 'users' had its pending CLEARED (durable),
-			// so it is excluded from the retry — no re-append, no re-commit. Only the restored 'posts'
-			// is re-attempted, and now succeeds.
-			await coordinator.commit(transaction);
-
-			// The winner ('users') produced NO new durable commit on retry — no double-apply. Only the
-			// previously-failed 'posts' committed on the second attempt.
-			expect(transactor.durableCommits, 'retry commits only the previously-failed collection')
+			// The winner ('users') produced NO new durable commit on the retry — no double-apply.
+			// Only the previously-refused 'posts' committed on the second attempt.
+			expect(transactor.durableCommits, 'the retry commits only the previously-refused collection')
 				.to.deep.equal(['users', 'posts']);
 
 			// Both collections now read back their values.
@@ -4346,13 +4398,13 @@ describe('Transaction', () => {
 		type UserEntry = { key: number; name: string };
 		type PostEntry = { key: number; userId: number; title: string };
 
-		/** Commits every collection EXCEPT the poison one, which loses (a returned StaleFailure)
-		 * permanently — reproducing a PARTIAL landing (winner durable, loser rejected). Counts commit
-		 * calls so a test can prove the partial signal is NOT auto-retried. */
+		/** Commits every collection EXCEPT the poison one, whose commit is refused (a returned
+		 * StaleFailure) `refusals` times — forever by default — reproducing a PARTIAL landing (winner
+		 * durable, loser refused). Counts commit calls so a test can prove how the loser is re-driven. */
 		class PartialLossTransactor extends DelegatingTransactor {
 			commitCalls = 0;
 			private readonly poison = new Set<BlockId>();
-			constructor(inner: TestTransactor, private readonly poisonCollectionId: string) { super(inner); }
+			constructor(inner: TestTransactor, private readonly poisonCollectionId: string, private refusals = Infinity) { super(inner); }
 			override async pend(request: PendRequest): Promise<PendResult> {
 				const firstInsert = Object.values(request.transforms.inserts ?? {})[0] as IBlock | undefined;
 				if (firstInsert?.header.collectionId === this.poisonCollectionId) {
@@ -4362,7 +4414,8 @@ describe('Transaction', () => {
 			}
 			override async commit(request: CommitRequest): Promise<CommitResult> {
 				this.commitCalls++;
-				if (request.blockIds.some(id => this.poison.has(id))) {
+				if (request.blockIds.some(id => this.poison.has(id)) && this.refusals > 0) {
+					this.refusals--;
 					return { success: false, reason: `forced loss: ${this.poisonCollectionId}` };
 				}
 				return this.inner.commit(request);
@@ -4484,26 +4537,55 @@ describe('Transaction', () => {
 			expect(await postsTree.get(100)).to.deep.equal({ key: 100, userId: 1, title: 'First' });
 		});
 
-		it('a PARTIAL landing throws CoordinatorPartialCommitError and is NOT auto-retried', async () => {
+		it('a PARTIAL landing whose loser is refused twice then accepted lands the whole transaction', async () => {
 			const inner = new TestTransactor();
-			const transactor = new PartialLossTransactor(inner, 'posts'); // posts loses permanently
-			const { coordinator, transaction } = await makeMultiCollection(transactor);
+			// 'posts' is refused on the first two attempts, then accepted; 'users' commits at once.
+			// A lagging member that catches up, or a rival's cancel that raced the commit, looks
+			// exactly like this from the writer: a returned refusal that clears on a later attempt.
+			const transactor = new PartialLossTransactor(inner, 'posts', 2);
+			const { coordinator, usersTree, postsTree, transaction } = await makeMultiCollection(transactor);
+
+			// The default attempt budget (10) — the refusal clears well inside it.
+			await coordinator.commit(transaction, { baseBackoffMs: 1, maxBackoffMs: 5 });
+
+			// The loser alone is re-driven, once per attempt: 2 (attempt 1) + 1 + 1 = 4 commit calls.
+			expect(transactor.commitCalls, 'the loser alone is re-driven, once per attempt').to.equal(4);
+			// Each collection holds exactly one log entry for the transaction — the winner was
+			// committed once and never re-logged by the retries.
+			expect((await logActions(usersTree.getCollection())).length, 'the winner logged exactly once').to.equal(1);
+			expect((await logActions(postsTree.getCollection())).length, 'the loser logged exactly once').to.equal(1);
+			expect(await usersTree.get(1)).to.deep.equal({ key: 1, name: 'Alice' });
+			expect(await postsTree.get(100)).to.deep.equal({ key: 100, userId: 1, title: 'First' });
+			expect((coordinator as any).stampData.has(transaction.stamp.id), 'the success path released the stamp').to.be.false;
+		});
+
+		it('a PARTIAL landing whose loser is refused forever is reported as CoordinatorPartialCommitError once the budget ends', async () => {
+			const inner = new TestTransactor();
+			const transactor = new PartialLossTransactor(inner, 'posts'); // posts refused forever
+			const { coordinator, usersTree, postsTree, transaction } = await makeMultiCollection(transactor);
 
 			let err: unknown;
 			try {
-				// Default options → auto-retry is ON, but a partial landing must bypass it.
-				await coordinator.commit(transaction);
+				await coordinator.commit(transaction, { maxAttempts: 3, baseBackoffMs: 1, maxBackoffMs: 5 });
 			} catch (e) {
 				err = e;
 			}
 
-			expect(err, 'partial landing surfaces the partial signal').to.be.instanceOf(CoordinatorPartialCommitError);
+			expect(err, 'the split surfaces as the partial signal once the budget ends').to.be.instanceOf(CoordinatorPartialCommitError);
 			expect([...(err as CoordinatorPartialCommitError).committedCollections]).to.deep.equal(['users']);
 			expect([...(err as CoordinatorPartialCommitError).failedCollections]).to.deep.equal(['posts']);
-			// The winner ('users') stayed durable; nothing was re-driven.
-			expect(inner.getCommittedActions().size, "only the winner's half landed").to.equal(1);
-			// Proof of no-retry: exactly one commit call per collection (2), NOT 2 + retry rounds.
-			expect(transactor.commitCalls, 'partial landing was not re-driven').to.equal(2);
+			// The report carries the stale-loss signal the retries ran on, which names the last refusal.
+			expect((err as CoordinatorPartialCommitError).reason).to.be.instanceOf(CoordinatorStaleLossError);
+			expect((err as Error).message).to.include('forced loss: posts');
+			// The winner stayed durable and was logged exactly once; the loser never landed and is
+			// still staged for the caller's reconciliation.
+			expect((await logActions(usersTree.getCollection())).length, 'the winner logged exactly once').to.equal(1);
+			expect((await logActions(postsTree.getCollection())).length, 'the loser never landed').to.equal(0);
+			expect(usersTree.hasUnsyncedChanges(), 'nothing left to push on the winner').to.be.false;
+			expect(postsTree.hasUnsyncedChanges(), 'the loser is still staged').to.be.true;
+			// The loser alone was re-driven, once per attempt: 2 (attempt 1) + 1 + 1 = 4 commit calls.
+			expect(transactor.commitCalls, 'the loser re-driven once per attempt').to.equal(4);
+			expect((coordinator as any).stampData.has(transaction.stamp.id), 'the report released the stamp').to.be.false;
 		});
 
 		it('a MIXED pend failure (one conflict + one hard) fails fast, not as a retryable stale loss', async () => {

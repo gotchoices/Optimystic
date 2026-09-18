@@ -1000,21 +1000,26 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * both must distinguish a confirmed conflict (return it; the caller cancels and re-drives) from
 	 * a transient fault (throw / tolerate).
 	 *
-	 * NOTE: a reason-only StaleFailure (success:false, no `missing`) lands here too and returns
-	 * `{ missing: [], success:false }` — the `reason` PROSE is dropped rather than surfaced.
-	 * `staleAt` is carried, so the one machine-readable fact in that prose (which block is at which
-	 * revision) survives; only the free-form wording is lost. If the wording itself is ever needed,
-	 * gate this on non-empty missing rather than reinstating it unconditionally.
+	 * Rebuilt the same way {@link pend}'s aggregate is: `reason` is the first one any batch gave
+	 * (the only diagnostic that survives into the coordinator's error text — a refusal whose reason
+	 * is `commit-not-durable` must not read as "stale commit", a rival's win), `conflict` holds when
+	 * any batch was a classified conflict, and `staleAt` is the highest confirmed revision. A
+	 * reason-only StaleFailure (success:false, no `missing`) lands here too and comes out with
+	 * `missing: []` and its reason intact.
 	 */
 	private staleFromBatches(batches: CoordinatorBatch<BlockId[], CommitResult>[]): StaleFailure | undefined {
 		const stale = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
 		if (stale.length === 0) {
 			return undefined;
 		}
-		const staleAt = highestStaleAt(stale.map(b => (b.request!.response! as StaleFailure).staleAt));
+		const responses = stale.map(b => b.request!.response! as StaleFailure);
+		const staleAt = highestStaleAt(responses.map(r => r.staleAt));
+		const reason = responses.map(r => r.reason).find(r => r !== undefined);
 		return {
-			missing: distinctBlockActionTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing).filter((x): x is ActionTransforms => x !== undefined)),
+			missing: distinctBlockActionTransforms(responses.flatMap(r => r.missing).filter((x): x is ActionTransforms => x !== undefined)),
 			...(staleAt === undefined ? {} : { staleAt }),
+			...(reason === undefined ? {} : { reason }),
+			conflict: responses.some(isConflictFailure),
 			success: false as const
 		};
 	}

@@ -900,6 +900,8 @@ Logged when this node's own cohort member applied a commit during consensus, its
 
 Either way, the commit then goes to the durability gate, which counts only the other members' reports. If `coordinator-repo:commit-not-durable` comes next, the commit was refused as not stored by a majority. If no refusal line follows, the rest of the cohort carried it.
 
+A refused commit is not the end of the write. db-core's coordinator treats the returned refusal as a stale loss and retries it under its ordinary budget: the refresh before the next attempt finishes the collection's own log entry where its tail landed, or the next attempt re-pends it afresh. For a multi-collection transaction whose sibling collections had already committed, a `commit:partial-retry` line on the `optimystic:db-core:trx:coordinator` namespace names the collections that landed (`committed`), the one being re-driven (`failed`) and the refusal's `reason`; the re-drive then carries only that collection. Only a refusal that outlasts the retry budget reaches the caller, as a `CoordinatorPartialCommitError` whose committed set is what that line reported (a `commit:partial-after-refresh` line comes just before it).
+
 ### `cluster-member:admission-reject` — whose problem is it?
 
 Logged under `optimystic:db-p2p:cluster-member` when a cohort member refuses to vote because the peer set the coordinator declared failed this member's membership check (`admitMembership` in `packages/db-p2p/src/cluster/cluster-repo.ts`). The `reason` field says which check failed and, which matters more, whose problem it is. The same reason travels back to the coordinator in the member's signed reject vote, as `membership-not-admitted:<reason>`.

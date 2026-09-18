@@ -40,7 +40,18 @@ This document describes the architecture for multi-collection transactions in Op
 >   well above the retry budget, since no member ever sees it).
 >   Regression: `packages/quereus-plugin-optimystic/test/two-node-unique-value-race.spec.ts`.
 > - **The residual** is the commit phase, shared with session mode: after every pend
->   succeeded, one tree's commit can still be lost permanently while its siblings land.
+>   succeeded, one tree's commit can be refused while its siblings land. A refusal the
+>   cluster *returns* — a member behind on the block's base (the durability gate's
+>   `commit-not-durable`, typically the writer's own replica on a node that has just
+>   joined), or a rival that took the revision slot — is retried forward by the
+>   coordinator under its ordinary retry budget: the committed trees are recorded as
+>   saved, the refresh between attempts finishes the refused tree's own log entry where
+>   its tail landed (or the next attempt re-pends it afresh), and only what is still
+>   staged is re-driven, so the durable half is never re-logged. A refusal that clears
+>   within the budget lands the whole transaction
+>   (`packages/quereus-plugin-optimystic/test/two-node-lagging-replica-multi-collection-commit.spec.ts`).
+>   What is left is a refusal that does not clear within the budget, or a hard failure
+>   (the transport budget spent, a structural rejection) after a sibling committed.
 >   That surfaces as db-core's
 >   [`CoordinatorPartialCommitError`](../packages/db-core/src/transaction/errors.ts)
 >   naming the committed and the failed collections — in legacy mode too, since the
@@ -79,11 +90,22 @@ This document describes the architecture for multi-collection transactions in Op
 > COMMIT phase commits each collection's pended blocks **independently**
 > (`TransactionCoordinator.commitPhase`, fanned out per collection). Once PEND
 > succeeds for every collection the coordinator has "decided to commit", but a
-> per-collection commit can still fail *permanently* between PEND and COMMIT — most
-> commonly a **stale loss**: a racing transaction advanced that collection's log
-> tail, so our commit can never win. Meanwhile the other collections commit
-> successfully. Those durable commits are per-collection with no cross-collection
-> undo, so the ones that landed cannot be un-committed.
+> per-collection commit can still be refused between PEND and COMMIT — a **stale
+> loss** (a racing transaction advanced that collection's log tail, so this exact
+> commit can never win) or a **lagging member** (the durability gate's
+> `commit-not-durable`: the block's base is not held by a majority, typically because
+> the writer's own replica has not caught up on that collection). Meanwhile the other
+> collections commit successfully. Those durable commits are per-collection with no
+> cross-collection undo, so the ones that landed cannot be un-committed — and the
+> coordinator therefore recovers **forward**. When every refusal was returned by the
+> cluster, the attempt records the committed collections as saved and throws the same
+> internal stale-loss signal a clean loss does, so the retry loop refreshes — finishing
+> the refused collection's own log entry where its tail landed
+> (`Collection.completeOwnEntry`), or re-pending it afresh when nothing of it landed —
+> and re-drives only what is still staged. A refusal that clears within the budget
+> lands the whole transaction. The split window is what remains: a refusal that never
+> clears within the budget, or a hard failure (the transport budget spent, a structural
+> rejection) after a sibling committed.
 >
 > **Honest-reporting contract.** When this happens `coordinator.commit()` throws a
 > [`CoordinatorPartialCommitError`](../packages/db-core/src/transaction/errors.ts)
@@ -115,7 +137,8 @@ This document describes the architecture for multi-collection transactions in Op
 > **Caller recovery differs between the two entry points.** Re-driving `commit()`
 > for the same transaction re-attempts only the failed collection: the winner's
 > pending queue was cleared by the success-path fold, so there is nothing left to
-> re-log. `execute()` does **not** have that property — it re-runs the engine and
+> re-log — which is exactly what the coordinator's own retry did before reporting
+> the split. `execute()` does **not** have that property — it re-runs the engine and
 > re-stages every collection the engine names, so re-driving the *same*
 > transaction would apply the winner's actions a second time. An `execute()`
 > caller reconciling a partial landing must build a **new** transaction naming only

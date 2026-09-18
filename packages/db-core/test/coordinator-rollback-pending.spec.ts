@@ -320,14 +320,17 @@ describe('TransactionCoordinator.rollback: pending queue', () => {
 			{ collectionId: loser, value: 'lose' },
 		]);
 
+		// The loser is refused forever, so the coordinator retries it forward until the budget ends
+		// and then reports the split; a small budget keeps that quick.
 		let err: unknown;
 		try {
-			await coordinator.commit(staged.transaction);
+			await coordinator.commit(staged.transaction, { maxAttempts: 2, baseBackoffMs: 1, maxBackoffMs: 5 });
 		} catch (e) { err = e; }
 		expect(err, 'partial landing surfaces the partial signal').to.be.instanceOf(CoordinatorPartialCommitError);
 
-		// commitOnceLatched deletes the stampData entry on a partial landing precisely so rollback
-		// cannot rewind the collection that DID durably commit. That must stay true.
+		// The stampData entry is deleted when the partial landing is reported (reportSaved, once the
+		// retry budget ends) precisely so rollback cannot rewind the collection that DID durably
+		// commit. That must stay true.
 		const winnerLogBefore = await logValues(collections.get(winner)!);
 		await coordinator.rollback(staged.stampId);
 

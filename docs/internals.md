@@ -1481,7 +1481,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   reports), report success (`coordinator-repo:commit-local-failed-cluster-succeeded`) and let
   replication converge this peer. Returning the refusal instead would surface a *landed*
   transaction as a stale loss, since db-core's `commitPhase` treats any returned `success:false`
-  as a permanent stale failure and retries until its budget is exhausted. Without that durable
+  as a stale loss and its coordinator re-drives the refused collection — alone, even after a
+  sibling collection committed — until its retry budget is exhausted. Without that durable
   majority the answer is the gate's retryable refusal (`COMMIT_NOT_DURABLE_REASON`,
   `coordinator-repo:commit-not-durable`): nothing is known to hold the revision, and the members
   that refused have dropped their pending records, so the writer must cancel and re-drive at a

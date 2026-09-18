@@ -64,10 +64,14 @@ type CommitCycle = {
 	 * registered collection no attempt included is not part of this transaction and appears in no
 	 * report. */
 	participants: Set<CollectionId>;
-	/** Participants a refresh between attempts has saved: it found this transaction's own log
-	 * entry and finished it (see {@link RefreshReport}). Once non-empty, the commit can no longer
-	 * fail cleanly. Participants an attempt itself commits are not recorded here — a successful
-	 * attempt ends the commit, and a partial one reports its own committed set. */
+	/** Participants that are durably committed while the commit is still being driven: a refresh
+	 * between attempts found this transaction's own log entry and finished it (see
+	 * {@link RefreshReport}), or an attempt committed them and was refused on a sibling that can
+	 * still be finished (the partial-retry branch of {@link commitOnceLatched}). Once non-empty,
+	 * the commit can no longer fail cleanly: every later failure is reported through
+	 * {@link reportSaved} as a partial landing naming these as committed. A successful attempt
+	 * ends the commit and records nothing here; a partial landing on a hard failure reports its
+	 * own committed set at once. */
 	saved: Set<CollectionId>;
 };
 
@@ -292,10 +296,15 @@ export class TransactionCoordinator {
 	 * {@link Collection.sync}. Retry is bounded by `maxAttempts` and an optional wall-clock
 	 * `deadlineMs`, and honours an abort `signal`.
 	 *
-	 * A {@link CoordinatorPartialCommitError} (a partial landing — some collection durably committed)
-	 * is NOT retryable and escapes immediately: blindly retrying would re-log already-durable actions.
-	 * Any other failure (expired transaction, unavailable transactor, unreachable cluster) also
-	 * propagates without retry — only genuine clean stale losses are re-driven.
+	 * A PARTIAL landing — some collection durably committed while a sibling's commit was refused —
+	 * is re-driven too when every refusal was a returned one (a member behind on the block's base,
+	 * a rival that took the revision slot): the committed collections are recorded as saved and the
+	 * next attempt commits only what is still staged, so the durable half is never re-logged and the
+	 * refused collection gets the same refresh-and-finish recovery a clean loss gets. A caller must
+	 * still never re-drive a partial landing itself. A partial landing on a HARD failure (the
+	 * transport budget spent, a structural rejection) escapes at once as
+	 * {@link CoordinatorPartialCommitError}, and any other failure (expired transaction,
+	 * unavailable transactor, unreachable cluster) also propagates without retry.
 	 *
 	 * A participant can also be SAVED between attempts: an attempt that reported a loss may still
 	 * have stored that participant's log tail, and the refresh before the next attempt then finishes
@@ -566,7 +575,9 @@ export class TransactionCoordinator {
 	 * and folds the committed transforms back into each collection's read cache.
 	 *
 	 * On a clean stale loss (nothing durable, every tracker restored) it throws
-	 * {@link CoordinatorStaleLossError} so the caller can retry; on a partial landing it throws
+	 * {@link CoordinatorStaleLossError} so the caller can retry. On a partial landing it throws the
+	 * same, after recording the committed collections in `cycle.saved`, when every refusal was a
+	 * returned one (the retry finishes the refused collection); on a hard failure it throws
 	 * {@link CoordinatorPartialCommitError} (not retryable).
 	 *
 	 * @param transaction - The transaction to commit
@@ -633,7 +644,7 @@ export class TransactionCoordinator {
 				// non-participant is left unmarked and its refresh behaves exactly as a reader's.
 				cycle.inFlightDisposers.push(collection.beginInFlightAction(transaction.id));
 			}
-			await this.commitOnceLatched(transaction, collectionData);
+			await this.commitOnceLatched(transaction, collectionData, cycle);
 		} finally {
 			for (const release of latchReleases.reverse()) {
 				release();
@@ -647,10 +658,15 @@ export class TransactionCoordinator {
 	 * participant's latch — every Collection member it touches (snapshotPending, getPendingActions,
 	 * recordCommitted, applyCommittedToCache, restorePending, clearPendingActions, tracker.reset)
 	 * is latch-free by contract.
+	 *
+	 * `cycle` is written only on a partial landing that is retried forward: the participants this
+	 * attempt committed go into `cycle.saved`, so the retry loop reports every later failure as the
+	 * partial landing it is (see {@link reportSaved}).
 	 */
 	private async commitOnceLatched(
 		transaction: Transaction,
-		collectionData: { collectionId: CollectionId; collection: Collection<any> }[]
+		collectionData: { collectionId: CollectionId; collection: Collection<any> }[],
+		cycle: CommitCycle
 	): Promise<void> {
 		// Append each collection's staged actions to its log, then collect the
 		// resulting transforms + critical (log-tail) block for consensus.
@@ -776,15 +792,31 @@ export class TransactionCoordinator {
 						collection.restorePending(preCommitSnapshots.get(collectionId)!);
 					}
 				}
-				// The transaction half-landed, so it is neither cleanly retryable nor
-				// cleanly abortable: drop its stamp tracking (the success path does the
-				// same at the end) and surface the structured signal for reconciliation.
+				const failed = [...(coordResult.failedCollections ?? new Set<CollectionId>())];
+				if (coordResult.staleLoss) {
+					// Every failure was a RETURNED refusal: a member behind on the block's base (the
+					// durability gate's `commit-not-durable`, from a replica that has not caught up —
+					// the writer's own, on a node that has just joined), or a rival that took the
+					// revision slot. The siblings above have landed and cannot be rolled back, so
+					// FORWARD recovery — finishing this collection — is the only way back to
+					// all-or-nothing, and the retry loop already does it: the refresh between attempts
+					// finds this transaction's own log entry where the tail landed and re-sends the
+					// retained attempt at the same revision (Collection.completeOwnEntry), or the next
+					// attempt re-pends afresh when nothing of it landed. The committed siblings are
+					// recorded as saved, so every failure that still escapes is reported as the partial
+					// landing it is (reportSaved), and the next attempt commits only what is still
+					// staged (stagedCollections) — the durable half is never re-logged. The stamp stays
+					// open for the retry; reportSaved or the success path releases it.
+					for (const collectionId of committed) cycle.saved.add(collectionId);
+					log('commit:partial-retry tx=%s committed=%o failed=%o reason=%s', transaction.id, [...committed], failed, coordResult.error);
+					throw new CoordinatorStaleLossError(failed, coordResult.error);
+				}
+				// Half-landed on a HARD failure (the transport budget spent on a thrown fault, a
+				// structural rejection): neither cleanly retryable nor cleanly abortable, so drop the
+				// stamp tracking (the success path does the same at the end) and surface the
+				// structured signal for reconciliation at once.
 				this.stampData.delete(transaction.stamp.id);
-				throw new CoordinatorPartialCommitError(
-					[...committed],
-					[...(coordResult.failedCollections ?? new Set<CollectionId>())],
-					coordResult.error
-				);
+				throw new CoordinatorPartialCommitError([...committed], failed, coordResult.error);
 			}
 
 			// EMPTY committed set: PEND failed, or the whole commit failed cleanly with
@@ -1678,10 +1710,14 @@ export class TransactionCoordinator {
 		};
 
 		// Retry ONLY transient/thrown failures (unreachable peers, timeout) — forward recovery.
-		// A returned { success:false } is a permanent stale loss (someone committed a newer rev);
-		// the identical request can never win, so return immediately without retrying. Either way
-		// cancelPhase (run by coordinateTransaction on commitPhase failure) releases the pend
-		// exactly once — commit itself no longer self-cancels.
+		// A returned { success:false } is a refusal the IDENTICAL request can never win (a rival
+		// committed a newer rev, or a member behind on the base refused and dropped its pending
+		// record), so return immediately without retrying it here. The refusal is retried at the
+		// coordinator level instead, as a DIFFERENT request: the retry loop refreshes, finishes the
+		// collection's own log entry where the tail landed, or re-pends afresh — and it does so even
+		// when a sibling collection has already committed (the partial-retry branch of
+		// commitOnceLatched). Either way cancelPhase (run by coordinateTransaction on commitPhase
+		// failure) releases the pend exactly once — commit itself no longer self-cancels.
 		let lastTransientError: string | undefined;
 		for (let attempt = 0; attempt < 3; attempt++) {
 			try {

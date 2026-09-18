@@ -2566,9 +2566,11 @@ export class CoordinatorRepo implements IRepo {
 			//     but not the revision that created the block (see StorageRepo.internalCommit).
 			// Reporting a tolerated divergence to the caller as the raw refusal would surface a
 			// committed transaction as a stale loss: db-core's commitPhase treats any returned
-			// `success:false` as a permanent stale failure. So a divergence on a durable majority is
-			// reported as success, and one WITHOUT a durable majority as the durability gate's
-			// retryable refusal (`tolerateLocalCommitDivergence`).
+			// `success:false` as a stale loss, and its coordinator re-drives the refused collection
+			// (alone, even after a sibling collection committed) until its retry budget is spent. So
+			// a divergence on a durable majority is reported as success, and one WITHOUT a durable
+			// majority as the durability gate's retryable refusal (`tolerateLocalCommitDivergence`),
+			// which that re-drive is what clears.
 			//
 			// The gate is evaluated BEFORE the local fallback commit, and a failing gate skips it.
 			// This node counts toward the majority only when it is in the cohort the commit ran on;
