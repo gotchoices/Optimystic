@@ -56,6 +56,7 @@ files:
   - `recordClaim` keeps `pendingRevs` absent when it is empty.
 - **Hygiene:** no file-size concern from this diff. The comments state reasons rather than narrate code.
 - **Performance:** the one wasted raw operation per commit is gone. Sereus's downstream op counts were not re-measured here, because this repo has no solo-strand op-count spec.
+  - Downstream confirmation, added by sereus on 2026-09-17: against this repo's dist rebuilt at `fbf165ee`, sereus's `strand-solo-write-budget.spec.ts` measured solo insert at 88 raw ops (was 99) and solo launch at 80 (was 88), with the same figures on 3 runs. `deletePendingTransaction` is 0 in both phases, so the solo launch path runs no recovery-path delete. The remaining rise over the older figures (insert 80, launch 78) is the per-pend `saveMetadata` from `9cbc7427`, which is intended.
 
 ## Tests and validation
 
