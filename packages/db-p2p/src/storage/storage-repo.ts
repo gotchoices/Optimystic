@@ -363,15 +363,16 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 								if (!pending) {
 									continue;
 								}
-								const latest = await blockStorage.getLatest();
-								if (!(await this.mayPromoteOnRead(blockId, blockStorage, actionId, pending, latest))) {
+								// Re-read per entry: the previous iteration may have just promoted the base this one needs.
+								const held = await blockStorage.getLatest();
+								if (!(await this.mayPromoteOnRead(blockId, blockStorage, actionId, pending, held))) {
 									// A decline is not a refusal: the record stays, and the committed content
 									// served below is real, merely behind — the reader's floors and the
 									// coordinator's read-repair own "behind", so no flag. The one exception is
 									// a block this node holds NO committed revision of: the answer below would
 									// be an absent that this node's own record contradicts, so it is flagged as
 									// a guess rather than posing as "never existed".
-									if (latest === undefined) {
+									if (held === undefined) {
 										unavailable = 'unmaterializable';
 									}
 									break;
@@ -1488,6 +1489,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		if (isBaseIndependent(transform)) {
 			return;
 		}
+		// NOTE: `pendingClaimOf` re-reads the record `internalCommit` already holds (to prove the claim
+		// is live) plus the metadata — two local KV gets per update-only commit, unmeasured. If the
+		// commit path ever shows them in a profile, read the metadata alone here: the caller's record
+		// read is the liveness proof.
 		const stored = (await storage.pendingClaimOf(actionId))?.baseRev;
 		const declared = typeof declaredBaseRev === 'number' ? declaredBaseRev : undefined;
 		if (stored !== undefined && declared !== undefined && stored !== declared) {
@@ -1497,6 +1502,9 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		}
 		const effective = stored ?? declared;
 		if (effective === undefined) {
+			// NOTE: debug level only, so the base-less residual is countable but not visible in production
+			// logs; every bare test-double pend lands here, so a visible level would drown the suites. If
+			// a mixed-version fleet ever needs the count, give this one line its own logger.
 			log('commit:base-undeclared blockId=%s rev=%d actionId=%s latest=%s', blockId, rev, actionId, latest?.rev ?? 'none');
 			return;
 		}

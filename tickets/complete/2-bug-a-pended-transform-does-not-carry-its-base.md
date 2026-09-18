@@ -7,7 +7,7 @@ severity: corruption
 likelihood: unusual
 ----
 
-# A pend carries, and storage keeps, the version each block's change was computed against — implemented, for review
+# A pend carries, and storage keeps, the version each block's change was computed against — complete
 
 Second of the three tickets split from the plan ticket of this slug. The first (`a-staged-edit-keeps-the-version-it-was-computed-against`, complete) made the writer's base trustworthy; this one is the representation change; the third (`a-rival-pend-is-superseded-only-by-a-writer-that-built-on-it`, in `implement/`, prereq on this slug) reads the new stored base in the rival-pend rule.
 
@@ -73,6 +73,56 @@ The defect was reproduced before the fix: with the stored-base comparison neuter
 - A record with a base but no slot (a rev-less pend that names a base) is representable in the metadata; no producer sends one, and the sweep still reasons from slots alone, so such a base entry lives until the record is deleted. Harmless; noted so nobody reads the two maps as always co-keyed.
 - No pre-existing test failures were seen in any suite.
 
-## Review note from the garden check-in (2026-09-18 ~08:20)
+## Review findings
 
-This branch lands after the release cut from `6d43b9f4`, which has no `pendingBases` and no `baseRevs`. Please confirm, with a test if none exists, that block metadata and pending records written by `6d43b9f4`'s code still read and promote correctly under this change. Records with no stored base must fall back to the commit's declaration exactly as the plan intends, and must never be refused, or declined forever, merely for lacking a base. A node upgraded from the release would otherwise wedge on its own leftover pending records.
+### What was checked
+
+- The implement-stage diff in full (`git show 0df3e069`, all 23 files), read before the handoff summary.
+- **That the new wire field reaches every cohort member, not only the unit-tested `StorageRepo` path.** `CoordinatorRepo.pendThroughCluster` builds the cluster record as `operations: [{ pend: request }]` and `ClusterRepo` applies it with `storageRepo.pend(operation.pend)`; the RPC service hands `operation.pend` through the same way. Nothing rebuilds the request from its parts, and there is no ingress schema (`validatePendOperations` reads transforms only), so `baseRevs` survives to storage on the consensus path.
+- **That no storage driver drops the new metadata key.** The kv, filesystem, sqlite and LevelDB drivers store `BlockMetadata` as opaque JSON bytes; none names `pendingRevs`, so `pendingBases` needs no driver change.
+- **Every site that drops a claim also drops the base.** `deletePendingTransaction`, `setLatest`, `sweepDeadClaims`, `saveForwardRevision` (replica and deletion) and `recover` all go through `BlockStorage.recordClaim`, which clears both maps; a claim can never outlive its base or the reverse.
+- **The `unavailable` deviation the handoff asked about.** Agreed with the implementer's reading. When this node holds no committed revision at all, an update-only record that names a base proves the block exists elsewhere, so an unflagged absent answer would be the authoritative lie the flag exists to prevent; when a revision is held, the served content is real and merely behind, which the reader's floors and the coordinator's read-repair already own.
+- **The garden check-in's question: do records written by the release (`6d43b9f4`, no `pendingBases`) still commit and promote?** Traced and now pinned by a new test (below). A release-shaped record has a slot and no base map. At commit, `guardCommitBase` falls back to the commit's declaration and, with none, abstains exactly as the release's code did, so such a record is never refused for lacking a base. On a context read it is declined and kept, and it is not held forever: the three mechanisms that bring a lagging node current all remove it. A retry of the same commit applies it through the fallback; the next commit for the block that the guard refuses runs the cohort reconcile, whose replica lands a later revision and `sweepDeadClaims` removes the record; and the coordinator's lazy read-repair, when this node coordinates a read on the block, fetches the newer revision through `saveReplicatedBlock`, whose same-action delete and sweep remove it. The one behaviour the release had that this change removes is the read-driven promotion of such a record, which is the defect itself.
+- The docs diff (`docs/internals.md`, `docs/repository.md`, `docs/correctness.md`, `packages/db-p2p/docs/storage.md`) against the code as landed; each paragraph now describes the stored-base-first rule, the decline on read, and the base-less residual as accepted. `yarn lint:docs` resolves.
+- Aspects: the one choke point for the metadata maps (`recordClaim` and `setEntry`), the one predicate for base-independence (`isBaseIndependent`, keyed on the member's own record), the one helper for per-batch narrowing (`subsetOf`), the untrusted-data posture at `declaredBaseFor` and `guardCommitBase`, and the comments, which say why rather than narrating.
+
+### What was found and fixed inline (minor)
+
+- A `latest` declared inside the promotion loop shadowed the `latest` the loop's `missing` list was computed from. Renamed the inner one `held`, with a one-line comment on why it is re-read per entry (`StorageRepo.get`).
+- Added a test to the fork-guard suite in `packages/db-p2p/test/storage-repo.spec.ts`: "a pending record written by the release before the field existed still commits and is still swept". It writes records in the release's metadata shape through raw storage and pins that a commit declaring a base lands through the fallback, a commit declaring nothing lands through the abstain, a context read declines and keeps the record, and the replica that brings the node current sweeps it.
+
+### Major findings
+
+None. The representation change is closed at every drop site through one choke point, the wire field reaches every member through the verbatim cluster record, the untrusted-data posture matches the existing one for `blockDigests`, and the handoff's negative control shows the stored-base comparison is load-bearing in exactly the tests that pin the two arms.
+
+### Tripwires recorded
+
+- `guardCommitBase` pays two extra local reads per update-only commit (the record, to prove the claim is live, and the metadata). `NOTE:` at the call in `packages/db-p2p/src/storage/storage-repo.ts`, with the cheaper shape to switch to if a profile ever shows it.
+- `commit:base-undeclared` counts the base-less residual at debug level only. `NOTE:` at the log line, same file, saying why the level is deliberate and what to do if a mixed-version fleet needs the count.
+- A rev-less pend that names a base would leave an entry in `pendingBases` that the slot-driven sweep cannot see. `NOTE:` on `BlockMetadata.pendingBases` in `packages/db-p2p/src/storage/struct.ts`; no production caller sends a rev-less pend.
+
+### Considered and declined
+
+None encountered: no accepted-tradeoff `NOTE:` sits at any site this review touched.
+
+### Left for the next ticket, as the handoff said
+
+- The cluster vote's `IPendingClaimReader` does not expose `pendingClaimOf`; the third ticket (`a-rival-pend-is-superseded-only-by-a-writer-that-built-on-it`) adds what the vote needs.
+- The pend-batching tests in `commit-digest-threading.spec.ts` use single-member clusters because the shared routes put every block on one peer. The retry-split assertion (peer B throws once; b1 lands on C, b3 on A) passes; this review did not re-derive the routes by hand.
+
+### Not run
+
+The env-gated integration suites (`OPTIMYSTIC_INTEGRATION=1`, real sockets, 63 pending here) were not run in this review or in the implement stage; they belong to the `yarn check` release gate.
+
+### What was measured
+
+| Check | Result |
+|---|---|
+| `yarn build` then `yarn typecheck` (root) | clean |
+| eslint on `storage-repo.ts`, `struct.ts`, `storage-repo.spec.ts` | clean |
+| `yarn workspace @optimystic/db-core test` | 1832 passing |
+| `yarn workspace @optimystic/db-p2p test` | 3042 passing, 63 pending (3041 before this review, plus the one new test) |
+| `yarn workspace @optimystic/quereus-plugin-optimystic test` | 997 passing, 13 pending, smoke ok |
+| `yarn lint:docs` | 46 documents, all resolve |
+
+No pre-existing test failures were seen.

@@ -4,7 +4,7 @@ import { blockWriteLatchKey, withBlockWriteLatch, type BlockWriteLatch } from '.
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockArchive, RestoreCallback, RevisionRange } from '../src/storage/struct.js';
-import type { BlockId, ActionId, ActionRev, ActionTransforms, BlockContentDigest, CommitResult, PendRequest, PendSuccess, StaleFailure, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
+import type { BlockId, ActionId, ActionRev, ActionTransforms, BlockContentDigest, CommitResult, PendRequest, PendSuccess, StaleFailure, Transform, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
 import { isBlockChangeNotifier, Latches, canonicalBlockHash } from '@optimystic/db-core';
 import { delay } from '@optimystic/db-core/test';
 
@@ -2742,6 +2742,49 @@ describe('StorageRepo', () => {
 				});
 				const result = await member.commit({ actionId: 'a5' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 5 });
 				expect(result.success, 'a string is not a base; with nothing else named the guard abstains').to.equal(true);
+			});
+
+			it('a pending record written by the release before the field existed still commits and is still swept', async () => {
+				// A node upgraded from a build with no `pendingBases` holds leftover records whose metadata
+				// carries a slot but no base map at all. Such a record must never be refused, or held
+				// forever, merely for lacking a base: at commit the guard falls back to the declaration
+				// and then abstains; on a context read it is declined, and the replica or reconcile that
+				// brings the node current sweeps it.
+				const { repo: member, raw } = makeMember();
+				await seed(member);
+				expect((await apply(member, 'a2', 2, spliceItems(0, ['a']), { baseRev: 1 }, 1)).success).to.equal(true);
+				/** Writes `actionId`'s record and its slot in the release's metadata shape — `pendingRevs` only. */
+				const pendAsRelease = async (actionId: string, rev: number, transform: Transform): Promise<void> => {
+					const meta = (await raw.getMetadata(BLOCK))!;
+					expect(meta.pendingBases, 'the release wrote no base map').to.equal(undefined);
+					await raw.saveMetadata(BLOCK, { ...meta, pendingRevs: { ...meta.pendingRevs, [actionId]: rev } });
+					await raw.savePendingTransaction(BLOCK, actionId as ActionId, transform);
+				};
+				const spliceOne = (index: number, values: unknown[]): Transform => ({ updates: [['items', index, 0, values]] });
+
+				await pendAsRelease('a-declared', 3, spliceOne(1, ['b']));
+				expect(await new BlockStorage(BLOCK, raw).pendingClaimOf('a-declared' as ActionId)).to.deep.equal({ actionId: 'a-declared', rev: 3 });
+				expect((await member.commit({
+					actionId: 'a-declared' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 3,
+					blockDigests: { [BLOCK]: { digest: 'declared', baseRev: 2 } as BlockContentDigest }
+				})).success, 'the commit declaration is the fallback for a record with no stored base').to.equal(true);
+
+				await pendAsRelease('a-undeclared', 4, spliceOne(2, ['c']));
+				expect((await member.commit({ actionId: 'a-undeclared' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 4 })).success,
+					'with nothing named anywhere the guard abstains, as before the field existed').to.equal(true);
+				expect(await itemsOf(member)).to.deep.equal(['a', 'b', 'c']);
+
+				// A leftover record for a change this node MISSED the commit of: a context read declines it
+				// (no base to establish), and the replica that lands its revision sweeps it.
+				await pendAsRelease('a-missed', 5, spliceOne(0, ['z']));
+				const declined = (await member.get({ blockIds: [BLOCK], context: { committed: [{ actionId: 'a-missed' as ActionId, rev: 5 }], rev: 5 } }))[BLOCK]!;
+				expect(declined.state.latest?.rev, 'declined, latest untouched').to.equal(4);
+				expect('unavailable' in declined, 'behind is not a guess').to.equal(false);
+				expect(await raw.getPendingTransaction(BLOCK, 'a-missed' as ActionId), 'declined, not refused').to.not.equal(undefined);
+				await member.saveReplicatedBlock(BLOCK, makeBlock(BLOCK, { items: ['z', 'a', 'b', 'c'] }), { actionId: 'a-missed' as ActionId, rev: 5 });
+				expect((await member.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest?.rev).to.equal(5);
+				expect(await raw.getPendingTransaction(BLOCK, 'a-missed' as ActionId), 'the replica that brought the node current swept the record').to.equal(undefined);
+				expect((await raw.getMetadata(BLOCK))!.pendingRevs, 'and its claim').to.equal(undefined);
 			});
 		});
 	});

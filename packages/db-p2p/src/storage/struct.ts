@@ -63,6 +63,11 @@ export type BlockMetadata = {
 	 * entry here simply reads as base-unknown. What each apply site does with an unknown base is
 	 * its own rule — `StorageRepo.internalCommit` falls back to the commit's declaration and then
 	 * abstains; the read-driven promotion in `StorageRepo.get` declines.
+	 *
+	 * NOTE: the two maps are not always co-keyed. A rev-less pend that names a base would leave an
+	 * entry here and none in `pendingRevs`, which the slot-driven dead-claim sweep cannot see, so it
+	 * would live until the record is deleted or promoted. Harmless, and no production caller sends a
+	 * rev-less pend (see the NOTE in `StorageRepo.pend`); if one ever appears, sweep this map too.
 	 */
 	pendingBases?: Record<ActionId, number>;
 };
