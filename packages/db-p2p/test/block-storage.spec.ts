@@ -1836,13 +1836,24 @@ describe('BlockStorage.savePendingTransaction — unpromotable-record refusal', 
  *  - a record claiming a revision the block has since reached is DEAD — it can never be promoted —
  *    and every path that advances `latest` sweeps it, including a replica landing under a DIFFERENT
  *    action (the cohort reconcile of a block this node fell behind on), which used to leave the
- *    missed action's record standing forever.
+ *    missed action's record standing forever;
+ *  - the committing action's OWN claim is dropped without a delete, on commit and on recover alike:
+ *    promotion already moved its record, so a delete there is a wasted raw-storage op per commit.
  */
 describe('BlockStorage pending claims — a record claims the slot it was pended at', () => {
-	let raw: MemoryRawStorage;
+	/** Records every raw pending-record delete, so a test can pin which records a path paid to delete. */
+	class DeleteRecordingStorage extends MemoryRawStorage {
+		readonly deletedPending: ActionId[] = [];
+		override async deletePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
+			this.deletedPending.push(actionId);
+			await super.deletePendingTransaction(blockId, actionId);
+		}
+	}
+
+	let raw: DeleteRecordingStorage;
 
 	beforeEach(() => {
-		raw = new MemoryRawStorage();
+		raw = new DeleteRecordingStorage();
 	});
 
 	it('records the claim with the record, drops it with the record, and reads a rev-less pend as unknown', async () => {
@@ -1879,6 +1890,7 @@ describe('BlockStorage pending claims — a record claims the slot it was pended
 			await storage.savePendingTransaction('a-loser' as ActionId, { updates: [['items', 0, 0, ['l']]] }, 2, l);
 			await storage.savePendingTransaction('a-next' as ActionId, { updates: [['items', 0, 0, ['n']]] }, 3, l);
 			await storage.savePendingTransaction('a-unknown' as ActionId, { updates: [['items', 0, 0, ['u']]] }, undefined, l);
+			raw.deletedPending.length = 0;
 			// The winner commits: the same steps `StorageRepo.internalCommit` takes.
 			await storage.saveMaterializedBlock(winner, makeBlock('block-sweep-commit', { items: ['w'] }), l);
 			await storage.saveRevision(2, winner, l);
@@ -1886,6 +1898,7 @@ describe('BlockStorage pending claims — a record claims the slot it was pended
 			await storage.setLatest({ rev: 2, actionId: winner }, true, l);
 		});
 
+		expect(raw.deletedPending, 'one delete, for the rival: the winner\'s record was moved, not left behind').to.deep.equal(['a-loser']);
 		expect(await storage.getPendingTransaction('a-loser' as ActionId), 'the loser of the slot is dead and swept').to.equal(undefined);
 		expect(await storage.getPendingTransaction('a-next' as ActionId), 'a claim above the new latest is live').to.not.equal(undefined);
 		expect(await storage.getPendingTransaction('a-unknown' as ActionId), 'an unknown claim is never swept: its death is unprovable').to.not.equal(undefined);
@@ -1931,9 +1944,64 @@ describe('BlockStorage pending claims — a record claims the slot it was pended
 		});
 		expect(await storage.getPendingTransaction('a-loser' as ActionId), 'still standing before recovery').to.not.equal(undefined);
 
+		raw.deletedPending.length = 0;
 		const recovered = await withBlockWriteLatch(blockId, l => storage.recover(l));
 		expect(recovered).to.deep.equal({ reconciled: true, latest: { rev: 2, actionId: winner } });
+		expect(raw.deletedPending, 'one delete, for the rival: the recovered winner\'s record was moved').to.deep.equal(['a-loser']);
 		expect(await storage.getPendingTransaction('a-loser' as ActionId), 'swept as the lost setLatest would have').to.equal(undefined);
 		expect((await raw.getMetadata(blockId))!.pendingRevs).to.equal(undefined);
+	});
+
+	it('a solo commit deletes no pending record: promotion already moved its own', async () => {
+		const blockId = 'block-solo-commit' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+		const actionId = 'a-solo' as ActionId;
+
+		await withBlockWriteLatch(blockId, async (l) => {
+			await storage.saveReplica(makeBlock('block-solo-commit', { items: [] }), { rev: 1, actionId: 'r1' as ActionId }, undefined, l);
+			await storage.savePendingTransaction(actionId, { updates: [['items', 0, 0, ['s']]] }, 2, l);
+		});
+		raw.deletedPending.length = 0;
+
+		await withBlockWriteLatch(blockId, async (l) => {
+			// The same steps `StorageRepo.internalCommit` takes.
+			await storage.saveMaterializedBlock(actionId, makeBlock('block-solo-commit', { items: ['s'] }), l);
+			await storage.saveRevision(2, actionId, l);
+			await storage.promotePendingTransaction(actionId, l);
+			await storage.setLatest({ rev: 2, actionId }, true, l);
+		});
+
+		expect(raw.deletedPending, 'no delete is issued for a record promotion already moved').to.deep.equal([]);
+		expect(await storage.getLatest()).to.deep.equal({ rev: 2, actionId });
+		expect(await raw.getTransaction(blockId, actionId), 'the record is committed').to.not.equal(undefined);
+		expect(await storage.getPendingTransaction(actionId), 'and no longer pending').to.equal(undefined);
+		expect((await raw.getMetadata(blockId))!.pendingRevs, 'its claim is dropped, and the empty map is not kept').to.equal(undefined);
+	});
+
+	it('recover after lost setLatests deletes no pending record for any recovered action', async () => {
+		const blockId = 'block-solo-recover' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+		const first = 'a-first' as ActionId;
+		const second = 'a-second' as ActionId;
+
+		await withBlockWriteLatch(blockId, async (l) => {
+			await storage.saveReplica(makeBlock('block-solo-recover', { items: [] }), { rev: 1, actionId: 'r1' as ActionId }, undefined, l);
+			await storage.savePendingTransaction(first, { updates: [['items', 0, 0, ['f']]] }, 2, l);
+			await storage.savePendingTransaction(second, { updates: [['items', 0, 0, ['s']]] }, 3, l);
+			// Crash-D3 twice over: both promoted with their revisions saved, both `setLatest`s lost.
+			await storage.saveMaterializedBlock(first, makeBlock('block-solo-recover', { items: ['f'] }), l);
+			await storage.saveRevision(2, first, l);
+			await storage.promotePendingTransaction(first, l);
+			await storage.saveMaterializedBlock(second, makeBlock('block-solo-recover', { items: ['s', 'f'] }), l);
+			await storage.saveRevision(3, second, l);
+			await storage.promotePendingTransaction(second, l);
+		});
+		expect((await raw.getMetadata(blockId))!.pendingRevs, 'both claims outlive the lost setLatests').to.deep.equal({ 'a-first': 2, 'a-second': 3 });
+		raw.deletedPending.length = 0;
+
+		const recovered = await withBlockWriteLatch(blockId, l => storage.recover(l));
+		expect(recovered).to.deep.equal({ reconciled: true, latest: { rev: 3, actionId: second } });
+		expect(raw.deletedPending, 'no delete is issued for records promotion already moved').to.deep.equal([]);
+		expect((await raw.getMetadata(blockId))!.pendingRevs, 'every recovered claim is dropped').to.equal(undefined);
 	});
 });
