@@ -2,6 +2,8 @@ import { expect } from 'chai';
 import { build, type BuildFailure, type Message } from 'esbuild';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { PartialCommitError as RootPartialCommitError } from '../dist/index.js';
+import { PartialCommitError as PluginPartialCommitError } from '../dist/plugin.js';
 
 // Regression guard: both entry points must bundle for a browser.
 //
@@ -47,5 +49,24 @@ describe('browser bundle', function () {
 
 		const problems = outcome.errors.map(describeMessage);
 		if (problems.length > 0) expect.fail(`the plugin no longer bundles for a browser:\n  ${problems.join('\n  ')}`);
+	});
+});
+
+// Regression guard: `PartialCommitError` must be the SAME class whether a caller imports it from
+// the root entry (`./index.js`) or the `./plugin` entry it more commonly loads through. Today that
+// holds only because tsup.config.ts splits shared code into one chunk both entries pull from — see
+// the comment next to `splitting` there. If a future build config change ever gives each entry its
+// own copy, `instanceof` silently stops matching for every real error and nothing else here would
+// catch it (verified: building once with `splitting: false` makes this fail).
+describe('plugin error class identity', function () {
+	it('exports the same PartialCommitError constructor from both entries', function () {
+		expect(PluginPartialCommitError).to.equal(RootPartialCommitError);
+	});
+
+	it('classifies an error thrown through the plugin entry as instanceof the root export', function () {
+		// Constructed via the `./plugin` entry's own export, i.e. the exact class reference the
+		// plugin's internal commit-sweep code throws (see txn-bridge.ts) — not a re-implementation.
+		const error = new PluginPartialCommitError(['tree-a'], ['tree-b'], new Error('injected'));
+		expect(error).to.be.instanceOf(RootPartialCommitError);
 	});
 });
