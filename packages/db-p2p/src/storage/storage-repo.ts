@@ -13,7 +13,7 @@ import {
 } from "@optimystic/db-core";
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
-import { isReservationAgainst, reservationRequestFor, isBaseIndependent, declaredBaseFor, type PendingClaim } from "./pending-claim.js";
+import { isReservationAgainst, isBaseIndependent, declaredBaseFor, type PendingClaim } from "./pending-claim.js";
 import type { IBlockReplicaStore } from "../cluster/block-transfer-service.js";
 import { proofDeclaredDigest, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { RevisionNotCoveredError } from "./i-block-storage.js";
@@ -761,24 +761,20 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				// consensus round per such write), refuse at `ClusterMember.validatePendOperations`
 				// instead of here.
 
-				// Then the pending records that RESERVE the block against this request. A record this
-				// request's writer has built on — its declared base for the block is at or past the
-				// record's slot, or, with no base, the collection has moved past that slot — is not one of
-				// them (see `isReservationAgainst`): counting it refused every later writer on the strength
-				// of a commit this node merely missed. The promise vote
-				// (`ClusterMember.validatePendOperations`) applies the same rule to the same base, so a
-				// pend the cohort approved is not then refused here at apply.
-				const { request: reservation, ignoredBase } = reservationRequestFor(request, blockId, transforms);
-				if (ignoredBase !== undefined) {
-					log('pend:base-ignored actionId=%s blockId=%s requestedRev=%s base=%o',
-						request.actionId, blockId, request.rev, ignoredBase);
-				}
+				// Then the pending records that RESERVE the block against this request. A record claiming a
+				// slot the collection has already moved past is not one of them (the revision rule of
+				// `isReservationAgainst`): counting it refused every later writer on the strength of a
+				// commit this node merely missed. Deliberately NOT fed the pend's declared base: the base
+				// arm is the promise vote's alone, and only in a cohort that can leave a member out
+				// (`ClusterMember.reservingRivals`), so this scan is never stricter than the vote — a pend
+				// the cohort approved is not then refused here at apply, and a member that voted `held` on
+				// a stray record but was outvoted still stores the pend, whose commit then sweeps the record.
 				for (const claim of await blockStorage.listPendingClaims()) {
-					if (isReservationAgainst(claim, reservation)) {
+					if (isReservationAgainst(claim, { rev: request.rev })) {
 						pendings.push({ blockId, actionId: claim.actionId });
 					} else {
-						log('pend:superseded-claim actionId=%s blockId=%s rival=%s claimedRev=%d requestedRev=%d base=%s',
-							request.actionId, blockId, claim.actionId, claim.rev, request.rev, reservation.baseRev ?? 'none');
+						log('pend:superseded-claim actionId=%s blockId=%s rival=%s claimedRev=%d requestedRev=%d',
+							request.actionId, blockId, claim.actionId, claim.rev, request.rev);
 					}
 				}
 			}

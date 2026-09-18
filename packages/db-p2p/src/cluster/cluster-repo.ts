@@ -18,7 +18,7 @@ import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
 import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister, type IRevisionActionReader, type IPendingClaimReader } from "../storage/storage-repo.js";
-import { isReservationAgainst, reservationRequestFor, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
+import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
 import { StuckReservationTracker } from "../repo/stuck-reservation.js";
 import { checkPendValidation } from "../pend-validation.js";
 import { getAffectedBlockIds } from "./record-operations.js";
@@ -1665,11 +1665,12 @@ export class ClusterMember implements ICluster {
 				// Approving over it is safe because the incoming writer's operations were computed
 				// against a version of the block that already holds that record's change. This member
 				// comes current when the approved pend's own commit applies here — through
-				// `internalCommit`, or through the behind-reconcile its fork guard triggers. A record
-				// claiming a slot PAST the declared base still reserves even when the requested revision
-				// has moved beyond it: that is a writer that read the block without the record's change
-				// — from four members up, a member that never held the rival's pend can serve it — and
-				// admitting it would lose the change. See `isReservationAgainst`.
+				// `internalCommit`, or through the behind-reconcile its fork guard triggers. In a cohort
+				// that can reach its promise bar without one member (`cohortCanMissAPend`: four members up
+				// at the default threshold), a record claiming a slot PAST the declared base still
+				// reserves even when the requested revision has moved beyond it: that is a writer that
+				// read the block without the record's change — served by a member that never held the
+				// rival's pend — and admitting it would lose the change. See `isReservationAgainst`.
 				for (const blockId of blockIds) {
 					const rivalIds = (blockResults[blockId]?.state?.pendings ?? []).filter(actionId => actionId !== pendRequest.actionId);
 					const rivals = rivalIds.length === 0 ? [] : await this.reservingRivals(record, blockId, rivalIds, pendRequest);
@@ -1775,8 +1776,14 @@ export class ClusterMember implements ICluster {
 
 	/** `pendRequest`'s {@link ReservationRequest} for `blockId`, logging a base the rule cannot read —
 	 *  never a refusal: `baseRevs` is untrusted wire data, and a malformed entry only drops that block
-	 *  back to the revision rule. */
+	 *  back to the revision rule. The base is read only when `record`'s cohort can reach its promise
+	 *  super-majority without one of its members (`cohortCanMissAPend`); in a cohort that needs every
+	 *  member, a stray record on one member (a cancel that never reached it) would otherwise refuse
+	 *  every later writer for good, and no member can have missed the pend the base arm guards against. */
 	private reservationRequestOf(record: ClusterRecord, pendRequest: PendRequest, blockId: BlockId): ReservationRequest {
+		if (!cohortCanMissAPend(Object.keys(record.peers).length, this.superMajorityThreshold)) {
+			return { rev: pendRequest.rev };
+		}
 		const { request, ignoredBase } = reservationRequestFor(pendRequest, blockId, transformForBlockId(pendRequest.transforms, blockId));
 		if (ignoredBase !== undefined) {
 			log('cluster-member:pend-base-ignored', {
@@ -2037,19 +2044,18 @@ export class ClusterMember implements ICluster {
 	 * is surplus to `blockIds` or carries no numeric `baseRev` (untrusted wire data, same posture as the
 	 * digest check), this member holds no record for the action on the block, the record carries no
 	 * base (an inserted or deleted block, a base-less sender, or a record written before bases were
-	 * kept), or the read fails.
+	 * kept), the read fails — or this member does not hold the declared base as its latest.
 	 *
-	 * NOTE: the one shape an HONEST writer can meet here is a stale record from an earlier attempt of a
-	 * retried action (same action id) meeting the retry's commit, when the retry's pend — which would
-	 * have overwritten the record — never reached this member. At three members one reject sinks the
-	 * commit record (the default super-majority allows none), where the apply-time refusal alone would
-	 * let the other two commit and this member reconcile. When this member's latest equals the declared
-	 * base, the digest check below already rejects that shape whenever the stale operations materialize
-	 * differently over it, so what this adds is mostly the behind-member case; it heals when the
-	 * writer's cancel of the failed commit removes the record, or its torn-entry re-send re-pends over
-	 * it. If three-member cohorts show `rejected-by-validators` with this reason for honest retries,
-	 * abstain here when this member's latest is not the declared base and leave that case to
-	 * `guardCommitBase`.
+	 * That last abstain is what keeps an HONEST retry off this reject. The one disagreement an honest
+	 * writer can meet here is a stale record from an earlier attempt of a retried action (same action
+	 * id) meeting the retry's commit, when the retry's pend — which would have overwritten the record
+	 * — never reached this member. Such a member is typically behind: it missed a pend, and the retry
+	 * declares a base the rest of the cohort moved to. At three members one reject sinks the commit
+	 * record (the default super-majority allows none), where abstaining lets the others commit and
+	 * leaves this member to `guardCommitBase`, which refuses to apply the stale record and reconciles.
+	 * When this member's latest IS the declared base, the stale operations are exactly what it would
+	 * apply over it, and the digest check below rejects the same shape whenever they materialize
+	 * differently; rejecting here names the cause instead.
 	 */
 	private async validateCommitBaseDeclarations(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
 		const reader = this.storageRepo as IRepo & Partial<IPendingClaimReader>;
@@ -2081,20 +2087,48 @@ export class ClusterMember implements ICluster {
 					});
 					continue; // a local read fault is an abstain, never a verdict
 				}
-				if (storedBaseRev !== undefined && storedBaseRev !== declaredBaseRev) {
-					log('cluster-member:base-declaration-disagrees', {
+				if (storedBaseRev === undefined || storedBaseRev === declaredBaseRev) {
+					continue;
+				}
+				const latestRev = await this.latestRevOf(record, blockId as BlockId);
+				if (latestRev !== declaredBaseRev) {
+					log('cluster-member:base-declaration-disagrees-abstained', {
 						messageHash: record.messageHash,
 						blockId,
 						actionId: commit.actionId,
-						rev: commit.rev,
 						storedBaseRev,
-						declaredBaseRev
+						declaredBaseRev,
+						latestRev
 					});
-					return { valid: false, reason: BASE_DECLARATION_DISAGREES };
+					continue;
 				}
+				log('cluster-member:base-declaration-disagrees', {
+					messageHash: record.messageHash,
+					blockId,
+					actionId: commit.actionId,
+					rev: commit.rev,
+					storedBaseRev,
+					declaredBaseRev
+				});
+				return { valid: false, reason: BASE_DECLARATION_DISAGREES };
 			}
 		}
 		return { valid: true };
+	}
+
+	/** This member's own committed revision of `blockId` (raw storage, no cluster recursion), or
+	 *  `undefined` when it holds none or the read fails — a fault reads as "cannot judge". */
+	private async latestRevOf(record: ClusterRecord, blockId: BlockId): Promise<number | undefined> {
+		try {
+			return (await this.storageRepo.get({ blockIds: [blockId] }))[blockId]?.state?.latest?.rev;
+		} catch (err) {
+			log('cluster-member:base-declaration-read-error', {
+				messageHash: record.messageHash,
+				blockId,
+				error: err instanceof Error ? err.message : String(err)
+			});
+			return undefined;
+		}
 	}
 
 	/**

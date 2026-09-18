@@ -15,7 +15,9 @@
  *     — which has walked no entry and so holds no floor for the block — accepts it. N pends past R's slot,
  *     declaring the stale revision as its base. A, B and C still hold R's record; under the revision rule
  *     they approved, because N's revision was past R's slot, and N's commit then applied over the stale base
- *     and swept R's record. With the base rule they HOLD: N's base is below R's claim.
+ *     and swept R's record. With the base rule they HOLD at the promise vote — four members can reach the
+ *     promise bar without one, so the vote reads N's base, and N's base is below R's claim. (Two- and
+ *     three-member cohorts cannot miss a pend this way, and their vote keeps the revision rule.)
  *  4. **R's commit is released.** R lands on every machine. N's write is either saved with both rows or
  *     refused — today it is refused: its handle never re-reads the block it was served short, so every
  *     retry re-pends on the stale base and the fork guard refuses the data-block commit (backlog
@@ -31,7 +33,7 @@
  */
 
 import { expect } from 'chai';
-import { Tree, type ActionId, type BlockId, type ClusterRecord, type CommitRequest, type CommitResult, type IRepo, type ITransactor, type PendRequest, type WriteDurability } from '@optimystic/db-core';
+import { Tree, TornActionError, type ActionId, type BlockId, type ClusterRecord, type CommitRequest, type CommitResult, type IRepo, type ITransactor, type PendRequest, type WriteDurability } from '@optimystic/db-core';
 import type { Mesh, MeshNode } from '../src/testing/mesh-harness.js';
 import { createProductionShapedMesh, transactorDrivenBy, recording, type Attempt } from './util/node-count-mesh.js';
 import { sequentialPhases } from './util/two-machine-lifecycle.js';
@@ -195,7 +197,14 @@ describe('A rival pend is superseded only by a writer that built on it (four mac
 			acknowledged.set('row-N', 'written-by-N');
 			newcomerOutcome = 'acknowledged';
 		} catch (err) {
-			newcomerOutcome = `refused (${(err as Error).name})`;
+			expect(err, 'a refusal reaches the caller as a torn action').to.be.instanceOf(TornActionError);
+			// NOTE: `final` is false today (review, 2026-09-18): the write ends on `commit-not-durable` —
+			// "0 of 4 cohort member(s) report holding" it — which `Collection` reads as "could not be
+			// established", although every member answered. So the application is told to read back
+			// before resubmitting; phase 5's keyed `replace` is idempotent, so that is safe here. Not
+			// pinned either way: backlog `bug-a-writer-held-by-a-change-it-never-saw-retries-on-its-stale-copy`
+			// owns making this write land (or refuse as final).
+			newcomerOutcome = `refused (${(err as Error).name}, final=${String((err as TornActionError).final)})`;
 		}
 		console.log(`    phase 4: N's first write was ${newcomerOutcome}`);
 

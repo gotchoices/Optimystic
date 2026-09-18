@@ -34,8 +34,9 @@ export type BlockMetadata = {
 	 * The revision each pending record on this block was pended AT, keyed by the record's action id —
 	 * the `rev` of the `PendRequest` it belongs to. This is what turns a pending record into a
 	 * *reservation for a slot* rather than a bare "someone is writing": a record the incoming writer
-	 * has built on — its declared base for the block is at or past the slot, or, with no base, its
-	 * requested revision is past it — is no rival (see `isReservationAgainst` in `pending-claim.ts`),
+	 * has built on — its requested revision is past the slot, or, where the promise vote reads it, its
+	 * declared base for the block is at or past the slot — is no rival (see `isReservationAgainst` in
+	 * `pending-claim.ts`),
 	 * and one claiming a revision this block has already committed can never be promoted here at all.
 	 *
 	 * Kept here, beside `latest`, rather than inside the pending record itself, because the raw

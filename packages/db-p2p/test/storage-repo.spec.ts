@@ -3567,17 +3567,18 @@ describe('StorageRepo.pend — a pending record claiming a superseded slot is no
 });
 
 /**
- * Ticket: a-rival-pend-is-superseded-only-by-a-writer-that-built-on-it.
+ * Ticket: a-rival-pend-is-superseded-only-by-a-writer-that-built-on-it (review).
  *
- * The apply-time rival scan now reads the base the incoming pend declares for the block
- * (`PendRequest.baseRevs`): a rival record is superseded only when that base is at or past the
- * record's slot. The shape it closes: the collection has moved past the rival's slot, but the
- * newcomer read the block WITHOUT the rival's change (from four members up, a member that never
- * received the rival's pend can serve it while the rival's data-block commit is in flight). Under the
- * revision rule this node admitted the newcomer, and its commit then applied over the stale base and
- * swept the rival's record — the rival's change lost while the log names it.
+ * The rule's base arm — a rival record is superseded only when the newcomer's declared base is at or
+ * past its slot — is read at the PROMISE VOTE alone, and only in a cohort that can leave a member out
+ * (`ClusterMember.reservingRivals`, `cohortCanMissAPend`). The apply-time scan here keeps the revision
+ * rule whatever base the pend declares, so it is never stricter than the vote: a pend the cohort
+ * approved is not refused at apply, and a member that voted `held` on a stray record of its own (a
+ * cancel that never reached it) but was outvoted still stores the pend, whose commit then sweeps the
+ * record. What storage still does with the base is keep it (`pendingBases`) for the fork guard and the
+ * read-driven promotion.
  */
-describe('StorageRepo.pend — a rival record is superseded only by a pend that built on it', () => {
+describe('StorageRepo.pend — the apply-time rival scan keeps the revision rule whatever base the pend declares', () => {
 	const B = 'block-built-on' as BlockId;
 	let raw: MemoryRawStorage;
 	let repo: StorageRepo;
@@ -3602,34 +3603,18 @@ describe('StorageRepo.pend — a rival record is superseded only by a pend that 
 		expect(rival.success, 'the rival pend is recorded').to.equal(true);
 	});
 
-	it('refuses, as held, a pend past the record\'s slot whose declared base is below it', async () => {
-		const result = await repo.pend(newcomer({ baseRevs: { [B]: 4 } }));
-		expect(result.success, 'the newcomer did not read the rival\'s change').to.equal(false);
-		expect((result as StaleFailure).pending?.map(p => p.actionId)).to.deep.equal(['a-rival']);
-		expect(await raw.getPendingTransaction(B, 'a-newcomer' as ActionId), 'and wrote no record').to.equal(undefined);
-		expect(await raw.getPendingTransaction(B, 'a-rival' as ActionId), 'the rival\'s record stands').to.not.equal(undefined);
-	});
-
-	it('admits the same pend when its declared base is the record\'s slot', async () => {
-		const result = await repo.pend(newcomer({ baseRevs: { [B]: 5 } }));
-		expect(result.success, JSON.stringify(result)).to.equal(true);
-		expect((result as PendSuccess).pending, 'and reports no rival').to.deep.equal([]);
-	});
-
-	it('admits the same pend when it names no base — the revision rule, pinned as unchanged', async () => {
-		const result = await repo.pend(newcomer());
-		expect(result.success, JSON.stringify(result)).to.equal(true);
-		expect((result as PendSuccess).pending).to.deep.equal([]);
-	});
-
-	it('falls back to the revision rule on a base it cannot read, never refusing on it', async () => {
-		for (const bad of ['4', 6, 9]) {
-			const actionId = `a-bad-${String(bad)}` as ActionId;
-			const result = await repo.pend(newcomer({ actionId, baseRevs: { [B]: bad as number } }));
-			expect(result.success, `base ${JSON.stringify(bad)}: ${JSON.stringify(result)}`).to.equal(true);
+	it('admits a pend past the record\'s slot, whatever base it declares, and keeps that base', async () => {
+		for (const base of [4, 5, undefined, '4', 9]) {
+			const actionId = `a-base-${String(base)}` as ActionId;
+			const result = await repo.pend(newcomer({ actionId, ...(base === undefined ? {} : { baseRevs: { [B]: base as number } }) }));
+			expect(result.success, `base ${JSON.stringify(base)}: ${JSON.stringify(result)}`).to.equal(true);
+			expect((result as PendSuccess).pending, 'and reports no rival').to.deep.equal([]);
+			const claim = await repo.pendingClaimOf(B, actionId);
+			expect(claim?.baseRev, `base ${JSON.stringify(base)} is kept as storage keeps any base`).to.equal(typeof base === 'number' ? base : undefined);
 			// Each admitted pend claims slot 6 itself; clear it so the next case meets only the rival.
 			await repo.cancel({ actionId, blockIds: [B] });
 		}
+		expect(await raw.getPendingTransaction(B, 'a-rival' as ActionId), 'the rival\'s record stands').to.not.equal(undefined);
 	});
 
 	it('still holds a pend for the record\'s own slot whatever base it declares', async () => {

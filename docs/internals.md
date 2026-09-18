@@ -489,10 +489,13 @@ differ — the member's record holds operations computed against a base other th
 is about to be applied as. `StorageRepo.internalCommit` refuses the same shape at apply; the vote
 puts a signed verdict on it one round earlier, and when a writer's commit contradicts its own pend
 every member refuses at the vote rather than after consensus. It abstains wherever it cannot
-compare: no numeric declared `baseRev`, no record for the action, or a record with no base. The
-shape an honest writer can meet is a stale record from an earlier attempt of a retried action (the
-retry's pend never reached this member); at three members one such reject sinks the commit record,
-where the apply-time refusal alone would let the other two commit — see the `NOTE:` at the method.
+compare: no numeric declared `baseRev`, no record for the action, a record with no base — or a
+member whose own latest is not the declared base. That last abstain keeps an honest retry off the
+reject: the disagreement an honest writer can meet is a stale record from an earlier attempt of a
+retried action (the retry's pend never reached this member), on a member that is behind, and at
+three members one reject would sink the commit record for the whole cohort. Abstaining lets the
+others commit, and the member's own apply (`guardCommitBase`) refuses the stale record and
+reconciles.
 
 **The check runs on the promise round, not the commit round.** The commit-round vote is cast
 deliberately blind: a member signs the commit whenever the cohort's promise approvals reach
@@ -1168,11 +1171,13 @@ saveMaterializedBlock(block): store(structuredClone(block));
   member's durable storage, which that member reports as a signed `held` vote naming the holder's
   action id (`Signature.heldBy`). *Reserved* is decided by the slot the record claims, not by its
   presence: storage keeps the revision each pending record was pended at (`BlockMetadata.pendingRevs`),
-  and a record the incoming writer has built on is superseded and does not refuse — the base the pend
-  declares for the block (`PendRequest.baseRevs`) is at or past the record's slot, or, when it
-  declares none, the requested revision is past it (`isReservationAgainst` in
-  `packages/db-p2p/src/storage/pending-claim.ts`, applied by `ClusterMember.validatePendOperations`
-  at the vote and by `StorageRepo.pend` at apply). Without
+  and a record the incoming writer has built on is superseded and does not refuse — the requested
+  revision is past the record's slot, or, at the vote of a cohort that can reach its promise bar
+  without one member (four and up at the default threshold) and for a record that stored a base,
+  the base the pend declares for the block (`PendRequest.baseRevs`) is at or past that slot
+  (`isReservationAgainst` and `cohortCanMissAPend` in `packages/db-p2p/src/storage/pending-claim.ts`,
+  applied by `ClusterMember.validatePendOperations` at the vote and, revision rule only, by
+  `StorageRepo.pend` at apply). Without
   that rule a member that promised a write and missed its commit vetoed every later write to the
   block; see [repository.md §Invariant P](repository.md#invariant-p--a-pending-record-and-a-committed-record-never-coexist-for-one-action).
   The coordinator raises `BlocksHeldError` — again never

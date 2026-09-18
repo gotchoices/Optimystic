@@ -223,36 +223,35 @@ metadata reads without a migration. The base is stored as told and never checked
 member has no grounds to second-guess the author's claim about its own computation, and a pend-time
 refusal on a mismatch would be the wrong tier — a member holding a torn or abandoned higher revision
 would veto every honest retry, whereas the same mismatch at commit is one member's refusal that
-heals by reconcile (the `NOTE:` at `declaredBaseFor` in `packages/db-p2p/src/storage/storage-repo.ts`).
+heals by reconcile (the `NOTE:` at `declaredBaseFor` in `packages/db-p2p/src/storage/pending-claim.ts`).
 Both maps live in the metadata rather than in the record because the raw drivers promote a record
 by moving its bytes into the committed store unchanged — a rename on the filesystem backend — so
 the record's value has to stay a plain transform.
 
 Both rival scans — `StorageRepo.pend` at apply and `ClusterMember.validatePendOperations` at the
 promise vote — read a record through one rule, `isReservationAgainst` in
-`packages/db-p2p/src/storage/pending-claim.ts`, fed the same two facts about the incoming pend:
-the revision it requests, and the base it declares for the block (`reservationRequestFor`, which
-reads `PendRequest.baseRevs` exactly as storage keeps it — nothing for an inserted or deleted block,
-nothing for a malformed entry). A record stops reserving once the incoming writer has **built on**
-it, meaning its operations were computed against a version of the block that already holds the
-record's change:
+`packages/db-p2p/src/storage/pending-claim.ts`. A record stops reserving once the incoming writer has
+**built on** it, meaning its operations were computed against a version of the block that already
+holds the record's change. What the rule is fed decides how precisely it can tell:
 
-- **With a base** (every update-only block from a current writer): a record claiming a slot **at or
-  below** the declared base is superseded — the writer read the block with that change in it,
-  whatever became of the record's action (committed there, and this member merely missed the
-  commit; or lost the slot). A record claiming a slot **past** the base reserves, however far the
-  requested revision has moved: the writer read the block without that change, and admitting it
-  would let its commit apply over the stale base and sweep the record — the record's change lost
-  while the log names it. That is the shape the revision rule alone admitted from four members up,
-  where one member can miss a pend entirely and then serve a handle with no floor for the block one
+- **The requested revision** (every scan). Revisions are allocated per collection and a writer pends
+  at one past the collection revision it read, so a record claiming the requested revision **or a
+  later one** reserves — a live rival inside its pend-to-commit window, and admitting the pend would
+  put two writers in one slot — and a record claiming an **earlier** revision is superseded: the
+  collection has moved past its slot, which is taken as having been built on.
+- **The declared base** — only at the promise vote, only in a cohort that can reach its promise bar
+  without one member (`cohortCanMissAPend`: four members and up at the default 0.75 threshold), and
+  only for a record that itself carries a stored base. The incoming pend's base for the block is read
+  through `reservationRequestFor`, exactly as storage keeps it (nothing for an inserted or deleted
+  block, nothing for a malformed entry). A record claiming a slot **at or below** that base is
+  superseded — the writer read the block with that change in it. A record claiming a slot **past**
+  the base reserves, however far the requested revision has moved: the writer read the block without
+  that change, and admitting it would let its commit apply over the stale base and sweep the record —
+  the record's change lost while the log names it. That shape needs a member outside the pend's
+  quorum: it never received the record's pend, and serves a handle with no floor for the block one
   change short while the record's data-block commit is still in flight
-  (`packages/db-p2p/test/rival-superseded-only-by-a-writer-that-built-on-it.spec.ts`).
-- **Without a base**, the requested revision stands in for it. Revisions are allocated per
-  collection and a writer pends at one past the collection revision it read, so a record claiming
-  the requested revision **or a later one** reserves — a live rival inside its pend-to-commit
-  window, and admitting the pend would put two writers in one slot — and a record claiming an
-  **earlier** revision is superseded: the collection has moved past its slot, which is taken as
-  having been built on.
+  (`packages/db-p2p/test/rival-superseded-only-by-a-writer-that-built-on-it.spec.ts`). A cohort that
+  needs every member's promise cannot produce it, which is why the base is read only where it can.
 - A record with **no** claim on file — pended without a revision, or written before the revision
   was kept — reserves, so an old record can only refuse more than it should, never less.
 
@@ -266,19 +265,28 @@ member holding the change declares at least that revision, and one served by the
 member itself is served after that member promotes the record (`StorageRepo.get` promotes a held
 record for any action the reader's context names, when the record's stored base is the member's
 latest). The member comes current when the admitted pend's own commit applies — through
-`StorageRepo.internalCommit`, or through the behind-reconcile its fork guard triggers. What holding
-more costs is liveness, never safety, in two shapes recorded at `isReservationAgainst`: a writer
-that read the block one change short is held until the record's action commits, and today its
-retries do not re-read the block, so it then re-pends on the stale base and its commit is refused
-(backlog `bug-a-writer-held-by-a-change-it-never-saw-retries-on-its-stale-copy`); and a record
-whose change no member will ever take — an abandoned action's, on a block no later write touched, or
-a base-less one from an older sender whose data-block commit never ran — is no longer superseded by
-the collection moving on (backlog `debt-unpromotable-pending-records-need-a-sweep`).
+`StorageRepo.internalCommit`, or through the behind-reconcile its fork guard triggers.
+
+Holding more costs liveness, never safety, in two shapes recorded at `isReservationAgainst`, and the
+narrowing above exists to keep both off two- and three-member cohorts, where one member's hold sinks
+a pend: a writer that read the block one change short is held until the record's action commits,
+and today its retries do not re-read the block, so it then re-pends on the stale base and its commit
+is refused (backlog `bug-a-writer-held-by-a-change-it-never-saw-retries-on-its-stale-copy`); and a
+record whose change no member will ever take — an abandoned action's, on a block no later write
+touched — is no longer superseded by the collection moving on where it stands on enough members to
+deny a super-majority (backlog `debt-unpromotable-pending-records-need-a-sweep`). A copy on one
+member alone is outvoted, and because the apply-time scan keeps the revision rule, that member still
+stores the admitted pend, whose commit sweeps the record. A record with no stored base — the release
+wrote slots without bases — keeps the revision rule, so a node upgraded over its own leftovers does
+not wedge on them.
 
 The commit vote checks the base from the other side: a member whose record for the action carries a
-base other than the one the commit declares for the block (`blockDigests[id].baseRev`) votes reject
-with `base-declaration-disagrees` (`ClusterMember.validateCommitBaseDeclarations`), one round before
-`StorageRepo.internalCommit` would refuse the same commit at apply.
+base other than the one the commit declares for the block (`blockDigests[id].baseRev`), while its own
+latest is that declared base, votes reject with `base-declaration-disagrees`
+(`ClusterMember.validateCommitBaseDeclarations`), one round before `StorageRepo.internalCommit` would
+refuse the same commit at apply. A member that is not at the declared base abstains — that is the
+shape an honest retry meets on a member still holding the earlier attempt's record — and leaves the
+refusal to its own apply.
 
 A record claiming a revision the block has **already reached** can never be promoted here at all
 (promotion needs `latest.rev < rev`, and `latest` only advances), so every path that advances

@@ -110,10 +110,11 @@ class MockPeerNetwork implements IPeerNetwork {
  */
 const voteOnCommit = async (
 	repo: IRepo,
-	commit: CommitRequest
+	commit: CommitRequest,
+	cohortSize = 2
 ): Promise<{ type: string; rejectReason?: string }> => {
 	const self = await makeKeyPair();
-	const other = await makeKeyPair();
+	const others = await Promise.all(Array.from({ length: cohortSize - 1 }, makeKeyPair));
 	const member = clusterMember({
 		storageRepo: repo,
 		peerNetwork: new MockPeerNetwork(),
@@ -121,7 +122,7 @@ const voteOnCommit = async (
 		privateKey: self.privateKey
 	});
 	try {
-		const record = await makeCommitRecord(makeClusterPeers([self, other]), commit);
+		const record = await makeCommitRecord(makeClusterPeers([self, ...others]), commit);
 		const result = await member.update(record);
 		const sig = result.promises[self.peerId.toString()];
 		return { type: sig?.type ?? 'none', rejectReason: sig?.type === 'reject' ? sig.rejectReason : undefined };
@@ -382,14 +383,23 @@ describe('ClusterMember — commit content-digest check (promise round)', () => 
  *
  * The author names each update-only block's base twice — on the pend (`PendRequest.baseRevs`, kept
  * with the member's pending record) and on the commit (`blockDigests[id].baseRev`). A member whose
- * record carries a base other than the one the commit declares votes reject on the promise round,
- * with the signed reason `base-declaration-disagrees`; storage refuses the same shape at apply
- * (`guardCommitBase`). The check needs no preview. Every case it cannot compare abstains.
+ * record carries a base other than the one the commit declares, while it holds that declared base as
+ * its own latest, votes reject on the promise round with the signed reason `base-declaration-disagrees`;
+ * storage refuses the same shape at apply (`guardCommitBase`). The check needs no preview. Every case it
+ * cannot compare abstains — including a member that is not at the declared base, which is the shape an
+ * HONEST retry meets on a member still holding the earlier attempt's record (review: at three members
+ * one reject sinks the commit, so that member abstains and leaves the refusal to its apply).
  */
 describe('ClusterMember — commit base-declaration check (promise round)', () => {
-	/** A repo that reads one record's claim and nothing else: no preview, so only this check can fire. */
+	/** A repo that reads one record's claim and its own latest, and nothing else: no preview, so only
+	 *  this check can fire. */
 	class ClaimOfRepo extends MockRepo implements IPendingClaimReader {
-		constructor(private readonly claims: Record<string, PendingClaim | undefined>) { super(); }
+		constructor(private readonly claims: Record<string, PendingClaim | undefined>, private readonly latestRev?: number) { super(); }
+		override async get(gets: BlockGets): Promise<GetBlockResults> {
+			if (this.latestRev === undefined) return {};
+			const latest = { rev: this.latestRev, actionId: 'latest-action' as ActionId };
+			return Object.fromEntries(gets.blockIds.map(id => [id, { state: { latest, pendings: [] } }])) as unknown as GetBlockResults;
+		}
 		async listPendingClaims(): Promise<PendingClaim[]> { return []; }
 		async pendingClaimOf(blockId: BlockId, actionId: ActionId): Promise<PendingClaim | undefined> {
 			const claim = this.claims[blockId];
@@ -399,7 +409,7 @@ describe('ClusterMember — commit base-declaration check (promise round)', () =
 
 	/** Both capabilities: the preview would reject too, so the reason says which check fired first. */
 	class ClaimAndPreviewRepo extends ClaimOfRepo {
-		constructor(claims: Record<string, PendingClaim | undefined>, private readonly previews: Record<string, CommitDigestPreview | undefined>) { super(claims); }
+		constructor(claims: Record<string, PendingClaim | undefined>, latestRev: number, private readonly previews: Record<string, CommitDigestPreview | undefined>) { super(claims, latestRev); }
 		async previewCommitDigest(blockId: BlockId): Promise<CommitDigestPreview | undefined> { return this.previews[blockId]; }
 	}
 
@@ -411,33 +421,40 @@ describe('ClusterMember — commit base-declaration check (promise round)', () =
 	const storedBase = (baseRev?: number): Record<string, PendingClaim> =>
 		({ [BLOCK]: { actionId: ACTION, rev: 2, ...(baseRev === undefined ? {} : { baseRev }) } });
 
-	it('rejects, with the signed reason, a commit declaring a base other than the one its pend carried here', async () => {
-		const vote = await voteOnCommit(new ClaimOfRepo(storedBase(4)), makeCommit({ [BLOCK]: { digest: 'd', baseRev: 5 } }));
+	it('rejects, with the signed reason, a commit declaring a base other than the one its pend carried here, at the base this member holds', async () => {
+		const vote = await voteOnCommit(new ClaimOfRepo(storedBase(4), 5), makeCommit({ [BLOCK]: { digest: 'd', baseRev: 5 } }));
 		expect(vote.type).to.equal('reject');
 		expect(vote.rejectReason).to.equal(BASE_DECLARATION_DISAGREES);
 	});
 
+	it('abstains when this member is not at the declared base — behind (the honest-retry shape), ahead, or holding nothing', async () => {
+		for (const latestRev of [4, 6, undefined]) {
+			const vote = await voteOnCommit(new ClaimOfRepo(storedBase(4), latestRev), makeCommit({ [BLOCK]: { digest: 'd', baseRev: 5 } }));
+			expect(vote.type, `latest ${latestRev ?? 'none'}`).to.equal('approve');
+		}
+	});
+
 	it('approves a commit declaring the base its pend carried', async () => {
-		const vote = await voteOnCommit(new ClaimOfRepo(storedBase(4)), makeCommit({ [BLOCK]: { digest: 'd', baseRev: 4 } }));
+		const vote = await voteOnCommit(new ClaimOfRepo(storedBase(4), 4), makeCommit({ [BLOCK]: { digest: 'd', baseRev: 4 } }));
 		expect(vote.type).to.equal('approve');
 	});
 
 	it('abstains when this member holds no record for the action', async () => {
-		const vote = await voteOnCommit(new ClaimOfRepo({}), makeCommit({ [BLOCK]: { digest: 'd', baseRev: 5 } }));
+		const vote = await voteOnCommit(new ClaimOfRepo({}, 5), makeCommit({ [BLOCK]: { digest: 'd', baseRev: 5 } }));
 		expect(vote.type).to.equal('approve');
 		const otherAction = await voteOnCommit(
-			new ClaimOfRepo({ [BLOCK]: { actionId: 'someone-else' as ActionId, rev: 2, baseRev: 4 } }),
+			new ClaimOfRepo({ [BLOCK]: { actionId: 'someone-else' as ActionId, rev: 2, baseRev: 4 } }, 5),
 			makeCommit({ [BLOCK]: { digest: 'd', baseRev: 5 } }));
 		expect(otherAction.type, 'a different action\'s record is not this commit\'s').to.equal('approve');
 	});
 
 	it('abstains when the record carries no base (an insert, a delete, or a base-less sender)', async () => {
-		const vote = await voteOnCommit(new ClaimOfRepo(storedBase()), makeCommit({ [BLOCK]: { digest: 'd', baseRev: 5 } }));
+		const vote = await voteOnCommit(new ClaimOfRepo(storedBase(), 5), makeCommit({ [BLOCK]: { digest: 'd', baseRev: 5 } }));
 		expect(vote.type).to.equal('approve');
 	});
 
 	it('abstains when the commit declares no base, a malformed one, or no declarations at all', async () => {
-		const repo = new ClaimOfRepo(storedBase(4));
+		const repo = new ClaimOfRepo(storedBase(4), 5);
 		expect((await voteOnCommit(repo, makeCommit({ [BLOCK]: { digest: 'd' } }))).type, 'no baseRev').to.equal('approve');
 		expect((await voteOnCommit(repo, makeCommit(
 			{ [BLOCK]: { digest: 'd', baseRev: '5' } } as unknown as BlockContentDigests))).type, 'a string baseRev').to.equal('approve');
@@ -448,7 +465,7 @@ describe('ClusterMember — commit base-declaration check (promise round)', () =
 
 	it('ignores a surplus declaration for a block the commit does not cover', async () => {
 		const surplus = 'block-not-committed' as BlockId;
-		const repo = new ClaimOfRepo({ [surplus]: { actionId: ACTION, rev: 2, baseRev: 4 } });
+		const repo = new ClaimOfRepo({ [surplus]: { actionId: ACTION, rev: 2, baseRev: 4 } }, 5);
 		const vote = await voteOnCommit(repo, makeCommit({ [surplus]: { digest: 'd', baseRev: 5 } }));
 		expect(vote.type).to.equal('approve');
 	});
@@ -459,7 +476,7 @@ describe('ClusterMember — commit base-declaration check (promise round)', () =
 	});
 
 	it('names the base disagreement rather than the digest mismatch it causes', async () => {
-		const repo = new ClaimAndPreviewRepo(storedBase(4), { [BLOCK]: { digest: 'local-digest', baseRev: 5, baseIndependent: false } });
+		const repo = new ClaimAndPreviewRepo(storedBase(4), 5, { [BLOCK]: { digest: 'local-digest', baseRev: 5, baseIndependent: false } });
 		const vote = await voteOnCommit(repo, makeCommit({ [BLOCK]: { digest: 'declared-digest', baseRev: 5 } }));
 		expect(vote.type).to.equal('reject');
 		expect(vote.rejectReason).to.equal(BASE_DECLARATION_DISAGREES);
@@ -472,8 +489,8 @@ describe('ClusterMember — commit base-declaration check (promise round)', () =
 		} as unknown as IBlock);
 		const UPDATE_ACTION = 'update-action' as ActionId;
 
-		/** BLOCK committed at rev 1, then an update pended at rev 2 naming base 1. */
-		const seeded = async (): Promise<StorageRepo> => {
+		/** BLOCK committed at rev 1, then an update pended at `rev` naming `base`. */
+		const seeded = async (rev = 2, base = 1): Promise<StorageRepo> => {
 			const rawStorage = new MemoryRawStorage();
 			const repo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage));
 			expect((await repo.pend({ actionId: ACTION, transforms: { inserts: { [BLOCK]: block(['x']) }, updates: {}, deletes: [] }, rev: 1, policy: 'c' })).success).to.equal(true);
@@ -481,8 +498,8 @@ describe('ClusterMember — commit base-declaration check (promise round)', () =
 			expect((await repo.pend({
 				actionId: UPDATE_ACTION,
 				transforms: { inserts: {}, updates: { [BLOCK]: [['items', 1, 0, ['y']]] as never }, deletes: [] },
-				rev: 2,
-				baseRevs: { [BLOCK]: 1 },
+				rev,
+				baseRevs: { [BLOCK]: base },
 				policy: 'c'
 			})).success).to.equal(true);
 			return repo;
@@ -494,12 +511,26 @@ describe('ClusterMember — commit base-declaration check (promise round)', () =
 			expect(vote.type).to.equal('approve');
 		});
 
-		it('rejects a commit that contradicts its own pend, where the digest check alone would abstain', async () => {
-			// Declared base 0 while the member holds rev 1: the digest check is not checkable and would
-			// abstain, so only the base check can see the contradiction.
-			const vote = await voteOnCommit(await seeded(), makeCommit({ [BLOCK]: { digest: 'whatever', baseRev: 0 } }, { actionId: UPDATE_ACTION, rev: 2 }));
+		it('rejects a commit that contradicts its own pend at the base this member holds', async () => {
+			// The pend told this member base 0; the commit declares base 1, which this member holds.
+			const vote = await voteOnCommit(await seeded(2, 0), makeCommit({ [BLOCK]: { digest: 'whatever', baseRev: 1 } }, { actionId: UPDATE_ACTION, rev: 2 }));
 			expect(vote.type).to.equal('reject');
 			expect(vote.rejectReason).to.equal(BASE_DECLARATION_DISAGREES);
+		});
+
+		it('three members, an honest retry: the member still holding the earlier attempt\'s record abstains, and its apply refuses the stale record instead', async () => {
+			// The earlier attempt pended at rev 2 on base 1 here. The cohort then moved the block to rev 2
+			// (this member missed that commit) and the SAME action retried at rev 3 on base 2 — a pend this
+			// member also missed, so it still holds the first attempt's record. The retry's commit reaches it.
+			const repo = await seeded(2, 1);
+			const retry = makeCommit({ [BLOCK]: { digest: 'retry-digest', baseRev: 2 } }, { actionId: UPDATE_ACTION, rev: 3 });
+			const vote = await voteOnCommit(repo, retry, 3);
+			// Before the review's narrowing this was `reject` — and at three members (0.75 → all three
+			// must promise) that one signed reject sank the honest retry's commit for the whole cohort.
+			expect(vote.type, 'behind the declared base: abstain, so the other two can commit').to.equal('approve');
+			const applied = await repo.commit(retry);
+			expect(applied.success, 'the apply refuses to put the stale record over the older base').to.equal(false);
+			expect((await repo.get({ blockIds: [BLOCK] }))[BLOCK]!.state.latest?.rev, 'and nothing was applied').to.equal(1);
 		});
 	});
 });

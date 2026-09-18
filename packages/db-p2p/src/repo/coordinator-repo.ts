@@ -13,7 +13,7 @@ import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAn
 import { DEFAULT_CLUSTER_SIZE, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
 import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, type ICommitProofPersister, type IRevisionActionReader, type IPendingClaimReader } from "../storage/storage-repo.js";
-import { isReservationAgainst, reservationRequestFor, type PendingClaim } from "../storage/pending-claim.js";
+import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
 import type { ReconcileBlockCallback, CommittedHoldersSink } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
@@ -2117,7 +2117,7 @@ export class CoordinatorRepo implements IRepo {
 				return { success: false, conflict: true, reason: error.message };
 			}
 			if (error instanceof BlocksHeldError) {
-				return await this.answerBlocksHeld(error, request, allBlockIds);
+				return await this.answerBlocksHeld(error, request, allBlockIds, cohort.peerIds.length);
 			}
 			const stale = await this.classifyStaleRejection(error, request, allBlockIds);
 			if (stale) return stale;
@@ -2264,8 +2264,8 @@ export class CoordinatorRepo implements IRepo {
 	 * WAIT on the holder rather than re-race it needs a typed field added here; never recover the ids
 	 * by parsing `reason`.
 	 */
-	private async answerBlocksHeld(error: BlocksHeldError, request: PendRequest, blockIds: BlockId[]): Promise<StaleFailure> {
-		const pending = await this.corroborateHeldBlocks(request, blockIds);
+	private async answerBlocksHeld(error: BlocksHeldError, request: PendRequest, blockIds: BlockId[], peerCount: number): Promise<StaleFailure> {
+		const pending = await this.corroborateHeldBlocks(request, blockIds, peerCount);
 		if (pending.length === 0) {
 			// The member that refused is ahead of us — the normal shape under latency. Still a conflict:
 			// the refusal is signed, and the un-enriched answer is exactly the shape the lost-race arm
@@ -2312,20 +2312,26 @@ export class CoordinatorRepo implements IRepo {
 	 * Diagnostic enrichment only, never a gate: the refusal it corroborates was already cast and signed
 	 * by a member, and nothing here can turn an admission into a refusal or the reverse.
 	 */
-	private async corroborateHeldBlocks(request: PendRequest, blockIds: BlockId[]): Promise<ActionPending[]> {
+	private async corroborateHeldBlocks(request: PendRequest, blockIds: BlockId[], peerCount: number): Promise<ActionPending[]> {
 		const pending: ActionPending[] = [];
+		// The refusing member reads the request's base only in a cohort that can leave a member out
+		// (`ClusterMember.reservationRequestOf`); read it here under the same condition.
+		const readsBase = cohortCanMissAPend(peerCount, this.superMajorityThreshold);
 		try {
 			for (const blockId of blockIds) {
 				// The request's base for the block, read exactly as the refusing member read it (the
 				// malformed-base log line is that member's, so none is repeated here).
-				const { request: reservation } = reservationRequestFor(request, blockId, transformForBlockId(request.transforms, blockId));
+				const reservation = readsBase
+					? reservationRequestFor(request, blockId, transformForBlockId(request.transforms, blockId)).request
+					: { rev: request.rev };
 				for (const claim of await this.pendingClaimsOf(blockId)) {
 					// The same rule, on the same inputs, as the refusing member (`isReservationAgainst`): a
 					// record this request's writer has built on is not the rival it was refused on, and
 					// naming it would feed a superseded action into the writer's `pending` list and into
-					// the stuck-reservation holder comparison; and a record claiming a slot past the
-					// request's declared base IS one, even when the requested revision has moved beyond it —
-					// the revision rule alone would leave that refusal uncorroborated.
+					// the stuck-reservation holder comparison; and, where the base is read, a record
+					// claiming a slot past the request's declared base IS one, even when the requested
+					// revision has moved beyond it — the revision rule alone would leave that refusal
+					// uncorroborated.
 					if (claim.actionId !== request.actionId && isReservationAgainst(claim, reservation)) {
 						pending.push({ blockId, actionId: claim.actionId });
 					}

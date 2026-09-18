@@ -29,3 +29,11 @@ Measured on the in-process mesh (`packages/db-p2p/test/rival-superseded-only-by-
 After a held refusal on a block whose holder the handle's log already names as committed, the writer's next attempt re-reads that block, from a machine that has the change or with a floor at the holder's revision, and re-stages over it, so it lands once the rival commits instead of ending torn. A held refusal on a rival the log does not name (a genuinely in-flight rival) keeps today's behaviour.
 
 Related, not the same: `feat-refresh-can-demand-a-revision-floor` (a refresh of the *collection* answered by a behind machine) and `bug-a-refused-write-can-leave-its-log-entry-behind` (the leftover log entry this shape also produces).
+
+## Which cohort sizes reach this (review, 2026-09-18)
+
+Only cohorts that can reach their promise bar without one member: `cohortCanMissAPend` in `packages/db-p2p/src/storage/pending-claim.ts`, which at the default 0.75 threshold is four members and up. The review narrowed the rival rule so that the promise vote reads the incoming base only there; two- and three-member cohorts keep the revision rule, so a member there never holds a writer on the base, and no two- or three-member shape reaches this retry path. (A two- or three-member cohort also cannot produce the stale read: every member must approve every pend.)
+
+## The refusal is not reported as final
+
+Measured on the same spec (phase 4 now prints it): N's write reaches the caller as `TornActionError` with `final: false` — "whether the write is saved could not be established" — although all four members answered that they do not hold it (`commit-not-durable: 0 of 4 cohort member(s) report holding rev 3`) and the fork guard deleted each member's pending record when it refused. So the application is told to read back before resubmitting rather than that it may resubmit. That is conservative, never unsafe, but it is the wrong signal for a write that can never land. Fixing the retry above removes this outcome in this shape; if the retry fix does not land first, `Collection`'s classification of an all-members-answered `commit-not-durable` refusal is the site to look at.

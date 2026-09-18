@@ -148,16 +148,16 @@ interface Voter {
 	dispose(): void;
 }
 
-const memberOver = async (repo: IRepo): Promise<Voter> => {
+const memberOver = async (repo: IRepo, cohortSize = 2): Promise<Voter> => {
 	const self = await makeKeyPair();
-	const other = await makeKeyPair();
+	const others = await Promise.all(Array.from({ length: cohortSize - 1 }, makeKeyPair));
 	const member = clusterMember({
 		storageRepo: repo,
 		peerNetwork: new MockPeerNetwork(),
 		peerId: self.peerId,
 		privateKey: self.privateKey
 	});
-	const peers = makeClusterPeers([self, other]);
+	const peers = makeClusterPeers([self, ...others]);
 	return {
 		async vote(pend) {
 			const record = await makePendRecord(peers, pend);
@@ -170,10 +170,11 @@ const memberOver = async (repo: IRepo): Promise<Voter> => {
 
 /**
  * Drive a pend record through a fresh member backed by `repo` and return the member's own promise
- * vote alongside what it voted on, so a caller can re-derive the signed payload.
+ * vote alongside what it voted on, so a caller can re-derive the signed payload. `cohortSize` is the
+ * record's peer count, this member included — it decides whether the vote reads the pend's base.
  */
-const voteOnPend = async (repo: IRepo, pend: PendRequest): Promise<CastVote> => {
-	const voter = await memberOver(repo);
+const voteOnPend = async (repo: IRepo, pend: PendRequest, cohortSize = 2): Promise<CastVote> => {
+	const voter = await memberOver(repo, cohortSize);
 	try {
 		return await voter.vote(pend);
 	} finally {
@@ -340,39 +341,67 @@ describe('ClusterMember — a pending record reserves only the slot it claims', 
 /**
  * Ticket: a-rival-pend-is-superseded-only-by-a-writer-that-built-on-it.
  *
- * The promise vote reads the base the incoming pend declares for the block
+ * In a cohort that can reach its promise bar without one member (`cohortCanMissAPend`: four members up
+ * at the default 0.75), the promise vote reads the base the incoming pend declares for the block
  * (`PendRequest.baseRevs`) and treats a rival record as superseded only when that base is at or past
  * the record's slot — the writer read the block WITH the record's change in it. A pend that has moved
- * past the record's slot but declares a base below it read the block without the change (from four
- * members up, a member that never held the rival's pend can serve that read), and is held. A pend
- * naming no base keeps the revision rule, pinned here as such.
+ * past the record's slot but declares a base below it read the block without the change (a member that
+ * never held the rival's pend can serve that read), and is held. A pend naming no base, and a record
+ * with no stored base, keep the revision rule.
+ *
+ * In a cohort that needs every member (two and three at the default threshold) the vote reads no base:
+ * no member can have missed the pend the base arm guards against, and a stray record on one member —
+ * a cancel that never reached it — would otherwise hold every later writer for good, since that one
+ * member's hold sinks the pend.
  */
 describe('ClusterMember — a rival record is superseded only by a pend that built on it', () => {
+	const FOUR = 4;
 	const LATEST_4 = { rev: 4, actionId: 'r4' as ActionId };
-	const RIVAL_AT_5 = [{ actionId: RIVAL_ACTION, rev: 5 }];
+	const RIVAL_AT_5 = [{ actionId: RIVAL_ACTION, rev: 5, baseRev: 4 }];
 	const withBase = (baseRev: unknown): Partial<PendRequest> => ({ rev: 6, baseRevs: { [BLOCK]: baseRev as number } });
 
-	it('holds a pend past the record\'s slot whose declared base is below it', async () => {
-		const vote = await voteOnPend(new ClaimRepo(RIVAL_AT_5, LATEST_4), makePend(withBase(4)));
+	it('holds a pend past the record\'s slot whose declared base is below it (four members)', async () => {
+		const vote = await voteOnPend(new ClaimRepo(RIVAL_AT_5, LATEST_4), makePend(withBase(4)), FOUR);
 		expect(vote.signature?.type, 'the writer did not read the rival\'s change').to.equal('held');
 		expect(vote.signature).to.have.property('heldBy', RIVAL_ACTION);
 		expect(await voteVerifies(vote)).to.equal(true);
 	});
 
 	it('approves the same pend when its declared base is the record\'s slot', async () => {
-		const vote = await voteOnPend(new ClaimRepo(RIVAL_AT_5, LATEST_4), makePend(withBase(5)));
+		const vote = await voteOnPend(new ClaimRepo(RIVAL_AT_5, LATEST_4), makePend(withBase(5)), FOUR);
 		expect(vote.signature?.type, 'the writer built on the rival\'s change').to.equal('approve');
 	});
 
 	it('approves the same pend when it names no base (the revision rule, unchanged)', async () => {
-		const vote = await voteOnPend(new ClaimRepo(RIVAL_AT_5, LATEST_4), makePend({ rev: 6 }));
+		const vote = await voteOnPend(new ClaimRepo(RIVAL_AT_5, LATEST_4), makePend({ rev: 6 }), FOUR);
 		expect(vote.signature?.type).to.equal('approve');
+	});
+
+	it('approves over a record with no stored base — a release-shaped record keeps the revision rule', async () => {
+		const vote = await voteOnPend(new ClaimRepo([{ actionId: RIVAL_ACTION, rev: 5 }], LATEST_4), makePend(withBase(4)), FOUR);
+		expect(vote.signature?.type, 'a base-less record is superseded once the collection moves past its slot').to.equal('approve');
+	});
+
+	for (const cohortSize of [2, 3]) {
+		it(`approves the base-below pend at ${cohortSize} members: a stray record on one member must not sink every later writer`, async () => {
+			const captured = await captureLog('cluster-member', async () => {
+				const vote = await voteOnPend(new ClaimRepo(RIVAL_AT_5, LATEST_4), makePend(withBase(4)), cohortSize);
+				expect(vote.signature?.type, 'the revision rule: the collection moved past the record\'s slot').to.equal('approve');
+			});
+			expect(linesWith(captured, 'cluster-member:validation-pending-superseded'), 'and the supersession is logged').to.have.lengthOf(1);
+			expect(linesWith(captured, 'cluster-member:pend-base-ignored'), 'the base is not read at all, so nothing is "ignored"').to.have.lengthOf(0);
+		});
+	}
+
+	it('still holds a pend for the record\'s own slot at three members', async () => {
+		const vote = await voteOnPend(new ClaimRepo(RIVAL_AT_5, LATEST_4), makePend({ rev: 5, baseRevs: { [BLOCK]: 4 } }), 3);
+		expect(vote.signature?.type).to.equal('held');
 	});
 
 	it('falls back to the revision rule on a malformed base, and logs it rather than refusing', async () => {
 		for (const bad of ['5', 6, 9, null]) {
 			const captured = await captureLog('cluster-member', async () => {
-				const vote = await voteOnPend(new ClaimRepo(RIVAL_AT_5, LATEST_4), makePend(withBase(bad)));
+				const vote = await voteOnPend(new ClaimRepo(RIVAL_AT_5, LATEST_4), makePend(withBase(bad)), FOUR);
 				expect(vote.signature?.type, `base ${String(bad)}`).to.equal('approve');
 			});
 			expect(linesWith(captured, 'cluster-member:pend-base-ignored'), `base ${String(bad)} is logged`).to.have.lengthOf(1);
@@ -384,7 +413,7 @@ describe('ClusterMember — a rival record is superseded only by a pend that bui
 			rev: 6,
 			transforms: { inserts: { [BLOCK]: { header: { id: BLOCK, type: 't', collectionId: 'c' } } as never }, updates: {}, deletes: [] },
 			baseRevs: { [BLOCK]: 4 }
-		}));
+		}), FOUR);
 		expect(vote.signature?.type, 'no base is read for an insert, so the revision rule supersedes').to.equal('approve');
 	});
 });
