@@ -261,6 +261,19 @@ registerTransactor('mytransactor', MyCustomTransactor);
 
 Then use `transactor='mytransactor'` or `keyNetwork='mynetwork'` in your `USING` clause.
 
+## React Native
+
+Both entries, `@optimystic/quereus-plugin-optimystic` and `@optimystic/quereus-plugin-optimystic/plugin`, bundle for React Native with nothing beyond what `@optimystic/db-p2p` already needs: the global polyfills and the Node built-in module shims listed in [db-p2p's React Native section](../db-p2p/readme.md#react-native). The plugin imports bare `@optimystic/db-p2p`, which the `react-native` export condition routes to db-p2p's React Native entry, so it needs no alias of its own. `yarn check:rn` (the private `packages/rn-bundle-check` workspace) bundles both entries with Metro and compiles them with legacy Hermes, so a change that breaks either step fails in this repository. It never runs the bundle.
+
+At runtime, the `network` transactor cannot build its own libp2p node on React Native: db-p2p's React Native `createLibp2pNode` requires explicit `transports`, and the plugin passes none. Build the node yourself with `createLibp2pNode` from `@optimystic/db-p2p/rn` (see that section for the transports), then hand it to the plugin before creating any table that uses it:
+
+```typescript
+const plugin = register(db, { default_transactor: 'network', default_network_name: 'mynet' });
+plugin.collectionFactory.registerLibp2pNode('mynet', node, node.coordinatedRepo);
+```
+
+A registered node is used by tables whose `networkName` matches and whose `port` is `0` (the default).
+
 ## Quereus SQL Dialect
 
 Quereus is not SQLite — it is a distinct SQL engine with intentional departures from the SQL standard, aligned with [The Third Manifesto](https://www.dcs.warwick.ac.uk/~hugh/TTM/DTATRM.pdf). Key differences that affect schema design:

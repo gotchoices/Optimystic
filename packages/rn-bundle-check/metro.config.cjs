@@ -77,7 +77,7 @@ const quietReporter = {
 const defaults = getDefaultConfig(workspaceDir);
 
 module.exports = mergeConfig(defaults, {
-	watchFolders: [repoRoot, ...outOfRepoLinkTargets()],
+	watchFolders: [repoRoot, ...siblingWatchRoots()],
 	resolver: {
 		// Watching `repoRoot` would otherwise crawl this check's own transform cache and run outputs, and
 		// print an ENOENT error whenever a concurrent run deletes its output directory mid-crawl.
@@ -122,17 +122,61 @@ function packageDir(name) {
 }
 
 /**
- * Real paths of the workspace `node_modules` links that lead outside this repository — today only
- * `p2p-fret`, which the root `resolutions` portal-links to ../Fret/packages/fret. Metro refuses to
- * load a file outside its watch folders, so each such target must be watched. Derived by scanning
- * rather than hard-coded (as the sereus reference app does), so a new portal needs no edit here and a
- * checkout that installed `p2p-fret` from npm simply finds none.
+ * What to watch for each sibling repository the install links into: the sibling's workspace root (see
+ * `siblingWorkspaceRoot`), so Metro can load both the linked package and the dependencies that
+ * repository installed for it. Metro refuses to load a file outside its watch folders, and it finds a
+ * linked package's own dependencies the way Node does, by walking up from the package's real path.
+ * Quereus hoists them to its root `node_modules` (`../quereus/node_modules/temporal-polyfill`), which
+ * watching only `../quereus/packages/quereus` would leave invisible; Fret keeps them beside the package
+ * (`nmHoistingLimits: workspaces`), which either choice covers.
  *
- * NOTE: this watches the linked package directory, not the sibling repository's root. That covers the
- * sibling's own dependencies only while that repository also installs with
- * `nmHoistingLimits: workspaces`, as Fret does today. If it ever hoists them to its root
- * `node_modules`, bundling fails with "Unable to resolve module" from inside the sibling; watch the
- * sibling's workspace root instead.
+ * Watching only the linked package also bundles today, but by accident: Quereus's dependencies then
+ * fall through to `nodeModulesPaths` and land on this workspace's own copies, which exist only because
+ * this workspace declares `@quereus/quereus` directly (Yarn installs a portal's dependencies for each
+ * workspace that declares it). That bundles different copies than Node loads, and reaching Quereus
+ * only through the plugin failed with "Unable to resolve module temporal-polyfill".
+ *
+ * NOTE: the cost is that Metro crawls each sibling checkout whole, its `node_modules` included, on
+ * every run: about 64,000 files in ../quereus and 15,000 in ../Fret, beside about 79,000 in this
+ * repository (2026-09-17, Windows). Against watching only the two linked packages, that measured about
+ * 0.4 s on a warm Metro bundle (2.2 s → 2.6 s). If a sibling grows until the crawl dominates, block its
+ * directories no bundled module can reach (its `tickets/`, `docs/`, other packages) with
+ * `resolver.blockList`, anchored to that sibling's root.
+ */
+function siblingWatchRoots() {
+	return [...new Set(outOfRepoLinkTargets().map(siblingWorkspaceRoot))].sort();
+}
+
+/**
+ * The nearest ancestor of `target` (itself included) whose `package.json` declares `workspaces`, or
+ * `target` when there is none. The walk stops below the directory that holds this repository, so an
+ * unrelated manifest further up (a `package.json` in the directory that holds every checkout) can never
+ * widen the watch to every sibling project on the machine.
+ */
+function siblingWorkspaceRoot(target) {
+	for (let dir = target; !isInside(dir, repoRoot); dir = path.dirname(dir)) {
+		if (declaresWorkspaces(path.join(dir, 'package.json'))) return dir;
+		// A target on another drive never reaches a directory holding this repository.
+		if (path.dirname(dir) === dir) break;
+	}
+	return target;
+}
+
+function declaresWorkspaces(manifestPath) {
+	try {
+		return JSON.parse(fs.readFileSync(manifestPath, 'utf8')).workspaces !== undefined;
+	} catch (error) {
+		if (error.code === 'ENOENT') return false;
+		throw error;
+	}
+}
+
+/**
+ * Real paths of the workspace `node_modules` links that lead outside this repository — today
+ * `@quereus/quereus` and `p2p-fret`, which the root `resolutions` portal-link to
+ * ../quereus/packages/quereus and ../Fret/packages/fret. Derived by scanning rather than hard-coded
+ * (as the sereus reference app does), so a new portal needs no edit here and a checkout that installed
+ * them from npm simply finds none.
  */
 function outOfRepoLinkTargets() {
 	const targets = new Set();

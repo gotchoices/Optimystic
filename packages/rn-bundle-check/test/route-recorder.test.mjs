@@ -1,7 +1,8 @@
 /**
  * The routing assertion judges where Metro actually resolved a specifier: one that lands on its
  * expected file passes, one that lands elsewhere is reported with both paths, and one the bundle never
- * imports is reported rather than silently left unchecked.
+ * imports is reported rather than silently left unchecked. Every importer's resolution is judged, so a
+ * second importer landing elsewhere is reported even when the first landed right.
  */
 
 import assert from 'node:assert/strict';
@@ -40,4 +41,24 @@ it('passes a correct route and reports a wrong or unreached one', async (t) => {
 	const unreached = wrong.unreached();
 	assert.equal(unreached.length, 1, unreached.join('\n'));
 	assert.match(unreached[0], /^\.\/never-imported\.js was never imported/);
+});
+
+// entry.js and the Quereus plugin both import bare `@optimystic/db-p2p`. Metro resolves a specifier
+// once per importing directory, and the plugin's import must be judged even though entry.js's
+// resolution of the same specifier is right.
+it('judges every importer of a specifier, not only the first', async (t) => {
+	const outDir = createOutputDir();
+	t.after(() => rmSync(outDir, { recursive: true, force: true }));
+
+	const routes = createRouteRecorder(new Map([['./routed-target.js', TARGET]]));
+	await bundle({
+		entry: fileURLToPath(new URL('./fixtures/routed-twice.js', import.meta.url)),
+		outDir,
+		onResolve: routes.onResolve,
+	});
+
+	const misroutes = routes.misroutes();
+	assert.equal(misroutes.length, 1, misroutes.join('\n'));
+	assert.match(misroutes[0], /^\.\/routed-target\.js resolved to packages\/rn-bundle-check\/test\/fixtures\/nested\/routed-target\.js instead of packages\/rn-bundle-check\/test\/fixtures\/routed-target\.js\./);
+	assert.deepEqual(routes.unreached(), []);
 });

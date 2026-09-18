@@ -2180,7 +2180,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@optimystic/quereus-plugin-optimystic@workspace:packages/quereus-plugin-optimystic":
+"@optimystic/quereus-plugin-optimystic@workspace:^, @optimystic/quereus-plugin-optimystic@workspace:packages/quereus-plugin-optimystic":
   version: 0.0.0-use.local
   resolution: "@optimystic/quereus-plugin-optimystic@workspace:packages/quereus-plugin-optimystic"
   dependencies:
@@ -2260,6 +2260,8 @@ __metadata:
     "@optimystic/db-core": "workspace:^"
     "@optimystic/db-p2p": "workspace:^"
     "@optimystic/db-p2p-storage-rn": "workspace:^"
+    "@optimystic/quereus-plugin-optimystic": "workspace:^"
+    "@quereus/quereus": "npm:^4.19.4"
     "@react-native/babel-preset": "npm:0.83.10"
     "@react-native/metro-config": "npm:0.83.10"
     buffer: "npm:^6.0.3"

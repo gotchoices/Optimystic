@@ -30,3 +30,7 @@ The db-p2p readme's React Native section has a table of Node built-in modules th
 - `yarn check:rn` fails when a table alias is never resolved by the bundle, the same way it already reports an expected export route that the entry never imports (`unreached()` on the route recorder), naming the row to remove.
 - The readme table lists only the modules the React Native entry actually reaches. If a row is kept for another reason (for example, a known host dependency), the table says so, and the check has an explicit exemption for it.
 - The workspace drops any shim file and devDependency that only served a removed alias.
+
+# Still true with Quereus in the bundle (2026-09-17)
+
+`rn-bundle-check-covers-the-quereus-plugin` added both entries of the Quereus plugin, and through it Quereus itself, to `entry.js` (the bundle grew from 12 MB to 22 MB). The same recording, re-run on Windows with the origin of each request, still saw only `node:os` (five requests, every one from a copy of `@libp2p/utils`' `get-thin-waist-addresses.js`, one of them under `../Fret`) and the harness-only `react-native` (from `libp2p`'s `user-agent.react-native.js`). Neither Quereus nor the plugin requests any aliased module, so adding them changed nothing here.

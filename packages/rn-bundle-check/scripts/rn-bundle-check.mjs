@@ -45,6 +45,10 @@ const OUTPUT_PARENT = join(WORKSPACE_DIR, 'node_modules', '.cache', 'rn-bundle-c
  * root. The bare specifier is the one that regresses silently: repoint or drop the `react-native`
  * condition in packages/db-p2p/package.json and React Native gets the Node entry while every Node test
  * stays green, packages/db-p2p/test/entry-parity.spec.ts included.
+ *
+ * Every import of these specifiers is judged, not only entry.js's own: Metro resolves a specifier once
+ * per importing directory and reports each resolution, so the bare `@optimystic/db-p2p` imports made
+ * by the Quereus plugin and by db-p2p-storage-rn are checked too.
  */
 const EXPECTED_ROUTES = new Map([
 	['@optimystic/db-p2p', 'packages/db-p2p/dist/src/rn.js'],
@@ -127,7 +131,7 @@ export function compile({ bundlePath, sourceMapPath }) {
  * A fresh, private output directory, so concurrent runs (this check and its tests) never share a file.
  *
  * NOTE: nothing prunes `runs/`. A run kept after a hermesc failure, or one killed mid-bundle, stays on
- * disk (a 12 MB bundle plus its source map). Harmless while such runs are rare; if they pile up, delete
+ * disk (a 22 MB bundle plus its source map). Harmless while such runs are rare; if they pile up, delete
  * old `run-*` directories here before creating a new one.
  */
 export function createOutputDir() {
@@ -247,7 +251,8 @@ function translateBundlePositions(text, sourceMapPath) {
 // -- Export routing --------------------------------------------------------------------------------
 
 /**
- * Records, through `onResolve` (pass it to `bundle`), every file each expected specifier resolved to.
+ * Records, through `onResolve` (pass it to `bundle`), every file each expected specifier resolved to,
+ * from whichever module imported it.
  * `expected` maps a specifier to its repository-relative target; `main` uses `EXPECTED_ROUTES`.
  */
 export function createRouteRecorder(expected = EXPECTED_ROUTES) {
