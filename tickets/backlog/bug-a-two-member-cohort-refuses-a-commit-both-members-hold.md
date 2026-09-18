@@ -59,3 +59,7 @@ The fix ticket `concurrent-inserts-from-two-members-tear-and-some-torn-writes-la
 - **Where it went:** the tear is now `implement/cancelling-a-refused-write-blocks-another-writers-commit`, and the "reported torn but saved" answer is `implement/a-write-reported-torn-can-already-be-saved`.
 - **What stays here:** this ticket's own defect, a commit refused as not durable while both members end up holding it. It is still open and unaffected, and its confirmation step is unchanged.
 - **The proxied relay run:** the `1/2 approvals` shortfall through the delaying proxy was not examined by that work.
+
+# Reproduced in-process, 2026-09-18 (fix ticket `a-multi-collection-commit-half-lands-when-the-writers-replica-lags`)
+
+The race in steps 2–6 above shows up on the two-node mock mesh with no latency injection at all. `packages/quereus-plugin-optimystic/test/two-node-lagging-replica-multi-collection-commit.spec.ts` makes the joiner's raw storage lag on one collection; its commit trace reads `commit:missing-base` → `reconcile:no-rev-quorum { cohortPeers: 1, holders: 0, behind: 1 }` → `commit-not-durable { durableHolders: 1, cohortSize: 2 }`. `behind: 1` is the founder answering with a revision below the one being committed: it had not applied yet when the joiner's member reconciled. The founder held the revision a moment later. That spec asserts the *coordinator's* recovery, not this refusal, so this ticket is unchanged; but it is the place to start from if the reconcile is ever made to wait for, or re-ask, the peers that voted to commit.
