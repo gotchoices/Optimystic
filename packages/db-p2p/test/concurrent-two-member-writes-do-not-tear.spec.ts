@@ -10,6 +10,13 @@
  * had already landed, every re-send collided with the loser's next cancel the same way, and the
  * winner eventually reported `TornActionError` for a half-saved write.
  *
+ * The same scan tore writes one step later too, rarely enough (about 1 execution in 9 under six-way
+ * parallel load) that it first looked like noise: the NEXT writer read the first writer's leaf the
+ * moment its log tail landed, pended past it, and that pend, counted as a rival, knocked out the
+ * first writer's leaf commit. The rival's revision then landed over a member that never took the
+ * first one, and the first writer reported a torn leaf ("stale revision … at rev N+1, requested rev
+ * N"). A commit is no longer a rival to anything but an invalidation (`operationsConflict`).
+ *
  * The plain mesh delivers cluster messages synchronously and never interleaves them tightly enough to
  * reach this; a few milliseconds of latency on each remote delivery does.
  *

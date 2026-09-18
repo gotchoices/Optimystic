@@ -122,8 +122,33 @@ describe('race-resolution', () => {
 			expect(operationsConflict(pendOps('a1', 'shared'), commitOps('a1', 'shared'))).to.be.false;
 		});
 
-		it('reports a conflict for a commit racing a different action\'s pend on the same block', () => {
-			expect(operationsConflict(pendOps('a1', 'shared'), commitOps('a2', 'shared'))).to.be.true;
+		describe('a commit competes only with an invalidation', () => {
+			// A commit only promotes the record of a pend that already won its slot; storage's own checks
+			// order it against other actions. Counted as a rival, the next writer's pend knocked out a
+			// data-block commit whose log tail had already landed, and that write tore (two-member cohort).
+			const others: [string, RepoMessage['operations']][] = [
+				['a pend', pendOps('a2', 'shared')],
+				['a commit', commitOps('a2', 'shared')]
+			];
+			for (const [kind, other] of others) {
+				it(`does not conflict with ${kind} of a different action on a shared block, in either order`, () => {
+					const commit = commitOps('a1', 'shared');
+					expect(operationsConflict(commit, other), 'commit held').to.be.false;
+					expect(operationsConflict(other, commit), 'commit incoming').to.be.false;
+				});
+			}
+
+			it('still conflicts with an invalidation of a shared block, in either order', () => {
+				const commit = commitOps('a1', 'shared');
+				const invalidation = invalidateOps('a2', 'shared');
+				expect(operationsConflict(commit, invalidation), 'commit held').to.be.true;
+				expect(operationsConflict(invalidation, commit), 'commit incoming').to.be.true;
+			});
+
+			it('still conflicts when a message mixes a commit with a pend', () => {
+				const mixed = [...commitOps('a1', 'shared'), ...pendOps('a1', 'shared')] as unknown as RepoMessage['operations'];
+				expect(operationsConflict(mixed, pendOps('a2', 'shared'))).to.be.true;
+			});
 		});
 
 		describe('a cancel never competes with another action', () => {

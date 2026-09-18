@@ -428,6 +428,10 @@ export function operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMe
   // per-operation argument, and why counting it as a rival tore concurrent writes.
   if (isCancelOnly(ops1) || isCancelOnly(ops2)) return false;
 
+  // A commit-only message contests no slot — its pend already won one — so it serializes only
+  // against an invalidation. Counting it against a later writer's pend tore the earlier write.
+  if ((isCommitOnly(ops1) && !invalidates(ops2)) || (isCommitOnly(ops2) && !invalidates(ops1))) return false;
+
   const blocks1 = new Set(getAffectedBlockIds(ops1));
   const blocks2 = new Set(getAffectedBlockIds(ops2));
   

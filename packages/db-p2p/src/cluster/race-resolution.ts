@@ -144,6 +144,24 @@ export function recordPriority(record: ClusterRecord): number {
  * makes super-majority unreachable, so a refused writer's cancel knocked out the WINNER's commit after
  * its log tail had landed, and the winner tore. It also let a pend or commit abort a cancel's own
  * reservation, leaving the refused pending records standing longer.
+ *
+ * A commit-only message competes with nothing but an invalidation. A commit is only ever sent for an
+ * action whose pend already WON its slot (the race above ran at the pend, and storage holds that
+ * pend's record); the commit only promotes that record, so there is no contest left for it to lose:
+ *   - a pend of Y: storage and `validatePendOperations` refuse it while X's record claims the slot Y
+ *     asks for or a later one (`isReservationAgainst`), and refuse it as stale once X has committed
+ *     there — the worst outcome is a retry of Y. A Y asking PAST X's slot was built on X (it read the
+ *     block, and `StorageRepo.get` promotes X's record for a reader whose log names X), so both land,
+ *     X first: Y's commit declares X's revision as its base, and a member X has not reached yet
+ *     refuses Y as behind (the fork guard) and reconciles, rather than applying Y over the older base;
+ *   - a commit of Y: `StorageRepo.commit` never looks at another action's pending record; its own
+ *     stale and fork checks, and `validateCommitRevisions` at the vote, order the two under the block
+ *     latch.
+ * Counting either as a rival was the same tear as the cancel's, one step later: on a two-member cohort
+ * a writer whose log tail had just landed had its data-block commit knocked out by the NEXT writer's
+ * pend (which had read, and was building on, exactly that commit), so the next writer's revision
+ * landed over a member that never took the first one, and the first writer tore. An invalidation
+ * still serializes against a commit: it writes compensating revisions to the same blocks.
  */
 export function operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMessage['operations']): boolean {
 	// Check if one is a commit for the same action as a pend - these don't conflict
@@ -155,6 +173,10 @@ export function operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMe
 	}
 
 	if (isCancelOnly(ops1) || isCancelOnly(ops2)) {
+		return false;
+	}
+
+	if ((isCommitOnly(ops1) && !invalidates(ops2)) || (isCommitOnly(ops2) && !invalidates(ops1))) {
 		return false;
 	}
 
@@ -181,4 +203,13 @@ export function operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMe
  */
 function isCancelOnly(operations: RepoMessage['operations']): boolean {
 	return operations.length > 0 && operations.every(operation => 'cancel' in operation);
+}
+
+/** Every operation is a commit — conservative on a mixed list, like {@link isCancelOnly}. */
+function isCommitOnly(operations: RepoMessage['operations']): boolean {
+	return operations.length > 0 && operations.every(operation => 'commit' in operation);
+}
+
+function invalidates(operations: RepoMessage['operations']): boolean {
+	return operations.some(operation => 'invalidate' in operation);
 }
