@@ -1,6 +1,7 @@
-import type { TransactionCoordinator, ITransactionEngine, Collection, CollectionId } from '@optimystic/db-core';
+import type { ITransactionEngine, ITransactor, Collection, CollectionId, Transaction } from '@optimystic/db-core';
 import {
-  TransactionSession, CoordinatorPartialCommitError, TreeEntryChangedError, TreeGuardRefusedError, TreeKeyTakenError,
+  TransactionCoordinator, TransactionSession, CoordinatorPartialCommitError, TreeEntryChangedError, TreeGuardRefusedError,
+  TreeKeyTakenError, createTransactionId, createTransactionStamp,
 } from '@optimystic/db-core';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
@@ -35,13 +36,21 @@ export interface DirtyTree {
   restore(snapshot: unknown): void;
   /**
    * Optional refresh-without-flush (a Tree forwards to `Collection.update()`): adopt the
-   * newest committed revision and replay this tree's staged actions against it. The
-   * legacy commit sweep runs it over every staged tree BEFORE flushing any — a guarded
-   * entry a rival has since contradicted is refused there, while nothing is durable, and
-   * the whole transaction rolls back cleanly. Optional so test doubles need not
-   * implement it; a tree without it is flushed without the pre-flight.
+   * newest committed revision and replay this tree's staged actions against it. Only the
+   * per-tree fallback sweep ({@link TransactionBridge.sweepDirtyTreesLegacy}) uses it, as a
+   * pre-flight over every staged tree before flushing any — a guarded entry a rival has
+   * already contradicted is refused there, while nothing is durable. Optional so test
+   * doubles need not implement it; a tree without it is flushed without the pre-flight.
    */
   update?(): Promise<void>;
+  /**
+   * Optional access to the `Collection` this tree stages into (a Tree returns its own). A
+   * legacy commit that has several trees to push hands exactly these collections to a
+   * per-commit `TransactionCoordinator`, so that every tree is pended before any is
+   * committed ({@link TransactionBridge.commitBatchLegacy}). Optional so test doubles need
+   * not implement it; a commit that includes a tree without it takes the per-tree sweep.
+   */
+  getCollection?(): Collection<any>;
   /**
    * Optional human-readable identifier (a Tree returns its collection id) used
    * only to name persisted vs. unpersisted trees in a {@link PartialCommitError}.
@@ -148,12 +157,20 @@ interface CommitCollectionTrace {
 
 /**
  * Thrown by {@link TransactionBridge.commitTransaction} in LEGACY (no-coordinator)
- * mode when a multi-tree commit fails AFTER at least one tree was already durably
- * flushed to storage this commit.
+ * mode when the per-tree FALLBACK sweep ({@link TransactionBridge.sweepDirtyTreesLegacy})
+ * fails AFTER at least one tree was already durably flushed to storage this commit.
+ *
+ * Only the fallback raises this. A legacy commit with several trees to push normally
+ * pends all of them before committing any, through a per-commit coordinator, and a
+ * commit-phase split there surfaces as db-core's `CoordinatorPartialCommitError` — the
+ * same class session mode raises — so a caller that catches by class must handle both
+ * (see `docs/transactions.md` § "Legacy (single-node) commit"). The sweep remains only
+ * for a commit whose trees cannot share one pend batch: collections on different
+ * transactor instances, or test doubles with no collection.
  *
  * ## Why this exists (and why we can't just "roll back")
  *
- * Legacy commit flushes each dirty tree with an independent `tree.sync()`
+ * The sweep flushes each dirty tree with an independent `tree.sync()`
  * (its own pend+commit against the transactor). Those flushes are NOT a single
  * atomic unit: once tree N is committed to storage, a failure flushing tree N+1
  * cannot un-commit tree N locally (`StorageRepo.commit` is per-block; there is no
@@ -166,7 +183,7 @@ interface CommitCollectionTrace {
  * The {@link persisted} trees and {@link unpersisted} trees are now out of sync on
  * disk; recovering them is a caller/operator concern (re-run the transaction, or
  * reconcile). See the commit-site comment in this file and `docs/transactions.md`
- * (§ "Legacy (single-node) commit is not atomic across trees").
+ * (§ "Legacy (single-node) commit").
  */
 export class PartialCommitError extends Error {
   constructor(
@@ -186,6 +203,31 @@ export class PartialCommitError extends Error {
     );
     this.name = 'PartialCommitError';
   }
+}
+
+/**
+ * The engine id stamped on a legacy multi-tree commit's transaction. Purely descriptive: the
+ * pend carries no validation payload, so no member ever resolves an engine by it — it only
+ * says, to anyone reading the stamp, that the rows were staged straight into the trees rather
+ * than produced by re-executable statements.
+ */
+const LegacyCommitEngineId = 'legacy';
+
+/**
+ * Time-to-live of a legacy multi-tree commit's transaction stamp. Members never see the
+ * stamp (an unvalidated pend carries no transaction), so this expiry is only the
+ * coordinator's own ceiling, checked before each attempt. Set well above the default retry
+ * budget (about 21 s of backoff across 10 attempts, plus round trips) so that the budget,
+ * not the clock, ends a contended commit — the single-tree `Collection.sync` path has no
+ * clock at all.
+ */
+const LegacyCommitTtlMs = 5 * 60_000;
+
+/** The collections a multi-tree legacy commit pends as one batch, on the one transactor
+ * they all share. See {@link TransactionBridge.legacyBatch}. */
+interface LegacyBatch {
+  collections: readonly Collection<any>[];
+  transactor: ITransactor;
 }
 
 /**
@@ -210,9 +252,17 @@ export class TransactionBridge {
   // shared TransactionBridge" for the shared-vs-single-writer state table.
   private currentTransaction: TransactionState | null = null;
   /**
+   * The libp2p peer id of the node this bridge writes from, resolved at {@link beginTransaction}
+   * (undefined for a node with no exposed key: local, test and injected transactors). Session
+   * mode stamps it on the session; legacy mode stamps it on the per-commit transaction a
+   * multi-tree commit hands its coordinator ({@link legacyTransaction}).
+   */
+  private peerId: string | undefined;
+  /**
    * Non-null while the store is in a known-degraded state: a partial commit
-   * ({@link PartialCommitError} in legacy mode, `CoordinatorPartialCommitError` in
-   * session mode) left some trees durably committed and others not, so NO single
+   * (`CoordinatorPartialCommitError` from a pended batch in either mode, or
+   * {@link PartialCommitError} from the legacy per-tree fallback sweep) left some trees
+   * durably committed and others not, so NO single
    * tree set is a coherent commit boundary. While latched, committed
    * (`_readCommitted`) reads must refuse to answer — the vtab checks
    * {@link getDegradedReason} at the first pull and throws, per upstream's
@@ -545,6 +595,7 @@ export class TransactionBridge {
 
     const transactor = await this.collectionFactory.getOrCreateTransactor(options);
     const peerId = this.collectionFactory.getPeerId(options);
+    this.peerId = peerId;
 
     // Clear any previously accumulated statements + staged-tree tracking
     this.accumulatedStatements = [];
@@ -632,23 +683,22 @@ export class TransactionBridge {
           throw new Error(result.error || 'Transaction commit failed');
         }
       } else {
-        // Legacy mode: flush every tree that staged DML this transaction. This
+        // Legacy mode: push every tree that staged DML this transaction. This
         // replaces the inline updateAndSync that Tree.replace() used to perform
         // at DML time — deferring the flush to commit is what lets a deferred
         // (subquery-bearing) CHECK rejection roll back cleanly: the constraint
         // throws before this point, so the staged trees are rolled back never
         // having touched storage.
         //
-        // ⚠️ NOT DURABLY ATOMIC ACROSS TREES. Each tree.sync() is its own
-        // pend+commit against the transactor; there is no cross-tree undo here.
-        // If the sweep fails AFTER the first tree has synced, trees 1..N are
-        // already durably committed and trees N+1.. are not — a real split on
-        // disk. We surface that as a loud {@link PartialCommitError} rather than
-        // pretending to roll back (see commitDirtyTreesLegacy). True all-or-
-        // nothing across independent block clusters is the distributed consensus
-        // path's job (GATHER/PEND/COMMIT); see docs/transactions.md
-        // (§ "Legacy (single-node) commit is not atomic across trees") for the
-        // residual window and the planned pend-all-then-commit-all narrowing.
+        // A commit with several trees to push (a table and its indexes, or two
+        // tables) pends ALL of them before committing ANY, through a per-commit
+        // coordinator — so a refusal at pend (the common failure: a rival took a
+        // key, a unique value, or changed a row this write read) leaves nothing
+        // durable and rolls back cleanly. What remains is the commit-phase
+        // residual session mode shares: a permanent loss on one tree's commit
+        // after every pend succeeded, surfaced as CoordinatorPartialCommitError
+        // rather than papered over. See commitDirtyTreesLegacy and
+        // docs/transactions.md (§ "Legacy (single-node) commit").
         await this.commitDirtyTreesLegacy();
       }
 
@@ -663,7 +713,7 @@ export class TransactionBridge {
 
     } catch (error) {
       if (error instanceof PartialCommitError) {
-        // commitDirtyTreesLegacy already cleaned up: it restored the trees that
+        // The legacy fallback sweep already cleaned up: it restored the trees that
         // never touched storage and left the durably-committed trees alone (their
         // in-memory state correctly mirrors storage). Running rollbackTransaction
         // here would restore the committed trees too, re-introducing exactly the
@@ -674,16 +724,18 @@ export class TransactionBridge {
         throw error;
       }
       if (error instanceof CoordinatorPartialCommitError) {
-        // Session-mode analog of the legacy branch above: the coordinator's commit
-        // half-landed — some collections durably committed via consensus and CANNOT
-        // be rolled back. The coordinator ALREADY did the split local handling (folded
-        // the committed collections' trackers to cache + reset, restored the failed
-        // ones). Running rollbackTransaction here would clean-restore the committed
-        // collections' trackers too, cementing the memory/storage divergence and
-        // falsely reporting a rollback that did not happen. So latch the degraded
-        // state (committed reads must refuse until the next clean commit/rollback),
-        // tear down transaction state WITHOUT restoring, and propagate the
-        // structured signal for reconciliation.
+        // A pended batch's commit half-landed — in session mode, or a legacy
+        // multi-tree commit (commitBatchLegacy): some collections durably committed
+        // via consensus and CANNOT be rolled back. The coordinator ALREADY did the
+        // split local handling (folded the committed collections' trackers to cache
+        // + reset, restored the failed ones to their pre-append state; the legacy
+        // path then restored those failed trees to their pre-transaction snapshots,
+        // as the fallback sweep does). Running rollbackTransaction here would
+        // clean-restore the committed collections' trackers too, cementing the
+        // memory/storage divergence and falsely reporting a rollback that did not
+        // happen. So latch the degraded state (committed reads must refuse until the
+        // next clean commit/rollback), tear down transaction state WITHOUT
+        // restoring, and propagate the structured signal for reconciliation.
         this.degradedReason = error.message;
         this.currentTransaction!.collections.clear();
         this.currentTransaction!.isActive = false;
@@ -787,58 +839,24 @@ export class TransactionBridge {
   }
 
   /**
-   * Legacy (no-coordinator) commit sweep: flush each dirty tree in turn.
+   * Legacy (no-coordinator) commit: push every tree that staged DML this transaction.
    *
-   * On failure the correct recovery depends on how far the sweep got:
-   * - **No tree synced yet** (failure on the first tree): nothing is durably
-   *   committed, so re-throw untouched and let {@link commitTransaction}'s catch
-   *   run the ordinary snapshot-restore {@link rollbackTransaction} — a genuinely
-   *   clean rollback.
-   * - **At least one tree already synced**: trees 1..N are durably committed and
-   *   cannot be un-committed locally. Restore ONLY the trees that never touched
-   *   storage (they revert cleanly), leave the committed trees' in-memory state
-   *   as-is (it matches storage), tear down the transaction, and throw a
-   *   {@link PartialCommitError} naming both sets. We do NOT report success and do
-   *   NOT falsely claim a rollback.
+   * Which mechanism pushes them depends on how many trees actually have something to push:
+   * - **One tree** (a single table with no index — the common write): that tree's own
+   *   `sync()`, which is all-or-nothing by itself. Byte-identical to what this path has
+   *   always done; the clean trees are swept exactly as before.
+   * - **Several trees** (a table and its indexes, or two tables in one SQL transaction):
+   *   one pend-all-then-commit-all batch through a per-commit coordinator over exactly
+   *   those trees' collections ({@link commitBatchLegacy}). Two writers racing on a
+   *   unique value collide at pend, where nothing is durable yet, so the loser is
+   *   refused with nothing stored — the tear the per-tree sweep could not avoid.
+   * - **The per-tree sweep** ({@link sweepDirtyTreesLegacy}) only when the trees cannot
+   *   share one batch — see {@link legacyBatch} for the two cases.
    */
   private async commitDirtyTreesLegacy(): Promise<void> {
     const trees = [...this.dirtyTrees.keys()];
-    const synced: DirtyTree[] = [];
 
-    // PRE-FLIGHT: refresh every staged tree against storage BEFORE the first flush.
-    // Each `sync()` below opens with exactly this refresh (`Collection.updateAndSync`),
-    // where a guarded entry's uniqueness decision is re-made against the newest
-    // committed state — but a refresh run at flush time fires only when that tree's
-    // turn comes, and the main table always flushes before its index trees. A
-    // secondary-UNIQUE refusal (an `absentRange` guard in a unique index tree, see
-    // TreeRangeTakenError) would therefore land MID-SWEEP: the loser's row already
-    // durable in the main table, the index entry refused, the handle latched degraded
-    // by PartialCommitError — the very tear this sweep cannot undo, with a duplicate
-    // unique value left behind in storage. Hoisting the refresh here moves the
-    // deterministic shape (the rival committed before this commit began) to the
-    // first-tree exit: nothing persisted, ordinary rollback, ordinary UNIQUE message.
-    // Same for a PK refusal in a multi-table transaction whose colliding table is not
-    // swept first. Cost: one extra header/tail read per STAGED tree per legacy commit
-    // (clean trees skip it — nothing to replay, nothing to refuse), on top of the
-    // refresh sync() repeats.
-    // NOTE: this narrows the tear window to "a rival lands between this pre-flight
-    // and the tree's own flush"; it does not close it. Closing it needs
-    // pend-all-then-commit-all (backlog `feat-optimystic-legacy-commit-two-phase`).
-    if (trees.length > 1) {
-      for (const tree of trees) {
-        if (tree.update !== undefined && tree.hasUnsyncedChanges?.() !== false) {
-          try {
-            await tree.update();
-          } catch (rawError) {
-            // Nothing persisted: map a refusal and let commitTransaction's catch run
-            // the ordinary clean rollback (same exit as a first-tree flush failure).
-            throw this.mapCommitRefusal(rawError);
-          }
-        }
-      }
-    }
-
-    // Trace what this sweep is about to carry. Legacy mode's commit set is the
+    // Trace what this commit is about to carry. Legacy mode's commit set is the
     // dirty set (a tree only lands here once markDirty saw DML stage into it), so
     // an index collection missing from THIS line means the index was never staged
     // into — which is exactly the question the trace exists to answer.
@@ -851,6 +869,169 @@ export class TransactionBridge {
         rev: treeRevision(tree),
         action: treeActionId(tree),
       })));
+    }
+
+    const batch = this.legacyBatch(trees);
+    if (batch === undefined) {
+      await this.sweepDirtyTreesLegacy(trees);
+      return;
+    }
+    await this.commitBatchLegacy(batch);
+  }
+
+  /**
+   * The collections a legacy commit pends as one batch, on the transactor they all share —
+   * or `undefined` when this commit takes the per-tree sweep instead. That is the case when:
+   * - fewer than two trees have anything to push (a single tree's `sync()` is already
+   *   all-or-nothing, and keeping it is what keeps the common write byte-identical);
+   * - a tree is a test double with no collection to hand a coordinator; or
+   * - the collections sit on different transactor instances.
+   *
+   * A tree without `hasUnsyncedChanges` counts as staged: the sweep's `sync()` is a
+   * safe no-op for a clean tree, whereas wrongly leaving a staged one out would drop DML.
+   *
+   * NOTE: tables declared on different transactors in one SQL transaction cannot share a
+   * pend batch — each transactor is its own storage, with no consensus spanning them — so
+   * that commit keeps the per-tree sweep and its tear window. No host declares such a mix
+   * today; if one ever does, it needs one batch per transactor, committed in turn.
+   */
+  private legacyBatch(trees: readonly DirtyTree[]): LegacyBatch | undefined {
+    const staged = trees.filter(tree => tree.hasUnsyncedChanges?.() !== false);
+    if (staged.length < 2) {
+      return undefined;
+    }
+    const collections: Collection<any>[] = [];
+    for (const tree of staged) {
+      const collection = tree.getCollection?.();
+      if (collection === undefined) {
+        return undefined;
+      }
+      collections.push(collection);
+    }
+    const transactor = collections[0]!.transactor;
+    if (collections.some(collection => collection.transactor !== transactor)) {
+      return undefined;
+    }
+    return { collections, transactor };
+  }
+
+  /**
+   * Pend every collection of `batch`, then commit every one, through a coordinator built
+   * for this commit alone over exactly those collections — not the whole registry, whose
+   * clean members would only cost the coordinator refreshes between attempts.
+   *
+   * `pendValidation: 'none'` is what makes the coordinator usable here: legacy staging has
+   * no statements for a member to re-execute, so the pends carry bare transforms — the same
+   * shape every legacy write has always sent — with the aged retry priority on the pend
+   * itself. Members accept that shape under the default `unvalidatablePendPolicy`.
+   *
+   * Failures reach {@link commitTransaction}'s catch, which already handles both shapes:
+   * - **Nothing durable** (a pend refused, the retry budget spent on clean losses, or a guard
+   *   refusal thrown by the coordinator's refresh between attempts — the losing writer's
+   *   replay of a key, unique value or row a rival won): the coordinator restored every
+   *   tracker to its pre-append state and threw; the bridge rolls the trees back to their
+   *   pre-transaction snapshots and maps a guard refusal to the ordinary constraint message.
+   * - **A commit-phase split** (`CoordinatorPartialCommitError`: some collections committed
+   *   durably, one lost permanently after every pend succeeded): the coordinator gave the
+   *   committed collections the success-path fold and left the failed ones holding their
+   *   staged DML; THIS method then restores the failed trees to their pre-transaction
+   *   snapshots — memory mirrors storage for both halves, exactly as the fallback sweep
+   *   leaves a torn commit — and the catch latches the degraded state. Nothing rolls the
+   *   committed half back.
+   */
+  private async commitBatchLegacy({ collections, transactor }: LegacyBatch): Promise<void> {
+    // NOTE: the batch pends each tree at the revision this handle currently holds for it — the
+    // coordinator does not refresh before its first attempt, where the sweep's `updateAndSync`
+    // did. A tree a rival advanced since this handle last refreshed it therefore costs one
+    // refused attempt plus the first backoff (about 50–100 ms) before the retry pends fresh.
+    // Fine at current scale; if contended legacy commits ever show that latency, refresh the
+    // batch's collections here before committing.
+    const coordinator = new TransactionCoordinator(
+      transactor,
+      new Map(collections.map(collection => [collection.id, collection])),
+      { pendValidation: 'none' },
+    );
+    try {
+      await coordinator.commit(await this.legacyTransaction());
+    } catch (error) {
+      if (error instanceof CoordinatorPartialCommitError) {
+        this.restoreUncommittedTrees(new Set(error.committedCollections));
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * The transaction identity a legacy multi-tree commit hands its coordinator. Legacy
+   * staging has no statements (the rows went straight into the trees) and records no
+   * reads (the single-tree sync never did either), so the coordinator uses it for three
+   * things only: the action id every participant's log entry carries (`id`), the expiry it
+   * checks before each attempt (`stamp.expiration`), and its one-open-stamp check
+   * (`stamp.id`). No member ever sees it — the pend carries no validation payload.
+   */
+  private async legacyTransaction(): Promise<Transaction> {
+    const stamp = await createTransactionStamp(this.peerId ?? 'local', Date.now(), '', LegacyCommitEngineId, LegacyCommitTtlMs);
+    return { stamp, statements: [], reads: [], id: await createTransactionId(stamp.id, [], []) };
+  }
+
+  /**
+   * After a pended batch half-landed: restore every dirty tree whose collection is NOT in
+   * `committed` to the pre-transaction snapshot {@link markDirty} captured, so its memory
+   * matches storage (nothing of this transaction reached that collection). The committed
+   * trees are left alone — the coordinator already folded them, and their memory matches
+   * storage too. Restoring a clean tree is a no-op, as in the fallback sweep.
+   */
+  private restoreUncommittedTrees(committed: ReadonlySet<CollectionId>): void {
+    for (const [tree, snapshot] of this.dirtyTrees) {
+      const id = tree.getCollection?.()?.id;
+      if (id === undefined || !committed.has(id)) {
+        tree.restore(snapshot);
+      }
+    }
+  }
+
+  /**
+   * The per-tree FALLBACK: flush each dirty tree in turn with its own `sync()`. Reached
+   * only when {@link legacyBatch} found no batch to pend, so in practice a commit whose
+   * tables sit on different transactors, or one driven through test doubles.
+   *
+   * ⚠️ NOT DURABLY ATOMIC ACROSS TREES. Each `sync()` is its own pend+commit against the
+   * transactor; there is no cross-tree undo here. On failure the correct recovery depends
+   * on how far the sweep got:
+   * - **No tree synced yet** (failure on the first tree): nothing is durably
+   *   committed, so re-throw untouched and let {@link commitTransaction}'s catch
+   *   run the ordinary snapshot-restore {@link rollbackTransaction} — a genuinely
+   *   clean rollback.
+   * - **At least one tree already synced**: trees 1..N are durably committed and
+   *   cannot be un-committed locally. Restore ONLY the trees that never touched
+   *   storage (they revert cleanly), leave the committed trees' in-memory state
+   *   as-is (it matches storage), tear down the transaction, and throw a
+   *   {@link PartialCommitError} naming both sets. We do NOT report success and do
+   *   NOT falsely claim a rollback.
+   */
+  private async sweepDirtyTreesLegacy(trees: readonly DirtyTree[]): Promise<void> {
+    const synced: DirtyTree[] = [];
+
+    // PRE-FLIGHT: refresh every staged tree against storage BEFORE the first flush, so a
+    // guarded entry a rival has ALREADY contradicted (a duplicate key or unique value, a
+    // row it changed or removed) is refused here — while nothing is durable — rather than
+    // mid-sweep, after an earlier tree committed. Each `sync()` below opens with this same
+    // refresh, but at flush time it fires only when that tree's turn comes, and the main
+    // table always flushes before its index trees. Narrows the sweep's tear window to a
+    // rival landing between this refresh and the tree's own flush; only a pended batch
+    // closes it, which is why the batch is the normal path and this the fallback.
+    if (trees.length > 1) {
+      for (const tree of trees) {
+        if (tree.update !== undefined && tree.hasUnsyncedChanges?.() !== false) {
+          try {
+            await tree.update();
+          } catch (rawError) {
+            // Nothing persisted: map a refusal and let commitTransaction's catch run
+            // the ordinary clean rollback (same exit as a first-tree flush failure).
+            throw this.mapCommitRefusal(rawError);
+          }
+        }
+      }
     }
 
     for (const tree of trees) {

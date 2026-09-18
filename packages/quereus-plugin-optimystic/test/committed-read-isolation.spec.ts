@@ -38,6 +38,7 @@ import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p'
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
+import { makeSelectiveFailureTransactor } from './selective-failure-transactor.js';
 import { captureTrace, indexSeekTraces } from './trace-helpers.js';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -452,10 +453,11 @@ describe('Committed-read connection isolation', function () {
 			await fs.rm(dir, { recursive: true, force: true });
 		});
 
-		/** Injected transactor failing the SECOND tree's commit (mirrors
-		 * legacy-commit-atomicity.spec.ts) so the sweep splits: main table persisted,
-		 * index not → PartialCommitError. */
-		function createDbWithSecondTreeFailure() {
+		/** Injected transactor that can fail the INDEX tree's commit persistently (see
+		 * selective-failure-transactor.ts, shared with legacy-commit-atomicity.spec.ts), so the
+		 * pended batch splits in its commit phase: main table persisted, index not →
+		 * CoordinatorPartialCommitError. */
+		function createDbWithIndexCommitFailure() {
 			const db = new Database();
 			const config = {
 				default_transactor: 'local',
@@ -464,32 +466,8 @@ describe('Committed-read connection isolation', function () {
 				rawStorageFactory: () => new FileRawStorage(dir),
 			} as unknown as Record<string, SqlValue>;
 			const plugin = register(db, config);
-
-			const rawStorage = new FileRawStorage(dir);
-			const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, rawStorage));
-			let armed = false;
-			let firstTail: string | undefined;
-			let tripped = false;
-			const transactor = {
-				async get(blockGets: unknown) { return storageRepo.get(blockGets as never); },
-				async getStatus(_refs: unknown) { throw new Error('getStatus not implemented'); },
-				async pend(request: unknown) { return storageRepo.pend(request as never); },
-				async commit(request: unknown) {
-					if (armed && !tripped) {
-						const tail = (request as { tailId: string }).tailId;
-						if (firstTail === undefined) {
-							firstTail = tail;
-						} else if (tail !== firstTail) {
-							tripped = true;
-							throw new Error('injected commit failure (second tree)');
-						}
-					}
-					return storageRepo.commit(request as never);
-				},
-				async cancel(trxRef: unknown) { return storageRepo.cancel(trxRef as never); },
-				onCollectionChange: storageRepo.onCollectionChange.bind(storageRepo),
-			};
-			plugin.collectionFactory.registerTransactor('local:test', transactor as unknown as ITransactor);
+			const injected = makeSelectiveFailureTransactor(new FileRawStorage(dir));
+			plugin.collectionFactory.registerTransactor('local:test', injected.transactor);
 			for (const vtable of plugin.vtables) {
 				db.registerModule(vtable.name, vtable.module, vtable.auxData);
 			}
@@ -499,12 +477,12 @@ describe('Committed-read connection isolation', function () {
 			return {
 				db,
 				plugin,
-				arm() { armed = true; firstTail = undefined; tripped = false; },
-				disarm() { armed = false; },
+				arm() { injected.arm({ phase: 'commit', matches: (id: string) => id.includes('/index/') }); },
+				disarm() { injected.disarm(); },
 			};
 		}
 
-		async function forcePartialCommit(harness: ReturnType<typeof createDbWithSecondTreeFailure>): Promise<void> {
+		async function forcePartialCommit(harness: ReturnType<typeof createDbWithIndexCommitFailure>): Promise<void> {
 			const { db } = harness;
 			await db.exec(`create table Item (id integer primary key, cat text) using optimystic('tree://iso/degraded')`);
 			await db.exec(`create index idx_cat on Item (cat)`);
@@ -518,17 +496,18 @@ describe('Committed-read connection isolation', function () {
 		}
 
 		it('committed reads throw (naming the split trees) while latched; live reads still answer; a clean COMMIT clears it', async () => {
-			const harness = createDbWithSecondTreeFailure();
+			const harness = createDbWithIndexCommitFailure();
 			const { db, plugin } = harness;
 			try {
 				await forcePartialCommit(harness);
 
-				// Committed read refuses with the persisted/unpersisted split in the message.
+				// Committed read refuses with the committed/failed split in the message — the
+				// coordinator's partial-commit report, naming both collection sets.
 				const err = await captureThrow(() => scalar(db, `select count(*) as v from committed.Item`));
 				const message = String((err as Error)?.message ?? err);
 				expect(message).to.match(/partially-committed state/);
-				expect(message).to.match(/Persisted/);
-				expect(message).to.match(/Not persisted/);
+				expect(message).to.match(/Committed \(durable[^\]]*\[iso\/degraded\]/);
+				expect(message).to.match(/Failed \(never committed[^\]]*\[iso\/degraded\/index\/idx_cat\]/);
 
 				// Live reads are unaffected: the main tree durably committed row 2 and the
 				// live view honestly mirrors that.
@@ -544,7 +523,7 @@ describe('Committed-read connection isolation', function () {
 		});
 
 		it('a clean ROLLBACK also clears the latch', async () => {
-			const harness = createDbWithSecondTreeFailure();
+			const harness = createDbWithIndexCommitFailure();
 			const { db, plugin } = harness;
 			try {
 				await forcePartialCommit(harness);

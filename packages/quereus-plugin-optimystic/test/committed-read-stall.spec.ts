@@ -8,8 +8,8 @@
  * calls (`pend`/`commit`) await a test-controlled gate; `get` passes straight
  * through. Unlike Quereus's `installCommitStall` (which parks at the ENTRY of a
  * registered connection's commit, BEFORE this plugin's publish begins), this gate
- * parks INSIDE the publish window — including between tree N and tree N+1 of the
- * legacy multi-tree sweep, the arm the engine-shipped harness cannot reach.
+ * parks INSIDE the publish window — including after one tree's commit has landed and
+ * before its sibling's, the arm the engine-shipped harness cannot reach.
  *
  * Promptness is asserted with `settleMacrotasks` (bounded event-loop turns), never
  * a wall-clock timeout: a read that would queue behind the parked writer's exec
@@ -271,13 +271,14 @@ describe('Committed reads under a stalled commit (proof B)', function () {
 		});
 	});
 
-	describe('legacy mode (tree-by-tree sweep, no coordinator)', () => {
-		it('MID-SWEEP stall (main table flushed, index parked): committed reads still show the pre-transaction boundary and agree across access paths', async () => {
-			// gateOn 'commit' + skipCalls 1: tree 1 of the sweep (the main table) pends
-			// AND commits — durably flushed and folded into the live tree — then tree 2
-			// (the index) parks at its commit. This is the window where an unpinned
-			// committed view tears: the main tree's context has advanced past the index's.
-			// The snapshot-boundary pin (CollectionSnapshot.context) is what holds it.
+	describe('legacy mode (no coordinator wired)', () => {
+		it('MID-PUBLISH stall (main table committed, index parked): committed reads still show the pre-transaction boundary and agree across access paths', async () => {
+			// gateOn 'commit' + skipCalls 1: both trees pend, the main table's commit lands
+			// in storage — durable, though not folded locally until every tree of the batch
+			// has committed — and the index tree parks at its commit. In the per-tree
+			// fallback sweep, where the main tree is also folded and its context advanced
+			// past the index's, this is the window where an unpinned committed view tears.
+			// The snapshot-boundary pin (CollectionSnapshot.context) holds it in both shapes.
 			const h = makeHarness({ gateOn: 'commit', skipCalls: 1 });
 			let writer: Promise<void> | undefined;
 			try {
@@ -365,7 +366,14 @@ describe('Committed reads under a stalled commit (proof B)', function () {
 			}
 		});
 
-		it('a mid-sweep stall that ends in a PARTIAL commit: reads answer during the stall, then REFUSE once the store is split', async () => {
+		it('a mid-publish stall released into a TRANSIENT failure: reads answer during the stall; the batch recovers on retry, nothing splits, no latch', async () => {
+			// gateOn 'commit' + skipCalls 1: both trees pend, the main table's commit lands,
+			// the index tree's commit parks. Releasing the gate into an error makes that one
+			// commit call throw — the transient shape (an unreachable cohort member) the
+			// coordinator's commit phase retries up to three times, so the second try lands
+			// and the write completes whole. The PERMANENT loss that does split the store is
+			// pinned by legacy-commit-atomicity.spec.ts and committed-read-isolation.spec.ts
+			// with a failure that holds across the retries.
 			const h = makeHarness({ gateOn: 'commit', skipCalls: 1 });
 			let writer: Promise<void> | undefined;
 			try {
@@ -377,29 +385,24 @@ describe('Committed reads under a stalled commit (proof B)', function () {
 				writer = h.db.exec(`update Split set cat = 'z'`);
 				await h.gate.entered;
 
-				// During the stall the store is not yet split — reads answer, pre-write.
+				// During the stall nothing has folded locally — reads answer, pre-write.
 				const during = await expectPrompt(
 					collectRows(h.db, 'select id, cat from Split order by id', true),
-					'committed read during pre-split stall',
+					'committed read during the stall',
 				);
 				expect(during.map(r => r.cat)).to.deep.equal(seededCats());
 
-				// The parked SECOND tree's commit fails: main persisted, index not → a
-				// durable split, surfaced as PartialCommitError and latched.
+				// The parked index-tree commit fails once; the retry lands it.
 				h.gate.releaseWithError(new Error('injected cohort failure'));
-				const err = await captureThrow(() => writer!);
-				expect(String((err as Error)?.message ?? err).toLowerCase()).to.contain('not atomic');
-				expect(h.plugin.txnBridge.isDegraded()).to.equal(true);
+				await writer;
+				expect(h.plugin.txnBridge.isDegraded(), 'a recovered commit never latches').to.equal(false);
 
-				// Committed reads now REFUSE (the degraded latch), naming the split.
-				const refusal = await captureThrow(() => collectRows(h.db, 'select id, cat from Split order by id', true));
-				expect(String((refusal as Error)?.message ?? refusal)).to.match(/partially-committed state/);
-
-				// A later clean commit clears the latch and reads answer again.
-				await h.db.exec(`insert into Split (id, cat) values (${SEED + 1}, 'c')`);
-				expect(h.plugin.txnBridge.isDegraded()).to.equal(false);
-				const after = await collectRows(h.db, `select count(*) as v from Split`, true);
-				expect(Number(after[0]!.v)).to.equal(SEED + 1);
+				// Both trees carry the write: full scan and index-driven scan agree.
+				const after = await collectRows(h.db, 'select id, cat from Split order by id', true);
+				expect(after.map(r => r.cat)).to.deep.equal(Array.from({ length: SEED }, () => 'z'));
+				const committedTable = await connectCommitted(h.db, h.plugin, 'Split');
+				const indexRows = await drain(committedTable.query(filterInfo('idx=idx_cat(0);plan=2', ['z'])));
+				expect(indexRows.length, 'the index tree committed too').to.equal(SEED);
 			} finally {
 				h.gate.release();
 				await writer?.catch(() => { });

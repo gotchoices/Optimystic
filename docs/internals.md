@@ -268,14 +268,17 @@ tracker it scans can fetch a rival's commit the pre-stage probe's view had not; 
 vtab's DML catch maps that through the same `mapCommitRefusal`, and the statement-level
 savepoint discards what the statement staged before it). Because a UNIQUE-constrained table is
 backed by at least two collections (main table + index tree) and the refusal lives in
-the index tree — which flushes *after* the main table in the legacy sweep — the sweep
-now **pre-flights** a refresh of every staged tree before committing any
-(`commitDirtyTreesLegacy`), so a refusal whose rival already committed rolls back
-cleanly instead of tearing the base row from its index mid-sweep. That narrows, but
-does not close, the legacy multi-tree tear window (a rival landing between the
-pre-flight and a tree's own flush still tears loudly as a `PartialCommitError`); the
-full close is backlog `feat-optimystic-legacy-commit-two-phase`. Session (coordinator)
-mode is already atomic across trees. IGNORE- and REPLACE-resolved constraints are
+the index tree, a legacy commit with several trees to push pends **all** of them
+before committing **any**, through a per-commit coordinator over exactly those trees
+(`commitBatchLegacy` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`), so the
+refusal — at pend, or in the replay the refresh between attempts runs — arrives while
+nothing of the loser's is durable and the whole transaction rolls back cleanly. Session
+(coordinator) mode pends the same way. What remains in both is the commit-phase
+residual (`CoordinatorPartialCommitError`, see
+[transactions.md](transactions.md)); the per-tree sweep, with its pre-flight refresh
+and its `PartialCommitError`, is now only the fallback for trees that cannot share one
+batch. IGNORE- and REPLACE-resolved constraints are
 guarded too and *refuse* a concurrent duplicate rather than honouring their
 disposition: the rival's row lives in the main collection, which an index tree's replay
 can neither skip around nor evict, so an unguarded entry would silently commit two rows
@@ -901,8 +904,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   — a `ClusterMember` casting its promise vote and a `StorageRepo` applying a pend — run the one
   `checkPendValidation` ([`db-p2p/src/pend-validation.ts`](../packages/db-p2p/src/pend-validation.ts)),
   so they cannot drift on what they refuse. Two shapes are decided there. A pend carrying no
-  `validation` payload (the single-collection `Collection.sync` shape: bare transforms, nothing to
-  re-execute) takes a **logged policy branch** — `unvalidatablePendPolicy: 'accept'` (default) admits
+  `validation` payload (bare transforms, nothing to re-execute: the single-collection
+  `Collection.sync` shape, and the Quereus adapter's legacy multi-tree commit, whose per-commit
+  coordinator is built with `pendValidation: 'none'`) takes a **logged policy branch** — `unvalidatablePendPolicy: 'accept'` (default) admits
   it unchecked, `'reject'` refuses with `PEND_NOT_VALIDATABLE` — rather than falling through the same
   path as a checked one; the payload is ONE optional pair, so a sender cannot talk a receiver out of
   validating by omitting half of it. And a checker that **throws** becomes a reject reasoned

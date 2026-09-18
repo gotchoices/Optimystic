@@ -1,94 +1,40 @@
 /**
- * Regression coverage for LEGACY (default, no-coordinator) commit atomicity
- * across trees (see implement ticket `optimystic-legacy-commit-not-atomic`).
+ * Regression coverage for LEGACY (default, no-coordinator) commit atomicity across trees.
  *
- * Legacy commit flushes each dirty tree (main table + each secondary index) with
- * an independent `tree.sync()` — its own pend+commit against the transactor. Those
- * flushes are NOT one atomic unit. If the flush of the SECOND tree fails after the
- * FIRST has already durably committed, the first tree is written and the second is
- * not — a real split on disk that cannot be un-done locally.
+ * A legacy commit that has several trees to push (a table and its index here) pends EVERY
+ * tree before committing ANY, through a per-commit `TransactionCoordinator` over exactly
+ * those trees (`TransactionBridge.commitBatchLegacy`). So:
  *
- * Before the fix, the failure path called `rollbackTransaction()`, which restored
- * the in-memory snapshot of EVERY dirty tree — including the already-committed one.
- * That diverged memory from storage (memory said "not applied", storage said
- * "applied") AND falsely reported the transaction as rolled back.
+ * - a failure at PEND — the common failure class: a rival took a key, a unique value, or
+ *   changed a row this write read; here, an injected hard pend rejection — leaves nothing
+ *   durable and rolls back cleanly with a plain error;
+ * - a permanent failure at COMMIT after every pend succeeded — the residual session mode
+ *   shares — half-lands: the committed tree keeps its rows (memory keeps matching storage),
+ *   the failed tree is reverted to its pre-transaction snapshot, and the bridge raises
+ *   db-core's `CoordinatorPartialCommitError` (not the fallback sweep's `PartialCommitError`)
+ *   and latches degraded. It does NOT silently revert the persisted tree — before the
+ *   honest-failure work the failure path restored EVERY dirty tree's snapshot, which made
+ *   memory disagree with storage AND falsely reported the transaction as rolled back;
+ * - a successful multi-tree commit reads back identically through a fresh handle, including
+ *   after a history that mixes single-tree commits (the per-tree `sync()` log-entry shape)
+ *   with batched ones (the coordinator's, which names the participants on each entry).
  *
- * After the fix:
- * - a post-first-tree failure raises a loud `PartialCommitError` and does NOT
- *   silently revert the persisted tree in memory (memory keeps matching storage);
- * - a FIRST-tree failure (nothing persisted) still rolls back cleanly.
- *
- * These tests run against a real `FileRawStorage`-backed `StorageRepo` (wrapped by
- * an injected transactor that fails a targeted commit), and reopen the storage to
- * assert on-disk state matches the reported outcome.
+ * These tests run against a real `FileRawStorage`-backed `StorageRepo` (wrapped by the
+ * selective-failure transactor), and reopen the storage to assert on-disk state matches the
+ * reported outcome.
  */
 
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
-import { KeyRange } from '@optimystic/db-core';
-import { StorageRepo, BlockStorage } from '@optimystic/db-p2p';
+import { CoordinatorPartialCommitError, KeyRange } from '@optimystic/db-core';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import register from '../dist/plugin.js';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-
-/**
- * An injected transactor that wraps a real `StorageRepo` over `FileRawStorage`,
- * but can be told to FAIL a targeted `commit` to simulate a mid-sweep flush
- * failure. Failure is scoped by log-tail block id, so it targets a specific
- * collection regardless of how many commits that collection's sync issues.
- *
- * - `arm('second')`: the next commit whose `tailId` differs from the FIRST tail
- *   committed while armed throws (i.e. the second collection in the sweep). Used
- *   to leave the first tree persisted and the second not.
- * - `arm('first')`: the very first commit while armed throws (nothing persists).
- *
- * A commit "throws" (rather than returning `{ success: false }`) so the collection
- * sync fails FAST — a returned stale-failure would trigger ~10 backoff retries.
- */
-function makeInjectedTransactor(dir: string) {
-	const rawStorage = new FileRawStorage(dir);
-	const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, rawStorage));
-
-	let mode: 'off' | 'first' | 'second' = 'off';
-	let firstTail: string | undefined;
-	let tripped = false;
-
-	const transactor = {
-		async get(blockGets: any) { return storageRepo.get(blockGets); },
-		async getStatus(_refs: any) { throw new Error('getStatus not implemented in injected transactor'); },
-		async pend(request: any) { return storageRepo.pend(request); },
-		async commit(request: any) {
-			if (mode !== 'off' && !tripped) {
-				const tail = request.tailId as string;
-				if (mode === 'first') {
-					tripped = true;
-					throw new Error('injected commit failure (first tree)');
-				}
-				// mode === 'second'
-				if (firstTail === undefined) {
-					firstTail = tail;
-				} else if (tail !== firstTail) {
-					tripped = true;
-					throw new Error('injected commit failure (second tree)');
-				}
-			}
-			return storageRepo.commit(request);
-		},
-		async cancel(trxRef: any) { return storageRepo.cancel(trxRef); },
-		onCollectionChange: storageRepo.onCollectionChange.bind(storageRepo),
-	};
-
-	return {
-		transactor,
-		arm(m: 'first' | 'second') { mode = m; firstTail = undefined; tripped = false; },
-		disarm() { mode = 'off'; },
-		get tripped() { return tripped; },
-	};
-}
+import { makeSelectiveFailureTransactor } from './selective-failure-transactor.js';
 
 /** Register the optimystic plugin against a fresh Database wired to the `local`
  * transactor. The injected transactor (registered under the `local:test` key) is
@@ -102,11 +48,11 @@ function createDbWithInjected(dir: string) {
 		rawStorageFactory: () => new FileRawStorage(dir),
 	} as unknown as Record<string, SqlValue>;
 	const plugin = register(db, config);
-	const injected = makeInjectedTransactor(dir);
+	const injected = makeSelectiveFailureTransactor(new FileRawStorage(dir));
 	// Pre-register under the transactor cache key the factory computes for
 	// (transactor='local', keyNetwork='test'), so getOrCreateTransactor returns
 	// our instance instead of building a plain local transactor.
-	plugin.collectionFactory.registerTransactor('local:test', injected.transactor as any);
+	plugin.collectionFactory.registerTransactor('local:test', injected.transactor);
 	for (const vtable of plugin.vtables) {
 		db.registerModule(vtable.name, vtable.module, vtable.auxData);
 	}
@@ -143,6 +89,12 @@ async function selectCount(db: Database, sql: string): Promise<number> {
 	throw new Error('count query returned no rows');
 }
 
+async function selectRows(db: Database, sql: string): Promise<Record<string, SqlValue>[]> {
+	const rows: Record<string, SqlValue>[] = [];
+	for await (const row of db.eval(sql)) rows.push(row as Record<string, SqlValue>);
+	return rows;
+}
+
 /** Count materialised entries in the tree at `collectionUri`, reading the real
  * committed storage via the plugin's collection factory. */
 async function countTreeEntries(
@@ -167,20 +119,22 @@ async function countTreeEntries(
 	return n;
 }
 
-/** Reopen the storage dir in a fresh (plain) Database and return the count of `sql`.
+/** Reopen the storage dir in a fresh (plain) Database and run `read` against it.
  * The injected transactor writes through a bare `FileRawStorage`, BEHIND the plugin's read
  * cache, so this reopen must not inherit a warm cache from an earlier one: the read cache is
  * shared per directory for as long as any lease is held, so release ours before returning. */
-async function reopenCount(dir: string, countSql: string): Promise<number> {
+async function reopen<T>(dir: string, read: (db: Database) => Promise<T>): Promise<T> {
 	const { db, plugin } = createDbPlain(dir);
 	try {
 		await plugin.hydrate(db);
-		return await selectCount(db, countSql);
+		return await read(db);
 	} finally {
 		db.close();
 		await plugin.dispose();
 	}
 }
+
+const reopenCount = (dir: string, countSql: string): Promise<number> => reopen(dir, db => selectCount(db, countSql));
 
 /** Run `fn`, returning the thrown error (fails if it unexpectedly resolves). */
 async function captureThrow(fn: () => Promise<unknown>): Promise<unknown> {
@@ -191,6 +145,18 @@ async function captureThrow(fn: () => Promise<unknown>): Promise<unknown> {
 	}
 	throw new Error('expected operation to throw, but it resolved');
 }
+
+/** The first error of class `cls` in `error`'s cause chain, or undefined. The vtab wraps the
+ * bridge's error in `Commit transaction failed: …` with the original as `cause`. */
+function findCause<T>(error: unknown, cls: new (...args: never[]) => T): T | undefined {
+	for (let cursor: unknown = error; cursor instanceof Error; cursor = cursor.cause) {
+		if (cursor instanceof cls) return cursor;
+	}
+	return undefined;
+}
+
+const messageOf = (error: unknown): string => String((error as Error)?.message ?? error);
+const isIndexTree = (collectionId: string): boolean => collectionId.includes('/index/');
 
 describe('Legacy-mode commit atomicity across trees (local/FileRawStorage)', function () {
 	this.timeout(20000);
@@ -206,32 +172,79 @@ describe('Legacy-mode commit atomicity across trees (local/FileRawStorage)', fun
 		await fs.rm(dir, { recursive: true, force: true });
 	});
 
-	it('second-tree commit failure: persisted main table is NOT silently reverted; loud partial-commit error; index untouched', async () => {
+	/** `Item(id, cat)` with a plain index on `cat` and one committed row, so the next insert
+	 * pushes two trees that both already have committed state. */
+	async function itemWithIndex(db: Database, plugin: ReturnType<typeof register>, uri: string): Promise<void> {
+		await db.exec(`create table Item (id integer primary key, cat text) using optimystic('${uri}')`);
+		await db.exec(`create index idx_item_cat on Item (cat)`);
+		await db.exec(`insert into Item (id, cat) values (1, 'a')`);
+		expect(await selectCount(db, 'select count(*) as c from Item')).to.equal(1);
+		expect(await countTreeEntries(plugin, dir, `${uri}/index/idx_item_cat`)).to.equal(1);
+	}
+
+	it('index-tree PEND failure: nothing persisted, clean rollback with a plain error, reopen shows the pre-transaction state', async () => {
 		const uri = 'tree://legacy/item';
 		const { db, plugin, injected } = createDbWithInjected(dir);
 		try {
-			await db.exec(`create table Item (id integer primary key, cat text) using optimystic('${uri}')`);
-			await db.exec(`create index idx_item_cat on Item (cat)`);
-			await db.exec(`insert into Item (id, cat) values (1, 'a')`);
+			await itemWithIndex(db, plugin, uri);
+
+			// Every tree is pended before any is committed, so a refused pend on the index
+			// tree — the SECOND tree in the old per-tree sweep — leaves the main table's
+			// row unwritten too.
+			injected.arm({ phase: 'pend', matches: isIndexTree });
+			const err = await captureThrow(() => db.exec(`insert into Item (id, cat) values (2, 'b')`));
+			injected.disarm();
+			expect(injected.tripped, 'the injected index-tree pend refusal tripped').to.be.greaterThan(0);
+
+			// A clean failure: no partial-commit signal of either kind, no degraded latch.
+			expect(messageOf(err).toLowerCase()).to.not.contain('not atomic');
+			expect(findCause(err, CoordinatorPartialCommitError)).to.equal(undefined);
+			expect(plugin.txnBridge.isDegraded()).to.equal(false);
+
+			// The rejected row left no trace in memory or in either tree.
 			expect(await selectCount(db, 'select count(*) as c from Item')).to.equal(1);
+			expect(await countTreeEntries(plugin, dir, uri)).to.equal(1);
 			expect(await countTreeEntries(plugin, dir, `${uri}/index/idx_item_cat`)).to.equal(1);
 
-			// Arm the injected transactor to fail the SECOND tree's commit. The sweep
-			// flushes the main table first (durably committed) then the index (fails).
-			injected.arm('second');
-			const err = await captureThrow(() => db.exec(`insert into Item (id, cat) values (2, 'b')`));
-			expect(injected.tripped, 'injected second-tree commit should have tripped').to.equal(true);
+			// The handle is not wedged: the same insert lands once the failure is gone.
+			await db.exec(`insert into Item (id, cat) values (2, 'b')`);
+			expect(await selectCount(db, 'select count(*) as c from Item')).to.equal(2);
+		} finally {
+			db.close();
+		}
 
-			// Loud, honest error — not a false "rolled back" success. The message
-			// survives the module's `Commit transaction failed: …` wrapping.
-			expect(String((err as Error)?.message ?? err).toLowerCase()).to.contain('not atomic');
+		expect(await reopenCount(dir, 'select count(*) as c from Item')).to.equal(2);
+	});
+
+	it('index-tree COMMIT failure after every pend succeeded (the residual): loud CoordinatorPartialCommitError; persisted main table NOT silently reverted; index reverted', async () => {
+		const uri = 'tree://legacy/widget';
+		const { db, plugin, injected } = createDbWithInjected(dir);
+		try {
+			await itemWithIndex(db, plugin, uri);
+
+			// Both trees pend; the main table's commit lands; the index tree's commit throws
+			// on every forward-recovery retry, so it is lost for good.
+			injected.arm({ phase: 'commit', matches: isIndexTree });
+			const err = await captureThrow(() => db.exec(`insert into Item (id, cat) values (2, 'b')`));
+			injected.disarm();
+			expect(injected.tripped, 'the coordinator retried the thrown commit before giving up').to.equal(3);
+
+			// Loud, honest error — not a false "rolled back" success. It is db-core's
+			// partial-commit signal, naming both halves; it survives the module's
+			// `Commit transaction failed: …` wrapping as the cause.
+			expect(messageOf(err).toLowerCase()).to.contain('not atomic');
+			const partial = findCause(err, CoordinatorPartialCommitError);
+			expect(partial, 'a commit-phase split surfaces as CoordinatorPartialCommitError').to.not.equal(undefined);
+			expect([...partial!.committedCollections]).to.deep.equal(['legacy/widget']);
+			expect([...partial!.failedCollections]).to.deep.equal(['legacy/widget/index/idx_item_cat']);
+			expect(plugin.txnBridge.isDegraded(), 'the bridge latched the split').to.equal(true);
 
 			// The main table's row DID durably persist; its in-memory view must NOT be
-			// reverted (that would disagree with storage). Pre-fix this read returned 1.
+			// reverted (that would disagree with storage).
 			expect(await selectCount(db, 'select count(*) as c from Item')).to.equal(2);
 
-			// The index tree's flush failed and never persisted; it was reverted
-			// in-memory to its pre-transaction snapshot, so it still holds only row 1.
+			// The index tree's commit failed and never persisted; it was reverted in-memory
+			// to its pre-transaction snapshot, so it still holds only row 1.
 			expect(await countTreeEntries(plugin, dir, `${uri}/index/idx_item_cat`)).to.equal(1);
 		} finally {
 			db.close();
@@ -243,28 +256,36 @@ describe('Legacy-mode commit atomicity across trees (local/FileRawStorage)', fun
 		expect(await reopenCount(dir, 'select count(*) as c from Item')).to.equal(2);
 	});
 
-	it('first-tree commit failure: nothing persisted, clean rollback (no partial-commit error)', async () => {
-		const uri = 'tree://legacy/widget';
-		const { db, injected } = createDbWithInjected(dir);
+	it('a successful multi-tree commit, after a history of single-tree commits, reopens to identical rows through a fresh handle', async () => {
+		const uri = 'tree://legacy/gadget';
+		const { db, plugin } = createDbWithInjected(dir);
 		try {
-			await db.exec(`create table Widget (id integer primary key, cat text) using optimystic('${uri}')`);
-			await db.exec(`create index idx_widget_cat on Widget (cat)`);
-			await db.exec(`insert into Widget (id, cat) values (1, 'a')`);
-			expect(await selectCount(db, 'select count(*) as c from Widget')).to.equal(1);
+			// Single-tree commits first: the table alone (one tree, `sync()`), then the index
+			// backfill flush. Their log entries have the per-tree sync's shape.
+			await db.exec(`create table Item (id integer primary key, cat text) using optimystic('${uri}')`);
+			await db.exec(`insert into Item (id, cat) values (1, 'a')`);
+			await db.exec(`create index idx_item_cat on Item (cat)`);
+			// Then batched commits: one row, and a multi-statement transaction.
+			await db.exec(`insert into Item (id, cat) values (2, 'b')`);
+			await db.exec(`begin; insert into Item (id, cat) values (3, 'a'); update Item set cat = 'c' where id = 2; commit;`);
 
-			// Fail the FIRST tree's commit — nothing reaches storage this commit.
-			injected.arm('first');
-			const err = await captureThrow(() => db.exec(`insert into Widget (id, cat) values (2, 'b')`));
-			expect(injected.tripped).to.equal(true);
-			// A first-tree failure is a genuine clean rollback, NOT a partial commit.
-			expect(String((err as Error)?.message ?? err).toLowerCase()).to.not.contain('not atomic');
-
-			// Clean rollback: the rejected row left no trace in memory.
-			expect(await selectCount(db, 'select count(*) as c from Widget')).to.equal(1);
+			expect(await selectRows(db, 'select id, cat from Item order by id')).to.deep.equal([
+				{ id: 1, cat: 'a' }, { id: 2, cat: 'c' }, { id: 3, cat: 'a' },
+			]);
+			expect(await countTreeEntries(plugin, dir, uri)).to.equal(3);
+			expect(await countTreeEntries(plugin, dir, `${uri}/index/idx_item_cat`)).to.equal(3);
+			expect(plugin.txnBridge.isDegraded()).to.equal(false);
 		} finally {
 			db.close();
 		}
 
-		expect(await reopenCount(dir, 'select count(*) as c from Widget')).to.equal(1);
+		// A fresh handle over the mixed history reads the same rows, by full scan and
+		// through the index.
+		const reread = await reopen(dir, async fresh => ({
+			all: await selectRows(fresh, 'select id, cat from Item order by id'),
+			byCat: await selectRows(fresh, `select id from Item where cat = 'a' order by id`),
+		}));
+		expect(reread.all).to.deep.equal([{ id: 1, cat: 'a' }, { id: 2, cat: 'c' }, { id: 3, cat: 'a' }]);
+		expect(reread.byCat).to.deep.equal([{ id: 1 }, { id: 3 }]);
 	});
 });

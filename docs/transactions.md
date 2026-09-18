@@ -4,7 +4,7 @@
 
 This document describes the architecture for multi-collection transactions in Optimystic, with support for pluggable validation engines. The primary use case is SQL-validated transactions where cluster participants independently validate by re-executing SQL statements.
 
-> ### ⚠️ Legacy (single-node) commit is not atomic across trees
+> ### ⚠️ Legacy (single-node) commit: one pended batch, with the session-mode residual
 >
 > The distributed consensus path below (GATHER/PEND/COMMIT across all critical
 > blocks) is what delivers cross-collection consistency — though only **atomicity of
@@ -12,49 +12,62 @@ This document describes the architecture for multi-collection transactions in Op
 > stale loss on one collection's COMMIT can still half-land; see the session-mode note
 > below and [correctness.md](correctness.md) Theorem 3). The
 > **default single-node "legacy" mode** — used when no coordinator/engine is wired
-> (`TransactionBridge` without `configureTransactionMode`) — does **not**.
+> (`TransactionBridge` without `configureTransactionMode`) — now rides the same
+> machinery whenever a commit has more than one tree to push, and so has the same
+> guarantee and the same residual.
 >
-> Legacy commit flushes each dirty tree (main table + each secondary index, or
-> two tables mutated in one SQL transaction) with an **independent** `tree.sync()`,
-> and each sync is its own pend+commit against the transactor. There is no
-> cross-tree undo. If the flush of tree *N+1* fails **after** tree *N* has already
-> committed to storage, trees `1..N` stay durably written and trees `N+1..` do not
-> — a real split on disk with no automatic recovery.
+> How the adapter commits (`commitDirtyTreesLegacy` in
+> `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`):
+> - **One tree with something to push** (a single table with no index — the common
+>   write): that tree's own `sync()`, all-or-nothing by itself. Unchanged.
+> - **Several trees** (a table and its indexes, or two tables mutated in one SQL
+>   transaction): one pend-all-then-commit-all batch through a `TransactionCoordinator`
+>   built for that commit alone over exactly those trees' collections
+>   (`commitBatchLegacy`). Every tree is pended before any is committed, so the failures
+>   that matter — a rival took a key or a unique value, or changed a row this write read
+>   — are met at pend, or at the refresh between attempts where the losing tree's replay
+>   refuses the guarded entry, while nothing is durable: the whole transaction rolls back
+>   cleanly and the client sees the ordinary constraint message. This is what closed the
+>   field-reported tear in which two machines inserting the same unique value at the
+>   same instant both stored their rows (the loser's table row committed on its own
+>   retry, and only its unique-index tree, flushed later, refused it — six of six rounds
+>   on two nodes). The coordinator is constructed with `pendValidation: 'none'`: legacy
+>   staging has no statements for a member to re-execute, so its pends carry bare
+>   transforms — the shape every legacy write has always sent — with the aged retry
+>   priority on the pend itself. The transaction it hands the coordinator carries no
+>   statements and no reads; the coordinator uses only its id (the action id on every
+>   participant's log entry) and its stamp (the one-open-stamp check, and an expiry set
+>   well above the retry budget, since no member ever sees it).
+>   Regression: `packages/quereus-plugin-optimystic/test/two-node-unique-value-race.spec.ts`.
+> - **The residual** is the commit phase, shared with session mode: after every pend
+>   succeeded, one tree's commit can still be lost permanently while its siblings land.
+>   That surfaces as db-core's
+>   [`CoordinatorPartialCommitError`](../packages/db-core/src/transaction/errors.ts)
+>   naming the committed and the failed collections — in legacy mode too, since the
+>   batch is the coordinator's. The bridge then restores the failed trees to their
+>   pre-transaction snapshots (memory matches storage for both halves), leaves the
+>   committed trees folded, and latches the degraded state (see § "Committed reads
+>   refuse a degraded (partially-committed) store"). Callers must reconcile.
+> - **The per-tree fallback sweep** (`sweepDirtyTreesLegacy`) — each tree flushed with
+>   an independent `sync()`, a refresh of every staged tree first, and a split after the
+>   first tree reported as the adapter's own
+>   [`PartialCommitError`](../packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts)
+>   naming the persisted and unpersisted trees — remains only for a commit whose trees
+>   cannot share one pend batch: tables declared on different transactor instances in
+>   one SQL transaction (no host does this; a `NOTE:` at `legacyBatch` says what it would
+>   take), or test doubles with no collection. A caller catching partial commits by class
+>   must handle both `CoordinatorPartialCommitError` and `PartialCommitError`.
 >
-> How the adapter handles this (`quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`):
-> - **Failure on the first tree** (nothing persisted yet): a clean in-memory
->   snapshot rollback — genuinely all-or-nothing. This is the common case for a
->   conflict/validation/stale-read rejection, which surfaces at pend before any
->   durable commit. NOTE: only per *attempt*. A stale-revision loss is now retried by
->   `Collection.sync` (see [internals.md](internals.md#consensus-execution) on pend
->   rejections being returned rather than thrown), so a loss that exhausts its retry
->   budget surfaces wherever the flush sweep happens to be by then — it can land on
->   tree *N>1* and split the write, taking the second bullet's path instead.
-> - **Failure after the first tree synced**: the bridge throws
->   [`PartialCommitError`](../packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts),
->   naming the persisted vs. unpersisted trees. It deliberately does **not** restore
->   the already-committed trees in memory (that would make memory disagree with
->   storage and falsely report a rollback). Callers must reconcile (re-run the
->   transaction, or repair the split).
-> - **Pre-flight before the first flush** (`commitDirtyTreesLegacy`, when more than one
->   tree is staged): every staged tree is refreshed against storage before any tree
->   flushes, so a guarded entry a rival has already contradicted (any `TreeGuardRefusedError`
->   — a duplicate key or unique value as `TreeKeyTakenError`, a row a rival changed or
->   removed as `TreeEntryChangedError`, see
->   [internals.md](internals.md)) is refused while nothing is durable and takes the
->   first bullet's clean rollback. A rival landing between the pre-flight and a tree's
->   own flush still takes the second bullet.
+> Log-entry shape: a batched commit's entries carry the participant list and a reads
+> field (empty), as session mode's do; a single-tree commit's entries carry neither.
+> Every reader handles both, and a history that mixes them reopens cleanly
+> (`packages/quereus-plugin-optimystic/test/legacy-commit-atomicity.spec.ts`).
 >
-> Even the distributed coordinator commits critical blocks via `Promise.all`
-> (`coordinator.commitPhase`), so a failure *after the first block commits* is a
-> narrow-but-real residual window there too — legacy mode just has a wider window
-> because each tree is a separate pend+commit rather than one pended batch.
->
-> **Planned narrowing (beyond the pre-flight, not yet implemented):** restructure legacy commit to
-> pend-all-then-commit-all (mirror the coordinator) so conflict/validation
-> failures — which happen at pend — occur before any durable commit, making those
-> cases truly atomic and shrinking the residual window to the commit sweep only.
-> See the `feat-optimystic-legacy-commit-two-phase` backlog ticket.
+> History: before the batch, the sweep was the only legacy path. A pre-flight refresh
+> was added first (ticket `concurrent-secondary-unique-guard`) so a rival that had
+> ALREADY committed was refused before the first flush; that narrowed the tear window to
+> a rival landing between the pre-flight and a tree's own flush — which, for two writers
+> starting at the same instant, was the normal outcome, not the edge.
 
 > ### ⚠️ Session-mode (distributed) commit is not atomic across collections either
 >
@@ -214,8 +227,9 @@ Two consequences worth knowing:
 
 ### Committed reads refuse a degraded (partially-committed) store
 
-After a partial commit (`PartialCommitError` in legacy mode,
-`CoordinatorPartialCommitError` in session mode) some trees are durably
+After a partial commit (`CoordinatorPartialCommitError` from a pended batch in
+either mode, or `PartialCommitError` from the legacy per-tree fallback sweep) some
+trees are durably
 committed and others are not, so **no** single tree set is a coherent commit
 boundary. The bridge latches a degraded flag when either error is raised
 (`TransactionBridge.isDegraded()` / `getDegradedReason()`). While latched, a
@@ -251,11 +265,12 @@ What holds the guarantee, and where it is proven:
 - **The snapshot-boundary pin.** A `CollectionSnapshot` records the committed
   boundary (`context`) it was captured on, and a read view built from it pins to
   THAT boundary — not the collection's current one. This is what keeps a
-  committed read coherent while the **legacy tree-by-tree commit sweep** is
-  mid-publish: with the main table already flushed (its revision advanced) and
-  its index still parked, both views still describe the pre-transaction
-  boundary. Cache entries newer than the pin are excluded from the view's warm
-  seed and refetched at the pinned revision.
+  committed read coherent while a commit is mid-publish: with the main table's
+  blocks already durable in storage (a pended batch commits its trees in
+  parallel, and the legacy fallback sweep flushes them in turn) and its index
+  still parked, both views still describe the pre-transaction boundary. Cache
+  entries newer than the pin are excluded from the view's warm seed and
+  refetched at the pinned revision.
 - **Session-mode publish is event-loop-atomic.** `TransactionCoordinator`'s
   post-consensus fold loop (advance context, fold to cache, reset tracker, per
   collection) contains no `await`, so a committed read observes all collections
@@ -284,16 +299,17 @@ already written to.
 Proven by `test/committed-read-stall.spec.ts`, which parks a delegating
 transactor's commit-side calls (`pend`/`commit`; `get` passes through) and
 asserts committed reads settle within a bounded number of event-loop turns with
-pre-write values, in both commit modes — including a stall placed **between
-tree N and tree N+1** of the legacy sweep, and a stalled commit that is released
-into a failure.
+pre-write values, in both commit modes — including a stall placed **after one
+tree's commit has landed and before its sibling's**, and a stalled commit that
+is released into a failure (a transient one, which the batch's commit phase
+recovers on retry).
 
 **Harness blind spot.** The engine-shipped conformance harness
 (`runCommittedReadConformance` + `installCommitStall`, standing cover in
 `test/committed-read-conformance.spec.ts`) parks at the **entry** of the
 registered connection's `commit` — *before* this plugin's publish window begins.
-A tear inside the publish window (the legacy sweep, the coordinator fold) is
-invisible to it, so the gated-transactor spec above is the real cover; do not
+A tear inside the publish window (the coordinator fold, the legacy fallback
+sweep) is invisible to it, so the gated-transactor spec above is the real cover; do not
 delete it in favour of the harness.
 
 **Residual limit (shared with the serialized path).** The flag promises reads
@@ -1497,9 +1513,11 @@ export class TransactionCoordinator {
 > its operations hash ship as ONE optional pair, `PendRequest.validation: { transaction,
 > operationsHash }`, not two independently optional fields — "a transaction without its hash" was a
 > state no producer ever created, and a receiver whose guard required both could be talked out of
-> validating by a sender that omitted one. Only the multi-collection path
-> (`TransactionCoordinator.pendCollection`) sends the pair; a single-collection `Collection.sync`
-> pend carries bare transforms and is therefore not re-checkable, which is what
+> validating by a sender that omitted one. Only a validated coordinator pend
+> (`TransactionCoordinator.pendCollection` under the default `pendValidation: 'transaction'`) sends
+> the pair; a single-collection `Collection.sync` pend, and a pend from a coordinator built with
+> `pendValidation: 'none'` (the Quereus adapter's legacy multi-tree commit, which has no statements
+> to re-execute), carry bare transforms and are therefore not re-checkable, which is what
 > `ClusterConsensusConfig.unvalidatablePendPolicy` decides (see
 > [internals.md](internals.md), "A node that can re-check a transaction never skips the check
 > silently").

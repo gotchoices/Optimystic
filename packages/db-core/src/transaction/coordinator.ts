@@ -72,6 +72,27 @@ type CommitCycle = {
 };
 
 /**
+ * What a pend this coordinator sends carries for the receiving cluster members to re-check.
+ *
+ * - `'transaction'` (default): the transaction and the hash of every operation it produced — the
+ *   session-mode shape. A member with a transaction validator re-executes the statements and
+ *   compares hashes; the aged retry priority rides inside the transaction.
+ * - `'none'`: bare transforms, exactly the shape a single-collection `Collection.sync` pend has.
+ *   For a commit that has no statements to re-execute — the Quereus adapter's legacy multi-tree
+ *   commit, whose rows were staged directly into the trees — a validating member would otherwise
+ *   refuse the pend as a validator fault. The aged priority then rides on the pend itself
+ *   (`PendRequest.priority`), which is the other carrier a member's race resolution reads, so a
+ *   repeatedly-losing commit still ages. Members configured `unvalidatablePendPolicy: 'reject'`
+ *   refuse these pends, as they refuse every unvalidatable pend.
+ */
+export type PendValidationMode = 'transaction' | 'none';
+
+export interface CoordinatorOptions {
+	/** See {@link PendValidationMode}. Default `'transaction'`. */
+	pendValidation?: PendValidationMode;
+}
+
+/**
  * Coordinates multi-collection transactions.
  *
  * This is the ONLY interface for all mutations (single or multi-collection).
@@ -120,10 +141,35 @@ export class TransactionCoordinator {
 		preSnapshot: Map<Collection<any>, CollectionSnapshot<any>>;
 	}>();
 
+	/** See {@link PendValidationMode}; fixed for the coordinator's lifetime, so every pend it
+	 * sends has one shape. */
+	private readonly pendValidation: PendValidationMode;
+
 	constructor(
 		private readonly transactor: ITransactor,
-		private readonly collections: Map<CollectionId, Collection<any>>
-	) {}
+		private readonly collections: Map<CollectionId, Collection<any>>,
+		options: CoordinatorOptions = {}
+	) {
+		this.pendValidation = options.pendValidation ?? 'transaction';
+	}
+
+	/**
+	 * The validation pair every pend of this attempt carries, or `undefined` when this coordinator
+	 * sends unvalidated pends (see {@link PendValidationMode}). Built once per attempt, AFTER the
+	 * log append: the hash covers ALL operations across ALL collections, which a validator
+	 * recomputes from its own re-execution and compares. The shared operations-hash module
+	 * canonicalises (sort + canonical JSON), so the fingerprint is order-independent. Skipped
+	 * entirely — not computed and discarded — when no pend will carry it.
+	 */
+	private async pendValidationFor(
+		transaction: Transaction,
+		collectionTransforms: Map<CollectionId, Transforms>
+	): Promise<PendRequest['validation']> {
+		if (this.pendValidation === 'none') {
+			return undefined;
+		}
+		return { transaction, operationsHash: await hashOperations(collectOperations(collectionTransforms)) };
+	}
 
 	/**
 	 * Apply actions to collections (called by engines during statement execution).
@@ -449,20 +495,24 @@ export class TransactionCoordinator {
 		return refused;
 	}
 
-	/** Every registered collection whose tracker holds staged (un-synced) changes — the participants
-	 * an attempt starting now would commit. */
+	/** Every registered collection with something to push — the participants an attempt starting
+	 * now would commit. The predicate is {@link Collection.hasUnsyncedChanges}, the one
+	 * `Collection.sync` loops on: staged actions OR uncommitted tracker transforms. Not the
+	 * transforms alone: an action can be staged and have changed no block — a delete of an index
+	 * entry this instance's stale view never held (the shape `blind-index-delete-is-logged-but-
+	 * never-applied` fixed for the single-collection path) — and such a collection MUST still take
+	 * part. Its stale pend is refused, and the refresh between attempts replays the action against
+	 * the adopted revision, where it finds the entry and produces the delete the retry commits.
+	 * Filtering on transforms dropped it from the batch entirely, so the row went and its index
+	 * entry stayed behind, on every node. */
 	private stagedCollections(): { collectionId: CollectionId; collection: Collection<any>; transforms: Transforms }[] {
 		return Array.from(this.collections.entries())
+			.filter(([, collection]) => collection.hasUnsyncedChanges())
 			.map(([collectionId, collection]) => ({
 				collectionId,
 				collection,
 				transforms: collection.tracker.transforms
-			}))
-			.filter(({ transforms }) =>
-				Object.keys(transforms.inserts ?? {}).length +
-				Object.keys(transforms.updates ?? {}).length +
-				(transforms.deletes?.length ?? 0) > 0
-			);
+			}));
 	}
 
 	/**
@@ -657,16 +707,13 @@ export class TransactionCoordinator {
 				pendedRevs.set(collectionId, applyResult.rev!);
 			}
 
-			// Compute hash of ALL operations across ALL collections (post-log-append).
-			// Validators re-execute the transaction and compare their computed hash.
-			// The shared operations-hash module canonicalises (sort + canonical JSON) so
-			// this order-independent fingerprint matches what a validator recomputes.
-			const operationsHash = await hashOperations(collectOperations(collectionTransforms));
+			// What each pend carries for members to re-check (post-log-append) — see pendValidationFor.
+			const validation = await this.pendValidationFor(transaction, collectionTransforms);
 
 			// Execute consensus phases (GATHER, PEND, COMMIT)
 			coordResult = await this.coordinateTransaction(
 				transaction,
-				operationsHash,
+				validation,
 				collectionTransforms,
 				criticalBlocks,
 				pendedRevs
@@ -1075,8 +1122,8 @@ export class TransactionCoordinator {
 				pendedRevs.set(collectionId, applyResult.rev!);
 			}
 
-			// 3. Compute operations hash for validation (order-independent; see commit()).
-			const operationsHash = await hashOperations(collectOperations(collectionTransforms));
+			// 3. What each pend carries for members to re-check (see pendValidationFor).
+			const validation = await this.pendValidationFor(transaction, collectionTransforms);
 
 			const applyMs = Date.now() - tApply;
 
@@ -1084,7 +1131,7 @@ export class TransactionCoordinator {
 			const tCoord = Date.now();
 			const coordResult = await this.coordinateTransaction(
 				transaction,
-				operationsHash,
+				validation,
 				collectionTransforms,
 				criticalBlocks,
 				pendedRevs
@@ -1268,7 +1315,8 @@ export class TransactionCoordinator {
 	 * Coordinate a transaction across multiple collections.
 	 *
 	 * @param transaction - The transaction to coordinate
-	 * @param operationsHash - Hash of all operations for validation
+	 * @param validation - What every pend carries for members to re-check, or undefined for an
+	 * unvalidated pend (see {@link pendValidationFor})
 	 * @param collectionTransforms - Map of collectionId to its transforms
 	 * @param criticalBlocks - Map of collectionId to its log tail blockId
 	 * @param pendedRevs - Per collection, the revision its log entry was stamped with (from
@@ -1277,7 +1325,7 @@ export class TransactionCoordinator {
 	 */
 	private async coordinateTransaction(
 		transaction: Transaction,
-		operationsHash: string,
+		validation: PendRequest['validation'],
 		collectionTransforms: Map<CollectionId, Transforms>,
 		criticalBlocks: Map<CollectionId, BlockId>,
 		pendedRevs: ReadonlyMap<CollectionId, number>
@@ -1303,7 +1351,7 @@ export class TransactionCoordinator {
 		const tPend = Date.now();
 		const pendResult = await this.pendPhase(
 			transaction,
-			operationsHash,
+			validation,
 			collectionTransforms,
 			pendedRevs,
 			superclusterNominees
@@ -1396,8 +1444,10 @@ export class TransactionCoordinator {
 	/**
 	 * PEND phase: Distribute transaction to all affected block clusters.
 	 *
-	 * @param transaction - The full transaction for replay/validation
-	 * @param operationsHash - Hash of all operations for validation
+	 * @param transaction - The transaction being pended (its id names the action; its aged
+	 * priority rides on an unvalidated pend)
+	 * @param validation - What every pend carries for members to re-check, or undefined for an
+	 * unvalidated pend (see {@link pendValidationFor})
 	 * @param collectionTransforms - Map of collectionId to its transforms
 	 * @param pendedRevs - Per collection, the revision its log entry was stamped with — the pend
 	 * request repeats it verbatim rather than recomputing from the collection (a recompute after
@@ -1406,7 +1456,7 @@ export class TransactionCoordinator {
 	 */
 	private async pendPhase(
 		transaction: Transaction,
-		operationsHash: string,
+		validation: PendRequest['validation'],
 		collectionTransforms: ReadonlyMap<CollectionId, Transforms>,
 		pendedRevs: ReadonlyMap<CollectionId, number>,
 		superclusterNominees: ReadonlySet<PeerId> | null
@@ -1425,7 +1475,7 @@ export class TransactionCoordinator {
 		// with a concurrency limiter so peak in-flight round-trips stays sane. Same for commitPhase.
 		const outcomes = await Promise.allSettled(
 			Array.from(collectionTransforms.entries()).map(([collectionId, transforms]) =>
-				this.pendCollection(transaction, operationsHash, collectionId, transforms, pendedRevs.get(collectionId)!, actionId, nominees)
+				this.pendCollection(transaction, validation, collectionId, transforms, pendedRevs.get(collectionId)!, actionId, nominees)
 			)
 		);
 
@@ -1471,7 +1521,7 @@ export class TransactionCoordinator {
 	 */
 	private async pendCollection(
 		transaction: Transaction,
-		operationsHash: string,
+		validation: PendRequest['validation'],
 		collectionId: CollectionId,
 		transforms: Transforms,
 		/** The revision the log entry was stamped with (threaded from applyActionsToCollection),
@@ -1486,14 +1536,23 @@ export class TransactionCoordinator {
 			throw new Error(`Collection not found: ${collectionId}`);
 		}
 
-		// Create pend request with the validation payload (transaction + operations hash) —
-		// always BOTH, as one pair: this is the only producer of PendRequest.validation.
+		// Create the pend request. This is the only producer of PendRequest.validation, and it
+		// always sends the pair whole (transaction + operations hash) or not at all. The aged
+		// priority has one carrier per shape — inside the transaction when the pend carries it,
+		// on the pend itself when it does not — because a member's race resolution reads the
+		// transaction's priority first and falls back to the pend's (recordPriority in db-p2p's
+		// race-resolution.ts); an unvalidated pend that left both empty would never age. Omitted
+		// at 0, exactly as the single-collection path sends it (TransactorSource.transact), so
+		// the common first-attempt pend is indistinguishable from a Collection.sync pend.
+		const priority = clampPriority(transaction.priority);
 		const pendRequest: PendRequest = {
 			actionId,
 			rev,
 			transforms,
 			policy: 'r', // Return policy: fail but return pending actions
-			validation: { transaction, operationsHash },
+			...(validation === undefined
+				? (priority > 0 ? { priority } : {})
+				: { validation }),
 			superclusterNominees: nominees
 		};
 

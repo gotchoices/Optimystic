@@ -34,11 +34,14 @@ export type PendRequest = ActionTransforms & {
 	 * 'r' is return, which fails but returns the pending ActionIds and their transforms */
 	policy: 'c' | 'f' | 'r';
 	/**
-	 * Present only on the multi-collection path (`TransactionCoordinator.pendCollection`): the
-	 * transaction to re-execute plus the hash of ALL operations across all blocks it must produce.
-	 * Absent on the single-collection `Collection.sync` path, which carries bare transforms and is
-	 * therefore not re-checkable — see `ClusterConsensusConfig.unvalidatablePendPolicy` for what a
-	 * validating receiver does with that shape. ONE optional pair, deliberately: "transaction
+	 * Present only on a validated multi-collection pend (`TransactionCoordinator.pendCollection`
+	 * under its default `pendValidation: 'transaction'`): the transaction to re-execute plus the
+	 * hash of ALL operations across all blocks it must produce. Absent on every pend that carries
+	 * bare transforms and is therefore not re-checkable — the single-collection `Collection.sync`
+	 * path, and a coordinator built with `pendValidation: 'none'` (the Quereus adapter's legacy
+	 * multi-tree commit, which has no statements to re-execute) — see
+	 * `ClusterConsensusConfig.unvalidatablePendPolicy` for what a validating receiver does with
+	 * that shape. ONE optional pair, deliberately: "transaction
 	 * without its hash" (or the reverse) was a state the old two independent optional fields
 	 * permitted and no producer ever created — and a receiver whose guard required both could be
 	 * talked out of validating by a sender that omitted one.
@@ -52,10 +55,11 @@ export type PendRequest = ActionTransforms & {
 	/** For multi-collection transactions: supercluster nominees for consensus */
 	superclusterNominees?: PeerId[];
 	/**
-	 * Aged, advisory retry priority for the *single-collection* pend path (default 0 when absent).
-	 * The multi-collection path instead carries priority on the transaction inside
+	 * Aged, advisory retry priority for a pend that carries no transaction (default 0 when absent).
+	 * A validated multi-collection pend instead carries priority on the transaction inside
 	 * {@link PendRequest.validation} ({@link Transaction.priority}); this top-level field is the
-	 * carrier for a `Collection.sync` pend, which has no transaction. A cluster member reads whichever is present as the first
+	 * carrier for every pend without one — a `Collection.sync` pend, and an unvalidated
+	 * coordinator pend (`pendValidation: 'none'`). A cluster member reads whichever is present as the first
 	 * `resolveRace` tiebreak. FAIRNESS-ONLY: it rides inside the signed cluster `message` (so it is
 	 * integrity-protected in transit) but MUST NOT affect the operations hash, stale-read checks, or
 	 * validity — a stale pend is still rejected regardless of priority.

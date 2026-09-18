@@ -10,7 +10,7 @@
  * parks at the ENTRY of a registered `VirtualTableConnection.commit`, i.e. before
  * this plugin's publish window begins. This gate parks INSIDE it — at the
  * transactor calls the publish actually makes — so a stall can be placed
- * mid-publish (e.g. between tree 2 and tree 3 of the legacy multi-tree sweep).
+ * mid-publish (e.g. after one tree's commit has landed and before its sibling's).
  *
  * Usage:
  *   const gate = new CommitGate();
@@ -112,11 +112,11 @@ export class CommitGate {
 export interface GateTransactorOptions {
 	/** Which commit-side calls the gate covers. Default `'both'` (pend AND commit park).
 	 * `'commit'` lets pends through, parking only the final commit call — useful for
-	 * counting one gated call per tree in the legacy sweep. */
+	 * counting one gated call per tree of a multi-tree commit. */
 	gateOn?: 'pend' | 'commit' | 'both';
 	/** Number of gated calls (of the covered kind, while armed) to let THROUGH before
 	 * parking — places the stall mid-publish (e.g. `skipCalls: 1` with `gateOn:
-	 * 'commit'` lets tree 1 of a legacy sweep flush and parks tree 2). Default 0. */
+	 * 'commit'` lets the first tree's commit land and parks the second's). Default 0. */
 	skipCalls?: number;
 }
 

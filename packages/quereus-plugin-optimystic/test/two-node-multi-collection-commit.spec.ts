@@ -7,9 +7,10 @@
  * that a single Tree over two nodes converges on both the mock mesh and real sockets.
  * What none of those tests covered is the plugin's own commit path: one SQL statement
  * dirties the DATA tree, its UNIQUE-index sub-collection AND the plugin-global schema
- * catalog, and `TransactionBridge.commitDirtyTreesLegacy` flushes each with its own
- * independent pend+commit. Sereus's stack lands exactly there, and its three reported
- * stale-revision signatures name exactly those three collection kinds:
+ * catalog, and `TransactionBridge.commitDirtyTreesLegacy` pushes the dirty trees — as
+ * one pended batch when several have something to push. Sereus's stack lands exactly
+ * there, and its three reported stale-revision signatures name exactly those three
+ * collection kinds:
  *
  *   optimystic/schema                 at rev 1, requested rev 1
  *   default/Member/index/_uniq_1      at rev 2, requested rev 1
@@ -107,9 +108,10 @@ describe('Two-node multi-collection legacy commit (data tree + unique index + sc
 	});
 
 	it('a multi-statement transaction on B flushes all dirty trees after A advanced them', async () => {
-		// One commit, three trees: `commitDirtyTreesLegacy` sweeps data tree, unique-index
-		// sub-collection and (if dirtied) the schema catalog in sequence. A split here
-		// surfaces as PartialCommitError rather than a stale-revision exhaustion.
+		// One commit, several trees: `commitDirtyTreesLegacy` pends the data tree and the
+		// unique-index sub-collection as one batch and commits both only once both pends
+		// are accepted. A split here surfaces as CoordinatorPartialCommitError rather than
+		// a stale-revision exhaustion.
 		const dbA = createDb(transactorFor(0));
 		const dbB = createDb(transactorFor(1));
 

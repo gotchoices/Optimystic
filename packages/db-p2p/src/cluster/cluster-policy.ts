@@ -150,7 +150,8 @@ export interface ClusterPolicyOptions {
 		repairCorroborationClusterSize?: number;
 		/**
 		 * What a validator-configured member does with a pend that carries no `validation` payload
-		 * (nothing to re-execute — the single-collection `Collection.sync` shape). Default 'accept';
+		 * (nothing to re-execute — a single-collection `Collection.sync` pend, or the Quereus
+		 * adapter's legacy multi-tree commit, which pends through an unvalidated coordinator). Default 'accept';
 		 * see {@link UnvalidatablePendPolicy}.
 		 */
 		unvalidatablePendPolicy?: UnvalidatablePendPolicy;

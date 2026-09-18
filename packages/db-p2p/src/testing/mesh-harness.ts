@@ -86,7 +86,8 @@ export interface MeshOptions {
 	 *
 	 * A mesh that arms validators can also set `clusterPolicy.unvalidatablePendPolicy: 'reject'` to
 	 * refuse pends that carry no `validation` payload (the single-collection `Collection.sync`
-	 * shape, which a validator cannot re-check); the default 'accept' admits them unchecked.
+	 * shape, and the Quereus adapter's legacy multi-tree commit — neither can be re-checked); the
+	 * default 'accept' admits them unchecked.
 	 */
 	validatorFactory?: (index: number, peerId: PeerId) => ITransactionValidator;
 	/**

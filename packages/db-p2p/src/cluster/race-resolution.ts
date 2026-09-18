@@ -98,9 +98,11 @@ export function resolveRace(existing: ClusterRecord, incoming: ClusterRecord): '
 
 /**
  * Aged advisory priority carried by a record's pend operation, clamped to [0, MaxPriority].
- * The multi-collection path carries it on `pend.validation.transaction.priority`; the single-collection
- * (`Collection.sync`) path carries it as top-level `pend.priority`; a record with neither — a
- * legacy/unversioned coordinator's transaction, or a non-pend operation — is priority 0
+ * A validated multi-collection pend carries it on `pend.validation.transaction.priority`; a pend
+ * without a transaction — the single-collection (`Collection.sync`) path, and a coordinator built
+ * with `pendValidation: 'none'` (the Quereus adapter's legacy multi-tree commit) — carries it as
+ * top-level `pend.priority`; a record with neither — an unversioned coordinator's transaction, or a
+ * non-pend operation — is priority 0
  * (backward compatible: such transactions simply never age). Both carriers live inside the signed
  * `message`, so priority is integrity-protected in transit; clamping here bounds a self-asserted
  * out-of-range value to the cap.

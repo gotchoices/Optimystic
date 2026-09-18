@@ -276,9 +276,12 @@ optimystic:quereus-plugin:module index:tree-open table=Usage index=by_token uri=
 
 Reading `commit:collections` — one line per commit, emitted **before** the flush:
 
-- `mode=legacy` is the direct per-tree sync sweep (no coordinator wired). Its set is the **dirty
-  set**: a tree lands there only once DML staged into it, so an index collection *absent from the
-  line* means the index was never staged into.
+- `mode=legacy` is the no-coordinator mode. Its set is the **dirty set**: a tree lands there only
+  once DML staged into it, so an index collection *absent from the line* means the index was never
+  staged into. How the set is pushed depends on how many of its trees are `=staged`: one is
+  flushed with its own `sync()`; two or more are pended as one batch through a per-commit
+  coordinator and committed only once every pend was accepted (see
+  [transactions.md](transactions.md), "Legacy (single-node) commit").
 - `mode=session` is the distributed-consensus path. Its set is the **whole live collection
   registry**, because the coordinator commits by iterating its own collection map — so an index
   collection being *listed* does not by itself mean this write touched it; `=staged` is what says

@@ -168,19 +168,20 @@ describe('Concurrent same-VALUE refusal on a secondary UNIQUE column (two handle
 				.join(' | ');
 			expect(fulfilled.length, `exactly one writer wins (${outcomes})`).to.equal(1);
 			const message = rejected[0]!.reason instanceof Error ? rejected[0]!.reason.message : String(rejected[0]!.reason);
-			// The refusal names the UNIQUE COLUMN. In a true race the rival can commit
-			// AFTER the loser's legacy pre-flight refresh but before its index-tree flush;
-			// LEGACY commit is not durably atomic across trees, so that surfaces as a loud
-			// PartialCommitError (`not atomic`) whose underlying failure is the mapped UNIQUE
-			// message — never a silent double-commit. (The pre-flight makes the
-			// rival-already-committed shape clean; the DETERMINISTIC test above pins that. The
-			// residual race window is owned by backlog `feat-optimystic-legacy-commit-two-phase`.)
+			// The refusal is the plain UNIQUE-column message of a clean rollback. Both of the
+			// loser's trees (main table and unique index) are pended before either is
+			// committed, so the rival's win is met at pend — or at the refresh before the
+			// retry, where the index-tree replay refuses the value — while nothing of the
+			// loser's is durable. Never a torn commit (`not atomic`), never two rows.
 			expect(message, `the loser is refused naming T.v (${outcomes})`).to.match(UNIQUE_T_V);
+			expect(message.toLowerCase(), `no partial-commit signal (${outcomes})`).to.not.contain('not atomic');
 
-			// The enforced invariant that holds regardless of a torn base row: the winner's
-			// value is durably present in the UNIQUE index, so a fresh insert of it is refused
-			// on BOTH handles. This is the guarantee the constraint exists to make.
+			// Exactly one row holds the value, on BOTH handles, and a fresh insert of it is
+			// refused on both. This is the guarantee the constraint exists to make.
+			const winnerId = results[0]!.status === 'fulfilled' ? 1 : 2;
 			for (const db of [a, b]) {
+				expect(await selectCount(db, 'select count(*) as c from T'), 'exactly one row survives the race').to.equal(1);
+				expect(await selectScalar(db, `select id from T where v = 'x'`)).to.equal(winnerId);
 				const dup = await captureThrowMessage(() => db.exec(`insert into T (id, v) values (9, 'x')`));
 				expect(dup, 'the value stays enforced-present after the race').to.match(UNIQUE_T_V);
 			}

@@ -38,8 +38,9 @@ export type PendValidationEvent =
  *
  * Two decisions live here:
  *
- * - **No `validation` pair** (the single-collection `Collection.sync` shape — bare transforms, so
- *   there is nothing to re-execute): an explicit, LOGGED policy branch on both arms, never a silent
+ * - **No `validation` pair** (bare transforms, so there is nothing to re-execute: the
+ *   single-collection `Collection.sync` shape, and the Quereus adapter's legacy multi-tree commit,
+ *   whose coordinator is built with `pendValidation: 'none'`): an explicit, LOGGED policy branch on both arms, never a silent
  *   fall-through. `'accept'` admits it unchecked, preserving the historical behaviour; `'reject'`
  *   refuses with {@link PEND_NOT_VALIDATABLE}. The presence test is on the whole pair, so a sender
  *   cannot talk a receiver out of validating by omitting half of it.

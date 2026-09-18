@@ -286,21 +286,19 @@ describe('Concurrent same-key INSERT refusal (two handles, one FileRawStorage di
 		}
 	});
 
-	it('LEGACY mode, two-table transaction, DETERMINISTIC refusal: the commit-sweep pre-flight rolls back cleanly, nothing torn', async () => {
+	it('LEGACY mode, two-table transaction, DETERMINISTIC refusal: the pended batch rolls back cleanly, nothing torn', async () => {
 		// The clean table stages FIRST and the colliding table SECOND. A rival then commits
 		// the colliding key BEFORE this transaction commits (deterministic — no race).
 		//
-		// Before the secondary-unique work added it, the legacy sweep flushed U (durably
-		// committing it) and only THEN hit T's refusal — a mid-sweep split reported as a
-		// PartialCommitError. commitDirtyTreesLegacy now PRE-FLIGHTS every staged tree
-		// (`tree.update()`) before flushing any, so a refusal whose rival already committed
-		// surfaces before U reaches storage: nothing is torn, the whole transaction rolls
-		// back cleanly, and the client sees the bare mapped UNIQUE message. This is the
-		// deterministic shape moving from the honest-tear exit to the clean-rollback exit.
-		// (The genuine mid-sweep PartialCommitError — a flush that fails AFTER an earlier tree
-		// durably committed — is still covered by an injected commit failure in
-		// legacy-commit-atomicity.spec.ts; the pre-flight narrows, but cannot close, that
-		// window for a rival that lands between the pre-flight and a tree's own flush.)
+		// Before the legacy multi-tree commit became one pended batch, the per-tree sweep
+		// flushed U (durably committing it) and only THEN hit T's refusal — a mid-sweep
+		// split reported as a PartialCommitError. Now both trees are pended before either
+		// is committed: T's stale pend is refused, the refresh before the retry replays T's
+		// insert against the rival's commit and the key guard refuses it, and the whole
+		// transaction rolls back with nothing durable — the client sees the bare mapped
+		// UNIQUE message. (The residual — a commit that fails permanently AFTER every pend
+		// succeeded — is covered by an injected commit failure in
+		// legacy-commit-atomicity.spec.ts.)
 		const uriT = 'tree://race/partial-t';
 		const uriU = 'tree://race/partial-u';
 		const { db: a, plugin: pluginA } = createDb(dir);

@@ -101,3 +101,7 @@ What to assert, on the same harness (a real `TransactionCoordinator` built from 
 
 Merged from `debt-bridge-partial-commit-branch-test` (Arm A) and
 `debt-session-mode-bridge-statement-recording-test` (Arm B) during backlog gardening.
+
+## Arm A note, 2026-09-17 — the branch is now exercised, from the legacy side
+
+`implement/legacy-multi-tree-commit-pends-everything-before-committing-anything` routes every legacy commit with more than one tree to push through a per-commit `TransactionCoordinator`, so `commitTransaction`'s `CoordinatorPartialCommitError` branch is now reached in default mode too. `packages/quereus-plugin-optimystic/test/legacy-commit-atomicity.spec.ts` drives a real commit-phase split through the vtab (a persistent injected commit failure on the index tree, `test/selective-failure-transactor.ts`) and asserts the error class and its committed/failed sets, that the committed tree keeps its rows, and that the bridge tears down without restoring them; `committed-read-isolation.spec.ts` asserts the degraded latch on the same path. What Arm A still lacks is the SESSION-mode drive of that branch (the `session === null` difference: legacy restores the failed trees' pre-transaction snapshots before rethrowing, session mode does not), and Arm B is untouched.
