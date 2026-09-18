@@ -6,6 +6,13 @@ repro: static
 severity: corruption
 likelihood: unusual
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-09-18T10:33:54.101Z (agent: claude)
+  Log file: C:\projects\optimystic-next\tickets\.logs\2-bug-a-pended-transform-does-not-carry-its-base.implement.2026-09-18T10-33-54-100Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 
 # A pend carries, and storage keeps, the version each block's change was computed against
 
