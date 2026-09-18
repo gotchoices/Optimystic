@@ -11,9 +11,9 @@ import { Database, TEXT_TYPE } from '@quereus/quereus';
 // Independently resolve the installed @quereus/quereus version WITHOUT reading
 // its blocked './package.json' subpath. Reading that via require throws
 // ERR_PACKAGE_PATH_NOT_EXPORTED — even under the ts-node/esm loader, because
-// createRequire still enforces "exports" encapsulation. Mirror the module's
-// supported path: resolve the ESM entry, then walk up to the package's own
-// package.json (see quereus-engine.ts resolveQuereusVersion).
+// createRequire still enforces "exports" encapsulation. Mirror the build script's
+// path: resolve the ESM entry, then walk up to the package's own package.json
+// (see installedQuereusVersion in scripts/write-quereus-version.mjs).
 function installedQuereusVersion(): string {
 	let dir = dirname(fileURLToPath(import.meta.resolve('@quereus/quereus')));
 	for (let i = 0; i < 6; i++) {
@@ -68,9 +68,13 @@ describe('QuereusEngine', () => {
 			expect(QUEREUS_ENGINE_ID).to.match(/^quereus@\d+\.\d+\.\d+$/);
 		});
 
+		// The id is fixed at build time (scripts/write-quereus-version.mjs), so this is what
+		// catches a Quereus bump that was never followed by a build.
 		it('should match the installed @quereus/quereus version', () => {
 			const version = installedQuereusVersion();
-			expect(QUEREUS_ENGINE_ID).to.equal(`quereus@${version}`);
+			expect(QUEREUS_ENGINE_ID, 'the engine id was built against a different @quereus/quereus than is installed; '
+				+ 'run `yarn workspace @optimystic/quereus-plugin-optimystic build`, which regenerates '
+				+ 'src/transaction/quereus-version.ts and dist').to.equal(`quereus@${version}`);
 		});
 	});
 

@@ -181,7 +181,7 @@ Additionally, the self-coordination guard detects network shrinkage exceeding 50
 A transaction is defined by *(stamp, statements, parameters, readDependencies)*. The transaction hash is SHA-256(stamp.id, statements, readDependencies).
 
 Validators verify:
-1. **Engine ID match** — both validators use the same execution engine version.
+1. **Engine ID match** — the transaction names an execution engine the validator has registered. For Quereus the id (`QUEREUS_ENGINE_ID`) names the Quereus version the plugin build was compiled against, not the version installed at runtime, so it is a first gate, not proof that both validators run the same Quereus. A runtime Quereus that executes differently is caught by step 5.
 2. **Schema hash match** — both validators have identical schema (tables, columns, indexes, constraints, collations). The schema hash is SHA-256 of the sorted (type, name, DDL) tuples.
 3. **Read dependency match** — each block in the read set is at the expected revision. This ensures identical base state.
 4. **Re-execution** — the validator re-executes the SQL statements in order against the verified base state. By the deterministic execution assumption (§1.4), this produces identical operations.

@@ -7,39 +7,22 @@ import type {
 	TransactionCoordinator
 } from '@optimystic/db-core';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { QUEREUS_VERSION } from './quereus-version.js';
 
 /**
- * Resolve the installed @quereus/quereus version at runtime.
+ * Names the Quereus version this plugin was *built* against, not the one installed at runtime.
  *
- * We must NOT read '@quereus/quereus/package.json' directly: the package's
- * "exports" map defines no './package.json' subpath, so reading it throws
- * ERR_PACKAGE_PATH_NOT_EXPORTED under plain Node ESM — which used to take down
- * this whole module at load. It also defines only the "import" condition (no
- * "require"), so CJS createRequire cannot resolve it at all.
+ * Every node must derive this the same way, because a validator refuses a transaction stamped with
+ * an id it has not registered. Looking the version up at load would need `node:fs` and
+ * `import.meta`, which a browser or Hermes build of this module cannot have, so the value is written
+ * into `quereus-version.ts` by `scripts/write-quereus-version.mjs` on every build instead. A runtime
+ * Quereus that differs from it still cannot slip past validation: re-execution then yields a
+ * different operations hash (docs/correctness.md, Theorem 4).
  *
- * Instead resolve the package entry via ESM (import.meta.resolve honors the
- * "import" condition, sync + stable since Node 20.6), then walk up from the
- * resolved file to find the package's own package.json. Guard on pkg.name so a
- * stray inner package.json (e.g. a dist/ marker) can't yield the wrong version.
+ * NOTE: if `@quereus/quereus` ever exports its own version, read it from there instead — that is
+ * portable and names the Quereus actually running.
  */
-function resolveQuereusVersion(): string {
-	const entryUrl = import.meta.resolve('@quereus/quereus');
-	let dir = dirname(fileURLToPath(entryUrl));
-	for (let i = 0; i < 6; i++) {
-		try {
-			const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { name?: string; version?: string };
-			if (pkg.name === '@quereus/quereus' && pkg.version) return pkg.version;
-		} catch { /* keep walking up */ }
-		dir = dirname(dir);
-	}
-	throw new Error('Could not resolve @quereus/quereus version');
-}
-
-// Engine ID derived from the installed @quereus/quereus version at runtime.
-export const QUEREUS_ENGINE_ID = `quereus@${resolveQuereusVersion()}`;
+export const QUEREUS_ENGINE_ID = `quereus@${QUEREUS_VERSION}`;
 
 /**
  * Statement format for Quereus transactions.

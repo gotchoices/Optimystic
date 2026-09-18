@@ -170,6 +170,10 @@ const validator = createQuereusValidator({ db, coordinator });
 
 `createQuereusStatement()` and `createQuereusStatements()` are helpers for building the JSON statement format used in transaction records.
 
+`QUEREUS_ENGINE_ID` is `quereus@<version>`, where the version is the `@quereus/quereus` this plugin was **built** against, not the one installed at runtime. The build writes it into `src/transaction/quereus-version.ts`. A validator refuses a transaction stamped with an engine id it has not registered (`Unknown engine: …`), so two plugin builds compiled against different Quereus versions refuse each other's session-mode writes, even when both nodes now run the same Quereus. Nodes running the same plugin build agree on the id whatever Quereus they have installed within the peer range; if two such Quereus versions execute a statement differently, validation refuses it on the operations hash instead (see [docs/correctness.md](../../docs/correctness.md) § Theorem 4).
+
+Because the id is fixed at build time, the root entry reads nothing from disk when it loads: it is safe to import in a browser or React Native build. `test/browser-bundle.spec.ts` keeps it that way.
+
 ### Schema hash: keep it warm out of band (session mode)
 
 `configureTransactionMode()` takes a `schemaHashProvider` that `beginTransaction`
@@ -310,6 +314,15 @@ try {
 A value thrown that is not an `Error` reaches `cause` unchanged. Message text is unaffected
 by this — anything matching on `.message` keeps working.
 
+`PartialCommitError` (a legacy multi-tree commit that durably persisted some trees before it
+failed) is exported from the root entry, which imports on every platform, browser and React
+Native builds included. Import the class and use `instanceof` rather than matching its `name`
+string:
+
+```typescript
+import { PartialCommitError } from '@optimystic/quereus-plugin-optimystic';
+```
+
 ## Limitations
 
 - Primary keys are stored as strings; non-TEXT keys work correctly but are not order-optimised (the engine re-sorts them rather than reading them ordered from the tree)
@@ -333,7 +346,7 @@ by this — anything matching on `.message` keeps working.
 ## Development
 
 ```bash
-npm run build        # Build with tsup
+npm run build        # Write src/transaction/quereus-version.ts, then build with tsup
 npm run typecheck    # Type check
 npm test             # Run tests (mocha, node)
 ```

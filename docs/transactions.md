@@ -1035,9 +1035,10 @@ The Quereus-specific transaction engine:
 
 ```typescript
 // In quereus-plugin-optimystic/src/transaction/quereus-engine.ts
-// Derived at module load from the installed @quereus/quereus version (not a
-// hardcoded constant), so the ID always tracks the package actually running.
-export const QUEREUS_ENGINE_ID = `quereus@${resolveQuereusVersion()}`;
+// The Quereus version the plugin was built against, written into
+// quereus-version.ts by scripts/write-quereus-version.mjs on every build (a
+// runtime lookup would need node:fs, which browsers and React Native lack).
+export const QUEREUS_ENGINE_ID = `quereus@${QUEREUS_VERSION}`;
 
 // The QuereusEngine wraps a Quereus database instance and coordinator
 export class QuereusEngine implements ITransactionEngine {

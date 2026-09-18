@@ -22,12 +22,12 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsup",
-    "dev": "tsup --watch",
+    "build": "node scripts/write-quereus-version.mjs && tsup",
+    "dev": "node scripts/write-quereus-version.mjs && tsup --watch",
     "clean": "rimraf dist",
     "typecheck": "tsc --noEmit",
     "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min --exit && npm run test:smoke",
-    "test:smoke": "node --input-type=module -e \"import('./dist/index.js').then(m=>{if(!/^quereus@\\d+\\.\\d+\\.\\d+$/.test(m.QUEREUS_ENGINE_ID)){console.error('bad id',m.QUEREUS_ENGINE_ID);process.exit(1)}console.log('smoke ok',m.QUEREUS_ENGINE_ID)}).catch(e=>{console.error('THROW',e.code||e.message);process.exit(1)})\"",
+    "test:smoke": "node scripts/smoke.mjs",
     "test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec --exit",
     "test:integration": "OPTIMYSTIC_INTEGRATION=1 npm test",
     "quoomb": "npm run build && quoomb --config examples/quoomb.config.local.json",
@@ -45,6 +45,7 @@
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.2.0",
     "chai": "^6.2.2",
+    "esbuild": "^0.27.0",
     "mocha": "^11.7.5",
     "rimraf": "^6.1.2",
     "ts-node": "^10.9.2",
