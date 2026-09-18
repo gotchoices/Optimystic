@@ -72,3 +72,7 @@ The defect was reproduced before the fix: with the stored-base comparison neuter
 - The pend-batching tests needed single-member clusters (`MappedKeyNetwork(true)`), because the pend path batches by greedy set cover over `findCluster` and the shared routes put every block on one peer. The commit tests are unaffected. Worth a second look at whether the routes chosen exercise a genuine split on retry (peer-B throws once; b1 lands on C and b3 on A, asserted).
 - A record with a base but no slot (a rev-less pend that names a base) is representable in the metadata; no producer sends one, and the sweep still reasons from slots alone, so such a base entry lives until the record is deleted. Harmless; noted so nobody reads the two maps as always co-keyed.
 - No pre-existing test failures were seen in any suite.
+
+## Review note from the garden check-in (2026-09-18 ~08:20)
+
+This branch lands after the release cut from `6d43b9f4`, which has no `pendingBases` and no `baseRevs`. Please confirm, with a test if none exists, that block metadata and pending records written by `6d43b9f4`'s code still read and promote correctly under this change. Records with no stored base must fall back to the commit's declaration exactly as the plan intends, and must never be refused, or declined forever, merely for lacking a base. A node upgraded from the release would otherwise wedge on its own leftover pending records.
