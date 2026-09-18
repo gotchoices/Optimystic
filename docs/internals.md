@@ -365,11 +365,11 @@ Three further properties hold for that path:
   `CollectionSnapshot` records the committed boundary (`context`) it was captured on
   (i.e. at `TransactionBridge.markDirty`, before the first stage), and `Tree.readView`
   pins the view to that boundary — excluding newer-revision entries from the warm cache
-  seed. So while the legacy tree-by-tree commit sweep is mid-publish (main table
-  flushed and its revision advanced; index still unflushed), a committed read of both
-  trees still describes the one pre-transaction boundary. Regression anchor: the
-  "mid-sweep shape" test in `packages/db-core/test/read-view-pinned.spec.ts` and the
-  MID-SWEEP stall test in
+  seed. So while a multi-tree commit is mid-publish (the main table's blocks durable
+  in storage, or — in the legacy per-tree fallback sweep — flushed and its revision
+  advanced; the index still parked), a committed read of both trees still describes
+  the one pre-transaction boundary. Regression anchor: the "mid-sweep shape" test in
+  `packages/db-core/test/read-view-pinned.spec.ts` and the MID-PUBLISH stall test in
   `packages/quereus-plugin-optimystic/test/committed-read-stall.spec.ts`.
 
 `OptimysticModule` declares `concurrencyMode = 'reentrant-reads'`: concurrent

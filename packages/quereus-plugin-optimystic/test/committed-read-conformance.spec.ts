@@ -5,8 +5,8 @@
  *
  * KNOWN BLIND SPOT (upstream documents it too): `installCommitStall` parks at the
  * ENTRY of this plugin's registered `VirtualTableConnection.commit` — BEFORE the
- * publish window (the legacy tree-by-tree sweep, or the session coordinator's
- * fold) begins. A tear INSIDE the publish window is invisible here. The real
+ * publish window (the coordinator's fold — a pended batch in either mode — or the
+ * legacy per-tree fallback sweep) begins. A tear INSIDE the publish window is invisible here. The real
  * cover for that is committed-read-stall.spec.ts, whose gated transactor parks
  * mid-publish. Do not delete that spec in favour of this one.
  *

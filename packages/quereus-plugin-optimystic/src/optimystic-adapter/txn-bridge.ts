@@ -884,8 +884,10 @@ export class TransactionBridge {
    * or `undefined` when this commit takes the per-tree sweep instead. That is the case when:
    * - fewer than two trees have anything to push (a single tree's `sync()` is already
    *   all-or-nothing, and keeping it is what keeps the common write byte-identical);
-   * - a tree is a test double with no collection to hand a coordinator; or
-   * - the collections sit on different transactor instances.
+   * - a tree is a test double with no collection to hand a coordinator;
+   * - the collections sit on different transactor instances; or
+   * - two trees are separate instances over one collection id (two tables declared over
+   *   the same URI in one Database), which one id-keyed batch cannot hold.
    *
    * A tree without `hasUnsyncedChanges` counts as staged: the sweep's `sync()` is a
    * safe no-op for a clean tree, whereas wrongly leaving a staged one out would drop DML.
@@ -910,6 +912,13 @@ export class TransactionBridge {
     }
     const transactor = collections[0]!.transactor;
     if (collections.some(collection => collection.transactor !== transactor)) {
+      return undefined;
+    }
+    // Two instances over ONE collection id would collapse in the coordinator's id-keyed
+    // map, and the dropped instance's staged rows would be skipped by a commit that
+    // reports success (test/legacy-batch-shared-collection-id.spec.ts). The sweep pushes
+    // both: the second instance's sync refreshes onto the first's commit and replays.
+    if (new Set(collections.map(collection => collection.id)).size !== collections.length) {
       return undefined;
     }
     return { collections, transactor };

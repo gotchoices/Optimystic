@@ -55,7 +55,10 @@ This document describes the architecture for multi-collection transactions in Op
 >   naming the persisted and unpersisted trees — remains only for a commit whose trees
 >   cannot share one pend batch: tables declared on different transactor instances in
 >   one SQL transaction (no host does this; a `NOTE:` at `legacyBatch` says what it would
->   take), or test doubles with no collection. A caller catching partial commits by class
+>   take), two tree instances over one collection id (two tables declared over the same
+>   URI in one Database — one id-keyed batch cannot hold both, and would silently drop
+>   one; `test/legacy-batch-shared-collection-id.spec.ts`), or test doubles with no
+>   collection. A caller catching partial commits by class
 >   must handle both `CoordinatorPartialCommitError` and `PartialCommitError`.
 >
 > Log-entry shape: a batched commit's entries carry the participant list and a reads

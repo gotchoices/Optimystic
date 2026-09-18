@@ -155,7 +155,7 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 		expect(carrying!.rev.get(INDEX_COLLECTION_ID), 'the index collection named a revision')
 			.to.match(/^(\d+|none)$/);
 		expect(carrying!.count, 'count= agrees with the ids actually listed').to.equal(carrying!.ids.length);
-		expect(carrying!.mode, 'this harness wires no coordinator, so the commit is the legacy sweep')
+		expect(carrying!.mode, 'this harness wires no coordinator, so the commit is legacy mode')
 			.to.equal('legacy');
 	});
 
