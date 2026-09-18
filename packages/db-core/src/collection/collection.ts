@@ -1133,7 +1133,60 @@ export class Collection<TAction> implements ICollection<TAction> {
 			return true;
 		}
 		const adoptedRev = this.source.actionContext?.rev;
-		return adoptedRev !== undefined && adoptedRev !== priorContext?.rev && this.pending.length > 0;
+		if (adoptedRev !== undefined && adoptedRev !== priorContext?.rev && this.pending.length > 0) {
+			return true;
+		}
+		// Third reason: a staged block's base has MOVED — the read cache no longer describes it at
+		// the revision its operations were computed against (see `Tracker.movedBases`). A refresh
+		// that adopted nothing and found no conflict can still be standing over such a block: a
+		// concurrent read served content the cache then kept at a newer revision, say. Re-staging
+		// is the only repair; declaring the pinned revision on the pend would merely get it refused.
+		return this.pending.length > 0 && this.logMovedBases(this.tracker.movedBases()) > 0;
+	}
+
+	/** Re-judge every staged update's pinned base against the read cache and re-stage the pending
+	 * queue if any has moved. Runs immediately before each pend attempt — {@link syncAttempts} and
+	 * the coordinator's commit span both call it — because that is the last moment before the
+	 * base the pend declares is put on the wire, and nothing between a refused attempt and the
+	 * re-pend reads the block again (the refresh may have moved nothing and so replayed nothing).
+	 *
+	 * Two steps. First, one read for each pinned block the cache does NOT retain — content handed
+	 * through unkept (a below-floor answer, which the cache re-asks for on every read anyway): the
+	 * pin names the revision last served, storage may have caught up since without the log moving,
+	 * and only a read can tell. An evicted-but-kept base needs no read: its content met every floor
+	 * the handle knows, so storage cannot have moved it without a log entry the next refresh will
+	 * walk (and the pend would be refused as stale on revision alone). Then, one cache probe per
+	 * pinned block ({@link Tracker.movedBases}) and a replay if any moved.
+	 *
+	 * Latch-free by contract, like {@link snapshotPending}: the caller holds this instance's latch
+	 * ({@link replayActions} is always run under it).
+	 *
+	 * @returns whether the pending queue was re-staged. */
+	async restageIfBasesMoved(): Promise<boolean> {
+		for (const id of this.tracker.unretainedBases()) {
+			// `navigation` never upgrades the purpose the original read recorded (value-wins), and
+			// the revision recorded is the one returned, which the replay below re-records anyway.
+			await this.sourceCache.tryGet(id, 'navigation');
+		}
+		if (this.pending.length === 0 || this.logMovedBases(this.tracker.movedBases()) === 0) {
+			return false;
+		}
+		await this.replayActions();
+		return true;
+	}
+
+	/** Report each moved base, naming the revision the operations were computed against and the
+	 * one the cache describes now, and return how many there were. */
+	private logMovedBases(moved: readonly BlockId[]): number {
+		if (log.enabled) {
+			for (const blockId of moved) {
+				log('collection:restage-moved-base id=%s tag=%s block=%s pinnedRev=%s currentRev=%s',
+					this.id, this.instanceTag, blockId,
+					this.tracker.stagedBaseRevs([blockId])[blockId] ?? 'none',
+					this.sourceCache.getCachedRevision(blockId) ?? 'none');
+			}
+		}
+		return moved.length;
 	}
 
 	/** Capture the current staged state — tracker transforms plus the pending
@@ -1179,7 +1232,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * rival's commit) still restores verbatim below — rebasing it would require an async
 	 * replay this synchronous method cannot run. That shape predates this guard and
 	 * keeps its old behaviour; if it is ever observed producing stale reads, the rebase
-	 * belongs in an async caller that can replay the pending queue (see replayActions). */
+	 * belongs in an async caller that can replay the pending queue (see replayActions).
+	 * The same shape leaves the tracker's base pins (which the snapshot does not carry)
+	 * describing the replay's bases while the restored operations were computed on the
+	 * snapshot's, so the pend would declare the wrong base for them; the rebase closes that too. */
 	restorePending(snapshot: CollectionSnapshot<TAction>): void {
 		const capturedRev = snapshot.context?.rev;
 		const currentRev = this.source.actionContext?.rev;
@@ -1596,6 +1652,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 				// Else: the responder told us nothing new this round. No strike, and no reset either
 				// — the budget stays bounded by maxAttempts.
 			}
+
+			// A pending action is never pended over a base that has moved under it — before EVERY
+			// attempt, first and retries alike (see restageIfBasesMoved for why the retry needs it).
+			await this.restageIfBasesMoved();
 
 			// Snapshot the pending actions so that any new actions aren't assumed to be part of this action
 			const pending = [...this.pending];

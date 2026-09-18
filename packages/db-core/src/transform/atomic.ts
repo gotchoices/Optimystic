@@ -12,7 +12,10 @@ export class Atomic<TBlock extends IBlock> extends Tracker<TBlock> {
 		// store — without this, a single act() carrying more actions than the read cache holds loses
 		// digest coverage, because by the flush below the cache has already evicted the early bases.
 		// The parent gets a COPY (adopt), not this store itself: sharing the store would let the
-		// reset() below wipe the parent's pins a line before flushing into it.
+		// reset() below wipe the parent's pins a line before flushing into it. A block the parent
+		// already pins at a DIFFERENT revision is a base that moved between two actions of one
+		// transaction; adopt marks it moved rather than overwriting (see BasePins.adopt), and the
+		// pre-pend re-validation re-stages the queue.
 		if (this.store instanceof Tracker) this.store.pins.adopt(this.pins);
 		const transform = this.reset();
 		applyTransformToStore(transform, this.store);

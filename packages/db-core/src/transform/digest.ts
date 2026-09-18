@@ -16,15 +16,18 @@ const log = createLogger('digest');
  * block will contain at the committing revision; `baseRev` rides along except for base-independent
  * (inserted) blocks. */
 // NOTE: declarability follows what the transaction read and staged, not read-cache residency. Each
-// updated block's committed base is pinned at the moment its update is staged (Tracker.update ->
-// BasePins) and held until the transaction boundary, so a commit of any size declares 100% of the
-// blocks whose bases it read — verified through the production path (`Collection.act`/`sync`) in
-// `test/digest-cache-coverage.spec.ts` at 2x and 4x the cache capacity. The two remaining
-// legitimate omissions: a delete (materializes to nothing) and a blind update to a block this node
-// never read whose base is not cached (nothing to declare, and a commit must never pay a network
-// read to describe itself). Residual gap: read-far-then-update — a block read, then evicted by
-// 128+ other reads, and only then updated, finds nothing to pin; see the NOTE at the pin site in
-// `tracker.ts`.
+// updated block's committed base is pinned at the moment its FIRST update is staged (Tracker.update
+// -> BasePins), fixed there, and held until the transaction boundary, so a commit of any size
+// declares 100% of the blocks whose bases it read — verified through the production path
+// (`Collection.act`/`sync`) in `test/digest-cache-coverage.spec.ts` at 2x and 4x the cache capacity.
+// `baseRev` is always the pin's revision: the one the operations were computed against, never the
+// live cache's. The legitimate omissions: a delete (materializes to nothing); a blind update to a
+// block this node never read (nothing to declare, and a commit must never pay a network read to
+// describe itself); read-far-then-update — a block read, then evicted by 128+ other reads, and only
+// then updated — which pins the revision but not the content, so the base is still named on the
+// pend (`Tracker.stagedBaseRevs`) and only its digest is undeclared; and a base that MOVED under its
+// staged operations, which is never declared at any revision (`Tracker.revalidatePin`) and is
+// re-staged before it is pended (`Collection.restageIfBasesMoved`).
 export async function computeBlockContentDigests<T extends IBlock>(
 	tracker: Tracker<T>,
 	blockIds: BlockId[]

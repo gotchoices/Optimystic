@@ -688,6 +688,15 @@ export class TransactionCoordinator {
 		// through pend, commit, and the local recordCommitted, so all four name the same number.
 		const pendedRevs = new Map<CollectionId, number>();
 
+		// A participant is never pended over a base that moved under its staged operations
+		// (Collection.restageIfBasesMoved). Each re-stages its own queue only. BEFORE the snapshots
+		// below, so a failed attempt restores transforms that agree with the tracker's pins; and
+		// before the append loop, since a replay resets the tracker and would drop the appended
+		// log entry.
+		for (const { collection } of collectionData) {
+			await collection.restageIfBasesMoved();
+		}
+
 		// Snapshot EVERY participating collection's staged state (transforms + pending
 		// queue) BEFORE the append loop mutates any tracker. The loop appends log
 		// entries sequentially, so a failure on the Nth collection must also undo the
@@ -1142,6 +1151,12 @@ export class TransactionCoordinator {
 				if (collection) {
 					latchReleases.push(await collection.acquireLatch());
 				}
+			}
+
+			// Same pre-pend rule as commitOnceLatched: no participant is pended over a moved base.
+			// Under the latches and before the append loop, which a replay's tracker reset would undo.
+			for (const collectionId of allCollectionIds) {
+				await this.collections.get(collectionId)?.restageIfBasesMoved();
 			}
 
 			for (const [collectionId, actions] of batches) {

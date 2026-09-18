@@ -220,9 +220,11 @@ depends on why they are all behind: a lagging replica catches up within one read
 bound the storage layer already documents instead of forever, while a log entry whose blocks never
 landed sets a floor no machine can ever meet, and there the below-floor content is the *correct*
 content (the accepted-tradeoff `NOTE:` at `mayRetain`). It sets no floor for a block first read at open (no entries are walked then) or for the blocks an
-invalidation entry reverts. And it narrows, without closing, the hazard of a write staged over a
-too-old read (ticket `bug-a-pended-transform-does-not-carry-its-base`): once storage catches up, the
-base under already-staged edits changes with no replay.
+invalidation entry reverts. A write staged over a too-old read keeps the revision it was really
+computed against: once storage catches up, the base under the staged edits is re-judged as moved and
+the edits are re-staged before they are pended, never re-described at the newer revision (see
+[Staged Edits Keep Their Base](#staged-edits-keep-their-base); the storage side of the same defect,
+a pend that does not carry its base, is ticket `bug-a-pended-transform-does-not-carry-its-base`).
 While a floor is unmet every read of its block costs a transactor request rather than a memory hit,
 and now a second coordinator round with it; the tripwire `NOTE:` at `mayRetain` names the remedy if
 that ever shows up.
@@ -851,6 +853,32 @@ saveMaterializedBlock(block): store(structuredClone(block));
 - `Transforms.updates[blockId]` arrays and `Transforms.inserts[blockId]` blocks must NOT be shared between consumers
 - `copyTransforms()` and `transformForBlockId()` must deep-clone both `insert` and `updates`
 - JSON serialization over network creates implicit deep copies
+
+### Staged Edits Keep Their Base
+- **What a read returns for a block is what the read cache then describes for it.** `CacheSource.tryGet`
+  decides in one step (`admit` in `packages/db-core/src/transform/cache-source.ts`) both the content
+  the reader gets and what `peek` / `getCachedRevision` say for that id afterwards. An answer the
+  cache will not keep — below its floor, or overtaken while in flight — is returned only when nothing
+  is held for the id; otherwise the reader gets the held content, of two answers the higher revision
+  being the truer. An LRU-evicted id keeps its revision entry on purpose: it is the revision of the
+  content last served, which is what a write staged over the evicted read must name.
+- **The base of a block's staged updates is fixed when the first update is staged and is never
+  replaced while updates remain staged.** `Tracker.update` pins the cache's revision (and content,
+  when resident) at the first operation for an id (`pinBase` in
+  `packages/db-core/src/transform/tracker.ts`). A later change of what the cache holds for the id is
+  re-judged by revision (`revalidatePin`): the same revision refreshes the pin, a different one — or
+  none — marks the base **moved**. A moved base is never repaired by re-pinning or by falling back to
+  the live cache: the pend would then declare a base the operations were not built on, the one
+  direction the storage-side guard cannot catch. `Tracker.stagedBaseRevs` names the pinned revision
+  for every update-only block (moved or not); `Tracker.movedBases` lists the moved ones.
+- **A pending action is never pended over a moved base; it is re-staged first.**
+  `Collection.restageIfBasesMoved` in `packages/db-core/src/collection/collection.ts` runs before
+  every attempt of `syncAttempts` and at the top of both coordinator commit spans (`commitOnceLatched`
+  and `execute` in `packages/db-core/src/transaction/coordinator.ts`, before the pre-commit snapshots
+  and the log append): one read per pinned block the cache does not retain (a below-floor answer, so
+  storage may have caught up with no log movement), one cache probe per pinned block, and a replay of
+  the pending queue if any base moved (logged as `collection:restage-moved-base`). `mustReplay` has
+  the same test as its third reason, beside conflicts and a revision advance.
 
 ### Consensus Execution
 - `handleConsensus()` executes on ALL cluster peers, not just coordinator
