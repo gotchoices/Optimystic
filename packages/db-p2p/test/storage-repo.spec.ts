@@ -3360,3 +3360,45 @@ describe('StorageRepo.pend — a stale block is refused even when nothing can be
 			.to.equal(undefined);
 	});
 });
+
+/**
+ * Ticket: a-member-that-missed-a-commit-refuses-every-later-write.
+ *
+ * The apply-time rival scan reads each pending record as a claim on a slot (`isReservationAgainst`):
+ * a record claiming the requested revision or a later one reserves the block, one claiming an
+ * earlier revision has been superseded by the collection moving on and does not. Before this, the
+ * scan refused on any record at all, so a node that had promised a write and missed its commit
+ * refused every later pend of the block under the fail/return policies for as long as it lived.
+ */
+describe('StorageRepo.pend — a pending record claiming a superseded slot is not a reservation', () => {
+	const B = 'block-superseded' as BlockId;
+	let raw: MemoryRawStorage;
+	let repo: StorageRepo;
+
+	beforeEach(async () => {
+		raw = new MemoryRawStorage();
+		repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		// The block at revision 1, and a rival pended at revision 2 whose commit this node never saw.
+		await repo.saveReplicatedBlock(B, makeBlock(B, { items: [] }), { actionId: 'r1' as ActionId, rev: 1 });
+		const rival = await repo.pend({ actionId: 'a-missed' as ActionId, transforms: makeUpdateTransforms(B, [['items', 0, 0, ['x']]]), rev: 2, policy: 'r' });
+		expect(rival.success, 'the rival pend is recorded').to.equal(true);
+	});
+
+	it('still refuses a pend for the slot the record claims', async () => {
+		const sameSlot = await repo.pend({ actionId: 'a-same-slot' as ActionId, transforms: makeUpdateTransforms(B, [['items', 0, 0, ['y']]]), rev: 2, policy: 'r' });
+		expect(sameSlot.success, 'a live rival for the same slot reserves the block').to.equal(false);
+		expect((sameSlot as StaleFailure).pending?.map(p => p.actionId)).to.deep.equal(['a-missed']);
+	});
+
+	it('admits a pend for a later slot, reporting no rival, and the later commit sweeps the record', async () => {
+		const later = await repo.pend({ actionId: 'a-later' as ActionId, transforms: makeUpdateTransforms(B, [['items', 0, 0, ['y']]]), rev: 3, policy: 'r' });
+		expect(later.success, `the superseded record must not refuse: ${JSON.stringify(later)}`).to.equal(true);
+		expect((later as PendSuccess).pending, 'and is not reported as a rival either').to.deep.equal([]);
+		expect(await raw.getPendingTransaction(B, 'a-missed' as ActionId), 'the record itself is untouched by a pend').to.not.equal(undefined);
+
+		const committed = await repo.commit({ actionId: 'a-later' as ActionId, blockIds: [B], tailId: B, rev: 3 });
+		expect(committed.success, JSON.stringify(committed)).to.equal(true);
+		expect((await repo.get({ blockIds: [B] }))[B]!.state.latest).to.deep.equal({ actionId: 'a-later', rev: 3 });
+		expect(await raw.getPendingTransaction(B, 'a-missed' as ActionId), 'once the block passes its slot the record is dead, and swept').to.equal(undefined);
+	});
+});

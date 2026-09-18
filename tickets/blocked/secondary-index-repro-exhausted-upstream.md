@@ -148,3 +148,20 @@ The bullet above about `implement/coordinator-mutates-collections-outside-their-
 stale: that line of work completed (`complete/2-coordinator-commit-latch-and-rev-threading` and its
 siblings) and did not explain the fingerprint. Whoever picks this up next should read the fix ticket
 first. Nothing else about the human decision this ticket is parked on has changed.
+
+---
+
+## Update 2026-09-17 — verified fixed from the downstream side; this ticket can close
+
+Written from `sereus` (its ticket `fix/secondary-index-seek-blind-to-sibling-rows`, now retired). Measured against this repository at `bbecaf28`, dist built from that commit.
+
+The downstream reproducer was restored (the `index FormationUsageByToken on FormationUsage (Token)` line re-added to both control-schema copies), `strand-formation-concurrent-redemption` was run five times in isolation with `optimystic:quereus-plugin:module`, `optimystic:quereus-plugin:txn-bridge` and `optimystic:db-core:collection` enabled, and the line was removed again.
+
+- **5 of 5 runs, all three cases green.** Before, all three cases failed deterministically on every run since 2026-08-12.
+- **The index sub-collection now converges to a byte-identical revision and action id on both machines in every run** (`index:seek … rev=2@<same id>` and `rev=4@<same id>` on both `node=` values, `matched=2` on both). Until 2026-08-29 the two machines held different action ids at the same revision.
+- **Zero `collection:lineage-divergence` and zero `collection:context-not-lowered` lines** across the five runs. On 2026-08-29 both fired on the first run.
+- A sequential cross-machine `unique` column check (one node commits a `Strand` row under a stamp, the other node later inserts a different row under the same stamp, both directions) was refused with `UNIQUE constraint failed: Strand.StampId` in 6 of 6 cases over three runs, with the refusing node's `_uniq_…stampid` sub-collection basing on the writer's revision.
+
+The fix is attributed to the changes landed between the 2026-08-29 capture and now, most directly `complete/a-commit-over-a-gapped-base-forks-the-block` (`da57d4e9`), which matches the captured fingerprint exactly (two actions under one revision number, then the not-lowered guard making it permanent). Not bisected; the downstream measurement is the whole-system result.
+
+The downstream count that this ticket asked to be corrected (five vs six negatives) was recorded there on 2026-09-05. Nothing more is needed from this repository for this report.

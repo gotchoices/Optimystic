@@ -30,6 +30,24 @@ export type BlockMetadata = {
 	 * `IBlockStorage.lineageOf`, never compared by hand.
 	 */
 	lineageFloor?: number;
+	/**
+	 * The revision each pending record on this block was pended AT, keyed by the record's action id —
+	 * the `rev` of the `PendRequest` it belongs to. This is what turns a pending record into a
+	 * *reservation for a slot* rather than a bare "someone is writing": a record claiming a revision
+	 * the collection has since moved past cannot be a rival for any later slot (see
+	 * `isReservationAgainst` in `pending-claim.ts`), and one claiming a revision this block has
+	 * already committed can never be promoted here at all.
+	 *
+	 * Kept here, beside `latest`, rather than inside the pending record itself, because the raw
+	 * drivers move a pending record into the committed store byte-for-byte on promotion (a rename on
+	 * the filesystem backend), so the record's value has to stay a plain transform. The pending
+	 * NAMESPACE remains the record; this map only says what slot each record claims. An entry whose
+	 * record is gone is inert — every reader joins it against the namespace
+	 * (`IBlockStorage.listPendingClaims`) — and is dropped when the record is deleted or when
+	 * `latest` advances to or past it. A record with no entry (written before the field existed, or
+	 * pended without a revision) reads as an unknown claim, which is treated as the strongest kind.
+	 */
+	pendingRevs?: Record<ActionId, number>;
 };
 
 export type ArchiveRevisions = Record<number, {

@@ -1,4 +1,4 @@
-import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest, MemberApplyOutcome } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, PendRequest, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest, MemberApplyOutcome } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability } from "@optimystic/db-core";
@@ -17,7 +17,9 @@ import type { FretService } from "p2p-fret";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
-import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister, type IRevisionActionReader } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister, type IRevisionActionReader, type IPendingClaimReader } from "../storage/storage-repo.js";
+import { isReservationAgainst, type PendingClaim } from "../storage/pending-claim.js";
+import { StuckReservationTracker } from "../repo/stuck-reservation.js";
 import { checkPendValidation } from "../pend-validation.js";
 import { getAffectedBlockIds } from "./record-operations.js";
 import { operationsConflict, resolveRace } from "./race-resolution.js";
@@ -366,6 +368,14 @@ export class ClusterMember implements ICluster {
 	// inside the sink); this map only spares redundant work when the same invalidation reaches
 	// consensus twice (rebroadcast / sync) under different message hashes. (-> appliedAt timestamp)
 	private appliedInvalidations: Map<string, number> = new Map();
+	/**
+	 * Per block, what this member's own `held` votes have added up to — the member-side instance of
+	 * the counter `CoordinatorRepo.noteStuckReservation` keeps from the coordinator's vantage. Fed by
+	 * every `held` verdict {@link validatePendOperations} casts, so a reservation only THIS member
+	 * holds (one the coordinator's storage cannot corroborate) is still named, once, where the record
+	 * lives. Forgotten for a block the moment a vote finds it no longer reserved.
+	 */
+	private readonly stuckReservations = new StuckReservationTracker(1000);
 	// Queue of transactions to clean up
 	private cleanupQueue: string[] = [];
 	// Serialize concurrent updates for the same transaction
@@ -1539,12 +1549,19 @@ export class ClusterMember implements ICluster {
 
 	/**
 	 * Validates pend operations in a cluster record using the transaction validator.
-	 * Also checks for stale revisions, and for blocks held by a different unresolved pending
+	 * Also checks for stale revisions, and for blocks RESERVED by a different unresolved pending
 	 * action, to prevent consensus on operations that storage would refuse at apply.
 	 * Returns success if no validator is configured (backwards compatibility).
 	 *
 	 * Every refusal here is a validity judgement EXCEPT the pending-conflict one, which is transient by
-	 * construction and returns the `held` kind — see {@link PromiseVerdict}.
+	 * construction and returns the `held` kind — see {@link PromiseVerdict}. Transient means the
+	 * reservation it answers is one its holder is still going to commit or cancel: a record claiming
+	 * the slot this pend wants, or a later one. A record claiming a slot the collection has already
+	 * moved past is NOT a reservation against this pend and is not refused on — see
+	 * {@link reservingRivals} — because its holder is never going to remove it: the holder either
+	 * committed at that slot on the rest of the cohort (this member missed the commit) or lost the
+	 * slot, and in both cases the record would otherwise refuse every later write to the block, from
+	 * every writer, for as long as this member lives.
 	 */
 	private async validatePendOperations(record: ClusterRecord): Promise<PromiseVerdict> {
 		// Find pend operations in the message
@@ -1600,15 +1617,15 @@ export class ClusterMember implements ICluster {
 					}
 				}
 
-				// Refuse a pend whose blocks are held by a DIFFERENT unresolved pending action. This is
-				// the durable reservation the in-memory table (`findConflict` / `activeTransactions`)
+				// Refuse a pend whose blocks are RESERVED by a DIFFERENT unresolved pending action. This
+				// is the durable reservation the in-memory table (`findConflict` / `activeTransactions`)
 				// cannot provide: that table clears the moment the rival's PEND record reaches
 				// consensus, but the rival's storage pending record — written at pend-apply, removed at
 				// commit or cancel — spans exactly the pend→commit window in which `latest.rev` has not
 				// yet advanced. Storage's own pend would refuse this request at consensus-apply for the
-				// same reason (`StorageRepo.pend`'s listPendingTransactions scan); voting here moves
-				// that verdict into the phase where the cohort aggregates it, so the loser is refused
-				// with a real answer instead of burning a consensus round it cannot win. A
+				// same reason (`StorageRepo.pend`'s pending-claim scan, under the same rule); voting
+				// here moves that verdict into the phase where the cohort aggregates it, so the loser is
+				// refused with a real answer instead of burning a consensus round it cannot win. A
 				// member that has not yet applied the rival's pend has no record and simply abstains
 				// from this reason; the apply-time verdict catches that residual — retained locally
 				// (getExecutedPendResult) for the coordinating node's own member, and returned to the
@@ -1617,29 +1634,46 @@ export class ClusterMember implements ICluster {
 				// for this same action stays approvable. An unavailable block carries no `pendings` and
 				// abstains (the rev branch above already fail-closes when a revision claim is at stake).
 				//
-				// This is the ONE refusal in this method that is not a validity judgement: the rival's
-				// reservation is removed the moment it commits or cancels, so the very same pend
+				// This is the ONE refusal in this method that is not a validity judgement: a RESERVING
+				// rival's record is removed the moment it commits or cancels, so the very same pend
 				// succeeds on retry. It therefore returns the `held` kind, which becomes a `held` vote
 				// the coordinator counts toward neither approvals nor rejections. `heldBy` carries the
 				// first rival as signed structured data; the prose reason names the same one, and stays
 				// prose because it is fed to computeSigningPayload exactly like the reasons above.
+				//
+				// Which rivals reserve is decided by the slot each record claims, not by its presence
+				// (`reservingRivals`): a record claiming a revision below the one requested belongs to
+				// a commit this member missed or a race its holder lost, and would never clear on its
+				// own — refusing on it wedged the block for every writer (ticket
+				// `a-member-that-missed-a-commit-refuses-every-later-write`). Approving over it is safe
+				// because the incoming writer read the collection past that slot, so it built on that
+				// commit's outcome (a read under a block's floor is re-asked, `BlockGets.floors`), and
+				// this member comes current when the approved pend's own commit applies here — through
+				// `internalCommit`, or through the behind-reconcile its fork guard triggers.
 				for (const blockId of blockIds) {
-					const rivals = (blockResults[blockId]?.state?.pendings ?? []).filter(actionId => actionId !== pendRequest.actionId);
-					const heldBy = rivals[0];
-					if (heldBy !== undefined) {
-						log('cluster-member:validation-pending-conflict', {
-							messageHash: record.messageHash,
-							blockId,
-							actionId: pendRequest.actionId,
-							rivals
-						});
-						return {
-							valid: false,
-							kind: 'held',
-							heldBy,
-							reason: `pending conflict: block ${blockId} held by unresolved action(s) ${rivals.join(', ')}`
-						};
+					const rivalIds = (blockResults[blockId]?.state?.pendings ?? []).filter(actionId => actionId !== pendRequest.actionId);
+					const rivals = rivalIds.length === 0 ? [] : await this.reservingRivals(record, blockId, rivalIds, pendRequest);
+					if (rivals.length === 0) {
+						// Not reserved (any more): whatever episode this member was counting on the block
+						// has ended, so a later wedge gets its own count.
+						this.stuckReservations.forget([blockId]);
+						continue;
 					}
+					const heldBy = rivals[0]!;
+					log('cluster-member:validation-pending-conflict', {
+						messageHash: record.messageHash,
+						blockId,
+						actionId: pendRequest.actionId,
+						requestedRev: pendRequest.rev,
+						rivals
+					});
+					this.nameStuckReservation(blockId, rivals, pendRequest.actionId);
+					return {
+						valid: false,
+						kind: 'held',
+						heldBy,
+						reason: `pending conflict: block ${blockId} held by unresolved action(s) ${rivals.join(', ')}`
+					};
 				}
 
 				// Re-check the transaction when a validator is configured. The unvalidatable-pend
@@ -1672,6 +1706,61 @@ export class ClusterMember implements ICluster {
 		}
 
 		return { valid: true };
+	}
+
+	/**
+	 * Of the rival pending records `get` listed on `blockId`, the ones that RESERVE the block against
+	 * `pendRequest` — see `isReservationAgainst` for the rule. Asks storage's {@link IPendingClaimReader}
+	 * for the slot each record claims; a repo without that capability (a plain `IRepo` mock) or a
+	 * read that fails degrades to "every rival reserves", which is the refusal this member cast before
+	 * claims were recorded — never to silently admitting one. A rival that `get` listed but that is
+	 * gone by the time the claims are read has resolved in between, and is not a rival any more.
+	 */
+	private async reservingRivals(record: ClusterRecord, blockId: BlockId, rivalIds: ActionId[], pendRequest: PendRequest): Promise<ActionId[]> {
+		const reader = this.storageRepo as IRepo & Partial<IPendingClaimReader>;
+		if (typeof reader.listPendingClaims !== 'function') {
+			return rivalIds;
+		}
+		let claims: PendingClaim[];
+		try {
+			claims = await reader.listPendingClaims(blockId);
+		} catch (err) {
+			log('cluster-member:pending-claims-read-error', { messageHash: record.messageHash, blockId, error: (err as Error).message });
+			return rivalIds;
+		}
+		const claimOf = new Map(claims.map(claim => [claim.actionId, claim]));
+		const reserving: ActionId[] = [];
+		for (const actionId of rivalIds) {
+			const claim = claimOf.get(actionId);
+			if (claim === undefined) continue;
+			if (isReservationAgainst(claim, pendRequest.rev)) {
+				reserving.push(actionId);
+			} else {
+				log('cluster-member:validation-pending-superseded', {
+					messageHash: record.messageHash,
+					blockId,
+					actionId: pendRequest.actionId,
+					requestedRev: pendRequest.rev,
+					rival: actionId,
+					claimedRev: claim.rev
+				});
+			}
+		}
+		return reserving;
+	}
+
+	/**
+	 * Feed this member's own `held` vote to its {@link stuckReservations} counter and say, once per
+	 * episode and in words, when a block is wedged behind a reservation that is not going to clear —
+	 * the member-side twin of `CoordinatorRepo.noteStuckReservation`, for the reservations that
+	 * node cannot corroborate from its own storage. `peerId` is carried because this logger is not
+	 * suffixed with one and several members can share a process.
+	 */
+	private nameStuckReservation(blockId: BlockId, holders: readonly ActionId[], refusedActionId: ActionId): void {
+		const { named } = this.stuckReservations.note(new Map([[blockId, holders]]), refusedActionId);
+		for (const episode of named) {
+			log('cluster-member:stuck-reservation', { peerId: this.peerId.toString(), ...episode });
+		}
 	}
 
 	/**

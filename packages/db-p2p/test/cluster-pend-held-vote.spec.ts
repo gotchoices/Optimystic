@@ -2,9 +2,11 @@
  * Ticket: a-contended-pend-refusal-is-permanent-on-a-small-cohort.
  *
  * `ClusterMember.validatePendOperations` refuses a pend whose blocks are reserved by a DIFFERENT
- * unresolved action in this member's durable storage. That reservation disappears the moment the
- * rival commits or cancels, so the very same pend succeeds on retry — the refusal is transient by
- * construction, never a judgement that the write is invalid.
+ * unresolved action in this member's durable storage. A reserving rival's record disappears the
+ * moment it commits or cancels, so the very same pend succeeds on retry — the refusal is transient by
+ * construction, never a judgement that the write is invalid. (Which records RESERVE is decided by
+ * the slot each claims — the second suite below, from
+ * `a-member-that-missed-a-commit-refuses-every-later-write`.)
  *
  * It used to be answered with a `reject` vote all the same, which the coordinator counts toward a
  * permanent-failure threshold. On a cohort of three or fewer members that threshold allows zero
@@ -22,6 +24,10 @@
 import { expect } from 'chai';
 import { localDurability, clusterVoteVerificationPayload } from '@optimystic/db-core';
 import { clusterMember } from '../src/cluster/cluster-repo.js';
+import type { IPendingClaimReader } from '../src/storage/storage-repo.js';
+import type { PendingClaim } from '../src/storage/pending-claim.js';
+import { STUCK_RESERVATION_DISTINCT_ACTIONS } from '../src/repo/stuck-reservation.js';
+import { captureLog } from './support/capture-log.js';
 import type {
 	IRepo, ClusterRecord, RepoMessage, BlockGets, GetBlockResults, PendRequest, PendResult,
 	CommitRequest, CommitResult, ActionBlocks, ClusterPeers, BlockId, ActionId, ActionRev, Signature
@@ -67,6 +73,10 @@ const BLOCK = 'held-block' as BlockId;
 const OUR_ACTION = 'a-ours' as ActionId;
 const RIVAL_ACTION = 'a-rival' as ActionId;
 const SECOND_RIVAL = 'a-rival-2' as ActionId;
+const STUCK = 'cluster-member:stuck-reservation';
+
+const linesWith = (captured: unknown[][], tag: string): unknown[][] =>
+	captured.filter(args => typeof args[0] === 'string' && args[0].includes(tag));
 
 const makePend = (over: Partial<PendRequest> = {}): PendRequest => ({
 	actionId: OUR_ACTION,
@@ -109,17 +119,32 @@ class StateRepo implements IRepo {
 	async cancel(_actionRef: ActionBlocks): Promise<void> { /* no-op */ }
 }
 
+/**
+ * A {@link StateRepo} that also says which slot each pending record claims — the `IPendingClaimReader`
+ * capability `StorageRepo` has and the plain mock above deliberately lacks. `pendings` is derived
+ * from the claims so the two views cannot disagree.
+ */
+class ClaimRepo extends StateRepo implements IPendingClaimReader {
+	constructor(private readonly claims: PendingClaim[], latest?: ActionRev) {
+		super({ latest, pendings: claims.map(c => c.actionId) });
+	}
+	async listPendingClaims(_blockId: BlockId): Promise<PendingClaim[]> { return this.claims.map(c => ({ ...c })); }
+}
+
 class MockPeerNetwork implements IPeerNetwork {
 	async connect(_peerId: PeerId, _protocol: string): Promise<any> { return {}; }
 }
 
 interface CastVote { signature: Signature | undefined; record: ClusterRecord; self: KeyPair; }
 
-/**
- * Drive a pend record through a fresh member backed by `repo` and return the member's own promise
- * vote alongside what it voted on, so a caller can re-derive the signed payload.
- */
-const voteOnPend = async (repo: IRepo, pend: PendRequest): Promise<CastVote> => {
+/** One member over `repo`, kept alive across several pends so per-member state (its stuck-reservation
+ *  counter) accumulates the way it does in a running node. */
+interface Voter {
+	vote(pend: PendRequest): Promise<CastVote>;
+	dispose(): void;
+}
+
+const memberOver = async (repo: IRepo): Promise<Voter> => {
 	const self = await makeKeyPair();
 	const other = await makeKeyPair();
 	const member = clusterMember({
@@ -128,12 +153,27 @@ const voteOnPend = async (repo: IRepo, pend: PendRequest): Promise<CastVote> => 
 		peerId: self.peerId,
 		privateKey: self.privateKey
 	});
+	const peers = makeClusterPeers([self, other]);
+	return {
+		async vote(pend) {
+			const record = await makePendRecord(peers, pend);
+			const result = await member.update(record);
+			return { signature: result.promises[self.peerId.toString()], record, self };
+		},
+		dispose: () => member.dispose()
+	};
+};
+
+/**
+ * Drive a pend record through a fresh member backed by `repo` and return the member's own promise
+ * vote alongside what it voted on, so a caller can re-derive the signed payload.
+ */
+const voteOnPend = async (repo: IRepo, pend: PendRequest): Promise<CastVote> => {
+	const voter = await memberOver(repo);
 	try {
-		const record = await makePendRecord(makeClusterPeers([self, other]), pend);
-		const result = await member.update(record);
-		return { signature: result.promises[self.peerId.toString()], record, self };
+		return await voter.vote(pend);
 	} finally {
-		member.dispose();
+		voter.dispose();
 	}
 };
 
@@ -200,5 +240,95 @@ describe('ClusterMember — a pend queued behind a live reservation votes `held`
 			'rejectReason',
 			`stale revision: block ${BLOCK} at rev 2, requested rev 2`
 		);
+	});
+});
+
+/**
+ * Ticket: a-member-that-missed-a-commit-refuses-every-later-write.
+ *
+ * A pending record RESERVES a block only for the slot it claims (`isReservationAgainst`). A member
+ * that promised a write and then missed its commit keeps that write's record; the collection moves
+ * on without it; and every later pend of the block requests a revision past the record's slot. Such
+ * a record is superseded and must not be answered `held` — before this the member refused every
+ * later write to the block, from every writer, until something happened to read the block through
+ * it. A rival claiming the requested slot or a later one still reserves, exactly as before, and a
+ * repo that cannot say what slot a record claims degrades to refusing (never to admitting).
+ *
+ * The last arm is the member-side stuck-reservation line: the coordinator can only name a wedge its
+ * own storage corroborates, so a member names, once, a same-slot reservation of its own that keeps
+ * refusing distinct writers (`StuckReservationTracker`, shared with `CoordinatorRepo`).
+ */
+describe('ClusterMember — a pending record reserves only the slot it claims', () => {
+	const LATEST_1 = { rev: 1, actionId: 'r1' as ActionId };
+
+	it('approves over a rival record claiming a slot the pend has already moved past', async () => {
+		const vote = await voteOnPend(new ClaimRepo([{ actionId: RIVAL_ACTION, rev: 2 }], LATEST_1), makePend({ rev: 3 }));
+		expect(vote.signature?.type, 'a superseded record is not a reservation').to.equal('approve');
+	});
+
+	it('still holds for a rival claiming the requested slot', async () => {
+		const vote = await voteOnPend(new ClaimRepo([{ actionId: RIVAL_ACTION, rev: 2 }], LATEST_1), makePend({ rev: 2 }));
+		expect(vote.signature?.type).to.equal('held');
+		expect(vote.signature).to.have.property('heldBy', RIVAL_ACTION);
+	});
+
+	it('still holds for a rival claiming a later slot than the one requested', async () => {
+		const vote = await voteOnPend(new ClaimRepo([{ actionId: RIVAL_ACTION, rev: 3 }], LATEST_1), makePend({ rev: 2 }));
+		expect(vote.signature?.type).to.equal('held');
+	});
+
+	it('holds for a record whose slot is unknown', async () => {
+		const vote = await voteOnPend(new ClaimRepo([{ actionId: RIVAL_ACTION }], LATEST_1), makePend({ rev: 3 }));
+		expect(vote.signature?.type, 'an unknown claim is the strongest kind').to.equal('held');
+	});
+
+	it('names only the reserving rivals, and holds on the first of them', async () => {
+		const vote = await voteOnPend(
+			new ClaimRepo([{ actionId: RIVAL_ACTION, rev: 2 }, { actionId: SECOND_RIVAL, rev: 3 }], LATEST_1),
+			makePend({ rev: 3 })
+		);
+		expect(vote.signature?.type).to.equal('held');
+		expect(vote.signature, 'the superseded rival is not the holder').to.have.property('heldBy', SECOND_RIVAL);
+		expect(await voteVerifies(vote)).to.equal(true);
+	});
+
+	it('degrades to holding when the repo cannot say what slot a record claims', async () => {
+		// The plain `StateRepo` lacks `listPendingClaims`: every rival is taken to reserve, which is the
+		// refusal this member cast before claims were recorded — never an admission.
+		const vote = await voteOnPend(new StateRepo({ latest: LATEST_1, pendings: [RIVAL_ACTION] }), makePend({ rev: 3 }));
+		expect(vote.signature?.type).to.equal('held');
+	});
+
+	it('names, once, a same-slot reservation that keeps refusing distinct writers', async () => {
+		const voter = await memberOver(new ClaimRepo([{ actionId: RIVAL_ACTION, rev: 2 }], LATEST_1));
+		try {
+			const pendAs = (i: number): PendRequest => makePend({ actionId: `writer-${i}` as ActionId, rev: 2 });
+			const below = await captureLog('cluster-member', async () => {
+				for (let i = 0; i < STUCK_RESERVATION_DISTINCT_ACTIONS - 1; i++) {
+					expect((await voter.vote(pendAs(i))).signature?.type).to.equal('held');
+				}
+			});
+			expect(linesWith(below, STUCK), 'quiet below the threshold').to.have.lengthOf(0);
+
+			const at = await captureLog('cluster-member', async () => {
+				expect((await voter.vote(pendAs(STUCK_RESERVATION_DISTINCT_ACTIONS - 1))).signature?.type).to.equal('held');
+			});
+			const named = linesWith(at, STUCK).map(args => args[1] as { blockId?: string; holdingActionIds?: string[]; distinctRefusedActions?: number; message?: string; peerId?: string });
+			expect(named, 'said exactly once at the threshold').to.have.lengthOf(1);
+			expect(named[0]!.blockId).to.equal(BLOCK);
+			expect(named[0]!.holdingActionIds).to.deep.equal([RIVAL_ACTION]);
+			expect(named[0]!.distinctRefusedActions).to.equal(STUCK_RESERVATION_DISTINCT_ACTIONS);
+			expect(named[0]!.peerId, 'the member names itself, since several share this logger in a process').to.be.a('string');
+			expect(String(named[0]!.message)).to.include(RIVAL_ACTION);
+
+			const after = await captureLog('cluster-member', async () => {
+				for (let i = 0; i < 3; i++) {
+					expect((await voter.vote(pendAs(100 + i))).signature?.type).to.equal('held');
+				}
+			});
+			expect(linesWith(after, STUCK), 'and never again for this episode').to.have.lengthOf(0);
+		} finally {
+			voter.dispose();
+		}
 	});
 });

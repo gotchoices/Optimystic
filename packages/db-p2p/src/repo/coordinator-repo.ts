@@ -12,12 +12,14 @@ import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocatio
 import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAnchoring } from "../cluster/certified-claims.js";
 import { DEFAULT_CLUSTER_SIZE, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
-import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, type ICommitProofPersister, type IRevisionActionReader } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, type ICommitProofPersister, type IRevisionActionReader, type IPendingClaimReader } from "../storage/storage-repo.js";
+import { isReservationAgainst, type PendingClaim } from "../storage/pending-claim.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
 import type { ReconcileBlockCallback, CommittedHoldersSink } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
 import type { IUnderReplicationLedger } from "./i-under-replication-ledger.js";
 import { RESPONSIBILITY_TTL_MS, ResponsibilityRefusalError } from "./responsibility.js";
+import { StuckReservationTracker } from "./stuck-reservation.js";
 
 /**
  * Acquire a block's content for a cohort-corroborated revision, from the cohort, and persist it.
@@ -269,111 +271,6 @@ function soleHolderMessage(cohortPeers: number): string {
 }
 
 /**
- * What one block's pending-conflict refusals have added up to, for ONE unchanged set of holders.
- *
- * A block is reserved by an unresolved pending action for the span between that action's pend and
- * its commit or cancel, and while the reservation stands every OTHER writer's pend for the block is
- * refused. That is the healthy optimistic-concurrency loss. The unhealthy case has the identical
- * per-refusal shape and differs only in repetition: the same holder refusing DISTINCT later actions
- * without end, because the holder is never going to commit or cancel (see
- * {@link CoordinatorRepo.noteStuckReservation}).
- *
- * Counted per (block, holders) rather than per block: a holder that changes is the healthy cycle —
- * the previous reservation resolved and another writer took the block — so a new holder starts a new
- * count and gets its own chance to speak.
- */
-interface StuckReservationWatch {
-	/** The rival action ids the refusals in this episode named, sorted so the comparison is stable. */
-	holders: readonly ActionId[];
-	/**
-	 * Distinct action ids these holders have refused. Distinct ACTIONS, not refusals: one writer
-	 * retrying is one writer, because a sync reuses a single action id across all of its retry
-	 * attempts (`Collection.syncInternal` mints the id once and `syncAttempts` reuses it for every
-	 * attempt of that cycle). Emptied at the
-	 * moment the episode is reported — the count is in the line, and nothing reads the ids again —
-	 * so the set is bounded by {@link STUCK_RESERVATION_DISTINCT_ACTIONS}.
-	 */
-	refused: Set<ActionId>;
-	/** True once this episode has been named; suppresses every later refusal against these holders. */
-	reported: boolean;
-}
-
-/**
- * How many DISTINCT later actions one unchanged holder must refuse on a block before the refusals are
- * named as a stuck reservation rather than as an ordinary lost race.
- *
- * **Why a count of distinct actions and not something else.** Elapsed time answers the wrong question
- * — a slow writer is not a stuck one, and a holder legitimately keeps its reservation for as long as
- * its own commit takes. A raw refusal count answers the wrong question too: a single writer retrying
- * a lost race produces a run of refusals under ONE action id (see {@link StuckReservationWatch.refused}).
- * What no healthy holder can produce is an unbounded stream of *different* writers all losing to it,
- * because a healthy holder's reservation lasts one pend-to-commit window.
- *
- * **Why 8.** The bound to clear is how many distinct actions can honestly be refused inside one such
- * window. Measured on the in-process mesh, in the healthy-contention arm of
- * `test/stuck-reservation-named.spec.ts`: a holder that pends, is raced by other writers, and then
- * commits refuses **2** distinct actions per episode — the two rivals — and the count resets on every
- * holder change. `concurrent-diary-append-acknowledgement.spec.ts` races three writers at one diary
- * and cannot exceed that either, for the same reason: at most (writers - 1) rivals can lose to one
- * winner. 8 is four times the measured healthy figure, and it is a floor a genuinely stuck block
- * clears trivially (the field instance refused hundreds).
- *
- * **The bound stated exactly.** It is distinct SYNC CYCLES, not distinct writers: one writer that
- * exhausts a sync's retry budget and is re-driven by its caller mints a fresh id for the next cycle,
- * so it can contribute more than one. That does not widen the window much — a cycle only ends in
- * exhaustion after `DefaultMaxAttempts` (10) attempts of backoff, roughly 21s (see the exhaustion
- * NOTE in `Collection.syncAttempts`), so a lone writer needs a holder to keep the block for upwards
- * of two and a half minutes before it reaches 8 by itself, which is not a healthy holder.
- *
- * **What the margin does NOT cover, stated honestly.** A block with more than 8 distinct writers
- * racing it inside a single pend-to-commit round trip could reach 8 with a perfectly healthy holder.
- * That is a diagnostic false positive on a log line and nothing else — this counter never refuses,
- * expires, or deletes anything (see {@link CoordinatorRepo.noteStuckReservation}) — and the remedy if
- * a deployment ever hits it is to raise this number, not to add a control path. Raising it costs
- * detection latency on low-traffic blocks, which need this many distinct write ATTEMPTS before the
- * condition can be named at all.
- */
-const STUCK_RESERVATION_DISTINCT_ACTIONS = 8;
-
-/** Whether two sorted holder lists name the same reservation — i.e. whether a refusal continues an
- *  existing episode or starts a new one. Both sides come from the same sort, so this is a plain
- *  element-wise comparison; a block normally has exactly one holder, since a member's own pend refuses
- *  a second one (`ClusterMember.validatePendOperations`). */
-function sameHolders(a: readonly ActionId[], b: readonly ActionId[]): boolean {
-	return a.length === b.length && a.every((id, i) => id === b[i]);
-}
-
-/**
- * The stuck-reservation wording: written for an operator reading logs, in the same register as
- * {@link cohortTooSmallMessage} and {@link soleHolderMessage} — what is stuck, what will and will not
- * clear it, and what to do next.
- *
- * The claim is deliberately about the RESERVATION, not about the writer's intent: this node cannot
- * see whether the holding process is alive, only that it has held the block across enough unrelated
- * later actions that no retry is going to win. So the line says what is provable (the block accepts
- * no writes while this record stands, and nothing on the node removes it) and points at the one check
- * that settles the rest.
- */
-function stuckReservationMessage(holders: readonly ActionId[], refusedActions: number): string {
-	const held = holders.join(', ');
-	return `This block is WEDGED BEHIND A PENDING WRITE THAT IS NOT COMPLETING, and retrying will never ` +
-		`clear it: action(s) ${held} reserved the block and have now refused ${refusedActions} DISTINCT, ` +
-		`unrelated later actions. Each of those refusals on its own looks exactly like an ordinary ` +
-		`optimistic-concurrency loss, which is normal and healthy — the repetition is what is not. A ` +
-		`healthy rival holds a block only for its own pend-to-commit window and then releases it by ` +
-		`committing or cancelling; a reservation that keeps refusing NEW writers is holding the block ` +
-		`against every writer on every machine, and each of them loses again identically. EXACTLY TWO ` +
-		`THINGS CLEAR IT: a cancel for action(s) ${held} on this block (route it through the cohort so ` +
-		`every member drops the record), or that same action's own commit landing. Nothing on the node ` +
-		`expires it — there is no sweep for abandoned pending records — so until one of those two happens ` +
-		`the block takes NO writes while continuing to serve reads and to look healthy in every other ` +
-		`respect. The usual cause is a writer that went away between a failed or half-applied commit and ` +
-		`the cancel it owed, so check whether whatever ran ${held} still exists before cancelling on its ` +
-		`behalf. This line is a diagnosis and nothing more: this node does not expire, refuse, or delete ` +
-		`the record on the strength of it.`;
-}
-
-/**
  * What one repair pass established about a block that is still MISSING locally after it.
  * Ordered by how firmly the block is ruled out; `get` consults it only on the missing path.
  */
@@ -594,14 +491,14 @@ export class CoordinatorRepo implements IRepo {
 	 *  {@link reportRepairDeadlock} say its piece a second time. */
 	private readonly unsettledAheadClaims = new LruMap<string, AheadClaimState>(1000);
 	/**
-	 * Per block, what its pending-conflict refusals have added up to — see {@link StuckReservationWatch}
-	 * and {@link noteStuckReservation}. Deliberately its OWN map rather than a third fact hung off
-	 * {@link unsettledAheadClaims}: that entry belongs to the read-repair path and is cleared by a block
-	 * converging on a revision, whereas this one belongs to the write path and is cleared by the block
-	 * accepting a write. Sharing the entry would mean teaching both of those lifetimes about a fact
-	 * neither owns (backlog `debt-freshness-state-scattered-across-coordinator-repo` is the standing
-	 * argument for collapsing all of this per-block state behind one collaborator; adding a fourth
-	 * carve-out to the freshness entry would have made that harder, not easier).
+	 * Per block, what its pending-conflict refusals have added up to — see {@link StuckReservationTracker}
+	 * and {@link noteStuckReservation}. Deliberately its OWN collaborator rather than a third fact hung
+	 * off {@link unsettledAheadClaims}: that entry belongs to the read-repair path and is cleared by a
+	 * block converging on a revision, whereas this one belongs to the write path and is cleared by the
+	 * block accepting a write. Sharing the entry would mean teaching both of those lifetimes about a
+	 * fact neither owns (backlog `debt-freshness-state-scattered-across-coordinator-repo` is the
+	 * standing argument for collapsing all of this per-block state behind one collaborator; adding a
+	 * fourth carve-out to the freshness entry would have made that harder, not easier).
 	 *
 	 * NOTE: LRU-bounded like its siblings. An eviction under >1000 conflicted blocks loses an episode's
 	 * say-once flag, so the line can repeat once for that block — the same bounded duplication
@@ -610,12 +507,11 @@ export class CoordinatorRepo implements IRepo {
 	 * NOTE: per COORDINATOR, and a block's coordinator is whichever peer the writer's key lookup
 	 * resolved — normally stable, but cohort churn or a routing change moves it. When it moves, the
 	 * count restarts on the new coordinator (the condition is named later) and the old one may name the
-	 * same episode again (the condition is named twice). Fine while a wedged block is diagnosed by
-	 * searching for its id; if a churning deployment ever makes duplicate lines the noisy failure this
-	 * one exists to replace, the say-once state has to move to where the record lives (the member's own
-	 * storage) rather than to where the refusal was classified.
+	 * same episode again (the condition is named twice). Each MEMBER now keeps its own tracker as well
+	 * (`ClusterMember.validatePendOperations`), fed by its own `held` votes, so the episode is also
+	 * named where the record lives, by a count that does not move with the coordinator.
 	 */
-	private readonly stuckReservations = new LruMap<string, StuckReservationWatch>(1000);
+	private readonly stuckReservations = new StuckReservationTracker(1000);
 	private readonly readRepairMode: 'off' | 'lazy' | 'paranoid';
 	private readonly readRepairWindowMs: number;
 	private readonly readRepairSampleRate: number;
@@ -2414,9 +2310,19 @@ export class CoordinatorRepo implements IRepo {
 	 * Carries no `transform`, which {@link ActionPending} allows and no consumer rebases from.
 	 */
 	private async corroborateHeldBlocks(request: PendRequest, blockIds: BlockId[]): Promise<ActionPending[]> {
-		let results: GetBlockResults;
+		const pending: ActionPending[] = [];
 		try {
-			results = await this.storageRepo.get({ blockIds });
+			for (const blockId of blockIds) {
+				for (const claim of await this.pendingClaimsOf(blockId)) {
+					// The same rule the refusing member applied (`isReservationAgainst`): a record claiming
+					// a slot this request has already moved past is not the rival it was refused on, and
+					// naming it would feed a superseded action into the writer's `pending` list and into
+					// the stuck-reservation holder comparison.
+					if (claim.actionId !== request.actionId && isReservationAgainst(claim, request.rev)) {
+						pending.push({ blockId, actionId: claim.actionId });
+					}
+				}
+			}
 		} catch (readError) {
 			this.log('coordinator-repo:pend-conflict-classify-read-error', {
 				actionId: request.actionId,
@@ -2424,42 +2330,29 @@ export class CoordinatorRepo implements IRepo {
 			});
 			return [];
 		}
-		const pending: ActionPending[] = [];
-		for (const blockId of blockIds) {
-			for (const actionId of results[blockId]?.state?.pendings ?? []) {
-				if (actionId !== request.actionId) pending.push({ blockId, actionId });
-			}
-		}
 		return pending;
+	}
+
+	/**
+	 * This node's pending records on `blockId`, each with the slot it claims when storage can say
+	 * (`IPendingClaimReader`, which `StorageRepo` implements). A repo without the capability answers
+	 * with `state.pendings` alone, every record read as an unknown claim — which reserves, so the
+	 * corroboration can only over-name, never under-name.
+	 */
+	private async pendingClaimsOf(blockId: BlockId): Promise<PendingClaim[]> {
+		const reader = this.storageRepo as IRepo & Partial<IPendingClaimReader>;
+		if (typeof reader.listPendingClaims === 'function') {
+			return await reader.listPendingClaims(blockId);
+		}
+		const results: GetBlockResults = await this.storageRepo.get({ blockIds: [blockId] });
+		return (results[blockId]?.state?.pendings ?? []).map(actionId => ({ actionId }));
 	}
 
 	/**
 	 * Count one confirmed pending-conflict refusal against the holder(s) of each block it names, and say
 	 * ONCE — in words, at the moment it becomes provable — when a block is wedged behind a reservation
-	 * that is not going to clear.
-	 *
-	 * **Why this needs saying at all.** Every individual refusal here is indistinguishable from an
-	 * ordinary lost race, which is a normal and healthy event, so the logs of a permanently wedged block
-	 * read exactly like the logs of a busy one. Finding the difference today means noticing that the
-	 * SAME rival action id keeps appearing across unrelated writers for as long as the process lives —
-	 * a pattern nothing points at, and one that cost a downstream project several tickets and weeks to
-	 * re-derive from raw traces. The node has the fact in hand at every refusal; this makes it sayable.
-	 *
-	 * **The signal, and the two things that are NOT the signal.** The discriminator is repetition
-	 * against an unchanged holder — see {@link STUCK_RESERVATION_DISTINCT_ACTIONS} for why distinct
-	 * refused actions is the right counter and for the measured threshold. Two cheaper-looking tests
-	 * were tried and do not work: the members' in-memory reservation table
-	 * (`ClusterMember.activeTransactions`) clears the moment a rival's pend reaches consensus, so a
-	 * perfectly healthy rival inside its pend-to-commit window is absent from it too and absence there
-	 * says nothing; and "the block already passed this pending record's revision" catches a different
-	 * orphan class entirely — in the verified instance the wedged block sat at revision 1 while the
-	 * orphaned record was for revision 2, still nominally promotable.
-	 *
-	 * **Never a control path.** This classifies and logs; it never refuses, expires, or deletes
-	 * anything. Deciding when a durable pending record may be removed is precisely the hard problem
-	 * backlog `debt-unpromotable-pending-records-need-a-sweep` exists for — deleting a live reservation
-	 * is worse than the leak — and a counter accurate enough for a log line is not evidence enough to
-	 * destroy state.
+	 * that is not going to clear. The counting, the threshold and the wording live in
+	 * {@link StuckReservationTracker}; this node's part is the corroborated holder list and the tag.
 	 *
 	 * Returns the highest distinct-refusal count any of this refusal's blocks has now reached, for the
 	 * classification line to carry; it saturates at the threshold once an episode has been reported,
@@ -2468,21 +2361,14 @@ export class CoordinatorRepo implements IRepo {
 	 * NOTE: fed only by {@link answerBlocksHeld}, i.e. by cohort-wide `held`-answered refusals that this
 	 * node's own storage can corroborate. A block only PART of whose cohort holds the stranded record can
 	 * still reach approval super-majority, and its refusal then comes back through the retained local
-	 * apply verdict (`getExecutedPendResult`) instead, which this never sees — so a partially wedged
-	 * block goes unnamed. That is the weaker condition (the write does land on the healthy members),
-	 * and instrumenting the second path would count a refusal that the cohort as a whole did not make.
-	 * If partial strands ever turn out to be the common shape in the field, the counter belongs on the
-	 * member side (`ClusterMember.validatePendOperations`), where each member sees its own votes.
-	 *
-	 * NOTE: the un-corroborated arm of {@link answerBlocksHeld} is a SECOND unfed path, and a newer one.
-	 * It used to throw, so a wedge only remote members could see surfaced loudly as an error; it now
-	 * returns a retryable conflict, which is right for the writer and silent for this counter. The
-	 * refusal is still logged per occurrence (`coordinator-repo:pend-held-uncorroborated`, carrying the
-	 * holding action ids), and a wedge that never clears still ends at the writer's retry ceiling, so
-	 * nothing is lost outright — only the say-once naming. Left unfed deliberately: this node cannot
-	 * name the holder, and feeding it a guess would poison the holder comparison above, which is what
-	 * separates a wedge from healthy contention. If wedges behind remote-only reservations show up in
-	 * the field, the fix is the same one this NOTE already names — count on the member side.
+	 * apply verdict (`getExecutedPendResult`) instead, which this never sees. The un-corroborated arm of
+	 * {@link answerBlocksHeld} is likewise unfed: this node cannot name the holder, and feeding it a
+	 * guess would poison the holder comparison, which is what separates a wedge from healthy
+	 * contention. Neither gap goes unnamed any more: every MEMBER keeps its own tracker, fed by its own
+	 * `held` votes (`ClusterMember.validatePendOperations`, tag `cluster-member:stuck-reservation`), so
+	 * a reservation only some members hold — the shape `a-member-that-missed-a-commit-refuses-every-
+	 * later-write` measured, before the member stopped refusing on a superseded record at all — is
+	 * named by the members that hold it.
 	 */
 	private noteStuckReservation(pending: ActionPending[], refusedActionId: ActionId): number {
 		const rivalsByBlock = new Map<BlockId, ActionId[]>();
@@ -2491,36 +2377,9 @@ export class CoordinatorRepo implements IRepo {
 			if (rivals) rivals.push(actionId);
 			else rivalsByBlock.set(blockId, [actionId]);
 		}
-		let highest = 0;
-		for (const [blockId, rivals] of rivalsByBlock) {
-			const holders = [...new Set(rivals)].sort();
-			const prior = this.stuckReservations.get(blockId);
-			// A different holder set is a DIFFERENT episode — the block changed hands, which is the
-			// healthy cycle — so the count starts over and the new holder gets its own chance to speak.
-			const watch: StuckReservationWatch = prior !== undefined && sameHolders(prior.holders, holders)
-				? prior
-				: { holders, refused: new Set<ActionId>(), reported: false };
-			if (watch !== prior) this.stuckReservations.set(blockId, watch);
-			if (watch.reported) {
-				highest = Math.max(highest, STUCK_RESERVATION_DISTINCT_ACTIONS);
-				continue;
-			}
-			watch.refused.add(refusedActionId);
-			highest = Math.max(highest, watch.refused.size);
-			if (watch.refused.size < STUCK_RESERVATION_DISTINCT_ACTIONS) continue;
-			this.log('coordinator-repo:stuck-reservation', {
-				blockId,
-				// The ids an operator needs to grep for and to cancel, kept as data beside the prose so a
-				// log search finds the block and the action without parsing English.
-				holdingActionIds: holders,
-				distinctRefusedActions: watch.refused.size,
-				message: stuckReservationMessage(holders, watch.refused.size)
-			});
-			watch.reported = true;
-			// Said once per episode: from here the flag alone suppresses, and the ids have done their
-			// work (their count is in the line above), so drop them rather than growing a set for the
-			// unbounded remainder of a permanent condition.
-			watch.refused.clear();
+		const { highest, named } = this.stuckReservations.note(rivalsByBlock, refusedActionId);
+		for (const episode of named) {
+			this.log('coordinator-repo:stuck-reservation', episode);
 		}
 		return highest;
 	}
@@ -2539,10 +2398,7 @@ export class CoordinatorRepo implements IRepo {
 	 * episode holding an LRU slot can only evict a live one.
 	 */
 	private clearStuckReservations(blockIds: BlockId[], holderActionId?: ActionId): void {
-		for (const blockId of blockIds) {
-			if (holderActionId !== undefined && !this.stuckReservations.peek(blockId)?.holders.includes(holderActionId)) continue;
-			this.stuckReservations.delete(blockId);
-		}
+		this.stuckReservations.forget(blockIds, holderActionId);
 	}
 
 	async cancel(actionRef: ActionBlocks, options?: MessageOptions): Promise<void> {

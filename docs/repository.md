@@ -199,14 +199,61 @@ never received the pend), because the cluster layer reconciles the whole batch a
 block advances past the action. A genuine storage fault keeps the batch's pendings, because that
 failure is retried and the retry can still replay them.
 
+#### A pending record claims a slot, and reserves the block only for that slot
+
+A pending record is not a bare "someone is writing this block"; it is a reservation for the
+revision its pend asked for. Storage keeps that revision beside `latest` (`BlockMetadata.pendingRevs`
+in `packages/db-p2p/src/storage/struct.ts`, written by `BlockStorage.savePendingTransaction` in the
+same metadata write that seeds a fresh block, dropped with the record by `deletePendingTransaction`)
+and hands it back joined onto the record as a claim (`IBlockStorage.listPendingClaims`). It lives in
+the metadata rather than in the record because the raw drivers promote a record by moving its bytes
+into the committed store unchanged — a rename on the filesystem backend — so the record's value has
+to stay a plain transform.
+
+Both rival scans — `StorageRepo.pend` at apply and `ClusterMember.validatePendOperations` at the
+promise vote — read a record through one rule, `isReservationAgainst` in
+`packages/db-p2p/src/storage/pending-claim.ts`. Revisions are allocated per collection and a writer
+pends at one past the collection revision it read, so the requested revision says how far the
+collection had moved when the incoming writer read it:
+
+- a record claiming the requested revision **or a later one** reserves the block. A live rival
+  inside its pend-to-commit window looks exactly like this, and admitting the pend would put two
+  writers in one slot. The pend is refused (`held`) and retries once the rival commits or cancels.
+- a record claiming an **earlier** revision is superseded: the collection has moved past its slot, so
+  whatever became of its action — committed at that slot on the rest of the cohort, or lost it —
+  it cannot be a rival for the slot being requested, and it does not reserve. Treating it as live
+  was the wedge in `a-member-that-missed-a-commit-refuses-every-later-write`: a member that promised a
+  write and missed its commit kept the record, nothing would ever remove it (its writer believed the
+  write succeeded, and it had), and the member vetoed every later write to the block, from every
+  writer, until it happened to read the block itself. Admitting the pend is safe because the incoming
+  writer read the collection past that slot and so built on that commit's outcome (a read under a
+  block's floor is re-asked, `BlockGets.floors`), and the member comes current when the admitted
+  pend's own commit applies — through `StorageRepo.internalCommit`, or through the behind-reconcile
+  its fork guard triggers.
+- a record with **no** claim on file — pended without a revision, or written before the revision was
+  kept — reserves, so an old record can only refuse more than it should, never less.
+
+A record claiming a revision the block has **already reached** can never be promoted here at all
+(promotion needs `latest.rev < rev`, and `latest` only advances), so every path that advances
+`latest` sweeps such records and their claims under the block's write latch
+(`BlockStorage.sweepDeadClaims`, from `setLatest`, `recover` and `saveForwardRevision`): the loser
+of a same-slot race whose cancel never arrived, and the missed commit above once the block moves past
+it — including a replica landing under a *different* action, the reconcile shape that used to leave
+the missed action's record standing forever. A record with no claim on file is never swept, because
+its death cannot be proved. This is the locally decidable half of what backlog
+`debt-unpromotable-pending-records-need-a-sweep` asks for; a record whose slot the block has not
+reached and whose writer never came back is the half that ticket still owns.
+
 #### A pending record's lifetime is bounded by its writer
 
 Invariant P constrains which states may coexist on a member; this sibling rule constrains how long
-the pending state may outlive the transaction that created it. Only three things ever remove a
+the pending state may outlive the transaction that created it. Only four things ever remove a
 pending record: the client's `cancel` (routed through consensus, so every member drops it), a
-divergence-shaped commit refusal (`StorageRepo.dropUnpromotablePendings`), and a forward write
-carrying the *same* action id (`BlockStorage.saveForwardRevision`'s same-action delete). There is no
-age bound and no background sweep. So the writer that pends a block owns its record's fate: when
+divergence-shaped commit refusal (`StorageRepo.dropUnpromotablePendings`), a forward write
+carrying the *same* action id (`BlockStorage.saveForwardRevision`'s same-action delete), and the
+dead-claim sweep that runs whenever `latest` advances to or past the revision a record claims
+(`BlockStorage.sweepDeadClaims`, the section above). There is no age bound and no background sweep,
+and the sweep only ever removes a record whose promotion has become impossible. So the writer that pends a block owns its record's fate: when
 `NetworkTransactor.commit` returns, every block in the request must be either **committed** or have
 had its pending record **cancelled** — a client that reports success while walking away from a
 pended block strands the record permanently, and the members then reject every later write to that
@@ -246,10 +293,17 @@ unchanged holding action has refused eight *distinct* later actions on a block �
 refusals, since a retrying writer reuses one action id (minted once per sync cycle in `syncInternal`,
 `packages/db-core/src/collection/collection.ts`). The line carries the block id, the holding action
 ids, the count, and prose naming the only two cures: a cancel for that action id, or that action's own
-commit. Like every diagnostic in this package it goes to the `debug` logger, so a node that may need
-it has to be running with `DEBUG='optimystic:db-p2p:coordinator-repo*'` — see
+commit. The counting, threshold and wording live in `StuckReservationTracker`
+(`packages/db-p2p/src/repo/stuck-reservation.ts`), and every member keeps its own instance too, fed
+by its own `held` votes (`cluster-member:stuck-reservation`, from `ClusterMember.validatePendOperations`):
+the coordinator can only name a holder its own storage corroborates, so a reservation only some
+members hold is named by those members, where the record lives. Like every diagnostic in this
+package both go to the `debug` logger, so a node that may need them has to be running with
+`DEBUG='optimystic:db-p2p:coordinator-repo*,optimystic:db-p2p:cluster-member'` — see
 [debugging.md](debugging.md). It is a diagnosis only — nothing expires, refuses, or deletes a record on the strength of it,
-which remains the open problem the backlog ticket above exists for.
+which remains the open problem the backlog ticket above exists for. What reaches either counter
+since the section above is the *same-slot* residue only: a record claiming a slot the collection has
+already moved past no longer refuses at all.
 
 ## Block Storage Repository
 

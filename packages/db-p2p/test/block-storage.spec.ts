@@ -1824,3 +1824,116 @@ describe('BlockStorage.savePendingTransaction — unpromotable-record refusal', 
 		expect(meta!.ranges, 'no coverage claimed').to.deep.equal([]);
 	});
 });
+
+/**
+ * Ticket: a-member-that-missed-a-commit-refuses-every-later-write.
+ *
+ * A pending record is a reservation for the SLOT it was pended at, so storage keeps that revision
+ * beside `latest` (`BlockMetadata.pendingRevs`) and joins it back onto the record as a claim
+ * (`listPendingClaims`). Two consequences are pinned here at the storage seam:
+ *  - the claim follows the record: written with it, dropped with it, and unknown for a record that
+ *    named no revision;
+ *  - a record claiming a revision the block has since reached is DEAD — it can never be promoted —
+ *    and every path that advances `latest` sweeps it, including a replica landing under a DIFFERENT
+ *    action (the cohort reconcile of a block this node fell behind on), which used to leave the
+ *    missed action's record standing forever.
+ */
+describe('BlockStorage pending claims — a record claims the slot it was pended at', () => {
+	let raw: MemoryRawStorage;
+
+	beforeEach(() => {
+		raw = new MemoryRawStorage();
+	});
+
+	it('records the claim with the record, drops it with the record, and reads a rev-less pend as unknown', async () => {
+		const blockId = 'block-claims' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+		const block = makeBlock('block-claims', { items: [] });
+
+		await withBlockWriteLatch(blockId, async (l) => {
+			await storage.saveReplica(block, { rev: 1, actionId: 'r1' as ActionId }, undefined, l);
+			await storage.savePendingTransaction('a-at-2' as ActionId, { updates: [['items', 0, 0, ['x']]] }, 2, l);
+			await storage.savePendingTransaction('a-revless' as ActionId, { updates: [['items', 0, 0, ['y']]] }, undefined, l);
+		});
+
+		expect((await storage.listPendingClaims()).sort((a, b) => a.actionId.localeCompare(b.actionId)), 'each record with its claim')
+			.to.deep.equal([{ actionId: 'a-at-2', rev: 2 }, { actionId: 'a-revless' }]);
+		expect((await raw.getMetadata(blockId))!.pendingRevs, 'kept in the metadata, keyed by action').to.deep.equal({ 'a-at-2': 2 });
+
+		await withBlockWriteLatch(blockId, l => storage.deletePendingTransaction('a-at-2' as ActionId, l));
+		expect(await storage.listPendingClaims(), 'the claim goes with the record').to.deep.equal([{ actionId: 'a-revless' }]);
+		expect((await raw.getMetadata(blockId))!.pendingRevs, 'an empty map is not kept').to.equal(undefined);
+	});
+
+	it('setLatest sweeps a rival record claiming a slot at or below the new latest, and only that', async () => {
+		const blockId = 'block-sweep-commit' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+		const block = makeBlock('block-sweep-commit', { items: [] });
+		const winner = 'a-winner' as ActionId;
+
+		await withBlockWriteLatch(blockId, async (l) => {
+			await storage.saveReplica(block, { rev: 1, actionId: 'r1' as ActionId }, undefined, l);
+			// Two rivals pended at the same slot; a later writer already claiming the slot after it; and
+			// a record whose slot is unknown.
+			await storage.savePendingTransaction(winner, { updates: [['items', 0, 0, ['w']]] }, 2, l);
+			await storage.savePendingTransaction('a-loser' as ActionId, { updates: [['items', 0, 0, ['l']]] }, 2, l);
+			await storage.savePendingTransaction('a-next' as ActionId, { updates: [['items', 0, 0, ['n']]] }, 3, l);
+			await storage.savePendingTransaction('a-unknown' as ActionId, { updates: [['items', 0, 0, ['u']]] }, undefined, l);
+			// The winner commits: the same steps `StorageRepo.internalCommit` takes.
+			await storage.saveMaterializedBlock(winner, makeBlock('block-sweep-commit', { items: ['w'] }), l);
+			await storage.saveRevision(2, winner, l);
+			await storage.promotePendingTransaction(winner, l);
+			await storage.setLatest({ rev: 2, actionId: winner }, true, l);
+		});
+
+		expect(await storage.getPendingTransaction('a-loser' as ActionId), 'the loser of the slot is dead and swept').to.equal(undefined);
+		expect(await storage.getPendingTransaction('a-next' as ActionId), 'a claim above the new latest is live').to.not.equal(undefined);
+		expect(await storage.getPendingTransaction('a-unknown' as ActionId), 'an unknown claim is never swept: its death is unprovable').to.not.equal(undefined);
+		expect((await raw.getMetadata(blockId))!.pendingRevs, 'only the live claim remains on file').to.deep.equal({ 'a-next': 3 });
+	});
+
+	it('a replica landing under a DIFFERENT action sweeps the record of the commit this node missed', async () => {
+		// The shape from the ticket: this node promised action X at revision 2 and missed its commit;
+		// the cohort has since committed revision 3 under Y, and a reconcile lands Y here. X's record
+		// claims a slot this block has now passed, so it can never be promoted and must not stand.
+		const blockId = 'block-sweep-replica' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+		const block = makeBlock('block-sweep-replica', { items: [] });
+
+		await withBlockWriteLatch(blockId, async (l) => {
+			await storage.saveReplica(block, { rev: 1, actionId: 'r1' as ActionId }, undefined, l);
+			await storage.savePendingTransaction('a-missed' as ActionId, { updates: [['items', 0, 0, ['x']]] }, 2, l);
+			await storage.savePendingTransaction('a-ahead' as ActionId, { updates: [['items', 0, 0, ['z']]] }, 4, l);
+		});
+
+		await withBlockWriteLatch(blockId, l => storage.saveReplica(makeBlock('block-sweep-replica', { items: ['y'] }), { rev: 3, actionId: 'a-later' as ActionId }, undefined, l));
+
+		expect(await storage.getLatest()).to.deep.equal({ rev: 3, actionId: 'a-later' });
+		expect(await storage.getPendingTransaction('a-missed' as ActionId), 'the missed commit has a dead record, and it is swept').to.equal(undefined);
+		expect(await storage.getPendingTransaction('a-ahead' as ActionId), 'a claim beyond the landed revision survives').to.not.equal(undefined);
+		expect(await storage.listPendingClaims()).to.deep.equal([{ actionId: 'a-ahead', rev: 4 }]);
+	});
+
+	it('recover sweeps the claims the lost setLatest owed', async () => {
+		const blockId = 'block-sweep-recover' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+		const block = makeBlock('block-sweep-recover', { items: [] });
+		const winner = 'a-winner' as ActionId;
+
+		await withBlockWriteLatch(blockId, async (l) => {
+			await storage.saveReplica(block, { rev: 1, actionId: 'r1' as ActionId }, undefined, l);
+			await storage.savePendingTransaction(winner, { updates: [['items', 0, 0, ['w']]] }, 2, l);
+			await storage.savePendingTransaction('a-loser' as ActionId, { updates: [['items', 0, 0, ['l']]] }, 2, l);
+			// Crash-D3: promoted and revision saved, `setLatest` lost.
+			await storage.saveMaterializedBlock(winner, makeBlock('block-sweep-recover', { items: ['w'] }), l);
+			await storage.saveRevision(2, winner, l);
+			await storage.promotePendingTransaction(winner, l);
+		});
+		expect(await storage.getPendingTransaction('a-loser' as ActionId), 'still standing before recovery').to.not.equal(undefined);
+
+		const recovered = await withBlockWriteLatch(blockId, l => storage.recover(l));
+		expect(recovered).to.deep.equal({ reconciled: true, latest: { rev: 2, actionId: winner } });
+		expect(await storage.getPendingTransaction('a-loser' as ActionId), 'swept as the lost setLatest would have').to.equal(undefined);
+		expect((await raw.getMetadata(blockId))!.pendingRevs).to.equal(undefined);
+	});
+});

@@ -6,6 +6,7 @@ import type { IRawStorage } from "./i-raw-storage.js";
 import { mergeRanges } from "./helpers.js";
 import { RevisionNotCoveredError, PendRevisionTakenError, type IBlockStorage } from "./i-block-storage.js";
 import type { BlockWriteLatch } from "./block-latch.js";
+import type { PendingClaim } from "./pending-claim.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('block-storage');
@@ -155,6 +156,16 @@ export class BlockStorage implements IBlockStorage {
 		yield* this.storage.listPendingTransactions(this.blockId);
 	}
 
+	async listPendingClaims(): Promise<PendingClaim[]> {
+		const pendingRevs = (await this.storage.getMetadata(this.blockId))?.pendingRevs ?? {};
+		const claims: PendingClaim[] = [];
+		for await (const actionId of this.storage.listPendingTransactions(this.blockId)) {
+			const rev = pendingRevs[actionId];
+			claims.push(rev === undefined ? { actionId } : { actionId, rev });
+		}
+		return claims;
+	}
+
 	async savePendingTransaction(actionId: ActionId, transform: Transform, rev: number | undefined, latch: BlockWriteLatch): Promise<void> {
 		this.assertLatch(latch);
 		log('pend blockId=%s actionId=%s rev=%s', this.blockId, actionId, rev);
@@ -177,8 +188,13 @@ export class BlockStorage implements IBlockStorage {
 			// This read-then-seed is exactly the window a concurrent replica used to land in (the
 			// seed then erased its `latest`); the latch the caller holds is what closes it.
 			meta = { latest: undefined, ranges: [] };
-			await this.storage.saveMetadata(this.blockId, meta);
 		}
+		// Record the slot the record claims (see BlockMetadata.pendingRevs) in the same metadata write
+		// that seeds a fresh block, BEFORE the record itself: a crash between the two leaves an inert
+		// entry with no record, whereas the other order would leave a record with no claim, which every
+		// reader treats as the strongest kind and would refuse rivals on more than it should.
+		BlockStorage.recordClaim(meta, actionId, rev);
+		await this.storage.saveMetadata(this.blockId, meta);
 		await this.storage.savePendingTransaction(this.blockId, actionId, transform);
 	}
 
@@ -186,6 +202,45 @@ export class BlockStorage implements IBlockStorage {
 		this.assertLatch(latch);
 		log('cancel blockId=%s actionId=%s', this.blockId, actionId);
 		await this.storage.deletePendingTransaction(this.blockId, actionId);
+		// Metadata is written only when the record had a claim to drop: a cancel of an absent or
+		// claim-less record (the common torn-cancel retry) stays a pure no-op on the metadata blob.
+		const meta = await this.storage.getMetadata(this.blockId);
+		if (meta?.pendingRevs?.[actionId] !== undefined) {
+			BlockStorage.recordClaim(meta, actionId, undefined);
+			await this.storage.saveMetadata(this.blockId, meta);
+		}
+	}
+
+	/** Set or clear `actionId`'s claim in `meta`, keeping the map absent while it is empty. */
+	private static recordClaim(meta: BlockMetadata, actionId: ActionId, rev: number | undefined): void {
+		const pendingRevs = { ...meta.pendingRevs };
+		if (rev === undefined) delete pendingRevs[actionId];
+		else pendingRevs[actionId] = rev;
+		if (Object.keys(pendingRevs).length === 0) delete meta.pendingRevs;
+		else meta.pendingRevs = pendingRevs;
+	}
+
+	/**
+	 * Every pending record claiming a revision at or below `latestRev` can never be promoted here:
+	 * promotion needs `latest.rev < rev`, and `latest` only advances. Such a record is DEAD — a rival
+	 * that lost the slot, or a torn write's leftover on a block a later commit has since moved past —
+	 * and left in place it is reported as a live conflicting action to every reader of the block.
+	 * Delete those records and drop their claims from `meta`, which the caller then saves; a record
+	 * with no claim on file is left alone (its slot is unknown, so its death is unprovable here).
+	 *
+	 * Runs under the block's write latch on every path that advances `latest`, which is the one moment
+	 * a record's death becomes provable. This is the locally decidable half of what backlog
+	 * `debt-unpromotable-pending-records-need-a-sweep` asks for; the other half — a record whose slot
+	 * the block has NOT reached, whose writer simply never came back — is not decidable from local
+	 * state and is not touched here.
+	 */
+	private async sweepDeadClaims(meta: BlockMetadata, latestRev: number): Promise<void> {
+		for (const [actionId, rev] of Object.entries(meta.pendingRevs ?? {}) as [ActionId, number][]) {
+			if (rev > latestRev) continue;
+			await this.storage.deletePendingTransaction(this.blockId, actionId);
+			BlockStorage.recordClaim(meta, actionId, undefined);
+			log('sweep-dead-claim blockId=%s actionId=%s claimedRev=%d latestRev=%d', this.blockId, actionId, rev, latestRev);
+		}
 	}
 
 	async *listRevisions(startRev: number, endRev: number): AsyncIterable<ActionRev> {
@@ -277,6 +332,9 @@ export class BlockStorage implements IBlockStorage {
 		// before this call advances neither.
 		meta.ranges.unshift([prevRev ?? latest.rev]);
 		meta.ranges = mergeRanges(meta.ranges);
+		// The committing action's own record was just moved by `promotePendingTransaction`, so its
+		// claim goes here; any other record claiming a slot at or below the new latest is dead.
+		await this.sweepDeadClaims(meta, latest.rev);
 		await this.storage.saveMetadata(this.blockId, meta);
 	}
 
@@ -317,6 +375,8 @@ export class BlockStorage implements IBlockStorage {
 			// the prior [E, currentRev+1) (from the earlier setLatest) into one open-ended [E, +inf).
 			meta.ranges.unshift([currentRev + 1]);
 			meta.ranges = mergeRanges(meta.ranges);
+			// Each recovered revision's lost `setLatest` also owed this sweep.
+			await this.sweepDeadClaims(meta, maxRev);
 			await this.storage.saveMetadata(this.blockId, meta);
 			log('recover blockId=%s advanced latest from rev=%d to rev=%d', this.blockId, currentRev, maxRev);
 			return { reconciled: true, latest: advanced };
@@ -434,11 +494,9 @@ export class BlockStorage implements IBlockStorage {
 		// record is not this writer's to delete. Both paths run under the block's write latch, so
 		// this deletion is already mutually exclusive with a live commit.
 		//
-		// NOTE: deletes only this revision's actionId, not every pending whose action is already
-		// committed. A broader sweep would repair records orphaned by routes that do not carry the
-		// committing actionId; if orphaned pendings ever show up in the field on blocks whose
-		// committing action id differs, widen to a sweep over listPendingTransactions filtered by
-		// getTransaction.
+		// This same-action delete stays explicit even though the sweep below would usually cover it:
+		// Invariant P must hold for a record that has no claim on file (pended before claims were
+		// recorded), which the sweep — which reasons from claims — cannot see.
 		await this.storage.deletePendingTransaction(this.blockId, actionId);
 
 		// Seed metadata when absent, advance latest, and merge the covered range.
@@ -446,6 +504,12 @@ export class BlockStorage implements IBlockStorage {
 		if (!meta) {
 			meta = { latest: undefined, ranges: [] };
 		}
+		// Every OTHER record claiming a slot at or below the landing revision is dead too: the
+		// orphaned records a route that does not carry the committing action id used to leave behind
+		// (the cohort reconcile of a block a member fell behind on lands a later revision under a
+		// later action, and the missed action's record would otherwise stand forever).
+		BlockStorage.recordClaim(meta, actionId, undefined);
+		await this.sweepDeadClaims(meta, rev);
 		meta.latest = { rev, actionId };
 		// Content this node did not derive: nothing here says what it was built from, so the known
 		// lineage starts over at this revision (see BlockMetadata.lineageFloor).

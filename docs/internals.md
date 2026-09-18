@@ -1097,12 +1097,21 @@ saveMaterializedBlock(block): store(structuredClone(block));
 - **A pend queued behind a live reservation is returned too, on the same terms.** The other
   transient refusal: the requested blocks are reserved by a *different* unresolved action in a
   member's durable storage, which that member reports as a signed `held` vote naming the holder's
-  action id (`Signature.heldBy`). The coordinator raises `BlocksHeldError` — again never
+  action id (`Signature.heldBy`). *Reserved* is decided by the slot the record claims, not by its
+  presence: storage keeps the revision each pending record was pended at (`BlockMetadata.pendingRevs`),
+  and a record claiming a revision the incoming pend has already moved past is superseded and does
+  not refuse (`isReservationAgainst` in `packages/db-p2p/src/storage/pending-claim.ts`, applied by
+  `ClusterMember.validatePendOperations` at the vote and by `StorageRepo.pend` at apply). Without
+  that rule a member that promised a write and missed its commit vetoed every later write to the
+  block; see [repository.md §Invariant P](repository.md#invariant-p--a-pending-record-and-a-committed-record-never-coexist-for-one-action).
+  The coordinator raises `BlocksHeldError` — again never
   `ValidatorRejectionError` — and `CoordinatorRepo.pend` returns it as a `StaleFailure` with
   `conflict: true` *unconditionally*. Its local re-read is an **enricher, not a gate**: when this
   node's own storage can corroborate the rivals they are attached as `StaleFailure.pending` and fed
   to `CoordinatorRepo.noteStuckReservation`; when it cannot — the ordinary shape under delivery
-  latency, where the refusing member is ahead of the coordinator — the conflict is returned bare.
+  latency, where the refusing member is ahead of the coordinator — the conflict is returned bare,
+  and the naming falls to the members that hold the record (`cluster-member:stuck-reservation`, the
+  same counter kept per member in `ClusterMember.validatePendOperations`).
   Gating on that re-read is what previously let a transient refusal escape as a permanent verdict on
   a small cohort, where one non-approval already sinks super-majority. Together with the bullet above
   these are the two returned refusals that are not confirmed revision losses; they are separate vote

@@ -1,6 +1,7 @@
 import type { BlockId, IBlock, Transform, ActionId, ActionRev, BlockLineage } from "@optimystic/db-core";
 import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockWriteLatch } from "./block-latch.js";
+import type { PendingClaim } from "./pending-claim.js";
 
 /**
  * Thrown by {@link IBlockStorage.getBlock} when the block has metadata here but the target revision
@@ -111,11 +112,24 @@ export interface IBlockStorage {
      * under one multi-block write-latch hold, so every block it saves was observed under that same
      * hold to satisfy `latest === undefined || latest.rev < rev`, and no writer can advance a block
      * without its latch. A throw here means a caller reintroduced check-then-act.
+     *
+     * The revision is also KEPT, in the block's metadata (`BlockMetadata.pendingRevs`), so the record
+     * can later be read as a claim on a specific slot — see {@link listPendingClaims}.
      */
     savePendingTransaction(actionId: ActionId, transform: Transform, rev: number | undefined, latch: BlockWriteLatch): Promise<void>;
 
-    /** Deletes a pending action */
+    /** Deletes a pending action, and the revision it was recorded as claiming. */
     deletePendingTransaction(actionId: ActionId, latch: BlockWriteLatch): Promise<void>;
+
+    /**
+     * Every pending record on this block, each with the revision it was pended at when that is
+     * known — the pending namespace joined against `BlockMetadata.pendingRevs`. This is the view the
+     * rival-pend checks read (`StorageRepo.pend`'s apply-time scan and
+     * `ClusterMember.validatePendOperations`' promise vote), because whether a record reserves the
+     * block against a given pend depends on the slot it claims (`isReservationAgainst`), not on its
+     * mere presence. Read-only; no latch.
+     */
+    listPendingClaims(): Promise<PendingClaim[]>;
 
     /** Lists revisions in ascending or descending order between startRev and endRev (inclusive) */
     listRevisions(startRev: number, endRev: number): AsyncIterable<ActionRev>;

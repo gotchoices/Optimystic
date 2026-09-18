@@ -13,6 +13,7 @@ import {
 } from "@optimystic/db-core";
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
+import { isReservationAgainst, type PendingClaim } from "./pending-claim.js";
 import type { IBlockReplicaStore } from "../cluster/block-transfer-service.js";
 import { proofDeclaredDigest, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { RevisionNotCoveredError } from "./i-block-storage.js";
@@ -159,7 +160,21 @@ export interface IRevisionActionReader {
 	getRevisionAction(blockId: BlockId, rev: number): Promise<ActionId | undefined>;
 }
 
-export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ICommitProofPersister, IRevisionActionReader {
+/**
+ * The capability that answers "which pending records hold this block, and for which slot?" — the
+ * question the promise-round rival check needs (`ClusterMember.validatePendOperations`), because a
+ * record claiming a revision the incoming pend has already moved past is not a reservation against
+ * it (`isReservationAgainst`). `GetBlockResult.state.pendings` carries only action ids, so the vote
+ * asks this on the refusal path instead. Named for the same reason as {@link IRevisionActionReader}:
+ * a repo that lacks it degrades the vote to "every rival reserves" — today's behaviour — rather
+ * than to silently admitting one.
+ */
+export interface IPendingClaimReader {
+	/** See `IBlockStorage.listPendingClaims`. Read-only; never takes the block write latch. */
+	listPendingClaims(blockId: BlockId): Promise<PendingClaim[]>;
+}
+
+export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ICommitProofPersister, IRevisionActionReader, IPendingClaimReader {
 	private readonly validatePend?: PendValidationHook;
 	private readonly unvalidatablePendPolicy: UnvalidatablePendPolicy;
 	/** Per-collection change listeners; empty sets are pruned on unsubscribe. */
@@ -718,9 +733,19 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				// consensus round per such write), refuse at `ClusterMember.validatePendOperations`
 				// instead of here.
 
-				// Then handle any pending actions
-				const pending = await asyncIteratorToArray(blockStorage.listPendingTransactions());
-				pendings.push(...pending.map(actionId => ({ blockId, actionId })));
+				// Then the pending records that RESERVE the block against this request. A record claiming a
+				// slot the collection has already moved past is not one of them (see `isReservationAgainst`):
+				// counting it refused every later writer on the strength of a commit this node merely
+				// missed. The promise vote (`ClusterMember.validatePendOperations`) applies the same rule,
+				// so a pend the cohort approved is not then refused here at apply.
+				for (const claim of await blockStorage.listPendingClaims()) {
+					if (isReservationAgainst(claim, request.rev)) {
+						pendings.push({ blockId, actionId: claim.actionId });
+					} else {
+						log('pend:superseded-claim actionId=%s blockId=%s rival=%s claimedRev=%d requestedRev=%d',
+							request.actionId, blockId, claim.actionId, claim.rev, request.rev);
+					}
+				}
 			}
 
 			// Every refusal below returns having written ZERO pending records — that is what pass 1
@@ -1265,6 +1290,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			return actionRev.actionId;
 		}
 		return undefined;
+	}
+
+	/** See {@link IPendingClaimReader}. */
+	async listPendingClaims(blockId: BlockId): Promise<PendingClaim[]> {
+		return await this.createBlockStorage(blockId).listPendingClaims();
 	}
 
 	/**
