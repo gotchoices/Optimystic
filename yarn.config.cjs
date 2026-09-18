@@ -82,5 +82,28 @@ module.exports = defineConfig({
 				}
 			}
 		}
+
+		// A peer range wider than the dev range admits versions this package is
+		// never built or tested against: the Quereus plugins once advertised
+		// ^4.3.0 while importing an export added in 4.12.0. Reported, not
+		// autofixed — the guard cannot tell whether the peer or the dev side is stale.
+		for (const peer of Yarn.dependencies({ type: 'peerDependencies' })) {
+			const dev = Yarn.dependency({ workspace: peer.workspace, ident: peer.ident, type: 'devDependencies' })
+			if (dev && dev.range !== peer.range) {
+				peer.error(
+					`peer range ${peer.range} for ${peer.ident} must match the devDependency range ${dev.range} it is built and tested against`
+				)
+			}
+		}
+
+		// `engines.quereus` restates the @quereus/quereus peer range for the plugin
+		// loader's manifest; the two must not drift apart.
+		for (const workspace of Yarn.workspaces()) {
+			const engine = workspace.manifest.engines?.quereus
+			const peer = workspace.manifest.peerDependencies?.['@quereus/quereus']
+			if (engine !== undefined && engine !== peer) {
+				workspace.error(`engines.quereus ${engine} must match peerDependencies['@quereus/quereus'] ${peer}`)
+			}
+		}
 	},
 })

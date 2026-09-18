@@ -24,7 +24,7 @@ It runs, in order:
 |------|----------------|
 | `yarn lint` | eslint across the monorepo |
 | `yarn lint:docs` | documentation citations still point at code that exists |
-| `yarn lint:deps` | shared libp2p packages stay on one major — in declared ranges and in the installed tree |
+| `yarn lint:deps` | shared libp2p packages stay on one major — in declared ranges and in the installed tree; peer ranges match the dev ranges they are tested against |
 | `yarn build` | every package compiles |
 | `yarn typecheck` | `tsc --noEmit` for the packages whose build does not type-check |
 | `yarn check:rn` | the React Native entry and the Quereus plugin bundle with Metro and compile with Hermes, as a phone app's build does |
