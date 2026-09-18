@@ -20,9 +20,9 @@ import { Tree } from '../src/collections/tree/index.js'
 import { TestTransactor, TailLandsButReportsStale } from '../src/testing/test-transactor.js'
 import { LogDataBlockType } from '../src/log/struct.js'
 import { Log } from '../src/log/log.js'
-import { TornActionError } from '../src/index.js'
+import { TornActionError, SyncRetryExhaustedError } from '../src/index.js'
 import { servedRevision } from '../src/transactor/transactor-source.js'
-import type { BlockGets, CommitRequest, CommitResult, GetBlockResults } from '../src/index.js'
+import type { BlockGets, BlockId, CommitRequest, CommitResult, GetBlockResults } from '../src/index.js'
 import { captureCollectionLog } from './capture-log.js'
 
 interface Row { key: number; value: string }
@@ -234,14 +234,16 @@ describe('a refreshed collection re-reading a block its log entry names', () => 
 		expect(after, 'silent once the answer meets the floor').to.deep.equal([])
 	})
 
-	it('of two concurrent reads, the too-old answer arriving second is not the one kept', async () => {
+	it('of two concurrent reads, the too-old answer arriving second is neither kept nor returned', async () => {
 		// Reads are not serialized (the SQL layer runs reentrant scans over one handle), so two can
 		// miss on one block at once. The first answer meets the floor and is kept; the second — from
-		// a machine still behind — must not displace it.
+		// a machine still behind — must not displace it, and its reader gets the kept row: a write
+		// staged over what a read returned pins the revision the cache describes, so what a read
+		// returns must be what the cache then describes.
 		const { net, reader } = await twoReadsAtOnce('two-at-once', 1)
 		const answers = await Promise.all([reader.get(1), reader.get(1)])
 		net.armed = false
-		expect(answers, 'each reader gets the answer it was given').to.deep.equal([NEW, OLD])
+		expect(answers, 'both readers get the row the collection holds').to.deep.equal([NEW, NEW])
 
 		net.lagAt = undefined
 		expect(await net.fetchedDuring(async () => {
@@ -389,6 +391,133 @@ describe('a refreshed collection re-reading a block its log entry names', () => 
 			await reader.replace([[2, { key: 2, value: 'mine' }]])
 			const [blockId] = net.laggedReads[0]!
 			expect(declared.at(-1)?.[blockId]?.baseRev, 'the revision the base was SERVED at, not the one asked for').to.equal(laggingRev)
+		})
+
+		/** Refuses a commit whose declared base for a block is not that block's latest — the rule
+		 *  `StorageRepo.internalCommit` applies (`packages/db-p2p/src/storage/storage-repo.ts`) — and
+		 *  records every commit request. `catchUpOnRefusal` flips the lagging replica current the
+		 *  moment a commit is refused, so the retry finds storage caught up with no log movement. */
+		class BaseCheckingTransactor extends LaggingDataTransactor {
+			readonly requests: CommitRequest[] = []
+			readonly refusals: Array<{ blockId: string; declared: number; latest: number }> = []
+			catchUpOnRefusal = false
+
+			override async commit(request: CommitRequest): Promise<CommitResult> {
+				this.requests.push(structuredClone(request))
+				for (const [blockId, digest] of Object.entries(request.blockDigests ?? {})) {
+					if (digest.baseRev === undefined) continue
+					const held = (await TestTransactor.prototype.get.call(this, { blockIds: [blockId] }))[blockId]
+					const latest = held?.state.latest?.rev
+					if (latest !== undefined && latest !== digest.baseRev) {
+						this.refusals.push({ blockId, declared: digest.baseRev, latest })
+						if (this.catchUpOnRefusal) this.lagAt = undefined
+						await this.cancel({ actionId: request.actionId, blockIds: request.blockIds })
+						return { success: false, reason: `local latest ${latest} is not the declared base ${digest.baseRev} of rev ${request.rev}` }
+					}
+				}
+				return super.commit(request)
+			}
+		}
+
+		const keysInLeafOrder = async (tree: Tree<number, Row>): Promise<number[]> => {
+			const keys: number[] = []
+			for await (const path of tree.ascending(await tree.first())) {
+				const row = tree.at(path)
+				if (row) keys.push(row.key)
+			}
+			return keys
+		}
+
+		/** A one-leaf tree holding key 5; a rival inserts key 1 while `reader` is served the old leaf
+		 *  (below its floor); `reader` stages an insert of key 9, computed as position 1 of `[5]`. */
+		async function stagedOverAnOldLeaf(collectionId: string) {
+			const net = new BaseCheckingTransactor()
+			const rival = await Tree.createOrOpen<number, Row>(net, collectionId, keyOf)
+			await rival.replace([[5, { key: 5, value: 'five' }]])
+			const reader = await Tree.createOrOpen<number, Row>(net, collectionId, keyOf)
+			await reader.update()
+			await reader.get(5)
+			net.lagAt = reader.committedRevision()!
+			await rival.replace([[1, { key: 1, value: 'one' }]])
+			await reader.update()
+			await reader.stage([[9, { key: 9, value: 'nine' }]])
+			const [leafId, , laggingRev] = net.laggedReads[0]!
+			return { net, reader, leafId, laggingRev, currentRev: rival.committedRevision()! }
+		}
+
+		const restageLines = (lines: string[]) => lines.filter(line => line.includes('collection:restage-moved-base'))
+
+		it('a staged edit whose base moves after a second read is re-staged, and declares the base it is re-made on', async () => {
+			// Storage catches up and the leaf is read again: the cache now keeps the new leaf. The
+			// edit was computed on the old one, so it is re-staged before the pend rather than sent
+			// over the new revision — which the storage guard would accept, forking the leaf as [1, 9, 5].
+			const { net, reader, leafId, laggingRev, currentRev } = await stagedOverAnOldLeaf('moved-after-read')
+			net.lagAt = undefined
+			expect(await reader.get(1), 'the re-read serves the current leaf').to.deep.equal({ key: 1, value: 'one' })
+
+			const lines = restageLines(await captureCollectionLog(async () => { await reader.sync() }))
+			expect(lines, lines.join('\n')).to.have.length(1)
+			expect(lines[0]).to.match(new RegExp(
+				`collection:restage-moved-base id=moved-after-read tag=\\S+ block=${leafId} pinnedRev=${laggingRev} currentRev=${currentRev}$`))
+			expect(net.refusals, 'no attempt declared the old base').to.deep.equal([])
+			expect(net.requests.at(-1)?.blockDigests?.[leafId as BlockId]?.baseRev, 'the commit declares the base the edit was re-made on').to.equal(currentRev)
+
+			const verifier = await Tree.createOrOpen<number, Row>(net, 'moved-after-read', keyOf)
+			expect(await keysInLeafOrder(verifier), 'the committed leaf is in order').to.deep.equal([1, 5, 9])
+			expect(await verifier.get(9)).to.deep.equal({ key: 9, value: 'nine' })
+		})
+
+		it('a staged edit whose base moves with no read in between declares the old base, is refused, and is re-staged on the retry', async () => {
+			// No read of the leaf after staging. The first attempt re-asks (the base was never kept)
+			// and storage is still behind, so it declares the old revision — and is refused, exactly
+			// as it should be. Storage catches up on that refusal, the log has not moved so the refresh
+			// replays nothing, and the re-validation before the retry is what re-stages the edit.
+			const { net, reader, leafId, laggingRev, currentRev } = await stagedOverAnOldLeaf('moved-no-read')
+			net.catchUpOnRefusal = true
+
+			const lines = restageLines(await captureCollectionLog(async () => {
+				await reader.getCollection().sync({ maxAttempts: 4, baseBackoffMs: 1, maxBackoffMs: 2 })
+			}))
+			expect(net.refusals, 'the first attempt declared the base it really had').to.deep.equal([
+				{ blockId: leafId, declared: laggingRev, latest: currentRev },
+			])
+			expect(lines, 'one re-stage, on the retry').to.have.length(1)
+			expect(net.requests.at(-1)?.blockDigests?.[leafId as BlockId]?.baseRev).to.equal(currentRev)
+
+			const verifier = await Tree.createOrOpen<number, Row>(net, 'moved-no-read', keyOf)
+			expect(await keysInLeafOrder(verifier)).to.deep.equal([1, 5, 9])
+			expect(await verifier.get(9)).to.deep.equal({ key: 9, value: 'nine' })
+		})
+
+		it('a staged edit whose base never catches up is refused every time, never forked', async () => {
+			const { net, reader, leafId, laggingRev, currentRev } = await stagedOverAnOldLeaf('never-catches-up')
+			await expect(reader.getCollection().sync({ maxAttempts: 3, baseBackoffMs: 1, maxBackoffMs: 2 }))
+				.to.be.rejectedWith(SyncRetryExhaustedError)
+			expect(net.refusals.map(r => r.blockId)).to.deep.equal([leafId, leafId, leafId])
+			expect(net.refusals.every(r => r.declared === laggingRev && r.latest === currentRev)).to.equal(true)
+
+			net.lagAt = undefined
+			const verifier = await Tree.createOrOpen<number, Row>(net, 'never-catches-up', keyOf)
+			expect(await keysInLeafOrder(verifier), 'storage holds the rival write alone').to.deep.equal([1, 5])
+		})
+
+		it("a handle's own commits folding into its cache never look like a moved base", async () => {
+			// After each successful attempt the tracker is reset before the commit folds into the
+			// cache, so no pin survives to be compared against the folded revision; and a second
+			// action staged over the first's uncommitted edit pins the same committed base.
+			const net = new BaseCheckingTransactor()
+			const writer = await Tree.createOrOpen<number, Row>(net, 'own-commits', keyOf)
+			const lines = restageLines(await captureCollectionLog(async () => {
+				await writer.replace([[1, OLD]])
+				await writer.replace([[2, { key: 2, value: 'two' }]])
+				await writer.stage([[3, { key: 3, value: 'three' }]])
+				await writer.stage([[4, { key: 4, value: 'four' }]])
+				await writer.sync()
+				await writer.replace([[1, NEW]])
+			}))
+			expect(lines, 'no re-stage for no reason').to.deep.equal([])
+			expect(net.refusals).to.deep.equal([])
+			expect(await keysInLeafOrder(writer)).to.deep.equal([1, 2, 3, 4])
 		})
 	})
 

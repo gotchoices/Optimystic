@@ -4,8 +4,10 @@ import type { LogBlock } from "../log/log.js";
 import type { ActionEntry, GetFromResult, LogEntry } from "../log/struct.js";
 import { Atomic } from "../transform/atomic.js";
 import { Tracker } from "../transform/tracker.js";
+import type { BasePins } from "../transform/base-pins.js";
 import { CacheSource } from "../transform/cache-source.js";
-import { computeBlockContentDigests } from "../transform/digest.js";
+import { computeBlockContentDigests, baseRevsField } from "../transform/digest.js";
+import type { BlockBaseRevs } from "../network/struct.js";
 import { copyTransforms, isTransformsEmpty } from "../transform/helpers.js";
 import { TransactorSource, answeredBlock, servedRevision } from "../transactor/transactor-source.js";
 import { BlockFloors } from "../transactor/block-floors.js";
@@ -62,6 +64,10 @@ export type InFlightAttempt = {
 	tailId: BlockId;
 	/** The per-block content declarations the attempt's commit carried, if any. */
 	blockDigests?: BlockContentDigests;
+	/** The per-block bases the attempt's pend carried, if any (see `PendRequest.baseRevs`). Kept
+	 * with the transforms because they describe them: a re-send of these operations must name the
+	 * same bases they were computed against. */
+	baseRevs?: BlockBaseRevs;
 };
 
 /** What one refresh ({@link Collection.refreshInFlight}, and the refresh inside a sync) found out
@@ -149,6 +155,12 @@ export interface ReadViewOptions {
 export interface CollectionSnapshot<TAction> {
 	/** Deep-cloned tracker transforms at snapshot time. */
 	transforms: Transforms;
+	/** The bases the transforms' update operations were computed against (see {@link BasePins}),
+	 *  copied at snapshot time. Restored with the transforms, so a restore never pairs operations
+	 *  with the bases of some later re-stage: the pend would then declare a base the operations
+	 *  were not built on. Absent on a snapshot built by hand; such a restore keeps whatever pins
+	 *  the tracker holds for the restored ids. */
+	pins?: BasePins;
 	/** Pending actions queued at snapshot time. */
 	pending: Action<TAction>[];
 	/** The committed boundary (action context) the staged state sat on when captured.
@@ -683,7 +695,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// pair is not obviously right either: a member re-executing the transaction after a sibling
 		// participant has landed no longer sees the state it was staged against. Tracked as an arm
 		// of tickets/backlog/feat-no-deployment-validates-transactions-at-pend.
-		const result = await this.source.transact(attempt.transforms, entry.actionId, rev, this.id, attempt.tailId, 0, attempt.blockDigests);
+		const result = await this.source.transact(attempt.transforms, entry.actionId, rev, this.id, attempt.tailId, 0, attempt.blockDigests, attempt.baseRevs);
 		if (result.success) {
 			return result.durability;
 		}
@@ -1133,7 +1145,65 @@ export class Collection<TAction> implements ICollection<TAction> {
 			return true;
 		}
 		const adoptedRev = this.source.actionContext?.rev;
-		return adoptedRev !== undefined && adoptedRev !== priorContext?.rev && this.pending.length > 0;
+		if (adoptedRev !== undefined && adoptedRev !== priorContext?.rev && this.pending.length > 0) {
+			return true;
+		}
+		// Third reason: a staged block's base has MOVED — the read cache no longer describes it at
+		// the revision its operations were computed against (see `Tracker.movedBases`). A refresh
+		// that adopted nothing and found no conflict can still be standing over such a block: a
+		// concurrent read served content the cache then kept at a newer revision, say. Re-staging
+		// is the only repair; declaring the pinned revision on the pend would merely get it refused.
+		return this.pending.length > 0 && this.logMovedBases(this.tracker.movedBases()) > 0;
+	}
+
+	/** Re-judge every staged update's pinned base against the read cache and re-stage the pending
+	 * queue if any has moved. Runs immediately before each pend attempt — {@link syncAttempts} and
+	 * the coordinator's commit span both call it — because that is the last moment before the
+	 * base the pend declares is put on the wire, and nothing between a refused attempt and the
+	 * re-pend reads the block again (the refresh may have moved nothing and so replayed nothing).
+	 *
+	 * Two steps. First, one read for each pinned block the cache does NOT retain — content handed
+	 * through unkept (a below-floor answer, which the cache re-asks for on every read anyway): the
+	 * pin names the revision last served, storage may have caught up since without the log moving,
+	 * and only a read can tell. An evicted-but-kept base needs no read: its content met every floor
+	 * the handle knows, so storage cannot have moved it without a log entry the next refresh will
+	 * walk (and the pend would be refused as stale on revision alone). Then, one cache probe per
+	 * pinned block ({@link Tracker.movedBases}) and a replay if any moved.
+	 *
+	 * Latch-free by contract, like {@link snapshotPending}: the caller holds this instance's latch
+	 * ({@link replayActions} is always run under it).
+	 *
+	 * NOTE: reads are not latched, so a concurrent read can still move a base between this check
+	 * and the pend. The pend then declares the pin's (old) revision, storage refuses it, and the
+	 * next attempt's call here re-stages — one wasted round trip, never a wrong base. If that
+	 * refusal ever shows up in practice, the closure is to hold the pend under the read latch.
+	 *
+	 * @returns whether the pending queue was re-staged. */
+	async restageIfBasesMoved(): Promise<boolean> {
+		for (const id of this.tracker.unretainedBases()) {
+			// `navigation` never upgrades the purpose the original read recorded (value-wins), and
+			// the revision recorded is the one returned, which the replay below re-records anyway.
+			await this.sourceCache.tryGet(id, 'navigation');
+		}
+		if (this.pending.length === 0 || this.logMovedBases(this.tracker.movedBases()) === 0) {
+			return false;
+		}
+		await this.replayActions();
+		return true;
+	}
+
+	/** Report each moved base, naming the revision the operations were computed against and the
+	 * one the cache describes now, and return how many there were. */
+	private logMovedBases(moved: readonly BlockId[]): number {
+		if (log.enabled) {
+			for (const blockId of moved) {
+				log('collection:restage-moved-base id=%s tag=%s block=%s pinnedRev=%s currentRev=%s',
+					this.id, this.instanceTag, blockId,
+					this.tracker.stagedBaseRevs([blockId])[blockId] ?? 'none',
+					this.sourceCache.getCachedRevision(blockId) ?? 'none');
+			}
+		}
+		return moved.length;
 	}
 
 	/** Capture the current staged state — tracker transforms plus the pending
@@ -1152,6 +1222,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	snapshotPending(): CollectionSnapshot<TAction> {
 		return {
 			transforms: copyTransforms(this.tracker.transforms),
+			pins: this.tracker.pins.copy(),
 			pending: [...this.pending],
 			context: structuredClone(this.source.actionContext),
 		};
@@ -1179,7 +1250,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * rival's commit) still restores verbatim below — rebasing it would require an async
 	 * replay this synchronous method cannot run. That shape predates this guard and
 	 * keeps its old behaviour; if it is ever observed producing stale reads, the rebase
-	 * belongs in an async caller that can replay the pending queue (see replayActions). */
+	 * belongs in an async caller that can replay the pending queue (see replayActions).
+	 * The WRITE side of that shape is closed here: the snapshot's base pins are restored with
+	 * its transforms, so the restored operations name the bases they were computed on, and the
+	 * pre-pend re-validation (restageIfBasesMoved) finds those bases moved and re-stages. */
 	restorePending(snapshot: CollectionSnapshot<TAction>): void {
 		const capturedRev = snapshot.context?.rev;
 		const currentRev = this.source.actionContext?.rev;
@@ -1190,6 +1264,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			return;
 		}
 		this.tracker.reset(copyTransforms(snapshot.transforms));
+		if (snapshot.pins) this.tracker.pins.replaceWith(snapshot.pins);
 		this.pending = [...snapshot.pending];
 	}
 
@@ -1597,6 +1672,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 				// — the budget stays bounded by maxAttempts.
 			}
 
+			// A pending action is never pended over a base that has moved under it — before EVERY
+			// attempt, first and retries alike (see restageIfBasesMoved for why the retry needs it).
+			await this.restageIfBasesMoved();
+
 			// Snapshot the pending actions so that any new actions aren't assumed to be part of this action
 			const pending = [...this.pending];
 
@@ -1631,12 +1710,16 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// blocks. Unmeasured and cheap relative to the round trips it is retrying; if a
 			// high-contention sync ever shows digest hashing in a profile, memoize per (id, staged ops).
 			const blockDigests = await computeBlockContentDigests(tracker, tracker.transformedBlockIds());
+			// The base each update-only block's operations were computed against, for the pend (see
+			// `PendRequest.baseRevs`): the tracker's pinned revisions, which `restageIfBasesMoved` at the
+			// top of this iteration has just re-judged, so a moved base was re-staged before it is named.
+			const baseRevs = tracker.stagedBaseRevs(tracker.transformedBlockIds());
 
 			// Commit the action to the transactor. Carry the aged retry priority derived from the
 			// consecutive-failure count so a sync that keeps losing concurrent races out-ranks fresh
 			// (priority-0) rivals in the cluster's resolveRace (fairness-only; capped at MaxPriority).
 			// First attempt has consecutiveFailures == 0, so priority 0 — the common pend is unchanged.
-			const attempt = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id, clampPriority(consecutiveFailures), blockDigests);
+			const attempt = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id, clampPriority(consecutiveFailures), blockDigests, baseRevs);
 			if (!attempt.success) {
 				consecutiveFailures++;
 				lastReason = attempt.reason ?? lastReason;
@@ -1670,6 +1753,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 					transforms: tracker.transforms,
 					tailId: addResult.tailPath.block.header.id,
 					...(blockDigests === undefined ? {} : { blockDigests }),
+					...baseRevsField(baseRevs),
 				});
 				// Refresh, and keep refreshing while it reports that this write's own half-landed
 				// action could not be finished YET. It must not fall through to a new attempt in that

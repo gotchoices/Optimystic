@@ -65,6 +65,23 @@ export type PendRequest = ActionTransforms & {
 	 * validity — a stale pend is still rejected regardless of priority.
 	 */
 	priority?: number;
+	/**
+	 * Per block, the committed revision of the base the author's update operations were computed
+	 * against (`Tracker.stagedBaseRevs`). Present for a block whose transform is update-only and
+	 * whose base the author knows; never for an inserted or deleted block (base-independent), and
+	 * absent for a block the author did not read through a source that reports revisions. Omitted
+	 * entirely when empty (`baseRevsField`): the request is hashed verbatim into every cohort
+	 * signature preimage, so a pend that declares nothing must serialize exactly as it did before
+	 * the field existed. Action-wide here; the transactor narrows it to each per-coordinator batch's
+	 * own block ids at send time, exactly as it narrows {@link CommitRequest.blockDigests}.
+	 *
+	 * Storage keeps it beside the pending record (`BlockMetadata.pendingBases` in db-p2p), so every
+	 * later step that applies the record can refuse to apply it to a different version of the block
+	 * — including the read-driven promotion in `StorageRepo.get`, which has no commit message to
+	 * consult. The commit's own `blockDigests[id].baseRev` is now the fallback for a record whose
+	 * pend named no base, not the primary check.
+	 */
+	baseRevs?: BlockBaseRevs;
 };
 
 export type BlockActionStatus = ActionBlocks & {
@@ -185,6 +202,12 @@ export type BlockContentDigest = {
 /** Per-block content declarations riding on a commit. Optional per id: a block the client cannot
  *  digest without a network read is simply omitted, and falls back to corroboration downstream. */
 export type BlockContentDigests = Record<BlockId, BlockContentDigest>;
+
+/** Per block, the committed revision its update operations were computed against — the shape
+ *  `Tracker.stagedBaseRevs` produces and {@link PendRequest.baseRevs} carries. Optional per id: an
+ *  inserted or deleted block is base-independent and never named; a block updated without a known
+ *  base is simply omitted. */
+export type BlockBaseRevs = Record<BlockId, number>;
 
 export type CommitRequest = ActionBlocks & {
 	/** The header block of the collection, present only when this commit creates the collection

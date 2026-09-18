@@ -8,14 +8,17 @@ export class Atomic<TBlock extends IBlock> extends Tracker<TBlock> {
 	}
 
 	commit() {
-		// Hand the bases pinned inside this atomic to the parent tracker BEFORE reset() wipes this
-		// store — without this, a single act() carrying more actions than the read cache holds loses
-		// digest coverage, because by the flush below the cache has already evicted the early bases.
-		// The parent gets a COPY (adopt), not this store itself: sharing the store would let the
-		// reset() below wipe the parent's pins a line before flushing into it.
-		if (this.store instanceof Tracker) this.store.pins.adopt(this.pins);
-		const transform = this.reset();
-		applyTransformToStore(transform, this.store);
+		// A parent tracker takes the staged transform AND the bases pinned inside this atomic
+		// (Tracker.absorb): without the pins, a single act() carrying more actions than the read
+		// cache holds would lose digest coverage, the cache having evicted the early bases by the
+		// flush; and without absorb keeping them as the bases of the flushed operations, a base the
+		// cache moved on from between the pin and the flush would be re-pinned at the newer revision.
+		// Any other store just receives the transform.
+		if (this.store instanceof Tracker) {
+			this.store.absorb(this);
+		} else {
+			applyTransformToStore(this.reset(), this.store);
+		}
 	}
 
 	// rollback = reset

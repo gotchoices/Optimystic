@@ -152,7 +152,7 @@ describe('Block lineage: whether a block was built from a committed write', () =
 		// Crash-D3: rev 2 durably promoted, the setLatest that would have advanced `latest` lost.
 		const storage = new BlockStorage(blockId, rawStorage);
 		await withBlockWriteLatch(blockId, async latch => {
-			await storage.savePendingTransaction('mine' as ActionId, { updates: [['items', 1, 0, ['mine']]] }, 2, latch);
+			await storage.savePendingTransaction('mine' as ActionId, { updates: [['items', 1, 0, ['mine']]] }, 2, undefined, latch);
 			await storage.saveRevision(2, 'mine' as ActionId, latch);
 			await storage.promotePendingTransaction('mine' as ActionId, latch);
 		});

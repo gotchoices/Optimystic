@@ -33,10 +33,11 @@ export type BlockMetadata = {
 	/**
 	 * The revision each pending record on this block was pended AT, keyed by the record's action id —
 	 * the `rev` of the `PendRequest` it belongs to. This is what turns a pending record into a
-	 * *reservation for a slot* rather than a bare "someone is writing": a record claiming a revision
-	 * the collection has since moved past cannot be a rival for any later slot (see
-	 * `isReservationAgainst` in `pending-claim.ts`), and one claiming a revision this block has
-	 * already committed can never be promoted here at all.
+	 * *reservation for a slot* rather than a bare "someone is writing": a record the incoming writer
+	 * has built on — its requested revision is past the slot, or, where the promise vote reads it, its
+	 * declared base for the block is at or past the slot — is no rival (see `isReservationAgainst` in
+	 * `pending-claim.ts`),
+	 * and one claiming a revision this block has already committed can never be promoted here at all.
 	 *
 	 * Kept here, beside `latest`, rather than inside the pending record itself, because the raw
 	 * drivers move a pending record into the committed store byte-for-byte on promotion (a rename on
@@ -48,6 +49,28 @@ export type BlockMetadata = {
 	 * pended without a revision) reads as an unknown claim, which is treated as the strongest kind.
 	 */
 	pendingRevs?: Record<ActionId, number>;
+	/**
+	 * The committed revision each pending record's update operations were computed against, keyed
+	 * by the record's action id — the pend's `baseRevs[blockId]` (`PendRequest.baseRevs`). Absent for
+	 * a record whose pend carried no base for this block (inserted, deleted, or unknown to the
+	 * author) and for records written before the field existed; both read as base-unknown. Kept
+	 * beside `pendingRevs`, and for the same reason: the raw drivers move a pending record into the
+	 * committed store byte-for-byte on promotion, so the record's value has to stay a plain
+	 * transform. Written, dropped and swept in the same metadata writes as `pendingRevs`
+	 * (`BlockStorage.recordClaim`), so the two can never describe different records.
+	 *
+	 * A SIBLING map rather than a change to `pendingRevs`' shape, deliberately: metadata written by
+	 * the release before this field must stay readable without a migration, and a record with no
+	 * entry here simply reads as base-unknown. What each apply site does with an unknown base is
+	 * its own rule — `StorageRepo.internalCommit` falls back to the commit's declaration and then
+	 * abstains; the read-driven promotion in `StorageRepo.get` declines.
+	 *
+	 * NOTE: the two maps are not always co-keyed. A rev-less pend that names a base would leave an
+	 * entry here and none in `pendingRevs`, which the slot-driven dead-claim sweep cannot see, so it
+	 * would live until the record is deleted or promoted. Harmless, and no production caller sends a
+	 * rev-less pend (see the NOTE in `StorageRepo.pend`); if one ever appears, sweep this map too.
+	 */
+	pendingBases?: Record<ActionId, number>;
 };
 
 export type ArchiveRevisions = Record<number, {

@@ -4,11 +4,11 @@ import { highestStaleAt, isConflictFailure } from "../network/stale-failure.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import { mergeDurability, withTornBlocks } from "../network/durability.js";
 import { judgeCohortLineage, type CohortLineage, type MemberLineage } from "../network/lineage.js";
-import type { ActionTransforms, ActionBlocks, ActionLineage, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, GetBlockResult, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, WriteDurability } from "../index.js";
+import type { ActionTransforms, ActionBlocks, ActionLineage, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, GetBlockResult, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, BlockBaseRevs, WriteDurability } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
 import { Tracker } from "../transform/tracker.js";
-import { blockDigestsField } from "../transform/digest.js";
+import { blockDigestsField, baseRevsField } from "../transform/digest.js";
 import { CacheSource } from "../transform/cache-source.js";
 import { TransactorSource, servedRevision } from "./transactor-source.js";
 import { Log } from "../log/log.js";
@@ -663,7 +663,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			await processBatches(
 				batches,
 				(batch) => this.getRepo(batch.peerId).pend(
-					{ ...blockAction, transforms: batch.payload },
+					pendRequestForBatch(blockAction, batch.payload),
 					{
 						expiration,
 						dialTimeoutMs: this.dialTimeoutMs,
@@ -1347,18 +1347,39 @@ function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult
 		.map(b => (b.request!.response! as CommitSuccess).durability);
 }
 
+/** The entries of `all` whose ids appear in `batchBlockIds` — the per-batch narrowing both
+ * per-block declarations share ({@link digestsFor}, {@link baseRevsFor}). */
+function subsetOf<T>(all: Record<BlockId, T>, batchBlockIds: BlockId[]): Record<BlockId, T> {
+	const subset: Record<BlockId, T> = {};
+	for (const id of batchBlockIds) {
+		const entry = all[id];
+		if (entry !== undefined) subset[id] = entry;
+	}
+	return subset;
+}
+
 /** The subset of `all` whose ids appear in `batchBlockIds`, wrapped (via {@link blockDigestsField})
  * so it spreads to nothing when the batch declares no digests. Called at SEND time, once per attempt,
  * because `processBatches` re-batches failed blocks onto different coordinators — a subset computed
  * up front would follow the wrong batch on retry. */
 function digestsFor(all: BlockContentDigests | undefined, batchBlockIds: BlockId[]): { blockDigests?: BlockContentDigests } {
-	if (!all) return {};
-	const subset: BlockContentDigests = {};
-	for (const id of batchBlockIds) {
-		const digest = all[id];
-		if (digest !== undefined) subset[id] = digest;
-	}
-	return blockDigestsField(subset);
+	return all ? blockDigestsField(subsetOf(all, batchBlockIds)) : {};
+}
+
+/** The pend-side sibling of {@link digestsFor}: the subset of `all` whose ids appear in
+ * `batchBlockIds`, wrapped (via {@link baseRevsField}) so it spreads to nothing when no block in the
+ * batch names a base. Same send-time rule, for the same reason. */
+function baseRevsFor(all: BlockBaseRevs | undefined, batchBlockIds: BlockId[]): { baseRevs?: BlockBaseRevs } {
+	return all ? baseRevsField(subsetOf(all, batchBlockIds)) : {};
+}
+
+/** `action` re-scoped to one coordinator batch: the batch's own transforms, and the bases for the
+ * blocks in it alone (see {@link PendRequest.baseRevs}). The action-wide `baseRevs` key is dropped
+ * BEFORE the subset is spread, so a batch none of whose blocks names a base carries no key at all
+ * rather than the whole action's map — and no cohort signs for a block it is not responsible for. */
+function pendRequestForBatch(action: PendRequest, payload: Transforms): PendRequest {
+	const { baseRevs, ...rest } = action;
+	return { ...rest, transforms: payload, ...baseRevsFor(baseRevs, blockIdsForTransforms(payload)) };
 }
 
 /**

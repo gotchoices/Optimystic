@@ -201,24 +201,19 @@ describe('commit content digests', () => {
 			expect(digests).to.deep.equal({});
 		});
 
-		it('stale pin after transformCache(): recomputed from the folded live base, never the pin', async () => {
+		it('a base folded to a new revision under a staged update has MOVED: undeclared, never re-described', async () => {
+			// The ops were computed on rev 7. Declaring them over the folded rev 9 content would put
+			// the one wrong base on the commit that the storage guard cannot catch (a member holding
+			// rev 9 applies them and agrees with everyone). So neither the stale pin nor the live base
+			// is declared; the base is reported as moved and the pinned revision stays what it was.
 			await tracker.tryGet('a' as BlockId);
 			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);          // pin captured at rev 7
-			const stalePinExpected = applyTransform(
-				structuredClone(blocks.get('a')!),
-				transformForBlockId(tracker.transforms, 'a' as BlockId)
-			);
 			cache.transformCache({ inserts: {}, updates: { ['a' as BlockId]: [['data', 0, 0, 'folded']] }, deletes: [] }, 9);
 
 			const digests = await computeBlockContentDigests(tracker, ['a' as BlockId]);
-			expect(digests['a' as BlockId]!.baseRev, 'declared at the folded revision').to.equal(9);
-			const foldedExpected = applyTransform(
-				cache.peek('a' as BlockId)!,
-				transformForBlockId(tracker.transforms, 'a' as BlockId)
-			);
-			expect(digests['a' as BlockId]!.digest).to.equal(await canonicalBlockHash(foldedExpected!));
-			expect(digests['a' as BlockId]!.digest, 'and NOT the stale pinned materialization')
-				.to.not.equal(await canonicalBlockHash(stalePinExpected!));
+			expect(digests, 'nothing is declared for a moved base').to.deep.equal({});
+			expect(tracker.movedBases()).to.deep.equal(['a']);
+			expect(tracker.stagedBaseRevs(['a' as BlockId]), 'the base named is still the one the ops were built on').to.deep.equal({ a: 7 });
 		});
 
 		it('one base probe per id: 50 updates clone the base once', async () => {
@@ -348,6 +343,175 @@ describe('commit content digests', () => {
 			const otherCache = new CacheSource(makeRevSource(blocks, revs));
 			expect(() => new Tracker(otherCache, undefined, tracker.pins))
 				.to.throw(/different base sources/);
+		});
+	});
+
+	describe('the base of a staged update is fixed at the first update', () => {
+		it('a generation bump at the SAME revision keeps the digest declared, at that revision', async () => {
+			await tracker.tryGet('a' as BlockId);
+			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);          // pinned at rev 7
+			const genAtPin = cache.getGeneration('a' as BlockId);
+			cache.clear(['a' as BlockId]);
+			await tracker.tryGet('a' as BlockId);                              // re-load: same content, same rev, new generation
+			expect(cache.getGeneration('a' as BlockId)).to.not.equal(genAtPin);
+
+			const digests = await computeBlockContentDigests(tracker, ['a' as BlockId]);
+			expect(digests['a' as BlockId]!.baseRev).to.equal(7);
+			expect(tracker.movedBases()).to.deep.equal([]);
+			expect(tracker.pins.get('a' as BlockId)!.gen, 'the pin was restamped, not replaced').to.equal(cache.getGeneration('a' as BlockId));
+		});
+
+		it('a generation bump to a DIFFERENT revision marks the base moved; the pinned revision is still reported', async () => {
+			await tracker.tryGet('a' as BlockId);
+			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);          // pinned at rev 7
+			cache.clear(['a' as BlockId]);
+			revs.set('a', 8);
+			await tracker.tryGet('a' as BlockId);                              // re-load at rev 8
+
+			expect(tracker.movedBases()).to.deep.equal(['a']);
+			expect(tracker.peekMaterialized('a' as BlockId), 'no digest can be declared').to.be.undefined;
+			expect(tracker.stagedBaseRevs(['a' as BlockId])).to.deep.equal({ a: 7 });
+			tracker.update('a' as BlockId, ['items', 0, 0, ['y']]);           // a later op never re-pins
+			expect(tracker.stagedBaseRevs(['a' as BlockId])).to.deep.equal({ a: 7 });
+			expect(tracker.movedBases()).to.deep.equal(['a']);
+		});
+
+		it('a base cleared under a staged update has moved: the pin is never repaired from the live cache', async () => {
+			await tracker.tryGet('a' as BlockId);
+			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);
+			cache.clear(['a' as BlockId]);
+			expect(tracker.movedBases()).to.deep.equal(['a']);
+			await tracker.tryGet('a' as BlockId);                              // same rev again — but the mark stands
+			expect(tracker.movedBases(), 'once moved, moved until the tracker is reset').to.deep.equal(['a']);
+			expect(tracker.stagedBaseRevs(['a' as BlockId])).to.deep.equal({ a: 7 });
+		});
+
+		it('stagedBaseRevs names update-only blocks, never inserted or deleted ones, nor unpinned ones', async () => {
+			await tracker.tryGet('a' as BlockId);
+			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);
+			await tracker.tryGet('b' as BlockId);
+			tracker.update('b' as BlockId, ['data', 0, 0, 'bee']);
+			tracker.delete('b' as BlockId);                                     // update then delete
+			tracker.update('n' as BlockId, ['items', 0, 0, ['late']]);
+			tracker.insert(makeBlock('n', 'new'));                              // update then insert
+			tracker.update('u' as BlockId, ['data', 0, 0, 'blind']);           // never read: no base to name
+
+			expect(tracker.stagedBaseRevs(['a', 'b', 'n', 'u', 'z'] as BlockId[])).to.deep.equal({ a: 7 });
+			expect(tracker.movedBases()).to.deep.equal([]);
+		});
+
+		it('a rev-only pin (read, evicted, then updated) names its base and declares no digest', async () => {
+			const smallCache = new CacheSource(makeRevSource(blocks, revs), 1);
+			const smallTracker = new Tracker(smallCache);
+			await smallTracker.tryGet('a' as BlockId);
+			await smallTracker.tryGet('b' as BlockId);         // evicts 'a'; its revision lingers
+			smallTracker.update('a' as BlockId, ['data', 0, 0, 'updated']);
+
+			expect(smallTracker.pins.get('a' as BlockId)).to.deep.equal({ rev: 7, gen: smallCache.getGeneration('a' as BlockId) });
+			expect(smallTracker.stagedBaseRevs(['a' as BlockId])).to.deep.equal({ a: 7 });
+			expect(await computeBlockContentDigests(smallTracker, ['a' as BlockId])).to.deep.equal({});
+			expect(smallTracker.movedBases()).to.deep.equal([]);
+
+			// The same revision read again fills the pin: the digest becomes declarable after all.
+			await smallTracker.tryGet('a' as BlockId);
+			const digests = await computeBlockContentDigests(smallTracker, ['a' as BlockId]);
+			expect(digests['a' as BlockId]!.baseRev).to.equal(7);
+		});
+
+		it('adopting a pin at a different revision than the parent already pins marks the base moved', async () => {
+			const parent = new Tracker(cache);
+			await parent.tryGet('a' as BlockId);
+			parent.update('a' as BlockId, ['items', 0, 0, ['first']]);         // parent pins a@7
+
+			cache.clear(['a' as BlockId]);
+			revs.set('a', 8);
+			const atomic = new Atomic<TestBlock>(parent);
+			await atomic.tryGet('a' as BlockId);                                // re-read at rev 8
+			atomic.update('a' as BlockId, ['items', 0, 0, ['second']]);         // the atomic pins a@8
+			atomic.commit();
+
+			expect(parent.movedBases()).to.deep.equal(['a']);
+			expect(parent.stagedBaseRevs(['a' as BlockId]), "the parent's revision — what the first op was built on").to.deep.equal({ a: 7 });
+			expect(parent.peekMaterialized('a' as BlockId)).to.be.undefined;
+		});
+
+		it("a base that moves between an atomic's pin and its flush stays the atomic's base in the parent, marked moved", async () => {
+			// The parent has nothing staged for 'a'. The atomic reads a@7 and updates it; before the
+			// flush a concurrent unlatched read reloads the cache at rev 9 (storage caught up, no log
+			// movement). The parent's first op for 'a' arrives with the adopted pin already in place —
+			// the base those ops were built on — and must not re-probe the live cache for a@9.
+			const parent = new Tracker(cache);
+			const atomic = new Atomic<TestBlock>(parent);
+			await atomic.tryGet('a' as BlockId);
+			atomic.update('a' as BlockId, ['items', 0, 0, ['z']]);            // the atomic pins a@7
+			cache.clear(['a' as BlockId]);
+			revs.set('a', 9);
+			await cache.tryGet('a' as BlockId);                                // the cache now describes a@9
+			atomic.commit();
+
+			expect(parent.stagedBaseRevs(['a' as BlockId]), 'the base the ops were built on').to.deep.equal({ a: 7 });
+			expect(parent.movedBases()).to.deep.equal(['a']);
+			expect(parent.peekMaterialized('a' as BlockId)).to.be.undefined;
+		});
+
+		it('adopting a pin at the same revision the parent pins is an overwrite, not a move', async () => {
+			const parent = new Tracker(cache);
+			await parent.tryGet('a' as BlockId);
+			parent.update('a' as BlockId, ['items', 0, 0, ['first']]);
+			const atomic = new Atomic<TestBlock>(parent);
+			await atomic.tryGet('a' as BlockId);
+			atomic.update('a' as BlockId, ['items', 0, 0, ['second']]);
+			atomic.commit();
+
+			expect(parent.movedBases()).to.deep.equal([]);
+			expect((await computeBlockContentDigests(parent, ['a' as BlockId]))['a' as BlockId]!.baseRev).to.equal(7);
+		});
+
+		it("adopting a rev-only pin at the revision the parent pins in full keeps the parent's clone", async () => {
+			// The atomic read 'a', then enough else to evict it, then updated it: its pin names rev 7
+			// without content. The parent's full pin at rev 7 is the same committed content and is what
+			// keeps the digest declarable after the fold.
+			const smallCache = new CacheSource(makeRevSource(blocks, revs), 1);
+			const parent = new Tracker(smallCache);
+			await parent.tryGet('a' as BlockId);
+			parent.update('a' as BlockId, ['items', 0, 0, ['first']]);
+			expect(parent.pins.get('a' as BlockId)!.block).to.not.be.undefined;
+
+			const atomic = new Atomic<TestBlock>(parent);
+			await atomic.tryGet('a' as BlockId);
+			await atomic.tryGet('b' as BlockId);                                // evicts 'a'
+			atomic.update('a' as BlockId, ['items', 0, 0, ['second']]);
+			expect(atomic.pins.get('a' as BlockId)).to.deep.equal({ rev: 7, gen: smallCache.getGeneration('a' as BlockId) });
+			atomic.commit();
+
+			expect(parent.pins.get('a' as BlockId)!.block, 'the clone survives the fold').to.not.be.undefined;
+			expect(parent.movedBases()).to.deep.equal([]);
+			expect((await computeBlockContentDigests(parent, ['a' as BlockId]))['a' as BlockId]!.baseRev).to.equal(7);
+		});
+
+		it('reset(transforms) keeps the moved mark of a retained pin; reset() clears it', async () => {
+			await tracker.tryGet('a' as BlockId);
+			tracker.update('a' as BlockId, ['items', 0, 0, ['z']]);
+			cache.clear(['a' as BlockId]);
+			expect(tracker.movedBases()).to.deep.equal(['a']);
+
+			tracker.reset({ inserts: {}, updates: { ['a' as BlockId]: [['items', 0, 0, ['z']]] }, deletes: [] });
+			expect(tracker.movedBases(), 'the same ops keep the same (moved) base').to.deep.equal(['a']);
+
+			tracker.reset();
+			expect(tracker.pins.size).to.equal(0);
+			expect(tracker.movedBases()).to.deep.equal([]);
+		});
+
+		it('an update over a drift-aware source that never described the block declares nothing, even once the cache holds it', async () => {
+			// The op was computed blind (no read). Declaring the revision the cache learns LATER would
+			// name a base the op was not built on.
+			tracker.update('b' as BlockId, ['data', 0, 0, 'blind']);
+			await tracker.tryGet('b' as BlockId);                              // the cache holds 'b' now
+			expect(cache.peek('b' as BlockId)).to.not.be.undefined;
+
+			expect(await computeBlockContentDigests(tracker, ['b' as BlockId])).to.deep.equal({});
+			expect(tracker.stagedBaseRevs(['b' as BlockId])).to.deep.equal({});
 		});
 	});
 

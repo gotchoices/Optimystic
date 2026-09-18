@@ -1,10 +1,10 @@
 import { randomBytes } from '@noble/hashes/utils.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
-import type { IBlock, BlockId, BlockHeader, ITransactor, ActionId, CommitResult, ActionContext, BlockType, BlockSource, ReadPurpose, Transforms, BlockContentDigests, GetBlockResult } from "../index.js";
+import type { IBlock, BlockId, BlockHeader, ITransactor, ActionId, CommitResult, ActionContext, BlockType, BlockSource, ReadPurpose, Transforms, BlockContentDigests, BlockBaseRevs, GetBlockResult } from "../index.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
-import { blockDigestsField } from "../transform/digest.js";
+import { blockDigestsField, baseRevsField } from "../transform/digest.js";
 import type { BlockFloorCheck } from "./block-floors.js";
 import { createLogger } from "../logger.js";
 
@@ -220,6 +220,9 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	 * computed by the caller from the same tracker that produced `transform`. Omitted from the commit request when
 	 * undefined, so a caller that declares nothing produces exactly the request shape as before — the field rides
 	 * inside every cohort signature's hash preimage, so keeping the shape clean keeps those preimages clean.
+	 * @param baseRevs - Optional per-block base revisions for the pend (see {@link PendRequest.baseRevs}): the
+	 * committed revision each update-only block's operations were computed against, from the same tracker
+	 * (`Tracker.stagedBaseRevs`). Omitted from the pend request when empty, for the same preimage reason.
 	 * @returns The transactor's own verdict, unflattened: a {@link CommitSuccess} carrying the
 	 * {@link WriteDurability} of the committed revision, or a {@link StaleFailure} if the pend or the commit
 	 * was refused. Success is deliberately NOT collapsed to `undefined` — the durability is the only thing
@@ -227,8 +230,12 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	 * old boolean reads `result.success`. Test "is this completely saved" through `isFullyDurable`, never
 	 * by comparing `quorum` (see {@link WriteDurability}).
 	 */
-	async transact(transform: Transforms, actionId: ActionId, rev: number, headerId: BlockId, tailId: BlockId, priority = 0, blockDigests?: BlockContentDigests): Promise<CommitResult> {
-		const pendResult = await this.transactor.pend({ transforms: transform, actionId, rev, policy: 'r', ...(priority > 0 ? { priority } : {}) });
+	async transact(transform: Transforms, actionId: ActionId, rev: number, headerId: BlockId, tailId: BlockId, priority = 0, blockDigests?: BlockContentDigests, baseRevs?: BlockBaseRevs): Promise<CommitResult> {
+		const pendResult = await this.transactor.pend({
+			transforms: transform, actionId, rev, policy: 'r',
+			...(priority > 0 ? { priority } : {}),
+			...baseRevsField(baseRevs)
+		});
 		if (!pendResult.success) {
 			return pendResult;
 		}

@@ -91,6 +91,8 @@ await collection.act(localAction);
 // (handled internally by conflict resolution)
 ```
 
+A refresh re-stages the pending queue (`replayActions` in `packages/db-core/src/collection/collection.ts`) for any of three reasons, decided by `mustReplay`: a walked log entry named a block the tracker holds a transform for (a conflict); the committed revision advanced while actions are pending (an action must be applied against the revision it commits over, even one that changed no block); or a staged block's **base moved** — the read cache no longer describes the block at the revision its staged operations were computed against. The third is also checked without a refresh, by `Collection.restageIfBasesMoved`, immediately before every pend attempt (`syncAttempts`, and the coordinator's commit spans), so a pending action is never pended over a moved base; the replay is logged as `collection:restage-moved-base` with the pinned and the current revision.
+
 ## Communication with Remote State
 
 Collections communicate with remote state through a **transactor** (covered in detail in another document). The transactor handles:
@@ -525,6 +527,8 @@ const tracker = new Tracker(sourceCache);
 // Cache invalidation on conflicts
 this.sourceCache.clear(entry.blockIds);
 ```
+
+The read cache keeps one invariant a write depends on: **what a read returns for a block is what the cache then describes for it** (`admit` in `packages/db-core/src/transform/cache-source.ts`). A below-floor answer, or one overtaken while in flight, is handed to its reader only when the cache holds nothing for the block; when it does hold something, the reader gets the held content. Either way `peek` and `getCachedRevision` describe exactly what the reader was given, and the tracker pins that revision as the base of any update staged over it (`Tracker.update` in `packages/db-core/src/transform/tracker.ts`) — fixed at the first update, and marked moved rather than replaced if the cache later describes the block at another revision. The pins follow the operations: an atomic's flush hands its pins to the parent tracker (`Tracker.absorb`), and a staged-state snapshot (`snapshotPending`) carries them so a restore reunites operations with the bases they were computed on.
 
 ## Usage Patterns
 

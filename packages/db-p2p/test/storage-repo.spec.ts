@@ -4,7 +4,7 @@ import { blockWriteLatchKey, withBlockWriteLatch, type BlockWriteLatch } from '.
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockArchive, RestoreCallback, RevisionRange } from '../src/storage/struct.js';
-import type { BlockId, ActionId, ActionRev, ActionTransforms, BlockContentDigest, CommitResult, PendRequest, PendSuccess, StaleFailure, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
+import type { BlockId, ActionId, ActionRev, ActionTransforms, BlockContentDigest, CommitResult, PendRequest, PendSuccess, StaleFailure, Transform, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
 import { isBlockChangeNotifier, Latches, canonicalBlockHash } from '@optimystic/db-core';
 import { delay } from '@optimystic/db-core/test';
 
@@ -144,7 +144,7 @@ describe('StorageRepo', () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const initialBlock = makeBlock('block-1');
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, undefined, l);
+				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, undefined, undefined, l);
 				await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock, l);
 				await blockStorage.saveRevision(1, 'initial-action' as ActionId, l);
 				await blockStorage.promotePendingTransaction('initial-action' as ActionId, l);
@@ -171,7 +171,7 @@ describe('StorageRepo', () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const initialBlock = makeBlock('block-1');
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, undefined, l);
+				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, undefined, undefined, l);
 				await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock, l);
 				await blockStorage.saveRevision(1, 'initial-action' as ActionId, l);
 				await blockStorage.promotePendingTransaction('initial-action' as ActionId, l);
@@ -197,7 +197,7 @@ describe('StorageRepo', () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const initialBlock = makeBlock('block-1');
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, undefined, l);
+				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, undefined, undefined, l);
 				await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock, l);
 				await blockStorage.saveRevision(1, 'initial-action' as ActionId, l);
 				await blockStorage.promotePendingTransaction('initial-action' as ActionId, l);
@@ -467,7 +467,7 @@ describe('StorageRepo', () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const existingBlock = makeBlock('block-1');
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await blockStorage.savePendingTransaction('setup' as ActionId, { insert: existingBlock }, undefined, l);
+				await blockStorage.savePendingTransaction('setup' as ActionId, { insert: existingBlock }, undefined, undefined, l);
 				await blockStorage.saveMaterializedBlock('setup' as ActionId, existingBlock, l);
 				await blockStorage.saveRevision(1, 'setup' as ActionId, l);
 				await blockStorage.promotePendingTransaction('setup' as ActionId, l);
@@ -518,7 +518,7 @@ describe('StorageRepo', () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const testBlock = makeBlock('block-1');
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await blockStorage.savePendingTransaction('create' as ActionId, { insert: testBlock }, undefined, l);
+				await blockStorage.savePendingTransaction('create' as ActionId, { insert: testBlock }, undefined, undefined, l);
 				await blockStorage.saveMaterializedBlock('create' as ActionId, testBlock, l);
 				await blockStorage.saveRevision(1, 'create' as ActionId, l);
 				await blockStorage.promotePendingTransaction('create' as ActionId, l);
@@ -583,7 +583,7 @@ describe('StorageRepo', () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const testBlock = makeBlock('block-1');
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await blockStorage.savePendingTransaction('create' as ActionId, { insert: testBlock }, undefined, l);
+				await blockStorage.savePendingTransaction('create' as ActionId, { insert: testBlock }, undefined, undefined, l);
 				await blockStorage.saveMaterializedBlock('create' as ActionId, testBlock, l);
 				await blockStorage.saveRevision(1, 'create' as ActionId, l);
 				await blockStorage.promotePendingTransaction('create' as ActionId, l);
@@ -787,13 +787,15 @@ describe('StorageRepo', () => {
 			expect(entry.materialized?.rev, 'no base ⇒ no materialized revision').to.equal(undefined);
 		});
 
-		it('a promotion refusal on the context\'s OWN actionId returns a flagged entry, never a throw', async () => {
-			// The context proves rev 2 for `p1` AND names `p1` as its pending overlay. Read-driven
-			// promotion refuses (no base to apply the update to) and `refuseMissingBase` DELETES that
-			// pending record. The overlay branch then finds no pending — but this repo did hold it and
-			// dropped it, so the honest answer is the availability flag. Throwing `Pending action …
-			// not found` here would escape the per-block catch and fail the whole batch.
-			const blockId = 'refused-own-pending' as BlockId;
+		it('a promotion DECLINE on the context\'s OWN actionId returns a flagged entry with the record kept, never a throw', async () => {
+			// The context proves rev 2 for `p1` AND names `p1` as its pending overlay. The read-driven
+			// promotion DECLINES (an update-only record with no base stored for it, over no committed
+			// base) and leaves the record in place; with nothing committed here an absent answer would
+			// contradict the record this node holds, so it is flagged. The overlay branch then finds
+			// the record and applies it over no base, which materializes nothing — flagged by its own
+			// rule. Before the pend carried its base this path REFUSED and deleted the record; keeping
+			// it is the new contract, since a replica can still bring its base.
+			const blockId = 'declined-own-pending' as BlockId;
 			await repo.pend({
 				actionId: 'p1' as ActionId,
 				transforms: makeUpdateTransforms(blockId, [['items', 0, 0, ['x']]]),
@@ -807,9 +809,10 @@ describe('StorageRepo', () => {
 
 			expect(result[blockId]!.block).to.equal(undefined);
 			expect(result[blockId]!.unavailable).to.equal('unmaterializable');
-			expect(result[blockId]!.state).to.deep.equal({});
-			// The refusal really did drop the record — otherwise this test proves nothing.
-			expect(await rawStorage.getPendingTransaction(blockId, 'p1' as ActionId)).to.equal(undefined);
+			expect(result[blockId]!.state.latest).to.equal(undefined);
+			expect(result[blockId]!.state.pendings, 'the overlay branch answered, with the record still held').to.deep.equal(['p1']);
+			// The decline really did keep the record — the old refusal deleted it.
+			expect(await rawStorage.getPendingTransaction(blockId, 'p1' as ActionId)).to.not.equal(undefined);
 		});
 
 		it('a pending DELETE over a real committed base reads absent and stays UNFLAGGED', async () => {
@@ -1110,7 +1113,7 @@ describe('StorageRepo', () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const testBlock = makeBlock('block-1', { items: [] });
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await blockStorage.savePendingTransaction('setup' as ActionId, { insert: testBlock }, undefined, l);
+				await blockStorage.savePendingTransaction('setup' as ActionId, { insert: testBlock }, undefined, undefined, l);
 				await blockStorage.saveMaterializedBlock('setup' as ActionId, testBlock, l);
 				await blockStorage.saveRevision(1, 'setup' as ActionId, l);
 				await blockStorage.promotePendingTransaction('setup' as ActionId, l);
@@ -1146,7 +1149,7 @@ describe('StorageRepo', () => {
 				const storage = new BlockStorage(blockId as BlockId, rawStorage);
 				const block = makeBlock(blockId, { items: [] });
 				await withBlockWriteLatch(blockId as BlockId, async l => {
-					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, undefined, l);
+					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, undefined, undefined, l);
 					await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 					await storage.saveRevision(1, 'setup' as ActionId, l);
 					await storage.promotePendingTransaction('setup' as ActionId, l);
@@ -1204,7 +1207,7 @@ describe('StorageRepo', () => {
 			const storage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const block = makeBlock('block-1', { items: [] });
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, undefined, l);
+				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, undefined, undefined, l);
 				await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 				await storage.saveRevision(1, 'setup' as ActionId, l);
 				await storage.promotePendingTransaction('setup' as ActionId, l);
@@ -1213,7 +1216,9 @@ describe('StorageRepo', () => {
 			await repo.pend({
 				actionId: 'a2' as ActionId,
 				transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['a2']]]),
-				policy: 'c'
+				policy: 'c',
+				// The read-driven promotion applies a record only to the base its pend named.
+				baseRevs: { ['block-1' as BlockId]: 1 }
 			});
 			return storage;
 		};
@@ -1290,7 +1295,7 @@ describe('StorageRepo', () => {
 			const storage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const block = makeBlock('block-1', { items: [] });
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, undefined, l);
+				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, undefined, undefined, l);
 				await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 				await storage.saveRevision(1, 'setup' as ActionId, l);
 				await storage.promotePendingTransaction('setup' as ActionId, l);
@@ -1299,7 +1304,11 @@ describe('StorageRepo', () => {
 			await gatedRepo.pend({
 				actionId: 'a2' as ActionId,
 				transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['a2']]]),
-				policy: 'c'
+				policy: 'c',
+				// a2 is promoted by the read, which applies a record only to the base its pend named.
+				// a3 commits through commit() naming no base anywhere (a base-less sender), so it
+				// applies over whichever revision it meets — either interleaving must end at rev 3.
+				baseRevs: { ['block-1' as BlockId]: 1 }
 			});
 			await gatedRepo.pend({
 				actionId: 'a3' as ActionId,
@@ -1347,13 +1356,13 @@ describe('StorageRepo', () => {
 			const storage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const block = makeBlock('block-1', { items: [] });
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, undefined, l);
+				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, undefined, undefined, l);
 				await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 				await storage.saveRevision(1, 'setup' as ActionId, l);
 				await storage.promotePendingTransaction('setup' as ActionId, l);
 				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, false, l);
 				// rev 2 durable but latest deliberately NOT advanced (the lost-setLatest / Crash-D3 signature).
-				await storage.savePendingTransaction('a2' as ActionId, { insert: makeBlock('block-1', { items: ['a2'] }) }, undefined, l);
+				await storage.savePendingTransaction('a2' as ActionId, { insert: makeBlock('block-1', { items: ['a2'] }) }, undefined, undefined, l);
 				await storage.saveMaterializedBlock('a2' as ActionId, makeBlock('block-1', { items: ['a2'] }), l);
 				await storage.saveRevision(2, 'a2' as ActionId, l);
 				await storage.promotePendingTransaction('a2' as ActionId, l);
@@ -1389,7 +1398,7 @@ describe('StorageRepo', () => {
 			const storage1 = new BlockStorage('block-1' as BlockId, rawStorage);
 			const block1 = makeBlock('block-1', { items: [] });
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await storage1.savePendingTransaction('setup' as ActionId, { insert: block1 }, undefined, l);
+				await storage1.savePendingTransaction('setup' as ActionId, { insert: block1 }, undefined, undefined, l);
 				await storage1.saveMaterializedBlock('setup' as ActionId, block1, l);
 				await storage1.saveRevision(1, 'setup' as ActionId, l);
 				await storage1.promotePendingTransaction('setup' as ActionId, l);
@@ -1400,7 +1409,7 @@ describe('StorageRepo', () => {
 			const storage2 = new BlockStorage('block-2' as BlockId, rawStorage);
 			const block2 = makeBlock('block-2', { items: [] });
 			await withBlockWriteLatch('block-2' as BlockId, async l => {
-				await storage2.savePendingTransaction('setup' as ActionId, { insert: block2 }, undefined, l);
+				await storage2.savePendingTransaction('setup' as ActionId, { insert: block2 }, undefined, undefined, l);
 				await storage2.saveMaterializedBlock('setup' as ActionId, block2, l);
 				await storage2.saveRevision(1, 'setup' as ActionId, l);
 				await storage2.promotePendingTransaction('setup' as ActionId, l);
@@ -1709,7 +1718,7 @@ describe('StorageRepo', () => {
 				const storage = new BlockStorage(id as BlockId, rawStorage);
 				const block = makeBlock(id, { items: [] });
 				await withBlockWriteLatch(id as BlockId, async l => {
-					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, undefined, l);
+					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, undefined, undefined, l);
 					await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 					await storage.saveRevision(1, 'setup' as ActionId, l);
 					await storage.promotePendingTransaction('setup' as ActionId, l);
@@ -1787,7 +1796,7 @@ describe('StorageRepo', () => {
 				const storage = new BlockStorage(id as BlockId, rawStorage);
 				const block = makeBlockInCollection(id, collectionId, { items: [] });
 				await withBlockWriteLatch(id as BlockId, async l => {
-					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, undefined, l);
+					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, undefined, undefined, l);
 					await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 					await storage.saveRevision(1, 'setup' as ActionId, l);
 					await storage.promotePendingTransaction('setup' as ActionId, l);
@@ -2411,9 +2420,14 @@ describe('StorageRepo', () => {
 			actionId: string,
 			rev: number,
 			transforms: Transforms,
-			declared?: { baseRev?: unknown }
+			declared?: { baseRev?: unknown },
+			/** The base the PEND carries for the block (`PendRequest.baseRevs`), when given. */
+			pendBase?: number
 		): Promise<CommitResult> => {
-			await target.pend({ actionId: actionId as ActionId, transforms, policy: 'c' });
+			await target.pend({
+				actionId: actionId as ActionId, transforms, policy: 'c',
+				...(pendBase === undefined ? {} : { baseRevs: { [BLOCK]: pendBase } })
+			});
 			return await target.commit({
 				actionId: actionId as ActionId,
 				blockIds: [BLOCK],
@@ -2476,7 +2490,7 @@ describe('StorageRepo', () => {
 			expect(gappedState?.state?.latest?.rev, 'the gapped member must stay behind, not fork').to.equal(2);
 			expect(await itemsOf(gapped.repo)).to.deep.equal(['a']);
 			// Pre-fix, both reported rev 5 with different bytes — this is the hash that used to differ.
-			expect(canonicalBlockHash(healthyState!.block!)).to.not.equal(canonicalBlockHash(gappedState!.block!));
+			expect(await canonicalBlockHash(healthyState!.block!)).to.not.equal(await canonicalBlockHash(gappedState!.block!));
 		});
 
 		it('refuses when this member is AHEAD of the declared base (divergent history)', async () => {
@@ -2623,6 +2637,155 @@ describe('StorageRepo', () => {
 				policy: 'f'
 			});
 			expect(later.success, 'no orphaned pending may remain on the unreached sibling').to.equal(true);
+		});
+
+		/**
+		 * Ticket: bug-a-pended-transform-does-not-carry-its-base (second of three).
+		 *
+		 * The base now travels with the PEND and is stored with the record, so the guard no longer
+		 * depends on the commit declaring anything: the stored base is primary, the commit's
+		 * declaration the fallback, and a disagreement between the two is its own refusal.
+		 */
+		describe('with the base carried on the pend', () => {
+			it('refuses a commit that declares NOTHING on the gapped member, and lands it on the healthy one', async () => {
+				// Arm one of the old defect: an undeclared commit used to gap-apply. With the base on
+				// the pend the gapped member has what it needs without any declaration.
+				const healthy = makeMember();
+				const gapped = makeMember();
+				for (const member of [healthy.repo, gapped.repo]) {
+					await seed(member);
+					expect((await apply(member, 'a2', 2, spliceItems(0, ['a']), undefined, 1)).success).to.equal(true);
+				}
+				expect((await apply(healthy.repo, 'a3', 3, spliceItems(1, ['b']), undefined, 2)).success).to.equal(true);
+				expect((await apply(healthy.repo, 'a4', 4, spliceItems(2, ['c']), undefined, 3)).success).to.equal(true);
+
+				expect((await apply(healthy.repo, 'a5', 5, spliceItems(0, ['z']), undefined, 4)).success).to.equal(true);
+				expectMissingBase(await apply(gapped.repo, 'a5', 5, spliceItems(0, ['z']), undefined, 4));
+
+				expect((await healthy.repo.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest?.rev).to.equal(5);
+				expect(await itemsOf(healthy.repo)).to.deep.equal(['z', 'a', 'b', 'c']);
+				expect((await gapped.repo.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest?.rev, 'behind, not forked').to.equal(2);
+				expect(await itemsOf(gapped.repo)).to.deep.equal(['a']);
+			});
+
+			it('refuses when the stored base disagrees with the declared base, even where the declaration matches latest', async () => {
+				// The shape this closes: a stale record from an EARLIER attempt of a retried action
+				// (its operations computed against rev 4) meets the retry's commit, which honestly
+				// declares rev 2 — exactly this member's latest. A guard reading only the declaration
+				// would apply the stale operations here.
+				const { repo: member } = makeMember();
+				await seed(member);
+				expect((await apply(member, 'a2', 2, spliceItems(0, ['a']), { baseRev: 1 }, 1)).success).to.equal(true);
+
+				const result = await apply(member, 'a5', 5, spliceItems(0, ['z']), { baseRev: 2 }, 4);
+
+				expectMissingBase(result);
+				expect((result as { reason?: string }).reason ?? '', 'its own detail, greppable apart from the plain mismatch')
+					.to.include('stored base 4 disagrees with declared base 2');
+				expect((await member.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest?.rev, 'latest untouched').to.equal(2);
+				expect(await itemsOf(member)).to.deep.equal(['a']);
+			});
+
+			it('refuses on the stored base alone when this member is AHEAD of it', async () => {
+				const { repo: member } = makeMember();
+				await seed(member);
+				expect((await apply(member, 'a2', 2, spliceItems(0, ['a']), undefined, 1)).success).to.equal(true);
+				expect((await apply(member, 'a3', 3, spliceItems(1, ['b']), undefined, 2)).success).to.equal(true);
+
+				expectMissingBase(await apply(member, 'a5', 5, spliceItems(0, ['z']), undefined, 1));
+
+				expect((await member.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest?.rev).to.equal(3);
+			});
+
+			it('applies when neither the pend nor the commit names a base — the residual, accepted for base-less senders', async () => {
+				const { repo: member } = makeMember();
+				await seed(member);
+
+				const result = await apply(member, 'a5', 5, spliceItems(0, ['z']));
+
+				expect(result.success, 'a sender that names no base anywhere still commits').to.equal(true);
+				expect((await member.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest?.rev).to.equal(5);
+			});
+
+			it('falls back to the commit declaration for a record whose pend named no base', async () => {
+				const { repo: member } = makeMember();
+				await seed(member);
+
+				expectMissingBase(await apply(member, 'a5', 5, spliceItems(0, ['z']), { baseRev: 4 }));
+				expect((await apply(member, 'a6', 6, spliceItems(0, ['y']), { baseRev: 1 })).success).to.equal(true);
+			});
+
+			it('never keeps a base for an insert-carrying record, so a hostile one cannot refuse the commit', async () => {
+				const { repo: member, raw } = makeMember();
+				await member.pend({
+					actionId: 'a5' as ActionId,
+					transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: ['fresh'] })),
+					policy: 'c',
+					baseRevs: { [BLOCK]: 4 }
+				});
+				expect(await new BlockStorage(BLOCK, raw).pendingClaimOf('a5' as ActionId), 'the base is dropped at pend for a base-independent transform')
+					.to.deep.equal({ actionId: 'a5' });
+				await member.saveReplicatedBlock(BLOCK, makeBlock(BLOCK, { items: ['seeded'] }), { actionId: 'a-repl' as ActionId, rev: 2 });
+
+				const result = await member.commit({ actionId: 'a5' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 5 });
+
+				expect(result.success).to.equal(true);
+				expect(await itemsOf(member)).to.deep.equal(['fresh']);
+			});
+
+			it('ignores a malformed pend base for that block alone', async () => {
+				const { repo: member } = makeMember();
+				await seed(member);
+				await member.pend({
+					actionId: 'a5' as ActionId, transforms: spliceItems(0, ['z']), policy: 'c',
+					baseRevs: { [BLOCK]: '4' as unknown as number, ['not-in-this-pend' as BlockId]: 4 }
+				});
+				const result = await member.commit({ actionId: 'a5' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 5 });
+				expect(result.success, 'a string is not a base; with nothing else named the guard abstains').to.equal(true);
+			});
+
+			it('a pending record written by the release before the field existed still commits and is still swept', async () => {
+				// A node upgraded from a build with no `pendingBases` holds leftover records whose metadata
+				// carries a slot but no base map at all. Such a record must never be refused, or held
+				// forever, merely for lacking a base: at commit the guard falls back to the declaration
+				// and then abstains; on a context read it is declined, and the replica or reconcile that
+				// brings the node current sweeps it.
+				const { repo: member, raw } = makeMember();
+				await seed(member);
+				expect((await apply(member, 'a2', 2, spliceItems(0, ['a']), { baseRev: 1 }, 1)).success).to.equal(true);
+				/** Writes `actionId`'s record and its slot in the release's metadata shape — `pendingRevs` only. */
+				const pendAsRelease = async (actionId: string, rev: number, transform: Transform): Promise<void> => {
+					const meta = (await raw.getMetadata(BLOCK))!;
+					expect(meta.pendingBases, 'the release wrote no base map').to.equal(undefined);
+					await raw.saveMetadata(BLOCK, { ...meta, pendingRevs: { ...meta.pendingRevs, [actionId]: rev } });
+					await raw.savePendingTransaction(BLOCK, actionId as ActionId, transform);
+				};
+				const spliceOne = (index: number, values: unknown[]): Transform => ({ updates: [['items', index, 0, values]] });
+
+				await pendAsRelease('a-declared', 3, spliceOne(1, ['b']));
+				expect(await new BlockStorage(BLOCK, raw).pendingClaimOf('a-declared' as ActionId)).to.deep.equal({ actionId: 'a-declared', rev: 3 });
+				expect((await member.commit({
+					actionId: 'a-declared' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 3,
+					blockDigests: { [BLOCK]: { digest: 'declared', baseRev: 2 } as BlockContentDigest }
+				})).success, 'the commit declaration is the fallback for a record with no stored base').to.equal(true);
+
+				await pendAsRelease('a-undeclared', 4, spliceOne(2, ['c']));
+				expect((await member.commit({ actionId: 'a-undeclared' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 4 })).success,
+					'with nothing named anywhere the guard abstains, as before the field existed').to.equal(true);
+				expect(await itemsOf(member)).to.deep.equal(['a', 'b', 'c']);
+
+				// A leftover record for a change this node MISSED the commit of: a context read declines it
+				// (no base to establish), and the replica that lands its revision sweeps it.
+				await pendAsRelease('a-missed', 5, spliceOne(0, ['z']));
+				const declined = (await member.get({ blockIds: [BLOCK], context: { committed: [{ actionId: 'a-missed' as ActionId, rev: 5 }], rev: 5 } }))[BLOCK]!;
+				expect(declined.state.latest?.rev, 'declined, latest untouched').to.equal(4);
+				expect('unavailable' in declined, 'behind is not a guess').to.equal(false);
+				expect(await raw.getPendingTransaction(BLOCK, 'a-missed' as ActionId), 'declined, not refused').to.not.equal(undefined);
+				await member.saveReplicatedBlock(BLOCK, makeBlock(BLOCK, { items: ['z', 'a', 'b', 'c'] }), { actionId: 'a-missed' as ActionId, rev: 5 });
+				expect((await member.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest?.rev).to.equal(5);
+				expect(await raw.getPendingTransaction(BLOCK, 'a-missed' as ActionId), 'the replica that brought the node current swept the record').to.equal(undefined);
+				expect((await raw.getMetadata(BLOCK))!.pendingRevs, 'and its claim').to.equal(undefined);
+			});
 		});
 	});
 
@@ -3074,7 +3237,7 @@ describe('StorageRepo', () => {
 			await rawStorage.saveMetadata(BLOCK, { latest: { rev: 3, actionId: 'ghost' as ActionId }, ranges: [[3]] });
 			await withBlockWriteLatch(BLOCK, async l => {
 				await new BlockStorage(BLOCK, rawStorage).savePendingTransaction('a1' as ActionId,
-					{ insert: makeBlock(BLOCK, { items: ['fresh'] }) }, undefined, l);
+					{ insert: makeBlock(BLOCK, { items: ['fresh'] }) }, undefined, undefined, l);
 			});
 
 			const preview = await repo.previewCommitDigest(BLOCK, 'a1' as ActionId, 4);
@@ -3400,5 +3563,214 @@ describe('StorageRepo.pend — a pending record claiming a superseded slot is no
 		expect(committed.success, JSON.stringify(committed)).to.equal(true);
 		expect((await repo.get({ blockIds: [B] }))[B]!.state.latest).to.deep.equal({ actionId: 'a-later', rev: 3 });
 		expect(await raw.getPendingTransaction(B, 'a-missed' as ActionId), 'once the block passes its slot the record is dead, and swept').to.equal(undefined);
+	});
+});
+
+/**
+ * Ticket: a-rival-pend-is-superseded-only-by-a-writer-that-built-on-it (review).
+ *
+ * The rule's base arm — a rival record is superseded only when the newcomer's declared base is at or
+ * past its slot — is read at the PROMISE VOTE alone, and only in a cohort that can leave a member out
+ * (`ClusterMember.reservingRivals`, `cohortCanMissAPend`). The apply-time scan here keeps the revision
+ * rule whatever base the pend declares, so it is never stricter than the vote: a pend the cohort
+ * approved is not refused at apply, and a member that voted `held` on a stray record of its own (a
+ * cancel that never reached it) but was outvoted still stores the pend, whose commit then sweeps the
+ * record. What storage still does with the base is keep it (`pendingBases`) for the fork guard and the
+ * read-driven promotion.
+ */
+describe('StorageRepo.pend — the apply-time rival scan keeps the revision rule whatever base the pend declares', () => {
+	const B = 'block-built-on' as BlockId;
+	let raw: MemoryRawStorage;
+	let repo: StorageRepo;
+
+	const newcomer = (over: Partial<PendRequest> = {}): PendRequest => ({
+		actionId: 'a-newcomer' as ActionId,
+		transforms: makeUpdateTransforms(B, [['items', 0, 0, ['n']]]),
+		rev: 6,
+		policy: 'r',
+		...over
+	});
+
+	beforeEach(async () => {
+		raw = new MemoryRawStorage();
+		repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		// The block at revision 4, and a rival pended at revision 5 over it whose commit has not landed here.
+		await repo.saveReplicatedBlock(B, makeBlock(B, { items: [] }), { actionId: 'r4' as ActionId, rev: 4 });
+		const rival = await repo.pend({
+			actionId: 'a-rival' as ActionId, transforms: makeUpdateTransforms(B, [['items', 0, 0, ['r']]]),
+			rev: 5, baseRevs: { [B]: 4 }, policy: 'r'
+		});
+		expect(rival.success, 'the rival pend is recorded').to.equal(true);
+	});
+
+	it('admits a pend past the record\'s slot, whatever base it declares, and keeps that base', async () => {
+		for (const base of [4, 5, undefined, '4', 9]) {
+			const actionId = `a-base-${String(base)}` as ActionId;
+			const result = await repo.pend(newcomer({ actionId, ...(base === undefined ? {} : { baseRevs: { [B]: base as number } }) }));
+			expect(result.success, `base ${JSON.stringify(base)}: ${JSON.stringify(result)}`).to.equal(true);
+			expect((result as PendSuccess).pending, 'and reports no rival').to.deep.equal([]);
+			const claim = await repo.pendingClaimOf(B, actionId);
+			expect(claim?.baseRev, `base ${JSON.stringify(base)} is kept as storage keeps any base`).to.equal(typeof base === 'number' ? base : undefined);
+			// Each admitted pend claims slot 6 itself; clear it so the next case meets only the rival.
+			await repo.cancel({ actionId, blockIds: [B] });
+		}
+		expect(await raw.getPendingTransaction(B, 'a-rival' as ActionId), 'the rival\'s record stands').to.not.equal(undefined);
+	});
+
+	it('still holds a pend for the record\'s own slot whatever base it declares', async () => {
+		const result = await repo.pend(newcomer({ rev: 5, baseRevs: { [B]: 4 } }));
+		expect(result.success).to.equal(false);
+		expect((result as StaleFailure).pending?.map(p => p.actionId)).to.deep.equal(['a-rival']);
+	});
+});
+
+/**
+ * Ticket: bug-a-pended-transform-does-not-carry-its-base (second of three).
+ *
+ * The read-driven promotion in `StorageRepo.get` has no commit message to consult, and it walks the
+ * context's committed list SKIPPING entries whose record it does not hold — so a member that missed
+ * one change to a block used to apply the next one straight over the stale copy. The base each
+ * record's pend carried (`PendingClaim.baseRev`) is what it now checks: a record is applied only to
+ * the exact revision its operations were computed against, and otherwise DECLINED — record and
+ * `latest` left as they are, walk stopped for the block.
+ */
+describe('StorageRepo.get — read-driven promotion applies a record only to the base it was computed against', () => {
+	const BLOCK = 'promotable-block' as BlockId;
+
+	const makeMember = () => {
+		const raw = new MemoryRawStorage();
+		return { raw, repo: new StorageRepo((blockId) => new BlockStorage(blockId, raw)) };
+	};
+
+	const splice = (index: number, values: unknown[]): Transforms => makeUpdateTransforms(BLOCK, [['items', index, 0, values]]);
+
+	const itemsOf = (block: IBlock | undefined): unknown[] | undefined =>
+		block === undefined ? undefined : (block as unknown as { items: unknown[] }).items;
+
+	/** Pend (carrying `base` when given) WITHOUT committing — the record a context read may promote. */
+	const pendOnly = async (target: StorageRepo, actionId: string, rev: number, transforms: Transforms, base?: number): Promise<void> => {
+		const result = await target.pend({
+			actionId: actionId as ActionId, transforms, rev, policy: 'c',
+			...(base === undefined ? {} : { baseRevs: { [BLOCK]: base } })
+		});
+		expect(result.success, `pend ${actionId}@${rev} must be accepted`).to.equal(true);
+	};
+
+	/** Pend + commit, carrying `base` on the pend when given. */
+	const land = async (target: StorageRepo, actionId: string, rev: number, transforms: Transforms, base?: number): Promise<void> => {
+		await pendOnly(target, actionId, rev, transforms, base);
+		const result = await target.commit({ actionId: actionId as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev });
+		expect(result.success, `commit ${actionId}@${rev} must land`).to.equal(true);
+	};
+
+	const seed = (target: StorageRepo) => land(target, 'a1', 1, makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: [] })));
+
+	const entry = (actionId: string, rev: number) => ({ actionId: actionId as ActionId, rev });
+
+	it('declines on the member that missed a change and promotes on the one that took it; a replica then lets the first catch up', async () => {
+		// The plan ticket's scenario. Two members hold rev 1; A takes rev 2 (computed against 1); B
+		// misses it; both hold the pend for rev 3, computed against 2.
+		const a = makeMember();
+		const b = makeMember();
+		await seed(a.repo);
+		await seed(b.repo);
+		await land(a.repo, 'a2', 2, splice(0, ['x']), 1);
+		await pendOnly(a.repo, 'a3', 3, splice(1, ['y']), 2);
+		await pendOnly(b.repo, 'a3', 3, splice(1, ['y']), 2);
+		const context = { committed: [entry('a2', 2), entry('a3', 3)], rev: 3 };
+
+		// B: rev 2 is not held, and rev 3's record was computed against 2, which B does not hold.
+		const onB = (await b.repo.get({ blockIds: [BLOCK], context }))[BLOCK]!;
+		expect(onB.state.latest?.rev, 'B declines: latest untouched').to.equal(1);
+		expect(itemsOf(onB.block), 'and serves its real, merely behind, content').to.deep.equal([]);
+		expect('unavailable' in onB, 'behind is not a guess').to.equal(false);
+		expect(await b.raw.getPendingTransaction(BLOCK, 'a3' as ActionId), 'the record is kept, not refused').to.not.equal(undefined);
+
+		// A: rev 3's record was computed against 2, which A holds — promoted.
+		const onA = (await a.repo.get({ blockIds: [BLOCK], context }))[BLOCK]!;
+		expect(onA.state.latest?.rev).to.equal(3);
+		expect(itemsOf(onA.block)).to.deep.equal(['x', 'y']);
+
+		// Rev 2 reaches B by replication; the same read now promotes rev 3 there too.
+		await b.repo.saveReplicatedBlock(BLOCK, makeBlock(BLOCK, { items: ['x'] }), { actionId: 'a2' as ActionId, rev: 2 });
+		const onBAfter = (await b.repo.get({ blockIds: [BLOCK], context }))[BLOCK]!;
+		expect(onBAfter.state.latest?.rev).to.equal(3);
+		expect(await canonicalBlockHash(onBAfter.block!), 'the two members agree byte for byte').to.equal(await canonicalBlockHash(onA.block!));
+		expect(await b.raw.getPendingTransaction(BLOCK, 'a3' as ActionId), 'promoted, so the record is gone').to.equal(undefined);
+	});
+
+	it('declines a record whose pend named no base, leaving it in place', async () => {
+		const { repo, raw } = makeMember();
+		await seed(repo);
+		await pendOnly(repo, 'a2', 2, splice(0, ['x']));
+
+		const served = (await repo.get({ blockIds: [BLOCK], context: { committed: [entry('a2', 2)], rev: 2 } }))[BLOCK]!;
+
+		expect(served.state.latest?.rev, 'nothing establishes the base, so nothing is applied').to.equal(1);
+		expect(itemsOf(served.block)).to.deep.equal([]);
+		expect('unavailable' in served).to.equal(false);
+		expect(await raw.getPendingTransaction(BLOCK, 'a2' as ActionId)).to.not.equal(undefined);
+	});
+
+	it('promotes an insert-carrying record and a delete-only record regardless of any base', async () => {
+		const { repo, raw } = makeMember();
+		// An insert: base-independent, and a (hostile) base on its pend is dropped at pend time.
+		const pended = await repo.pend({
+			actionId: 'a1' as ActionId, rev: 1, policy: 'c',
+			transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: ['fresh'] })),
+			baseRevs: { [BLOCK]: 9 }
+		});
+		expect(pended.success).to.equal(true);
+		const inserted = (await repo.get({ blockIds: [BLOCK], context: { committed: [entry('a1', 1)], rev: 1 } }))[BLOCK]!;
+		expect(inserted.state.latest?.rev).to.equal(1);
+		expect(itemsOf(inserted.block)).to.deep.equal(['fresh']);
+
+		// A delete: materializes to nothing, so no base can fork it.
+		await pendOnly(repo, 'a2', 2, makeDeleteTransforms(BLOCK));
+		const deleted = (await repo.get({ blockIds: [BLOCK], context: { committed: [entry('a1', 1), entry('a2', 2)], rev: 2 } }))[BLOCK]!;
+		expect(deleted.block).to.equal(undefined);
+		expect('unavailable' in deleted, 'an authoritative tombstone').to.equal(false);
+		// A tombstoned block reads as an absent with an empty state, so the landing is checked on disk.
+		expect((await raw.getMetadata(BLOCK))?.latest?.rev, 'the tombstone was promoted to rev 2').to.equal(2);
+		expect(await raw.getPendingTransaction(BLOCK, 'a2' as ActionId)).to.equal(undefined);
+	});
+
+	it('a decline on the first missing entry stops the walk for that block', async () => {
+		// Rev 2 is not held; rev 3 (base 2) declines; rev 4 (base 3) must not even be tried —
+		// each later entry builds on the one before.
+		const { repo, raw } = makeMember();
+		await seed(repo);
+		await pendOnly(repo, 'a3', 3, splice(0, ['y']), 2);
+		await pendOnly(repo, 'a4', 4, splice(0, ['z']), 3);
+
+		const served = (await repo.get({ blockIds: [BLOCK], context: { committed: [entry('a2', 2), entry('a3', 3), entry('a4', 4)], rev: 4 } }))[BLOCK]!;
+
+		expect(served.state.latest?.rev).to.equal(1);
+		expect(await raw.getPendingTransaction(BLOCK, 'a3' as ActionId)).to.not.equal(undefined);
+		expect(await raw.getPendingTransaction(BLOCK, 'a4' as ActionId)).to.not.equal(undefined);
+	});
+
+	it('walks on past a promoted record to the next one, whose base it now holds', async () => {
+		const { repo } = makeMember();
+		await seed(repo);
+		await pendOnly(repo, 'a2', 2, splice(0, ['x']), 1);
+		await pendOnly(repo, 'a3', 3, splice(1, ['y']), 2);
+
+		const served = (await repo.get({ blockIds: [BLOCK], context: { committed: [entry('a2', 2), entry('a3', 3)], rev: 3 } }))[BLOCK]!;
+
+		expect(served.state.latest?.rev, 'latest is re-read per entry, so rev 3 sees rev 2 just landed').to.equal(3);
+		expect(itemsOf(served.block)).to.deep.equal(['x', 'y']);
+	});
+
+	it('flags a decline as unavailable only when this node holds no committed revision at all', async () => {
+		// With nothing committed, an absent answer would contradict the record this node holds.
+		const { repo, raw } = makeMember();
+		await pendOnly(repo, 'a2', 2, splice(0, ['x']), 1);
+
+		const served = (await repo.get({ blockIds: [BLOCK], context: { committed: [entry('a2', 2)], rev: 2 } }))[BLOCK]!;
+
+		expect(served.block).to.equal(undefined);
+		expect(served.unavailable).to.equal('unmaterializable');
+		expect(await raw.getPendingTransaction(BLOCK, 'a2' as ActionId), 'declined, not refused: the record stays').to.not.equal(undefined);
 	});
 });

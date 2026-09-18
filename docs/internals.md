@@ -220,9 +220,12 @@ depends on why they are all behind: a lagging replica catches up within one read
 bound the storage layer already documents instead of forever, while a log entry whose blocks never
 landed sets a floor no machine can ever meet, and there the below-floor content is the *correct*
 content (the accepted-tradeoff `NOTE:` at `mayRetain`). It sets no floor for a block first read at open (no entries are walked then) or for the blocks an
-invalidation entry reverts. And it narrows, without closing, the hazard of a write staged over a
-too-old read (ticket `bug-a-pended-transform-does-not-carry-its-base`): once storage catches up, the
-base under already-staged edits changes with no replay.
+invalidation entry reverts. A write staged over a too-old read keeps the revision it was really
+computed against: once storage catches up, the base under the staged edits is re-judged as moved and
+the edits are re-staged before they are pended, never re-described at the newer revision (see
+[Staged Edits Keep Their Base](#staged-edits-keep-their-base); the storage side of the same defect
+is closed by the pend carrying that base and storage keeping it with the record — see the invariant
+*An update-only transform is applied only to the base its author read* under Key Invariants).
 While a floor is unmet every read of its block costs a transactor request rather than a memory hit,
 and now a second coordinator round with it; the tripwire `NOTE:` at `mayRetain` names the remedy if
 that ever shows up.
@@ -477,6 +480,22 @@ payload the client authored, delivered at pend):
 Base-independence is decided by the member's own transform and never by the declaration, so a
 hostile declarer can neither force nor dodge a check by mis-declaring `baseRev`; a surplus
 declaration for a block the commit does not cover is ignored.
+
+**The declared base is checked first, and needs no preview.** The author names each update-only
+block's base twice: on the pend (`PendRequest.baseRevs`, kept with the member's pending record) and
+in the commit's `blockDigests[id].baseRev`. Before any preview, `ClusterMember.validateCommitBaseDeclarations`
+compares the two and votes reject with the signed reason `base-declaration-disagrees` when they
+differ — the member's record holds operations computed against a base other than the one the commit
+is about to be applied as. `StorageRepo.internalCommit` refuses the same shape at apply; the vote
+puts a signed verdict on it one round earlier, and when a writer's commit contradicts its own pend
+every member refuses at the vote rather than after consensus. It abstains wherever it cannot
+compare: no numeric declared `baseRev`, no record for the action, a record with no base — or a
+member whose own latest is not the declared base. That last abstain keeps an honest retry off the
+reject: the disagreement an honest writer can meet is a stale record from an earlier attempt of a
+retried action (the retry's pend never reached this member), on a member that is behind, and at
+three members one reject would sink the commit record for the whole cohort. Abstaining lets the
+others commit, and the member's own apply (`guardCommitBase`) refuses the stale record and
+reconciles.
 
 **The check runs on the promise round, not the commit round.** The commit-round vote is cast
 deliberately blind: a member signs the commit whenever the cohort's promise approvals reach
@@ -852,6 +871,37 @@ saveMaterializedBlock(block): store(structuredClone(block));
 - `copyTransforms()` and `transformForBlockId()` must deep-clone both `insert` and `updates`
 - JSON serialization over network creates implicit deep copies
 
+### Staged Edits Keep Their Base
+- **What a read returns for a block is what the read cache then describes for it.** `CacheSource.tryGet`
+  decides in one step (`admit` in `packages/db-core/src/transform/cache-source.ts`) both the content
+  the reader gets and what `peek` / `getCachedRevision` say for that id afterwards. An answer the
+  cache will not keep — below its floor, or overtaken while in flight — is returned only when nothing
+  is held for the id; otherwise the reader gets the held content, of two answers the higher revision
+  being the truer. An LRU-evicted id keeps its revision entry on purpose: it is the revision of the
+  content last served, which is what a write staged over the evicted read must name.
+- **The base of a block's staged updates is fixed when the first update is staged and is never
+  replaced while updates remain staged.** `Tracker.update` pins the cache's revision (and content,
+  when resident) at the first operation for an id (`pinBase` in
+  `packages/db-core/src/transform/tracker.ts`). A later change of what the cache holds for the id is
+  re-judged by revision (`revalidatePin`): the same revision refreshes the pin, a different one — or
+  none — marks the base **moved**. A moved base is never repaired by re-pinning or by falling back to
+  the live cache: the pend would then declare a base the operations were not built on, the one
+  direction the storage-side guard cannot catch. `Tracker.stagedBaseRevs` names the pinned revision
+  for every update-only block (moved or not); `Tracker.movedBases` lists the moved ones. The pins
+  travel with the operations wherever the operations travel: an atomic's flush into its parent
+  (`Tracker.absorb`) hands over the atomic's pins as the bases of the flushed operations rather than
+  re-probing a cache that may have moved on, and a staged-state snapshot
+  (`Collection.snapshotPending` / `restorePending`) carries and restores them, so a rollback never
+  pairs operations with the bases of some later re-stage.
+- **A pending action is never pended over a moved base; it is re-staged first.**
+  `Collection.restageIfBasesMoved` in `packages/db-core/src/collection/collection.ts` runs before
+  every attempt of `syncAttempts` and at the top of both coordinator commit spans (`commitOnceLatched`
+  and `execute` in `packages/db-core/src/transaction/coordinator.ts`, before the pre-commit snapshots
+  and the log append): one read per pinned block the cache does not retain (a below-floor answer, so
+  storage may have caught up with no log movement), one cache probe per pinned block, and a replay of
+  the pending queue if any base moved (logged as `collection:restage-moved-base`). `mustReplay` has
+  the same test as its third reason, beside conflicts and a revision advance.
+
 ### Consensus Execution
 - `handleConsensus()` executes on ALL cluster peers, not just coordinator
 - `executedTransactions` map prevents duplicate execution (keyed by messageHash)
@@ -891,15 +941,33 @@ saveMaterializedBlock(block): store(structuredClone(block));
   bytes, permanently — after which the content-digest check above rejects every later write to
   that block from that member. Revision arithmetic cannot detect this (`latest.rev !== rev - 1`
   is the *routine* per-collection gap and rejecting it breaks ordinary writes — see the retired
-  decision ticket `st-commit-contiguity-guard-premise`). The only sound discriminator is the
-  writer's own per-block declaration: `internalCommit` refuses when `blockDigests[blockId].baseRev`
-  is a number, the member's pended transform carries no `insert`, and `latest?.rev` is not that
-  number — behind it, ahead of it, or absent. The refusal is the same `missing-base-revision`
-  divergence as above, so it heals by the same reconcile. **Two arms are not covered**, both by
-  design and both tracked by `backlog/bug-a-pended-transform-does-not-carry-its-base`:
-  a commit that declares no digest for the block (nothing to compare, so the member abstains and
-  gap-applies as before), and the read-driven promotion in `StorageRepo.get`, which has no commit
-  request and therefore no declaration.
+  decision ticket `st-commit-contiguity-guard-premise`). The only sound discriminator is what the
+  author says the base was, and the base now **travels with the change**: the pend names, per
+  update-only block, the committed revision its operations were computed against
+  (`PendRequest.baseRevs`, from the tracker's pins — see
+  [Staged Edits Keep Their Base](#staged-edits-keep-their-base)), and storage keeps it beside the
+  pending record (`BlockMetadata.pendingBases`, read back as `PendingClaim.baseRev`), so every step
+  that applies the record has the base to hand, commit message or not. At commit,
+  `StorageRepo.internalCommit` (its `guardCommitBase`) reads the stored base first and the commit's
+  own `blockDigests[blockId].baseRev` only as a fallback: both present and unequal is refused
+  outright (a stale record from an earlier attempt of a retried action, met by the retry's commit);
+  otherwise the effective base must equal `latest.rev` — behind it, ahead of it, or absent all
+  refuse. The refusal is the same `missing-base-revision` divergence as above, so it heals by the
+  same reconcile. The read-driven promotion in `StorageRepo.get` (`mayPromoteOnRead`) applies a
+  record only when its stored base equals `latest.rev` and otherwise **declines**: the record and
+  `latest` stay as they are, the walk stops for that block, and the committed content served is
+  real content merely behind — which the reader's floors and the coordinator's read-repair own —
+  except that a block with no committed revision here is flagged `unavailable`, since an absent
+  answer would contradict the record the node holds. A declined record is not dead: a replica or
+  reconcile brings the base, after which a later context read promotes it or the dead-claim sweep
+  removes it. An inserted or deleted block is base-independent and is never named or guarded.
+  **One arm stays open by choice**, for senders that name no base at all (a build before the field
+  existed, or a drift-blind source such as the test doubles): storage accepts and keeps their pend
+  without a base, the commit guard falls back to the declaration and then abstains — logged
+  `commit:base-undeclared` so the residual is countable — and the read-driven promotion declines
+  their held-but-missed records, which then come current only through the next commit's reconcile
+  or read-repair. Refusing a base-less pend was rejected because it would turn every such writer's
+  write into a hard failure on a release that may run mixed versions for a while.
 - **A node that can re-check a transaction never skips the check silently.** Both validating tiers
   — a `ClusterMember` casting its promise vote and a `StorageRepo` applying a pend — run the one
   `checkPendValidation` ([`db-p2p/src/pend-validation.ts`](../packages/db-p2p/src/pend-validation.ts)),
@@ -1103,9 +1171,13 @@ saveMaterializedBlock(block): store(structuredClone(block));
   member's durable storage, which that member reports as a signed `held` vote naming the holder's
   action id (`Signature.heldBy`). *Reserved* is decided by the slot the record claims, not by its
   presence: storage keeps the revision each pending record was pended at (`BlockMetadata.pendingRevs`),
-  and a record claiming a revision the incoming pend has already moved past is superseded and does
-  not refuse (`isReservationAgainst` in `packages/db-p2p/src/storage/pending-claim.ts`, applied by
-  `ClusterMember.validatePendOperations` at the vote and by `StorageRepo.pend` at apply). Without
+  and a record the incoming writer has built on is superseded and does not refuse — the requested
+  revision is past the record's slot, or, at the vote of a cohort that can reach its promise bar
+  without one member (four and up at the default threshold) and for a record that stored a base,
+  the base the pend declares for the block (`PendRequest.baseRevs`) is at or past that slot
+  (`isReservationAgainst` and `cohortCanMissAPend` in `packages/db-p2p/src/storage/pending-claim.ts`,
+  applied by `ClusterMember.validatePendOperations` at the vote and, revision rule only, by
+  `StorageRepo.pend` at apply). Without
   that rule a member that promised a write and missed its commit vetoed every later write to the
   block; see [repository.md §Invariant P](repository.md#invariant-p--a-pending-record-and-a-committed-record-never-coexist-for-one-action).
   The coordinator raises `BlocksHeldError` — again never
