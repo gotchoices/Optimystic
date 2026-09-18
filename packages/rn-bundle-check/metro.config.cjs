@@ -152,6 +152,9 @@ function siblingWatchRoots() {
  * `target` when there is none. The walk stops below the directory that holds this repository, so an
  * unrelated manifest further up (a `package.json` in the directory that holds every checkout) can never
  * widen the watch to every sibling project on the machine.
+ *
+ * NOTE: only the "found a workspace root" path runs today (../quereus, ../Fret); both stops are
+ * exercised by nothing. If this walk gains another case, move it to a module `test/` can import.
  */
 function siblingWorkspaceRoot(target) {
 	for (let dir = target; !isInside(dir, repoRoot); dir = path.dirname(dir)) {
@@ -167,7 +170,7 @@ function declaresWorkspaces(manifestPath) {
 		return JSON.parse(fs.readFileSync(manifestPath, 'utf8')).workspaces !== undefined;
 	} catch (error) {
 		if (error.code === 'ENOENT') return false;
-		throw error;
+		throw new Error(`could not read ${manifestPath}: ${error.message}`, { cause: error });
 	}
 }
 

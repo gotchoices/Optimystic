@@ -10,6 +10,7 @@ files:
   - packages/rn-bundle-check/readme.md
   - packages/quereus-plugin-optimystic/README.md (new "React Native" section)
   - tickets/backlog/debt-rn-shim-table-lists-unreached-aliases.md (evidence appended)
+  - AGENTS.md, docs/releasing.md (review: scope wording)
 ----
 
 # What was done
@@ -57,3 +58,33 @@ Quereus and the plugin need nothing beyond the db-p2p shim table. The bundle sti
 - **The new config helpers have no unit tests.** `siblingWorkspaceRoot` and `declaresWorkspaces` are internal to `metro.config.cjs`, as `outOfRepoLinkTargets` already was. They are exercised end to end by `yarn check:rn` with the real sibling layout. The stop at a directory that holds this repository and the stop at a drive root are not exercised by anything.
 - The route test depends on Metro resolving the entry's own dependency before the nested module's. That is the realistic order, but a recorder that kept only the *first* resolution would still pass this test if Metro ever reversed the order.
 - As before, only Windows has been run.
+
+# Review findings
+
+Reviewed the implement diff (6ae02008) first, then the handoff. Ran `yarn check:rn` (passes, Metro 2.7 s, hermesc 10.7 s warm), `yarn workspace @optimystic/rn-bundle-check test` (8/8), `yarn lint:docs` and `npx eslint packages/rn-bundle-check` (clean), before and after the fixes below.
+
+## Fixed in this pass (minor)
+
+- **Route test was order-dependent, as the handoff said.** `judges every importer of a specifier, not only the first` now runs two recorders over one bundle, one expecting each of the two resolutions, so a recorder that keeps only the first *or* only the last resolution fails regardless of Metro's order. Verified by mutation: a keep-first recorder fails the test; the mutation was reverted.
+- **A misroute did not say who imported the wrong file.** With several importers of bare `@optimystic/db-p2p` (entry.js, the plugin, db-p2p-storage-rn), "resolved to X instead of Y" left the reader guessing, and the remedy pointed only at db-p2p's `exports`, which is wrong when an importer has its own copy. `onResolve` now also receives Metro's `context.originModulePath`; the recorder keeps importers per resolved path and the message reads `X (imported by A) instead of Y`, and also suggests checking that the importer reaches the workspace copy. Both route tests assert the importer. Readme step 4 says so.
+- **Plugin README port rule was imprecise.** "whose `port` is `0` (the default)" ignored the plugin's `default_port` setting (`optimystic-module.ts` resolves `port` from the table argument, then `default_port`, then 0). Reworded. The rest of the section's runtime claims were checked against source: `createNetworkTransactor` calls `createLibp2pNode` without `transports`, db-p2p's React Native `createLibp2pNode` throws without them, `registerLibp2pNode` keys `${networkName}:0`, and `register` returns `collectionFactory`. Still static, not run (see below).
+- **`declaresWorkspaces` rethrew a bare JSON parse error**, which would not name the sibling manifest that broke Metro config loading. It now names the file, like `linkTarget` does.
+- **Docs that should have been touched:** AGENTS.md and docs/releasing.md described `yarn check:rn` as bundling only "the React Native entry"; both now mention the Quereus plugin.
+
+## Decision the implementer asked to have challenged: watching whole sibling checkouts
+
+Kept. Resolving a linked package's dependencies from its own repository's install is what Node does and what sereus's reference Metro config does; the alternative only works because this workspace happens to declare `@quereus/quereus`, which is a fragile reason for a check to pass. Measured cost (0.4 s warm) is recorded in the NOTE above `siblingWatchRoots`, with the remedy if it grows. Either choice bundles a working tree rather than the published package, which the readme already lists as a gap.
+
+## Tripwires recorded
+
+- `siblingWorkspaceRoot`'s two stop conditions (parent directory holding this repository, drive root) are exercised by nothing: `NOTE:` added above the function in `metro.config.cjs`, saying to move it into a testable module if the walk gains another case. Not filed: both stops are defensive and only the found-a-root path runs on any known layout.
+
+## Checked, nothing to do
+
+- **Freshness step**: `buildFreshnessProblems` derives candidates from `workspace:` ranges and root `resolutions` portals, so the plugin and Quereus are judged with no code change; `p2p-fret` remains uncovered, as the readme and the NOTE in `test-harness/build-freshness.mjs` already say.
+- **The `@quereus/quereus` direct dependency** is still needed with the root watch: the plugin declares Quereus as a peer, which the depending workspace must provide, and it is what brings Quereus into the freshness step.
+- **Shims**: no new alias needed; evidence already on `debt-rn-shim-table-lists-unreached-aliases`.
+- **Resource cleanup**: test output directories are removed in `t.after`; unchanged.
+- **Plugin cannot take host transports on React Native** (it only accepts a pre-built node through `registerLibp2pNode`): not filed. The workaround is documented and is what sereus's `cadre-core` already does; whether the plugin should accept transports is a feature question nobody has asked for.
+- **Running the plugin on Hermes** remains out of scope, tracked by backlog `feat-rn-bundle-runs-under-hermes`.
+- Only Windows has been run, as before.

@@ -27,7 +27,7 @@ It runs, in order:
 | `yarn lint:deps` | shared libp2p packages stay on one major — in declared ranges and in the installed tree |
 | `yarn build` | every package compiles |
 | `yarn typecheck` | `tsc --noEmit` for the packages whose build does not type-check |
-| `yarn check:rn` | the React Native entry bundles with Metro and compiles with Hermes, as a phone app's build does |
+| `yarn check:rn` | the React Native entry and the Quereus plugin bundle with Metro and compile with Hermes, as a phone app's build does |
 | `yarn test` | unit suites — fast, no sockets |
 | `yarn test:integration` | real-socket libp2p suites |
 

@@ -79,8 +79,9 @@ export class HermesCompileError extends Error {
  * Android, production, Hermes transform profile. Left unminified so a `hermesc` diagnostic stays
  * readable even before source-map translation.
  *
- * `onResolve(specifier, filePath)`, when given, sees every module resolution Metro performs. Rejects
- * with Metro's own error, extended with a remedy when the cause is one this repository has met before.
+ * `onResolve(specifier, filePath, importer)`, when given, sees every module resolution Metro performs.
+ * Rejects with Metro's own error, extended with a remedy when the cause is one this repository has met
+ * before.
  */
 export async function bundle({ entry, outDir, onResolve }) {
 	const bundlePath = join(outDir, 'bundle.js');
@@ -152,7 +153,7 @@ async function loadMetroConfig(onResolve) {
 			resolveRequest(context, moduleName, platform) {
 				// Inside a custom resolver, `context.resolveRequest` is Metro's own default resolver.
 				const resolution = (upstream ?? context.resolveRequest)(context, moduleName, platform);
-				if (resolution.type === 'sourceFile') onResolve(moduleName, resolution.filePath);
+				if (resolution.type === 'sourceFile') onResolve(moduleName, resolution.filePath, context.originModulePath);
 				return resolution;
 			},
 		},
@@ -252,27 +253,34 @@ function translateBundlePositions(text, sourceMapPath) {
 
 /**
  * Records, through `onResolve` (pass it to `bundle`), every file each expected specifier resolved to,
- * from whichever module imported it.
+ * and which modules imported it there, so a misroute names the importer that got the wrong file.
  * `expected` maps a specifier to its repository-relative target; `main` uses `EXPECTED_ROUTES`.
  */
 export function createRouteRecorder(expected = EXPECTED_ROUTES) {
+	/** specifier → resolved path → importers. */
 	const routes = new Map();
 	return {
-		onResolve(specifier, filePath) {
+		onResolve(specifier, filePath, importer) {
 			if (!expected.has(specifier)) return;
-			const seen = routes.get(specifier) ?? new Set();
-			seen.add(repoRelative(filePath));
-			routes.set(specifier, seen);
+			const byTarget = routes.get(specifier) ?? new Map();
+			const resolved = repoRelative(filePath);
+			const importers = byTarget.get(resolved) ?? new Set();
+			importers.add(repoRelative(importer));
+			byTarget.set(resolved, importers);
+			routes.set(specifier, byTarget);
 		},
 
 		/** Expected specifiers that resolved anywhere but their target. */
 		misroutes() {
 			return [...expected].flatMap(([specifier, target]) => {
-				const wrong = [...(routes.get(specifier) ?? [])].filter((path) => path !== target);
+				const wrong = [...(routes.get(specifier) ?? [])]
+					.filter(([path]) => path !== target)
+					.map(([path, importers]) => `${path} (imported by ${[...importers].join(', ')})`);
 				return wrong.length === 0 ? [] : [
-					`${specifier} resolved to ${wrong.join(', ')} instead of ${target}. A React Native app importing it ` +
-					'gets the wrong entry point. Check the `react-native` condition and the `./rn` subpath in ' +
-					'the `exports` of packages/db-p2p/package.json.',
+					`${specifier} resolved to ${wrong.join(', ')} instead of ${target}. A React Native app importing ` +
+					'it gets the wrong entry point. Check the `react-native` condition and the `./rn` subpath in the ' +
+					'`exports` of packages/db-p2p/package.json, and that the importer reaches the workspace copy of ' +
+					'the package rather than a copy of its own.',
 				];
 			});
 		},

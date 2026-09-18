@@ -117,9 +117,9 @@ types without checking them; it must run **after** `yarn build`, since their spe
 `yarn check` is the pre-release gate; see [docs/releasing.md](docs/releasing.md).
 
 **Nothing above runs React Native's build.** `yarn check:rn` does: the private `rn-bundle-check`
-workspace bundles the React Native entry with Metro (React Native's bundler) and compiles the bundle
-with `hermesc` (the Hermes engine's compiler), both pinned to the React Native 0.83 toolchain, so
-syntax a phone app's build rejects fails here. It needs `dist/` — it refuses a stale build the same
+workspace bundles the React Native entry and both Quereus plugin entries with Metro (React Native's
+bundler) and compiles the bundle with `hermesc` (the Hermes engine's compiler), both pinned to the
+React Native 0.83 toolchain, so syntax a phone app's build rejects fails here. It needs `dist/` — it refuses a stale build the same
 way the test guard does — and Yarn's `nodeLinker: node-modules`, which a fresh clone lacks because
 `.yarnrc.yml` is not committed. It never runs the bundle, so a green result says nothing about
 globals, polyfills, native modules or a device; see

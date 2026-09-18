@@ -12,7 +12,9 @@ import { fileURLToPath } from 'node:url';
 
 import { bundle, createOutputDir, createRouteRecorder } from '../scripts/rn-bundle-check.mjs';
 
-const TARGET = 'packages/rn-bundle-check/test/fixtures/routed-target.js';
+const FIXTURES = 'packages/rn-bundle-check/test/fixtures';
+const TARGET = `${FIXTURES}/routed-target.js`;
+const NESTED_TARGET = `${FIXTURES}/nested/routed-target.js`;
 
 it('passes a correct route and reports a wrong or unreached one', async (t) => {
 	const outDir = createOutputDir();
@@ -26,9 +28,9 @@ it('passes a correct route and reports a wrong or unreached one', async (t) => {
 	await bundle({
 		entry: fileURLToPath(new URL('./fixtures/routed.js', import.meta.url)),
 		outDir,
-		onResolve: (specifier, filePath) => {
-			correct.onResolve(specifier, filePath);
-			wrong.onResolve(specifier, filePath);
+		onResolve: (...resolution) => {
+			correct.onResolve(...resolution);
+			wrong.onResolve(...resolution);
 		},
 	});
 
@@ -36,7 +38,7 @@ it('passes a correct route and reports a wrong or unreached one', async (t) => {
 
 	const misroutes = wrong.misroutes();
 	assert.equal(misroutes.length, 1, misroutes.join('\n'));
-	assert.match(misroutes[0], /^\.\/routed-target\.js resolved to packages\/rn-bundle-check\/test\/fixtures\/routed-target\.js instead of packages\/db-p2p\/dist\/src\/rn\.js\./);
+	assert.match(misroutes[0], /^\.\/routed-target\.js resolved to packages\/rn-bundle-check\/test\/fixtures\/routed-target\.js \(imported by packages\/rn-bundle-check\/test\/fixtures\/routed\.js\) instead of packages\/db-p2p\/dist\/src\/rn\.js\./);
 
 	const unreached = wrong.unreached();
 	assert.equal(unreached.length, 1, unreached.join('\n'));
@@ -45,20 +47,31 @@ it('passes a correct route and reports a wrong or unreached one', async (t) => {
 
 // entry.js and the Quereus plugin both import bare `@optimystic/db-p2p`. Metro resolves a specifier
 // once per importing directory, and the plugin's import must be judged even though entry.js's
-// resolution of the same specifier is right.
+// resolution of the same specifier is right. Each recorder expects one of the two resolutions, so a
+// recorder that kept only the first (or only the last) resolution per specifier fails one of them,
+// whichever order Metro resolves them in.
 it('judges every importer of a specifier, not only the first', async (t) => {
 	const outDir = createOutputDir();
 	t.after(() => rmSync(outDir, { recursive: true, force: true }));
 
-	const routes = createRouteRecorder(new Map([['./routed-target.js', TARGET]]));
+	const expectsTop = createRouteRecorder(new Map([['./routed-target.js', TARGET]]));
+	const expectsNested = createRouteRecorder(new Map([['./routed-target.js', NESTED_TARGET]]));
 	await bundle({
 		entry: fileURLToPath(new URL('./fixtures/routed-twice.js', import.meta.url)),
 		outDir,
-		onResolve: routes.onResolve,
+		onResolve: (...resolution) => {
+			expectsTop.onResolve(...resolution);
+			expectsNested.onResolve(...resolution);
+		},
 	});
 
-	const misroutes = routes.misroutes();
-	assert.equal(misroutes.length, 1, misroutes.join('\n'));
-	assert.match(misroutes[0], /^\.\/routed-target\.js resolved to packages\/rn-bundle-check\/test\/fixtures\/nested\/routed-target\.js instead of packages\/rn-bundle-check\/test\/fixtures\/routed-target\.js\./);
-	assert.deepEqual(routes.unreached(), []);
+	assertOneMisroute(expectsTop, `./routed-target.js resolved to ${NESTED_TARGET} (imported by ${FIXTURES}/nested/routed.js) instead of ${TARGET}.`);
+	assertOneMisroute(expectsNested, `./routed-target.js resolved to ${TARGET} (imported by ${FIXTURES}/routed-twice.js) instead of ${NESTED_TARGET}.`);
 });
+
+function assertOneMisroute(recorder, expectedStart) {
+	const misroutes = recorder.misroutes();
+	assert.equal(misroutes.length, 1, misroutes.join('\n'));
+	assert.ok(misroutes[0].startsWith(expectedStart), misroutes[0]);
+	assert.deepEqual(recorder.unreached(), []);
+}

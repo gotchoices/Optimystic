@@ -272,7 +272,7 @@ const plugin = register(db, { default_transactor: 'network', default_network_nam
 plugin.collectionFactory.registerLibp2pNode('mynet', node, node.coordinatedRepo);
 ```
 
-A registered node is used by tables whose `networkName` matches and whose `port` is `0` (the default).
+A registered node is used by tables whose `networkName` matches and whose `port` resolves to `0`: the default when neither the table's `port` nor the plugin's `default_port` setting names another.
 
 ## Quereus SQL Dialect
 
