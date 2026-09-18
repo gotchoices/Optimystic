@@ -165,3 +165,7 @@ The downstream reproducer was restored (the `index FormationUsageByToken on Form
 The fix is attributed to the changes landed between the 2026-08-29 capture and now, most directly `complete/a-commit-over-a-gapped-base-forks-the-block` (`da57d4e9`), which matches the captured fingerprint exactly (two actions under one revision number, then the not-lowered guard making it permanent). Not bisected; the downstream measurement is the whole-system result.
 
 The downstream count that this ticket asked to be corrected (five vs six negatives) was recorded there on 2026-09-05. Nothing more is needed from this repository for this report.
+
+# Resolved (2026-09-17)
+
+Closed on sereus's verification above. The decision this ticket was parked on — keep looking here, or move the investigation downstream — no longer needs making, because the defect is gone. The reproducer now passes 5 of 5 on both machines, where it had failed deterministically on every run since 2026-08-12, and the index sub-collection converges to one revision and action id everywhere. Most directly attributable to `a-commit-over-a-gapped-base-forks-the-block` (`da57d4e9`), not bisected. The sereus update was swept into commit `9cbc7427` by the runner, not written by that ticket.
