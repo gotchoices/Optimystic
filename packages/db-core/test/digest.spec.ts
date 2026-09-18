@@ -435,6 +435,25 @@ describe('commit content digests', () => {
 			expect(parent.peekMaterialized('a' as BlockId)).to.be.undefined;
 		});
 
+		it("a base that moves between an atomic's pin and its flush stays the atomic's base in the parent, marked moved", async () => {
+			// The parent has nothing staged for 'a'. The atomic reads a@7 and updates it; before the
+			// flush a concurrent unlatched read reloads the cache at rev 9 (storage caught up, no log
+			// movement). The parent's first op for 'a' arrives with the adopted pin already in place —
+			// the base those ops were built on — and must not re-probe the live cache for a@9.
+			const parent = new Tracker(cache);
+			const atomic = new Atomic<TestBlock>(parent);
+			await atomic.tryGet('a' as BlockId);
+			atomic.update('a' as BlockId, ['items', 0, 0, ['z']]);            // the atomic pins a@7
+			cache.clear(['a' as BlockId]);
+			revs.set('a', 9);
+			await cache.tryGet('a' as BlockId);                                // the cache now describes a@9
+			atomic.commit();
+
+			expect(parent.stagedBaseRevs(['a' as BlockId]), 'the base the ops were built on').to.deep.equal({ a: 7 });
+			expect(parent.movedBases()).to.deep.equal(['a']);
+			expect(parent.peekMaterialized('a' as BlockId)).to.be.undefined;
+		});
+
 		it('adopting a pin at the same revision the parent pins is an overwrite, not a move', async () => {
 			const parent = new Tracker(cache);
 			await parent.tryGet('a' as BlockId);
@@ -444,6 +463,28 @@ describe('commit content digests', () => {
 			atomic.update('a' as BlockId, ['items', 0, 0, ['second']]);
 			atomic.commit();
 
+			expect(parent.movedBases()).to.deep.equal([]);
+			expect((await computeBlockContentDigests(parent, ['a' as BlockId]))['a' as BlockId]!.baseRev).to.equal(7);
+		});
+
+		it("adopting a rev-only pin at the revision the parent pins in full keeps the parent's clone", async () => {
+			// The atomic read 'a', then enough else to evict it, then updated it: its pin names rev 7
+			// without content. The parent's full pin at rev 7 is the same committed content and is what
+			// keeps the digest declarable after the fold.
+			const smallCache = new CacheSource(makeRevSource(blocks, revs), 1);
+			const parent = new Tracker(smallCache);
+			await parent.tryGet('a' as BlockId);
+			parent.update('a' as BlockId, ['items', 0, 0, ['first']]);
+			expect(parent.pins.get('a' as BlockId)!.block).to.not.be.undefined;
+
+			const atomic = new Atomic<TestBlock>(parent);
+			await atomic.tryGet('a' as BlockId);
+			await atomic.tryGet('b' as BlockId);                                // evicts 'a'
+			atomic.update('a' as BlockId, ['items', 0, 0, ['second']]);
+			expect(atomic.pins.get('a' as BlockId)).to.deep.equal({ rev: 7, gen: smallCache.getGeneration('a' as BlockId) });
+			atomic.commit();
+
+			expect(parent.pins.get('a' as BlockId)!.block, 'the clone survives the fold').to.not.be.undefined;
 			expect(parent.movedBases()).to.deep.equal([]);
 			expect((await computeBlockContentDigests(parent, ['a' as BlockId]))['a' as BlockId]!.baseRev).to.equal(7);
 		});

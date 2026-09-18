@@ -320,10 +320,41 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 	}
 
 	update(blockId: BlockId, op: BlockOperation) {
+		if (this.stageUpdate(blockId, op)) this.pinBase(blockId);
+		else this.recheckPin(blockId);
+	}
+
+	/** Fold a child tracker's staged transform into this one — the flush behind {@link Atomic.commit}
+	 * — and empty the child. The child's pins are adopted first ({@link BasePins.adopt}), and an
+	 * update whose id the child pinned keeps that pin as the base of its first operation here rather
+	 * than probing the base source: the child's pin IS the base those operations were computed
+	 * against, while the source may have moved on since (a concurrent unlatched read that reloaded
+	 * the block at a newer revision), and probing would put the newer revision on operations built
+	 * for the older one — the wrong base the storage-side guard cannot catch. An adopted pin the
+	 * source no longer describes at its revision is judged moved on its next use, like any pin. An
+	 * update the child did NOT pin (a blind one) is pinned here exactly as a direct update would be. */
+	absorb(child: Tracker<T>): void {
+		this.pins.adopt(child.pins);
+		const adopted = new Set(child.pins.ids());
+		const transform = child.reset();
+		for (const blockId of transform.deletes ?? []) this.delete(blockId);
+		for (const block of Object.values(transform.inserts ?? {})) this.insert(block as T);
+		for (const [blockId, ops] of Object.entries(transform.updates ?? {}) as [BlockId, BlockOperation[]][]) {
+			for (const op of ops) {
+				if (this.stageUpdate(blockId, op) && !adopted.has(blockId)) this.pinBase(blockId);
+				else this.recheckPin(blockId);
+			}
+		}
+	}
+
+	/** Stage `op` for `blockId` — folded into a staged insert if there is one, else appended to the
+	 * id's update list — and keep the materialized memo current. Returns whether this was the FIRST
+	 * update staged for the id here: the moment its base is fixed (see {@link pinBase}). */
+	private stageUpdate(blockId: BlockId, op: BlockOperation): boolean {
 		const inserted = this.transforms.inserts?.[blockId];
 		if (inserted) {
 			applyOperation(inserted, op);
-			return;
+			return false;
 		}
 		const updates = this.transforms.updates ??= {};
 		const ops = ensured(updates, blockId, () => []);
@@ -337,43 +368,28 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 		if (memo) {
 			applyOperation(memo.block, op);
 		}
-		if (first) {
-			this.pinBase(blockId);
-		} else {
-			const existing = this.pins.get(blockId);
-			if (existing) this.revalidatePin(blockId, existing);
-		}
+		return first;
 	}
 
 	/** Fix the base of `id`'s staged operations at the moment the FIRST of them is staged in this
 	 * tracker: the caller just read the block, so the base source describes what the operation was
-	 * computed against.
-	 *
-	 * The store may already hold a pin for the id. One that names the revision the source describes
-	 * NOW, and has not moved, is the base of this op list too — the same committed content — and is
-	 * kept: that is how an Atomic's flush into its parent ({@link Atomic.commit} adopts the atomic's
-	 * pins, then replays its ops through the parent's `update`) keeps the FULL pin the atomic took
-	 * while the block was resident, instead of re-probing a cache that has since evicted it. Any
-	 * other entry describes some OTHER tracker's operations — an abandoned per-attempt tracker's
-	 * log-block pin from before a refresh cleared the block, say — and is replaced, or dropped when
-	 * nothing can be pinned, so a stale entry never speaks for this op list. A later operation for
-	 * the same id never re-pins: it re-judges the pin ({@link revalidatePin}), and a base found to
-	 * have moved stays moved. */
+	 * computed against. Whatever the store held for the id before is replaced (or dropped, when the
+	 * source can pin nothing): no operations of THIS tracker's list were computed on it — a pin that
+	 * outlived its tracker, such as an abandoned per-attempt tracker's log-block pin from before a
+	 * refresh cleared the block, would otherwise speak for operations built on something else.
+	 * (The one pre-existing pin that IS this list's base, an atomic's, is kept by {@link absorb},
+	 * which never comes through here for it.) A later operation for the same id never re-pins: it
+	 * re-judges the pin ({@link recheckPin}), and a base found to have moved stays moved. */
 	private pinBase(id: BlockId): void {
-		const existing = this.pins.get(id);
-		if (existing && !existing.moved && existing.rev === this.baseRevision(id)) {
-			this.revalidatePin(id, existing);
-			return;
-		}
 		const pin = this.probeBase(id);
 		if (pin) this.pins.set(id, pin);
 		else this.pins.delete(id);
 	}
 
-	/** The committed revision the base source describes for `id` now, or undefined if it cannot. */
-	private baseRevision(id: BlockId): number | undefined {
-		const src = this.baseSource();
-		return typeof src.getCachedRevision === 'function' ? src.getCachedRevision(id) : undefined;
+	/** Re-judge `id`'s pin, if it has one, against the base source (see {@link revalidatePin}). */
+	private recheckPin(id: BlockId): void {
+		const existing = this.pins.get(id);
+		if (existing) this.revalidatePin(id, existing);
 	}
 
 	delete(blockId: BlockId) {

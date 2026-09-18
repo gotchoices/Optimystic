@@ -870,7 +870,12 @@ saveMaterializedBlock(block): store(structuredClone(block));
   none — marks the base **moved**. A moved base is never repaired by re-pinning or by falling back to
   the live cache: the pend would then declare a base the operations were not built on, the one
   direction the storage-side guard cannot catch. `Tracker.stagedBaseRevs` names the pinned revision
-  for every update-only block (moved or not); `Tracker.movedBases` lists the moved ones.
+  for every update-only block (moved or not); `Tracker.movedBases` lists the moved ones. The pins
+  travel with the operations wherever the operations travel: an atomic's flush into its parent
+  (`Tracker.absorb`) hands over the atomic's pins as the bases of the flushed operations rather than
+  re-probing a cache that may have moved on, and a staged-state snapshot
+  (`Collection.snapshotPending` / `restorePending`) carries and restores them, so a rollback never
+  pairs operations with the bases of some later re-stage.
 - **A pending action is never pended over a moved base; it is re-staged first.**
   `Collection.restageIfBasesMoved` in `packages/db-core/src/collection/collection.ts` runs before
   every attempt of `syncAttempts` and at the top of both coordinator commit spans (`commitOnceLatched`

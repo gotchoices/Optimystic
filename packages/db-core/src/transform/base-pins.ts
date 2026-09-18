@@ -59,6 +59,10 @@ export class BasePins {
 		return this.pins.get(id);
 	}
 
+	ids(): IterableIterator<BlockId> {
+		return this.pins.keys();
+	}
+
 	set(id: BlockId, pin: PinnedBase): void {
 		this.pins.set(id, pin);
 	}
@@ -84,12 +88,13 @@ export class BasePins {
 		}
 	}
 
-	/** Fold every entry of `other` in. Called from Atomic.commit so pins captured inside the atomic
-	 * survive into the parent tracker's store.
+	/** Fold every entry of `other` in. Called from Tracker.absorb (Atomic.commit) so pins captured
+	 * inside the atomic survive into the parent tracker's store.
 	 *
 	 * An id the parent does not pin takes the atomic's pin. An id it pins at the SAME revision takes
-	 * the atomic's too — the later observation of the same committed content, possibly with a clone
-	 * a rev-only parent pin lacked. An id it pins at a DIFFERENT revision is a base that MOVED
+	 * the atomic's too — the later observation of the same committed content — except that a clone
+	 * the parent holds is never traded for a rev-only pin (same revision, same content; the clone is
+	 * what makes the digest declarable). An id it pins at a DIFFERENT revision is a base that MOVED
 	 * between the two actions: the parent's operations were computed on one content and the
 	 * atomic's on another, and the combined list has no single base. The parent's pin is kept (its
 	 * revision is what the earlier operations were built on) and marked moved, and a mark on either
@@ -101,11 +106,33 @@ export class BasePins {
 		for (const [id, pin] of other.pins) {
 			const existing = this.pins.get(id);
 			if (existing === undefined || (existing.rev === pin.rev && !existing.moved)) {
-				this.pins.set(id, pin);
+				this.pins.set(id, pin.block === undefined && existing?.block !== undefined ? { ...pin, block: existing.block } : pin);
 			} else {
 				existing.moved = true;
 			}
 		}
+	}
+
+	/** A copy for a staged-state snapshot (Collection.snapshotPending): the same entries, bound to
+	 * the same source, in a store of its own. Entries are shared, not cloned — a pin's content is
+	 * never mutated in place (every consumer clones before applying), and a moved mark set on a
+	 * shared entry after the copy is a fact about the same operations. */
+	copy(): BasePins {
+		const copy = new BasePins();
+		if (this.bound) copy.bindAuthority(this.authority);
+		for (const [id, pin] of this.pins) copy.pins.set(id, pin);
+		return copy;
+	}
+
+	/** Make this store hold exactly `other`'s entries — the restore half of {@link copy}
+	 * (Collection.restorePending), applied in place because the live tracker's store is shared by
+	 * reference with every per-attempt tracker of the transaction. */
+	replaceWith(other: BasePins): void {
+		if (other.bound && other.authority !== this.authority) {
+			throw new Error('BasePins.replaceWith across different base sources: pin revisions and generations are not comparable across them.');
+		}
+		this.pins.clear();
+		for (const [id, pin] of other.pins) this.pins.set(id, pin);
 	}
 
 	get size(): number {

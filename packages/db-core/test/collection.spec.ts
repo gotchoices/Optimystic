@@ -857,6 +857,38 @@ describe('Collection', () => {
       expect(await readShared(collection2)).to.equal('v2-committed')
     })
 
+    it('a restored snapshot brings back the bases its operations were computed on, so the retry re-stages instead of forking', async () => {
+      // A savepoint captured with a pending action, a refresh that adopts a rival commit and
+      // replays the queue onto the new base, then a rollback to the savepoint. The restored
+      // operations were computed on the OLD content; were the tracker left with the replay's pins
+      // the pend would declare the new base for them, the guard would accept it, and the commit
+      // would apply "v1+local" over "v2-committed". The snapshot carries its pins, so the restored
+      // base is the old one, it is found moved before the pend, and the append is re-made.
+      const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, sharedOptions)
+      await collection1.act({ type: 'setShared', data: { value: 'v1', timestamp: 1 } })
+      await collection1.updateAndSync() // rev1: shared = v1
+
+      const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, sharedOptions)
+      await collection2.act({ type: 'appendShared', data: { value: 'local', timestamp: 2 } })
+      const basesAtStage = collection2.tracker.stagedBaseRevs([sharedBlockId as BlockId])
+      expect(basesAtStage).to.have.property(sharedBlockId)
+      const savepoint = collection2.snapshotPending()
+
+      await collection1.act({ type: 'setShared', data: { value: 'v2-committed', timestamp: 3 } })
+      await collection1.updateAndSync() // rev2: shared = v2-committed
+      await collection2.update() // conflict replay: the append is re-staged on v2-committed
+      expect(collection2.tracker.stagedBaseRevs([sharedBlockId as BlockId])).to.not.deep.equal(basesAtStage)
+
+      collection2.restorePending(savepoint)
+      expect(collection2.tracker.stagedBaseRevs([sharedBlockId as BlockId]), 'the restored operations name the base they were built on').to.deep.equal(basesAtStage)
+      expect(collection2.tracker.movedBases()).to.deep.equal([sharedBlockId])
+
+      await collection2.sync({ maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 })
+      expect(await readShared(collection2)).to.equal('v2-committed+local')
+      const verifier = await Collection.createOrOpen<TestAction>(transactor, collectionId, sharedOptions)
+      expect(await readShared(verifier), 'what storage holds').to.equal('v2-committed+local')
+    })
+
     it('a losing sync() retry rebuilds its transform against the adopted revision, not the stale one', async () => {
       // Write-path corollary from the ticket: syncInternal's retry loop calls updateInternal()
       // after a stale pend/commit failure and then resubmits at the new revision. Under the old

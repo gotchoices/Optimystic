@@ -4,6 +4,7 @@ import type { LogBlock } from "../log/log.js";
 import type { ActionEntry, GetFromResult, LogEntry } from "../log/struct.js";
 import { Atomic } from "../transform/atomic.js";
 import { Tracker } from "../transform/tracker.js";
+import type { BasePins } from "../transform/base-pins.js";
 import { CacheSource } from "../transform/cache-source.js";
 import { computeBlockContentDigests } from "../transform/digest.js";
 import { copyTransforms, isTransformsEmpty } from "../transform/helpers.js";
@@ -149,6 +150,12 @@ export interface ReadViewOptions {
 export interface CollectionSnapshot<TAction> {
 	/** Deep-cloned tracker transforms at snapshot time. */
 	transforms: Transforms;
+	/** The bases the transforms' update operations were computed against (see {@link BasePins}),
+	 *  copied at snapshot time. Restored with the transforms, so a restore never pairs operations
+	 *  with the bases of some later re-stage: the pend would then declare a base the operations
+	 *  were not built on. Absent on a snapshot built by hand; such a restore keeps whatever pins
+	 *  the tracker holds for the restored ids. */
+	pins?: BasePins;
 	/** Pending actions queued at snapshot time. */
 	pending: Action<TAction>[];
 	/** The committed boundary (action context) the staged state sat on when captured.
@@ -1161,6 +1168,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * Latch-free by contract, like {@link snapshotPending}: the caller holds this instance's latch
 	 * ({@link replayActions} is always run under it).
 	 *
+	 * NOTE: reads are not latched, so a concurrent read can still move a base between this check
+	 * and the pend. The pend then declares the pin's (old) revision, storage refuses it, and the
+	 * next attempt's call here re-stages — one wasted round trip, never a wrong base. If that
+	 * refusal ever shows up in practice, the closure is to hold the pend under the read latch.
+	 *
 	 * @returns whether the pending queue was re-staged. */
 	async restageIfBasesMoved(): Promise<boolean> {
 		for (const id of this.tracker.unretainedBases()) {
@@ -1205,6 +1217,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	snapshotPending(): CollectionSnapshot<TAction> {
 		return {
 			transforms: copyTransforms(this.tracker.transforms),
+			pins: this.tracker.pins.copy(),
 			pending: [...this.pending],
 			context: structuredClone(this.source.actionContext),
 		};
@@ -1233,9 +1246,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * replay this synchronous method cannot run. That shape predates this guard and
 	 * keeps its old behaviour; if it is ever observed producing stale reads, the rebase
 	 * belongs in an async caller that can replay the pending queue (see replayActions).
-	 * The same shape leaves the tracker's base pins (which the snapshot does not carry)
-	 * describing the replay's bases while the restored operations were computed on the
-	 * snapshot's, so the pend would declare the wrong base for them; the rebase closes that too. */
+	 * The WRITE side of that shape is closed here: the snapshot's base pins are restored with
+	 * its transforms, so the restored operations name the bases they were computed on, and the
+	 * pre-pend re-validation (restageIfBasesMoved) finds those bases moved and re-stages. */
 	restorePending(snapshot: CollectionSnapshot<TAction>): void {
 		const capturedRev = snapshot.context?.rev;
 		const currentRev = this.source.actionContext?.rev;
@@ -1246,6 +1259,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			return;
 		}
 		this.tracker.reset(copyTransforms(snapshot.transforms));
+		if (snapshot.pins) this.tracker.pins.replaceWith(snapshot.pins);
 		this.pending = [...snapshot.pending];
 	}
 
