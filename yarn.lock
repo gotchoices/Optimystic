@@ -2176,7 +2176,7 @@ __metadata:
     typescript: "npm:^5.9.3"
     uint8arrays: "npm:^6.1.1"
   peerDependencies:
-    "@quereus/quereus": ^4.3.0
+    "@quereus/quereus": ^4.19.4
   languageName: unknown
   linkType: soft
 
@@ -2214,7 +2214,7 @@ __metadata:
     typescript: "npm:^5.9.3"
     uint8arrays: "npm:^6.1.1"
   peerDependencies:
-    "@quereus/quereus": ^4.3.0
+    "@quereus/quereus": ^4.19.4
   languageName: unknown
   linkType: soft
 
