@@ -337,6 +337,8 @@ interface LocalClusterWithExecutionTracking extends ICluster {
 	getExecutedPendResult?(messageHash: string): PendResult | undefined;
 	/** Local storage's verdict for a commit applied during consensus; see ClusterMember.getExecutedCommitResult. */
 	getExecutedCommitResult?(messageHash: string): CommitResult | undefined;
+	/** One more reconcile for a behind-refused commit, once remote members hold it; see ClusterMember.reconcileRefusedCommit. */
+	reconcileRefusedCommit?(record: ClusterRecord): Promise<void>;
 	/** Self-sign a one-peer commit proof for the solo-cohort commit path; see ClusterMember.mintSoloCommitProof.
 	 *  Optional like its siblings: absent on a bare ICluster double, and then the solo path simply
 	 *  commits proof-less — exactly the pre-mint behavior. */
@@ -600,7 +602,8 @@ export class CoordinatorRepo implements IRepo {
 			peerId: localPeerId,
 			wasTransactionExecuted: localCluster.wasTransactionExecuted?.bind(localCluster),
 			getExecutedPendResult: localCluster.getExecutedPendResult?.bind(localCluster),
-			getExecutedCommitResult: localCluster.getExecutedCommitResult?.bind(localCluster)
+			getExecutedCommitResult: localCluster.getExecutedCommitResult?.bind(localCluster),
+			reconcileRefusedCommit: localCluster.reconcileRefusedCommit?.bind(localCluster)
 		} : undefined;
 		this.coordinator = new ClusterCoordinator(keyNetwork, createClusterClient, policy, localClusterRef, fretService, reputation, stateStore);
 	}

@@ -623,6 +623,93 @@ describe('ClusterMember commit-verdict retention (getExecutedCommitResult)', () 
 		expect(member.wasTransactionExecuted(record.messageHash)).to.equal(false);
 		expect(member.getExecutedCommitResult(record.messageHash), 'the verdict rolls back with the marker').to.equal(undefined);
 	});
+
+	/**
+	 * Ticket: a-two-member-cohort-refuses-a-commit-both-members-hold.
+	 *
+	 * `reconcileRefusedCommit` is the second reconcile the coordinating node gives its own member
+	 * once a remote member reports holding the revision. It must heal a behind refusal, and it must
+	 * leave every other retained verdict alone — above all an ahead refusal, which is never
+	 * reconciled downward.
+	 */
+	it('reconcileRefusedCommit heals a behind refusal once a cohort peer holds the revision', async () => {
+		// The sibling holds nothing while this member applies, as when the coordinating member applies
+		// before any remote member; it gains the revision afterwards.
+		const sibling = realStorageRepo();
+		const storage = realStorageRepo();
+		let reconcileCalls = 0;
+		const reconcileBlock: ReconcileBlockCallback = async (blockId, committed) => {
+			reconcileCalls++;
+			const entry = (await sibling.get({ blockIds: [blockId] }))[blockId];
+			const latest = entry?.state?.latest;
+			if (latest && entry?.block && latest.rev >= committed.rev) {
+				await storage.saveReplicatedBlock(blockId, entry.block, latest);
+			}
+		};
+		const reportedHolders: (readonly string[])[] = [];
+		member = clusterMember({
+			storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey, reconcileBlock,
+			onCommittedHolders: ({ holders }) => { reportedHolders.push(holders); }
+		});
+
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-missing', 'block-1', 1));
+		await member.update(record);
+		expect(member.getExecutedCommitResult(record.messageHash)?.success, 'nobody held the revision during the apply').to.equal(false);
+		expect(reportedHolders, 'a refused commit reports no holders').to.have.length(0);
+
+		await sibling.pend({ actionId: 'a-missing', transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] }, policy: 'c' });
+		expect((await sibling.commit({ actionId: 'a-missing', blockIds: ['block-1'], tailId: 'block-1' as BlockId, rev: 1 })).success).to.equal(true);
+
+		await member.reconcileRefusedCommit(record);
+
+		expect(reconcileCalls, 'one reconcile during the apply, one more afterwards').to.equal(2);
+		expect(member.getExecutedCommitResult(record.messageHash)).to.deep.equal({ success: true, durability: localDurability() });
+		expect(reportedHolders, 'the healed commit reports its holders').to.have.length(1);
+		const latest = (await storage.get({ blockIds: ['block-1'] }))['block-1']?.state?.latest;
+		expect(latest).to.deep.equal({ actionId: 'a-missing', rev: 1 });
+
+		// A healed verdict is a success, so a further call is a no-op.
+		await member.reconcileRefusedCommit(record);
+		expect(reconcileCalls).to.equal(2);
+	});
+
+	it('reconcileRefusedCommit never reconciles an ahead-shaped refusal', async () => {
+		const storage = realStorageRepo();
+		await storage.pend({ actionId: 'a-old', transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] }, policy: 'c' });
+		expect((await storage.commit({ actionId: 'a-old', blockIds: ['block-1'], tailId: 'block-1' as BlockId, rev: 2 })).success).to.equal(true);
+		let reconcileCalls = 0;
+		const reconcileBlock: ReconcileBlockCallback = async () => { reconcileCalls++; };
+		member = clusterMember({ storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey, reconcileBlock });
+
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-stale', 'block-1', 1));
+		await member.update(record);
+		const refused = member.getExecutedCommitResult(record.messageHash);
+		expect(refused?.success === false && !!refused.missing?.length, 'the retained refusal carries the ahead shape').to.equal(true);
+
+		await member.reconcileRefusedCommit(record);
+
+		expect(reconcileCalls, 'an ahead refusal must not be reconciled downward').to.equal(0);
+		expect(member.getExecutedCommitResult(record.messageHash), 'the retained verdict is untouched').to.equal(refused);
+	});
+
+	it('reconcileRefusedCommit does nothing for a commit the member already holds, or never applied', async () => {
+		const storage = realStorageRepo();
+		await storage.pend({ actionId: 'a1', transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] }, policy: 'c' });
+		let reconcileCalls = 0;
+		const reconcileBlock: ReconcileBlockCallback = async () => { reconcileCalls++; };
+		member = clusterMember({ storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey, reconcileBlock });
+
+		const applied = await buildConsensusCommitRecord(self, other, makeCommitOperation('a1', 'block-1', 1));
+		await member.update(applied);
+		await member.reconcileRefusedCommit(applied);
+
+		const neverApplied = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-other', 'block-2', 1));
+		await member.reconcileRefusedCommit(neverApplied);
+
+		expect(reconcileCalls).to.equal(0);
+		expect(member.getExecutedCommitResult(applied.messageHash)?.success).to.equal(true);
+		expect(member.getExecutedCommitResult(neverApplied.messageHash)).to.equal(undefined);
+	});
 });
 
 describe('ClusterMember commit-certificate capture (reactivity origination feed)', () => {

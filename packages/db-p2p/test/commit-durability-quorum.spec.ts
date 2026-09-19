@@ -21,6 +21,10 @@
  *    behind can reconcile from the one peer guaranteed to hold the revision by then — the
  *    coordinator's copy, which carries the cohort's commit proof and is therefore adoptable from a
  *    single holder.
+ *  - **The mirror of Arm B** (ticket a-two-member-cohort-refuses-a-commit-both-members-hold): when
+ *    the coordinating member is the one behind, its first reconcile runs before anyone holds the
+ *    revision, so the coordinator gives it one more reconcile after a remote member reports holding
+ *    it.
  *
  * The geometry is the smallest one that shows both: a two-member cohort (2 of 2 is both the promise
  * super-majority and the durable majority), the block seeded on the coordinating member only, and
@@ -151,10 +155,12 @@ describe('commit durability quorum (an acknowledged commit lands on a durable ma
 	/**
 	 * Wire a real two-member cohort behind a real `ClusterCoordinator` and `CoordinatorRepo`.
 	 *
-	 * `seedRemote` decides whether the remote member holds the block at all. `reconcileFromCoordinator`
-	 * gives the remote member the production reconcile path, served straight out of the coordinating
-	 * member's storage through `serveBlockArchive` — the same function a real peer answers a fetch
-	 * with, proof included.
+	 * `seedRemote` / `seedCoordinating` decide which members hold the block at all (the coordinating
+	 * member does unless told otherwise). `reconcileFromCoordinator` gives the remote member the
+	 * production reconcile path, served straight out of the coordinating member's storage through
+	 * `serveBlockArchive` — the same function a real peer answers a fetch with, proof included.
+	 * `coordinatingReconcilesFromRemote` is the mirror: the coordinating member reconciles from the
+	 * remote member's storage, and `coordinatingFetches` counts the archive fetches it made.
 	 *
 	 * The client through which the remote member is reached also witnesses the delivery order: on
 	 * the delivery that carries the commit transaction's full commit set (the one that makes the
@@ -162,23 +168,46 @@ describe('commit durability quorum (an acknowledged commit lands on a durable ma
 	 * member had already retained its own verdict for that transaction. That is true only when the
 	 * coordinator delivered to, and awaited, its own member first.
 	 */
-	const buildCohort = async (opts: { seedRemote: boolean; reconcileFromCoordinator: boolean }): Promise<{
+	const buildCohort = async (opts: {
+		seedRemote: boolean;
+		reconcileFromCoordinator: boolean;
+		seedCoordinating?: boolean;
+		coordinatingReconcilesFromRemote?: boolean;
+		/** Let `CoordinatorRepo`'s own constructor wire its coordinator to the local member, as a node does. */
+		productionWiring?: boolean;
+	}): Promise<{
 		repo: CoordinatorRepo;
 		coordinatingStorage: StorageRepo;
 		remoteStorage: StorageRepo;
 		/** `undefined` until the commit transaction's consensus record reached the remote member. */
 		localAppliedBeforeRemoteDelivery: () => boolean | undefined;
+		/** Archive fetches the coordinating member's reconcile made (mirror geometry only). */
+		coordinatingFetches: () => number;
 	}> => {
 		const coordinatingStorage = realStorageRepo();
 		const remoteStorage = realStorageRepo();
-		await seedBlockAtRev1(coordinatingStorage);
+		if (opts.seedCoordinating ?? true) await seedBlockAtRev1(coordinatingStorage);
 		if (opts.seedRemote) await seedBlockAtRev1(remoteStorage);
 
 		const peerNetwork = new MockPeerNetwork();
+		let coordinatingFetches = 0;
+		const coordinatingReconcileDeps: ReconcileBlockDeps = {
+			selfPeerId: coordinatingPeer.peerId.toString(),
+			fetchArchive: async (peerIdStr, blockId) => {
+				coordinatingFetches++;
+				return peerIdStr === remotePeer.peerId.toString() ? await serveBlockArchive(remoteStorage, blockId) : undefined;
+			},
+			saveReplicatedBlock: (blockId, block, source, verifiedProof) =>
+				coordinatingStorage.saveReplicatedBlock(blockId, block, source, verifiedProof),
+			simpleMajorityThreshold: cohortConfig.simpleMajorityThreshold,
+			superMajorityThreshold: cohortConfig.superMajorityThreshold,
+			repairCorroborationClusterSize: REPAIR_YARDSTICK
+		};
 		const coordinatingMember = clusterMember({
 			storageRepo: coordinatingStorage, peerNetwork,
 			peerId: coordinatingPeer.peerId, privateKey: coordinatingPeer.privateKey,
-			consensusConfig: cohortConfig
+			consensusConfig: cohortConfig,
+			...(opts.coordinatingReconcilesFromRemote ? { reconcileBlock: createReconcileBlock(coordinatingReconcileDeps) } : {})
 		});
 		const reconcileDeps: ReconcileBlockDeps = {
 			selfPeerId: remotePeer.peerId.toString(),
@@ -221,12 +250,22 @@ describe('commit durability quorum (an acknowledged commit lands on a durable ma
 
 		// `ClusterMember.peerId` is private on the class but public on the `ICluster` the node assembly
 		// hands the coordinator in production, so the structural check needs one cast here.
-		const localCluster = coordinatingMember as unknown as ConstructorParameters<typeof ClusterCoordinator>[3];
-		const coordinator = new ClusterCoordinator(keyNetwork, createClusterClient, cohortConfig, localCluster);
-		const repo = new CoordinatorRepo(keyNetwork, createClusterClient, coordinatingStorage, cohortConfig);
-		(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = coordinator;
+		let repo: CoordinatorRepo;
+		if (opts.productionWiring) {
+			const member = coordinatingMember as unknown as ConstructorParameters<typeof CoordinatorRepo>[4];
+			repo = new CoordinatorRepo(keyNetwork, createClusterClient, coordinatingStorage, cohortConfig, member, coordinatingPeer.peerId);
+		} else {
+			const localCluster = coordinatingMember as unknown as ConstructorParameters<typeof ClusterCoordinator>[3];
+			const coordinator = new ClusterCoordinator(keyNetwork, createClusterClient, cohortConfig, localCluster);
+			repo = new CoordinatorRepo(keyNetwork, createClusterClient, coordinatingStorage, cohortConfig);
+			(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = coordinator;
+		}
 
-		return { repo, coordinatingStorage, remoteStorage, localAppliedBeforeRemoteDelivery: () => localAppliedBeforeRemoteDelivery };
+		return {
+			repo, coordinatingStorage, remoteStorage,
+			localAppliedBeforeRemoteDelivery: () => localAppliedBeforeRemoteDelivery,
+			coordinatingFetches: () => coordinatingFetches
+		};
 	};
 
 	/** Drive the update's pend through the cohort; both members accept it today, holder or not. */
@@ -280,5 +319,53 @@ describe('commit durability quorum (an acknowledged commit lands on a durable ma
 		for (const storage of [cohort.coordinatingStorage, cohort.remoteStorage]) {
 			expect(await latestOf(storage)).to.deep.equal({ actionId: ACTION, rev: COMMIT_REV });
 		}
+	});
+	/**
+	 * Ticket: a-two-member-cohort-refuses-a-commit-both-members-hold.
+	 *
+	 * The mirror of Arm B: the COORDINATING member is the one lacking the base. Its own delivery
+	 * comes first, so its reconcile runs while no remote member has applied yet, finds no holder,
+	 * and retains a refusal; the remote member applies a moment later and holds the revision. One
+	 * holder of two is not a majority, so the write used to be refused as not durable although both
+	 * members end up holding it. The coordinator now gives its own member one more reconcile once a
+	 * remote member reports holding the revision, and the remote copy — which carries the cohort's
+	 * commit proof — is adoptable from that single holder.
+	 */
+	it('acknowledges when the coordinating member is the one behind and reconciles after the remote member applies', async () => {
+		// Wired the way a node wires it: the coordinator reaches the member's second reconcile only
+		// through the seam `CoordinatorRepo` builds from its `localCluster`.
+		const cohort = await buildCohort({
+			seedRemote: true, seedCoordinating: false,
+			reconcileFromCoordinator: false, coordinatingReconcilesFromRemote: true,
+			productionWiring: true
+		});
+		await pendAccepted(cohort.repo);
+
+		const result = await cohort.repo.commit(await commitRequest());
+
+		expect(result.success, `both members hold the revision, so the commit is durable at a majority (got ${JSON.stringify(result)})`).to.equal(true);
+		expect(await latestOf(cohort.coordinatingStorage), 'the coordinating member restored the committed revision')
+			.to.deep.equal({ actionId: ACTION, rev: COMMIT_REV });
+		expect(await cohort.coordinatingStorage.getBlockProof(BLOCK, COMMIT_REV),
+			'the restore came through the certified single-holder path, so the proof was retained').to.not.equal(undefined);
+		expect(await latestOf(cohort.remoteStorage)).to.deep.equal({ actionId: ACTION, rev: COMMIT_REV });
+		expect(cohort.coordinatingFetches(), 'one reconcile during the local apply, one after the remote member applied').to.equal(2);
+	});
+
+	it('does not reconcile the coordinating member again when no remote member holds the revision', async () => {
+		// Neither member holds the block, so both refuse and nobody can serve it: the second reconcile
+		// would be a wasted round trip, and the refusal must stand.
+		const cohort = await buildCohort({
+			seedRemote: false, seedCoordinating: false,
+			reconcileFromCoordinator: false, coordinatingReconcilesFromRemote: true
+		});
+		await pendAccepted(cohort.repo);
+
+		const result = await cohort.repo.commit(await commitRequest());
+
+		expect(result.success, 'a commit no member holds must not be acknowledged').to.equal(false);
+		expect(isCommitNotDurableFailure(result), 'the refusal names the durability gate').to.equal(true);
+		expect(cohort.coordinatingFetches(), 'only the reconcile during the local apply ran').to.equal(1);
+		expect(await latestOf(cohort.coordinatingStorage)).to.equal(undefined);
 	});
 });

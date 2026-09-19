@@ -203,6 +203,8 @@ export class ClusterCoordinator {
 			getExecutedPendResult?: (messageHash: string) => PendResult | undefined;
 			/** Local storage's verdict for a commit applied during consensus; see ClusterMember.getExecutedCommitResult. */
 			getExecutedCommitResult?: (messageHash: string) => CommitResult | undefined;
+			/** One more reconcile for a behind-refused commit, once remote members hold it; see ClusterMember.reconcileRefusedCommit. */
+			reconcileRefusedCommit?: (record: ClusterRecord) => Promise<void>;
 		},
 		private readonly fretService?: FretService,
 		private readonly reputation?: IPeerReputation,
@@ -395,7 +397,9 @@ export class ClusterCoordinator {
 		 * during consensus, when the member retained one. Same availability contract as
 		 * `localPendResult`. `CoordinatorRepo.commit` uses a retained refusal to detect a rival's
 		 * win swallowed by the member-side ahead-divergence tolerance, instead of fabricating a
-		 * success no member durably stored.
+		 * success no member durably stored. Read after the commit broadcast, so a behind member's
+		 * verdict already reflects the second reconcile `broadcastMergedRecord` gives it once a
+		 * remote member holds the revision.
 		 */
 		localCommitResult?: CommitResult;
 		/**
@@ -1048,11 +1052,14 @@ export class ClusterCoordinator {
 	 * reconcile target and gains nothing from this ordering; the durability gate in
 	 * `CoordinatorRepo.commit` is what makes that shape refuse rather than acknowledge.
 	 *
-	 * NOTE: when the coordinating member is ITSELF behind (it never saw the pend), its reconcile
-	 * runs here before any remote member has applied, finds no holder, and reports not-durable; the
-	 * remote members then apply and may carry the majority on their own. Fine while the coordinator
-	 * ordinarily saw the pend; if coordinators are routinely picked after the pend phase, deliver
-	 * local-first only when the local member holds the pend, or reconcile it once more afterwards.
+	 * The mirror case — the coordinating member is ITSELF behind (no pend, or no base for the block)
+	 * — is the price of that order: its reconcile runs before any remote member has applied, finds
+	 * no holder, and retains a refusal. So once the remote members have answered, and at least one
+	 * reported holding the revision, this node's own member gets one more reconcile
+	 * (`reconcileRefusedCommit`). The member skips it unless its retained refusal has the behind
+	 * shape, so only a behind coordinator pays the extra fetch. It finishes before this method
+	 * returns, so `executeClusterTransaction` reads the refreshed verdict, and a two-member cohort
+	 * whose members both end up holding the commit is no longer refused as not durable.
 	 */
 	private async broadcastMergedRecord(record: ClusterRecord, peerIds: string[]): Promise<{ failures: string[]; applyOutcomes?: ClusterRecord['applyOutcomes'] }> {
 		const deliver = async (peerIdStr: string) => {
@@ -1084,7 +1091,27 @@ export class ClusterCoordinator {
 		// asked, so a member cannot report an outcome on another member's behalf by echoing a record
 		// full of entries. Unsigned and advisory either way — see ClusterRecord.applyOutcomes.
 		const applyOutcomes = collectApplyOutcomes(results);
+		const remoteHolds = remote.some(id => applyOutcomes?.[id]?.commit?.success === true);
+		if (remoteHolds && localResults.some(r => r.success)) {
+			await this.reconcileLocalMemberAgain(record);
+		}
 		return { failures, ...(applyOutcomes === undefined ? {} : { applyOutcomes }) };
+	}
+
+	/**
+	 * Give this node's own member its second reconcile (see {@link broadcastMergedRecord}). The
+	 * member contract is never to throw; the catch keeps a broken seam from failing a transaction
+	 * the remote members already applied.
+	 */
+	private async reconcileLocalMemberAgain(record: ClusterRecord): Promise<void> {
+		try {
+			await this.localCluster?.reconcileRefusedCommit?.(record);
+		} catch (err) {
+			log('cluster-tx:local-reconcile-again-error', {
+				messageHash: record.messageHash,
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
 	}
 
 	/**

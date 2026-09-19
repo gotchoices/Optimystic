@@ -363,6 +363,12 @@ export class ClusterMember implements ICluster {
 	// applyConsensusOperation swallowed a refusal whose real cause was a RIVAL action holding the
 	// requested revision. Pruned alongside executedTransactions (same TTL).
 	private executedCommitResults: Map<string, CommitResult> = new Map();
+	// The messageHashes whose retained commit refusal above has the BEHIND shape (missing pend or
+	// missing base — this member held no usable revision), as opposed to the ahead shape, which must
+	// never be reconciled downward. Recorded from the apply branch that produced the refusal rather
+	// than read back from its prose. Only these are eligible for reconcileRefusedCommit. Same TTL,
+	// pruning and rollback as executedCommitResults.
+	private behindCommitRefusals: Set<string> = new Set();
 	// Conflict-shaped pend refusals this member's storage produced at consensus-apply, keyed by the
 	// refused action's id rather than by messageHash. The messageHash-keyed map above cannot serve the
 	// commit-promise guard: a commit is a DIFFERENT message with a different hash, so a member holding
@@ -491,6 +497,7 @@ export class ClusterMember implements ICluster {
 		this.cleanupQueue.length = 0;
 		this.executedPendResults.clear();
 		this.executedCommitResults.clear();
+		this.behindCommitRefusals.clear();
 		this.refusedPendActions.clear();
 	}
 
@@ -2329,6 +2336,7 @@ export class ClusterMember implements ICluster {
 			this.executedTransactions.delete(record.messageHash);
 			this.executedPendResults.delete(record.messageHash);
 			this.executedCommitResults.delete(record.messageHash);
+			this.behindCommitRefusals.delete(record.messageHash);
 			for (const operation of record.message.operations) {
 				if ('pend' in operation) this.refusedPendActions.delete(operation.pend.actionId);
 			}
@@ -2476,7 +2484,7 @@ export class ClusterMember implements ICluster {
 					membershipVersion: record.membershipVersion
 				});
 			}
-			const applied = await this.applyCommitToStorage(record, commit, proof);
+			const { applied, behind } = await this.applyCommitToStorage(record, commit, proof);
 			// Retain the POST-RECONCILE durable verdict (see getExecutedCommitResult and
 			// withOwnApplyOutcome): what this member's storage holds NOW, after any behind-reconcile the
 			// apply triggered — not what the first apply attempt said. A member that pulled the
@@ -2485,9 +2493,7 @@ export class ClusterMember implements ICluster {
 			// verdicts — its own member's through getExecutedCommitResult, every other member's off the
 			// response record — and the two readers must see the same answer, hence one verdict,
 			// computed once, retained here for both.
-			const verdict = await this.durableCommitVerdict(commit, applied);
-			this.executedCommitResults.set(messageHash, verdict);
-			if (verdict.success) this.reportCommittedHolders(record, commit);
+			this.retainCommitVerdict(record, commit, await this.durableCommitVerdict(commit, applied), behind);
 			return;
 		}
 		if ('invalidate' in operation) {
@@ -2499,12 +2505,14 @@ export class ClusterMember implements ICluster {
 	/**
 	 * Apply one consensus commit to local storage, tolerating every divergence shape the way the
 	 * doc comment on {@link applyConsensusOperation} describes and reconciling the behind ones.
-	 * Returns storage's own result — or, for the thrown missing-pend shape, which produces no
+	 * `applied` is storage's own result — or, for the thrown missing-pend shape, which produces no
 	 * `CommitResult` at all, a refusal built from the throw — so {@link durableCommitVerdict} works
-	 * from one uniform shape. Genuine faults (a bare-reason returned failure, an unrecognized throw)
-	 * propagate so {@link handleConsensus} rolls back the executed marker and rethrows.
+	 * from one uniform shape. `behind` is true exactly when one of the two behind branches ran, which
+	 * is what makes a refusal eligible for {@link reconcileRefusedCommit}. Genuine faults (a
+	 * bare-reason returned failure, an unrecognized throw) propagate so {@link handleConsensus} rolls
+	 * back the executed marker and rethrows.
 	 */
-	private async applyCommitToStorage(record: ClusterRecord, commit: CommitRequest, proof: BlockCommitProof | undefined): Promise<CommitResult> {
+	private async applyCommitToStorage(record: ClusterRecord, commit: CommitRequest, proof: BlockCommitProof | undefined): Promise<{ applied: CommitResult; behind: boolean }> {
 		const messageHash = record.messageHash;
 		let result: CommitResult;
 		try {
@@ -2524,12 +2532,12 @@ export class ClusterMember implements ICluster {
 				// cohort peer so the block is no longer under-replicated. Best-effort:
 				// failures are logged inside, never thrown (a throw would reset the stream).
 				await this.reconcileDivergentCommit(record, commit);
-				return { success: false, reason: (err as Error).message };
+				return { applied: { success: false, reason: (err as Error).message }, behind: true };
 			}
 			throw err;
 		}
 		if (result.success) {
-			return result;
+			return { applied: result, behind: false };
 		}
 		// success:false is a StaleFailure. `missing` ⇒ ahead/stale divergence
 		// (we already hold ≥ this rev): tolerate, do NOT reconcile downward. A
@@ -2559,7 +2567,7 @@ export class ClusterMember implements ICluster {
 				reason: result.reason,
 				hasMissing: true
 			});
-			return result;
+			return { applied: result, behind: false };
 		}
 		// This member holds no materializable base for one of the blocks, so
 		// `StorageRepo.commit` REFUSED rather than record a revision it could never serve.
@@ -2575,9 +2583,62 @@ export class ClusterMember implements ICluster {
 				reason: result.reason
 			});
 			await this.reconcileDivergentCommit(record, commit);
-			return result;
+			return { applied: result, behind: true };
 		}
 		throw new Error(`Consensus commit for action ${commit.actionId} failed: ${result.reason ?? 'unknown reason'}`);
+	}
+
+	/**
+	 * Retain `verdict` as this member's durable verdict for `record`'s commit (see
+	 * {@link executedCommitResults}), remember whether a refusal was the behind shape, and — once the
+	 * verdict is a success — report the committed holders. Shared by the consensus apply and
+	 * {@link reconcileRefusedCommit} so both leave the same state behind.
+	 */
+	private retainCommitVerdict(record: ClusterRecord, commit: CommitRequest, verdict: CommitResult, behind: boolean): void {
+		this.executedCommitResults.set(record.messageHash, verdict);
+		if (verdict.success) {
+			this.behindCommitRefusals.delete(record.messageHash);
+			this.reportCommittedHolders(record, commit);
+		} else if (behind) {
+			this.behindCommitRefusals.add(record.messageHash);
+		}
+	}
+
+	/**
+	 * One more reconcile for a commit this member already applied at consensus but could not hold:
+	 * its retained verdict is a BEHIND-shaped refusal (missing pend or missing base), and the
+	 * reconcile that ran during the apply found no cohort peer holding the revision yet. The
+	 * coordinating node calls this for its own member once the remote members have applied and at
+	 * least one reported holding the revision. Its own delivery goes first (see
+	 * `ClusterCoordinator.broadcastMergedRecord`), so that first reconcile ran before anyone else
+	 * held anything. The remote holder's copy carries the cohort's commit proof, so the existing
+	 * certified single-holder path adopts it; no new trust is involved.
+	 *
+	 * Does nothing unless the retained verdict for `record.messageHash` is a behind refusal; in
+	 * particular an ahead-shaped refusal (`missing`) is never reconciled downward. Recomputes and
+	 * re-retains the durable verdict afterwards, so `getExecutedCommitResult` then answers a success
+	 * when the revision landed. Bounded by the same per-block reconcile timeout and never throws.
+	 */
+	async reconcileRefusedCommit(record: ClusterRecord): Promise<void> {
+		const messageHash = record.messageHash;
+		const refused = this.executedCommitResults.get(messageHash);
+		if (refused === undefined || refused.success || !this.behindCommitRefusals.has(messageHash)) {
+			return;
+		}
+		const operation = record.message.operations.find((op): op is { commit: CommitRequest } => 'commit' in op);
+		if (operation === undefined) {
+			return;
+		}
+		const commit = operation.commit;
+		log('cluster-member:consensus-commit-reconcile-again', { messageHash, actionId: commit.actionId, rev: commit.rev });
+		await this.reconcileDivergentCommit(record, commit);
+		const verdict = await this.durableCommitVerdict(commit, refused);
+		// The apply's retention may have been pruned or rolled back while the reconcile ran; never
+		// resurrect it.
+		if (this.executedCommitResults.get(messageHash) !== refused) {
+			return;
+		}
+		this.retainCommitVerdict(record, commit, verdict, true);
 	}
 
 	/**
@@ -2982,6 +3043,7 @@ export class ClusterMember implements ICluster {
 				this.executedTransactions.delete(messageHash);
 				this.executedPendResults.delete(messageHash);
 				this.executedCommitResults.delete(messageHash);
+				this.behindCommitRefusals.delete(messageHash);
 			}
 		}
 		// Prune actionId-keyed pend refusals on the same TTL as the verdicts they were derived from.
