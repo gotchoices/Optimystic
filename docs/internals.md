@@ -1262,7 +1262,12 @@ saveMaterializedBlock(block): store(structuredClone(block));
   certified single-holder rule below accepts without a second corroborator — so a whole cohort of
   behind members can heal from it in one pass. A single parallel fan-out let the remote reconciles
   race the local apply and decline with `reconcile:no-rev-quorum` (`holders: 0`), which is how a
-  fully-approved commit ended up on no responsible node. A coordinator *outside* `record.peers`
+  fully-approved commit ended up on no responsible node. The price of that order is the mirror
+  case, where the coordinating member is itself behind: its reconcile runs before anyone holds the
+  revision and retains a refusal. So once a remote member reports holding the revision, the
+  coordinator gives its own member one more reconcile (`ClusterMember.reconcileRefusedCommit`, a
+  no-op unless the retained refusal has the behind shape) before the durability gate reads its
+  verdict. A coordinator *outside* `record.peers`
   is not a reconcile target, so a cohort with no holder at all stays behind; the durability gate
   in `CoordinatorRepo.commit` is what makes that shape refuse rather than acknowledge. The read path
   is no longer blind to it: `CoordinatorRepo` is handed the *same* callback instance and

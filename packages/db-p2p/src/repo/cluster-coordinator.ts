@@ -1091,6 +1091,11 @@ export class ClusterCoordinator {
 		// asked, so a member cannot report an outcome on another member's behalf by echoing a record
 		// full of entries. Unsigned and advisory either way — see ClusterRecord.applyOutcomes.
 		const applyOutcomes = collectApplyOutcomes(results);
+		// NOTE: after a healing second reconcile, `applyOutcomes[selfId].commit` still carries the
+		// pre-reconcile refusal. Nothing reads the self entry today (the gate reads
+		// `localCommitResult`); if anything starts to, re-stamp it from `getExecutedCommitResult` here.
+		// NOTE: in a 3+ cohort this also runs when the remote holders already form a majority without
+		// this member — one extra fetch that heals its copy; gate on the remote count if it ever shows up.
 		const remoteHolds = remote.some(id => applyOutcomes?.[id]?.commit?.success === true);
 		if (remoteHolds && localResults.some(r => r.success)) {
 			await this.reconcileLocalMemberAgain(record);
