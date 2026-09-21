@@ -35,3 +35,13 @@ Session-mode commit → `TransactionCoordinator` → per staged collection, one 
 # Evidence, 2026-09-17: now the dominant cost (sereus remeasure at `012573a2`)
 
 After the refresh and rebalance fixes, sereus measured a two-party relay strand with 150 ms added each way. Reads take 0.6–2.5 s, but inserts still take 9–10 s, once 38 s. With no delay an insert is 9 `/cluster` streams and 40–51 exchanges on A. B's burst about 25–30 s after joining was 45 `/cluster` streams for 5 commits. Report: `../sereus/tickets/complete/relay-round-trips-remeasure-optimystic-012573a2.md`. Over a phone-grade link, commit round trips are now what an application feels.
+
+# Promoted to plan 2026-09-20 (sereus, issue #13 follow-up)
+
+Promoted by the maintainer. The tradeoff line ("a local-network deployment will never notice") no longer holds. Phone-to-phone over a relay is the deployment sereus is building for. An outside reporter hit it (gotchoices/sereus#13), and relay scenarios now run with latency injected (`packages/integration-tests/src/harness/ws-latency.ts` in sereus).
+
+Evidence from that investigation: a two-party formation-plus-one-write-each run sends roughly 12,000 outbound WebSocket frames. A relayed node has exactly ONE outbound socket, and every round above is a fresh `newStream` on that socket. So each removed round also removes a stream setup and a request/response pair that would otherwise wait behind every other stream on that node, FRET maintenance included. The saving is more than latency.
+
+Sereus re-derived the same 3 × 3 inventory independently from code at `e6ab12c6`, with no leftover the inventory does not explain: `../sereus/tickets/blocked/optimystic-strand-operations-cost-dozens-of-relay-round-trips.md`, section "Static inventory of the write path". Nothing else in the stack is multiplying the count. These two rounds are the whole reducible part of the write path.
+
+Planning should settle the two Risk bullets under candidates 1 and 2 before any implement ticket is written. Candidate 3 stays out of scope.
