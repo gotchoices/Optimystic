@@ -212,11 +212,12 @@ export type BlockBaseRevs = Record<BlockId, number>;
 export type CommitRequest = ActionBlocks & {
 	/** The header block of the collection, present only when this commit creates the collection
 	 *  (the header is a fresh insert). Collection-identifying metadata, not an ordering signal —
-	 *  the header commits inside the ordinary sweep, after the tail, like any other touched block.
+	 *  the header commits after the tail, like any other touched block.
 	 *  Consumed by dispute reporting (`dispute-service.ts`) as a fallback to name the collection. */
 	headerId?: BlockId;
-	/** The tail block of the log. Unconditionally the first block committed — the ordering
-	 *  `Collection.bootstrapContext` relies on. */
+	/** The tail block of the log. Unconditionally the first block committed on every member, whether
+	 *  it travels alone or with the action's other blocks — the ordering `Collection.bootstrapContext`
+	 *  relies on. */
 	tailId: BlockId;
 	/** The new revision for the committed action */
 	rev: number;

@@ -14,9 +14,10 @@
  * (`util/node-count-mesh.ts`), reusing `member-leaves-and-returns.spec.ts`'s phase-2 mechanics:
  *
  *  1. **Seed.** A writes a row; every machine holds it.
- *  2. **C misses a commit.** C promises the TAIL commit of A's next write and drops before voting on it. The
- *     tail commits on A and B (the commit phase needs a simple majority); C keeps the pending record it stored
- *     when it promised the pend, and its own storage stays behind.
+ *  2. **C misses a commit.** C promises the commit carrying the TAIL of A's next write (on this mesh the tail
+ *     and the write's other blocks travel in one round) and drops before voting on it. The write commits on A
+ *     and B (the commit phase needs a simple majority); C keeps the pending records it stored when it
+ *     promised the pend, and its own storage stays behind.
  *  3. **Nobody owes C the commit.** A restarts while C is away, taking its scheduled commit retry
  *     (`ClusterCoordinator.scheduleCommitRetry`) with it — the mesh wires no transaction state store, so the
  *     restarted A recovers nothing. C returns owed nothing, still behind, still holding the record.
@@ -129,14 +130,15 @@ describe('A member that missed a commit is brought current by the commit of the 
 		await expectReadable(mesh.nodes, 'seeded');
 	});
 
-	it('phase 2 — C promises the tail commit of A\'s write and drops before voting on it: A and B hold the tail, C keeps only its pending record', async () => {
+	it('phase 2 — C promises the commit carrying the tail of A\'s write and drops before voting on it: A and B hold the write, C keeps only its pending records', async () => {
 		const cId = c.peerId.toString();
 		let leftDuring: ClusterRecord | undefined;
 		mesh.failures.onClusterDelivery = (target, record) => {
 			if (leftDuring !== undefined || target !== cId) return;
 			const commit = (record.message.operations[0] as { commit?: CommitRequest }).commit;
-			// The write's TAIL commit — the one that lands the log entry — on the delivery that would carry
-			// C's commit vote: C has promised it, and has not voted to commit it.
+			// The commit carrying the write's TAIL — the one that lands the log entry, with the write's other
+			// blocks in the same round — on the delivery that would carry C's commit vote: C has promised it,
+			// and has not voted to commit it.
 			const isTailStep = commit !== undefined && commit.blockIds.includes(commit.tailId);
 			if (isTailStep && record.promises[cId] !== undefined && record.commits[cId] === undefined) {
 				leftDuring = record;
@@ -150,15 +152,16 @@ describe('A member that missed a commit is brought current by the commit of the 
 			const durability = await write(a, 'written-as-C-left', 'held-by-A-and-B');
 			outcome = `returned ${JSON.stringify(durability)}`;
 		} catch (err) {
-			// The write's blocks after the tail cannot be swept with C away (the sweep needs all three
-			// promises), so the writer may report the write torn. What matters here is storage, below.
+			// Were the write split into a tail round and a sweep, the sweep could not run with C away (it
+			// needs all three promises) and the writer would report the write torn. What matters here is
+			// storage, below.
 			outcome = `threw ${(err as Error).message}`;
 		} finally {
 			mesh.failures.onClusterDelivery = undefined;
 		}
 		console.log(`    phase 2: A's write ${outcome}`);
 
-		expect(leftDuring, 'C left at the intended step — the tail commit, which C had promised').to.not.equal(undefined);
+		expect(leftDuring, 'C left at the intended step — the commit carrying the tail, which C had promised').to.not.equal(undefined);
 		expect(await holdersOfMissed(), `whose own storage holds action ${missed.actionId} at rev ${missed.rev}`).to.deep.equal(['A', 'B']);
 		const onC = await tailOn(c);
 		expect(onC.pendings, 'C still holds the pending record it stored when it promised the pend').to.include(missed.actionId);

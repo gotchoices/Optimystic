@@ -179,10 +179,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 	/** The action id of a write currently in flight ON THIS INSTANCE'S BEHALF, or `undefined`
 	 * outside a write. Read by {@link updateInternal}: if the committed log now carries an entry
 	 * under this id, that action's LOG TAIL landed despite the failure answer that sent us back here
-	 * — `NetworkTransactor.commit` commits the log tail BEFORE sweeping the remaining blocks, and
-	 * reports failure both when the tail itself was refused after landing on a minority
-	 * (`commit-not-durable`, in which case the sweep never ran) and when a later sweep block
-	 * confirmed a conflict. Such an entry is never REPLAYED, because replaying re-appends content
+	 * — every member applies the log tail before the action's other blocks, and
+	 * `NetworkTransactor.commit` reports failure when the commit carrying the tail was refused after
+	 * landing on a minority (`commit-not-durable`; in one round the other blocks may have landed on
+	 * that minority too, in two the sweep never ran) and when a later sweep block confirmed a
+	 * conflict. Such an entry is never REPLAYED, because replaying re-appends content
 	 * the committed tail already carries, producing a duplicate entry under one action id at two
 	 * revisions. But it is not proof the write is saved either: the entry proves only that the tail
 	 * landed, and the writer's own cancel has since dropped the pending records of every block that
@@ -2029,8 +2030,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 	}
 
 	/** Bootstrap ActionContext from the committed tail block's state.
-	 * The tail is always committed first (commit protocol guarantee), so it's readable
-	 * with context=undefined. Its state.latest contains the ActionRev of the most recent
+	 * Every member applies an action's tail before its other blocks (commit protocol guarantee:
+	 * `StorageRepo.commit` orders the tail first and stops at the first failure), so wherever
+	 * committed data of an action exists its tail does too, readable with context=undefined.
+	 * Its state.latest contains the ActionRev of the most recent
 	 * committed action — exactly the proof needed for the transactor to serve pending
 	 * non-tail blocks during chain walks. A tail with no `latest` (or no tail) no-ops.
 	 *

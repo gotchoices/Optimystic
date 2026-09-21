@@ -1002,6 +1002,78 @@ describe('NetworkTransactor', () => {
     })
   })
 
+  // When one coordinator covers every block of an action, the tail and the rest travel as ONE commit,
+  // tail first on the wire (the coordinator runs consensus on `blockIds[0]`'s cohort) whatever order
+  // the caller listed them in. A thrown one-round commit is not re-batched onto other coordinators;
+  // the same request is committed the two-step way instead: the tail, then the rest.
+  describe('commit in one round', () => {
+    const peer = 'peer-sole'
+    const tailId = 'block-tail' as BlockId
+    const otherId = 'block-other' as BlockId
+
+    const setup = async (throwsFirst: number) => {
+      const net: IKeyNetwork = {
+        async findCoordinator() { return peerIdFromString(peer) },
+        async findCluster() { return { [peer]: { multiaddrs: [], publicKey: '' } } },
+      }
+      const inner = new TestTransactor()
+      const sent: BlockId[][] = []
+      let throwsLeft = throwsFirst
+      const repo: IRepo = {
+        get: gets => inner.get(gets),
+        pend: request => inner.pend(request),
+        cancel: ref => inner.cancel(ref),
+        async commit(request) {
+          sent.push([...request.blockIds])
+          if (throwsLeft > 0) {
+            throwsLeft--
+            throw new Error('The stream has been reset')
+          }
+          return inner.commit(request as CommitRequest)
+        },
+      }
+      const networkTransactor = new NetworkTransactor({ timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: net, getRepo: () => repo })
+      const actionId = generateRandomActionId()
+      const pended = await networkTransactor.pend({
+        actionId,
+        transforms: {
+          inserts: {
+            [tailId]: { header: { id: tailId, type: 'block', collectionId: 'test' } },
+            [otherId]: { header: { id: otherId, type: 'block', collectionId: 'test' } },
+          },
+          updates: {},
+          deletes: [],
+        },
+        policy: 'c',
+      })
+      expect(pended.success).to.be.true
+      // The tail listed LAST, so a tail-first request proves the reorder rather than the caller's order.
+      const result = await networkTransactor.commit({ actionId, rev: 1, blockIds: [otherId, tailId], tailId })
+      const [status] = await inner.getStatus([{ actionId, blockIds: [tailId, otherId] }])
+      return { result, sent, statuses: status!.statuses }
+    }
+
+    it('sends the tail and the other block as one request, tail first', async () => {
+      const { result, sent, statuses } = await setup(0)
+      expect(sent, 'exactly one commit call, carrying the tail first').to.deep.equal([[tailId, otherId]])
+      expect(result.success).to.be.true
+      if (result.success) {
+        expect(result.durability.torn, 'nothing abandoned').to.equal(undefined)
+      }
+      expect(statuses).to.deep.equal(['committed', 'committed'])
+    })
+
+    it('falls back to the tail, then the rest, when the one-round request throws', async () => {
+      const { result, sent, statuses } = await setup(1)
+      expect(sent, 'the thrown round, then the tail, then the rest').to.deep.equal([[tailId, otherId], [tailId], [otherId]])
+      expect(result.success).to.be.true
+      if (result.success) {
+        expect(result.durability.torn, 'nothing abandoned').to.equal(undefined)
+      }
+      expect(statuses).to.deep.equal(['committed', 'committed'])
+    })
+  })
+
   // Ticket consensus-pend-refusal-commit-tier-verify2: the non-tail sweep in commit() used to
   // tolerate EVERY failure after the tail landed, on the theory that reconciliation finishes
   // lagging peers. That holds for transport faults (the commit consensus exists; peers converge)
@@ -1010,7 +1082,8 @@ describe('NetworkTransactor', () => {
   // the same returned-refusal extraction commitBlock uses for the tail (staleFromBatches) and
   // keeps the tolerance only for transport-shaped (thrown) failures.
   describe('commit non-tail conflict surfacing', () => {
-    // Routes each block to its own coordinator; findCoordinator honors exclusions and throws
+    // Routes each block to its own coordinator — which is what keeps these commits on the two-step
+    // path (tail, then sweep) rather than one round; findCoordinator honors exclusions and throws
     // once a block's candidates are exhausted (what a real one does), so a transport retry
     // terminates instead of re-dialing the same dead peer.
     class RoutedKeyNetwork implements IKeyNetwork {
@@ -2034,24 +2107,25 @@ describe('NetworkTransactor', () => {
       }
       expect(net.findCoordinatorCalls, 'every pend resolved from the cluster').to.equal(0);
 
-      // commit splits into tail (blockId) then the remainder; the remainder's two blocks
-      // consolidate onto ONE batch, whose peerId is block-2's cached object. The retry excludes
-      // exactly that object, so block-3's own cached object is only excluded if the comparison
-      // is by peer id string.
+      // All three blocks are cached to peerA, so commit first sends them as ONE round, which
+      // throws and is not retried; it then falls back to the tail (blockId) and the remainder.
+      // The remainder's two blocks consolidate onto ONE batch, whose peerId is block-2's cached
+      // object. The retry excludes exactly that object, so block-3's own cached object is only
+      // excluded if the comparison is by peer id string.
       const commitResult = await networkTransactor.commit({ actionId, rev: 1, blockIds: [tailId, blockId2, blockId3], tailId });
       expect(commitResult.success).to.be.true;
 
-      // Both commit rounds opened from the CACHE, so only their retries resolved live: one
-      // lookup for the tail's retry, two for the remainder's (one per re-homed block). Pinning
-      // the exact number is what rules out a commit that ignored the cache and resolved every
-      // round live — that case double-counts here and would slip past a `greaterThan(0)`.
+      // Every commit round opened from the CACHE, so only the retries resolved live: one lookup
+      // for the tail's retry, two for the remainder's (one per re-homed block). Pinning the exact
+      // number is what rules out a commit that ignored the cache and resolved every round live —
+      // that case double-counts here and would slip past a `greaterThan(0)`.
       expect(net.findCoordinatorCalls, 'only the two retries went live, never the initial rounds')
         .to.equal(3);
 
-      // Two dead dials: one for the tail round, one for the remainder round. A reference
-      // comparison would let block-3 re-resolve to the dead peer and add a third.
+      // Three dead dials: the one-round attempt, the tail round, the remainder round. A reference
+      // comparison would let block-3 re-resolve to the dead peer and add a fourth.
       expect(deadCommitA.commitCalls, 'the dead peer was dialed once per commit round, not re-picked')
-        .to.equal(2);
+        .to.equal(3);
       expect(liveB.commitCalls, 'each round re-homed as a single batch').to.equal(2);
 
       // Non-tail commit failures are swallowed, so `success` alone proves nothing about

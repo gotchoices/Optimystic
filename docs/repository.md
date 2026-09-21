@@ -315,8 +315,9 @@ and the sweep only ever removes a record whose promotion has become impossible. 
 had its pending record **cancelled** — a client that reports success while walking away from a
 pended block strands the record permanently, and the members then reject every later write to that
 block from any writer (the wedge described two paragraphs up). The one path that violated this — a
-non-tail sweep whose transport failed after the tail committed — now cancels the abandoned blocks
-before acknowledging.
+non-tail sweep whose transport failed after the tail committed, on the two-step path
+`NetworkTransactor.commit` takes when an action's blocks need more than one coordinator or its
+one-round commit threw — now cancels the abandoned blocks before acknowledging.
 
 The cancel that discharges a record is a **checked, retried** operation, not a single best-effort
 shot. `NetworkTransactor.cancel` runs rounds until every block of the action has had its cancel

@@ -21,8 +21,9 @@
  *     member took the result as a replica (the fork). Its revision index still names the write, and
  *     must not be believed: the row is gone. Torn, and final.
  *
- * Cases 2 and 3 are built from one fault — a member that does not apply one commit — and real
- * traffic from there on: the fork guard, reconcile and the durability gate do the rest.
+ * Cases 2 and 3 are built from one fault — a member that applies one commit's log tail but not its
+ * data blocks — and real traffic from there on: the fork guard, reconcile and the durability gate do
+ * the rest.
  */
 
 import { expect } from 'chai';
@@ -113,18 +114,25 @@ const readingFrom = (node: MeshNode, inner: ITransactor): ITransactor => {
 };
 
 /**
- * Makes `node` fail to apply the next commit of DATA blocks (one that does not carry the log tail)
- * that reaches its storage: it answers the "I am already past that revision" refusal a member
- * tolerates without reconciling, and stores nothing. The commit still lands on the other member, so
- * the cohort's durability gate sees one holder of two and refuses the writer.
+ * Makes `node` fail to apply the DATA blocks (every block but the log tail) of the next commit carrying
+ * any that reaches its storage. The tail, when the commit carries it too (it does whenever one
+ * coordinator covers the whole write), is applied for real; for the rest it answers the "I am already
+ * past that revision" refusal a member tolerates without reconciling, and stores none of them. The
+ * commit still lands whole on the other member, so the cohort's durability gate sees one holder of two
+ * and refuses the writer.
  */
 const missTheNextDataCommit = (node: MeshNode): { missed: () => number } => {
 	let missed = 0;
 	const storage = node.storageRepo;
 	const apply = storage.commit.bind(storage);
 	storage.commit = async (request, options, proof) => {
-		if (missed === 0 && !request.blockIds.includes(request.tailId)) {
+		const carriesTail = request.tailId !== undefined && request.blockIds.includes(request.tailId);
+		if (missed === 0 && request.blockIds.some(id => id !== request.tailId)) {
 			missed++;
+			if (carriesTail) {
+				const tail = await apply({ ...request, blockIds: [request.tailId!] }, options, proof);
+				if (!tail.success) return tail;
+			}
 			return { success: false, missing: [{ actionId: 'never-applied' as ActionId, rev: request.rev, transforms: emptyTransforms() }] };
 		}
 		return apply(request, options, proof);

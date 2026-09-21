@@ -885,10 +885,18 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 */
 	async commit(request: CommitRequest, _options?: MessageOptions, proof?: BlockCommitProof): Promise<CommitResult> {
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
-		// Deduped ONCE, in request order — the order blocks are committed and reported in. The latches
-		// are acquired in sorted order by `acquireBlockWriteLatches` over this same set, so every
-		// `latches.get(blockId)!` below resolves.
-		const blockIds = Array.from(new Set(request.blockIds));
+		// Deduped ONCE, tail first, then request order — the order blocks are committed and reported
+		// in. The latches are acquired in sorted order by `acquireBlockWriteLatches` over this same set,
+		// so every `latches.get(blockId)!` below resolves.
+		//
+		// Tail first is the invariant "no member commits a non-tail block of an action without its
+		// tail". The apply loop below stops at the first failure, and every whole-batch refusal (the
+		// stale partition, the missing-pend throw) returns before anything is applied, so a tail applied
+		// first means a member holding a committed non-tail block of this action also holds the tail.
+		// `Collection.bootstrapContext` reads the tail with no revision context and relies on exactly
+		// that; `NetworkTransactor.commit` sends the tail and the other blocks in one request when one
+		// coordinator covers them all, so the order is enforced here rather than trusted to the sender.
+		const blockIds = tailFirst(Array.from(new Set(request.blockIds)), request.tailId);
 		// Collects the blocks newly committed in this call, grouped by collection,
 		// so we can emit change events once locks are released. Blocks that land before
 		// a mid-loop failure stay here and are still emitted (Option A — emit eagerly):
@@ -904,8 +912,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		try {
 			// --- Start of Critical Section ---
 
-			// Request order, deduped (NOT the sorted acquisition order): the order here is the order
-			// blocks are committed and reported in change events, which callers may observe.
+			// Tail first, then request order, deduped (NOT the sorted acquisition order): the order here
+			// is the order blocks are committed and reported in change events, which callers may observe.
 			const blockStorages = blockIds.map(blockId => ({
 				blockId,
 				storage: this.createBlockStorage(blockId),
@@ -1759,4 +1767,13 @@ function perBlockActionTransformsToPerAction(missing: { blockId: BlockId; transf
 			transforms: emptyTransforms()
 		})
 	);
+}
+
+/** `blockIds` with `tailId` moved to the front and the rest left in their order. Returns `blockIds`
+ * itself when there is no tail, the tail is not in the list, or it is already first. */
+function tailFirst(blockIds: BlockId[], tailId: BlockId | undefined): BlockId[] {
+	if (tailId === undefined || blockIds[0] === tailId || !blockIds.includes(tailId)) {
+		return blockIds;
+	}
+	return [tailId, ...blockIds.filter(id => id !== tailId)];
 }

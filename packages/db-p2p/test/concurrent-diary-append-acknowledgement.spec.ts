@@ -51,10 +51,11 @@ const entriesOf = async (diary: Diary<DiaryEntry>): Promise<string[]> => {
  * asserted below is being pinned against the LEAST informative failure production can hand it —
  * `Collection.syncInternal` retries on any stale failure at all, never on `isConflictFailure`.
  *
- * That is the torn action in its exact production shape. `NetworkTransactor.commit` commits the
- * tail, then sweeps the rest (the header included, when the action touches it) — so by the
- * time a later block confirms a conflict the log entry the tail carries is already durable, and
- * the writer is nonetheless told it failed. Everything after that is the code under test: the
+ * That is the torn action in its exact production shape on `NetworkTransactor.commit`'s two-step
+ * path (taken when the action's blocks need more than one coordinator, or its one-round commit
+ * threw): it commits the tail, then sweeps the rest (the header included, when the action touches
+ * it) — so by the time a later block confirms a conflict the log entry the tail carries is already
+ * durable, and the writer is nonetheless told it failed. Everything after that is the code under test: the
  * writer cancels (a no-op on the already-promoted records) and refreshes, and that refresh must
  * recognize the committed entry as its OWN and consume it rather than replaying it into a
  * duplicate.

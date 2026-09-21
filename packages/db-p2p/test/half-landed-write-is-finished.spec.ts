@@ -1,11 +1,12 @@
 /**
  * Mesh-tier regression for the write that is acknowledged on the strength of its log entry alone.
  *
- * A write to a tree touches its log tail AND its data blocks (the leaf the row lives in).
- * `NetworkTransactor.commit` commits the tail first and sweeps the rest only if the tail answered
- * success — and a failed tail answer does not mean the tail is absent: the durability gate answers
- * `commit-not-durable` whenever fewer than a majority hold the revision, even though some members
- * stored it. The writer then cancels (dropping the data blocks' pending records on every member),
+ * A write to a tree touches its log tail AND its data blocks (the leaf the row lives in). Every
+ * member applies the tail before the rest; `NetworkTransactor.commit` sends them in one round when one
+ * coordinator covers them all, and otherwise commits the tail first and sweeps the rest only if the
+ * tail answered success — and a failed answer does not mean the tail is absent: the durability gate
+ * answers `commit-not-durable` whenever fewer than a majority hold the revision, even though some
+ * members stored it. The writer then cancels (dropping the data blocks' pending records on every member),
  * refreshes, and finds its own log entry. Before the fix it took that entry as proof the write was
  * saved: `replace()` resolved, the collection's revision advanced, and the leaf stayed at its
  * previous revision on every node. The row was gone and no reader got an error.
@@ -47,7 +48,7 @@ interface TearRecord {
  * Wraps a transactor so its FIRST multi-block commit lands ONLY the log tail — for real, through
  * consensus — and then answers the retryable refusal the durability gate produces. Every block
  * after the tail is never committed, exactly as when `NetworkTransactor.commit` returns at a
- * refused tail without sweeping. A commit carrying nothing but the tail has nothing to abandon and
+ * refused tail without sweeping (its two-step path). A commit carrying nothing but the tail has nothing to abandon and
  * is passed through untouched.
  *
  * Explicit delegation rather than a spread of `inner`: `NetworkTransactor` is a class, so its

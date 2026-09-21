@@ -2511,10 +2511,11 @@ export class CoordinatorRepo implements IRepo {
 			// fresh revision, which is what the `conflict: true` shape makes `Collection.syncAttempts`
 			// and the multi-collection `pendPhase` do. But a member reached only by
 			// `scheduleCommitRetry` can still land the refused revision later, and this node's own
-			// member (or its fallback commit) may hold it already. When the refused block is the
-			// action's LOG TAIL, that matters beyond this block: `NetworkTransactor.commit` stops at a
-			// refused tail and never sweeps the action's other blocks, so the writer can then read
-			// its own log entry back while none of the data it describes was committed anywhere.
+			// member (or its fallback commit) may hold it already. When the refused commit carries the
+			// action's LOG TAIL, that matters beyond this block: the writer can then read its own log
+			// entry back while the data it describes is on a minority at best — when the tail travelled
+			// with the other blocks, the members holding it may hold them too; when it travelled alone,
+			// `NetworkTransactor.commit` stops at the refused tail and never sweeps the rest.
 			// The writer's retry with the SAME action id is what converges that, and only because it
 			// does two things: `isOwnRevision` in `StorageRepo.pend` and `commit` treats an
 			// already-landed own revision as satisfied, and `Collection.completeOwnEntry` — on

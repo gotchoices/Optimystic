@@ -438,14 +438,40 @@ Collection.act(action)
 Collection.sync()
   → NetworkTransactor.transact(transforms)
     → pend() to all block clusters     # Two-phase: promise collection
-    → commit() to log tail cluster     # Two-phase: consensus + commit
+    → commit() to log tail cluster     # One round, tail first, when one coordinator covers
+                                       #   every block; else the tail, then a sweep of the rest
       → ClusterCoordinator.update()    # Coordinates with cluster peers
         → ClusterMember.update()       # Each peer votes
           → handleConsensus()          # Winner executes operations
-            → StorageRepo.pend/commit  # Applies to local storage
+            → StorageRepo.pend/commit  # Applies to local storage, the log tail first
 ```
 
 The `WriteDurability` each layer assembles on the way back up returns along this same path, unflattened: `TransactorSource.transact` hands the whole `CommitResult` to `Collection.syncAttempts`, which reports the committing attempt's class out of `sync`/`updateAndSync`, and `Tree`/`Diary` forward it. `undefined` from a sync means nothing was staged, so nothing was written — not that the write failed. `TransactionCoordinator.commit` is the one write path that reports no class; see the note on that method.
+
+#### One commit round when one coordinator covers every block
+
+`NetworkTransactor.commit` resolves a coordinator for every block the action touched, reusing the ones its pend
+resolved. When a single coordinator covers them all — always, in a group small enough that every machine is in
+every cohort, because the pend's cover (`consolidateCoordinators`) collapses onto one peer — it sends ONE commit
+listing the log tail first and the rest after it (`commitInOneRound`). `CoordinatorRepo.commit` runs consensus
+on `blockIds[0]`'s cohort, so that record runs on the tail's cohort, as a tail-only round would; the other
+blocks commit on that cohort too, the approximation a multi-block batch already makes. With one consensus
+operation for the pend and one for the commit, a single-collection write on a two-member group costs 4
+`/cluster` calls to the other member (measured on the in-process mesh), where a tail round plus a sweep costs 6.
+
+What `Collection.bootstrapContext` relies on — wherever committed data of an action exists, its committed tail
+does too — is enforced by storage rather than by the order of rounds: `StorageRepo.commit` applies the tail
+first whatever order the request lists (`tailFirst`), stops at the first failure, and makes every whole-batch
+refusal before applying anything. So a member can hold the tail with the other blocks still pending, never the
+reverse.
+
+When the blocks need more than one coordinator, the action touches only its tail, or the one-round commit
+THREW, it commits the tail and then sweeps the rest (`commitTailThenSweep`). A throw is not re-batched onto
+other coordinators the way `processBatches` retries a failed batch — that could land a non-tail block on one
+cohort before the tail lands on another; the fallback re-sends everything, and whatever the thrown round had
+landed is this action's own revision, which storage treats as already done. A RETURNED refusal of the one
+round is returned as a refused tail is. It can leave the tail and the other blocks on a minority of the
+cohort, which the writer's completion (`Collection.completeOwnEntry`) finishes as it finishes a lone tail.
 
 #### Commit content-digest check (promise round)
 
@@ -1010,7 +1036,11 @@ saveMaterializedBlock(block): store(structuredClone(block));
   question changes from "is this mine?" to "was what is here now BUILT FROM mine?", and that is
   answered elsewhere — see "The writer's retry" below.
 - **Not every torn action is reported as a failure — the tolerated arm cancels instead of
-  retrying.** `NetworkTransactor.commit` splits the sweep's failure by shape. A *returned*
+  retrying.** The sweep exists only on `NetworkTransactor.commit`'s two-step path (see
+  [One commit round when one coordinator covers every block](#one-commit-round-when-one-coordinator-covers-every-block)):
+  a one-round commit that throws falls back to it, and one that returns a refusal returns it, so
+  the arm below is never reached from the one round directly. `NetworkTransactor.commit` splits the
+  sweep's failure by shape. A *returned*
   `success:false` is a confirmed conflict and is surfaced, so the writer retries (everything below
   is about that path). A *thrown* sweep is transport-shaped: the tail is already durable, so
   refusing would disown an acknowledged write, and commit returns success — with the abandoned
@@ -1023,12 +1053,14 @@ saveMaterializedBlock(block): store(structuredClone(block));
   prior revision, and only the log entry the tail carries is durable.
 - **The writer's retry finishes its own half-landed action, then consumes its log entry.** The
   carve-out above only stops the *storage* side refusing the retry; the client half is that a torn
-  action's log entry can already be stored when the failure is reported, because
-  `NetworkTransactor.commit` commits the log tail BEFORE sweeping the remaining blocks. It reports
-  failure over a stored tail in two ways: a later sweep block confirms a conflict, or — the common
-  one — the tail's own commit answers `commit-not-durable` (held by fewer than a majority, not
-  "absent") and the sweep **never runs**. Either way the writer then cancels, which drops the
-  pending records of every block that did not land, so nothing else will ever land them.
+  action's log entry can already be stored when the failure is reported, because every member
+  applies the log tail before the action's other blocks and a commit can land on a minority.
+  `NetworkTransactor.commit` reports failure over a stored tail in two ways: the common one is the
+  commit carrying the tail answering `commit-not-durable` (held by fewer than a majority, not
+  "absent") — in one round the other blocks may sit on that minority too, and on the two-step path
+  the sweep **never runs** — and the other, on the two-step path only, is a later sweep block
+  confirming a conflict. Either way the writer then cancels, which drops the pending records of
+  every block that did not land, so nothing else will ever land them.
   **The rule: a write may be reported saved only if every block its log entry names holds the
   write — at the write's own revision, or at a later revision that was built from it. Finding
   the entry proves only that the tail landed.** Readers materialize blocks, not log entries, so an

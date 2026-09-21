@@ -144,6 +144,10 @@ Phase 2 (Commit): Apply changes atomically across all clusters
 3. Other Blocks: Apply changes with order already determined
 ```
 
+When one coordinator covers every block of the action, the tail and the other blocks travel in one commit, and
+every member applies the tail first; otherwise the tail is committed in a round of its own before the rest. See
+[docs/internals.md §One commit round when one coordinator covers every block](../../../docs/internals.md#one-commit-round-when-one-coordinator-covers-every-block).
+
 **Why log-first ordering works:**
 - **Single Point of Ordering**: Each collection has one log, eliminating ordering conflicts
 - **Append-Only Semantics**: Log appends are naturally serializable

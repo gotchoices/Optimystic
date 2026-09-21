@@ -20,11 +20,13 @@
  * acknowledged by A and B, naming C as the member that does not hold it. That is the one documented way C can
  * come back behind.
  *
- * Why the FINAL step (the sweep of the write's non-tail blocks, which `NetworkTransactor.commit` runs after the
- * tail) and not the tail: a member lost before the sweep's own promise round leaves the sweep short of its
- * all-three bar, so the write is acknowledged torn and the pending record it abandons cannot be cancelled
- * (a cancel needs the same all-three bar) until the member returns. That residual is owned by backlog
- * `debt-unpromotable-pending-records-need-a-sweep`; it is not the healing this spec is about.
+ * Why the FINAL step — the one carrying the write's non-tail blocks. On this mesh one coordinator covers every
+ * block, so `NetworkTransactor.commit` sends the tail and the rest as one round, and that is the only commit
+ * step. Were the write split into a tail round and a sweep of the rest, C lost during the tail round would miss
+ * the sweep's own promise round, leaving the sweep short of its all-three bar: the write would be acknowledged
+ * torn and the pending record it abandons could not be cancelled (a cancel needs the same all-three bar) until
+ * the member returns. That residual is owned by backlog `debt-unpromotable-pending-records-need-a-sweep`; it is
+ * not the healing this spec is about.
  *
  * ## Two arms: how long C was away
  *
@@ -33,13 +35,15 @@
  *    is still running, and that retry delivers the commit before C does anything at all;
  *  - **long** — the writer restarts while C is away, taking the retry with it (the mesh wires no transaction
  *    state store, so the restarted writer recovers no retry; a phone asleep for longer than the retry schedule
- *    ends the same way), so C returns owed nothing and its own reads must bring it current.
- *    What does it, observed under full debug logging: no cohort consult and no fetch at all. C still holds
- *    the pending record it stored when it promised the write, and it holds the write's tail, which lists the
- *    action as committed; a read carrying that collection context promotes the pending record in C's own
- *    storage (the read-driven promotion in `StorageRepo.get`). At three machines C always holds that record —
- *    the pend needed its promise too — so a member missing the record (the case read repair would have to
- *    cover, gated by its lazy window) is not reachable here.
+ *    ends the same way), so C returns owed nothing and its own reads must bring it current. C missed the
+ *    write's only commit step, so it lacks the write's log tail as well as its data blocks, and until its
+ *    read-repair window lapses its reads serve its own older copy of the tail without asking anyone. A long
+ *    absence outlasts that window too (10 s by default), and this arm waits it out.
+ *    What does it then, observed under full debug logging: C's first read of the tail consults the cohort,
+ *    A and B corroborate the newer revision, and C restores it (`cluster-tx:read-repair-applied`). The data
+ *    blocks need no fetch: C still holds the pending records it stored when it promised the write, and a read
+ *    carrying the collection context the restored tail provides promotes them in C's own storage (the
+ *    read-driven promotion in `StorageRepo.get`).
  *
  * ## Phases, per arm, over one mesh (a phase whose predecessor failed fails at once, naming it)
  *
@@ -57,7 +61,7 @@
 
 import { expect } from 'chai';
 import { Tree, isFullyDurable, type ClusterRecord, type CommitRequest, type ITransactor, type WriteDurability } from '@optimystic/db-core';
-import { waitFor } from '@optimystic/db-core/test';
+import { delay, waitFor } from '@optimystic/db-core/test';
 import type { Mesh, MeshNode } from '../src/testing/mesh-harness.js';
 import {
 	createProductionShapedMesh, setUnreachable, transactorDrivenBy,
@@ -78,6 +82,14 @@ const COMMIT_RETRY_INTERVALS_MS = [250, 500, 1_000, 2_000, 4_000];
 const COMMIT_RETRY_SCHEDULE_MS = COMMIT_RETRY_INTERVALS_MS.reduce((total, interval) => total + interval, 0);
 /** Slack on top of the schedule for the retry's own delivery and apply. */
 const RETRY_DELIVERY_SLACK_MS = 1_000;
+/**
+ * How long a coordinator serves its own copy of a block before a read consults the cohort again — the
+ * `readRepairWindowMs` default `CoordinatorRepo` applies. Written out for the same reason as the retry
+ * schedule: the long arm's premise is an absence longer than this.
+ */
+const READ_REPAIR_WINDOW_MS = 10_000;
+/** Slack past the window, so no read in the long arm's phase 4 lands at its edge. */
+const READ_REPAIR_WINDOW_SLACK_MS = 250;
 
 interface Row {
 	key: string;
@@ -199,9 +211,10 @@ describe('A member that leaves mid-session and returns (three machines)', functi
 				mesh.failures.onClusterDelivery = (target, record) => {
 					if (leftDuring !== undefined || target !== cId) return;
 					const commit = (record.message.operations[0] as { commit?: CommitRequest }).commit;
-					// The write's final commit step — the sweep of its non-tail blocks — on the delivery that would
-					// carry C's commit vote: C has promised it, and has not voted to commit it.
-					const isFinalStep = commit !== undefined && !commit.blockIds.includes(commit.tailId);
+					// The write's final commit step — the one carrying its non-tail blocks, here together with the
+					// tail — on the delivery that would carry C's commit vote: C has promised it, and has not voted
+					// to commit it.
+					const isFinalStep = commit !== undefined && commit.blockIds.some(id => id !== commit.tailId);
 					if (isFinalStep && record.promises[cId] !== undefined && record.commits[cId] === undefined) {
 						leftDuring = record;
 						leftAt = Date.now();
@@ -220,7 +233,7 @@ describe('A member that leaves mid-session and returns (three machines)', functi
 					attempts.push(...phaseAttempts);
 				}
 
-				expect(leftDuring, 'C left at the intended step — the write\'s commit had a step after its tail, and C promised it').to.not.equal(undefined);
+				expect(leftDuring, 'C left at the intended step — the write\'s commit carried blocks beyond its tail, and C promised it').to.not.equal(undefined);
 				// Acknowledged, and truthful about it: two of the three hold it, and the one that does not is named.
 				expect(durability, 'the write is acknowledged').to.not.equal(undefined);
 				const { quorum, confirmed, cohort, unconfirmed, torn } = durability!;
@@ -272,7 +285,10 @@ describe('A member that leaves mid-session and returns (three machines)', functi
 			});
 
 			if (arm.writerRestartsWhileAway) {
-				it('phase 4 — C returns owed nothing: its own reads bring its storage current, and it reads every acknowledged row', async () => {
+				it('phase 4 — C returns owed nothing, after longer than one read-repair window: its own reads bring its storage current, and it reads every acknowledged row', async () => {
+					// A long absence outlasts C's read-repair window as well as the writer's retry schedule. C's
+					// last consult of any block happened before it left, so waiting from `leftAt` suffices.
+					await delay(Math.max(0, leftAt + READ_REPAIR_WINDOW_MS + READ_REPAIR_WINDOW_SLACK_MS - Date.now()));
 					setUnreachable(mesh, []);
 					report.awayMs = Date.now() - leftAt;
 					// The arm's premise: there is something to heal, and nobody is about to deliver it.
@@ -284,7 +300,7 @@ describe('A member that leaves mid-session and returns (three machines)', functi
 					const readsMs = Date.now() - startedReads;
 					// Not merely served: C's OWN storage holds the write now.
 					expect(await holdersOf(missed), `whose own storage holds action ${missed.actionId} after C's reads`).to.deep.equal(['A', 'B', 'C']);
-					report.heal = `its own reads (${acknowledged.size} rows in ${readsMs}ms)`;
+					report.heal = `its own reads, past its read-repair window (${acknowledged.size} rows in ${readsMs}ms)`;
 				});
 			} else {
 				it('phase 4 — C returns: the writer\'s scheduled commit retry brings C\'s own storage current before C reads anything, and C reads every acknowledged row', async () => {

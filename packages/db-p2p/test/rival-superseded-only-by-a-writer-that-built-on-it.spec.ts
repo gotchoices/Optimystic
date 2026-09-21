@@ -8,8 +8,10 @@
  *  1. **Seed.** A writes a row; every machine holds it.
  *  2. **R pends past D, and its data-block commit is held.** A writes a second row (the rival, R). D never
  *     receives R's pend (its deliveries of that pend fail); A, B and C store R's pending record on the data
- *     block. R's TAIL commit lands everywhere — D reconciles it, since it holds no pend — and R's data-block
- *     commit is held on the writer's side, so the log names R while no member's data block holds R's row.
+ *     block. R's writer is made to commit in two steps — its one-round commit of tail and data together is
+ *     refused with a transport-shaped throw, so it falls back to the tail, then the rest. R's TAIL commit
+ *     lands everywhere — D reconciles it, since it holds no pend — and R's data-block commit is held on the
+ *     writer's side, so the log names R while no member's data block holds R's row.
  *  3. **N reads through D and writes.** A fresh handle driven by D opens the tree: the log (current on D)
  *     names R, but D holds no record to promote, so it serves the data block without R's row, and the handle
  *     — which has walked no entry and so holds no floor for the block — accepts it. N pends past R's slot,
@@ -129,8 +131,11 @@ describe('A rival pend is superseded only by a writer that built on it (four mac
 				throw new Error(`D (${dId}) misses the rival's pend`);
 			}
 		};
-		// On the writer's side: learn R's action from its pend, and hold its data-block stage — the second
-		// commit call, the one that does not carry the tail.
+		// On the writer's side: learn R's action from its pend, and hold its data-block stage. One coordinator
+		// covers every block here, so R's commit would carry its tail and data blocks in one round; that round
+		// is refused with a transport-shaped throw (before it reaches any member), which makes the writer
+		// commit the tail on its own and then the data blocks — the second commit call, the one that does not
+		// carry the tail, and the one held here.
 		const wrapRepo = (_peer: string, repo: IRepo): IRepo => ({
 			get: gets => repo.get(gets),
 			cancel: ref => repo.cancel(ref),
@@ -139,7 +144,11 @@ describe('A rival pend is superseded only by a writer that built on it (four mac
 				return await repo.pend(request);
 			},
 			commit: async (request: CommitRequest): Promise<CommitResult> => {
-				if (request.actionId === rivalAction && !request.blockIds.includes(request.tailId)) {
+				const carriesTail = request.blockIds.includes(request.tailId);
+				if (request.actionId === rivalAction && carriesTail && request.blockIds.length > 1) {
+					throw new Error('injected: the rival\'s one-round commit is not delivered');
+				}
+				if (request.actionId === rivalAction && !carriesTail) {
 					rivalDataBlocks = [...request.blockIds];
 					gateReached = true;
 					await gate;

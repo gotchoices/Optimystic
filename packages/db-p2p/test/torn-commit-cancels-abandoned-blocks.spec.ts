@@ -16,10 +16,12 @@
  *    away from the sibling). Every member keeps the sibling's pending record, later writes to it
  *    are refused, and an explicit cancel is exactly the repair. Independent of HOW the tear was
  *    produced — this is the durable state itself.
- *  - PRODUCTION PATH: the only thing injected is a failing sweep RPC (a transport-shaped throw out
- *    of the non-tail commit, after the tail committed durably). Before the fix, commit reported
- *    success and stranded the sweep's pending records on every member. With the fix, commit cancels
- *    the abandoned blocks before acknowledging, so later writes succeed.
+ *  - PRODUCTION PATH: the only thing injected is a transport-shaped throw out of every commit RPC
+ *    carrying a non-tail block. One coordinator covers both blocks here, so `NetworkTransactor.commit`
+ *    first sends them as one round; that throws, it falls back to committing the tail and then
+ *    sweeping the rest, and the sweep throws after the tail committed durably — the torn shape. Before
+ *    the fix, commit reported success and stranded the sweep's pending records on every member. With
+ *    the fix, commit cancels the abandoned blocks before acknowledging, so later writes succeed.
  *  - CONFIRMED CONFLICT: a returned `success:false` still surfaces as a stale failure.
  */
 
@@ -56,9 +58,11 @@ const assertPendingLifetimeInvariant = async (mesh: Mesh, actionId: ActionId, bl
 	}
 };
 
-/** A commit request is the SWEEP stage iff it names a tail it is not itself committing. */
-const isSweep = (request: RepoCommitRequest): boolean =>
-	request.tailId !== undefined && !request.blockIds.includes(request.tailId);
+/** A commit request carries a non-tail block: the one-round request (tail and the rest together), or
+ * the SWEEP stage of the two-step fallback (the rest, without the tail). Only a tail-only request
+ * does not. */
+const carriesNonTail = (request: RepoCommitRequest): boolean =>
+	request.blockIds.some(id => id !== request.tailId);
 
 interface SweepInjection {
 	transactor: ITransactor;
@@ -70,10 +74,11 @@ interface SweepInjection {
 }
 
 /**
- * A NetworkTransactor over the mesh whose per-peer repo lets the test fail the SWEEP commit — the
- * non-tail second stage of a multi-block commit — with a transport-shaped throw, and records the
- * cancels the transactor issues. `cancel`, `pend`, `get`, and tail commits pass through untouched,
- * so everything after the injected failure is the production code under test.
+ * A NetworkTransactor over the mesh whose per-peer repo lets the test fail every commit carrying a
+ * non-tail block with a transport-shaped throw — the one-round request, and then the SWEEP stage of the
+ * tail-then-sweep fallback it forces — and records the cancels the transactor issues. `cancel`, `pend`,
+ * `get`, and tail-only commits pass through untouched, so everything after the injected failure is the
+ * production code under test.
  */
 const buildSweepDroppingTransactor = (mesh: Mesh): SweepInjection => {
 	let dropSweeps = false;
@@ -88,7 +93,7 @@ const buildSweepDroppingTransactor = (mesh: Mesh): SweepInjection => {
 				return inner.cancel(r, o);
 			},
 			commit: (r: RepoCommitRequest, o?: MessageOptions) => {
-				if (dropSweeps && isSweep(r)) {
+				if (dropSweeps && carriesNonTail(r)) {
 					failures++;
 					return Promise.reject(new Error('injected: sweep RPC failed'));
 				}
@@ -182,24 +187,24 @@ describe('Torn commit — the blocks a sweep abandons are cancelled, never stran
 		if (commit1.success) {
 			expect(commit1.durability.quorum, 'every member of the cohort confirmed').to.equal('full');
 			expect(commit1.durability.torn, 'nothing abandoned').to.equal(undefined);
-			// The tail and the sweep are separate batches answered by the same cohort; that is one
-			// cohort's answer, not two cohorts.
+			// One cohort answered (one coordinator covers both blocks, so they committed in one round);
+			// its answer is not repeated as another cohort.
 			expect(commit1.durability.otherCohorts, 'one cohort answering twice is not another cohort').to.equal(undefined);
 			expect(isFullyDurable(commit1.durability)).to.equal(true);
 		}
 		await assertPendingLifetimeInvariant(mesh, 'a1', ['T', 'S']);
 
-		// rev 2: touch both, and let every sweep RPC (the non-tail commit stage) fail in the
-		// transport-shaped way — a throw, not a returned refusal.
+		// rev 2: touch both, and let every commit RPC carrying S fail in the transport-shaped way — a
+		// throw, not a returned refusal: first the one-round commit, then the sweep of the fallback.
 		arm();
 		const pend2 = await transactor.pend({ actionId: 'a2', transforms: updatesFor('x', 'T', 'S'), rev: 2, policy: 'c' });
 		expect(pend2.success, 'torn pend must succeed').to.equal(true);
 		const commit2 = await transactor.commit({ actionId: 'a2', blockIds: ['T', 'S'] as BlockId[], tailId: 'T' as BlockId, rev: 2 });
 		disarm();
 
-		// The injection must actually have fired, and the tolerance must hold for the RESULT: the
-		// tail committed durably before the sweep failed, so the commit is still acknowledged.
-		expect(sweepFailures(), 'the sweep injection must have fired').to.be.at.least(1);
+		// The injection must actually have fired on both requests, and the tolerance must hold for the
+		// RESULT: the tail committed durably before the sweep failed, so the commit is still acknowledged.
+		expect(sweepFailures(), 'the one-round commit and the sweep were both refused').to.be.at.least(2);
 		expect(commit2.success, 'a transport-failed sweep must not disown the durably committed tail').to.equal(true);
 		// The acknowledgement must SAY the action is torn: `torn` names exactly the abandoned block
 		// (the same set the cancel below covers), and the write does not read as completely saved.
@@ -235,7 +240,7 @@ describe('Torn commit — the blocks a sweep abandons are cancelled, never stran
 		}
 	});
 
-	it('a confirmed conflict on the sweep still returns the stale failure (cancellation stays with the caller)', async () => {
+	it('a confirmed conflict on a non-tail block still returns the stale failure (cancellation stays with the caller)', async () => {
 		// Guard the neighbouring arm: a RETURNED success:false from a cohort coordinator is a
 		// confirmed conflict and must still surface as a stale failure — TransactorSource.transact
 		// owns the cancel on that path, and the tolerated arm must not have swallowed it.
@@ -247,7 +252,7 @@ describe('Torn commit — the blocks a sweep abandons are cancelled, never stran
 		expect(commit1.success).to.equal(true);
 
 		// A rival (a2) takes S at rev 2 outright, then a3 pends only T at rev 2 (its own view of S is
-		// stale) — the commit's sweep of S must come back as a confirmed conflict, not a throw.
+		// stale) — the commit of S must come back as a confirmed conflict, not a throw.
 		const rivalPend = await transactor.pend({ actionId: 'a2', transforms: updatesFor('rival', 'S'), rev: 2, policy: 'c' });
 		expect(rivalPend.success, 'rival pend must succeed').to.equal(true);
 		const rivalCommit = await transactor.commit({ actionId: 'a2', blockIds: ['S'] as BlockId[], tailId: 'S' as BlockId, rev: 2 });
@@ -255,8 +260,10 @@ describe('Torn commit — the blocks a sweep abandons are cancelled, never stran
 
 		const pend3 = await transactor.pend({ actionId: 'a3', transforms: updatesFor('loser', 'T'), rev: 2, policy: 'c' });
 		expect(pend3.success, 'the losing action pends T cleanly').to.equal(true);
-		// Commit claims both blocks; the sweep meets S already committed at rev 2 under a2.
+		// Commit claims both blocks and meets S already committed at rev 2 under a2. a3 never pended S, so
+		// its coordinator is looked up live and may differ from T's: the commit runs in one round or as
+		// tail-then-sweep depending on where the ids fall on the ring. Either way the conflict is returned.
 		const commit3 = await transactor.commit({ actionId: 'a3', blockIds: ['T', 'S'] as BlockId[], tailId: 'T' as BlockId, rev: 2 });
-		expect(commit3.success, 'a confirmed sweep conflict must surface as a stale failure').to.equal(false);
+		expect(commit3.success, 'a confirmed conflict must surface as a stale failure').to.equal(false);
 	});
 });

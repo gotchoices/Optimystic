@@ -816,19 +816,117 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		return { nominees };
 	}
 
+	/**
+	 * Commits the action: its log tail, then every other block it touched (the header included, when
+	 * the action touches it).
+	 *
+	 * `request.tailId` is threaded into every per-block commit so the coordinator carries it into the
+	 * consensus commit op → each committing node's StorageRepo.commit stamps it onto the emitted
+	 * CollectionChangeEvent (the reactivity topic anchor). Without this the per-block RepoCommitRequest
+	 * drops the collection tail and reactivity origination is gated off (undefined tail → non-member).
+	 * `request.blockDigests` (when present) is the FULL per-block declaration map for the action; it is
+	 * narrowed to each request's own blocks at send time ({@link sendCommit}) so each cohort only signs
+	 * for the blocks it is actually driving.
+	 *
+	 * **One round when one coordinator covers every block** ({@link commitInOneRound}) — always the
+	 * case in small groups, where `consolidateCoordinators` collapses the pend onto one peer. Otherwise,
+	 * or when that round throws, **two**: the tail, then the rest ({@link commitTailThenSweep}).
+	 *
+	 * Either way the guarantee `Collection.bootstrapContext` rests on holds: no member commits a
+	 * non-tail block of the action without its tail. In one round it holds because every member's
+	 * `StorageRepo.commit` applies the tail first and stops at the first failure; in two, because the
+	 * sweep starts only once the tail round was acknowledged.
+	 */
 	async commit(request: CommitRequest): Promise<CommitResult> {
 		const t0 = Date.now();
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
+		const remainingBlocks = Array.from(new Set(request.blockIds)).filter(bid => bid !== request.tailId);
+		// An action touching only its tail has nothing to combine: its single round IS the tail round,
+		// with the tail round's retries.
+		if (remainingBlocks.length > 0) {
+			const result = await this.commitInOneRound(request, remainingBlocks);
+			if (result) {
+				log('commit:done actionId=%s ms=%d rounds=1 success=%s', request.actionId, Date.now() - t0, result.success);
+				return result;
+			}
+		}
+		const result = await this.commitTailThenSweep(request, remainingBlocks);
+		log('commit:done actionId=%s ms=%d rounds=2 torn=%d', request.actionId, Date.now() - t0,
+			result.success ? result.durability.torn?.length ?? 0 : 0);
+		return result;
+	}
 
-		// `request.tailId` is threaded into every per-block commit so the coordinator carries it into the
-		// consensus commit op → each committing node's StorageRepo.commit stamps it onto the emitted
-		// CollectionChangeEvent (the reactivity topic anchor). Without this the per-block RepoCommitRequest
-		// drops the collection tail and reactivity origination is gated off (undefined tail → non-member).
-		// `request.blockDigests` (when present) is the FULL per-block declaration map for the action;
-		// it is threaded whole through commitBlock/commitBlocks and subset per batch at send time (see
-		// commitBlocks) so each cohort only signs for the blocks it is actually driving.
+	/**
+	 * Sends the whole action — tail first, then `remainingBlocks` in order — to one coordinator as ONE
+	 * commit, when one coordinator covers every block. Returns `undefined` when the round does not
+	 * apply (the blocks need more than one coordinator, or their coordinators could not be looked up)
+	 * or when it THREW; the caller then runs {@link commitTailThenSweep} for the same request.
+	 *
+	 * Tail first on the wire because `CoordinatorRepo.commit` runs consensus on `blockIds[0]`'s cohort:
+	 * the combined record runs on the tail's cohort, as the tail round would. The other blocks then
+	 * commit on the tail's cohort rather than on their own — the same approximation a multi-block
+	 * sweep batch already makes (backlog `debt-sender-side-coordinating-block-binding-is-unchecked`),
+	 * and identical whenever the cohorts coincide.
+	 *
+	 * A RETURNED refusal (a confirmed conflict, or `commit-not-durable`) is returned as a refused tail
+	 * is: the caller cancels and the writer's retry takes over. A refusal can still leave the tail AND
+	 * the other blocks on a minority of the cohort — a strictly more complete state than a refused
+	 * tail round leaves, and one `Collection.completeOwnEntry` already finishes.
+	 *
+	 * A THROW is not retried here. `processBatches`' retry re-batches the failed blocks onto possibly
+	 * different coordinators, in parallel, which could land a non-tail block on one cohort before the
+	 * tail lands on another. The two-step fallback re-sends everything instead, and whatever the thrown
+	 * round did land is this action's own revision, so re-committing it is an idempotent no-op
+	 * (`isOwnRevision` in `StorageRepo.commit`). The fallback starts from the same cached coordinator,
+	 * so a dead one costs one more dial before its retries move on, and a round that hangs to its
+	 * deadline costs one more `timeoutMs` before the fallback starts.
+	 */
+	private async commitInOneRound(request: CommitRequest, remainingBlocks: BlockId[]): Promise<CommitResult | undefined> {
+		const blockIds = [request.tailId, ...remainingBlocks];
+		const coordinator = await this.soleCommitCoordinator(blockIds, request.actionId);
+		if (!coordinator) {
+			return undefined;
+		}
+		let result: CommitResult;
+		try {
+			result = await this.sendCommit(coordinator, blockIds, request, Date.now() + this.timeoutMs);
+		} catch (e) {
+			log('WARN: one-round commit threw; committing the tail, then the rest: actionId=%s peer=%s error=%s',
+				request.actionId, coordinator.toString(), errorMessage(e));
+			return undefined;
+		}
+		return result.success
+			? { success: true, durability: mergeDurability([result.durability]) }
+			: refusalFrom([result]);
+	}
 
-		// Commit the tail block
+	/**
+	 * The one coordinator covering every block in `blockIds` — resolved as {@link commitBlocks}
+	 * resolves them, preferring what the pend already resolved — or `undefined` when they need more
+	 * than one, or a lookup failed (logged; the two-step path then repeats the lookups and reports
+	 * whatever they report).
+	 */
+	private async soleCommitCoordinator(blockIds: BlockId[], actionId: ActionId): Promise<PeerId | undefined> {
+		let batches: CoordinatorBatch<BlockId[], CommitResult>[];
+		try {
+			batches = await this.batchesForPayload<BlockId[], CommitResult>(blockIds, blockIds, mergeBlocks, [], actionId);
+		} catch (e) {
+			log('commit:one-round-unplanned actionId=%s error=%s', actionId, errorMessage(e));
+			return undefined;
+		}
+		if (batches.length !== 1) {
+			log('commit:one-round-inapplicable actionId=%s coordinators=%d', actionId, batches.length);
+			return undefined;
+		}
+		return batches[0]!.peerId;
+	}
+
+	/**
+	 * Commits the tail, and — once the tail round was acknowledged — every block in `remainingBlocks`.
+	 * The path for an action whose blocks need more than one coordinator, for an action touching only
+	 * its tail, and for a {@link commitInOneRound} that threw.
+	 */
+	private async commitTailThenSweep(request: CommitRequest, remainingBlocks: BlockId[]): Promise<CommitResult> {
 		const tailResult = await this.commitBlock(request.tailId, request.actionId, request.rev, request.tailId, request.blockDigests);
 		if (!tailResult.success) {
 			// NOTE: a refused tail is NOT an absent tail. The coordinator's durability gate answers
@@ -854,13 +952,12 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// Sweep every non-tail block (the header, when the action touches it, lands here too — after
 		// the tail, like any other touched block). The tail is the only exclusion needed.
 		//
-		// The tail-then-sweep order IS load-bearing; do not reorder it to put the
-		// contested blocks first. `Collection.bootstrapContext` documents the guarantee it rests on:
-		// "The tail is always committed first (commit protocol guarantee), so it's readable with
-		// context=undefined" — that bootstrap is what makes pending non-tail blocks visible to a
-		// chain walk. Sweeping before the tail would also let a committed header point at a
-		// never-committed tail: a dangling pointer, strictly worse than an orphaned block.
-		const remainingBlocks = request.blockIds.filter(bid => bid !== request.tailId);
+		// The tail-then-sweep order IS load-bearing; do not reorder it to put the contested blocks
+		// first. Across two rounds it is the only thing keeping a member from committing a non-tail
+		// block of this action without the tail, which `Collection.bootstrapContext` relies on (see
+		// {@link commit}): that bootstrap is what makes pending non-tail blocks visible to a chain
+		// walk. Sweeping before the tail would also let a committed header point at a never-committed
+		// tail: a dangling pointer, strictly worse than an orphaned block.
 		if (remainingBlocks.length > 0) {
 			const { batches, error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev, tailId: request.tailId, blockDigests: request.blockDigests });
 			cohortReports.push(...confirmedDurabilities(batches));
@@ -908,7 +1005,6 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			}
 		}
 
-		log('commit:done actionId=%s ms=%d torn=%d', request.actionId, Date.now() - t0, torn.length);
 		// `withTornBlocks` clamps the class below `full` when the sweep abandoned anything — a cohort
 		// can hold every block it was asked for while the action as a whole is incomplete — and never
 		// raises it. `isFullyDurable` then answers false; a consumer that needs to know WHICH blocks
@@ -994,44 +1090,35 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	}
 
 	/**
-	 * Merge the RETURNED `success:false` responses out of a set of commit batches into one
-	 * {@link StaleFailure}, or `undefined` when every failure was transport-shaped (thrown, no
-	 * response). Shared by {@link commitBlock} (the tail) and {@link commit}'s non-tail sweep —
-	 * both must distinguish a confirmed conflict (return it; the caller cancels and re-drives) from
-	 * a transient fault (throw / tolerate).
-	 *
-	 * Rebuilt the same way {@link pend}'s aggregate is: `reason` is the first one any batch gave
-	 * (the only diagnostic that survives into the coordinator's error text — a refusal whose reason
-	 * is `commit-not-durable` must not read as "stale commit", a rival's win), `conflict` holds when
-	 * any batch was a classified conflict, and `staleAt` is the highest confirmed revision. A
-	 * reason-only StaleFailure (success:false, no `missing`) lands here too and comes out with
-	 * `missing: []` and its reason intact.
+	 * The RETURNED `success:false` responses out of a set of commit batches, merged by
+	 * {@link refusalFrom}, or `undefined` when every failure was transport-shaped (thrown, no
+	 * response). Shared by {@link commitBlock} (the tail) and {@link commitTailThenSweep}'s non-tail
+	 * sweep — both must distinguish a confirmed conflict (return it; the caller cancels and
+	 * re-drives) from a transient fault (throw / tolerate).
 	 */
 	private staleFromBatches(batches: CoordinatorBatch<BlockId[], CommitResult>[]): StaleFailure | undefined {
 		const stale = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
-		if (stale.length === 0) {
-			return undefined;
-		}
-		const responses = stale.map(b => b.request!.response! as StaleFailure);
-		const staleAt = highestStaleAt(responses.map(r => r.staleAt));
-		const reason = responses.map(r => r.reason).find(r => r !== undefined);
-		return {
-			missing: distinctBlockActionTransforms(responses.flatMap(r => r.missing).filter((x): x is ActionTransforms => x !== undefined)),
-			...(staleAt === undefined ? {} : { staleAt }),
-			...(reason === undefined ? {} : { reason }),
-			conflict: responses.some(isConflictFailure),
-			success: false as const
-		};
+		return stale.length === 0 ? undefined : refusalFrom(stale.map(b => b.request!.response! as StaleFailure));
 	}
 
-	/** Attempts to commit a set of blocks, and handles failures and errors.
-	 *
-	 * `blockDigests` arrives as the action's FULL declaration map and is narrowed to each batch's own
-	 * block ids inside the send callback below — never up front. Each batch's message becomes its own
-	 * cluster record, so shipping the whole map would make one cohort sign for blocks it is not
-	 * responsible for; and `processBatches` re-batches failed blocks onto different coordinators, so
-	 * only a send-time subset stays correct across retries. */
-	private async commitBlocks({ blockIds, actionId, rev, tailId, blockDigests }: RepoCommitRequest) {
+	/**
+	 * The one place a commit request to a coordinator is built — shared by {@link commitInOneRound}
+	 * and {@link commitBlocks}. `blockDigests` arrives as the action's FULL declaration map and is
+	 * narrowed to `blockIds` here, at send time, never up front: each request becomes its own cluster
+	 * record, so shipping the whole map would make one cohort sign for blocks it is not responsible
+	 * for; and `processBatches` re-batches failed blocks onto different coordinators, so only a
+	 * send-time subset stays correct across retries.
+	 */
+	private sendCommit(peerId: PeerId, blockIds: BlockId[], { actionId, rev, tailId, blockDigests }: RepoCommitRequest, expiration: number): Promise<CommitResult> {
+		return this.getRepo(peerId).commit(
+			{ actionId, blockIds, rev, tailId, ...digestsFor(blockDigests, blockIds) },
+			{ expiration, dialTimeoutMs: this.dialTimeoutMs }
+		);
+	}
+
+	/** Attempts to commit a set of blocks, and handles failures and errors. */
+	private async commitBlocks(request: RepoCommitRequest) {
+		const { blockIds, actionId, rev } = request;
 		const expiration = Date.now() + this.timeoutMs;
 		// Thread the transaction's actionId so both the initial batch assembly and any
 		// per-block retry re-resolution prefer the coordinator pend already resolved.
@@ -1041,7 +1128,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		try {
 			await processBatches(
 				batches,
-				(batch) => this.getRepo(batch.peerId).commit({ actionId, blockIds: batch.payload, rev, tailId, ...digestsFor(blockDigests, batch.payload) }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
+				(batch) => this.sendCommit(batch.peerId, batch.payload, request, expiration),
 				batch => batch.payload,
 				mergeBlocks,
 				expiration,
@@ -1345,6 +1432,26 @@ function dischargedBlocks(batches: CoordinatorBatch<BlockId[], void>[]): Set<Blo
 function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult>[]): WriteDurability[] {
 	return Array.from(allBatches(batches, b => b.request?.isResponse === true && b.request!.response!.success))
 		.map(b => (b.request!.response! as CommitSuccess).durability);
+}
+
+/**
+ * One {@link StaleFailure} standing for every refused commit response in `responses`, rebuilt the
+ * same way {@link NetworkTransactor.pend}'s aggregate is: `reason` is the first one any response gave
+ * (the only diagnostic that survives into the coordinator's error text — a refusal whose reason is
+ * `commit-not-durable` must not read as "stale commit", a rival's win), `conflict` holds when any
+ * response was a classified conflict, and `staleAt` is the highest confirmed revision. A reason-only
+ * refusal (no `missing`) comes out with `missing: []` and its reason intact.
+ */
+function refusalFrom(responses: StaleFailure[]): StaleFailure {
+	const staleAt = highestStaleAt(responses.map(r => r.staleAt));
+	const reason = responses.map(r => r.reason).find(r => r !== undefined);
+	return {
+		missing: distinctBlockActionTransforms(responses.flatMap(r => r.missing).filter((x): x is ActionTransforms => x !== undefined)),
+		...(staleAt === undefined ? {} : { staleAt }),
+		...(reason === undefined ? {} : { reason }),
+		conflict: responses.some(isConflictFailure),
+		success: false as const
+	};
 }
 
 /** The entries of `all` whose ids appear in `batchBlockIds` — the per-batch narrowing both

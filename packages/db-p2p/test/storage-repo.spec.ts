@@ -2190,13 +2190,15 @@ describe('StorageRepo', () => {
 		 * A batch mixing a committable block with one that has no base. `commit()` breaks out of its
 		 * per-block loop on the first failure, so which block refuses decides how much of the batch
 		 * lands. Both orders must still surface the refusal (that is what routes the action to the
-		 * healing path) and must never leave a block at a revision it cannot materialize.
+		 * healing path) and must never leave a block at a revision it cannot materialize. The block
+		 * applied first is the log tail, wherever the request lists it; unless a test says otherwise
+		 * the first-listed block is named the tail, so the listed order is the applied order.
 		 */
 		describe('mixed batch (one block committable, one with no base)', () => {
 			const OK = 'sibling-block' as BlockId;
 
 			/** Pend an insert on `OK` and an update on `BLOCK` under one action, then commit both. */
-			const commitMixedBatch = async (blockIds: BlockId[]): Promise<CommitResult> => {
+			const commitMixedBatch = async (blockIds: BlockId[], tailId: BlockId = blockIds[0]!): Promise<CommitResult> => {
 				await repo.pend({
 					actionId: 'a-mixed' as ActionId,
 					transforms: {
@@ -2206,7 +2208,7 @@ describe('StorageRepo', () => {
 					},
 					policy: 'c'
 				});
-				return await repo.commit({ actionId: 'a-mixed' as ActionId, blockIds, tailId: OK, rev: 2 });
+				return await repo.commit({ actionId: 'a-mixed' as ActionId, blockIds, tailId, rev: 2 });
 			};
 
 			it('surfaces the refusal even when a sibling block committed first', async () => {
@@ -2236,6 +2238,26 @@ describe('StorageRepo', () => {
 
 				expect((await repo.get({ blockIds: [OK] }))[OK]?.state?.latest, 'sibling not reached').to.equal(undefined);
 				expect((await repo.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest).to.equal(undefined);
+			});
+
+			it('applies the log tail first whatever order the request lists, so no block lands without it', async () => {
+				// A refusing tail listed second: the sibling listed ahead of it must not land, because a
+				// member holding a committed non-tail block of an action without its tail breaks what
+				// `Collection.bootstrapContext` relies on — and one request can carry both.
+				expectMissingBase(await commitMixedBatch([OK, BLOCK], BLOCK));
+				expect((await repo.get({ blockIds: [OK] }))[OK]?.state?.latest, 'sibling not reached ahead of its tail').to.equal(undefined);
+
+				// Both committable, tail again listed last: the tail is applied (and reported) first.
+				const TAIL = 'tail-block' as BlockId;
+				const events: CollectionChangeEvent[] = [];
+				repo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+				await repo.pend({
+					actionId: 'a-both' as ActionId,
+					transforms: { inserts: { [OK]: makeBlock(OK, { items: [] }), [TAIL]: makeBlock(TAIL, { items: [] }) }, updates: {}, deletes: [] },
+					policy: 'c'
+				});
+				expect((await repo.commit({ actionId: 'a-both' as ActionId, blockIds: [OK, TAIL], tailId: TAIL, rev: 3 })).success).to.equal(true);
+				expect(events.map(e => e.blockIds), 'applied in this order').to.deep.equal([[TAIL, OK]]);
 			});
 
 			/** Pend a later exclusive write to `OK` and report whether it was accepted. */
@@ -2316,8 +2338,8 @@ describe('StorageRepo', () => {
 					policy: 'c'
 				});
 
-				// FAULT first, so the break happens before OK is reached.
-				const result = await faultingRepo.commit({ actionId: 'a-fault' as ActionId, blockIds: [FAULT, OK], tailId: OK, rev: 1 });
+				// FAULT first (and the tail, so it is applied first), so the break happens before OK is reached.
+				const result = await faultingRepo.commit({ actionId: 'a-fault' as ActionId, blockIds: [FAULT, OK], tailId: FAULT, rev: 1 });
 				expect(result.success, 'the injected fault fails the commit').to.equal(false);
 				expect((result as { reason?: string }).reason ?? '', 'a fault, not a divergence refusal')
 					.to.not.include(MISSING_BASE_REVISION_REASON);
@@ -2330,7 +2352,7 @@ describe('StorageRepo', () => {
 				expect(faultPending, 'the faulting block keeps its pending too').to.not.equal(undefined);
 
 				// The retry (same actionId + rev) replays both from those records.
-				const retried = await faultingRepo.commit({ actionId: 'a-fault' as ActionId, blockIds: [FAULT, OK], tailId: OK, rev: 1 });
+				const retried = await faultingRepo.commit({ actionId: 'a-fault' as ActionId, blockIds: [FAULT, OK], tailId: FAULT, rev: 1 });
 				expect(retried.success, 'retry replays the retained pendings').to.equal(true);
 				const got = await faultingRepo.get({ blockIds: [FAULT, OK] });
 				expect(got[FAULT]?.state?.latest?.rev).to.equal(1);
