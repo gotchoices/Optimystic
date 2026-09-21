@@ -984,6 +984,9 @@ export class ClusterCoordinator {
 		const awaiting = membersAwaitingConsensus(deliveries.filter(d => d.peerId !== selfId));
 		const { failures, applyOutcomes } = await this.broadcastMergedRecord(record, awaiting);
 		mergeApplyOutcomes(record, applyOutcomes);
+		// The scheduled retry works from the stored copy, and reads its apply outcomes to decide on the
+		// coordinating member's second reconcile, so it needs the broadcast's too.
+		this.updateTransactionRecord(record, 'after-broadcast');
 		this.scheduleOrClearRetry(record, failures);
 		return record;
 	}
@@ -1281,11 +1284,14 @@ export class ClusterCoordinator {
 		const record = state.record;
 		const selfId = this.localCluster?.peerId.toString();
 		log('cluster-tx:retry-start', { messageHash, attempt, peerIds: Array.from(pendingPeers) });
-		// Each pending remote member gets the record as it stands: it adds its commit, and applies once
-		// the record then carries a majority, which in a small cohort this very delivery can complete.
+		// Each pending member gets the record as it stands: it adds its commit, and applies once the
+		// record then carries a majority, which in a small cohort this very delivery can complete. This
+		// node's member is left to the consensus broadcast below once the record already carries a
+		// majority; before that (the commit round failed on it too) it is asked for its commit like the rest.
 		const payload: ClusterRecord = { ...record };
+		const selfToBroadcast = this.hasCommitMajority(record);
 		const deliveries = await Promise.all(Array.from(pendingPeers)
-			.filter(peerId => peerId !== selfId)
+			.filter(peerId => !selfToBroadcast || peerId !== selfId)
 			.map(peerId => this.deliver(payload, peerId, 0, 'commit-retry')));
 		mergeCommits(record, deliveries);
 		mergeApplyOutcomes(record, collectApplyOutcomes(deliveries));
@@ -1297,9 +1303,11 @@ export class ClusterCoordinator {
 			// missed the commit round), and then this node's member has not applied; a remote member that
 			// applied on receipt before this node's member did may hold a behind refusal; and in a cohort
 			// of four or more the members that answered here have not applied at all. The consensus
-			// broadcast covers all three, in its usual order. This node's member is pending only when its
-			// own broadcast delivery failed, and the broadcast delivers it again.
-			const { failures } = await this.broadcastMergedRecord(record, membersAwaitingConsensus(deliveries.filter(d => d.success)));
+			// broadcast covers all three, in its usual order, and delivers this node's member unless it
+			// already applied.
+			const { failures, applyOutcomes } = await this.broadcastMergedRecord(record,
+				membersAwaitingConsensus(deliveries.filter(d => d.success && d.peerId !== selfId)));
+			mergeApplyOutcomes(record, applyOutcomes);
 			if (selfId !== undefined) pendingPeers.delete(selfId);
 			for (const peerId of failures) pendingPeers.add(peerId);
 		}
