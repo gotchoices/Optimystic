@@ -77,9 +77,11 @@ export type ClusterPeers = {
 
 /**
  * One member's own report of what its storage did with this transaction at consensus-apply time; see
- * {@link ClusterRecord.applyOutcomes} for the trust rules. The two arms report differently, and
+ * {@link ClusterRecord.applyOutcomes} for the trust rules. The fields report differently, and
  * deliberately so:
  *
+ *  - `executed` says only that the member has run the consensus apply for this record, whatever its
+ *    storage answered. The coordinator uses it to leave a member out of the consensus broadcast.
  *  - `pend` is set ONLY for a conflict-shaped refusal. The coordinator's rule for it is "an entry
  *    means retry", so a success must not exist there.
  *  - `commit` is ALWAYS set once a commit applied — successes included — because the coordinator
@@ -91,6 +93,16 @@ export type ClusterPeers = {
  *    but it was never evidence of storage — which is what this arm supplies.
  */
 export type MemberApplyOutcome = {
+	/**
+	 * `true` once this member has run the consensus apply for the record's `messageHash` — pend,
+	 * commit or cancel alike. In a cohort of three or fewer, a member receiving the commit round
+	 * reaches consensus there, because the round already carries the coordinator's own commit vote;
+	 * the coordinator then skips its broadcast to that member. Stated explicitly rather than inferred
+	 * from the response carrying a commit majority, which would hold only while the member's phase
+	 * loop happens to run consensus in the same delivery. A member on an older build never sets it,
+	 * so the coordinator broadcasts to it as before.
+	 */
+	executed?: boolean;
 	/** This member's storage refused the record's pend with a conflict-shaped result. */
 	pend?: PendResult;
 	/**
@@ -145,13 +157,14 @@ export type ClusterRecord = {
 	 * Pend successes and bare-reason faults are omitted: a bare fault stays tolerated local
 	 * divergence, mirroring the coordinator's own local-verdict arm. The commit arm is set for every
 	 * applied commit, success or not, because the coordinator counts the successes
-	 * ({@link MemberApplyOutcome}).
+	 * ({@link MemberApplyOutcome}). `executed` is set once the member has applied the record at all.
 	 *
 	 * Why unsigned is acceptable: a hostile pend entry can only *downgrade* a reported pend success
 	 * into a retryable conflict, which the writer answers by rebasing and trying again. A hostile
 	 * commit entry is no worse: a false *success* counts one durable holder the member already
 	 * counted for with its signed approve vote (the vote is what admits it to the majority the count
-	 * is measured against), and a false *refusal* is again only retry pressure. The same member
+	 * is measured against), and a false *refusal* is again only retry pressure. A false `executed`
+	 * only makes the coordinator skip that member's own broadcast. The same member
 	 * could already force strictly worse outcomes with a signed reject or conflict vote, so this adds
 	 * no attack surface beyond retry pressure — and failing toward retry is the correct direction for
 	 * optimistic concurrency. Never treat an entry here as evidence of anything but "retry" (pend) or

@@ -32,3 +32,7 @@ A member's late promise must never invalidate signatures already collected on th
 Write a four-member mesh test (`createMesh(4, { responsibilityK: 4, clusterSize: 4 })`). Use `mesh.failures.onClusterDelivery` to make D unreachable for its promise delivery only, then reachable. Then check whether the commit applies on A, B and C at consensus, or only through the retry timer, and whether `Invalid commit signature` is logged.
 
 Found while planning `cluster-commit-round-carries-the-coordinators-commit-vote`, which does not change this: its apply-on-receipt path only applies in cohorts of three or fewer, where every member must promise.
+
+## Update from `cluster-commit-round-carries-the-coordinators-commit-vote`
+
+When the late member is the coordinating node itself, the defect no longer arises. Its own member now votes to commit in process before the commit round goes out (`ClusterCoordinator.presignLocalCommit`), and the coordinator merges that member's `promises` along with its commit before sending anything, so every remote member signs over the same promise map. A remote late member (D above) is unchanged: `collectCommits` still merges only `commits` from remote responses.

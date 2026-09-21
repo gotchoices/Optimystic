@@ -44,6 +44,38 @@ function mergeApplyOutcomes(record: ClusterRecord, collected: ClusterRecord['app
 	record.applyOutcomes = { ...record.applyOutcomes, ...collected };
 }
 
+/** Fold the commit signatures of every answered response into a record in place. */
+function mergeCommits(record: ClusterRecord, responses: ReadonlyArray<{ response?: ClusterRecord | null }>): void {
+	for (const { response } of responses) {
+		if (response) record.commits = { ...record.commits, ...response.commits };
+	}
+}
+
+/** One member's answer to a delivery; `response` is absent, and `error` present, when it failed. */
+interface MemberDelivery {
+	peerId: string;
+	success: boolean;
+	response?: ClusterRecord;
+	error?: string;
+}
+
+/**
+ * The members of `deliveries` that still need the consensus record: one whose delivery failed, one
+ * whose response does not report having run the consensus apply (`MemberApplyOutcome.executed`,
+ * which a member on an older build never sets), and one that reports a refused commit —
+ * sending it the record again gives a behind member another reconcile once the coordinating member
+ * holds the revision (`ClusterMember.handleAlreadyExecuted`). Each member is judged by its own entry
+ * in its own response, as {@link collectApplyOutcomes} takes it.
+ */
+function membersAwaitingConsensus(deliveries: readonly MemberDelivery[]): string[] {
+	return deliveries
+		.filter(({ peerId, response }) => {
+			const own = response?.applyOutcomes?.[peerId];
+			return own?.executed !== true || own.commit?.success === false;
+		})
+		.map(({ peerId }) => peerId);
+}
+
 /**
  * Consensus refused a transaction: enough members voted reject that super-majority became
  * impossible. A typed error (rather than a bare `Error`) so the repo layer above can distinguish
@@ -323,8 +355,9 @@ export class ClusterCoordinator {
 
 	/**
 	 * A node never runs a cluster transaction for a cohort it is not in. Behind members reconcile from the
-	 * coordinator's own proof-carrying copy (its member applies before the merged record fans out), and a
-	 * coordinator outside `record.peers` is not a reconcile target — so a cohort with no holder would stay
+	 * coordinator's own proof-carrying copy (its member applies before the consensus broadcast, and a
+	 * member that applied earlier, on receipt of the commit round, is sent the record again once it has),
+	 * and a coordinator outside `record.peers` is not a reconcile target — so a cohort with no holder would stay
 	 * behind and the commit durability gate would refuse, having first put this node's vote and storage
 	 * where the cohort does not look. The invariant is held here, at the one place a record's `peers` is
 	 * chosen, rather than left to the routing convention.
@@ -397,9 +430,9 @@ export class ClusterCoordinator {
 		 * during consensus, when the member retained one. Same availability contract as
 		 * `localPendResult`. `CoordinatorRepo.commit` uses a retained refusal to detect a rival's
 		 * win swallowed by the member-side ahead-divergence tolerance, instead of fabricating a
-		 * success no member durably stored. Read after the commit broadcast, so a behind member's
-		 * verdict already reflects the second reconcile `broadcastMergedRecord` gives it once a
-		 * remote member holds the revision.
+		 * success no member durably stored. Read after the consensus broadcast, so a behind member's
+		 * verdict already reflects the reconcile it ran against the remote members that applied in the
+		 * commit round, and any second one `broadcastMergedRecord` gave it.
 		 */
 		localCommitResult?: CommitResult;
 		/**
@@ -902,12 +935,104 @@ export class ClusterCoordinator {
 	}
 
 	/**
-	 * Commits the transaction to all peers in the cluster
+	 * The commit round, then the consensus delivery. Runs once the promise round reached super-majority.
+	 *
+	 * **This node's own member votes to commit first, in process, and its signature rides on the commit
+	 * round** ({@link presignLocalCommit}). A remote member receiving that record adds its own commit,
+	 * and in a cohort of two (2 of 2) or three (2 of 3) that is already the strict majority its phase
+	 * loop needs for consensus, so it applies in the same delivery and answers with its apply report
+	 * stamped on. What a member accepts does not change: it reaches consensus only on commit signatures
+	 * it verified, and it signed its own commit only after seeing a super-majority of approved promises.
+	 * It is the same kind of record the consensus broadcast carries, arriving one round earlier. In a
+	 * cohort of four or more the coordinator's commit plus one member's is short of a majority, so
+	 * nobody applies on receipt and the broadcast below works as it always did.
+	 *
+	 * Once the merged commits reach the majority, {@link broadcastMergedRecord} delivers the record to
+	 * this node's member and then only to the remote members still needing it
+	 * ({@link membersAwaitingConsensus}). With every remote member healthy in a small cohort that list is
+	 * empty, so a consensus operation costs each remote member two calls (promise, commit) instead of
+	 * three. When the pre-sign is unavailable the round runs as it did before — every member in
+	 * parallel, this node's included — and the broadcast then reaches every member.
 	 */
 	private async commitTransaction(record: ClusterRecord): Promise<ClusterRecord> {
-		// For each peer, create a client and send the commit
-		const peerIds = Object.keys(record.peers);
-		const summary: ClusterLogPeerOutcome[] = [];
+		const selfId = this.localCluster?.peerId.toString();
+		const presigned = await this.presignLocalCommit(record);
+		const roundPeers = Object.keys(record.peers).filter(id => !presigned || id !== selfId);
+		const deliveries = await this.collectCommits(record, roundPeers);
+		// A member can reach consensus during THIS round (see above), so its apply report arrives on
+		// these responses. The broadcast's copy wins on overlap, being the later of the two.
+		mergeApplyOutcomes(record, collectApplyOutcomes(deliveries));
+		mergeCommits(record, deliveries);
+		log('cluster-tx:commit-merge', {
+			messageHash: record.messageHash,
+			presigned,
+			mergedCommits: Object.keys(record.commits)
+		});
+		this.updateTransactionRecord(record, 'after-commit');
+
+		if (!this.hasCommitMajority(record)) {
+			this.scheduleOrClearRetry(record, deliveries.filter(d => !d.success).map(d => d.peerId));
+			return record;
+		}
+		log('cluster-tx:commit-majority-reached', {
+			messageHash: record.messageHash,
+			commitCount: Object.keys(record.commits).length,
+			peerCount: Object.keys(record.peers).length,
+			threshold: this.cfg.simpleMajorityThreshold
+		});
+		// This node's member is not in the list: the broadcast decides its delivery itself.
+		const awaiting = membersAwaitingConsensus(deliveries.filter(d => d.peerId !== selfId));
+		const { failures, applyOutcomes } = await this.broadcastMergedRecord(record, awaiting);
+		mergeApplyOutcomes(record, applyOutcomes);
+		this.scheduleOrClearRetry(record, failures);
+		return record;
+	}
+
+	/**
+	 * Have this node's own member vote to commit on the promise-complete record, in process, before the
+	 * commit round goes out, and merge its signature into `record`. True when the member answered: the
+	 * round then leaves it out, and the consensus broadcast delivers it the merged record (should it
+	 * have answered without a commit — its phase was not `OurCommitNeeded` — it is no worse off than
+	 * in the round, where it would have answered the same). False when there is no local member in the
+	 * cohort (some test wiring) or the member threw (an expired message, or `validateRecord` refused):
+	 * the round then runs with it included, as it always did.
+	 *
+	 * The member cannot reach consensus here: the record carries no commit yet, and its own is a
+	 * majority only in a cohort of one, which `CoordinatorRepo`'s solo path keeps away from this class.
+	 * Were one to arrive anyway, the member would apply here and the broadcast would skip it as
+	 * already executed.
+	 */
+	private async presignLocalCommit(record: ClusterRecord): Promise<boolean> {
+		const selfId = this.localCluster?.peerId.toString();
+		if (selfId === undefined || !(selfId in record.peers)) {
+			return false;
+		}
+		try {
+			const response = await this.localCluster!.update({ ...record });
+			// Its promise too, not only its commit. A member whose promise round delivery failed (possible
+			// only in a cohort of four or more, where super-majority can be reached without it) adds its
+			// promise here and signs its commit over a commit hash covering it; a round that carried the
+			// commit without the promise would fail every remote member's signature check.
+			record.promises = { ...record.promises, ...response.promises };
+			mergeCommits(record, [{ response }]);
+			log('cluster-tx:commit-presign', { messageHash: record.messageHash, signed: response.commits[selfId] !== undefined });
+			return true;
+		} catch (err) {
+			log('cluster-tx:commit-presign-error', {
+				messageHash: record.messageHash,
+				error: err instanceof Error ? err.message : String(err)
+			});
+			return false;
+		}
+	}
+
+	/**
+	 * Send `record` to each of `peerIds` in parallel for its commit vote. No per-peer immediate retry:
+	 * a failure here is recovered by the consensus broadcast's in-line retry and the scheduled
+	 * commit-retry timer. (The promise round has no such backstop, which is why `collectPromises` gets
+	 * the immediate retry instead.)
+	 */
+	private async collectCommits(record: ClusterRecord, peerIds: readonly string[]): Promise<MemberDelivery[]> {
 		if (verbose) {
 			const peerDetail = peerIds.map(id => ({
 				id: id.substring(0, 12),
@@ -915,192 +1040,137 @@ export class ClusterCoordinator {
 			}));
 			log('cluster-tx:commit-peers', { messageHash: record.messageHash, peers: peerDetail });
 		}
-		// Send the record with promises to all peers
-		// Each peer will add its own commit signature
-		const commitPayload = {
-			...record
-		};
-		// No per-peer immediate retry here: a commit-collection failure is recovered
-		// downstream by broadcastMergedRecord's in-line retry and the scheduled
-		// commit-retry timer. (The promise phase has no such backstop, which is why
-		// collectPromises gets the immediate retry instead.)
-		const commitRequests = peerIds.map(peerIdStr => {
-			const isLocal = this.localCluster && peerIdStr === this.localCluster.peerId.toString();
-			log('cluster-tx:commit-request', { messageHash: record.messageHash, peerId: peerIdStr, isLocal });
-			const promise = isLocal
-				? this.localCluster!.update(commitPayload)
-				: this.createClusterClient(peerIdFromString(peerIdStr)).update(commitPayload);
-			return new Pending(promise);
-		});
-
-		// Wait for all commits to complete
-		const results = await Promise.all(commitRequests.map((p, idx) => p.result().then(res => {
-			const peerIdStr = peerIds[idx]!;
-			log('cluster-tx:commit-response', { messageHash: record.messageHash, peerId: peerIdStr, success: true });
-			summary.push({ peerId: peerIdStr, success: true });
-			return res;
-		}).catch(err => {
-			const peerIdStr = peerIds[idx]!;
-			log('cluster-tx:commit-response', { messageHash: record.messageHash, peerId: peerIdStr, success: false, error: err });
-			summary.push({ peerId: peerIdStr, success: false, error: err instanceof Error ? err.message : String(err) });
-			this.reputation?.reportPeer(peerIdStr, PenaltyReason.ConsensusTimeout, `commit:${record.messageHash}`);
-			return null;
-		})));
-		const commitSuccesses = summary.filter(entry => entry.success).map(entry => entry.peerId);
-		const commitFailures = summary.filter(entry => !entry.success);
+		// A snapshot: the members answer from the record as sent, and `record` is merged into only after
+		// every answer is in.
+		const payload: ClusterRecord = { ...record };
+		const selfId = this.localCluster?.peerId.toString();
+		const deliveries = await Promise.all(peerIds.map(peerId => {
+			log('cluster-tx:commit-request', { messageHash: record.messageHash, peerId, isLocal: peerId === selfId });
+			return this.deliver(payload, peerId, 0, 'commit');
+		}));
+		for (const { peerId, success } of deliveries) {
+			if (!success) this.reputation?.reportPeer(peerId, PenaltyReason.ConsensusTimeout, `commit:${record.messageHash}`);
+		}
 		log('cluster-tx:commit-summary', {
 			messageHash: record.messageHash,
-			successes: commitSuccesses,
-			failures: commitFailures
+			successes: deliveries.filter(d => d.success).map(d => d.peerId),
+			failures: deliveries.filter(d => !d.success).map(({ peerId, error }) => ({ peerId, error }))
 		});
-		log('cluster-tx:commit-merge-begin', {
-			messageHash: record.messageHash,
-			initialCommits: Object.keys(record.commits ?? {}),
-			transactionsEntry: this.transactions.get(record.messageHash)
-		});
+		return deliveries;
+	}
 
-		// A member can reach consensus during THIS round rather than during the broadcast below (a
-		// record that already carries commits — a retried delivery), so its apply verdicts arrive on
-		// these responses. Collect both; the broadcast's copy wins on overlap, being the later of the two.
-		mergeApplyOutcomes(record, collectApplyOutcomes(results.map((response, idx) => ({ peerId: peerIds[idx]!, response }))));
-
-		// Merge all commits into the record
-		for (const result of results.filter(Boolean) as ClusterRecord[]) {
-			log('cluster-tx:commit-merge-input', {
-				messageHash: record.messageHash,
-				resultFrom: Object.keys(result.commits ?? {}),
-				recordBefore: Object.keys(record.commits ?? {})
-			});
-			log('cluster-tx:commit-merge-result', {
-				messageHash: record.messageHash,
-				peerCommits: Object.keys(result.commits ?? {})
-			});
-			record.commits = { ...record.commits, ...result.commits };
-			log('cluster-tx:commit-merge-after', {
-				messageHash: record.messageHash,
-				mergedCommits: Object.keys(record.commits ?? {})
-			});
-		}
-		log('cluster-tx:commit-merge', {
-			messageHash: record.messageHash,
-			mergedCommits: Object.keys(record.commits ?? {})
-		});
-		log('cluster-tx:commit-merge-end', {
-			messageHash: record.messageHash,
-			finalCommits: Object.keys(record.commits ?? {}),
-			transactionsEntry: this.transactions.get(record.messageHash)
-		});
-		this.updateTransactionRecord(record, 'after-commit');
-
-		// Check for simple majority (>50%) - this proves commitment
+	/** Whether `record`'s commit signatures reach the simple majority (>50%) that proves the commit. */
+	private hasCommitMajority(record: ClusterRecord): boolean {
 		const peerCount = Object.keys(record.peers).length;
-		const simpleMajority = Math.floor(peerCount * this.cfg.simpleMajorityThreshold) + 1;
-		const commitCount = Object.keys(record.commits).length;
+		return Object.keys(record.commits).length >= Math.floor(peerCount * this.cfg.simpleMajorityThreshold) + 1;
+	}
 
-		if (commitCount >= simpleMajority) {
-			log('cluster-tx:commit-majority-reached', {
-				messageHash: record.messageHash,
-				commitCount,
-				simpleMajority,
-				peerCount,
-				threshold: this.cfg.simpleMajorityThreshold
-			});
-			// Broadcast the merged record (with all commit signatures) to ALL peers
-			// so each peer can independently reach consensus and execute the operations.
-			// Without this, only the coordinator's local cluster executes — remote peers
-			// never see enough commits to reach consensus on their own.
-			const { failures: broadcastFailures, applyOutcomes } = await this.broadcastMergedRecord(record, peerIds);
-			mergeApplyOutcomes(record, applyOutcomes);
-			if (broadcastFailures.length > 0) {
-				this.scheduleCommitRetry(record.messageHash, record, broadcastFailures);
-			} else {
-				this.clearRetry(record.messageHash);
-			}
+	/** Schedule a commit retry for `missingPeers`, or clear any pending one when nobody is missing. */
+	private scheduleOrClearRetry(record: ClusterRecord, missingPeers: string[]): void {
+		if (missingPeers.length > 0) {
+			this.scheduleCommitRetry(record.messageHash, record, missingPeers);
 		} else {
-			const missingPeers = commitFailures.map(entry => entry.peerId);
-			if (missingPeers.length > 0) {
-				this.scheduleCommitRetry(record.messageHash, record, missingPeers);
-			} else {
-				this.clearRetry(record.messageHash);
-			}
+			this.clearRetry(record.messageHash);
 		}
-		return record;
 	}
 
 	/**
-	 * Broadcast the merged commit record to every peer, with `commitBroadcastImmediateRetries`
-	 * in-line re-attempts per peer before giving up. The libp2p connection used during
-	 * the prior commit phase is typically still warm, so a single immediate retry recovers
-	 * most transient stream errors without falling back to the scheduled retry timer.
-	 * Local cluster is invoked exactly once — local failures are fatal, not transient.
-	 *
-	 * **Delivery order is load-bearing: this node's own member first, awaited, then the remote
-	 * members in parallel.** This broadcast is where members apply the commit, and a member that is
-	 * behind (it never saw the pend, or holds no base for the block) reconciles the committed
-	 * revision from `record.peers` DURING its apply. The coordinator's own member is the one peer
-	 * guaranteed to hold the revision by then — provided it has actually applied, which a single
-	 * `Promise.all` over every peer did not guarantee: the remote members' reconciles raced the
-	 * local apply and found no holder. Its copy also carries the cohort's commit proof
-	 * (`buildBlockCommitProof`), which `createReconcileBlock` accepts from a single holder, so a
-	 * whole cohort of behind members can heal from it. The cost is one in-process apply before the
-	 * network fan-out; no extra round trip. The commit round in `commitTransaction` may stay
-	 * parallel: on the first pass the record it carries has no commit signatures yet, so no member
-	 * can reach consensus (and apply) there. The scheduled retry (`retryCommits`) does re-send a
-	 * record that already carries them, in parallel — but by then this node's member applied in the
-	 * first broadcast unless it was itself among the failed deliveries, which is the retry residual
-	 * documented on `executeClusterTransaction`. A coordinator outside `record.peers` is not a
-	 * reconcile target and gains nothing from this ordering; the durability gate in
-	 * `CoordinatorRepo.commit` is what makes that shape refuse rather than acknowledge.
-	 *
-	 * The mirror case — the coordinating member is ITSELF behind (no pend, or no base for the block)
-	 * — is the price of that order: its reconcile runs before any remote member has applied, finds
-	 * no holder, and retains a refusal. So once the remote members have answered, and at least one
-	 * reported holding the revision, this node's own member gets one more reconcile
-	 * (`reconcileRefusedCommit`). The member skips it unless its retained refusal has the behind
-	 * shape, so only a behind coordinator pays the extra fetch. It finishes before this method
-	 * returns, so `executeClusterTransaction` reads the refreshed verdict, and a two-member cohort
-	 * whose members both end up holding the commit is no longer refused as not durable.
+	 * One {@link updateMember} call whose failure is logged and returned rather than thrown, so a
+	 * parallel round can read every member's answer.
 	 */
-	private async broadcastMergedRecord(record: ClusterRecord, peerIds: string[]): Promise<{ failures: string[]; applyOutcomes?: ClusterRecord['applyOutcomes'] }> {
-		const deliver = async (peerIdStr: string) => {
-			try {
-				const response = await this.updateMember(peerIdStr, record, this.commitBroadcastImmediateRetries, 'commit-broadcast');
-				return { peerId: peerIdStr, success: true as const, response };
-			} catch (err) {
-				log('cluster-tx:consensus-broadcast-error', {
-					messageHash: record.messageHash,
-					peerId: peerIdStr,
-					error: err instanceof Error ? err.message : String(err)
-				});
-				return { peerId: peerIdStr, success: false as const, response: undefined };
-			}
-		};
-		const selfId = this.localCluster?.peerId.toString();
-		const localFirst = peerIds.filter(id => id === selfId);
-		const remote = peerIds.filter(id => id !== selfId);
-		const localResults = await Promise.all(localFirst.map(deliver));
-		const remoteResults = await Promise.all(remote.map(deliver));
-		const results = [...localResults, ...remoteResults];
-		const failures = results.filter(r => !r.success).map(r => r.peerId);
-		// This broadcast is where members actually apply the operations, so their responses carry the
-		// only report the coordinator ever gets of what each member's OWN storage said. Collecting it
-		// here is what lets a pend refused by a non-coordinating member reach the writer as a conflict
-		// instead of the fabricated success that used to fork the block.
+	private async deliver(record: ClusterRecord, peerId: string, immediateRetries: number, phase: string): Promise<MemberDelivery> {
+		try {
+			return { peerId, success: true, response: await this.updateMember(peerId, record, immediateRetries, phase) };
+		} catch (err) {
+			const error = err instanceof Error ? err.message : String(err);
+			log('cluster-tx:member-delivery-error', { messageHash: record.messageHash, peerId, phase, error });
+			return { peerId, success: false, error };
+		}
+	}
+
+	/**
+	 * Deliver the consensus record — carrying a majority of commit signatures — to the members that
+	 * still have to apply it: this node's own member first, awaited, unless it already applied
+	 * ({@link deliverToLocalMember}); then `remoteTargets` in parallel. Each remote delivery gets
+	 * `commitBroadcastImmediateRetries` in-line re-attempts before it counts as failed: the connection
+	 * the commit round used is usually still warm, so an immediate retry recovers most transient stream
+	 * errors without falling back to the scheduled retry timer. This node's member is invoked exactly
+	 * once — a local failure is a real fault, not a transient one.
+	 *
+	 * **Delivery order is load-bearing: this node's own member first, then the remote members.** A
+	 * member that is behind (it never saw the pend, or holds no base for the block) reconciles the
+	 * committed revision from `record.peers` during its apply. Once the coordinating member has applied
+	 * it holds the revision, and its copy carries the cohort's commit proof (`buildBlockCommitProof`),
+	 * which `createReconcileBlock` accepts from a single holder, so a whole cohort of behind members can
+	 * heal from it. This is also why `remoteTargets` includes members that have ALREADY applied but
+	 * report a refused commit: in a cohort of three or fewer a remote member applies on receipt of the
+	 * commit round ({@link commitTransaction}), before this node's member, so a behind one reconciled
+	 * while nobody held the revision. Sending it the record again now gives it another reconcile
+	 * (`ClusterMember.handleAlreadyExecuted`), and its answer carries the refreshed verdict. A
+	 * coordinator outside `record.peers` is not a reconcile target and gains nothing from this order;
+	 * the durability gate in `CoordinatorRepo.commit` is what makes that shape refuse rather than
+	 * acknowledge.
+	 *
+	 * The mirror case — the coordinating member is ITSELF behind — mostly heals on its own: in a small
+	 * cohort a remote member applied during the commit round, so this node's member finds a holder on
+	 * its first reconcile. Where no remote member has applied yet (a cohort of four or more, where
+	 * nobody applies on receipt), that first reconcile runs before anyone holds the revision and
+	 * retains a refusal. So once a remote member reports holding the revision, this node's member gets
+	 * one more reconcile (`reconcileRefusedCommit`). The member skips it unless its retained refusal has
+	 * the behind shape, so only a behind coordinator pays the extra fetch. It finishes before this
+	 * method returns, so `executeClusterTransaction` reads the refreshed verdict.
+	 */
+	private async broadcastMergedRecord(record: ClusterRecord, remoteTargets: readonly string[]): Promise<{ failures: string[]; applyOutcomes?: ClusterRecord['applyOutcomes'] }> {
+		const local = await this.deliverToLocalMember(record);
+		const remote = await Promise.all(remoteTargets.map(peerId =>
+			this.deliver(record, peerId, this.commitBroadcastImmediateRetries, 'commit-broadcast')));
+		const deliveries = local === undefined ? remote : [local, ...remote];
+		// This delivery is where most members apply the operations, so their responses carry the only
+		// report the coordinator ever gets of what each member's OWN storage said. Collecting it here is
+		// what lets a pend refused by a non-coordinating member reach the writer as a conflict instead of
+		// the fabricated success that used to fork the block.
 		//
-		// Each peer's entry is taken from that peer's OWN response and re-keyed under the peer we
-		// asked, so a member cannot report an outcome on another member's behalf by echoing a record
-		// full of entries. Unsigned and advisory either way — see ClusterRecord.applyOutcomes.
-		const applyOutcomes = collectApplyOutcomes(results);
+		// Each peer's entry is taken from that peer's OWN response and re-keyed under the peer we asked,
+		// so a member cannot report an outcome on another member's behalf by echoing a record full of
+		// entries. Unsigned and advisory either way — see ClusterRecord.applyOutcomes.
+		const applyOutcomes = collectApplyOutcomes(deliveries);
 		// NOTE: after a healing second reconcile, `applyOutcomes[selfId].commit` still carries the
 		// pre-reconcile refusal. Nothing reads the self entry today (the gate reads
 		// `localCommitResult`); if anything starts to, re-stamp it from `getExecutedCommitResult` here.
 		// NOTE: in a 3+ cohort this also runs when the remote holders already form a majority without
 		// this member — one extra fetch that heals its copy; gate on the remote count if it ever shows up.
-		const remoteHolds = remote.some(id => applyOutcomes?.[id]?.commit?.success === true);
-		if (remoteHolds && localResults.some(r => r.success)) {
+		if (this.localMemberHasApplied(record, local) && this.remoteMemberHolds(record, applyOutcomes)) {
 			await this.reconcileLocalMemberAgain(record);
 		}
-		return { failures, ...(applyOutcomes === undefined ? {} : { applyOutcomes }) };
+		return {
+			failures: deliveries.filter(d => !d.success).map(d => d.peerId),
+			...(applyOutcomes === undefined ? {} : { applyOutcomes })
+		};
+	}
+
+	/**
+	 * Deliver `record` to this node's own member, awaited. `undefined` — nothing sent — when there is
+	 * no local member in the cohort, or it has already applied the record.
+	 */
+	private async deliverToLocalMember(record: ClusterRecord): Promise<MemberDelivery | undefined> {
+		const selfId = this.localCluster?.peerId.toString();
+		if (selfId === undefined || !(selfId in record.peers) || this.localCluster!.wasTransactionExecuted?.(record.messageHash) === true) {
+			return undefined;
+		}
+		return await this.deliver(record, selfId, 0, 'commit-broadcast');
+	}
+
+	/** This node's member is in the cohort and has applied the record: just now (`local`), or before. */
+	private localMemberHasApplied(record: ClusterRecord, local: MemberDelivery | undefined): boolean {
+		const selfId = this.localCluster?.peerId.toString();
+		return selfId !== undefined && selfId in record.peers && (local?.success ?? true);
+	}
+
+	/** Whether any remote member reports holding the commit, on this delivery or an earlier one. */
+	private remoteMemberHolds(record: ClusterRecord, latest: ClusterRecord['applyOutcomes']): boolean {
+		const selfId = this.localCluster?.peerId.toString();
+		const outcomes = { ...record.applyOutcomes, ...latest };
+		return Object.keys(record.peers).some(id => id !== selfId && outcomes[id]?.commit?.success === true);
 	}
 
 	/**
@@ -1208,35 +1278,38 @@ export class ClusterCoordinator {
 			this.clearRetry(messageHash);
 			return;
 		}
-		const peerIds = Array.from(pendingPeers);
 		const record = state.record;
-		log('cluster-tx:retry-start', { messageHash, attempt, peerIds });
-		const results = await Promise.all(peerIds.map(async peerIdStr => {
-			const isLocal = this.localCluster && peerIdStr === this.localCluster.peerId.toString();
-			const payload: ClusterRecord = {
-				...record,
-				commits: record.commits
-			};
-			try {
-				const res = isLocal
-					? await this.localCluster!.update(payload)
-					: await this.createClusterClient(peerIdFromString(peerIdStr)).update(payload);
-				state.record.commits = { ...state.record.commits, ...res.commits };
-				return { peerId: peerIdStr, success: true as const };
-			} catch (err) {
-				return {
-					peerId: peerIdStr,
-					success: false as const,
-					error: err instanceof Error ? err.message : String(err)
-				};
-			}
-		}));
-		const successes = results.filter(r => r.success).map(r => r.peerId);
-		const failures = results.filter(r => !r.success);
-		for (const peerId of successes) {
-			pendingPeers.delete(peerId);
+		const selfId = this.localCluster?.peerId.toString();
+		log('cluster-tx:retry-start', { messageHash, attempt, peerIds: Array.from(pendingPeers) });
+		// Each pending remote member gets the record as it stands: it adds its commit, and applies once
+		// the record then carries a majority, which in a small cohort this very delivery can complete.
+		const payload: ClusterRecord = { ...record };
+		const deliveries = await Promise.all(Array.from(pendingPeers)
+			.filter(peerId => peerId !== selfId)
+			.map(peerId => this.deliver(payload, peerId, 0, 'commit-retry')));
+		mergeCommits(record, deliveries);
+		mergeApplyOutcomes(record, collectApplyOutcomes(deliveries));
+		for (const { peerId, success } of deliveries) {
+			if (success) pendingPeers.delete(peerId);
 		}
-		log('cluster-tx:retry-complete', { messageHash, attempt, successes, failures });
+		if (this.hasCommitMajority(record)) {
+			// The retry may itself have assembled the majority (a two-member cohort whose remote member
+			// missed the commit round), and then this node's member has not applied; a remote member that
+			// applied on receipt before this node's member did may hold a behind refusal; and in a cohort
+			// of four or more the members that answered here have not applied at all. The consensus
+			// broadcast covers all three, in its usual order. This node's member is pending only when its
+			// own broadcast delivery failed, and the broadcast delivers it again.
+			const { failures } = await this.broadcastMergedRecord(record, membersAwaitingConsensus(deliveries.filter(d => d.success)));
+			if (selfId !== undefined) pendingPeers.delete(selfId);
+			for (const peerId of failures) pendingPeers.add(peerId);
+		}
+		log('cluster-tx:retry-complete', {
+			messageHash,
+			attempt,
+			successes: deliveries.filter(d => d.success).map(d => d.peerId),
+			failures: deliveries.filter(d => !d.success).map(({ peerId, error }) => ({ peerId, error })),
+			stillPending: Array.from(pendingPeers)
+		});
 		if (pendingPeers.size === 0) {
 			log('cluster-tx:retry-finished', { messageHash });
 			this.clearRetry(messageHash);

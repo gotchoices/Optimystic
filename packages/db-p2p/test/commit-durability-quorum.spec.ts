@@ -16,15 +16,17 @@
  *    coordinator counts durable holders, its own member included, and acknowledges only a strict
  *    majority of the cohort. Otherwise it answers a retryable refusal
  *    (`COMMIT_NOT_DURABLE_REASON`) instead of a fabricated success.
- *  - **Arm B — the coordinating member applies first.** `ClusterCoordinator.broadcastMergedRecord`
- *    delivers the merged record to its own member before the remote ones, so a member that is
- *    behind can reconcile from the one peer guaranteed to hold the revision by then — the
- *    coordinator's copy, which carries the cohort's commit proof and is therefore adoptable from a
- *    single holder.
+ *  - **Arm B — a behind member heals from the coordinating member's copy.** In a two-member cohort
+ *    the remote member applies on receipt of the commit round, which already carries the
+ *    coordinator's own commit vote (ticket cluster-commit-round-carries-the-coordinators-commit-vote),
+ *    so a behind remote member reconciles before anyone holds the revision and reports a refusal.
+ *    `ClusterCoordinator.broadcastMergedRecord` then applies the commit on its own member and sends
+ *    the merged record again to a remote member reporting a refused commit; that redelivery gives it
+ *    another reconcile, against the coordinator's copy, which carries the cohort's commit proof and is
+ *    therefore adoptable from a single holder.
  *  - **The mirror of Arm B** (ticket a-two-member-cohort-refuses-a-commit-both-members-hold): when
- *    the coordinating member is the one behind, its first reconcile runs before anyone holds the
- *    revision, so the coordinator gives it one more reconcile after a remote member reports holding
- *    it.
+ *    the coordinating member is the one behind, the remote member has already applied in the commit
+ *    round, so the coordinating member's first reconcile finds it.
  *
  * The geometry is the smallest one that shows both: a two-member cohort (2 of 2 is both the promise
  * super-majority and the durable majority), the block seeded on the coordinating member only, and
@@ -163,10 +165,11 @@ describe('commit durability quorum (an acknowledged commit lands on a durable ma
 	 * remote member's storage, and `coordinatingFetches` counts the archive fetches it made.
 	 *
 	 * The client through which the remote member is reached also witnesses the delivery order: on
-	 * the delivery that carries the commit transaction's full commit set (the one that makes the
-	 * remote member apply), it records — synchronously, before forwarding — whether the coordinating
-	 * member had already retained its own verdict for that transaction. That is true only when the
-	 * coordinator delivered to, and awaited, its own member first.
+	 * the first delivery that carries the commit transaction's full commit set, it records —
+	 * synchronously, before forwarding — whether the coordinating member had already retained its own
+	 * verdict for that transaction. The commit round carries only the coordinator's commit, so that
+	 * delivery is the redelivery a remote member gets after it applied, and the witness is true only
+	 * when the coordinator applied on its own member, and awaited it, before sending it.
 	 */
 	const buildCohort = async (opts: {
 		seedRemote: boolean;
@@ -291,9 +294,10 @@ describe('commit durability quorum (an acknowledged commit lands on a durable ma
 	});
 
 	it('acknowledges once the remote member restores the revision from the coordinating member', async () => {
-		// Same geometry with the production reconcile path wired. The remote member's reconcile can
-		// only find the coordinator's copy if the coordinator applied BEFORE fanning out — that is
-		// the delivery order this arm witnesses — and can only adopt a single holder because that
+		// Same geometry with the production reconcile path wired. The remote member applies on receipt
+		// of the commit round, before the coordinator holds anything, so its first reconcile finds no
+		// holder. It heals on the redelivery the coordinator sends it after applying on its own member
+		// — the delivery order this arm witnesses — and can adopt that single holder only because its
 		// copy carries the cohort's verified commit proof.
 		const cohort = await buildCohort({ seedRemote: false, reconcileFromCoordinator: true });
 		await pendAccepted(cohort.repo);
@@ -323,15 +327,16 @@ describe('commit durability quorum (an acknowledged commit lands on a durable ma
 	/**
 	 * Ticket: a-two-member-cohort-refuses-a-commit-both-members-hold.
 	 *
-	 * The mirror of Arm B: the COORDINATING member is the one lacking the base. Its own delivery
-	 * comes first, so its reconcile runs while no remote member has applied yet, finds no holder,
-	 * and retains a refusal; the remote member applies a moment later and holds the revision. One
-	 * holder of two is not a majority, so the write used to be refused as not durable although both
-	 * members end up holding it. The coordinator now gives its own member one more reconcile once a
-	 * remote member reports holding the revision, and the remote copy — which carries the cohort's
-	 * commit proof — is adoptable from that single holder.
+	 * The mirror of Arm B: the COORDINATING member is the one lacking the base. When its own delivery
+	 * came first, its reconcile ran while no remote member had applied yet, found no holder, and
+	 * retained a refusal, so the write was refused as not durable although both members ended up
+	 * holding it. Now the remote member applies on receipt of the commit round, before the coordinating
+	 * member applies, so the coordinating member's first reconcile finds the remote copy — which
+	 * carries the cohort's commit proof and is adoptable from that single holder — and the second
+	 * reconcile `broadcastMergedRecord` keeps for cohorts where no remote member applied first is
+	 * not needed.
 	 */
-	it('acknowledges when the coordinating member is the one behind and reconciles after the remote member applies', async () => {
+	it('acknowledges when the coordinating member is the one behind and reconciles from the remote member that applied first', async () => {
 		// Wired the way a node wires it: the coordinator reaches the member's second reconcile only
 		// through the seam `CoordinatorRepo` builds from its `localCluster`.
 		const cohort = await buildCohort({
@@ -349,7 +354,7 @@ describe('commit durability quorum (an acknowledged commit lands on a durable ma
 		expect(await cohort.coordinatingStorage.getBlockProof(BLOCK, COMMIT_REV),
 			'the restore came through the certified single-holder path, so the proof was retained').to.not.equal(undefined);
 		expect(await latestOf(cohort.remoteStorage)).to.deep.equal({ actionId: ACTION, rev: COMMIT_REV });
-		expect(cohort.coordinatingFetches(), 'one reconcile during the local apply, one after the remote member applied').to.equal(2);
+		expect(cohort.coordinatingFetches(), 'the reconcile during the local apply already found the remote member\'s copy').to.equal(1);
 	});
 
 	it('does not reconcile the coordinating member again when no remote member holds the revision', async () => {

@@ -1254,20 +1254,31 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `reconcileBlock` callback — `SyncClient` fetch + `saveReplicatedBlock` in
   `libp2p-node-base`) and restores it locally, repairing the under-replication at the
   moment of the commit rather than waiting for someone to read the block. **The reconcile
-  targets are `record.peers` minus self, and it runs during the consensus broadcast — so the
-  coordinator delivers the merged record to its own member first, awaited, and only then to the
-  remote members** (`broadcastMergedRecord` in `packages/db-p2p/src/repo/cluster-coordinator.ts`).
-  The coordinating member is the one peer guaranteed to hold the revision by the time a behind
-  member asks, and its copy carries the cohort's commit proof (`buildBlockCommitProof`), which the
-  certified single-holder rule below accepts without a second corroborator — so a whole cohort of
-  behind members can heal from it in one pass. A single parallel fan-out let the remote reconciles
-  race the local apply and decline with `reconcile:no-rev-quorum` (`holders: 0`), which is how a
-  fully-approved commit ended up on no responsible node. The price of that order is the mirror
-  case, where the coordinating member is itself behind: its reconcile runs before anyone holds the
-  revision and retains a refusal. So once a remote member reports holding the revision, the
-  coordinator gives its own member one more reconcile (`ClusterMember.reconcileRefusedCommit`, a
-  no-op unless the retained refusal has the behind shape) before the durability gate reads its
-  verdict. A coordinator *outside* `record.peers`
+  targets are `record.peers` minus self, and it runs when the member applies — so what matters is
+  who already holds the revision at that moment.** Before the commit round goes out, the
+  coordinator's own member signs its commit vote in process, and that signature rides on the
+  round (`commitTransaction` in `packages/db-p2p/src/repo/cluster-coordinator.ts`). In a cohort of
+  three or fewer a remote member's own commit plus the coordinator's is already a strict majority,
+  so it applies on receipt of the commit round; in a cohort of four or more it is not, and nobody
+  applies before the consensus broadcast. The broadcast (`broadcastMergedRecord`, same file) then
+  delivers the merged record to the coordinator's own member first, awaited, and only then to the
+  remote members that still need it: one whose commit-round call failed, one whose response does
+  not report having applied (`MemberApplyOutcome.executed`, which an older build never sets), and
+  one that reports a refused commit. In a healthy two- or three-member cohort that list is empty,
+  so a consensus operation costs each remote member two calls rather than three. The coordinating
+  member's copy carries the cohort's commit proof (`buildBlockCommitProof`), which the certified
+  single-holder rule below accepts without a second corroborator, so a whole cohort of behind
+  members can heal from it. A single parallel fan-out let the remote reconciles race the local
+  apply and decline with `reconcile:no-rev-quorum` (`holders: 0`), which is how a fully-approved
+  commit ended up on no responsible node. Each case therefore gets a reconcile after someone holds
+  the revision. A behind *remote* member in a small cohort applied first, found no holder, and
+  answered with a refused commit, so the broadcast sends it the merged record again once the
+  coordinating member has applied; a member receiving a record it already applied runs
+  `ClusterMember.reconcileRefusedCommit` (a no-op unless its retained refusal has the behind
+  shape), and its answer carries the refreshed verdict. A behind *coordinating* member in a small
+  cohort finds the remote members' copies on its first reconcile. In a larger cohort, where it
+  applies first, it gets one more reconcile once a remote member reports holding the revision,
+  before the durability gate reads its verdict. A coordinator *outside* `record.peers`
   is not a reconcile target, so a cohort with no holder at all stays behind; the durability gate
   in `CoordinatorRepo.commit` is what makes that shape refuse rather than acknowledge. The read path
   is no longer blind to it: `CoordinatorRepo` is handed the *same* callback instance and

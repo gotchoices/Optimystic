@@ -85,7 +85,9 @@ const clockOpts = (clock: FakeScheduler): { now: () => number; setTimer: FakeSch
  * Mock cluster client for testing ClusterCoordinator retry behavior.
  * Determines phase by checking whether our promise is already in the record:
  * - Not present → promise phase (add our promise)
- * - Present → commit phase (add our commit, or fail if configured)
+ * - Present → commit phase (add our commit, or fail if configured). Like a real member, once the
+ *   commits it answers with make a majority it has applied, and says so (`applyOutcomes[self].executed`),
+ *   which is what spares it the coordinator's consensus broadcast.
  */
 class MockClusterClient {
 	updateCalls = 0;
@@ -120,12 +122,15 @@ class MockClusterClient {
 			throw new Error(`Peer ${this.peerIdStr.substring(0, 8)} unreachable`);
 		}
 
+		const commits = {
+			...record.commits,
+			[this.peerIdStr]: { type: 'approve', signature: `csig-${this.peerIdStr.substring(0, 8)}` } as Signature
+		};
+		const executed = Object.keys(commits).length > Object.keys(record.peers).length / 2;
 		return {
 			...record,
-			commits: {
-				...record.commits,
-				[this.peerIdStr]: { type: 'approve', signature: `csig-${this.peerIdStr.substring(0, 8)}` } as Signature
-			}
+			commits,
+			...(executed ? { applyOutcomes: { ...record.applyOutcomes, [this.peerIdStr]: { executed: true } } } : {})
 		};
 	}
 }

@@ -780,12 +780,13 @@ export class ClusterMember implements ICluster {
 	}
 
 	/**
-	 * Add this member's own apply verdicts to a record's {@link ClusterRecord.applyOutcomes}, when
-	 * storage produced any for this transaction. The two arms follow the rules on
-	 * {@link MemberApplyOutcome}: the pend arm carries ONLY a conflict-shaped refusal (a success, a
-	 * bare-reason fault, or no retained verdict leaves it off — the coordinator's rule is "an entry
-	 * means retry", so an entry that does not mean retry must not exist); the commit arm carries the
-	 * retained durable verdict whatever it says, because the coordinator counts the successes.
+	 * Add this member's own apply report to a record's {@link ClusterRecord.applyOutcomes}, when it
+	 * has anything to report for this transaction. The fields follow the rules on
+	 * {@link MemberApplyOutcome}: `executed` is set once this member has run the consensus apply; the
+	 * pend arm carries ONLY a conflict-shaped refusal (a success, a bare-reason fault, or no retained
+	 * verdict leaves it off — the coordinator's rule is "an entry means retry", so an entry that does
+	 * not mean retry must not exist); the commit arm carries the retained durable verdict whatever it
+	 * says, because the coordinator counts the successes.
 	 *
 	 * The member never signs this and never writes another peer's entry.
 	 */
@@ -793,6 +794,7 @@ export class ClusterMember implements ICluster {
 		const pend = this.executedPendResults.get(record.messageHash);
 		const commit = this.executedCommitResults.get(record.messageHash);
 		const own: MemberApplyOutcome = {
+			...(this.executedTransactions.has(record.messageHash) ? { executed: true } : {}),
 			...(pend !== undefined && !pend.success && isConflictFailure(pend) ? { pend } : {}),
 			...(commit !== undefined ? { commit } : {})
 		};
@@ -2302,14 +2304,14 @@ export class ClusterMember implements ICluster {
 		// Check persistent store first for post-recovery dedup (in-memory map is cleared on restart).
 		// wasTransactionExecutedAsync also checks the in-memory map as a fast path.
 		if (await this.wasTransactionExecutedAsync(record.messageHash)) {
-			log('cluster-member:consensus-already-executed', { messageHash: record.messageHash });
+			await this.handleAlreadyExecuted(record);
 			return;
 		}
 		// Check-and-set ATOMICALLY to prevent race condition where multiple calls
 		// pass the async check before any completes. Since JavaScript is single-threaded,
 		// this synchronous check-and-set is atomic before any await.
 		if (this.executedTransactions.has(record.messageHash)) {
-			log('cluster-member:consensus-already-executed', { messageHash: record.messageHash });
+			await this.handleAlreadyExecuted(record);
 			return;
 		}
 		// Set the in-memory guard IMMEDIATELY, before any async operations: its synchronous
@@ -2355,6 +2357,20 @@ export class ClusterMember implements ICluster {
 		// dropping. Fire-and-forget: a persist failure must not fail the apply that succeeded.
 		this.stateStore?.markExecuted(record.messageHash, executedAt)
 			.catch(err => log('cluster-member:persist-executed-error', { messageHash: record.messageHash, error: (err as Error).message }));
+	}
+
+	/**
+	 * A delivery of a record this member already applied. Nothing is applied again, but a retained
+	 * behind-shaped commit refusal gets one more reconcile ({@link reconcileRefusedCommit}, a no-op for
+	 * every other verdict). This is how a behind remote member heals when it applied on receipt of the
+	 * commit round, before the coordinating member held the revision: the coordinator re-sends it the
+	 * merged record once its own member has applied, and this delivery's response carries the
+	 * refreshed verdict (`withOwnApplyOutcome`), which the durability gate reads. A scheduled commit
+	 * retry reaching such a member heals it the same way.
+	 */
+	private async handleAlreadyExecuted(record: ClusterRecord): Promise<void> {
+		log('cluster-member:consensus-already-executed', { messageHash: record.messageHash });
+		await this.reconcileRefusedCommit(record);
 	}
 
 	/**
@@ -2607,12 +2623,14 @@ export class ClusterMember implements ICluster {
 	/**
 	 * One more reconcile for a commit this member already applied at consensus but could not hold:
 	 * its retained verdict is a BEHIND-shaped refusal (missing pend or missing base), and the
-	 * reconcile that ran during the apply found no cohort peer holding the revision yet. The
-	 * coordinating node calls this for its own member once the remote members have applied and at
-	 * least one reported holding the revision. Its own delivery goes first (see
-	 * `ClusterCoordinator.broadcastMergedRecord`), so that first reconcile ran before anyone else
-	 * held anything. The remote holder's copy carries the cohort's commit proof, so the existing
-	 * certified single-holder path adopts it; no new trust is involved.
+	 * reconcile that ran during the apply found no cohort peer holding the revision yet. Two callers.
+	 * The coordinating node calls it for its own member once a remote member reports holding the
+	 * revision (`ClusterCoordinator.broadcastMergedRecord`), for a cohort where the remote members
+	 * applied after it did. And every member runs it on a redelivery of a record it already applied
+	 * ({@link handleAlreadyExecuted}), which is how a remote member that applied on receipt of the
+	 * commit round, before anyone held the revision, heals once the coordinator re-sends it the merged
+	 * record. The holder's copy carries the cohort's commit proof, so the existing certified
+	 * single-holder path adopts it; no new trust is involved.
 	 *
 	 * Does nothing unless the retained verdict for `record.messageHash` is a behind refusal; in
 	 * particular an ahead-shaped refusal (`missing`) is never reconciled downward. Recomputes and
@@ -2783,6 +2801,16 @@ export class ClusterMember implements ICluster {
 	 * **synchronous** (no `await` here) so the cert is retained before `StorageRepo.commit` emits its
 	 * change event. No-op (zero cost) when no sink is configured; a throwing sink is isolated + logged so
 	 * it can never break consensus.
+	 *
+	 * A record carrying fewer approving commit signatures than `minSigs` retains no cert, so the bridge
+	 * skips origination on this member rather than forwarding a cert below its own threshold. Consensus
+	 * needs only a simple majority of commits, so a member can apply with fewer.
+	 *
+	 * NOTE: in a three-member cohort that is the ordinary case for the two remote members. Each applies
+	 * on receipt of the commit round holding its own commit and the coordinator's (2 of `minSigs` 3), and
+	 * the coordinator does not broadcast the full set to a member that already applied, so only the
+	 * coordinating member, which applies with every commit merged, originates. If origination from the
+	 * other members is ever needed, have the coordinator deliver the merged record to them too.
 	 */
 	private captureCommitCert(record: ClusterRecord, actionId: ActionId, signedPayload: Uint8Array): void {
 		if (!this.onCommitCertificate) {
@@ -2790,7 +2818,12 @@ export class ClusterMember implements ICluster {
 		}
 		const minSigs = Math.ceil(Object.keys(record.peers).length * this.superMajorityThreshold);
 		try {
-			this.onCommitCertificate(actionId, buildCommitCert(record, minSigs, signedPayload));
+			const cert = buildCommitCert(record, minSigs, signedPayload);
+			if (cert.signers.length < minSigs) {
+				log('cluster-member:commit-cert-below-threshold', { actionId, signers: cert.signers.length, minSigs });
+				return;
+			}
+			this.onCommitCertificate(actionId, cert);
 		} catch (err) {
 			log('cluster-member:commit-cert-sink-error', { actionId, error: (err as Error).message });
 		}

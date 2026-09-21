@@ -245,8 +245,11 @@ checked this"):
 call, so the record it answers with can carry what its own storage said. A member that refused a pend
 with a conflict-shaped result (a rival's unresolved action holds the blocks, or the revision is already
 committed) stamps that verdict onto `ClusterRecord.applyOutcomes` under its own peer id. The
-coordinator collects it off the consensus broadcast and `CoordinatorRepo.pend` answers the writer with
-that conflict rather than a fabricated success.
+coordinator collects it off the member's answer to the commit round (in a cohort of three or fewer,
+where members apply on receipt of it — see [Phase 2](#phase-2-commit-execution-simple-majority-required))
+or to the consensus broadcast, and `CoordinatorRepo.pend` answers the writer with that conflict rather
+than a fabricated success. A member also reports that it has applied the record at all
+(`MemberApplyOutcome.executed`), which is what lets the coordinator leave it out of the broadcast.
 
 The field is unsigned and advisory — it is written *after* the votes are cast, so no signed payload
 could carry it without another round trip. That is acceptable because an entry can only *downgrade* a
@@ -266,6 +269,24 @@ if (promiseCount < superMajority) {
 ### Phase 2: Commit Execution (Simple Majority Required)
 
 Once super-majority promises are collected, the commit phase begins. **Commits only require a simple majority (>50%)** to prove commitment, with remaining propagation happening in the background via the [commit retry loop](#commit-retry-loop).
+
+**The coordinator's own member votes first, and its vote rides on the commit round.** Before the
+round goes out, `ClusterCoordinator.commitTransaction` delivers the promise-complete record to its own
+member in process; the member signs its commit, and the round carries that signature to every remote
+member. A remote member adds its own commit, and in a cohort of two (2 of 2) or three (2 of 3) that is
+already the majority its phase loop needs, so it reaches consensus and applies in the same delivery,
+answering with its apply report. Nothing about what a member accepts changes — it reaches consensus
+only on commit signatures it verified, having signed its own only after seeing a super-majority of
+approved promises — the record simply arrives one round earlier than the broadcast would bring it. In a
+cohort of four or more the two commits are short of a majority and nobody applies on receipt.
+
+Once the merged commits reach the majority, `broadcastMergedRecord` delivers the record to the
+coordinator's own member (awaited) and then only to the remote members still needing it: a member whose
+commit-round call failed, one whose answer does not report having applied (`MemberApplyOutcome.executed`,
+which a member on an older build never sets), and one reporting a refused commit — sending that one the
+record again, now that the coordinator's member holds the revision, gives a behind member another
+reconcile. In a healthy two- or three-member cohort that list is empty, so a consensus operation costs
+each remote member two calls instead of three.
 
 This simple majority is the *cluster-internal* commit-signature count — how many members have signed commit — not the writer-facing acknowledgement. The coordinator's answer to the writer is gated separately, by a post-reconcile storage-durability majority (the durability gate); it does not follow from commit-signature count alone. See [`docs/correctness.md` Theorem 6](../../../docs/correctness.md#theorem-6-durability) for the full three-checkpoint pipeline.
 
@@ -594,7 +615,7 @@ Once the tail block commits, the coordinator now tracks any peers that promised 
 
 Unless the node was built with a `transactionStateStore` (from which `recoverTransactions` resumes a persisted retry after a restart), the retry lives only in the coordinator's memory: a member that stays away longer than the schedule, or whose coordinator restarts meanwhile, is not owed anything afterwards. At three machines such a member still heals on its own reads — it holds the pending record it stored when it promised, and a read that sees the action committed in the collection's log promotes it — which `packages/db-p2p/test/member-leaves-and-returns.spec.ts` pins alongside the retry path.
 
-Retries reuse the original `ClusterRecord` so peers that missed the initial commit can still apply the operation idempotently.
+Retries reuse the original `ClusterRecord` so peers that missed the initial commit can still apply the operation idempotently. A retry can itself complete the commit majority — in a two-member cohort whose other member missed the commit round, the record carries only the coordinator's commit until the retry reaches that member, which then applies on receipt — so once a retry leaves the record at a majority it runs the same consensus broadcast as the first pass: the coordinator's own member first if it has not applied, then any member that has not applied or reports a refused commit.
 
 A successful retry clears the pending list; hitting the max attempts emits `cluster-tx:retry-abort` so operators can intervene. The coordinator keeps the transaction in memory while any peers remain unfixed, ensuring follow-up requests (reads, additional commits) see a consistent state.
 
@@ -749,7 +770,7 @@ const updatedRecord = await clusterMember.update(incomingRecord);
 
 - **Promise Phase**: Single round-trip to all peers (~100-500ms)
 - **Commit Phase**: Second round-trip for final confirmation (~100-500ms)
-- **Total Transaction Time**: 2-3 round-trips depending on network conditions
+- **Total Transaction Time**: two round trips to each remote member in a cohort of three or fewer, where members apply on receipt of the commit round; a third, the consensus broadcast, in a cohort of four or more, and to any member that missed the commit round or reports a refused commit
 
 ### Throughput Optimization
 
