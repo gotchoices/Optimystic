@@ -57,3 +57,7 @@
 {"slug":"debt-e2e-stale-cache-hit-read-rejected","file":"2-debt-e2e-stale-cache-hit-read-rejected.md","completedAt":"2026-08-17","commit":"c68a5a9034de0b9c6dc288e3628646ae6f65169f","prunedAt":"2026-09-16T07:03:17.351Z"}
 {"slug":"debt-txn-coordinator-cache-tests","file":"2-debt-txn-coordinator-cache-tests.md","completedAt":"2026-08-17","commit":"12eeef9bfe8bdd4ea9c4acea1a2771d045311d36","prunedAt":"2026-09-16T18:30:01.553Z"}
 {"slug":"debt-owned-block-seed-e2e-restart-test","file":"3-debt-owned-block-seed-e2e-restart-test.md","completedAt":"2026-08-17","commit":"6d30e6e30ffd256ceeaf5c5a3ae3de306ec277c7","prunedAt":"2026-09-16T18:30:01.553Z"}
+{"slug":"findcluster-publishes-inbound-source-addresses","file":"1-findcluster-publishes-inbound-source-addresses.md","completedAt":"2026-08-21","commit":"8f60f1d3c53df6c98bbd82af9a4fee7d1c81e693","prunedAt":"2026-09-21T03:48:25.776Z"}
+{"slug":"relay-cannot-dial-its-own-reservation-holders","file":"2-relay-cannot-dial-its-own-reservation-holders.md","completedAt":"2026-08-21","commit":"bf22a956783d363b740fc265c85c33bd87fb5563","prunedAt":"2026-09-21T03:48:25.776Z"}
+{"slug":"address-book-merge-logs-under-two-namespaces","file":"3-address-book-merge-logs-under-two-namespaces.md","completedAt":"2026-08-21","commit":"51ad87a4fc4e9470d07dbc9ee3adf5efb8117797","prunedAt":"2026-09-21T03:48:25.776Z"}
+{"slug":"db-p2p-adopt-fret-framing","file":"db-p2p-adopt-fret-framing.md","completedAt":"2026-08-20","commit":"235539e757f796d6bfe33f310b9072c11b599c13","prunedAt":"2026-09-21T03:48:25.776Z"}
