@@ -127,7 +127,7 @@ Phase 2 (Commit): Apply changes atomically across all clusters
 
 **Failure handling:**
 - **Pend failures**: Cancel all pending operations and return conflict information
-- **Commit failures**: Cannot occur after tail commit succeeds (log-first ordering)
+- **Commit failures**: A refused commit carrying the tail is returned and the writer re-drives with the same action id; on the two-step path a non-tail block can still be refused after the tail landed (a rival took its revision), which is also returned. See [docs/internals.md §One commit round when one coordinator covers every block](../../../docs/internals.md#one-commit-round-when-one-coordinator-covers-every-block)
 - **Network failures**: Retry with different cluster coordinators
 
 ## Coordination Strategy
@@ -166,7 +166,7 @@ Network Partition → Operations continue in connected partition
 **Transaction-Level Conflicts:**
 ```
 Pend Conflict → Cancel all pending, return conflict info to collection layer
-Commit Conflict → Cannot happen after tail commit (ordering established)
+Commit Conflict → Returned to the collection layer, which finishes or re-drives its own action
 Missing Transactions → Return newer committed transactions for rebasing
 ```
 

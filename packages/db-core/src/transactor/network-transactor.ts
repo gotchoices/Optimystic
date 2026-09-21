@@ -846,12 +846,12 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		if (remainingBlocks.length > 0) {
 			const result = await this.commitInOneRound(request, remainingBlocks);
 			if (result) {
-				log('commit:done actionId=%s ms=%d rounds=1 success=%s', request.actionId, Date.now() - t0, result.success);
+				log('commit:done actionId=%s ms=%d path=one-round success=%s', request.actionId, Date.now() - t0, result.success);
 				return result;
 			}
 		}
 		const result = await this.commitTailThenSweep(request, remainingBlocks);
-		log('commit:done actionId=%s ms=%d rounds=2 torn=%d', request.actionId, Date.now() - t0,
+		log('commit:done actionId=%s ms=%d path=tail-then-sweep torn=%d', request.actionId, Date.now() - t0,
 			result.success ? result.durability.torn?.length ?? 0 : 0);
 		return result;
 	}

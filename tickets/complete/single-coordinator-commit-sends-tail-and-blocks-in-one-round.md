@@ -64,3 +64,24 @@ Updated, each still testing what its title says:
 - **One round is refused whole where two rounds tore**: a returned refusal (a rival holding any block, or `commit-not-durable`) now stops the tail from committing anywhere the refusal came before apply. This is strictly fewer torn actions, and `completeOwnEntry` handles both "entry found, blocks missing" and "entry found, everything present" on a minority.
 - **Reactivity**: the combined apply emits one `CollectionChangeEvent` per collection covering every block, instead of one for the tail and one for the sweep. Watchers invalidate coarsely, so this was checked by reading only.
 - Pre-existing, not touched: `packages/db-core/docs/network.md` still claims "Commit failures: Cannot occur after tail commit succeeds" and "Commit Conflict → Cannot happen after tail commit", which were already wrong (a sweep block can conflict). I only added the one-round paragraph there.
+
+## Review findings
+
+Read the implement diff (`f8dab0ca`) first, then the handoff.
+
+**Checked, correct:**
+- `commitInOneRound` / `soleCommitCoordinator`: planning reuses `batchesForPayload` with the pend cache exactly as `commitBlocks`; a lookup failure or more than one coordinator falls back; a throw falls back without re-batching (the stated reason, a non-tail block landing on another cohort ahead of the tail, holds). A returned refusal goes through `refusalFrom`, which is the old `staleFromBatches` body unchanged.
+- `StorageRepo.commit` + `tailFirst`: confirmed by reading that the stale partition and the missing-pend throw both return before any `internalCommit`, and that the apply loop breaks on the first failure, so the tail-first invariant holds on the commit path. The Crash-D3 recovery arm only re-lands blocks that were already committed, so it does not break it.
+- Error handling: the one-round throw is logged, not eaten. Resource cleanup: a returned refusal leaves cancelling to the caller, as a refused tail always did. Types: no `any`, and the dedup of `request.blockIds` is new but harmless.
+- Tests: the two new transactor tests and the storage-repo reorder test each pin a real branch (the reorder has a negative control in the handoff). The updated mesh specs still test what their titles say. None restate the implementation, so none were cut and none added.
+
+**Found and fixed (minor):**
+- The docs and the `StorageRepo.commit` comment said a member "can hold the tail with the other blocks pending, never the reverse". That holds only on the commit path: the read-driven promotion in `StorageRepo.get` can land a non-tail block on a member that does not yet hold its own tail (on a context proving the action committed). The qualifier is now in docs/internals.md §"One commit round when one coordinator covers every block" and in the comment.
+- The `commit:done` log said `rounds=2` for a tail-only commit, which takes one round. It now logs `path=one-round` or `path=tail-then-sweep`.
+- `packages/db-core/docs/network.md` had two claims that were already wrong before this change and that the handoff flagged: "Commit failures: Cannot occur after tail commit succeeds" and "Commit Conflict → Cannot happen after tail commit". Both are rewritten to say what actually happens.
+
+**Found and not filed:**
+- The handoff's known gaps were reviewed and left as they are. They are documented already, or they are conditional: the lost instant heal for a member that misses the one round, mesh coverage of the genuine two-coordinator plan (already backlog `debt-no-mesh-fixture-forces-two-coordinator-batches`), commit planning without cluster intersection, the cost of a thrown round, and the own-durable-plus-rival extra round, which still reaches the correct answer. None meets the filing bar as a current-release defect.
+- No new tripwires.
+
+**Validation:** db-core `yarn test` 1834 passing; db-p2p `yarn test` 3108 passing / 63 pending; `tsc --noEmit` clean in both; eslint clean on the two edited source files; `yarn lint:docs` clean. `yarn test:integration` was not re-run: this pass changed only comments, one log string and docs, and the implementer's integration run is in the handoff above.

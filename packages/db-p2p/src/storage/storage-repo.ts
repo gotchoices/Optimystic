@@ -896,6 +896,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// `Collection.bootstrapContext` reads the tail with no revision context and relies on exactly
 		// that; `NetworkTransactor.commit` sends the tail and the other blocks in one request when one
 		// coordinator covers them all, so the order is enforced here rather than trusted to the sender.
+		// (The read-driven promotion in `get` is the other landing path; it acts only on a context
+		// proving the action committed, so the tail is committed somewhere in the cohort by then.)
 		const blockIds = tailFirst(Array.from(new Set(request.blockIds)), request.tailId);
 		// Collects the blocks newly committed in this call, grouped by collection,
 		// so we can emit change events once locks are released. Blocks that land before

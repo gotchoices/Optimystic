@@ -463,7 +463,9 @@ What `Collection.bootstrapContext` relies on — wherever committed data of an a
 does too — is enforced by storage rather than by the order of rounds: `StorageRepo.commit` applies the tail
 first whatever order the request lists (`tailFirst`), stops at the first failure, and makes every whole-batch
 refusal before applying anything. So a member can hold the tail with the other blocks still pending, never the
-reverse.
+reverse — through a commit. The read-driven promotion in `StorageRepo.get` is the one path that can
+land a non-tail block on a member before that member's own tail, and it acts only on a reader's context
+proving the action committed, so the tail is committed somewhere in the cohort by then.
 
 When the blocks need more than one coordinator, the action touches only its tail, or the one-round commit
 THREW, it commits the tail and then sweeps the rest (`commitTailThenSweep`). A throw is not re-batched onto
