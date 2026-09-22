@@ -2291,6 +2291,29 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@optimystic/upgrade-check@workspace:packages/upgrade-check":
+  version: 0.0.0-use.local
+  resolution: "@optimystic/upgrade-check@workspace:packages/upgrade-check"
+  dependencies:
+    "@libp2p/crypto": "npm:^5.1.19"
+    "@libp2p/interface": "npm:^3.1.0"
+    "@optimystic/db-core": "workspace:^"
+    "@optimystic/db-p2p": "workspace:^"
+    "@optimystic/db-p2p-storage-fs": "workspace:^"
+    "@optimystic/db-p2p-storage-rn": "workspace:^"
+    "@optimystic/quereus-plugin-optimystic": "workspace:^"
+    "@quereus/quereus": "npm:^4.19.4"
+    "@types/chai": "npm:^5.2.3"
+    "@types/mocha": "npm:^10.0.10"
+    "@types/node": "npm:^25.1.0"
+    chai: "npm:^6.2.2"
+    classic-level: "npm:^3.0.0"
+    mocha: "npm:^11.7.5"
+    ts-node: "npm:^10.9.2"
+    typescript: "npm:^5.9.3"
+  languageName: unknown
+  linkType: soft
+
 "@pkgjs/parseargs@npm:^0.11.0":
   version: 0.11.0
   resolution: "@pkgjs/parseargs@npm:0.11.0"

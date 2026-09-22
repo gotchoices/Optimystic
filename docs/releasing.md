@@ -46,6 +46,12 @@ with `tsc` and is checked by `yarn build` itself. It must run **after** `yarn bu
 packages' specs import their own `dist/index.js`, whose `.d.ts` only exists once the build has run,
 so `yarn typecheck` on a clean tree fails with unresolved-module errors rather than real ones.
 
+`yarn test` includes one suite that no other step can stand in for: `packages/upgrade-check` starts the
+working tree's build over data that earlier *published* releases wrote, and checks that it reads all of
+it and writes on top of it. Every other suite writes and reads with one build. It needs no network — the
+older data is checked in, one fixture per release — so it only covers the releases someone recorded; see
+step 4 below and [packages/upgrade-check/readme.md](../packages/upgrade-check/readme.md).
+
 `yarn test:integration` is the step that matters most and is the easiest to skip by accident: the
 integration specs are **env-gated** (`OPTIMYSTIC_INTEGRATION=1`) and live in a separate per-package
 `test:integration` script, so **plain `yarn test` does not run them**. They cover real TCP meshes,
@@ -114,7 +120,19 @@ yarn pub:quereus-crypto
 # etc.
 ```
 
-### 4. Create a GitHub release (optional)
+### 4. Record what the release writes
+
+```bash
+yarn workspace @optimystic/upgrade-check write-fixture {version}
+```
+
+Installs the packages just published into a scratch directory, has them write the upgrade-check
+scenario to each storage backend a deployment runs on, and packs the result into
+`packages/upgrade-check/fixtures/{version}/`. Commit it. From then on `yarn test` checks that every
+later build still reads what this release wrote. Needs the network, and the packages must already be
+on npm.
+
+### 5. Create a GitHub release (optional)
 
 ```bash
 gh release create v{version} --generate-notes
@@ -137,9 +155,12 @@ Publish prereleases with a dist-tag so they don't become `latest`:
 
 All packages in the monorepo share the same version number. The `--recursive` flag in the bump script ensures this stays in sync. Do not manually edit version numbers in individual `package.json` files.
 
+- NOTE: sharing a version number does not make a host install them together. Our packages name each other with `workspace:^`, which publishes as a caret range, so a host that pins one package at an older version gets the newest matching siblings beneath it — installing `@optimystic/quereus-plugin-optimystic@1.0.0-beta.3` today resolves `@optimystic/db-core@1.2.0` and `@optimystic/db-p2p@1.2.0`. The upgrade-check scenario runs without error on exactly that mix (checked by hand when that suite was added; nothing runs it routinely). If a release ever changes a contract one of our packages relies on in another — a return value's meaning, a thrown error's type — such hosts break at runtime, where types cannot see it; that is the point to publish exact internal versions (`workspace:*`) instead of caret ranges.
+
 ## Checklist
 
 - [ ] `yarn check` passes (lint + lint:docs + lint:deps + build + typecheck + check:rn + test + **test:integration**)
 - [ ] Clean working tree
 - [ ] `yarn release` (or `yarn bump` + `yarn pub` separately)
+- [ ] `yarn workspace @optimystic/upgrade-check write-fixture {version}`, and the new fixture committed
 - [ ] GitHub release created

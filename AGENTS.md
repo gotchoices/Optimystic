@@ -116,6 +116,14 @@ types without checking them; it must run **after** `yarn build`, since their spe
 `dist/` output.
 `yarn check` is the pre-release gate; see [docs/releasing.md](docs/releasing.md).
 
+**One suite reads data an older release wrote.** Every other suite writes and reads with one build.
+`packages/upgrade-check` restarts the working tree's build over data that published releases wrote —
+checked in as `fixtures/<version>/<backend>.json`, one per release and storage backend — and runs in
+plain `yarn test`. A change that stops reading something a release wrote fails it until the change
+documents an upgrade step or retires that fixture; see
+[packages/upgrade-check/readme.md](packages/upgrade-check/readme.md). Recording each release's fixture
+is a release step ([docs/releasing.md](docs/releasing.md)).
+
 **Nothing above runs React Native's build.** `yarn check:rn` does: the private `rn-bundle-check`
 workspace bundles the React Native entry and both Quereus plugin entries with Metro (React Native's
 bundler) and compiles the bundle with `hermesc` (the Hermes engine's compiler), both pinned to the

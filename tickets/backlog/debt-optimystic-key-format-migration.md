@@ -91,3 +91,7 @@ that landed with that fix, both in `packages/quereus-plugin-optimystic`:
   probe, so no data is lost. The old `_uniq_<positions>` trees are simply never read
   again and stay in storage as unreferenced collections; a migration or a cleanup pass
   could delete them.
+
+## A harness for trying an old build's data now exists (added by `debt-no-scenario-restarts-over-data-written-by-an-older-build`)
+
+`packages/upgrade-check` restarts the current build over data a published build wrote, with one checked-in fixture per release (`yarn workspace @optimystic/upgrade-check write-fixture <version>` records one). Its oldest fixture, `1.0.0-beta.3`, postdates all three changes above — its keys are framed, its catalog records name index columns by name, and its enforcement tree is `_uniq_5.email` — so none of them is exercised, and all of its reads come back correct. Recording a fixture from a 0.x release would show this ticket's failure directly, provided the writer (`packages/upgrade-check/writer/write-scenario.mjs`) can be made to run on that release's API; nobody has tried.

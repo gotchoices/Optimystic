@@ -1,0 +1,34 @@
+{
+	"name": "@optimystic/upgrade-check",
+	"version": "1.2.0",
+	"private": true,
+	"type": "module",
+	"description": "Restarts the working tree's build over data a published older build wrote, and checks that it reads all of it and writes on top of it",
+	"license": "MIT",
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min --exit",
+		"test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec --exit",
+		"write-fixture": "node scripts/write-fixture.mjs"
+	},
+	"dependencies": {
+		"@libp2p/crypto": "^5.1.19",
+		"@libp2p/interface": "^3.1.0",
+		"@optimystic/db-core": "workspace:^",
+		"@optimystic/db-p2p": "workspace:^",
+		"@optimystic/db-p2p-storage-fs": "workspace:^",
+		"@optimystic/db-p2p-storage-rn": "workspace:^",
+		"@optimystic/quereus-plugin-optimystic": "workspace:^",
+		"@quereus/quereus": "^4.19.4",
+		"classic-level": "^3.0.0"
+	},
+	"devDependencies": {
+		"@types/chai": "^5.2.3",
+		"@types/mocha": "^10.0.10",
+		"@types/node": "^25.1.0",
+		"chai": "^6.2.2",
+		"mocha": "^11.7.5",
+		"ts-node": "^10.9.2",
+		"typescript": "^5.9.3"
+	}
+}
