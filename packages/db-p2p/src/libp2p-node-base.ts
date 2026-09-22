@@ -635,7 +635,7 @@ export async function createLibp2pNodeBase(
 		},
 		...(options.connectionGater ? { connectionGater: options.connectionGater } : {}),
 		transports,
-		connectionEncrypters: [noise(options.noiseCrypto ? { crypto: options.noiseCrypto } : undefined)],
+		connectionEncrypters: [noise({ crypto: options.noiseCrypto })],
 		streamMuxers: [yamux()],
 		// Narrow cast confined to the `services` field, so the rest of `libp2pOptions` stays typed as
 		// `Libp2pInit`: `@libp2p/dcutr` and `@libp2p/autonat` are typed against `@libp2p/interface` 3.2.x
