@@ -173,6 +173,7 @@ async function writeTable(db) {
 	await db.exec(`delete from ${TABLE} where id = 3`);
 }
 
+/** `writeTable` inserts `INITIAL_ROWS` plus one and deletes one, so `INITIAL_ROWS` remain. */
 async function readRows(db) {
 	const rows = [];
 	for await (const row of db.eval(`select id, email, name from ${TABLE} order by id`)) {

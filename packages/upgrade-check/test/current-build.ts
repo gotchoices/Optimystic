@@ -39,18 +39,22 @@ export async function startCurrentBuild(dataDir: string, manifest: FixtureManife
 	});
 	const transactor = nodeTransactor(node, manifest.networkName);
 	const { db, plugin } = openDatabase(node, transactor, manifest.networkName);
-	// Loads the table definitions the older build persisted, so the catalog knows `users` and its
-	// indexes before any statement names them.
-	await plugin.hydrate(db);
-	return {
-		node, transactor, db, plugin,
-		async stop() {
-			db.close();
-			await plugin.dispose();
-			await node.stop();
-			await backend.close();
-		},
+	const stop = async (): Promise<void> => {
+		db.close();
+		await plugin.dispose();
+		await node.stop();
+		await backend.close();
 	};
+	try {
+		// Loads the table definitions the older build persisted, so the catalog knows `users` and its
+		// indexes before any statement names them.
+		await plugin.hydrate(db);
+	} catch (err) {
+		// The caller never gets a handle to stop, so release the node and the store before rethrowing.
+		await stop();
+		throw err;
+	}
+	return { node, transactor, db, plugin, stop };
 }
 
 interface OpenBackend {
