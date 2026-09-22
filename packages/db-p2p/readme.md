@@ -704,6 +704,21 @@ Optimystic's own code also does not call `AbortSignal.timeout` or `AbortSignal.a
 
 **Dormant, not yet reached:** `crypto.subtle` on React Native provides only `digest`. `@libp2p/crypto`'s ECDSA/RSA import-export and `@libp2p/keychain`'s AES-GCM call other `crypto.subtle` methods and would throw if a host application reached them; nothing in Optimystic's own code path does — peer identity uses Ed25519 through `@noble/curves`/`@noble/hashes`, not the platform `crypto.subtle`. Revisit if a host ever adds a feature that reaches `@libp2p/keychain` or a non-Ed25519 key type on React Native.
 
+**Connection encryption runs in pure JavaScript unless you supply native crypto.** `@chainsafe/libp2p-noise` declares a `browser` field that maps its default crypto to `pureJsCrypto`, and Metro honours it, so on React Native every Noise handshake and every ChaCha20-Poly1305 frame is computed in JavaScript, where Node gets OpenSSL and WebAssembly. On an old phone that cost dominates a sync. Pass `noiseCrypto` with native primitives to avoid it; the value must implement all of Noise's crypto interface, so the usual shape spreads `noisePureJsCrypto` and overrides the hot functions. Both names are exported from this package, so the app need not depend on `@chainsafe/libp2p-noise` itself. Only local computation changes — the wire protocol is the same, so a node with native crypto talks to one without.
+
+```typescript
+import { createLibp2pNode, noisePureJsCrypto, type NoiseCryptoInterface } from '@optimystic/db-p2p/rn';
+
+const noiseCrypto: NoiseCryptoInterface = {
+    ...noisePureJsCrypto,
+    hashSHA256: data => nativeSha256(data.subarray()),
+    chaCha20Poly1305Encrypt: (plaintext, nonce, ad, key) => nativeSeal(plaintext.subarray(), nonce, ad, key),
+    chaCha20Poly1305Decrypt: (ciphertext, nonce, ad, key, dst) => nativeOpen(ciphertext.subarray(), nonce, ad, key, dst),
+};
+
+const node = await createLibp2pNode({ /* … */ transports, noiseCrypto });
+```
+
 See the [Sereus reference-app-rn](https://github.com/gotchoices/sereus/tree/master/packages/reference-app-rn/polyfills) for working polyfill implementations.
 
 ### Ring Transitions

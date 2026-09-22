@@ -1,5 +1,5 @@
 import { createLibp2p, type Libp2p } from 'libp2p';
-import { noise } from '@chainsafe/libp2p-noise';
+import { noise, type ICryptoInterface } from '@chainsafe/libp2p-noise';
 import { yamux } from '@chainsafe/libp2p-yamux';
 import { identify, identifyPush } from '@libp2p/identify';
 import { ping } from '@libp2p/ping';
@@ -403,6 +403,23 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * Playwright e2e, RN simulators) supply a permissive gater here.
 	 */
 	connectionGater?: ConnectionGater;
+
+	/**
+	 * Optional crypto primitives for Noise, the connection encrypter every node runs. Unset → Noise's
+	 * own default, which is OpenSSL and WebAssembly on Node but pure JavaScript under React Native,
+	 * because Metro honours `@chainsafe/libp2p-noise`'s `browser` field and that maps the default to
+	 * `pureJsCrypto`. On a slow phone the pure-JS handshake and per-frame ChaCha20-Poly1305 dominate
+	 * a sync; an app with native crypto passes it here.
+	 *
+	 * The value must implement every member of `ICryptoInterface` (SHA-256, HKDF, X25519 key
+	 * generation and shared-key derivation, ChaCha20-Poly1305 encrypt and decrypt). The usual shape
+	 * spreads `noisePureJsCrypto` and overrides the hot functions with native ones.
+	 *
+	 * This swaps local primitives only: the wire protocol is unchanged, so a node with native crypto
+	 * interoperates with one without. It is deliberately not a general `connectionEncrypters`
+	 * override — Noise stays the only encrypter, so every node can talk to every other.
+	 */
+	noiseCrypto?: ICryptoInterface;
 };
 
 /**
@@ -618,7 +635,7 @@ export async function createLibp2pNodeBase(
 		},
 		...(options.connectionGater ? { connectionGater: options.connectionGater } : {}),
 		transports,
-		connectionEncrypters: [noise()],
+		connectionEncrypters: [noise(options.noiseCrypto ? { crypto: options.noiseCrypto } : undefined)],
 		streamMuxers: [yamux()],
 		// Narrow cast confined to the `services` field, so the rest of `libp2pOptions` stays typed as
 		// `Libp2pInit`: `@libp2p/dcutr` and `@libp2p/autonat` are typed against `@libp2p/interface` 3.2.x

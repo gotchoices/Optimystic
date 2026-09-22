@@ -47,6 +47,7 @@ export * from "./sync/service.js";
 export * from "./it-utility.js";
 export * from "./libp2p-key-network.js";
 export * from "./libp2p-node.js";
+export * from "./noise-crypto.js";
 export * from "./optimystic-node.js";
 export * from "./routing/responsibility.js";
 export * from "./routing/libp2p-known-peers.js";
