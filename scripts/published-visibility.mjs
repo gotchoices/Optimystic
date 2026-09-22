@@ -76,6 +76,8 @@ export function parseWorkspaceList(text) {
  * @returns {PackageSpec[]}
  */
 export function expectedPackages(workspaces, manifestAt) {
+	// An empty list would otherwise "succeed" at once, printing the release-finished line over nothing.
+	if (workspaces.length === 0) throw new Error('yarn workspaces list named no public workspace to wait for');
 	return workspaces.map(({ name, location }) => {
 		const { version } = manifestAt(location);
 		if (typeof version !== 'string' || !VERSION_RE.test(version)) {
