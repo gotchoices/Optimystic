@@ -8,7 +8,7 @@
  * work out whether it was run directly — a check that can get that wrong, and then exit 0 having
  * checked nothing.
  */
-import { env, platform } from 'node:process';
+import { PACKAGE_NAME_RE, cliCommand } from './cli-command.mjs';
 
 /**
  * @typedef {object} Resolution  One installed version of a guarded package.
@@ -245,27 +245,17 @@ export function describeLocator(locator) {
 
 // -- The yarn command ----------------------------------------------------------------------------
 
-/** An npm package name, optionally scoped. */
-const PACKAGE_NAME_RE = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/i;
-
 /**
- * The `yarn info` call, as an executable plus an argument array.
- *
- * On Windows `yarn` is a `.cmd` shim, which Node refuses to spawn directly (since the fix for
- * CVE-2024-27980), and `shell: true` with an argument array is deprecated because it joins the
- * arguments unescaped. Running the shim through `cmd.exe` is the route Node's documentation gives for
- * batch files. The package-name check is what makes that safe: no argument that passes it can carry
- * a character cmd.exe would interpret.
+ * The `yarn info` call, as an executable plus an argument array (see `cliCommand` for why Windows
+ * goes through cmd.exe). The package-name check is what makes that safe: no argument that passes it
+ * can carry a character cmd.exe would interpret.
  *
  * @param {string[]} idents
  * @param {string} [os]  `process.platform`, injectable for tests.
  */
-export function yarnInfoCommand(idents, os = platform) {
+export function yarnInfoCommand(idents, os) {
 	for (const ident of idents) {
 		if (!PACKAGE_NAME_RE.test(ident)) throw new Error(`${JSON.stringify(ident)} is not a package name — check scripts/shared-majors.cjs`);
 	}
-	const args = ['info', '--all', '--recursive', '--json', '--dependents', ...idents];
-	return os === 'win32'
-		? { file: env['ComSpec'] ?? 'cmd.exe', args: ['/d', '/s', '/c', 'yarn', ...args] }
-		: { file: 'yarn', args };
+	return cliCommand('yarn', ['info', '--all', '--recursive', '--json', '--dependents', ...idents], os);
 }

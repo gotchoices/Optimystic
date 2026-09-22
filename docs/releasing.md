@@ -67,8 +67,9 @@ yarn release
 
 `yarn release` runs a preflight prompt (`scripts/release-preflight.mjs`) that restates the checklist,
 reports the working-tree and upstream state, and waits for you to type `release` to confirm — then
-`yarn bump` (interactive version prompt, commits, tags, pushes) then `yarn pub` (clean + build +
-publish each package).
+`yarn bump` (interactive version prompt, commits, tags, pushes), then `yarn pub` (build + publish each
+package), then `yarn await-published` (waits until npm serves every package at its new version — see
+[When the release is finished](#when-the-release-is-finished)).
 
 The preflight is a **reminder, not a substitute**: it does not run `yarn check` for you. Publishing
 is irreversible for a given version number, so the confirmation is deliberate rather than a
@@ -76,6 +77,27 @@ y/N keypress.
 
 For automation, `node scripts/release-preflight.mjs --yes` (or `CI=1`) bypasses the prompt. Without a
 terminal and without an explicit bypass the preflight aborts rather than assuming consent.
+
+### When the release is finished
+
+`yarn pub` returns once `npm publish` has returned for every package, but npm starts serving each new
+version at its own moment: for 1.3.0, `@optimystic/db-core` and `@optimystic/db-p2p` appeared 30–90 s
+after the other packages, and a downstream upgrade run in that gap installed a mix of old and new
+versions. So `yarn release` ends with `yarn await-published` (`scripts/await-published.mjs`), which
+asks npm for every public package at the version in its `package.json` every 5 s, with the npm
+configuration `npm publish` used, until all of them are served. Its last line is the one to wait for:
+
+```
+all 9 packages published and visible on npm at 1.3.0
+```
+
+**Upgrade downstream repositories only after that line.** Before it, an upgrade can resolve a mix of
+versions.
+
+If ten minutes pass first, it lists each package still missing, with npm's reason, and exits non-zero:
+the release is not finished. `OPTIMYSTIC_PUBLISH_WAIT_SECONDS` changes the deadline. The script can
+be run on its own at any time — after an interrupted `yarn release`, or after publishing a package
+that failed — and reports on the versions currently in the manifests.
 
 ## Step by Step
 
@@ -104,21 +126,17 @@ yarn bump --release major
 3. Create an annotated tag: `v{version}`
 4. Push the commit and tag to `origin`
 
-### 3. Publish to npm
+### 3. Publish to npm, and wait until npm serves it
 
 ```bash
-# Publish all public packages (clean + build + publish each)
+# Publish all public packages (build + publish each)
 yarn pub
+
+# Wait until npm serves every one of them at the new version
+yarn await-published
 ```
 
-Or publish individually:
-
-```bash
-yarn pub:db-core
-yarn pub:db-p2p
-yarn pub:quereus-crypto
-# etc.
-```
+See [When the release is finished](#when-the-release-is-finished) for what the wait's last line means.
 
 ### 4. Record what the release writes
 
@@ -130,7 +148,7 @@ Installs the packages just published into a scratch directory, has them write th
 scenario to each storage backend a deployment runs on, and packs the result into
 `packages/upgrade-check/fixtures/{version}/`. Commit it. From then on `yarn test` checks that every
 later build still reads what this release wrote. Needs the network, and the packages must already be
-on npm.
+on npm: run it after `yarn await-published` has reported them all visible.
 
 ### 5. Create a GitHub release (optional)
 
@@ -161,6 +179,7 @@ All packages in the monorepo share the same version number. The `--recursive` fl
 
 - [ ] `yarn check` passes (lint + lint:docs + lint:deps + build + typecheck + check:rn + test + **test:integration**)
 - [ ] Clean working tree
-- [ ] `yarn release` (or `yarn bump` + `yarn pub` separately)
+- [ ] `yarn release` (or `yarn bump` + `yarn pub` + `yarn await-published` separately), ending with `all N packages published and visible on npm at {version}`
+- [ ] Only then: tell downstream repositories to upgrade
 - [ ] `yarn workspace @optimystic/upgrade-check write-fixture {version}`, and the new fixture committed
 - [ ] GitHub release created
