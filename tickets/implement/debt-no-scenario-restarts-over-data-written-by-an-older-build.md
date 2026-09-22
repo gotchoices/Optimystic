@@ -69,3 +69,5 @@ return-value flip would bite.
 
 Filed at the maintainer's request while the release was going out, deliberately in `backlog` so no
 runner picks it up mid-release. Promote it to `implement` once the release is done.
+
+**Promoted 2026-09-21** after the 1.2.0 release, at the maintainer's standing request. Build A: the last published release (1.2.0 is on npm; 1.1.0 is also available if a pre-`cadcb919` writer is wanted to cover the one-round commit change). The pending-record shape change (`pendingBases`) predates both, so covering it needs a record with no stored base — a fixture or a writer older than beta.4 — and the ticket's open questions still stand for whoever implements.
