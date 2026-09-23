@@ -23,6 +23,7 @@ import type { SqlValue } from '@quereus/quereus';
 import { CoordinatorPartialCommitError } from '@optimystic/db-core';
 import { PartialCommitError, uniqueEnforcementTreeName } from '../dist/index.js';
 import { countTreeEntries, createMeshDbNode, startMockMesh, type MeshDbNode } from './mesh-node-harness.js';
+import { expectConstraintRefusal } from './query-helpers.js';
 
 const ROUNDS = 6;
 
@@ -73,6 +74,8 @@ function isPartialCommit(reason: unknown): boolean {
 interface RaceOutcome {
 	/** Index into the nodes tuple of the writer whose insert fulfilled. */
 	winner: 0 | 1;
+	/** The loser's rejection. */
+	refusal: Error;
 	/** The loser's rejection message. */
 	message: string;
 	partial: boolean;
@@ -90,9 +93,11 @@ async function race([a, b]: Nodes, insertA: string, insertB: string): Promise<Ra
 	expect(fulfilled, `exactly one writer wins (${outcomes})`).to.have.length(1);
 	const rejected = results.find((r): r is PromiseRejectedResult => r.status === 'rejected')!;
 	const reason: unknown = rejected.reason;
+	const refusal = reason instanceof Error ? reason : new Error(String(reason));
 	return {
 		winner: fulfilled[0] as 0 | 1,
-		message: reason instanceof Error ? reason.message : String(reason),
+		refusal,
+		message: refusal.message,
 		partial: isPartialCommit(reason),
 		outcomes,
 	};
@@ -101,6 +106,7 @@ async function race([a, b]: Nodes, insertA: string, insertB: string): Promise<Ra
 /** The loser's rejection is the ordinary constraint refusal of a clean rollback. */
 function expectCleanRefusal(outcome: RaceOutcome, pattern: RegExp, label: string): void {
 	expect(outcome.message, `${label}: the loser is refused with the constraint message (${outcome.outcomes})`).to.match(pattern);
+	expectConstraintRefusal(outcome.refusal, `${label} (${outcome.outcomes})`);
 	expect(outcome.partial, `${label}: the refusal is a clean rollback, not a torn commit (${outcome.outcomes})`).to.equal(false);
 	expect(outcome.message.toLowerCase(), `${label}: no partial-commit text (${outcome.outcomes})`).to.not.contain('not atomic');
 }

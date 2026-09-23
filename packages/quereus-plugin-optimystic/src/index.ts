@@ -23,7 +23,7 @@ export { OptimysticModule, OptimysticVirtualTable } from './optimystic-module.js
 // across trees. Exported so hosts can catch it and reconcile the split. It and the
 // db-core errors callers classify commit failures by are exported from `./plugin`
 // too; test/entry-identity.spec.ts holds both entries to the same objects.
-export { PartialCommitError } from './optimystic-adapter/txn-bridge.js';
+export { PartialCommitError, ConcurrentModificationError } from './optimystic-adapter/txn-bridge.js';
 export { CoordinatorPartialCommitError, SyncRetryExhaustedError, TornActionError } from '@optimystic/db-core';
 
 // Export schema utilities

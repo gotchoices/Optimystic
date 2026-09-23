@@ -20,7 +20,7 @@ const log = createLogger('plugin');
 // here, without relying on the two entries sharing a build chunk (test/entry-identity.spec.ts checks
 // that they do anyway). The db-core classes are safe to re-export: db-core is `external` in
 // tsup.config.ts, so this package never bundles its own copy of them.
-export { PartialCommitError } from './optimystic-adapter/txn-bridge.js';
+export { PartialCommitError, ConcurrentModificationError } from './optimystic-adapter/txn-bridge.js';
 export { CoordinatorPartialCommitError, SyncRetryExhaustedError, TornActionError } from '@optimystic/db-core';
 
 /**

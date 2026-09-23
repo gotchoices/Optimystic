@@ -31,7 +31,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { captureThrowMessage } from './query-helpers.js';
+import { captureThrowMessage, captureThrown, expectConstraintRefusal } from './query-helpers.js';
 
 type Plugin = ReturnType<typeof register>;
 
@@ -107,8 +107,9 @@ describe('Concurrent same-VALUE refusal on a secondary UNIQUE column (two handle
 			await a.exec(`insert into T (id, v) values (1, 'x')`);
 			await b.exec(`insert into T (id, v) values (2, 'x')`);
 
-			const message = await captureThrowMessage(() => a.exec('commit'));
-			expect(message, 'the loser is refused naming the UNIQUE COLUMN, not the PK').to.match(UNIQUE_T_V);
+			const refusal = await captureThrown(() => a.exec('commit'));
+			expect(refusal.message, 'the loser is refused naming the UNIQUE COLUMN, not the PK').to.match(UNIQUE_T_V);
+			expectConstraintRefusal(refusal, 'the loser\'s COMMIT');
 
 			// The rival's row is the durable one on both handles; A rolled back entirely.
 			for (const db of [a, b]) {
@@ -258,8 +259,9 @@ describe('Concurrent same-VALUE refusal on a secondary UNIQUE column (two handle
 			await a.exec(`insert into U (id, v) values (1, 'clean')`);
 			await b.exec(`insert into T (id, v) values (2, 'x')`);
 
-			const message = await captureThrowMessage(() => a.exec('commit'));
-			expect(message, 'the session-mode refusal carries the mapped UNIQUE-column message').to.match(UNIQUE_T_V);
+			const refusal = await captureThrown(() => a.exec('commit'));
+			expect(refusal.message, 'the session-mode refusal carries the mapped UNIQUE-column message').to.match(UNIQUE_T_V);
+			expectConstraintRefusal(refusal, 'the session-mode refusal');
 
 			expect(await selectCount(a, 'select count(*) as c from T')).to.equal(1);
 			expect(await selectScalar(a, `select id from T where v = 'x'`), 'the rival\'s row survives').to.equal(2);

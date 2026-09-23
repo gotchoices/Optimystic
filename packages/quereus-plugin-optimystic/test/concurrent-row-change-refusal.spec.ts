@@ -35,7 +35,9 @@ import { TransactionCoordinator } from '@optimystic/db-core';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import register from '../dist/plugin.js';
 import { QuereusEngine } from '../dist/index.js';
-import { captureThrowMessage, expectIndexAgreesWithScan, expectIndexesIntact, queryAll } from './query-helpers.js';
+import {
+	captureThrowMessage, captureThrown, expectConcurrentModificationRefusal, expectIndexAgreesWithScan, expectIndexesIntact, queryAll,
+} from './query-helpers.js';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
@@ -161,11 +163,16 @@ describe('Concurrent same-ROW change refusal (two handles, one dir)', function (
 	 * transaction, B commits `rival`, then A commits. The refusal can only come from A's
 	 * commit-time conflict replay, never from its pre-stage probe. Returns A's commit error.
 	 */
-	async function stageThenRival(handles: Handles, staged: string, rival: string): Promise<string> {
+	async function stageThenRivalError(handles: Handles, staged: string, rival: string): Promise<Error> {
 		await handles.a.exec('begin');
 		await handles.a.exec(staged);
 		await handles.b.exec(rival);
-		return captureThrowMessage(() => handles.a.exec('commit'));
+		return captureThrown(() => handles.a.exec('commit'));
+	}
+
+	/** {@link stageThenRivalError}, for the cases that assert only the loser's message. */
+	async function stageThenRival(handles: Handles, staged: string, rival: string): Promise<string> {
+		return (await stageThenRivalError(handles, staged, rival)).message;
 	}
 
 	const SEED: TableRows = [[1, 'seed-1'], [2, 'seed-2']];
@@ -193,10 +200,11 @@ describe('Concurrent same-ROW change refusal (two handles, one dir)', function (
 	it('UPDATE vs a rival UPDATE of the same row: the loser is refused, the retry applies over the rival\'s value', async () => {
 		const handles = await twoHandles('tree://row-race/update-update', PLAIN, SEED);
 		try {
-			const message = await stageThenRival(handles,
+			const refusal = await stageThenRivalError(handles,
 				`update T set v = 'from-A' where id = 1`,
 				`update T set v = 'from-B' where id = 1`);
-			expect(message, 'the loser is refused naming the row, not as a UNIQUE failure').to.match(concurrentModificationOf(1));
+			expect(refusal.message, 'the loser is refused naming the row, not as a UNIQUE failure').to.match(concurrentModificationOf(1));
+			expectConcurrentModificationRefusal(refusal, 'the loser\'s COMMIT');
 			await expectStateOnBoth(handles, [[1, 'from-B'], [2, 'seed-2']], 'after the refused race');
 
 			// Sequentially the same statement is an ordinary update over the rival's value.
@@ -532,8 +540,9 @@ describe('Concurrent same-ROW change refusal (two handles, one dir)', function (
 			await a.exec(`insert into U (id, v) values (1, 'clean')`);
 			await b.exec(`update T set v = 'from-B' where id = 1`);
 
-			const message = await captureThrowMessage(() => a.exec('commit'));
-			expect(message, 'the session-mode refusal carries the mapped concurrent-modification message').to.match(concurrentModificationOf(1));
+			const refusal = await captureThrown(() => a.exec('commit'));
+			expect(refusal.message, 'the session-mode refusal carries the mapped concurrent-modification message').to.match(concurrentModificationOf(1));
+			expectConcurrentModificationRefusal(refusal, 'the session-mode refusal');
 
 			for (const db of [a, b]) {
 				await expectRows(db, [[1, 'from-B']], 'the rival\'s row survives');

@@ -3,6 +3,7 @@ import {
   TransactionCoordinator, TransactionSession, CoordinatorPartialCommitError, TreeEntryChangedError, TreeGuardRefusedError,
   TreeKeyTakenError, createTransactionId, createTransactionStamp,
 } from '@optimystic/db-core';
+import { ConstraintError, QuereusError, StatusCode } from '@quereus/quereus';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
@@ -206,6 +207,24 @@ export class PartialCommitError extends Error {
 }
 
 /**
+ * A commit refused because another writer changed or removed the row this statement read — the
+ * lost-update refusal ({@link TransactionBridge.mapCommitRefusal} maps a `TreeEntryChangedError`
+ * to it). Deliberately NOT a `ConstraintError`: no uniqueness or integrity rule was violated, and
+ * dressing a lost update as one would misreport it to every client. It carries
+ * `StatusCode.BUSY`, the code the engine's own memory table raises for the same
+ * optimistic-concurrency loss, so a caller can classify by class (`instanceof`) or by code
+ * (`code === StatusCode.BUSY`). The refusal is reachable through `cause`; retrying the statement
+ * sequentially re-reads the row and decides again.
+ */
+export class ConcurrentModificationError extends QuereusError {
+  constructor(message: string, cause?: Error) {
+    super(message, StatusCode.BUSY, cause);
+    this.name = 'ConcurrentModificationError';
+    Object.setPrototypeOf(this, ConcurrentModificationError.prototype);
+  }
+}
+
+/**
  * The engine id stamped on a legacy multi-tree commit's transaction. Purely descriptive: the
  * pend carries no validation payload, so no member ever resolves an engine by it — it only
  * says, to anyone reading the stamp, that the rows were staged straight into the trees rather
@@ -330,9 +349,9 @@ export class TransactionBridge {
    * OptimysticVirtualTable.registerCollections). A `TreeKeyTakenError` — or its
    * `TreeRangeTakenError` subclass out of a unique index tree — surfacing at commit,
    * the losing writer's conflict replay refusing a key (or a unique value) a rival
-   * already committed, is rewrapped via {@link mapCommitRefusal} so clients see the
-   * exact message shape a sequential duplicate INSERT produces, distinguishable from
-   * a transport failure with no new downstream classification arm.
+   * already committed, is rewrapped via {@link mapCommitRefusal} into the engine's
+   * `ConstraintError` carrying the exact message a sequential duplicate INSERT produces,
+   * so a client classifying by type or code sees no difference between the two.
    */
   private keyTakenMessages = new Map<CollectionId, string>();
   /**
@@ -343,8 +362,10 @@ export class TransactionBridge {
    * commit — the losing writer's conflict replay finding that the row image its UPDATE,
    * DELETE, or REPLACE was computed from is no longer what the collection holds — is
    * rewrapped via {@link mapCommitRefusal} through this renderer, which decodes the framed
-   * key into the row's logical primary-key values. A renderer rather than a fixed string
-   * because the message names the refused row, which only the error carries.
+   * key into the row's logical primary-key values, into a {@link ConcurrentModificationError}
+   * — deliberately not a `ConstraintError`, since a lost update violates no constraint. A
+   * renderer rather than a fixed string because the message names the refused row, which
+   * only the error carries.
    */
   private entryChangedRenderers = new Map<CollectionId, (key: string) => string>();
   /**
@@ -537,16 +558,27 @@ export class TransactionBridge {
   /**
    * Rewrap a commit failure caused by a guard refusal (`TreeGuardRefusedError` anywhere
    * in the cause chain — a losing writer's conflict replay refusing what a rival already
-   * committed) into an error whose MESSAGE is the SQL rendering registered for the
-   * refusing collection, keeping the structured refusal reachable via `cause`. The
-   * rendering is chosen by the refusal's class, because the two mean different things
-   * to a client: a `TreeKeyTakenError` (its `TreeRangeTakenError` subclass included) is a
-   * uniqueness violation and renders as the registered `UNIQUE constraint failed: …`
-   * message; a `TreeEntryChangedError` is a lost update — the row the statement read was
-   * changed or removed — and renders through the registered concurrent-modification
-   * renderer. Anything else — no guard refusal in the chain, an unregistered collection,
-   * or an error already carrying the mapped message (the legacy sweep maps before
-   * rethrowing, and commitTransaction's catch maps again) — passes through unchanged.
+   * committed) into a typed engine error whose MESSAGE is the SQL rendering registered for
+   * the refusing collection, keeping the structured refusal reachable via `cause`. Message
+   * and type are both chosen by the refusal's class, because the two mean different things
+   * to a client:
+   *
+   * - a `TreeKeyTakenError` (its `TreeRangeTakenError` subclass included) is a uniqueness
+   *   violation. It renders as the registered `UNIQUE constraint failed: …` message and
+   *   becomes the engine's `ConstraintError` (`StatusCode.CONSTRAINT`), so a refused
+   *   concurrent duplicate differs from a sequential one in nothing a client can observe.
+   * - a `TreeEntryChangedError` is a lost update — the row the statement read was changed
+   *   or removed. It renders through the registered concurrent-modification renderer and
+   *   becomes a {@link ConcurrentModificationError} (`StatusCode.BUSY`), NOT a
+   *   `ConstraintError`: no integrity rule was violated, and a constraint error would also
+   *   be rewrapped by the engine's `or fail` / `or rollback` handling into keeping the
+   *   statement's prior rows, which is wrong for a lost update.
+   *
+   * Both types extend `QuereusError`, which is what makes the vtab's DML catch rethrow a
+   * mapped error verbatim instead of wrapping it again. Anything else — no guard refusal in
+   * the chain, an unregistered collection, or an error already carrying the mapped message
+   * (the legacy sweep maps before rethrowing, and commitTransaction's catch maps again) —
+   * passes through unchanged.
    *
    * Public because the vtab's DML catch maps through it too: a guard is enforced at
    * INITIAL staging as well as at replay, and a staging-time refusal (the tracker
@@ -560,7 +592,10 @@ export class TransactionBridge {
         if (message === undefined || (error instanceof Error && error.message === message)) {
           return error;
         }
-        return new Error(message, { cause: error });
+        const cause = error instanceof Error ? error : undefined;
+        return cursor instanceof TreeKeyTakenError
+          ? new ConstraintError(message, StatusCode.CONSTRAINT, cause)
+          : new ConcurrentModificationError(message, cause);
       }
     }
     return error;

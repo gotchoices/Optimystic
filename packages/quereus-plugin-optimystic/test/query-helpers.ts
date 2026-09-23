@@ -1,6 +1,7 @@
 import { expect } from 'chai';
+import { ConstraintError, StatusCode } from '@quereus/quereus';
 import type { Database, Row, SqlValue } from '@quereus/quereus';
-import { OptimysticModule, OptimysticVirtualTable } from '../dist/index.js';
+import { ConcurrentModificationError, OptimysticModule, OptimysticVirtualTable } from '../dist/index.js';
 import type { IndexIntegrityReport, MissingIndexEntry, OrphanedIndexEntry } from '../dist/index.js';
 
 /** Collect every row `sql` returns from a node's database, finalizing the statement. */
@@ -19,14 +20,43 @@ export async function queryAll(
 	}
 }
 
-/** Assert that `fn` rejects and return the thrown error's message. */
-export async function captureThrowMessage(fn: () => Promise<unknown>): Promise<string> {
+/** Assert that `fn` rejects and return what it threw (a non-Error is wrapped, so its text survives). */
+export async function captureThrown(fn: () => Promise<unknown>): Promise<Error> {
 	try {
 		await fn();
 	} catch (err) {
-		return err instanceof Error ? err.message : String(err);
+		return err instanceof Error ? err : new Error(String(err));
 	}
 	throw new Error('expected operation to throw, but it resolved');
+}
+
+/** Assert that `fn` rejects and return the thrown error's message. */
+export async function captureThrowMessage(fn: () => Promise<unknown>): Promise<string> {
+	return (await captureThrown(fn)).message;
+}
+
+/**
+ * Assert that `refusal` is the engine's `ConstraintError` with `StatusCode.CONSTRAINT` — the
+ * type a SEQUENTIAL duplicate raises, which a concurrent one must not differ from in anything a
+ * client can observe. Asserting the message alone let the unclassified `Error` it used to be
+ * pass unnoticed.
+ */
+export function expectConstraintRefusal(refusal: Error, why: string): void {
+	const detail = `${refusal.name} (code=${(refusal as { code?: unknown }).code}): ${refusal.message}`;
+	expect(refusal, `${why}: expected the engine's ConstraintError, got ${detail}`).to.be.instanceOf(ConstraintError);
+	expect((refusal as ConstraintError).code, `${why}: ${detail}`).to.equal(StatusCode.CONSTRAINT);
+}
+
+/**
+ * Assert that `refusal` is the lost-update type — `ConcurrentModificationError`, `StatusCode.BUSY`
+ * — and NOT a `ConstraintError`, which would misreport a changed row as an integrity violation and
+ * make the engine's `or fail` / `or rollback` handling keep the statement's prior rows.
+ */
+export function expectConcurrentModificationRefusal(refusal: Error, why: string): void {
+	const detail = `${refusal.name} (code=${(refusal as { code?: unknown }).code}): ${refusal.message}`;
+	expect(refusal, `${why}: expected ConcurrentModificationError, got ${detail}`).to.be.instanceOf(ConcurrentModificationError);
+	expect((refusal as ConcurrentModificationError).code, `${why}: ${detail}`).to.equal(StatusCode.BUSY);
+	expect(refusal, `${why}: a lost update is not a constraint violation`).to.not.be.instanceOf(ConstraintError);
 }
 
 /** Run `sql` and return its single row, or `undefined` when no row matches (not ready yet). */

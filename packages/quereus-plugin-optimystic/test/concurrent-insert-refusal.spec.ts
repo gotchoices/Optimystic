@@ -27,7 +27,7 @@
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
-import { TransactionCoordinator } from '@optimystic/db-core';
+import { TransactionCoordinator, TreeKeyTakenError } from '@optimystic/db-core';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import debugFactory from 'debug';
 import { format } from 'node:util';
@@ -37,7 +37,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { captureThrowMessage } from './query-helpers.js';
+import { captureThrowMessage, captureThrown, expectConstraintRefusal } from './query-helpers.js';
 
 type Plugin = ReturnType<typeof register>;
 
@@ -87,6 +87,13 @@ async function captureAllOptimysticTrace(body: () => Promise<void>): Promise<str
 }
 
 const UNIQUE_T_ID = /UNIQUE constraint failed: T\.id/;
+
+/** `error` and every error reachable through its `cause` links, outermost first. */
+function causeChain(error: Error): Error[] {
+	const chain: Error[] = [];
+	for (let cursor: unknown = error; cursor instanceof Error; cursor = cursor.cause) chain.push(cursor);
+	return chain;
+}
 
 describe('Concurrent same-key INSERT refusal (two handles, one FileRawStorage dir)', function () {
 	this.timeout(30000);
@@ -216,8 +223,10 @@ describe('Concurrent same-key INSERT refusal (two handles, one FileRawStorage di
 			await a.exec(`insert into T (id, v) values (1, 'from-A')`);
 			await b.exec(`insert into T (id, v) values (1, 'from-B')`);
 
-			const message = await captureThrowMessage(() => a.exec('commit'));
-			expect(message, 'the loser\'s COMMIT carries the ordinary duplicate-key message').to.match(UNIQUE_T_ID);
+			const refusal = await captureThrown(() => a.exec('commit'));
+			expect(refusal.message, 'the loser\'s COMMIT carries the ordinary duplicate-key message').to.match(UNIQUE_T_ID);
+			expectConstraintRefusal(refusal, 'the loser\'s COMMIT');
+			expect(causeChain(refusal).some(e => e instanceof TreeKeyTakenError), 'the structured refusal stays reachable through cause').to.equal(true);
 
 			// The winner's row survives on both handles; the loser's transaction rolled back.
 			for (const db of [a, b]) {
@@ -361,8 +370,9 @@ describe('Concurrent same-key INSERT refusal (two handles, one FileRawStorage di
 			await a.exec(`insert into U (id, v) values (1, 'clean')`);
 			await b.exec(`insert into T (id, v) values (1, 'from-B')`);
 
-			const message = await captureThrowMessage(() => a.exec('commit'));
-			expect(message, 'the session-mode refusal carries the mapped UNIQUE message').to.match(UNIQUE_T_ID);
+			const refusal = await captureThrown(() => a.exec('commit'));
+			expect(refusal.message, 'the session-mode refusal carries the mapped UNIQUE message').to.match(UNIQUE_T_ID);
+			expectConstraintRefusal(refusal, 'the session-mode refusal');
 
 			expect(await selectCount(a, 'select count(*) as c from T')).to.equal(1);
 			expect(await selectScalar(a, 'select v from T where id = 1'), 'the rival\'s row survives').to.equal('from-B');

@@ -1885,9 +1885,9 @@ export class OptimysticVirtualTable extends VirtualTable {
    * key, decoded back to the logical values a client can match to their SQL:
    *   `concurrent modification: another writer changed or removed the row in <table> at primary key (…)`
    * A plain message, deliberately NOT the UNIQUE wording: a lost update is not a
-   * uniqueness violation. Its error type is the same plain `Error` the UNIQUE mapping
-   * produces (backlog `bug-concurrent-unique-refusal-is-not-a-constraint-error` owns the
-   * type question for both). Registered with the bridge in {@link registerCollections}.
+   * uniqueness violation, and the bridge likewise raises it as `ConcurrentModificationError`
+   * rather than the `ConstraintError` a uniqueness refusal becomes. Registered with the
+   * bridge in {@link registerCollections}.
    */
   private concurrentModificationMessage(key: string): string {
     const values = this.rowCodec?.decodePrimaryKey(key) ?? [];

@@ -350,6 +350,15 @@ not others), `SyncRetryExhaustedError`, and `TornActionError` — so a host need
 `@optimystic/db-core` import to catch them. See [docs/transactions.md](../../docs/transactions.md)
 for the partial-commit pair and [docs/internals.md](../../docs/internals.md) for the other two.
 
+When two writers race and the loser's commit is refused, the failure is a typed engine error, the
+same as its sequential counterpart. A concurrent duplicate key (or unique value) is the engine's own
+`ConstraintError` (`code === StatusCode.CONSTRAINT`), indistinguishable from a sequential duplicate.
+A concurrent change to a row the losing statement read is a `ConcurrentModificationError`
+(`code === StatusCode.BUSY`, exported from both entries), deliberately not a `ConstraintError`
+because no constraint was violated. Both keep the storage-level refusal in `cause`. Retrying the
+statement re-reads the row and decides again. See
+[docs/internals.md](../../docs/internals.md#conflict-replay-re-makes-the-uniqueness-decision-entry-guards).
+
 ## Limitations
 
 - Primary keys are stored as strings; non-TEXT keys work correctly but are not order-optimised (the engine re-sorts them rather than reading them ordered from the tree)

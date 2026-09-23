@@ -125,7 +125,9 @@ export type TreeReplaceAction<TKey, TEntry> = (
  *
  * Subclasses split by WHAT was refused, because consumers map them differently: a
  * {@link TreeKeyTakenError} is a uniqueness violation (the Quereus bridge renders it as
- * `UNIQUE constraint failed`), while a {@link TreeEntryChangedError} is a lost update. Catch
+ * `UNIQUE constraint failed` and raises the engine's `ConstraintError`), while a
+ * {@link TreeEntryChangedError} is a lost update (the bridge raises its
+ * `ConcurrentModificationError`, status code BUSY, which is not a constraint error). Catch
  * this base to treat any guard refusal uniformly; catch a subclass to say which happened.
  */
 export class TreeGuardRefusedError<TKey = unknown> extends Error {
@@ -166,8 +168,9 @@ export class TreeKeyTakenError<TKey = unknown> extends TreeGuardRefusedError<TKe
  * index tree, a rival's row carrying the same unique value under a different primary
  * key. A subclass of {@link TreeKeyTakenError} on purpose: every consumer that treats a
  * key refusal as a non-retryable uniqueness failure (the sync/commit retry loops let it
- * escape; the Quereus bridge maps it by `collectionId` to a `UNIQUE constraint failed`
- * message) handles this one identically without a second arm. `collectionId` is the
+ * escape; the Quereus bridge maps it by `collectionId` to a `ConstraintError` carrying the
+ * `UNIQUE constraint failed` message) handles this one identically without a second arm.
+ * `collectionId` is the
  * discriminator that names WHICH constraint fired — each unique index is its own
  * collection — so the bridge needs nothing beyond it.
  */
@@ -193,9 +196,11 @@ export class TreeRangeTakenError<TKey = unknown> extends TreeKeyTakenError<TKey>
  * write read — a rival committed a different entry there, or removed it (`actual` is
  * `undefined`). A lost update, NOT a uniqueness violation, which is why this deliberately does
  * NOT subclass {@link TreeKeyTakenError}: the Quereus bridge renders every `TreeKeyTakenError`
- * as that collection's registered `UNIQUE constraint failed` message (`mapCommitRefusal` in
+ * as that collection's registered `UNIQUE constraint failed` message and raises the engine's
+ * `ConstraintError` for it (`mapCommitRefusal` in
  * `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`), and reporting a
  * concurrent-update refusal as a uniqueness failure would mislead every client that reads it.
+ * The bridge raises its own `ConcurrentModificationError` (status code BUSY) for this one instead.
  * The shared contract lives on {@link TreeGuardRefusedError}.
  */
 export class TreeEntryChangedError<TKey = unknown, TEntry = unknown> extends TreeGuardRefusedError<TKey> {
