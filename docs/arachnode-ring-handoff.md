@@ -177,10 +177,13 @@ release instant.
 
 **Move-in needs no release phase.** A node moving in only *gains* keyspace and sheds nothing, so the
 floor is never at risk from the mover. It still uses Phase A (advertise) so peers observe the
-membership change; the gained half is not fetched by this handoff. It arrives the way any
-cohort-growth gain does — the existing holders' own growth push, once they observe the mover as
-newly co-responsible ([internals.md § RebalanceMonitor](internals.md#rebalancemonitor) → cohort
-growth) — with a read repairing any gap on first access.
+membership change; the gained half is not fetched by this handoff, and it is not guaranteed to be
+pushed either. The cohort-growth push ([internals.md § RebalanceMonitor](internals.md#rebalancemonitor))
+derives a block's cohort from `findCluster` — FRET proximity plus network membership, with the
+arachnode ring depth playing no part — so it delivers the gained half only where FRET routing also
+places the mover in that block's cohort. What always delivers it is read repair on first access; the
+`NOTE:` at `moveIn` in `packages/db-p2p/src/storage/ring-shift-coordinator.ts` records what that
+costs and when a fetch phase would be worth adding.
 
 ## Part 3 — Interactions & edge cases (the adversarial surface)
 

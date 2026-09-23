@@ -92,10 +92,10 @@ export interface ReconcileBlockDeps {
 	/**
 	 * Optional: told, after a successful restore, that the peers whose archives corroborated the
 	 * selected revision hold this block — and that this node now holds it too. The node's rebalance
-	 * monitor consumes that as growth evidence, so a repaired block is neither pushed back to the
-	 * peers it was repaired from nor pulled again as if newly gained. A DECLINE reports nothing:
-	 * nothing was persisted, and suppressing `gained` for a block this node does not hold would be a
-	 * lie. See {@link BlockHoldersSink}.
+	 * monitor consumes that as growth evidence, so a repaired block is not pushed back to the peers it
+	 * was repaired from (nor reported `gained`, which starts no transfer either way). A DECLINE
+	 * reports nothing: nothing was persisted, and claiming co-holders for a block this node does not
+	 * hold would be a lie. See {@link BlockHoldersSink}.
 	 */
 	onBlockHolders?: BlockHoldersSink;
 }

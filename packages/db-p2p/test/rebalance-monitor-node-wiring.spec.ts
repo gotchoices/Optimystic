@@ -33,8 +33,8 @@ const blockTransferProtocolFor = (networkName: string): string =>
  * `rebalance-monitor.spec.ts`; the coordinator's confirm/push reaction in `block-transfer.spec.ts`; and
  * the `onRebalance → handleRebalanceEvent` hop in `rebalance-reaction.spec.ts`. This spec proves the
  * *assembly + owned-block feed + teardown + config gate* on a real solo node. The wiring lives behind
- * the arachnode gate (fretAdapter + RestorationCoordinator only exist there), so it boots with
- * arachnode ENABLED here (unlike the spread node-wiring spec).
+ * the arachnode gate (the fretAdapter it needs only exists there), so it boots with arachnode ENABLED
+ * here (unlike the spread node-wiring spec).
  */
 describe('rebalance-monitor / node wiring (real libp2p, solo arachnode node)', function () {
 	// Real libp2p boot + FRET seeding + arachnode init dominate; ops finish in seconds.
@@ -158,8 +158,8 @@ describe('rebalance-monitor / node wiring (real libp2p, solo arachnode node)', f
 	it('arachnode disabled leaves the rebalance path inert (no monitor, no coordinator)', async () => {
 		const node: any = await spawn('rebalance-wiring-noarachnode', { arachnode: { enableRingZulu: false } });
 		try {
-			// fretAdapter + RestorationCoordinator only exist inside the arachnode gate; without it the
-			// rebalance reaction stays inert (acceptable — rebalance is a resilience optimization).
+			// The fretAdapter only exists inside the arachnode gate; without it the rebalance reaction
+			// stays inert (acceptable — rebalance is a resilience optimization).
 			expect(node.rebalanceMonitor, 'no monitor without arachnode/FRET adapter').to.equal(undefined);
 			expect(node.blockTransferCoordinator, 'no coordinator without arachnode').to.equal(undefined);
 		} finally {

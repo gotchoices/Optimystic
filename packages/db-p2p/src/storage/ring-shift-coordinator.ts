@@ -69,10 +69,12 @@ export type ShiftOutcome =
  *   failure — partition, unreachable holders, floor unmet — rolls back to `active` at the old ring,
  *   keeping the range. No shed block is released unless EVERY shed block confirmed.
  * - **Move-in** (`R → R-1`, gains keyspace, sheds nothing) is Phase A only: it advertises the inner
- *   ring so peers observe the membership change. Nothing pulls the gained half — the existing
- *   holders' own cohort-growth push (their cohort grew to include this mover) delivers it, and a
- *   read repairs any gap on first access. The floor is never at risk from a mover that only gains,
- *   so there is no confirm/release.
+ *   ring so peers observe the membership change. Nothing fetches the gained half, and nothing here
+ *   guarantees it is pushed either: the cohort-growth arm that would push it derives a block's
+ *   cohort from `findCluster` (FRET proximity + network membership), which the arachnode ring depth
+ *   does not enter — so a growth push delivers the gained half only where FRET routing ALSO places
+ *   this mover in that block's cohort. What is guaranteed is read repair on first access. The floor
+ *   is never at risk from a mover that only gains, so there is no confirm/release.
  *
  * The trigger is the (damped) `RingSelector.shouldTransition()` decision; this class is the state
  * machine that decision drives.
@@ -235,10 +237,15 @@ export class RingShiftCoordinator {
 	private async moveIn(newRingDepth: number, oldInfo: ArachnodeInfo | undefined): Promise<ShiftOutcome> {
 		const oldRing = oldInfo?.ringDepth ?? 0;
 		// Sheds nothing: advertise the (broader) inner ring directly at `active`. Nothing here fetches
-		// the gained half — the old holders' own cohort-growth push delivers it once they observe this
-		// mover as newly co-responsible, and a read repairs any gap on first access. The old holders
-		// keep serving until THEY confirm their own release, so the floor is never at risk from this
-		// mover.
+		// the gained half; a read repairs any gap on first access, and the old holders keep serving
+		// until THEY confirm their own release, so the floor is never at risk from this mover.
+		//
+		// NOTE: the cohort-growth push is NOT a second delivery guarantee for this range. `RebalanceMonitor`
+		// derives a block's cohort from `findCluster`, which knows nothing of arachnode ring depth, so a
+		// move-in that FRET routing does not mirror leaves the gained half un-prefetched — every read of
+		// it costs a repair round until a commit touches the block. Give move-in its own fetch phase if
+		// ring moves become frequent or reads of a freshly-gained range show up as slow, and make it a
+		// corroborating one (see the NOTE on `BlockTransferCoordinator.handleRebalanceEvent`).
 		const target = await this.deps.ringSelector.createArachnodeInfo(this.deps.selfPeerId, newRingDepth);
 		this.deps.fretAdapter.setArachnodeInfo(this.clearMove({ ...target, status: 'active' }));
 		log('moveIn:advertise from=%d to=%d', oldRing, newRingDepth);

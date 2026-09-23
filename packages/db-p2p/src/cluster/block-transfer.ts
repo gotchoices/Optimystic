@@ -73,9 +73,9 @@ export interface RebalanceReactionResult {
  * For grown blocks (still owned, but a peer became newly co-responsible): pushes the block to those
  * peers (see {@link replicateGrown}).
  *
- * A block this node has GAINED responsibility for needs no reaction here: `RebalanceMonitor` only
- * ever reports `gained` for a block this node already stores (see `RebalanceEvent.gained`'s doc), so
- * there is nothing to fetch.
+ * A block this node has GAINED responsibility for needs no reaction here: `RebalanceMonitor` reports
+ * `gained` only for a block in its tracked set, and that set holds what this node's own storage
+ * already has (see `RebalanceEvent.gained`'s doc), so there is nothing to fetch.
  */
 export class BlockTransferCoordinator {
 	private readonly maxConcurrency: number;
@@ -107,7 +107,15 @@ export class BlockTransferCoordinator {
 	}
 
 	/**
-	 * Push blocks that this node has lost responsibility for to new owners.
+	 * Push blocks that this node has lost responsibility for to new owners, stopping at the first
+	 * owner that accepts each.
+	 *
+	 * NOTE: nothing in `src` calls this. The lost-block arm of {@link handleRebalanceEvent} moved to
+	 * {@link confirmReplicated} (which must count holders, not stop at one) when release became
+	 * confirm-gated, and `enablePush` — the only config field this method reads — is likewise
+	 * unreachable: `libp2p-node-base` constructs this class with no {@link BlockTransferConfig} at
+	 * all. Kept as the fire-and-forget primitive for a caller that wants placement without a floor;
+	 * delete it, and `enablePush` with it, if none appears.
 	 */
 	async pushBlocks(
 		blockIds: string[],
@@ -135,15 +143,19 @@ export class BlockTransferCoordinator {
 	 * Handle a complete rebalance event — **confirm** lost blocks replicated to the floor before
 	 * reporting them releasable, and push grown blocks to their newly co-responsible peers.
 	 *
-	 * `event.gained` is deliberately not acted on here. `RebalanceMonitor` only ever reports a block
-	 * `gained` when this node already stores it (see `RebalanceEvent.gained`'s doc) — the watched set
-	 * is built entirely from this node's own storage and its own commits/replicas/repairs — so there
-	 * is nothing to fetch and nowhere to fetch it from.
+	 * `event.gained` is deliberately not acted on here. `RebalanceMonitor` reports `gained` only for a
+	 * block in its tracked set (see `RebalanceEvent.gained`'s doc), and that set is built from this
+	 * node's own storage — its commits, the replicas it received, the blocks it repaired, plus the
+	 * restart seed's scan of its own metadata store — so there is nothing to fetch. The one entry that
+	 * is not committed content is the seed's accepted over-inclusion of pend-only blocks
+	 * (`seedOwnedBlocksFromStorage`'s NOTE), and fetching for those would be wrong rather than
+	 * missing: a pend is not a committed revision anyone can serve.
 	 *
-	 * NOTE: if `trackedBlocks` ever grows a source that reports a block this node does NOT hold (a
-	 * declared-placement feed, say), a pull hook would belong here — but it would have to persist and
-	 * verify what it fetched first, the way `cluster/reconcile-block.ts`'s corroborating repair does,
-	 * not adopt a single unverified peer's answer the way `RestorationCoordinator.restore` does.
+	 * NOTE: if `trackedBlocks` ever grows a source that reports a COMMITTED block this node does not
+	 * hold (a declared-placement feed, say), a pull hook would belong here — but it would have to
+	 * persist and verify what it fetched first, the way `cluster/reconcile-block.ts`'s corroborating
+	 * repair does, not adopt a single unverified peer's answer the way `RestorationCoordinator.restore`
+	 * does.
 	 *
 	 * The lost path pushes to confirm, not fire-and-forget: it runs {@link confirmReplicated} against
 	 * the event's `newOwners` and `floor`, so `released` contains only blocks that landed on ≥ floor
@@ -233,11 +245,13 @@ export class BlockTransferCoordinator {
 				confirmed.push(blockId);
 				growth.set(blockId, { satisfiedPeers: [...newPeers], complete: true });
 			} else if (result.noLocalData) {
-				// NOTE: nothing local to replicate (the gained∩grown first-observation case) — the
-				// reported peers are recorded satisfied so this does not become a permanent retry loop
-				// (those cohort peers are the pull's own source). If the node later obtains the block by
-				// another route (a fresh local commit, a spread push), these peers stay recorded and are
-				// never pushed — benign today, since a gained block's data comes from these very peers.
+				// NOTE: nothing local to push — a tracked block this node cannot read (the restart
+				// seed's pend-only over-inclusion, or a read that came back empty). The reported peers are
+				// recorded satisfied so this does not become a permanent retry loop; nothing is lost by
+				// it, since a block this node cannot read is one it cannot replicate FROM, and these
+				// cohort peers are exactly the holders a later read repair would fetch it from. If the
+				// node later obtains the block by another route (a fresh local commit, a spread push),
+				// these peers stay recorded and are never pushed — benign for the same reason.
 				unconfirmed.push(blockId);
 				growth.set(blockId, { satisfiedPeers: [...newPeers], complete: true });
 			} else {

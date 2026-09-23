@@ -7,7 +7,6 @@ import { RebalanceMonitor, type RebalanceEvent, type RebalanceMonitorDeps } from
 import { BlockTransferCoordinator } from '../src/cluster/block-transfer.js';
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { ArachnodeFretAdapter } from '../src/storage/arachnode-fret-adapter.js';
-import type { BlockArchive } from '../src/storage/struct.js';
 import type { FretService } from 'p2p-fret';
 import { waitFor } from '@optimystic/db-core/test';
 
@@ -25,17 +24,6 @@ import { waitFor } from '@optimystic/db-core/test';
 
 const makeBlock = (id: string): IBlock => ({
 	header: { id: id as BlockId, type: 'test', collectionId: 'col-1' as BlockId } as BlockHeader
-});
-
-const makeArchive = (blockId: string): BlockArchive => ({
-	blockId,
-	revisions: {
-		1: {
-			action: { actionId: 'a1', transform: { insert: makeBlock(blockId) } },
-			block: makeBlock(blockId)
-		}
-	},
-	range: [1, 2]
 });
 
 const makePeerId = async (): Promise<PeerId> => {
@@ -113,15 +101,6 @@ class MockRepo implements IRepo {
 	}
 }
 
-class MockRestorationCoordinator {
-	restoreCalls: string[] = [];
-	results = new Map<string, BlockArchive | undefined>();
-	async restore(blockId: string): Promise<BlockArchive | undefined> {
-		this.restoreCalls.push(blockId);
-		return this.results.get(blockId);
-	}
-}
-
 class MockPeerNetwork {
 	connectCalls: Array<{ peerId: string; protocol: string }> = [];
 	async connect(peerId: PeerId, protocol: string): Promise<any> {
@@ -142,7 +121,6 @@ describe('RebalanceMonitor → BlockTransferCoordinator reaction wiring', () => 
 	let deps: RebalanceMonitorDeps;
 	let repo: MockRepo;
 	let peerNetwork: MockPeerNetwork;
-	let restoration: MockRestorationCoordinator;
 
 	beforeEach(async () => {
 		selfId = await makePeerId();
@@ -162,7 +140,6 @@ describe('RebalanceMonitor → BlockTransferCoordinator reaction wiring', () => 
 
 		repo = new MockRepo();
 		peerNetwork = new MockPeerNetwork();
-		restoration = new MockRestorationCoordinator();
 	});
 
 	function wire(config = { debounceMs: 10, minRebalanceIntervalMs: 0 }): {
@@ -191,9 +168,6 @@ describe('RebalanceMonitor → BlockTransferCoordinator reaction wiring', () => 
 
 	it('a topology-triggered gained event reaches the coordinator but drives no fetch (gained is a responsibility signal only)', async () => {
 		mockFret.setCohort([selfId.toString()]); // self responsible → block-1 gained
-		// Even though restoration COULD serve the block, nothing may call it — RebalanceMonitor only
-		// ever reports `gained` for a block this node already stores, so there is nothing to fetch.
-		restoration.results.set('block-1', makeArchive('block-1'));
 
 		const { monitor, events, reactions } = wire();
 		monitor.trackBlock('block-1');
@@ -209,7 +183,6 @@ describe('RebalanceMonitor → BlockTransferCoordinator reaction wiring', () => 
 
 		expect(events, 'rebalance event reached the onRebalance handler').to.have.length(1);
 		expect(events[0]!.gained).to.deep.equal(['block-1']);
-		expect(restoration.restoreCalls, 'no restoration fetch for a gained block').to.deep.equal([]);
 		expect(peerNetwork.connectCalls, 'no network call of any kind').to.deep.equal([]);
 	});
 

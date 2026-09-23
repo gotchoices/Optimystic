@@ -31,8 +31,10 @@ export interface RebalanceEvent {
 	 * appears in `lost` — the holder keeps the block — so without this arm nothing ever pushes the
 	 * second copy and the block stays readable only by its sole holder. The reaction pushes each
 	 * block to these peers (capped by the replication floor). A block can appear in both `gained`
-	 * and `grown` (first observation after a restart/regain — the push then finds no local data and
-	 * is a benign no-op); it can never appear in both `lost` and `grown` (lost ⇒ not responsible).
+	 * and `grown` (first observation after a restart/regain): `gained` starts nothing, so the growth
+	 * push runs as it would for any kept block — off local data the restart seed normally supplies,
+	 * or, for the seed's pend-only over-inclusion, as the benign no-local-data no-op. It can never
+	 * appear in both `lost` and `grown` (lost ⇒ not responsible).
 	 */
 	grown: Map<string, string[]>
 	/**
@@ -377,11 +379,12 @@ export class RebalanceMonitor implements Startable {
 	}
 
 	/**
-	 * Evidence that these peers hold each of these blocks, AND that this node holds them too — so the
-	 * blocks need no pull. `holders` are recorded as confirmed co-holders at the next check, and the
-	 * blocks are not reported `gained` then. Both halves of the premise matter: suppressing `gained`
-	 * is only honest for a block this node now holds, so a producer reports nothing for a block it
-	 * failed to store.
+	 * Evidence that these peers hold each of these blocks too, so the growth arm owes them no push.
+	 * `holders` are recorded as confirmed co-holders at the next check, and the blocks are not
+	 * reported `gained` then — incidental, since `gained` starts no transfer either way (see
+	 * {@link RebalanceEvent.gained}); the push suppression is what this buys. A producer still
+	 * reports nothing for a block it failed to store, so the co-holder claim is only ever made by a
+	 * node that holds the block itself.
 	 *
 	 * Four producers, each reporting evidence it gathered by a different route:
 	 *
@@ -394,7 +397,7 @@ export class RebalanceMonitor implements Startable {
 	 *
 	 * Without this, every block arriving by any of those routes has no growth memory, so the next
 	 * check reports the whole cohort grown and pushes the block back to the peers that already hold
-	 * it — and reports it gained, pulling it back from them.
+	 * it. (It also reports the block `gained`, which costs nothing on its own.)
 	 *
 	 * How far the evidence is trusted: a pushing peer's claim to hold the block it pushed is its own
 	 * word, as is a receiving peer's report that it persisted a push, which `recordGrowthOutcome`

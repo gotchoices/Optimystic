@@ -10,7 +10,6 @@ import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { BlockTransferCoordinator } from '../src/cluster/block-transfer.js';
 import type { RebalanceEvent } from '../src/cluster/rebalance-monitor.js';
 import { BlockTransferService, sourceBlockMeta, pushBlockToPeers, type BlockTransferRequest, type BlockTransferResponse, buildBlockTransferProtocol } from '../src/cluster/block-transfer-service.js';
-import type { BlockArchive } from '../src/storage/struct.js';
 
 // --- Mocks ---
 
@@ -53,21 +52,6 @@ class MockRepo implements IRepo {
 	 */
 	async getBlockProof(_blockId: string, _rev: number): Promise<undefined> {
 		return undefined;
-	}
-}
-
-class MockRestorationCoordinator {
-	restoreCalls: string[] = [];
-	/** blockId → archive or undefined */
-	results: Map<string, BlockArchive | undefined> = new Map();
-	delayMs = 0;
-
-	async restore(blockId: string): Promise<BlockArchive | undefined> {
-		this.restoreCalls.push(blockId);
-		if (this.delayMs > 0) {
-			await new Promise(r => setTimeout(r, this.delayMs));
-		}
-		return this.results.get(blockId);
 	}
 }
 
@@ -125,17 +109,6 @@ function createMockStream(response: BlockTransferResponse, sentRequests: BlockTr
 	};
 }
 
-const makeArchive = (blockId: string): BlockArchive => ({
-	blockId,
-	revisions: {
-		1: {
-			action: { actionId: 'a1', transform: { insert: makeBlock(blockId) } },
-			block: makeBlock(blockId)
-		}
-	},
-	range: [1, 2]
-});
-
 const makePeerId = async (): Promise<PeerId> => {
 	const key = await generateKeyPair('Ed25519');
 	return peerIdFromPrivateKey(key);
@@ -146,14 +119,12 @@ const makePeerId = async (): Promise<PeerId> => {
 describe('BlockTransferCoordinator', () => {
 	let repo: MockRepo;
 	let peerNetwork: MockPeerNetwork;
-	let restoration: MockRestorationCoordinator;
 	let partitionDetector: PartitionDetector;
 	let coordinator: BlockTransferCoordinator;
 
 	beforeEach(() => {
 		repo = new MockRepo();
 		peerNetwork = new MockPeerNetwork();
-		restoration = new MockRestorationCoordinator();
 		partitionDetector = new PartitionDetector();
 		coordinator = new BlockTransferCoordinator(
 			repo,
@@ -165,13 +136,11 @@ describe('BlockTransferCoordinator', () => {
 	});
 
 	describe('reaction to gained blocks (responsibility signal only)', () => {
-		it('makes no restoration call and no network call for a gained block, even when restoration could serve it', async () => {
-			// RebalanceMonitor only ever reports `gained` for a block this node already holds (see
-			// RebalanceEvent.gained's doc), so the reaction has nothing to fetch. MockRestorationCoordinator
-			// stays wired with an archive ready to serve, as the witness that nothing ever reaches it — the
-			// coordinator's constructor no longer even accepts a restoration coordinator.
-			restoration.results.set('block-already-held', makeArchive('block-already-held'));
-
+		it('makes no network call for a gained block, and reports no work for it', async () => {
+			// RebalanceMonitor reports `gained` only for a block already in its tracked set (see
+			// RebalanceEvent.gained's doc), so the reaction has nothing to fetch and must touch no peer.
+			// The block is deliberately NOT in `repo.blocks` — a reaction that tried to move it would
+			// have to dial for it, which `connectCalls` would catch.
 			const event: RebalanceEvent = {
 				gained: ['block-already-held'],
 				lost: [],
@@ -183,9 +152,10 @@ describe('BlockTransferCoordinator', () => {
 
 			const result = await coordinator.handleRebalanceEvent(event);
 
-			expect(restoration.restoreCalls, 'no restoration fetch for a gained block').to.deep.equal([]);
-			expect(peerNetwork.connectCalls, 'and no network call of any kind').to.deep.equal([]);
-			expect(result).to.not.have.property('pulled');
+			expect(peerNetwork.connectCalls, 'no network call of any kind').to.deep.equal([]);
+			expect(result.released, 'nothing released').to.deep.equal([]);
+			expect(result.replicated, 'nothing replicated').to.deep.equal([]);
+			expect(result.growth.size, 'no growth feedback').to.equal(0);
 		});
 	});
 
@@ -362,14 +332,17 @@ describe('BlockTransferCoordinator', () => {
 				return realConnect(peerId, protocol);
 			};
 
-			// maxConcurrency=2, both blocks fail on first attempt and retry
-			const result = await coordinator.pushBlocks(['block-a', 'block-b'], new Map([
+			// maxConcurrency=2, both blocks fail on first attempt and retry. Driven through
+			// confirmReplicated because that is the semaphore's live caller (the rebalance release and
+			// the ring-shift confirm both enter here); `pushBlocks` shares the semaphore but nothing in
+			// `src` calls it.
+			const result = await coordinator.confirmReplicated(['block-a', 'block-b'], new Map([
 				['block-a', [ownerA]],
 				['block-b', [ownerB]]
-			]));
+			]), 1);
 
-			expect(result.succeeded).to.have.length(2);
-			expect(result.failed).to.have.length(0);
+			expect(result.confirmed).to.have.length(2);
+			expect(result.unconfirmed).to.have.length(0);
 			expect(callCount).to.equal(4);
 		});
 
@@ -394,16 +367,16 @@ describe('BlockTransferCoordinator', () => {
 				return realConnect(peerId, protocol);
 			};
 
-			// Launch 6 pushes with maxConcurrency=2 (the beforeEach coordinator's)
-			const result = await coordinator.pushBlocks(blockIds, newOwners);
+			// Launch 6 confirms with maxConcurrency=2 (the beforeEach coordinator's)
+			const result = await coordinator.confirmReplicated(blockIds, newOwners, 1);
 
-			expect(result.succeeded).to.have.length(6);
+			expect(result.confirmed).to.have.length(6);
 			expect(maxConcurrent).to.be.at.most(2);
 		});
 	});
 
 	describe('handleRebalanceEvent', () => {
-		it('confirms a lost block replicated to its new owner, and makes no restoration call for a co-reported gained block', async () => {
+		it('confirms a lost block replicated to its new owner, and starts no transfer for a co-reported gained block', async () => {
 			repo.blocks.set('block-old', makeBlock('block-old'));
 
 			const ownerId = await makePeerId();
@@ -423,9 +396,11 @@ describe('BlockTransferCoordinator', () => {
 
 			const result = await coordinator.handleRebalanceEvent(event);
 
-			expect(restoration.restoreCalls, 'a gained block triggers no fetch').to.deep.equal([]);
 			// The lost block confirmed to its single new owner (missing:[] response) → released.
 			expect(result.released).to.include('block-old');
+			// The gained block started nothing: the only peer dialled was the lost block's new owner.
+			expect(peerNetwork.connectCalls.map(c => c.peerId.toString()), 'only the new owner was dialled')
+				.to.deep.equal([ownerId.toString()]);
 		});
 
 		it('handles empty rebalance events', async () => {

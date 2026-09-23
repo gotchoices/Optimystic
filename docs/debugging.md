@@ -155,7 +155,7 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 | `block-storage`       | Block-level pend/commit/cancel, per-revision save/skip, prune, latest-revision recovery, and refused restores |
 | `block-archive`       | Serving archived revisions: pinned-read skips that refuse to mislabel content, and commit-proof lookup failures or claim mismatches |
 | `storage:restoration` | Block restoration coordination: per-block restore success/failure with elapsed ms, peer query failures, solo-node skips |
-| `block-transfer`      | Rebalance block movement: per-block push/pull/confirm outcomes, retries, holder counts, and partition-detected bail-outs |
+| `block-transfer`      | Rebalance block movement: per-block push/confirm/grow outcomes, retries, holder counts, and partition-detected bail-outs |
 | `block-transfer-service` | The inbound side of the same protocol: push/pull request and response sizes, certified-push accepts and rejects, persist failures, service start/stop |
 | `rebalance-monitor`   | Periodic rebalance checks: gained/lost/grown block counts, growth budget deferrals and give-ups, throttling, partition suppression |
 | `spread-on-churn`     | Replica spreading triggered by peer churn: per-block push ok/fail/rejected, blocks untracked for missing local data, partition suppression |

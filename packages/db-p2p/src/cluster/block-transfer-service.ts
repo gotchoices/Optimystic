@@ -218,8 +218,8 @@ export interface BlockTransferServiceComponents {
 	/**
 	 * Optional: told, per accepted pushed block, that the sending peer holds it — and that this node
 	 * now holds it too. The node's rebalance monitor consumes that as growth evidence, so a received
-	 * replica is not pushed straight back to its sender on the next check, nor pulled from the cohort
-	 * as if newly gained. See {@link BlockHoldersSink}.
+	 * replica is not pushed straight back to its sender on the next check (nor reported `gained`,
+	 * which starts no transfer either way). See {@link BlockHoldersSink}.
 	 *
 	 * Optional so a directly-constructed service (tests, an embedder wiring only the protocol) keeps
 	 * working; absent, `handlePush` behaves exactly as it did without it.
