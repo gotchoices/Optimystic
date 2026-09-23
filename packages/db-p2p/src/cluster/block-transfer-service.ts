@@ -12,6 +12,7 @@ import { createInboundStreamAuthorization, type InboundStreamAuthorization, type
 import { certifyContent, proofThresholds } from './certified-claims.js';
 import type { BlockCommitProof, ProofThresholds } from './commit-proof.js';
 import { servableProof, type ArchiveServingRepo } from '../storage/block-archive.js';
+import type { BlockHoldersSink } from './cluster-repo.js';
 import { registerProtocolHandler } from '../network/register-protocol-handler.js';
 
 const log = createLogger('block-transfer-service');
@@ -214,6 +215,16 @@ export interface BlockTransferServiceComponents {
 	 * its thresholds with.
 	 */
 	superMajorityThreshold: number;
+	/**
+	 * Optional: told, per accepted pushed block, that the sending peer holds it — and that this node
+	 * now holds it too. The node's rebalance monitor consumes that as growth evidence, so a received
+	 * replica is not pushed straight back to its sender on the next check, nor pulled from the cohort
+	 * as if newly gained. See {@link BlockHoldersSink}.
+	 *
+	 * Optional so a directly-constructed service (tests, an embedder wiring only the protocol) keeps
+	 * working; absent, `handlePush` behaves exactly as it did without it.
+	 */
+	onBlockHolders?: BlockHoldersSink;
 }
 
 /**
@@ -233,6 +244,8 @@ export class BlockTransferService implements Startable {
 	private readonly proofThresholds: ProofThresholds;
 	/** See {@link BlockTransferServiceInit.requirePushCertificate}. */
 	private readonly requirePushCertificate: boolean;
+	/** See {@link BlockTransferServiceComponents.onBlockHolders}. */
+	private readonly onBlockHolders: BlockHoldersSink | undefined;
 
 	constructor(
 		components: BlockTransferServiceComponents,
@@ -243,6 +256,7 @@ export class BlockTransferService implements Startable {
 		this.registrar = components.registrar;
 		this.proofThresholds = proofThresholds(components.superMajorityThreshold);
 		this.requirePushCertificate = init.requirePushCertificate ?? true;
+		this.onBlockHolders = components.onBlockHolders;
 		// Denials are errors, so they go to this module's own `:error` child channel rather than its
 		// main one — visible under `optimystic:db-p2p:block-transfer-service:*`, not under an exact
 		// match on `optimystic:db-p2p:block-transfer-service` alone.
@@ -297,7 +311,7 @@ export class BlockTransferService implements Startable {
 						try {
 							response = request.type === 'pull'
 								? await self.handlePull(request)
-								: await self.handlePush(request);
+								: await self.handlePush(request, connection?.remotePeer?.toString());
 						} catch (error) {
 							log('error: %s', (error as Error).message);
 							response = { blocks: {}, missing: [] };
@@ -352,8 +366,16 @@ export class BlockTransferService implements Startable {
 	 *
 	 * Decisions are strictly PER BLOCK: in a multi-block push a block that verifies is accepted
 	 * beside one that does not. `handlePull` is unaffected — it serves this node's own storage.
+	 *
+	 * **The sender is reported as a holder of every block this call ACCEPTS** (see
+	 * {@link BlockTransferServiceComponents.onBlockHolders}), which is exactly the set left out of
+	 * `missing`: a block that failed parsing, certification or persistence is not one this node now
+	 * holds, and suppressing its `gained` report would be a lie. A monotonic no-op acceptance —
+	 * `saveReplicatedBlock` finding the pushed revision already held, so no collection change fires —
+	 * is reported like any other: the sender is a holder either way, and the block may already be
+	 * tracked from an earlier route.
 	 */
-	private async handlePush(request: BlockTransferRequest): Promise<BlockTransferResponse> {
+	private async handlePush(request: BlockTransferRequest, senderPeerId?: string): Promise<BlockTransferResponse> {
 		const blocks: Record<string, string> = {};
 		const missing: string[] = [];
 
@@ -447,7 +469,24 @@ export class BlockTransferService implements Startable {
 			}
 		}
 
+		this.reportSenderHolds(Object.keys(blocks), senderPeerId);
 		return { blocks, missing };
+	}
+
+	/**
+	 * Tell the {@link BlockHoldersSink} that `senderPeerId` holds each accepted block — and, since
+	 * this node just persisted them, that it holds them too. A push with no resolvable remote peer id
+	 * (a directly-driven handler, a connection without one) reports nothing: there is no peer to name.
+	 *
+	 * Never throws. A push reply must not fail because a monitor's listener did.
+	 */
+	private reportSenderHolds(acceptedBlockIds: string[], senderPeerId: string | undefined): void {
+		if (!this.onBlockHolders || !senderPeerId || acceptedBlockIds.length === 0) return;
+		try {
+			this.onBlockHolders({ blockIds: acceptedBlockIds, holders: [senderPeerId] });
+		} catch (error) {
+			log('push:block-holders-sink-error peer=%s err=%s', senderPeerId, (error as Error).message);
+		}
 	}
 }
 

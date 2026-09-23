@@ -12,8 +12,8 @@ const log = createLogger('rebalance-monitor')
 export interface RebalanceEvent {
 	/**
 	 * Block IDs this node has gained responsibility for (the reaction pulls each). A block first seen
-	 * through a commit this node holds ({@link RebalanceMonitor.recordCommittedHolders}) is not
-	 * reported: there is nothing to pull.
+	 * through evidence that this node already holds it ({@link RebalanceMonitor.recordBlockHolders} —
+	 * a commit, a received replica, a repaired block) is not reported: there is nothing to pull.
 	 */
 	gained: string[]
 	/** Block IDs this node has lost responsibility for */
@@ -58,23 +58,24 @@ export interface GrowthOutcome {
 }
 
 /**
- * What an acknowledged commit proved about who holds its blocks, reported by the node that holds them.
- * Only ever reported for a commit THIS node's own storage durably holds, so a block named here needs
- * no pull. See {@link RebalanceMonitor.recordCommittedHolders}.
+ * Peers evidenced to hold a block, reported by a node that holds it too — so the block needs neither
+ * a pull (this node has it) nor a push to those peers (they have it). See
+ * {@link RebalanceMonitor.recordBlockHolders} for the four producers and what each one's evidence is.
  */
-export interface CommittedHolders {
+export interface BlockHolders {
 	blockIds: readonly string[]
-	/** Peers evidenced to hold the committed revision. Self may appear; it is ignored. */
+	/** Peers evidenced to hold the same revision this node holds. Self may appear; it is ignored. */
 	holders: readonly string[]
 	/**
 	 * Cohort members the commit's coordinator knows did NOT confirm holding the revision. Withdraws
-	 * any earlier record of them as holders, so the growth arm pushes them the block.
+	 * any earlier record of them as holders, so the growth arm pushes them the block. Only the
+	 * coordinator producer names any: the other three learn about holders, never about non-holders.
 	 */
 	unconfirmed?: readonly string[]
 }
 
 /** Evidence gathered between two checks for one block: `holders` and `unconfirmed` stay disjoint. */
-interface CommitEvidence {
+interface HolderEvidence {
 	holders: Set<string>
 	unconfirmed: Set<string>
 }
@@ -153,8 +154,8 @@ interface BlockGrowthState {
 	/**
 	 * The growth arm's seen set: peers CONFIRMED to hold a replica of this block (or satisfied
 	 * another way — floor met, or nothing local to push). Peers enter ONLY via
-	 * {@link RebalanceMonitor.recordGrowthOutcome} or an acknowledged commit's holders
-	 * ({@link RebalanceMonitor.recordCommittedHolders}), never at report time.
+	 * {@link RebalanceMonitor.recordGrowthOutcome} or evidenced holders
+	 * ({@link RebalanceMonitor.recordBlockHolders}), never at report time.
 	 */
 	cohortPeers: Set<string>
 	/** Peers reported grown at the last emitting check whose confirmation is still outstanding. */
@@ -183,13 +184,13 @@ const intersect = (remembered: Set<string> | undefined, current: Set<string>): S
  * Carry a still-responsible block's growth state into the next check, intersecting both remembered
  * peer sets against the CURRENT cohort: a peer that left drops out of `cohortPeers` (so its return
  * is re-detected — the departure self-heal) and out of `abandonedPeers` (so a rejoin is retried from
- * scratch). Commit evidence gathered since the last check is folded into `cohortPeers` first.
+ * scratch). Holder evidence gathered since the last check is folded into `cohortPeers` first.
  * `pendingPeers` is always rebuilt from this check's own report, never carried.
  */
 const carryGrowthState = (
 	prior: BlockGrowthState | undefined,
 	currentPeers: Set<string>,
-	evidence: CommitEvidence | undefined
+	evidence: HolderEvidence | undefined
 ): BlockGrowthState => {
 	const confirmed = new Set([...(prior?.cohortPeers ?? []), ...(evidence?.holders ?? [])])
 	for (const peerId of evidence?.unconfirmed ?? []) confirmed.delete(peerId)
@@ -216,14 +217,15 @@ export class RebalanceMonitor implements Startable {
 	// reports the whole non-self cohort as grown — that is what heals the founder case (A alone
 	// commits; B joins → first check pushes to B) and the restarted-holder case (snapshot memory is
 	// process-local, so a restarted holder re-pushes to everyone once). Peers enter the set only
-	// through recordGrowthOutcome or a commit's confirmed holders (recordCommittedHolders) — a
+	// through recordGrowthOutcome or evidenced holders (recordBlockHolders) — a
 	// reported-but-unconfirmed peer stays out, so a failed push is re-detected on the next check
 	// instead of being recorded as done.
 	private readonly responsibilitySnapshot = new Map<string, BlockGrowthState>()
-	// Commit evidence (recordCommittedHolders) waiting for the next check, which consumes each block's
+	// Holder evidence (recordBlockHolders) waiting for the next check, which consumes each block's
 	// entry once its cohort lookup succeeds and drops entries for blocks no longer tracked. Held apart
-	// from the snapshot because a commit does not say whether this node is responsible — only a check does.
-	private readonly commitEvidence = new Map<string, CommitEvidence>()
+	// from the snapshot because a producer does not say whether this node is responsible for the block
+	// — only a check does.
+	private readonly holderEvidence = new Map<string, HolderEvidence>()
 	private readonly handlers: RebalanceHandler[] = []
 	private debounceTimer: ReturnType<typeof setTimeout> | null = null
 	private recheckTimer: ReturnType<typeof setTimeout> | null = null
@@ -288,7 +290,7 @@ export class RebalanceMonitor implements Startable {
 		}
 
 		this.pendingTopologyChange = false
-		this.commitEvidence.clear()
+		this.holderEvidence.clear()
 		log('stopped')
 	}
 
@@ -303,7 +305,7 @@ export class RebalanceMonitor implements Startable {
 	untrackBlock(blockId: string): void {
 		this.trackedBlocks.delete(blockId)
 		this.responsibilitySnapshot.delete(blockId)
-		this.commitEvidence.delete(blockId)
+		this.holderEvidence.delete(blockId)
 	}
 
 	getTrackedBlockCount(): number {
@@ -362,12 +364,30 @@ export class RebalanceMonitor implements Startable {
 	}
 
 	/**
-	 * Evidence from an acknowledged commit that this node's storage holds: `holders` are recorded as
-	 * confirmed co-holders of each block at the next check, and the block is not reported `gained`
-	 * then (this node already holds it, so there is nothing to pull). Without this, every freshly
-	 * committed block has no growth memory, so the next check reports the whole cohort grown and
-	 * pushes the block back to the members that stored it as part of the commit — and reports it
-	 * gained, pulling it back from them.
+	 * Evidence that these peers hold each of these blocks, AND that this node holds them too — so the
+	 * blocks need no pull. `holders` are recorded as confirmed co-holders at the next check, and the
+	 * blocks are not reported `gained` then. Both halves of the premise matter: suppressing `gained`
+	 * is only honest for a block this node now holds, so a producer reports nothing for a block it
+	 * failed to store.
+	 *
+	 * Four producers, each reporting evidence it gathered by a different route:
+	 *
+	 *  - `ClusterMember`, after a durable consensus apply — the record's approving commit signers.
+	 *  - `CoordinatorRepo`, on acknowledging a cohort commit it holds — the confirmed members that
+	 *    also signed, plus the members the durability class leaves `unconfirmed`.
+	 *  - `BlockTransferService.handlePush`, per accepted block — the peer that pushed it.
+	 *  - `createReconcileBlock`, after a successful restore — the peers whose archives corroborated
+	 *    the revision that was restored.
+	 *
+	 * Without this, every block arriving by any of those routes has no growth memory, so the next
+	 * check reports the whole cohort grown and pushes the block back to the peers that already hold
+	 * it — and reports it gained, pulling it back from them.
+	 *
+	 * How far the evidence is trusted: a pushing peer's claim to hold the block it pushed is its own
+	 * word, as is a receiving peer's report that it persisted a push, which `recordGrowthOutcome`
+	 * already accepts as confirmation. The cost of a lie is one cohort member that does not get a
+	 * copy it would otherwise get, re-detected whenever that peer leaves the cohort and rejoins, or
+	 * whenever a commit touches the block.
 	 *
 	 * Later evidence for the same block overrides earlier evidence about the same peer, so the
 	 * coordinator's durability-checked answer corrects the member-side signer list recorded moments
@@ -376,19 +396,19 @@ export class RebalanceMonitor implements Startable {
 	 * Does not affect the founder case: a commit no other peer confirmed names no holders, so the
 	 * cohort is still reported grown once peers appear.
 	 */
-	recordCommittedHolders(committed: CommittedHolders): void {
+	recordBlockHolders(report: BlockHolders): void {
 		if (!this.running) return
-		for (const blockId of committed.blockIds) {
-			let evidence = this.commitEvidence.get(blockId)
+		for (const blockId of report.blockIds) {
+			let evidence = this.holderEvidence.get(blockId)
 			if (!evidence) {
 				evidence = { holders: new Set<string>(), unconfirmed: new Set<string>() }
-				this.commitEvidence.set(blockId, evidence)
+				this.holderEvidence.set(blockId, evidence)
 			}
-			for (const peerId of committed.holders) {
+			for (const peerId of report.holders) {
 				evidence.holders.add(peerId)
 				evidence.unconfirmed.delete(peerId)
 			}
-			for (const peerId of committed.unconfirmed ?? []) {
+			for (const peerId of report.unconfirmed ?? []) {
 				evidence.unconfirmed.add(peerId)
 				evidence.holders.delete(peerId)
 			}
@@ -502,7 +522,7 @@ export class RebalanceMonitor implements Startable {
 			// Nothing left to grow, so any prior deferral is moot — drop it and let the re-check timer
 			// disarm, rather than re-arming forever against blocks that were untracked out from under it.
 			this.lastGrowthDeferred = 0
-			this.commitEvidence.clear()
+			this.holderEvidence.clear()
 			this.updateRecheckTimer()
 			return null
 		}
@@ -535,8 +555,8 @@ export class RebalanceMonitor implements Startable {
 			// durable verdict (member) or cohort acknowledgement (coordinator); a check landing in that
 			// window still reports it gained + grown, the pre-evidence behaviour. If relay traces show
 			// post-commit transfers surviving, skip a block's first check while a commit touching it is in flight.
-			const evidence = this.commitEvidence.get(blockId)
-			this.commitEvidence.delete(blockId)
+			const evidence = this.holderEvidence.get(blockId)
+			this.holderEvidence.delete(blockId)
 
 			if (isResponsible && !wasResponsible && !evidence) {
 				gained.push(blockId)
@@ -579,10 +599,10 @@ export class RebalanceMonitor implements Startable {
 			this.responsibilitySnapshot.set(blockId, state)
 		}
 
-		// Evidence for a block that is not tracked has no consumer: a commit this node does not hold
-		// as an owned block, or one untracked since.
-		for (const blockId of [...this.commitEvidence.keys()]) {
-			if (!this.trackedBlocks.has(blockId)) this.commitEvidence.delete(blockId)
+		// Evidence for a block that is not tracked has no consumer: a block this node does not hold as
+		// an owned block, or one untracked since.
+		for (const blockId of [...this.holderEvidence.keys()]) {
+			if (!this.trackedBlocks.has(blockId)) this.holderEvidence.delete(blockId)
 		}
 
 		// Fill the growth budget in two passes: fresh growth (no failed attempts yet) first, retrying

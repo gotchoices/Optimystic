@@ -504,7 +504,7 @@ describe('RebalanceMonitor', () => {
 		});
 	});
 
-	describe('commit evidence (recordCommittedHolders)', () => {
+	describe('commit evidence (recordBlockHolders)', () => {
 		// Ticket rebalance-pushes-freshly-committed-blocks-back-to-members-that-hold-them: a freshly
 		// committed block had no growth memory, so the next check reported it gained (a pull) and its
 		// whole cohort grown (a push to members that stored it as part of the commit).
@@ -514,7 +514,7 @@ describe('RebalanceMonitor', () => {
 			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
 			await monitor.start();
 			monitor.trackBlock('block-1');
-			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [selfId.toString(), peerId2.toString()] });
+			monitor.recordBlockHolders({ blockIds: ['block-1'], holders: [selfId.toString(), peerId2.toString()] });
 
 			expect(await monitor.checkNow(), 'nothing to pull, nothing to push').to.be.null;
 			expect(await monitor.checkNow(), 'the holder stays remembered').to.be.null;
@@ -526,7 +526,7 @@ describe('RebalanceMonitor', () => {
 			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
 			await monitor.start();
 			monitor.trackBlock('block-1');
-			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [peerId2.toString()] });
+			monitor.recordBlockHolders({ blockIds: ['block-1'], holders: [peerId2.toString()] });
 
 			const event = await monitor.checkNow();
 			expect(event!.gained, 'this node holds the commit — no pull').to.deep.equal([]);
@@ -539,7 +539,7 @@ describe('RebalanceMonitor', () => {
 			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
 			await monitor.start();
 			monitor.trackBlock('block-1');
-			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [selfId.toString()] });
+			monitor.recordBlockHolders({ blockIds: ['block-1'], holders: [selfId.toString()] });
 
 			const event = await monitor.checkNow();
 			expect(event!.grown.get('block-1')).to.deep.equal([peerId2.toString()]);
@@ -555,7 +555,7 @@ describe('RebalanceMonitor', () => {
 			monitor.recordGrowthOutcome('block-1', { satisfiedPeers: [peerId2.toString()], complete: true });
 			expect(await monitor.checkNow()).to.be.null;
 
-			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [], unconfirmed: [peerId2.toString()] });
+			monitor.recordBlockHolders({ blockIds: ['block-1'], holders: [], unconfirmed: [peerId2.toString()] });
 
 			const event = await monitor.checkNow();
 			expect(event!.grown.get('block-1')).to.deep.equal([peerId2.toString()]);
@@ -568,10 +568,10 @@ describe('RebalanceMonitor', () => {
 			await monitor.start();
 			monitor.trackBlock('block-1');
 			// peerId2: listed by the member as a signer, then named unconfirmed by the coordinator.
-			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [peerId2.toString(), peerId3.toString()] });
-			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [], unconfirmed: [peerId2.toString(), peerId3.toString()] });
+			monitor.recordBlockHolders({ blockIds: ['block-1'], holders: [peerId2.toString(), peerId3.toString()] });
+			monitor.recordBlockHolders({ blockIds: ['block-1'], holders: [], unconfirmed: [peerId2.toString(), peerId3.toString()] });
 			// peerId3: a later commit confirms it again.
-			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [peerId3.toString()] });
+			monitor.recordBlockHolders({ blockIds: ['block-1'], holders: [peerId3.toString()] });
 
 			const event = await monitor.checkNow();
 			expect(event!.grown.get('block-1')).to.deep.equal([peerId2.toString()]);
@@ -589,7 +589,7 @@ describe('RebalanceMonitor', () => {
 			const monitor = new RebalanceMonitor({ ...deps, keyNetwork, clusterSize: 2 }, { minRebalanceIntervalMs: 0 });
 			await monitor.start();
 			monitor.trackBlock('block-1');
-			monitor.recordCommittedHolders({ blockIds: ['block-1'], holders: [peerId2.toString()] });
+			monitor.recordBlockHolders({ blockIds: ['block-1'], holders: [peerId2.toString()] });
 
 			expect(await monitor.checkNow()).to.be.null;
 			fail = false;
@@ -602,11 +602,11 @@ describe('RebalanceMonitor', () => {
 			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
 
 			monitor.trackBlock('block-stopped');
-			monitor.recordCommittedHolders({ blockIds: ['block-stopped'], holders: [peerId2.toString()] });
+			monitor.recordBlockHolders({ blockIds: ['block-stopped'], holders: [peerId2.toString()] });
 
 			await monitor.start();
 			monitor.trackBlock('block-other');
-			monitor.recordCommittedHolders({ blockIds: ['block-later', 'block-untracked'], holders: [peerId2.toString()] });
+			monitor.recordBlockHolders({ blockIds: ['block-later', 'block-untracked'], holders: [peerId2.toString()] });
 			const first = await monitor.checkNow();
 			expect(first!.gained, 'evidence recorded while stopped was ignored').to.have.members(['block-stopped', 'block-other']);
 

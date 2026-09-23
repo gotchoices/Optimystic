@@ -24,7 +24,7 @@ import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js'
 import { latestClaimFromArchive, servableProof, type ArchiveServingRepo } from './storage/block-archive.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
 import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
-import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type CommittedHoldersSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
+import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type BlockHoldersSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
 import { createReconcileBlock } from './cluster/reconcile-block.js';
 import { resolveClusterPolicy, type ClusterPolicyOptions } from './cluster/cluster-policy.js';
 import { assertClusterSizeCoupling } from './cluster/cluster-size-coupling.js';
@@ -637,6 +637,21 @@ export async function createLibp2pNodeBase(
 	// below is the fail-fast backstop if a future edit reintroduces that split.
 	const consensusConfig = resolveClusterPolicy(options);
 
+	// Who is evidenced to hold each block this node holds, for the rebalance monitor (so it neither
+	// pushes a block back to a peer that already has it nor pulls a copy it already holds). Four
+	// producers report through this one sink: the cluster member after a durable consensus apply, the
+	// coordinator on acknowledging a cohort commit, the block-transfer service for the peer that
+	// pushed an accepted replica, and the reconcile closure for the peers that corroborated a
+	// restored revision.
+	//
+	// Declared HERE, above `libp2pOptions`, rather than beside the member and coordinator below: the
+	// `blockTransfer` service factory lives inside `libp2pOptions` and is evaluated at `createLibp2p`,
+	// so a declaration further down is not in scope for it. It closes over nothing, so the position
+	// is free. Late-bound on purpose — the monitor is built much further down inside the arachnode
+	// gate, and not at all when rebalance or FRET is off, in which case reports fall on the floor.
+	let blockHoldersTarget: BlockHoldersSink | undefined;
+	const onBlockHolders: BlockHoldersSink = (holders) => blockHoldersTarget?.(holders);
+
 	const libp2pOptions: Libp2pInit = {
 		start: false,
 		privateKey: nodePrivateKey,
@@ -809,7 +824,11 @@ export async function createLibp2pNodeBase(
 					// Read from the SAME resolved `consensusConfig` the member and coordinator read (whose
 					// coupling `assertSuperMajorityCoupling` below already asserts) — a third copy resolving
 					// its own default would defeat that.
-					superMajorityThreshold: consensusConfig.superMajorityThreshold
+					superMajorityThreshold: consensusConfig.superMajorityThreshold,
+					// A received replica is a block this node now holds, and its sender demonstrably holds
+					// it too — without this the next rebalance check pushes the copy straight back to the
+					// sender and pulls it again over `/sync`.
+					onBlockHolders
 				});
 			},
 
@@ -1000,7 +1019,10 @@ export async function createLibp2pNodeBase(
 			simpleMajorityThreshold: consensusConfig.simpleMajorityThreshold,
 			superMajorityThreshold: consensusConfig.superMajorityThreshold,
 			repairCorroborationClusterSize: consensusConfig.repairCorroborationClusterSize,
-			reputation
+			reputation,
+			// A restored block is one this node now holds, and the peers that corroborated the revision
+			// hold it too. Reported only on a successful restore — a decline persists nothing.
+			onBlockHolders
 			// `anchoring` (proof layer-2, `ProofAnchoring`) is intentionally NOT wired here yet — nor
 			// is the coordinator's `proofAnchoring` below: a real implementation re-derives the
 			// block's cohort from `keyNetwork.findCluster` (the same source `deriveExpectedCluster`
@@ -1028,13 +1050,6 @@ export async function createLibp2pNodeBase(
 			return { peers: peers ?? {}, confidence };
 		};
 
-		// Who holds each commit this node holds, for the rebalance monitor (so it does not push freshly
-		// committed blocks back to the members that stored them). Late-bound: the member and coordinator
-		// are built here, the monitor much further down inside the arachnode gate — and not at all when
-		// rebalance or FRET is off, in which case reports go nowhere.
-		let committedHoldersTarget: CommittedHoldersSink | undefined;
-		const onCommittedHolders: CommittedHoldersSink = (committed) => committedHoldersTarget?.(committed);
-
 		clusterImpl = clusterMember({
 			storageRepo,
 			peerNetwork: keyNetwork,
@@ -1049,7 +1064,7 @@ export async function createLibp2pNodeBase(
 			stateStore: options.transactionStateStore,
 			reconcileBlock,
 			onCommitCertificate,
-			onCommittedHolders,
+			onBlockHolders,
 			deriveExpectedCluster
 			// `recomputeArbitratorSet` (invalidation layer-2) is intentionally NOT wired here yet: a live FRET
 			// recompute needs a churn-tolerance window so it does not false-reject legitimate certificates from
@@ -1154,7 +1169,7 @@ export async function createLibp2pNodeBase(
 			// Records who is still missing each block of a commit acknowledged below `full`. Nothing
 			// drains it yet: sending those copies is `under-replication-drain-and-full-replication-event`.
 			underReplicationLedger,
-			onCommittedHolders
+			onBlockHolders
 		});
 
 		// Fail-fast coupling: the cluster member (what accepts a super-majority as sufficient) and the
@@ -1409,7 +1424,7 @@ export async function createLibp2pNodeBase(
 							options.rebalance,
 						);
 						await rebalanceMonitor.start();
-						committedHoldersTarget = (committed) => rebalanceMonitor.recordCommittedHolders(committed);
+						blockHoldersTarget = (holders) => rebalanceMonitor.recordBlockHolders(holders);
 
 						// onRebalance fires synchronously from the monitor's debounced check; the coordinator's
 						// reaction (pull gained / push lost, each partition-guarded) is async, so hop it off the

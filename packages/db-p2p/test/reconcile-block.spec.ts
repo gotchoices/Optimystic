@@ -20,6 +20,7 @@ import type { ActionId, ActionRev, BlockHeader, BlockId, CommitRequest, IBlock }
 import type { BlockArchive } from '../src/storage/struct.js';
 import { singleRevisionArchive } from '../src/storage/block-archive.js';
 import { createReconcileBlock, type ReconcileBlockDeps } from '../src/cluster/reconcile-block.js';
+import type { BlockHolders } from '../src/cluster/rebalance-monitor.js';
 import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
 import { PenaltyReason } from '../src/reputation/types.js';
 import type { BlockCommitProof } from '../src/cluster/commit-proof.js';
@@ -48,6 +49,8 @@ interface Harness {
 	saved: { blockId: BlockId; block: IBlock; source: ActionRev; proof?: BlockCommitProof }[];
 	fetches: string[];
 	penalties: { peerId: string; reason: PenaltyReason }[];
+	/** Everything reported to the rebalance monitor's holder sink, in order. */
+	holderReports: BlockHolders[];
 }
 
 const harness = (
@@ -57,6 +60,7 @@ const harness = (
 	const saved: Harness['saved'] = [];
 	const fetches: string[] = [];
 	const penalties: Harness['penalties'] = [];
+	const holderReports: BlockHolders[] = [];
 	const reconcile = createReconcileBlock({
 		selfPeerId: SELF,
 		simpleMajorityThreshold: THRESHOLD,
@@ -72,9 +76,10 @@ const harness = (
 			saved.push({ blockId, block, source, proof });
 		},
 		reputation: { reportPeer: (peerId, reason) => { penalties.push({ peerId, reason }); } },
+		onBlockHolders: (holders) => { holderReports.push(holders); },
 		...overrides
 	});
-	return { reconcile, saved, fetches, penalties };
+	return { reconcile, saved, fetches, penalties, holderReports };
 };
 
 const COMMITTED: ActionRev = { actionId: 'action-2' as ActionId, rev: 2 };
@@ -344,6 +349,45 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 
 		expect(h.saved.length, 'the usable revision is still adopted').to.equal(1);
 		expect(h.saved[0]!.source.rev).to.equal(2);
+	});
+
+	/**
+	 * Ticket: received-replicas-report-their-source-as-a-holder. A repaired block enters the owned-block
+	 * set like any other, so without evidence the next rebalance check reports it `gained` (pulling it
+	 * again) and its whole cohort `grown` (pushing it back to the peers it was just repaired from).
+	 * The corroborating supporters ARE that evidence — but only on a restore: a decline persists
+	 * nothing, and suppressing `gained` for a block this node does not hold would be a lie.
+	 */
+	describe('holder evidence for the rebalance monitor', () => {
+		it('reports the corroborating supporters after a restore', async () => {
+			const h = harness(
+				{
+					p1: archiveAt(2, 'action-2', makeBlock('v2')),
+					p2: archiveAt(2, 'action-2', makeBlock('v2')),
+					behind: archiveAt(1, 'action-1', makeBlock('v1'))
+				},
+				{ repairCorroborationClusterSize: 4 }
+			);
+
+			await h.reconcile(BLOCK_ID, COMMITTED, ['p1', 'p2', 'behind']);
+
+			expect(h.saved.length, 'precondition: the block was restored').to.equal(1);
+			expect(h.holderReports.length).to.equal(1);
+			expect(h.holderReports[0]!.blockIds).to.deep.equal([BLOCK_ID]);
+			expect([...h.holderReports[0]!.holders], 'only the peers that corroborated the restored revision')
+				.to.have.members(['p1', 'p2']);
+		});
+
+		it('reports nothing when the pass declines', async () => {
+			// The lone-uncorroborated-claim decline: nothing is persisted, so this node still owes a pull.
+			const h = harness({ [PEER_A]: archiveAt(2, 'action-2', makeBlock('v2')) },
+				{ repairCorroborationClusterSize: 10 });
+
+			await h.reconcile(BLOCK_ID, COMMITTED, [PEER_A]);
+
+			expect(h.saved.length, 'precondition: the pass declined').to.equal(0);
+			expect(h.holderReports).to.deep.equal([]);
+		});
 	});
 
 	it('survives a reputation sink that throws', async () => {

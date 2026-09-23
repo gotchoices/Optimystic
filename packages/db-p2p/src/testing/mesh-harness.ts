@@ -16,7 +16,7 @@ import type { IRawStorage } from '../storage/i-raw-storage.js';
 import type { BlockArchive } from '../storage/struct.js';
 import { serveBlockArchive, servableProof } from '../storage/block-archive.js';
 import { coordinatorRepo, type ClusterLatestCallback, type CertifiedActionRev } from '../repo/coordinator-repo.js';
-import type { CommittedHolders } from '../cluster/rebalance-monitor.js';
+import type { BlockHolders } from '../cluster/rebalance-monitor.js';
 import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
 import { toString as u8ToString } from 'uint8arrays';
 
@@ -113,12 +113,14 @@ export interface MeshOptions {
 	 */
 	keySeed?: number;
 	/**
-	 * Receives each node's committed-holders reports — from its member after a durable consensus apply
-	 * and from its coordinator on acknowledging a cohort commit — the harness analogue of the sink
-	 * `libp2p-node-base` routes to the node's rebalance monitor. The harness builds no monitor; a spec
-	 * that wants one routes reports to its own. Omitted → nothing is reported.
+	 * Receives each node's block-holder reports — from its member after a durable consensus apply,
+	 * from its coordinator on acknowledging a cohort commit, and from its reconcile closure after a
+	 * successful restore — the harness analogue of the sink `libp2p-node-base` routes to the node's
+	 * rebalance monitor. (The push producer has no analogue here: the harness runs no
+	 * `BlockTransferService`.) The harness builds no monitor; a spec that wants one routes reports to
+	 * its own. Omitted → nothing is reported.
 	 */
-	onCommittedHolders?: (node: MeshNode, committed: CommittedHolders) => void;
+	onBlockHolders?: (node: MeshNode, holders: BlockHolders) => void;
 }
 
 export interface MeshFailureConfig {
@@ -460,7 +462,9 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 				storageRepo.saveReplicatedBlock(blockId, block, source, verifiedProof),
 			simpleMajorityThreshold: policy.simpleMajorityThreshold,
 			superMajorityThreshold: policy.superMajorityThreshold,
-			repairCorroborationClusterSize: policy.repairCorroborationClusterSize
+			repairCorroborationClusterSize: policy.repairCorroborationClusterSize,
+			// Production shape: a successful restore reports the corroborating peers as holders.
+			onBlockHolders: options.onBlockHolders && ((holders) => options.onBlockHolders!(meshNode, holders))
 		});
 		reconcileByPeer.set(peerId.toString(), reconcileBlock);
 
@@ -490,7 +494,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// Absent by default: `undefined` here is identical to omitting the field, and
 			// `validatePendOperations` then skips the validation step entirely.
 			validator: options.validatorFactory?.(index, peerId),
-			onCommittedHolders: options.onCommittedHolders && ((committed) => options.onCommittedHolders!(meshNode, committed))
+			onBlockHolders: options.onBlockHolders && ((committed) => options.onBlockHolders!(meshNode, committed))
 		});
 	};
 
@@ -583,7 +587,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// The read path's transfer mechanism — the SAME instance the member uses on the commit
 			// path, mirroring how `libp2p-node-base` shares one `reconcileBlock` between both.
 			acquireBlockFromCohort: reconcileByPeer.get(node.peerId.toString())!,
-			onCommittedHolders: options.onCommittedHolders && ((committed) => options.onCommittedHolders!(node, committed))
+			onBlockHolders: options.onBlockHolders && ((committed) => options.onBlockHolders!(node, committed))
 		});
 	};
 

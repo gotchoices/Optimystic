@@ -59,8 +59,8 @@ const buildRig = async (nodeCount: number, options: MeshOptions, reportHolders: 
 	const monitors = new Map<string, RebalanceMonitor>();
 	const mesh = await createMesh(nodeCount, {
 		...options,
-		onCommittedHolders: reportHolders
-			? (node, committed) => monitors.get(node.peerId.toString())?.recordCommittedHolders(committed)
+		onBlockHolders: reportHolders
+			? (node, committed) => monitors.get(node.peerId.toString())?.recordBlockHolders(committed)
 			: undefined
 	});
 	for (const node of mesh.nodes) {
@@ -143,7 +143,7 @@ describe('rebalance after a commit (committed holders seed the growth memory)', 
 		const mesh = await createMesh(1, {
 			responsibilityK: 1,
 			clusterSize: 1,
-			onCommittedHolders: (_node, committed) => reports.push(committed)
+			onBlockHolders: (_node, committed) => reports.push(committed)
 		});
 		const [founder] = mesh.nodes as [MeshNode];
 		await commitThrough(founder, 'a-solo', BLOCKS);

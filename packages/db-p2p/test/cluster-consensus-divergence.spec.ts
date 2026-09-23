@@ -649,7 +649,7 @@ describe('ClusterMember commit-verdict retention (getExecutedCommitResult)', () 
 		const reportedHolders: (readonly string[])[] = [];
 		member = clusterMember({
 			storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey, reconcileBlock,
-			onCommittedHolders: ({ holders }) => { reportedHolders.push(holders); }
+			onBlockHolders: ({ holders }) => { reportedHolders.push(holders); }
 		});
 
 		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-missing', 'block-1', 1));

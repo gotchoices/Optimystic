@@ -15,7 +15,7 @@ import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
 import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, type ICommitProofPersister, type IRevisionActionReader, type IPendingClaimReader } from "../storage/storage-repo.js";
 import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
-import type { ReconcileBlockCallback, CommittedHoldersSink } from "../cluster/cluster-repo.js";
+import type { ReconcileBlockCallback, BlockHoldersSink } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
 import type { IUnderReplicationLedger } from "./i-under-replication-ledger.js";
 import { RESPONSIBILITY_TTL_MS, ResponsibilityRefusalError } from "./responsibility.js";
@@ -401,9 +401,9 @@ interface CoordinatorRepoComponents {
 	underReplicationLedger?: IUnderReplicationLedger;
 	/**
 	 * Optional: told who holds each cohort commit this node acknowledges and holds — see
-	 * {@link CoordinatorRepo.reportCommittedHolders}. Absent → commit behaves exactly as without it.
+	 * {@link CoordinatorRepo.reportBlockHolders}. Absent → commit behaves exactly as without it.
 	 */
-	onCommittedHolders?: CommittedHoldersSink;
+	onBlockHolders?: BlockHoldersSink;
 }
 
 /**
@@ -440,7 +440,7 @@ export function coordinatorRepo(
 		components.acquireBlockFromCohort,
 		components.proofAnchoring,
 		components.underReplicationLedger,
-		components.onCommittedHolders
+		components.onBlockHolders
 	);
 }
 
@@ -550,7 +550,7 @@ export class CoordinatorRepo implements IRepo {
 		private readonly acquireBlockFromCohort?: AcquireBlockCallback,
 		private readonly proofAnchoring?: ProofAnchoring,
 		private readonly underReplicationLedger?: IUnderReplicationLedger,
-		private readonly onCommittedHolders?: CommittedHoldersSink
+		private readonly onBlockHolders?: BlockHoldersSink
 	) {
 		this.localPeerId = localPeerId;
 		this.log = createLogger('coordinator-repo', localPeerId?.toString());
@@ -2804,13 +2804,13 @@ export class CoordinatorRepo implements IRepo {
 	 * holders to report).
 	 */
 	private async acknowledgeCommit(request: CommitRequest, answer: CommitSuccess, localHolds: boolean, record?: ClusterRecord): Promise<CommitSuccess> {
-		if (localHolds && record !== undefined) this.reportCommittedHolders(request, answer.durability, record);
+		if (localHolds && record !== undefined) this.reportBlockHolders(request, answer.durability, record);
 		await this.noteReplicationShortfall(request, answer.durability, localHolds);
 		return answer;
 	}
 
 	/**
-	 * Tell the {@link CommittedHoldersSink} who holds a cohort commit this node holds, so its rebalance
+	 * Tell the {@link BlockHoldersSink} who holds a cohort commit this node holds, so its rebalance
 	 * monitor does not push the blocks back to members that stored them. A holder is a member the
 	 * durability class confirmed AND that signed an approving commit vote: the confirmation rests on
 	 * the member's unsigned apply report, and requiring the signature too means a member lying in that
@@ -2819,17 +2819,17 @@ export class CoordinatorRepo implements IRepo {
 	 * (including the signer list this node's own member reported at apply), so they are pushed the
 	 * block. Never throws: the commit is already acknowledged.
 	 */
-	private reportCommittedHolders(request: CommitRequest, durability: WriteDurability, record: ClusterRecord): void {
-		if (!this.onCommittedHolders) return;
+	private reportBlockHolders(request: CommitRequest, durability: WriteDurability, record: ClusterRecord): void {
+		if (!this.onBlockHolders) return;
 		const self = this.localPeerId?.toString();
 		const unconfirmed = durability.unconfirmed ?? [];
 		const holders = (durability.cohortPeerIds ?? [])
 			.filter(peerId => !unconfirmed.includes(peerId))
 			.filter(peerId => peerId === self || record.commits[peerId]?.type === 'approve');
 		try {
-			this.onCommittedHolders({ blockIds: request.blockIds, holders, unconfirmed });
+			this.onBlockHolders({ blockIds: request.blockIds, holders, unconfirmed });
 		} catch (err) {
-			this.log('coordinator-repo:committed-holders-sink-error', { actionId: request.actionId, error: (err as Error).message });
+			this.log('coordinator-repo:block-holders-sink-error', { actionId: request.actionId, error: (err as Error).message });
 		}
 	}
 

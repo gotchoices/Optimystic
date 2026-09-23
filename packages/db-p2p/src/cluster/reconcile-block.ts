@@ -2,7 +2,7 @@ import type { ActionId, ActionRev, BlockId, IBlock } from "@optimystic/db-core";
 import { canonicalBlockHash } from "@optimystic/db-core";
 import type { BlockArchive } from "../storage/struct.js";
 import { maxArchiveRevision } from "../storage/block-archive.js";
-import type { ReconcileBlockCallback } from "./cluster-repo.js";
+import type { BlockHoldersSink, ReconcileBlockCallback } from "./cluster-repo.js";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import {
@@ -89,6 +89,15 @@ export interface ReconcileBlockDeps {
 	repairCorroborationClusterSize: number;
 	/** Best-effort misbehavior reporting; a throwing implementation is swallowed. */
 	reputation?: Pick<IPeerReputation, 'reportPeer'>;
+	/**
+	 * Optional: told, after a successful restore, that the peers whose archives corroborated the
+	 * selected revision hold this block — and that this node now holds it too. The node's rebalance
+	 * monitor consumes that as growth evidence, so a repaired block is neither pushed back to the
+	 * peers it was repaired from nor pulled again as if newly gained. A DECLINE reports nothing:
+	 * nothing was persisted, and suppressing `gained` for a block this node does not hold would be a
+	 * lie. See {@link BlockHoldersSink}.
+	 */
+	onBlockHolders?: BlockHoldersSink;
 }
 
 /**
@@ -423,5 +432,26 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 		await deps.saveReplicatedBlock(
 			blockId, agreed.block, { actionId: selected.actionId, rev: selected.rev }, certifiedCarrier?.proof);
 		log('reconcile:restored', { blockId, rev: selected.rev, actionId: selected.actionId });
+		reportRestoredHolders(deps, blockId, selected.supporters);
 	};
+}
+
+/**
+ * Report the restored block's corroborating peers as holders (see
+ * {@link ReconcileBlockDeps.onBlockHolders}). The supporters ARE the evidence: each one served an
+ * archive claiming the revision that was just persisted here, which is that peer's own word — the
+ * same trust class `recordGrowthOutcome` already extends to a receiver's report that it persisted a
+ * push. A lie costs one cohort member the copy it would otherwise be pushed, re-detected when it
+ * leaves the cohort and rejoins or when a commit touches the block.
+ *
+ * Never throws: the block is already restored, and a listener fault must not turn a successful heal
+ * into a thrown reconcile (the commit path tolerates but logs those, the read path stalls a `get`).
+ */
+function reportRestoredHolders(deps: ReconcileBlockDeps, blockId: BlockId, supporters: string[]): void {
+	if (!deps.onBlockHolders) return;
+	try {
+		deps.onBlockHolders({ blockIds: [blockId], holders: supporters });
+	} catch (err) {
+		log('reconcile:block-holders-sink-error', { blockId, error: (err as Error).message });
+	}
 }

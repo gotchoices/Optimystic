@@ -25,7 +25,7 @@ import { getAffectedBlockIds } from "./record-operations.js";
 import { operationsConflict, resolveRace } from "./race-resolution.js";
 import { buildBlockCommitProof, mintSoloCommitProof, type BlockCommitProof } from "./commit-proof.js";
 import { RECONCILE_TIMEOUT_MS } from "./reconcile-block.js";
-import type { CommittedHolders } from "./rebalance-monitor.js";
+import type { BlockHolders } from "./rebalance-monitor.js";
 
 const log = createLogger('cluster-member')
 
@@ -134,13 +134,15 @@ export type ReconcileBlockCallback = (blockId: BlockId, committed: ActionRev, co
 export type CommitCertificateSink = (actionId: ActionId, cert: CommitCert) => void;
 
 /**
- * Sink for who is known to hold a commit this node's own storage durably holds — fed to the rebalance
- * monitor so it does not push freshly committed blocks back to the members that stored them (see
- * `RebalanceMonitor.recordCommittedHolders`). Fired by the member after applying a consensus commit,
- * and by `CoordinatorRepo.commit` when it acknowledges one. Optional; a throwing sink is isolated +
- * logged (it must never break consensus or the writer's answer).
+ * Sink for peers evidenced to hold a block this node's own storage also holds — fed to the rebalance
+ * monitor so it neither pushes the block back to a peer that already has it nor pulls a copy it
+ * already holds (see `RebalanceMonitor.recordBlockHolders`). Four producers fire it: the member
+ * after applying a consensus commit, `CoordinatorRepo.commit` when it acknowledges one,
+ * `BlockTransferService.handlePush` for the peer that pushed an accepted replica, and
+ * `createReconcileBlock` for the peers that corroborated a restored revision. Optional; a throwing
+ * sink is isolated + logged (it must never break consensus, a writer's answer, or a push reply).
  */
-export type CommittedHoldersSink = (committed: CommittedHolders) => void;
+export type BlockHoldersSink = (holders: BlockHolders) => void;
 
 /**
  * Applies a consensus-ordered {@link InvalidateRequest} to local storage — the deterministic
@@ -264,8 +266,8 @@ interface ClusterMemberComponents {
 	reconcileBlock?: ReconcileBlockCallback;
 	/** Receives the consensus commit cert per committed action; see {@link CommitCertificateSink}. */
 	onCommitCertificate?: CommitCertificateSink;
-	/** Receives who holds each consensus commit this member durably applied; see {@link CommittedHoldersSink}. */
-	onCommittedHolders?: CommittedHoldersSink;
+	/** Receives who holds each consensus commit this member durably applied; see {@link BlockHoldersSink}. */
+	onBlockHolders?: BlockHoldersSink;
 	/** Applies a consensus-ordered invalidation to local storage; see {@link InvalidationApplySink}. */
 	onInvalidate?: InvalidationApplySink;
 	/** Layer-2 arbitrator-set recompute for invalidation verification; see {@link RecomputeArbitratorSetCapability}. */
@@ -306,7 +308,7 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.recomputeArbitratorSet,
 		components.deriveExpectedCluster,
 		components.now,
-		components.onCommittedHolders
+		components.onBlockHolders
 	);
 }
 
@@ -445,7 +447,7 @@ export class ClusterMember implements ICluster {
 		private readonly recomputeArbitratorSet?: RecomputeArbitratorSetCapability,
 		private readonly deriveExpectedCluster?: DeriveExpectedClusterCallback,
 		now?: () => number,
-		private readonly onCommittedHolders?: CommittedHoldersSink
+		private readonly onBlockHolders?: BlockHoldersSink
 	) {
 		this.now = now ?? ((): number => Date.now());
 		this.superMajorityThreshold = consensusConfig?.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD;
@@ -2614,7 +2616,7 @@ export class ClusterMember implements ICluster {
 		this.executedCommitResults.set(record.messageHash, verdict);
 		if (verdict.success) {
 			this.behindCommitRefusals.delete(record.messageHash);
-			this.reportCommittedHolders(record, commit);
+			this.reportBlockHolders(record, commit);
 		} else if (behind) {
 			this.behindCommitRefusals.add(record.messageHash);
 		}
@@ -2830,7 +2832,7 @@ export class ClusterMember implements ICluster {
 	}
 
 	/**
-	 * Tell the {@link CommittedHoldersSink} which cohort members hold a commit this member just
+	 * Tell the {@link BlockHoldersSink} which cohort members hold a commit this member just
 	 * durably applied. A member learns nothing about the others' storage at apply time, so the
 	 * evidence is the record's approving commit signers: each is a cohort member that signed to apply
 	 * this commit. A signer that then failed to apply is wrongly recorded, which only spares it a
@@ -2838,17 +2840,17 @@ export class ClusterMember implements ICluster {
 	 * coordinator's durability-checked report (which lands after this one and overrides it) still
 	 * reach it.
 	 */
-	private reportCommittedHolders(record: ClusterRecord, commit: CommitRequest): void {
-		if (!this.onCommittedHolders) {
+	private reportBlockHolders(record: ClusterRecord, commit: CommitRequest): void {
+		if (!this.onBlockHolders) {
 			return;
 		}
 		const holders = Object.entries(record.commits)
 			.filter(([peerId, vote]) => vote.type === 'approve' && peerId in record.peers)
 			.map(([peerId]) => peerId);
 		try {
-			this.onCommittedHolders({ blockIds: commit.blockIds, holders });
+			this.onBlockHolders({ blockIds: commit.blockIds, holders });
 		} catch (err) {
-			log('cluster-member:committed-holders-sink-error', { actionId: commit.actionId, error: (err as Error).message });
+			log('cluster-member:block-holders-sink-error', { actionId: commit.actionId, error: (err as Error).message });
 		}
 	}
 
