@@ -225,6 +225,17 @@ export class ConcurrentModificationError extends QuereusError {
 }
 
 /**
+ * How one guard refusal renders to SQL: the message registered for its collection, and the
+ * engine error type that class of refusal raises over it (see
+ * {@link TransactionBridge.mapRefusal}). `raise` takes the failure being rewrapped as the
+ * new error's `cause`, so the structured refusal stays reachable.
+ */
+interface MappedRefusal {
+  readonly message: string;
+  readonly raise: (cause: Error) => Error;
+}
+
+/**
  * The engine id stamped on a legacy multi-tree commit's transaction. Purely descriptive: the
  * pend carries no validation payload, so no member ever resolves an engine by it — it only
  * says, to anyone reading the stamp, that the rows were staged straight into the trees rather
@@ -584,31 +595,47 @@ export class TransactionBridge {
    * INITIAL staging as well as at replay, and a staging-time refusal (the tracker
    * fetched a rival's commit the pre-stage probe's view had not) must reach the client
    * as the same message a commit-time one does.
+   *
+   * NOTE: a STAGING-time `ConstraintError` is the one mapped error the engine may replace
+   * rather than propagate — `translateConflictError` in
+   * `@quereus/quereus/src/runtime/emit/dml-executor.ts` rebuilds it as `FailConflictError` /
+   * `RollbackConflictError` under `or fail` / `or rollback`, copying message and code but NOT
+   * `cause`, so the structured refusal is unreachable on those two dispositions. That is the
+   * same treatment a sequential duplicate gets, which is the point; only the `cause` promise is
+   * narrower there than at a commit-time refusal, which never passes through that translation.
    */
   mapCommitRefusal(error: unknown): unknown {
     for (let cursor: unknown = error; cursor instanceof Error; cursor = cursor.cause) {
       if (cursor instanceof TreeGuardRefusedError) {
-        const message = this.renderRefusal(cursor);
-        if (message === undefined || (error instanceof Error && error.message === message)) {
+        const mapped = this.mapRefusal(cursor);
+        if (mapped === undefined || !(error instanceof Error) || error.message === mapped.message) {
           return error;
         }
-        const cause = error instanceof Error ? error : undefined;
-        return cursor instanceof TreeKeyTakenError
-          ? new ConstraintError(message, StatusCode.CONSTRAINT, cause)
-          : new ConcurrentModificationError(message, cause);
+        return mapped.raise(error);
       }
     }
     return error;
   }
 
-  /** The registered SQL message for one guard refusal, dispatched by its class, or
-   *  `undefined` when its collection registered nothing for that class. */
-  private renderRefusal(refusal: TreeGuardRefusedError): string | undefined {
+  /**
+   * How one guard refusal surfaces to SQL — the registered message and the engine error type
+   * that carries it — or `undefined` when its collection registered nothing for that class.
+   * Both halves are dispatched here, in ONE place: a future `TreeGuardRefusedError` subclass
+   * that registers a message must also say which error type raises it, rather than acquiring
+   * a message in one dispatch and silently inheriting the lost-update type from another.
+   */
+  private mapRefusal(refusal: TreeGuardRefusedError): MappedRefusal | undefined {
     if (refusal instanceof TreeKeyTakenError) {
-      return this.keyTakenMessages.get(refusal.collectionId);
+      const message = this.keyTakenMessages.get(refusal.collectionId);
+      return message === undefined
+        ? undefined
+        : { message, raise: cause => new ConstraintError(message, StatusCode.CONSTRAINT, cause) };
     }
     if (refusal instanceof TreeEntryChangedError) {
-      return this.entryChangedRenderers.get(refusal.collectionId)?.(String(refusal.key));
+      const message = this.entryChangedRenderers.get(refusal.collectionId)?.(String(refusal.key));
+      return message === undefined
+        ? undefined
+        : { message, raise: cause => new ConcurrentModificationError(message, cause) };
     }
     return undefined;
   }

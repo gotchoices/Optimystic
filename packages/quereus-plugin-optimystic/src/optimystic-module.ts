@@ -1288,11 +1288,14 @@ export class OptimysticVirtualTable extends VirtualTable {
       // and a guarded insert whose key a rival committed throws TreeKeyTakenError
       // mid-scan, as does a guarded UPDATE, DELETE or REPLACE whose row a rival changed
       // or removed (TreeEntryChangedError; test/external-commit-visibility-after-rollback.spec.ts
-      // pins that shape). It reaches the client wrapped here as `Query failed: …`, not
-      // as the mapped `UNIQUE constraint failed: …` / `concurrent modification: …` the
-      // same refusal gets at commit (mapCommitRefusal sits only at the commit boundaries
-      // and the DML catch). Not silent, and the commit would refuse anyway; if clients
-      // ever need the two shapes to match, map it here via the bridge, as the DML catch does.
+      // pins that shape). It reaches the client wrapped here as a plain Error reading
+      // `Query failed: …`, not as the mapped `UNIQUE constraint failed: …` /
+      // `concurrent modification: …` the same refusal gets at commit — and so with neither
+      // the ConstraintError nor the ConcurrentModificationError type and code a commit-time
+      // refusal carries (mapCommitRefusal sits only at the commit boundaries and the DML
+      // catch). Not silent — the refusal stays reachable through `cause` — and the commit
+      // would refuse anyway; if clients ever need the two shapes to match, map it here via
+      // the bridge, as the DML catch does.
       const wrapped = rewrapAsQueryError('Query failed', error);
       this.setErrorMessage(wrapped.message);
       throw wrapped;
