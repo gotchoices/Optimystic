@@ -38,6 +38,15 @@ export interface BlockFloorCheck {
 	 * @returns `true` for a below-floor answer, which the caller hands on but must not let any cache
 	 * remember (see `TransactorSource.describeServed`). */
 	answeredBelowFloor(blockId: BlockId, context: ActionContext | undefined, servedRev: number): boolean;
+
+	/** The same comparison {@link answeredBelowFloor} makes, without reporting it — for content that
+	 * is not an answer being served to a reader, where the `collection:block-below-floor` line would
+	 * misdescribe what happened. `Collection.keepWhatTheRefreshRead` weighs the header and log tail
+	 * its refresh read around `TransactorSource` this way.
+	 *
+	 * @param servedRev the revision the content is.
+	 * @returns `true` when no floor applies or the content meets the one that does. */
+	meetsApplicableFloor(blockId: BlockId, context: ActionContext | undefined, servedRev: number): boolean;
 }
 
 /** The floors of one collection handle, shared by EVERY read source that handle builds — its own
@@ -90,12 +99,24 @@ export class BlockFloors implements BlockFloorCheck {
 	}
 
 	answeredBelowFloor(blockId: BlockId, context: ActionContext | undefined, servedRev: number): boolean {
-		const floor = this.applicableTo(blockId, context);
-		if (floor === undefined || servedRev >= floor.rev) {
+		const floor = this.unmetFloor(blockId, context, servedRev);
+		if (floor === undefined) {
 			return false;
 		}
 		this.onBelowFloor?.({ blockId, floor, servedRev });
 		return true;
+	}
+
+	meetsApplicableFloor(blockId: BlockId, context: ActionContext | undefined, servedRev: number): boolean {
+		return this.unmetFloor(blockId, context, servedRev) === undefined;
+	}
+
+	/** The applicable floor that `servedRev` FAILS, or undefined when it meets it (or none applies).
+	 * The one comparison behind both public checks, so a caller that only asks the question cannot
+	 * drift from the one that also reports the answer. */
+	private unmetFloor(blockId: BlockId, context: ActionContext | undefined, servedRev: number): BlockFloor | undefined {
+		const floor = this.applicableTo(blockId, context);
+		return floor !== undefined && servedRev < floor.rev ? floor : undefined;
 	}
 
 	/** How many blocks have a floor. */

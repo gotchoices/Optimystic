@@ -1066,9 +1066,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 *
 	 * NOTE: the floor check lives here because {@link readLogEnds} reads around
 	 * {@link TransactorSource}, which is what applies floors on every other read — nothing else on
-	 * this path would apply one. It compares without reporting: this is not an answer being served
-	 * to a reader, so `answeredBelowFloor`'s `collection:block-below-floor` line would misdescribe
-	 * it.
+	 * this path would apply one. It asks {@link BlockFloors.meetsApplicableFloor} rather than
+	 * spelling the comparison out, so it cannot drift from the one `answeredBelowFloor` makes, and
+	 * asks the non-reporting face because this is not an answer being served to a reader — the
+	 * `collection:block-below-floor` line would misdescribe it.
 	 *
 	 * Only this site seeds. The early return at {@link tailShowsNothingNewer} is deliberately left
 	 * alone: it fires when the log has not moved, and the cache is then already warm with the tail
@@ -1087,8 +1088,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			return;
 		}
 		for (const [blockId, block, rev] of served) {
-			const floor = this.floors.applicableTo(blockId, context);
-			if (rev <= context.rev && (floor === undefined || rev >= floor.rev)) {
+			if (rev <= context.rev && this.floors.meetsApplicableFloor(blockId, context, rev)) {
 				this.sourceCache.offerServed(blockId, block, rev);
 			}
 		}

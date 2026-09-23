@@ -42,7 +42,12 @@ the tail id the previous header named), and stops there when the tail shows noth
 newer than the revision the collection already holds (`Collection.tailShowsNothingNewer`):
 same revision, same action, and no disagreement with the tail block's entries. Only
 otherwise does it walk the log, and that walk reads through one block cache seeded with
-the header and tail, so no block is fetched twice in one refresh. On a peer-to-peer node
+the header and tail, so no block is fetched twice in one refresh — with one parked
+exception, a refresh that finds the header naming a NEW tail block: the tail id it
+remembered was asked for in the same request as the header, that answer is then
+discarded, and the walk fetches that block again on its way back through the chain (the
+accepted one-extra-request cost recorded at `Collection.logTailId` in
+`packages/db-core/src/collection/collection.ts`). On a peer-to-peer node
 each request is a network round trip, so an idle poll costs one per tree rather than the
 seven or more it used to. The budgets are asserted in
 `packages/db-core/test/refresh-read-cost.spec.ts`.

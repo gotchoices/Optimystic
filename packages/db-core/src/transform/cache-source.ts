@@ -75,9 +75,11 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 		/** Shared per-transaction read-dependency accumulator (same instance the collection's
 		 *  TransactorSource holds). Optional: log-walk caches that never form a transaction omit it. */
 		private readonly collector?: ReadDependencyCollector,
-		/** Pre-warm entries for a pinned read view — the output of another cache's
-		 *  {@link snapshotEntries}. Entries are already cloned by snapshotEntries, so they are
-		 *  adopted as-is; per-id revisions ride along so a seeded HIT still records at the
+		/** Pre-warm entries: the output of another cache's {@link snapshotEntries} for a pinned read
+		 *  view, or the blocks a refresh already fetched for its own log walk
+		 *  (`Collection.readLogEnds`). Blocks are adopted BY REFERENCE — a seeder that keeps its own
+		 *  handle on one must not mutate it, which is why {@link offerServed}, whose caller does keep
+		 *  one, clones instead. Per-id revisions ride along so a seeded HIT still records at the
 		 *  revision the block was committed at. Seeding does not bump generations (a fresh
 		 *  cache has no consumers with stale memos). */
 		seed?: ReadonlyArray<[BlockId, T, number]>,
@@ -149,7 +151,7 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 	 *  handed through (see {@link handThrough}): returned, described, not kept. */
 	private admit(id: BlockId, answer: T, rev: number, mayRetain: boolean, generationAtMiss: number): { block: T; rev: number } {
 		if (mayRetain && this.stillWanted(id, rev, generationAtMiss)) {
-			this.keep(id, answer, rev);
+			this.keep(id, answer, rev, 'miss:loaded');
 			return { block: answer, rev };
 		}
 		const held = this.cache.get(id);
@@ -206,7 +208,7 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 			log('offer:superseded id=%s rev=%d heldRev=%d', id, rev, heldRev);
 			return;
 		}
-		this.keep(id, structuredClone(block), rev);
+		this.keep(id, structuredClone(block), rev, 'offer:kept');
 	}
 
 	/** The revision of the content this cache HOLDS for `id` right now — cached, or handed through
@@ -214,17 +216,26 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 	 *  also answers for an LRU-evicted id: that revision describes content this cache no longer has,
 	 *  so it is the right answer for a base probe and the wrong one for "is there anything here to
 	 *  weigh an offer against?". */
+	// NOTE: the consequence is that an offer over an LRU-evicted id is accepted even when it is
+	// OLDER than the revision this cache last served for the id — a lagging replica answering the
+	// unpinned refresh read below what this handle has already seen, with no walked entry to floor
+	// the block. That is the same answer a pinned re-read of the evicted id would have been kept at,
+	// so the offer path is no worse than the read path it replaces; if lagging-replica staleness on
+	// the header or log tail ever shows up, refuse an offer below `getCachedRevision` here (a block
+	// never goes back a revision, so refusing is always right) rather than adding a floor for it.
 	private heldRevision(id: BlockId): number | undefined {
 		return this.cache.has(id) ? this.revisions.get(id) : this.unkept.get(id)?.rev;
 	}
 
-	/** A keepable answer: cached, and served to every later read of `id` until something clears it. */
-	private keep(id: BlockId, block: T, rev: number) {
+	/** A keepable answer: cached, and served to every later read of `id` until something clears it.
+	 *  `reason` names how the content got here, so a log read to count source loads is not misled by
+	 *  an offer this cache never fetched. */
+	private keep(id: BlockId, block: T, rev: number, reason: 'miss:loaded' | 'offer:kept') {
 		this.cache.set(id, block);
 		this.revisions.set(id, rev);
 		this.unkept.delete(id);
 		this.bump(id);
-		log('miss:loaded id=%s cacheSize=%d', id, this.cache.size);
+		log('%s id=%s cacheSize=%d', reason, id, this.cache.size);
 	}
 
 	/** An answer this cache will not keep, over an id it holds nothing for: returned to this one

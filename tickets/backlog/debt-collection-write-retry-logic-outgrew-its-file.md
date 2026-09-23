@@ -19,3 +19,7 @@ The long explanatory comments mostly restate rules that are also in `docs/intern
 # Re-measured by `a-write-reported-torn-can-already-be-saved` (2026-09-17)
 
 `wc -l packages/db-core/src/collection/collection.ts` → 1965 lines: that ticket added the settlement of an unfinished write (`settleUnfinished`, `dischargeOwnPendings`, `lineageOfOwnEntry`, `throwTorn`) and the stage-and-flush bracket `Tree.replace` / `Diary.append` use (`actAndSync`, `unstage`). The retry loop itself did not grow; the new methods sit beside it and are small. The argument for this ticket is unchanged and a little stronger.
+
+# Re-measured by `debt-a-write-after-another-handles-commit-refetches-the-log-tail` (2026-09-23)
+
+`wc -l packages/db-core/src/collection/collection.ts` → 2118 lines. That ticket added about 60 of them to the REFRESH path (`keepWhatTheRefreshRead`, plus an argument on `forgetAndAdopt`), not to the retry machinery this ticket is about, so the retry loop itself is unchanged. The evidence it adds is only that the file keeps growing from more than one direction: a split that moves the retry machinery out would also give the refresh path room.

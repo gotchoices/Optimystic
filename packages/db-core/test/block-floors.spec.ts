@@ -61,4 +61,18 @@ describe('BlockFloors', () => {
 		expect(floors.answeredBelowFloor(block, pinnedAt(8), 6), 'a later too-old answer is still caught').to.equal(true)
 		expect(reported).to.have.length(1)
 	})
+
+	// `Collection.keepWhatTheRefreshRead` weighs the header and log tail its refresh read around
+	// `TransactorSource`, which is not an answer being served to a reader — so it must reach the same
+	// verdict without the `collection:block-below-floor` line, which would misdescribe it.
+	it('answers the same question silently for content that was not served to a reader', () => {
+		const reported: BelowFloorAnswer[] = []
+		const floors = new BlockFloors(answer => reported.push(answer))
+		floors.raise([block], { rev: 7, actionId: action('seven') })
+
+		expect(floors.meetsApplicableFloor(block, pinnedAt(8), 6), 'under the floor').to.equal(false)
+		expect(floors.meetsApplicableFloor(block, pinnedAt(8), 7), 'at the floor').to.equal(true)
+		expect(floors.meetsApplicableFloor(block, pinnedAt(6), 6), 'pinned below the floor, so none applies').to.equal(true)
+		expect(reported, 'and none of it was reported').to.deep.equal([])
+	})
 })
