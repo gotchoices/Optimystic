@@ -987,7 +987,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			anyConflicts = true;
 		}
 
-		this.forgetAndAdopt(latest, entryRevs, revertedBlockIds);
+		this.forgetAndAdopt(latest, entryRevs, revertedBlockIds, ends.served);
 
 		Collection.reportShortfall(this.id, this.instanceTag, tailRev, actionContext?.rev, this.source.actionContext?.rev);
 
@@ -1005,8 +1005,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 	}
 
-	/** Forget every block the refresh saw change, floor the ones a log entry names, and adopt the
-	 * revision the log is at — ONE synchronous step, which must stay free of any `await`.
+	/** Forget every block the refresh saw change, floor the ones a log entry names, adopt the
+	 * revision the log is at, and keep what the refresh already read
+	 * ({@link keepWhatTheRefreshRead}) — ONE synchronous step, which must stay free of any `await`.
 	 *
 	 * Reads are not latched, so one can run while a refresh is under way. Forgetting a block while
 	 * this handle still reads at the revision it is LEAVING invites exactly the wrong re-read: the
@@ -1028,6 +1029,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		latest: GetFromResult<Action<TAction>> | undefined,
 		entryRevs: ReadonlyMap<ActionId, number>,
 		revertedBlockIds: BlockId[],
+		served: LogEnds['served'],
 	): void {
 		for (const entry of latest?.entries ?? []) {
 			this.sourceCache.clear(entry.blockIds);
@@ -1035,6 +1037,61 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 		this.sourceCache.clear(revertedBlockIds);
 		Collection.advanceContext(this.source, this.id, this.instanceTag, 'refresh', latest?.context);
+		this.keepWhatTheRefreshRead(served);
+	}
+
+	/** Put the header and log tail block {@link readLogEnds} already fetched into this handle's own
+	 * cache, so the next read of either is a hit rather than a second fetch of a block just
+	 * received. Without it, a write that follows ANOTHER handle's commit fetches the log tail twice:
+	 * the refresh reads it, the walked entry names it (a commit's blocks include the log block its
+	 * entry was appended to) so the clear above drops it, and `Chain.add` then reads it again to
+	 * append this write's own entry.
+	 *
+	 * Last in {@link forgetAndAdopt}'s one synchronous step, after BOTH clears — offering before
+	 * either would simply be undone by it. An id that an invalidation reverted is therefore
+	 * re-offered rather than left forgotten, which is sound because the revert is itself a commit
+	 * and {@link readLogEnds} read unpinned: what it read already includes the revert.
+	 *
+	 * An offer is made only when all three hold:
+	 * - **This handle holds a context.** With none adopted, every later read is unpinned and may
+	 *   legitimately be answered newer than what was read here, so there is nothing to judge the
+	 *   offer against.
+	 * - **The served revision is at or below the adopted one.** {@link readLogEnds} reads unpinned,
+	 *   so it can come back newer than the view this handle now reads at — exactly the
+	 *   `collection:context-short-of-tail` case. Serving that to a read pinned lower would fabricate
+	 *   a view that never existed. At or below the pin it is sound: a block whose newest content is
+	 *   at `rev <= context.rev` has the same content at `context.rev`.
+	 * - **The served revision meets any applicable floor.** A cache must never keep a below-floor
+	 *   answer.
+	 *
+	 * NOTE: the floor check lives here because {@link readLogEnds} reads around
+	 * {@link TransactorSource}, which is what applies floors on every other read — nothing else on
+	 * this path would apply one. It compares without reporting: this is not an answer being served
+	 * to a reader, so `answeredBelowFloor`'s `collection:block-below-floor` line would misdescribe
+	 * it.
+	 *
+	 * Only this site seeds. The early return at {@link tailShowsNothingNewer} is deliberately left
+	 * alone: it fires when the log has not moved, and the cache is then already warm with the tail
+	 * (folded in by this handle's own commit, or kept from its last walk), so seeding there would
+	 * buy a fetch back only when the LRU had evicted it — at the cost of putting the one-synchronous-
+	 * step reasoning in a second place. */
+	// NOTE: an offer whose revision equals what the cache already holds is still kept, so a walking
+	// refresh bumps the header's generation even when the header was neither cleared nor changed.
+	// Over-bumping is safe (see `CacheSource.bump`) and costs a re-materialize of that block on its
+	// next read; if that ever shows up, skip the offer when the cache already RETAINS the id at the
+	// same revision — but note it would then also stop correcting a cached block whose content was
+	// folded forward locally at that revision.
+	private keepWhatTheRefreshRead(served: LogEnds['served']): void {
+		const context = this.source.actionContext;
+		if (context === undefined) {
+			return;
+		}
+		for (const [blockId, block, rev] of served) {
+			const floor = this.floors.applicableTo(blockId, context);
+			if (rev <= context.rev && (floor === undefined || rev >= floor.rev)) {
+				this.sourceCache.offerServed(blockId, block, rev);
+			}
+		}
 	}
 
 	/** The revision each action in `context` committed at, keyed by action id. `Log.getFrom` returns

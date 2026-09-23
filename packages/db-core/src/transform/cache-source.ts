@@ -186,6 +186,38 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 		return replacesOlder;
 	}
 
+	/** Adopt an answer some other read already obtained for `id` — the collection header and log
+	 *  tail block that `Collection.readLogEnds` fetches AROUND this cache — so the next read of the
+	 *  id is a hit rather than a second fetch of a block this handle just received.
+	 *
+	 *  Kept only when nothing strictly newer is held ({@link heldRevision}), on the same ground
+	 *  {@link admit} stands on: of two answers to one source the higher revision is the truer. The
+	 *  block is cloned on the way in — this cache stores the reference, and the caller's array is
+	 *  handed to other caches as a seed as well — and goes through {@link keep}, so the generation
+	 *  bump, the {@link unkept} eviction and the {@link revisions} entry all happen exactly as they
+	 *  do for an answer this cache fetched itself.
+	 *
+	 *  The CALLER owns the floor and pin checks. The offered block did not come through this cache's
+	 *  source, so `sourceServed` can say nothing about it: there is no `describeServed` record for a
+	 *  block the source never returned, and the by-id fallback would describe some other read. */
+	offerServed(id: BlockId, block: T, rev: number): void {
+		const heldRev = this.heldRevision(id);
+		if (heldRev !== undefined && heldRev > rev) {
+			log('offer:superseded id=%s rev=%d heldRev=%d', id, rev, heldRev);
+			return;
+		}
+		this.keep(id, structuredClone(block), rev);
+	}
+
+	/** The revision of the content this cache HOLDS for `id` right now — cached, or handed through
+	 *  unkept — and `undefined` when it holds none. Distinct from {@link getCachedRevision}, which
+	 *  also answers for an LRU-evicted id: that revision describes content this cache no longer has,
+	 *  so it is the right answer for a base probe and the wrong one for "is there anything here to
+	 *  weigh an offer against?". */
+	private heldRevision(id: BlockId): number | undefined {
+		return this.cache.has(id) ? this.revisions.get(id) : this.unkept.get(id)?.rev;
+	}
+
 	/** A keepable answer: cached, and served to every later read of `id` until something clears it. */
 	private keep(id: BlockId, block: T, rev: number) {
 		this.cache.set(id, block);

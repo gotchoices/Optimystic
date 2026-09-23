@@ -184,6 +184,42 @@ describe('refresh read cost', () => {
 		expect(reader.committedActionId(), 'the refresh walked and adopted the complete list').to.equal(newestAction)
 	})
 
+	it("a write that follows another handle's commit costs two requests", async () => {
+		// The contended shape: two parties alternating writes to one table, which is what a shared
+		// SQL table under two writers looks like. Every such write refreshes (reading the header and
+		// the log tail in one request), finds the other handle's entry, and forgets the blocks it
+		// names — the log tail among them, since a commit's blocks include the log block its entry
+		// was appended to. The two requests left are both owed: the refresh has to ask, and the leaf
+		// the other writer changed has to be re-read. A third would be a second fetch of the tail the
+		// refresh just received.
+		const a = await Tree.createOrOpen<number, Row>(net, 'alternating', keyOf)
+		const b = await Tree.createOrOpen<number, Row>(net, 'alternating', keyOf)
+		// Two rounds before the measured one: a handle learns the log tail's id from a refresh that
+		// found a committed header, and asks for the header and the tail in one request only from
+		// then on (`Collection.logTailId`).
+		await a.replace([[0, row(0)]])
+		await b.replace([[1, row(1)]])
+		await a.replace([[2, row(2)]])
+		await b.replace([[3, row(3)]])
+
+		const { requests, fetchesPerBlock } = await net.cost(async () => { await a.replace([[4, row(4)]]) })
+		expect(requests, `requests: ${JSON.stringify(net.requests)}`).to.be.at.most(2)
+		expectNoBlockFetchedTwice(fetchesPerBlock)
+		expect(await a.get(3), "and the write still saw the other handle's row").to.deep.equal(row(3))
+	})
+
+	it("a solo writer's write still costs one request", async () => {
+		// The uncontended half of the budget above, and the guard that the seed did not make it
+		// worse: this handle's own commit folds the tail back into its cache, so its next refresh
+		// stops at `tailShowsNothingNewer` having cleared nothing.
+		const writer = await Tree.createOrOpen<number, Row>(net, 'solo', keyOf)
+		await writeRows(writer, 0, 5)
+
+		const { requests, fetchesPerBlock } = await net.cost(async () => { await writer.replace([[5, row(5)]]) })
+		expect(requests, `requests: ${JSON.stringify(net.requests)}`).to.be.at.most(1)
+		expectNoBlockFetchedTwice(fetchesPerBlock)
+	})
+
 	it('a table and its index tree each cost one request when neither changed', async () => {
 		// The query adapter refreshes the table tree and then each index tree it scans through.
 		const table = await Tree.createOrOpen<number, Row>(net, 'table', keyOf)

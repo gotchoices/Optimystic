@@ -47,6 +47,22 @@ each request is a network round trip, so an idle poll costs one per tree rather 
 seven or more it used to. The budgets are asserted in
 `packages/db-core/test/refresh-read-cost.spec.ts`.
 
+A **write** pays that same refresh plus what the write itself needs: one request when
+nothing else has committed since this handle last looked, two when another handle has.
+The second is the leaf the other writer changed, which has to be re-read. There is no
+third, because the refresh KEEPS the header and log tail it just read in the collection's
+own cache (`Collection.keepWhatTheRefreshRead`, the last move of
+`Collection.forgetAndAdopt`'s one synchronous step). Without it the tail is fetched twice
+per contended write: the walked entry names the log tail — a commit's blocks include the
+log block its entry was appended to — so the clear beside that entry drops the tail, and
+`Chain.add` then fetches the block the refresh had just received in order to append this
+write's own entry. The keep is refused for anything read above the revision the walk
+adopted (`readLogEnds` reads unpinned, so a walk that lands short leaves a tail newer than
+the view the handle now reads at, and serving that would fabricate a view that never
+existed), and for anything under a floor that applies — checked at the seed itself
+(`BlockFloors.applicableTo`), because this path reads around `TransactorSource`, which is
+what applies floors on every other read.
+
 A suspected gap — that `count(*)` alone skipped the pull and so a count-only
 consumer never saw a peer's appends — was investigated and **empirically
 disproven** by `packages/quereus-plugin-optimystic/test/read-pull-mechanism.spec.ts`,

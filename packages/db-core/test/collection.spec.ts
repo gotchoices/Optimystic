@@ -1829,6 +1829,23 @@ describe('Collection', () => {
       return { transactor, arm: () => { armed = true } }
     }
 
+    /** Counts, per block id, how many `get` requests named it — the only way to tell a read
+     *  answered from a collection's own cache from one that went back to the transactor. */
+    const countingTransactor = (inner: ITransactor) => {
+      const counts = new Map<string, number>()
+      const transactor: ITransactor = {
+        async get(gets: BlockGets): Promise<GetBlockResults> {
+          for (const id of gets.blockIds) counts.set(id, (counts.get(id) ?? 0) + 1)
+          return inner.get(gets)
+        },
+        getStatus: (refs: ActionBlocks[]) => inner.getStatus(refs),
+        pend: (req: PendRequest) => inner.pend(req),
+        cancel: (ref: ActionBlocks) => inner.cancel(ref),
+        commit: (req: CommitRequest) => inner.commit(req),
+      }
+      return { transactor, reset: () => counts.clear(), fetches: (id: string) => counts.get(id) ?? 0 }
+    }
+
     // The healthy path is the assertion that matters most: a shortfall line on an ordinary
     // refresh would be noise in every log this diagnostic is meant to be read in.
     it('an ordinary refresh of an already-current collection says nothing', async () => {
@@ -2004,6 +2021,54 @@ describe('Collection', () => {
       expect(lines.filter(l => l.includes('collection:lineage-divergence')),
         'and nothing claims a divergence').to.deep.equal([])
       expect(reader!.committedRevision(), 'the refusal kept the higher revision').to.equal(rev)
+    })
+
+    // A refresh KEEPS the header and log tail it just read, so the write that follows does not
+    // fetch the tail a second time (`Collection.keepWhatTheRefreshRead`). That keep is sound only
+    // at or below the revision the walk adopted: `readLogEnds` reads UNPINNED, so a walk landing
+    // short leaves a tail whose content is newer than the view this handle now reads at, and
+    // serving it from cache would fabricate a view that never existed — and would label it with a
+    // revision a write staged over it then declares as its base.
+    //
+    // The observable here is the re-fetch, not the content: the truncation makes the tail's
+    // unpinned content identical to its content at the adopted revision, so only WHERE the next
+    // read is answered from can tell the two apart. Without the rule that read is a cache hit.
+    it('does not keep a tail it read above the revision its walk adopted', async () => {
+      const writer = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await writer.act({ type: 'set', data: { value: 'one', timestamp: 1 } })
+      await writer.updateAndSync()
+      const first = await syncedTail()
+
+      // Truncating one revision below the newest is what makes the walk land SHORT of the tail
+      // while still finding an entry — the entry is what drops the tail from this handle's cache,
+      // so whether the seed puts it back is visible as a fetch.
+      const truncated = truncatedTailTransactor(transactor, first.tailId, first.rev + 1)
+      const counted = countingTransactor(truncated.transactor)
+      const reader = await Collection.open<TestAction>(counted.transactor, collectionId, initOptions)
+      expect(reader?.committedRevision(), 'the reader opens at the first revision').to.equal(first.rev)
+
+      await writer.act({ type: 'set', data: { value: 'two', timestamp: 2 } })
+      await writer.updateAndSync()
+      await writer.act({ type: 'set', data: { value: 'three', timestamp: 3 } })
+      await writer.updateAndSync()
+      const latest = await syncedTail()
+      expect(latest.tailId, 'all three entries fit in one tail block').to.equal(first.tailId)
+      expect(latest.rev, 'and the log is two revisions on').to.equal(first.rev + 2)
+
+      truncated.arm()
+      const lines = await captureCollectionLog(() => reader!.update())
+      expect(lines.filter(l => l.includes(shortfallTag)).length,
+        `the refresh reports it landed short, got: ${lines.join(' | ')}`).to.equal(1)
+      expect(reader!.committedRevision(), 'having adopted the middle revision, not the one the tail claims')
+        .to.equal(first.rev + 1)
+
+      counted.reset()
+      const values: string[] = []
+      for await (const a of reader!.selectLog()) { values.push(a.data.value) }
+      expect(counted.fetches(first.tailId),
+        'the tail read above the adopted revision was not kept, so the next read asks again')
+        .to.be.greaterThan(0)
+      expect(values, 'and it is answered at the revision the collection adopted').to.deep.equal(['one', 'two'])
     })
 
     // The refusal is the guard; the fields only explain it. Every other test here runs with the
