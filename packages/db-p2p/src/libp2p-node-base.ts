@@ -431,21 +431,49 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * A peer whose event loop is saturated — a phone running Noise in pure JavaScript, see
 	 * {@link NodeOptions.noiseCrypto} — can miss that 5s deadline while perfectly healthy. Its
 	 * connections are then dropped, it re-dials, and it pays another handshake, which is slower
-	 * still. Such a deployment widens the deadline with `pingTimeout.minTimeout` (milliseconds).
-	 * `pingTimeout` is an adaptive-timeout init, but `minTimeout` is the only field of it that
-	 * changes anything here: the monitor never reports a ping's duration back to the timeout, so
-	 * the timeout's moving average stays at zero and the deadline is always exactly `minTimeout` —
-	 * `maxTimeout` is never reached, and setting it alone changes nothing. Both ends must set it —
-	 * a connection either peer's monitor gives up on is closed for both.
+	 * still. Such a deployment widens the deadline with `pingTimeout.minTimeout` (milliseconds) AND
+	 * moves `pingInterval` above it, both ends alike — a connection either peer's monitor gives up
+	 * on is closed for both:
+	 *
+	 * ```
+	 * connectionMonitor: { pingInterval: 35_000, pingTimeout: { minTimeout: 30_000, maxTimeout: 30_000 } }
+	 * ```
+	 *
+	 * Raising the deadline alone does not work, because the monitor opens a ping stream every
+	 * `pingInterval` whether or not the previous one has answered, and it pings on
+	 * `/ipfs/ping/1.0.0` — the protocol the `@libp2p/ping` service registered in `services` below
+	 * also serves, with `maxOutboundStreams: 1`. libp2p reads that limit off the registrar, so the
+	 * monitor's second stream to a peer still owing an answer is refused locally with
+	 * `TooManyOutboundProtocolStreamsError`, which the monitor's catch cannot tell from a late reply:
+	 * it aborts the connection. The deadline a peer actually gets is therefore
+	 * `min(minTimeout, pingInterval)` — `minTimeout: 30_000` under the default 10s interval buys 10s,
+	 * not 30. `test/connection-monitor-ping-overlap.spec.ts` reproduces both halves on two real nodes.
+	 *
+	 * What the patient shape costs is how long a genuinely dead peer is held: the next ping is due
+	 * within `pingInterval` of the freeze and then waits out `minTimeout`, so the connection is
+	 * reclaimed within about `pingInterval + minTimeout` — a little over a minute for the numbers
+	 * above. A large `maxTimeout` is not a ten-minute grace period; see the next paragraph for what
+	 * it does.
+	 *
+	 * `pingTimeout` is an adaptive-timeout init, but on this libp2p line `minTimeout` is the only
+	 * field of it that changes the deadline: the monitor never reports a ping's duration back to the
+	 * timeout, so the timeout's moving average stays at zero and the deadline is always exactly
+	 * `minTimeout` — `maxTimeout` is never reached, and setting it alone changes nothing. Setting the
+	 * two equal, as above, is what keeps the deadline exactly `minTimeout` once the adaptation below
+	 * starts working.
 	 *
 	 * NOTE: "always exactly `minTimeout`" holds because `ConnectionMonitor` never calls
 	 * `AdaptiveTimeout.cleanUp` (libp2p 3.1.3 over `@libp2p/utils`), so nothing ever feeds the
-	 * moving average the deadline is computed from. If a later libp2p starts reporting ping times
-	 * back, the deadline begins adapting upward from `minTimeout` toward `maxTimeout`, and this
-	 * paragraph and the matching one in the readme's React Native section both need re-checking.
-	 * libp2p 3.3 does exactly that (its monitor calls `cleanUp` after every ping), so this trips on
-	 * the move to 3.3. The monitor keeps one `AdaptiveTimeout` for all of a node's connections, so
-	 * from then on one slow peer lengthens the deadline for every connection on the node.
+	 * moving average the deadline is computed from. libp2p 3.3 calls it after every ping, so the move
+	 * to 3.3 starts the deadline adapting upward from `minTimeout` toward `maxTimeout` — but for ONE
+	 * ping only. The average decays over `pingTimeout.interval` (5s by default), which is shorter than
+	 * any ping interval a patient deadline can use, so by the next ping the stalled sample has almost
+	 * fully decayed and one fast reply puts the deadline back at `minTimeout`. A peer that stalls
+	 * intermittently is still dropped (4 of 4, measured on libp2p 3.3.11). So 3.3 buys tolerance of a
+	 * single slow ping, not a deadline that grows toward `maxTimeout`; and since the monitor keeps one
+	 * `AdaptiveTimeout` for all of a node's connections, the one ping it does buy is bought for every
+	 * connection on the node, off whichever peer was slowest. Re-check this paragraph and the matching
+	 * one in the readme's React Native section on that move.
 	 */
 	connectionMonitor?: ConnectionMonitorInit;
 };

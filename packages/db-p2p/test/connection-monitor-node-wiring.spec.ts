@@ -5,7 +5,10 @@
  * interval far shorter than libp2p's 10s default; its monitor stamps `Connection.rtt` on its own
  * side of the pair once a ping answers. An rtt appearing well inside that 10s default is therefore
  * the observation, and the whole claim: the supplied init reached libp2p's monitor. What the
- * monitor then does with a `pingTimeout` is libp2p's business and is deliberately not tested here.
+ * monitor then does with a `pingTimeout` is libp2p's business and is deliberately not tested here —
+ * except for the one part of it a deployment has to configure around, which
+ * `connection-monitor-ping-overlap.spec.ts` covers: a ping that overlaps the previous one aborts
+ * the connection, so the deadline a peer really gets is capped at `pingInterval`.
  *
  * NOTE: that reading rests on `ConnectionMonitor` being the only writer of `Connection.rtt` — true
  * of libp2p 3.1.x, where it is the sole assignment in the tree. If a later libp2p stamps rtt from

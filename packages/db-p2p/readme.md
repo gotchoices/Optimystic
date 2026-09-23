@@ -725,7 +725,8 @@ const node = await createLibp2pNode({ /* … */ transports, noiseCrypto });
 import { createLibp2pNode, type Libp2pConnectionMonitorInit } from '@optimystic/db-p2p/rn';
 
 const connectionMonitor: Libp2pConnectionMonitorInit = {
-    pingTimeout: { minTimeout: 30_000, maxTimeout: 600_000 }
+    pingInterval: 35_000,
+    pingTimeout: { minTimeout: 30_000, maxTimeout: 30_000 }
 };
 
 const node = await createLibp2pNode({ /* … */ transports, connectionMonitor });
@@ -733,7 +734,11 @@ const node = await createLibp2pNode({ /* … */ transports, connectionMonitor })
 
 The value is libp2p's own connection-monitor init, passed through unchanged; unset leaves libp2p's defaults alone. The type is re-exported here so the app need not depend on `libp2p` itself.
 
-**`minTimeout` is the only field that changes the deadline.** `pingTimeout` is an adaptive-timeout init, but the connection monitor never reports a ping's duration back to it, so the moving average the deadline is computed from stays at zero and the deadline is always exactly `minTimeout`. `maxTimeout` is never reached, and setting it alone changes nothing — it appears above only because that is the configuration the measurement ran with.
+**`pingInterval` has to be longer than the deadline, or the deadline does not apply.** The monitor opens a ping stream every `pingInterval` whether or not the previous ping has answered, and it pings on `/ipfs/ping/1.0.0` — the same protocol the `@libp2p/ping` service that every node here registers serves, and that service allows one outbound ping stream per connection. So the second ping to a peer that has not yet answered the first is refused before it leaves the phone, the monitor cannot tell that from a late reply, and it aborts the connection. A peer really gets `min(minTimeout, pingInterval)` to answer, so leaving the interval at its 10-second default caps a 30-second deadline at 10 seconds — which is what the measurement above actually ran with. `test/connection-monitor-ping-overlap.spec.ts` reproduces both halves on two real nodes.
+
+**What the patient shape costs is how long a dead peer is held.** The next ping after a peer freezes is due within `pingInterval`, and then waits out `minTimeout`, so the connection is reclaimed within about `pingInterval + minTimeout` — a little over a minute for the numbers above. A large `maxTimeout` does not extend that; it is not a grace period, and on this libp2p line it does nothing at all.
+
+**`minTimeout` is the only field that changes the deadline.** `pingTimeout` is an adaptive-timeout init, but the connection monitor never reports a ping's duration back to it, so the moving average the deadline is computed from stays at zero and the deadline is always exactly `minTimeout`. `maxTimeout` is never reached, and setting it alone changes nothing; it is set equal to `minTimeout` above so that the deadline stays exactly `minTimeout` on a libp2p line that *does* report ping durations back. libp2p 3.3 does, and there a slow reply widens the deadline for one ping before the next fast one brings it back to `minTimeout` — tolerance of a single slow ping, not a deadline that grows toward `maxTimeout`.
 
 **Both ends need it:** a connection either peer's monitor gives up on is closed for both, so the relay the phone talks through has to be given the same setting.
 
