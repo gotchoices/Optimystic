@@ -496,6 +496,51 @@ landed is this action's own revision, which storage treats as already done. A RE
 round is returned as a refused tail is. It can leave the tail and the other blocks on a minority of the
 cohort, which the writer's completion (`Collection.completeOwnEntry`) finishes as it finishes a lone tail.
 
+#### Both consensus rounds carry the coordinator's own member's vote
+
+Before a record fans out to the cohort, the coordinating node hands it to its OWN cluster member, in process,
+and sends the record carrying that member's vote. Both rounds do this: `prevoteLocalPromise` on the promise
+round and `presignLocalCommit` on the commit round, both in
+`packages/db-p2p/src/repo/cluster-coordinator.ts`. Either way the member is then left out of the round it
+already voted in, so it is invoked exactly once per phase.
+
+The two rounds want it for different reasons. On the **commit** round the pre-signature is what lets a remote
+member in a cohort of three or fewer reach its majority and apply in the same delivery, which is where the
+reconcile ordering in *A behind member actively reconciles* (under Key Invariants) starts. On the **promise**
+round it is what makes the race arbiter run at all. `resolveRace`
+(`packages/db-p2p/src/cluster/race-resolution.ts`) compares the count of `approve` promise votes first, and
+that comparison gates the two below it — the aged priority and the message hash, which are the comparisons
+that make every member pick the same winner. A record fanned out with no vote on it loses the count to any
+rival the member it lands on has already voted on, so what decided a first-round collision was arrival order.
+On a two-member cohort with each writer coordinating through its own node that was a guaranteed double loss:
+each member held its own coordinator's record and refused the other's, neither write reached the promise bar,
+and both writers backed off and re-drove. With both records carrying one approval the counts tie, the
+tie-breaks decide, and every member computes the same winner.
+
+Three rules hold this together, each of which has a failure mode if dropped:
+
+- **The pre-vote's outcome is the member's outcome for the round, success or throw.** A throw does not put the
+  member back into the round: the promise phase's contract is that the local member is invoked exactly once,
+  because a local throw is a real fault (validation, merge, consensus) rather than the relayed stream reset the
+  per-peer immediate retry exists for. The throw is recorded in the round's summary, so the per-peer logging,
+  the reputation accounting and the shortfall arithmetic see it exactly as they saw a failed local delivery
+  before. Pinned by `packages/db-p2p/test/cluster-coordinator-promise-retry.spec.ts` ("does NOT retry the
+  LOCAL cluster on a throw").
+- **The promise round merges only `promises`.** Merging a member's promises into a record that already carries
+  commit signatures is the defect in backlog
+  `bug-a-late-promise-invalidates-the-commit-signatures-already-collected`: a commit signature covers the
+  promise map it was signed over, so a late promise invalidates it. The pre-vote cannot hit that, because no
+  commit signature exists anywhere before the promise round completes — a member signs a commit only after
+  seeing a super-majority of approved promises. Keep that true.
+- **It fixes the two coordinators' members, not the whole cohort.** A member that is neither coordinator still
+  votes for whichever record reached it first, and its approval re-inflates that record to two against the
+  newcomer's one, so from three members up the count comparison can decide again one layer out. Observed at
+  four and five members in `packages/db-p2p/test/transaction-node-count-sweep.spec.ts`, whose per-size table
+  reports how the first round went. Both writers re-drive and the backoff separates them, which is why
+  [correctness.md Theorem 9](correctness.md#theorem-9-progress-under-contention) states its guarantee per
+  retry cycle rather than per round; the residual and why it is not simply relaxable are recorded at
+  `resolveRace`.
+
 #### Commit content-digest check (promise round)
 
 The client that authored a transaction declares, inside the commit request it submits for

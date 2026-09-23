@@ -250,12 +250,24 @@ describe('Transaction sweep across node counts (one scenario at 1–5 machines)'
 						expect(isConflictFailure(lost.result as StaleFailure), `lost ${lost.kind}@${lost.rev} is conflict-shaped: ${JSON.stringify(lost.result)}`).to.equal(true);
 					}
 
-					// Exactly one action committed the contested revision. Deliberately NOT "one writer wins the first
-					// round": both racing pends can reach pend consensus, each member's storage then keeps whichever
-					// pending record reached it first, and both coordinators hear a cohort refusal
-					// (`CoordinatorRepo.pendThroughCluster`, `cohortPendRefusals`) — an all-lose round that the retry
-					// loop's jittered backoff separates. The guarantee is that no revision is ever won twice, and
-					// that is what is asserted; how the first round went is reported in the table.
+					// Exactly one action committed the contested revision — the guarantee this phase holds at every
+					// size. How the FIRST round goes is size-dependent, so it is asserted separately below (at two
+					// members) and reported in the table at every size:
+					//
+					//  - At two and three members every member must promise, so each racing record is decided by
+					//    `resolveRace` at the promise vote. Both records now reach a member carrying their own
+					//    coordinator's approval (`ClusterCoordinator.prevoteLocalPromise`), so the approval counts tie
+					//    and the message-hash tie-break below them — the part that makes every member pick the same
+					//    winner — decides. One writer wins outright and the other is answered `Conflict race lost`
+					//    (`cluster-tx:conflict-race-lost`, surfaced by `CoordinatorRepo.pend` as a returned conflict).
+					//  - At four members and up super-majority is reachable without one member, so a member that is
+					//    neither coordinator still approves whichever record reached it first and both pends can reach
+					//    pend consensus anyway. Each member's storage then keeps whichever pending record arrived
+					//    first, and both coordinators hear a cohort refusal instead
+					//    (`CoordinatorRepo.pendThroughCluster`, `cohortPendRefusals`,
+					//    `coordinator-repo:pend-remote-refusal`) — an all-lose round that the retry loop's jittered
+					//    backoff separates. That residual is recorded at `resolveRace` in
+					//    `packages/db-p2p/src/cluster/race-resolution.ts`.
 					const winnersByRev = new Map<number, Set<ActionId>>();
 					for (const commit of committed(all)) {
 						winnersByRev.set(commit.rev!, (winnersByRev.get(commit.rev!) ?? new Set()).add(commit.actionId));
@@ -289,6 +301,17 @@ describe('Transaction sweep across node counts (one scenario at 1–5 machines)'
 					const firstRound = wonFirstRound(raceAttempts.a) ? 'node 0 won' : wonFirstRound(raceAttempts.b) ? 'node 1 won' : 'both lost';
 					const contestedWinner = committed(raceAttempts.a).some(a => a.rev === contestedRev) ? 0 : 1;
 					row.race = `round 1: ${firstRound}; ${refused.length} lost attempt(s), all conflicts; rev ${contestedRev} won by node ${contestedWinner}; ${landed} of 2 landed`;
+
+					if (size === 2) {
+						// The size where the arbitration is unambiguous: a two-member cohort needs both promises, so
+						// neither writer can win past a member that holds its rival. Before the pre-vote each member
+						// held its own coordinator's record and refused the other's, and BOTH writers re-drove; now
+						// the tie-break picks one winner at both members. Asserted here rather than at three-and-up
+						// because only this size rules the residual above out by construction.
+						const winners = [raceAttempts.a, raceAttempts.b].filter(wonFirstRound);
+						expect(winners.length, `exactly one writer wins the first round (${describeAttempts(all)})`).to.equal(1);
+						expect(refused.length, `the loser is refused exactly once (${describeAttempts(all)})`).to.equal(1);
+					}
 				});
 			}
 

@@ -72,6 +72,21 @@ export function approvalCount(record: ClusterRecord): number {
  * NOTE: keep priority a self-contained additive message field + this one comparison key so it
  * composes with — does not block — a future HLC/crdt-sync redesign of this same path
  * (design-hot-log-tail-sharding-guidance).
+ *
+ * NOTE: from three members up, a member that is neither of the two racing coordinators still votes for
+ * whichever record reached it FIRST, and its own approval re-inflates that record to two against the
+ * newcomer's one — so comparison 1 decides again and the tie-breaks below it are bypassed one layer
+ * out. Each coordinator's own member now votes before its record fans out
+ * (`ClusterCoordinator.prevoteLocalPromise`), which is what makes the two coordinators' members agree;
+ * a third member's vote is what can still split them. Observed as `round 1: both lost` at four and five
+ * members in `test/transaction-node-count-sweep.spec.ts` (at three, where the cohort needs every
+ * promise, whether it shows depends on delivery order, and that sweep does not see it). Both writers
+ * then re-drive and the retry loop's jittered backoff separates them, so this costs a round, not
+ * correctness. Do NOT close it by relaxing "first arrival wins that member's vote": a member cannot
+ * retract an approval it has already signed, and letting a member that approved a write which went on
+ * to reach super-majority also approve its rival is exactly the split brain the approvals-first order
+ * above exists to prevent. Closing it needs something structurally different — a member that can hold
+ * its vote back until it has seen both rivals, or a rival that carries proof of how far it has got.
  */
 export function resolveRace(existing: ClusterRecord, incoming: ClusterRecord): 'keep-existing' | 'accept-incoming' {
 	// 1. Transaction with more APPROVALS wins — never displace a more-progressed rival (safety, see

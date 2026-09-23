@@ -36,3 +36,7 @@ Found while planning `cluster-commit-round-carries-the-coordinators-commit-vote`
 ## Update from `cluster-commit-round-carries-the-coordinators-commit-vote`
 
 When the late member is the coordinating node itself, the defect no longer arises. Its own member now votes to commit in process before the commit round goes out (`ClusterCoordinator.presignLocalCommit`), and the coordinator merges that member's `promises` along with its commit before sending anything, so every remote member signs over the same promise map. A remote late member (D above) is unchanged: `collectCommits` still merges only `commits` from remote responses.
+
+## Update from `every-member-votes-for-whichever-racing-write-reached-it-first`
+
+The promise round now works the same way the commit round does: `ClusterCoordinator.prevoteLocalPromise` has this node's own member vote before the record fans out, and merges that member's `promises` into the record every remote member receives. That merge cannot reach this defect — at that point in the transaction no commit signature exists anywhere, because a member signs a commit only after it has seen a super-majority of approved promises, and the commit round has not run. The defect as described is unchanged: `collectCommits` still merges only `commits` from a remote member's answer, so a remote member that was silent for the promise round and answers the commit round still signs over a promise map nobody else has.

@@ -838,7 +838,26 @@ export class ClusterCoordinator {
 	}
 
 	/**
-	 * Collects promises from all peers in the cluster
+	 * The promise round: this node's own member votes first, in process, and the record that fans out
+	 * to the remote members carries that vote ({@link prevoteLocalPromise}).
+	 *
+	 * The pre-vote is what makes `resolveRace` (`packages/db-p2p/src/cluster/race-resolution.ts`) the
+	 * arbiter it is documented to be. Its first comparison is the count of `approve` promise votes, and
+	 * a vote-less record loses that comparison to any rival a member has already voted on — including
+	 * the member's own coordinator's write. So a fan-out that went out unvoted decided every first-round
+	 * collision by arrival order, and the priority and message-hash tie-breaks below the count never ran.
+	 * On a two-member cohort where each writer coordinates through its own node that was a guaranteed
+	 * double loss: each member held its own coordinator's record and refused the other's, neither write
+	 * reached the promise bar, and both writers backed off and re-drove. With both records carrying one
+	 * approval the counts tie, the tie-breaks run, and every member computes the same winner
+	 * (docs/correctness.md Theorem 9).
+	 *
+	 * Merging the member's promises here cannot invalidate a signature the way a LATE promise can on the
+	 * commit round (backlog `bug-a-late-promise-invalidates-the-commit-signatures-already-collected`):
+	 * a commit signature covers the promise map it was signed over, and at this point in the transaction
+	 * no commit signature exists anywhere — the commit round has not run, and no member signs a commit
+	 * before it sees a super-majority of approved promises. Keep that true: anything that would let a
+	 * commit signature exist before the promise round completes brings that defect here.
 	 */
 	private async collectPromises(peers: ClusterPeers, record: ClusterRecord): Promise<{ record: ClusterRecord }> {
 		const peerIds = Object.keys(peers);
@@ -850,12 +869,21 @@ export class ClusterCoordinator {
 			}));
 			log('cluster-tx:promise-peers', { messageHash: record.messageHash, peers: peerDetail });
 		}
-		// For each peer, create a client and request a promise. A remote promise rides
+		// Self votes first, and its outcome IS its outcome for the round — success or throw. The round
+		// then leaves it out, so the local member is invoked exactly once in the promise phase, which is
+		// the contract `cluster-coordinator-promise-retry.spec.ts` pins ("does NOT retry the LOCAL
+		// cluster on a throw"): a local throw is a real fault, and re-including self on that path would
+		// call it a second time.
+		const selfId = this.localCluster?.peerId.toString();
+		const prevote = await this.prevoteLocalPromise(record);
+		if (prevote) summary.push(prevote);
+		const roundPeers = prevote ? peerIds.filter(id => id !== selfId) : peerIds;
+		// For each remaining peer, create a client and request a promise. A remote promise rides
 		// a libp2p stream that a relayed (limited) connection can reset transiently, so
 		// each remote request gets `promiseImmediateRetries` in-line re-attempts before
 		// it counts as a failure — without this a single relayed reset drops the peer and
 		// sinks super-majority (the commit broadcast already has the same guard).
-		const promiseRequests = peerIds.map(peerIdStr => {
+		const promiseRequests = roundPeers.map(peerIdStr => {
 			const isLocal = this.localCluster && peerIdStr === this.localCluster.peerId.toString();
 			log('cluster-tx:promise-request', { messageHash: record.messageHash, peerId: peerIdStr, isLocal });
 			return new Pending(this.updateMember(peerIdStr, record, this.promiseImmediateRetries, 'promise'));
@@ -863,7 +891,7 @@ export class ClusterCoordinator {
 
 		// Wait for all promises to complete
 		const results = await Promise.all(promiseRequests.map((p, idx) => p.result().then(res => {
-			const peerIdStr = peerIds[idx]!;
+			const peerIdStr = roundPeers[idx]!;
 			log('cluster-tx:promise-response', {
 				messageHash: record.messageHash,
 				peerId: peerIdStr,
@@ -874,7 +902,7 @@ export class ClusterCoordinator {
 			summary.push({ peerId: peerIdStr, success: true });
 			return res;
 		}).catch(err => {
-			const peerIdStr = peerIds[idx]!;
+			const peerIdStr = roundPeers[idx]!;
 			log('cluster-tx:promise-response', { messageHash: record.messageHash, peerId: peerIdStr, success: false, error: err });
 			summary.push({ peerId: peerIdStr, success: false, error: err instanceof Error ? err.message : String(err) });
 			this.reputation?.reportPeer(peerIdStr, PenaltyReason.ConsensusTimeout, `promise:${record.messageHash}`);
@@ -932,6 +960,51 @@ export class ClusterCoordinator {
 		});
 		this.updateTransactionRecord(record, 'after-promises');
 		return { record };
+	}
+
+	/**
+	 * Have this node's own member cast its promise vote on `record`, in process, before the record
+	 * fans out, and merge its vote into `record`. The promise-round twin of {@link presignLocalCommit},
+	 * and the reason {@link collectPromises} runs it is in that method's own comment.
+	 *
+	 * Returns the member's outcome for the round's summary — which is where the caller's per-peer
+	 * logging and reputation accounting read it — on BOTH paths, so the round leaves self out whether
+	 * the member voted or threw. That is the difference from {@link presignLocalCommit}, which returns
+	 * `false` on a throw and lets the round include self: the commit round has the consensus broadcast
+	 * and the commit-retry timer behind it, while the promise phase's contract is that the local member
+	 * is invoked exactly ONCE — a local throw is a real fault (validation / merge / consensus), not
+	 * transport churn worth a second call. `undefined` means there is no local member in this cohort
+	 * (some test wiring), and the round then runs over every peer unchanged.
+	 *
+	 * Only `promises` is merged, not `commits`: the round merges only `promises` from every other
+	 * member's answer, and a member cannot sign a commit here anyway without seeing a super-majority of
+	 * approved promises, which a record carrying one vote is not at any cohort size this class runs on
+	 * (`CoordinatorRepo`'s solo path keeps a cohort of one away from it).
+	 */
+	private async prevoteLocalPromise(record: ClusterRecord): Promise<ClusterLogPeerOutcome | undefined> {
+		const selfId = this.localCluster?.peerId.toString();
+		if (selfId === undefined || !(selfId in record.peers)) {
+			return undefined;
+		}
+		log('cluster-tx:promise-request', { messageHash: record.messageHash, peerId: selfId, isLocal: true, prevote: true });
+		try {
+			// A copy, so the member cannot mutate the record the fan-out is about to send.
+			const response = await this.localCluster!.update({ ...record });
+			record.promises = { ...record.promises, ...response.promises };
+			log('cluster-tx:promise-response', {
+				messageHash: record.messageHash,
+				peerId: selfId,
+				success: true,
+				prevote: true,
+				returnedPromises: Object.keys(response.promises ?? {}),
+				returnedCommits: Object.keys(response.commits ?? {})
+			});
+			return { peerId: selfId, success: true };
+		} catch (err) {
+			log('cluster-tx:promise-response', { messageHash: record.messageHash, peerId: selfId, success: false, prevote: true, error: err });
+			this.reputation?.reportPeer(selfId, PenaltyReason.ConsensusTimeout, `promise:${record.messageHash}`);
+			return { peerId: selfId, success: false, error: err instanceof Error ? err.message : String(err) };
+		}
 	}
 
 	/**

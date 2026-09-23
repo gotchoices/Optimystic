@@ -207,6 +207,33 @@ private async handlePromiseNeeded(record: ClusterRecord): Promise<ClusterRecord>
 }
 ```
 
+**The coordinator's own member votes first, and its vote rides on the round.** Before the record fans out,
+`ClusterCoordinator.prevoteLocalPromise` delivers it to this node's own member in process and merges that
+member's vote into the record every remote member then receives; the round itself leaves self out, so the
+local member is invoked exactly once in this phase. That is the promise-round twin of the commit round's
+pre-signature (below), and it is what makes `resolveRace` the arbiter this document describes. Its first
+comparison is the count of `approve` votes, and that comparison gates the aged-priority and message-hash
+tie-breaks below it — the parts that make every member pick the same winner. A record fanned out carrying no
+vote loses the count to any rival the member it lands on has already voted on, so first-round collisions were
+decided by arrival order: on a two-member cohort with each writer coordinating through its own node, each
+member held its own coordinator's record and refused the other's, neither write reached the super-majority,
+and both writers re-drove. With both records carrying one approval the counts tie and the tie-breaks decide.
+
+Two consequences worth keeping in mind when changing this phase. The pre-vote's outcome is the member's
+outcome for the round on **both** paths — a throw counts as that one invocation and is recorded in the round's
+summary (so the per-peer logging, reputation accounting and shortfall arithmetic see it), rather than putting
+the member back into the round for a second call; a local throw is a real fault, not the relayed stream reset
+the per-peer immediate retry exists for. And only `promises` is merged: merging a vote into a record that
+already carries commit signatures invalidates them (backlog
+`bug-a-late-promise-invalidates-the-commit-signatures-already-collected`), which the pre-vote cannot do
+because no commit signature exists before this round completes.
+
+It fixes the two racing coordinators' members, not every member. A member that is neither coordinator still
+votes for whichever record reached it first, and its own approval re-inflates that record to two against the
+newcomer's one, so from three members up the count comparison can decide again one layer out; both writers
+then re-drive and the retry loop's jittered backoff separates them. The residual is recorded at `resolveRace`
+in `packages/db-p2p/src/cluster/race-resolution.ts`.
+
 **Never silence.** A member that loses the race answers with a `conflict` vote rather than
 withholding its promise: absence on the wire cannot be told apart from an unreachable peer, so a
 silently-lost race reached the writer as "the cohort did not answer" and could not be retried
