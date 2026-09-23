@@ -464,9 +464,10 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 *
 	 * NOTE: "always exactly `minTimeout`" holds because `ConnectionMonitor` never calls
 	 * `AdaptiveTimeout.cleanUp` (libp2p 3.1.3 over `@libp2p/utils`), so nothing ever feeds the
-	 * moving average the deadline is computed from. libp2p 3.3 calls it after every ping, so the move
-	 * to 3.3 starts the deadline adapting upward from `minTimeout` toward `maxTimeout` — but for ONE
-	 * ping only. The average decays over `pingTimeout.interval` (5s by default), which is shorter than
+	 * moving average the deadline is computed from. libp2p 3.3 calls it after every ping, so on that
+	 * line a `maxTimeout` left ABOVE `minTimeout` lets the deadline adapt upward between the two —
+	 * but for ONE ping only, and the shape above sets them equal, which pins it at `minTimeout`
+	 * there as well. The average decays over `pingTimeout.interval` (5s by default), which is shorter than
 	 * any ping interval a patient deadline can use, so by the next ping the stalled sample has almost
 	 * fully decayed and one fast reply puts the deadline back at `minTimeout`. A peer that stalls
 	 * intermittently is still dropped (4 of 4, measured on libp2p 3.3.11). So 3.3 buys tolerance of a
@@ -747,6 +748,14 @@ export async function createLibp2pNodeBase(
 			identifyPush: identifyPush({
 				protocolPrefix: `optimystic/${options.networkName}`
 			}),
+			// NOTE: constructed bare, so `@libp2p/ping`'s own `maxOutboundStreams: 1` is the outbound
+			// limit the registrar reports for `/ipfs/ping/1.0.0` to every caller on this node —
+			// including libp2p's connection monitor, which pings on that same protocol. That limit is
+			// what makes an overlapping ping abort the connection, and so what makes the deadline rule
+			// in {@link NodeOptions.connectionMonitor} (`pingInterval` above `pingTimeout.minTimeout`)
+			// necessary. Raising it here would retire that rule, change what every node accepts from an
+			// application's own pings, and falsify `test/connection-monitor-ping-overlap.spec.ts` plus
+			// both documents it backs — re-check all three before doing so.
 			ping: ping(),
 			// DCUtR (hole-punch) upgrades relayed node↔node connections to direct
 			// ones; AutoNAT learns this node's public reachability via peer dial-back.

@@ -104,6 +104,11 @@ describe('connectionMonitor — a ping that overlaps the previous one', function
 	 * Make `node` a peer whose ping answer never comes: accept the stream, echo nothing, hold it
 	 * open. Unhandling the protocol instead would be a different case — the monitor reads
 	 * `UnsupportedProtocolError` as proof the peer is alive.
+	 *
+	 * `maxInboundStreams` restates `@libp2p/ping`'s own default, which the `force` re-registration
+	 * would otherwise drop back to the registrar's. Two is what the overlap arm needs: multistream
+	 * select runs before the dialer counts its outbound streams, so the ping it is about to refuse
+	 * has already been negotiated on this side and both are open here at once.
 	 */
 	async function stallPingAnswers(node: OptimysticNode): Promise<void> {
 		await node.handle(PING_PROTOCOL, () => {}, { force: true, runOnLimitedConnection: true, maxInboundStreams: 2 });
