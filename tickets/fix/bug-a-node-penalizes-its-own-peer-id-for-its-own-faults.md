@@ -10,6 +10,13 @@ severity: edge-case
 likelihood: unusual
 tradeoffs: The blast radius is bounded — it takes sixteen local consensus faults inside one thirty-minute decay window to reach the ban threshold, and a machine failing that often has a bigger problem than its own reputation entry, so a maintainer may reasonably rank this below work with a user visible in the loop.
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-09-23T18:36:45.764Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\bug-a-node-penalizes-its-own-peer-id-for-its-own-faults.fix.2026-09-23T18-36-45-761Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 # A node files reputation penalties against itself
 
 ## What happens
