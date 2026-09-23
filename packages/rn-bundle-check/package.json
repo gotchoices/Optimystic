@@ -1,6 +1,6 @@
 {
   "name": "@optimystic/rn-bundle-check",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "private": true,
   "type": "module",
   "description": "Bundles the React Native entry with Metro and compiles it with hermesc, the way a phone app's build does",
