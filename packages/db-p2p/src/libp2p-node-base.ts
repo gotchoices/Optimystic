@@ -424,16 +424,25 @@ export type NodeOptions = ClusterPolicyOptions & {
 	/**
 	 * Optional settings for libp2p's connection monitor, which pings every open connection on an
 	 * interval and — unless told otherwise — aborts the connection when a ping does not answer in
-	 * time. Unset → libp2p's own defaults (ping every 10s; the ping deadline adapts to observed
-	 * round trips but never drops below 5s). The value is libp2p's own `ConnectionMonitorInit`,
-	 * passed through unchanged; this package substitutes no default of its own.
+	 * time. Unset → libp2p's own defaults (ping every 10s, each ping given 5s to answer). The value
+	 * is libp2p's own `ConnectionMonitorInit`, passed through unchanged; this package substitutes no
+	 * default of its own.
 	 *
 	 * A peer whose event loop is saturated — a phone running Noise in pure JavaScript, see
-	 * {@link NodeOptions.noiseCrypto} — can miss that 5s floor while perfectly healthy. Its
+	 * {@link NodeOptions.noiseCrypto} — can miss that 5s deadline while perfectly healthy. Its
 	 * connections are then dropped, it re-dials, and it pays another handshake, which is slower
-	 * still. Such a deployment passes a patient `pingTimeout` (an adaptive-timeout init:
-	 * `{ minTimeout, maxTimeout }` in ms). Both ends must do it — a connection either peer's
-	 * monitor gives up on is closed for both.
+	 * still. Such a deployment widens the deadline with `pingTimeout.minTimeout` (milliseconds).
+	 * `pingTimeout` is an adaptive-timeout init, but `minTimeout` is the only field of it that
+	 * changes anything here: the monitor never reports a ping's duration back to the timeout, so
+	 * the timeout's moving average stays at zero and the deadline is always exactly `minTimeout` —
+	 * `maxTimeout` is never reached, and setting it alone changes nothing. Both ends must set it —
+	 * a connection either peer's monitor gives up on is closed for both.
+	 *
+	 * NOTE: "always exactly `minTimeout`" holds because `ConnectionMonitor` never calls
+	 * `AdaptiveTimeout.cleanUp` (libp2p 3.1.3 over `@libp2p/utils`), so nothing ever feeds the
+	 * moving average the deadline is computed from. If a later libp2p starts reporting ping times
+	 * back, the deadline begins adapting upward from `minTimeout` toward `maxTimeout`, and this
+	 * paragraph and the matching one in the readme's React Native section both need re-checking.
 	 */
 	connectionMonitor?: ConnectionMonitorInit;
 };
