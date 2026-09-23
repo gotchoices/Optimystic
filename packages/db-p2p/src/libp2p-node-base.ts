@@ -443,6 +443,9 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * moving average the deadline is computed from. If a later libp2p starts reporting ping times
 	 * back, the deadline begins adapting upward from `minTimeout` toward `maxTimeout`, and this
 	 * paragraph and the matching one in the readme's React Native section both need re-checking.
+	 * libp2p 3.3 does exactly that (its monitor calls `cleanUp` after every ping), so this trips on
+	 * the move to 3.3. The monitor keeps one `AdaptiveTimeout` for all of a node's connections, so
+	 * from then on one slow peer lengthens the deadline for every connection on the node.
 	 */
 	connectionMonitor?: ConnectionMonitorInit;
 };
