@@ -64,7 +64,16 @@ export interface GrowthOutcome {
  */
 export interface BlockHolders {
 	blockIds: readonly string[]
-	/** Peers evidenced to hold the same revision this node holds. Self may appear; it is ignored. */
+	/**
+	 * Peers evidenced to hold a copy of the block. Self may appear; it is ignored.
+	 *
+	 * Deliberately NOT "at the same revision this node holds": the growth arm counts copies, not
+	 * currency, and one producer cannot promise more than that — a push whose declared revision this
+	 * node already holds is accepted as a monotonic no-op, which evidences only that its sender holds
+	 * some revision at or below this one. Bringing a behind peer current is the repair path's job,
+	 * not growth's. NOTE: if the growth arm ever becomes revision-aware, this field has to carry the
+	 * revision each producer actually witnessed rather than being read as the block's latest.
+	 */
 	holders: readonly string[]
 	/**
 	 * Cohort members the commit's coordinator knows did NOT confirm holding the revision. Withdraws

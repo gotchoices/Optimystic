@@ -18,7 +18,6 @@
  */
 
 import { expect } from 'chai';
-import { pushable } from 'it-pushable';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
 import type { PeerId } from '@libp2p/interface';
 import { canonicalBlockHash } from '@optimystic/db-core';
@@ -38,6 +37,7 @@ import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { ArachnodeFretAdapter } from '../src/storage/arachnode-fret-adapter.js';
 import type { BlockCommitProof } from '../src/cluster/commit-proof.js';
 import { makeKeyPair, makeSignedProof, PROOF_THRESHOLDS } from './support/commit-proof-fixtures.js';
+import { makeLinkedPair } from './support/linked-duplex-pair.js';
 
 const SUPER_MAJORITY = PROOF_THRESHOLDS.superMajorityThreshold;
 
@@ -77,31 +77,6 @@ const monitorLibp2p = (peerId: PeerId) => ({
 
 /** FRET stand-in: the cohort comes from the injected key network, so only the adapter needs a target. */
 const idleFret = {} as unknown as FretService;
-
-/**
- * A linked in-memory duplex pair modelling the libp2p stream shape both the client and the service
- * duck-type against (`send` / `close` / `abort` / async-iterable): what one side writes the other
- * reads. Same shape as `block-transfer-roundtrip.spec.ts`'s pair — kept local because that one wires
- * no connection, and the connection is the whole point here.
- */
-const makeLinkedPair = () => {
-	const toServer = pushable<any>({ objectMode: true });
-	const toClient = pushable<any>({ objectMode: true });
-	return {
-		clientStream: {
-			send: (chunk: any) => { toServer.push(chunk); },
-			close: async () => { toServer.end(); },
-			abort: (err?: Error) => { toServer.end(err); toClient.end(err); },
-			async *[Symbol.asyncIterator]() { yield* toClient; }
-		},
-		serverStream: {
-			send: (chunk: any) => { toClient.push(chunk); },
-			close: async () => { toClient.end(); },
-			abort: (err?: Error) => { toClient.end(err); toServer.end(err); },
-			async *[Symbol.asyncIterator]() { yield* toServer; }
-		}
-	};
-};
 
 interface Rig {
 	monitor: RebalanceMonitor;

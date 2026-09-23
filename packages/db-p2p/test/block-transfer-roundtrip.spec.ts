@@ -19,6 +19,7 @@ import {
 } from '../src/cluster/block-transfer-service.js';
 import { ResponseTimeoutError, RESPONSE_TIMEOUT_ERROR_CODE } from '../src/protocol-client.js';
 import { makeSignedProof } from './support/commit-proof-fixtures.js';
+import { makeLinkedPair } from './support/linked-duplex-pair.js';
 
 /**
  * Default-suite (no env gate) regression for the block-transfer request→response
@@ -46,34 +47,6 @@ const makeBlock = (id: string): IBlock => ({
 
 /** Mirrors `support/commit-proof-fixtures.ts`'s `PROOF_THRESHOLDS.superMajorityThreshold`. */
 const SUPER_MAJORITY = 0.75;
-
-/**
- * In-memory linked duplex pair backed by two it-pushable queues. Models the libp2p
- * stream shape (`send` / `close` / `abort` / `[Symbol.asyncIterator]`) both the
- * ProtocolClient and BlockTransferService duck-type against. `clientStream.send`
- * feeds the server's input queue (and vice versa), so what one side writes the other
- * side reads. `abort(err)` ends both queues with the error so a deadline-driven
- * `stream.abort(...)` actually unblocks a blocked read (mirrors a real libp2p stream
- * rejecting its async iterator on abort).
- */
-function makeLinkedPair() {
-	const toServer = pushable<any>({ objectMode: true });
-	const toClient = pushable<any>({ objectMode: true });
-
-	const clientStream = {
-		send: (chunk: any) => { toServer.push(chunk); },
-		close: async () => { toServer.end(); },
-		abort: (err?: Error) => { toServer.end(err); toClient.end(err); },
-		async *[Symbol.asyncIterator]() { yield* toClient; },
-	};
-	const serverStream = {
-		send: (chunk: any) => { toClient.push(chunk); },
-		close: async () => { toClient.end(); },
-		abort: (err?: Error) => { toClient.end(err); toServer.end(err); },
-		async *[Symbol.asyncIterator]() { yield* toServer; },
-	};
-	return { clientStream, serverStream };
-}
 
 /**
  * Wires a real BlockTransferService into a mock peerNetwork. The registrar captures

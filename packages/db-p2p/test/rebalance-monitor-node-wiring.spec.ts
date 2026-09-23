@@ -109,11 +109,11 @@ describe('rebalance-monitor / node wiring (real libp2p, solo arachnode node)', f
 			expect(spreadMonitor.getTrackedBlockCount(), 'both monitors agree on the shared tracked-block count')
 				.to.equal(monitor.getTrackedBlockCount());
 
-			// Committed-holders reports reach the monitor. The sink is late-bound (the member and
+			// Block-holder reports reach the monitor. The sink is late-bound (the member and
 			// coordinator are built before the monitor exists), and a solo commit reports no holders, so
 			// fire the coordinator's sink directly: the evidence must land in this node's monitor.
 			const sink = (node.coordinatedRepo as any).onBlockHolders as (c: { blockIds: string[]; holders: string[] }) => void;
-			expect(sink, 'coordinator was handed a committed-holders sink').to.be.a('function');
+			expect(sink, 'coordinator was handed a block-holders sink').to.be.a('function');
 			sink({ blockIds: ['rebalance-owned-block'], holders: ['some-peer'] });
 			expect((monitor as any).holderEvidence.get('rebalance-owned-block')?.holders.has('some-peer'),
 				'the report reached the rebalance monitor').to.equal(true);

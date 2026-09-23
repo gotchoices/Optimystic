@@ -494,7 +494,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// Absent by default: `undefined` here is identical to omitting the field, and
 			// `validatePendOperations` then skips the validation step entirely.
 			validator: options.validatorFactory?.(index, peerId),
-			onBlockHolders: options.onBlockHolders && ((committed) => options.onBlockHolders!(meshNode, committed))
+			onBlockHolders: options.onBlockHolders && ((holders) => options.onBlockHolders!(meshNode, holders))
 		});
 	};
 
@@ -587,7 +587,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// The read path's transfer mechanism — the SAME instance the member uses on the commit
 			// path, mirroring how `libp2p-node-base` shares one `reconcileBlock` between both.
 			acquireBlockFromCohort: reconcileByPeer.get(node.peerId.toString())!,
-			onBlockHolders: options.onBlockHolders && ((committed) => options.onBlockHolders!(node, committed))
+			onBlockHolders: options.onBlockHolders && ((holders) => options.onBlockHolders!(node, holders))
 		});
 	};
 

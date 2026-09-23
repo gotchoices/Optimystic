@@ -289,10 +289,13 @@ export class BlockTransferService implements Startable {
 
 	private async handleRequest(stream: Stream, connection?: Connection): Promise<void> {
 		const self = this;
+		// The one derivation of who is on the other end: the authorization gate judges it, and a push
+		// names it as the holder of what it sends. Two readings of `connection` could disagree.
+		const remotePeerId = connection?.remotePeer?.toString();
 		try {
 			// Authorization runs before ANY decoding or execution. Guarded on the field so a
 			// node without a predicate keeps the original path untouched.
-			if (this.authorization && await this.authorization.deny(stream, connection?.remotePeer?.toString())) return;
+			if (this.authorization && await this.authorization.deny(stream, remotePeerId)) return;
 			// Read the request, process it, and write the response on ONE continuous duplex
 			// pipe (mirrors cluster/repo/dispute services). The earlier read-to-end-then-write
 			// design deadlocked over a real stream: the client sends one length-prefixed request
@@ -311,7 +314,7 @@ export class BlockTransferService implements Startable {
 						try {
 							response = request.type === 'pull'
 								? await self.handlePull(request)
-								: await self.handlePush(request, connection?.remotePeer?.toString());
+								: await self.handlePush(request, remotePeerId);
 						} catch (error) {
 							log('error: %s', (error as Error).message);
 							response = { blocks: {}, missing: [] };
