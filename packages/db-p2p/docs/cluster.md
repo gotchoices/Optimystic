@@ -877,6 +877,7 @@ Errors are thrown as plain `Error` instances with descriptive messages. Key erro
 - **Equivocation Detection**: `detectEquivocation()` in `mergeRecords()` compares existing vs incoming vote types for each peer. If a peer changes their vote (approve↔reject) for the same transaction, the first-seen signature is preserved and a `PenaltyReason.Equivocation` penalty (weight 100) is applied. A single equivocation exceeds the default ban threshold (80), resulting in immediate peer exclusion. Same-type re-delivery (retransmission) is not flagged.
 - **Timeout / DoS**: Transaction expiration and cleanup intervals (60s queue, 1s process) prevent resource exhaustion from stale transactions
 - **Reputation**: Failed peers are reported via `IPeerReputation` with `PenaltyReason.ConsensusTimeout`
+- **No Self-Penalty**: every penalty above describes a peer OTHER than the reporting node. `PeerReputationService` is built with the node's own identifier (`selfPeerId`) and refuses any report naming it, so neither a local fault nor a forged inbound record can move this node's own score. `validateSignatures` above is the reason the guard lives at the scoring service rather than at its callers: it runs before any membership or authorization check, and an Ed25519 public key is derivable from the public peer id, so a stranger could otherwise have this node ban itself with two messages it need only be able to connect to send. The framing residual described under *Key ↔ peer-id binding* is unchanged for every other peer
 
 ## Network Size Estimation and Partition Detection
 

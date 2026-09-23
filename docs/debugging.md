@@ -173,7 +173,7 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 | `network-manager`     | `NetworkManagerService`: `awaitHealthy` connection counts and timeouts, cohort key seeding failures, invalid peer ids in a cohort |
 | `network:get-manager` | Failures injecting the real libp2p node into the network manager after construction        |
 | `peer-address-book`   | Peer multiaddrs learned, capped or rejected: `merge`, `capped`, `record-capped`, `peerstore-miss`, plus `WARN:` lines for multiaddrs that address nothing or fail to parse, records carrying an unparseable peer id, and failed peerstore merges *(peer-id suffixed)* |
-| `peer-reputation`     | Reputation scoring: per-peer reports with reason, weight, resulting score and context, and resets |
+| `peer-reputation`     | Reputation scoring: per-peer reports with reason, weight, resulting score and context, resets, and `refused self-report` when a report named the node's own identifier — carrying that identifier, the reason, the caller's context and a running count, which is the only place a local fault the node refuses to score against itself is countable |
 | `matchmaking-query`   | Matchmaking query transport: dropped and rate-limited inbound queries, dial/decode failures against a primary |
 | `sync-service`        | Sync protocol service start/stop, request-handling errors, and archive-build failures per block |
 
