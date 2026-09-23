@@ -1,4 +1,4 @@
-import { createLibp2p, type Libp2p } from 'libp2p';
+import { createLibp2p, type ConnectionMonitorInit, type Libp2p } from 'libp2p';
 import { noise, type ICryptoInterface } from '@chainsafe/libp2p-noise';
 import { yamux } from '@chainsafe/libp2p-yamux';
 import { identify, identifyPush } from '@libp2p/identify';
@@ -420,6 +420,22 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * override — Noise stays the only encrypter, so every node can talk to every other.
 	 */
 	noiseCrypto?: ICryptoInterface;
+
+	/**
+	 * Optional settings for libp2p's connection monitor, which pings every open connection on an
+	 * interval and — unless told otherwise — aborts the connection when a ping does not answer in
+	 * time. Unset → libp2p's own defaults (ping every 10s; the ping deadline adapts to observed
+	 * round trips but never drops below 5s). The value is libp2p's own `ConnectionMonitorInit`,
+	 * passed through unchanged; this package substitutes no default of its own.
+	 *
+	 * A peer whose event loop is saturated — a phone running Noise in pure JavaScript, see
+	 * {@link NodeOptions.noiseCrypto} — can miss that 5s floor while perfectly healthy. Its
+	 * connections are then dropped, it re-dials, and it pays another handshake, which is slower
+	 * still. Such a deployment passes a patient `pingTimeout` (an adaptive-timeout init:
+	 * `{ minTimeout, maxTimeout }` in ms). Both ends must do it — a connection either peer's
+	 * monitor gives up on is closed for both.
+	 */
+	connectionMonitor?: ConnectionMonitorInit;
 };
 
 /**
@@ -636,6 +652,9 @@ export async function createLibp2pNodeBase(
 		...(options.connectionGater ? { connectionGater: options.connectionGater } : {}),
 		transports,
 		connectionEncrypters: [noise({ crypto: options.noiseCrypto })],
+		// Straight through, including `undefined`: libp2p reads an absent `connectionMonitor` as
+		// "use my defaults", so a default of our own here would silently override them.
+		connectionMonitor: options.connectionMonitor,
 		streamMuxers: [yamux()],
 		// Narrow cast confined to the `services` field, so the rest of `libp2pOptions` stays typed as
 		// `Libp2pInit`: `@libp2p/dcutr` and `@libp2p/autonat` are typed against `@libp2p/interface` 3.2.x

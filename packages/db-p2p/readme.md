@@ -719,6 +719,20 @@ const noiseCrypto: NoiseCryptoInterface = {
 const node = await createLibp2pNode({ /* … */ transports, noiseCrypto });
 ```
 
+**A phone this slow also needs a patient connection monitor.** libp2p pings every open connection every 10 seconds and aborts it on the first ping whose reply is late. That deadline adapts to the round trips it observes, but it never drops below 5 seconds, and a phone whose event loop is saturated by pure-JavaScript Noise misses it while perfectly healthy — so the connection is dropped, the phone re-dials, pays another handshake, and a sync never converges. Pass `connectionMonitor` to widen it. Measured on a phone at full device crypto cost, a sync that failed all 3 attempts on the stock setting passed 2 of 3 with only the relay configured, and 4 of 4 — about 90 seconds each, slow but correct — once the relay and the clients were both configured:
+
+```typescript
+import { createLibp2pNode, type Libp2pConnectionMonitorInit } from '@optimystic/db-p2p/rn';
+
+const connectionMonitor: Libp2pConnectionMonitorInit = {
+    pingTimeout: { minTimeout: 30_000, maxTimeout: 600_000 }
+};
+
+const node = await createLibp2pNode({ /* … */ transports, connectionMonitor });
+```
+
+The value is libp2p's own connection-monitor init, passed through unchanged; unset leaves libp2p's defaults alone. The type is re-exported here so the app need not depend on `libp2p` itself. **Both ends need it:** a connection either peer's monitor gives up on is closed for both, so the relay the phone talks through has to be given the same setting.
+
 See the [Sereus reference-app-rn](https://github.com/gotchoices/sereus/tree/master/packages/reference-app-rn/polyfills) for working polyfill implementations.
 
 ### Ring Transitions
