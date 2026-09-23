@@ -10,7 +10,6 @@ import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { BlockTransferCoordinator } from '../src/cluster/block-transfer.js';
 import type { RebalanceEvent } from '../src/cluster/rebalance-monitor.js';
 import { BlockTransferService, sourceBlockMeta, pushBlockToPeers, type BlockTransferRequest, type BlockTransferResponse, buildBlockTransferProtocol } from '../src/cluster/block-transfer-service.js';
-import type { RestorationCoordinator } from '../src/storage/restoration-coordinator.js';
 import type { BlockArchive } from '../src/storage/struct.js';
 
 // --- Mocks ---
@@ -159,65 +158,34 @@ describe('BlockTransferCoordinator', () => {
 		coordinator = new BlockTransferCoordinator(
 			repo,
 			peerNetwork,
-			restoration as unknown as RestorationCoordinator,
 			partitionDetector,
 			'',
 			{ maxConcurrency: 2, transferTimeoutMs: 5000, maxRetries: 1 }
 		);
 	});
 
-	describe('pullBlocks', () => {
-		it('pulls blocks via RestorationCoordinator on gained responsibility', async () => {
-			restoration.results.set('block-1', makeArchive('block-1'));
-			restoration.results.set('block-2', makeArchive('block-2'));
+	describe('reaction to gained blocks (responsibility signal only)', () => {
+		it('makes no restoration call and no network call for a gained block, even when restoration could serve it', async () => {
+			// RebalanceMonitor only ever reports `gained` for a block this node already holds (see
+			// RebalanceEvent.gained's doc), so the reaction has nothing to fetch. MockRestorationCoordinator
+			// stays wired with an archive ready to serve, as the witness that nothing ever reaches it — the
+			// coordinator's constructor no longer even accepts a restoration coordinator.
+			restoration.results.set('block-already-held', makeArchive('block-already-held'));
 
-			const result = await coordinator.pullBlocks(['block-1', 'block-2']);
-
-			expect(result.succeeded).to.deep.equal(['block-1', 'block-2']);
-			expect(result.failed).to.deep.equal([]);
-			expect(restoration.restoreCalls).to.include('block-1');
-			expect(restoration.restoreCalls).to.include('block-2');
-		});
-
-		it('reports failed pulls when restoration returns undefined', async () => {
-			restoration.results.set('block-1', undefined);
-
-			const result = await coordinator.pullBlocks(['block-1']);
-
-			expect(result.succeeded).to.deep.equal([]);
-			expect(result.failed).to.deep.equal(['block-1']);
-		});
-
-		it('retries failed pulls up to maxRetries', async () => {
-			// First attempt fails, second succeeds
-			let callCount = 0;
-			restoration.restore = async (blockId: string) => {
-				callCount++;
-				if (callCount === 1) return undefined;
-				return makeArchive(blockId);
+			const event: RebalanceEvent = {
+				gained: ['block-already-held'],
+				lost: [],
+				newOwners: new Map(),
+				grown: new Map(),
+				floor: 1,
+				triggeredAt: Date.now()
 			};
 
-			const result = await coordinator.pullBlocks(['block-1']);
+			const result = await coordinator.handleRebalanceEvent(event);
 
-			expect(result.succeeded).to.deep.equal(['block-1']);
-			expect(callCount).to.equal(2);
-		});
-
-		it('skips transfer during partition', async () => {
-			// Simulate partition by recording many failures
-			for (let i = 0; i < 10; i++) {
-				partitionDetector.recordFailure(`peer-${i}`);
-				partitionDetector.recordFailure(`peer-${i}`);
-				partitionDetector.recordFailure(`peer-${i}`);
-			}
-
-			restoration.results.set('block-1', makeArchive('block-1'));
-
-			const result = await coordinator.pullBlocks(['block-1']);
-
-			expect(result.succeeded).to.deep.equal([]);
-			expect(result.failed).to.deep.equal(['block-1']);
-			expect(restoration.restoreCalls).to.have.length(0);
+			expect(restoration.restoreCalls, 'no restoration fetch for a gained block').to.deep.equal([]);
+			expect(peerNetwork.connectCalls, 'and no network call of any kind').to.deep.equal([]);
+			expect(result).to.not.have.property('pulled');
 		});
 	});
 
@@ -274,7 +242,6 @@ describe('BlockTransferCoordinator', () => {
 			const noPushCoordinator = new BlockTransferCoordinator(
 				repo,
 				peerNetwork,
-				restoration as unknown as RestorationCoordinator,
 				partitionDetector,
 				'',
 				{ enablePush: false }
@@ -377,18 +344,29 @@ describe('BlockTransferCoordinator', () => {
 	describe('concurrency limiting', () => {
 		it('does not deadlock when all concurrent tasks retry', async function () {
 			// Tighter than the 10s package default: this test is a forcing function for a
-			// concurrency deadlock — if the pull ever hangs, we want a fast-fail signal.
+			// concurrency deadlock — if a push ever hangs, we want a fast-fail signal.
 			this.timeout(5000);
+			repo.blocks.set('block-a', makeBlock('block-a'));
+			repo.blocks.set('block-b', makeBlock('block-b'));
+			const ownerA = (await makePeerId()).toString();
+			const ownerB = (await makePeerId()).toString();
+			peerNetwork.responses.set(ownerA, { blocks: { 'block-a': 'data' }, missing: [] });
+			peerNetwork.responses.set(ownerB, { blocks: { 'block-b': 'data' }, missing: [] });
+
 			let callCount = 0;
-			restoration.restore = async (blockId: string) => {
+			const realConnect = peerNetwork.connect.bind(peerNetwork);
+			peerNetwork.connect = async (peerId, protocol) => {
 				callCount++;
 				// First round (2 calls) fail, second round succeeds
-				if (callCount <= 2) return undefined;
-				return makeArchive(blockId);
+				if (callCount <= 2) throw new Error('Connection failed');
+				return realConnect(peerId, protocol);
 			};
 
 			// maxConcurrency=2, both blocks fail on first attempt and retry
-			const result = await coordinator.pullBlocks(['block-a', 'block-b']);
+			const result = await coordinator.pushBlocks(['block-a', 'block-b'], new Map([
+				['block-a', [ownerA]],
+				['block-b', [ownerB]]
+			]));
 
 			expect(result.succeeded).to.have.length(2);
 			expect(result.failed).to.have.length(0);
@@ -399,19 +377,25 @@ describe('BlockTransferCoordinator', () => {
 			let maxConcurrent = 0;
 			let currentConcurrent = 0;
 
-			restoration.restore = async (blockId: string) => {
+			const blockIds = ['block-1', 'block-2', 'block-3', 'block-4', 'block-5', 'block-6'];
+			const owners = await Promise.all(blockIds.map(() => makePeerId()));
+			const newOwners = new Map(blockIds.map((id, i) => [id, [owners[i]!.toString()]]));
+			for (let i = 0; i < blockIds.length; i++) {
+				repo.blocks.set(blockIds[i]!, makeBlock(blockIds[i]!));
+				peerNetwork.responses.set(owners[i]!.toString(), { blocks: { [blockIds[i]!]: 'data' }, missing: [] });
+			}
+
+			const realConnect = peerNetwork.connect.bind(peerNetwork);
+			peerNetwork.connect = async (peerId, protocol) => {
 				currentConcurrent++;
 				maxConcurrent = Math.max(maxConcurrent, currentConcurrent);
 				await new Promise(r => setTimeout(r, 50));
 				currentConcurrent--;
-				return makeArchive(blockId);
+				return realConnect(peerId, protocol);
 			};
 
-			// Launch 6 pulls with maxConcurrency=2
-			const result = await coordinator.pullBlocks([
-				'block-1', 'block-2', 'block-3',
-				'block-4', 'block-5', 'block-6'
-			]);
+			// Launch 6 pushes with maxConcurrency=2 (the beforeEach coordinator's)
+			const result = await coordinator.pushBlocks(blockIds, newOwners);
 
 			expect(result.succeeded).to.have.length(6);
 			expect(maxConcurrent).to.be.at.most(2);
@@ -419,8 +403,7 @@ describe('BlockTransferCoordinator', () => {
 	});
 
 	describe('handleRebalanceEvent', () => {
-		it('processes gained and lost blocks from a rebalance event', async () => {
-			restoration.results.set('block-new', makeArchive('block-new'));
+		it('confirms a lost block replicated to its new owner, and makes no restoration call for a co-reported gained block', async () => {
 			repo.blocks.set('block-old', makeBlock('block-old'));
 
 			const ownerId = await makePeerId();
@@ -440,7 +423,7 @@ describe('BlockTransferCoordinator', () => {
 
 			const result = await coordinator.handleRebalanceEvent(event);
 
-			expect(restoration.restoreCalls).to.include('block-new');
+			expect(restoration.restoreCalls, 'a gained block triggers no fetch').to.deep.equal([]);
 			// The lost block confirmed to its single new owner (missing:[] response) → released.
 			expect(result.released).to.include('block-old');
 		});
@@ -595,41 +578,7 @@ describe('BlockTransferCoordinator', () => {
 		});
 	});
 
-	describe('idempotent block receipt', () => {
-		it('pulling a block already present locally is a no-op via restoration', async () => {
-			// RestorationCoordinator returns archive (as if block exists elsewhere)
-			restoration.results.set('block-1', makeArchive('block-1'));
-
-			const result1 = await coordinator.pullBlocks(['block-1']);
-			const result2 = await coordinator.pullBlocks(['block-1']);
-
-			expect(result1.succeeded).to.deep.equal(['block-1']);
-			expect(result2.succeeded).to.deep.equal(['block-1']);
-		});
-	});
-
 	describe('timeout behavior', () => {
-		it('times out slow transfers', async () => {
-			const slowCoordinator = new BlockTransferCoordinator(
-				repo,
-				peerNetwork,
-				restoration as unknown as RestorationCoordinator,
-				partitionDetector,
-				'',
-				{ transferTimeoutMs: 50, maxRetries: 0 }
-			);
-
-			restoration.restore = async () => {
-				await new Promise(r => setTimeout(r, 200));
-				return makeArchive('block-1');
-			};
-
-			const result = await slowCoordinator.pullBlocks(['block-1']);
-
-			expect(result.succeeded).to.deep.equal([]);
-			expect(result.failed).to.deep.equal(['block-1']);
-		});
-
 		it('clears the timeout timer once a transfer settles, so none outlives the transfer', async () => {
 			// Left running, each timer held a stopped node's process open for the full transfer timeout.
 			const transferTimeoutMs = 5000; // the beforeEach coordinator's

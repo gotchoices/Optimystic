@@ -49,7 +49,6 @@ import { BlockTransferCoordinator } from '../src/cluster/block-transfer.js';
 import { RebalanceMonitor, type RebalanceMonitorDeps } from '../src/cluster/rebalance-monitor.js';
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { ArachnodeFretAdapter } from '../src/storage/arachnode-fret-adapter.js';
-import type { RestorationCoordinator } from '../src/storage/restoration-coordinator.js';
 import type { FretService } from 'p2p-fret';
 
 const BLOCK_ID = 'block-founder' as BlockId;
@@ -295,9 +294,8 @@ describe('cohort growth replicates the founder block and makes it readable', fun
 			fretAdapter: new ArachnodeFretAdapter(mockFret as unknown as FretService)
 		};
 		const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
-		const restorationStub = { restore: async () => undefined } as unknown as RestorationCoordinator;
 		const coordinator = new BlockTransferCoordinator(
-			aRepo, network, restorationStub, partitionDetector, '', { maxRetries: 0 });
+			aRepo, network, partitionDetector, '', { maxRetries: 0 });
 
 		// B's reader — the same three-peer CoordinatorRepo + createReconcileBlock harness the
 		// single-holder spec pins the deadlock with, except C answers from its REAL repo (so after

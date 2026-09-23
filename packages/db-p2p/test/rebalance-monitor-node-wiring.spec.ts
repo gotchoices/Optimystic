@@ -30,7 +30,7 @@ const blockTransferProtocolFor = (networkName: string): string =>
  * `StorageRepo.onAnyCollectionChange`), and tears it down on `node.stop()` before transports close.
  *
  * The monitor's detection logic (gained/lost/debounce/throttle/partition-suppress) is unit-tested in
- * `rebalance-monitor.spec.ts`; the coordinator's pull/push reaction in `block-transfer.spec.ts`; and
+ * `rebalance-monitor.spec.ts`; the coordinator's confirm/push reaction in `block-transfer.spec.ts`; and
  * the `onRebalance → handleRebalanceEvent` hop in `rebalance-reaction.spec.ts`. This spec proves the
  * *assembly + owned-block feed + teardown + config gate* on a real solo node. The wiring lives behind
  * the arachnode gate (fretAdapter + RestorationCoordinator only exist there), so it boots with

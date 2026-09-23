@@ -175,9 +175,12 @@ GC-eligible. Because release happens strictly after Phase B confirmed ≥ N *oth
 the serving replica count for every shed key never dips below N — the invariant holds across the
 release instant.
 
-**Move-in needs no release phase.** A node moving in only *gains* keyspace; it pulls the new half
-(existing `RestorationCoordinator` path) and sheds nothing, so the floor is never at risk from the
-mover. It still uses Phase A (advertise) so peers observe the membership change.
+**Move-in needs no release phase.** A node moving in only *gains* keyspace and sheds nothing, so the
+floor is never at risk from the mover. It still uses Phase A (advertise) so peers observe the
+membership change; the gained half is not fetched by this handoff. It arrives the way any
+cohort-growth gain does — the existing holders' own growth push, once they observe the mover as
+newly co-responsible ([internals.md § RebalanceMonitor](internals.md#rebalancemonitor) → cohort
+growth) — with a read repairing any gap on first access.
 
 ## Part 3 — Interactions & edge cases (the adversarial surface)
 
@@ -254,7 +257,7 @@ coordinator rather than inline in `libp2p-node-base.ts`:
   same-range movers). Single source of truth for block/peer responsibility derivation.
 - `packages/db-p2p/src/cluster/block-transfer.ts` — `confirmReplicated(blockIds, owners, floor)` is
   the confirm primitive (pushes, counts holders reporting *not* `missing`, requires ≥ floor);
-  `handleRebalanceEvent` returns `{ pulled, released, retained, replicated, underReplicated, growth }` — release is gated on confirmation, and the last three report the cohort-growth push arm (nothing is ever released off it). `growth` carries a per-block `GrowthOutcome { satisfiedPeers, complete }` that the caller feeds back to `RebalanceMonitor.recordGrowthOutcome`, so a grown peer is recorded as holding the block only once a push to it is confirmed; a block the reaction had no information about has no entry and is re-detected next check.
+  `handleRebalanceEvent` returns `{ released, retained, replicated, underReplicated, growth }` — release is gated on confirmation, and the last three report the cohort-growth push arm (nothing is ever released off it). `growth` carries a per-block `GrowthOutcome { satisfiedPeers, complete }` that the caller feeds back to `RebalanceMonitor.recordGrowthOutcome`, so a grown peer is recorded as holding the block only once a push to it is confirmed; a block the reaction had no information about has no entry and is re-detected next check.
 - `packages/db-p2p/src/cluster/rebalance-monitor.ts` — `RebalanceEvent.newOwners` / `.grown` / `.floor`
   and the now-public `getCohortSize()` supply the post-move holders, the newly co-responsible peers of
   blocks that are KEPT, and floor `N`. `recordGrowthOutcome` consumes the reaction's growth feedback

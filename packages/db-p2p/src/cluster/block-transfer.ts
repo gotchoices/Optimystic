@@ -1,6 +1,5 @@
 import type { IPeerNetwork } from '@optimystic/db-core';
 import type { PartitionDetector } from './partition-detector.js';
-import type { RestorationCoordinator } from '../storage/restoration-coordinator.js';
 import type { ProofRetainingRepo } from '../storage/block-archive.js';
 import { pushBlockToPeers, type PushBlockOutcome, type PushRefusal } from './block-transfer-service.js';
 import type { GrowthOutcome, RebalanceEvent } from './rebalance-monitor.js';
@@ -23,10 +22,10 @@ export interface BlockTransferConfig {
 	/** Max concurrent transfers. Default: 4 */
 	maxConcurrency?: number;
 	/**
-	 * Timeout per block transfer (ms). Default: 30000. A pull is bounded as a whole. A push or
-	 * confirm is bounded PER PEER, as two deadlines of this length: one on the dial and one on the
-	 * reply (the `BlockTransferClient.pushBlocks` deadlines, which abort the dial and tear down a
-	 * silent stream rather than leaving them running).
+	 * Timeout per block transfer (ms). Default: 30000. A push or confirm is bounded PER PEER, as two
+	 * deadlines of this length: one on the dial and one on the reply (the
+	 * `BlockTransferClient.pushBlocks` deadlines, which abort the dial and tear down a silent stream
+	 * rather than leaving them running).
 	 */
 	transferTimeoutMs?: number;
 	/** Retry attempts for failed transfers. Default: 2 */
@@ -43,8 +42,6 @@ export interface BlockTransferConfig {
  * rebalance. See `docs/arachnode-ring-handoff.md` § Part 2.
  */
 export interface RebalanceReactionResult {
-	/** Gained blocks successfully pulled (now durably held locally). */
-	pulled: string[];
 	/** Lost blocks confirmed replicated to ≥ floor new owners — safe to release. */
 	released: string[];
 	/** Lost blocks whose replication could not be confirmed — keep serving, retry later. */
@@ -70,11 +67,15 @@ export interface RebalanceReactionResult {
 /**
  * Coordinates block transfers in response to rebalance events.
  *
- * For gained blocks: delegates to RestorationCoordinator.restore() which
- * already handles ring-based discovery and fetching.
+ * For lost blocks: confirms the block replicated to the floor of new responsible peers before
+ * reporting it releasable (see {@link confirmReplicated}).
  *
- * For lost blocks: proactively pushes block data to new responsible peers
- * via the BlockTransfer protocol.
+ * For grown blocks (still owned, but a peer became newly co-responsible): pushes the block to those
+ * peers (see {@link replicateGrown}).
+ *
+ * A block this node has GAINED responsibility for needs no reaction here: `RebalanceMonitor` only
+ * ever reports `gained` for a block this node already stores (see `RebalanceEvent.gained`'s doc), so
+ * there is nothing to fetch.
  */
 export class BlockTransferCoordinator {
 	private readonly maxConcurrency: number;
@@ -95,7 +96,6 @@ export class BlockTransferCoordinator {
 		 */
 		private readonly repo: ProofRetainingRepo,
 		private readonly peerNetwork: IPeerNetwork,
-		private readonly restorationCoordinator: RestorationCoordinator,
 		private readonly partitionDetector: PartitionDetector,
 		private readonly protocolPrefix: string = '',
 		config: BlockTransferConfig = {}
@@ -104,26 +104,6 @@ export class BlockTransferCoordinator {
 		this.transferTimeoutMs = config.transferTimeoutMs ?? 30000;
 		this.maxRetries = config.maxRetries ?? 2;
 		this.enablePush = config.enablePush ?? true;
-	}
-
-	/**
-	 * Pull blocks that this node has gained responsibility for.
-	 * Uses RestorationCoordinator to discover holders and fetch block data.
-	 */
-	async pullBlocks(blockIds: string[]): Promise<{ succeeded: string[]; failed: string[] }> {
-		if (this.partitionDetector.detectPartition()) {
-			log('pull:partition-detected, skipping %d blocks', blockIds.length);
-			return { succeeded: [], failed: blockIds };
-		}
-
-		const succeeded: string[] = [];
-		const failed: string[] = [];
-
-		const ids = blockIds.filter(id => !this.inFlight.has(`pull:${id}`));
-
-		await Promise.all(ids.map(id => this.executePull(id, succeeded, failed)));
-
-		return { succeeded, failed };
 	}
 
 	/**
@@ -152,35 +132,43 @@ export class BlockTransferCoordinator {
 	}
 
 	/**
-	 * Handle a complete rebalance event — pull gained, and **confirm** lost blocks replicated to the
-	 * floor before reporting them releasable.
+	 * Handle a complete rebalance event — **confirm** lost blocks replicated to the floor before
+	 * reporting them releasable, and push grown blocks to their newly co-responsible peers.
 	 *
-	 * The lost path no longer pushes fire-and-forget: it runs {@link confirmReplicated} against the
-	 * event's `newOwners` and `floor`, so `released` contains only blocks that landed on ≥ floor new
-	 * owners. The caller gates its `untrackBlock` (release + GC-eligibility) on `released` and leaves
-	 * `retained` blocks tracked/served for the next rebalance. This closes the release-before-confirm
-	 * hole (`docs/arachnode-ring-handoff.md` § Why the current code violates it #2).
+	 * `event.gained` is deliberately not acted on here. `RebalanceMonitor` only ever reports a block
+	 * `gained` when this node already stores it (see `RebalanceEvent.gained`'s doc) — the watched set
+	 * is built entirely from this node's own storage and its own commits/replicas/repairs — so there
+	 * is nothing to fetch and nowhere to fetch it from.
+	 *
+	 * NOTE: if `trackedBlocks` ever grows a source that reports a block this node does NOT hold (a
+	 * declared-placement feed, say), a pull hook would belong here — but it would have to persist and
+	 * verify what it fetched first, the way `cluster/reconcile-block.ts`'s corroborating repair does,
+	 * not adopt a single unverified peer's answer the way `RestorationCoordinator.restore` does.
+	 *
+	 * The lost path pushes to confirm, not fire-and-forget: it runs {@link confirmReplicated} against
+	 * the event's `newOwners` and `floor`, so `released` contains only blocks that landed on ≥ floor
+	 * new owners. The caller gates its `untrackBlock` (release + GC-eligibility) on `released` and
+	 * leaves `retained` blocks tracked/served for the next rebalance. This closes the
+	 * release-before-confirm hole (`docs/arachnode-ring-handoff.md` § Why the current code violates it
+	 * #2).
 	 */
 	async handleRebalanceEvent(event: RebalanceEvent): Promise<RebalanceReactionResult> {
 		log('rebalance:start gained=%d lost=%d grown=%d floor=%d',
 			event.gained.length, event.lost.length, event.grown.size, event.floor);
 
 		const floor = Math.max(1, event.floor);
-		const [pullResult, confirmResult, growResult] = await Promise.all([
-			event.gained.length > 0 ? this.pullBlocks(event.gained) : { succeeded: [], failed: [] },
+		const [confirmResult, growResult] = await Promise.all([
 			event.lost.length > 0 && event.newOwners.size > 0
 				? this.confirmReplicated(event.lost, event.newOwners, floor)
 				: { confirmed: [], unconfirmed: [...event.lost] },
 			this.replicateGrown(event.grown, floor)
 		]);
 
-		log('rebalance:done pull=%d/%d released=%d/%d replicated=%d/%d',
-			pullResult.succeeded.length, event.gained.length,
+		log('rebalance:done released=%d/%d replicated=%d/%d',
 			confirmResult.confirmed.length, event.lost.length,
 			growResult.confirmed.length, event.grown.size);
 
 		return {
-			pulled: pullResult.succeeded,
 			released: confirmResult.confirmed,
 			retained: confirmResult.unconfirmed,
 			replicated: growResult.confirmed,
@@ -308,47 +296,6 @@ export class BlockTransferCoordinator {
 		}));
 
 		return { confirmed, unconfirmed };
-	}
-
-	private async executePull(
-		blockId: string,
-		succeeded: string[],
-		failed: string[]
-	): Promise<void> {
-		const key = `pull:${blockId}`;
-		if (this.inFlight.has(key)) return;
-		this.inFlight.add(key);
-
-		try {
-			for (let attempt = 0; ; attempt++) {
-				await this.acquireSemaphore();
-				let archive: Awaited<ReturnType<RestorationCoordinator['restore']>>;
-				try {
-					archive = await this.withTimeout(
-						this.restorationCoordinator.restore(blockId),
-						this.transferTimeoutMs
-					);
-				} finally {
-					this.releaseSemaphore();
-				}
-
-				if (archive) {
-					log('pull:ok block=%s', blockId);
-					succeeded.push(blockId);
-					return;
-				}
-				if (attempt < this.maxRetries) {
-					log('pull:retry block=%s attempt=%d', blockId, attempt + 1);
-					await this.delay(this.backoffMs(attempt));
-					continue;
-				}
-				log('pull:failed block=%s', blockId);
-				failed.push(blockId);
-				return;
-			}
-		} finally {
-			this.inFlight.delete(key);
-		}
 	}
 
 	private async executePush(
@@ -523,20 +470,5 @@ export class BlockTransferCoordinator {
 
 	private delay(ms: number): Promise<void> {
 		return new Promise(resolve => setTimeout(resolve, ms));
-	}
-
-	/**
-	 * Resolve `undefined` if `promise` has not settled within `ms`. The timer is cleared on either
-	 * outcome: left running, it outlived every pull, push and confirm by the full transfer timeout and
-	 * held a stopped node's process open that long (see `withDeadline` in `repo/coordinator-repo.ts`).
-	 */
-	private withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const timeout = new Promise<undefined>(resolve => {
-			timer = setTimeout(() => resolve(undefined), ms);
-		});
-		return Promise.race([promise, timeout]).finally(() => {
-			if (timer !== undefined) clearTimeout(timer);
-		});
 	}
 }

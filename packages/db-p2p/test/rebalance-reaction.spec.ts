@@ -7,19 +7,20 @@ import { RebalanceMonitor, type RebalanceEvent, type RebalanceMonitorDeps } from
 import { BlockTransferCoordinator } from '../src/cluster/block-transfer.js';
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { ArachnodeFretAdapter } from '../src/storage/arachnode-fret-adapter.js';
-import type { RestorationCoordinator } from '../src/storage/restoration-coordinator.js';
 import type { BlockArchive } from '../src/storage/struct.js';
 import type { FretService } from 'p2p-fret';
 import { waitFor } from '@optimystic/db-core/test';
 
 /**
  * The `onRebalance → BlockTransferCoordinator.handleRebalanceEvent` CONNECTION wired on a live node
- * (`5.1-rebalance-monitor-wiring-and-reaction`). The coordinator's own pull-gained / push-lost
+ * (`5.1-rebalance-monitor-wiring-and-reaction`). The coordinator's own confirm-lost / push-grown
  * reaction is exercised exhaustively in `block-transfer.spec.ts`; here the new coverage is that a
  * topology-triggered `RebalanceEvent` emitted by the monitor actually reaches the coordinator through
  * the `onRebalance(e => void coordinator.handleRebalanceEvent(e))` hop the node-base installs — i.e.
- * gained blocks get pulled and lost blocks get pushed when the monitor fires, not just when
- * `handleRebalanceEvent` is called directly.
+ * lost blocks get pushed and grown blocks get pushed when the monitor fires, not just when
+ * `handleRebalanceEvent` is called directly. A gained block reaches the coordinator too, but (per
+ * `RebalanceEvent.gained`'s doc) drives no fetch — this file pins that the topology-triggered path
+ * agrees with the direct-call path pinned in `block-transfer.spec.ts`.
  */
 
 const makeBlock = (id: string): IBlock => ({
@@ -168,40 +169,48 @@ describe('RebalanceMonitor → BlockTransferCoordinator reaction wiring', () => 
 		monitor: RebalanceMonitor;
 		coordinator: BlockTransferCoordinator;
 		events: RebalanceEvent[];
+		reactions: Promise<unknown>[];
 	} {
 		const monitor = new RebalanceMonitor(deps, config);
 		const coordinator = new BlockTransferCoordinator(
 			repo,
 			peerNetwork as unknown as IPeerNetwork,
-			restoration as unknown as RestorationCoordinator,
 			partitionDetector,
 			''
 		);
 		const events: RebalanceEvent[] = [];
+		const reactions: Promise<unknown>[] = [];
 		// Exactly the connection the node-base installs (async reaction hopped off the emit loop, with
-		// its rejection swallowed so a restore/push failure cannot surface as an unhandled rejection).
-		monitor.onRebalance((event) => { events.push(event); coordinator.handleRebalanceEvent(event).catch(() => {}); });
-		return { monitor, coordinator, events };
+		// its rejection swallowed so a push failure cannot surface as an unhandled rejection).
+		monitor.onRebalance((event) => {
+			events.push(event);
+			reactions.push(coordinator.handleRebalanceEvent(event).catch(() => {}));
+		});
+		return { monitor, coordinator, events, reactions };
 	}
 
-	it('a topology-triggered gained event drives the coordinator to PULL via restoration', async () => {
+	it('a topology-triggered gained event reaches the coordinator but drives no fetch (gained is a responsibility signal only)', async () => {
 		mockFret.setCohort([selfId.toString()]); // self responsible → block-1 gained
+		// Even though restoration COULD serve the block, nothing may call it — RebalanceMonitor only
+		// ever reports `gained` for a block this node already stores, so there is nothing to fetch.
 		restoration.results.set('block-1', makeArchive('block-1'));
 
-		const { monitor, events } = wire();
+		const { monitor, events, reactions } = wire();
 		monitor.trackBlock('block-1');
 
 		await monitor.start();
 		mockLibp2p.emit('connection:open');
-		// Poll the terminal effect of the whole chain (debounce → emit → handler → coordinator pull)
-		// rather than sleeping a fixed span: the restore call is the deepest observable, and the handler
-		// pushes to `events` before invoking the coordinator, so a restore proves the event arrived too.
-		await waitFor(() => restoration.restoreCalls.includes('block-1'), { description: 'the topology-triggered gained event drove a pull via restoration' });
+		// Poll the terminal effect of the whole chain (debounce → emit → handler) rather than sleeping a
+		// fixed span: the handler pushes to `events` and `reactions` synchronously together, so once the
+		// event has arrived the (empty) reaction promise is already queued and safe to await.
+		await waitFor(() => events.length > 0, { description: 'the topology-triggered gained event reached the onRebalance handler' });
+		await Promise.all(reactions);
 		await monitor.stop();
 
 		expect(events, 'rebalance event reached the onRebalance handler').to.have.length(1);
 		expect(events[0]!.gained).to.deep.equal(['block-1']);
-		expect(restoration.restoreCalls, 'handleRebalanceEvent pulled the gained block').to.include('block-1');
+		expect(restoration.restoreCalls, 'no restoration fetch for a gained block').to.deep.equal([]);
+		expect(peerNetwork.connectCalls, 'no network call of any kind').to.deep.equal([]);
 	});
 
 	it('a topology-triggered lost event drives the coordinator to PUSH to new owners', async () => {

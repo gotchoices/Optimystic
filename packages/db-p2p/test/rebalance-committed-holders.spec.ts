@@ -2,18 +2,20 @@
  * Ticket: rebalance-pushes-freshly-committed-blocks-back-to-members-that-hold-them.
  *
  * Every block a commit touches enters the node's owned-block set, and the rebalance monitor treats a
- * block it has no memory of as brand new: the next check reports it `gained` (the reaction pulls it
- * from the cohort over `/sync`) and its whole non-self cohort `grown` (the reaction pushes it to each
- * of those peers over `/block-transfer`). For a freshly committed block both are pure waste — the
- * members stored it as part of the commit — and over a relay one insert set off dozens of streams.
+ * block it has no memory of as brand new: the next check reports it `gained` and its whole non-self
+ * cohort `grown` (the reaction pushes it to each of those peers over `/block-transfer`). For a
+ * freshly committed block the `grown` push is pure waste — the members stored it as part of the
+ * commit — and over a relay one insert set off dozens of streams. (`gained` is a responsibility
+ * report only — see `RebalanceEvent.gained`'s doc — and triggers no transfer of its own either way;
+ * see `bug-rebalance-pulls-blocks-it-already-holds-and-discards-the-copy`.)
  *
  * The fix reports, for each commit a node holds, which cohort members are known to hold it: the
  * member after a durable consensus apply (the record's approving signers), the coordinator on
  * acknowledging a cohort commit (confirmed holders that also signed, plus who is unconfirmed). This
  * spec drives real `ClusterMember`s and `CoordinatorRepo`s in the mesh harness, each node with a real
  * `RebalanceMonitor` fed by its own storage's change events — the `libp2p-node-base` wiring — and
- * counts the transfers a check would start straight off the event: one pull per `gained` block, one
- * push per `grown` (block, peer).
+ * counts the pushes a check would start straight off the event's `grown` arm: one push per `grown`
+ * (block, peer). `gained` is reported alongside for completeness, but never itself starts a transfer.
  */
 
 import { expect } from 'chai';
@@ -89,9 +91,13 @@ const commitThrough = async (coordinator: MeshNode, actionId: string, blockIds: 
 	return commit;
 };
 
-/** The transfers a check's reaction would start: a pull per gained block, a push per grown (block, peer). */
-const transfersOf = (event: RebalanceEvent | null): { pulls: string[]; pushes: string[] } => ({
-	pulls: event?.gained ?? [],
+/**
+ * What a check reports: `gained` block ids (a responsibility report only — the reaction never fetches
+ * for it, see `RebalanceEvent.gained`'s doc) and the pushes a check's reaction would actually start,
+ * one per `grown` (block, peer).
+ */
+const transfersOf = (event: RebalanceEvent | null): { gainedReports: string[]; pushes: string[] } => ({
+	gainedReports: event?.gained ?? [],
 	pushes: [...(event?.grown ?? new Map<string, string[]>())].flatMap(([blockId, peers]) => peers.map(peer => `${blockId}->${peer}`))
 });
 
@@ -106,22 +112,22 @@ const BLOCKS = ['block-insert-a', 'block-insert-b', 'block-insert-c'];
 
 describe('rebalance after a commit (committed holders seed the growth memory)', () => {
 
-	it('baseline without holder reports: each member would pull and push every block the other already holds', async () => {
+	it('baseline without holder reports: each member would report every block gained and push it back to the other, which already holds it', async () => {
 		const rig = await buildRig(2, TWO_MEMBERS, false);
 		const [coordinator, member] = rig.mesh.nodes as [MeshNode, MeshNode];
 		const commit = await commitThrough(coordinator, 'a-baseline', BLOCKS);
 		expect(commit.success && commit.durability.quorum, 'both members confirmed the commit').to.equal('full');
 
 		for (const [node, other] of [[coordinator, member], [member, coordinator]] as const) {
-			const { pulls, pushes } = await checkNode(rig, node);
-			expect(pulls, 'every freshly committed block reads as gained').to.have.members(BLOCKS);
+			const { gainedReports, pushes } = await checkNode(rig, node);
+			expect(gainedReports, 'every freshly committed block reads as gained').to.have.members(BLOCKS);
 			expect(pushes, 'and is pushed back to the member that stored it').to.have.members(
 				BLOCKS.map(blockId => `${blockId}->${other.peerId.toString()}`));
 		}
 		await stopAll(rig);
 	});
 
-	it('after a full-quorum commit, neither member pulls or pushes that commit\'s blocks — on this check or a later one', async () => {
+	it('after a full-quorum commit, neither member reports gained nor pushes that commit\'s blocks — on this check or a later one', async () => {
 		const rig = await buildRig(2, TWO_MEMBERS, true);
 		const [coordinator, member] = rig.mesh.nodes as [MeshNode, MeshNode];
 		const commit = await commitThrough(coordinator, 'a-seeded', BLOCKS);
@@ -131,9 +137,9 @@ describe('rebalance after a commit (committed holders seed the growth memory)', 
 		// monitor heard from its member alone (it coordinated nothing).
 		for (const node of [coordinator, member]) {
 			expect(await checkNode(rig, node), `first check on ${node === coordinator ? 'coordinator' : 'member'}`)
-				.to.deep.equal({ pulls: [], pushes: [] });
+				.to.deep.equal({ gainedReports: [], pushes: [] });
 			expect(await checkNode(rig, node), 'a later check (the next connection event) stays quiet')
-				.to.deep.equal({ pulls: [], pushes: [] });
+				.to.deep.equal({ gainedReports: [], pushes: [] });
 		}
 		await stopAll(rig);
 	});
@@ -161,10 +167,10 @@ describe('rebalance after a commit (committed holders seed the growth memory)', 
 		expect(commit.success && commit.durability.quorum).to.equal('majority');
 		expect(commit.success && commit.durability.unconfirmed).to.deep.equal([absent.peerId.toString()]);
 
-		const expected = { pulls: [], pushes: BLOCKS.map(blockId => `${blockId}->${absent.peerId.toString()}`) };
+		const expected = { gainedReports: [], pushes: BLOCKS.map(blockId => `${blockId}->${absent.peerId.toString()}`) };
 		for (const node of [coordinator, member]) {
 			const transfers = await checkNode(rig, node);
-			expect(transfers.pulls).to.deep.equal(expected.pulls);
+			expect(transfers.gainedReports).to.deep.equal(expected.gainedReports);
 			expect(transfers.pushes).to.have.members(expected.pushes);
 		}
 		await stopAll(rig);

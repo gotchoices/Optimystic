@@ -11,9 +11,13 @@ const log = createLogger('rebalance-monitor')
 
 export interface RebalanceEvent {
 	/**
-	 * Block IDs this node has gained responsibility for (the reaction pulls each). A block first seen
-	 * through evidence that this node already holds it ({@link RebalanceMonitor.recordBlockHolders} —
-	 * a commit, a received replica, a repaired block) is not reported: there is nothing to pull.
+	 * Block IDs this node has become responsible for. This is a plain responsibility signal, not a
+	 * transfer trigger: `trackedBlocks` (see {@link RebalanceMonitorDeps.trackedBlocks}) is built
+	 * entirely from what this node already stores — its own commits, replicas it received, and blocks
+	 * it repaired — so a block reported here is always a block this node already holds, and no fetch
+	 * follows. A block first seen through evidence that this node already holds it
+	 * ({@link RebalanceMonitor.recordBlockHolders} — a commit, a received replica, a repaired block)
+	 * is not reported here either.
 	 */
 	gained: string[]
 	/** Block IDs this node has lost responsibility for */

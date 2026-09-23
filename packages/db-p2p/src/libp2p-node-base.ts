@@ -265,9 +265,9 @@ export type NodeOptions = ClusterPolicyOptions & {
 	spreadOnChurn?: Partial<SpreadOnChurnConfig>;
 
 	/**
-	 * Rebalance reaction tuning. Drives the RebalanceMonitor + BlockTransferCoordinator pull-gained/
-	 * push-lost/replicate-grown path when arachnode/FRET are available (the only place fretAdapter +
-	 * restoration coordinator exist). The grown arm is what pushes a block this node keeps to peers
+	 * Rebalance reaction tuning. Drives the RebalanceMonitor + BlockTransferCoordinator
+	 * confirm-lost/replicate-grown path when arachnode/FRET are available (the only place fretAdapter
+	 * exists). The grown arm is what pushes a block this node keeps to peers
 	 * that newly became co-responsible for it — the founder case: anything committed while the
 	 * deployment was one node gets its second copy only through this path (bounded per pass by
 	 * `growthBlockBudget`). Absent -> enabled with defaults (see RebalanceMonitorConfig). Set
@@ -1399,22 +1399,21 @@ export async function createLibp2pNodeBase(
 				// --- Rebalance reaction: drive RebalanceMonitor + react via BlockTransferCoordinator ---
 				// Nothing previously activated the rebalance path on a real node: initRebalanceMonitor was
 				// never called, the monitor was never start()ed, and BlockTransferCoordinator (the
-				// pull-gained / push-lost reaction primitive) was never constructed in src. This block lives
-				// inside the arachnode `if (fret)` gate because both dependencies only exist here — the
-				// fretAdapter and the RestorationCoordinator. When arachnode is disabled or FRET is absent the
-				// rebalance path stays inert (acceptable: rebalance is a resilience optimization). A wiring
-				// failure here is non-fatal (log + continue), unlike the operator-opted-in cohortTopic block.
+				// confirm-lost / push-grown reaction primitive) was never constructed in src. This block
+				// lives inside the arachnode `if (fret)` gate because the fretAdapter it needs only exists
+				// here. When arachnode is disabled or FRET is absent the rebalance path stays inert
+				// (acceptable: rebalance is a resilience optimization). A wiring failure here is non-fatal
+				// (log + continue), unlike the operator-opted-in cohortTopic block.
 				if (networkManager && (options.rebalance?.enabled ?? true) !== false) {
 					try {
-						// repo → the LOCAL storageRepo (not repoProxy/coordinatedRepo): a pulled/pushed replica
-						// must land in / be read from this node's own storage, same reasoning as the
-						// blockTransfer service handler registration. protocolPrefix (/optimystic/<networkName>)
-						// MUST match the prefix the node registers its block-transfer handler under, or every
-						// lost-block push dials the wrong protocol and fails to connect.
+						// repo → the LOCAL storageRepo (not repoProxy/coordinatedRepo): a pushed replica must
+						// land in / be read from this node's own storage, same reasoning as the blockTransfer
+						// service handler registration. protocolPrefix (/optimystic/<networkName>) MUST match
+						// the prefix the node registers its block-transfer handler under, or every lost-block
+						// push dials the wrong protocol and fails to connect.
 						const coordinator = new BlockTransferCoordinator(
 							storageRepo,
 							keyNetwork,
-							restorationCoordinatorV2,
 							partitionDetector,
 							protocolPrefix,
 						);
@@ -1430,15 +1429,16 @@ export async function createLibp2pNodeBase(
 						blockHoldersTarget = (holders) => rebalanceMonitor.recordBlockHolders(holders);
 
 						// onRebalance fires synchronously from the monitor's debounced check; the coordinator's
-						// reaction (pull gained / push lost, each partition-guarded) is async, so hop it off the
-						// handler rather than blocking the monitor's emit loop. handleRebalanceEvent can REJECT
-						// (e.g. RestorationCoordinator.restore() throws while pulling a gained block) and a bare
-						// `void` would surface that as an unhandled rejection (process-fatal on Node >=15); the
-						// reaction is a resilience optimization, so swallow + log instead.
+						// reaction (confirm lost / push grown, each partition-guarded) is async, so hop it off
+						// the handler rather than blocking the monitor's emit loop. handleRebalanceEvent can
+						// REJECT (a coding bug inside the coordinator — every per-peer error it makes is already
+						// caught) and a bare `void` would surface that as an unhandled rejection (process-fatal
+						// on Node >=15); the reaction is a resilience optimization, so swallow + log instead.
 						//
-						// ALONGSIDE dispatching to the coordinator, drive the shared owned-block set off this
-						// authoritative responsibility signal. A GAINED block is added immediately so it is
-						// tracked even before its next commit/replica touches the feed.
+						// event.gained needs no action here: RebalanceMonitor only ever reports a block gained
+						// when this node already stores it (trackedBlocks is built from this node's own owned
+						// blocks — see RebalanceEvent.gained's doc), so the shared owned-block set already has
+						// it and there is nothing to fetch.
 						//
 						// A LOST block is NO LONGER released synchronously: doing so stopped spreading a block
 						// whose push to the new owners might fail, drop it below the replication floor, and let a
@@ -1467,7 +1467,6 @@ export async function createLibp2pNodeBase(
 						// state stays un-advanced and the next check retries, the correct outcome for a reaction
 						// that threw.
 						rebalanceMonitor.onRebalance((event) => {
-							for (const blockId of event.gained) ownedBlocks.add(blockId);
 							coordinator.handleRebalanceEvent(event).then((result) => {
 								for (const blockId of result.released) {
 									rebalanceMonitor.untrackBlock(blockId); // also evicts from the shared ownedBlocks set

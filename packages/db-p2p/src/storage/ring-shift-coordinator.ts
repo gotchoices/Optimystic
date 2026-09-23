@@ -69,9 +69,10 @@ export type ShiftOutcome =
  *   failure — partition, unreachable holders, floor unmet — rolls back to `active` at the old ring,
  *   keeping the range. No shed block is released unless EVERY shed block confirmed.
  * - **Move-in** (`R → R-1`, gains keyspace, sheds nothing) is Phase A only: it advertises the inner
- *   ring so peers observe the membership change, then pulls the gained half via the restoration /
- *   rebalance path. The floor is never at risk from a mover that only gains, so there is no
- *   confirm/release.
+ *   ring so peers observe the membership change. Nothing pulls the gained half — the existing
+ *   holders' own cohort-growth push (their cohort grew to include this mover) delivers it, and a
+ *   read repairs any gap on first access. The floor is never at risk from a mover that only gains,
+ *   so there is no confirm/release.
  *
  * The trigger is the (damped) `RingSelector.shouldTransition()` decision; this class is the state
  * machine that decision drives.
@@ -233,9 +234,11 @@ export class RingShiftCoordinator {
 
 	private async moveIn(newRingDepth: number, oldInfo: ArachnodeInfo | undefined): Promise<ShiftOutcome> {
 		const oldRing = oldInfo?.ringDepth ?? 0;
-		// Sheds nothing: advertise the (broader) inner ring directly at `active`. The gained half is
-		// pulled by the restoration / rebalance path; the old holders keep serving until THEY confirm
-		// their own release, so the floor is never at risk from this mover.
+		// Sheds nothing: advertise the (broader) inner ring directly at `active`. Nothing here fetches
+		// the gained half — the old holders' own cohort-growth push delivers it once they observe this
+		// mover as newly co-responsible, and a read repairs any gap on first access. The old holders
+		// keep serving until THEY confirm their own release, so the floor is never at risk from this
+		// mover.
 		const target = await this.deps.ringSelector.createArachnodeInfo(this.deps.selfPeerId, newRingDepth);
 		this.deps.fretAdapter.setArachnodeInfo(this.clearMove({ ...target, status: 'active' }));
 		log('moveIn:advertise from=%d to=%d', oldRing, newRingDepth);
