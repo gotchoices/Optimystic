@@ -883,9 +883,10 @@ export class ClusterCoordinator {
 		// each remote request gets `promiseImmediateRetries` in-line re-attempts before
 		// it counts as a failure — without this a single relayed reset drops the peer and
 		// sinks super-majority (the commit broadcast already has the same guard).
+		// Every peer here is remote: `record.peers` is the map `peerIds` was taken from, so the only
+		// local member this round could have held is the one the pre-vote above just removed.
 		const promiseRequests = roundPeers.map(peerIdStr => {
-			const isLocal = this.localCluster && peerIdStr === this.localCluster.peerId.toString();
-			log('cluster-tx:promise-request', { messageHash: record.messageHash, peerId: peerIdStr, isLocal });
+			log('cluster-tx:promise-request', { messageHash: record.messageHash, peerId: peerIdStr, isLocal: false });
 			return new Pending(this.updateMember(peerIdStr, record, this.promiseImmediateRetries, 'promise'));
 		});
 
@@ -976,10 +977,15 @@ export class ClusterCoordinator {
 	 * transport churn worth a second call. `undefined` means there is no local member in this cohort
 	 * (some test wiring), and the round then runs over every peer unchanged.
 	 *
-	 * Only `promises` is merged, not `commits`: the round merges only `promises` from every other
-	 * member's answer, and a member cannot sign a commit here anyway without seeing a super-majority of
-	 * approved promises, which a record carrying one vote is not at any cohort size this class runs on
-	 * (`CoordinatorRepo`'s solo path keeps a cohort of one away from it).
+	 * Only `promises` is merged, not `commits` — which is exactly what the round itself merges from
+	 * every other member's answer, so the pre-vote is not a second rule. A commit signature normally
+	 * cannot exist yet: a member signs one only on a super-majority of approved promises, and one vote
+	 * is that only in a cohort of one, which `CoordinatorRepo`'s solo path keeps away from this class.
+	 * Were one to arrive anyway — a cohort that shrank between `resolveCohort` and
+	 * {@link getClusterForBlock}, admitted by `allowUnvalidatedSmallCluster` — the member reaches
+	 * consensus and applies during the pre-vote, and the commit signature dropped here is simply
+	 * re-collected by {@link presignLocalCommit} on the next round, as it was when self voted inside
+	 * the round.
 	 */
 	private async prevoteLocalPromise(record: ClusterRecord): Promise<ClusterLogPeerOutcome | undefined> {
 		const selfId = this.localCluster?.peerId.toString();

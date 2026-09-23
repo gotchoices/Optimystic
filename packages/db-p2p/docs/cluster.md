@@ -179,26 +179,29 @@ longer reach super-majority" — the writer retries as a fresh transaction.
 
 During the promise phase, each peer evaluates whether they can commit to the transaction. **The coordinator requires a super-majority (default 3/4) of promises** to proceed to the commit phase, providing stronger consensus guarantees than simple majority.
 
-A member answers with exactly one of three signed vote kinds, chosen by `getTransactionPhase`
-*before* the handler runs (`findConflict` decides between the first two):
+A member answers with exactly one of four signed vote kinds (`Signature` in
+`packages/db-core/src/cluster/structs.ts`). Which one is decided in two places: `getTransactionPhase`
+routes a lost race to `handleConflictVoteNeeded` *before* the handler runs (`findConflict` picks
+between `approve` and `conflict`), and `signPromiseVerdict` turns the handler's own verdict into
+`approve`, `reject` or `held`:
 
 ```typescript
 type Signature =
   | { type: 'approve'; signature: string }
   | { type: 'reject'; signature: string; rejectReason?: string }
   // We hold a conflicting transaction that won the race; `conflictWith` is its messageHash.
-  | { type: 'conflict'; signature: string; conflictWith: string };
+  | { type: 'conflict'; signature: string; conflictWith: string }
+  // The pend's blocks are reserved by a different unresolved action in our storage; `heldBy` is
+  // that action's id — a different id space from `conflictWith`, hence its own variant.
+  | { type: 'held'; signature: string; heldBy: string };
 ```
 
 ```typescript
 private async handlePromiseNeeded(record: ClusterRecord): Promise<ClusterRecord> {
-  // Validity only — the conflict check already happened in getTransactionPhase, which routes a
-  // lost race to handleConflictVoteNeeded instead of here.
-  const validation = await this.evaluatePromise(record);
-
-  const signature: Signature = validation.valid
-    ? { type: 'approve', signature: await this.signVote(promiseHash, 'approve') }
-    : { type: 'reject', signature: await this.signVote(promiseHash, 'reject', validation.reason), rejectReason: validation.reason };
+  // Validity and reservations only — the conflict check already happened in getTransactionPhase,
+  // which routes a lost race to handleConflictVoteNeeded instead of here.
+  const verdict = await this.evaluatePromise(record);
+  const signature = await this.signPromiseVerdict(await this.computePromiseHash(record), verdict);
 
   return {
     ...record,
@@ -206,6 +209,10 @@ private async handlePromiseNeeded(record: ClusterRecord): Promise<ClusterRecord>
   };
 }
 ```
+
+`reject` is a validity judgement and is permanent; `conflict` and `held` are the two *transient*
+refusals, counted apart from rejections at every threshold so neither can trip the
+permanent-rejection bar (see [docs/correctness.md §Theorem 9](../../../docs/correctness.md#theorem-9-progress-under-contention)).
 
 **The coordinator's own member votes first, and its vote rides on the round.** Before the record fans out,
 `ClusterCoordinator.prevoteLocalPromise` delivers it to this node's own member in process and merges that

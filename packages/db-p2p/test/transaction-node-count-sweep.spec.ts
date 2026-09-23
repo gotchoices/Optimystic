@@ -254,20 +254,26 @@ describe('Transaction sweep across node counts (one scenario at 1–5 machines)'
 					// size. How the FIRST round goes is size-dependent, so it is asserted separately below (at two
 					// members) and reported in the table at every size:
 					//
-					//  - At two and three members every member must promise, so each racing record is decided by
-					//    `resolveRace` at the promise vote. Both records now reach a member carrying their own
-					//    coordinator's approval (`ClusterCoordinator.prevoteLocalPromise`), so the approval counts tie
-					//    and the message-hash tie-break below them — the part that makes every member pick the same
-					//    winner — decides. One writer wins outright and the other is answered `Conflict race lost`
-					//    (`cluster-tx:conflict-race-lost`, surfaced by `CoordinatorRepo.pend` as a returned conflict).
-					//  - At four members and up super-majority is reachable without one member, so a member that is
-					//    neither coordinator still approves whichever record reached it first and both pends can reach
-					//    pend consensus anyway. Each member's storage then keeps whichever pending record arrived
-					//    first, and both coordinators hear a cohort refusal instead
-					//    (`CoordinatorRepo.pendThroughCluster`, `cohortPendRefusals`,
-					//    `coordinator-repo:pend-remote-refusal`) — an all-lose round that the retry loop's jittered
-					//    backoff separates. That residual is recorded at `resolveRace` in
-					//    `packages/db-p2p/src/cluster/race-resolution.ts`.
+					//  - At two members the two racing records are decided by `resolveRace` at the promise vote, and
+					//    by nothing else: every member is one of the two coordinators, so both records reach a member
+					//    carrying their own coordinator's approval (`ClusterCoordinator.prevoteLocalPromise`), the
+					//    approval counts tie, and the message-hash tie-break below them — the part that makes every
+					//    member pick the same winner — decides. One writer wins outright and the other is answered
+					//    `Conflict race lost` (`cluster-tx:conflict-race-lost`, surfaced by `CoordinatorRepo.pend` as
+					//    a returned conflict). That is the only size this holds at by construction, so it is the only
+					//    size asserted.
+					//  - At three members up there is a member that is neither coordinator, and it approves whichever
+					//    record reached it first; that record's count of two then decides comparison (1) at the other
+					//    members, in place of the tie-break, and two members comparing at different moments can pick
+					//    different winners. So which writer wins the first round — or whether either does — depends
+					//    on delivery order here, and the outcome is reported rather than asserted. That residual is
+					//    recorded at `resolveRace` in `packages/db-p2p/src/cluster/race-resolution.ts`.
+					//  - At four members and up the same third-member vote applies, and super-majority is additionally
+					//    reachable without one member, so both pends can reach pend consensus anyway. Each member's
+					//    storage then keeps whichever pending record arrived first, and both coordinators hear a
+					//    cohort refusal instead (`CoordinatorRepo.pendThroughCluster`, `cohortPendRefusals`,
+					//    `coordinator-repo:pend-remote-refusal`) — the all-lose round this sweep observes at four and
+					//    five, which the retry loop's jittered backoff separates.
 					const winnersByRev = new Map<number, Set<ActionId>>();
 					for (const commit of committed(all)) {
 						winnersByRev.set(commit.rev!, (winnersByRev.get(commit.rev!) ?? new Set()).add(commit.actionId));
@@ -303,11 +309,12 @@ describe('Transaction sweep across node counts (one scenario at 1–5 machines)'
 					row.race = `round 1: ${firstRound}; ${refused.length} lost attempt(s), all conflicts; rev ${contestedRev} won by node ${contestedWinner}; ${landed} of 2 landed`;
 
 					if (size === 2) {
-						// The size where the arbitration is unambiguous: a two-member cohort needs both promises, so
-						// neither writer can win past a member that holds its rival. Before the pre-vote each member
-						// held its own coordinator's record and refused the other's, and BOTH writers re-drove; now
-						// the tie-break picks one winner at both members. Asserted here rather than at three-and-up
-						// because only this size rules the residual above out by construction.
+						// The size where the arbitration is unambiguous: every member IS one of the two racing
+						// coordinators, so there is no third member whose first-arrival approval could decide
+						// comparison (1) instead of the tie-break. Before the pre-vote each member held its own
+						// coordinator's record and refused the other's, and BOTH writers re-drove; now the tie-break
+						// picks the same winner at both members. Asserted here rather than at three-and-up because
+						// only this size rules the residual above out by construction.
 						const winners = [raceAttempts.a, raceAttempts.b].filter(wonFirstRound);
 						expect(winners.length, `exactly one writer wins the first round (${describeAttempts(all)})`).to.equal(1);
 						expect(refused.length, `the loser is refused exactly once (${describeAttempts(all)})`).to.equal(1);
