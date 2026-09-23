@@ -19,6 +19,8 @@ export class PeerReputationService implements IPeerReputation {
 	private readonly thresholds: ReputationThresholds;
 	private readonly weights: Record<PenaltyReason, number>;
 	private readonly maxPenaltiesPerPeer: number;
+	private readonly selfPeerId: string | undefined;
+	private selfReportsRefused = 0;
 
 	constructor(config?: ReputationConfig) {
 		this.halfLifeMs = config?.halfLifeMs ?? 30 * 60_000;
@@ -31,9 +33,11 @@ export class PeerReputationService implements IPeerReputation {
 			...config?.weights,
 		};
 		this.maxPenaltiesPerPeer = config?.maxPenaltiesPerPeer ?? 100;
+		this.selfPeerId = config?.selfPeerId;
 	}
 
 	reportPeer(peerId: string, reason: PenaltyReason, context?: string): void {
+		if (this.refuseSelfReport(peerId, reason, context)) return;
 		const record = this.getOrCreateRecord(peerId);
 		const weight = this.weights[reason];
 		const penalty: PenaltyRecord = {
@@ -52,6 +56,8 @@ export class PeerReputationService implements IPeerReputation {
 	}
 
 	recordSuccess(peerId: string): void {
+		// Creates no record for this machine, so the read methods answer 0 / false for it without a second guard.
+		if (peerId === this.selfPeerId) return;
 		const record = this.getOrCreateRecord(peerId);
 		record.successCount++;
 		record.lastSuccess = Date.now();
@@ -97,6 +103,18 @@ export class PeerReputationService implements IPeerReputation {
 	resetPeer(peerId: string): void {
 		this.peers.delete(peerId);
 		log('reset peerId=%s', peerId.substring(0, 12));
+	}
+
+	/**
+	 * The one place a self-report is refused, so a reporter added later cannot bypass it. The count on the
+	 * log line is how "this machine faulted N times" stays answerable without any mechanism that can take
+	 * the machine out of service.
+	 */
+	private refuseSelfReport(peerId: string, reason: PenaltyReason, context: string | undefined): boolean {
+		if (peerId !== this.selfPeerId) return false;
+		this.selfReportsRefused++;
+		log('refused self-report reason=%s context=%s refused=%d', reason, context ?? '', this.selfReportsRefused);
+		return true;
 	}
 
 	private getOrCreateRecord(peerId: string): PeerRecord {

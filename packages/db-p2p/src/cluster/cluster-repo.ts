@@ -1067,6 +1067,8 @@ export class ClusterMember implements ICluster {
 			// an arbitrary one) but cannot eliminate it here: a single signature can't distinguish "victim
 			// signed badly" from "someone pasted the victim's public key + junk". Fully closing it needs an
 			// authenticated membership/channel layer (cohort-topic membership certs), out of scope for this fix.
+			// The victim being THIS node is closed: the reputation service refuses any report naming its own
+			// identifier, so the residual applies to other peers only.
 			return ok ? { valid: true } : { valid: false, penalize: true };
 		} catch {
 			// Malformed signature bytes / key decode failure: reject, but do not penalize on unparseable input.

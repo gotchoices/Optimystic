@@ -992,7 +992,7 @@ export async function createLibp2pNodeBase(
 		}
 
 		// Initialize peer reputation service
-		const reputation = new PeerReputationService();
+		const reputation = new PeerReputationService({ selfPeerId: node.peerId.toString() });
 
 		// Initialize cluster coordination components
 		const networkMode: NetworkMode = (options.bootstrapNodes?.length ?? 0) > 0 ? 'joining' : 'forming';

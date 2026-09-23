@@ -64,6 +64,11 @@ export interface ReputationConfig {
 	weights?: Partial<Record<PenaltyReason, number>>;
 	/** Maximum penalty records per peer before pruning. Default: 100 */
 	maxPenaltiesPerPeer?: number;
+	/** Identifier (`PeerId.toString()`) of the machine running this service. The table describes other
+	 *  machines only: a report naming this identifier is logged and never recorded, so a local fault —
+	 *  or a forged message a stranger attributed to this machine — cannot ban the node from its own
+	 *  coordinator selection. Unset, every identifier is scored, this one included. */
+	selfPeerId?: string;
 }
 
 /** A single recorded penalty event */

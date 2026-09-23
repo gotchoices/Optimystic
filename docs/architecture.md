@@ -208,7 +208,7 @@ Each node tracks peer behavior through a `PeerReputation` service:
 | `FalseApproval` (approved a tx the wider audience rejected) | 40 |
 | `DisputeLost` (rejection overturned) | 30 |
 
-Scores ≥ 20 trigger deprioritization; ≥ 80 trigger banning; penalties decay exponentially. An **EngineHealthMonitor** tracks a node's own dispute losses and, above threshold, suppresses outbound disputes to stop self-harming.
+Scores ≥ 20 trigger deprioritization; ≥ 80 trigger banning; penalties decay exponentially. The table describes *other* machines only: a report naming the node's own identifier is logged (with a running count) and never scored, which is what stops a local fault — or a stranger's forged message attributed to this node — from removing it from its own coordinator selection. An **EngineHealthMonitor** tracks a node's own dispute losses and, above threshold, suppresses outbound disputes to stop self-harming.
 
 ## Topology & Storage Management
 

@@ -141,6 +141,29 @@ describe('PeerReputationService', () => {
 		expect(summary.successCount).to.equal(0);
 	});
 
+	it('never records reports naming its own identifier, and scores every other identifier as before', () => {
+		const self = 'QmThisMachine';
+		const stranger = 'QmSomeoneElse';
+		const withSelf = new PeerReputationService({ selfPeerId: self });
+		// Two InvalidSignature reports (50 each) reach the ban threshold (80) for an ordinary identifier —
+		// the count a stranger needs to frame this node with forged votes carrying its own key.
+		for (let i = 0; i < 2; i++) {
+			withSelf.reportPeer(self, PenaltyReason.InvalidSignature, 'forged');
+			withSelf.reportPeer(stranger, PenaltyReason.InvalidSignature, 'forged');
+		}
+		withSelf.recordSuccess(self);
+
+		expect(withSelf.getScore(self)).to.equal(0);
+		expect(withSelf.isBanned(self)).to.be.false;
+		expect(withSelf.getAllReputations().has(self)).to.be.false;
+		expect(withSelf.isBanned(stranger)).to.be.true;
+
+		const withoutSelf = new PeerReputationService();
+		withoutSelf.reportPeer(self, PenaltyReason.InvalidSignature);
+		withoutSelf.reportPeer(self, PenaltyReason.InvalidSignature);
+		expect(withoutSelf.isBanned(self)).to.be.true;
+	});
+
 	it('should store context with penalties', () => {
 		const svc = new PeerReputationService();
 		svc.reportPeer(peerId, PenaltyReason.InvalidSignature, 'txn-abc123');
