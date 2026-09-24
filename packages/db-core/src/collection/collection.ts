@@ -1628,19 +1628,24 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * `addActions` appends exactly one entry, so at most one block per attempt; the memory is an
 	 * ordered list anyway, so a future multi-entry append cannot silently reintroduce this.
 	 *
-	 * Reuse is keyed on the in-flight action (the memory is cleared with the rest of that state by
-	 * {@link beginInFlightAction}) AND on `rev`. At a DIFFERENT revision the write is genuinely
-	 * different, and re-inserting an id an earlier attempt may have committed at the old revision
-	 * would give that block a second revision on the machines that landed that attempt and a first
-	 * on the machines that did not — the same divergence through another door. A revision change
-	 * needs no extra bookkeeping to spot: {@link getNextRev} only ever rises, so "the same
-	 * revision" is "`rev` unchanged since the ids were minted".
+	 * Reuse is keyed on `actionId` matching the action marked in flight (the memory is cleared with
+	 * the rest of that state by {@link beginInFlightAction}) AND on `rev`. At a DIFFERENT revision
+	 * the write is genuinely different, and re-inserting an id an earlier attempt may have committed
+	 * at the old revision would give that block a second revision on the machines that landed that
+	 * attempt and a first on the machines that did not — the same divergence through another door.
+	 * A revision change needs no extra bookkeeping to spot: {@link getNextRev} only ever rises, so
+	 * "the same revision" is "`rev` unchanged since the ids were minted".
 	 *
-	 * A caller with no action marked in flight — `TransactionCoordinator.execute`, which re-runs
-	 * the engine and re-stages, so its re-drive is not the same write — mints afresh and remembers
-	 * nothing. */
-	logAppendBlockIds(store: BlockStore<IBlock>, rev: number): () => BlockId {
-		if (this.inFlightActionId === undefined) {
+	 * Matching on the id rather than merely on "something is in flight" is what keeps the memory
+	 * private to one write: `TransactionCoordinator.execute` appends under a transaction it never
+	 * marks in flight, and it can run on an instance a DIFFERENT write left marked between its own
+	 * attempts (the mark outlives the instance latch on purpose, so the inter-attempt refresh can
+	 * read it). Keyed on presence alone, that append would hand its new log block the id the other
+	 * write minted — one block id inserted by two actions, which is the divergence this method
+	 * exists to close, reintroduced sideways. A caller whose action is not the marked one mints
+	 * afresh and remembers nothing. */
+	logAppendBlockIds(store: BlockStore<IBlock>, actionId: ActionId, rev: number): () => BlockId {
+		if (this.inFlightActionId !== actionId) {
 			return () => store.generateId();
 		}
 		if (this.mintedLogBlockIds?.rev !== rev) {
@@ -1795,6 +1800,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 			// A pending action is never pended over a base that has moved under it — before EVERY
 			// attempt, first and retries alike (see restageIfBasesMoved for why the retry needs it).
+			// NOTE: this is the one way the byte-identity the append below relies on can be broken at
+			// an UNCHANGED revision — a replay re-runs the action handlers, which mint fresh ids for
+			// whatever blocks they insert, so the retry sends different content under this write's
+			// `(action id, revision)`. It needs a base to move without this collection adopting a
+			// newer revision, which takes a block re-read that catches up while the log does not
+			// move (the abandoned-entry floor at TransactorSource.mayRetain is the way that happens),
+			// and such an attempt is in any case refused by storage's own base guard on the machines
+			// whose base moved. If that conjunction ever shows up in the field, the answer is to
+			// abandon the action id and re-drive as a NEW write rather than to suppress the replay.
 			await this.restageIfBasesMoved();
 
 			// Snapshot the pending actions so that any new actions aren't assumed to be part of this action
@@ -1819,7 +1833,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// earlier attempt at this revision already minted (logAppendBlockIds).
 			const newRev = this.getNextRev();
 			const collectionLog = await Log.open<Action<TAction>>(tracker, this.id,
-				{ newDataBlockId: this.logAppendBlockIds(tracker, newRev) });
+				{ newDataBlockId: this.logAppendBlockIds(tracker, actionId, newRev) });
 			if (!collectionLog) {
 				throw new Error(`Log not found for collection ${this.id}`);
 			}

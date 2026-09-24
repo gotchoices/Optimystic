@@ -146,4 +146,28 @@ describe('Retry: a re-sent write is byte-identical to the attempt it repeats', (
 
 		expectAttemptsIdentical(transactor.attempts);
 	});
+
+	it('the minted ids belong to the marked action alone', async () => {
+		// One instance can be marked in flight by a write that is between attempts (the mark
+		// deliberately outlives the instance latch) while a DIFFERENT write appends on it —
+		// `TransactionCoordinator.execute`, which marks nothing. Handing that append the marked
+		// write's ids would insert one block id under two action ids: the very divergence the
+		// memory exists to close, through another door.
+		const collection = await Collection.createOrOpen<SpecAction>(
+			new TestTransactor(), 'retry-identical-memory-scope', init());
+		const store = collection.tracker;
+
+		const endMarked = collection.beginInFlightAction('marked');
+		try {
+			const mine = collection.logAppendBlockIds(store, 'marked', 1)();
+			expect(collection.logAppendBlockIds(store, 'marked', 1)(),
+				'the marked action at the same revision gets its own id back').to.equal(mine);
+			expect(collection.logAppendBlockIds(store, 'other', 1)(),
+				'another action appending on this instance mints its own').to.not.equal(mine);
+			expect(collection.logAppendBlockIds(store, 'marked', 1)(),
+				'and left the marked action memory untouched').to.equal(mine);
+		} finally {
+			endMarked();
+		}
+	});
 });

@@ -1177,11 +1177,20 @@ saveMaterializedBlock(block): store(structuredClone(block));
   genuinely different, and re-inserting an id an earlier attempt may have committed at the old
   revision would give that block a second revision on the machines that landed that attempt and a
   first on the machines that did not. `getNextRev()` only rises, so "the same revision" needs no
-  bookkeeping beyond the number itself. `TransactionCoordinator.execute` re-runs the engine and
-  re-stages, so its re-drive is not the same write; it reaches the append with nothing marked in
-  flight and mints afresh. The rule is pinned by
+  bookkeeping beyond the number itself. Matching the id — rather than merely "something is in
+  flight" — is what keeps the memory private to one write: `TransactionCoordinator.execute` re-runs
+  the engine and re-stages, so its re-drive is not the same write, and it appends under a
+  transaction it never marks in flight even on an instance another write left marked between its own
+  attempts. The rule is pinned by
   `packages/db-core/test/retry-resends-identical-transforms.spec.ts`, which asserts on the whole
   transform set rather than on either value, so it fails for any per-attempt value added later.
+
+  One condition suspends it, recorded as a tripwire at `Collection.restageIfBasesMoved`'s call site
+  in `Collection.syncAttempts`: a replay re-runs the action handlers, which mint fresh ids for the
+  blocks they insert, so a base that moves while the collection's own revision does not leaves the
+  retry sending different content under one `(action id, revision)`. It is narrow — a block re-read
+  has to catch up while the log stays put — and such an attempt is refused by storage's own base
+  guard on exactly the machines whose base moved.
 - **A refused re-send is not yet an answer: the blocks' own history is asked next.** Storage
   refuses the re-send whenever any block has moved past the write's revision — and *every* later
   commit to the collection moves the log tail past it — which says a rival was there, not whether

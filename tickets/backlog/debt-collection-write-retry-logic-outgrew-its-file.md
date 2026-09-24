@@ -23,3 +23,7 @@ The long explanatory comments mostly restate rules that are also in `docs/intern
 # Re-measured by `debt-a-write-after-another-handles-commit-refetches-the-log-tail` (2026-09-23)
 
 `wc -l packages/db-core/src/collection/collection.ts` → 2118 lines. That ticket added about 60 of them to the REFRESH path (`keepWhatTheRefreshRead`, plus an argument on `forgetAndAdopt`), not to the retry machinery this ticket is about, so the retry loop itself is unchanged. The evidence it adds is only that the file keeps growing from more than one direction: a split that moves the retry machinery out would also give the refresh path room.
+
+# Re-measured by `bug-a-retried-write-can-store-two-versions-of-one-log-revision` (2026-09-24)
+
+`wc -l packages/db-core/src/collection/collection.ts` → 2203 lines (from 2118). That ticket added `logAppendBlockIds` and the `mintedLogBlockIds` field, which belong squarely to the state this ticket already names — they are cleared by `beginInFlightAction` and its disposer alongside `inFlightActionId` and `inFlightAttempt`, and they are read from inside `syncAttempts`' loop. So the in-flight/retry unit now has four pieces of state rather than two, and a fifth thing the loop has to get right. `packages/db-core/src/transaction/coordinator.ts` is 1839 lines and its `applyActionsToCollection` now reaches into the same state, which is a second caller for the extracted unit to serve.

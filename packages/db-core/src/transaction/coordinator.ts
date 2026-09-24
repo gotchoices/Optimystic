@@ -1339,14 +1339,14 @@ export class TransactionCoordinator {
 		// timestamp, which is fixed at BEGIN and already stable across attempts, rather than with
 		// the time of the attempt.
 		//
-		// NOTE: execute() reaches this method with nothing marked in flight, so it mints afresh every
-		// time — correct today, because it re-runs the engine and re-stages, so a re-drive of it is a
-		// DIFFERENT write, and because nothing re-drives it under one transaction (it returns its
-		// failure rather than looping). If execute() ever grows a retry that reuses the transaction
-		// id, it must mark each participant in flight the way commitOnce does, or it reintroduces
-		// exactly the divergence logAppendBlockIds closes.
+		// NOTE: execute() reaches this method without marking its transaction in flight, so it mints
+		// afresh every time — correct today, because it re-runs the engine and re-stages, so a
+		// re-drive of it is a DIFFERENT write, and because nothing re-drives it under one transaction
+		// (it returns its failure rather than looping). If execute() ever grows a retry that reuses
+		// the transaction id, it must mark each participant in flight the way commitOnce does, or it
+		// reintroduces exactly the divergence logAppendBlockIds closes.
 		const log = await Log.open(collection.tracker, collectionActions.collectionId,
-			{ newDataBlockId: collection.logAppendBlockIds(collection.tracker, newRev) });
+			{ newDataBlockId: collection.logAppendBlockIds(collection.tracker, actionId, newRev) });
 		if (!log) {
 			return {
 				success: false,
