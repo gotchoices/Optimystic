@@ -222,6 +222,12 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 			expect(mock.updateCalls).to.equal(3);
 		}
 
+		// Exactly ONE deferred release is armed. This is what the `clearRetry` guard buys: on this path
+		// `scheduleOrClearRetry` calls `clearRetry` with no retry ever armed, and the `finally` of
+		// `executeClusterTransaction` releases moments later — without the guard both would arm a
+		// release, deleting twice and printing two `cluster-tx:transaction-remove` lines.
+		expect(clock.pending, 'exactly one deferred release armed').to.equal(1);
+
 		// No retry scheduled — advancing the fake clock fires only the deferred cleanup timer, never
 		// another update.
 		clock.advance(300);

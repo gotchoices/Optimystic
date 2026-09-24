@@ -1412,7 +1412,9 @@ export class ClusterCoordinator {
 	 * A live retry has nothing left to chase: every peer it was re-sending to has committed. The guard
 	 * is what keeps the ordinary all-peers-committed path quiet — there {@link scheduleOrClearRetry}
 	 * calls this with no retry ever armed, and the `finally` of {@link executeClusterTransaction}
-	 * releases the entry moments later, so releasing here too would print two removal lines.
+	 * releases the entry moments later, so releasing here too would arm a second deferred delete and
+	 * print a second `cluster-tx:transaction-remove`. Pinned by the timer count asserted in the
+	 * `completes without retry when all peers commit` case of `test/cluster-coordinator.spec.ts`.
 	 */
 	private clearRetry(messageHash: string): void {
 		const state = this.transactions.get(messageHash);

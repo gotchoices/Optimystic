@@ -212,15 +212,17 @@ After the initial commit phase, the `ClusterCoordinator` tracks any peers that p
 
 | Attempt | Delay  |
 |---------|--------|
-| 1       | 2 s    |
-| 2       | 4 s    |
-| 3       | 8 s    |
-| 4       | 16 s   |
-| 5       | 30 s (cap) |
+| 1       | 250 ms |
+| 2       | 500 ms |
+| 3       | 1 s    |
+| 4       | 2 s    |
+| 5       | 4 s    |
+
+The delays are `commitBroadcastRetryInitialMs` (250 ms) doubled by `commitBroadcastRetryBackoffFactor` (2) each attempt and capped at `commitBroadcastRetryMaxIntervalMs` (8 s), over `commitBroadcastRetryMaxAttempts` (5) attempts — all four declared on `ClusterConsensusConfig` in `packages/db-core/src/cluster/structs.ts` and defaulted in `CoordinatorRepo` (`packages/db-p2p/src/repo/coordinator-repo.ts`). The cap is above every delay a default budget reaches, so it binds only a raised attempt count or initial interval.
 
 - The coordinator returns success to the caller as soon as **simple majority** commits are received — retries happen in the background
-- A successful retry removes the peer from the pending set; when the set is empty, retry state is cleared
-- After 5 failed attempts, the coordinator emits `cluster-tx:retry-abort` and stops retrying
+- A successful retry removes the peer from the pending set; when the set is empty, the transaction is released
+- After 5 failed attempts, the coordinator emits `cluster-tx:retry-abort`, stops retrying, and releases the transaction — see [packages/db-p2p/docs/cluster.md §Commit Retry Loop](../../db-p2p/docs/cluster.md#commit-retry-loop) for the single release site the three terminal exits share
 - Retries reuse the original `ClusterRecord`, so peers can apply the operation idempotently
 
 ### Timeout Budgets
