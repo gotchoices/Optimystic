@@ -415,9 +415,12 @@ export class TransactionCoordinator {
 				// A participant whose log tail landed despite the reported loss finds its own entry
 				// here and FINISHES that action before consuming it (Collection.completeOwnEntry,
 				// from the attempt commitOnceLatched retained). When finishing is refused for a cause
-				// that can clear, the refresh — not the commit — is what gets retried: commitOnce
-				// would rebuild the participant's log entry with a fresh timestamp and send a second
-				// version of a log tail already stored under this transaction's id and revision.
+				// that can clear, the refresh — not the commit — is what gets retried: the
+				// participant's log entry is already durable, and once a refresh adopts a newer
+				// revision commitOnce appends a SECOND entry under this transaction's id. (At an
+				// unchanged revision the re-append is byte-identical — see
+				// Collection.logAppendBlockIds — so what is at stake is the duplicate entry, not two
+				// versions of one tail block.)
 				// Each such round counts against the same budget as a stale loss; a permanent
 				// refusal (a rival holds the revision) escapes as the named TornActionError at once.
 				// Re-refreshing collections an earlier round already refreshed is a no-op.
@@ -1323,18 +1326,33 @@ export class TransactionCoordinator {
 		// Get transforms from the collection's tracker
 		const transforms = collection.tracker.transforms;
 
-		// Write actions to the collection's log to get the log tail block ID
-		const log = await Log.open(collection.tracker, collectionActions.collectionId);
+		// Generate action ID from transaction ID
+		const actionId = transaction.id;
+		const newRev = collection.getNextRev();
+
+		// Write actions to the collection's log to get the log tail block ID. The append must be a
+		// fixed function of this write and the revision it requests, because a refused commit is
+		// retried under the same action id and — when nothing else committed in between — at the
+		// same revision, and storage keys a saved block revision by `(action id, revision)`. So any
+		// data block the append mints takes the id an earlier attempt at this revision minted
+		// (Collection.logAppendBlockIds), and the entry is stamped with the transaction's own
+		// timestamp, which is fixed at BEGIN and already stable across attempts, rather than with
+		// the time of the attempt.
+		//
+		// NOTE: execute() reaches this method with nothing marked in flight, so it mints afresh every
+		// time — correct today, because it re-runs the engine and re-stages, so a re-drive of it is a
+		// DIFFERENT write, and because nothing re-drives it under one transaction (it returns its
+		// failure rather than looping). If execute() ever grows a retry that reuses the transaction
+		// id, it must mark each participant in flight the way commitOnce does, or it reintroduces
+		// exactly the divergence logAppendBlockIds closes.
+		const log = await Log.open(collection.tracker, collectionActions.collectionId,
+			{ newDataBlockId: collection.logAppendBlockIds(collection.tracker, newRev) });
 		if (!log) {
 			return {
 				success: false,
 				error: `Log not found for collection ${collectionActions.collectionId}`
 			};
 		}
-
-		// Generate action ID from transaction ID
-		const actionId = transaction.id;
-		const newRev = collection.getNextRev();
 
 		// Add actions to log (this updates the tracker with log block changes).
 		// Persist the transaction's read set on the entry so a later invalidation cascade can
@@ -1359,8 +1377,7 @@ export class TransactionCoordinator {
 			actionId,
 			newRev,
 			() => blockIdsForTransforms(transforms),
-			allCollectionIds,
-			transaction.reads
+			{ collectionIds: allCollectionIds, reads: transaction.reads, timestamp: transaction.stamp.timestamp }
 		);
 
 		// Return the transforms and log tail block ID

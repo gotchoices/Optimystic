@@ -36,6 +36,37 @@ export function logBlockHashPayload<TAction>(block: LogBlock<TAction>) {
 	return covered;
 }
 
+/** What {@link Log.open} may be told beyond the block it opens. */
+export type LogOpenOptions = {
+	/** Supplies the id for each data block an append mints, in place of a fresh random one. */
+	newDataBlockId?: () => BlockId;
+};
+
+/** The trailing, mostly-optional inputs to {@link Log.addActions}. An options object rather than
+ *  positional parameters because the two most interesting ones are the last two, and a caller that
+ *  needs only the timestamp should not have to spell out the two before it. */
+export type AddActionsOptions = {
+	/** Every collection participating in the action this entry records. */
+	collectionIds?: CollectionId[];
+	/** The transaction's `(blockId, revision)` read set, persisted on the entry so the invalidation
+	 *  cascade can later discover this action's read-dependents (see {@link ActionEntry.reads}).
+	 *  Omit it on the low-level direct-commit path that carries no `Transaction`; the cascade then
+	 *  treats the entry as an unknown dependency. */
+	reads?: ReadDependency[];
+	/**
+	 * When the entry was written. Nothing in the tree reads it for logic — it is informational —
+	 * which is what makes it safe for a writer to supply the time of the WRITE rather than of the
+	 * attempt, and arguably the more honest value.
+	 *
+	 * A writer whose attempt may be retried MUST supply it. Storage identifies a saved block
+	 * revision by `(action id, revision)` and accepts a retry of the same action at the same
+	 * revision, so a retry that took a fresh timestamp here would store a second, different log
+	 * block under one `(action, revision)` on every machine that missed the first attempt.
+	 * Defaults to `Date.now()` for a caller that appends once.
+	 */
+	timestamp?: number;
+};
+
 export class Log<TAction> {
 	protected constructor(
 		private readonly chain: Chain<LogEntry<TAction>>,
@@ -46,9 +77,15 @@ export class Log<TAction> {
 		return this.chain.id;
 	}
 
-	/** Opens a presumably existing log. */
-	static async open<TAction>(store: BlockStore<IBlock>, id: BlockId): Promise<Log<TAction> | undefined> {
-		const chain = await Chain.open<LogEntry<TAction>>(store, id, Log.getChainOptions(store));
+	/** Opens a presumably existing log.
+	 *
+	 * `options.newDataBlockId` supplies the id for each data block an append has to mint, in place
+	 * of a fresh random one. A writer whose attempt may be RETRIED passes a source that hands back
+	 * the ids its earlier attempt minted, so the retry's transforms are byte-identical to the
+	 * attempt it repeats (see {@link Collection.logAppendBlockIds}); everything else omits it and
+	 * mints at random exactly as before. */
+	static async open<TAction>(store: BlockStore<IBlock>, id: BlockId, options?: LogOpenOptions): Promise<Log<TAction> | undefined> {
+		const chain = await Chain.open<LogEntry<TAction>>(store, id, Log.getChainOptions(store, options?.newDataBlockId));
 		return chain ? new Log<TAction>(chain) : undefined;
 	}
 
@@ -64,12 +101,11 @@ export class Log<TAction> {
 	/**
 	 * Adds a new action entry to the log.
 	 *
-	 * `reads` is the transaction's `(blockId, revision)` read set, persisted on the entry so the
-	 * invalidation cascade can later discover this action's read-dependents (see
-	 * {@link ActionEntry.reads}). Omit it (or pass `undefined`) on the low-level direct-commit path
-	 * that carries no `Transaction`; the cascade then treats the entry as an unknown dependency.
+	 * See {@link AddActionsOptions} for what the trailing options carry, and in particular why a
+	 * writer that may retry passes its own `timestamp` rather than letting each attempt take one.
 	 */
-	async addActions(actions: TAction[], actionId: ActionId, rev: number, getBlockIds: () => BlockId[], collectionIds: CollectionId[] = [], reads?: ReadDependency[], timestamp: number = Date.now()) {
+	async addActions(actions: TAction[], actionId: ActionId, rev: number, getBlockIds: () => BlockId[], options?: AddActionsOptions) {
+		const { collectionIds = [], reads, timestamp = Date.now() } = options ?? {};
 		const action = reads !== undefined
 			? { actionId, actions, blockIds: [], collectionIds, reads }
 			: { actionId, actions, blockIds: [], collectionIds };
@@ -250,9 +286,9 @@ export class Log<TAction> {
 
 	/** Chain options used by every log: block type factories plus the priorHash `newBlock` hook.
 	 *  Exposed (not private) so tests can drive a raw {@link Chain} through the exact same hook. */
-	static getChainOptions<TAction>(store: BlockStore<IBlock>) {
+	static getChainOptions<TAction>(store: BlockStore<IBlock>, newDataBlockId?: () => BlockId) {
 		return {
-			createDataBlock: () => ({ header: store.createBlockHeader(LogDataBlockType) }),
+			createDataBlock: () => ({ header: store.createBlockHeader(LogDataBlockType, newDataBlockId?.()) }),
 			createHeaderBlock: (id?: BlockId) => ({ header: store.createBlockHeader(LogHeaderBlockType, id) }),
 			newBlock: async (newTail: LogBlock<TAction>, oldTail: LogBlock<TAction> | undefined) => {
 				if (oldTail) {

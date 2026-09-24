@@ -216,16 +216,23 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * assuming it is finished (see {@link completeOwnEntry}). Set by {@link retainInFlightAttempt},
 	 * cleared with the mark by {@link beginInFlightAction}'s disposer, and meaningless without it.
 	 *
-	 * The transforms are retained VERBATIM, not rebuilt: a rebuilt attempt re-appends the log entry
-	 * with a fresh timestamp, so its log tail would differ byte-for-byte from the one already
-	 * stored under the same action id and revision — and any replica that had not yet stored the
-	 * tail would then store the second version, leaving two contents under one `(action, revision)`.
+	 * The transforms are retained VERBATIM rather than rebuilt at the point of finishing: by then
+	 * the attempt's snapshot tracker is gone, and the re-send has to name the same log tail block
+	 * the entry was appended to. The separate guarantee that a same-revision REBUILD sends identical
+	 * bytes ({@link logAppendBlockIds}, and the per-write timestamp {@link syncInternal} mints)
+	 * covers the retry that finds NO entry at all; it does not hand this path a tail id.
 	 *
 	 * Only the latest attempt is kept. An own entry can only be visible at the revision of an
 	 * attempt whose tail landed, and a later attempt at a DIFFERENT revision is only made after a
 	 * refresh adopted somebody else's entry at the earlier one — which is proof the earlier tail did
 	 * not land. {@link completeOwnEntry} still checks the revision and refuses on a mismatch. */
 	private inFlightAttempt?: InFlightAttempt;
+
+	/** The log data-block ids the append of the action marked in {@link inFlightActionId} has
+	 * minted, in the order it minted them, together with the revision they were minted for. Set and
+	 * read by {@link logAppendBlockIds}, cleared with the rest of the in-flight state by
+	 * {@link beginInFlightAction} and its disposer. */
+	private mintedLogBlockIds?: { rev: number; ids: BlockId[] };
 
 	/** The log tail block id the most recent header read named. A refresh asks for this block in the
 	 * same request as the header ({@link readLogEnds}): the tail id only changes when the tail block
@@ -1574,14 +1581,17 @@ export class Collection<TAction> implements ICollection<TAction> {
 		if (this.inFlightActionId !== actionId) {
 			// A different action's failed attempt cannot finish this one. Re-marking the SAME id (a
 			// coordinator re-marks on every attempt) keeps what the previous attempt retained — that
-			// is the attempt the next refresh may need.
+			// is the attempt the next refresh may need, and the block ids it minted are what make the
+			// next attempt's log append identical to it.
 			this.inFlightAttempt = undefined;
+			this.mintedLogBlockIds = undefined;
 		}
 		this.inFlightActionId = actionId;
 		return () => {
 			if (this.inFlightActionId === actionId) {
 				this.inFlightActionId = undefined;
 				this.inFlightAttempt = undefined;
+				this.mintedLogBlockIds = undefined;
 			}
 		};
 	}
@@ -1601,6 +1611,53 @@ export class Collection<TAction> implements ICollection<TAction> {
 		if (this.inFlightActionId === actionId) {
 			this.inFlightAttempt = attempt;
 		}
+	}
+
+	/** Ids for the log data blocks a write's log append may have to mint, so a RETRY of that write
+	 * at the same revision sends the same ids the attempt it is repeating sent. Hand the result to
+	 * {@link Log.open} as `newDataBlockId`; it yields remembered ids in order and mints (and
+	 * remembers) a fresh one past the end.
+	 *
+	 * The divergence this closes is not confined to the new block, which on its own would only be
+	 * an orphan: minting a second id also rewrites `nextId` on the block that was the tail and
+	 * `tailId` on the collection header, so two attempts send DIFFERENT update operations for two
+	 * blocks that already exist, under one action id and revision. A machine that landed the first
+	 * attempt then reads the log as ending in one block and a machine that landed the retry reads
+	 * it as ending in another, permanently — a forked history.
+	 *
+	 * `addActions` appends exactly one entry, so at most one block per attempt; the memory is an
+	 * ordered list anyway, so a future multi-entry append cannot silently reintroduce this.
+	 *
+	 * Reuse is keyed on the in-flight action (the memory is cleared with the rest of that state by
+	 * {@link beginInFlightAction}) AND on `rev`. At a DIFFERENT revision the write is genuinely
+	 * different, and re-inserting an id an earlier attempt may have committed at the old revision
+	 * would give that block a second revision on the machines that landed that attempt and a first
+	 * on the machines that did not — the same divergence through another door. A revision change
+	 * needs no extra bookkeeping to spot: {@link getNextRev} only ever rises, so "the same
+	 * revision" is "`rev` unchanged since the ids were minted".
+	 *
+	 * A caller with no action marked in flight — `TransactionCoordinator.execute`, which re-runs
+	 * the engine and re-stages, so its re-drive is not the same write — mints afresh and remembers
+	 * nothing. */
+	logAppendBlockIds(store: BlockStore<IBlock>, rev: number): () => BlockId {
+		if (this.inFlightActionId === undefined) {
+			return () => store.generateId();
+		}
+		if (this.mintedLogBlockIds?.rev !== rev) {
+			this.mintedLogBlockIds = { rev, ids: [] };
+		}
+		const minted = this.mintedLogBlockIds;
+		let next = 0;
+		return () => {
+			const index = next++;
+			const remembered = minted.ids[index];
+			if (remembered !== undefined) {
+				return remembered;
+			}
+			const id = store.generateId();
+			minted.ids[index] = id;
+			return id;
+		};
 	}
 
 	/** Push our pending actions to the transactor.
@@ -1627,10 +1684,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 	private async syncInternal(options?: SyncOptions): Promise<WriteDurability | undefined> {
 		const bytes = randomBytes(16);
 		const actionId = uint8ArrayToString(bytes, 'base64url');
+		// One timestamp for the WRITE, minted here beside the action id and for the same reason: an
+		// attempt that takes its own would make the retry's log block differ from the one the
+		// attempt it repeats may already have stored under this `(action id, revision)`.
+		const timestamp = Date.now();
 
 		const endInFlight = this.beginInFlightAction(actionId);
 		try {
-			return await this.syncAttempts(actionId, options);
+			return await this.syncAttempts(actionId, timestamp, options);
 		} finally {
 			endInFlight();
 		}
@@ -1638,9 +1699,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** The retry loop behind {@link syncInternal}, run with `actionId` already marked in flight.
 	 *
+	 * @param timestamp the WRITE's time, stamped on the log entry every attempt appends — see
+	 * {@link syncInternal}, which mints it.
 	 * @returns the durability of what this sync committed, or `undefined` when the loop never ran a
 	 * commit (nothing staged). See {@link sync}. */
-	private async syncAttempts(actionId: ActionId, options?: SyncOptions): Promise<WriteDurability | undefined> {
+	private async syncAttempts(actionId: ActionId, timestamp: number, options?: SyncOptions): Promise<WriteDurability | undefined> {
 		const maxAttempts = options?.maxAttempts ?? DefaultMaxAttempts;
 		const baseBackoffMs = options?.baseBackoffMs ?? PendingRetryDelayMs;
 		const maxBackoffMs = options?.maxBackoffMs ?? DefaultMaxBackoffMs;
@@ -1750,13 +1813,18 @@ export class Collection<TAction> implements ICollection<TAction> {
 			const snapshot = copyTransforms(this.tracker.transforms);
 			const tracker = new Tracker(this.sourceCache, snapshot, this.tracker.pins);
 
-			// Add the action to the log (in local tracking space)
-			const collectionLog = await Log.open<Action<TAction>>(tracker, this.id);
+			// Add the action to the log (in local tracking space). The append is a fixed function of
+			// this write and the revision it is requesting: the timestamp was minted once for the
+			// whole write (syncInternal) and any data block the append has to mint takes the id an
+			// earlier attempt at this revision already minted (logAppendBlockIds).
+			const newRev = this.getNextRev();
+			const collectionLog = await Log.open<Action<TAction>>(tracker, this.id,
+				{ newDataBlockId: this.logAppendBlockIds(tracker, newRev) });
 			if (!collectionLog) {
 				throw new Error(`Log not found for collection ${this.id}`);
 			}
-			const newRev = this.getNextRev();
-			const addResult = await collectionLog.addActions(pending, actionId, newRev, () => tracker.transformedBlockIds());
+			const addResult = await collectionLog.addActions(pending, actionId, newRev,
+				() => tracker.transformedBlockIds(), { timestamp });
 
 			// Declare what each touched block will contain once committed, computed from this snapshot
 			// tracker (which layers over `this.sourceCache`, so the peek/getCachedRevision probes are
@@ -1815,9 +1883,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 				});
 				// Refresh, and keep refreshing while it reports that this write's own half-landed
 				// action could not be finished YET. It must not fall through to a new attempt in that
-				// state: a new attempt rebuilds the log entry (fresh timestamp) and would send a second
-				// version of a log tail that is already stored under this action and revision. Each
-				// round is a failure against the same no-progress budget as a refused attempt.
+				// state: this action's log entry is already durable, and as soon as a refresh adopts a
+				// newer revision a new attempt appends a SECOND entry under the same action id — the
+				// duplicate consumeOwnEntry exists to prevent. (At an unchanged revision the rebuild
+				// is byte-identical — see logAppendBlockIds — so what is at stake is the second entry,
+				// not two versions of one tail block.) Each round is a failure against the same
+				// no-progress budget as a refused attempt.
 				for (;;) {
 					// Back off before every retry (any stale failure — reason/missing/pending), growing
 					// exponentially from the base delay up to the cap, with proportional random jitter so a

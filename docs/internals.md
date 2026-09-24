@@ -1139,9 +1139,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   (`Collection.retainInFlightAttempt` — transforms, revision, tail, block digests), and the refresh
   re-sends it at the SAME action id and revision. The own-revision carve-out turns that re-send into
   "land exactly the blocks that are missing", and into a no-op when nothing is. The transforms are
-  retained rather than rebuilt because a rebuilt attempt re-appends the log entry with a fresh
-  timestamp, and a replica that had not yet stored the tail would then store a second, different
-  tail under the same `(action, revision)`. Only then does it **consume** the entry
+  retained rather than rebuilt because the refresh cannot rebuild them: by then the instance's own
+  tracker has moved on, and the re-send has to name the same tail block and the same per-block
+  content digests the failed attempt declared. Only then does it **consume** the entry
   (`Collection.consumeOwnEntry`) instead of running it through the conflict filter and replaying
   it — replaying re-appends content the committed tail already holds, leaving the same action
   recorded twice in the log. Consuming drops the entry's actions off the head of `pending` and
@@ -1149,6 +1149,39 @@ saveMaterializedBlock(block): store(structuredClone(block));
   reports success, with the re-send's `WriteDurability` as its answer. Finishing runs before the
   refresh has changed anything on the instance, so when it cannot finish, the staged actions, the
   tracker and the held revision are exactly as the failed attempt left them.
+- **A write's log append is a fixed function of the write and the revision it is requesting.** The
+  rule above covers the retry that finds its own entry and re-sends verbatim; this one covers the
+  retry that does not — the refused commit landed nothing, so the refresh reaches no entry (or, for
+  a brand-new collection, cannot reach the log at all, its header having been among the blocks the
+  refused commit left behind) and the attempt is REBUILT from scratch. Storage identifies a saved
+  block revision by `(action id, revision)` and deliberately accepts a retry of the same action at
+  the same revision, so any value the rebuild mints per attempt becomes two different contents under
+  one `(action id, revision)`: the machines that landed the first attempt keep what they have, the
+  machines that missed it store what the retry sent. Two attempts of one action at one revision
+  therefore produce byte-identical transforms, which needs both of the values the append would
+  otherwise mint fresh to be per-WRITE:
+  - the entry's **timestamp**, minted once beside the action id (`Collection.syncInternal`) and
+    passed down to `Log.addActions`; on the coordinator path it is `transaction.stamp.timestamp`,
+    fixed at BEGIN and already stable across attempts. Nothing in the tree reads
+    `LogEntry.timestamp` for logic — it is informational — so the write's time is a safe value, and
+    arguably the more honest one.
+  - the **id of the data block** the append mints when the current log block is full (32 entries).
+    `Collection.logAppendBlockIds` hands `Log.open` the ids an earlier attempt of this action minted
+    at this revision, in order, and mints fresh past them. This one is worse than a stray orphan
+    block: a second id also rewrites `nextId` on the block that was the tail and `tailId` on the
+    collection header, so two attempts send different update operations for two blocks that already
+    exist — a machine that landed the first reads the log as ending in one block and a machine that
+    landed the retry reads it as ending in another, at one revision of one header block, permanently.
+
+  Reuse is keyed on the in-flight action id AND the revision: at a different revision the write is
+  genuinely different, and re-inserting an id an earlier attempt may have committed at the old
+  revision would give that block a second revision on the machines that landed that attempt and a
+  first on the machines that did not. `getNextRev()` only rises, so "the same revision" needs no
+  bookkeeping beyond the number itself. `TransactionCoordinator.execute` re-runs the engine and
+  re-stages, so its re-drive is not the same write; it reaches the append with nothing marked in
+  flight and mints afresh. The rule is pinned by
+  `packages/db-core/test/retry-resends-identical-transforms.spec.ts`, which asserts on the whole
+  transform set rather than on either value, so it fails for any per-attempt value added later.
 - **A refused re-send is not yet an answer: the blocks' own history is asked next.** Storage
   refuses the re-send whenever any block has moved past the write's revision — and *every* later
   commit to the collection moves the log tail past it — which says a rival was there, not whether

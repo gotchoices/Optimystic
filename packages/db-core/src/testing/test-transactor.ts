@@ -676,6 +676,68 @@ export class TailLandsButReportsStale extends DelegatingTransactor {
 	}
 }
 
+/** What one attempt of a write put on the wire: the pend's transforms, with the action id and
+ *  revision it was pended under. Recorded by {@link RecordsAttemptsRefusesFirstCommit}. */
+export type RecordedAttempt = {
+	actionId: ActionId;
+	rev?: number;
+	transforms: Transforms;
+};
+
+/**
+ * Records what every attempt of a write pends, and refuses the FIRST commit outright — nothing is
+ * delegated, so nothing lands and the retry's refresh cannot find the write's own log entry.
+ *
+ * That is the case `Collection.completeOwnEntry` does NOT reach: the refused commit left the log
+ * block (and, for a brand-new collection, the header) uncommitted, so the refresh has no entry to
+ * finish from and the retry REBUILDS its log append from scratch. Storage identifies a saved block
+ * revision by `(action id, revision)` and deliberately accepts a retry of the same action at the
+ * same revision, so any per-attempt value in that rebuild becomes two contents under one
+ * `(action, revision)` across the machines that landed different attempts.
+ *
+ * `attempts` is therefore asserted on WHOLE — not field by field — so the rule it pins ("a retry at
+ * the same revision sends byte-identical transforms") fails for any future per-attempt value, not
+ * only the ones known today. Transforms are cloned on the way in, since the caller keeps mutating
+ * the live tracker afterwards.
+ *
+ * Lives here beside {@link CommitLandsButReportsStale} for the reason that one gives: the
+ * collection-path and coordinator-path specs must not drift apart on the double they share.
+ */
+export class RecordsAttemptsRefusesFirstCommit extends DelegatingTransactor {
+	readonly attempts: RecordedAttempt[] = [];
+	private refusals: number;
+
+	constructor(inner: TestTransactor, refusals = 1) {
+		super(inner);
+		this.refusals = refusals;
+	}
+
+	/** Arm (or re-arm) the refusal counter, so a test can let its setup writes land cleanly and
+	 *  then refuse only the write under test. Replaces whatever is left of the current count. */
+	refuseNextCommits(count: number): void {
+		this.refusals = count;
+	}
+
+	override async pend(request: PendRequest): Promise<PendResult> {
+		this.attempts.push({
+			actionId: request.actionId,
+			rev: request.rev,
+			transforms: structuredClone(request.transforms),
+		});
+		return this.inner.pend(request);
+	}
+
+	override async commit(request: CommitRequest): Promise<CommitResult> {
+		if (this.refusals > 0) {
+			this.refusals--;
+			// Never delegated: nothing of this attempt is durable, so `TransactorSource.transact`
+			// cancels the pend and the writer re-drives at the same action id and revision.
+			return { success: false, conflict: true, reason: 'stale commit: injected refusal, nothing landed' };
+		}
+		return this.inner.commit(request);
+	}
+}
+
 /** A competing writer: a real write driven against the UNWRAPPED transactor, so its own
  *  pend/commit calls are invisible to {@link CompetingWriterTransactor}'s counters and cannot
  *  re-trigger the interception. See {@link commitRivalTreeWrite} for the usual implementation. */
