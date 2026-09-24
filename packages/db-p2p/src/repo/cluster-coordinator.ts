@@ -189,6 +189,13 @@ interface CommitRetryState {
 	cancel?: TimerCancel;
 }
 
+/**
+ * Which terminal exit released a transaction's bookkeeping, reported as the `reason` field of
+ * `cluster-tx:transaction-remove`: the commit finished with no retry pending, a live retry ran out
+ * of peers to chase, or a retry gave up with peers still missing (the `cluster-tx:retry-abort` case).
+ */
+type ReleaseReason = 'complete' | 'retry-finished' | 'retry-abandoned';
+
 interface ClusterTransactionState {
 	messageHash: string;
 	record: ClusterRecord;
@@ -580,18 +587,10 @@ export class ClusterCoordinator {
 				finalCommits: stored ? Object.keys(stored.record.commits ?? {}) : undefined,
 				retry: retrySnapshot
 			});
-			// Don't remove transaction immediately if retries are scheduled
-			// Let the retry completion or abort handle cleanup
+			// A live retry still owns the release: it holds the record it is re-sending, and whichever
+			// way it ends (all peers commit, or the budget runs out) releases the entry then.
 			if (!stored?.retry) {
-				// Wait a bit before cleanup to allow any in-flight responses to arrive
-				this.setTimer(() => {
-					this.transactions.delete(messageHash);
-					this.deleteCoordinatorState(messageHash);
-					log('cluster-tx:transaction-remove', {
-						messageHash,
-						remaining: Array.from(this.transactions.keys())
-					});
-				}, 100);
+				this.releaseTransaction(messageHash, 'complete');
 			}
 		}
 	}
@@ -1324,6 +1323,7 @@ export class ClusterCoordinator {
 		const nextAttempt = (existing?.attempt ?? 0) + 1;
 		if (nextAttempt > this.retryMaxAttempts) {
 			log('cluster-tx:retry-abort', { messageHash, missingPeers });
+			this.releaseTransaction(messageHash, 'retry-abandoned');
 			return;
 		}
 		if (missingPeers.length === 0) {
@@ -1408,19 +1408,44 @@ export class ClusterCoordinator {
 		this.scheduleCommitRetry(messageHash, state.record, Array.from(pendingPeers));
 	}
 
+	/**
+	 * A live retry has nothing left to chase: every peer it was re-sending to has committed. The guard
+	 * is what keeps the ordinary all-peers-committed path quiet — there {@link scheduleOrClearRetry}
+	 * calls this with no retry ever armed, and the `finally` of {@link executeClusterTransaction}
+	 * releases the entry moments later, so releasing here too would print two removal lines.
+	 */
 	private clearRetry(messageHash: string): void {
 		const state = this.transactions.get(messageHash);
 		if (!state?.retry) {
 			return;
 		}
-		state.retry.cancel?.();
-		state.retry = undefined;
-		// Clean up the transaction after retry is complete
+		this.releaseTransaction(messageHash, 'retry-finished');
+	}
+
+	/**
+	 * Release one transaction's bookkeeping — the in-memory entry, any armed retry, and the persisted
+	 * coordinator state — from whichever of the three terminal exits reached it. Routing them all
+	 * through here, rather than deleting ad hoc at each, is what keeps a terminal path added later
+	 * from forgetting the cleanup; the abandoned-retry exit is the one that used to, leaving the whole
+	 * `ClusterRecord` held for the life of the process.
+	 *
+	 * The deletes stay on the 100 ms deferral the completion path has always used, so any in-flight
+	 * member response still finds a live entry to merge into. The deferral is armed whether or not an
+	 * entry is held here: a hash already gone from memory can still have persisted state to delete,
+	 * which is what the completion path did before and must keep doing.
+	 */
+	private releaseTransaction(messageHash: string, reason: ReleaseReason): void {
+		const state = this.transactions.get(messageHash);
+		if (state?.retry) {
+			state.retry.cancel?.();
+			state.retry = undefined;
+		}
 		this.setTimer(() => {
 			this.transactions.delete(messageHash);
 			this.deleteCoordinatorState(messageHash);
 			log('cluster-tx:transaction-remove', {
 				messageHash,
+				reason,
 				remaining: Array.from(this.transactions.keys())
 			});
 		}, 100);

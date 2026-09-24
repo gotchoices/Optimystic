@@ -144,6 +144,13 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 	let mockClusters: Map<string, MockClusterClient>;
 	let coordinator: ClusterCoordinator;
 	let clock: FakeScheduler;
+	/**
+	 * A real state store rather than `undefined`, so the release assertions below can see the
+	 * persisted coordinator state go as well as the in-memory entry. It is inert for every other test
+	 * in this block — it adds map writes and arms no timers. (`InMemoryStateStore` is declared further
+	 * down the file; this `beforeEach` runs long after module evaluation, so the reference resolves.)
+	 */
+	let stateStore: InMemoryStateStore;
 
 	const cfg: ClusterConsensusConfig & { clusterSize: number } = {
 		clusterSize: 3,
@@ -155,6 +162,9 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 		partitionDetectionWindow: 60000
 	};
 
+	/** The coordinator's in-memory bookkeeping entry for `messageHash`, or `undefined` once released. */
+	const heldEntry = (messageHash: string): unknown => (coordinator as any).transactions.get(messageHash);
+
 	// Expiration is stamped against the SAME fake clock the coordinator reads, so it is not instantly
 	// expired against a fake `now` that starts at 0.
 	const makeMessage = (): RepoMessage => ({
@@ -164,6 +174,7 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 
 	beforeEach(async () => {
 		clock = new FakeScheduler();
+		stateStore = new InMemoryStateStore();
 		peerIds = await Promise.all([makePeerId(), makePeerId(), makePeerId()]);
 
 		const clusterPeers: ClusterPeers = {};
@@ -195,7 +206,7 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 			undefined, // localCluster
 			undefined, // fretService
 			undefined, // reputation
-			undefined, // stateStore
+			stateStore,
 			clockOpts(clock)
 		);
 	});
@@ -258,7 +269,7 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 		const failingMock = mockClusters.get(failingId)!;
 		failingMock.failCommit = true;
 
-		await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
 		expect(failingMock.updateCalls).to.equal(4);
 
 		// Fix the peer before the retry fires
@@ -274,6 +285,7 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 		clock.advance(5000);
 		await flush();
 		expect(failingMock.updateCalls, 'no further retries after the peer recovered').to.equal(callsAfterRecovery);
+		expect(heldEntry(result.record.messageHash), 'the finished retry released the transaction entry').to.equal(undefined);
 	});
 
 	it('continues retrying with exponential backoff on persistent failure', async () => {
@@ -313,6 +325,36 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 		await flush();
 		expect(failingMock.updateCalls, 'attempt 3 ran at exactly 1000ms').to.equal(7);
 		expect(retryState()?.intervalMs, 'attempt 4 interval doubles to 2000').to.equal(2000);
+	});
+
+	it('releases the transaction when the retry budget runs out', async () => {
+		const failingId = peerIds[2]!.toString();
+		const failingMock = mockClusters.get(failingId)!;
+		failingMock.failCommit = true;
+
+		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		const hash = result.record.messageHash;
+
+		// While the retry is live the entry is held on purpose — the retry is re-sending its record.
+		expect(heldEntry(hash), 'entry held while the retry is pending').to.not.equal(undefined);
+		expect(stateStore.coordinator.has(hash), 'coordinator state persisted while the retry is pending').to.equal(true);
+
+		// Drive the whole default budget: 5 attempts at 250, 500, 1000, 2000 and 4000 ms, each followed
+		// by a flush because `retryCommits` is async — advancing only *starts* the attempt.
+		for (const delay of [250, 500, 1000, 2000, 4000]) {
+			clock.advance(delay);
+			await flush();
+		}
+		// The 5th attempt failed too, so arming a 6th aborts (`cluster-tx:retry-abort`) and releases.
+		expect(failingMock.updateCalls, 'all five scheduled attempts ran').to.equal(9);
+
+		// Release defers the deletes by 100 ms, to let any in-flight member response still land.
+		clock.advance(100);
+		await flush();
+
+		expect(heldEntry(hash), 'the abandoned retry released the transaction entry').to.equal(undefined);
+		expect(stateStore.coordinator.has(hash), 'the abandoned retry deleted the persisted coordinator state').to.equal(false);
+		expect(clock.pending, 'no timers left armed').to.equal(0);
 	});
 });
 
