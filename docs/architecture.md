@@ -208,7 +208,7 @@ Each node tracks peer behavior through a `PeerReputation` service:
 | `FalseApproval` (approved a tx the wider audience rejected) | 40 |
 | `DisputeLost` (rejection overturned) | 30 |
 
-Scores ≥ 20 trigger deprioritization; ≥ 80 trigger banning; penalties decay exponentially. The table describes *other* machines only: a report naming the node's own identifier is logged (with a running count) and never scored, which is what stops a local fault — or a stranger's forged message attributed to this node — from removing it from its own coordinator selection. An **EngineHealthMonitor** tracks a node's own dispute losses and, above threshold, suppresses outbound disputes to stop self-harming.
+Scores ≥ 20 trigger deprioritization; ≥ 80 trigger banning; penalties decay exponentially. The table describes *other* machines only: a report naming the node's own identifier is logged (with a running count) and never scored, which is what stops a local fault — or a stranger's forged message attributed to this node — from removing it from its own coordinator selection. The table is bounded (`maxPeers`, default 1024), because the names in it come off the wire and a stranger can mint one per message: at the cap a new name displaces the lowest-scoring record that is not banned, a banned record is never evicted (spraying fresh names cannot launder an offender out), and a table holding nothing but bans refuses the new name until a ban decays — see `getOrCreateRecord` in `packages/db-p2p/src/reputation/peer-reputation.ts`. An **EngineHealthMonitor** tracks a node's own dispute losses and, above threshold, suppresses outbound disputes to stop self-harming.
 
 ## Topology & Storage Management
 

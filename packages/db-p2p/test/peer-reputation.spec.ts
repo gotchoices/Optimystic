@@ -164,6 +164,32 @@ describe('PeerReputationService', () => {
 		expect(withoutSelf.isBanned(self)).to.be.true;
 	});
 
+	it('bounds the table without ever forgetting a banned peer, and refuses new names once every record is banned', () => {
+		const maxPeers = 4;
+		const svc = new PeerReputationService({ maxPeers });
+		const offender = 'QmOffender';
+		const quiet = 'QmQuiet';
+		svc.reportPeer(offender, PenaltyReason.Equivocation);
+		svc.recordSuccess(quiet);
+
+		// A stranger minting a keypair per message: each fresh name earns one record.
+		for (let i = 0; i < 20; i++) {
+			svc.reportPeer(`QmFresh${i}`, PenaltyReason.ProtocolViolation);
+			expect(svc.getAllReputations().size).to.be.at.most(maxPeers);
+		}
+		expect(svc.isBanned(offender)).to.be.true;
+		expect(svc.getAllReputations().has(quiet), 'the lowest-scoring record is the one forgotten').to.be.false;
+
+		// Nothing left to forget without releasing a ban: the newcomer is the one dropped.
+		for (const peerId of svc.getAllReputations().keys()) {
+			svc.reportPeer(peerId, PenaltyReason.Equivocation);
+		}
+		svc.reportPeer('QmLateComer', PenaltyReason.Equivocation);
+		expect(svc.getAllReputations().size).to.equal(maxPeers);
+		expect(svc.getAllReputations().has('QmLateComer')).to.be.false;
+		expect(svc.isBanned(offender)).to.be.true;
+	});
+
 	it('should store context with penalties', () => {
 		const svc = new PeerReputationService();
 		svc.reportPeer(peerId, PenaltyReason.InvalidSignature, 'txn-abc123');

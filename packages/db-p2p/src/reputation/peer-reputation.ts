@@ -14,19 +14,25 @@ import { createLogger } from '../logger.js';
 const log = createLogger('peer-reputation');
 
 export class PeerReputationService implements IPeerReputation {
-	// NOTE: unbounded, and keyed by strings that arrive off the wire — `ClusterMember.validateSignatures`
-	// reports against the peer ids of an inbound consensus record, on a protocol whose per-stream
-	// authorization is opt-in. `pruneRecord` trims the penalties inside a record but never removes the
-	// record, and `resetPeer` has no caller, so the map only grows for the life of the process. Bounding it
-	// is `debt-the-reputation-table-has-no-entry-cap`; do not add a second uncapped attacker-keyed map here
-	// in the meantime (`peer-address-book.ts` caps its own ingress for the same reason).
+	// Bounded at `maxPeers`, enforced in `getOrCreateRecord` — the one place an entry is created. The keys
+	// arrive off the wire (`ClusterMember.validateSignatures` reports against the peer ids of an inbound
+	// consensus record, on a protocol whose per-stream authorization is opt-in), so a collection keyed this
+	// way is bounded where entries are admitted, as `peer-address-book.ts` does for its own ingress.
+	// NOTE: accepted limits of the cap. (a) Only bans are protected, so a spray of fresh names (each scoring
+	// as much as a single `InvalidSignature`) can push a lower-scoring deprioritized record out — the same
+	// effect time has, sooner. (b) An attacker with unlimited fresh keys can fill the table with
+	// ban-weight records, after which genuine new offenders go unrecorded until those decay (minutes at the
+	// default half-life). Both stand until an authenticated membership layer exists to say which names are
+	// worth a slot; revisit then. A forgotten name scores 0, exactly what an unseen machine already scores.
 	private readonly peers = new Map<string, PeerRecord>();
 	private readonly halfLifeMs: number;
 	private readonly thresholds: ReputationThresholds;
 	private readonly weights: Record<PenaltyReason, number>;
 	private readonly maxPenaltiesPerPeer: number;
+	private readonly maxPeers: number;
 	private readonly selfPeerId: string | undefined;
 	private selfReportsRefused = 0;
+	private newRecordsRefused = 0;
 
 	constructor(config?: ReputationConfig) {
 		this.halfLifeMs = config?.halfLifeMs ?? 30 * 60_000;
@@ -39,12 +45,14 @@ export class PeerReputationService implements IPeerReputation {
 			...config?.weights,
 		};
 		this.maxPenaltiesPerPeer = config?.maxPenaltiesPerPeer ?? 100;
+		this.maxPeers = config?.maxPeers ?? 1024;
 		this.selfPeerId = config?.selfPeerId;
 	}
 
 	reportPeer(peerId: string, reason: PenaltyReason, context?: string): void {
 		if (this.refuseSelfReport(peerId, reason, context)) return;
 		const record = this.getOrCreateRecord(peerId);
+		if (!record) return;
 		const weight = this.weights[reason];
 		const penalty: PenaltyRecord = {
 			reason,
@@ -67,6 +75,7 @@ export class PeerReputationService implements IPeerReputation {
 		// methods answer 0 / false for it by construction rather than by a second guard.
 		if (this.isSelf(peerId)) return;
 		const record = this.getOrCreateRecord(peerId);
+		if (!record) return;
 		record.successCount++;
 		record.lastSuccess = Date.now();
 	}
@@ -145,18 +154,67 @@ export class PeerReputationService implements IPeerReputation {
 		return true;
 	}
 
-	private getOrCreateRecord(peerId: string): PeerRecord {
-		let record = this.peers.get(peerId);
-		if (!record) {
-			record = {
-				penalties: [],
-				successCount: 0,
-				lastSuccess: 0,
-				lastPenalty: 0,
-			};
-			this.peers.set(peerId, record);
+	/**
+	 * The one place a record is created, and so the one place the table's cap is enforced. Returns
+	 * `undefined` when the table is full of banned records and there is nothing safe to forget — the
+	 * caller drops the report.
+	 */
+	private getOrCreateRecord(peerId: string): PeerRecord | undefined {
+		const existing = this.peers.get(peerId);
+		if (existing) return existing;
+		if (this.peers.size >= this.maxPeers && !this.evictOne()) {
+			this.refuseNewRecord(peerId);
+			return undefined;
 		}
+		const record: PeerRecord = {
+			penalties: [],
+			successCount: 0,
+			lastSuccess: 0,
+			lastPenalty: 0,
+		};
+		this.peers.set(peerId, record);
 		return record;
+	}
+
+	private evictOne(): boolean {
+		const victim = this.pickEvictionVictim();
+		if (victim === undefined) return false;
+		this.peers.delete(victim);
+		return true;
+	}
+
+	/**
+	 * The record that carries the least information: never a banned one (time releases a ban, eviction
+	 * must not do it sooner — otherwise spraying fresh names would launder a real offender out of the
+	 * table), otherwise the lowest current score, ties to the least recently touched. Map iteration is
+	 * insertion order, so a strict comparison also leaves a full tie to the oldest entry.
+	 *
+	 * NOTE: scans every entry (and each entry's penalties) per creation once the table is full. Fine at
+	 * the default cap; if the cap is ever raised into the tens of thousands, or a profile shows this scan,
+	 * keep a running lowest-score index or sample a bounded number of candidates instead.
+	 */
+	private pickEvictionVictim(): string | undefined {
+		let victim: string | undefined;
+		let victimScore = Infinity;
+		let victimTouched = Infinity;
+		for (const [peerId, record] of this.peers) {
+			const score = this.computeScore(record);
+			if (score >= this.thresholds.ban) continue;
+			const touched = Math.max(record.lastPenalty, record.lastSuccess);
+			if (score < victimScore || (score === victimScore && touched < victimTouched)) {
+				victim = peerId;
+				victimScore = score;
+				victimTouched = touched;
+			}
+		}
+		return victim;
+	}
+
+	/** Counted and logged like `refuseSelfReport`, never acted on: a full table is not a fault of the peer named. */
+	private refuseNewRecord(peerId: string): void {
+		this.newRecordsRefused++;
+		log('refused new record, table full of banned peers peerId=%s maxPeers=%d refused=%d',
+			peerId.substring(0, 12), this.maxPeers, this.newRecordsRefused);
 	}
 
 	private computeScore(record: PeerRecord): number {
