@@ -66,7 +66,9 @@ export interface ReputationConfig {
 	maxPenaltiesPerPeer?: number;
 	/** Maximum peers tracked at once. Default: 1024. Peer ids reach the table from inbound messages, so a
 	 *  stranger chooses which ids get a record. When the table is full a new id displaces the
-	 *  lowest-scoring record that is not banned; if every record is banned the new id is not recorded. */
+	 *  lowest-scoring record that is not banned; if every record is banned the new id is not recorded.
+	 *  Not clamped: `0` means what it says — no record is ever created, so the service tracks nothing and
+	 *  every identifier scores 0. Set it deliberately or leave it unset. */
 	maxPeers?: number;
 	/** Identifier (`PeerId.toString()`) of the machine running this service. The table describes other
 	 *  machines only: a report naming this identifier is logged and never recorded, so a local fault —

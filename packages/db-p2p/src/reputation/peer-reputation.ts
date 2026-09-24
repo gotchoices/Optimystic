@@ -189,9 +189,14 @@ export class PeerReputationService implements IPeerReputation {
 	 * table), otherwise the lowest current score, ties to the least recently touched. Map iteration is
 	 * insertion order, so a strict comparison also leaves a full tie to the oldest entry.
 	 *
-	 * NOTE: scans every entry (and each entry's penalties) per creation once the table is full. Fine at
-	 * the default cap; if the cap is ever raised into the tens of thousands, or a profile shows this scan,
-	 * keep a running lowest-score index or sample a bounded number of candidates instead.
+	 * NOTE: scans every entry, and every penalty inside it, on each new name once the table is full — and
+	 * a stranger picks when that happens, since one inbound message naming an id this node has not seen is
+	 * one creation. The work per scan is bounded by `maxPeers` x `maxPenaltiesPerPeer` decay computations
+	 * (1024 x 100 at the defaults), and the message that drove it already paid for a signature
+	 * verification, so the scan is not self-evidently the cheaper half of that exchange; neither has been
+	 * profiled. Revisit if the cap is raised into the tens of thousands, if records routinely carry many
+	 * penalties, or if a profile shows this scan — keep a running lowest-score index, or sample a bounded
+	 * number of candidates rather than scanning all of them.
 	 */
 	private pickEvictionVictim(): string | undefined {
 		let victim: string | undefined;
