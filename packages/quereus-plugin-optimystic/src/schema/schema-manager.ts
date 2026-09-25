@@ -398,10 +398,11 @@ export interface PersistedIndexColumn {
  * - An index present on either side survives. The result's ORDER means nothing:
  *   every written record is put in canonical order afterwards
  *   ({@link canonicalizeRecordOrder}), so this keeps `incoming`'s order and
- *   appends the indexes only `persisted` knows about. There is no
- *   index-removal path in this plugin today (DROP TABLE tombstones the whole
- *   entry via deleteSchema), so "union" and "correct" coincide; if a DROP INDEX
- *   ever lands it needs a dedicated removal API, not a shrunken write here.
+ *   appends the indexes only `persisted` knows about. A removal never comes
+ *   through here: `DROP TABLE` tombstones the whole entry
+ *   ({@link SchemaManager.deleteSchema}), and `DROP INDEX` subtracts by name
+ *   through {@link SchemaManager.removeIndex} — a record merely written without
+ *   an index would be unioned straight back to what the catalog holds.
  * - Uniqueness never silently downgrades: when both sides carry the index and
  *   only `persisted` marks it unique, the merged entry keeps `unique` (and the
  *   predicate that scopes it) — mirroring addIndex's upgrade rule, which only
@@ -645,6 +646,29 @@ export function toStoredSchema(record: PersistedTableSchema): StoredTableSchema 
  * refused at the write with the way out spelled out. `DROP TABLE` tombstones the
  * entry ({@link SchemaManager.deleteSchema}), so drop-then-recreate is unaffected.
  */
+/**
+ * `record` with index `indexName` (matched case-insensitively) moved from `indexes` to
+ * `orphanedIndexes` — the shape a `DROP INDEX` leaves. The description moves rather than
+ * disappears: the drop leaves the index tree at `<uri>/index/<name>` in storage (nothing in this
+ * plugin deletes a collection), and `orphanedIndexes` is the field that describes storage the
+ * catalog no longer lists, read by the CREATE INDEX adoption guard. The dropped description goes
+ * FIRST into the by-name merge, so it wins over an older description of the same name (a dropped
+ * table's index stashed by the table-adoption guard): the tree's entries were last written under
+ * the columns this index declared. Undefined when the record lists no such index.
+ */
+export function withoutIndex(record: PersistedTableSchema, indexName: string): PersistedTableSchema | undefined {
+	const lower = indexName.toLowerCase();
+	const removed = record.indexes.find(idx => idx.name.toLowerCase() === lower);
+	if (!removed) {
+		return undefined;
+	}
+	return canonicalizeRecordOrder({
+		...record,
+		indexes: record.indexes.filter(idx => idx !== removed),
+		orphanedIndexes: mergeIndexLists([removed], record.orphanedIndexes ?? []),
+	});
+}
+
 export function mergePersistedSchemas(
 	incoming: PersistedTableSchema,
 	persisted: PersistedTableSchema | undefined
@@ -1119,6 +1143,73 @@ export class SchemaManager {
 			gravestone = undefined;
 		}
 		batch.write(key, gravestone ? [key, gravestone] : undefined);
+	}
+
+	/**
+	 * The `DROP INDEX` write: take `indexName` off the table's live record, keeping its description
+	 * as leftover storage ({@link withoutIndex}). The one catalog write that SHRINKS an index list,
+	 * which is why it cannot go through {@link storeStoredSchema}: that path unions the incoming list
+	 * with the persisted one at write time — deliberately, so an index a sibling added since the
+	 * caller's read survives — and would union a removal straight back in. Here the latest record is
+	 * read and written back subtracted in one step (the same read-to-write window
+	 * {@link storeStoredSchema} has); inside an `APPLY SCHEMA` batch the subtracted record is staged
+	 * into the overlay AND the name is handed to the batch, so the commit-time re-merge leaves it out
+	 * of the committed side ({@link CatalogBatch.excludeIndexAtCommit}).
+	 *
+	 * Open-only on the catalog, and a no-op on a record that lists no such index: a table whose record
+	 * never landed (`OptimysticVirtualTable.markSchemaUnpersisted`) has nothing to subtract from, and
+	 * the live instance still has to stop maintaining the index — that half is the caller's. Returns
+	 * the record as it now stands, resolved, or undefined when the catalog holds none.
+	 */
+	async removeIndex(
+		schemaName: string,
+		tableName: string,
+		indexName: string,
+		transactor?: ITransactor
+	): Promise<StoredTableSchema | undefined> {
+		const key = catalogKey(schemaName, tableName);
+		if (this.batch) {
+			return this.removeIndexInBatch(this.batch, key, indexName, transactor);
+		}
+		const tree = await this.getSchemaTree(transactor);
+		if (!tree) {
+			return undefined;
+		}
+		await tree.update();
+		const path = await tree.find(key);
+		const record = tree.isValid(path) ? this.livePersistedEntry(tree.at(path)) : undefined;
+		if (!record) {
+			return undefined;
+		}
+		const subtracted = withoutIndex(record, indexName);
+		if (!subtracted) {
+			return toStoredSchema(record);
+		}
+		await tree.replace([[key, [key, subtracted]]]);
+		// Cached only once the write landed, as storeStoredSchema does.
+		const resolved = toStoredSchema(subtracted);
+		this.schemaCache.set(key, resolved);
+		return resolved;
+	}
+
+	/** The batched half of {@link removeIndex}: staged into the overlay, and named to the batch's commit. */
+	private async removeIndexInBatch(
+		batch: CatalogBatch,
+		key: string,
+		indexName: string,
+		transactor?: ITransactor
+	): Promise<StoredTableSchema | undefined> {
+		const record = this.livePersistedEntry(await batch.readEntry(key, transactor));
+		if (!record) {
+			return undefined;
+		}
+		const subtracted = withoutIndex(record, indexName);
+		if (!subtracted) {
+			return toStoredSchema(record);
+		}
+		batch.write(key, [key, subtracted]);
+		batch.excludeIndexAtCommit(key, indexName);
+		return toStoredSchema(subtracted);
 	}
 
 	/**

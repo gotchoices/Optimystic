@@ -62,6 +62,12 @@ export type MergeLatest = (
  */
 export interface CatalogBatchCheckpoint {
 	readonly pending: ReadonlyMap<string, CatalogEntry | undefined>;
+	readonly removedIndexes: ReadonlyMap<string, ReadonlySet<string>>;
+}
+
+/** A deep copy of a `removedIndexes` map, so a checkpoint and the live batch never share a set. */
+function copyRemovedIndexes(source: ReadonlyMap<string, ReadonlySet<string>>): Map<string, Set<string>> {
+	return new Map([...source].map(([key, names]) => [key, new Set(names)]));
 }
 
 /**
@@ -102,6 +108,16 @@ export class CatalogBatch {
 	 * `undefined` value is a pending bare tombstone, distinct from "not pending".
 	 */
 	private pending = new Map<string, CatalogEntry | undefined>();
+	/**
+	 * catalog key → the index names (lower-cased) a `DROP INDEX` removed from that record inside
+	 * this batch. The subtracted record itself is in `pending`; this map exists for the commit,
+	 * whose re-merge unions the pending record's `indexes` with the LATEST committed record's — the
+	 * union that keeps an index a sibling added meanwhile — and would union a dropped index straight
+	 * back in from the committed copy. {@link commit} leaves these names out of the committed side.
+	 * Snapshotted with `pending`, so a checkpoint restore withdraws a DROP INDEX's subtraction
+	 * together with its write.
+	 */
+	private removedIndexes = new Map<string, Set<string>>();
 	/**
 	 * Every committed record (live or gravestone) by catalog key, built by ONE walk of the committed
 	 * catalog the first time a URI lookup needs it. Bare tombstones are skipped: they describe
@@ -147,6 +163,21 @@ export class CatalogBatch {
 	}
 
 	/**
+	 * Record that `indexName` was removed from the live record under `key` by a write this batch
+	 * holds, so the commit-time re-merge does not resurrect it from the committed copy (see
+	 * `removedIndexes`). The caller stages the subtracted record itself with {@link write}.
+	 *
+	 * NOTE: a sibling that dropped and re-created the same index while this batch was open has its
+	 * re-creation stripped here too — the batch's staleness contract (a sibling's write during the
+	 * apply is not seen until the end-of-batch re-merge), now covering a drop as well as an add.
+	 */
+	excludeIndexAtCommit(key: string, indexName: string): void {
+		const names = this.removedIndexes.get(key) ?? new Set<string>();
+		names.add(indexName.toLowerCase());
+		this.removedIndexes.set(key, names);
+	}
+
+	/**
 	 * The record — live OR gravestone — describing the storage at `collectionUri`, as this
 	 * batch sees it: the committed records with the pending entries overlaid BY KEY (a
 	 * pending gravestone replaces the committed live record of the same table; a pending
@@ -183,12 +214,13 @@ export class CatalogBatch {
 
 	/** Snapshot the pending writes. Cheap: one map entry per table this batch has touched. */
 	checkpoint(): CatalogBatchCheckpoint {
-		return { pending: new Map(this.pending) };
+		return { pending: new Map(this.pending), removedIndexes: copyRemovedIndexes(this.removedIndexes) };
 	}
 
 	/** Drop every write staged since `checkpoint` was taken. */
 	restore(checkpoint: CatalogBatchCheckpoint): void {
 		this.pending = new Map(checkpoint.pending);
+		this.removedIndexes = copyRemovedIndexes(checkpoint.removedIndexes);
 	}
 
 	/**
@@ -197,7 +229,8 @@ export class CatalogBatch {
 	 * Does zero I/O when nothing is pending: an apply that touched no optimystic table must
 	 * not open — let alone create — the catalog. Otherwise the committed tree is refreshed
 	 * once, each pending LIVE record is re-merged with the latest committed live record for
-	 * its key ({@link MergeLatest}), gravestones and tombstones are written as-is, and the
+	 * its key ({@link MergeLatest}) — less any index a `DROP INDEX` in this batch removed
+	 * ({@link excludeIndexAtCommit}) — gravestones and tombstones are written as-is, and the
 	 * whole set is staged and synced together. The catalog is created (`create = true`) only
 	 * here, and only because something is pending — the same open-only rule
 	 * `SchemaManager.deleteSchema` documents.
@@ -217,7 +250,7 @@ export class CatalogBatch {
 				const path = await tree.find(key);
 				const latest = tree.isValid(path) ? recordOfEntry(tree.at(path)) : undefined;
 				const latestLive = latest && !latest.droppedAt ? latest : undefined;
-				written.set(key, [key, this.mergeLatest(record, latestLive)]);
+				written.set(key, [key, this.mergeLatest(record, this.withoutRemovedIndexes(key, latestLive))]);
 			} else {
 				written.set(key, entry);
 			}
@@ -225,6 +258,18 @@ export class CatalogBatch {
 		await tree.stage([...written.entries()]);
 		await tree.sync();
 		return written;
+	}
+
+	/** `latestLive` without the indexes a DROP INDEX in this batch removed from `key`'s record. */
+	private withoutRemovedIndexes(
+		key: string,
+		latestLive: PersistedTableSchema | undefined,
+	): PersistedTableSchema | undefined {
+		const removed = this.removedIndexes.get(key);
+		if (!latestLive || !removed) {
+			return latestLive;
+		}
+		return { ...latestLive, indexes: latestLive.indexes.filter(idx => !removed.has(idx.name.toLowerCase())) };
 	}
 
 	/** The committed catalog tree, opened and refreshed once; `null` when there is none. */

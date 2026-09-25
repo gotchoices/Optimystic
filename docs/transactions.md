@@ -384,26 +384,61 @@ figures at two scales;
 semantics below.
 
 **The batch is a write-coalescing buffer, not a transaction.** It commits what
-landed on **both** success and error — a deliberate deviation from the upstream
-hook doc, which says to discard the overlay on error. Quereus keeps the
-statements that landed when an apply fails part-way
-(`@quereus/quereus/test/ddl-schema-event-atomicity.spec.ts`): the created table
-stays in the engine catalog and is usable. Each of our DDL statements used to
-commit on its own, so our catalog matched the engine's; discarding the overlay
-would leave those tables in the engine's catalog, and cached in the module as
-initialized instances, with no persisted record — the next process would not
-hydrate them. Instead each `create`, `createIndex` and `destroy` runs under a
-**per-statement checkpoint** (`underBatchCheckpoint` in
+the overlay holds on **both** success and error — a deliberate deviation from
+the upstream hook doc, which says to discard the overlay on error. Since Quereus
+4.20 an apply that fails part-way is normally **unwound** by the engine before
+`endSchemaBatch` fires: each landed step's undo DDL (`drop table` for a
+`create table`, `drop index if exists` for a `create index`) runs through the
+module's ordinary hooks, inside the batch, and the engine checks its catalog
+against the pre-apply state before rethrowing the step's own error. The overlay
+then holds the restored state — a create followed by its own gravestone, an
+index subtracted again — and committing it lands exactly that (one commit; the
+create-then-gravestone pair is not elided). The exception is a step the differ
+marks irreversible (`drop table`, which discards rows): it poisons the undo
+journal before it runs, nothing is unwound, the apply reports the schema as
+partially migrated, and the engine keeps the steps that landed. Committing on
+error puts the plugin on the right side of the review `NOTE:` on
+`endSchemaBatch` in `@quereus/quereus/src/vtab/module.ts`, which warns that a
+module which *discards* its overlay would rewind a substrate the catalog still
+describes as migrated: partial or restored, the overlay and the engine's catalog
+agree by construction. Discarding would instead leave a table the engine still
+lists (the partial case), or one it has dropped (the restored case, whose
+gravestone is discarded along with its create), cached in the module as an
+initialized instance with no matching record, so the next process hydrates
+something else. Each `create`, `createIndex`, `dropIndex` and `destroy` runs
+under a **per-statement checkpoint** (`underBatchCheckpoint` in
 `packages/quereus-plugin-optimystic/src/optimystic-module.ts`): a throw withdraws
 exactly that statement's catalog writes, so a `CREATE TABLE` the storage-adoption
 guard refuses — or one that fails later in initialization, after its schema
-already reached the overlay — leaves no record, while everything before it
-commits at the end. Per-statement atomicity and partial-apply semantics are what
-they were.
+already reached the overlay — leaves no record for the unwind to take back and
+none for the commit to persist.
+
+**`DROP INDEX` subtracts by name.** The catalog's ordinary write path unions the
+incoming index list with the persisted one at write time, so an index a sibling
+added meanwhile survives — which means it cannot express a removal: a record
+merely written without an index is unioned straight back. `removeIndex` in
+`packages/quereus-plugin-optimystic/src/schema/schema-manager.ts` instead reads
+the latest record and writes it back without the index, keeping the index's
+description under the record's `orphanedIndexes` because the drop leaves the
+tree at `<uri>/index/<name>` in storage (nothing in the plugin deletes a
+collection; the adoption guard of a later `CREATE INDEX` of that name reads the
+description). Inside a batch the subtraction is staged into the overlay and
+named to it (`excludeIndexAtCommit` in
+`packages/quereus-plugin-optimystic/src/schema/catalog-batch.ts`), so the
+end-of-batch re-merge against the latest committed record leaves the dropped
+index out. The unwind of a `CREATE INDEX` is this path: `dropIndex` in
+`packages/quereus-plugin-optimystic/src/optimystic-module.ts` also withdraws the
+index's populated tree from the batch's deferred flush, so an unwound index
+lands neither in the record nor as an unlisted tree. The live table instance
+stops maintaining the index at the same time (its tree leaves the
+`IndexManager` and the transaction bridge), so no later DML writes into a tree
+nothing lists.
 
 **End-commit failure.** If the one catalog commit itself fails, `endSchemaBatch`
 throws (the engine rethrows it when there was no loop error, and logs and
-swallows it when there was). The tables created or given an index inside the
+swallows it when there was — by which point it has normally already unwound
+the apply, so the tables below are those of a loop that succeeded or of one
+left partially migrated). The tables created or given an index inside the
 batch are then in the engine's catalog and cached as initialized, but
 unpersisted. The module marks each of them unpersisted
 (`markSchemaUnpersisted` in
@@ -413,11 +448,12 @@ including the indexes it maintains, refreshed from its `IndexManager`, since
 Quereus's `CREATE INDEX` replaces the engine's `TableSchema` rather than
 mutating the copy the table holds. Nothing was cached for those tables (a batch
 seeds the schema cache only after its commit lands), so no stale hit masks the
-gap. A table **dropped** inside the batch has no instance left to heal anything:
-its gravestone is lost with the commit and the catalog keeps its live record
-past the DROP, so the next hydrate resurrects it and a later CREATE over the
-same URI is not checked against it — the same failure direction as the
-unbatched, best-effort drop, and the failure log names those tables.
+gap. A table **dropped** inside the batch — by the plan, or by the unwind of its
+own create — has no instance left to heal anything: its gravestone is lost with
+the commit and the catalog keeps its live record past the DROP, so the next
+hydrate resurrects it and a later CREATE over the same URI is not checked
+against it — the same failure direction as the unbatched, best-effort drop, and
+the failure log names those tables.
 
 **Index-tree failure.** A deferred index tree that fails to land cancels its
 manager's catalog commit. Trees first, catalog second is what guarantees that

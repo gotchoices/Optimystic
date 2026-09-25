@@ -309,6 +309,27 @@ export class IndexManager {
 	}
 
 	/**
+	 * Stop maintaining the declared index `indexName` (matched case-insensitively): its
+	 * descriptor leaves `schema.indexes`, so no staging path iterates it again, and its tree
+	 * leaves the registry. Returns the tree that was registered, for the caller to withdraw
+	 * from whatever else still holds it, or undefined when this manager never maintained the
+	 * index — the `DROP INDEX` of an index the engine lists but this connection did not attach
+	 * (a withheld index after a failed batch commit). Declared indexes only: a
+	 * unique-enforcement tree has no name a `DROP INDEX` could carry, and is left alone.
+	 */
+	unregisterIndex(indexName: string): Tree<IndexKey, IndexEntry> | undefined {
+		const lower = indexName.toLowerCase();
+		const declared = this.schema.indexes.find(idx => idx.name.toLowerCase() === lower);
+		if (!declared) {
+			return undefined;
+		}
+		this.schema = { ...this.schema, indexes: this.schema.indexes.filter(idx => idx !== declared) };
+		const tree = this.indexTrees.get(declared.name);
+		this.indexTrees.delete(declared.name);
+		return tree;
+	}
+
+	/**
 	 * Swap the table schema this manager keys off. Used by addIndex to fold a
 	 * newly added index definition into the schema so subsequent insert/delete/
 	 * update staging iterates the new index alongside the existing ones.

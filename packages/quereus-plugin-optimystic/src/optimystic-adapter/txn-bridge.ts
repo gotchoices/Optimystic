@@ -1278,6 +1278,24 @@ export class TransactionBridge {
   }
 
   /**
+   * The reverse of {@link markDirty} and {@link registerCollection}, for a tree the vtab has
+   * stopped maintaining (`DROP INDEX`). It leaves the dirty set, so a legacy commit does not flush
+   * what DML staged into it this transaction and a rollback does not restore it; and its collection
+   * leaves the registry — only while the registered instance IS this tree's, so a newer instance
+   * under the same id (a re-created index) is left alone. Without the registry half a session-mode
+   * coordinator, which commits every registered collection with unsynced changes, would carry a
+   * dropped index's staged entries into a tree nothing lists. Open savepoints keep whatever they
+   * captured for it: restoring an abandoned tree changes nothing anyone reads.
+   */
+  forgetTree(tree: DirtyTree): void {
+    this.dirtyTrees.delete(tree);
+    const collection = tree.getCollection?.();
+    if (collection && this.collectionRegistry.get(collection.id) === collection) {
+      this.collectionRegistry.delete(collection.id);
+    }
+  }
+
+  /**
    * The pre-transaction snapshot captured for `tree` by {@link markDirty} this
    * transaction, or undefined when the tree has not been staged this transaction.
    *

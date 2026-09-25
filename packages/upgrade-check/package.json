@@ -19,7 +19,7 @@
 		"@optimystic/db-p2p-storage-fs": "workspace:^",
 		"@optimystic/db-p2p-storage-rn": "workspace:^",
 		"@optimystic/quereus-plugin-optimystic": "workspace:^",
-		"@quereus/quereus": "^4.19.4",
+		"@quereus/quereus": "^4.20.0",
 		"classic-level": "^3.0.0"
 	},
 	"devDependencies": {

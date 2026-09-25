@@ -10,11 +10,16 @@
  * and re-read a growing catalog on every create (quadratic reads — see
  * `cold-apply-cost.spec.ts`, whose gates now pin the new shape).
  *
- * The batch is a WRITE-COALESCING BUFFER, NOT A TRANSACTION. Quereus keeps the statements that
- * landed when an apply fails part-way (`@quereus/quereus/test/ddl-schema-event-atomicity.spec.ts`,
- * "a partially-applied schema keeps the events of the statements that landed"), so the plugin
- * commits what landed on BOTH success and error, and a per-statement checkpoint removes only the
- * failed statement's own catalog changes. Several cases below pin exactly that.
+ * The batch is a WRITE-COALESCING BUFFER, NOT A TRANSACTION. It commits what the overlay holds on
+ * BOTH success and error. Since Quereus 4.20 an apply that fails part-way is normally UNWOUND by
+ * the engine before `endSchemaBatch` fires: each landed step's undo DDL (`drop table` for a create,
+ * `drop index if exists` for a `create index`) runs through the plugin's ordinary hooks, inside the
+ * batch, so the overlay then holds the pre-apply state and the one commit lands it. A per-statement
+ * checkpoint withdraws the failed statement's own catalog changes; the exception to the unwind is a
+ * step the differ marks irreversible (`drop table`), after which the engine keeps what landed and
+ * reports the schema as partially migrated. Every failure-shape case below asserts BOTH catalogs —
+ * the live Database's and a fresh, hydrated one's — because checking storage alone is what let a
+ * `DROP INDEX` that never reached the plugin's record go unnoticed.
  *
  * Index trees ride the same batch. A new index over an EMPTY table leaves its invented tree
  * unwritten, exactly as CREATE TABLE leaves an unwritten table tree, so a cold apply of empty
@@ -219,6 +224,47 @@ async function queryWithSeeks(db: Database, sql: string): Promise<{ rows: Record
 /** Sorted `id` column of `rows`, so a multi-row result is compared independent of scan order. */
 const idsOf = (rows: Record<string, any>[]): number[] => rows.map(row => Number(row.id)).sort((a, b) => a - b);
 
+/** Quereus's in-memory catalog of `main`: table name → its index names, sorted. */
+function engineCatalog(db: Database): Record<string, string[]> {
+	const catalog: Record<string, string[]> = {};
+	for (const table of db.schemaManager.getSchema('main')!.getAllTables()) {
+		catalog[table.name] = (table.indexes ?? []).map(idx => idx.name).sort();
+	}
+	return catalog;
+}
+
+/**
+ * The live Database's catalog and what a fresh Database hydrates from the shared storage both
+ * describe exactly `expected` (table → index names). Returns the fresh Database. Checking storage
+ * alone is what let a dropped index that hydrated back go unnoticed; checking the engine alone
+ * cannot see a record that never landed.
+ */
+async function expectCatalogsAgree(h: Harness, db: Database, expected: Record<string, string[]>): Promise<Database> {
+	expect(engineCatalog(db), 'the live Database').to.deep.equal(expected);
+	const { db: fresh, hydrated } = await h.reopen();
+	const indexes = Object.values(expected).reduce((n, names) => n + names.length, 0);
+	expect(hydrated, 'what a fresh Database hydrated').to.deep.equal({ tables: Object.keys(expected).length, indexes });
+	expect(engineCatalog(fresh), 'the fresh Database').to.deep.equal(expected);
+	return fresh;
+}
+
+/** The plugin's one SchemaManager in a single-transactor case: the catalog record as the plugin reads it. */
+function catalogManagerOf(plugin: PluginHandle): SchemaManager {
+	const managers = [...moduleOf(plugin).schemaManagers.values()];
+	expect(managers, 'one transactor configuration').to.have.lengthOf(1);
+	return managers[0] as SchemaManager;
+}
+
+/** A committed `t0` holding `rows` (a SQL VALUES list), from an index-free apply — the table a later apply or statement indexes. */
+async function seedT0(h: Harness, rows: string): Promise<void> {
+	await h.db.exec(`pragma default_vtab_module='optimystic'`);
+	await h.db.exec(declaration(1));
+	await h.db.exec(`insert into t0 values ${rows}`);
+}
+
+/** Forget what the trail recorded so far, so a case can assert on one statement or apply alone. */
+const resetTrail = (h: Harness) => { h.trail.commits.length = 0; h.trail.events.length = 0; };
+
 /**
  * Switch `db` to session mode (a `TransactionCoordinator` over the case's shared transactor),
  * the pattern from `committed-read-conformance.spec.ts`. `warm` recomputes the engine's schema
@@ -246,7 +292,8 @@ function declaration(tables: number, indexes: string[] = []): string {
 	return `declare schema main {\n${parts.join('\n')}\n}\napply schema main;`;
 }
 
-async function expectRejects(promise: Promise<unknown>, pattern: RegExp): Promise<void> {
+/** Assert `promise` rejects with a message matching `pattern`, and return the error for further assertions. */
+async function expectRejects(promise: Promise<unknown>, pattern: RegExp): Promise<Error> {
 	let thrown: unknown;
 	try {
 		await promise;
@@ -255,6 +302,7 @@ async function expectRejects(promise: Promise<unknown>, pattern: RegExp): Promis
 	}
 	expect(thrown, 'expected the statement to reject').to.be.instanceOf(Error);
 	expect((thrown as Error).message).to.match(pattern);
+	return thrown as Error;
 }
 
 /** Bump every counter in `counts` down by its value in `since`: what happened after `since`. */
@@ -376,7 +424,7 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 		expect(await queryAll(h.db, 'select count(*) as n from m')).to.deep.equal([{ n: 0 }]);
 	});
 
-	it('a statement refused mid-loop leaves no catalog trace of its own; what landed before it commits', async () => {
+	it('a statement refused mid-loop: the engine unwinds what landed before it, and the one catalog commit lands the restored state', async () => {
 		const h = harness();
 		// Storage at tree://batch/b still holds a row of a DROPPED table declared (id, name).
 		await h.db.exec(`create table b (${tableBody}) using optimystic('tree://batch/b')`);
@@ -391,49 +439,59 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 			`}\napply schema main;`;
 
 		// `a` lands; `b` re-declares an added column over rows that cannot supply it and the
-		// storage-adoption guard refuses it — after `a`, so the loop aborts with `a` in the batch.
-		await expectRejects(h.db.exec(declared(`${tableBody}, extra text`)), /still holds rows from a dropped table/);
+		// storage-adoption guard refuses it — after `a`, so the undo journal runs `drop table a`
+		// through this module's destroy hook, inside the batch, and the apply rethrows the step's
+		// own error with the catalog verified restored.
+		const error = await expectRejects(h.db.exec(declared(`${tableBody}, extra text`)), /still holds rows from a dropped table/);
+		expect(error.message, 'a verified restore rethrows the step\'s own error').to.not.match(/partially migrated|could not be restored/);
 		expect(h.hooks.endErrors, 'endSchemaBatch received the loop error').to.have.lengthOf(1);
 		expect(h.hooks.endErrors[0]).to.be.instanceOf(Error);
-		expect(h.counts['commit']! - commitsBefore, 'the surviving statement committed once').to.equal(1);
+		// The overlay holds `a`'s create and its own gravestone; the pair is not elided, so the
+		// restored state still costs the one catalog commit.
+		expect(h.counts['commit']! - commitsBefore, 'one catalog commit').to.equal(1);
 
-		// A fresh Database hydrates `a` and not `b`.
-		const { db: db2, hydrated } = await h.reopen();
-		expect(hydrated.tables).to.equal(1);
-		expect(db2.schemaManager.findTable('a', 'main'), 'a landed').to.not.equal(undefined);
-		expect(db2.schemaManager.findTable('b', 'main'), 'b did not').to.equal(undefined);
+		// Neither `a` nor `b` exists, on either side.
+		await expectCatalogsAgree(h, h.db, {});
 
-		// A corrected re-apply on the same Database succeeds and adopts the surviving row.
+		// A corrected re-apply on the same Database creates both and adopts the surviving row.
 		await h.db.exec(declared(tableBody));
 		expect(await queryAll(h.db, 'select name from b')).to.deep.equal([{ name: 'kept' }]);
+		await expectCatalogsAgree(h, h.db, { a: [], b: [] });
 	});
 
-	it('a create refused AFTER its schema reached the overlay is rolled back by the checkpoint', async () => {
+	it('a create refused AFTER its schema reached the overlay: the checkpoint withdraws it, the engine unwinds the create before it', async () => {
 		const h = harness();
 		await h.db.exec(`pragma default_vtab_module='optimystic'`);
 		// A secondary UNIQUE constraint makes doInitialize open a synthesized enforcement tree
 		// AFTER it has written the schema; fail that open so the statement dies past the write.
 		h.gate.failGet = ids => ids.some(id => id.includes('/index/_uniq_'));
+		const uniqueTable = `table u { id integer primary key, email text unique }`;
 
-		const declared = `declare schema main {\n` +
-			`table ok { ${tableBody} }\n` +
-			`table u { id integer primary key, email text unique }\n` +
-			`}\napply schema main;`;
+		// Arm 1 — `u` alone. Nothing landed before it, so the undo journal has nothing to run: the
+		// only thing keeping `u` out of storage is the per-statement checkpoint, and the proof is
+		// that the batch ends EMPTY — zero catalog commits, where a record left in the overlay
+		// would have cost one.
+		await expectRejects(h.db.exec(`declare schema main {\n${uniqueTable}\n}\napply schema main;`), /injected failure/);
+		expect(h.catalog.commits(), 'an empty overlay commits nothing').to.equal(0);
+		await expectCatalogsAgree(h, h.db, {});
+
+		// Arm 2 — `ok` then `u`. `ok` landed, so the journal unwinds it (`drop table ok` through
+		// destroy, inside the batch) while the checkpoint withdraws `u` as before. One commit:
+		// `ok`'s create followed by its own gravestone.
+		const declared = `declare schema main {\ntable ok { ${tableBody} }\n${uniqueTable}\n}\napply schema main;`;
 		await expectRejects(h.db.exec(declared), /injected failure/);
+		expect(h.catalog.commits(), 'the gravestone of the unwound create').to.equal(1);
+		await expectCatalogsAgree(h, h.db, {});
 
-		// `ok` committed; `u`'s overlay entry was withdrawn with the failed statement.
-		const { hydrated } = await h.reopen();
-		expect(hydrated.tables).to.equal(1);
-
-		// Heal and re-apply: `u` is created cleanly (no stale catalog record to fight).
+		// Heal and re-apply: both are created cleanly (no stale catalog record to fight).
 		h.gate.failGet = undefined;
 		await h.db.exec(declared);
 		await h.db.exec(`insert into u values (1, 'a@x')`);
 		await expectRejects(h.db.exec(`insert into u values (2, 'a@x')`), /unique/i);
-		expect((await h.reopen()).hydrated.tables).to.equal(2);
+		await expectCatalogsAgree(h, h.db, { ok: [], u: [] });
 	});
 
-	it('a CREATE INDEX that fails inside the batch withdraws only the index from the pending record', async () => {
+	it('a CREATE INDEX that fails inside the batch: the checkpoint withdraws the index, the engine unwinds the table under it', async () => {
 		const h = harness();
 		await h.db.exec(`pragma default_vtab_module='optimystic'`);
 		// addIndex writes the index into the table's (pending) catalog record, then opens the
@@ -443,15 +501,16 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 
 		await expectRejects(h.db.exec(declaration(1, ['t0'])), /injected failure/);
 
-		// The table committed WITHOUT the index; the index statement left no trace.
+		// The index statement left no trace of its own, and `t0` — landed a statement earlier —
+		// was unwound with it: its gravestone is the one thing the batch commits.
+		expect(h.catalog.commits(), 'the gravestone of the unwound create').to.equal(1);
+		expect(commitsCarrying(h.trail, '/index/'), 'no index tree was flushed').to.equal(0);
 		h.gate.failGet = undefined;
-		const { db: db2, hydrated } = await h.reopen();
-		expect(hydrated).to.deep.equal({ tables: 1, indexes: 0 });
-		expect(db2.schemaManager.findTable('t0', 'main')!.indexes ?? []).to.have.lengthOf(0);
+		await expectCatalogsAgree(h, h.db, {});
 
-		// Re-applying adds the index cleanly on top of the committed table.
+		// Re-applying builds both cleanly.
 		await h.db.exec(declaration(1, ['t0']));
-		expect((await h.reopen()).hydrated).to.deep.equal({ tables: 1, indexes: 1 });
+		await expectCatalogsAgree(h, h.db, { t0: ['t0_by_name'] });
 	});
 
 	it('drop then create over the same URI in one apply sees the PENDING gravestone', async () => {
@@ -465,16 +524,21 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 		// The plan is `drop table old` then `create table new`. The drop's gravestone is only in
 		// the overlay when the create runs; the adoption guard must still find it and refuse the
 		// contradicting re-declare over rows that still exist.
-		await expectRejects(h.db.exec(declared(`${tableBody}, extra text`)), /still holds rows from a dropped table/);
+		const error = await expectRejects(h.db.exec(declared(`${tableBody}, extra text`)), /still holds rows from a dropped table/);
 
-		// The drop landed (committed at end despite the loop error); the create did not.
-		const { db: db2, hydrated } = await h.reopen();
-		expect(hydrated.tables).to.equal(0);
-		expect(db2.schemaManager.findTable('old', 'main')).to.equal(undefined);
+		// Nothing is unwound here: the differ marks `drop table` irreversible (it discards rows), so
+		// the step poisons the undo journal before it runs and the apply reports the schema as
+		// partially migrated. Both catalogs keep the drop — the engine because it never took the
+		// step back, storage because the batch commits on error (see endSchemaBatch). This is the
+		// shape the review NOTE on `endSchemaBatch` in `@quereus/quereus/src/vtab/module.ts` warns
+		// a module that DISCARDS its overlay about; committing is what keeps the two sides agreeing.
+		expect(error.message).to.match(/partially migrated[\s\S]*cannot be undone/);
+		await expectCatalogsAgree(h, h.db, {});
 
 		// A matching re-declare adopts the rows.
 		await h.db.exec(declared(tableBody));
 		expect(await queryAll(h.db, 'select name from new')).to.deep.equal([{ name: 'kept' }]);
+		await expectCatalogsAgree(h, h.db, { new: [] });
 	});
 
 	it('a failed end-of-batch commit is recovered by the next touch of each batch-created table', async () => {
@@ -598,16 +662,6 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 	});
 
 	describe('index trees: left unwritten when empty, landed before the catalog when populated', () => {
-		/** A committed `t0` holding `rows` (a SQL VALUES list), from an index-free apply — the table the apply under test indexes. */
-		async function seedT0(h: Harness, rows: string): Promise<void> {
-			await h.db.exec(`pragma default_vtab_module='optimystic'`);
-			await h.db.exec(declaration(1));
-			await h.db.exec(`insert into t0 values ${rows}`);
-		}
-
-		/** Forget what the trail recorded so far, so a case can assert on one apply alone. */
-		const resetTrail = (h: Harness) => { h.trail.commits.length = 0; h.trail.events.length = 0; };
-
 		it('an index over an empty table is left unwritten like the table; the first INSERT lands both trees (legacy bridge)', async () => {
 			const h = harness();
 			await h.db.exec(`pragma default_vtab_module='optimystic'`);
@@ -893,6 +947,121 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 			const fresh = await queryWithSeeks(db2, `select id from t0 where name = 'bob'`);
 			expect(fresh.rows).to.deep.equal([{ id: 2 }]);
 			expect(fresh.seeks).to.include('t0_by_name');
+		});
+	});
+
+	describe('DROP INDEX: the record loses the index, and the undo journal reaches the same hook', () => {
+		it('a dropped index stays dropped: both catalogs agree, the tree is left in storage, and a re-create adopts it', async () => {
+			const h = harness();
+			await seedT0(h, `(1, 'alice'), (2, 'bob'), (3, 'bob')`);
+			await h.db.exec(`create index t0_by_name on t0 (name)`);
+			await expectCatalogsAgree(h, h.db, { t0: ['t0_by_name'] });
+			const catalogCommits = h.catalog.commits();
+			resetTrail(h);
+
+			await h.db.exec(`drop index t0_by_name`);
+
+			// One catalog commit and nothing else: the tree is left in storage, not rewritten.
+			expect(h.catalog.commits() - catalogCommits, 'one catalog commit').to.equal(1);
+			expect(commitsCarrying(h.trail, '/index/'), 'the index tree is not touched').to.equal(0);
+			// Before the hook existed the live Database agreed and a fresh one hydrated the index back.
+			const fresh = await expectCatalogsAgree(h, h.db, { t0: [] });
+			for (const db of [h.db, fresh]) {
+				const byName = await queryWithSeeks(db, `select id from t0 where name = 'bob'`);
+				expect(idsOf(byName.rows)).to.deep.equal([2, 3]);
+				expect(byName.seeks, 'no seek through a dropped index').to.not.include('t0_by_name');
+			}
+			// The live instance stopped maintaining it: a row written after the drop rides no
+			// index-tree commit.
+			resetTrail(h);
+			await h.db.exec(`insert into t0 values (4, 'bob')`);
+			expect(commitsCarrying(h.trail, '/index/'), 'nothing staged into the dropped tree').to.equal(0);
+			// The record keeps the dropped index's description as leftover storage — what the
+			// adoption guard of a later CREATE INDEX of that name reads — and not as schema.
+			const record = await catalogManagerOf(h.plugin).getSchemaFresh('main', 't0');
+			expect(record!.indexes).to.deep.equal([]);
+			expect((record!.orphanedIndexes ?? []).map(idx => idx.name)).to.deep.equal(['t0_by_name']);
+
+			// A re-create adopts the leftover tree and re-stages every row, the post-drop one included.
+			await h.db.exec(`create index t0_by_name on t0 (name)`);
+			await expectCatalogsAgree(h, h.db, { t0: ['t0_by_name'] });
+			const rebuilt = await queryWithSeeks(h.db, `select id from t0 where name = 'bob'`);
+			expect(idsOf(rebuilt.rows)).to.deep.equal([2, 3, 4]);
+			expect(rebuilt.seeks).to.include('t0_by_name');
+		});
+
+		it('an apply that no longer declares an index drops it: the batched subtraction survives the commit-time re-merge', async () => {
+			const h = harness();
+			await seedT0(h, `(1, 'alice'), (2, 'bob')`);
+			await h.db.exec(declaration(1, ['t0']));
+			await expectCatalogsAgree(h, h.db, { t0: ['t0_by_name'] });
+			resetTrail(h);
+
+			// The plan is a lone `drop index t0_by_name`, inside the batch. The committed record still
+			// lists the index when the batch commits, and the end-of-batch re-merge unions the pending
+			// record with it — the subtraction has to be named to the batch or the union brings the
+			// index straight back.
+			await h.db.exec(declaration(1));
+
+			expect(h.hooks.begin, 'the drop ran as a batched apply').to.equal(3);
+			expect(commitsCarrying(h.trail, '/index/'), 'the tree is left in storage').to.equal(0);
+			const fresh = await expectCatalogsAgree(h, h.db, { t0: [] });
+			for (const db of [h.db, fresh]) {
+				const byName = await queryWithSeeks(db, `select id from t0 where name = 'bob'`);
+				expect(byName.rows).to.deep.equal([{ id: 2 }]);
+				expect(byName.seeks).to.not.include('t0_by_name');
+			}
+			// The idempotent re-apply plans nothing.
+			await h.db.exec(declaration(1));
+			expect(h.hooks.begin).to.equal(3);
+		});
+
+		it('a CREATE INDEX unwound inside a failing apply: the drop reaches the record, and its deferred tree never lands', async () => {
+			const h = harness();
+			const body = 'id integer primary key, name text, tag text';
+			const declared = (indexes: string) => `declare schema main {\ntable t0 { ${body} }\n${indexes}}\napply schema main;`;
+			const bothIndexes = 'index t0_by_name on t0 (name)\nindex t0_by_tag on t0 (tag)\n';
+			await h.db.exec(`pragma default_vtab_module='optimystic'`);
+			await h.db.exec(declared(''));
+			await h.db.exec(`insert into t0 values (1, 'alice', 'x'), (2, 'bob', 'y'), (3, 'bob', 'x')`);
+			const catalogCommits = h.catalog.commits();
+			resetTrail(h);
+			// The first index builds and defers its populated tree; the second dies opening its tree.
+			h.gate.failGet = ids => ids.some(id => id.includes('/index/t0_by_tag'));
+
+			const error = await expectRejects(h.db.exec(declared(bothIndexes)), /injected failure/);
+
+			// The journal ran `drop index if exists t0_by_name` through this module's hook, inside
+			// the batch, and the apply rethrows the step's own error with the catalog verified restored.
+			expect(error.message).to.not.match(/partially migrated|could not be restored/);
+			expect(h.hooks.endErrors[1], 'endSchemaBatch received the loop error').to.be.instanceOf(Error);
+			// The deferred tree was withdrawn from the end-of-batch flush, so no unlisted orphan
+			// landed; the one catalog commit lands t0's record subtracted again.
+			expect(commitsCarrying(h.trail, '/index/'), 'no orphan tree landed').to.equal(0);
+			expect(h.catalog.commits() - catalogCommits, 'one catalog commit').to.equal(1);
+			h.gate.failGet = undefined;
+			// Before the hook existed, the live Database listed no index while a fresh one hydrated
+			// t0_by_name back.
+			const fresh = await expectCatalogsAgree(h, h.db, { t0: [] });
+			for (const db of [h.db, fresh]) {
+				const byName = await queryWithSeeks(db, `select id from t0 where name = 'bob'`);
+				expect(idsOf(byName.rows)).to.deep.equal([2, 3]);
+				expect(byName.seeks, 'no seek through the unwound index').to.not.include('t0_by_name');
+			}
+
+			// The corrected re-apply builds both indexes complete, on the same Database.
+			resetTrail(h);
+			await h.db.exec(declared(bothIndexes));
+			expect(commitsCarrying(h.trail, '/index/t0_by_name'), 'the tree lands once, at the end').to.equal(1);
+			const rebuilt = await expectCatalogsAgree(h, h.db, { t0: ['t0_by_name', 't0_by_tag'] });
+			for (const db of [h.db, rebuilt]) {
+				const byName = await queryWithSeeks(db, `select id from t0 where name = 'bob'`);
+				expect(idsOf(byName.rows)).to.deep.equal([2, 3]);
+				expect(byName.seeks).to.include('t0_by_name');
+				const byTag = await queryWithSeeks(db, `select id from t0 where tag = 'x'`);
+				expect(idsOf(byTag.rows)).to.deep.equal([1, 3]);
+				expect(byTag.seeks).to.include('t0_by_tag');
+			}
 		});
 	});
 

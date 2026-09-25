@@ -2987,6 +2987,59 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
+   * The `DROP INDEX` half of {@link addIndex}. The catalog record loses the index — its
+   * description moves to `orphanedIndexes`, because the tree at `<uri>/index/<name>` stays in
+   * storage ({@link SchemaManager.removeIndex}) — and then this instance stops maintaining it:
+   * the descriptor and tree leave the {@link IndexManager}, so no DML stages into it again; the
+   * tree leaves the transaction bridge, so nothing flushes what was already staged into it; and
+   * the index and the UNIQUE constraint {@link mirrorDerivedUniqueConstraint} derived from it leave
+   * this instance's own `tableSchema`, which a later re-initialize would otherwise write back. The
+   * catalog write goes first so a refused write leaves the instance maintaining the index exactly
+   * as before. Quereus hands over the index's STORED casing; the record and the manager are
+   * matched case-insensitively regardless and keep what they hold.
+   *
+   * Returns the tree this instance maintained for the index, or undefined when it maintained
+   * none — the drop of an index the engine lists but this connection never attached (an index
+   * withheld after a failed batch commit; see {@link markSchemaUnpersisted}).
+   *
+   * NOTE: the index tree is left in storage. Nothing in this plugin deletes a collection, and
+   * `DROP TABLE` leaves its trees the same way. A later `CREATE INDEX` of the same name adopts it
+   * (the adoption guard checks its columns against the description kept here) and re-stages every
+   * row idempotently. Entries for rows DELETED between the drop and that re-create are never
+   * re-staged and survive it: an index-driven seek then resolves such an entry to a row that is
+   * gone — `executeIndexScan` skips it, so results stay right, but a unique-enforcement probe
+   * still counts it (`bug-stale-index-entry-causes-false-unique-refusal`). The same residual a
+   * failed deferred flush already leaves, except that a deliberate drop can sit in front of the
+   * re-create for much longer. Deleting the tree needs a collection-delete primitive first.
+   */
+  async removeIndex(indexName: string): Promise<Tree<IndexKey, IndexEntry> | undefined> {
+    if (!this.isInitialized) {
+      await this.initialize();
+    }
+    if (!this.schemaManager || !this.indexManager) {
+      throw new Error('Table not initialized');
+    }
+
+    const txnState = this.txnBridge.getCurrentTransaction();
+    await this.schemaManager.removeIndex(this.schemaName, this.tableName, indexName, txnState?.transactor);
+
+    const tree = this.indexManager.unregisterIndex(indexName);
+    if (tree) {
+      this.txnBridge.forgetTree(tree);
+    }
+    const lower = indexName.toLowerCase();
+    const uniqueConstraints = (this.tableSchema.uniqueConstraints ?? []).filter(
+      uc => uc.derivedFromIndex?.toLowerCase() !== lower,
+    );
+    this.tableSchema = {
+      ...this.tableSchema,
+      indexes: (this.tableSchema.indexes ?? []).filter(idx => idx.name.toLowerCase() !== lower),
+      uniqueConstraints: uniqueConstraints.length > 0 ? uniqueConstraints : undefined,
+    };
+    return tree;
+  }
+
+  /**
    * Persist a CHECK that `ALTER TABLE … ADD CONSTRAINT` added, and carry it on this instance's
    * own schema ({@link OptimysticModule.alterTable} builds `check` exactly as the engine
    * registers it).
@@ -3410,11 +3463,13 @@ export class OptimysticVirtualTable extends VirtualTable {
       .map(idx => idx.name);
     // NOTE: setSchema REPLACES the manager's index list, so a `storedSchema` that is
     // missing an index the manager already maintains would narrow the maintained set
-    // rather than widen it. The supply side is closed (mutating paths read the catalog
-    // fresh, and storeStoredSchema's write-time union means the persisted list never
-    // shrinks — see SchemaManager); if a narrower schema ever lands here anyway, the
-    // reads still fail loudly (assertIndexMaintained), but switch this to a name-keyed
-    // union of the two lists.
+    // rather than widen it. The only write that shrinks a persisted list is DROP INDEX
+    // (SchemaManager.removeIndex), and a drop through THIS instance unregisters the index
+    // from the manager first, so the two agree. A drop by a SIBLING process narrows the
+    // record while this manager keeps maintaining the tree: harmless (entries written into
+    // a tree nothing lists) until this instance re-initializes, and the reads still fail
+    // loudly (assertIndexMaintained) if it ever lands here narrower — switch this to a
+    // name-keyed union of the two lists then.
     if (storedSchema.indexes.some(idx => manager.getIndexSchema(idx.name) === undefined)) {
       manager.setSchema(storedSchema);
     }
@@ -3796,18 +3851,26 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * (an invented, empty index tree is left unwritten), so it costs exactly one commit.
    *
    * NOTE: commits on ERROR too, deliberately deviating from the upstream hook doc ("on error,
-   * the module should discard the in-flight overlay"). Quereus keeps the statements that
-   * landed when an apply fails part-way (`@quereus/quereus/test/ddl-schema-event-atomicity.spec.ts`,
-   * "a partially-applied schema keeps the events of the statements that landed"): the created
-   * table stays in the engine catalog and is usable. Before the batch each of our DDL
-   * statements committed on its own, so our catalog matched the engine's; discarding the
-   * overlay now would leave those tables in the engine's catalog — and cached here as
-   * initialized instances — with no persisted record, so the next process would not hydrate
-   * them and a later CREATE INDEX on them would find no schema. The batch is therefore a
-   * write-coalescing buffer, not a transaction: the per-statement checkpoint in
-   * {@link underBatchCheckpoint} already withdrew the failed statement's own catalog changes,
-   * and what landed commits here whether or not `error` is set. Per-statement atomicity and
-   * partial-apply semantics are exactly what they were.
+   * the module should discard the in-flight overlay"). The batch is a write-coalescing buffer,
+   * not a transaction: the per-statement checkpoint in {@link underBatchCheckpoint} already
+   * withdrew the failed statement's own catalog changes, and whatever the overlay holds when
+   * this fires is what the engine's catalog holds too, so committing it is what keeps the two
+   * describing the same tables. Since Quereus 4.20 an apply that fails part-way is normally
+   * UNWOUND by the engine before this fires: each landed step's undo DDL (`DROP TABLE` for a
+   * `CREATE TABLE`, `DROP INDEX IF EXISTS` for a `CREATE INDEX`) runs through this module's
+   * ordinary hooks, inside the batch, so the overlay then holds the pre-apply state — a create
+   * followed by its own gravestone, an index subtracted again — and committing it lands that
+   * restored state (one commit; the create-then-gravestone pair is not elided). The exception is
+   * a step the differ marks irreversible (`DROP TABLE`, which discards rows): it poisons the undo
+   * journal before it runs, nothing is unwound, the apply reports the schema as partially
+   * migrated, and the engine keeps the steps that landed — exactly the case the review NOTE on
+   * `endSchemaBatch` in `@quereus/quereus/src/vtab/module.ts` warns about, for a module that
+   * DISCARDS its overlay and so rewinds a substrate the catalog still describes as migrated.
+   * Committing puts this module on the right side of that note by construction: partial or
+   * restored, the overlay and the engine's catalog agree. Discarding would instead leave a
+   * table the engine still lists (partial case), or one it has dropped (restored case, where the
+   * gravestone is discarded with the create), in the engine's catalog and cached here as an
+   * initialized instance with no matching record, so the next process hydrates something else.
    *
    * If one of a manager's deferred index trees fails to land, that manager's catalog is NOT
    * committed (see the ordering NOTE in the body) and its batch is discarded; if its catalog
@@ -3848,7 +3911,8 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         // NOTE: a tree whose table was DROPPED later in the same apply still lands here, as an
         // unlisted orphan (destroy never deletes index trees). If a migration ever plans CREATE
         // INDEX then DROP TABLE on one table and that sync throws, it cancels this manager's whole
-        // catalog commit, gravestone included; then have destroy remove the table's `deferred` entries.
+        // catalog commit, gravestone included; then have destroy remove the table's `deferred`
+        // entries the way dropIndex already removes a dropped index's.
         for (const tree of [...unlanded.keys()]) {
           if (tree.hasUnsyncedChanges()) {
             await tree.sync();
@@ -4269,7 +4333,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     // NOTE: the per-statement checkpoint below does NOT withdraw a tree deferred here when a
     // later part of this statement throws — it still lands at the end, unlisted (harmless:
     // adopted and re-staged by a later CREATE INDEX of the same name). That is today's
-    // semantics kept, not a new gap: unbatched, the tree had already flushed by then.
+    // semantics kept, not a new gap: unbatched, the tree had already flushed by then. A tree
+    // deferred by a statement that SUCCEEDED and is then unwound by the engine's undo journal
+    // (a later step failed) is withdrawn by the unwind's DROP INDEX — see dropIndex.
     const batch = this.schemaBatch;
     const deferFlush: DeferIndexFlush | undefined = batch
       ? (indexName, tree) => {
@@ -4290,6 +4356,55 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       }
       await table.addIndex(indexSchema, deferFlush);
     });
+  }
+
+  /**
+   * `DROP INDEX` on an Optimystic table, shaped like {@link createIndex}: the table is resolved
+   * the same way (a hydrated table no statement has touched yet is instantiated, and initialized
+   * and registered inside the statement's batch checkpoint), and the catalog write
+   * ({@link OptimysticVirtualTable.removeIndex}) runs under that checkpoint, so an open
+   * `APPLY SCHEMA` batch coalesces it and a throw withdraws it. Quereus passes the index's stored
+   * casing (`storedIndexName` in `@quereus/quereus/src/schema/manager.ts`) and removes the index
+   * from its own catalog only after this returns.
+   *
+   * Inside a batch the drop also withdraws the index's tree from the batch's deferred flush.
+   * Quereus 4.20 reaches this hook from its own undo journal: when a later step of an
+   * `apply schema` fails, each landed `CREATE INDEX` is unwound as `DROP INDEX IF EXISTS` before
+   * `endSchemaBatch` fires, and without the withdrawal the tree that `CREATE INDEX` deferred would
+   * still land at the end — unlisted, and at the cost of a commit. Withdrawn only once the drop
+   * succeeded: a refused drop leaves the index, tree flush included, exactly as it was.
+   */
+  async dropIndex(
+    db: Database,
+    schemaName: string,
+    tableName: string,
+    indexName: string
+  ): Promise<void> {
+    const tableKey = `${schemaName}.${tableName}`.toLowerCase();
+    const resolved = await this.lookupOrInstantiate(db, schemaName, tableName);
+
+    if (!resolved) {
+      throw new Error(`Optimystic table '${tableName}' not found in schema '${schemaName}'. Cannot drop index.`);
+    }
+    const { table, fresh } = resolved;
+
+    await this.underBatchCheckpoint(table, 'written', tableKey, async () => {
+      if (fresh) {
+        await table.initialize();
+        await table.ensureConnectionRegistered();
+      }
+      await table.removeIndex(indexName);
+    });
+
+    const deferred = this.schemaBatch?.deferred.get(table.catalogManager);
+    if (deferred) {
+      const lower = indexName.toLowerCase();
+      for (const [tree, entry] of deferred) {
+        if (entry.tableKey === tableKey && entry.indexName.toLowerCase() === lower) {
+          deferred.delete(tree);
+        }
+      }
+    }
   }
 
   /**

@@ -29,7 +29,7 @@
 		"test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec"
 	},
 	"devDependencies": {
-		"@quereus/quereus": "^4.19.4",
+		"@quereus/quereus": "^4.20.0",
 		"@types/chai": "^5.2.3",
 		"@types/mocha": "^10.0.10",
 		"@types/node": "^25.2.0",
@@ -47,10 +47,10 @@
 		"uint8arrays": "^6.1.1"
 	},
 	"peerDependencies": {
-		"@quereus/quereus": "^4.19.4"
+		"@quereus/quereus": "^4.20.0"
 	},
 	"engines": {
-		"quereus": "^4.19.4"
+		"quereus": "^4.20.0"
 	},
 	"keywords": [
 		"quereus-plugin",
