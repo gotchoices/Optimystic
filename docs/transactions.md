@@ -453,7 +453,12 @@ own create — has no instance left to heal anything: its gravestone is lost wit
 the commit and the catalog keeps its live record past the DROP, so the next
 hydrate resurrects it and a later CREATE over the same URI is not checked
 against it — the same failure direction as the unbatched, best-effort drop, and
-the failure log names those tables.
+the failure log names those tables. A
+`DROP INDEX` inside the batch is lost the same way: its subtraction never
+reaches the record, the table instance's next touch re-persists its schema
+through the write-time union — which puts the index the record still lists
+back under the instance's maintenance — and the next hydrate lists it again,
+while the engine's catalog no longer does.
 
 **Index-tree failure.** A deferred index tree that fails to land cancels its
 manager's catalog commit. Trees first, catalog second is what guarantees that

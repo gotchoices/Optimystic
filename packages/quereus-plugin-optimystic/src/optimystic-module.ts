@@ -2078,19 +2078,28 @@ export class OptimysticVirtualTable extends VirtualTable {
     // version-valid but sits on no entry).
     const treeEmpty = tree.at(await tree.first()) === undefined;
     if (treeEmpty) {
-      await this.collection.update();
-      for await (const { row, primaryKey } of walkDecodedRows(this.collection, this.rowCodec)) {
-        // NULL-bearing rows are exempt from the constraint — stage no entry, matching the
-        // probe's null-exemption and keeping the all-null tree legitimately empty.
-        if (hasNullIndexValue(descriptor, row)) {
-          continue;
-        }
-        const treeKey = indexEntryKey(this.indexManager.createIndexKey(descriptor, row), primaryKey);
-        await tree.stage([[treeKey, [treeKey, primaryKey]]]);
-      }
-      await tree.sync();
+      await this.populateUniqueTree(descriptor, tree);
     }
     this.populatedUniqueTrees.add(descriptor.name);
+  }
+
+  /**
+   * Stage one entry per current row of the table into the synthesized unique tree `tree` and
+   * flush it, in isolation from whatever the caller has staged elsewhere — the same populate
+   * loop as addIndex's. NULL-bearing rows are exempt from the constraint and stage no entry,
+   * matching the probe's null-exemption (and keeping an all-null tree legitimately empty).
+   */
+  private async populateUniqueTree(descriptor: StoredIndexSchema, tree: Tree<string, IndexEntry>): Promise<void> {
+    if (!this.collection || !this.rowCodec || !this.indexManager) return;
+    await this.collection.update();
+    for await (const { row, primaryKey } of walkDecodedRows(this.collection, this.rowCodec)) {
+      if (hasNullIndexValue(descriptor, row)) {
+        continue;
+      }
+      const treeKey = indexEntryKey(this.indexManager.createIndexKey(descriptor, row), primaryKey);
+      await tree.stage([[treeKey, [treeKey, primaryKey]]]);
+    }
+    await tree.sync();
   }
 
   /**
@@ -2996,11 +3005,12 @@ export class OptimysticVirtualTable extends VirtualTable {
    * this instance's own `tableSchema`, which a later re-initialize would otherwise write back. The
    * catalog write goes first so a refused write leaves the instance maintaining the index exactly
    * as before. Quereus hands over the index's STORED casing; the record and the manager are
-   * matched case-insensitively regardless and keep what they hold.
+   * matched case-insensitively regardless and keep what they hold. Last, a UNIQUE constraint the
+   * dropped index was enforcing gets a synthesized tree ({@link reassignUniqueEnforcement}).
    *
-   * Returns the tree this instance maintained for the index, or undefined when it maintained
-   * none — the drop of an index the engine lists but this connection never attached (an index
-   * withheld after a failed batch commit; see {@link markSchemaUnpersisted}).
+   * An index the engine lists but this connection never attached (one withheld after a failed
+   * batch commit; see {@link markSchemaUnpersisted}) has no tree here to withdraw; the record
+   * write and the schema filter still apply.
    *
    * NOTE: the index tree is left in storage. Nothing in this plugin deletes a collection, and
    * `DROP TABLE` leaves its trees the same way. A later `CREATE INDEX` of the same name adopts it
@@ -3012,7 +3022,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    * failed deferred flush already leaves, except that a deliberate drop can sit in front of the
    * re-create for much longer. Deleting the tree needs a collection-delete primitive first.
    */
-  async removeIndex(indexName: string): Promise<Tree<IndexKey, IndexEntry> | undefined> {
+  async removeIndex(indexName: string): Promise<void> {
     if (!this.isInitialized) {
       await this.initialize();
     }
@@ -3036,7 +3046,58 @@ export class OptimysticVirtualTable extends VirtualTable {
       indexes: (this.tableSchema.indexes ?? []).filter(idx => idx.name.toLowerCase() !== lower),
       uniqueConstraints: uniqueConstraints.length > 0 ? uniqueConstraints : undefined,
     };
-    return tree;
+    await this.reassignUniqueEnforcement(txnState?.transactor);
+  }
+
+  /**
+   * After a declared index left this instance: every point-enforceable UNIQUE constraint that
+   * index was enforcing gets the synthesized `_uniq_` tree it would have had without the index.
+   * {@link resolveEnforcingIndex} prefers a declared index over the constraint's columns, and
+   * {@link buildUniqueEnforcementIndexes} synthesizes nothing for a constraint a declared index
+   * covers at initialization — so with the index gone the constraint would resolve to no tree at
+   * all: the probe would fall back to a full scan and the staged entry would carry no
+   * concurrency guard, until this instance re-initializes. A fresh Database over the subtracted
+   * record synthesizes exactly what is built here.
+   *
+   * The new tree is rebuilt from the table NOW rather than backfilled on its first probe.
+   * {@link ensureUniquePopulated} trusts a non-empty tree, and this tree may already exist in
+   * storage: a constraint declared before its covering index was created had the tree from the
+   * start, and every initialization since the index existed stopped maintaining it. This flush
+   * is what makes it current for every process that opens it after the drop (a sibling still
+   * enforcing through the dropped index writes past it until it re-initializes — see the NOTE in
+   * {@link reconcileMaintainedIndexes}). Entries are keyed `indexKey ‖ primaryKey`, so re-staging
+   * the rows the tree already holds is idempotent. A tree this instance was maintaining all
+   * along (a constraint whose index was created in THIS session, so both were kept) is current
+   * already and is left alone; a constraint derived from the dropped index itself is gone by now.
+   *
+   * Runs after the catalog write and the unregistration, so a throw here (the tree failing to
+   * open, or the rebuild failing to land) leaves the drop reported failed with this instance no
+   * longer maintaining the index, and the engine still listing it. Every step of the retried
+   * `DROP INDEX` is idempotent, this one included: a tree is recorded on this instance only once
+   * its rebuild landed, so the retry rebuilds exactly the trees the failed attempt did not.
+   */
+  private async reassignUniqueEnforcement(transactor?: ITransactor): Promise<void> {
+    if (!this.indexManager || !this.schemaManager) return;
+    const stored: StoredTableSchema = {
+      ...this.schemaManager.tableSchemaToStored(this.tableSchema),
+      indexes: this.indexManager.getDeclaredIndexes(),
+    };
+    const maintained = new Set(this.uniqueEnforcementIndexes.map(idx => idx.name));
+    const added = this.buildUniqueEnforcementIndexes(stored).filter(idx => !maintained.has(idx.name));
+    if (added.length === 0) return;
+
+    await this.indexManager.setUniqueEnforcementIndexes([...this.uniqueEnforcementIndexes, ...added], transactor);
+    for (const descriptor of added) {
+      const tree = this.indexManager.getIndexTree(descriptor.name);
+      if (!tree) {
+        throw new Error(`Index tree not found: ${descriptor.name}`);
+      }
+      this.txnBridge.registerCollection(tree.getCollection());
+      await this.populateUniqueTree(descriptor, tree);
+      this.populatedUniqueTrees.add(descriptor.name);
+      this.uniqueEnforcementIndexes = [...this.uniqueEnforcementIndexes, descriptor];
+    }
+    this.registerUniqueKeyTakenMessages();
   }
 
   /**
@@ -3466,10 +3527,14 @@ export class OptimysticVirtualTable extends VirtualTable {
     // rather than widen it. The only write that shrinks a persisted list is DROP INDEX
     // (SchemaManager.removeIndex), and a drop through THIS instance unregisters the index
     // from the manager first, so the two agree. A drop by a SIBLING process narrows the
-    // record while this manager keeps maintaining the tree: harmless (entries written into
-    // a tree nothing lists) until this instance re-initializes, and the reads still fail
-    // loudly (assertIndexMaintained) if it ever lands here narrower — switch this to a
-    // name-keyed union of the two lists then.
+    // record while this manager keeps maintaining the tree until this instance
+    // re-initializes: harmless (entries written into a tree nothing lists) unless the
+    // dropped index was enforcing a UNIQUE constraint, whose synthesized tree (see
+    // reassignUniqueEnforcement) then misses the rows this instance writes meanwhile — the
+    // same stale-sibling shape as an index a sibling CREATED (producer three of
+    // bug-stale-index-entry-causes-false-unique-refusal). The reads still fail loudly
+    // (assertIndexMaintained) if it ever lands here narrower — switch this to a name-keyed
+    // union of the two lists then.
     if (storedSchema.indexes.some(idx => manager.getIndexSchema(idx.name) === undefined)) {
       manager.setSchema(storedSchema);
     }

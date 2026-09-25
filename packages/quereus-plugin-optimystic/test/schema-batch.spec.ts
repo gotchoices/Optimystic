@@ -1063,6 +1063,33 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 				expect(byTag.seeks).to.include('t0_by_tag');
 			}
 		});
+
+		it('dropping the declared index that enforced an explicit UNIQUE constraint hands enforcement to a synthesized tree, rebuilt from the table', async () => {
+			const h = harness();
+			await h.db.exec(`pragma default_vtab_module='optimystic'`);
+			await h.db.exec(`create table u (id integer primary key, email text unique)`);
+			// The constraint's own synthesized tree enforces it and receives these rows.
+			await h.db.exec(`insert into u values (1, 'a@x'), (2, 'b@x')`);
+			await h.db.exec(`create index u_by_email on u (email)`);
+			// A fresh Database hands enforcement to the declared index at initialization and stops
+			// maintaining the synthesized tree, which now goes stale: this row reaches only the index.
+			const { db: reopened } = await h.reopen();
+			await reopened.exec(`insert into u values (3, 'c@x')`);
+
+			await reopened.exec(`drop index u_by_email`);
+
+			// The live instance enforces through the synthesized tree again (a full-scan fallback
+			// would also refuse here; the fresh Database below is what tells the two apart) …
+			await expectRejects(reopened.exec(`insert into u values (4, 'c@x')`), /unique/i);
+			await reopened.exec(`insert into u values (5, 'e@x')`);
+			await expectCatalogsAgree(h, reopened, { u: [] });
+			// … and the tree it left in storage is current: rebuilt at the drop, so it holds the
+			// row written while it was unmaintained, and maintained since, so it holds the row
+			// written after the drop. A fresh Database trusts a non-empty synthesized tree as is.
+			const { db: fresh } = await h.reopen();
+			await expectRejects(fresh.exec(`insert into u values (6, 'c@x')`), /unique/i);
+			await expectRejects(fresh.exec(`insert into u values (7, 'e@x')`), /unique/i);
+		});
 	});
 
 	describe('SchemaManager batch against a sibling writer (unit level)', () => {

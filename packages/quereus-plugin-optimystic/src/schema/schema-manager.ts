@@ -634,19 +634,6 @@ export function toStoredSchema(record: PersistedTableSchema): StoredTableSchema 
 }
 
 /**
- * The record a schema write produces: `incoming` (the caller's declaration, already in
- * persisted form) with its index list unioned against what the catalog holds
- * ({@link mergeIndexLists}), validated so that every surviving index column exists in
- * the MERGED record's column list — which is `incoming`'s.
- *
- * The one way that validation fails is a re-declare that drops a column a persisted
- * index still covers (the incoming indexes were de-resolved from the incoming columns,
- * so they always resolve). Before index columns were persisted by name, that write
- * went through silently and every later row was indexed under the NULL key; now it is
- * refused at the write with the way out spelled out. `DROP TABLE` tombstones the
- * entry ({@link SchemaManager.deleteSchema}), so drop-then-recreate is unaffected.
- */
-/**
  * `record` with index `indexName` (matched case-insensitively) moved from `indexes` to
  * `orphanedIndexes` — the shape a `DROP INDEX` leaves. The description moves rather than
  * disappears: the drop leaves the index tree at `<uri>/index/<name>` in storage (nothing in this
@@ -669,6 +656,19 @@ export function withoutIndex(record: PersistedTableSchema, indexName: string): P
 	});
 }
 
+/**
+ * The record a schema write produces: `incoming` (the caller's declaration, already in
+ * persisted form) with its index list unioned against what the catalog holds
+ * ({@link mergeIndexLists}), validated so that every surviving index column exists in
+ * the MERGED record's column list — which is `incoming`'s.
+ *
+ * The one way that validation fails is a re-declare that drops a column a persisted
+ * index still covers (the incoming indexes were de-resolved from the incoming columns,
+ * so they always resolve). Before index columns were persisted by name, that write
+ * went through silently and every later row was indexed under the NULL key; now it is
+ * refused at the write with the way out spelled out. `DROP TABLE` tombstones the
+ * entry ({@link SchemaManager.deleteSchema}), so drop-then-recreate is unaffected.
+ */
 export function mergePersistedSchemas(
 	incoming: PersistedTableSchema,
 	persisted: PersistedTableSchema | undefined
