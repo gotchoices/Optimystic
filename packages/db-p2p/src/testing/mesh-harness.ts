@@ -685,6 +685,10 @@ export interface NodeWithBlocks {
  * owns can be too small for any of a bounded run of ids to land in. This returns the first node to
  * accumulate `count` ids, skipping `exclude` (for a spec that needs two distinct nodes). It throws after
  * `maxCandidates` ids when no node got there, rather than returning fewer ids than asked for.
+ *
+ * With no `exclude` that throw is out of reach for any plausible `count`: every candidate lands in some
+ * eligible node's cohort, so the busiest node owns at least `maxCandidates / nodes` of them. It becomes
+ * reachable only when `exclude` leaves behind nodes whose arcs are collectively vanishing.
  */
 export async function nodeWithBlocksInCohort(
 	mesh: Mesh,
@@ -694,6 +698,10 @@ export async function nodeWithBlocksInCohort(
 ): Promise<NodeWithBlocks> {
 	const { exclude = [], maxCandidates = 10_000 } = options;
 	const eligible = new Map(mesh.nodes.filter(n => !exclude.includes(n)).map(n => [n.peerId.toString(), n]));
+	// Both of these ask for something no ring can answer, and the scan below would spend every candidate
+	// discovering that before failing with a count rather than a cause.
+	if (count < 1) throw new Error(`nodeWithBlocksInCohort: count must be at least 1, got ${count}`);
+	if (eligible.size === 0) throw new Error(`nodeWithBlocksInCohort: every one of the mesh's ${mesh.nodes.length} nodes is excluded`);
 	const idsByNode = new Map<string, BlockId[]>();
 	for (let i = 0; i < maxCandidates; i++) {
 		const id = `${prefix}-${i}` as BlockId;
