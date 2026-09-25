@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import type { BlockId, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
-import { createMesh, nonResponsibleNodes, responsibleNodes, blockIdsInCohortOf, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
+import { createMesh, nonResponsibleNodes, responsibleNodes, nodeWithBlocksInCohort, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
 
 const makeHeader = (id: string): BlockHeader => ({
 	id: id as BlockId,
@@ -155,10 +155,8 @@ describe('Mesh Sanity Tests', () => {
 
 		it('pend + commit through different nodes independently', async () => {
 			// Each node independently writes a block it is the sole responsible peer for, via fast path (K=1)
-			const node0 = mesh.nodes[0]!;
-			const node1 = mesh.nodes[1]!;
-			const [blockA] = await blockIdsInCohortOf(mesh, node0, 1, 'block-a');
-			const [blockB] = await blockIdsInCohortOf(mesh, node1, 1, 'block-b');
+			const { node: node0, blockIds: [blockA] } = await nodeWithBlocksInCohort(mesh, 1, 'block-a');
+			const { node: node1, blockIds: [blockB] } = await nodeWithBlocksInCohort(mesh, 1, 'block-b', { exclude: [node0] });
 
 			await node0.coordinatorRepo.pend(
 				{ actionId: 'a1', transforms: makeTransforms(blockA!), policy: 'c' }

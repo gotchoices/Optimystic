@@ -670,24 +670,44 @@ export async function responsibleNodes(mesh: Mesh, blockId: string): Promise<Mes
 	return cohort.map(id => mesh.nodes.find(node => node.peerId.toString() === id)!);
 }
 
+export interface NodeWithBlocks {
+	node: MeshNode;
+	blockIds: BlockId[];
+}
+
 /**
- * The first `count` ids of the form `${prefix}-${i}` whose cohort includes `node` — for a spec that needs
+ * A node, and `count` ids of the form `${prefix}-${i}` whose cohort includes it — for a spec that needs
  * several blocks one node is responsible for (a multi-block pend through that node's coordinator, or
  * sequential writes it coordinates alone). In a `responsibilityK: 1` mesh these are blocks the node is
- * the SOLE responsible peer for. Throws after `maxCandidates` ids rather than looping on a node whose ring
- * arc no id lands in.
+ * the SOLE responsible peer for.
+ *
+ * The node is chosen from the ring, not by index: peer ids are random per mesh, so the arc a fixed node
+ * owns can be too small for any of a bounded run of ids to land in. This returns the first node to
+ * accumulate `count` ids, skipping `exclude` (for a spec that needs two distinct nodes). It throws after
+ * `maxCandidates` ids when no node got there, rather than returning fewer ids than asked for.
  */
-export async function blockIdsInCohortOf(mesh: Mesh, node: MeshNode, count: number, prefix: string, maxCandidates = 10_000): Promise<BlockId[]> {
-	const nodeId = node.peerId.toString();
-	const ids: BlockId[] = [];
-	for (let i = 0; ids.length < count && i < maxCandidates; i++) {
+export async function nodeWithBlocksInCohort(
+	mesh: Mesh,
+	count: number,
+	prefix: string,
+	options: { exclude?: readonly MeshNode[]; maxCandidates?: number } = {}
+): Promise<NodeWithBlocks> {
+	const { exclude = [], maxCandidates = 10_000 } = options;
+	const eligible = new Map(mesh.nodes.filter(n => !exclude.includes(n)).map(n => [n.peerId.toString(), n]));
+	const idsByNode = new Map<string, BlockId[]>();
+	for (let i = 0; i < maxCandidates; i++) {
 		const id = `${prefix}-${i}` as BlockId;
-		if (nodeId in await mesh.keyNetwork.findCluster(routingKeyForBlock(id))) ids.push(id);
+		for (const peerId of Object.keys(await mesh.keyNetwork.findCluster(routingKeyForBlock(id)))) {
+			const node = eligible.get(peerId);
+			if (!node) continue;
+			const ids = idsByNode.get(peerId) ?? [];
+			ids.push(id);
+			idsByNode.set(peerId, ids);
+			if (ids.length === count) return { node, blockIds: ids };
+		}
 	}
-	if (ids.length < count) {
-		throw new Error(`blockIdsInCohortOf: only ${ids.length} of ${count} ids with prefix ${prefix} place ${nodeId} in their cohort`);
-	}
-	return ids;
+	const best = Math.max(0, ...[...idsByNode.values()].map(ids => ids.length));
+	throw new Error(`nodeWithBlocksInCohort: no node is in the cohort of ${count} ids with prefix ${prefix} within ${maxCandidates} candidates (best had ${best})`);
 }
 
 export interface BuildTransactorOptions {

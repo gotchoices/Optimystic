@@ -9,7 +9,7 @@
 import { expect } from 'chai';
 import type { BlockId, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
 import { routingKeyForBlock } from '@optimystic/db-core';
-import { createMesh, buildNetworkTransactor, responsibleNodes, nonResponsibleNodes, blockIdsInCohortOf, type Mesh } from '../src/testing/mesh-harness.js';
+import { createMesh, buildNetworkTransactor, responsibleNodes, nonResponsibleNodes, nodeWithBlocksInCohort, type Mesh } from '../src/testing/mesh-harness.js';
 
 const makeHeader = (id: string): BlockHeader => ({
 	id: id as BlockId,
@@ -128,8 +128,7 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 		});
 
 		it('should succeed with sequential pend+commit at increasing revisions', async () => {
-			const node = mesh.nodes[0]!;
-			const [block1, block2] = await blockIdsInCohortOf(mesh, node, 2, 'block-seq');
+			const { node, blockIds: [block1, block2] } = await nodeWithBlocksInCohort(mesh, 2, 'block-seq');
 
 			// Transaction 1: rev=1
 			const pend1 = await node.coordinatorRepo.pend(
@@ -162,8 +161,7 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 		});
 
 		it('should track revision state across multiple commits', async () => {
-			const node = mesh.nodes[0]!;
-			const blockIds = await blockIdsInCohortOf(mesh, node, 3, 'block-rev');
+			const { node, blockIds } = await nodeWithBlocksInCohort(mesh, 3, 'block-rev');
 
 			// Commit 3 sequential transactions
 			for (const [index, blockId] of blockIds.entries()) {
@@ -192,8 +190,7 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 		});
 
 		it('should pend a transaction with multiple block IDs', async () => {
-			const node = mesh.nodes[0]!;
-			const blockIds = await blockIdsInCohortOf(mesh, node, 3, 'block-multi');
+			const { node, blockIds } = await nodeWithBlocksInCohort(mesh, 3, 'block-multi');
 
 			const pendResult = await node.coordinatorRepo.pend({
 				actionId: 'a-multi',
@@ -204,8 +201,7 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 		});
 
 		it('should commit a multi-block transaction and verify all blocks', async () => {
-			const node = mesh.nodes[0]!;
-			const blockIds = await blockIdsInCohortOf(mesh, node, 2, 'block-mb');
+			const { node, blockIds } = await nodeWithBlocksInCohort(mesh, 2, 'block-mb');
 
 			await node.coordinatorRepo.pend({
 				actionId: 'a-mb',
@@ -228,8 +224,7 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 		});
 
 		it('should cancel a multi-block pending transaction', async () => {
-			const node = mesh.nodes[0]!;
-			const blockIds = await blockIdsInCohortOf(mesh, node, 2, 'block-mbc');
+			const { node, blockIds } = await nodeWithBlocksInCohort(mesh, 2, 'block-mbc');
 
 			await node.coordinatorRepo.pend({
 				actionId: 'a-mbc',
