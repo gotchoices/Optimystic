@@ -1,6 +1,6 @@
 {
 	"name": "@optimystic/upgrade-check",
-	"version": "1.5.0",
+	"version": "1.5.1",
 	"private": true,
 	"type": "module",
 	"description": "Restarts the working tree's build over data a published older build wrote, and checks that it reads all of it and writes on top of it",
