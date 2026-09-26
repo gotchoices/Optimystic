@@ -74,3 +74,5 @@
 {"slug":"replicate-owned-blocks-when-the-cohort-grows","file":"2-replicate-owned-blocks-when-the-cohort-grows.md","completedAt":"2026-08-26","commit":"f36548f321c51eb658cdae99ee55c1597c97c4ee","prunedAt":"2026-09-25T15:50:15.698Z"}
 {"slug":"a-refresh-that-fails-to-close-a-known-gap-says-nothing","file":"2.1-a-refresh-that-fails-to-close-a-known-gap-says-nothing.md","completedAt":"2026-08-26","commit":"f747f72fda2353ae9dd319e1af73548facac083e","prunedAt":"2026-09-25T15:50:15.698Z"}
 {"slug":"mesh-harness-real-reconcile","file":"3-mesh-harness-real-reconcile.md","completedAt":"2026-08-26","commit":"e7dcc2e81ec15d9662cc41d4bbc67b67187b4cb7","prunedAt":"2026-09-25T15:50:15.698Z"}
+{"slug":"mesh-partition-admission-quereus-validation","file":"4-mesh-partition-admission-quereus-validation.md","completedAt":"2026-08-27","commit":"50e32dfbccce749e92b98e714b6b2df93da4a68f","prunedAt":"2026-09-26T04:48:29.842Z"}
+{"slug":"mesh-harness-signature-enforcement","file":"5-mesh-harness-signature-enforcement.md","completedAt":"2026-08-27","commit":"e3ab6ce730b4e7187fac3b24e6df974f56fe555b","prunedAt":"2026-09-26T04:48:29.842Z"}
