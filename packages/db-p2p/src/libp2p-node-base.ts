@@ -1023,6 +1023,14 @@ export async function createLibp2pNodeBase(
 		//
 		// A timed-out fetch resolves to "no archive", exactly as a peer that holds nothing does — the
 		// pass moves on to the next peer. Only the number is configurable; the contract is unchanged.
+		//
+		// NOTE: this is the SAME request `clusterLatestCallback` already made of the same peer — both ask
+		// `requestBlock({ blockId, rev: undefined })` and get the whole archive back; the consult just
+		// projects the claim out of it and drops the bytes. So a read that goes on to repair pays two
+		// identical round trips per peer rather than one, which is invisible on a LAN and is a second
+		// `cohortQueryTimeoutMs` per peer on a relayed link. If read-repair latency on slow links ever
+		// needs cutting, carry the consult's archive through to the acquisition instead of shortening
+		// either deadline.
 		const fetchArchiveFromPeer = async (peerIdStr: string, blockId: BlockId): Promise<BlockArchive | undefined> => {
 			let peerId: ReturnType<typeof peerIdFromString>;
 			try {
@@ -1032,17 +1040,25 @@ export async function createLibp2pNodeBase(
 			}
 			if (peerId.equals(node.peerId)) return undefined;
 			const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix);
+			// Cleared on either outcome: a peer that answers quickly must not leave a timer pending for the
+			// rest of the budget. `unref` alone kept that harmless only while the budget was a hardcoded
+			// second — an operator raising it to tens of seconds would otherwise retain one timer per fetch
+			// per peer for that long.
+			let deadline: ReturnType<typeof setTimeout> | undefined;
 			try {
 				const response = await Promise.race<SyncResponse>([
 					syncClient.requestBlock({ blockId, rev: undefined }),
 					new Promise<SyncResponse>(resolve => {
-						setTimeout(() => resolve({ success: false }), consensusConfig.cohortQueryTimeoutMs).unref();
+						deadline = setTimeout(() => resolve({ success: false }), consensusConfig.cohortQueryTimeoutMs);
+						deadline.unref();
 					})
 				]);
 				return response.success ? response.archive : undefined;
 			} catch {
 				// Peer unreachable / no data — caller falls back to the next cohort peer.
 				return undefined;
+			} finally {
+				if (deadline !== undefined) clearTimeout(deadline);
 			}
 		};
 

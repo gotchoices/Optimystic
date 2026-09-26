@@ -167,7 +167,8 @@ export interface ClusterPolicyOptions {
 		 * for which two deadlines it sets and why they share one field, and
 		 * {@link reconcilePassTimeoutMs} for the whole-pass bound derived from it.
 		 *
-		 * A value that is not a positive finite number throws at node construction — see
+		 * A value that is not a finite number above zero, or is above
+		 * {@link MAX_COHORT_QUERY_TIMEOUT_MS}, throws at node construction — see
 		 * {@link resolveCohortQueryTimeoutMs} for why this one does not fall through the way the size
 		 * fields do.
 		 */
@@ -257,6 +258,24 @@ export function resolveRepairCorroborationClusterSize(
 }
 
 /**
+ * The largest `clusterPolicy.cohortQueryTimeoutMs` a node accepts, in milliseconds (about 4.97 days).
+ *
+ * Not a policy judgement but a representability one, and the reason it is not simply
+ * `2 ** 31 - 1`: every platform this runs on truncates a `setTimeout` delay to a 32-bit signed
+ * integer and fires almost immediately when it overflows (node warns and uses 1 ms; browsers and
+ * React Native clamp the same way), and the largest delay derived from this field is the pass bound
+ * {@link reconcilePassTimeoutMs} builds by multiplying it by five. So the ceiling is that limit
+ * divided by five.
+ *
+ * No real deployment comes near it — a per-peer read budget is seconds. It is here because the one
+ * plausible way to exceed it is a host computing the field in the wrong unit (microseconds or
+ * nanoseconds where milliseconds were meant), and an overflowing delay lands on exactly the failure
+ * this field exists to end, only harder: every cohort peer reads as silent after a millisecond
+ * rather than after a second, with no diagnostic but a runtime warning.
+ */
+export const MAX_COHORT_QUERY_TIMEOUT_MS = Math.floor((2 ** 31 - 1) / 5);
+
+/**
  * The per-peer read-path deadline, in milliseconds: the declared
  * `clusterPolicy.cohortQueryTimeoutMs`, else {@link DEFAULT_COHORT_QUERY_TIMEOUT_MS}.
  *
@@ -266,13 +285,14 @@ export function resolveRepairCorroborationClusterSize(
  * node, a hand-wired coordinator and a member given the same operator number must land on the same
  * deadline. One function rather than three copies, so they cannot drift.
  *
- * NOTE: a declared value that is not a positive finite number THROWS, rather than falling through to
- * the default the way a degenerate cohort size does ({@link asDeclaredSize}). The two differ because
- * there is no safe direction to fall toward here. For a cohort SIZE, falling through lands on the
- * strict `clusterSize` default and clamping would be the unsafe direction, so a nonsense declaration
- * has a safe reading. For a TIMEOUT there is none: falling through to 1000 would silently keep the
- * LAN default on the deployment that typed the field precisely in order to escape it — the exact
- * failure this field exists to end. Fail fast at node construction instead, matching
+ * NOTE: a declared value that is not a finite number above zero, or is above
+ * {@link MAX_COHORT_QUERY_TIMEOUT_MS}, THROWS rather than falling through to the default the way a
+ * degenerate cohort size does ({@link asDeclaredSize}). The two differ because there is no safe
+ * direction to fall toward here. For a cohort SIZE, falling through lands on the strict `clusterSize`
+ * default and clamping would be the unsafe direction, so a nonsense declaration has a safe reading.
+ * For a TIMEOUT there is none: falling through to 1000 would silently keep the LAN default on the
+ * deployment that typed the field precisely in order to escape it — the exact failure this field
+ * exists to end. Fail fast at node construction instead, matching
  * `assertSuperMajorityCoupling` in `cluster/supermajority-coupling.ts`.
  *
  * A positive finite FRACTIONAL value is accepted: this is a millisecond duration and `setTimeout`
@@ -281,9 +301,9 @@ export function resolveRepairCorroborationClusterSize(
  */
 export function resolveCohortQueryTimeoutMs(declared: number | undefined): number {
 	if (declared === undefined) return DEFAULT_COHORT_QUERY_TIMEOUT_MS;
-	if (!Number.isFinite(declared) || declared <= 0) {
+	if (!Number.isFinite(declared) || declared <= 0 || declared > MAX_COHORT_QUERY_TIMEOUT_MS) {
 		throw new Error(
-			`clusterPolicy.cohortQueryTimeoutMs must be a positive finite number of milliseconds; got ${String(declared)}`
+			`clusterPolicy.cohortQueryTimeoutMs must be a finite number of milliseconds above 0 and no greater than ${MAX_COHORT_QUERY_TIMEOUT_MS}; got ${String(declared)}`
 		);
 	}
 	return declared;
@@ -303,6 +323,9 @@ export function resolveCohortQueryTimeoutMs(declared: number | undefined): numbe
  * acquisition (`CoordinatorRepo.restoreCorroborated`) and the commit path's reconcile
  * (`ClusterMember.withReconcileTimeout`). They shared one constant on purpose ("same operation, same
  * bound", docs/internals.md) and must not drift apart.
+ *
+ * The multiple is also why the per-peer field has a ceiling: the product is what reaches a timer, so
+ * it is the number that must stay representable — see {@link MAX_COHORT_QUERY_TIMEOUT_MS}.
  */
 export function reconcilePassTimeoutMs(cohortQueryTimeoutMs: number): number {
 	return Math.max(RECONCILE_TIMEOUT_MS, 5 * cohortQueryTimeoutMs);

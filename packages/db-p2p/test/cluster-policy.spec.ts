@@ -16,7 +16,7 @@
 
 import { expect } from 'chai';
 import { DEFAULT_SUPER_MAJORITY_THRESHOLD } from '@optimystic/db-core';
-import { minAbsoluteClusterSize, reconcilePassTimeoutMs, resolveClusterPolicy, resolveCohortQueryTimeoutMs, resolveRepairCorroborationClusterSize } from '../src/cluster/cluster-policy.js';
+import { MAX_COHORT_QUERY_TIMEOUT_MS, minAbsoluteClusterSize, reconcilePassTimeoutMs, resolveClusterPolicy, resolveCohortQueryTimeoutMs, resolveRepairCorroborationClusterSize } from '../src/cluster/cluster-policy.js';
 import { captureLog, hasTag } from './support/capture-log.js';
 
 describe('resolveClusterPolicy', () => {
@@ -86,18 +86,34 @@ describe('resolveClusterPolicy', () => {
 		 * duration throws. There is no safe direction to fall toward: falling through to 1000 would
 		 * silently keep the LAN default on the one deployment that typed this field in order to
 		 * escape it.
+		 *
+		 * The last case is the one a host reaches by accident rather than by nonsense: a budget above the
+		 * ceiling makes `setTimeout` truncate its delay to 32 bits and fire after a millisecond, so a
+		 * field meant to RAISE the deadline would instead make every cohort peer read as silent at once.
+		 * Nothing in the value's shape says so, which is why it is refused rather than clamped.
 		 */
 		for (const [label, value] of [
 			['zero', 0],
 			['negative', -1],
 			['NaN', Number.NaN],
-			['Infinity', Number.POSITIVE_INFINITY]
+			['Infinity', Number.POSITIVE_INFINITY],
+			['past the setTimeout delay ceiling', MAX_COHORT_QUERY_TIMEOUT_MS + 1]
 		] as [string, number][]) {
 			it(`throws on a ${label} cohortQueryTimeoutMs rather than falling back to the default`, () => {
 				expect(() => resolveClusterPolicy({ clusterPolicy: { cohortQueryTimeoutMs: value } }))
 					.to.throw(/cohortQueryTimeoutMs/);
 			});
 		}
+
+		it('accepts the ceiling itself, and keeps the derived pass bound representable there', () => {
+			// The ceiling is `setTimeout`'s 32-bit delay limit divided by the 5x the pass bound applies, so
+			// the largest accepted budget must still produce a bound a timer can hold. An off-by-one here
+			// would mean the highest legal setting silently fires its reconcile pass immediately.
+			const policy = resolveClusterPolicy({ clusterPolicy: { cohortQueryTimeoutMs: MAX_COHORT_QUERY_TIMEOUT_MS } });
+
+			expect(policy.cohortQueryTimeoutMs).to.equal(MAX_COHORT_QUERY_TIMEOUT_MS);
+			expect(policy.reconcilePassTimeoutMs).to.be.at.most(2 ** 31 - 1);
+		});
 
 		it('derives the pass bound the same way for every caller', () => {
 			// `ClusterMember` and `CoordinatorRepo` each call this on the `cohortQueryTimeoutMs` they

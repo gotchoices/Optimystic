@@ -310,9 +310,10 @@ export interface ClusterConsensusConfig {
 	 * every time and a rejoining node never catches up.
 	 *
 	 * Fractional values are accepted — this is a duration, not a count of peers. A value that is not
-	 * a finite number, or is at or below zero, is a configuration error and throws at node
-	 * construction rather than silently falling back to the default (see `resolveCohortQueryTimeoutMs`
-	 * in db-p2p's `cluster/cluster-policy.ts`).
+	 * a finite number above zero, or is large enough that the deadlines derived from it overflow the
+	 * 32-bit delay `setTimeout` accepts (roughly 4.97 days, the one way a unit mix-up shows up), is a
+	 * configuration error and throws at node construction rather than silently falling back to the
+	 * default (see `resolveCohortQueryTimeoutMs` in db-p2p's `cluster/cluster-policy.ts`).
 	 *
 	 * The whole-pass reconcile bound is derived from this rather than declared separately; see
 	 * `reconcilePassTimeoutMs` in the same module.

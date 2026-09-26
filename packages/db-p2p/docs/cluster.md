@@ -1113,12 +1113,16 @@ In a two-member cohort one late answer is the whole quorum, so the consult decli
 a machine that re-attaches after being away never catches up. The symptom in the logs is steady
 `cluster-fetch:peers-silent` against peers that are healthy and answering everything else.
 
-Unlike the size fields above, a declared value that is not a positive finite number **throws** at node
-construction rather than falling through to the default. The size fields have a safe fall-through (the
-strict `clusterSize` default); a timeout has none — falling back to 1000 would silently keep the LAN
-default on the one deployment that typed this field in order to escape it. Fractional values are
-accepted: it is a millisecond duration, not a count of peers. Like the sizes, it is read once at node
-construction — see *Changing a size after the node is running* below, which applies to it verbatim.
+Unlike the size fields above, a declared value that is not a finite number above zero **throws** at
+node construction rather than falling through to the default. The size fields have a safe fall-through
+(the strict `clusterSize` default); a timeout has none — falling back to 1000 would silently keep the
+LAN default on the one deployment that typed this field in order to escape it. A value above
+`MAX_COHORT_QUERY_TIMEOUT_MS` (about 4.97 days) throws for the same reason rather than a different
+one: `setTimeout` truncates its delay to a 32-bit signed integer, so a larger budget — realistically a
+host computing this field in microseconds or nanoseconds — would expire every deadline after a
+millisecond instead of raising it. Fractional values are accepted: it is a millisecond duration, not
+a count of peers. Like the sizes, it is read once at node construction — see *Changing a size after
+the node is running* below, which applies to it verbatim.
 
 **Changing a size after the node is running.** Both yardsticks are resolved **once**, by
 `resolveClusterPolicy` at node construction, and every consumer — the cluster member, the coordinator,
