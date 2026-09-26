@@ -24,7 +24,7 @@ import { checkPendValidation } from "../pend-validation.js";
 import { getAffectedBlockIds } from "./record-operations.js";
 import { operationsConflict, resolveRace } from "./race-resolution.js";
 import { buildBlockCommitProof, mintSoloCommitProof, type BlockCommitProof } from "./commit-proof.js";
-import { RECONCILE_TIMEOUT_MS } from "./reconcile-block.js";
+import { reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs } from "./cluster-policy.js";
 import type { BlockHolders } from "./rebalance-monitor.js";
 
 const log = createLogger('cluster-member')
@@ -323,12 +323,6 @@ const ExecutedTransactionTtlMs = 10 * 60 * 1000;
  */
 export const CONFLICT_STALE_THRESHOLD_MS = 2000;
 
-// Upper bound on an awaited active reconciliation of a divergent commit. Bounds the
-// consensus path so a slow/unreachable cohort peer can't stall the cluster stream;
-// a timeout is logged and tolerated (never thrown — that would reset the stream).
-// Shared with the read path's acquisition (see RECONCILE_TIMEOUT_MS) — same operation, same bound.
-const ReconcileTimeoutMs = RECONCILE_TIMEOUT_MS;
-
 /**
  * True when a thrown storage error reports a missing pending action — i.e. this
  * member reached commit-consensus without having seen the matching pend phase.
@@ -427,6 +421,25 @@ export class ClusterMember implements ICluster {
 	private readonly unvalidatablePendPolicy: UnvalidatablePendPolicy;
 	/** Clock behind the reservation table's `lastUpdate` — see {@link ClusterMemberComponents.now}. */
 	private readonly now: () => number;
+	/**
+	 * Upper bound on an awaited active reconciliation of a divergent commit, in milliseconds. Bounds
+	 * the consensus path so a slow or unreachable cohort peer cannot stall the cluster stream; a
+	 * timeout is logged and tolerated (never thrown — that would reset the stream).
+	 *
+	 * Derived — not declared — from the same per-peer `cohortQueryTimeoutMs` the read path uses:
+	 * `max(5000, 5 × cohortQueryTimeoutMs)`, so a deployment on slow links widens both the peer
+	 * budget and the pass that spends it with one setting, and an unconfigured node keeps the
+	 * historical 5000 ms.
+	 *
+	 * NOTE: no coupling assertion accompanies this, unlike `assertSuperMajorityCoupling`. This member
+	 * and `CoordinatorRepo` each call `reconcilePassTimeoutMs` on the `cohortQueryTimeoutMs` they read
+	 * from their own config, and on a live node both read the ONE `resolveClusterPolicy` result
+	 * (`libp2p-node-base.ts`'s `consensusConfig`) — one derivation function on one input cannot
+	 * produce two numbers, so an assertion here would assert an identity. What would re-open the drift
+	 * is a change that gives either side its own default or its own field; that is the point at which
+	 * an assertion becomes worth adding.
+	 */
+	private readonly reconcileTimeoutMs: number;
 
 	constructor(
 		private readonly storageRepo: IRepo,
@@ -457,6 +470,10 @@ export class ClusterMember implements ICluster {
 		this.assumedClusterSize = consensusConfig?.assumedClusterSize;
 		this.allowUnvalidatedSmallCluster = consensusConfig?.allowUnvalidatedSmallCluster ?? false;
 		this.unvalidatablePendPolicy = consensusConfig?.unvalidatablePendPolicy ?? 'accept';
+		// Derived from the per-peer budget, not declared: one function on one input, which is why this
+		// needs no `assertSuperMajorityCoupling`-style check against the coordinator's copy — see the
+		// field's doc for what would re-open the drift.
+		this.reconcileTimeoutMs = reconcilePassTimeoutMs(resolveCohortQueryTimeoutMs(consensusConfig?.cohortQueryTimeoutMs));
 		// State the resolved gate parameters once, so an operator diagnosing a membership rejection can see
 		// what this node actually resolved. A fact, not a warning: `assumedClusterSize < clusterSize` is the
 		// normal default state, so warning on it would fire for every node and be ignored.
@@ -2904,8 +2921,8 @@ export class ClusterMember implements ICluster {
 		let timer: NodeJS.Timeout | undefined;
 		const timeout = new Promise<never>((_, reject) => {
 			timer = setTimeout(
-				() => reject(new Error(`reconcile for block ${blockId} timed out after ${ReconcileTimeoutMs}ms`)),
-				ReconcileTimeoutMs
+				() => reject(new Error(`reconcile for block ${blockId} timed out after ${this.reconcileTimeoutMs}ms`)),
+				this.reconcileTimeoutMs
 			);
 			timer.unref();
 		});

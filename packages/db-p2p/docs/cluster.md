@@ -956,6 +956,7 @@ interface ClusterConsensusConfig {
   clusterSize?: number;               // Replication factor / target cohort breadth (default 10)
   assumedClusterSize?: number;        // Smallest cohort the operator asserts exists (admission gate; default 2 via libp2p-node-base)
   membershipAdmissionFraction?: number; // Default 0.75 — fraction of the size reference a declared set must meet
+  cohortQueryTimeoutMs?: number;      // Default 1000ms — one cohort peer's budget for one read-path request
 }
 ```
 
@@ -1083,6 +1084,41 @@ deployments end up either refusing writes or trusting a lone peer:
   availability**, since each node applies its own floor to the pends it is asked to admit. Its honest
   value trades write availability under low confidence against defence from a partition-induced
   downsize. The two separate fields give a host that choice; the library does not make it.
+
+**`cohortQueryTimeoutMs` — how long one cohort peer gets to answer.** The other `clusterPolicy` field
+that a small or slow deployment is likely to need, and the only one here that is a duration rather
+than a size. It bounds ONE cohort peer answering ONE read-path request, and it sets **both** per-peer
+deadlines on that path:
+
+- the latest-revision consult (`queryClusterForLatest` in
+  `packages/db-p2p/src/repo/coordinator-repo.ts`), where a miss puts the peer in the `silent` set, and
+- the archive fetch the acquisition runs (`fetchArchiveFromPeer` in
+  `packages/db-p2p/src/libp2p-node-base.ts`), where a miss resolves to "that peer holds nothing" and
+  the pass moves on.
+
+One field for both is deliberate: they are the same kind of round trip, to the same peer, over the
+same protocol, so a separate setting for each would only let one be raised while the other still
+expired. The whole-pass bound is **derived** from it rather than declared —
+`reconcilePassTimeoutMs(cohortQueryTimeoutMs)` = `max(5000, 5 × cohortQueryTimeoutMs)` — and both
+callers of that bound derive it the same way from the same input: the read path's acquisition
+(`CoordinatorRepo.restoreCorroborated`) and the commit path's reconcile
+(`ClusterMember.withReconcileTimeout`). So an unconfigured node keeps the shipped 1000 ms / 5000 ms
+pair exactly, and a deployment that raises the per-peer budget widens the pass that spends it instead
+of having a slow pass cut short under it.
+
+Raise it when the link is slower than a LAN. Every one of these requests is a fresh stream — dial or
+reuse the connection, select the sync protocol, send, receive — so a relayed link whose round trip is
+near 1.8 s cannot finish one inside a second: every honest answer arrives late and counts as silence.
+In a two-member cohort one late answer is the whole quorum, so the consult declines on every read and
+a machine that re-attaches after being away never catches up. The symptom in the logs is steady
+`cluster-fetch:peers-silent` against peers that are healthy and answering everything else.
+
+Unlike the size fields above, a declared value that is not a positive finite number **throws** at node
+construction rather than falling through to the default. The size fields have a safe fall-through (the
+strict `clusterSize` default); a timeout has none — falling back to 1000 would silently keep the LAN
+default on the one deployment that typed this field in order to escape it. Fractional values are
+accepted: it is a millisecond duration, not a count of peers. Like the sizes, it is read once at node
+construction — see *Changing a size after the node is running* below, which applies to it verbatim.
 
 **Changing a size after the node is running.** Both yardsticks are resolved **once**, by
 `resolveClusterPolicy` at node construction, and every consumer — the cluster member, the coordinator,

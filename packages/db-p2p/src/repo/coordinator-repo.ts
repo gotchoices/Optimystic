@@ -10,8 +10,7 @@ import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocation, CORROBORATION_FLOOR, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
 import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAnchoring } from "../cluster/certified-claims.js";
-import { DEFAULT_CLUSTER_SIZE, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
-import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
+import { DEFAULT_CLUSTER_SIZE, reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
 import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, type ICommitProofPersister, type IRevisionActionReader, type IPendingClaimReader } from "../storage/storage-repo.js";
 import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
@@ -32,9 +31,6 @@ import { StuckReservationTracker } from "./stuck-reservation.js";
  * is what keeps read-repair from being a weaker trust path than reconcile.
  */
 export type AcquireBlockCallback = ReconcileBlockCallback;
-
-/** How long one cohort peer gets to answer the latest-revision consult before it counts as silent. */
-const LATEST_QUERY_TIMEOUT_MS = 1000;
 
 /** True when a freshly-read local revision is strictly ahead of the baseline the repair started from. */
 function isAdvanceOver(rev: number | undefined, baselineRev: number | undefined): boolean {
@@ -526,6 +522,20 @@ export class CoordinatorRepo implements IRepo {
 	 * caller that has adopted neither field keeps today's behavior exactly.
 	 */
 	private readonly repairCorroborationClusterSize: number;
+	/**
+	 * How long ONE cohort peer gets to answer the latest-revision consult before it counts as silent,
+	 * in milliseconds. Resolved by `resolveClusterPolicy` for a real node; a direct constructor that
+	 * declares nothing gets the same default through the same shared resolver
+	 * (`resolveCohortQueryTimeoutMs`, `cluster/cluster-policy.ts`), so the two paths cannot default
+	 * differently.
+	 */
+	private readonly cohortQueryTimeoutMs: number;
+	/**
+	 * Whole-pass bound for one read-path acquisition, in milliseconds, derived from
+	 * {@link cohortQueryTimeoutMs} by `reconcilePassTimeoutMs`. The commit path's reconcile
+	 * (`ClusterMember.withReconcileTimeout`) derives the same number from the same input.
+	 */
+	private readonly reconcilePassTimeoutMs: number;
 	/** Resolved super-majority threshold the coordinator commits on (mirrors the value handed to ClusterCoordinator). */
 	private readonly superMajorityThreshold: number;
 	private readonly reputation?: IPeerReputation;
@@ -575,6 +585,10 @@ export class CoordinatorRepo implements IRepo {
 			readRepairMode: cfg?.readRepairMode ?? 'lazy',
 			readRepairWindowMs: cfg?.readRepairWindowMs ?? 10000,
 			readRepairSampleRate: cfg?.readRepairSampleRate ?? 0,
+			// Through the shared resolver, not a second literal: a hand-wired coordinator and a node
+			// assembly given the same operator number must bound their per-peer reads identically, and
+			// a degenerate declaration must fail here exactly as it fails at node construction.
+			cohortQueryTimeoutMs: resolveCohortQueryTimeoutMs(cfg?.cohortQueryTimeoutMs),
 			// Default false: an undersized cluster with no confident network-size estimate
 			// is REJECTED (fail closed). Callers only opt in for single-node/local/test meshes.
 			allowUnvalidatedSmallCluster: cfg?.allowUnvalidatedSmallCluster ?? false
@@ -582,6 +596,8 @@ export class CoordinatorRepo implements IRepo {
 		this.readRepairMode = policy.readRepairMode!;
 		this.readRepairWindowMs = policy.readRepairWindowMs!;
 		this.readRepairSampleRate = policy.readRepairSampleRate!;
+		this.cohortQueryTimeoutMs = policy.cohortQueryTimeoutMs!;
+		this.reconcilePassTimeoutMs = reconcilePassTimeoutMs(this.cohortQueryTimeoutMs);
 		this.simpleMajorityThreshold = policy.simpleMajorityThreshold;
 		this.superMajorityThreshold = policy.superMajorityThreshold;
 		// Unlike the membership admission gate (which treats an absent assumedClusterSize as "unknown"
@@ -1433,13 +1449,16 @@ export class CoordinatorRepo implements IRepo {
 			// acquires and releases it around the promotion above, and nothing wraps this method).
 			// NOTE: `get` walks its block ids sequentially, so the bound is per block, not per call — a
 			// multi-block read that is missing N blocks against a wholly stalled cohort waits N × this.
-			// Acceptable today (the underlying per-peer archive fetch is itself 1s-bounded and runs the
-			// cohort in parallel, so the 5s is a stall ceiling, not a typical cost). If a cold reader
-			// batching a wide read ever times out above this layer, repair the block ids concurrently
-			// rather than shortening the bound.
+			// Acceptable today, and the reason survives the bound becoming configurable: the underlying
+			// per-peer archive fetch is bounded by `cohortQueryTimeoutMs` and runs the cohort in
+			// parallel, while this pass bound is `max(5000, 5 × cohortQueryTimeoutMs)` — so the pass
+			// stays several per-peer budgets wide at every setting, and remains a stall ceiling rather
+			// than a typical cost. Preserving that ratio is exactly what the `max` in
+			// `reconcilePassTimeoutMs` is for. If a cold reader batching a wide read ever times out
+			// above this layer, repair the block ids concurrently rather than shortening the bound.
 			await withDeadline(
 				this.acquireBlockFromCohort(blockId, corroborated, cohortPeerIds),
-				RECONCILE_TIMEOUT_MS,
+				this.reconcilePassTimeoutMs,
 				`block acquisition for ${blockId}`
 			);
 		} catch (err) {
@@ -1519,17 +1538,19 @@ export class CoordinatorRepo implements IRepo {
 		// raced-to-undefined: a peer that blows the deadline lands in the silent set below exactly
 		// like a dial failure, because a slow peer and a peer claiming "I hold nothing" must produce
 		// different answers (ticket cluster-read-consult-cannot-report-unreachable).
-		// NOTE: LATEST_QUERY_TIMEOUT_MS is a LAN-shaped budget. A cohort whose round trip honestly
-		// exceeds it now reads as permanently silent, which is safe (the read is flagged, not
-		// mis-reported) but makes every miss cost a transactor-level retry. If a WAN deployment shows
-		// steady `cluster-fetch:peers-silent` against healthy peers, raise this rather than softening
-		// the deadline back into an absent claim.
+		// NOTE: the deadline defaults to a LAN-shaped budget (1s). A cohort whose round trip honestly
+		// exceeds it reads as permanently silent, which is safe (the read is flagged, not
+		// mis-reported) but makes every miss cost a transactor-level retry, and in a two-member cohort
+		// one late answer is the whole quorum. If a deployment shows steady
+		// `cluster-fetch:peers-silent` against peers that are healthy and answering everything else,
+		// raise `clusterPolicy.cohortQueryTimeoutMs` rather than softening the deadline back into an
+		// absent claim.
 		const latestResults = await Promise.allSettled(
 			peerIds.map(async peerIdStr => {
 				const peerId = peerIdFromString(peerIdStr);
 				return await withDeadline(
 					this.clusterLatestCallback!(peerId, blockId, context),
-					LATEST_QUERY_TIMEOUT_MS,
+					this.cohortQueryTimeoutMs,
 					`latest query to ${peerIdStr}`
 				);
 			})

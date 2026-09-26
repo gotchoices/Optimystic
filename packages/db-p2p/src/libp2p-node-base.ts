@@ -1015,10 +1015,14 @@ export async function createLibp2pNodeBase(
 		const partitionDetector = new PartitionDetector();
 		const fretSvc = (node as any).services?.fret as FretService | undefined;
 
-		// Fetch a block archive from one cohort peer over the sync protocol, bounded by a
-		// per-peer timeout so an unreachable peer can't stall reconciliation. Mirrors the
-		// SyncClient query in `clusterLatestCallback`, but returns the full archive (which
+		// Fetch a block archive from one cohort peer over the sync protocol, bounded by the same
+		// per-peer deadline the latest-revision consult uses (`consensusConfig.cohortQueryTimeoutMs`,
+		// read off the one resolved policy above) so an unreachable peer can't stall reconciliation.
+		// Mirrors the SyncClient query in `clusterLatestCallback`, but returns the full archive (which
 		// carries the materialized block) rather than only the latest ActionRev.
+		//
+		// A timed-out fetch resolves to "no archive", exactly as a peer that holds nothing does — the
+		// pass moves on to the next peer. Only the number is configurable; the contract is unchanged.
 		const fetchArchiveFromPeer = async (peerIdStr: string, blockId: BlockId): Promise<BlockArchive | undefined> => {
 			let peerId: ReturnType<typeof peerIdFromString>;
 			try {
@@ -1031,7 +1035,9 @@ export async function createLibp2pNodeBase(
 			try {
 				const response = await Promise.race<SyncResponse>([
 					syncClient.requestBlock({ blockId, rev: undefined }),
-					new Promise<SyncResponse>(resolve => { setTimeout(() => resolve({ success: false }), 1000).unref(); })
+					new Promise<SyncResponse>(resolve => {
+						setTimeout(() => resolve({ success: false }), consensusConfig.cohortQueryTimeoutMs).unref();
+					})
 				]);
 				return response.success ? response.archive : undefined;
 			} catch {

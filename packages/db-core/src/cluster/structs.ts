@@ -201,6 +201,20 @@ export type ClusterRecord = {
  */
 export const DEFAULT_SUPER_MAJORITY_THRESHOLD = 0.75;
 
+/**
+ * Single source of truth for the default per-peer cohort read deadline, in milliseconds — how long
+ * one cohort peer gets to answer one read-path request (the latest-revision query, and the archive
+ * fetch that follows it). Placed beside {@link DEFAULT_SUPER_MAJORITY_THRESHOLD} for the same
+ * reason: every tier that falls back to a default references THIS constant, so the coordinator and
+ * the node's archive fetch cannot silently default differently.
+ *
+ * 1000 = 1s: the value both deadlines were hardcoded at, so a node that declares nothing behaves
+ * exactly as before. It is a LAN-shaped budget — a relayed link whose round trip is near 1.8s
+ * cannot finish a fresh stream inside it, which is what
+ * {@link ClusterConsensusConfig.cohortQueryTimeoutMs} exists to raise.
+ */
+export const DEFAULT_COHORT_QUERY_TIMEOUT_MS = 1000;
+
 export interface ClusterConsensusConfig {
 	/** Super-majority threshold for promises (default {@link DEFAULT_SUPER_MAJORITY_THRESHOLD} = 0.75 = 3/4) */
 	superMajorityThreshold: number;
@@ -281,6 +295,29 @@ export interface ClusterConsensusConfig {
 	readRepairWindowMs?: number;
 	/** Per-read probability of triggering read-repair in 'lazy' mode even within the window (0..1). Default 0 (no random check). */
 	readRepairSampleRate?: number;
+	/**
+	 * How long ONE cohort peer gets to answer ONE read-path request, in milliseconds (default
+	 * {@link DEFAULT_COHORT_QUERY_TIMEOUT_MS} = 1000). It sets BOTH per-peer deadlines on the read
+	 * path — the latest-revision query (`CoordinatorRepo.queryClusterForLatest`) and the archive
+	 * fetch the acquisition runs (`fetchArchiveFromPeer` in `libp2p-node-base.ts`) — because they
+	 * are the same kind of round trip to the same peer over the same protocol, and raising one while
+	 * the other still expires would fix nothing.
+	 *
+	 * Raise it for a deployment whose links are slower than a LAN: two phones reaching each other
+	 * only through a public circuit relay have a round trip near 1.8s, and every fresh stream (dial
+	 * or reuse, protocol select, send, receive) must fit inside this budget or the peer counts as
+	 * silent. In a two-member cohort one late answer is the whole quorum, so the consult declines
+	 * every time and a rejoining node never catches up.
+	 *
+	 * Fractional values are accepted — this is a duration, not a count of peers. A value that is not
+	 * a finite number, or is at or below zero, is a configuration error and throws at node
+	 * construction rather than silently falling back to the default (see `resolveCohortQueryTimeoutMs`
+	 * in db-p2p's `cluster/cluster-policy.ts`).
+	 *
+	 * The whole-pass reconcile bound is derived from this rather than declared separately; see
+	 * `reconcilePassTimeoutMs` in the same module.
+	 */
+	cohortQueryTimeoutMs?: number;
 	/**
 	 * When FRET has no confident network-size estimate, allow an undersized cluster
 	 * (peerCount < minAbsoluteClusterSize) to proceed anyway. Default false: with no

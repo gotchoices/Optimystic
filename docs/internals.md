@@ -1642,8 +1642,15 @@ saveMaterializedBlock(block): store(structuredClone(block));
   No rev quorum, or no content quorum →
   it leaves the block for a later churn/rebalance retry (logged
   `reconcile:no-rev-quorum` / `reconcile:no-content-quorum`). Reconciliation is
-  best-effort and bounded (`ReconcileTimeoutMs`, the shared `RECONCILE_TIMEOUT_MS` the read
-  path's acquisition also uses — same operation, same bound):
+  best-effort and bounded by a **derived** pass bound — `reconcilePassTimeoutMs` in
+  `packages/db-p2p/src/cluster/cluster-policy.ts`, which is `max(RECONCILE_TIMEOUT_MS,
+  5 × clusterPolicy.cohortQueryTimeoutMs)`. The read path's acquisition
+  (`CoordinatorRepo.restoreCorroborated`) derives the same number from the same input, so the two
+  remain on one bound without a coupling assertion: same operation, same bound. `RECONCILE_TIMEOUT_MS`
+  is now that derivation's floor rather than the bound itself, which is what keeps an unconfigured
+  node at the historical 5000 ms while a deployment on slow links widens the pass along with the
+  per-peer budget it spends (see
+  [transactions.md §Read Consistency and Staleness](transactions.md#read-consistency-and-staleness)):
   failures/timeouts are logged (`cluster-member:consensus-commit-reconcile-failed`),
   never thrown. A pass that ran to completion logs
   `cluster-member:consensus-commit-reconcile-attempted` — deliberately *attempted*, since the

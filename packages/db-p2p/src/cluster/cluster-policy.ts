@@ -1,6 +1,10 @@
-import { DEFAULT_SUPER_MAJORITY_THRESHOLD, type ClusterConsensusConfig, type UnvalidatablePendPolicy } from "@optimystic/db-core";
+import { DEFAULT_COHORT_QUERY_TIMEOUT_MS, DEFAULT_SUPER_MAJORITY_THRESHOLD, type ClusterConsensusConfig, type UnvalidatablePendPolicy } from "@optimystic/db-core";
 import { createLogger } from "../logger.js";
 import { CORROBORATION_FLOOR } from "./quorum-restore.js";
+// Importing the constant (a value, not a type) from `reconcile-block.ts` adds no runtime cycle: its
+// only edge back toward this subtree is a clause-level `import type`, which is erased — see
+// docs/internals.md "Importing a Barrel That Re-exports You" for why that distinction matters.
+import { RECONCILE_TIMEOUT_MS } from "./reconcile-block.js";
 
 const log = createLogger('cluster-policy');
 
@@ -155,6 +159,19 @@ export interface ClusterPolicyOptions {
 		 * see {@link UnvalidatablePendPolicy}.
 		 */
 		unvalidatablePendPolicy?: UnvalidatablePendPolicy;
+		/**
+		 * How long ONE cohort peer gets to answer ONE read-path request, in milliseconds (default
+		 * {@link DEFAULT_COHORT_QUERY_TIMEOUT_MS} = 1000). Raise it for links slower than a LAN —
+		 * relayed phone-to-phone deployments, where a fresh stream cannot complete inside a second and
+		 * every peer therefore reads as silent. See {@link ClusterConsensusConfig.cohortQueryTimeoutMs}
+		 * for which two deadlines it sets and why they share one field, and
+		 * {@link reconcilePassTimeoutMs} for the whole-pass bound derived from it.
+		 *
+		 * A value that is not a positive finite number throws at node construction — see
+		 * {@link resolveCohortQueryTimeoutMs} for why this one does not fall through the way the size
+		 * fields do.
+		 */
+		cohortQueryTimeoutMs?: number;
 	};
 }
 
@@ -172,6 +189,22 @@ export type ResolvedClusterPolicy = ClusterConsensusConfig & {
 	 * operator field. See the module doc.
 	 */
 	repairCorroborationClusterSize: number;
+	/**
+	 * Per-peer read-path deadline, in milliseconds — see
+	 * {@link ClusterConsensusConfig.cohortQueryTimeoutMs}. Narrowed to a concrete number here the way
+	 * {@link clusterSize} and {@link repairCorroborationClusterSize} are, so the resolution is
+	 * directly assertable and `libp2p-node-base` can thread it into `fetchArchiveFromPeer` off the one
+	 * resolved policy object.
+	 */
+	cohortQueryTimeoutMs: number;
+	/**
+	 * Whole-pass bound for one reconcile / read-path acquisition, in milliseconds, derived from
+	 * {@link cohortQueryTimeoutMs} — see {@link reconcilePassTimeoutMs}. Both callers
+	 * (`ClusterMember.withReconcileTimeout` on the commit path, `CoordinatorRepo.restoreCorroborated`
+	 * on the read path) derive it the same way from the same input, which is what keeps them on one
+	 * number without a coupling assertion.
+	 */
+	reconcilePassTimeoutMs: number;
 };
 
 /**
@@ -224,6 +257,58 @@ export function resolveRepairCorroborationClusterSize(
 }
 
 /**
+ * The per-peer read-path deadline, in milliseconds: the declared
+ * `clusterPolicy.cohortQueryTimeoutMs`, else {@link DEFAULT_COHORT_QUERY_TIMEOUT_MS}.
+ *
+ * Exported for the same reason as {@link resolveRepairCorroborationClusterSize}: there is more than
+ * one composition path onto this number — {@link resolveClusterPolicy} (what `createLibp2pNodeBase`
+ * runs), the `CoordinatorRepo` constructor (the readme's manual wiring), and `ClusterMember` — and a
+ * node, a hand-wired coordinator and a member given the same operator number must land on the same
+ * deadline. One function rather than three copies, so they cannot drift.
+ *
+ * NOTE: a declared value that is not a positive finite number THROWS, rather than falling through to
+ * the default the way a degenerate cohort size does ({@link asDeclaredSize}). The two differ because
+ * there is no safe direction to fall toward here. For a cohort SIZE, falling through lands on the
+ * strict `clusterSize` default and clamping would be the unsafe direction, so a nonsense declaration
+ * has a safe reading. For a TIMEOUT there is none: falling through to 1000 would silently keep the
+ * LAN default on the deployment that typed the field precisely in order to escape it — the exact
+ * failure this field exists to end. Fail fast at node construction instead, matching
+ * `assertSuperMajorityCoupling` in `cluster/supermajority-coupling.ts`.
+ *
+ * A positive finite FRACTIONAL value is accepted: this is a millisecond duration and `setTimeout`
+ * takes one. Do not add `Number.isInteger` here — that check belongs to the size fields, which count
+ * peers.
+ */
+export function resolveCohortQueryTimeoutMs(declared: number | undefined): number {
+	if (declared === undefined) return DEFAULT_COHORT_QUERY_TIMEOUT_MS;
+	if (!Number.isFinite(declared) || declared <= 0) {
+		throw new Error(
+			`clusterPolicy.cohortQueryTimeoutMs must be a positive finite number of milliseconds; got ${String(declared)}`
+		);
+	}
+	return declared;
+}
+
+/**
+ * The whole-pass bound for one reconcile / read-path acquisition, in milliseconds, derived from the
+ * per-peer deadline: `max(RECONCILE_TIMEOUT_MS, 5 x cohortQueryTimeoutMs)`.
+ *
+ * The `max` keeps the historical 5000 ms as a floor, so a node that declares nothing — or declares a
+ * per-peer budget smaller than the default — behaves exactly as before. The multiple is what makes
+ * the bound grow with the per-peer budget instead of cutting a slow pass short: a pass runs the
+ * cohort in parallel but each peer's fetch is bounded by the per-peer number, so a whole pass worth
+ * several of them is the same ratio the shipped pair (1000 / 5000) already expressed.
+ *
+ * Both callers derive it here rather than each holding a bound of its own — the read path's
+ * acquisition (`CoordinatorRepo.restoreCorroborated`) and the commit path's reconcile
+ * (`ClusterMember.withReconcileTimeout`). They shared one constant on purpose ("same operation, same
+ * bound", docs/internals.md) and must not drift apart.
+ */
+export function reconcilePassTimeoutMs(cohortQueryTimeoutMs: number): number {
+	return Math.max(RECONCILE_TIMEOUT_MS, 5 * cohortQueryTimeoutMs);
+}
+
+/**
  * Apply every cluster-policy default a node needs. Same options in, same numbers out, so the
  * composition root's behavior is unit-testable (`test/cluster-policy.spec.ts`). Its one side effect
  * is the `repair-fault-tolerance` advisory below, which lives here because this is the only place
@@ -251,6 +336,10 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 	const clusterSize = options.clusterSize ?? DEFAULT_CLUSTER_SIZE;
 	const repairCorroborationClusterSize =
 		resolveRepairCorroborationClusterSize(declaredRepairSize, declaredCohortSize, clusterSize);
+	// Throws on a degenerate declaration rather than falling through — see the `NOTE:` on
+	// `resolveCohortQueryTimeoutMs`. Resolved before the advisory below so a misconfigured node fails
+	// at construction instead of emitting an advisory it will never act on.
+	const cohortQueryTimeoutMs = resolveCohortQueryTimeoutMs(options.clusterPolicy?.cohortQueryTimeoutMs);
 
 	// ## What the advisory actually claims, and why the trigger is what it is
 	//
@@ -450,6 +539,11 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 		// `assumedClusterSize`, else strict — the replication factor — so an unconfigured node cannot
 		// have its floor talked down to a single voter by a shrunken cohort view. A genuinely small
 		// mesh declares its size (any of the three) to regain self-repair.
-		repairCorroborationClusterSize
+		repairCorroborationClusterSize,
+		// Per-peer read-path deadline, and the whole-pass bound derived from it. One declared number
+		// sets both, so the latest-revision query, the archive fetch and the pass that runs them
+		// cannot be raised independently of one another.
+		cohortQueryTimeoutMs,
+		reconcilePassTimeoutMs: reconcilePassTimeoutMs(cohortQueryTimeoutMs)
 	};
 }

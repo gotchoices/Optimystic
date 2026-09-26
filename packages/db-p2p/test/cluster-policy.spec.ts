@@ -16,7 +16,7 @@
 
 import { expect } from 'chai';
 import { DEFAULT_SUPER_MAJORITY_THRESHOLD } from '@optimystic/db-core';
-import { minAbsoluteClusterSize, resolveClusterPolicy, resolveRepairCorroborationClusterSize } from '../src/cluster/cluster-policy.js';
+import { minAbsoluteClusterSize, reconcilePassTimeoutMs, resolveClusterPolicy, resolveCohortQueryTimeoutMs, resolveRepairCorroborationClusterSize } from '../src/cluster/cluster-policy.js';
 import { captureLog, hasTag } from './support/capture-log.js';
 
 describe('resolveClusterPolicy', () => {
@@ -45,6 +45,70 @@ describe('resolveClusterPolicy', () => {
 			// Fails closed: an undersized cluster with no confident network-size estimate is rejected.
 			expect(policy.allowUnvalidatedSmallCluster).to.equal(false);
 			expect(policy.partitionDetectionWindow).to.equal(60000);
+			// The read-path deadlines an unconfigured node runs on, unchanged from when both were
+			// hardcoded: one second per cohort peer, five seconds for the whole reconcile pass.
+			expect(policy.cohortQueryTimeoutMs).to.equal(1000);
+			expect(policy.reconcilePassTimeoutMs).to.equal(5000);
+		});
+	});
+
+	/**
+	 * Ticket: cohort-read-deadlines-are-fixed-at-lan-speeds.
+	 *
+	 * The per-peer read deadline used to be a hardcoded 1000 ms, which a relayed link (round trip
+	 * near 1.8s) can never meet — so every cohort peer read as silent and a rejoining node could
+	 * never catch up. It is one operator field now, and the whole-pass bound is derived from it
+	 * rather than declared separately, so the two cannot be raised out of step.
+	 */
+	describe('the cohort read deadlines', () => {
+		it('raises the pass bound along with the per-peer budget', () => {
+			const policy = resolveClusterPolicy({ clusterPolicy: { cohortQueryTimeoutMs: 3000 } });
+
+			expect(policy.cohortQueryTimeoutMs).to.equal(3000);
+			expect(policy.reconcilePassTimeoutMs, 'five per-peer budgets wide').to.equal(15000);
+		});
+
+		it('keeps the pass bound at its 5000 ms floor for a per-peer budget below the default', () => {
+			// The `max` is what makes an unconfigured node — and one that only ever TIGHTENS the
+			// per-peer budget — behave exactly as the shipped pair did.
+			const policy = resolveClusterPolicy({ clusterPolicy: { cohortQueryTimeoutMs: 100 } });
+
+			expect(policy.cohortQueryTimeoutMs).to.equal(100);
+			expect(policy.reconcilePassTimeoutMs).to.equal(5000);
+		});
+
+		it('accepts a fractional duration — it is milliseconds, not a count of peers', () => {
+			expect(resolveCohortQueryTimeoutMs(1500.5)).to.equal(1500.5);
+		});
+
+		/**
+		 * Unlike a degenerate cohort SIZE, which falls through to the strict default, a degenerate
+		 * duration throws. There is no safe direction to fall toward: falling through to 1000 would
+		 * silently keep the LAN default on the one deployment that typed this field in order to
+		 * escape it.
+		 */
+		for (const [label, value] of [
+			['zero', 0],
+			['negative', -1],
+			['NaN', Number.NaN],
+			['Infinity', Number.POSITIVE_INFINITY]
+		] as [string, number][]) {
+			it(`throws on a ${label} cohortQueryTimeoutMs rather than falling back to the default`, () => {
+				expect(() => resolveClusterPolicy({ clusterPolicy: { cohortQueryTimeoutMs: value } }))
+					.to.throw(/cohortQueryTimeoutMs/);
+			});
+		}
+
+		it('derives the pass bound the same way for every caller', () => {
+			// `ClusterMember` and `CoordinatorRepo` each call this on the `cohortQueryTimeoutMs` they
+			// read from their own config; on a live node both read this one resolved object. One
+			// function on one input is what stands in for a coupling assertion.
+			for (const declared of [undefined, 100, 1000, 3000, 1500.5]) {
+				const policy = resolveClusterPolicy({ clusterPolicy: { cohortQueryTimeoutMs: declared } });
+
+				expect(reconcilePassTimeoutMs(policy.cohortQueryTimeoutMs), `declared ${String(declared)}`)
+					.to.equal(policy.reconcilePassTimeoutMs);
+			}
 		});
 	});
 

@@ -19,10 +19,17 @@ import { createLogger } from '../logger.js';
 const log = createLogger('reconcile-block');
 
 /**
- * Wall-clock bound on one whole reconcile pass (all cohort peers, both quorums, the persist).
- * Shared by both callers so a slow or unreachable cohort peer stalls neither the commit path
- * (`ClusterMember.withReconcileTimeout` — a stall there holds up consensus execution) nor the read
- * path (`CoordinatorRepo.restoreCorroborated` — a stall there holds up a caller's `get`).
+ * FLOOR on the wall-clock bound for one whole reconcile pass (all cohort peers, both quorums, the
+ * persist) — and the whole bound for a node that declares nothing, which is what keeps the shipped
+ * default at 5000 ms.
+ *
+ * It is no longer the bound itself. Both callers derive theirs by
+ * `reconcilePassTimeoutMs(cohortQueryTimeoutMs)` (`cluster/cluster-policy.ts`) =
+ * `max(this, 5 × the per-peer deadline)`, so a deployment on slow links widens the pass along with
+ * the per-peer budget instead of having a slow pass cut short. They derive it identically from one
+ * input, which is what keeps the commit path (`ClusterMember.withReconcileTimeout` — a stall there
+ * holds up consensus execution) and the read path (`CoordinatorRepo.restoreCorroborated` — a stall
+ * there holds up a caller's `get`) on the same number: same operation, same bound.
  */
 export const RECONCILE_TIMEOUT_MS = 5000;
 
