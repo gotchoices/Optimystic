@@ -28,6 +28,7 @@ import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink,
 import { createReconcileBlock } from './cluster/reconcile-block.js';
 import { resolveClusterPolicy, type ClusterPolicyOptions } from './cluster/cluster-policy.js';
 import { assertClusterSizeCoupling } from './cluster/cluster-size-coupling.js';
+import type { Libp2pConnectionTimeouts } from './connection-monitor.js';
 import { createCommitCertStore, makeClusterCommitCertExtractor, type CommitCertStore } from './cluster/commit-cert.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
@@ -477,6 +478,27 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * one in the readme's React Native section on that move.
 	 */
 	connectionMonitor?: ConnectionMonitorInit;
+
+	/**
+	 * Optional connection-manager deadlines, passed to libp2p unchanged:
+	 *
+	 * - `dialTimeout` — how long an outbound dial may take, socket through upgrade, when the caller
+	 *   passes no abort signal of its own. Unset → libp2p's default (10s).
+	 * - `inboundUpgradeTimeout` — how long an inbound connection may take to finish its upgrade
+	 *   (encryption + muxer) before this node discards it. Unset → 10s, this package's own value.
+	 *
+	 * Both default to 10s, and a relayed connection costs about eight one-way link delays to open,
+	 * so above roughly 1250ms one-way the defaults fail it. The dialer then abandons the dial; or,
+	 * when only the listener's limit is exceeded, the dialer's dial succeeds against a connection
+	 * the listener has already discarded, and every stream on it dies with `Unexpected EOF`. A
+	 * deployment that supports slow relayed links raises BOTH, on every node — each node is the
+	 * listener for someone.
+	 *
+	 * NOTE: this governs only dials that carry no signal. This package's own RPC clients dial with
+	 * their own shorter deadlines (`DEFAULT_DIAL_TIMEOUT_MS` in `rpc-deadline.ts`, the
+	 * `pushDialTimeoutMs` defaults), which this option does not raise.
+	 */
+	connectionManager?: Libp2pConnectionTimeouts;
 };
 
 /**
@@ -701,9 +723,10 @@ export async function createLibp2pNodeBase(
 			// version has no such keys — auto-dial is now default connection-manager behavior with no
 			// direct replacement — so they are dropped rather than re-cast. See review handoff.
 			maxConnections: 16,
-			// Renamed from the stale `inboundConnectionUpgradeTimeout`. 10_000 equals this version's
-			// default, so surfacing (and correcting) the key is behavior-preserving; the old key was a no-op.
-			inboundUpgradeTimeout: 10_000
+			// 10_000 equals libp2p's own default; kept explicit so the fallback does not move with libp2p.
+			inboundUpgradeTimeout: options.connectionManager?.inboundUpgradeTimeout ?? 10_000,
+			// Only when declared: an absent key is libp2p's "use my default".
+			...(options.connectionManager?.dialTimeout !== undefined ? { dialTimeout: options.connectionManager.dialTimeout } : {})
 		},
 		...(options.connectionGater ? { connectionGater: options.connectionGater } : {}),
 		transports,
