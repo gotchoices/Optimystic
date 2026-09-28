@@ -3,7 +3,7 @@ files:
   - packages/db-p2p/src/repo/coordinator-repo.ts (`fetchBlockFromCluster`'s solo-self exit, `cluster-fetch:solo-self-skip`)
   - packages/db-p2p/src/cluster/rebalance-monitor.ts (the cohort-growth push: `debounceMs` 5000, `minRebalanceIntervalMs` 60000)
   - packages/db-p2p/src/libp2p-key-network.ts (`findCluster`)
-source: sereus-ec, from sereus's re-attach measurements for optimystic #22 (sereus tickets/blocked/report-reattach-over-partial-replica-to-optimystic.md)
+source: sereus-ec, from sereus's re-attach measurements for optimystic #22 (sereus tickets/blocked/report-reattach-over-partial-replica-to-optimystic.md); related: gotchoices/sereus#18
 ----
 # Re-attaching over a partial replica reads "absent"
 
@@ -38,9 +38,14 @@ REATTACH_SYNC_MEASURE=1 REATTACH_ARMS=reattach-kept REATTACH_RUNS=3 DEBUG='optim
    itself, so its local emptiness is served as an authoritative absent. internals.md accepts this
    cost for a cold boot with an empty routing table (see the `'cohort-unreachable'` row note in
    "A block read has three answers"). The cost is worse here, because this node *did* have a cohort
-   member last session. The phone report on #22 (kjeib, 01:56Z) has the same shape: on two real phones
-   over relay.sereus.org, every read is `solo-self-skip`. That is being filed as its own GitHub issue
-   with traces.
+   member last session. The phone report on #22 (kjeib) has the same shape: on two real phones over
+   relay.sereus.org, every read is `solo-self-skip`. It is filed as gotchoices/sereus#18, with a
+   pure-Node repro: two relay-only nodes rebuilt over the same storage re-attach but never replicate
+   again. The primary cause there is on the sereus side: a cross-party strand learns its partner's
+   addresses only in memory, during the invitation, so after a restart each node's FRET ring holds
+   only itself. Sereus is adding a persisted address book for strands. That does not remove this
+   ticket's question. Until the redial finds the partner, a restarted node still answers reads from
+   its own partial store as final.
 3. **The `Missing block` case** is the same incomplete replica, hit one block further down: B holds
    the header, and the solo exit answers for the referenced block too.
 
@@ -58,4 +63,5 @@ REATTACH_SYNC_MEASURE=1 REATTACH_ARMS=reattach-kept REATTACH_RUNS=3 DEBUG='optim
 - Reproduce on the in-process or TCP mesh: two members, one joining after the commits and detaching
   inside the growth debounce, then restarting over the same storage.
 - Confirm or refute hypotheses 1 and 2 from the trace.
-- Output implement ticket(s). Coordinate with the kjeib phone issue once it is filed.
+- Output implement ticket(s). Keep the fix on our side (the self-only view after a restart) distinct
+  from sereus#18's address-book fix.
