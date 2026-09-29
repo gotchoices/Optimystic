@@ -2,14 +2,14 @@ description: A re-attaching peer catches up about twice as slowly from a partial
 files:
   - packages/db-p2p/src/repo/coordinator-repo.ts (read-repair: `queryClusterForLatest`, `cluster-fetch:certified-selected`, `cluster-fetch:local-current`)
   - packages/db-p2p/src/sync (the sync-service request to the reader)
-prereq: reattach-over-a-partial-replica-reads-absent
+prereq: a-peer-that-joins-soon-after-a-check-never-gets-a-copy, a-restarted-node-forgets-which-peers-serve-its-network
 source: sereus-ec, from sereus's re-attach measurements for optimystic #22 (sereus tickets/blocked/report-reattach-over-partial-replica-to-optimystic.md)
 ----
 # Catch-up from a stale replica is slower than from empty
 
 ## Report
 
-The setup is the same as in `reattach-over-a-partial-replica-reads-absent`, with 900 ms one-way
+The setup is the same as in the re-attach report now split into `a-peer-that-joins-soon-after-a-check-never-gets-a-copy` and `a-restarted-node-forgets-which-peers-serve-its-network`, with 900 ms one-way
 latency.
 
 | measure | from partial store (5 runs) | from empty store (7 runs) |

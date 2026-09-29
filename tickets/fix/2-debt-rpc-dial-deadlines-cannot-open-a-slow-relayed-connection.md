@@ -55,7 +55,8 @@ only, and `connectionManager.dialTimeout` is overridden by the caller's signal.
 - Stream negotiation on a reused connection needs its own bound, or none. Either stop forwarding the
   dial signal into `newStream` on the reuse path (the response deadline still bounds the request), or
   give negotiation a separate bound derived from the link round trip. Sereus is unblocked by either
-  this or the node-level knob above.
+  this or the node-level knob above, and prefers the knob: it lets sereus derive the deadline from
+  its declared link round trip.
 - Whether `clusterLatestCallback` should pass `cohortQueryTimeoutMs` down as the request's deadline, so
   the configured per-peer budget is the one that actually applies.
 
