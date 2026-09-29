@@ -10,6 +10,13 @@ files:
 tradeoffs: A read that skips the network check can return data that is up to one window stale if a change notification is lost, which weakens the "a live read sees the latest committed state" guarantee applications may rely on. The refresh-cost fix may already make the check cheap enough.
 prereq: refresh-of-an-unchanged-collection-refetches-the-same-blocks
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-09-29T21:44:12.952Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\4-feat-a-live-read-can-skip-a-refresh-the-cohort-already-told-it-about.plan.2026-09-29T21-44-12-952Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 # A live read could skip a refresh the cohort already told it about
 
 ## Context
