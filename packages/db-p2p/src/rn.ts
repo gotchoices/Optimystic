@@ -21,6 +21,7 @@ export * from './cluster/block-transfer.js';
 export * from './cluster/block-transfer-service.js';
 export * from './inbound-authorization.js';
 export * from './protocol-client.js';
+export * from './rpc-deadline.js';
 export * from './repo/client.js';
 export * from './repo/cluster-coordinator.js';
 export * from './repo/coordinator-repo.js';

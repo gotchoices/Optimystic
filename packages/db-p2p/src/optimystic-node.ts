@@ -3,6 +3,7 @@ import type { IBlockChangeNotifier, IRepo } from '@optimystic/db-core';
 import type { DisputeService } from './dispute/dispute-service.js';
 import type { Libp2pKeyPeerNetwork } from './libp2p-key-network.js';
 import type { PeerReputationService } from './reputation/peer-reputation.js';
+import type { LinkDeadlines } from './rpc-deadline.js';
 import type { StorageRepo } from './storage/storage-repo.js';
 
 /**
@@ -31,6 +32,13 @@ export interface OptimysticNodeAttachments {
 	disputeService?: DisputeService;
 	/** The node's libp2p Ed25519 identity key, for hosts binding a client-transaction signer. */
 	peerPrivateKey: PrivateKey;
+	/**
+	 * Every network deadline the node derived from `NodeOptions.linkRoundTripMs` (the undeclared
+	 * constants when it was not set). A host that dials through the node — a `NetworkTransactor`'s
+	 * `dialTimeoutMs` — reads its deadline here rather than restating one that ignores the
+	 * declaration.
+	 */
+	linkDeadlines: LinkDeadlines;
 }
 
 export type OptimysticNode = Libp2p & OptimysticNodeAttachments;

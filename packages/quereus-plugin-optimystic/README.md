@@ -208,6 +208,7 @@ The `register(db, config)` call accepts plugin-level defaults (consumed via the 
 | `default_transactor` | Default `transactor` when a table omits the option |
 | `default_key_network` | Default `keyNetwork` when a table omits the option |
 | `default_port`, `default_network_name` | libp2p defaults |
+| `link_round_trip_ms` | The slowest round trip, in milliseconds, between any two nodes that will talk to each other, relayed hops included. The node the plugin builds derives every network deadline from it, including the dial deadline of the plugin's own transactor; see `linkRoundTripMs` under *Slow relayed links* in [the db-p2p readme](../db-p2p/readme.md). Unset keeps the LAN deadlines. A table on a node the host registered takes the dial deadline from that node instead. Plugin-level only: it configures the node, which every table on one network and port shares. |
 | `rawStorageFactory` | `() => IRawStorage` — supplies the raw storage backing the `'local'` transactor. Defaults to in-memory `MemoryRawStorage`. Hosts can plug in persistent storage (e.g. RN/MMKV). Function-typed, so it can only be passed via `register()`, not in a `USING` clause. |
 
 ```typescript

@@ -320,9 +320,21 @@ function resolveBinding(
       port,
       networkName,
       bootstrapNodes: [],
+      linkRoundTripMs: declaredLinkRoundTripMs(aux),
     },
     rawStorageFactory,
   };
+}
+
+/**
+ * The plugin-level `link_round_trip_ms`, or `undefined` when unset. Anything else that is not a
+ * number throws: ignoring it would build the node on the LAN deadlines the setting exists to escape.
+ * The node itself refuses a number that is not a usable round trip.
+ */
+function declaredLinkRoundTripMs(aux: Readonly<Record<string, unknown>>): number | undefined {
+  const declared = aux['link_round_trip_ms'];
+  if (declared === undefined || typeof declared === 'number') return declared;
+  throw new Error(`link_round_trip_ms must be a number of milliseconds; got ${typeof declared} ${String(declared)}`);
 }
 
 /**

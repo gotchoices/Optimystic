@@ -1,6 +1,6 @@
 import type { PeerId, IPeerNetwork } from '@optimystic/db-core';
 import { ProtocolClient } from '../protocol-client.js';
-import { DEFAULT_DIAL_TIMEOUT_MS, withRpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
+import { withRpcDeadlineDefaults, type RpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { DisputeChallenge, DisputeResolution, ArbitrationVote, DisputeMessage } from './types.js';
 
@@ -11,13 +11,14 @@ import type { DisputeChallenge, DisputeResolution, ArbitrationVote, DisputeMessa
 export class DisputeClient extends ProtocolClient {
 	private readonly protocol: string;
 
-	constructor(peerId: PeerId, peerNetwork: IPeerNetwork, protocolPrefix?: string) {
-		super(peerId, peerNetwork);
+	constructor(peerId: PeerId, peerNetwork: IPeerNetwork, protocolPrefix?: string, rpcDeadlines?: RpcDeadlineDefaults) {
+		super(peerId, peerNetwork, rpcDeadlines);
 		this.protocol = (protocolPrefix ?? '/db-p2p') + '/dispute/1.0.0';
 	}
 
-	static create(peerId: PeerId, peerNetwork: IPeerNetwork, protocolPrefix?: string): DisputeClient {
-		return new DisputeClient(peerId, peerNetwork, protocolPrefix);
+	/** `rpcDeadlines` are the client's fallback deadlines — see {@link ProtocolClient}. */
+	static create(peerId: PeerId, peerNetwork: IPeerNetwork, protocolPrefix?: string, rpcDeadlines?: RpcDeadlineDefaults): DisputeClient {
+		return new DisputeClient(peerId, peerNetwork, protocolPrefix, rpcDeadlines);
 	}
 
 	/** Send a challenge to an arbitrator and get their vote */
@@ -26,7 +27,7 @@ export class DisputeClient extends ProtocolClient {
 		// Preserve the existing `timeoutMs`→`signal` contract callers rely on. Post the
 		// processMessage response-deadline work, this `signal` now tears down the
 		// *response read* (not merely the dial) — the desired "give up on a silent
-		// arbitrator" behavior. Also apply the default dial cap so a challenge to an
+		// arbitrator" behavior. Also apply the client's dial cap so a challenge to an
 		// unreachable arbitrator fails the dial fast even when no `timeoutMs` is given;
 		// this does not alter the response semantics (still bounded only by the signal).
 		//
@@ -40,7 +41,7 @@ export class DisputeClient extends ProtocolClient {
 			const response = await this.processMessage<{ type: 'vote'; vote: ArbitrationVote }>(
 				message,
 				this.protocol,
-				{ signal: controller?.signal, dialTimeoutMs: DEFAULT_DIAL_TIMEOUT_MS, maxDataLength: MAX_CONTROL_MESSAGE_BYTES }
+				{ signal: controller?.signal, dialTimeoutMs: this.rpcDeadlines.dialTimeoutMs, maxDataLength: MAX_CONTROL_MESSAGE_BYTES }
 			);
 			return response.vote;
 		} finally {
@@ -56,7 +57,7 @@ export class DisputeClient extends ProtocolClient {
 		await this.processMessage<{ type: 'ack' }>(
 			message,
 			this.protocol,
-			{ ...withRpcDeadlineDefaults(options), maxDataLength: MAX_CONTROL_MESSAGE_BYTES },
+			{ ...withRpcDeadlineDefaults(options, this.rpcDeadlines), maxDataLength: MAX_CONTROL_MESSAGE_BYTES },
 		);
 	}
 }

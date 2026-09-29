@@ -6,19 +6,19 @@ import { isClusterErrorEnvelope, clusterErrorFromEnvelope } from './cluster-erro
 import type { RedirectPayload } from '../repo/redirect.js';
 import { mergeRecordPeerAddresses } from '../peer-address-book.js';
 import { createLogger } from '../logger.js';
-import { withRpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
+import { withRpcDeadlineDefaults, type RpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 
 const log = createLogger('cluster-client');
 
 export class ClusterClient extends ProtocolClient implements ICluster {
-	private constructor(peerId: PeerId, peerNetwork: IPeerNetwork, readonly protocolPrefix?: string) {
-		super(peerId, peerNetwork);
+	private constructor(peerId: PeerId, peerNetwork: IPeerNetwork, readonly protocolPrefix?: string, rpcDeadlines?: RpcDeadlineDefaults) {
+		super(peerId, peerNetwork, rpcDeadlines);
 	}
 
-	/** Create a new client instance */
-	public static create(peerId: PeerId, peerNetwork: IPeerNetwork, protocolPrefix?: string): ClusterClient {
-		return new ClusterClient(peerId, peerNetwork, protocolPrefix);
+	/** Create a new client instance. `rpcDeadlines` are its fallback deadlines — see {@link ProtocolClient}. */
+	public static create(peerId: PeerId, peerNetwork: IPeerNetwork, protocolPrefix?: string, rpcDeadlines?: RpcDeadlineDefaults): ClusterClient {
+		return new ClusterClient(peerId, peerNetwork, protocolPrefix, rpcDeadlines);
 	}
 
 	async update(record: ClusterRecord, hop: number = 0, options?: RpcDeadlineOptions): Promise<ClusterRecord> {
@@ -34,7 +34,7 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 		// Apply the client-level dial/response deadline so a silent cluster peer
 		// can't hang the coordinator forever; an explicit caller override wins.
 		// Response is a ClusterRecord (peer set + signatures + small metadata) → control cap.
-		const response = await this.processMessage<unknown>(message, protocol, { ...withRpcDeadlineDefaults(options), maxDataLength: MAX_CONTROL_MESSAGE_BYTES });
+		const response = await this.processMessage<unknown>(message, protocol, { ...withRpcDeadlineDefaults(options, this.rpcDeadlines), maxDataLength: MAX_CONTROL_MESSAGE_BYTES });
 
 		// A member that threw inside `update` replies with a structured error
 		// envelope rather than aborting the stream; rethrow the server's real
@@ -62,7 +62,7 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 			// for it at all. Merging after the dial would help only some later hop.
 			this.peerNetwork.recordPeerAddresses?.(nextId, next.addrs ?? [])
 			this.recordCoordinatorForRecordIfSupported(record, nextId)
-			const nextClient = ClusterClient.create(nextId, this.peerNetwork, this.protocolPrefix)
+			const nextClient = ClusterClient.create(nextId, this.peerNetwork, this.protocolPrefix, this.rpcDeadlines)
 			// Thread the caller's *original* options through the redirect hop (the
 			// recursive call re-applies its own defaults) so the deadline survives a redirect.
 			return await nextClient.update(record, hop + 1, options)

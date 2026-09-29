@@ -7,6 +7,7 @@ import type { PartitionDetector } from './partition-detector.js'
 import type { ProofRetainingRepo } from '../storage/block-archive.js'
 import { pushBlockToPeers } from './block-transfer-service.js'
 import { createLogger } from '../logger.js'
+import { DEFAULT_DIAL_TIMEOUT_MS, DEFAULT_RESPONSE_TIMEOUT_MS } from '../rpc-deadline.js'
 
 const log = createLogger('spread-on-churn')
 
@@ -28,14 +29,16 @@ export interface SpreadOnChurnConfig {
 	/**
 	 * Per-target dial deadline (ms) for churn pushes. A target that never accepts
 	 * the connection fails fast instead of stalling the sequential spread pass.
-	 * Default: 3000 (matches the codebase's other dial caps).
+	 * Default: the node's RPC dial deadline, derived from `NodeOptions.linkRoundTripMs`
+	 * (3000 when that is undeclared, or when the monitor is built on its own).
 	 */
 	pushDialTimeoutMs: number
 	/**
 	 * Per-target response deadline (ms) for churn pushes. A target that dials OK but
 	 * never replies (connects, then goes silent) is given up on — the push throws
 	 * `ResponseTimeoutError`, is recorded as failed, and the loop continues to the
-	 * next target/block rather than hanging the whole pass. Default: 10000.
+	 * next target/block rather than hanging the whole pass. Default: the node's RPC response
+	 * deadline, derived the same way (10000 when undeclared).
 	 */
 	pushResponseTimeoutMs: number
 }
@@ -87,8 +90,8 @@ const DEFAULT_CONFIG: SpreadOnChurnConfig = {
 	healthThreshold: 0.6,
 	departureDebounceMs: 5000,
 	expansionStep: 4,
-	pushDialTimeoutMs: 3000,
-	pushResponseTimeoutMs: 10000,
+	pushDialTimeoutMs: DEFAULT_DIAL_TIMEOUT_MS,
+	pushResponseTimeoutMs: DEFAULT_RESPONSE_TIMEOUT_MS,
 }
 
 // ── Monitor ──────────────────────────────────────────────────────────

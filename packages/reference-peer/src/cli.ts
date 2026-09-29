@@ -473,9 +473,10 @@ class PeerSession {
 				timeoutMs: 30000,
 				abortOrCancelTimeoutMs: 10000,
 				// Per-peer dial cap: an unreachable cluster member fails fast
-				// (~3s) so the consensus retry loop can re-pick within the 30s
-				// overall budget instead of one stuck peer monopolizing it.
-				dialTimeoutMs: 3000,
+				// (3s on an undeclared link) so the consensus retry loop can re-pick
+				// within the 30s overall budget instead of one stuck peer monopolizing
+				// it. The node's own derived value, so it follows its link declaration.
+				dialTimeoutMs: node.linkDeadlines.dialTimeoutMs,
 				keyNetwork,
 				getRepo: (peerId) => {
 					return peerId.toString() === node.peerId.toString()

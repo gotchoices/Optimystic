@@ -4,6 +4,7 @@ import type { ProofRetainingRepo } from '../storage/block-archive.js';
 import { pushBlockToPeers, type PushBlockOutcome, type PushRefusal } from './block-transfer-service.js';
 import type { GrowthOutcome, RebalanceEvent } from './rebalance-monitor.js';
 import { createLogger } from '../logger.js';
+import { DEFAULT_TRANSFER_TIMEOUT_MS } from '../rpc-deadline.js';
 
 const log = createLogger('block-transfer');
 
@@ -22,10 +23,11 @@ export interface BlockTransferConfig {
 	/** Max concurrent transfers. Default: 4 */
 	maxConcurrency?: number;
 	/**
-	 * Timeout per block transfer (ms). Default: 30000. A push or confirm is bounded PER PEER, as two
-	 * deadlines of this length: one on the dial and one on the reply (the
-	 * `BlockTransferClient.pushBlocks` deadlines, which abort the dial and tear down a silent stream
-	 * rather than leaving them running).
+	 * Timeout per block transfer (ms). Default: 30000; a live node passes the value it derives from
+	 * `NodeOptions.linkRoundTripMs` (`LinkDeadlines.transferTimeoutMs`, never below 30000). A push or
+	 * confirm is bounded PER PEER, as two deadlines of this length: one on the dial and one on the
+	 * reply (the `BlockTransferClient.pushBlocks` deadlines, which abort the dial and tear down a
+	 * silent stream rather than leaving them running).
 	 */
 	transferTimeoutMs?: number;
 	/** Retry attempts for failed transfers. Default: 2 */
@@ -101,7 +103,7 @@ export class BlockTransferCoordinator {
 		config: BlockTransferConfig = {}
 	) {
 		this.maxConcurrency = config.maxConcurrency ?? 4;
-		this.transferTimeoutMs = config.transferTimeoutMs ?? 30000;
+		this.transferTimeoutMs = config.transferTimeoutMs ?? DEFAULT_TRANSFER_TIMEOUT_MS;
 		this.maxRetries = config.maxRetries ?? 2;
 		this.enablePush = config.enablePush ?? true;
 	}

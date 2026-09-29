@@ -133,6 +133,12 @@
         "help": "Default network identifier"
       },
       {
+        "key": "link_round_trip_ms",
+        "label": "Link Round Trip (ms)",
+        "type": "number",
+        "help": "Slowest round trip between any two nodes, relayed hops included; every network deadline is derived from it. Unset keeps the LAN deadlines"
+      },
+      {
         "key": "enable_cache",
         "label": "Enable Caching",
         "type": "boolean",

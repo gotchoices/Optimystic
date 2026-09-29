@@ -47,6 +47,14 @@ export interface LibP2PNodeOptions {
 
   /** Bootstrap nodes for peer discovery */
   bootstrapNodes?: string[];
+
+  /**
+   * The slowest round trip (ms) between any two nodes that will talk to each other; the node derives
+   * every network deadline from it (`NodeOptions.linkRoundTripMs` in `@optimystic/db-p2p`). Set
+   * through the plugin-level `link_round_trip_ms` only: it configures the node, which every table on
+   * one network and port shares.
+   */
+  linkRoundTripMs?: number;
 }
 
 /**

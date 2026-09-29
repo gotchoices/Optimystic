@@ -8,6 +8,7 @@ import type { IPeerNetwork } from '@optimystic/db-core';
 import type { ArachnodeFretAdapter } from './arachnode-fret-adapter.js';
 import { partitionCovers } from './arachnode-partition.js';
 import { createLogger } from '../logger.js';
+import type { RpcDeadlineDefaults } from '../rpc-deadline.js';
 
 /**
  * Coordinates block restoration across discovered Arachnode storage rings.
@@ -31,7 +32,9 @@ export class RestorationCoordinator {
 		private readonly peerNetwork: IPeerNetwork,
 		private readonly protocolPrefix: string,
 		/** Optional self peer id — used to skip dialing self on solo/bootstrap nodes. */
-		private readonly selfPeerId?: string
+		private readonly selfPeerId?: string,
+		/** The fallback deadlines of every `SyncClient` it builds — the node's resolved `LinkDeadlines`. */
+		private readonly rpcDeadlines?: RpcDeadlineDefaults
 	) {}
 
 	private readonly log = createLogger('storage:restoration')
@@ -151,7 +154,8 @@ export class RestorationCoordinator {
 			const client = new SyncClient(
 				peerId,
 				this.peerNetwork,
-				this.protocolPrefix
+				this.protocolPrefix,
+				this.rpcDeadlines
 			);
 
 			const response = await client.requestBlock({ blockId, rev });

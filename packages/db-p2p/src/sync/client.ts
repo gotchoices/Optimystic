@@ -2,7 +2,7 @@ import type { PeerId } from '@libp2p/interface';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { ProtocolClient } from '../protocol-client.js';
 import { buildSyncProtocol, type SyncRequest, type SyncResponse } from './protocol.js';
-import { withRpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
+import { withRpcDeadlineDefaults, type RpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
 import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js';
 
 /**
@@ -17,9 +17,11 @@ export class SyncClient extends ProtocolClient {
 	constructor(
 		peerId: PeerId,
 		peerNetwork: IPeerNetwork,
-		protocolPrefix: string = ''
+		protocolPrefix: string = '',
+		/** Fallback deadlines for a request whose caller supplies none — see {@link ProtocolClient}. */
+		rpcDeadlines?: RpcDeadlineDefaults
 	) {
-		super(peerId, peerNetwork);
+		super(peerId, peerNetwork, rpcDeadlines);
 		this.protocol = buildSyncProtocol(protocolPrefix);
 	}
 
@@ -28,7 +30,7 @@ export class SyncClient extends ProtocolClient {
 	 *
 	 * @param request - Sync request specifying block and options
 	 * @param options - Optional per-call deadlines/cancellation. Absent keys fall
-	 *   back to the client-level defaults so a silent peer can't hang the caller.
+	 *   back to the client's fallback deadlines so a silent peer can't hang the caller.
 	 * @returns Response with archive if successful
 	 * @throws Error if request fails or times out
 	 */
@@ -36,7 +38,7 @@ export class SyncClient extends ProtocolClient {
 		// Asymmetry: the *request* the server reads is a tiny SyncRequest (control cap
 		// on the server side), but the *response* read here is a BlockArchive carrying
 		// block data → block cap.
-		return await this.processMessage<SyncResponse>(request, this.protocol, { ...withRpcDeadlineDefaults(options), maxDataLength: MAX_BLOCK_MESSAGE_BYTES });
+		return await this.processMessage<SyncResponse>(request, this.protocol, { ...withRpcDeadlineDefaults(options, this.rpcDeadlines), maxDataLength: MAX_BLOCK_MESSAGE_BYTES });
 	}
 
 	/**

@@ -275,6 +275,12 @@ interface ClusterMemberComponents {
 	/** Member-side cluster derivation for the membership admission gate; see {@link DeriveExpectedClusterCallback}. */
 	deriveExpectedCluster?: DeriveExpectedClusterCallback;
 	/**
+	 * Builds the client this member re-sends a record to a cohort peer with (its reject on an expired
+	 * transaction). A live node passes the same factory its coordinator uses, which carries the
+	 * node's derived RPC deadlines; absent → `ClusterClient.create` with the undeclared deadlines.
+	 */
+	createClusterClient?: (peerId: PeerId) => ICluster;
+	/**
 	 * Wall clock in unix milliseconds; defaults to `Date.now`. Injectable so a test can age a held
 	 * reservation past {@link CONFLICT_STALE_THRESHOLD_MS} without sleeping. It governs BOTH sides of
 	 * the reservation's `lastUpdate` — the stamp and the comparison — so the two can never end up on
@@ -308,7 +314,8 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.recomputeArbitratorSet,
 		components.deriveExpectedCluster,
 		components.now,
-		components.onBlockHolders
+		components.onBlockHolders,
+		components.createClusterClient
 	);
 }
 
@@ -440,6 +447,7 @@ export class ClusterMember implements ICluster {
 	 * an assertion becomes worth adding.
 	 */
 	private readonly reconcileTimeoutMs: number;
+	private readonly createClusterClient: (peerId: PeerId) => ICluster;
 
 	constructor(
 		private readonly storageRepo: IRepo,
@@ -460,9 +468,12 @@ export class ClusterMember implements ICluster {
 		private readonly recomputeArbitratorSet?: RecomputeArbitratorSetCapability,
 		private readonly deriveExpectedCluster?: DeriveExpectedClusterCallback,
 		now?: () => number,
-		private readonly onBlockHolders?: BlockHoldersSink
+		private readonly onBlockHolders?: BlockHoldersSink,
+		createClusterClient?: (peerId: PeerId) => ICluster
 	) {
 		this.now = now ?? ((): number => Date.now());
+		this.createClusterClient = createClusterClient
+			?? ((peerId): ICluster => ClusterClient.create(peerId, this.peerNetwork, this.protocolPrefix));
 		this.superMajorityThreshold = consensusConfig?.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD;
 		this.minAbsoluteClusterSize = consensusConfig?.minAbsoluteClusterSize ?? 3;
 		this.clusterSizeTolerance = consensusConfig?.clusterSizeTolerance ?? 0.5;
@@ -3037,7 +3048,7 @@ export class ClusterMember implements ICluster {
 			if (peerId === this.peerId.toString()) continue;
 
 			try {
-				const client = ClusterClient.create(peerIdFromString(peerId), this.peerNetwork, this.protocolPrefix);
+				const client = this.createClusterClient(peerIdFromString(peerId));
 				promises.push(client.update(record));
 			} catch (error) {
 				log('ERROR: Failed to propagate to peer %s: %o', peerId, error);

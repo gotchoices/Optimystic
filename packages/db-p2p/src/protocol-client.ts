@@ -6,6 +6,7 @@ import { routingKeyForBlock } from '@optimystic/db-core';
 import { first } from './it-utility.js';
 import { createLogger } from './logger.js';
 import { MAX_BLOCK_MESSAGE_BYTES } from './protocol-limits.js';
+import { UNDECLARED_RPC_DEADLINES, type RpcDeadlineDefaults } from './rpc-deadline.js';
 
 const log = createLogger('protocol-client');
 
@@ -47,6 +48,12 @@ export class ProtocolClient {
 	constructor(
 		protected readonly peerId: PeerId,
 		protected readonly peerNetwork: IPeerNetwork,
+		/**
+		 * What a subclass applies to a request whose caller supplied no deadline of its own — the
+		 * node's resolved `LinkDeadlines` on a live node. A client that follows a redirect hands these
+		 * to the client it builds for the next hop.
+		 */
+		protected readonly rpcDeadlines: RpcDeadlineDefaults = UNDECLARED_RPC_DEADLINES,
 	) { }
 
 	/**

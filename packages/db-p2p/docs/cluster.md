@@ -956,7 +956,7 @@ interface ClusterConsensusConfig {
   clusterSize?: number;               // Replication factor / target cohort breadth (default 10)
   assumedClusterSize?: number;        // Smallest cohort the operator asserts exists (admission gate; default 2 via libp2p-node-base)
   membershipAdmissionFraction?: number; // Default 0.75 — fraction of the size reference a declared set must meet
-  cohortQueryTimeoutMs?: number;      // Default 1000ms — one cohort peer's budget for one read-path request
+  cohortQueryTimeoutMs?: number;      // Default 1000ms, or max(1000, 3 × linkRoundTripMs) when the node declares one — one cohort peer's budget for one read-path request
 }
 ```
 
@@ -1131,6 +1131,20 @@ host computing this field in microseconds or nanoseconds — would expire every 
 millisecond instead of raising it. Fractional values are accepted: it is a millisecond duration, not
 a count of peers. Like the sizes, it is read once at node construction — see *Changing a size after
 the node is running* below, which applies to it verbatim.
+
+**Declaring the link instead.** A node on slow links usually needs every network deadline raised, not
+this one: the cluster client's dial and reply deadlines bound every consensus round, and libp2p's own
+connection deadlines bound opening the connection underneath. `NodeOptions.linkRoundTripMs` — the
+slowest round trip between any two nodes that will talk to each other, relayed hops included — derives
+them all from one number (`resolveLinkDeadlines` in `packages/db-p2p/src/rpc-deadline.ts`), and fills
+an undeclared `cohortQueryTimeoutMs` with `max(1000, 3 × linkRoundTripMs)`: three round trips, over the
+two a request costs on an open connection. A request that has to open a relayed connection first
+(about four more) does not fit, and that is safe — the peer is counted silent and the read is flagged,
+never misreported. The fill happens before `resolveClusterPolicy`, so the member, the coordinator and
+`reconcilePassTimeoutMs` all read one number, and a declared `cohortQueryTimeoutMs` still wins. The
+cluster client the coordinator dials each cohort member with — and the one a member re-sends an
+expired transaction's reject with — carries the derived dial and reply deadlines, so a consensus round
+on a 3 s link is no longer failed at the 3 s dial before the peer can answer.
 
 **Changing a size after the node is running.** Both yardsticks are resolved **once**, by
 `resolveClusterPolicy` at node construction, and every consumer — the cluster member, the coordinator,

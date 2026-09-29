@@ -12,6 +12,7 @@ import {
 	type ReadCacheLease,
 	withReadCache,
 	signPeer,
+	DEFAULT_DIAL_TIMEOUT_MS,
 	type OptimysticNodeAttachments,
 } from '@optimystic/db-p2p';
 import { createMesh, buildNetworkTransactor } from '@optimystic/db-p2p/testing';
@@ -244,6 +245,7 @@ export class CollectionFactory {
         port: options.libp2pOptions?.port ?? 0,
         networkName: options.libp2pOptions?.networkName ?? 'optimystic',
         bootstrapNodes: options.libp2pOptions?.bootstrapNodes ?? [],
+        linkRoundTripMs: options.libp2pOptions?.linkRoundTripMs,
         fretProfile: 'edge',
         clusterSize: 1,
         clusterPolicy: {
@@ -284,9 +286,16 @@ export class CollectionFactory {
     };
 
     return new NetworkTransactor({
+      // NOTE: fits a 3 s link round trip, but narrowly: a pend plus commit with a redirect is about
+      // 5-6 round trips on a warm connection (15-18 s), and a cold relayed connection adds about 4.
+      // If writes on slow links fail with `RepoClient timeout`, derive this budget from the node's
+      // declared link round trip too, as `dialTimeoutMs` below is.
       timeoutMs: 30_000,
       abortOrCancelTimeoutMs: 5_000,
-      dialTimeoutMs: 3_000,
+      // The node's own derived dial deadline, so a declared link round trip reaches every repo dial.
+      // A node a host injected without building it through `createLibp2pNode` carries none; it gets
+      // the undeclared constant.
+      dialTimeoutMs: node.linkDeadlines?.dialTimeoutMs ?? DEFAULT_DIAL_TIMEOUT_MS,
       keyNetwork,
       getRepo,
       localChangeNotifier: blockChangeNotifier,

@@ -47,7 +47,7 @@ import type { RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
-import { withinRequestBudget } from './rpc-deadline.js';
+import { resolveLinkDeadlines, withinRequestBudget, type LinkDeadlines } from './rpc-deadline.js';
 import type { ClusterLatestCallback } from './repo/coordinator-repo.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
 import { RingSelector } from './storage/ring-selector.js';
@@ -262,6 +262,8 @@ export type NodeOptions = ClusterPolicyOptions & {
 	/**
 	 * Churn-resilient spread protocol tuning. Absent -> enabled with defaults
 	 * (see SpreadOnChurnConfig). Set { enabled: false } to disable spread on this node.
+	 * `pushDialTimeoutMs` and `pushResponseTimeoutMs` default to the RPC deadlines derived from
+	 * {@link NodeOptions.linkRoundTripMs}; a value set here wins.
 	 */
 	spreadOnChurn?: Partial<SpreadOnChurnConfig>;
 
@@ -287,7 +289,9 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * runs whether or not arachnode/FRET rebalancing is enabled. Absent -> enabled with defaults (see
 	 * `UnderReplicationDrainConfig`). Set { enabled: false } to leave the ledger unsent on this node.
 	 * The push deadlines are separate because they bound the wire, not the pass: `pushDialTimeoutMs`
-	 * (default 3000) and `pushResponseTimeoutMs` (default 10000), the same caps spread-on-churn uses.
+	 * and `pushResponseTimeoutMs`, which default to the RPC deadlines derived from
+	 * {@link NodeOptions.linkRoundTripMs} (3000 and 10000 when that is undeclared) — the same
+	 * defaults spread-on-churn uses. A value set here wins.
 	 */
 	underReplicationDrain?: Partial<UnderReplicationDrainConfig> & { enabled?: boolean; pushDialTimeoutMs?: number; pushResponseTimeoutMs?: number };
 
@@ -480,26 +484,61 @@ export type NodeOptions = ClusterPolicyOptions & {
 	connectionMonitor?: ConnectionMonitorInit;
 
 	/**
-	 * Optional connection-manager deadlines, passed to libp2p unchanged:
+	 * Explicit connection-manager deadlines, passed to libp2p unchanged. Each one set here overrides
+	 * the value derived from {@link NodeOptions.linkRoundTripMs}; a deployment that declares its link
+	 * round trip has no need to set either.
 	 *
 	 * - `dialTimeout` — how long an outbound dial may take, socket through upgrade, when the caller
-	 *   passes no abort signal of its own. Unset → libp2p's default (10s).
+	 *   passes no abort signal of its own.
 	 * - `inboundUpgradeTimeout` — how long an inbound connection may take to finish its upgrade
-	 *   (encryption + muxer) before this node discards it. Unset → 10s, this package's own value.
+	 *   (encryption + muxer) before this node discards it.
 	 *
-	 * Both default to 10s, and a relayed connection costs about eight one-way link delays to open,
-	 * so above roughly 1250ms one-way the defaults fail it. The dialer then abandons the dial; or,
-	 * when only the listener's limit is exceeded, the dialer's dial succeeds against a connection
-	 * the listener has already discarded, and every stream on it dies with `Unexpected EOF`. A
-	 * deployment that supports slow relayed links raises BOTH, on every node — each node is the
+	 * Unset, both are `LinkDeadlines.connectionTimeoutMs`: 10s (libp2p's own default) when no round
+	 * trip is declared, and five round trips when one is. When only the listener's limit is too short,
+	 * the dialer's dial succeeds against a connection the listener has already discarded, and every
+	 * stream on it dies with `Unexpected EOF`, so an override belongs on every node — each node is the
 	 * listener for someone.
 	 *
-	 * NOTE: this governs only dials that carry no signal. This package's own RPC clients dial with
-	 * their own shorter deadlines (`DEFAULT_DIAL_TIMEOUT_MS` in `rpc-deadline.ts`, the
-	 * `pushDialTimeoutMs` defaults), which this option does not raise.
+	 * NOTE: `dialTimeout` governs only dials that carry no signal. This package's own RPC clients dial
+	 * under their own deadlines, which the same declaration derives (`resolveLinkDeadlines` in
+	 * `rpc-deadline.ts`) and this option does not change.
 	 */
 	connectionManager?: Libp2pConnectionTimeouts;
+
+	/**
+	 * The slowest round trip, in milliseconds, between any two nodes that will talk to each other,
+	 * relayed hops included. Every network deadline the node applies is derived from it
+	 * (`resolveLinkDeadlines` in `rpc-deadline.ts`): the RPC clients' dial and response deadlines,
+	 * the block pushes', libp2p's connection deadlines, and — when `clusterPolicy.cohortQueryTimeoutMs`
+	 * is not declared — the read path's per-peer budget. Each derived value floors at the constant it
+	 * replaces, so absent means the LAN deadlines exactly.
+	 *
+	 * Declare it on every node, with the same value: each node dials some and is dialed by others.
+	 * An explicit per-deadline setting still wins over the derived value — {@link NodeOptions.connectionManager},
+	 * the `push*` fields of {@link NodeOptions.spreadOnChurn} and {@link NodeOptions.underReplicationDrain},
+	 * `clusterPolicy.cohortQueryTimeoutMs`, and a caller's own `dialTimeoutMs`.
+	 *
+	 * A value that is not a finite number above zero, or is above `MAX_LINK_ROUND_TRIP_MS`, throws at
+	 * node construction: falling back to the LAN deadlines would silently keep them on the one
+	 * deployment that declared its links slower.
+	 */
+	linkRoundTripMs?: number;
 };
+
+/**
+ * `options` with an undeclared `clusterPolicy.cohortQueryTimeoutMs` filled from the declared link
+ * round trip. A declared budget wins. With no round trip declared the fill is
+ * `DEFAULT_COHORT_QUERY_TIMEOUT_MS`, which is what resolution falls back to anyway.
+ */
+function withLinkDerivedCohortBudget(options: NodeOptions, deadlines: LinkDeadlines): NodeOptions {
+	return {
+		...options,
+		clusterPolicy: {
+			...options.clusterPolicy,
+			cohortQueryTimeoutMs: options.clusterPolicy?.cohortQueryTimeoutMs ?? deadlines.cohortQueryTimeoutMs
+		}
+	};
+}
 
 /**
  * Resolve the node's raw storage and put the write-through read cache in front of it. This is
@@ -585,6 +624,9 @@ export async function createLibp2pNodeBase(
 		transports: Libp2pTransports;
 	}
 ): Promise<OptimysticNode> {
+	// First, before anything is acquired: a declared round trip that is not usable throws, and there is
+	// nothing yet to release. Every network deadline below is read off this one result.
+	const linkDeadlines = resolveLinkDeadlines(options.linkRoundTripMs);
 	const { storage: rawStorage, lease } = resolveStorage(options.storage, options.networkName);
 	const kvStore = resolveKvStore(options.kvStore);
 	const underReplicationLedger = new KvUnderReplicationLedger(kvStore);
@@ -689,7 +731,10 @@ export async function createLibp2pNodeBase(
 	// rather than `options.clusterSize` directly, or they can each apply their own fallback default and
 	// silently disagree (ticket bug-cluster-size-resolution-single-source). `assertClusterSizeCoupling`
 	// below is the fail-fast backstop if a future edit reintroduces that split.
-	const consensusConfig = resolveClusterPolicy(options);
+	//
+	// The cohort budget is filled from the declared link round trip BEFORE resolution, so the member,
+	// the coordinator and `reconcilePassTimeoutMs` all read the one resolved number.
+	const consensusConfig = resolveClusterPolicy(withLinkDerivedCohortBudget(options, linkDeadlines));
 
 	// Who is evidenced to hold each block this node holds, for the rebalance monitor (so it neither
 	// pushes a block back to a peer that already has it nor pulls a copy it already holds). Four
@@ -723,10 +768,10 @@ export async function createLibp2pNodeBase(
 			// version has no such keys — auto-dial is now default connection-manager behavior with no
 			// direct replacement — so they are dropped rather than re-cast. See review handoff.
 			maxConnections: 16,
-			// 10_000 equals libp2p's own default; kept explicit so the fallback does not move with libp2p.
-			inboundUpgradeTimeout: options.connectionManager?.inboundUpgradeTimeout ?? 10_000,
-			// Only when declared: an absent key is libp2p's "use my default".
-			...(options.connectionManager?.dialTimeout !== undefined ? { dialTimeout: options.connectionManager.dialTimeout } : {})
+			// Always explicit, so the undeclared fallback (10_000, libp2p's own default) does not move
+			// with libp2p. Both ends: every node is someone's listener.
+			inboundUpgradeTimeout: options.connectionManager?.inboundUpgradeTimeout ?? linkDeadlines.connectionTimeoutMs,
+			dialTimeout: options.connectionManager?.dialTimeout ?? linkDeadlines.connectionTimeoutMs
 		},
 		...(options.connectionGater ? { connectionGater: options.connectionGater } : {}),
 		transports,
@@ -1027,7 +1072,7 @@ export async function createLibp2pNodeBase(
 		const protocolPrefix = `/optimystic/${options.networkName}`;
 		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, networkMode, options.persistence, reputation, protocolPrefix);
 		await keyNetwork.initFromPersistedState();
-		const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix);
+		const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
 
 		// Inject reputation into NetworkManagerService. Load-bearing and non-optional: the service is
 		// unconditionally present, so a throw is a real wiring bug. The node has already started here, but
@@ -1063,7 +1108,7 @@ export async function createLibp2pNodeBase(
 				return undefined;
 			}
 			if (peerId.equals(node.peerId)) return undefined;
-			const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix);
+			const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix, linkDeadlines);
 			try {
 				const response = await withinRequestBudget(peerIdStr, syncClient.getProtocol(), consensusConfig.cohortQueryTimeoutMs,
 					options => syncClient.requestBlock({ blockId, rev: undefined }, options));
@@ -1141,7 +1186,8 @@ export async function createLibp2pNodeBase(
 			reconcileBlock,
 			onCommitCertificate,
 			onBlockHolders,
-			deriveExpectedCluster
+			deriveExpectedCluster,
+			createClusterClient
 			// `recomputeArbitratorSet` (invalidation layer-2) is intentionally NOT wired here yet: a live FRET
 			// recompute needs a churn-tolerance window so it does not false-reject legitimate certificates from
 			// late-joiners (a liveness regression). Until that is tuned against live topology — and the
@@ -1214,13 +1260,13 @@ export async function createLibp2pNodeBase(
 					return undefined;
 				}
 			}
-			const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix);
+			const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix, linkDeadlines);
 			// No try/catch: a dial or protocol failure rejects through to the coordinator, which counts
 			// the peer silent. The budget is the same resolved `cohortQueryTimeoutMs` the coordinator
 			// deadlines this call with, so the two fire together: the coordinator's deadline is what
 			// classifies a late peer as silent, and this one tears the stream down at that moment. It
-			// also replaces the sync client's own 3 s dial default, which on a link with a round trip
-			// near 3 s failed every consult before a larger configured budget could take effect.
+			// also replaces the sync client's own dial deadline, which, when shorter than the budget,
+			// failed every consult on a slow link before the larger budget could take effect.
 			const response = await withinRequestBudget(peerId.toString(), syncClient.getProtocol(), consensusConfig.cohortQueryTimeoutMs,
 				options => syncClient.requestBlock({ blockId, rev: undefined }, options));
 			if (response.success && response.archive) {
@@ -1328,7 +1374,11 @@ export async function createLibp2pNodeBase(
 					consensusConfig.clusterSize,
 					protocolPrefix,
 					ownedBlocks,
-					options.spreadOnChurn,
+					{
+						pushDialTimeoutMs: linkDeadlines.dialTimeoutMs,
+						pushResponseTimeoutMs: linkDeadlines.responseTimeoutMs,
+						...options.spreadOnChurn
+					},
 				);
 				await spreadMonitor.start();
 				ensureOwnedBlockFeed();
@@ -1381,8 +1431,8 @@ export async function createLibp2pNodeBase(
 				pushBlock: (blockId, peerIds) => pushBlockToPeers(storageRepo, keyNetwork, blockId, peerIds, {
 					reason: 'replication',
 					protocolPrefix,
-					dialTimeoutMs: pushDialTimeoutMs ?? 3000,
-					responseTimeoutMs: pushResponseTimeoutMs ?? 10_000
+					dialTimeoutMs: pushDialTimeoutMs ?? linkDeadlines.dialTimeoutMs,
+					responseTimeoutMs: pushResponseTimeoutMs ?? linkDeadlines.responseTimeoutMs
 				}),
 				emit: (event) => storageRepo.emitBlockDurabilityReached(event)
 			}, drainConfig);
@@ -1462,7 +1512,8 @@ export async function createLibp2pNodeBase(
 					// caller's AbortSignal, so `SyncClient`'s per-peer dial deadline never bounded a dial.
 					keyNetwork,
 					`/optimystic/${options.networkName}`,
-					node.peerId.toString()
+					node.peerId.toString(),
+					linkDeadlines
 				);
 
 				// Update restore callback to use new coordinator
@@ -1494,6 +1545,7 @@ export async function createLibp2pNodeBase(
 							keyNetwork,
 							partitionDetector,
 							protocolPrefix,
+							{ transferTimeoutMs: linkDeadlines.transferTimeoutMs },
 						);
 
 						const rebalanceMonitor = networkManager.initRebalanceMonitor(
@@ -1709,7 +1761,7 @@ export async function createLibp2pNodeBase(
 		// Initialize dispute service if enabled
 		let disputeServiceInstance: DisputeService | undefined;
 		if (options.dispute?.disputeEnabled) {
-			const createDisputeClient = (peerId: any) => DisputeClient.create(peerId, keyNetwork, protocolPrefix);
+			const createDisputeClient = (peerId: any) => DisputeClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
 			disputeServiceInstance = new DisputeService({
 				peerId: node.peerId,
 				privateKey: nodePrivateKey,
@@ -1769,6 +1821,7 @@ export async function createLibp2pNodeBase(
 			// key on its public `Libp2p` interface, so this attachment is the sanctioned in-process handle.
 			// Ed25519 by construction (options.privateKey defaults to generateKeyPair('Ed25519')).
 			peerPrivateKey: nodePrivateKey,
+			linkDeadlines,
 		};
 		Object.assign(node, attachments);
 
