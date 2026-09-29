@@ -303,11 +303,15 @@ export interface ClusterConsensusConfig {
 	 * are the same kind of round trip to the same peer over the same protocol, and raising one while
 	 * the other still expires would fix nothing.
 	 *
+	 * It is the whole budget for each request and nothing inside the request is shorter: the sync
+	 * client's own dial and response defaults do not apply underneath it.
+	 *
 	 * Raise it for a deployment whose links are slower than a LAN: two phones reaching each other
 	 * only through a public circuit relay have a round trip near 1.8s, and every fresh stream (dial
 	 * or reuse, protocol select, send, receive) must fit inside this budget or the peer counts as
-	 * silent. In a two-member cohort one late answer is the whole quorum, so the consult declines
-	 * every time and a rejoining node never catches up.
+	 * silent. The protocol select costs a round trip even on an open connection, so a request over a
+	 * reused connection costs two. In a two-member cohort one late answer is the whole quorum, so the
+	 * consult declines every time and a rejoining node never catches up.
 	 *
 	 * Fractional values are accepted — this is a duration, not a count of peers. A value that is not
 	 * a finite number above zero, or is large enough that the deadlines derived from it overflow the

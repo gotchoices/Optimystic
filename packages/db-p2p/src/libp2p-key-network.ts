@@ -713,12 +713,17 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * entries libp2p has not yet evicted, opt in to limited connections) lives in
 	 * {@link openProtocolStream}, the single place in this package that opens a protocol stream.
 	 *
-	 * `negotiateFully: false` is safe here and saves a round trip: this is request/response and the
-	 * caller always reads a reply, so an unsupported-protocol failure deferred to the first read is
-	 * still observed. The caller's `AbortSignal` is forwarded so a per-peer dial deadline (enforced
-	 * upstream by `ProtocolClient.processMessage`) can actually cancel a stuck dial — without it,
-	 * libp2p falls back to its built-in connection-manager `dialTimeout` and the caller's tighter
-	 * deadline is decorative.
+	 * `negotiateFully: false` is meant to skip waiting for the remote's protocol acknowledgement, and
+	 * is safe here because this is request/response and the caller always reads a reply, so an
+	 * unsupported-protocol failure deferred to the first read is still observed. It currently saves
+	 * nothing: `@libp2p/multistream-select@7` accepts the option and ignores it, so opening a stream
+	 * costs one link round trip even on a connection that is already open, and a dial deadline shorter
+	 * than that round trip fails every request (`test/stream-open-costs-a-round-trip.spec.ts` pins
+	 * this, and fails if libp2p honours the option again). It is passed anyway, since it costs nothing
+	 * and takes effect if it is ever honoured. The caller's `AbortSignal` is forwarded so a per-peer
+	 * dial deadline (enforced upstream by `ProtocolClient.processMessage`) can actually cancel a stuck
+	 * dial or negotiation — without it, libp2p falls back to its built-in connection-manager
+	 * `dialTimeout` and the caller's tighter deadline is decorative.
 	 *
 	 * The cold path pays one `peerStore.get` before dialing, to separate two failures libp2p
 	 * reports identically: "nobody ever taught us an address" and "every address we hold routes

@@ -43,3 +43,54 @@ export function withRpcDeadlineDefaults(options?: RpcDeadlineOptions): RpcDeadli
 		signal: options?.signal,
 	};
 }
+
+/**
+ * The abort reason of a request run under {@link withinRequestBudget} when its budget expires.
+ * Distinct from `DialTimeoutError` and `ResponseTimeoutError`, which name one phase of a request
+ * and a client default: this names the caller's own budget for the whole request.
+ * `.code === REQUEST_BUDGET_EXCEEDED_ERROR_CODE`.
+ */
+export const REQUEST_BUDGET_EXCEEDED_ERROR_CODE = 'REQUEST_BUDGET_EXCEEDED';
+
+export class RequestBudgetExceededError extends Error {
+	readonly code = REQUEST_BUDGET_EXCEEDED_ERROR_CODE;
+	constructor(peer: string, protocol: string, budgetMs: number) {
+		super(`request budget exceeded: peer=${peer} protocol=${protocol} after ${budgetMs}ms`);
+		this.name = 'RequestBudgetExceededError';
+	}
+}
+
+/**
+ * Run one RPC to `peer` with `budgetMs` as the only limit on it: dial, stream negotiation, request
+ * and reply all share the one budget, and nothing inside the request is shorter.
+ *
+ * For a caller that owns a per-peer budget of its own. The client defaults cannot simply be left
+ * underneath it: opening a stream costs one link round trip even on a connection that is already
+ * open (`test/stream-open-costs-a-round-trip.spec.ts`), so on a link whose round trip reaches
+ * {@link DEFAULT_DIAL_TIMEOUT_MS} the default dial deadline fails every request, and a larger
+ * budget above it never takes effect. So `request` receives explicit `0`s for both phase deadlines
+ * ("no cap", see {@link withRpcDeadlineDefaults}) and a signal that aborts with a
+ * {@link RequestBudgetExceededError} once the budget runs out. `ProtocolClient.processMessage`
+ * forwards that signal to the dial and aborts the stream with it during the read, so an expired
+ * request is torn down rather than left running to a later default.
+ *
+ * The signal is built from an `AbortController` and a timer rather than `AbortSignal.timeout`,
+ * which Hermes (React Native's JS engine) does not provide. The timer is cleared on either outcome,
+ * so a peer that answers quickly leaves nothing pending for the rest of the budget, and it is
+ * `unref`'d where the platform supports that.
+ */
+export async function withinRequestBudget<T>(
+	peer: string,
+	protocol: string,
+	budgetMs: number,
+	request: (options: RpcDeadlineOptions) => Promise<T>
+): Promise<T> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(new RequestBudgetExceededError(peer, protocol, budgetMs)), budgetMs);
+	(timer as { unref?: () => void }).unref?.();
+	try {
+		return await request({ signal: controller.signal, dialTimeoutMs: 0, responseTimeoutMs: 0 });
+	} finally {
+		clearTimeout(timer);
+	}
+}

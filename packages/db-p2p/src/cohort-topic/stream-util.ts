@@ -17,9 +17,12 @@
  * NOTE: accepted tradeoff — both calls to {@link openProtocolStream} below deliberately omit
  * `negotiateFully`, taking libp2p's default of full multistream-select negotiation at stream-open.
  * FRET's `openRpcStream` and `libp2p-key-network.ts#connect` both pass `negotiateFully: false`,
- * which saves a round trip but defers an unsupported-protocol failure from stream-open to the
- * first read — that would turn {@link sendOneWay} against a peer lacking the protocol into a
- * silent no-op. Revisit if stream-open latency shows up in a profile.
+ * which is meant to save a round trip but defers an unsupported-protocol failure from stream-open
+ * to the first read — that would turn {@link sendOneWay} against a peer lacking the protocol into a
+ * silent no-op. Omitting it currently costs nothing: `@libp2p/multistream-select@7` ignores the
+ * option, so every stream open pays the round trip anyway. If a libp2p upgrade honours it again,
+ * `test/stream-open-costs-a-round-trip.spec.ts` fails and this tradeoff has a price again. Revisit
+ * if stream-open latency shows up in a profile.
  */
 
 import type { Libp2p } from "libp2p";

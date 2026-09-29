@@ -29,8 +29,10 @@ export interface OpenProtocolStreamOptions {
 	signal?: AbortSignal;
 	/**
 	 * Omit for libp2p's default (full multistream-select negotiation at stream-open).
-	 * Pass `false` to save the round trip, accepting that an unsupported-protocol failure is
-	 * deferred to the first read — only safe when the caller always reads a reply.
+	 * Pass `false` to ask libp2p not to wait for the remote's acknowledgement, accepting that an
+	 * unsupported-protocol failure is deferred to the first read — only safe when the caller always
+	 * reads a reply. `@libp2p/multistream-select@7` ignores it, so today the stream open costs one
+	 * round trip either way (`test/stream-open-costs-a-round-trip.spec.ts`).
 	 */
 	negotiateFully?: boolean;
 	/**

@@ -47,7 +47,7 @@ import type { RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
-import type { SyncResponse } from './sync/protocol.js';
+import { withinRequestBudget } from './rpc-deadline.js';
 import type { ClusterLatestCallback } from './repo/coordinator-repo.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
 import { RingSelector } from './storage/ring-selector.js';
@@ -1039,10 +1039,11 @@ export async function createLibp2pNodeBase(
 		const fretSvc = (node as any).services?.fret as FretService | undefined;
 
 		// Fetch a block archive from one cohort peer over the sync protocol, bounded by the same
-		// per-peer deadline the latest-revision consult uses (`consensusConfig.cohortQueryTimeoutMs`,
+		// per-peer budget the latest-revision consult uses (`consensusConfig.cohortQueryTimeoutMs`,
 		// read off the one resolved policy above) so an unreachable peer can't stall reconciliation.
-		// Mirrors the SyncClient query in `clusterLatestCallback`, but returns the full archive (which
-		// carries the materialized block) rather than only the latest ActionRev.
+		// The budget bounds the whole request and nothing inside it is shorter — see
+		// `withinRequestBudget`. Mirrors the SyncClient query in `clusterLatestCallback`, but returns
+		// the full archive (which carries the materialized block) rather than only the latest ActionRev.
 		//
 		// A timed-out fetch resolves to "no archive", exactly as a peer that holds nothing does — the
 		// pass moves on to the next peer. Only the number is configurable; the contract is unchanged.
@@ -1063,25 +1064,14 @@ export async function createLibp2pNodeBase(
 			}
 			if (peerId.equals(node.peerId)) return undefined;
 			const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix);
-			// Cleared on either outcome: a peer that answers quickly must not leave a timer pending for the
-			// rest of the budget. `unref` alone kept that harmless only while the budget was a hardcoded
-			// second — an operator raising it to tens of seconds would otherwise retain one timer per fetch
-			// per peer for that long.
-			let deadline: ReturnType<typeof setTimeout> | undefined;
 			try {
-				const response = await Promise.race<SyncResponse>([
-					syncClient.requestBlock({ blockId, rev: undefined }),
-					new Promise<SyncResponse>(resolve => {
-						deadline = setTimeout(() => resolve({ success: false }), consensusConfig.cohortQueryTimeoutMs);
-						deadline.unref();
-					})
-				]);
+				const response = await withinRequestBudget(peerIdStr, syncClient.getProtocol(), consensusConfig.cohortQueryTimeoutMs,
+					options => syncClient.requestBlock({ blockId, rev: undefined }, options));
 				return response.success ? response.archive : undefined;
 			} catch {
-				// Peer unreachable / no data — caller falls back to the next cohort peer.
+				// Peer unreachable, out of budget, or no data — the caller falls back to the next cohort
+				// peer. `protocol-client` has already logged which of those it was.
 				return undefined;
-			} finally {
-				if (deadline !== undefined) clearTimeout(deadline);
 			}
 		};
 
@@ -1224,9 +1214,14 @@ export async function createLibp2pNodeBase(
 				}
 			}
 			const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix);
-			// No try/catch: a dial or protocol failure rejects through to the coordinator, whose
-			// per-peer deadline also bounds a hung request — slowness needs no race here.
-			const response = await syncClient.requestBlock({ blockId, rev: undefined });
+			// No try/catch: a dial or protocol failure rejects through to the coordinator, which counts
+			// the peer silent. The budget is the same resolved `cohortQueryTimeoutMs` the coordinator
+			// deadlines this call with, so the two fire together: the coordinator's deadline is what
+			// classifies a late peer as silent, and this one tears the stream down at that moment. It
+			// also replaces the sync client's own 3 s dial default, which on a link with a round trip
+			// near 3 s failed every consult before a larger configured budget could take effect.
+			const response = await withinRequestBudget(peerId.toString(), syncClient.getProtocol(), consensusConfig.cohortQueryTimeoutMs,
+				options => syncClient.requestBlock({ blockId, rev: undefined }, options));
 			if (response.success && response.archive) {
 				// Projection lives with the archive shape (`latestClaimFromArchive`) rather than
 				// re-read inline here — it reads the claim and its proof out of ONE revision entry,

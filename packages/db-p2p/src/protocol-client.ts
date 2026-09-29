@@ -104,6 +104,12 @@ export class ProtocolClient {
 				log('dial:timeout peer=%s protocol=%s ms=%d%s', peer, protocol, elapsed, cid ? ` cid=${cid}` : '');
 				throw dialController.signal.reason;
 			}
+			// A cancelled caller is owed its own reason — a whole-request budget's names the budget —
+			// not whichever error libp2p raised several layers down. Mirrors the read below.
+			if (options?.signal?.aborted) {
+				log('dial:aborted peer=%s protocol=%s ms=%d%s', peer, protocol, elapsed, cid ? ` cid=${cid}` : '');
+				throw options.signal.reason;
+			}
 			const errCode = (err as { code?: unknown })?.code;
 			const errMessage = err instanceof Error ? err.message : String(err);
 			const truncatedMsg = errMessage.length > 200 ? errMessage.slice(0, 200) + '…' : errMessage;
@@ -192,6 +198,7 @@ export class ProtocolClient {
 					throw responseTimeoutError;
 				}
 				if (options?.signal?.aborted) {
+					log('response:aborted peer=%s protocol=%s ms=%d%s', peer, protocol, Date.now() - t0, cid ? ` cid=${cid}` : '');
 					throw options.signal.reason;
 				}
 				throw err;
