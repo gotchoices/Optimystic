@@ -248,6 +248,7 @@ export class RebalanceMonitor implements Startable {
 	private debounceTimer: ReturnType<typeof setTimeout> | null = null
 	private recheckTimer: ReturnType<typeof setTimeout> | null = null
 	private deferredCheckTimer: ReturnType<typeof setTimeout> | null = null
+	private checkInFlight = false
 	private lastRebalanceAt = 0
 	private pendingTopologyChange = false
 	private topologyChangeTimestamp = 0
@@ -526,6 +527,11 @@ export class RebalanceMonitor implements Startable {
 	 */
 	private async maybeRebalance(): Promise<void> {
 		if (!this.running) return
+		// A check awaits a cohort lookup per block and sets lastRebalanceAt only when it ends, so the
+		// throttle alone cannot keep two apart: the deferred and re-check timers both fall due at the
+		// end of one interval. The running check serves this trigger; a topology change it may have
+		// sampled too early is picked up by the pendingTopologyChange test after it.
+		if (this.checkInFlight) return
 
 		const now = Date.now()
 		const wait = this.lastRebalanceAt + this.minRebalanceIntervalMs - now
@@ -538,9 +544,19 @@ export class RebalanceMonitor implements Startable {
 		// earliest one's timestamp.
 		const triggeredAt = this.pendingTopologyChange ? this.topologyChangeTimestamp : now
 		this.pendingTopologyChange = false
-		const event = await this.performRebalanceCheck(triggeredAt)
+		this.checkInFlight = true
+		let event: RebalanceEvent | null
+		try {
+			event = await this.performRebalanceCheck(triggeredAt)
+		} finally {
+			this.checkInFlight = false
+		}
 		if (event) {
 			this.emitEvent(event)
+		}
+		// A connection event landed while the check ran; it may have read the affected blocks before it.
+		if (this.pendingTopologyChange) {
+			await this.maybeRebalance()
 		}
 	}
 
@@ -569,6 +585,10 @@ export class RebalanceMonitor implements Startable {
 
 	private async performRebalanceCheck(triggeredAt: number): Promise<RebalanceEvent | null> {
 		if (this.suppressDuringPartition && this.deps.partitionDetector.detectPartition()) {
+			// NOTE: a suppressed check re-arms nothing, so the trigger it was serving is gone; the next
+			// connection event (or outstanding growth's re-check timer) is what runs one. The detector's
+			// goodbye window ages out on its own, with no event, so a node whose last event met a
+			// partition flag reports nothing until the next one. If that shows up, defer on suppression.
 			log('partition detected, suppressing rebalance')
 			return null
 		}

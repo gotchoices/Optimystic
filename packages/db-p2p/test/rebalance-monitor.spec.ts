@@ -886,6 +886,33 @@ describe('RebalanceMonitor', () => {
 
 			await monitor.stop();
 		});
+
+		it('the deferred check and the growth re-check falling due together run one check, not two at once', async () => {
+			let inFlight = 0;
+			let maxInFlight = 0;
+			let lookups = 0;
+			const keyNetwork = {
+				findCluster: async () => {
+					lookups++;
+					maxInFlight = Math.max(maxInFlight, ++inFlight);
+					await delay(40); // a check spans real async lookups
+					inFlight--;
+					return { [selfId.toString()]: {}, [peerId2.toString()]: {} } as any;
+				}
+			};
+			const monitor = new RebalanceMonitor({ ...deps, keyNetwork, clusterSize: 2 }, { debounceMs: 5, minRebalanceIntervalMs: 150 });
+			monitor.trackBlock('block-1');
+			await monitor.start();
+
+			await monitor.checkNow(); // reports peerId2 grown, left unconfirmed: the re-check timer arms
+			mockLibp2p.emit('connection:open'); // deferred to the end of the same interval
+
+			await waitFor(() => lookups >= 2, { description: 'the interval-end check ran' });
+			await delay(60);
+			expect(maxInFlight).to.equal(1);
+
+			await monitor.stop();
+		});
 	});
 
 	describe('partition suppression', () => {
