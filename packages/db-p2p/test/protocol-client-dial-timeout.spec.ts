@@ -79,12 +79,14 @@ describe('ProtocolClient dial timeout', () => {
 		expect(observedSignal).to.equal(undefined);
 	});
 
-	it('forwards parent signal abort to the dial', async () => {
+	it('forwards parent signal abort to the dial, and surfaces the parent reason over the dial error', async () => {
 		const peerId = await makePeerId();
+		// The dial rejects with an error of its own, not the signal's reason — as libp2p can from
+		// several layers down — so the parent's reason reaching the caller is processMessage's doing.
 		const network: IPeerNetwork = {
 			async connect(_p: CorePeerId, _proto: string, options?: AbortOptions) {
 				return new Promise<never>((_, reject) => {
-					options?.signal?.addEventListener('abort', () => reject(options!.signal!.reason), { once: true });
+					options?.signal?.addEventListener('abort', () => reject(new Error('The operation was aborted')), { once: true });
 				});
 			}
 		} as unknown as IPeerNetwork;

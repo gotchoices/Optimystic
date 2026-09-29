@@ -1069,8 +1069,9 @@ export async function createLibp2pNodeBase(
 					options => syncClient.requestBlock({ blockId, rev: undefined }, options));
 				return response.success ? response.archive : undefined;
 			} catch {
-				// Peer unreachable, out of budget, or no data — the caller falls back to the next cohort
-				// peer. `protocol-client` has already logged which of those it was.
+				// Peer unreachable, out of budget, or an unreadable reply — the caller falls back to the
+				// next cohort peer. `protocol-client` has already logged a dial failure or a budget expiry
+				// (`dial:fail`, `dial:aborted`, `response:aborted`); an unreadable reply it does not log.
 				return undefined;
 			}
 		};
