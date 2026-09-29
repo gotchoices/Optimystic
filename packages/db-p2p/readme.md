@@ -590,7 +590,11 @@ In solo mode:
 
 Once remote peers become reachable, the node transitions out of solo mode
 automatically as FRET discovers them. Persisted network state (HWM, FRET
-table) carries across restarts when an `options.persistence` is supplied.
+table, and `servingPeers` — which peers in that table were seen serving this
+network) carries across restarts when an `options.persistence` is supplied.
+Without `servingPeers` a restored table would still give a self-only cohort
+until every remembered peer reconnected and re-identified, and the node would
+answer reads of blocks it lacks as absent rather than as unreachable.
 
 #### Custom transports (including React Native)
 

@@ -1766,6 +1766,26 @@ saveMaterializedBlock(block): store(structuredClone(block));
   absent, unflagged. So a consumer relying on `'cohort-unreachable'` to detect isolation must also
   tolerate the unflagged absent; the two differ only in whether FRET still remembers peers.
 
+  "Remembers" has to cover which of those peers serve this network, not only that they exist. The
+  cohort admits only peers positively classified as serving, and the classification reads each
+  peer's advertised protocols from the libp2p peerStore, which is in memory. So after a restart
+  every peer FRET restored reads as not-yet-identified until it reconnects, and a restored table on
+  its own still yields a self-only cohort. With network-state `persistence`
+  (`createLibp2pNode({ persistence })`), a restart keeps both FRET's table and the serving verdicts
+  for the peers in it (`servingPeers`, `packages/db-p2p/src/libp2p-key-network.ts`), so a restarted
+  node assembles the cohort it had before and lands on the flagged side. Without `persistence` a
+  restart is a cold boot. Only a positive verdict is remembered, and a fresh protocol list always
+  replaces it, so a node that has never seen a serving peer, one behind a relay shared with other
+  networks included, is unaffected.
+
+  When a remembered peer never returns, FRET's own liveness is what ends the doubt, not a timer:
+  once FRET marks the peer dead it leaves the cohort, the cohort shrinks to self, and the unflagged
+  absent answers again. Until then reads of blocks this node lacks fail with `'cohort-unreachable'`,
+  and creating a new collection through this node fails, because its header probe cannot be ruled
+  absent. That is the cost the same process already paid, before any restart, when a partner went
+  offline; persistence only stops a restart from erasing it. The revisit condition is recorded at
+  `membershipOf` in `packages/db-p2p/src/libp2p-key-network.ts`.
+
   No row is remembered after the read: every read of a block still missing locally consults again,
   so an unflagged absent always rests on a consult made for that read. That includes the
   cohort-of-one case of the second row — a memo of it served a block another coordinator had just

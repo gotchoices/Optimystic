@@ -2028,6 +2028,44 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect(cluster[selfPeerId.toString()], 'the one slot goes to the nearest serving peer').to.not.exist;
 		});
 
+		it('findCluster still admits a peer it saw serving this network after a restart, before identify re-runs', async () => {
+			// A restart restores FRET's table, so FRET still returns `remote` for the key, but the
+			// peerStore is in memory and comes back empty: `remote` has no protocols until it
+			// reconnects and identify re-runs. Without the remembered verdict it read 'unknown', the
+			// cohort shrank to self, and the coordinator served every block it lacked as absent.
+			const remote = await makePeerId();
+			const table: SerializedTable = {
+				v: 1, peerId: selfPeerId.toString(), timestamp: Date.now(),
+				entries: [{
+					id: remote.toString(), coord: 'AAAA', relevance: 1, lastAccess: Date.now(), state: 'connected',
+					accessCount: 1, successCount: 1, failureCount: 0, avgLatencyMs: 10
+				}]
+			};
+			const fret = () => baseFret({
+				assembleCohort: () => [remote.toString(), selfPeerId.toString()],
+				exportTable: () => table,
+				importTable: async () => {}
+			});
+			const persistence = new MemoryPersistence();
+			const KEY = routingKeyForBlock('restart-key');
+
+			const before = new Libp2pKeyPeerNetwork(createMockLibp2p(selfPeerId, {
+				fret: fret(),
+				peerStore: peerStoreOf({ [remote.toString()]: { protocols: servesProto(PREFIX) } })
+			}), 2, undefined, 'forming', persistence, undefined, PREFIX);
+			expect(Object.keys(await before.findCluster(KEY))).to.include(remote.toString());
+			await waitFor(() => persistence.saved?.servingPeers?.includes(remote.toString()) === true,
+				{ description: 'the serving verdict for remote was saved' });
+
+			const after = new Libp2pKeyPeerNetwork(createMockLibp2p(selfPeerId, {
+				fret: fret(),
+				peerStore: peerStoreOf({})
+			}), 2, undefined, 'forming', persistence, undefined, PREFIX);
+			await after.initFromPersistedState();
+			expect(Object.keys(await after.findCluster(KEY)), 'the restarted node assembles the cohort it had before')
+				.to.deep.equal([remote.toString(), selfPeerId.toString()]);
+		});
+
 		it('with protocolPrefix ABSENT, findCluster retains a cross-network member (filter disabled — regression guard)', async () => {
 			const crossNet = await makePeerId();
 			const fret = baseFret({ assembleCohort: () => [crossNet.toString()] });

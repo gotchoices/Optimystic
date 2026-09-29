@@ -294,7 +294,7 @@ export type NodeOptions = ClusterPolicyOptions & {
 	/** Transaction validator for cluster consensus */
 	validator?: ITransactionValidator;
 
-	/** Optional persistence for network state (HWM, FRET table) across restarts */
+	/** Optional persistence for network state (HWM, FRET table, which of its peers serve this network) across restarts */
 	persistence?: NetworkStatePersistence;
 
 	/** Dispute protocol configuration */

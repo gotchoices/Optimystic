@@ -58,7 +58,8 @@ export type FindCoordinatorErrorCode =
  *                both a fresh same-network peer (will flip to `serves`) AND a cross-network
  *                peer (whose network-namespaced identify can NEVER complete, so it stays
  *                `unknown` forever) — indistinguishable at a single instant, separated over
- *                the retry/stabilization window.
+ *                the retry/stabilization window. A peer this node has already seen serving
+ *                reads `serves` instead, across a restart too (`rememberedServing`).
  */
 export type NetworkMembership = 'serves' | 'foreign' | 'unknown';
 
@@ -124,6 +125,12 @@ export interface PersistedNetworkState {
 	lastConnectedTimestamp: number;
 	consecutiveIsolatedSessions: number;
 	fretTable?: SerializedTable;
+	/**
+	 * Peers in `fretTable` this node has seen serving this network (see
+	 * `Libp2pKeyPeerNetwork.rememberedServing`). Optional rather than a version bump: a snapshot
+	 * without it restores an empty memory, which is exactly what an older build knew.
+	 */
+	servingPeers?: string[];
 }
 
 export interface NetworkStatePersistence {
@@ -435,6 +442,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				await this.getFret().importTable(state.fretTable);
 			} catch (err) { this.log('init:fret-import-skipped %o', err); }
 		}
+		for (const id of state.servingPeers ?? []) this.rememberedServing.add(id);
 
 		// If HWM > 1 but FRET table is empty/self-only, increment isolated sessions
 		if (state.networkHighWaterMark > 1) {
@@ -534,7 +542,26 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			const fret = this.getFret();
 			state.fretTable = fret.exportTable();
 		} catch { /* FRET not available */ }
+		// Bounded by the table being saved beside it: a peer FRET has forgotten is never in a band,
+		// so its verdict would be dead weight across every later restart.
+		const inTable = new Set(state.fretTable?.entries.map(e => e.id) ?? []);
+		state.servingPeers = [...this.rememberedServing].filter(id => inTable.has(id));
 		void this.persistence.save(state).catch(err => this.log('persist-state-failed %o', err));
+	}
+
+	/**
+	 * Coalesces the saves a burst of changed verdicts would trigger — one cohort assembly can
+	 * classify a whole band — into one, after the synchronous classification loop finishes.
+	 */
+	private persistScheduled = false;
+
+	private schedulePersist(): void {
+		if (!this.persistence || this.persistScheduled) return;
+		this.persistScheduled = true;
+		queueMicrotask(() => {
+			this.persistScheduled = false;
+			this.persistState();
+		});
 	}
 
 	/**
@@ -1249,16 +1276,57 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	}
 
 	/**
+	 * Remote peers whose peerStore protocol list last named this network's storage protocol —
+	 * only positive verdicts, never `unknown`. The peerStore is in memory, so after a restart
+	 * every peer restored into FRET's table has no protocols until it reconnects and identify
+	 * re-runs; without this memory the restarted node's cohorts shrink to self, and it serves
+	 * every block it lacks as authoritatively absent instead of flagging the cohort unreachable.
+	 * Saved with FRET's table ({@link persistState}), on the next microtask after it changes.
+	 *
+	 * NOTE: a verdict learned and lost to a crash before that save lands is simply re-learned the
+	 * next time the peer is identified — until then the node reads it `unknown`, as before this
+	 * memory existed.
+	 * NOTE: only the saved copy is cut to FRET's table; in process the set gains one entry per
+	 * distinct peer ever seen serving this network, the same order as the peerStore itself. If a
+	 * long-lived node on a churning network ever shows it in a heap profile, prune it to the
+	 * exported table inside `persistState` as well.
+	 */
+	private readonly rememberedServing = new Set<string>()
+
+	/**
 	 * Classify a peer's network membership from its advertised protocols. Self is classified
 	 * from its own registered protocols ({@link selfServes}) rather than assumed to serve.
 	 * When no `protocolPrefix` is configured the filter is disabled and EVERY peer is
 	 * reported `serves`, so all callers behave exactly as before this scoping was added.
+	 *
+	 * A non-empty protocol list always wins and updates {@link rememberedServing}; an empty one
+	 * falls back to it.
 	 */
 	private membershipOf(idStr: string, protocols: string[] | undefined): NetworkMembership {
 		if (this.protocolPrefix == null) return 'serves'
 		if (idStr === this.libp2p.peerId.toString()) return this.selfServes() ? 'serves' : 'foreign'
-		if (protocols == null || protocols.length === 0) return 'unknown'
-		return this.servesThisNetwork(protocols) ? 'serves' : 'foreign'
+		if (protocols == null || protocols.length === 0) {
+			// NOTE: accepted tradeoff — a remembered peer that never comes back keeps this node's
+			// cohorts from shrinking to self until FRET declares it dead, so meanwhile reads of
+			// blocks this node lacks fail as 'cohort-unreachable' and creating a collection through
+			// it fails too. That is the cost the same process already paid, before a restart, when
+			// a partner went offline; the restart no longer erases it. Revisit if a two-machine
+			// deployment reports it cannot create collections after its partner is permanently
+			// gone: the remedy is a declared member list (backlog
+			// `feat-declared-membership-feeds-cohort-assembly`) or an explicit "forget peer"
+			// operation, not dropping this memory.
+			return this.rememberedServing.has(idStr) ? 'serves' : 'unknown'
+		}
+		const membership = this.servesThisNetwork(protocols) ? 'serves' : 'foreign'
+		this.rememberVerdict(idStr, membership === 'serves')
+		return membership
+	}
+
+	private rememberVerdict(idStr: string, serves: boolean): void {
+		if (this.rememberedServing.has(idStr) === serves) return
+		if (serves) this.rememberedServing.add(idStr)
+		else this.rememberedServing.delete(idStr)
+		this.schedulePersist()
 	}
 
 	/**
