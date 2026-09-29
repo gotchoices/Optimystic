@@ -229,7 +229,7 @@ The delays are `commitBroadcastRetryInitialMs` (250 ms) doubled by `commitBroadc
 
 - **Transaction-level**: `expiration` timestamp on `RepoMessage` (default 30 s from `CoordinatorRepo.DEFAULT_TIMEOUT`)
 - **Abort/cancel**: 5 s timeout (`abortOrCancelTimeoutMs`) for cleanup after failures
-- **Peer query**: 3 s per-peer timeout when querying cluster for latest revision
+- **Peer query**: `clusterPolicy.cohortQueryTimeoutMs` per peer when querying the cluster for the latest revision (1 s default; a node that declares `linkRoundTripMs` derives it from that)
 - Cleanup intervals: expired transaction queue processed every 60 s, cleanup queue every 1 s
 
 ### Stale Failure Handling

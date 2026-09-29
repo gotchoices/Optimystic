@@ -1098,8 +1098,9 @@ deadlines on that path:
 
 Each is the whole budget for its request: dial, protocol negotiation, request and reply all share it,
 and nothing inside the request is shorter. Both run through `withinRequestBudget` in
-`packages/db-p2p/src/rpc-deadline.ts`, which replaces the sync client's own 3 s dial and 10 s response
-defaults rather than running under them, so a budget above 3 s takes effect in full.
+`packages/db-p2p/src/rpc-deadline.ts`, which replaces the sync client's own dial and response
+deadlines (3 s and 10 s when no link round trip is declared) rather than running under them, so a
+budget above them takes effect in full.
 
 One field for both is deliberate: they are the same kind of round trip, to the same peer, over the
 same protocol, so a separate setting for each would only let one be raised while the other still

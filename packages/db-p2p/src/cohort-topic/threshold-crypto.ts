@@ -32,7 +32,14 @@ import { bytesToPeerIdString } from "./peer-codec.js";
 /** Width of an Ed25519 signature in bytes — the fixed stride of the concatenated `thresholdSig`. */
 export const ED25519_SIG_BYTES = 64;
 
-/** Default per-round deadline for collecting cohort endorsements (ms). */
+/**
+ * Default per-round deadline for collecting cohort endorsements (ms).
+ *
+ * NOTE: not derived from `NodeOptions.linkRoundTripMs` (`resolveLinkDeadlines` in `rpc-deadline.ts`).
+ * A `/sign` request is a stream negotiation plus a reply, two round trips on an open connection, so
+ * this holds only up to about a 2.5 s round trip and a fresh relayed connection not at all. Cohort-topic
+ * is opt-in; if it is enabled on slow links, fill `collectTimeoutMs` from the node's `LinkDeadlines`.
+ */
 export const DEFAULT_SIGN_COLLECT_TIMEOUT_MS = 5_000;
 
 /**

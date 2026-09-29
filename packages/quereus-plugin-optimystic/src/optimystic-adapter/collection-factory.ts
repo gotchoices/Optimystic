@@ -285,17 +285,27 @@ export class CollectionFactory {
       return RepoClient.create(peerId, keyNetwork, protocolPrefix);
     };
 
+    // The node's own derived dial deadline, so a declared link round trip reaches every repo dial.
+    // A node a host injected without building it through `createLibp2pNode` carries none; it gets
+    // the undeclared constant.
+    const dialTimeoutMs = node.linkDeadlines?.dialTimeoutMs ?? DEFAULT_DIAL_TIMEOUT_MS;
+
     return new NetworkTransactor({
       // NOTE: fits a 3 s link round trip, but narrowly: a pend plus commit with a redirect is about
       // 5-6 round trips on a warm connection (15-18 s), and a cold relayed connection adds about 4.
       // If writes on slow links fail with `RepoClient timeout`, derive this budget from the node's
-      // declared link round trip too, as `dialTimeoutMs` below is.
+      // declared link round trip too, as `dialTimeoutMs` is.
       timeoutMs: 30_000,
-      abortOrCancelTimeoutMs: 5_000,
-      // The node's own derived dial deadline, so a declared link round trip reaches every repo dial.
-      // A node a host injected without building it through `createLibp2pNode` carries none; it gets
-      // the undeclared constant.
-      dialTimeoutMs: node.linkDeadlines?.dialTimeoutMs ?? DEFAULT_DIAL_TIMEOUT_MS,
+      // A cancel is a stream negotiation and a request to the coordinator, which then runs a
+      // consensus round with the block's cohort: about six round trips on warm connections, so a
+      // fixed 5 s fails every cancel once the round trip passes about 800 ms. The derived dial
+      // deadline is six round trips, and 3 s when undeclared, so the 5 s floor keeps an undeclared
+      // node where it was.
+      // NOTE: holds a warm-connection cancel narrowly, and a cold relayed one not at all; if cancels
+      // on slow links run out of time (a failed cancel leaves its pending records standing; see
+      // `NetworkTransactor.dischargeCancel`), give this budget its own number of round trips.
+      abortOrCancelTimeoutMs: Math.max(5_000, dialTimeoutMs),
+      dialTimeoutMs,
       keyNetwork,
       getRepo,
       localChangeNotifier: blockChangeNotifier,
