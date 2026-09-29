@@ -98,7 +98,10 @@ interface HolderEvidence {
 export interface RebalanceMonitorConfig {
 	/** Debounce window for topology changes (ms). Default: 5000 */
 	debounceMs?: number
-	/** Maximum frequency of full rebalance scans (ms). Default: 60000 */
+	/**
+	 * Maximum frequency of full rebalance scans (ms). A trigger landing inside the window runs when it
+	 * ends; it is not dropped. Default: 60000
+	 */
 	minRebalanceIntervalMs?: number
 	/** Whether to suppress rebalancing during detected partitions. Default: true */
 	suppressDuringPartition?: boolean
@@ -244,6 +247,7 @@ export class RebalanceMonitor implements Startable {
 	private readonly handlers: RebalanceHandler[] = []
 	private debounceTimer: ReturnType<typeof setTimeout> | null = null
 	private recheckTimer: ReturnType<typeof setTimeout> | null = null
+	private deferredCheckTimer: ReturnType<typeof setTimeout> | null = null
 	private lastRebalanceAt = 0
 	private pendingTopologyChange = false
 	private topologyChangeTimestamp = 0
@@ -302,6 +306,10 @@ export class RebalanceMonitor implements Startable {
 		if (this.recheckTimer) {
 			clearTimeout(this.recheckTimer)
 			this.recheckTimer = null
+		}
+		if (this.deferredCheckTimer) {
+			clearTimeout(this.deferredCheckTimer)
+			this.deferredCheckTimer = null
 		}
 
 		this.pendingTopologyChange = false
@@ -497,34 +505,66 @@ export class RebalanceMonitor implements Startable {
 			clearTimeout(this.debounceTimer)
 		}
 
-		// NOTE: the check samples FRET's cohort once, debounceMs after the last connection event. A joiner
-		// FRET has not admitted by then is not reported grown, and nothing re-checks until the next
-		// connection event outside minRebalanceIntervalMs — so a machine that wrote alone would not push its
-		// blocks to its new backup. Over loopback FRET admits well inside the default (the backup phase of
-		// `small-deployment-lifecycle.integration.spec.ts` lands in ~10s); if a slower link, such as a phone
-		// pair over a relay, ever shows a joiner that never receives the founder's blocks, re-check when FRET
-		// reports the peer instead of on this timer alone.
+		// NOTE: the check samples FRET's cohort once, debounceMs after the last connection event (or at the
+		// end of the throttle window, if that is later). A joiner FRET has not admitted by then is not
+		// reported grown, and nothing re-checks until the next connection event — so a machine that wrote
+		// alone would not push its blocks to its new backup. Over loopback FRET admits well inside the
+		// default (the backup phase of `small-deployment-lifecycle.integration.spec.ts` lands in ~10s); if a
+		// slower link, such as a phone pair over a relay, ever shows a joiner that never receives the
+		// founder's blocks, re-check when FRET reports the peer instead of on this timer alone.
 		this.debounceTimer = setTimeout(() => {
 			this.debounceTimer = null
-			this.pendingTopologyChange = false
-			this.maybeRebalance()
+			void this.maybeRebalance().catch(err => { log('topology check error: %O', err) })
 		}, this.debounceMs)
 	}
 
+	/**
+	 * Run a check now, or — inside the `minRebalanceIntervalMs` window — at the end of it. A refused
+	 * trigger must be deferred rather than dropped: nothing else remembers it, since the debounce has
+	 * already fired and the re-check timer is armed only for growth already outstanding, which a peer
+	 * the monitor has never reported is not.
+	 */
 	private async maybeRebalance(): Promise<void> {
 		if (!this.running) return
 
 		const now = Date.now()
-		const elapsed = now - this.lastRebalanceAt
-		if (elapsed < this.minRebalanceIntervalMs) {
-			log('throttled, %dms since last rebalance', elapsed)
+		const wait = this.lastRebalanceAt + this.minRebalanceIntervalMs - now
+		if (wait > 0) {
+			this.deferCheck(wait)
 			return
 		}
 
-		const event = await this.performRebalanceCheck(this.topologyChangeTimestamp || now)
+		// Cleared only when a check actually runs, so triggers folded into a deferred check keep the
+		// earliest one's timestamp.
+		const triggeredAt = this.pendingTopologyChange ? this.topologyChangeTimestamp : now
+		this.pendingTopologyChange = false
+		const event = await this.performRebalanceCheck(triggeredAt)
 		if (event) {
 			this.emitEvent(event)
 		}
+	}
+
+	/**
+	 * Arm the one deferred check for `delayMs` from now; a trigger refused while it is armed folds into
+	 * it. The armed timer is never due later than a newer refusal asks for, since `lastRebalanceAt` only
+	 * moves forward; one that fires early (a check ran meanwhile) is simply deferred again. unref'd so it
+	 * never holds the process open; stop() clears it.
+	 *
+	 * NOTE: the worst-case delay before a joiner gets its copy is `debounceMs + minRebalanceIntervalMs`
+	 * (it joins just after the previous check), so a joiner that detaches sooner still leaves without
+	 * one — the re-attaching side must not treat its own partial store as the whole truth (ticket
+	 * `a-restarted-node-forgets-which-peers-serve-its-network`). If a deployment ever needs the delay
+	 * shorter, add a growth-only fast path for newly reported peers rather than shortening the
+	 * full-scan throttle.
+	 */
+	private deferCheck(delayMs: number): void {
+		log('throttled, check deferred %dms to the end of the interval', delayMs)
+		if (this.deferredCheckTimer) return
+		this.deferredCheckTimer = setTimeout(() => {
+			this.deferredCheckTimer = null
+			void this.maybeRebalance().catch(err => { log('deferred check error: %O', err) })
+		}, delayMs)
+		;(this.deferredCheckTimer as unknown as { unref?: () => void }).unref?.()
 	}
 
 	private async performRebalanceCheck(triggeredAt: number): Promise<RebalanceEvent | null> {

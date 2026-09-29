@@ -867,6 +867,25 @@ describe('RebalanceMonitor', () => {
 
 			expect(events).to.have.length(0);
 		});
+
+		it('a topology change landing inside the throttle window is deferred, not dropped', async () => {
+			mockFret.setCohort('*', [selfId.toString()]);
+
+			const events: RebalanceEvent[] = [];
+			const monitor = new RebalanceMonitor(deps, { debounceMs: 20, minRebalanceIntervalMs: 300 });
+			monitor.onRebalance(e => events.push(e));
+			monitor.trackBlock('block-1');
+			await monitor.start();
+
+			await monitor.checkNow(); // the founder's check, alone
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+			mockLibp2p.emit('connection:open'); // the joiner arrives inside the throttle window
+
+			await waitFor(() => events.some(e => e.grown.has('block-1')), { description: 'the deferred check reported the joiner' });
+			expect(events.flatMap(e => [...e.grown.entries()])).to.deep.equal([['block-1', [peerId2.toString()]]]);
+
+			await monitor.stop();
+		});
 	});
 
 	describe('partition suppression', () => {
