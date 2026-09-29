@@ -5,6 +5,13 @@ files:
 prereq: a-peer-that-joins-soon-after-a-check-never-gets-a-copy, a-restarted-node-forgets-which-peers-serve-its-network
 source: sereus-ec, from sereus's re-attach measurements for optimystic #22 (sereus tickets/blocked/report-reattach-over-partial-replica-to-optimystic.md)
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-09-29T18:35:46.667Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\3-catch-up-from-a-stale-replica-is-slower-than-from-empty.fix.2026-09-29T18-35-46-667Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 # Catch-up from a stale replica is slower than from empty
 
 ## Report
