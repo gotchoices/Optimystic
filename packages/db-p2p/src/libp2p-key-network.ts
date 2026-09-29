@@ -1290,6 +1290,12 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * distinct peer ever seen serving this network, the same order as the peerStore itself. If a
 	 * long-lived node on a churning network ever shows it in a heap profile, prune it to the
 	 * exported table inside `persistState` as well.
+	 * NOTE: identify is network-namespaced, so a remembered peer that later rejoins under another
+	 * network never completes identify here and never produces the fresh protocol list that would
+	 * clear its verdict; while FRET keeps it live it stays in cohorts and its cluster/repo dials
+	 * fail at negotiation. The in-memory peerStore already kept its stale list the same way before
+	 * a restart. If peers are ever expected to switch networks under one identity, drop a verdict
+	 * for a peer that stays connected without identifying.
 	 */
 	private readonly rememberedServing = new Set<string>()
 
