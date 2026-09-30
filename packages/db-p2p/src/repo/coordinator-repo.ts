@@ -772,7 +772,7 @@ export class CoordinatorRepo implements IRepo {
 		// unflagged absent means the cohort was consulted before answering. When the consult
 		// FAILS outright — or runs without ruling the block out and the block stays
 		// missing — the entry is flagged `unavailable` below with a reason naming what
-		// the consult established (see AbsenceVerdict and the mapping in the loop body),
+		// the consult established (see AbsenceVerdict and the mapping in `readRepairBlock`),
 		// which re-enables the transactor-level retry against a different peer. If a
 		// coordinator is configured WITHOUT clusterLatestCallback, there is no cohort to
 		// consult and the local answer IS the whole truth — it stays authoritative, with
@@ -791,122 +791,140 @@ export class CoordinatorRepo implements IRepo {
 		// `coordinator-repo-absence-write-bypass.spec.ts` is the gate, and backlog
 		// `feat-a-cohort-member-remembers-a-settled-absence` holds the design notes.
 		if (this.clusterLatestCallback && !skipClusterFetch) {
-			for (const blockId of blockGets.blockIds) {
-				const localEntry = localResult[blockId];
-				const localRev = localEntry?.state?.latest?.rev;
-				const isMissing = !localEntry?.state?.latest;
-				// The asker's floor for this block, when it sent one (`BlockGets.floors`). It is a second
-				// trigger for the consult below, never a verdict on the answer: a copy still below the
-				// floor after the pass is served exactly as any other, labelled with its `materialized`
-				// revision, and the asker's own check and retry handle it.
-				const floor = blockGets.floors?.[blockId];
-				const windowDemands = !isMissing && this.shouldReadRepair(blockId);
-				const floorDemands = !isMissing && this.floorDemandsConsult(blockId, floor, localRev);
-				const isStale = windowDemands || floorDemands;
-				if (!isMissing && !isStale) {
-					// No consult this pass — the read-repair window says this block was checked
-					// recently. An unsettled claim an earlier pass recorded still applies: the doubt
-					// is a property of what this node HOLDS, not of whether a consult just ran.
-					// Without this, every read inside the window after a failed convergence would
-					// serve the same content as confirmed — the exact silent lie this marker exists
-					// to end, re-opened for `readRepairWindowMs` at a time.
-					this.flagUnconfirmedCurrency(localResult, blockId, blockGets.context);
-					continue;
-				}
-
-				if (isStale) {
-					// `reason` is 'floor' whenever the floor demanded the consult, even when the window
-					// would have consulted anyway: an operator reading `ageMs` at or below the window needs
-					// to know the asker asked for it (see docs/debugging.md).
-					this.log('cluster-tx:read-repair-triggered', {
-						blockId,
-						mode: this.readRepairMode,
-						ageMs: this.ageMs(blockId),
-						localRev,
-						reason: floorDemands ? 'floor' : 'window',
-						...(floor === undefined ? {} : { floor })
-					});
-				}
-
-				try {
-					const { absence, currency } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev, floor);
-					// `lineageOf` rides along: the refreshed entry REPLACES the local one below, and an
-					// entry that lost its lineage answer would read to the asker as "could not say".
-					const refreshed = await this.storageRepo.get({
-						blockIds: [blockId], context: blockGets.context,
-						...(blockGets.lineageOf === undefined ? {} : { lineageOf: blockGets.lineageOf })
-					}, options);
-					const newRev = refreshed[blockId]?.state?.latest?.rev;
-					if (refreshed[blockId]) {
-						localResult[blockId] = refreshed[blockId];
-					}
-					if (isStale) {
-						if (typeof newRev === 'number' && typeof localRev === 'number' && newRev > localRev) {
-							this.log('cluster-tx:read-repair-applied', { blockId, oldRev: localRev, newRev });
-						} else {
-							this.log('cluster-tx:read-repair-noop', { blockId });
-						}
-					}
-					// The consult ran but could not rule the block out, and the verdict names the
-					// evidence (see AbsenceVerdict): part of the cohort was silent (`unconfirmed`
-					// → 'peers-unreachable' — another coordinator may know better), no cohort
-					// member outside this node could be asked at all (`isolated` →
-					// 'cohort-unreachable' — there is no better-connected coordinator to re-ask),
-					// or a peer positively claimed a revision this pass could neither corroborate
-					// nor acquire (`claimed` → 'claimed-elsewhere' — the block is known to exist
-					// somewhere). Either way a still-missing block must not pose as an
-					// authoritative absent. When the whole cohort answers "holds nothing" the
-					// absent stays authoritative (`confirmed`) — the new-collection probe against
-					// a healthy cohort stays one round-trip.
-					if (isMissing && absence !== 'confirmed') {
-						this.flagUnconfirmedAbsence(localResult, blockId,
-							absence === 'claimed' ? 'claimed-elsewhere'
-								: absence === 'isolated' ? 'cohort-unreachable'
-									: 'peers-unreachable');
-					}
-					// A PRESENT block served below a cohort claim the repair could not settle is
-					// the mirror lie: real content posing as confirmed-current. A consult that
-					// REACHED THE CLAIMANTS is the authority on that claim, so it replaces whatever
-					// an earlier one recorded — including clearing it when those peers claim nothing
-					// any more. One that reached nobody (`currency.kind === 'no-evidence'` — no
-					// cohort, solo-self, or total silence) refutes nothing, and neither does one
-					// whose answers came from peers that never made the claim; `recordAheadClaim`
-					// weighs the verdict's evidence against the recorded claimants, and only in the
-					// direction that could hide a stale serve (a higher claim always lands). The missing
-					// case is excluded — it is the absence path above, and a bare absent below a
-					// claim already reads as either authoritative (cohort answered, nothing
-					// corroborated) or flagged.
-					if (!isMissing) {
-						this.recordAheadClaim(blockId, currency);
-						this.flagUnconfirmedCurrency(localResult, blockId, blockGets.context);
-					}
-				} catch (err) {
-					this.log('cluster-fetch:error', { blockId, error: (err as Error).message });
-					// The consult that was supposed to make this answer trustworthy did not run.
-					// NOTE: a consult that THROWS (e.g. `findCluster` itself rejected) is reported
-					// 'peers-unreachable' even on an isolated node: a failed cohort lookup is a
-					// routing failure and says nothing about how many cohort members were
-					// reachable. If `findCluster` on an isolated node turns out to throw routinely
-					// rather than return a stale cohort view, revisit — that would put the
-					// isolated case back under this vaguer reason.
-					if (isMissing) {
-						this.flagUnconfirmedAbsence(localResult, blockId, 'peers-unreachable');
-					} else {
-						// It told us nothing, so it refutes nothing: an earlier pass's unsettled
-						// claim stands.
-						this.flagUnconfirmedCurrency(localResult, blockId, blockGets.context);
-					}
-				}
-			}
+			// The per-block passes share no state (see `readRepairBlock`), so they run concurrently: a read
+			// naming several blocks that each need a consult costs about one consult, not one per block — a
+			// table refresh reads the collection header and log tail together. Duplicate ids are dropped so
+			// one block never has two consults running against its own memo entries.
+			const blockIds = [...new Set(blockGets.blockIds)];
+			await Promise.all(blockIds.map(blockId => this.readRepairBlock(blockId, blockGets, localResult, options)));
 		}
 
 		return localResult;
 	}
 
 	/**
+	 * One block's share of `get`'s cohort reconciliation: decide whether this read must consult the
+	 * cohort for `blockId` (missing locally, the read-repair window, or the asker's floor), run the
+	 * consult, replace the block's entry in `results` with the refreshed local read, and set the flags
+	 * that say what the consult could not establish. Touches only `results[blockId]` and state keyed by
+	 * `blockId` (freshness stamp, unsettled-claim memo), and acquisition latches the one block, which is
+	 * what lets `get` run one of these per block concurrently.
+	 *
+	 * A consult that throws is caught here and flags only this block, so one block's failed consult
+	 * cannot fail the rest of the read.
+	 */
+	private async readRepairBlock(blockId: BlockId, blockGets: BlockGets, results: GetBlockResults, options?: MessageOptions): Promise<void> {
+		const localEntry = results[blockId];
+		const localRev = localEntry?.state?.latest?.rev;
+		const isMissing = !localEntry?.state?.latest;
+		// The asker's floor for this block, when it sent one (`BlockGets.floors`). It is a second
+		// trigger for the consult below, never a verdict on the answer: a copy still below the
+		// floor after the pass is served exactly as any other, labelled with its `materialized`
+		// revision, and the asker's own check and retry handle it.
+		const floor = blockGets.floors?.[blockId];
+		const windowDemands = !isMissing && this.shouldReadRepair(blockId);
+		const floorDemands = !isMissing && this.floorDemandsConsult(blockId, floor, localRev);
+		const isStale = windowDemands || floorDemands;
+		if (!isMissing && !isStale) {
+			// No consult this pass — the read-repair window says this block was checked
+			// recently. An unsettled claim an earlier pass recorded still applies: the doubt
+			// is a property of what this node HOLDS, not of whether a consult just ran.
+			// Without this, every read inside the window after a failed convergence would
+			// serve the same content as confirmed — the exact silent lie this marker exists
+			// to end, re-opened for `readRepairWindowMs` at a time.
+			this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
+			return;
+		}
+
+		if (isStale) {
+			// `reason` is 'floor' whenever the floor demanded the consult, even when the window
+			// would have consulted anyway: an operator reading `ageMs` at or below the window needs
+			// to know the asker asked for it (see docs/debugging.md).
+			this.log('cluster-tx:read-repair-triggered', {
+				blockId,
+				mode: this.readRepairMode,
+				ageMs: this.ageMs(blockId),
+				localRev,
+				reason: floorDemands ? 'floor' : 'window',
+				...(floor === undefined ? {} : { floor })
+			});
+		}
+
+		try {
+			const { absence, currency } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev, floor);
+			// `lineageOf` rides along: the refreshed entry REPLACES the local one below, and an
+			// entry that lost its lineage answer would read to the asker as "could not say".
+			const refreshed = await this.storageRepo.get({
+				blockIds: [blockId], context: blockGets.context,
+				...(blockGets.lineageOf === undefined ? {} : { lineageOf: blockGets.lineageOf })
+			}, options);
+			const newRev = refreshed[blockId]?.state?.latest?.rev;
+			if (refreshed[blockId]) {
+				results[blockId] = refreshed[blockId];
+			}
+			if (isStale) {
+				if (typeof newRev === 'number' && typeof localRev === 'number' && newRev > localRev) {
+					this.log('cluster-tx:read-repair-applied', { blockId, oldRev: localRev, newRev });
+				} else {
+					this.log('cluster-tx:read-repair-noop', { blockId });
+				}
+			}
+			// The consult ran but could not rule the block out, and the verdict names the
+			// evidence (see AbsenceVerdict): part of the cohort was silent (`unconfirmed`
+			// → 'peers-unreachable' — another coordinator may know better), no cohort
+			// member outside this node could be asked at all (`isolated` →
+			// 'cohort-unreachable' — there is no better-connected coordinator to re-ask),
+			// or a peer positively claimed a revision this pass could neither corroborate
+			// nor acquire (`claimed` → 'claimed-elsewhere' — the block is known to exist
+			// somewhere). Either way a still-missing block must not pose as an
+			// authoritative absent. When the whole cohort answers "holds nothing" the
+			// absent stays authoritative (`confirmed`) — the new-collection probe against
+			// a healthy cohort stays one round-trip.
+			if (isMissing && absence !== 'confirmed') {
+				this.flagUnconfirmedAbsence(results, blockId,
+					absence === 'claimed' ? 'claimed-elsewhere'
+						: absence === 'isolated' ? 'cohort-unreachable'
+							: 'peers-unreachable');
+			}
+			// A PRESENT block served below a cohort claim the repair could not settle is
+			// the mirror lie: real content posing as confirmed-current. A consult that
+			// REACHED THE CLAIMANTS is the authority on that claim, so it replaces whatever
+			// an earlier one recorded — including clearing it when those peers claim nothing
+			// any more. One that reached nobody (`currency.kind === 'no-evidence'` — no
+			// cohort, solo-self, or total silence) refutes nothing, and neither does one
+			// whose answers came from peers that never made the claim; `recordAheadClaim`
+			// weighs the verdict's evidence against the recorded claimants, and only in the
+			// direction that could hide a stale serve (a higher claim always lands). The missing
+			// case is excluded — it is the absence path above, and a bare absent below a
+			// claim already reads as either authoritative (cohort answered, nothing
+			// corroborated) or flagged.
+			if (!isMissing) {
+				this.recordAheadClaim(blockId, currency);
+				this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
+			}
+		} catch (err) {
+			this.log('cluster-fetch:error', { blockId, error: (err as Error).message });
+			// The consult that was supposed to make this answer trustworthy did not run.
+			// NOTE: a consult that THROWS (e.g. `findCluster` itself rejected) is reported
+			// 'peers-unreachable' even on an isolated node: a failed cohort lookup is a
+			// routing failure and says nothing about how many cohort members were
+			// reachable. If `findCluster` on an isolated node turns out to throw routinely
+			// rather than return a stale cohort view, revisit — that would put the
+			// isolated case back under this vaguer reason.
+			if (isMissing) {
+				this.flagUnconfirmedAbsence(results, blockId, 'peers-unreachable');
+			} else {
+				// It told us nothing, so it refutes nothing: an earlier pass's unsettled
+				// claim stands.
+				this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
+			}
+		}
+	}
+
+	/**
 	 * Downgrade an absence the coordinator could not confirm to the given `unavailable` reason —
 	 * a flag `NetworkTransactor.get` retries against another peer instead of taking as final.
-	 * The reason names the evidence (see {@link AbsenceVerdict} for the mapping in `get`); this
+	 * The reason names the evidence (see {@link AbsenceVerdict} for the mapping in {@link readRepairBlock}); this
 	 * method only decides WHETHER the entry may carry a flag at all.
 	 *
 	 * No-op once the entry carries a real answer (the consult restored the block) or a sharper flag

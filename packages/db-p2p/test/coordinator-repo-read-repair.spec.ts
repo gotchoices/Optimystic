@@ -1147,4 +1147,55 @@ describe('CoordinatorRepo read-repair', () => {
 			expect(served[blockId]?.unconfirmedAheadRev).to.equal(undefined);
 		});
 	});
+
+	it('consults the cohort for every block of a multi-block read at once, not one after another', async () => {
+		// A table refresh reads the collection header and the log tail in one request. On a slow link
+		// one consult costs several network delays, so consulting the two back to back doubled it.
+		const localPeer = await makePeerId();
+		const otherPeer = await makePeerId();
+		const cluster = makeClusterPeers([localPeer, otherPeer]);
+		const blockIds: BlockId[] = ['block-header', 'block-log-tail'];
+		const held: ActionRev = { actionId: 'local-action', rev: 1 };
+		const storageRepo: IRepo = {
+			...makePresentStorageRepo(blockIds[0]!, held.rev).repo,
+			async get(blockGets: BlockGets): Promise<GetBlockResults> {
+				return Object.fromEntries(blockGets.blockIds.map(id => [id, { state: { latest: held } }]));
+			}
+		};
+
+		// Each remote consult is held open until every block's consult has arrived. The fallback
+		// releases it anyway (well inside the per-peer deadline), so a serial loop finishes and fails
+		// the assertion instead of hanging.
+		const open = new Set<BlockId>();
+		let mostOpenAtOnce = 0;
+		let releaseAll!: () => void;
+		const allArrived = new Promise<void>(resolve => { releaseAll = resolve; });
+		const clusterLatestCallback: ClusterLatestCallback = async (peerId, id) => {
+			if (peerId.equals(localPeer)) return held;
+			open.add(id);
+			mostOpenAtOnce = Math.max(mostOpenAtOnce, open.size);
+			if (open.size === blockIds.length) releaseAll();
+			let fallback: ReturnType<typeof setTimeout> | undefined;
+			await Promise.race([allArrived, new Promise<void>(resolve => { fallback = setTimeout(resolve, 250); })]);
+			clearTimeout(fallback);
+			open.delete(id);
+			return held;
+		};
+
+		const repo = new CoordinatorRepo(
+			makeKeyNetwork(cluster),
+			makeClusterClient,
+			storageRepo,
+			{ clusterSize: 2, readRepairMode: 'lazy' },
+			undefined,
+			localPeer,
+			undefined,
+			clusterLatestCallback
+		);
+
+		const result = await repo.get({ blockIds });
+
+		expect(mostOpenAtOnce, 'both blocks\' consults in flight at once').to.equal(blockIds.length);
+		for (const id of blockIds) expect(result[id]?.state?.latest).to.deep.equal(held);
+	});
 });
