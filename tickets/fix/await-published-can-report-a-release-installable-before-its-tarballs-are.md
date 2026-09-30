@@ -24,6 +24,19 @@ Sereus's port changes one thing: once a manifest answers, it polls that manifest
 published. `npm view <spec> dist.tarball` already returns the URL, so the probe stays inside the
 existing visible/not-visible verdict in `published-visibility.mjs`.
 
+Sereus's final port (from its runner on sereus plan/2) counts a package visible only when all three
+hold:
+
+- the abbreviated packument (`accept: application/vnd.npm.install-v1+json`, `cache-control: no-cache`)
+  lists the version — the document installers read, which the `NOTE:` on `npmViewCommand` already
+  asks about;
+- the dist-tag points at it;
+- a GET of that version's `dist.tarball` answers 200.
+
+Its observation: just after publish, three packages 404'd for both packument and tarball; by 18:40
+UTC every version record answered 200 while those three tarballs still 404'd. The version record and
+the tarball become visible at different moments.
+
 ## TODO
 
 - Confirm the gap against the registry's behaviour (manifest 200 while the tarball 404s) rather than
