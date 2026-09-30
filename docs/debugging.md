@@ -868,8 +868,8 @@ The line fires when a read of a block this node **holds** decides to consult the
 - `mode` — the `readRepairMode` in force, `lazy` or `paranoid`. Mode `off` never consults about a held block, so it never emits this line.
 - `ageMs` — milliseconds since the block was last stamped (`ageMs` in `packages/db-p2p/src/repo/coordinator-repo.ts`), or `undefined` when it has no stamp.
 - `localRev` — the revision this node holds. Always present, because the line only fires for a held block.
-- `reason` — what asked for the consult: `window` (the lazy window's time test or sample, or `paranoid` mode) or `floor` (the read carried a floor above `localRev`). Reported as `floor` whenever the floor asked, even when the window would have consulted anyway.
-- `floor` — the asker's floor for the block, when the read carried one; absent otherwise. Present on every `reason: 'floor'` line, and possibly on a `reason: 'window'` line whose floor this node had already consulted under.
+- `reason` — what asked for the consult: `window` (the lazy window's time test or sample, or `paranoid` mode) or `floor` (the read carried a floor above `localRev` that this node had not yet consulted under). Reported as `floor` whenever the floor asked, even when the window or `paranoid` mode would have consulted anyway.
+- `floor` — the asker's floor for the block, when the read carried one; absent otherwise. Present on every `reason: 'floor'` line, and on a `reason: 'window'` line whenever the read carried one that did not ask — either `localRev` already meets it, or this node consulted under it earlier in the window.
 
 | `mode` | `ageMs` | What it means |
 |---|---|---|

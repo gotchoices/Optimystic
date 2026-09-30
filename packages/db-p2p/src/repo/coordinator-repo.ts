@@ -1470,6 +1470,14 @@ export class CoordinatorRepo implements IRepo {
 		// archive on every read of that block. Correct, and self-limiting once the cohort can agree; if
 		// it ever shows as read amplification, gate the acquisition step (not the latest-query) on the
 		// same window rather than remembering the absence (GitHub issue #20).
+		// NOTE: the asker's floor is recorded here whether or not the pass converged. So a floor the
+		// cohort corroborates but this node could not ACQUIRE (a content-quorum decline) waits out one
+		// window together with the failed acquisition: the same floor does not re-trigger inside it, the
+		// doubt memo keeps stamping `unconfirmedAheadRev`, and the asker's second-chance round against
+		// another coordinator is what serves the revision meanwhile. Deliberate — an acquisition that
+		// just failed on this cohort is not made to succeed by re-asking seconds later — but if a
+		// profile ever shows floored reads stuck a window behind a revision the cohort holds, record
+		// the floor only when `converged` and let the floor be the retry cadence for this exit.
 		this.markBlocksSeen([blockId], floor);
 		// Converged: the corroboration is itself the evidence that nothing is ahead, and it came from
 		// peers that answered — the shared verdict resolves to `nothing-ahead`, and the memo retires
