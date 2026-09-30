@@ -1547,15 +1547,13 @@ export class CoordinatorRepo implements IRepo {
 			// inside the callback via `saveReplicatedBlock`, which takes the block write latch —
 			// safe to call from here because the read path holds no latch of its own (`StorageRepo.get`
 			// acquires and releases it around the promotion above, and nothing wraps this method).
-			// NOTE: `get` walks its block ids sequentially, so the bound is per block, not per call — a
-			// multi-block read that is missing N blocks against a wholly stalled cohort waits N × this.
-			// Acceptable today, and the reason survives the bound becoming configurable: the underlying
+			// The bound is per block, and `get` runs its blocks' passes concurrently (`readRepairBlock`),
+			// so a multi-block read missing N blocks against a wholly stalled cohort waits about one of
+			// these, not N. The pass bound is `max(5000, 5 × cohortQueryTimeoutMs)` while the underlying
 			// per-peer archive fetch is bounded by `cohortQueryTimeoutMs` and runs the cohort in
-			// parallel, while this pass bound is `max(5000, 5 × cohortQueryTimeoutMs)` — so the pass
-			// stays several per-peer budgets wide at every setting, and remains a stall ceiling rather
-			// than a typical cost. Preserving that ratio is exactly what the `max` in
-			// `reconcilePassTimeoutMs` is for. If a cold reader batching a wide read ever times out
-			// above this layer, repair the block ids concurrently rather than shortening the bound.
+			// parallel, so the pass stays several per-peer budgets wide at every setting and remains a
+			// stall ceiling rather than a typical cost. Preserving that ratio is exactly what the `max`
+			// in `reconcilePassTimeoutMs` is for; do not shorten the bound to speed up a slow read.
 			await withDeadline(
 				this.acquireBlockFromCohort(blockId, corroborated, cohortPeerIds),
 				this.reconcilePassTimeoutMs,
