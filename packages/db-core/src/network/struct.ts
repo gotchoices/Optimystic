@@ -305,8 +305,10 @@ export type BlockGets = {
 	 *  one. A peer that predates the field ignores it and answers as it always did, which is safe
 	 *  because the reader-side check is what enforces the floor, on the merged answer, either way
 	 *  (`TransactorSource` / `BlockFloorCheck`) — so an `ITransactor` that ignores the field
-	 *  (`TestTransactor`, the reference peer's) stays correct too. What a coordinator that does read
-	 *  it does with it is ticket `a-coordinator-told-of-a-newer-revision-consults-past-its-window`.
+	 *  (`TestTransactor`, the reference peer's) stays correct too. A coordinator that does read it
+	 *  (`CoordinatorRepo.get`) consults its cohort at once for a present block whose local revision
+	 *  is below the floor, whatever its read-repair window says, and remembers the floor it consulted
+	 *  under so a floor no machine can meet costs one consult per window; it never refuses on a floor.
 	 *
 	 *  NOTE: the retry `NetworkTransactor.get` runs is per BATCH, not per block, so one below-floor
 	 *  block re-asks every block that shared its coordinator. Costs nothing today — `tryGet` asks

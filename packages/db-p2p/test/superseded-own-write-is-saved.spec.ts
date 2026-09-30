@@ -195,12 +195,19 @@ describe('A superseded write is reported for what it is: saved when built upon, 
 		await treeA.replace([['seed', { key: 'seed', value: 'Seed' }]]);
 		const { missed } = missTheNextDataCommit(mesh.nodes[0]!);
 
-		// The rival is a handle that has walked the writer's log entry, so its read of the leaf is
-		// floored at the writer's revision: node A's older copy is refused and the read is answered
-		// by node B's. The rival therefore builds on the write, declaring it as its base — which node
-		// A, holding the revision before it, refuses to apply and reconciles from node B instead.
+		// The rival reads node B's copy of the leaf — the write's revision — and builds on it,
+		// declaring the write as its base, which node A, holding the revision before it, refuses to
+		// apply and reconciles from node B instead. It reads B's storage directly on purpose: a handle
+		// that has walked the writer's log entry floors its read of the leaf at the writer's revision,
+		// and a coordinator asked with a floor above its own copy consults its cohort and repairs
+		// itself before answering (ticket `a-coordinator-told-of-a-newer-revision-consults-past-its-window`),
+		// so a read routed through node A's coordinator would bring A up to the write before the rival
+		// built on it — case 1's shape, where A can vouch for the write, not this one's.
 		const { transactor, intercepted } = interceptFirstCommit(transactorFor(transactors, peerB), {
-			beforeAnswer: async () => { await treeA.replace([['rival', { key: 'rival', value: 'Rival' }]]); },
+			beforeAnswer: async () => {
+				const rival = await openOn(peerA, treeId, readingFrom(mesh.nodes[1]!, transactorFor(transactors, peerA)));
+				await rival.replace([['rival', { key: 'rival', value: 'Rival' }]]);
+			},
 			maskSuccess: false
 		});
 		const treeB = await openOn(peerB, treeId, transactor);

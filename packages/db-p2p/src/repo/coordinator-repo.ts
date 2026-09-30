@@ -474,13 +474,34 @@ export interface ICoordinatorClusterSeam {
 	recoverTransactions(): Promise<void>;
 }
 
+/**
+ * What {@link CoordinatorRepo.lastSeenCommitMs} remembers per block: when the block was last marked
+ * freshness-checked, and — when the pass that marked it was asked for one — the asker's floor it
+ * consulted under.
+ *
+ * `floorConsulted` is what stops a floor no machine can meet from turning every read of the block
+ * into a cohort consult. The asker keeps sending the floor for as long as its own answer stays
+ * below it (`BlockGets.floors`), and a log entry whose blocks never landed sets one nobody can
+ * satisfy (ticket `bug-a-refused-write-can-leave-its-log-entry-behind`). Re-asking the cohort under
+ * the same floor inside the window could not teach this node anything the last pass did not, which
+ * is the rule every stamping exit already arms under — so the floor is recorded at exactly those
+ * exits, and only a floor STRICTLY above it triggers again ({@link CoordinatorRepo.floorDemandsConsult}).
+ * A stamp written without a floor (a commit, or a pass that was not asked one) clears the memory:
+ * a commit moves `latest`, and a floor above the new `latest` is new information.
+ */
+interface FreshnessStamp {
+	at: number;
+	floorConsulted?: number;
+}
+
 /** Cluster coordination repo - uses local store, as well as distributes changes to other nodes using cluster consensus. */
 export class CoordinatorRepo implements IRepo {
 	private coordinator: ICoordinatorClusterSeam;
 	private readonly DEFAULT_TIMEOUT = 30000; // 30 seconds default timeout
 	private readonly localPeerId?: PeerId;
 	private readonly responsibilityCache = new LruMap<string, { inCluster: boolean, expires: number }>(1000);
-	private readonly lastSeenCommitMs = new LruMap<string, number>(1000);
+	/** Per block, the lazy read-repair window's stamp — see {@link FreshnessStamp}. */
+	private readonly lastSeenCommitMs = new LruMap<string, FreshnessStamp>(1000);
 	/** Per block, what earlier repair passes left unresolved — see {@link AheadClaimState}.
 	 *  Outlives the consult on purpose: the read-repair window skips consults for blocks checked
 	 *  recently, and a doubt dropped there is a stale answer served as confirmed again.
@@ -774,7 +795,14 @@ export class CoordinatorRepo implements IRepo {
 				const localEntry = localResult[blockId];
 				const localRev = localEntry?.state?.latest?.rev;
 				const isMissing = !localEntry?.state?.latest;
-				const isStale = !isMissing && this.shouldReadRepair(blockId);
+				// The asker's floor for this block, when it sent one (`BlockGets.floors`). It is a second
+				// trigger for the consult below, never a verdict on the answer: a copy still below the
+				// floor after the pass is served exactly as any other, labelled with its `materialized`
+				// revision, and the asker's own check and retry handle it.
+				const floor = blockGets.floors?.[blockId];
+				const windowDemands = !isMissing && this.shouldReadRepair(blockId);
+				const floorDemands = !isMissing && this.floorDemandsConsult(blockId, floor, localRev);
+				const isStale = windowDemands || floorDemands;
 				if (!isMissing && !isStale) {
 					// No consult this pass — the read-repair window says this block was checked
 					// recently. An unsettled claim an earlier pass recorded still applies: the doubt
@@ -787,16 +815,21 @@ export class CoordinatorRepo implements IRepo {
 				}
 
 				if (isStale) {
+					// `reason` is 'floor' whenever the floor demanded the consult, even when the window
+					// would have consulted anyway: an operator reading `ageMs` at or below the window needs
+					// to know the asker asked for it (see docs/debugging.md).
 					this.log('cluster-tx:read-repair-triggered', {
 						blockId,
 						mode: this.readRepairMode,
 						ageMs: this.ageMs(blockId),
-						localRev
+						localRev,
+						reason: floorDemands ? 'floor' : 'window',
+						...(floor === undefined ? {} : { floor })
 					});
 				}
 
 				try {
-					const { absence, currency } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev);
+					const { absence, currency } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev, floor);
 					// `lineageOf` rides along: the refreshed entry REPLACES the local one below, and an
 					// entry that lost its lineage answer would read to the asker as "could not say".
 					const refreshed = await this.storageRepo.get({
@@ -1050,7 +1083,7 @@ export class CoordinatorRepo implements IRepo {
 			case 'off': return false;
 			case 'paranoid': return true;
 			case 'lazy': {
-				const lastSeen = this.lastSeenCommitMs.get(blockId);
+				const lastSeen = this.lastSeenCommitMs.get(blockId)?.at;
 				if (lastSeen == null) return true;
 				if (this.now() - lastSeen > this.readRepairWindowMs) return true;
 				if (this.readRepairSampleRate > 0 && this.rand() < this.readRepairSampleRate) return true;
@@ -1059,9 +1092,36 @@ export class CoordinatorRepo implements IRepo {
 		}
 	}
 
+	/**
+	 * Whether the asker's floor for a PRESENT block demands a cohort consult this read, whatever the
+	 * read-repair window says: a floor was sent, the copy this node holds is below it, and the floor
+	 * is strictly above the one this node last consulted under for the block (see
+	 * {@link FreshnessStamp}). The window's stamp says "this copy matched the cohort at some past
+	 * moment"; the floor says the asker has since learned a newer revision exists — from a log entry
+	 * it walked, or from the revision a refused write was told it lost to — so the stamp alone is no
+	 * reason to skip the cohort.
+	 *
+	 * `readRepairMode: 'off'` stays off: never consulting for a present block is the operator's
+	 * decision, and the asker still gets the transactor's second-chance round against another
+	 * coordinator. `'paranoid'` consults on every read already, so the floor changes nothing there.
+	 *
+	 * NOTE: the exits of {@link fetchBlockFromCluster} that deliberately do not arm the window (an
+	 * empty cohort, a transient corroboration decline, a thrown consult) record no floor either, so a
+	 * floored read after one of them consults again. That is the same per-read cost those exits
+	 * already impose once a window has expired, and it is bounded by the asker sending the floor only
+	 * for the blocks it actually re-reads. If it ever shows in a profile, record the floor at the
+	 * transient exit too and let the window be the retry cadence.
+	 */
+	private floorDemandsConsult(blockId: BlockId, floor: number | undefined, localRev: number | undefined): boolean {
+		if (floor === undefined || this.readRepairMode === 'off') return false;
+		if (localRev === undefined || localRev >= floor) return false;
+		const consultedUnder = this.lastSeenCommitMs.get(blockId)?.floorConsulted;
+		return consultedUnder === undefined || floor > consultedUnder;
+	}
+
 	/** Milliseconds since we last marked this block fresh, or undefined if never. */
 	private ageMs(blockId: BlockId): number | undefined {
-		const lastSeen = this.lastSeenCommitMs.get(blockId);
+		const lastSeen = this.lastSeenCommitMs.get(blockId)?.at;
 		return lastSeen == null ? undefined : this.now() - lastSeen;
 	}
 
@@ -1088,11 +1148,16 @@ export class CoordinatorRepo implements IRepo {
 		return localRev === undefined && (this.ageMs(blockId) ?? Infinity) <= this.readRepairWindowMs;
 	}
 
-	/** Mark blocks as freshly observed from cluster authority (post-commit or post-fetch). */
-	private markBlocksSeen(blockIds: BlockId[]): void {
+	/**
+	 * Mark blocks as freshly observed from cluster authority (post-commit or post-fetch). `floor` is
+	 * the asker's floor the marking pass consulted under, recorded so a later read under the same
+	 * floor does not consult again inside the window; omitted (a commit, or a pass not asked one) it
+	 * clears any floor recorded before — see {@link FreshnessStamp}.
+	 */
+	private markBlocksSeen(blockIds: BlockId[], floor?: number): void {
 		const now = this.now();
 		for (const id of blockIds) {
-			this.lastSeenCommitMs.set(id, now);
+			this.lastSeenCommitMs.set(id, floor === undefined ? { at: now } : { at: now, floorConsulted: floor });
 		}
 	}
 
@@ -1130,7 +1195,7 @@ export class CoordinatorRepo implements IRepo {
 	 * a full pend/commit cycle through the cluster coordinator.
 	 */
 	setLastSeenForTest(blockId: BlockId, ts: number): void {
-		this.lastSeenCommitMs.set(blockId, ts);
+		this.lastSeenCommitMs.set(blockId, { at: ts });
 	}
 
 	/**
@@ -1160,8 +1225,14 @@ export class CoordinatorRepo implements IRepo {
 	 *
 	 * Nothing is remembered about an absence: `get` runs this pass on every read of a block missing
 	 * locally (see the accepted-tradeoff NOTE there).
+	 *
+	 * `floor` is the asker's floor for the block when the read carried one (`BlockGets.floors`). It
+	 * changes nothing about what the pass does or decides; it is recorded with the stamp at exactly
+	 * the exits that arm the read-repair window, so a later read under the same floor inside the
+	 * window does not consult again ({@link FreshnessStamp}). The exits that deliberately leave the
+	 * window unarmed record no floor either.
 	 */
-	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext, localRev?: number): Promise<{ absence: AbsenceVerdict; currency: CurrencyVerdict }> {
+	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext, localRev?: number, floor?: number): Promise<{ absence: AbsenceVerdict; currency: CurrencyVerdict }> {
 		if (!this.clusterLatestCallback) return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
 
 		const peers = await this.keyNetwork.findCluster(routingKeyForBlock(blockId));
@@ -1208,7 +1279,10 @@ export class CoordinatorRepo implements IRepo {
 			// Deliberately opposite to the commit-side rule that withholds arming from a commit
 			// whose quorum proves nothing about rivals: that damps nothing, this bounds an
 			// otherwise unbounded loop. Landing both, keep both — see the specs for each.
-			if (!namedThisWindow) this.markBlocksSeen([blockId]);
+			// The floor is recorded with the stamp for the same reason: a one-machine deployment
+			// holding a floor it cannot meet (an abandoned entry's) consults once per window per
+			// block, not once per read.
+			if (!namedThisWindow) this.markBlocksSeen([blockId], floor);
 			// Currency: this exit queried NOBODY, so it refutes nothing — an earlier pass's unsettled
 			// claim survives it. Note the coupling with the arming just above: retained doubt now
 			// persists for up to `readRepairWindowMs` before a consult can refute it. That is correct
@@ -1306,7 +1380,7 @@ export class CoordinatorRepo implements IRepo {
 			// reportRepairDeadlock is what lets the window re-arm after it expires without the log
 			// repeating.
 			if (deadlock === 'cohort-too-small') {
-				this.markBlocksSeen([blockId]);
+				this.markBlocksSeen([blockId], floor);
 			}
 			return { absence, currency };
 		}
@@ -1354,7 +1428,7 @@ export class CoordinatorRepo implements IRepo {
 				voters: corroboration?.voters,
 				...(corroboration?.certified ? { certified: true } : {})
 			});
-			this.markBlocksSeen([blockId]);
+			this.markBlocksSeen([blockId], floor);
 			// Only reachable when this node HOLDS a revision (the baseline), so `get` never
 			// consults this verdict — computed consistently rather than hard-coded.
 			// Currency: the cohort corroborated at or below what this node holds, so nothing is
@@ -1396,7 +1470,7 @@ export class CoordinatorRepo implements IRepo {
 		// archive on every read of that block. Correct, and self-limiting once the cohort can agree; if
 		// it ever shows as read amplification, gate the acquisition step (not the latest-query) on the
 		// same window rather than remembering the absence (GitHub issue #20).
-		this.markBlocksSeen([blockId]);
+		this.markBlocksSeen([blockId], floor);
 		// Converged: the corroboration is itself the evidence that nothing is ahead, and it came from
 		// peers that answered — the shared verdict resolves to `nothing-ahead`, and the memo retires
 		// if its claimants are among those peers.

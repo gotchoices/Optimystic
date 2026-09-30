@@ -234,9 +234,13 @@ after the refresh rather than the next one. The floor also goes out on the wire:
 alone, and leaves the field off a batch none of whose blocks has one, so an unfloored read goes out
 exactly as before. A coordinator on a build that predates the field ignores it and answers as it
 always did — no version gate is needed, because `TransactorSource` judges the merged answer either
-way, which is also why an `ITransactor` that ignores the field stays correct. What a coordinator that
-does read the field does with it is ticket
-`a-coordinator-told-of-a-newer-revision-consults-past-its-window`.
+way, which is also why an `ITransactor` that ignores the field stays correct. A coordinator that does
+read the field treats a floor above its own copy as a reason to consult its cohort at once, inside
+its read-repair window, and remembers the floor it consulted under (see *The asker's floor rides out
+on the request* under Key Invariants, and
+[transactions.md § Lazy read-repair window](transactions.md#lazy-read-repair-window)). So a lagging
+coordinator asked with the floor repairs its own copy at the moment of the read, instead of when its
+window expires, and answers with the revision the asker was told about.
 
 **A refresh that follows a refused write puts a floor on its read of the log tail.** A write refused
 because a newer revision exists is told which one (`StaleFailure.staleAt`, see *The revision a writer
@@ -273,10 +277,12 @@ history, and the refresh that reaches it reports `collection:lineage-divergence`
 
 What this deliberately does not do. When *every* reachable coordinator is below the floor the old
 content is still *returned* — the highest revision anyone served, unflagged. How long that lasts
-depends on why they are all behind: a lagging replica catches up within one read-repair window, the
-bound the storage layer already documents instead of forever, while a log entry whose blocks never
-landed sets a floor no machine can ever meet, and there the below-floor content is the *correct*
-content (the accepted-tradeoff `NOTE:` at `mayRetain`). It sets no floor for a block first read at open (no entries are walked then) or for the blocks an
+depends on why they are all behind: a coordinator merely lagging its cohort is repaired by the floored
+read itself, since the floor makes it consult past its window (see *The asker's floor rides out on
+the request* under Key Invariants), so the old content outlasts one read only when no reachable cohort
+member can corroborate the revision — a partition, or a log entry whose blocks never landed, which
+sets a floor no machine can ever meet, and there the below-floor content is the *correct* content
+(the accepted-tradeoff `NOTE:` at `mayRetain`). It sets no floor for a block first read at open (no entries are walked then) or for the blocks an
 invalidation entry reverts. A write staged over a too-old read keeps the revision it was really
 computed against: once storage catches up, the base under the staged edits is re-judged as moved and
 the edits are re-staged before they are pended, never re-described at the newer revision (see
@@ -2005,8 +2011,12 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `RepoService` hands the operation to `CoordinatorRepo.get` verbatim, so the field needs no
   protocol change: a peer that predates it ignores it, and an `ITransactor` that ignores it
   (`TestTransactor`, the reference peer's) stays correct, because the reader-side check still
-  judges the merged answer. What a coordinator that reads it does with it is ticket
-  `a-coordinator-told-of-a-newer-revision-consults-past-its-window`. What it buys the asker is a second machine:
+  judges the merged answer. A coordinator that reads it consults its cohort at once for a present
+  block whose local revision is below the floor, inside its read-repair window, and records the floor
+  it consulted under with the window's stamp (`floorDemandsConsult` and `FreshnessStamp` in
+  `packages/db-p2p/src/repo/coordinator-repo.ts`), so the same floor does not consult again inside
+  the window while a higher one does; the rest of the repair pass is unchanged, and it never refuses
+  on a floor. What it buys the asker is a second machine:
   `NetworkTransactor.get` counts an entry whose `servedRevision` is below its block's floor as *not*
   answered, so it earns the same one retry round against a different coordinator that `unavailable`
   and `unconfirmedAheadRev` earn, and the merge's newer-content tie-break (currency bullet above)

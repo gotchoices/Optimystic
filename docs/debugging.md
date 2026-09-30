@@ -856,26 +856,31 @@ Some fields of this kind are already explained where their event is documented, 
 Logged under `optimystic:db-p2p:coordinator-repo` (peer-id suffixed):
 
 ```
-optimystic:db-p2p:coordinator-repo:12D3KooWAbCd cluster-tx:read-repair-triggered { blockId: 'default/Revocation', mode: 'lazy', ageMs: 14322, localRev: 3 }
-optimystic:db-p2p:coordinator-repo:12D3KooWAbCd cluster-tx:read-repair-triggered { blockId: 'default/Strand', mode: 'lazy', ageMs: undefined, localRev: 7 }
+optimystic:db-p2p:coordinator-repo:12D3KooWAbCd cluster-tx:read-repair-triggered { blockId: 'default/Revocation', mode: 'lazy', ageMs: 14322, localRev: 3, reason: 'window' }
+optimystic:db-p2p:coordinator-repo:12D3KooWAbCd cluster-tx:read-repair-triggered { blockId: 'default/Strand', mode: 'lazy', ageMs: undefined, localRev: 7, reason: 'window' }
+optimystic:db-p2p:coordinator-repo:12D3KooWAbCd cluster-tx:read-repair-triggered { blockId: 'default/Strand', mode: 'lazy', ageMs: 2104, localRev: 8, reason: 'floor', floor: 9 }
 ```
 
 Background, in one paragraph: a node that holds a block does not re-check it with its cohort on every read. In the default `lazy` read-repair mode it stamps the time the cohort last confirmed the block — a commit whose votes were a majority of the full cohort, or a consult that settled the block (including the no-op consult on a node that is its block's whole cohort) — and re-checks only once `readRepairWindowMs` (10 s by default) has passed since that stamp. The stamp is what "arms" the window. Which outcomes stamp it, and the configuration knobs, are in [docs/transactions.md §Lazy read-repair window](transactions.md#lazy-read-repair-window); this entry covers only how to read the line.
 
-The line fires when a read of a block this node **holds** decides to consult the cohort (`shouldReadRepair` in `packages/db-p2p/src/repo/coordinator-repo.ts`). A read of a block this node does not hold consults without ever emitting it. Fields:
+The line fires when a read of a block this node **holds** decides to consult the cohort (`shouldReadRepair` and `floorDemandsConsult` in `packages/db-p2p/src/repo/coordinator-repo.ts`). A read of a block this node does not hold consults without ever emitting it. Fields:
 
 - `mode` — the `readRepairMode` in force, `lazy` or `paranoid`. Mode `off` never consults about a held block, so it never emits this line.
 - `ageMs` — milliseconds since the block was last stamped (`ageMs` in `packages/db-p2p/src/repo/coordinator-repo.ts`), or `undefined` when it has no stamp.
 - `localRev` — the revision this node holds. Always present, because the line only fires for a held block.
+- `reason` — what asked for the consult: `window` (the lazy window's time test or sample, or `paranoid` mode) or `floor` (the read carried a floor above `localRev`). Reported as `floor` whenever the floor asked, even when the window would have consulted anyway.
+- `floor` — the asker's floor for the block, when the read carried one; absent otherwise. Present on every `reason: 'floor'` line, and possibly on a `reason: 'window'` line whose floor this node had already consulted under.
 
 | `mode` | `ageMs` | What it means |
 |---|---|---|
 | `paranoid` | anything | Every read consults, by design. `ageMs` tells you nothing about a defect in this mode. |
 | `lazy` | `undefined` or missing | This node has no stamp for the block. Either no outcome has stamped it yet (the window was never armed), or its stamp was **evicted**: stamps are kept for at most 1000 blocks, least recently used dropped first (`lastSeenCommitMs` in `packages/db-p2p/src/repo/coordinator-repo.ts`), so a node working across more than 1000 blocks can lose one. Absence alone is not proof the window was never armed. One such line per block, the first time it is touched, is normal. |
 | `lazy` | above `readRepairWindowMs` | The window expired. A healthy, intended re-check. |
-| `lazy` | `readRepairWindowMs` or below | Depends on `readRepairSampleRate`. Above `0`, this is a random sampled re-check, which is healthy. At its default of `0`, this is a **genuine defect**: the block re-entered repair while its window was armed. |
+| `lazy` | `readRepairWindowMs` or below | Depends on `reason` and `readRepairSampleRate`. `reason: 'floor'` is the asker's doing — it sent a floor above this node's copy — and is healthy inside the window (see below). With `reason: 'window'`: a sample rate above `0` makes this a random sampled re-check, which is healthy; at its default of `0`, this is a **genuine defect**: the block re-entered repair while its window was armed. |
 
-Read the `lazy` rows only together with `mode` and `readRepairSampleRate`. "`ageMs` at or below the window" is a defect only when both of those conditions hold, and a table without them reproduces exactly the misreading this section exists to prevent.
+Read the `lazy` rows only together with `mode`, `reason` and `readRepairSampleRate`. "`ageMs` at or below the window" is a defect only when all of those conditions hold, and a table without them reproduces exactly the misreading this section exists to prevent.
+
+**`reason: 'floor'` inside the window is a consult the asker asked for.** A reader that walked a log entry naming the block, or whose write was refused with the revision it lost to, sends that revision as the block's floor on its read, and a coordinator whose copy is below it consults at once rather than serving from its window ([transactions.md § Lazy read-repair window](transactions.md#lazy-read-repair-window)). One such line per block per floor is the healthy shape: the floor the pass consulted under is remembered with the stamp, so the same floor does not trigger again inside the window, and a rising `floor` across lines is the asker learning of newer revisions. The same `floor` repeating for one block inside one window means the passes in between did not stamp — look for `cluster-fetch:no-quorum` (a transient decline), an empty cohort, or `cluster-fetch:error` beside them — which is the per-read cost those outcomes already impose once a window has expired, bounded by the asker re-reading only the blocks it needs. A `reason: 'floor'` line followed by `cluster-tx:read-repair-noop` is a floor no reachable machine met; when that is the same block and the same floor a window later, the entry that raised it may be one whose blocks never landed (`bug-a-refused-write-can-leave-its-log-entry-behind`), and the asker's `collection:block-below-floor` line names the entry.
 
 **Repeated `undefined` for one block is a defect only if the consults in between should have stamped it.** Some consult outcomes deliberately leave the window unarmed, so that the next read tries again: a corroboration decline (`cluster-fetch:no-quorum`), unless it is the permanent `cohort-too-small` kind, and an empty cohort lookup. Repeated `undefined` after either of those is correct. Repeated `undefined` after outcomes that *do* stamp — `cluster-fetch:solo-self-skip`, `cluster-fetch:local-current`, `cluster-fetch:synced` or `cluster-fetch:not-restored` — is the never-armed defect GitHub issue #8 reported against 0.27.0.
 

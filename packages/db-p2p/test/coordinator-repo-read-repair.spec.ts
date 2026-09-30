@@ -1027,4 +1027,124 @@ describe('CoordinatorRepo read-repair', () => {
 			expect(deadlockLines(captured)).to.have.lengthOf(1);
 		});
 	});
+
+	/**
+	 * Ticket: a-coordinator-told-of-a-newer-revision-consults-past-its-window.
+	 *
+	 * The lazy window's stamp says "this copy matched the cohort at some past moment"; the asker can
+	 * know more, and says so with a per-block floor on the read (`BlockGets.floors`). A floor above
+	 * the local copy consults the cohort inside the window. The floor consulted under is then
+	 * remembered with the stamp, so a floor no machine can meet costs one consult per window per
+	 * block rather than one per read, while a higher floor is new information and consults again.
+	 */
+	describe('a read carrying a floor above the local copy', () => {
+		const TRIGGERED = 'cluster-tx:read-repair-triggered';
+		const localActionId = 'local-action';
+		const window = 60_000;
+		const baseTime = 1_000_000;
+		type TriggerPayload = { blockId?: string; reason?: string; floor?: number; ageMs?: number };
+		const triggers = (captured: unknown[][]): TriggerPayload[] =>
+			captured.filter(args => typeof args[0] === 'string' && args[0].includes(TRIGGERED))
+				.map(args => args[1] as TriggerPayload);
+
+		/**
+		 * A reader holding `blockId` at `localRev`, stamped fresh in lazy mode, on a two-member cohort
+		 * (`clusterSize: 2`, so the one peer's word corroborates) whose peer answers `remoteLatest` —
+		 * or alone, when `solo`. Consults are counted as invocations of the callback for the REMOTE
+		 * peer, one per consult; self answers from the storage double, as the real callback does.
+		 */
+		const makeStampedReader = async (localRev: number, remoteLatest: ActionRev | undefined, opts?: { solo?: boolean }) => {
+			const localPeer = await makePeerId();
+			const otherPeer = await makePeerId();
+			const cluster = makeClusterPeers(opts?.solo ? [localPeer] : [localPeer, otherPeer]);
+			const { repo: storageRepo } = makePresentStorageRepo(blockId, localRev, localActionId);
+			let consults = 0;
+			const clusterLatestCallback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(localPeer)) {
+					return (await storageRepo.get({ blockIds: [blockId] }))[blockId]?.state?.latest;
+				}
+				consults++;
+				return remoteLatest;
+			};
+			const repo = new CoordinatorRepo(
+				makeKeyNetwork(cluster),
+				makeClusterClient,
+				storageRepo,
+				{ clusterSize: 2, readRepairMode: 'lazy', readRepairWindowMs: window },
+				undefined,
+				localPeer,
+				undefined,
+				clusterLatestCallback
+			);
+			repo.now = () => baseTime;
+			repo.setLastSeenForTest(blockId, baseTime);
+			const servedRev = async (floor?: number): Promise<number | undefined> => {
+				const result = await repo.get({ blockIds: [blockId], ...(floor === undefined ? {} : { floors: { [blockId]: floor } }) });
+				return result[blockId]?.state?.latest?.rev;
+			};
+			return { repo, servedRev, consults: () => consults };
+		};
+
+		it('consults inside the window and answers with the revision it converged onto', async () => {
+			const { servedRev, consults } = await makeStampedReader(6, { actionId: 'remote-action', rev: 7 });
+
+			expect(await servedRev(), 'inside the window, no floor: served as is').to.equal(6);
+			expect(consults()).to.equal(0);
+
+			const captured = await captureCoordinatorLog(async () => {
+				expect(await servedRev(7), 'the floor gets the cohort asked, and the newer revision served').to.equal(7);
+			});
+			expect(consults()).to.equal(1);
+			expect(triggers(captured)).to.deep.equal([{ blockId, mode: 'lazy', ageMs: 0, localRev: 6, reason: 'floor', floor: 7 }]);
+
+			// Met: the local copy is at the floor now, so the floor is no reason to ask again.
+			expect(await servedRev(7)).to.equal(7);
+			expect(consults()).to.equal(1);
+		});
+
+		it('remembers the floor it consulted under: the same floor does not consult again inside the window, a higher one does', async () => {
+			// The cohort is at 6 too — the floor cannot be met by anyone (an abandoned entry's shape).
+			const { repo, servedRev, consults } = await makeStampedReader(6, { actionId: localActionId, rev: 6 });
+
+			expect(await servedRev(7), 'served below the floor, not refused').to.equal(6);
+			expect(consults(), 'the floor consulted once').to.equal(1);
+
+			expect(await servedRev(7)).to.equal(6);
+			expect(consults(), 'the same floor inside the window does not consult again').to.equal(1);
+			await servedRev();
+			expect(consults(), 'nor does an unfloored read').to.equal(1);
+
+			expect(await servedRev(8)).to.equal(6);
+			expect(consults(), 'a higher floor is new information').to.equal(2);
+			await servedRev(8);
+			expect(consults()).to.equal(2);
+
+			// A pass not asked for a floor clears the memory: the window lapses, the unfloored read
+			// consults and re-stamps without a floor, and the old floor consults once more.
+			repo.now = () => baseTime + window + 1;
+			await servedRev();
+			expect(consults(), 'the lapsed window consulted').to.equal(3);
+			await servedRev(7);
+			expect(consults(), 'the re-stamp without a floor forgot the floor consulted under').to.equal(4);
+		});
+
+		it('on a cohort of one, consults once per window per block under an unmeetable floor', async () => {
+			// The solo exit asks nobody and arms the window; with the floor recorded there, a
+			// one-machine deployment holding an abandoned entry's floor pays one trigger per window,
+			// not one per read. Counted by the trigger line, since no callback is ever invoked.
+			const { repo, servedRev, consults } = await makeStampedReader(6, undefined, { solo: true });
+
+			const captured = await captureCoordinatorLog(async () => {
+				expect(await servedRev(7), 'served below the floor, unflagged').to.equal(6);
+				await servedRev(7);
+				await servedRev(7);
+				await servedRev(8);
+			});
+			expect(triggers(captured).map(t => t.floor)).to.deep.equal([7, 8]);
+			expect(consults(), 'the solo exit never dials').to.equal(0);
+			const served = await repo.get({ blockIds: [blockId], floors: { [blockId]: 8 } });
+			expect(served[blockId]?.unavailable).to.equal(undefined);
+			expect(served[blockId]?.unconfirmedAheadRev).to.equal(undefined);
+		});
+	});
 });
