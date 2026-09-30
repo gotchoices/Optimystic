@@ -56,7 +56,8 @@ export interface AskerStatement {
 	/** The asker, as the connection it asked on authenticated it (`MessageOptions.asker`). */
 	peerId: string;
 	/** Its stated committed latest, or `undefined` for "holds no committed revision". Never carries a
-	 *  commit proof: a statement is the asker's bare word. */
+	 *  commit proof: a statement is the asker's bare word. (Where it names exactly the coordinator's own
+	 *  revision, the coordinator weighs it with its OWN proof — `CoordinatorRepo.lendLocalProofToStandIn`.) */
 	held: ActionRev | undefined;
 	/** Whether the statement stands in for consulting the asker — see {@link askerStatementFor}. */
 	standsIn: boolean;

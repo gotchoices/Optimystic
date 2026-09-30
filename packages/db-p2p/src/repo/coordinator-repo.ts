@@ -1722,6 +1722,7 @@ export class CoordinatorRepo implements IRepo {
 		if (silent.length > 0) {
 			this.log('cluster-fetch:peers-silent', { blockId, silent: silent.length, consulted: peerIds.length });
 		}
+		const proofLentBySelf = this.lendLocalProofToStandIn(claims, standIn, local);
 
 		// Verify every attached proof, in parallel, BEFORE selection — and penalize provable proof
 		// misbehavior HERE, at verification time, independent of what selection later does with the
@@ -1760,7 +1761,8 @@ export class CoordinatorRepo implements IRepo {
 			this.log('cluster-fetch:proof-uncertified', {
 				blockId, peerId: claim.peerId, rev: claim.rev, failure: verdict.failure
 			});
-			if (isAttributableProofFailure(verdict.failure)) {
+			// A proof this node lent the asker's statement is not the asker's to answer for.
+			if (isAttributableProofFailure(verdict.failure) && claim !== proofLentBySelf) {
 				this.penalizeProofService(claim.peerId, blockId);
 			}
 		}));
@@ -1868,6 +1870,25 @@ export class CoordinatorRepo implements IRepo {
 			blockId, asker: asker.peerId, held: asker.held?.rev ?? 'nothing', standsIn: asker.standsIn
 		});
 		return asker.standsIn ? asker : undefined;
+	}
+
+	/**
+	 * When the asker's statement names exactly the revision this node holds, carry this node's own
+	 * retained proof for that revision on the asker's claim, and return that claim.
+	 *
+	 * A statement carries no proof of its own (it is the asker's bare word), but the revision it names
+	 * here is one this node's proof certifies, and a consulted asker would have attached that same
+	 * cohort proof. Without it the asker is one uncertified voter, which changes what a cohort of three
+	 * or more concludes whenever its other members cannot corroborate: with one member silent, the pass
+	 * declines instead of reaching `local-current`, never arms the read-repair window, and every read
+	 * of the block then waits out the silent member's deadline instead of one read per window.
+	 */
+	private lendLocalProofToStandIn(claims: RevClaim[], standIn: AskerStatement | undefined, local: CertifiedActionRev | undefined): RevClaim | undefined {
+		const held = standIn?.held;
+		if (!held || !local?.proof || held.rev !== local.rev || held.actionId !== local.actionId) return undefined;
+		const claim = claims.find(c => c.peerId === standIn.peerId);
+		if (claim) claim.proof = local.proof;
+		return claim;
 	}
 
 	/**

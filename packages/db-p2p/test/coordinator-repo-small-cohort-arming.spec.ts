@@ -122,7 +122,7 @@ describe('CoordinatorRepo small-cohort arming rule', () => {
 	 * `repairCorroborationClusterSize` falls back to `clusterSize` (default 10), the undeclared
 	 * shape whose corroboration floor never relaxes.
 	 */
-	const makeCohortRepo = async (partners: PartnerAnswer[], cfg?: Partial<CoordinatorRepoConfig>) => {
+	const makeCohortRepo = async (partners: PartnerAnswer[], cfg?: Partial<CoordinatorRepoConfig>, selfProof?: BlockCommitProof) => {
 		const localPeer = await makePeerId();
 		const partnerPeers = await Promise.all(partners.map(() => makePeerId()));
 		const cluster = makeClusterPeers([localPeer, ...partnerPeers]);
@@ -133,7 +133,9 @@ describe('CoordinatorRepo small-cohort arming rule', () => {
 		const clusterLatestCallback: ClusterLatestCallback = async (peerId) => {
 			const id = peerId.toString();
 			callbackInvocations.push(id);
-			if (id === localPeer.toString()) return undefined;	// self short-circuit stand-in
+			if (id === localPeer.toString()) {	// self short-circuit stand-in
+				return selfProof ? { rev: LOCAL_REV, actionId: 'local-action', proof: selfProof } : undefined;
+			}
 			const answer = answers.get(id);
 			if (!answer || answer.kind === 'silent') throw new Error('partner unreachable');
 			if (answer.kind === 'holds-nothing') return undefined;
@@ -152,7 +154,7 @@ describe('CoordinatorRepo small-cohort arming rule', () => {
 		);
 		let clock = BASE_TIME;
 		repo.now = () => clock;
-		return { repo, callbackInvocations, setClock: (t: number) => { clock = t; } };
+		return { repo, callbackInvocations, partnerPeers, setClock: (t: number) => { clock = t; } };
 	};
 
 	/** Three reads spaced one second apart — all inside one window — returning every result. */
@@ -245,6 +247,39 @@ describe('CoordinatorRepo small-cohort arming rule', () => {
 				expect(countTag(captured, 'cluster-fetch:repair-deadlock'),
 					'a pass with silence makes no permanent claim').to.equal(0);
 			}
+		});
+	});
+
+	describe('a read from a partner that says what it holds', () => {
+
+		it('stands in with this node\'s proof: a silent third member still lets the window arm', async () => {
+			// Cohort of three: the reader (partner 0) states this node's own revision instead of being
+			// consulted; partner 1 is silent. Consulted, the reader would have answered with the cohort's
+			// proof and the pass would reach local-current. Its bare statement is one uncertified voter,
+			// so without this node's proof lent to it every read re-consulted and waited out partner 1.
+			const { proof } = await makeSignedProof(3, {
+				actionId: 'local-action', blockIds: [BLOCK], tailId: BLOCK, rev: LOCAL_REV
+			});
+			const { repo, callbackInvocations, partnerPeers, setClock } = await makeCohortRepo(
+				[{ kind: 'claims', rev: LOCAL_REV, actionId: 'local-action' }, { kind: 'silent' }],
+				undefined,
+				proof
+			);
+			const reader = partnerPeers[0]!.toString();
+
+			const captured = await captureCoordinatorLog(async () => {
+				for (let i = 0; i < 3; i++) {
+					setClock(BASE_TIME + i * 1_000);
+					await repo.get(
+						{ blockIds: [BLOCK], askerHolds: { [BLOCK]: { rev: LOCAL_REV, actionId: 'local-action' } } },
+						{ asker: reader }
+					);
+				}
+			});
+
+			expect(callbackInvocations, 'the reader is never asked').to.not.include(reader);
+			expect(countTag(captured, 'cluster-tx:read-repair-triggered'), 'one consult per window').to.equal(1);
+			expect(payloadOf(captured, 'cluster-fetch:local-current')?.certified).to.equal(true);
 		});
 	});
 

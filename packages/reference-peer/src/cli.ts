@@ -2,7 +2,7 @@
 import { Command, InvalidArgumentError } from 'commander';
 import { multiaddr } from '@multiformats/multiaddr';
 import debug from 'debug';
-import { getNetworkManager, createLibp2pNode, MemoryRawStorage, MemoryKVStore, RepoClient, ArachnodeFretAdapter, type IRawStorage, type IKVStore } from '@optimystic/db-p2p';
+import { getNetworkManager, createLibp2pNode, MemoryRawStorage, MemoryKVStore, RepoClient, stateHoldingsOnReads, ArachnodeFretAdapter, type IRawStorage, type IKVStore } from '@optimystic/db-p2p';
 import { FileRawStorage, FileKVStore } from '@optimystic/db-p2p-storage-fs';
 import { Diary, NetworkTransactor, BTree, registerDebugModule, type ITransactor, type BlockGets, type GetBlockResults, type ActionBlocks, type BlockActionStatus, type PendRequest, type PendResult, type CommitRequest, type CommitResult } from '@optimystic/db-core';
 import * as readline from 'readline';
@@ -481,7 +481,8 @@ class PeerSession {
 				getRepo: (peerId) => {
 					return peerId.toString() === node.peerId.toString()
 						? coordinatedRepo  // Use coordinated repo for self to enable cluster consensus
-						: RepoClient.create(peerId, keyNetwork, `/optimystic/${options.network || 'optimystic'}`);
+						// A remote read states what this node holds, so a coordinator need not ask it back.
+						: stateHoldingsOnReads(RepoClient.create(peerId, keyNetwork, `/optimystic/${options.network || 'optimystic'}`), storageRepo);
 				},
 				// Self is served by the co-located repo above, so a write this node is responsible for
 				// is coordinated here rather than sent to an equally responsible neighbour.
