@@ -700,8 +700,11 @@ reachable coordinator was asked for the confirmed revision and none could serve 
 hold it are unreachable from here, or the revision sits on a history this node cannot see (read
 `collection:lineage-divergence` for the second). A strike *without* this line on a run that has the
 namespace enabled means the tail did meet the floor and the stall lies elsewhere — the tail named a
-revision the refresh's walk could not reach, which `collection:context-short-of-tail` reports. The
-line changes nothing about what the refresh does next; the stall check still decides.
+revision the refresh's walk could not reach, which `collection:context-short-of-tail` reports beside
+the strike. A strike with *neither* line means the tail came back with no block at all: this line
+judges only a tail that carries content, and a tail with no content gives the shortfall line no
+revision to compare. The line changes nothing about what the refresh does next; the stall check
+still decides.
 
 #### Did a re-read come back older than the log says?
 

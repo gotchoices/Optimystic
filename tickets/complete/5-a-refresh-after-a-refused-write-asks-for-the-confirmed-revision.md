@@ -1,0 +1,38 @@
+description: When a write is refused because a newer version already exists, the client's re-read now says which version it knows exists, so an out-of-date machine is no longer the last one asked and the write can land on the next try instead of failing.
+prereq:
+files: packages/db-core/src/collection/collection.ts (syncAttempts, updateInternal, refreshInFlight, readLogEnds, readLogTail, tailFloorField, reportTailBelowFloor), packages/db-core/src/transactor/network-transactor.ts (get: askRepo; module function downstreamGets), packages/db-core/src/network/struct.ts (BlockGets.floors doc), packages/db-core/test/network-transactor.spec.ts ("on the wire"), packages/db-core/test/refresh-below-floor.spec.ts ("a refresh after a write refused for a newer revision"), docs/internals.md, docs/transactions.md, docs/debugging.md
+----
+
+# A refresh after a refused write asks for a tail no older than the revision it was told about
+
+## What was built
+
+A write refused with `StaleFailure.staleAt = { blockId, rev }` refreshes before its next attempt. That refresh used to read the collection header and log tail unpinned from whichever coordinator answered first. A coordinator behind the rival answered the tail at the revision the writer already held, the refresh moved nowhere, and after two rounds `Collection.syncAttempts` threw `SyncRevisionStalledError`, even when a machine one hop away held the revision. Every commit touches the log tail block, so the refused revision is a lower bound (a floor) for the tail read.
+
+- **Collection.** `syncAttempts` passes `lastStaleAt?.rev` (the highest confirmed revision seen this sync) into `updateInternal`, and `readLogEnds` puts it on whichever request reads the tail: the batched header-and-tail read, or `readLogTail` when the header names a different tail. The header never carries one. The floor lasts one refresh and is never raised into the handle's `BlockFloors`, because a floor on a tail that later rolls over would be wrong for the rest of the handle's life. A tail still below the floor after the transactor's retry is logged as `collection:tail-below-floor`, and nothing else changes: the stall check still decides. `refreshInFlight` takes the same optional argument. `TransactionCoordinator.commit` has no revision to pass it yet (backlog `debt-multi-collection-retry-cannot-see-the-taken-revision`).
+- **NetworkTransactor.** Both rounds of `get` now send `downstreamGets`: the batch's ids, the context, and the caller's floors narrowed to the batch's ids. The key is left off when the batch has no floors. What a coordinator does with the field is the companion ticket `a-coordinator-told-of-a-newer-revision-consults-past-its-window`.
+- **Docs.** `docs/internals.md`, `docs/transactions.md` and `docs/debugging.md` were updated to match (the floor now goes on the wire, the tail floor after a refusal, and the new log line).
+
+## Review findings
+
+**Read first:** the whole `ticket(implement): a-refresh-after-a-refused-write-asks-for-the-confirmed-revision` diff (source, tests, docs), then the surrounding `syncAttempts` loop, `updateInternal`, `reportShortfall` and `NetworkTransactor.get`'s `belowFloor` / `isAuthoritative`.
+
+**Checked and found correct:**
+- *The floor is sound.* `staleAt` is set only from a producer's own committed `latest`, and revisions are per collection. A later failure that carries no `staleAt` leaves the older, lower `lastStaleAt` standing, which is at or below the held revision. An honest current tail always meets that floor, so a stale floor can never cause a spurious retry against a current machine. A success resets the floor, and so does a refresh that finishes the write's own entry.
+- *Stall interaction.* A strike requires `requestedRev <= lastStaleAt.rev`, so the floor is always above the held revision whenever a strike can happen. The one-`tail-below-floor`-line-per-strike count the second test asserts follows from the loop order: attempt, refresh (logs), then the strike at the top of the loop.
+- *Wire shape.* `downstreamGets` narrows floors per batch and omits the key when there are none, and the retry round uses the same `askRepo`. A `context: undefined` key is still present on the object, exactly as before the change, and JSON drops it on the wire. db-p2p reads `floors` nowhere in `src/`, so older coordinators ignore it.
+- *Roll-over.* When the tail rolls over between the held and the refused revision, the old tail's first answer is wasted and one extra round is paid before the header names the new tail. This is documented as a `NOTE:` in `readLogEnds` and is an accepted cost, left alone.
+- *Reproduction.* I re-verified the implementer's claim. With `lastStaleAt?.rev` removed from the `syncAttempts` call, both new `refresh-below-floor.spec.ts` cases fail: the first with `SyncRevisionStalledError`, the second because the second replica is never asked. With the argument restored, both pass.
+- *Tests pay for themselves.* The two collection cases are the reproduction and the "still stalls, and says so" contract. The two wire-shape cases pin the new on-the-wire behaviour that the companion ticket depends on. The widened test doubles keep their defaults. Nothing was cut.
+
+**Found and fixed inline (minor):**
+- `docs/debugging.md` claimed that a stall strike *without* `collection:tail-below-floor` always means the tail met the floor and `context-short-of-tail` explains the stall. I traced it: when the tail met the floor, the tail's revision is above the held one, so a walk that does not advance does log the shortfall line. That part holds. The claim missed one case: a tail answered with no block produces neither line. The paragraph now says so.
+- The backlog ticket `debt-multi-collection-retry-cannot-see-the-taken-revision` pointed at `feat-refresh-can-demand-a-revision-floor`, which is now this ticket. I updated the pointer and appended an arm: once the coordinator reads `staleAt`, it should also pass it to `refreshInFlight` as the tail floor. That turns some multi-collection stalls into successes, not just faster failures.
+
+**Parked / declined:**
+- *`refreshInFlight`'s optional `tailFloor` has no caller yet.* It is kept because it is documented, costs one parameter, and is the exact seam the backlog arm above names. Not a ticket.
+- *An authoritatively absent tail under a floor is not reported.* A header that names a tail which then reads absent is already a contradiction handled by the existence rules (the three-way block answer), and `NetworkTransactor.get` deliberately does not treat an absent answer as below-floor. Reporting it here would diverge from that rule. Declined; now covered by the debugging.md wording above.
+- *File size.* `collection.ts` is 2262 lines (`wc -l`), about 60 added here. The existing `debt-collection-write-retry-logic-outgrew-its-file` already covers it. I appended the measurement and suggested the self-contained log-ends statics as a first piece to move out. No new ticket.
+- *Tests over the real network.* No mesh test drives a refused write past a lagging coordinator. It belongs with the companion ticket, where coordinators act on the floor. Not filed separately.
+
+**Runs:** `yarn workspace @optimystic/db-core build`, then the db-core suite: 1845 passing. `yarn lint` passes (exit 0) and `yarn lint:docs` is clean, both run again after the doc edit. The review changed only docs and tickets, so I did not re-run db-p2p or quereus-plugin-optimystic; the implementer reported them green (3144 passing / 63 pending, and 1001 passing / 13 pending plus smoke). `yarn test:integration` was not run in either stage.
