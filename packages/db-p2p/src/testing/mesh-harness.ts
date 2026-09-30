@@ -18,6 +18,7 @@ import { serveBlockArchive, servableProof } from '../storage/block-archive.js';
 import { coordinatorRepo, type ClusterLatestCallback, type CertifiedActionRev } from '../repo/coordinator-repo.js';
 import type { BlockHolders } from '../cluster/rebalance-monitor.js';
 import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
+import { stateHoldingsOnReads } from '../repo/stated-holdings.js';
 import { toString as u8ToString } from 'uint8arrays';
 
 export interface MeshNode {
@@ -758,8 +759,7 @@ export const buildNetworkTransactors = (mesh: Mesh, options: BuildTransactorOpti
 function meshTransactor(mesh: Mesh, options: BuildTransactorOptions, localNode: MeshNode | undefined): ITransactor {
 	const repoByPeer = new Map<string, IRepo>();
 	for (const node of mesh.nodes) {
-		const repo = node.coordinatorRepo as unknown as IRepo;
-		repoByPeer.set(node.peerId.toString(), options.wrapRepo ? options.wrapRepo(repo, node) : repo);
+		repoByPeer.set(node.peerId.toString(), repoAsReachedBy(node, localNode, options.wrapRepo));
 	}
 	return new NetworkTransactor({
 		timeoutMs: options.timeoutMs ?? 5_000,
@@ -774,4 +774,31 @@ function meshTransactor(mesh: Mesh, options: BuildTransactorOptions, localNode: 
 		},
 		localPeerId: localNode?.peerId
 	});
+}
+
+/**
+ * `target`'s repo as the transactor running on `reader` reaches it, with the layers production puts
+ * between the two: the reader states what it holds on every read it sends to another machine
+ * (`stateHoldingsOnReads`, as the plugin's `getRepo` does), then the transport (`wrapRepo`, where a spec
+ * injects its faults), then the receiving service binding the read to the peer it arrived from
+ * (`RepoService` passing the connection's peer as `asker`). A transactor that runs on no node, and a node
+ * reaching itself, get neither end, as in production.
+ */
+function repoAsReachedBy(target: MeshNode, reader: MeshNode | undefined, wrapRepo: BuildTransactorOptions['wrapRepo']): IRepo {
+	const coordinator = target.coordinatorRepo as unknown as IRepo;
+	if (!reader || reader === target) return wrapRepo ? wrapRepo(coordinator, target) : coordinator;
+	const received = arrivingFrom(coordinator, reader.peerId.toString());
+	const sent = wrapRepo ? wrapRepo(received, target) : received;
+	// The reader's store is looked up per read: `Mesh.restart` gives a node a new one.
+	return stateHoldingsOnReads(sent, { heldRevisions: blockIds => reader.storageRepo.heldRevisions(blockIds) });
+}
+
+/** `repo` as `RepoService` hands it a read that arrived over a connection from `asker`. */
+function arrivingFrom(repo: IRepo, asker: string): IRepo {
+	return {
+		get: (blockGets, options) => repo.get(blockGets, { ...options, asker }),
+		pend: (request, options) => repo.pend(request, options),
+		cancel: (actionRef, options) => repo.cancel(actionRef, options),
+		commit: (request, options) => repo.commit(request, options)
+	};
 }

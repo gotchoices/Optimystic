@@ -317,6 +317,26 @@ export type BlockGets = {
 	 *  but a read source that batches unrelated blocks would pay it. Split the retry payload down to
 	 *  the failing block ids then. */
 	floors?: Record<BlockId, number>;
+	/** Per block, what the ASKER itself holds of it: its committed latest `(rev, actionId)`, or `null`
+	 *  when it holds no committed revision. A block the asker could not read locally is left out, and
+	 *  the field is left off when none could be read.
+	 *
+	 *  It exists because a coordinator's cohort consult asks every other cohort member "what do you hold
+	 *  for this block?", and when the asker is itself a member that question has just been answered in
+	 *  its own request. A coordinator that reads the field uses the statement as that member's answer
+	 *  instead of asking it over the network (`CoordinatorRepo.get`), but only where doing so loses
+	 *  nothing: the statement is "nothing", or a revision at or below the coordinator's own (at an equal
+	 *  revision, only under the same action). A statement ahead of the coordinator is consulted as
+	 *  before, because acquiring or judging that revision needs the member's archive and commit proof,
+	 *  which a stated revision carries neither of. A statement can only lower what the coordinator
+	 *  concludes about being behind; it never makes it adopt anything.
+	 *
+	 *  The statement names no peer. WHO is stating is the identity of the connection the request
+	 *  arrived on (`MessageOptions.asker`), so a request cannot speak for another member. Filled below
+	 *  the transactor, by the reader's remote-repo decorator (`stateHoldingsOnReads` in
+	 *  `packages/db-p2p/src/repo/stated-holdings.ts`), and only on a read sent to another machine. A
+	 *  peer that predates the field ignores it and consults as before. */
+	askerHolds?: Record<BlockId, ActionRev | null>;
 	/** Ask the answering repo whether each block's CURRENT content was built from this committed
 	 *  action at this revision; it answers per block in {@link GetBlockResult.lineage}. On the wire,
 	 *  unlike `floors`. A repo that predates the field leaves `lineage` absent, which every consumer

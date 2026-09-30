@@ -179,7 +179,21 @@ export interface IPendingClaimReader {
 	pendingClaimOf(blockId: BlockId, actionId: ActionId): Promise<PendingClaim | undefined>;
 }
 
-export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ICommitProofPersister, IRevisionActionReader, IPendingClaimReader {
+/**
+ * The capability that answers "which committed revision of each of these blocks does this node hold?"
+ * without doing anything else — the statement a reader attaches to a read it sends to another machine
+ * (`BlockGets.askerHolds`, via `stateHoldingsOnReads`). It runs before the request goes out, so it must
+ * cost no network time and change nothing: see {@link StorageRepo.heldRevisions}.
+ */
+export interface IHeldRevisionReader {
+	/**
+	 * Per requested block, its committed latest, or `null` when this node holds no committed revision of
+	 * it. A block whose local metadata could not be read is left out: this node has no answer for it.
+	 */
+	heldRevisions(blockIds: BlockId[]): Promise<Record<BlockId, ActionRev | null>>;
+}
+
+export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ICommitProofPersister, IRevisionActionReader, IPendingClaimReader, IHeldRevisionReader {
 	private readonly validatePend?: PendValidationHook;
 	private readonly unvalidatablePendPolicy: UnvalidatablePendPolicy;
 	/** Per-collection change listeners; empty sets are pruned on unsubscribe. */
@@ -1332,6 +1346,31 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			return actionRev.actionId;
 		}
 		return undefined;
+	}
+
+	/**
+	 * See {@link IHeldRevisionReader}. Reads each block's metadata `latest` and nothing more: no
+	 * materialization, so no restore from a peer (which {@link get} can run through `readBlockHealing`),
+	 * and no context, so no read-driven promotion. Unlatched, like the other readers here: a commit
+	 * landing meanwhile only makes the answer early, and the answer is a statement about one moment anyway.
+	 *
+	 * `latest` is the revision a peer consulting this node would be told about, with two harmless
+	 * differences in what that consult reports (it projects {@link get}'s answer): a committed tombstone,
+	 * and a `latest` this node cannot materialize, both read there as holding nothing. The coordinator
+	 * uses a statement in place of a consult only at or below its own revision, where a claim and an
+	 * absence equally leave nothing ahead of it.
+	 */
+	async heldRevisions(blockIds: BlockId[]): Promise<Record<BlockId, ActionRev | null>> {
+		const held: Record<BlockId, ActionRev | null> = {};
+		await Promise.all(Array.from(new Set(blockIds)).map(async blockId => {
+			try {
+				const latest = await this.createBlockStorage(blockId).getLatest();
+				held[blockId] = latest ? { rev: latest.rev, actionId: latest.actionId } : null;
+			} catch (err) {
+				log('held-revisions:unreadable blockId=%s error=%s', blockId, err instanceof Error ? err.message : String(err));
+			}
+		}));
+		return held;
 	}
 
 	/** See {@link IPendingClaimReader}. */

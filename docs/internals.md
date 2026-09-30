@@ -1853,7 +1853,14 @@ saveMaterializedBlock(block): store(structuredClone(block));
   three-way contract: an `ActionRev` is a claim, a resolved `undefined` is the peer answering that
   it holds nothing, and a **rejection** is silence — so implementations must let transport errors
   propagate, and the coordinator deadlines each per-peer query (rejecting, not resolving, on
-  expiry) so a slow peer counts as silent too. One silent peer flags the whole consult, fail-closed:
+  expiry) so a slow peer counts as silent too. One member's answer can arrive without asking it:
+  the cohort member that sent the read, whose own statement of what it holds
+  (`BlockGets.askerHolds`, bound to the peer its connection authenticated) stands in for the
+  callback when it cannot put anything ahead of the coordinator — a stated revision as its claim,
+  "holds nothing" as the resolved `undefined`, and never as silence, since the member did answer
+  (`askerStatementFor` in `packages/db-p2p/src/repo/stated-holdings.ts`; the rule and its limits are
+  in [transactions.md § Lazy read-repair window](transactions.md#lazy-read-repair-window)). One
+  silent peer flags the whole consult, fail-closed:
   it could be the sole holder. A merely-stale block keeps its real local answer,
   unflagged, whatever the consult did; so do `skipClusterFetch` sync reads. Consumers: `NetworkTransactor.get`
   treats a flagged entry as *not* answered — it earns the second-chance retry an authoritative

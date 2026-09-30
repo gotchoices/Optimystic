@@ -19,6 +19,7 @@ import type { CertifiedActionRev } from "../storage/block-archive.js";
 import type { IUnderReplicationLedger } from "./i-under-replication-ledger.js";
 import { RESPONSIBILITY_TTL_MS, ResponsibilityRefusalError } from "./responsibility.js";
 import { StuckReservationTracker } from "./stuck-reservation.js";
+import { askerStatementFor, type AskerStatement } from "./stated-holdings.js";
 
 /**
  * Acquire a block's content for a cohort-corroborated revision, from the cohort, and persist it.
@@ -851,7 +852,8 @@ export class CoordinatorRepo implements IRepo {
 		}
 
 		try {
-			const { absence, currency } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev, floor);
+			const asker = askerStatementFor(blockGets, blockId, options?.asker, localEntry?.state?.latest);
+			const { absence, currency } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev, floor, asker);
 			// `lineageOf` rides along: the refreshed entry REPLACES the local one below, and an
 			// entry that lost its lineage answer would read to the asker as "could not say".
 			const refreshed = await this.storageRepo.get({
@@ -1249,8 +1251,19 @@ export class CoordinatorRepo implements IRepo {
 	 * the exits that arm the read-repair window, so a later read under the same floor inside the
 	 * window does not consult again ({@link FreshnessStamp}). The exits that deliberately leave the
 	 * window unarmed record no floor either.
+	 *
+	 * `asker` is what the peer that sent this read said it holds of the block, when it said anything
+	 * (see {@link askerStatementFor}); it only changes how that one peer's answer is obtained, in
+	 * {@link queryClusterForLatest}, and every decision below weighs the answer exactly as it would a
+	 * consulted one.
 	 */
-	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext, localRev?: number, floor?: number): Promise<{ absence: AbsenceVerdict; currency: CurrencyVerdict }> {
+	private async fetchBlockFromCluster(
+		blockId: BlockId,
+		context?: ActionContext,
+		localRev?: number,
+		floor?: number,
+		asker?: AskerStatement
+	): Promise<{ absence: AbsenceVerdict; currency: CurrencyVerdict }> {
 		if (!this.clusterLatestCallback) return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
 
 		const peers = await this.keyNetwork.findCluster(routingKeyForBlock(blockId));
@@ -1310,7 +1323,7 @@ export class CoordinatorRepo implements IRepo {
 			return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
 		}
 
-		const { corroborated, corroboration, local, silent, answered, claims, uncorroboratedRev, deadlock } = await this.queryClusterForLatest(peerIds, blockId, context);
+		const { corroborated, corroboration, local, silent, answered, claims, uncorroboratedRev, deadlock } = await this.queryClusterForLatest(peerIds, blockId, context, asker);
 		// Any silence taints the WHOLE consult, not a fraction of it (fail-closed): one silent
 		// peer could be the sole holder, and the cost — an extra transactor-level retry against
 		// another coordinator — is paid only while a peer is actually unreachable. Silence with
@@ -1630,8 +1643,13 @@ export class CoordinatorRepo implements IRepo {
 	 * block's responsible cohort (anyone controlling N keys can sign their own N-peer
 	 * proof); anchoring the signer set to topology is the optional, observational-only
 	 * {@link ProofAnchoring} layer, unwired in production today.
+	 *
+	 * The peer that sent this read is not asked when its statement may stand in for its answer
+	 * ({@link askerStandIn}): the answer then comes from the request, and is weighed like any other.
 	 */
-	private async queryClusterForLatest(peerIds: string[], blockId: BlockId, context?: ActionContext): Promise<ClusterLatestQuery> {
+	private async queryClusterForLatest(peerIds: string[], blockId: BlockId, context?: ActionContext, asker?: AskerStatement): Promise<ClusterLatestQuery> {
+		const selfId = this.localPeerId?.toString();
+		const standIn = this.askerStandIn(peerIds, blockId, selfId, asker);
 		// Query peers in parallel for their latest revision. Each query is DEADLINED (rejects), not
 		// raced-to-undefined: a peer that blows the deadline lands in the silent set below exactly
 		// like a dial failure, because a slow peer and a peer claiming "I hold nothing" must produce
@@ -1644,7 +1662,8 @@ export class CoordinatorRepo implements IRepo {
 		// raise `clusterPolicy.cohortQueryTimeoutMs` rather than softening the deadline back into an
 		// absent claim.
 		const latestResults = await Promise.allSettled(
-			peerIds.map(async peerIdStr => {
+			peerIds.map(async (peerIdStr): Promise<CertifiedActionRev | undefined> => {
+				if (peerIdStr === standIn?.peerId) return standIn.held;
 				const peerId = peerIdFromString(peerIdStr);
 				return await withDeadline(
 					this.clusterLatestCallback!(peerId, blockId, context),
@@ -1671,7 +1690,6 @@ export class CoordinatorRepo implements IRepo {
 		// revision (never self, whose answer reads the storage being repaired, per the argument
 		// above), so when that peer goes silent it is a silent claimant and the memo stands. This
 		// node agreeing with itself retires nothing.
-		const selfId = this.localPeerId?.toString();
 		let local: CertifiedActionRev | undefined;
 		const claims: RevClaim[] = [];
 		const silent: string[] = [];
@@ -1832,6 +1850,24 @@ export class CoordinatorRepo implements IRepo {
 			},
 			local, silent, answered, claims
 		};
+	}
+
+	/**
+	 * The statement that answers for the asker in this consult, or `undefined` when the asker is asked
+	 * like any other peer: it made no statement, it is not in the consulted cohort (only a member's
+	 * answer is sought, so a non-member's statement is ignored), it is this node, or its statement may
+	 * not stand in ({@link askerStatementFor}).
+	 *
+	 * Logs `cluster-fetch:asker-stated` whenever a member of the consulted cohort made a statement, used
+	 * or not: a trace that shows no inbound consult on the reader then says why, and one that does shows
+	 * the statement that did not qualify.
+	 */
+	private askerStandIn(peerIds: string[], blockId: BlockId, selfId: string | undefined, asker: AskerStatement | undefined): AskerStatement | undefined {
+		if (!asker || asker.peerId === selfId || !peerIds.includes(asker.peerId)) return undefined;
+		this.log('cluster-fetch:asker-stated', {
+			blockId, asker: asker.peerId, held: asker.held?.rev ?? 'nothing', standsIn: asker.standsIn
+		});
+		return asker.standsIn ? asker : undefined;
 	}
 
 	/**

@@ -1198,4 +1198,67 @@ describe('CoordinatorRepo read-repair', () => {
 		expect(mostOpenAtOnce, 'both blocks\' consults in flight at once').to.equal(blockIds.length);
 		for (const id of blockIds) expect(result[id]?.state?.latest).to.deep.equal(held);
 	});
+
+	describe('a read from a cohort member that says what it holds', () => {
+		// A two-member cohort: this coordinator and the reader that sent the read. Without the statement,
+		// the consult asks the reader over the network what the reader already knew when it asked.
+		// Asked, the reader answers with what its last statement said it holds.
+		const makeCoordinatorForReader = async () => {
+			const localPeer = await makePeerId();
+			const reader = await makePeerId();
+			const { repo: storageRepo } = makePresentStorageRepo(blockId, 6, 'local-action');
+			const readerConsults: BlockId[] = [];
+			let readerHolds: ActionRev | undefined;
+			const clusterLatestCallback: ClusterLatestCallback = async (peerId, id) => {
+				if (peerId.equals(localPeer)) return (await storageRepo.get({ blockIds: [id] }))[id]?.state?.latest;
+				readerConsults.push(id);
+				return readerHolds;
+			};
+			const repo = new CoordinatorRepo(
+				makeKeyNetwork(makeClusterPeers([localPeer, reader])),
+				makeClusterClient,
+				storageRepo,
+				{ clusterSize: 2, readRepairMode: 'paranoid' },
+				undefined,
+				localPeer,
+				undefined,
+				clusterLatestCallback
+			);
+			const readAs = (asker: string | undefined, id: BlockId, held: ActionRev | null) => {
+				readerHolds = held ?? undefined;
+				return repo.get({ blockIds: [id], askerHolds: { [id]: held } }, asker === undefined ? undefined : { asker });
+			};
+			return { readAs, readerConsults, reader: reader.toString() };
+		};
+
+		it('is answered without asking that member when it holds nothing ahead, and asked otherwise', async () => {
+			const { readAs, readerConsults, reader } = await makeCoordinatorForReader();
+
+			for (const held of [{ actionId: 'older-action', rev: 5 }, { actionId: 'local-action', rev: 6 }]) {
+				const result = await readAs(reader, blockId, held);
+				expect(result[blockId]?.state?.latest?.rev).to.equal(6);
+				expect(result[blockId]?.unconfirmedAheadRev, 'the answer stays confirmed').to.equal(undefined);
+			}
+			expect(readerConsults, 'a statement at or below this copy answers for the reader').to.deep.equal([]);
+
+			await readAs(reader, blockId, { actionId: 'rival-action', rev: 6 });
+			expect(readerConsults, 'another action at the same revision is consulted').to.have.length(1);
+			// Last of the reader's own, because the consult it earns moves this copy up to 7.
+			await readAs(reader, blockId, { actionId: 'reader-action', rev: 7 });
+			expect(readerConsults, 'so is a statement ahead of this copy: acquiring it needs the archive').to.have.length(2);
+			await readAs(undefined, blockId, { actionId: 'older-action', rev: 5 });
+			expect(readerConsults, 'a statement no connection vouches for is ignored').to.have.length(3);
+		});
+
+		it('keeps the new-collection probe authoritative when the reader holds nothing either', async () => {
+			const { readAs, readerConsults, reader } = await makeCoordinatorForReader();
+			const absentId: BlockId = 'block-never-written';
+
+			const result = await readAs(reader, absentId, null);
+
+			expect(readerConsults, 'the whole rest of the cohort already answered').to.deep.equal([]);
+			expect(result[absentId]?.state?.latest).to.equal(undefined);
+			expect(result[absentId]?.unavailable, 'an absence the whole cohort vouched for').to.equal(undefined);
+		});
+	});
 });

@@ -329,7 +329,12 @@ export class RepoService implements Startable {
 					// — one consult per block per `readRepairWindowMs`, damped by a 1000-entry LRU of
 					// block ids. If a working set wider than that LRU ever shows a consult on every
 					// read, widen the LRU rather than reinstating the skip.
-					response = await this.repo.get(operation.get, { expiration: message.expiration })
+					// The connection's authenticated peer is the only identity a read's `askerHolds` may be
+					// bound to, so it is passed here rather than read from anything the request says.
+					response = await this.repo.get(operation.get, {
+						expiration: message.expiration,
+						...(peerId ? { asker: peerId.toString() } : {})
+					})
 				} else if ('pend' in operation) {
 					response = await this.repo.pend(operation.pend, { expiration: message.expiration })
 				} else if ('cancel' in operation) {

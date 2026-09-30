@@ -6,6 +6,7 @@ import {
 	DEFAULT_CLUSTER_SIZE,
 	Libp2pKeyPeerNetwork,
 	RepoClient,
+	stateHoldingsOnReads,
 	StorageRepo,
 	BlockStorage,
 	MemoryRawStorage,
@@ -276,13 +277,17 @@ export class CollectionFactory {
     const protocolPrefix = `/optimystic/${options.libp2pOptions?.networkName ?? 'optimystic'}`;
     const keyNetwork = this.resolveKeyNetwork(options.keyNetwork, node, protocolPrefix);
 
+    // A node a host injected may carry no store; its reads then state nothing.
+    const localStore = node.storageRepo;
     const getRepo = (peerId: PeerId): IRepo => {
       // If it's the local peer, return the coordinated repo
       if (peerId.toString() === node.peerId.toString()) {
         return coordinatedRepo;
       }
-      // For remote peers, create a RepoClient
-      return RepoClient.create(peerId, keyNetwork, protocolPrefix);
+      // For remote peers, create a RepoClient. Its reads say what this node holds of each block, so a
+      // coordinator whose cohort includes this node need not ask it back over the network.
+      const remote = RepoClient.create(peerId, keyNetwork, protocolPrefix);
+      return localStore ? stateHoldingsOnReads(remote, localStore) : remote;
     };
 
     // The node's own derived dial deadline, so a declared link round trip reaches every repo dial.

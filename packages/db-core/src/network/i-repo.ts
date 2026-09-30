@@ -21,6 +21,14 @@ export type MessageOptions = {
 	 * transforms' own block ids.
 	 */
 	coordinatingBlockIds?: BlockId[];
+	/**
+	 * The peer id (string form) of the node a request arrived from, as the connection it arrived on
+	 * authenticated it. Set only by the service that received the request (`RepoService`), and never
+	 * sent: this is what binds a read's {@link BlockGets.askerHolds} to a peer, so the binding has to
+	 * come from the connection rather than from anything the request itself says. Absent on a local
+	 * call, where there is no asker to stand in for.
+	 */
+	asker?: string;
 }
 
 export type RepoCommitRequest = {

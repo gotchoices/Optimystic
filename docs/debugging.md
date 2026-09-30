@@ -981,6 +981,14 @@ Both lines report a repair that declined because too few peers backed one revisi
 - `noArchive` — the peer served nothing. **This combines two cases that need different fixes:** the peer holds no copy, or the peer could not be reached in time. The production fetch (`fetchArchiveFromPeer` in `packages/db-p2p/src/libp2p-node-base.ts`) turns every dial failure, and the expiry of its per-peer budget (`clusterPolicy.cohortQueryTimeoutMs`, default one second — the same budget the read path's consult uses, bounding the whole request with nothing inside it shorter), into the same empty answer. `protocol-client` logs which it was: `dial:fail`, or `dial:aborted` / `response:aborted` for the budget. To tell them apart, find the read path's `cluster-fetch:no-quorum` for the same block, which reports `absent` and `silent` separately.
 - `fetchErrors` — the fetch threw. The production fetch never throws (see the previous item), so this stays `0` on a real node. A nonzero value means a custom `fetchArchive` is wired in.
 
+### `cluster-fetch:asker-stated` — was the reader asked back?
+
+Logged under `coordinator-repo` when a consult weighs what the peer that sent the read said it holds of the block, and that peer is in the cohort being consulted ([transactions.md § Lazy read-repair window](transactions.md#lazy-read-repair-window)). Fields: `blockId`; `asker`, the peer the read's connection authenticated; `held`, the revision it stated, or `'nothing'`; and `standsIn`.
+
+- `standsIn: true` — the statement answered for that peer and it was not asked. Its own log shows no inbound sync request for the block, and it is counted in `cluster-fetch:no-quorum`'s `holders` or `absent` exactly as if it had answered.
+- `standsIn: false` — the peer was asked as usual: its statement was ahead of this node's copy, named a different action at the same revision, or this node holds no copy.
+- No line at all, on a read from another cohort member — the read carried no statement for the block (a reader on an older build, or one whose local metadata for the block could not be read), or no consult ran for it.
+
 ### `cluster-tx:complete` — is a commit retry still running?
 
 Logged under `optimystic:db-p2p:cluster` when a coordinator's cluster transaction finishes, **whether it succeeded or failed**; the line is written on the way out either way (`executeClusterTransaction` in `packages/db-p2p/src/repo/cluster-coordinator.ts`). Fields: `messageHash`, `finalPromises`, `finalCommits`, `retry`. The `reason` field of the `cluster-tx:transaction-remove` that eventually follows names which of the three exits released the entry, so a completed transaction, a finished retry and an abandoned one are distinguishable in a log search.
