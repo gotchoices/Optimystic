@@ -144,12 +144,17 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		);
 
 		const expiration = Date.now() + this.timeoutMs;
+		// Both rounds forward the caller's floors for the batch's blocks. A repo that predates the
+		// field ignores it and answers as before; the `belowFloor` check below is what holds the floor
+		// either way, so forwarding adds a chance of a first answer that meets it, never a guarantee.
+		const askRepo = (batch: CoordinatorBatch<BlockId[], GetBlockResults>) =>
+			this.getRepo(batch.peerId).get(downstreamGets(batch.payload, blockGets), { expiration, dialTimeoutMs: this.dialTimeoutMs });
 
 		let error: Error | undefined;
 		try {
 			await processBatches(
 				batches,
-				(batch) => this.getRepo(batch.peerId).get({ blockIds: batch.payload, context: blockGets.context }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
+				askRepo,
 				batch => batch.payload,
 				(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(bid => bid === blockId)],
 				expiration,
@@ -254,7 +259,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 					b.subsumedBy = [...(b.subsumedBy ?? []), ...retries];
 					await processBatches(
 						retries,
-						(batch) => this.getRepo(batch.peerId).get({ blockIds: batch.payload, context: blockGets.context }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
+						askRepo,
 						batch => batch.payload,
 						(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(id => id === blockId)],
 						expiration,
@@ -1487,6 +1492,19 @@ function baseRevsFor(all: BlockBaseRevs | undefined, batchBlockIds: BlockId[]): 
 function pendRequestForBatch(action: PendRequest, payload: Transforms): PendRequest {
 	const { baseRevs, ...rest } = action;
 	return { ...rest, transforms: payload, ...baseRevsFor(baseRevs, blockIdsForTransforms(payload)) };
+}
+
+/** The read one coordinator batch sends downstream: the batch's ids, the caller's context, and the
+ * caller's floors for those ids alone (see {@link BlockGets.floors}). The `floors` key is left off
+ * entirely when no block in the batch has one, so an unfloored read goes out exactly as it did before
+ * floors travelled. Same send-time rule as {@link digestsFor}, for the same reason. */
+function downstreamGets(batchBlockIds: BlockId[], blockGets: BlockGets): BlockGets {
+	const floors = blockGets.floors === undefined ? {} : subsetOf(blockGets.floors, batchBlockIds);
+	return {
+		blockIds: batchBlockIds,
+		context: blockGets.context,
+		...(isRecordEmpty(floors) ? {} : { floors }),
+	};
 }
 
 /**

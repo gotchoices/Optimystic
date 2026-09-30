@@ -20,9 +20,9 @@ import { Tree } from '../src/collections/tree/index.js'
 import { TestTransactor, TailLandsButReportsStale } from '../src/testing/test-transactor.js'
 import { LogDataBlockType } from '../src/log/struct.js'
 import { Log } from '../src/log/log.js'
-import { TornActionError, SyncRetryExhaustedError } from '../src/index.js'
+import { TornActionError, SyncRetryExhaustedError, SyncRevisionStalledError } from '../src/index.js'
 import { servedRevision } from '../src/transactor/transactor-source.js'
-import type { BlockGets, BlockId, CommitRequest, CommitResult, GetBlockResults } from '../src/index.js'
+import type { BlockGets, BlockId, CollectionHeaderBlock, CommitRequest, CommitResult, GetBlockResults } from '../src/index.js'
 import { captureCollectionLog } from './capture-log.js'
 
 interface Row { key: number; value: string }
@@ -51,11 +51,13 @@ class CountingTransactor extends TestTransactor {
 /** While `lagAt` is set, a PINNED read of any non-log block is answered as of `lagAt` at most —
  *  the content and the `materialized` revision a replica that stopped at `lagAt` would report.
  *  Unpinned reads (the refresh's header and tail) and log blocks are served current, so the reader
- *  correctly learns that the log moved. */
+ *  correctly learns that the log moved — unless `lagsLog` is set, when the replica is behind on the
+ *  log too and answers those as of `lagAt` as well. */
 class LaggingDataTransactor extends CountingTransactor {
 	lagAt?: number
-	/** Pinned reads answered below the revision they asked for, as [blockId, askedRev, servedRev]. */
-	laggedReads: Array<[string, number, number]> = []
+	lagsLog = false
+	/** Reads answered below what they asked for, as [blockId, askedRev (none when unpinned), servedRev]. */
+	laggedReads: Array<[string, number | undefined, number]> = []
 
 	override async get(gets: BlockGets): Promise<GetBlockResults> {
 		// Decided when the read is ASKED, so a double that answers two reads in flight differently
@@ -63,10 +65,10 @@ class LaggingDataTransactor extends CountingTransactor {
 		const lagAt = this.lagAt
 		const results = await super.get(gets)
 		const askedRev = gets.context?.rev
-		if (lagAt === undefined || askedRev === undefined || askedRev <= lagAt) return results
+		if (lagAt === undefined || (askedRev === undefined ? !this.lagsLog : askedRev <= lagAt)) return results
 		for (const [id, entry] of Object.entries(results)) {
-			if (!entry.block || entry.block.header.type === LogDataBlockType) continue
-			const lagged = (await TestTransactor.prototype.get.call(this, { blockIds: [id], context: { ...gets.context!, committed: [], rev: lagAt } }))[id]!
+			if (!entry.block || (!this.lagsLog && entry.block.header.type === LogDataBlockType)) continue
+			const lagged = (await TestTransactor.prototype.get.call(this, { blockIds: [id], context: { ...gets.context, committed: [], rev: lagAt } }))[id]!
 			// Same shape StorageRepo gives a lagging replica: its own newest revision as `state.latest`.
 			results[id] = { ...lagged, state: { ...lagged.state, latest: lagged.materialized } }
 			if ((lagged.materialized?.rev ?? 0) < (entry.materialized?.rev ?? 0)) {
@@ -82,10 +84,12 @@ class LaggingDataTransactor extends CountingTransactor {
  *  answer falls under it is re-asked against the second replica, and the newer content wins — the
  *  second-chance round `NetworkTransactor.get` runs against a coordinator it excluded, in miniature,
  *  so what a collection sees can be pinned without standing up a simulated network. A read carrying
- *  no floor is one round, exactly as before. */
+ *  no floor is one round, exactly as before. Setting `secondLagAt` puts the second replica behind
+ *  too, at that revision: every machine there is to ask is then below the floor. */
 class TwoReplicaTransactor extends LaggingDataTransactor {
 	/** One entry per block the second replica was asked for. */
 	reAsked: string[] = []
+	secondLagAt?: number
 
 	override async get(gets: BlockGets): Promise<GetBlockResults> {
 		const answers = await super.get(gets)
@@ -96,7 +100,7 @@ class TwoReplicaTransactor extends LaggingDataTransactor {
 		if (tooOld.length === 0) return answers
 		this.reAsked.push(...tooOld)
 		const behind = this.lagAt
-		this.lagAt = undefined	// the second replica, which is current
+		this.lagAt = this.secondLagAt	// the second replica
 		try {
 			const fresh = await super.get({ ...gets, blockIds: tooOld })
 			for (const id of tooOld) {
@@ -601,6 +605,76 @@ describe('a refreshed collection re-reading a block its log entry names', () => 
 			expect(await reader.get(1)).to.deep.equal(NEW)
 			expect(await net.fetchedDuring(() => reader.get(1)), 'kept once committed at the floor').to.deep.equal([])
 		})
+	})
+})
+
+// A refused write names the revision it lost to (`staleAt`), and every commit touches the log tail
+// block, so that revision is a floor for the refresh's read of the tail. Before the refresh said so,
+// a machine behind the rival answered the tail at the revision the writer already held, the refresh
+// moved nowhere, and the write ended in `SyncRevisionStalledError` although a machine one hop away
+// held exactly what the writer needed.
+describe('a refresh after a write refused for a newer revision', () => {
+	const RIVAL: Row = { key: 2, value: 'rival' }
+	const MINE: Row = { key: 3, value: 'mine' }
+	const giveUpFast = { maxAttempts: 10, baseBackoffMs: 1, maxBackoffMs: 2 }
+	const tailBelowFloorLines = (lines: string[]) => lines.filter(line => line.includes('collection:tail-below-floor'))
+
+	/** `writer` stages a row without having seen the rival's commit, and the replica asked first
+	 *  missed that commit, log included — so the only way past the refusal is the second replica. */
+	async function writerBehindARival(collectionId: string, net: TwoReplicaTransactor) {
+		const writer = await Tree.createOrOpen<number, Row>(net, collectionId, keyOf)
+		await writer.replace([[1, OLD]])
+		const rival = await Tree.createOrOpen<number, Row>(net, collectionId, keyOf)
+		await rival.replace([[2, RIVAL]])
+		const rivalRev = rival.committedRevision()!
+		net.lagsLog = true
+		net.lagAt = rivalRev - 1
+		await writer.getCollection().act({ type: 'replace', data: [[3, MINE]] })
+		return { writer, rivalRev }
+	}
+
+	/** The id of the log tail block the collection's header names now, read around the lag. */
+	async function currentTailId(net: TestTransactor, collectionId: string): Promise<string> {
+		const header = (await TestTransactor.prototype.get.call(net, { blockIds: [collectionId] }))[collectionId]!
+		return (header.block as CollectionHeaderBlock).tailId!
+	}
+
+	it('asks the machine that holds the confirmed revision, and the write lands on the next attempt', async () => {
+		const net = new TwoReplicaTransactor()
+		const { writer, rivalRev } = await writerBehindARival('refused-then-lands', net)
+
+		const lines = await captureCollectionLog(async () => { await writer.getCollection().sync(giveUpFast) })
+
+		expect(net.reAsked[0], "the refresh's read of the log tail was re-asked of the current replica")
+			.to.equal(await currentTailId(net, 'refused-then-lands'))
+		expect(writer.committedRevision(), 'the next attempt asked for one past the rival').to.equal(rivalRev + 1)
+		expect(tailBelowFloorLines(lines), 'a tail that meets the floor is not reported').to.deep.equal([])
+
+		net.lagAt = undefined
+		const fresh = await Tree.createOrOpen<number, Row>(net, 'refused-then-lands', keyOf)
+		expect([await fresh.get(1), await fresh.get(2), await fresh.get(3)], 'both writes are in storage').to.deep.equal([OLD, RIVAL, MINE])
+	})
+
+	it('still stalls when no machine holds it, and says every stalled refresh asked for it', async () => {
+		const net = new TwoReplicaTransactor()
+		const { writer, rivalRev } = await writerBehindARival('refused-and-stalls', net)
+		net.secondLagAt = rivalRev - 1
+
+		let err: unknown
+		const lines = await captureCollectionLog(async () => {
+			err = await writer.getCollection().sync(giveUpFast).catch(e => e)
+		})
+
+		expect(err).to.be.instanceOf(SyncRevisionStalledError)
+		const stalled = lines.filter(line => line.includes('collection:sync-stalled'))
+		const belowFloor = tailBelowFloorLines(lines)
+		expect(stalled, lines.join('\n')).to.have.length(2)
+		expect(belowFloor, 'one per stalled refresh').to.have.length(stalled.length)
+		for (const line of belowFloor) {
+			expect(line).to.match(new RegExp(
+				`collection:tail-below-floor id=refused-and-stalls tag=\\S+ floorRev=${rivalRev} servedRev=${rivalRev - 1}$`))
+		}
+		expect(net.reAsked, 'the second replica was asked on every one of them').to.have.length(stalled.length)
 	})
 })
 

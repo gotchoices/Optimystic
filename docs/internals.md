@@ -229,11 +229,47 @@ the same single second-chance round against a different coordinator that `unavai
 cannot beat the fresh one its own retry fetched (see the currency bullet below). So the reader that
 picked itself as coordinator and served its own copy inside the read-repair window now asks the
 cohort member one hop away that holds the revision, and returns the new content on the first read
-after the refresh rather than the next one. The floor never leaves the asking process:
-`NetworkTransactor.get` builds its own `{ blockIds, context }` for each downstream `IRepo.get`, so no
-peer sees it and no coordinator's freshness decision changes (ticket
-`feat-refresh-can-demand-a-revision-floor` is where that would change), and an `ITransactor` that
-ignores the field stays correct because `TransactorSource` judges the merged answer either way.
+after the refresh rather than the next one. The floor also goes out on the wire:
+`NetworkTransactor.get` forwards to each downstream `IRepo.get` the floors of that batch's blocks
+alone, and leaves the field off a batch none of whose blocks has one, so an unfloored read goes out
+exactly as before. A coordinator on a build that predates the field ignores it and answers as it
+always did — no version gate is needed, because `TransactorSource` judges the merged answer either
+way, which is also why an `ITransactor` that ignores the field stays correct. What a coordinator that
+does read the field does with it is ticket
+`a-coordinator-told-of-a-newer-revision-consults-past-its-window`.
+
+**A refresh that follows a refused write puts a floor on its read of the log tail.** A write refused
+because a newer revision exists is told which one (`StaleFailure.staleAt`, see *The revision a writer
+lost to travels as data* under Key Invariants), and every commit touches the log tail block — its
+entry is appended there, and a roll-over rewrites the old tail's `nextId` — so the tail block a
+header names at collection revision `R` is materialized at exactly `R`, and a tail answered below the
+refused revision is provably not the current one. `Collection.syncAttempts` therefore hands
+`staleAt.rev` to the refresh it runs before the next attempt, and `Collection.readLogEnds` puts it on
+whichever request reads the tail (the batched header-and-tail read, or `readLogTail` when the header
+names a different tail). Without it, a coordinator behind the rival answered the tail at the revision
+the writer already held, the refresh moved nowhere, and the write ended in `SyncRevisionStalledError`
+with the revision it needed one hop away. Three choices keep it narrow:
+
+- **The header carries none.** It is rewritten only when the tail rolls over, so its revision says
+  nothing about the collection's.
+- **It lasts one refresh.** It is never raised into the handle's `BlockFloors`: a standing floor on the
+  tail id the handle remembers would be wrong once that tail fills, since a filled tail's last revision
+  is the roll-over's, below the floor, and every later read of it — the chain walk, the invalidation
+  walk — would be judged too old, never cached and re-asked of a second coordinator for the life of the
+  handle. (A roll-over between the held and the refused revision costs one wasted retry round on the
+  old tail before the header names the new one; see the `NOTE:` in `readLogEnds`.)
+- **It changes nothing when no machine can meet it.** The refresh adopts what the tail says, the
+  stall check ends the write as before, and the refresh logs `collection:tail-below-floor`, which
+  separates "no reachable machine held the confirmed revision" from "it was never asked for" (see
+  [debugging.md](debugging.md#the-write-paths-report-of-the-same-failure)).
+
+A reader's `update()` and a refresh that follows no refusal carry no tail floor.
+`TransactionCoordinator.commit`'s refresh has none to pass today — its loop loses the number before
+the refresh runs (backlog `debt-multi-collection-retry-cannot-see-the-taken-revision`) — and
+`Collection.refreshInFlight` takes it as an optional argument for when it does. A tail floor helps a
+client that is merely *behind*; on a forked lineage the refused revision exists on the rival's
+history, and the refresh that reaches it reports `collection:lineage-divergence` (backlog
+`6.5-partition-healing`) — in one round now, instead of never.
 
 What this deliberately does not do. When *every* reachable coordinator is below the floor the old
 content is still *returned* — the highest revision anyone served, unflagged. How long that lasts
@@ -1961,11 +1997,16 @@ saveMaterializedBlock(block): store(structuredClone(block));
   what let every producer that cannot report a materialized revision stay unchanged.
 - **The asker's floor rides out on the request.** `BlockGets` carries an optional
   `floors: Record<BlockId, number>` — per block, the lowest revision the asker can accept — filled
-  by `TransactorSource.tryGet` from the collection's `BlockFloors` for whichever blocks have one.
-  It is a **client-side hint that never reaches a peer**: `NetworkTransactor.get` builds its own
-  `{ blockIds, context }` for each downstream `IRepo.get`, so nothing on the wire changed, and an
-  `ITransactor` that ignores the field (`TestTransactor`, the reference peer's) stays correct
-  because the reader-side check still judges the merged answer. What it buys is a second machine:
+  by `TransactorSource.tryGet` from the collection's `BlockFloors` for whichever blocks have one, and
+  by a refresh that follows a refused write for its read of the log tail (the refused revision; see
+  § A block re-read after a refresh, above). `NetworkTransactor.get` forwards each downstream
+  `IRepo.get` the floors of that batch's blocks alone, and omits the field for a batch that has
+  none, so an unfloored read's request is unchanged. The repo protocol is plain JSON and
+  `RepoService` hands the operation to `CoordinatorRepo.get` verbatim, so the field needs no
+  protocol change: a peer that predates it ignores it, and an `ITransactor` that ignores it
+  (`TestTransactor`, the reference peer's) stays correct, because the reader-side check still
+  judges the merged answer. What a coordinator that reads it does with it is ticket
+  `a-coordinator-told-of-a-newer-revision-consults-past-its-window`. What it buys the asker is a second machine:
   `NetworkTransactor.get` counts an entry whose `servedRevision` is below its block's floor as *not*
   answered, so it earns the same one retry round against a different coordinator that `unavailable`
   and `unconfirmedAheadRev` earn, and the merge's newer-content tie-break (currency bullet above)

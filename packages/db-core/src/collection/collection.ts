@@ -7,7 +7,7 @@ import { Tracker } from "../transform/tracker.js";
 import type { BasePins } from "../transform/base-pins.js";
 import { CacheSource } from "../transform/cache-source.js";
 import { computeBlockContentDigests, baseRevsField } from "../transform/digest.js";
-import type { BlockBaseRevs } from "../network/struct.js";
+import type { BlockBaseRevs, BlockGets } from "../network/struct.js";
 import { copyTransforms, isTransformsEmpty } from "../transform/helpers.js";
 import { TransactorSource, answeredBlock, servedRevision } from "../transactor/transactor-source.js";
 import { BlockFloors } from "../transactor/block-floors.js";
@@ -611,11 +611,17 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 *
 	 * `lastChance` is REQUIRED for the same reason: only the caller knows whether its retry budget
 	 * ends with this round, and a round that is the last must settle a half-landed write rather than
-	 * ask for another (see {@link completeOwnEntry}). */
-	async refreshInFlight(report: RefreshReport, lastChance: boolean): Promise<void> {
+	 * ask for another (see {@link completeOwnEntry}).
+	 *
+	 * `tailFloor` is optional: a revision a responder confirmed is taken, when the caller has one (see
+	 * {@link updateInternal}). `TransactionCoordinator.commit` has none to pass today — its commit loop
+	 * does not see the confirmed revision (backlog:
+	 * debt-multi-collection-retry-cannot-see-the-taken-revision) — and this is the parameter it will
+	 * pass it through. */
+	async refreshInFlight(report: RefreshReport, lastChance: boolean, tailFloor?: number): Promise<void> {
 		const release = await Latches.acquire(this.latchId);
 		try {
-			await this.updateInternal(report, lastChance);
+			await this.updateInternal(report, lastChance, tailFloor);
 		} finally {
 			release();
 		}
@@ -886,15 +892,22 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * here still leaves it set. Never set on a reader's refresh. A caller with no use for it passes `{}`.
 	 * @param lastChance - Whether the write in flight will get no further refresh (see
 	 * {@link completeOwnEntry}). Meaningless, and left false, on a reader's refresh.
+	 * @param tailFloor - A revision a responder CONFIRMED is committed under this collection
+	 * (`StaleFailure.staleAt.rev`, from the refusal that sent the caller here). Every commit touches
+	 * the log tail block, so the current tail is materialized at or above it, and an answer below it
+	 * is provably not the current tail. It rides out on the tail read ({@link readLogEnds}) so a
+	 * machine behind it is not the last one asked, and a tail still below it after that is reported
+	 * ({@link reportTailBelowFloor}). Scoped to this one refresh on purpose — never raised into
+	 * {@link floors}; see {@link readLogEnds} for why. Omitted on a reader's refresh.
 	 * @throws TornActionError when it found that entry and could not finish the action — thrown
 	 * before anything on this instance changed, and with `report` untouched. */
-	private async updateInternal(report: RefreshReport, lastChance = false): Promise<void> {
+	private async updateInternal(report: RefreshReport, lastChance = false, tailFloor?: number): Promise<void> {
 		// Start with a context that can see to the end of the log
 		const source = new TransactorSource(this.id, this.transactor, undefined);
 
 		// A header the storage layer could not retrieve throws BlockUnavailableError out of
 		// this read (it is not a StaleFailure, so sync's retry loop does not absorb it).
-		const ends = await Collection.readLogEnds(this.transactor, this.id, this.logTailId);
+		const ends = await Collection.readLogEnds(this.transactor, this.id, this.logTailId, tailFloor);
 		if (!ends) {
 			if (this.source.actionContext) {
 				// An absent header is only believable for a collection that has never committed.
@@ -916,6 +929,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			return;
 		}
 		this.logTailId = ends.header.tailId;
+		Collection.reportTailBelowFloor(this.id, this.instanceTag, tailFloor, ends.tail);
 		// Bootstrap context from committed tail so pending blocks are accessible.
 		Collection.bootstrapContext(source, ends.tail);
 
@@ -1925,8 +1939,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 						// instead of asking for another round, so the error that escapes below says
 						// whether the write can still land. (A deadline cannot be foreseen the same
 						// way; a write given up on it escapes unsettled, as `final: false`.)
+						// The highest revision a responder confirmed is taken rides out as the floor of
+						// the refresh's tail read, so a machine that has not caught up to it is not the
+						// last one asked (see updateInternal).
 						const report: RefreshReport = {};
-						await this.updateInternal(report, consecutiveFailures + 1 >= maxAttempts);
+						await this.updateInternal(report, consecutiveFailures + 1 >= maxAttempts, lastStaleAt?.rev);
 						const completed = report.ownEntryFinished?.durability;
 						if (completed !== undefined) {
 							// The refresh made this sync's write durable: that is a commit, and it is
@@ -2121,9 +2138,24 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * refresh that finds a new tail walks back through the old one anyway. If checkpoints start
 	 * letting that walk stop short, read the known tail in its own request instead.
 	 *
+	 * `tailFloor` (see {@link updateInternal}) goes on whichever request reads the tail — never on
+	 * the header, which is rewritten only when the tail rolls over, so its revision says nothing about
+	 * the collection's. It is not raised into the handle's {@link floors}: a standing floor on the tail
+	 * id this handle remembers would be wrong once that tail rolls over, because a filled tail's last
+	 * revision is the roll-over's, below the floor, so every later read of it (the chain walk, the
+	 * invalidation walk) would be judged too old for the life of the handle.
+	 *
 	 * @returns undefined when the header is authoritatively absent. */
-	private static async readLogEnds(transactor: ITransactor, id: CollectionId, knownTailId: BlockId | undefined): Promise<LogEnds | undefined> {
-		const results = await transactor.get({ blockIds: knownTailId === undefined ? [id] : [id, knownTailId] });
+	private static async readLogEnds(transactor: ITransactor, id: CollectionId, knownTailId: BlockId | undefined, tailFloor?: number): Promise<LogEnds | undefined> {
+		// NOTE: when the known tail filled between the held revision and the floor, even a current
+		// machine answers it below the floor (its last revision is the roll-over's), which costs the
+		// transactor one wasted retry round before the header below names the new tail — read next,
+		// with the same floor. Accepted: the tail rolls over once per full log block (32 entries), and
+		// only a refresh that follows a refusal carries a floor at all.
+		const results = await transactor.get({
+			blockIds: knownTailId === undefined ? [id] : [id, knownTailId],
+			...Collection.tailFloorField(knownTailId, tailFloor),
+		});
 		const headerEntry = results?.[id];
 		if (headerEntry === undefined) {
 			return undefined;
@@ -2139,16 +2171,43 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 		const tail = tailId === knownTailId
 			? Collection.checkedLogTail(tailId, results[tailId])
-			: await Collection.readLogTail(transactor, tailId);
+			: await Collection.readLogTail(transactor, tailId, tailFloor);
 		if (tail?.block) {
 			served.push([tailId, tail.block, servedRevision(tail)]);
 		}
 		return { header, tail, served };
 	}
 
-	/** An unpinned read of the log tail block, checked as {@link checkedLogTail} describes. */
-	private static async readLogTail(transactor: ITransactor, tailId: BlockId): Promise<GetBlockResult | undefined> {
-		return Collection.checkedLogTail(tailId, (await transactor.get({ blockIds: [tailId] }))?.[tailId]);
+	/** An unpinned read of the log tail block, checked as {@link checkedLogTail} describes, carrying
+	 * `tailFloor` when the caller has one (see {@link readLogEnds}). */
+	private static async readLogTail(transactor: ITransactor, tailId: BlockId, tailFloor?: number): Promise<GetBlockResult | undefined> {
+		const results = await transactor.get({ blockIds: [tailId], ...Collection.tailFloorField(tailId, tailFloor) });
+		return Collection.checkedLogTail(tailId, results?.[tailId]);
+	}
+
+	/** `BlockGets.floors` for a read of the tail block `tailId`, spreading to nothing when there is no
+	 * tail to read or no floor to put on it — so a refresh that follows no refusal asks exactly as
+	 * before. */
+	private static tailFloorField(tailId: BlockId | undefined, tailFloor: number | undefined): Pick<BlockGets, 'floors'> {
+		return tailId === undefined || tailFloor === undefined ? {} : { floors: { [tailId]: tailFloor } };
+	}
+
+	/** Report a refresh whose tail read came back below the revision the caller knows is committed
+	 * ({@link updateInternal}'s `tailFloor`), after the transactor asked every machine it could.
+	 * Judged by {@link servedRevision}, the number every floor check uses, and only for an answer
+	 * that carries a block — the rule `NetworkTransactor.get` judges below-floor answers by.
+	 *
+	 * Logs, does not throw: nothing changes about what the refresh does next. The refresh adopts
+	 * whatever the tail says, and when that is nothing new the stall check in {@link syncAttempts}
+	 * ends the write with its own named error. What this line adds is the distinction that error
+	 * cannot make — every reachable machine was asked for the confirmed revision and none could serve
+	 * it, as opposed to it never being asked for. */
+	private static reportTailBelowFloor(id: CollectionId, instanceTag: string, tailFloor: number | undefined, tail: GetBlockResult | undefined): void {
+		if (tailFloor === undefined || !tail?.block || servedRevision(tail) >= tailFloor) {
+			return;
+		}
+		log('collection:tail-below-floor id=%s tag=%s floorRev=%d servedRev=%d',
+			id, instanceTag, tailFloor, servedRevision(tail));
 	}
 
 	/** The repo's answer for the log tail, once it has passed {@link answeredBlock}'s unpinned-read

@@ -566,35 +566,55 @@ describe('NetworkTransactor', () => {
         expect(result[ordinary]!.materialized!.rev).to.equal(1)
       })
 
-      it('never reaches a repo: the field is consumed inside this process', async () => {
-        // `BlockGets.floors` is a client-side hint, and the whole claim that nothing on the wire
-        // changed rests on this: every downstream `IRepo.get` — the retry's included — must see the
-        // request an UNFLOORED read would have made. Otherwise a coordinator's freshness decision
-        // silently starts depending on a number the repo protocol never agreed to honour, which is
-        // the deliberate, separate step `feat-refresh-can-demand-a-revision-floor` describes.
-        const peerA = 'peer-A', peerB = 'peer-B'
-        const net = new CountingKeyNetwork([peerA, peerB])
-        const blockId = 'lagging-block' as BlockId
-
-        const seen: BlockGets[] = []
-        const recordingRepoAt = (rev: number) => makeGetOnlyRepo(async (gets: BlockGets) => {
-          seen.push(gets)
-          const res: GetBlockResults = {}
-          for (const bid of gets.blockIds) res[bid] = blockAt(bid, rev)
-          return res
-        })
-
-        const networkTransactor = new NetworkTransactor({
-          timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: net,
-          getRepo: (peerId: PeerId) => recordingRepoAt(peerId.toString() === peerA ? 1 : 2),
-        })
-
-        await networkTransactor.get({ blockIds: [blockId], context: pinnedAt2, floors: { [blockId]: 2 } })
-
-        expect(seen, 'the first round and the retry it earned').to.have.length(2)
-        for (const gets of seen) {
-          expect(Object.keys(gets).sort(), 'exactly the fields an unfloored read sends').to.deep.equal(['blockIds', 'context'])
+      describe('on the wire', () => {
+        // Every downstream `IRepo.get` the read makes, first round and retry alike.
+        const recordingTransactor = (peerA: string, net: IKeyNetwork) => {
+          const seen: BlockGets[] = []
+          const recordingRepoAt = (rev: number) => makeGetOnlyRepo(async (gets: BlockGets) => {
+            seen.push(gets)
+            const res: GetBlockResults = {}
+            for (const bid of gets.blockIds) res[bid] = blockAt(bid, rev)
+            return res
+          })
+          const networkTransactor = new NetworkTransactor({
+            timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: net,
+            getRepo: (peerId: PeerId) => recordingRepoAt(peerId.toString() === peerA ? 1 : 2),
+          })
+          return { seen, networkTransactor }
         }
+
+        it('forwards each batch the floors of its own blocks, in both rounds', async () => {
+          // A coordinator can only act on a floor it is told about (ticket
+          // a-coordinator-told-of-a-newer-revision-consults-past-its-window), so the floor rides on
+          // every downstream request that reads a floored block — narrowed to that batch's blocks, so
+          // no coordinator is told about a block it was not asked for.
+          const peerA = 'peer-A', peerB = 'peer-B'
+          const floored = 'lagging-block' as BlockId
+          const other = 'other-block' as BlockId
+          const { seen, networkTransactor } = recordingTransactor(peerA, new CountingKeyNetwork([peerA, peerB]))
+
+          await networkTransactor.get({
+            blockIds: [floored, other], context: pinnedAt2, floors: { [floored]: 2, ['elsewhere' as BlockId]: 7 },
+          })
+
+          expect(seen, 'the first round and the retry it earned').to.have.length(2)
+          for (const gets of seen) {
+            expect(gets.floors, 'the batch\'s own floors, and only those').to.deep.equal({ [floored]: 2 })
+          }
+        })
+
+        it('leaves the field off entirely when no block in the batch has a floor', async () => {
+          // An unfloored read must go out exactly as it did before floors travelled, so a peer on any
+          // build sees the request shape it always saw.
+          const peerA = 'peer-A', peerB = 'peer-B'
+          const blockId = 'lagging-block' as BlockId
+          const { seen, networkTransactor } = recordingTransactor(peerA, new CountingKeyNetwork([peerA, peerB]))
+
+          await networkTransactor.get({ blockIds: [blockId], context: pinnedAt2, floors: { ['elsewhere' as BlockId]: 7 } })
+
+          expect(seen, 'one round').to.have.length(1)
+          expect(Object.keys(seen[0]!).sort(), 'exactly the fields an unfloored read sends').to.deep.equal(['blockIds', 'context'])
+        })
       })
 
       it('is still returned when the retry can find no other coordinator to ask', async () => {

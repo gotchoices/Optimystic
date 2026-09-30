@@ -106,7 +106,7 @@ Both reporters on GitHub issue #8 found that turning debug logging on roughly do
 | `network-transactor`  | Batch creation sizes, retries, stale/missing, cancel triggers |
 | `batch-coordinator`   | Batch creation, retry paths, excluded peers       |
 | `cache`               | Block cache hit/miss                              |
-| `collection`          | `collection:invented` (`createOrOpen` found no committed header and staged a fresh empty collection), plus the read path's `collection:context-short-of-tail` / `collection:context-not-lowered` / `collection:lineage-divergence` / `collection:block-below-floor` and the write path's `collection:sync-stalled` |
+| `collection`          | `collection:invented` (`createOrOpen` found no committed header and staged a fresh empty collection), plus the read path's `collection:context-short-of-tail` / `collection:context-not-lowered` / `collection:lineage-divergence` / `collection:block-below-floor` and the write path's `collection:sync-stalled` / `collection:tail-below-floor` |
 
 ### cohort-topic sub-namespaces
 
@@ -679,6 +679,29 @@ land.
 of a fork: the write is not behind the cluster, it is on a different history from it. Silence on
 this line during a slow sync means the opposite — the refresh *is* moving, and the sync is losing
 races rather than re-requesting a taken number.
+
+**Was the confirmed revision asked for?** The refresh between attempts carries `staleRev` as a floor
+on its read of the log tail, so a machine that has not caught up to it is not the last one asked
+(`BlockGets.floors`; see [internals.md](internals.md#a-block-re-read-after-a-refresh-can-be-answered-too-old-and-is-never-remembered)).
+When the tail still comes back below it, after the transactor has asked every coordinator it could
+reach, the refresh says so:
+
+```
+optimystic:db-core:collection collection:tail-below-floor id=default/main/Usage/index/by_token tag=k3Vq_A floorRev=42 servedRev=41
+```
+
+- `floorRev=` — the confirmed revision the tail read asked for: the `staleRev` of the refusal that
+  sent the write to this refresh (the highest one reported so far in this sync).
+- `servedRev=` — the revision the tail it got back is materialized at, the same number every floor
+  check judges.
+
+This line right before a `collection:sync-stalled` strike on the same `id=` and `tag=` means every
+reachable coordinator was asked for the confirmed revision and none could serve it: the machines that
+hold it are unreachable from here, or the revision sits on a history this node cannot see (read
+`collection:lineage-divergence` for the second). A strike *without* this line on a run that has the
+namespace enabled means the tail did meet the floor and the stall lies elsewhere — the tail named a
+revision the refresh's walk could not reach, which `collection:context-short-of-tail` reports. The
+line changes nothing about what the refresh does next; the stall check still decides.
 
 #### Did a re-read come back older than the log says?
 

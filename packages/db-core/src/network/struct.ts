@@ -295,20 +295,25 @@ export type BlockGets = {
 	 *  "action A, committed at revision r, changed block X" knows a read of X at a context at or
 	 *  above `r` must come back materialized at `r` or later, while the repo answering may honestly
 	 *  believe its older copy is current. `TransactorSource.tryGet` fills this from the collection's
-	 *  `BlockFloors`; `NetworkTransactor.get` treats an answer under a block's floor as NOT answered,
-	 *  so it earns the same second-chance round against a different coordinator that `unavailable`
-	 *  and `unconfirmedAheadRev` earn.
+	 *  `BlockFloors`, and a refresh that follows a refused write puts the revision the refusal
+	 *  confirmed on its read of the log tail (`Collection.readLogEnds`). `NetworkTransactor.get`
+	 *  treats an answer under a block's floor as NOT answered, so it earns the same second-chance
+	 *  round against a different coordinator that `unavailable` and `unconfirmedAheadRev` earn.
 	 *
-	 *  CLIENT-SIDE HINT, never on the wire: `NetworkTransactor.get` builds its own
-	 *  `{ blockIds, context }` for each downstream `IRepo.get`, so this field reaches no peer and no
-	 *  coordinator's freshness decision. An `ITransactor` that ignores it (`TestTransactor`, the
-	 *  reference peer's) stays correct, because the reader-side check that actually enforces the
-	 *  floor runs on the merged answer either way (`TransactorSource` / `BlockFloorCheck`).
+	 *  On the wire, per batch: `NetworkTransactor.get` forwards to each downstream `IRepo.get` the
+	 *  floors of that batch's blocks alone, and leaves the field off a batch none of whose blocks has
+	 *  one. A peer that predates the field ignores it and answers as it always did, which is safe
+	 *  because the reader-side check is what enforces the floor, on the merged answer, either way
+	 *  (`TransactorSource` / `BlockFloorCheck`) — so an `ITransactor` that ignores the field
+	 *  (`TestTransactor`, the reference peer's) stays correct too. What a coordinator that does read
+	 *  it does with it is ticket `a-coordinator-told-of-a-newer-revision-consults-past-its-window`.
 	 *
 	 *  NOTE: the retry `NetworkTransactor.get` runs is per BATCH, not per block, so one below-floor
 	 *  block re-asks every block that shared its coordinator. Costs nothing today — `tryGet` asks
-	 *  for one block per request, so this map never holds more than one entry — but a read source
-	 *  that batches would pay it. Split the retry payload down to the failing block ids then. */
+	 *  for one block per request, and the one batched floored read is a refresh's header-and-tail
+	 *  read, whose other block is the header the refresh needed from the second machine anyway —
+	 *  but a read source that batches unrelated blocks would pay it. Split the retry payload down to
+	 *  the failing block ids then. */
 	floors?: Record<BlockId, number>;
 	/** Ask the answering repo whether each block's CURRENT content was built from this committed
 	 *  action at this revision; it answers per block in {@link GetBlockResult.lineage}. On the wire,
