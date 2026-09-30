@@ -1943,7 +1943,7 @@ export async function createLibp2pNodeBase(
 
 			// Node-level subscriber registry: a constructed ReactivitySubscriptionManager registers here so a
 			// socket-delivered NotificationV1 reaches it. (The Quereus Database.watch → manager bridge that
-			// CONSTRUCTS managers stays the backlog item optimystic-network-reactive-watch-integration-test.)
+			// CONSTRUCTS managers stays the ticket quereus-tables-opt-in-to-network-change-notification.)
 			const reactivitySubscribers = new ReactivitySubscriberRegistry();
 			(node as any).reactivitySubscribers = reactivitySubscribers;
 
@@ -2045,7 +2045,7 @@ export async function createLibp2pNodeBase(
 			// "what did I miss?" and is brought current over a real request-reply socket. The SERVE side is live
 			// here: this node answers RecoverRequestV1 frames against its live forwarder PushStates. The OUTBOUND
 			// transport + signers are constructed and exposed for the subscribe factory that CONSTRUCTS managers
-			// (the Quereus Database.watch app-bridge — backlog optimystic-network-reactive-watch-integration-test);
+			// (the Quereus Database.watch app-bridge — ticket quereus-tables-opt-in-to-network-change-notification);
 			// no node-internal manager calls them yet, exactly as the notify subscriber side is constructed against
 			// `reactivitySubscribers` rather than from a watch.
 			//
@@ -2106,7 +2106,7 @@ export async function createLibp2pNodeBase(
 			// when its manager surfaces a `RotationNotice` (`reactivity-rotation-rereg-scheduler`). Constructed with
 			// the default unref'd `setTimeout` timer so an idle re-registration never pins the process. The
 			// `reRegister(plan)` MOVE belongs to the subscribe factory that CONSTRUCTS managers (the deferred Quereus
-			// `Database.watch` bridge — backlog optimystic-network-reactive-watch-integration-test): on fire it builds
+			// `Database.watch` bridge — ticket quereus-tables-opt-in-to-network-change-notification): on fire it builds
 			// a fresh `ReactivitySubscriptionManager` under `plan.newTopicId` carrying `plan.lastRevision`, registers
 			// it, and swaps the `ReactivitySubscriberRegistry` entry — registering the NEW-topic handler BEFORE
 			// unregistering the old, so a notification mid-swap is never dropped. Until that factory lands no
@@ -2114,7 +2114,7 @@ export async function createLibp2pNodeBase(
 			// `reactivitySubscribers` / `reactivityRecover` without a live manager constructor.
 			reactivityRotation = new RotationReRegistrationScheduler({
 				reRegister: (plan): Promise<void> => {
-					reactivityWiringLog("reactivity rotation re-registration fired for successor topic=%s (lastRevision=%d) but no subscribe factory is wired yet — deferred to optimystic-network-reactive-watch-integration-test", bytesToB64url(plan.newTopicId), plan.lastRevision);
+					reactivityWiringLog("reactivity rotation re-registration fired for successor topic=%s (lastRevision=%d) but no subscribe factory is wired yet — deferred to quereus-tables-opt-in-to-network-change-notification", bytesToB64url(plan.newTopicId), plan.lastRevision);
 					return Promise.resolve();
 				},
 			});

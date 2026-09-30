@@ -458,7 +458,7 @@ Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; c
 > forwarder host, the recover serve's `rotationFor` → `ReactivityForwarderHost.rotationRedirectFor`, and
 > constructs + exposes an unref'd-timer `RotationReRegistrationScheduler` (`node.reactivityRotation`); its
 > `reRegister(plan)` is driven by the subscribe factory that constructs managers (the deferred Quereus
-> `Database.watch` bridge, `optimystic-network-reactive-watch-integration-test`) — until that lands the
+> `Database.watch` bridge, `quereus-tables-opt-in-to-network-change-notification`) — until that lands the
 > scheduler is constructed + exposed + unit/mesh-tested but not driven by a node-internal manager. Specs:
 > db-p2p `mesh-tail-rotation.spec.ts` (redirect-driven re-registration with no gap; cross-rotation resume from
 > the inherited checkpoint), `node-wiring.spec.ts` (scheduler exposed + torn down), `managers.spec.ts`
@@ -850,11 +850,10 @@ Tail cohort emits notification for revision 7800. Tier-1 forwarder `F_a` receive
 > delivery, **verified end-to-end against the tail cohort's `MembershipCertV1` with real Ed25519
 > collected-multisig crypto** (no pass-crypto stub). The harness *models* only the notification transport
 > (the application protocol that would dial each subscriber's primary / child cohort) and, like the
-> matchmaking mock tier, the **single-tier-0 reach**. This **supersedes the intent** of the superseded
-> backlog stub [`optimystic-network-reactive-watch-integration-test`] — that stub asked for a single
-> networked reactive-watch test; the suites here generalize it to the full reactivity surface at scale. The
-> residual *real-libp2p socket* wakeup of a `Database.watch` consumer (the stub's Quereus-bridge concern) is
-> the `substrate-e2e-real-libp2p-tier` ticket's, not duplicated here.
+> matchmaking mock tier, the **single-tier-0 reach**. The suites cover
+> the reactivity surface at scale; the real-libp2p socket wakeup of a `Database.watch` consumer on a
+> machine that does not store the table belongs to ticket
+> `quereus-tables-opt-in-to-network-change-notification`, not duplicated here.
 
 Each §Worked scenario / §Failure mode maps to a named test (or a tagged-unimplemented expectation):
 
@@ -919,7 +918,7 @@ never hard-code drifting numbers.
 > **Still deferred (tagged, not faked):** the tail-rotation-specific *redirect* on socket delivery
 > (`12.5-reactivity-tail-rotation-transport`) and the real-libp2p `Database.watch` wakeup — the Quereus
 > application bridge that *constructs* a subscription manager from a watch and registers it
-> (`optimystic-network-reactive-watch-integration-test`). 12.33 + recover-node-wiring own the transport,
+> (`quereus-tables-opt-in-to-network-change-notification`). 12.33 + recover-node-wiring own the transport,
 > registry, and recover serve+signers those plug into.
 
 ---

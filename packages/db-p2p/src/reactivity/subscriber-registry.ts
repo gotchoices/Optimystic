@@ -14,7 +14,7 @@
  *
  * **Scope.** This delivers socket-routed notifications into a manager that was *already constructed* and
  * registered. Constructing the manager from a Quereus `Database.watch` (the application bridge) stays the
- * backlog item `optimystic-network-reactive-watch-integration-test`; this registry is the plug it will use.
+ * ticket `quereus-tables-opt-in-to-network-change-notification`; this registry is the plug it will use.
  */
 
 import { bytesToB64url, type NotificationV1 } from "@optimystic/db-core";

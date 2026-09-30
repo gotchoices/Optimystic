@@ -965,7 +965,7 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
     peer-id string (the transport dials with `peerIdFromString`). Teardown stops the gossip timer,
     unsubscribes the inbound notify handler, and unhandles the reactivity protocols before the host
     stops. (The Quereus `Database.watch` → subscription-manager bridge that *constructs* subscribers
-    remains the backlog `optimystic-network-reactive-watch-integration-test`.)
+    remains the ticket `quereus-tables-opt-in-to-network-change-notification`.)
   - **Tail rotation is now live** (`reactivity-rotation-host-wiring-e2e`). `ReactivityOriginationManager`
     tracks the last-seen reactivity tail per collection and, when `event.tailId` **changes** between commits,
     fires `forwarderHost.markRotated(oldTopicId, { newTailId, effectiveAtRevision: event.rev }, now)` — the
@@ -975,7 +975,7 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
     a recover reaching the draining old tail returns a `kind:"rotated"` redirect), and constructs + exposes an
     unref'd-timer `RotationReRegistrationScheduler` as `node.reactivityRotation` (torn down in the stop wrapper
     before `host.stop()`). The scheduler's `reRegister(plan)` move is wired by the deferred subscribe factory
-    (the same `optimystic-network-reactive-watch-integration-test` that constructs managers); until then it is
+    (the same `quereus-tables-opt-in-to-network-change-notification` that constructs managers); until then it is
     constructed + exposed + unit/mesh-tested but not driven by a node-internal manager. Anticipatory warm-up on
     a live node is signal-only (logged; no successor coord is fabricated).
 

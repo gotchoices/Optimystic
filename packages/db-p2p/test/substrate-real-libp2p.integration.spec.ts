@@ -549,7 +549,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	// registry receives inbound frames. A committed change on a tail-cohort member fires a NotificationV1 that
 	// reaches a remote subscriber over a real socket; the subscriber verifies it with real Ed25519 against the
 	// tail cohort's membership. (Rotation-specific redirect is 12.5; the Quereus Database.watch app-bridge that
-	// CONSTRUCTS managers stays the backlog optimystic-network-reactive-watch-integration-test — here the
+	// CONSTRUCTS managers stays the ticket quereus-tables-opt-in-to-network-change-notification — here the
 	// subscriber is constructed directly against the remote node's registry.)
 	it('a commit on a real cohort member delivers a NotificationV1 to a remote subscriber over a real socket', async () => {
 		const tailBytes = reactivityTailBytes(TAIL_ID);
@@ -682,7 +682,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	// forwarder host's live PushStates. A remote subscriber that slept past the live tail's last delivered
 	// revision sends one ResumeV1 over a real `/optimystic/reactivity/1.0.0/recover` socket to a real tail-cohort
 	// member and is brought current (the backfill variant). The subscriber side is constructed directly (the
-	// Quereus Database.watch → manager factory stays the backlog optimystic-network-reactive-watch-integration-test,
+	// Quereus Database.watch → manager factory stays the ticket quereus-tables-opt-in-to-network-change-notification,
 	// exactly as the notify test notes); the recover transport is pinned to the origin for determinism — the full
 	// sticky-primary → cohort-walk target selection is unit-covered by reactivity/recover-transport.spec.ts.
 	it('a remote subscriber resumes past the tail over a real recover socket and is brought current (backfill)', async () => {
