@@ -137,3 +137,7 @@ application to make that call, which it can — but only if it can tell the case
 site instead of guessing, which makes it the strongest candidate for a security-sensitive consumer,
 and gives it the same shape as the write side's `WriteDurability`. Answer 3 alone leaves the caller
 retrying blind.
+
+# Arm (2026-09-29): the rule the read-routing ticket adopted
+
+`implement/a-read-prefers-its-own-copy-when-it-holds-the-block` (from the plan ticket `feat-a-live-read-can-skip-a-refresh-the-cohort-already-told-it-about`) settles the *healthy* half of "when may a live read use local state without asking another machine": when the machine is in the block's cohort and its self-coordination guard allows it, a read goes to its own storage. The answer is then held to the coordinator's own currency rules (lazy read-repair window, floors, doubt markers), exactly as a remote coordinator's answer is. Any decision this ticket makes should extend that rule rather than add a second one. The open case here is the one where those currency rules cannot be met: the consult reaches nobody and the block is missing locally (`cohort-unreachable`). The isolated-read degrade in `findCoordinator` already routes an isolated read to self; what fails is the answer, not the routing.
