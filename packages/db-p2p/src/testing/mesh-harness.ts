@@ -747,6 +747,14 @@ export const buildNetworkTransactor = (mesh: Mesh, options: BuildTransactorOptio
  * node the way a production node's transactor does (`localPeerId`): when that
  * node is in a block's cohort and ties another member on coverage, it
  * coordinates the write itself. Reads and retries still route by proximity.
+ *
+ * NOTE: production differs for reads — a node in a block's cohort answers its own reads from its own
+ * replica whenever its self-coordination guard allows (`selfReadVerdict` in
+ * `Libp2pKeyPeerNetwork`), so mesh specs exercise the remote-coordinator read path for keys whose
+ * nearest node is another member, and no mesh spec exercises the self-first path (the real-socket
+ * `routing-key-convention-divergence.integration.spec.ts` does). If a mesh spec needs that path, give
+ * each node's transactor a key network whose read picks `localNode` when it is in the key's cohort
+ * and not excluded — expect specs that rely on reads reaching a particular coordinator to move.
  */
 export const buildNetworkTransactors = (mesh: Mesh, options: BuildTransactorOptions = {}): Map<string, ITransactor> => {
 	const transactors = new Map<string, ITransactor>();
