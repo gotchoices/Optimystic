@@ -1,4 +1,4 @@
-import { routingKeyForBlock } from '@optimystic/db-core';
+import { routingKeyForBlock, type FindCoordinatorOptions } from '@optimystic/db-core';
 import { expect } from 'chai';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
@@ -1082,6 +1082,44 @@ describe('Libp2pKeyPeerNetwork', () => {
 					FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_BLOCKED
 				);
 			}
+		});
+	});
+
+	// --- A read prefers this node's own replica when it holds the block ------------
+	// A remote coordinator answers from ITS copy under its own read-repair window, so a read this
+	// node is responsible for gains nothing by leaving the machine. Yet the coordinator cache —
+	// fed a remote pick by every commit's coordinator resolution — is consulted first, and the
+	// proximity ranking puts self first for only about half the keys, so reads went remote anyway.
+	describe('findCoordinator() — a read prefers this node\'s own replica when it holds the block', () => {
+		it('a responsible node reads locally ahead of a cached remote pick; excluding self, a write, or a non-member still routes remote', async () => {
+			const remote = await makePeerId();
+			const KEY = routingKeyForBlock('self-read-key');
+			// The remote is nearest the key and connected, and it is already cached for the key.
+			const networkWith = (clusterSize: number): Libp2pKeyPeerNetwork => {
+				const fret = {
+					assembleCohort: () => [remote.toString(), selfPeerId.toString()],
+					getNetworkSizeEstimate: () => ({ size_estimate: 2, confidence: 0.5 }),
+					detectPartition: () => false,
+					exportTable: () => undefined
+				};
+				const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(remote)], fret });
+				// Default high-water mark of 1: the guard allows self as a bootstrap node.
+				const network = new Libp2pKeyPeerNetwork(libp2p, clusterSize, undefined, 'forming');
+				network.recordCoordinator(KEY, remote);
+				return network;
+			};
+			const pick = async (network: Libp2pKeyPeerNetwork, options: Partial<FindCoordinatorOptions>): Promise<string> =>
+				(await network.findCoordinator(KEY, options)).toString();
+
+			const member = networkWith(2);
+			expect(member.shouldAllowSelfCoordination('read').allow, 'precondition: the guard allows self').to.equal(true);
+			expect(await pick(member, { intent: 'read' }), 'a read stays on this node').to.equal(selfPeerId.toString());
+			expect(await pick(member, { intent: 'read', excludedPeers: [selfPeerId] }),
+				'the second-chance retry after a local answer reaches another machine').to.equal(remote.toString());
+			expect(await pick(member, {}), 'a write (intent unset, as a pend passes it) keeps its cached coordinator').to.equal(remote.toString());
+
+			// clusterSize 1: the nearer remote is the whole cohort, so this node is not responsible.
+			expect(await pick(networkWith(1), { intent: 'read' }), 'a non-member read keeps the cached pick').to.equal(remote.toString());
 		});
 	});
 

@@ -47,10 +47,23 @@ exception, a refresh that finds the header naming a NEW tail block: the tail id 
 remembered was asked for in the same request as the header, that answer is then
 discarded, and the walk fetches that block again on its way back through the chain (the
 accepted one-extra-request cost recorded at `Collection.logTailId` in
-`packages/db-core/src/collection/collection.ts`). On a peer-to-peer node
-each request is a network round trip, so an idle poll costs one per tree rather than the
-seven or more it used to. The budgets are asserted in
+`packages/db-core/src/collection/collection.ts`). An idle poll therefore costs one
+request per tree rather than the seven or more it used to. The budgets are asserted in
 `packages/db-core/test/refresh-read-cost.spec.ts`.
+
+On a peer-to-peer node that request is a network round trip only when another machine
+answers it. A read goes to the node's own replica, ahead of the coordinator cache and of
+proximity ranking, whenever the node is one of the block's responsible peers and its
+self-coordination guard allows it (`selfReadVerdict` in
+`packages/db-p2p/src/libp2p-key-network.ts`). So on a machine in the block's cohort an idle
+poll costs no network request inside the lazy read-repair window, plus one cohort consult per
+block per window. That adds no staleness: a remote coordinator answers from its own copy
+under the same window, so answering locally changes which cohort member answers, not what the
+answer guarantees — the bound is the one stated in
+[transactions.md § Lazy read-repair window](transactions.md#lazy-read-repair-window). Floors,
+`unconfirmedAheadRev` and `unavailable` still earn the transactor's second-chance round, which
+excludes this node and so reaches another machine. A guard denial, even a deferrable one,
+leaves the read to go to a reachable cohort member, as before.
 
 A **write** pays that same refresh plus what the write itself needs: one request when
 nothing else has committed since this handle last looked, two when another handle has.

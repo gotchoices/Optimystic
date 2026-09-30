@@ -649,7 +649,8 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 
 	/**
 	 * Memoize the coordinator for a key. A pick of SELF is deliberately ignored — the
-	 * cache is consulted ahead of every selection tier, so a self entry would keep the
+	 * cache is consulted ahead of every selection tier but a read's own-replica tier
+	 * ({@link selfReadVerdict}), so a self entry would keep the
 	 * key routed at our own (possibly stale) replica for the full TTL long after a
 	 * better-placed peer became reachable, and would return self without re-consulting
 	 * {@link shouldAllowSelfCoordination}, letting a partitioned node silently serve its
@@ -773,6 +774,55 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return svc
 	}
 
+	/**
+	 * Should a READ of `key` be answered by this node's own replica? Yes when this node is one of
+	 * the key's responsible peers (the same {@link assembleServingCohort} every tier works from) and
+	 * its self-coordination guard allows it outright, with or without a warning.
+	 *
+	 * This adds no staleness over a remote pick: a remote coordinator answers from ITS copy under its
+	 * own lazy read-repair window, and a self pick answers from ours under the identical rule, with
+	 * the caller's floors, the `unconfirmedAheadRev` doubt marker and the `unavailable` flag riding
+	 * along unchanged. What keeps a bad local answer from sticking is the caller's second-chance
+	 * retry, which excludes the first coordinator — hence the exclusion check here.
+	 *
+	 * A guard denial, deferrable or not, leaves the pick to the tiers below: the isolation-gated
+	 * degrade there is the only path that hands a read to a self its own guard refused, so a node
+	 * that calls itself partitioned still routes to a reachable cohort member.
+	 *
+	 * Returns the assembly it made, so the first cohort attempt need not repeat it.
+	 *
+	 * NOTE: this assembles the cohort on EVERY read, where a cached remote pick used to skip that —
+	 * a hash, a FRET table walk and peerStore reads, all local. If it shows up in profiles, memoize
+	 * "self is in this key's cohort" with a short TTL (`CoordinatorRepo`'s responsibility check
+	 * already keeps a 60 s one) rather than skipping the tier.
+	 * NOTE: after this tier an idle poll on a responsible node costs one in-process
+	 * `CoordinatorRepo.get` per tree, plus one cohort consult per block per read-repair window. A
+	 * `Collection`-level "known current" mark cleared by change events would save only the
+	 * in-process call; consider it if in-process refreshes ever show up in profiles.
+	 */
+	private async selfReadVerdict(key: RoutingKey, excludedSet: Set<string>, keyStr: string): Promise<{ pick: boolean; assembled?: ServingCohort }> {
+		const selfStr = this.libp2p.peerId.toString()
+		if (!this.isSelectable(selfStr, excludedSet)) return { pick: false }
+		let assembled: ServingCohort
+		try {
+			assembled = await this.assembleServingCohort(key)
+		} catch (err) {
+			// A read that works today must not fail here: the tiers below assemble again and route
+			// without a cohort if they must.
+			this.log('findCoordinator:self-read-assembly-failed key=%s - %o', keyStr, err)
+			return { pick: false }
+		}
+		if (!assembled.cohort.includes(selfStr)) return { pick: false, assembled }
+		// An allow-with-warning is still an allow: on a connected node that has seen more than one
+		// peer it is the guard's ordinary answer, and the guard logs it itself.
+		const decision = this.shouldAllowSelfCoordination('read')
+		if (!decision.allow) {
+			this.log('findCoordinator:self-read-declined key=%s reason=%s', keyStr, decision.reason)
+			return { pick: false, assembled }
+		}
+		return { pick: true, assembled }
+	}
+
 	async findCoordinator(key: RoutingKey, _options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
 		const t0 = Date.now();
 		const excludedSet = new Set<string>((_options?.excludedPeers ?? []).map(p => p.toString()))
@@ -793,6 +843,20 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		let lastCohort: string[] | undefined
 
 		this.log('findCoordinator:start key=%s excluded=%o', keyStr, Array.from(excludedSet).map(s => s.substring(0, 12)))
+
+		// Read tier, ahead of the cache: the cache only ever holds REMOTE picks (every commit resolves
+		// one, and redirect hints add more), so consulting it first kept a responsible node's reads
+		// going remote for the life of each entry. The assembly it makes is handed to the first cohort
+		// attempt.
+		let reusableAssembly: ServingCohort | undefined
+		if (intent === 'read') {
+			const verdict = await this.selfReadVerdict(key, excludedSet, keyStr)
+			if (verdict.pick) {
+				this.log('findCoordinator:done key=%s ms=%d source=%s', keyStr, Date.now() - t0, 'self-read')
+				return this.libp2p.peerId
+			}
+			reusableAssembly = verdict.assembled
+		}
 
 		// honor cache if not excluded
 		const cached = this.getCachedCoordinator(key)
@@ -819,7 +883,8 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			// always one of the peers that will hold the block, never a neighbour just
 			// outside that set.
 			try {
-				const assembled = await this.assembleServingCohort(key)
+				const assembled = reusableAssembly ?? await this.assembleServingCohort(key)
+				reusableAssembly = undefined
 				lastCohort = assembled.cohort
 				band = assembled.band
 				this.log('findCoordinator:cohort key=%s size=%d selfInCohort=%s', keyStr, assembled.cohort.length, assembled.cohort.includes(selfStr))
