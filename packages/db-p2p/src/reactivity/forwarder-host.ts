@@ -8,7 +8,8 @@
  * inbound off a dial ({@link ReactivityForwarderHost.onInbound}) — it:
  *
  *  1. lazily instantiates the per-collection {@link PushState} + forwarder behind the Edge policy gate
- *     ({@link instantiateForwarderPushState}: `undefined` on an Edge node ⇒ this node never forwards);
+ *     ({@link mayServeAsReactivityForwarder}: an Edge node never forwards) and only once the topic has demand —
+ *     at least one direct subscriber — so a collection nobody watches costs no replay ring and no gossip;
  *  2. runs the db-core receive path (verify → dedupe → buffer) and stops on `"duplicate"` / `"untrusted"`;
  *  3. on `"forward"`, fans the **unmodified** frame out to every direct subscriber (through the
  *     per-subscriber bounded queue, so a slow/dead subscriber's drops never stall the rest) and every
@@ -38,7 +39,8 @@ import {
 	b64urlToBytes,
 	bytesToB64url,
 	createReactivityForwarder,
-	instantiateForwarderPushState,
+	mayServeAsReactivityForwarder,
+	requireForwarderPushState,
 	decodeSubscribeAppPayload,
 	TailDrainGate,
 	type NotificationV1,
@@ -109,7 +111,7 @@ export interface ReactivityForwarderHostDeps {
 	readonly selfPeerId: string;
 	/** Node profile; gates {@link PushState} instantiation (Edge ⇒ subscriber-only, never forwards). */
 	readonly profile: NodeProfile;
-	/** Build the per-collection {@link PushStateInit} on first ingest for a topic this node serves. */
+	/** Build the per-collection {@link PushStateInit} on the first ingest of a served topic that has a subscriber. */
 	readonly pushStateInit: (topicId: Uint8Array, n: NotificationV1) => PushStateInit;
 	/** The notification verifier for a topic (a db-core `createNotificationVerifier` over the host's service verifier, T3). */
 	readonly verifierFor: (topicId: Uint8Array) => NotificationVerifier;
@@ -139,7 +141,7 @@ interface ServedTopic {
 
 /**
  * The reactivity fan-out orchestrator. Build one per node; it serves every reactivity topic the node is a
- * cohort member for, lazily instantiating per-collection state on first ingest. Bind
+ * cohort member for, lazily instantiating per-collection state on the first ingest that finds a subscriber. Bind
  * {@link ReactivityForwarderHost.ingest} to the origination `emit` seam and
  * {@link ReactivityForwarderHost.onInbound} to the transport's inbound subscribe.
  */
@@ -154,7 +156,13 @@ export class ReactivityForwarderHost {
 	private readonly deliverLocal?: (topicId: Uint8Array, n: NotificationV1) => void;
 	private readonly clock: () => number;
 
-	/** Per-topic served state. `ServedTopic` ⇒ forwards; `null` ⇒ resolved subscriber-only (Edge); absent ⇒ unresolved. */
+	/**
+	 * Per-topic served state. `ServedTopic` ⇒ forwards; `null` ⇒ resolved subscriber-only (Edge); absent ⇒
+	 * unresolved, or no demand yet (see {@link hasDemand}).
+	 *
+	 * NOTE: a `ServedTopic` outlives its last subscriber — it is reclaimed only when a tail rotation's drain window
+	 * closes ({@link rotationRedirectFor}). If memory ever shows it, evict on a {@link hasDemand} check at ingest.
+	 */
 	private readonly served = new Map<string, ServedTopic | null>();
 	/** Per-topic serialization tail: an ingest chains onto its topic's prior ingest so the ring/dedupe never interleave. */
 	private readonly ingestTails = new Map<string, Promise<void>>();
@@ -202,8 +210,8 @@ export class ReactivityForwarderHost {
 	private async ingestSerialized(topicId: Uint8Array, n: NotificationV1, key: string): Promise<void> {
 		try {
 			const served = this.resolveServed(topicId, n, key);
-			if (served === null) {
-				return; // Edge / subscriber-only: this node never forwards (delivery rides onInbound → deliverLocal).
+			if (served === undefined) {
+				return; // Edge, or nobody subscribed: nothing to forward (local delivery rides onInbound → deliverLocal).
 			}
 			const decision = await served.forwarder.receive(n, this.clock());
 			if (decision !== "forward") {
@@ -231,11 +239,11 @@ export class ReactivityForwarderHost {
 		}
 		// Subscriber role first: deliver in-process to a co-located subscription manager, if any.
 		this.deliverInProcess(topicId, n);
-		// Forwarder role: ingest self-gates (Edge ⇒ no PushState; a non-member ⇒ empty fan-out).
+		// Forwarder role: ingest self-gates (Edge, or no subscriber here ⇒ no PushState, no fan-out).
 		await this.ingest(topicId, n);
 	}
 
-	/** The live {@link PushState} for a served topic, or `undefined` (Edge, or not yet ingested). Test/diagnostic. */
+	/** The live {@link PushState} for a served topic, or `undefined` (Edge, no demand, or not yet ingested). Test/diagnostic. */
 	pushStateFor(topicId: Uint8Array): PushState | undefined {
 		const served = this.served.get(this.topicKey(topicId));
 		return served === undefined || served === null ? undefined : served.pushState;
@@ -243,10 +251,10 @@ export class ReactivityForwarderHost {
 
 	/**
 	 * Every live forwarder {@link PushState} this node currently serves: the topics it has ingested at least
-	 * one notification for and instantiated state behind the Edge gate (subscriber-only `null`s and
-	 * not-yet-ingested topics are skipped). The push-state-gossip driver iterates these each round to
-	 * broadcast convergence state to each collection's cohort, so a member that missed an origin dial still
-	 * ends up holding the replay entry.
+	 * one notification for while they had a subscriber, and instantiated state behind the Edge gate
+	 * (subscriber-only `null`s, topics without demand and not-yet-ingested topics are skipped). The
+	 * push-state-gossip driver iterates these each round to broadcast convergence state to each collection's
+	 * cohort, so a member that missed an origin dial still ends up holding the replay entry.
 	 */
 	livePushStates(): PushState[] {
 		const out: PushState[] = [];
@@ -414,23 +422,40 @@ export class ReactivityForwarderHost {
 		});
 	}
 
-	/** Resolve (instantiating once, behind the Edge gate) the served state for a topic. */
-	private resolveServed(topicId: Uint8Array, n: NotificationV1, key: string): ServedTopic | null {
+	/**
+	 * Resolve the served state for a topic, instantiating it once behind the Edge gate and the demand check.
+	 * `undefined` ⇒ nothing to forward. A no-demand answer is deliberately not remembered, so the first ingest
+	 * after a subscriber registers builds the state.
+	 */
+	private resolveServed(topicId: Uint8Array, n: NotificationV1, key: string): ServedTopic | undefined {
 		const existing = this.served.get(key);
 		if (existing !== undefined) {
-			return existing; // a `ServedTopic` or a remembered `null` (Edge / subscriber-only)
+			return existing ?? undefined; // a `ServedTopic`, or a remembered Edge `null`
 		}
-		const pushState = instantiateForwarderPushState(this.profile, this.pushStateInit(topicId, n));
-		if (pushState === undefined) {
+		if (!mayServeAsReactivityForwarder(this.profile)) {
 			this.served.set(key, null); // Edge node: remember it never forwards this topic.
-			return null;
+			return undefined;
 		}
+		if (!this.hasDemand(topicId)) {
+			return undefined;
+		}
+		const pushState = requireForwarderPushState(this.profile, this.pushStateInit(topicId, n));
 		const served: ServedTopic = {
 			pushState,
 			forwarder: createReactivityForwarder({ state: pushState, verifier: this.verifierFor(topicId) }),
 		};
 		this.served.set(key, served);
 		return served;
+	}
+
+	/**
+	 * Whether anyone downstream wants `topicId`'s notifications: at least one direct subscriber. Child cohorts
+	 * join as a second clause once the parent/child link ([cohort-topic-parent-child-link]) supplies them
+	 * ahead of any {@link PushState}. One registry lookup plus a records scan per ingest of a topic without
+	 * state — cheap enough not to cache.
+	 */
+	private hasDemand(topicId: Uint8Array): boolean {
+		return this.directSubscribers(topicId).length > 0;
 	}
 
 	private topicKey(topicId: Uint8Array): string {

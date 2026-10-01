@@ -982,7 +982,10 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
     the reactivity notification transport onto the host: a `ReactivityOriginationManager` installs
     `onLocalCommit` (so the bridge's invocation builds a `NotificationV1` from `(event, commitCert)`),
     a `ReactivityForwarderHost` fans that frame out over the `/optimystic/reactivity/1.0.0/notify`
-    protocol to direct subscribers + child cohorts, inbound notify frames route by topic to a
+    protocol to direct subscribers + child cohorts (keeping per-collection forwarding state only for a
+    topic with at least one subscriber — see
+    [reactivity.md § Forwarder-cohort state](reactivity.md#forwarder-cohort-state-per-collection-served)),
+    inbound notify frames route by topic to a
     node-level `ReactivitySubscriberRegistry` (exposed as `node.reactivitySubscribers`) for the
     subscriber role, and a `ReactivityPushStateGossipDriver` rides the host's cohort gossip transport
     for intra-cohort push-state convergence. The subscriber-id / dial-target space is the canonical

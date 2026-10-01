@@ -729,6 +729,19 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			n.host.service.verifier().cache(cert);
 		}
 
+		// A node keeps forwarding state only for a topic someone subscribed to, so the remote registers as a direct
+		// reactivity subscriber on the origin's cohort engine first: originated with no subscriber, rev 1 would be
+		// buffered nowhere and there would be nothing to backfill.
+		const appPayload = subscribeAppPayloadBytes({
+			collectionId: collectionIdB64,
+			tailIdAtAttach: bytesToB64url(tailBytes),
+			lastKnownRev: 0,
+			deltaMaxBytes: 0,
+		});
+		const reg = await signedRegister(remote.member, topicId, now, 'rx-resume-sub', { tier: Tier.T3, selfVouch: true, appPayload });
+		const accept = await originEngine.engine.handleRegister(reg, { followOn: false, treeTier: 0 }, now);
+		expect(accept.result, 'the remote registered as a reactivity subscriber on the origin cohort engine').to.equal('accepted');
+
 		// Originate rev 1 on the origin: the production onLocalCommit builds a NotificationV1 and ingests it into
 		// the origin's forwarder host, filling its PushState replay ring with rev 1 — the live tail's last
 		// delivered revision the remote will resume past. Real threshold commit cert (every member signs its

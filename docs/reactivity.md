@@ -137,6 +137,10 @@ PushState {
 
 The direct-subscriber list is the cohort-topic layer's `RegistrationRecord` set with `appPayload.kind == "reactivity"`. Reactivity reads it but does not duplicate it.
 
+**Only for a topic someone subscribed to.** A node builds this state for a topic on the first notification it handles while the topic has at least one direct subscriber, and not before (child cohorts will count too, once a cohort can have children; `hasDemand` in `packages/db-p2p/src/reactivity/forwarder-host.ts`). A collection whose announcements the node originates but nobody watches — an index tree, the Quereus plugin's schema tree, a table not tagged for network change notification — therefore costs no replay ring, no dedupe window and no push-state gossip frame per round, so enabling the feature for one table leaves every other table as it was. The check is one registry lookup and a scan of the topic's registration records, run for each notification on a topic that has no state yet; a "nobody subscribed" answer is not remembered, so the first notification after a registration lands builds the state. Once built, the state stays until a tail rotation's drain window closes, even after its last subscriber leaves (the `NOTE:` at `served` in the same file names the remedy if that ever shows in memory).
+
+**What a late subscriber gets.** A subscriber attaches with the collection's current revision as its starting point. A commit that lands between that read and the registration reaching the cohort is buffered nowhere, so the subscriber's next notification shows a gap; the backfill finds nothing to serve and escalates, and the watch service ([§The node's watch service](#the-nodes-watch-service)) answers an unservable gap by waking its watchers, while its tick re-reads the tail regardless. The watcher therefore wakes; it does not learn the missed revision from the cohort, which whole-table invalidation does not need. Cohort members other than the primary learn of the subscriber when its registration record reaches them over cohort gossip, so they build state a little later; until then a backfill reaching one of them declines and the recover transport tries the next member.
+
 ---
 
 ## Notification origination
@@ -204,7 +208,8 @@ The `delta` field is optional and bounded by `delta_max` (default: 4 KB at Core 
 > **Implemented** (`12.31-reactivity-forwarder-host`). The receive→forward→fan-out orchestration is the
 > db-p2p `ReactivityForwarderHost` (`packages/db-p2p/src/reactivity/forwarder-host.ts`): `ingest(topicId, n)`
 > lazily instantiates the per-collection `PushState` + forwarder behind the Edge policy gate
-> (`instantiateForwarderPushState`), serializes ingests per topic so the replay ring + dedupe never
+> (`mayServeAsReactivityForwarder`), and only for a topic with a subscriber (§Forwarder-cohort state),
+> serializes ingests per topic so the replay ring + dedupe never
 > interleave, runs the db-core forwarder receive path, and on `"forward"` fans the **unmodified** frame out
 > to every direct subscriber (through `PushState.perSubscriberQueue`) and child cohort. `onInbound` drives
 > both the subscriber and forwarder roles for an inbound dial. It is **encoding-agnostic** over the

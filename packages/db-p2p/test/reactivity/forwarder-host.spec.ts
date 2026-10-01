@@ -285,22 +285,39 @@ describe('reactivity / forwarder host', () => {
 	});
 
 	it('dials a child cohort primary on fan-out (CohortRef.primary, and the resolveChildPrimary fallback)', async () => {
+		// A direct subscriber gives the topic demand, so the PushState carrying the child cohorts is built.
 		// (a) CohortRef.primary present → dialed directly.
 		const childA: CohortRef = { coord: bytesToB64url(new Uint8Array([0x30])), primary: CHILD_PRIMARY };
-		const { host: hostA, transport: txA } = makeHost({ directSubscribers: (): string[] => [], childCohorts: [childA] });
+		const { host: hostA, transport: txA } = makeHost({ directSubscribers: (): string[] => [SUB_A], childCohorts: [childA] });
 		await hostA.ingest(TOPIC, note(1));
-		expect(txA.sent.map((s) => s.target), 'child primary dialed with the unmodified frame').to.deep.equal([CHILD_PRIMARY]);
-		expect(txA.sent[0]!.n.revision).to.equal(1);
+		expect(txA.sent.map((s) => s.target), 'child primary dialed after the direct subscriber').to.deep.equal([SUB_A, CHILD_PRIMARY]);
+		expect(txA.sent[1]!.n, 'the child gets the unmodified frame').to.equal(txA.sent[0]!.n);
 
 		// (b) CohortRef.primary absent → resolveChildPrimary resolves the dial target.
 		const childB: CohortRef = { coord: bytesToB64url(new Uint8Array([0x31])) };
 		const { host: hostB, transport: txB } = makeHost({
-			directSubscribers: (): string[] => [],
+			directSubscribers: (): string[] => [SUB_A],
 			childCohorts: [childB],
 			resolveChildPrimary: (ref): string | undefined => (ref.coord === childB.coord ? CHILD_PRIMARY : undefined),
 		});
 		await hostB.ingest(TOPIC, note(1));
-		expect(txB.sent.map((s) => s.target)).to.deep.equal([CHILD_PRIMARY]);
+		expect(txB.sent.map((s) => s.target)).to.deep.equal([SUB_A, CHILD_PRIMARY]);
+	});
+
+	it('builds no forwarding state for a topic nobody subscribed to, and builds it on the first ingest after one does', async () => {
+		let subs: string[] = [];
+		const { host, transport } = makeHost({ directSubscribers: (): string[] => subs });
+
+		await host.ingest(TOPIC, note(1));
+		expect(host.pushStateFor(TOPIC), 'no subscriber ⇒ no PushState').to.equal(undefined);
+		expect(host.livePushStates(), 'nothing to gossip').to.have.length(0);
+		expect(transport.sent).to.have.length(0);
+
+		subs = [SUB_A];
+		await host.ingest(TOPIC, note(2));
+		expect(host.pushStateFor(TOPIC)!.replayBuffer.entries().map((e) => e.revision), 'only the watched revision is buffered').to.deep.equal([2]);
+		expect(host.livePushStates()).to.have.length(1);
+		expect(transport.sent.map((s) => [s.target, s.n.revision]), 'fanned out to the new subscriber').to.deep.equal([[SUB_A, 2]]);
 	});
 
 	it('never forwards on an Edge node (no PushState), but still delivers locally as a subscriber', async () => {
