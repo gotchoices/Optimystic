@@ -1,5 +1,7 @@
 /**
- * Reactivity — the one pinned `BlockId` → raw tail-bytes encoding, shared by origination and subscription.
+ * Reactivity — the pinned byte encodings origination and subscription must share: a tail `BlockId` → raw
+ * tail bytes ({@link reactivityTailBytes}, described below) and a collection id → raw bytes
+ * ({@link reactivityCollectionIdBytes}).
  *
  * `reactivityTopicId` (db-core) hashes `H(tailBytes ‖ "reactivity")` to derive the topic's `coord_0`
  * cohort. Origination (the cohort-change membership gate, {@link
@@ -32,4 +34,21 @@ import { routingKeyForBlock } from "@optimystic/db-core";
  */
 export function reactivityTailBytes(tailId: BlockId): Uint8Array {
 	return routingKeyForBlock(tailId);
+}
+
+const utf8 = new TextEncoder();
+
+/**
+ * The pinned collection-id → raw bytes encoding: the utf8 of the id exactly as blocks carry it
+ * (`header.collectionId`, e.g. `app/users`). A notification names its collection by the base64url of these
+ * bytes, and a subscriber registers under, and matches inbound notifications against, the same bytes.
+ *
+ * Load-bearing: origination and the subscriber side must call this **same** function for a given
+ * collection. A collection id is a path, not base64url, so putting it on the wire unencoded fails the
+ * notification's wire validation on the receiving node, and encoding it differently on the two sides makes
+ * every notification read as another collection's. Either way the subscriber silently never delivers. The
+ * `topic-bytes-encoding` spec pins the equality.
+ */
+export function reactivityCollectionIdBytes(collectionId: string): Uint8Array {
+	return utf8.encode(collectionId);
 }

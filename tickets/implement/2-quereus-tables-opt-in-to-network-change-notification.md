@@ -78,6 +78,13 @@ No unit tests: the tag read, the option passthrough and the factory seam are wir
 - `docs/internals.md` § Reactive Watch Bridge: "Host requirement" now has the network alternative; "Lifetime" covers the network watch and `dispose()`; the double-wake decision.
 - `docs/reactivity.md` § Real-libp2p e2e coverage: the "still deferred" paragraph's `Database.watch` half is done.
 
+## What the prerequisite actually shipped (added by `network-collection-watch-service`)
+
+- `Collection.readCommittedTail(transactor, id, knownTailId?)` returns `{ tailId, rev }`. It costs one request only when `knownTailId` is the tail the header still names, and two otherwise, so the factory's `readTail` closure should remember the tail id its previous call returned and pass it back.
+- `node.reactivityWatch.isAttached(collectionId)` reports whether the collection's subscription holds a cohort registration. The integration spec needs it: a first attach took about 30 s on a three-node mesh, because a cohort defers the first registration under a topic nobody has registered under before and the service retries on its next tick (backlog `feat-a-new-topic-admits-its-first-registration-without-a-second-ask`). A commit made before the attach is reported by the fallback check, not by a notification.
+- In a three-node cohort only the node that coordinates a commit announces it, and it sends the announcement to the registrations its own cohort engine holds. The watcher's registration reaches that node over cohort gossip (one round, 5 s by default) unless that node is the topic's primary. The db-p2p case (`collection watch over real libp2p` in `packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts`) waits for that before committing, and proves the wake came from a notification by counting tail reads; the same shape works here.
+- There is no setting for the tick interval; "assert on time" or count `readTail` calls.
+
 ## TODO
 
 - `cohortTopic` on `LibP2PNodeOptions`; `cohort_topic` parsed in `resolveBinding`; passed to `createLibp2pNode`.

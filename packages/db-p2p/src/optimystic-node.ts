@@ -2,6 +2,7 @@ import type { Libp2p, PrivateKey } from '@libp2p/interface';
 import type { IBlockChangeNotifier, IRepo } from '@optimystic/db-core';
 import type { DisputeService } from './dispute/dispute-service.js';
 import type { Libp2pKeyPeerNetwork } from './libp2p-key-network.js';
+import type { ReactivityCollectionWatch } from './reactivity/collection-watch.js';
 import type { PeerReputationService } from './reputation/peer-reputation.js';
 import type { LinkDeadlines } from './rpc-deadline.js';
 import type { StorageRepo } from './storage/storage-repo.js';
@@ -14,6 +15,8 @@ import type { StorageRepo } from './storage/storage-repo.js';
  * Deliberately NOT the full set of `(node as any).*` attachments made in `libp2p-node-base.ts`:
  * the churn/rebalance/ring-shift monitors, the cohort-topic host and the reactivity registries
  * are node-internal wiring, not a host-facing surface, and typing them is a separate job.
+ * `reactivityWatch` is the exception among the reactivity pieces because it IS the surface a
+ * host uses; the registry, recover transport and rotation scheduler behind it stay internal.
  */
 export interface OptimysticNodeAttachments {
 	/**
@@ -39,6 +42,13 @@ export interface OptimysticNodeAttachments {
 	 * declaration.
 	 */
 	linkDeadlines: LinkDeadlines;
+	/**
+	 * Wake-on-network-change for a collection: one `watch` call per collection a host wants to be
+	 * told about, whichever machine commits to it. Present exactly when the node was built with
+	 * `cohortTopic.enabled`; a host on a node without it has only `blockChangeNotifier`, which
+	 * reports commits this node itself stores.
+	 */
+	reactivityWatch?: ReactivityCollectionWatch;
 }
 
 export type OptimysticNode = Libp2p & OptimysticNodeAttachments;

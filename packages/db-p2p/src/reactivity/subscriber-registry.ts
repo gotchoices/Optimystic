@@ -13,8 +13,8 @@
  * from the notification's tail anchor — routes to exactly the managers watching that tail's collection.
  *
  * **Scope.** This delivers socket-routed notifications into a manager that was *already constructed* and
- * registered. Constructing the manager from a Quereus `Database.watch` (the application bridge) stays the
- * ticket `quereus-tables-opt-in-to-network-change-notification`; this registry is the plug it will use.
+ * registered. Constructing managers, and registering and unregistering them here as a collection's tail
+ * moves, is the collection watch service's ({@link import("./collection-watch.js").ReactivityCollectionWatch}).
  */
 
 import { bytesToB64url, type NotificationV1 } from "@optimystic/db-core";
@@ -26,9 +26,9 @@ const log = createLogger("reactivity-subscribers");
 export type ReactivityNotificationHandler = (n: NotificationV1) => void | Promise<unknown>;
 
 /**
- * The node's `topicId → subscriber handlers` table. Exposed on the node as `reactivitySubscribers` so a
- * subscribe factory can register a {@link import("./subscription-manager.js").ReactivitySubscriptionManager}
- * and have socket-delivered notifications routed to it.
+ * The node's `topicId → subscriber handlers` table. The node's collection watch service registers each
+ * {@link import("./subscription-manager.js").ReactivitySubscriptionManager} it builds here so
+ * socket-delivered notifications are routed to it; also exposed on the node as `reactivitySubscribers`.
  */
 export class ReactivitySubscriberRegistry {
 	private readonly byTopic = new Map<string, Set<ReactivityNotificationHandler>>();

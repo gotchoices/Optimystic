@@ -23,6 +23,13 @@ const utf8 = new TextEncoder();
 
 /** Per-emission context the origination point supplies alongside the bridge's event + cert. */
 export interface OriginationContext {
+	/**
+	 * The collection id to put on the notification, base64url. Default: `event.collectionId` as-is, which
+	 * is only correct when that id is already base64url. A real collection id is a path (`app/users`), not
+	 * base64url, so the wire validator rejects it and a subscriber could never match it: db-p2p supplies
+	 * the base64url of the bytes a subscriber registers under.
+	 */
+	readonly collectionId?: string;
 	/** Current tail block id (base64url) the reactivity topic is anchored on. */
 	readonly tailId: string;
 	/** Emission timestamp (unix ms). */
@@ -60,7 +67,7 @@ export function buildNotificationV1(event: CollectionChangeEvent, commitCert: Co
 	const encodeSigner = ctx.encodeSigner ?? ((s: string): string => s);
 	const notification: NotificationV1 = {
 		v: 1,
-		collectionId: event.collectionId,
+		collectionId: ctx.collectionId ?? event.collectionId,
 		tailId: ctx.tailId,
 		revision: event.rev,
 		digest: bytesToB64url(commitCert.signedPayload),

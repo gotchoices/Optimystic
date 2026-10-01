@@ -42,7 +42,10 @@ import {
 	type ActionId,
 	type QueryV1,
 } from '@optimystic/db-core';
+import { Collection, Tree, routingKeyForBlock } from '@optimystic/db-core';
 import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
+import type { OptimysticNode } from '../src/optimystic-node.js';
+import { transactorFor } from './util/two-machine-lifecycle.js';
 import { peerIdToBytes, bytesToPeerIdString } from '../src/cohort-topic/peer-codec.js';
 import { signPeer, verifyPeerSig } from '../src/cohort-topic/peer-sig.js';
 import { sendOneWay, requestResponse, DEFAULT_STREAM_MAX_BYTES } from '../src/cohort-topic/stream-util.js';
@@ -55,6 +58,8 @@ import { signedWillingness, type Member } from '../src/testing/cohort-topic-mesh
 import { createReactivitySelfMembershipGate, reactivityTailBytes } from '../src/cohort-topic/reactivity-membership-gate.js';
 import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
 import { DEFAULT_REACTIVITY_PROTOCOLS } from '../src/reactivity/protocols.js';
+import { reactivityCollectionIdBytes } from '../src/reactivity/topic-bytes.js';
+import { reactivityDirectSubscribers } from '../src/reactivity/forwarder-host.js';
 import {
 	Libp2pReactivityRecoverTransport,
 	createLibp2pRecoverDialer,
@@ -548,9 +553,9 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	// ReactivityOriginationManager.emit → forwarder host → the notify protocol, and a node-level subscriber
 	// registry receives inbound frames. A committed change on a tail-cohort member fires a NotificationV1 that
 	// reaches a remote subscriber over a real socket; the subscriber verifies it with real Ed25519 against the
-	// tail cohort's membership. (Rotation-specific redirect is 12.5; the Quereus Database.watch app-bridge that
-	// CONSTRUCTS managers stays the ticket quereus-tables-opt-in-to-network-change-notification — here the
-	// subscriber is constructed directly against the remote node's registry.)
+	// tail cohort's membership. (Rotation-specific redirect is 12.5. The subscriber here is a bare handler
+	// registered straight into the remote node's registry, to isolate the socket; the node's own watch service,
+	// which builds subscription managers, is exercised by the collection-watch case at the end of this file.)
 	it('a commit on a real cohort member delivers a NotificationV1 to a remote subscriber over a real socket', async () => {
 		const tailBytes = reactivityTailBytes(TAIL_ID);
 		const topicId = reactivityTopicId(tailBytes);
@@ -566,7 +571,10 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		// The remote subscriber is a different real node; register it as a direct reactivity subscriber on the
 		// origin's cohort engine so origin's `directSubscribers(topicId)` → [remote] and origin dials it.
 		const remote = nodes.find((n) => n.idStr !== origin.idStr)!;
-		const collectionIdB64 = bytesToB64url(new TextEncoder().encode('rx-socket-collection'));
+		// The event carries the collection id as blocks do (raw); the subscriber side names it by the base64url of
+		// the pinned bytes, which is what origination puts on the notification.
+		const collectionId = 'rx-socket-collection';
+		const collectionIdB64 = bytesToB64url(reactivityCollectionIdBytes(collectionId));
 		const now = Date.now();
 		const appPayload = subscribeAppPayloadBytes({
 			collectionId: collectionIdB64,
@@ -657,7 +665,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			// Fire origination on the origin: the production onLocalCommit hook builds the NotificationV1 and
 			// emits it → forwarder host → notify socket → the remote node's subscriber registry.
 			const event: CollectionChangeEvent = {
-				collectionId: collectionIdB64 as unknown as BlockId,
+				collectionId: collectionId as BlockId,
 				blockIds: [],
 				actionId: 'rx-socket-action' as ActionId,
 				rev: 1,
@@ -669,6 +677,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			await waitFor(() => received.length >= 1, { timeoutMs: 20_000, intervalMs: 150, description: 'the remote subscriber received a NotificationV1 over the real notify socket' });
 			expect(received[0]!.revision, 'the delivered notification carries the committed revision').to.equal(1);
 			expect(received[0]!.tailId, 'the delivered notification anchors on the committed tail').to.equal(bytesToB64url(tailBytes));
+			expect(received[0]!.collectionId, 'the delivered notification names the collection as the subscriber registered it').to.equal(collectionIdB64);
 
 			await waitFor(() => verdicts.length >= 1, { timeoutMs: 5_000, intervalMs: 50, description: 'the subscriber ran the verify path on the delivered notification' });
 			expect(verdicts[0], 'the delivered notification verified end-to-end (real Ed25519 against the tail cohort)').to.equal('verified');
@@ -681,9 +690,8 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	// above, now LIVE in production (12.42): the node registers the recover request-reply handler against the
 	// forwarder host's live PushStates. A remote subscriber that slept past the live tail's last delivered
 	// revision sends one ResumeV1 over a real `/optimystic/reactivity/1.0.0/recover` socket to a real tail-cohort
-	// member and is brought current (the backfill variant). The subscriber side is constructed directly (the
-	// Quereus Database.watch → manager factory stays the ticket quereus-tables-opt-in-to-network-change-notification,
-	// exactly as the notify test notes); the recover transport is pinned to the origin for determinism — the full
+	// member and is brought current (the backfill variant). The subscriber side is constructed directly, as in
+	// the notify test; the recover transport is pinned to the origin for determinism — the full
 	// sticky-primary → cohort-walk target selection is unit-covered by reactivity/recover-transport.spec.ts.
 	it('a remote subscriber resumes past the tail over a real recover socket and is brought current (backfill)', async () => {
 		const RESUME_TAIL = 'optimystic/collection/tail-resume-real-libp2p';
@@ -698,7 +706,10 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		expect(await quorumOn(originEngine, reactivityCoord), 'willingness converged for the resume topic').to.equal(true);
 
 		const remote = nodes.find((n) => n.idStr !== origin.idStr)!;
-		const collectionIdB64 = bytesToB64url(new TextEncoder().encode('rx-resume-collection'));
+		// Raw on the event, encoded for the subscriber (see the notify case above): a resume whose collection id
+		// did not match what origination put on the notification would find no served state.
+		const collectionId = 'rx-resume-collection';
+		const collectionIdB64 = bytesToB64url(reactivityCollectionIdBytes(collectionId));
 
 		// The production recover transport's cohort-walk WOULD reach the origin: at wantK = N it is in the resume
 		// topic's FRET cohort (the same coord_0 assembly `resolveReactivityCohort` uses in libp2p-node-base).
@@ -741,7 +752,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		}
 		const commitCert: CommitCert = { thresholdSig, signers: sortedSigners.map((n) => n.idStr), minSigs: MIN_SIGS, signedPayload };
 		const event: CollectionChangeEvent = {
-			collectionId: collectionIdB64 as unknown as BlockId,
+			collectionId: collectionId as BlockId,
 			blockIds: [],
 			actionId: 'rx-resume-action' as ActionId,
 			rev: 1,
@@ -1046,5 +1057,138 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	// deterministically by the mock tier (`live-tier.spec.ts` test 2); see the review handoff for the rationale.
 	it.skip('[covered at cohort-admission + replication level here; full FRET-routed participant walk is mock-tier-deterministic] a participant service.register() walk over real sockets resolves an accepted handle', () => {
 		/* deferred to avoid FRET-routing flakiness at small N; the cohort-side admission it would drive is asserted above */
+	});
+});
+
+/**
+ * **The collection watch service over a real network.** The cases above each fake one end of reactivity — a
+ * hand-built commit certificate fed to `onLocalCommit`, a membership certificate cached by hand, a registration
+ * handed straight to a cohort engine. This one fakes none of them: a real `NetworkTransactor` commits a row
+ * through cluster consensus on one node, and a watch opened through another node's `reactivityWatch` wakes.
+ *
+ * Every machine is in every cohort (`clusterSize` = `wantK` = the node count, `minSigs` below it): the only
+ * configuration in which a notification verifies today, because the machines that store a collection's log
+ * and the machines that announce its changes are otherwise different groups (blocked ticket
+ * `reactivity-notifications-need-the-tail-cohort-to-be-the-topic-cohort`).
+ *
+ * The wake still crosses a real socket. In a three-member cohort the two members that do not coordinate a
+ * commit apply it holding two of the three commit signatures, below the certificate threshold, so they
+ * retain no certificate and announce nothing (the NOTE at `captureCommitCert` in
+ * `src/cluster/cluster-repo.ts`). Only the writing node announces, and the watcher is a different node.
+ */
+(GATED ? describe : describe.skip)('collection watch over real libp2p (every machine in every cohort)', function () {
+	this.timeout(300_000);
+
+	const WATCH_NETWORK = 'collection-watch-real-libp2p-it';
+	const MACHINES = 3;
+	const COLLECTION = 'app/watched-rows';
+	interface WatchedRow { key: number; value: string }
+
+	const nodes: OptimysticNode[] = [];
+
+	after(async () => {
+		await Promise.allSettled(nodes.splice(0, nodes.length).map((n) => n.stop()));
+	});
+
+	async function spawnMachine(bootstrapNodes: string[]): Promise<OptimysticNode> {
+		const node = await createLibp2pNode({
+			port: 0,
+			networkName: WATCH_NETWORK,
+			bootstrapNodes,
+			fretProfile: bootstrapNodes.length === 0 ? 'edge' : 'core',
+			clusterSize: MACHINES,
+			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
+			arachnode: { enableRingZulu: true },
+			cohortTopic: { enabled: true, wantK: MACHINES, host: { minSigs: MACHINES - 1 } },
+		});
+		nodes.push(node);
+		return node;
+	}
+
+	/** Every node connected to every other, and each assembling the whole mesh as a block's cohort. */
+	async function stabilizedMesh(): Promise<void> {
+		const seed = await spawnMachine([]);
+		const seedAddr = pickLocalTcpMultiaddr(seed);
+		for (let i = 1; i < MACHINES; i++) {
+			await spawnMachine([seedAddr]);
+		}
+		const addrs = nodes.map(pickLocalTcpMultiaddr);
+		for (const n of nodes) {
+			for (const addr of addrs) {
+				try { await n.dial(multiaddr(addr)); } catch { /* self, or a peer that already dialed us */ }
+			}
+		}
+		await waitFor(() => nodes.every((n) => n.getPeers().length >= MACHINES - 1), { timeoutMs: 60_000, intervalMs: 250, description: 'the mesh fully connected' });
+		await waitFor(async () => {
+			for (const n of nodes) {
+				if (Object.keys(await n.keyNetwork.findCluster(routingKeyForBlock('collection-watch-probe'))).length !== MACHINES) return false;
+			}
+			return true;
+		}, { timeoutMs: 90_000, intervalMs: 500, description: 'every node assembles the whole mesh as a cohort' });
+	}
+
+	it('a watch opened through node.reactivityWatch wakes when another node commits through its own NetworkTransactor', async () => {
+		await stabilizedMesh();
+		const [writer, watcher] = nodes as [OptimysticNode, OptimysticNode, ...OptimysticNode[]];
+		expect(watcher.reactivityWatch, 'a cohortTopic-enabled node exposes the watch service').to.not.equal(undefined);
+
+		// The collection has to exist before it can be watched: a watch anchors on the log's tail block.
+		const tree = await Tree.createOrOpen<number, WatchedRow>(transactorFor(writer, WATCH_NETWORK), COLLECTION, (row) => row.key);
+		await tree.replace([[1, { key: 1, value: 'before the watch' }]]);
+
+		const watcherTransactor = transactorFor(watcher, WATCH_NETWORK);
+		const reads = { started: 0, finished: 0 };
+		let wakes = 0;
+		const handle = watcher.reactivityWatch!.watch({
+			collectionId: COLLECTION,
+			readTail: async () => {
+				reads.started++;
+				try {
+					const tail = await Collection.readCommittedTail(watcherTransactor, COLLECTION);
+					return tail === undefined ? undefined : { tailId: tail.tailId, revision: tail.rev };
+				} finally {
+					reads.finished++;
+				}
+			},
+			onChange: () => { wakes++; },
+		});
+		try {
+			await waitFor(() => watcher.reactivityWatch!.isAttached(COLLECTION), { timeoutMs: 120_000, intervalMs: 250, description: 'the watch registered with the topic cohort through the real register walk' });
+
+			// In a three-member cohort only the node that coordinates a commit holds a full commit certificate
+			// (see captureCommitCert in cluster-repo.ts), so only the writer announces. It fans an announcement out
+			// to the registrations its own cohort engine holds, and the watcher's reaches it over cohort gossip
+			// unless the writer happens to be the topic's primary.
+			const tail = await Collection.readCommittedTail(watcherTransactor, COLLECTION);
+			const topicId = reactivityTopicId(reactivityTailBytes(tail!.tailId));
+			const writerHost = (writer as unknown as { cohortTopicHost: CohortTopicHost }).cohortTopicHost;
+			await waitFor(() => {
+				const engine = writerHost.registry.findServing(topicId, 0);
+				return engine !== undefined && reactivityDirectSubscribers(engine, topicId).includes(watcher.peerId.toString());
+			}, { timeoutMs: 60_000, intervalMs: 250, description: "the watcher's registration replicated to the announcing node" });
+			expect(wakes, 'nothing has changed since the watch opened').to.equal(0);
+
+			// A wake proves the notification path only if no tail read can account for it, so an attempt during
+			// which the service read the tail (its fallback check, or an early registration retry) proves nothing
+			// and is repeated. So is an attempt with no wake at all: the announcing node verifies its own
+			// notification against the topic cohort's membership certificate, which a newly formed cohort
+			// publishes on its next gossip round.
+			let wokeByNotification = false;
+			for (let attempt = 0; attempt < 4 && !wokeByNotification; attempt++) {
+				await waitFor(() => reads.started === reads.finished, { timeoutMs: 30_000, intervalMs: 50, description: 'no tail read in flight' });
+				const readsBeforeCommit = reads.started;
+				const wakesBeforeCommit = wakes;
+				await tree.replace([[attempt + 2, { key: attempt + 2, value: `after the watch, attempt ${attempt}` }]]);
+				try {
+					await waitFor(() => wakes > wakesBeforeCommit, { timeoutMs: 10_000, intervalMs: 50, description: 'the watch woke' });
+				} catch {
+					continue;
+				}
+				wokeByNotification = reads.started === readsBeforeCommit;
+			}
+			expect(wokeByNotification, 'a commit on another node woke the watch with no tail read between the commit and the wake').to.equal(true);
+		} finally {
+			await handle.close();
+		}
 	});
 });

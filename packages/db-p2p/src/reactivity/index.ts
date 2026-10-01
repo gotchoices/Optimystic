@@ -17,3 +17,4 @@ export * from "./origination-manager.js";
 export * from "./forwarder-host.js";
 export * from "./push-state-gossip.js";
 export * from "./subscriber-registry.js";
+export * from "./collection-watch.js";

@@ -59,7 +59,7 @@ import type { RestoreCallback, BlockArchive } from './storage/struct.js';
 import type { FretService } from 'p2p-fret';
 import { createCohortTopicHost, type CohortTopicHostOptions } from './cohort-topic/host.js';
 import { attachCohortChangeBridge } from './cohort-topic/change-bridge.js';
-import { createReactivitySelfMembershipGate, reactivityTailBytes } from './cohort-topic/reactivity-membership-gate.js';
+import { createReactivitySelfMembershipGate } from './cohort-topic/reactivity-membership-gate.js';
 import { Libp2pReactivityNotifyTransport, registerNotifyHandler } from './reactivity/notify-transport.js';
 import {
 	Libp2pReactivityRecoverTransport,
@@ -68,10 +68,12 @@ import {
 	createRecoverRequestSigners,
 } from './reactivity/recover-transport.js';
 import { ReactivityForwarderHost, reactivityDirectSubscribers, reactivityNotificationTopicId } from './reactivity/forwarder-host.js';
-import { ReactivityOriginationManager } from './reactivity/origination-manager.js';
+import { ReactivityOriginationManager, liveOriginationContext } from './reactivity/origination-manager.js';
 import { ReactivityPushStateGossipDriver, registerPushStateGossipHandler, type ReactivityGossipCollection } from './reactivity/push-state-gossip.js';
 import { RotationReRegistrationScheduler } from './reactivity/rotation-rereg-scheduler.js';
 import { ReactivitySubscriberRegistry } from './reactivity/subscriber-registry.js';
+import { ReactivityCollectionWatch } from './reactivity/collection-watch.js';
+import { peerIdToBytes } from './cohort-topic/peer-codec.js';
 import { DEFAULT_REACTIVITY_PROTOCOLS, reactivityProtocolList } from './reactivity/protocols.js';
 import { registerMatchmakingQueryHandler } from './matchmaking/query-transport.js';
 import { DEFAULT_MATCHMAKING_PROTOCOLS, matchmakingProtocolList } from './matchmaking/protocols.js';
@@ -133,9 +135,6 @@ type WiredServices = {
 	networkManager: SetLibp2pCapable & SetReputationCapable;
 	repo: SetLibp2pCapable;
 };
-
-/** Logger for the reactivity node-wiring (origination/forwarder/recover/rotation composition). */
-const reactivityWiringLog = createLogger('reactivity-node-wiring');
 
 /**
  * Logger for the best-effort in-factory service wiring. These injections run during `createLibp2p`
@@ -1882,10 +1881,14 @@ export async function createLibp2pNodeBase(
 			let offInboundNotify: (() => void) | undefined;
 			let pushStateGossip: ReactivityPushStateGossipDriver | undefined;
 			let reactivityRotation: RotationReRegistrationScheduler | undefined;
+			let reactivityWatch: ReactivityCollectionWatch | undefined;
 			{
 				const previousStop = node.stop.bind(node);
 				node.stop = async (): Promise<void> => {
 					try {
+						// The watch service first: its subscriptions' ticks and scheduled moves must not run
+						// against a scheduler or a host that has already stopped.
+						await reactivityWatch?.stop();
 						reactivityRotation?.stop();
 						pushStateGossip?.stop();
 						offInboundNotify?.();
@@ -1942,8 +1945,8 @@ export async function createLibp2pNodeBase(
 			const REACTIVITY_FORWARDER_TREE_TIER = 0;
 
 			// Node-level subscriber registry: a constructed ReactivitySubscriptionManager registers here so a
-			// socket-delivered NotificationV1 reaches it. (The Quereus Database.watch → manager bridge that
-			// CONSTRUCTS managers stays the ticket quereus-tables-opt-in-to-network-change-notification.)
+			// socket-delivered NotificationV1 reaches it. The collection watch service (step 7 below) is what
+			// constructs managers and registers them.
 			const reactivitySubscribers = new ReactivitySubscriberRegistry();
 			(node as any).reactivitySubscribers = reactivitySubscribers;
 
@@ -1995,22 +1998,9 @@ export async function createLibp2pNodeBase(
 			// 3. Origination emit — install onLocalCommit: a member commit builds a NotificationV1 and ingests it.
 			const origination = new ReactivityOriginationManager({
 				service: host.service,
-				resolveContext: (event) => {
-					if (event.tailId === undefined) {
-						return undefined; // tail-less (read-driven promotion) never originates (the gate also returns first)
-					}
-					return {
-						// MUST reuse the gate's `reactivityTailBytes` (raw utf8, the tail's routing key), never
-						// a pre-hashed digest — else origination derives a different coord than subscribers resolve.
-						tailId: reactivityTailBytes(event.tailId),
-						deltaMaxBytes: reactivityPolicy.deltaMaxBytes,
-						// rotationHint stays undefined on a live node: the successor tail id is not knowable at the
-						// filling commit (random block ids; gated on 6.5-block-id-derivation). The authoritative,
-						// observable rotation signal is `event.tailId` CHANGING, which the manager observes via the
-						// `markRotated` binding below. (The pre-announce remains exercised in the mock-tier harness +
-						// the design simulator, both of which can synthesize the successor id.)
-					};
-				},
+				// The collection id and tail go on the notification in the pinned encodings a subscriber registers
+				// under (see liveOriginationContext); a tail-less event never originates.
+				resolveContext: (event) => liveOriginationContext(event, reactivityPolicy.deltaMaxBytes),
 				// reactivityNotificationTopicId(n) = reactivityTopicId(b64urlToBytes(n.tailId)); since
 				// n.tailId = b64url(reactivityTailBytes(tail)), this is the SAME topicId the gate assembled coord_0
 				// around and the subscriber/forwarder verifier derives — closing the encoding loop.
@@ -2044,13 +2034,11 @@ export async function createLibp2pNodeBase(
 			// subscriber that detected a gap, or woke from sleep past the live tail, asks a serving cohort member
 			// "what did I miss?" and is brought current over a real request-reply socket. The SERVE side is live
 			// here: this node answers RecoverRequestV1 frames against its live forwarder PushStates. The OUTBOUND
-			// transport + signers are constructed and exposed for the subscribe factory that CONSTRUCTS managers
-			// (the Quereus Database.watch app-bridge — ticket quereus-tables-opt-in-to-network-change-notification);
-			// no node-internal manager calls them yet, exactly as the notify subscriber side is constructed against
-			// `reactivitySubscribers` rather than from a watch.
+			// transport + signers are handed to the collection watch service (step 7 below), whose managers send
+			// backfill and resume requests through them.
 			//
 			// Node-level sticky cohort-hint cache (keyed by collectionId), shared between the outbound transport's
-			// sticky-primary lookup and a future manager's rotation-invalidation so both see ONE cache. It starts
+			// sticky-primary lookup and each manager's rotation-invalidation so both see ONE cache. It starts
 			// empty ⇒ the transport falls through to the cohort-walk (any member holding the gossiped PushState
 			// answers); populating the sticky primary is a one-RT optimization, not a correctness need.
 			const reactivityCohortHintCache = createStickyCohortHintCache();
@@ -2091,34 +2079,45 @@ export async function createLibp2pNodeBase(
 			});
 
 			// The subscriber's synchronous request signers over the node's Ed25519 key (resolves the recover wiring's
-			// lone design point — see recover-transport.ts §createRecoverRequestSigners). Fed to a manager by the
-			// subscribe factory alongside recover.backfillTransport(topicId, collectionId) /
+			// lone design point — see recover-transport.ts §createRecoverRequestSigners). The collection watch
+			// service feeds them to each manager alongside recover.backfillTransport(topicId, collectionId) /
 			// recover.resumeTransport(topicId, collectionId).
 			const recoverSigners = createRecoverRequestSigners(nodePrivateKey);
 
-			// Expose the recover seams so the subscribe factory wires backfill/resume RPC + signers + the shared
-			// sticky cache (mirrors `reactivitySubscribers` above).
+			// The recover seams stay exposed for diagnostics and tests (mirrors `reactivitySubscribers` above).
 			(node as any).reactivityRecover = recover;
 			(node as any).reactivityRecoverSigners = recoverSigners;
 			(node as any).reactivityCohortHintCache = reactivityCohortHintCache;
 
 			// 6. Rotation re-registration scheduler — the host timer that moves a subscriber to the rotated tree
 			// when its manager surfaces a `RotationNotice` (`reactivity-rotation-rereg-scheduler`). Constructed with
-			// the default unref'd `setTimeout` timer so an idle re-registration never pins the process. The
-			// `reRegister(plan)` MOVE belongs to the subscribe factory that CONSTRUCTS managers (the deferred Quereus
-			// `Database.watch` bridge — ticket quereus-tables-opt-in-to-network-change-notification): on fire it builds
-			// a fresh `ReactivitySubscriptionManager` under `plan.newTopicId` carrying `plan.lastRevision`, registers
-			// it, and swaps the `ReactivitySubscriberRegistry` entry — registering the NEW-topic handler BEFORE
-			// unregistering the old, so a notification mid-swap is never dropped. Until that factory lands no
-			// node-internal manager drives `schedule()`, so this seam is a logged no-op — exactly as 12.33 exposed
-			// `reactivitySubscribers` / `reactivityRecover` without a live manager constructor.
+			// the default unref'd `setTimeout` timer so an idle re-registration never pins the process. ONE scheduler
+			// serves every subscription on the node: it de-duplicates by successor topic, which is sound because the
+			// watch service keeps one subscription per collection. The MOVE is the watch service's: it finds the
+			// subscription waiting on the successor topic and re-registers it there (a timer that fires before the
+			// service exists, which only a throw mid-wiring could produce, finds nothing to move).
 			reactivityRotation = new RotationReRegistrationScheduler({
-				reRegister: (plan): Promise<void> => {
-					reactivityWiringLog("reactivity rotation re-registration fired for successor topic=%s (lastRevision=%d) but no subscribe factory is wired yet — deferred to quereus-tables-opt-in-to-network-change-notification", bytesToB64url(plan.newTopicId), plan.lastRevision);
-					return Promise.resolve();
-				},
+				reRegister: (plan): Promise<void> => reactivityWatch?.reRegister(plan) ?? Promise.resolve(),
 			});
 			(node as any).reactivityRotation = reactivityRotation;
+
+			// 7. Collection watch service — the host-facing surface of everything above: one call per collection an
+			// application wants to be woken for. It builds the subscription managers, registers them in
+			// `reactivitySubscribers`, renews them, and moves them on a tail rotation (driving the scheduler above).
+			const scheduler = reactivityRotation;
+			reactivityWatch = new ReactivityCollectionWatch({
+				service: host.service,
+				profile: reactivityProfile,
+				subscribers: reactivitySubscribers,
+				scheduleRotation: (notice): void => scheduler.schedule(notice),
+				recover,
+				recoverSigners,
+				cohortHintCache: reactivityCohortHintCache,
+				// The coordinate the cohort-topic service registers this node under: its member-id bytes.
+				subscriberCoord: bytesToB64url(peerIdToBytes(selfPeerId)),
+			});
+			const watchAttachment: Pick<OptimysticNodeAttachments, 'reactivityWatch'> = { reactivityWatch };
+			Object.assign(node, watchAttachment);
 
 			// --- Matchmaking QueryV1 RPC — cohort serve side (docs/matchmaking.md §Seeker query) ---
 			// The server half of the seeker query transport: a remote seeker dials `/optimystic/matchmaking/1.0.0/query`

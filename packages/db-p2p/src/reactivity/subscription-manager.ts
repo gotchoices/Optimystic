@@ -74,14 +74,18 @@ export interface RotationNotice {
 export interface ReactivitySubscriptionManagerOptions {
 	/** Participant-facing cohort-topic substrate API. */
 	readonly service: CohortTopicService;
-	/** Stable collection identity (the collection's id block id, raw bytes). */
+	/**
+	 * Stable collection identity, raw bytes. Inbound notifications are matched against their base64url, so
+	 * these MUST be the bytes origination encodes onto a notification: `reactivityCollectionIdBytes(id)`
+	 * (`reactivity/topic-bytes.ts`) on a node.
+	 */
 	readonly collectionId: Uint8Array;
 	/**
 	 * Tail block id at attach time (raw bytes); anchors the rotating topic (`reactivityTopicId` is applied to
 	 * it) and detects rotation.
 	 *
-	 * **Load-bearing encoding contract.** When a production subscribe factory converts a `BlockId` tail to
-	 * these bytes it MUST use `reactivityTailBytes(tailId)` (`reactivity/topic-bytes.ts`) — the SAME function
+	 * **Load-bearing encoding contract.** A host converting a `BlockId` tail to these bytes (the node's
+	 * `ReactivityCollectionWatch` does) MUST use `reactivityTailBytes(tailId)` (`reactivity/topic-bytes.ts`) — the SAME function
 	 * origination's membership gate uses — never a pre-hashed digest of the id, which would double-hash.
 	 * Origination derives the topic's `coord_0` cohort from `reactivityTopicId(reactivityTailBytes(
 	 * tailId))`; if this side feeds differently-encoded bytes it subscribes to a *different* coord and
@@ -111,8 +115,8 @@ export interface ReactivitySubscriptionManagerOptions {
 	/**
 	 * The subscriber's **real ring coordinate**, base64url (the `participantCoord` it registers under at the
 	 * cohort-topic tier), carried in the signed {@link ResumeV1}. The recover transport replies on the same
-	 * stream, so this is not used for reply routing today; still, the production factory should source it
-	 * correctly so the signed field is meaningful and a future out-of-band reply path is unblocked. Absent ⇒
+	 * stream, so this is not used for reply routing today; still, a host should source it correctly so the
+	 * signed field is meaningful and a future out-of-band reply path is unblocked. Absent ⇒
 	 * the manager falls back to the collection id as a placeholder and logs (the signed field is then merely
 	 * a stable per-collection token, not the ring coord).
 	 */
@@ -284,6 +288,16 @@ export class ReactivitySubscriptionManager {
 	/** Last contiguously-delivered revision. */
 	get lastRevision(): number {
 		return this.subscriber.lastRevision;
+	}
+
+	/**
+	 * Advance the contiguity head to `revision` because the host read the collection's committed log up to
+	 * it (the chain-read fallback). The next notification the manager delivers is then `revision + 1`, so a
+	 * gap the serving cohort could not backfill stops re-requesting a backfill on every later notification.
+	 * Only advances; a notification at or below `revision` that arrives afterwards is a duplicate.
+	 */
+	rebaseline(revision: number): void {
+		this.subscriber.rebaseline(revision);
 	}
 
 	/** Register the subscriber at tier T3 with the reactivity `appPayload`. */

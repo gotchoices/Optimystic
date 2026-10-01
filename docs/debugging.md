@@ -183,7 +183,6 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 |-------------------------|------------------------------------------------------------------------------------------|
 | `node-wiring`           | Node construction and startup: in-factory `setLibp2p` proxy fallbacks, owned-block seeding, spread-on-churn init, rollback failures after a failed start, and a `WARN:` line when no `kvStore` was supplied (the under-replication ledger will not survive a restart) |
 | `node-wiring:arachnode` | Arachnode ring membership during startup: ring announcements, ring transitions, ring-shift outcomes, unconfirmed cohort growth, rebalance reaction failures |
-| `reactivity-node-wiring`| Reactivity wiring at startup — currently, a rotation re-registration that fired with no subscribe factory wired |
 | `relay-reservation`     | The per-relay reservation supervisor a node runs for every listen address naming a relay: `relay-reservation:drive` (with its trigger), `relay-reservation:held`, `relay-reservation:failed` (with the reason), `relay-reservation:slot-taken` (relay discovery filled the slot through another relay; logged once per episode), and the libp2p-internals seam going missing |
 
 #### Reactivity (change subscription and propagation)
@@ -198,6 +197,7 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 | `reactivity-recover`           | Recover transport: dial fall-through to the next target, replay/stale and signature-verification rejections, malformed sticky primary |
 | `reactivity-push-state-gossip` | Push-state gossip: undecodable frames, frames from non-members, replay entries clipped to fit `maxBytes`, isolated round failures |
 | `reactivity-rotation-rereg`    | Rotation re-registration scheduler: scheduling with delay, duplicate notices ignored, ledger-cap evictions, rejected or throwing re-registrations |
+| `reactivity-collection-watch`  | Collection watch service: tail reads, registrations and renewals that failed (each retried by the next tick), a scheduled move that found no open subscription, a throwing `onChange`, watches refused after stop |
 
 #### Disputes
 

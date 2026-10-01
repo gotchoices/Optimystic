@@ -30,12 +30,20 @@ import {
 	type RotationHintV1,
 } from "@optimystic/db-core";
 import { peerIdToBytes } from "../cohort-topic/peer-codec.js";
+import { reactivityCollectionIdBytes, reactivityTailBytes } from "./topic-bytes.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("reactivity-origination");
 
 /** Per-collection origination context the manager resolves at emit time. */
 export interface OriginationCollectionContext {
+	/**
+	 * The collection id's bytes; the notification names its collection by their base64url. The node supplies
+	 * `reactivityCollectionIdBytes(event.collectionId)` — the SAME bytes a subscriber registers under and
+	 * matches against (`reactivity/topic-bytes.ts`). Absent ⇒ `event.collectionId` goes on the notification
+	 * unencoded, correct only for a caller whose collection ids are already base64url (the mock harness).
+	 */
+	readonly collectionId?: Uint8Array;
 	/** Current tail block id the reactivity topic is anchored on (raw bytes). */
 	readonly tailId: Uint8Array;
 	/** Per-collection delta budget (bytes); `0` ⇒ omit `delta` (Edge / collection declines deltas). */
@@ -44,6 +52,27 @@ export interface OriginationCollectionContext {
 	readonly delta?: Uint8Array;
 	/** Optional tail-rotation pre-announce (rotation ticket supplies it). */
 	readonly rotationHint?: RotationHintV1;
+}
+
+/**
+ * The origination context a live node resolves for one committed change, or `undefined` for a tail-less
+ * event (a read-driven promotion never originates; the membership gate also returns before this).
+ *
+ * Both ids go on the notification in the pinned encodings of `reactivity/topic-bytes.ts`, the SAME ones a
+ * subscriber registers under — a different encoding on either side and origination silently never reaches
+ * it. `rotationHint` stays absent on a live node: the successor tail id is not knowable at the filling
+ * commit (random block ids; gated on `6.5-block-id-derivation`), so the observable rotation signal is
+ * `event.tailId` changing, which the manager reports through `markRotated`.
+ */
+export function liveOriginationContext(event: CollectionChangeEvent, deltaMaxBytes: number): OriginationCollectionContext | undefined {
+	if (event.tailId === undefined) {
+		return undefined;
+	}
+	return {
+		collectionId: reactivityCollectionIdBytes(event.collectionId),
+		tailId: reactivityTailBytes(event.tailId),
+		deltaMaxBytes,
+	};
 }
 
 /** Construction inputs for a {@link ReactivityOriginationManager}. */
@@ -118,6 +147,7 @@ export class ReactivityOriginationManager {
 			// ever blocks the notification — the delivery-critical path.
 			this.observeTail(event, ctx);
 			const notification = buildNotificationV1(event, commitCert, {
+				collectionId: ctx.collectionId === undefined ? undefined : bytesToB64url(ctx.collectionId),
 				tailId: bytesToB64url(ctx.tailId),
 				timestamp: this.clock(),
 				deltaMaxBytes: ctx.deltaMaxBytes,

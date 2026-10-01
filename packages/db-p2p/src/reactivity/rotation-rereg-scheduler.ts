@@ -6,9 +6,10 @@
  * notify-driven pre-announce and the recover-driven `RotationRedirectError` converge on the same
  * `surfaceRotation` seam), but it neither schedules the timer nor performs the move. This host component
  * does: it consumes a notice, schedules a one-shot timer for `max(0, plan.fireAt - now())`, and on fire
- * invokes an injected `reRegister(plan)` seam that re-subscribes the watcher at the rotated tree. The node
- * composition that constructs the manager + binds this scheduler to its `onRotation` observer lives in
- * `reactivity-rotation-host-wiring-e2e`; this module is the standalone, unit-testable piece.
+ * invokes an injected `reRegister(plan)` seam that re-subscribes the watcher at the rotated tree. On a node
+ * both ends are the collection watch service ({@link import("./collection-watch.js").ReactivityCollectionWatch}):
+ * it binds each manager's `onRotation` observer to {@link RotationReRegistrationScheduler.schedule} and is
+ * the `reRegister` this scheduler calls. This module is the standalone, unit-testable piece.
  *
  * **Where the stagger lives.** The spread that keeps the new tail from being flooded is entirely in
  * `plan.fireAt`, drawn by the **manager's** `rejoinJitter`. This scheduler only *consumes* `plan.fireAt`; it
@@ -49,6 +50,10 @@
  * timers; **both may fire**. Re-registering at A and then immediately rotating A→B is self-correcting via the
  * manager's `rotationHandledFor` guard, so a superseded timer is intentionally **not** cancelled (a
  * superseded re-register is harmless and rare).
+ *
+ * **Move ordering is the `reRegister` implementation's contract, not this scheduler's:** the new topic's
+ * handler is registered before the old one is unregistered, so a notification arriving mid-move is never
+ * dropped. The watch service's `moveTo` is where that is implemented and tested.
  */
 
 import { bytesToB64url, type ReRegistrationPlan } from "@optimystic/db-core";
@@ -72,11 +77,12 @@ export type RotationTimerCancel = () => void;
 /**
  * Production timer binding: a one-shot `setTimeout` whose handle is **unref'd** so a pending re-registration
  * never keeps an otherwise-idle process alive. The returned handle clears the timeout (idempotent — clearing
- * an already-fired/cleared timeout is a no-op).
+ * an already-fired/cleared timeout is a no-op). Shared with the collection watch service's tick.
  */
-function defaultSetTimer(fn: () => void, delayMs: number): RotationTimerCancel {
+export function setUnrefTimer(fn: () => void, delayMs: number): RotationTimerCancel {
 	const handle = setTimeout(fn, delayMs);
-	// Node timers keep the event loop alive; an idle rotation timer must not pin a process (mirror push-state gossip).
+	// Node timers keep the event loop alive; an idle reactivity timer must not pin a process (mirror push-state
+	// gossip). The guard is for runtimes whose timer handle has no `unref` (browsers, React Native).
 	(handle as { unref?: () => void }).unref?.();
 	return (): void => clearTimeout(handle);
 }
@@ -99,9 +105,11 @@ export interface RotationReRegistrationSchedulerOptions {
 }
 
 /**
- * Hosts the per-successor one-shot timers that move a subscriber to the rotated tree. Construct one per
- * subscription manager and bind {@link schedule} to the manager's
- * {@link import("./subscription-manager.js").ReactivitySubscriptionManagerOptions.onRotation} observer.
+ * Hosts the per-successor one-shot timers that move a subscriber to the rotated tree. Bind {@link schedule}
+ * to a manager's {@link import("./subscription-manager.js").ReactivitySubscriptionManagerOptions.onRotation}
+ * observer. One scheduler may serve many managers as long as no two of them can name the same successor
+ * topic — a node shares one across every collection, which holds because the watch service keeps one
+ * subscription per collection; two subscriptions of ONE collection would collide in the de-dupe ledger.
  *
  * See the module doc for where the re-registration stagger actually lives (the manager's `rejoinJitter`; this
  * scheduler only consumes `plan.fireAt`, it does not draw it).
@@ -123,7 +131,7 @@ export class RotationReRegistrationScheduler {
 
 	constructor(options: RotationReRegistrationSchedulerOptions) {
 		this.reRegister = options.reRegister;
-		this.setTimer = options.setTimer ?? defaultSetTimer;
+		this.setTimer = options.setTimer ?? setUnrefTimer;
 		this.now = options.now ?? ((): number => Date.now());
 	}
 
@@ -243,8 +251,9 @@ export class RotationReRegistrationScheduler {
 		// would surface on the host event loop. Guard BOTH a rejected promise and a (mis-implemented) seam that
 		// throws synchronously. `seen` retains the key so a duplicate notice still no-ops. No retry this pass —
 		// and because `seen` keeps the key, a re-notice for this *same* successor is deduped (the manager's
-		// `rotationHandledFor` already holds it too), so the recovery backstop for a failed move is the
-		// subscriber's normal recover/re-walk path, not a re-detected rotation to the same tail.
+		// `rotationHandledFor` already holds it too), so the recovery backstop for a failed move is not a
+		// re-detected rotation to the same tail: on a node it is the watch service's tick, which reads the
+		// collection's tail and re-attaches wherever it finds it.
 		try {
 			void this.reRegister(plan).catch((err: unknown) => {
 				log("rotation re-registration rejected for successor topic=%s (isolated, not retried): %o", key, err);

@@ -964,8 +964,25 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
     for intra-cohort push-state convergence. The subscriber-id / dial-target space is the canonical
     peer-id string (the transport dials with `peerIdFromString`). Teardown stops the gossip timer,
     unsubscribes the inbound notify handler, and unhandles the reactivity protocols before the host
-    stops. (The Quereus `Database.watch` → subscription-manager bridge that *constructs* subscribers
-    remains the ticket `quereus-tables-opt-in-to-network-change-notification`.)
+    stops. A notification names its collection by the base64url of the collection id's UTF-8 bytes
+    (`reactivityCollectionIdBytes` in `packages/db-p2p/src/reactivity/topic-bytes.ts`), not by the id
+    itself: a real collection id is a path such as `app/users`, which fails the notification's wire
+    validation on the receiving node.
+  - **A host subscribes through `node.reactivityWatch`** (`network-collection-watch-service`).
+    `ReactivityCollectionWatch` in `packages/db-p2p/src/reactivity/collection-watch.ts` is the typed,
+    host-facing surface over all of the above — present exactly when `cohortTopic.enabled` built a host.
+    `watch({ collectionId, readTail, onChange })` returns at once; in the background the service keeps
+    one subscription per collection (shared by every watch of it on the node), registers its manager in
+    the subscriber registry and with the cohort, renews it, and moves it when the log's tail block
+    changes. Each subscription also ticks at the renewal cadence (30 s Core, 20 s Edge) and reads the
+    collection's committed tail: a revision above the last one the watchers were woken for wakes them,
+    and a different tail block moves the subscription. That check is what turns a lost notification, a
+    failed registration, an unannounced rotation or a commit nobody announced into one tick of delay
+    instead of a watcher that never wakes; it costs one tail read per watched collection per tick.
+    `Collection.readCommittedTail` in `packages/db-core/src/collection/collection.ts` is the reader a
+    host passes — it opens no collection handle, so it cannot replay a table's staged actions. The stop
+    wrapper stops the service first, ahead of the rotation scheduler and the host. (The Quereus plugin's
+    use of it is ticket `quereus-tables-opt-in-to-network-change-notification`.)
   - **Tail rotation is now live** (`reactivity-rotation-host-wiring-e2e`). `ReactivityOriginationManager`
     tracks the last-seen reactivity tail per collection and, when `event.tailId` **changes** between commits,
     fires `forwarderHost.markRotated(oldTopicId, { newTailId, effectiveAtRevision: event.rev }, now)` — the
@@ -974,10 +991,13 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
     that `markRotated` seam, binds the recover serve's `rotationFor` to `forwarderHost.rotationRedirectFor` (so
     a recover reaching the draining old tail returns a `kind:"rotated"` redirect), and constructs + exposes an
     unref'd-timer `RotationReRegistrationScheduler` as `node.reactivityRotation` (torn down in the stop wrapper
-    before `host.stop()`). The scheduler's `reRegister(plan)` move is wired by the deferred subscribe factory
-    (the same `quereus-tables-opt-in-to-network-change-notification` that constructs managers); until then it is
-    constructed + exposed + unit/mesh-tested but not driven by a node-internal manager. Anticipatory warm-up on
-    a live node is signal-only (logged; no successor coord is fabricated).
+    before `host.stop()`). The scheduler is driven by the watch service: a manager that learns of a
+    rotation schedules through it, and its `reRegister(plan)` is `ReactivityCollectionWatch.reRegister`,
+    which registers the new topic's handler before the old one is dropped. A manager learns of a rotation
+    only from a recover redirect, though — a subscriber under the old tail is not sent the new tail's
+    notifications — so the usual mover is the watch service's own tick, which reads the tail and
+    re-registers under whatever block it finds. Anticipatory warm-up on a live node is signal-only
+    (logged; no successor coord is fabricated).
 
 ## Mutation Contracts
 

@@ -91,6 +91,30 @@ ActiveSubscription {
 
 `tailIdAtAttach` is the subscriber-side detector for tail rotation. The cohort-topic-level `cohortEpoch` already detects cohort membership churn within a topic; `tailIdAtAttach` detects the whole-tree migration triggered by tail rotation.
 
+### The node's watch service
+
+On a running node an application does not build any of this itself. A node created with `cohortTopic.enabled` carries `reactivityWatch` (`ReactivityCollectionWatch` in `packages/db-p2p/src/reactivity/collection-watch.ts`, typed on `OptimysticNodeAttachments` in `packages/db-p2p/src/optimystic-node.ts`), and one call starts a watch:
+
+```ts
+const handle = node.reactivityWatch.watch({
+  collectionId: 'app/users',                      // exactly as blocks carry it
+  readTail: () => /* { tailId, revision } of the committed log, or undefined */,
+  onChange: () => { /* coarse: no payload */ },
+});
+await handle.close();
+```
+
+`watch` returns at once and never fails for network reasons; everything else runs in the background:
+
+- **One subscription per collection per node.** Every watch of a collection shares one `ReactivitySubscriptionManager`; the subscription closes with its last handle.
+- **Attach.** The service reads the tail, registers the manager's handler in the node's `ReactivitySubscriberRegistry` for that tail's topic, then registers with the cohort. A registration under a topic nobody has registered under before is normally deferred by the cohort (its members have not yet exchanged the willingness that admits one), and the retry is the next tick, so a first attach measured about 30 s on a three-node Core mesh. The watcher is still woken in the meantime, by the tick below.
+- **The tick.** At the renewal cadence (TTL / 3: 30 s Core, 20 s Edge) the service renews the registration, reads the tail again, wakes the watchers if the revision is above the last one they were woken for, and moves the subscription if the tail block is a different one. This is what bounds every failure the push path cannot rule out — a lost notification, a failed registration, a tail rotation nobody announced, a commit that was never announced at all — to one tick of delay. It costs one tail read per watched collection per tick.
+- **Recovery.** A gap is backfilled over the recover RPC. When the cohort cannot serve the gap, the watchers are woken anyway and the next tail read moves the manager's contiguity head to the revision it read, so one unservable gap does not turn every later notification into another backfill request.
+
+`Collection.readCommittedTail` in `packages/db-core/src/collection/collection.ts` is the `readTail` a host needs: it reads the header and tail block without opening a collection handle.
+
+**Collection ids on the wire.** A collection id is a path such as `app/users`, which is not base64url, so a notification names its collection by the base64url of the id's UTF-8 bytes (`reactivityCollectionIdBytes` in `packages/db-p2p/src/reactivity/topic-bytes.ts`). Origination (`liveOriginationContext` in `packages/db-p2p/src/reactivity/origination-manager.ts`) and the watch service call that one function; the `topic-bytes-encoding` spec pins that they agree and that the result passes `validateNotificationV1`.
+
 ### Forwarder-cohort state (per collection served)
 
 A reactivity forwarder cohort holds the cohort-topic-standard registration records plus per-collection notification state:
@@ -449,20 +473,28 @@ Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; c
 > commits — a *hard* rotation: `ReactivityOriginationManager` tracks the last-seen tail per collection and, on
 > a change, fires `markRotated(oldTopicId, { newTailId, effectiveAtRevision: event.rev }, now)` (the
 > `oldTopicId` is byte-identical to the topic a subscriber subscribed under — `reactivityTopicId(
-> reactivityTailBytes(tail))`). Active subscribers then detect the rotation via the delivered `tailId`
-> differing (`detectRotation` → `RotationNotice`, `preAnnounced: false`); a slept subscriber that resumes
-> against the old tail is redirected (`kind:"rotated"`). The pre-announce + anticipatory warm-up remain
+> reactivityTailBytes(tail))`). **A subscriber registered under the old tail is not sent the new tail's
+> notifications**, so on a live node a delivered `tailId` never differs from the one it attached under
+> (that detection, `detectRotation` → `RotationNotice`, fires only where a successor can be pre-announced).
+> A live subscriber moves in one of two ways. The watch service's tick (§Subscription) reads the collection's
+> tail and, finding a different tail block, registers under the new tail's topic — the new handler before the
+> old one is dropped — with no added jitter, since each subscription's tick started when its watch opened and
+> subscribers are already spread over the tick interval. And a subscriber that sends a recover request to
+> the old cohort inside its drain window is redirected (`kind:"rotated"`), which surfaces a `RotationNotice`
+> that the scheduler turns into the same move. Until one of those happens — up to one tick — the subscriber
+> hears nothing from the network and the tick's revision check is what wakes it (backlog
+> `feat-reactivity-rotation-reaches-current-subscribers`). The pre-announce + anticipatory warm-up remain
 > exercised in the **mock-tier harness** (`mesh-tail-rotation.spec.ts`) and the design simulator (both can
 > synthesize the successor id) and are documented as gated on `6.5`; warm-up on a live node is **signal-only**
 > (logged, never fabricating a successor coord). The node composition binds origination's `markRotated` → the
 > forwarder host, the recover serve's `rotationFor` → `ReactivityForwarderHost.rotationRedirectFor`, and
-> constructs + exposes an unref'd-timer `RotationReRegistrationScheduler` (`node.reactivityRotation`); its
-> `reRegister(plan)` is driven by the subscribe factory that constructs managers (the deferred Quereus
-> `Database.watch` bridge, `quereus-tables-opt-in-to-network-change-notification`) — until that lands the
-> scheduler is constructed + exposed + unit/mesh-tested but not driven by a node-internal manager. Specs:
+> constructs + exposes an unref'd-timer `RotationReRegistrationScheduler` (`node.reactivityRotation`). One
+> scheduler serves every subscription on the node; each manager's `onRotation` schedules through it and its
+> `reRegister(plan)` is the watch service's move (`ReactivityCollectionWatch.reRegister`). Specs:
 > db-p2p `mesh-tail-rotation.spec.ts` (redirect-driven re-registration with no gap; cross-rotation resume from
 > the inherited checkpoint), `node-wiring.spec.ts` (scheduler exposed + torn down), `managers.spec.ts`
-> (`markRotated` fires on a tail-id change with the correctly-encoded `oldTopicId`).
+> (`markRotated` fires on a tail-id change with the correctly-encoded `oldTopicId`), `collection-watch.spec.ts`
+> (the move's handler ordering, a failed move, a close during a move).
 
 Tail block ID changes when a block fills (default `block_fill_size = 64` transactions). Rotation moves the topic anchor — and hence the tree root — to a new ring coord.
 
@@ -476,7 +508,7 @@ Tail block ID changes when a block fills (default `block_fill_size = 64` transac
 
 3. **Subscriber re-registration with jitter.** Subscribers, on receiving the rotation hint, schedule re-registration at the new `topicId` with random jitter over `T_rejoin_jitter` (default 30 s). Re-registration carries the subscriber's existing `lastRevision`; revisions are continuous across rotations, so no replay confusion.
 
-   The db-p2p **host scheduler** that performs this is `RotationReRegistrationScheduler` (`reactivity/rotation-rereg-scheduler.ts`, `12.53-reactivity-rotation-rereg-scheduler`). The `ReactivitySubscriptionManager` surfaces a `RotationNotice{ newTailId, preAnnounced, plan }` once per successor (both the notify-driven pre-announce and the recover-driven `RotationRedirectError` converge on it); the scheduler consumes a notice, arms a one-shot timer for `max(0, plan.fireAt − now())`, and on fire invokes an injected `reRegister(plan)` that re-subscribes at the new tree. It injects `setTimer` + `now` for deterministic tests (defaulting to an **unref'd** `setTimeout`/`Date.now`, mirroring the push-state-gossip driver's unref'd timer so an idle re-registration never pins a process), de-dupes by successor `newTopicId` (base64url) so a redirect+pre-announce pair for the same successor moves once, and isolates+logs a failed `reRegister` (no retry this pass). A chained OLD→A→B before A's timer fires arms two independent timers (both may fire — self-corrected by the manager's `rotationHandledFor`); `cancel(newTopicId?)` / `stop()` tear pending timers down. **Where the stagger lives:** `plan.fireAt` is drawn by the *manager's* `rejoinJitter` via the single-subscriber planner `planReRegistration` → `scheduleRejoin`, a **uniform** offset over `T_rejoin_jitter` (default 30 s). Each subscriber jitters independently, so the load-bearing knob on this path is the **window** (not a `capPromote`); the new tail sees ≈ `subscribers / T_rejoin_jitter` arrivals/s, and that burst is absorbed on the *receiving* side by the new tail cohort's `cap_promote_fast` fast-promotion (see §Rotation cost and the Worked scenario) — a cohort-topic promotion mechanism, independent of the jitter's `capPromote`. (`RejoinJitter.capPromote` is consulted only by the *wave* planner `scheduleWave` / `planReRegistrationWave`, which the production manager does not use; were the composing site to adopt the wave planner it would then need `createRejoinJitter({ capPromote: DEFAULT_CAP_PROMOTE_FAST })` = 32, since the default cap is the cohort-failure `cap_promote = 64`.) The node composition that binds the scheduler to the manager's `onRotation` observer lands in `reactivity-rotation-host-wiring-e2e`.
+   The db-p2p **host scheduler** that performs this is `RotationReRegistrationScheduler` (`reactivity/rotation-rereg-scheduler.ts`, `12.53-reactivity-rotation-rereg-scheduler`). The `ReactivitySubscriptionManager` surfaces a `RotationNotice{ newTailId, preAnnounced, plan }` once per successor (both the notify-driven pre-announce and the recover-driven `RotationRedirectError` converge on it); the scheduler consumes a notice, arms a one-shot timer for `max(0, plan.fireAt − now())`, and on fire invokes an injected `reRegister(plan)` that re-subscribes at the new tree. It injects `setTimer` + `now` for deterministic tests (defaulting to an **unref'd** `setTimeout`/`Date.now`, mirroring the push-state-gossip driver's unref'd timer so an idle re-registration never pins a process), de-dupes by successor `newTopicId` (base64url) so a redirect+pre-announce pair for the same successor moves once, and isolates+logs a failed `reRegister` (no retry this pass). A chained OLD→A→B before A's timer fires arms two independent timers (both may fire — self-corrected by the manager's `rotationHandledFor`); `cancel(newTopicId?)` / `stop()` tear pending timers down. On a node the injected `reRegister` is `ReactivityCollectionWatch.reRegister`, and a move that fails is retried by that service's next tick. **Where the stagger lives:** `plan.fireAt` is drawn by the *manager's* `rejoinJitter` via the single-subscriber planner `planReRegistration` → `scheduleRejoin`, a **uniform** offset over `T_rejoin_jitter` (default 30 s). Each subscriber jitters independently, so the load-bearing knob on this path is the **window** (not a `capPromote`); the new tail sees ≈ `subscribers / T_rejoin_jitter` arrivals/s, and that burst is absorbed on the *receiving* side by the new tail cohort's `cap_promote_fast` fast-promotion (see §Rotation cost and the Worked scenario) — a cohort-topic promotion mechanism, independent of the jitter's `capPromote`. (`RejoinJitter.capPromote` is consulted only by the *wave* planner `scheduleWave` / `planReRegistrationWave`, which the production manager does not use; were the composing site to adopt the wave planner it would then need `createRejoinJitter({ capPromote: DEFAULT_CAP_PROMOTE_FAST })` = 32, since the default cap is the cohort-failure `cap_promote = 64`.) The node composition that binds the scheduler to each manager's `onRotation` observer is the watch service (§Subscription).
 
 4. **Forwarder draining.** Forwarder cohorts under the old tail observe their direct-subscriber count dropping (subscribers re-registering under the new tail) and demote naturally per the cohort-topic demotion protocol. They do not migrate state to the new tree — the new tree rebuilds via re-registration.
 
@@ -851,9 +883,9 @@ Tail cohort emits notification for revision 7800. Tier-1 forwarder `F_a` receive
 > collected-multisig crypto** (no pass-crypto stub). The harness *models* only the notification transport
 > (the application protocol that would dial each subscriber's primary / child cohort) and, like the
 > matchmaking mock tier, the **single-tier-0 reach**. The suites cover
-> the reactivity surface at scale; the real-libp2p socket wakeup of a `Database.watch` consumer on a
-> machine that does not store the table belongs to ticket
-> `quereus-tables-opt-in-to-network-change-notification`, not duplicated here.
+> the reactivity surface at scale; the real-libp2p wakeup of a watch is covered in §Real-libp2p e2e
+> coverage, and a `Database.watch` consumer's by ticket
+> `quereus-tables-opt-in-to-network-change-notification`.
 
 Each §Worked scenario / §Failure mode maps to a named test (or a tagged-unimplemented expectation):
 
@@ -915,11 +947,20 @@ never hard-code drifting numbers.
 > the origin for determinism; the sticky-primary → cohort-walk target selection is unit-covered by
 > `reactivity/recover-transport.spec.ts`.)
 >
+> **The watch service is exercised with nothing faked** (`network-collection-watch-service`): on three real
+> nodes a watch opened through one node's `reactivityWatch` wakes after another node commits a row through
+> its own `NetworkTransactor`. The commit certificate comes from real cluster consensus, the registration from
+> the real register walk, and the membership certificate from the cohort's own publication — the three things
+> the cases above hand-build. The case passes only on a wake with no tail read between the commit and the
+> wake, so the fallback tick cannot be what passed it. It also runs the real collection id (`app/watched-rows`)
+> through the wire, which the earlier cases avoided by inventing ids that were already base64url. The mesh is
+> configured so every machine is in every cohort (`clusterSize` = `cohortTopic.wantK` = 3, `minSigs` 2), the
+> only configuration in which notifications verify today (blocked ticket
+> `reactivity-notifications-need-the-tail-cohort-to-be-the-topic-cohort`).
+>
 > **Still deferred (tagged, not faked):** the tail-rotation-specific *redirect* on socket delivery
 > (`12.5-reactivity-tail-rotation-transport`) and the real-libp2p `Database.watch` wakeup — the Quereus
-> application bridge that *constructs* a subscription manager from a watch and registers it
-> (`quereus-tables-opt-in-to-network-change-notification`). 12.33 + recover-node-wiring own the transport,
-> registry, and recover serve+signers those plug into.
+> plugin's use of the watch service (`quereus-tables-opt-in-to-network-change-notification`).
 
 ---
 

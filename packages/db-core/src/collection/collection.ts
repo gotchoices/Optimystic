@@ -335,6 +335,26 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return collection;
 	}
 
+	/** The committed tail of `id` — the tail block id its header names and that block's latest
+	 * committed revision, which is the collection's (every commit touches the log tail). Resolves
+	 * `undefined` when the collection has never committed: no header, a header naming no tail, or
+	 * a tail with no committed revision.
+	 *
+	 * Reads no collection handle: nothing is opened, cached or staged, so it is safe to call
+	 * beside a handle with a transaction open (a refresh of that handle would replay its staged
+	 * actions). It costs one request when `knownTailId` is the tail the header still names, and
+	 * two otherwise — a caller that polls should pass the tail id its previous call returned.
+	 *
+	 * Throws what a refresh's first read throws: `BlockUnavailableError` for a header or tail the
+	 * storage layer could not retrieve, `BlockPossiblyStaleError` for one it could not confirm
+	 * current. Neither is an absence. */
+	static async readCommittedTail(transactor: ITransactor, id: CollectionId, knownTailId?: BlockId): Promise<{ tailId: BlockId; rev: number } | undefined> {
+		const ends = await Collection.readLogEnds(transactor, id, knownTailId);
+		const tailId = ends?.header.tailId;
+		const rev = ends?.tail?.state.latest?.rev;
+		return tailId === undefined || rev === undefined ? undefined : { tailId, rev };
+	}
+
 	/** The per-instance read wiring every open path needs, plus the header probe result.
 	 * Shared by {@link open} and {@link createOrOpen} so the two cannot drift. */
 	private static async probeHeader(transactor: ITransactor, id: CollectionId, instanceTag: string): Promise<{
