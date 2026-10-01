@@ -14,6 +14,7 @@ const UNDECLARED: LinkDeadlines = {
 	dialTimeoutMs: 3000,
 	responseTimeoutMs: 10_000,
 	connectionTimeoutMs: 10_000,
+	addressDialTimeoutMs: 6000,
 	cohortQueryTimeoutMs: 1000,
 	transferTimeoutMs: 30_000,
 };
@@ -33,6 +34,8 @@ describe('resolveLinkDeadlines', () => {
 			// 3 x 3000 = 9000 is still under the 10 s floor.
 			responseTimeoutMs: 10_000,
 			connectionTimeoutMs: 15_000,
+			// One address has to carry a whole relayed open (about 12 s measured at this link).
+			addressDialTimeoutMs: 15_000,
 			cohortQueryTimeoutMs: 9000,
 			// The dial (18 s) is still under the 30 s floor.
 			transferTimeoutMs: 30_000,

@@ -453,6 +453,9 @@ export class ReactivityMesh {
 		return createNotificationVerifier({ verifier: service.verifier(), tier: Tier.T3 });
 	}
 
+	// NOTE: the harness builds a collection's PushState at registration, so it buffers commits made before anyone
+	// subscribed; a running node builds it only once the topic has a subscriber (`ReactivityForwarderHost.hasDemand`).
+	// If a mesh test ever asserts replay of such a commit, model the demand rule here first.
 	private makePushState(collectionIdB64: string, topicId: Uint8Array, tailId: Uint8Array, w: number, wCheckpoint: number, queueMax: number, deltaMaxBytes: number): PushState {
 		return new PushState({
 			collectionId: collectionIdB64,

@@ -19,7 +19,6 @@ import {
 	type MembershipCertV1,
 	type NotificationV1,
 	type NotificationVerifier,
-	type NodeProfile,
 	type PeerRef,
 	type PushStateInit,
 	type CohortRef,
@@ -419,6 +418,18 @@ describe('reactivity / forwarder host — rotation drain', () => {
 		expect(host.rotationRedirectFor(TOPIC, NOW + T_DRAIN_MS)).to.equal(undefined);
 		expect(host.pushStateFor(TOPIC), 'served PushState reclaimed on drain-elapsed eviction').to.equal(undefined);
 		expect(host.livePushStates(), 'no live forwarder state lingers for the drained tail').to.have.length(0);
+	});
+
+	it('releases a drained tail no recover request ever asked about on the next rotation it observes', async () => {
+		const { host } = makeHost({ directSubscribers: (): string[] => [SUB_A] });
+		await host.ingest(TOPIC, note(1));
+		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 2 }, NOW);
+
+		// Another collection's rotation after the window closed: the old tail is released without a recover query.
+		const otherTopic = reactivityTopicId(b64urlToBytes(NEW_TAIL_2));
+		host.markRotated(otherTopic, { newTailId: NEW_TAIL, effectiveAtRevision: 9 }, NOW + T_DRAIN_MS);
+		expect(host.pushStateFor(TOPIC), 'served state of the drained tail reclaimed').to.equal(undefined);
+		expect(host.livePushStates()).to.have.length(0);
 	});
 
 	it('is idempotent for the same successor (no-op; drain window not restarted)', () => {

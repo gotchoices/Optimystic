@@ -36,6 +36,13 @@ export const DEFAULT_RESPONSE_TIMEOUT_MS = 10000;
 export const DEFAULT_CONNECTION_TIMEOUT_MS = 10_000;
 
 /**
+ * libp2p's connection-manager `addressDialTimeout` on a node that declares no link round trip, and the
+ * floor of the derived one. Equal to libp2p's own default (`ADDRESS_DIAL_TIMEOUT`), stated here so the
+ * fallback does not move with libp2p.
+ */
+export const DEFAULT_ADDRESS_DIAL_TIMEOUT_MS = 6000;
+
+/**
  * Per-peer deadline, on the dial and again on the reply, for the rebalance reaction's pushes and
  * confirms (`BlockTransferCoordinator`), on a node that declares no link round trip; the floor of
  * the derived one.
@@ -64,6 +71,12 @@ export const UNDECLARED_RPC_DEADLINES: RpcDeadlineDefaults = Object.freeze({
 export type LinkDeadlines = RpcDeadlineDefaults & {
 	/** libp2p's connection-manager `dialTimeout` and `inboundUpgradeTimeout`: opening a connection, both ends. */
 	connectionTimeoutMs: number;
+	/**
+	 * libp2p's connection-manager `addressDialTimeout`: the most one address of a peer may take to
+	 * connect. libp2p applies it inside every dial, including one that carries the caller's own signal,
+	 * so it caps this package's RPC dials too.
+	 */
+	addressDialTimeoutMs: number;
 	/** `clusterPolicy.cohortQueryTimeoutMs` when that field is not declared. */
 	cohortQueryTimeoutMs: number;
 	/** `BlockTransferCoordinator`'s per-peer `transferTimeoutMs`. */
@@ -77,7 +90,8 @@ export type LinkDeadlines = RpcDeadlineDefaults & {
  *
  * - dial: connection open (4) + stream negotiation (1) + one of margin.
  * - response: request plus reply is one; the rest covers payload transfer and the peer's own work.
- * - connection: connection open only (4) + one of margin.
+ * - connection: connection open only (4) + one of margin. libp2p's per-address limit takes the same
+ *   multiple: one address has to be able to carry a whole relayed connection open.
  * - cohort query: negotiation plus request is two on a reused connection. A fresh relayed connection
  *   does not fit, which is safe: the peer is counted silent and the read is flagged, not misreported.
  */
@@ -114,6 +128,7 @@ export function resolveLinkDeadlines(linkRoundTripMs?: number): LinkDeadlines {
 		dialTimeoutMs,
 		responseTimeoutMs: Math.max(DEFAULT_RESPONSE_TIMEOUT_MS, RESPONSE_ROUND_TRIPS * roundTripMs),
 		connectionTimeoutMs: Math.max(DEFAULT_CONNECTION_TIMEOUT_MS, CONNECTION_ROUND_TRIPS * roundTripMs),
+		addressDialTimeoutMs: Math.max(DEFAULT_ADDRESS_DIAL_TIMEOUT_MS, CONNECTION_ROUND_TRIPS * roundTripMs),
 		cohortQueryTimeoutMs: Math.max(DEFAULT_COHORT_QUERY_TIMEOUT_MS, COHORT_QUERY_ROUND_TRIPS * roundTripMs),
 		// A transfer is a dial like any other, so it may never be the shorter of the two.
 		transferTimeoutMs: Math.max(DEFAULT_TRANSFER_TIMEOUT_MS, dialTimeoutMs),

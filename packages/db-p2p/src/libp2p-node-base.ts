@@ -1,4 +1,4 @@
-import { createLibp2p, type ConnectionMonitorInit, type Libp2p } from 'libp2p';
+import { createLibp2p, type ConnectionManagerInit, type ConnectionMonitorInit, type Libp2p } from 'libp2p';
 import { noise, type ICryptoInterface } from '@chainsafe/libp2p-noise';
 import { yamux } from '@chainsafe/libp2p-yamux';
 import { identify, identifyPush } from '@libp2p/identify';
@@ -492,8 +492,13 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * - `inboundUpgradeTimeout` — how long an inbound connection may take to finish its upgrade
 	 *   (encryption + muxer) before this node discards it.
 	 *
-	 * Unset, both are `LinkDeadlines.connectionTimeoutMs`: 10s (libp2p's own default) when no round
-	 * trip is declared, and five round trips when one is. When only the listener's limit is too short,
+	 * - `addressDialTimeout` — how long one address of a peer may take to connect, inside any dial,
+	 *   including the RPC clients' own (libp2p 3.3.0 and later; 3.1.x ignores it).
+	 *
+	 * Unset, the first two are `LinkDeadlines.connectionTimeoutMs`: 10s (libp2p's own default) when no
+	 * round trip is declared, and five round trips when one is. `addressDialTimeout` is
+	 * `LinkDeadlines.addressDialTimeoutMs`: 6s (libp2p's own default) undeclared, five round trips
+	 * declared. When only the listener's limit is too short,
 	 * the dialer's dial succeeds against a connection the listener has already discarded, and every
 	 * stream on it dies with `Unexpected EOF`, so an override belongs on every node — each node is the
 	 * listener for someone.
@@ -750,6 +755,23 @@ export async function createLibp2pNodeBase(
 	let blockHoldersTarget: BlockHoldersSink | undefined;
 	const onBlockHolders: BlockHoldersSink = (holders) => blockHoldersTarget?.(holders);
 
+	// Built apart from `libp2pOptions` so the field libp2p 3.1.x's `ConnectionManagerInit` does not
+	// declare (`addressDialTimeout`, read from libp2p 3.3.0) type-checks without a cast.
+	const connectionManager: ConnectionManagerInit & Libp2pConnectionTimeouts = {
+		// `autoDial`, `minConnections`, and `dialQueue` were stale libp2p option keys silently
+		// ignored under the former `libp2pOptions as any` (removed with this change). This libp2p
+		// version has no such keys — auto-dial is now default connection-manager behavior with no
+		// direct replacement — so they are dropped rather than re-cast. See review handoff.
+		maxConnections: 16,
+		// Always explicit, so the undeclared fallback (10_000, libp2p's own default) does not move
+		// with libp2p. Both ends: every node is someone's listener.
+		inboundUpgradeTimeout: options.connectionManager?.inboundUpgradeTimeout ?? linkDeadlines.connectionTimeoutMs,
+		dialTimeout: options.connectionManager?.dialTimeout ?? linkDeadlines.connectionTimeoutMs,
+		// libp2p applies this inside every dial, signalled or not, so left at its 6 s default it cut off
+		// a relayed connection open on a slow link whatever the dial's own deadline said.
+		addressDialTimeout: options.connectionManager?.addressDialTimeout ?? linkDeadlines.addressDialTimeoutMs
+	};
+
 	const libp2pOptions: Libp2pInit = {
 		start: false,
 		privateKey: nodePrivateKey,
@@ -761,17 +783,7 @@ export async function createLibp2pNodeBase(
 			...(options.announceAddrs ? { announce: options.announceAddrs } : {}),
 			...(options.appendAnnounceAddrs ? { appendAnnounce: options.appendAnnounceAddrs } : {})
 		},
-		connectionManager: {
-			// `autoDial`, `minConnections`, and `dialQueue` were stale libp2p option keys silently
-			// ignored under the former `libp2pOptions as any` (removed with this change). This libp2p
-			// version has no such keys — auto-dial is now default connection-manager behavior with no
-			// direct replacement — so they are dropped rather than re-cast. See review handoff.
-			maxConnections: 16,
-			// Always explicit, so the undeclared fallback (10_000, libp2p's own default) does not move
-			// with libp2p. Both ends: every node is someone's listener.
-			inboundUpgradeTimeout: options.connectionManager?.inboundUpgradeTimeout ?? linkDeadlines.connectionTimeoutMs,
-			dialTimeout: options.connectionManager?.dialTimeout ?? linkDeadlines.connectionTimeoutMs
-		},
+		connectionManager,
 		...(options.connectionGater ? { connectionGater: options.connectionGater } : {}),
 		transports,
 		connectionEncrypters: [noise({ crypto: options.noiseCrypto })],

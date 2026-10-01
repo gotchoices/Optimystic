@@ -160,8 +160,8 @@ export class ReactivityForwarderHost {
 	 * Per-topic served state. `ServedTopic` ⇒ forwards; `null` ⇒ resolved subscriber-only (Edge); absent ⇒
 	 * unresolved, or no demand yet (see {@link hasDemand}).
 	 *
-	 * NOTE: a `ServedTopic` outlives its last subscriber — it is reclaimed only when a tail rotation's drain window
-	 * closes ({@link rotationRedirectFor}). If memory ever shows it, evict on a {@link hasDemand} check at ingest.
+	 * NOTE: a `ServedTopic` outlives its last subscriber — it is reclaimed only once a tail rotation's drain window
+	 * has closed ({@link releaseDrainedTopics}). If memory ever shows it, evict on a {@link hasDemand} check at ingest.
 	 */
 	private readonly served = new Map<string, ServedTopic | null>();
 	/** Per-topic serialization tail: an ingest chains onto its topic's prior ingest so the ring/dedupe never interleave. */
@@ -203,6 +203,13 @@ export class ReactivityForwarderHost {
 			() => this.ingestSerialized(topicId, n, key),
 		);
 		this.ingestTails.set(key, next);
+		// Drop the tail once it settles with nothing chained behind it: every collection this node originates for
+		// passes through here, one topic per log tail block, so a kept entry would grow with the commit count.
+		void next.then(() => {
+			if (this.ingestTails.get(key) === next) {
+				this.ingestTails.delete(key);
+			}
+		});
 		return next;
 	}
 
@@ -301,6 +308,7 @@ export class ReactivityForwarderHost {
 	 * (or equal) successor leaves the existing gate untouched.
 	 */
 	markRotated(oldTopicId: Uint8Array, redirect: { newTailId: string; effectiveAtRevision: number }, now: number): void {
+		this.releaseDrainedTopics(now);
 		const key = this.topicKey(oldTopicId);
 		const existing = this.rotationGates.get(key);
 		if (existing !== undefined && redirect.effectiveAtRevision <= existing.rotationRedirect.effectiveAtRevision) {
@@ -331,12 +339,29 @@ export class ReactivityForwarderHost {
 		if (gate.isDraining(now)) {
 			return gate.rotationRedirect;
 		}
-		// Drain window closed: the outgoing tail is done. Drop the gate and reclaim its served state so the
-		// per-topic maps don't leak across rotations.
+		this.releaseDrainedTopic(key);
+		return undefined;
+	}
+
+	/**
+	 * Release every outgoing tail whose drain window has closed. Run on each {@link markRotated}: the origination
+	 * manager marks a rotation for every collection this node originates for, watched or not, and a recover
+	 * request — the only other release point — never reaches the old tail of a collection nobody watches, so
+	 * without this sweep the gates (and any served state behind them) would accumulate one per filled log block.
+	 */
+	private releaseDrainedTopics(now: number): void {
+		for (const [key, gate] of [...this.rotationGates]) {
+			if (!gate.isDraining(now)) {
+				this.releaseDrainedTopic(key);
+			}
+		}
+	}
+
+	/** The outgoing tail is done: drop its gate and reclaim its served state so the per-topic maps don't leak across rotations. */
+	private releaseDrainedTopic(key: string): void {
 		this.rotationGates.delete(key);
 		this.served.delete(key);
 		this.ingestTails.delete(key);
-		return undefined;
 	}
 
 	/**
@@ -451,8 +476,9 @@ export class ReactivityForwarderHost {
 	/**
 	 * Whether anyone downstream wants `topicId`'s notifications: at least one direct subscriber. Child cohorts
 	 * join as a second clause once the parent/child link ([cohort-topic-parent-child-link]) supplies them
-	 * ahead of any {@link PushState}. One registry lookup plus a records scan per ingest of a topic without
-	 * state — cheap enough not to cache.
+	 * ahead of any {@link PushState}. Costs what one fan-out's subscriber read costs (in the node wiring, a scan of
+	 * the served cohort engines and then of one engine's records), once per ingest of a topic without state —
+	 * cheap enough not to cache.
 	 */
 	private hasDemand(topicId: Uint8Array): boolean {
 		return this.directSubscribers(topicId).length > 0;
