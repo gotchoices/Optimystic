@@ -27,14 +27,16 @@ trip, declared through `linkRoundTripMs`) fails with a `TimeoutError` 6.0 s into
   today as well, not only libp2p's `dialTimeout`.
 - The option and constant first appear in libp2p 3.2.x (absent in 3.2.0, present in 3.2.4; 3.1.x has
   neither). This repository declares `libp2p: ^3.1.3` and its lockfile resolves 3.1.3, so neither our
-  tests nor our types see it; sereus's install resolves 3.3.11 and does.
+  tests nor our types see it. Sereus's lockfile also resolves 3.1.3; kjeib hit it because a fresh
+  embedder install resolves the newest 3.x (3.3.11). Both repositories were testing an older libp2p
+  than their users run.
 - Sereus cannot set it: `Libp2pConnectionTimeouts` is
   `Pick<ConnectionManagerInit, 'dialTimeout' | 'inboundUpgradeTimeout'>`.
 
 ## Proposed fix
 
 - Raise the `libp2p` range in the three workspaces to a version that has `addressDialTimeout`
-  (^3.3.11 is what sereus runs) and update the lockfile; run `yarn lint:deps` (same major).
+  (^3.3.11, what a fresh embedder install resolves today) and update the lockfile; run `yarn lint:deps` (same major).
 - Add `addressDialTimeout` to `Libp2pConnectionTimeouts`, and pass
   `addressDialTimeout: options.connectionManager?.addressDialTimeout ?? <derived>` beside
   `dialTimeout` and `inboundUpgradeTimeout`.
@@ -49,6 +51,14 @@ trip, declared through `linkRoundTripMs`) fails with a `TimeoutError` 6.0 s into
   relay fixture exists (the 1500 ms measurements in
   `complete/2.5-declared-link-round-trip-derives-every-dial-deadline`), extend it to show a relayed
   dial at a 3 s round trip now completes.
+
+## The underlying gap
+
+The lockfile kept every test on libp2p 3.1.3 while every new embedder got 3.3.x, and a behaviour
+change between them went unseen. Moving the lockfile to 3.3.11 closes this instance. Consider in
+review whether a lockfile-drift check belongs in the release steps (for example, comparing the locked
+libp2p-family versions against what a fresh install of the published packages resolves); if so, file
+it as a backlog ticket rather than growing this one.
 
 ## After release
 
