@@ -1140,12 +1140,18 @@ slowest round trip between any two nodes that will talk to each other, relayed h
 them all from one number (`resolveLinkDeadlines` in `packages/db-p2p/src/rpc-deadline.ts`), and fills
 an undeclared `cohortQueryTimeoutMs` with `max(1000, 3 × linkRoundTripMs)`: three round trips, over the
 two a request costs on an open connection. A request that has to open a relayed connection first
-(about four more) does not fit, and that is safe — the peer is counted silent and the read is flagged,
-never misreported. The fill happens before `resolveClusterPolicy`, so the member, the coordinator and
-`reconcilePassTimeoutMs` all read one number, and a declared `cohortQueryTimeoutMs` still wins. The
-cluster client the coordinator dials each cohort member with — and the one a member re-sends an
-expired transaction's reject with — carries the derived dial and reply deadlines, so a consensus round
-on a 3 s link is no longer failed at the 3 s dial before the peer can answer.
+(about four more when this node already has a connection to the relay, up to about ten when it does
+not) does not fit, and that is safe — the peer is counted silent and the read is flagged, never
+misreported. It has one consequence worth knowing: when the budget runs out it also abandons the
+connection open the request started, and libp2p does not let a later dial to the same peer extend that
+open. So read requests alone never open a cold relayed connection; consensus, sync repair or FRET's own
+dials have to (the `NOTE:` at the consult's `withinRequestBudget` call in
+`packages/db-p2p/src/libp2p-node-base.ts`). The fill happens before `resolveClusterPolicy`, so the
+member, the coordinator and `reconcilePassTimeoutMs` all read one number, and a declared
+`cohortQueryTimeoutMs` still wins. The cluster client the coordinator dials each cohort member with —
+and the one a member re-sends an expired transaction's reject with — carries the derived dial and reply
+deadlines, so a consensus round on a 3 s link is no longer failed at the 3 s dial before the peer can
+answer.
 
 **Changing a size after the node is running.** Both yardsticks are resolved **once**, by
 `resolveClusterPolicy` at node construction, and every consumer — the cluster member, the coordinator,

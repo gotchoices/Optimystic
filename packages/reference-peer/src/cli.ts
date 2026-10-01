@@ -470,11 +470,14 @@ class PeerSession {
 			transactor = new LocalTransactor(storageRepo);
 		} else {
 			transactor = new NetworkTransactor({
-				timeoutMs: 30000,
-				abortOrCancelTimeoutMs: 10000,
+				// The node's own derived budget (30s on an undeclared link), so it grows with the dial
+				// deadline below and a dead coordinator can still be re-picked over slow relayed links.
+				timeoutMs: node.linkDeadlines.transactionTimeoutMs,
+				// A cancel reaches the coordinator through one dial, so it is never given less than one.
+				abortOrCancelTimeoutMs: Math.max(10000, node.linkDeadlines.dialTimeoutMs),
 				// Per-peer dial cap: an unreachable cluster member fails fast
 				// (3s on an undeclared link) so the consensus retry loop can re-pick
-				// within the 30s overall budget instead of one stuck peer monopolizing
+				// within the overall budget instead of one stuck peer monopolizing
 				// it. The node's own derived value, so it follows its link declaration.
 				dialTimeoutMs: node.linkDeadlines.dialTimeoutMs,
 				keyNetwork,

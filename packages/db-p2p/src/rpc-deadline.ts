@@ -1,5 +1,4 @@
 import { DEFAULT_COHORT_QUERY_TIMEOUT_MS } from '@optimystic/db-core';
-import { MAX_COHORT_QUERY_TIMEOUT_MS } from './cluster/cluster-policy.js';
 
 /**
  * Per-RPC deadline knobs shared by the simple {@link ProtocolClient} subclasses
@@ -29,11 +28,18 @@ export const DEFAULT_DIAL_TIMEOUT_MS = 3000;
 export const DEFAULT_RESPONSE_TIMEOUT_MS = 10000;
 
 /**
- * libp2p's connection-manager `dialTimeout` and `inboundUpgradeTimeout` on a node that declares no
- * link round trip, and the floor of the derived one. Equal to libp2p's own defaults, but stated here
- * so the fallback does not move with libp2p.
+ * libp2p's connection-manager `dialTimeout` on a node that declares no link round trip, and the floor
+ * of the derived one. Equal to libp2p's own default, but stated here so the fallback does not move
+ * with libp2p.
  */
-export const DEFAULT_CONNECTION_TIMEOUT_MS = 10_000;
+export const DEFAULT_LIBP2P_DIAL_TIMEOUT_MS = 10_000;
+
+/**
+ * libp2p's connection-manager `inboundUpgradeTimeout` on a node that declares no link round trip, and
+ * the floor of the derived one. Equal to libp2p's own default, but stated here so the fallback does
+ * not move with libp2p.
+ */
+export const DEFAULT_INBOUND_UPGRADE_TIMEOUT_MS = 10_000;
 
 /**
  * libp2p's connection-manager `addressDialTimeout` on a node that declares no link round trip, and the
@@ -48,6 +54,12 @@ export const DEFAULT_ADDRESS_DIAL_TIMEOUT_MS = 6000;
  * the derived one.
  */
 export const DEFAULT_TRANSFER_TIMEOUT_MS = 30_000;
+
+/**
+ * The overall budget of one `NetworkTransactor` operation (its `timeoutMs`) on a node that declares no
+ * link round trip; the floor of the derived one.
+ */
+export const DEFAULT_TRANSACTION_TIMEOUT_MS = 30_000;
 
 /**
  * The fallback deadlines a {@link ProtocolClient} subclass applies to a request whose caller
@@ -69,52 +81,87 @@ export const UNDECLARED_RPC_DEADLINES: RpcDeadlineDefaults = Object.freeze({
  * (`NodeOptions.linkRoundTripMs`). All in milliseconds.
  */
 export type LinkDeadlines = RpcDeadlineDefaults & {
-	/** libp2p's connection-manager `dialTimeout` and `inboundUpgradeTimeout`: opening a connection, both ends. */
-	connectionTimeoutMs: number;
+	/**
+	 * libp2p's connection-manager `dialTimeout`: the whole of a dial that carries no signal of its own,
+	 * a cold relayed one included. Never shorter than {@link LinkDeadlines.addressDialTimeoutMs}, since
+	 * one address has to be able to use all of its limit inside it.
+	 */
+	libp2pDialTimeoutMs: number;
+	/**
+	 * libp2p's connection-manager `inboundUpgradeTimeout`: the listener's side of a connection open.
+	 * Its timer runs only over this node's own upgrade, never over a relay connection the dialer had
+	 * to open first, so it does not take the cold-path multiple.
+	 */
+	inboundUpgradeTimeoutMs: number;
 	/**
 	 * libp2p's connection-manager `addressDialTimeout`: the most one address of a peer may take to
 	 * connect. libp2p applies it inside every dial, including one that carries the caller's own signal,
-	 * so it caps this package's RPC dials too.
+	 * so it caps this package's RPC dials too, and a circuit dial opens its relay connection inside it.
 	 */
 	addressDialTimeoutMs: number;
 	/** `clusterPolicy.cohortQueryTimeoutMs` when that field is not declared. */
 	cohortQueryTimeoutMs: number;
 	/** `BlockTransferCoordinator`'s per-peer `transferTimeoutMs`. */
 	transferTimeoutMs: number;
+	/**
+	 * The overall budget of one `NetworkTransactor` operation (its `timeoutMs`), for a host that builds
+	 * one over this node. The node itself applies it nowhere.
+	 */
+	transactionTimeoutMs: number;
 };
 
 /**
- * How many link round trips each derived deadline allows. Opening a relayed connection costs about
- * four (eight one-way delays), and opening a stream on it costs one more, even on a connection that
- * is already open (`test/stream-open-costs-a-round-trip.spec.ts`).
+ * How many link round trips each derived deadline allows. A relayed dial whose connection to the relay
+ * is already open costs about four (the hop, the stop and the relayed upgrade); one through a relay
+ * this node is NOT connected to opens that connection first, from inside libp2p's per-address limit,
+ * and costs up to about 6.6 (`test/cold-relayed-dial-fits-the-address-limit.spec.ts`, with the whole
+ * round trip on the dialer's leg to the relay). That measurement leaves out the socket setup on the
+ * dialer's leg, which adds one leg round trip for TCP, one more for a WebSocket upgrade and one more
+ * for TLS 1.3 under `wss`. The leg's round trip is bounded by the declared one, since it is one hop of
+ * the relayed path the declaration covers (an overestimate, but the only number there is), so a cold
+ * open costs up to about 8.6 round trips over WebSocket and 9.6 over `wss`. Opening a stream costs one
+ * more, even on a connection that is already open (`test/stream-open-costs-a-round-trip.spec.ts`).
  *
- * - dial: connection open (4) + stream negotiation (1) + one of margin.
+ * Every deadline that covers a connection open is sized for the cold path, because libp2p takes one
+ * `addressDialTimeout` for every address of every dial and cannot be told which ones are cold. What a
+ * longer limit costs is only that a dial that is going to fail fails later.
+ *
+ * - connection open (the per-address limit, and libp2p's `dialTimeout`): the cold open over WebSocket
+ *   (8.6) plus margin; `wss` (9.6) still fits.
+ * - dial: the cold open (10) + stream negotiation (1). The margin is already in the 10.
+ * - inbound upgrade: the listener's timer runs over its own upgrade only (the relay's upgrade of the
+ *   dialer's connection, or the target's upgrade of the relayed one after the stop), never over a
+ *   relay connection the dialer had to open first, so it keeps the warm open (4) + one of margin.
  * - response: request plus reply is one; the rest covers payload transfer and the peer's own work.
- * - connection: connection open only (4) + one of margin. libp2p's per-address limit takes the same
- *   multiple: one address has to be able to carry a whole relayed connection open.
  * - cohort query: negotiation plus request is two on a reused connection. A fresh relayed connection
  *   does not fit, which is safe: the peer is counted silent and the read is flagged, not misreported.
- *
- * NOTE: the connection and dial multiples assume the connection to the relay is already open, which
- * holds while a node with a reservation keeps its relay connection up. A circuit dial through a relay
- * this node is NOT connected to opens the relay connection from inside libp2p's per-address limit,
- * so it pays that open on top of the hop, the stop and the relayed upgrade: more than the five round
- * trips of the per-address limit, and more than the six of the RPC dial deadline. If relayed dials
- * ever go through a relay this node is not already connected to, size both for that cold path.
+ * - transaction: counted in dial deadlines, since dials dominate its cost: one dial to a dead
+ *   coordinator that runs out its deadline, the cold dial to the coordinator picked next, that
+ *   coordinator's own cold dial to a cohort member, and a fourth for the warm round trips of the
+ *   consensus rounds.
  */
-const DIAL_ROUND_TRIPS = 6;
+const CONNECTION_ROUND_TRIPS = 10;
+const DIAL_ROUND_TRIPS = CONNECTION_ROUND_TRIPS + 1;
+const INBOUND_UPGRADE_ROUND_TRIPS = 5;
 const RESPONSE_ROUND_TRIPS = 3;
-const CONNECTION_ROUND_TRIPS = 5;
 const COHORT_QUERY_ROUND_TRIPS = 3;
+const TRANSACTION_DIALS = 4;
 
 /**
- * The largest `linkRoundTripMs` a node accepts, in milliseconds (about 1.66 days). The largest delay
- * derived from it is the reconcile pass bound built on the derived cohort budget, which has to fit
- * the 32-bit delay `setTimeout` accepts — the same limit {@link MAX_COHORT_QUERY_TIMEOUT_MS} states
- * for a declared cohort budget. So the ceiling is that cohort ceiling divided by the cohort budget's
- * multiple, and every derived value (the dial deadline's six round trips included) then fits too.
+ * The largest delay `setTimeout` accepts on every platform this runs on; a larger one fires almost
+ * at once (see `MAX_COHORT_QUERY_TIMEOUT_MS` in `cluster/cluster-policy.ts`).
  */
-export const MAX_LINK_ROUND_TRIP_MS = Math.floor(MAX_COHORT_QUERY_TIMEOUT_MS / COHORT_QUERY_ROUND_TRIPS);
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
+/**
+ * The largest `linkRoundTripMs` a node accepts, in milliseconds (about 13 hours). The largest value
+ * derived from it is the transaction budget (forty-four round trips), and that reaches timers: a
+ * `RepoClient` arms one for what is left of the expiration the budget stamps, and a cluster member
+ * arms one 5 s past that expiration. So the ceiling is the 32-bit delay `setTimeout` accepts divided
+ * by the transaction budget's round trips plus one of headroom for those few seconds, and every other
+ * derived delay (the reconcile pass bound's fifteen round trips included) then fits too.
+ */
+export const MAX_LINK_ROUND_TRIP_MS = Math.floor(MAX_TIMER_DELAY_MS / (TRANSACTION_DIALS * DIAL_ROUND_TRIPS + 1));
 
 /**
  * Derive every network deadline from the slowest round trip, in milliseconds, between any two
@@ -134,11 +181,13 @@ export function resolveLinkDeadlines(linkRoundTripMs?: number): LinkDeadlines {
 	return {
 		dialTimeoutMs,
 		responseTimeoutMs: Math.max(DEFAULT_RESPONSE_TIMEOUT_MS, RESPONSE_ROUND_TRIPS * roundTripMs),
-		connectionTimeoutMs: Math.max(DEFAULT_CONNECTION_TIMEOUT_MS, CONNECTION_ROUND_TRIPS * roundTripMs),
+		libp2pDialTimeoutMs: Math.max(DEFAULT_LIBP2P_DIAL_TIMEOUT_MS, CONNECTION_ROUND_TRIPS * roundTripMs),
+		inboundUpgradeTimeoutMs: Math.max(DEFAULT_INBOUND_UPGRADE_TIMEOUT_MS, INBOUND_UPGRADE_ROUND_TRIPS * roundTripMs),
 		addressDialTimeoutMs: Math.max(DEFAULT_ADDRESS_DIAL_TIMEOUT_MS, CONNECTION_ROUND_TRIPS * roundTripMs),
 		cohortQueryTimeoutMs: Math.max(DEFAULT_COHORT_QUERY_TIMEOUT_MS, COHORT_QUERY_ROUND_TRIPS * roundTripMs),
 		// A transfer is a dial like any other, so it may never be the shorter of the two.
 		transferTimeoutMs: Math.max(DEFAULT_TRANSFER_TIMEOUT_MS, dialTimeoutMs),
+		transactionTimeoutMs: Math.max(DEFAULT_TRANSACTION_TIMEOUT_MS, TRANSACTION_DIALS * dialTimeoutMs),
 	};
 }
 

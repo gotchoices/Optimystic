@@ -13,7 +13,7 @@ import {
 	type ReadCacheLease,
 	withReadCache,
 	signPeer,
-	DEFAULT_DIAL_TIMEOUT_MS,
+	resolveLinkDeadlines,
 	type OptimysticNodeAttachments,
 	type CollectionWatchHandle,
 } from '@optimystic/db-p2p';
@@ -341,25 +341,30 @@ export class CollectionFactory {
       return localStore ? stateHoldingsOnReads(remote, localStore) : remote;
     };
 
-    // The node's own derived dial deadline, so a declared link round trip reaches every repo dial.
-    // A node a host injected without building it through `createLibp2pNode` carries none; it gets
-    // the undeclared constant.
-    const dialTimeoutMs = node.linkDeadlines?.dialTimeoutMs ?? DEFAULT_DIAL_TIMEOUT_MS;
+    // The node's own derived deadlines, so a declared link round trip reaches every repo dial and
+    // the budget around them. A node a host injected without building it through `createLibp2pNode`
+    // carries none; it gets the undeclared ones.
+    const { dialTimeoutMs, transactionTimeoutMs } = node.linkDeadlines ?? resolveLinkDeadlines();
 
     return new NetworkTransactor({
-      // NOTE: fits a 3 s link round trip, but narrowly: a pend plus commit with a redirect is about
-      // 5-6 round trips on a warm connection (15-18 s), and a cold relayed connection adds about 4.
-      // If writes on slow links fail with `RepoClient timeout`, derive this budget from the node's
-      // declared link round trip too, as `dialTimeoutMs` is.
-      timeoutMs: 30_000,
+      // Four dial deadlines (30 s when undeclared): a dial to a dead coordinator that runs out its
+      // deadline, the cold relayed dial to the one picked next, that coordinator's own cold dial to a
+      // cohort member, and the warm round trips of the consensus rounds. At a 3 s round trip, 132 s.
+      // NOTE: a write against an unreachable cohort takes that long to fail, and a cluster member keeps
+      // the record's consensus state until the expiration it stamps; if either matters more than a
+      // re-picked coordinator, give this budget fewer dials and accept that a dead coordinator then
+      // cannot be re-picked over cold relayed links.
+      timeoutMs: transactionTimeoutMs,
       // A cancel is a stream negotiation and a request to the coordinator, which then runs a
       // consensus round with the block's cohort: about six round trips on warm connections, so a
       // fixed 5 s fails every cancel once the round trip passes about 800 ms. The derived dial
-      // deadline is six round trips, and 3 s when undeclared, so the 5 s floor keeps an undeclared
+      // deadline is eleven round trips, and 3 s when undeclared, so the 5 s floor keeps an undeclared
       // node where it was.
-      // NOTE: holds a warm-connection cancel narrowly, and a cold relayed one not at all; if cancels
-      // on slow links run out of time (a failed cancel leaves its pending records standing; see
-      // `NetworkTransactor.dischargeCancel`), give this budget its own number of round trips.
+      // NOTE: holds a warm-connection cancel with five round trips to spare, but not one that must
+      // first open a cold relayed connection (up to ten more). A cancel usually reuses the connection
+      // its pend just opened; if cancels on slow links run out of time anyway (a failed cancel leaves
+      // its pending records standing; see `NetworkTransactor.dischargeCancel`), give this budget its
+      // own number of round trips.
       abortOrCancelTimeoutMs: Math.max(5_000, dialTimeoutMs),
       dialTimeoutMs,
       keyNetwork,

@@ -68,9 +68,9 @@ import { NetworkTransactor } from '@optimystic/db-core';
 import { RepoClient } from '@optimystic/db-p2p';
 
 const transactor = new NetworkTransactor({
-  timeoutMs: 30_000,
-  abortOrCancelTimeoutMs: 5_000,
-  dialTimeoutMs: node.linkDeadlines.dialTimeoutMs, // derived from the node's `linkRoundTripMs`
+  timeoutMs: node.linkDeadlines.transactionTimeoutMs, // all three derived from the node's `linkRoundTripMs`
+  abortOrCancelTimeoutMs: Math.max(5_000, node.linkDeadlines.dialTimeoutMs),
+  dialTimeoutMs: node.linkDeadlines.dialTimeoutMs,
   keyNetwork: node.keyNetwork,   // the instance createLibp2pNode already built with this
                                  // node's cluster size and network scoping
   getRepo: peerId => peerId.equals(node.peerId)

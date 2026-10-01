@@ -488,13 +488,16 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * - `addressDialTimeout` — how long one address of a peer may take to connect, inside any dial,
 	 *   including the RPC clients' own.
 	 *
-	 * Unset, the first two are `LinkDeadlines.connectionTimeoutMs`: 10s (libp2p's own default) when no
-	 * round trip is declared, and five round trips when one is. `addressDialTimeout` is
-	 * `LinkDeadlines.addressDialTimeoutMs`: 6s (libp2p's own default) undeclared, five round trips
-	 * declared. When only the listener's limit is too short,
-	 * the dialer's dial succeeds against a connection the listener has already discarded, and every
-	 * stream on it dies with `Unexpected EOF`, so an override belongs on every node — each node is the
-	 * listener for someone.
+	 * Unset, each is derived from the declared round trip and floors at libp2p's own default:
+	 * `dialTimeout` is `LinkDeadlines.libp2pDialTimeoutMs` (10s, or ten round trips),
+	 * `inboundUpgradeTimeout` is `LinkDeadlines.inboundUpgradeTimeoutMs` (10s, or five round trips), and
+	 * `addressDialTimeout` is `LinkDeadlines.addressDialTimeoutMs` (6s, or ten round trips). The two
+	 * outbound limits take ten because a circuit dial through a relay this node is not connected to
+	 * opens that connection inside them; the listener's limit runs only over its own upgrade. When only
+	 * the listener's limit is too short, the dialer's dial succeeds against a connection the listener
+	 * has already discarded, and every stream on it dies with `Unexpected EOF`, so an override belongs
+	 * on every node — each node is the listener for someone. An override of `addressDialTimeout` wants
+	 * a `dialTimeout` at least as long, or the second cuts off what the first allows.
 	 *
 	 * NOTE: `dialTimeout` governs only dials that carry no signal. This package's own RPC clients dial
 	 * under their own deadlines, which the same declaration derives (`resolveLinkDeadlines` in
@@ -509,6 +512,11 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * the block pushes', libp2p's connection deadlines, and — when `clusterPolicy.cohortQueryTimeoutMs`
 	 * is not declared — the read path's per-peer budget. Each derived value floors at the constant it
 	 * replaces, so absent means the LAN deadlines exactly.
+	 *
+	 * The dial deadlines are sized for a relayed dial through a relay this node is not yet connected
+	 * to, which opens that connection first. The round trip of that first leg, dialer to relay, is
+	 * taken to be at most this value: it is one hop of the relayed path this value covers. That
+	 * overestimates the leg, but it is the only number available.
 	 *
 	 * Declare it on every node, with the same value: each node dials some and is dialed by others.
 	 * An explicit per-deadline setting still wins over the derived value — {@link NodeOptions.connectionManager},
@@ -768,8 +776,8 @@ export async function createLibp2pNodeBase(
 			maxConnections: 16,
 			// Always explicit, so the undeclared fallback (10_000, libp2p's own default) does not move
 			// with libp2p. Both ends: every node is someone's listener.
-			inboundUpgradeTimeout: options.connectionManager?.inboundUpgradeTimeout ?? linkDeadlines.connectionTimeoutMs,
-			dialTimeout: options.connectionManager?.dialTimeout ?? linkDeadlines.connectionTimeoutMs,
+			inboundUpgradeTimeout: options.connectionManager?.inboundUpgradeTimeout ?? linkDeadlines.inboundUpgradeTimeoutMs,
+			dialTimeout: options.connectionManager?.dialTimeout ?? linkDeadlines.libp2pDialTimeoutMs,
 			// libp2p applies this inside every dial, signalled or not, so left at its 6 s default it cut off
 			// a relayed connection open on a slow link whatever the dial's own deadline said.
 			addressDialTimeout: options.connectionManager?.addressDialTimeout ?? linkDeadlines.addressDialTimeoutMs
@@ -1260,6 +1268,13 @@ export async function createLibp2pNodeBase(
 			// classifies a late peer as silent, and this one tears the stream down at that moment. It
 			// also replaces the sync client's own dial deadline, which, when shorter than the budget,
 			// failed every consult on a slow link before the larger budget could take effect.
+			// NOTE: the budget does not cover opening a cold relayed connection (up to about ten round
+			// trips), and when it expires it aborts the open this request started: libp2p 3.3.11 runs a
+			// dial under its first caller's signal, and a later caller joins that dial without extending
+			// it. So a node whose only traffic to a peer is read-path requests (this consult and
+			// `fetchArchiveFromPeer`) never opens a cold relayed connection to it; consensus, sync repair
+			// or FRET's own dials, which have longer deadlines, open it. Fine while those paths exist. If a
+			// read-only node ever has to reach a peer nothing else dials, size this budget for a cold open.
 			const response = await withinRequestBudget(peerId.toString(), syncClient.getProtocol(), consensusConfig.cohortQueryTimeoutMs,
 				options => syncClient.requestBlock({ blockId, rev: undefined }, options));
 			if (response.success && response.archive) {

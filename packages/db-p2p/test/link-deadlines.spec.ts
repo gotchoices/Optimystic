@@ -13,10 +13,12 @@ import { MAX_LINK_ROUND_TRIP_MS, resolveLinkDeadlines, type LinkDeadlines } from
 const UNDECLARED: LinkDeadlines = {
 	dialTimeoutMs: 3000,
 	responseTimeoutMs: 10_000,
-	connectionTimeoutMs: 10_000,
+	libp2pDialTimeoutMs: 10_000,
+	inboundUpgradeTimeoutMs: 10_000,
 	addressDialTimeoutMs: 6000,
 	cohortQueryTimeoutMs: 1000,
 	transferTimeoutMs: 30_000,
+	transactionTimeoutMs: 30_000,
 };
 
 describe('resolveLinkDeadlines', () => {
@@ -25,27 +27,31 @@ describe('resolveLinkDeadlines', () => {
 	});
 
 	it('a round trip fast enough that no multiple exceeds its floor changes nothing', () => {
-		expect(resolveLinkDeadlines(300)).to.deep.equal(UNDECLARED);
+		expect(resolveLinkDeadlines(250)).to.deep.equal(UNDECLARED);
 	});
 
 	it('a 3 s round trip scales each deadline by its own number of round trips', () => {
 		expect(resolveLinkDeadlines(3000)).to.deep.equal({
-			dialTimeoutMs: 18_000,
+			// A cold relayed open (10 round trips) plus stream negotiation.
+			dialTimeoutMs: 33_000,
 			// 3 x 3000 = 9000 is still under the 10 s floor.
 			responseTimeoutMs: 10_000,
-			connectionTimeoutMs: 15_000,
-			// One address has to carry a whole relayed open (about 12 s measured at this link).
-			addressDialTimeoutMs: 15_000,
+			// Never shorter than the per-address limit, which a cold relayed dial can use all of.
+			libp2pDialTimeoutMs: 30_000,
+			// The listener's timer runs over its own upgrade only, never over the dialer's relay open.
+			inboundUpgradeTimeoutMs: 15_000,
+			// One address has to carry a whole cold relayed open, relay connection included.
+			addressDialTimeoutMs: 30_000,
 			cohortQueryTimeoutMs: 9000,
-			// The dial (18 s) is still under the 30 s floor.
-			transferTimeoutMs: 30_000,
+			transferTimeoutMs: 33_000,
+			transactionTimeoutMs: 132_000,
 		});
 	});
 
 	it('the transfer deadline never falls below the dial deadline', () => {
 		const deadlines = resolveLinkDeadlines(10_000);
-		expect(deadlines.dialTimeoutMs).to.equal(60_000);
-		expect(deadlines.transferTimeoutMs).to.equal(60_000);
+		expect(deadlines.dialTimeoutMs).to.equal(110_000);
+		expect(deadlines.transferTimeoutMs).to.equal(110_000);
 	});
 
 	for (const declared of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, MAX_LINK_ROUND_TRIP_MS + 1]) {
@@ -54,9 +60,17 @@ describe('resolveLinkDeadlines', () => {
 		});
 	}
 
-	it('accepts the ceiling itself, and every derived delay there fits a 32-bit timer after the reconcile pass multiplies the cohort budget by five', () => {
+	it('accepts the ceiling itself, and every derived delay there fits a 32-bit timer, including the reconcile pass bound and a timer armed 5 s past the transaction budget', () => {
 		const deadlines = resolveLinkDeadlines(MAX_LINK_ROUND_TRIP_MS);
-		const largest = Math.max(deadlines.dialTimeoutMs, deadlines.connectionTimeoutMs, deadlines.transferTimeoutMs, 5 * deadlines.cohortQueryTimeoutMs);
+		const largest = Math.max(
+			deadlines.dialTimeoutMs,
+			deadlines.libp2pDialTimeoutMs,
+			deadlines.inboundUpgradeTimeoutMs,
+			deadlines.addressDialTimeoutMs,
+			deadlines.transferTimeoutMs,
+			deadlines.transactionTimeoutMs + 5000,
+			5 * deadlines.cohortQueryTimeoutMs
+		);
 		expect(largest).to.be.at.most(2 ** 31 - 1);
 	});
 });
