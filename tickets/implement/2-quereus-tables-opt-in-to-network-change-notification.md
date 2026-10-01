@@ -3,6 +3,13 @@ prereq: network-collection-watch-service
 architecture: docs/reactivity.md
 files: packages/quereus-plugin-optimystic/src/optimystic-module.ts, packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts, packages/quereus-plugin-optimystic/src/types.ts, packages/quereus-plugin-optimystic/test/network-change-notification.integration.spec.ts (new), packages/quereus-plugin-optimystic/README.md, docs/internals.md, docs/reactivity.md
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-10-01T01:38:25.324Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\2-quereus-tables-opt-in-to-network-change-notification.implement.2026-10-01T01-38-25-322Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 
 # Quereus tables opt in to network change notification
 
