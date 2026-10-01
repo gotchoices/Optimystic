@@ -510,8 +510,9 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * Explicit deadlines for this package's own RPCs, used exactly as given in place of the values
 	 * derived from {@link NodeOptions.linkRoundTripMs} — with no floor, so a value below the derived
 	 * one is honoured too. They reach every RPC client the node builds (cluster consensus, sync,
-	 * dispute, block pushes) and, through `node.linkDeadlines`, a host's `RepoClient` and
-	 * `NetworkTransactor`.
+	 * dispute, block pushes). Through `node.linkDeadlines` the dial deadline also reaches a host's
+	 * `NetworkTransactor`, which applies it to each `RepoClient` dial; a `RepoClient` takes no response
+	 * deadline, since the transactor's own budget bounds its reply.
 	 *
 	 * - `dialTimeoutMs` — how long a request may take to connect and negotiate its stream. The rebalance
 	 *   transfer deadline (`transferTimeoutMs`, at least 30 s) and the transaction budget
