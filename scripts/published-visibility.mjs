@@ -1,6 +1,6 @@
 /**
- * The pure half of the post-publish wait: which packages a release publishes, what `npm view` said
- * about each, and when to stop asking.
+ * The pure half of the post-publish wait: which packages a release publishes, what `npm view` and a
+ * request for each package's tarball said about it, and when to stop asking.
  *
  * Nothing here runs a command, reads a file or exits. `scripts/await-published.mjs` does that, and is
  * the place to read about why the wait exists. The two are separate files for the reason
@@ -14,7 +14,11 @@ import { PACKAGE_NAME_RE, cliCommand } from './cli-command.mjs';
  * @property {string} name     e.g. `@optimystic/db-core`
  * @property {string} version  e.g. `1.3.0`
  *
- * @typedef {{ visible: true } | { visible: false, reason: string }} ViewAnswer
+ * @typedef {{ listed: true, tarball: string } | { listed: false, reason: string }} ViewAnswer
+ *   What `npm view` said: the registry lists the version, with the URL its tarball is served from.
+ *
+ * @typedef {{ visible: true } | { visible: false, reason: string }} Visibility
+ *   Whether a package counts as published: listed, and its tarball downloadable.
  *
  * @typedef {object} Straggler  A package the registry did not yet show at its version.
  * @property {PackageSpec} spec
@@ -29,10 +33,13 @@ import { PACKAGE_NAME_RE, cliCommand } from './cli-command.mjs';
 /** The reason given for a package the registry simply does not list at its version yet. */
 export const NOT_YET_VISIBLE = 'not on the registry yet';
 
+/** The reason given for a package the registry lists, but whose tarball it does not serve yet. */
+export const TARBALL_NOT_YET_DOWNLOADABLE = 'tarball not downloadable yet';
+
 /** Semver, restricted to the characters semver allows — none of which cmd.exe interprets. */
 const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
-/** How long one registry request may take before npm reports it as failed. */
+/** How long one registry request — npm's, or the tarball check — may take before it counts as failed. */
 export const FETCH_TIMEOUT_MS = 30_000;
 
 /** `name@version`, the form npm takes and the form every report prints. */
@@ -90,12 +97,13 @@ export function expectedPackages(workspaces, manifestAt) {
 // -- Asking npm ----------------------------------------------------------------------------------
 
 /**
- * The `npm view` call that asks the registry for exactly `spec`. Going through npm, rather than
- * fetching from a registry URL, answers with the npm configuration `npm publish` used — registry,
- * scopes, credentials. `--prefer-online` makes npm revalidate its local metadata cache instead of
- * answering from it: the question is what the registry serves now. The fetch flags make one call one
- * bounded request: the wait already asks again every few seconds, and npm's own defaults (two
- * retries, five minutes each) would let a single stalled call outlast the whole deadline.
+ * The `npm view` call that asks the registry for exactly `spec`, and for the URL of its tarball.
+ * Going through npm, rather than fetching from a registry URL, answers with the npm configuration
+ * `npm publish` used — registry, scopes, credentials. `--prefer-online` makes npm revalidate its
+ * local metadata cache instead of answering from it: the question is what the registry serves now.
+ * The fetch flags make one call one bounded request: the wait already asks again every few seconds,
+ * and npm's own defaults (two retries, five minutes each) would let a single stalled call outlast the
+ * whole deadline.
  *
  * NOTE: `npm view` reads the registry's full metadata document for a package. Installers usually read
  * the abbreviated one (`application/vnd.npm.install-v1+json`), which the registry caches separately,
@@ -108,18 +116,21 @@ export function expectedPackages(workspaces, manifestAt) {
 export function npmViewCommand(spec, os) {
 	if (!PACKAGE_NAME_RE.test(spec.name)) throw new Error(`${JSON.stringify(spec.name)} is not a package name`);
 	if (!VERSION_RE.test(spec.version)) throw new Error(`${JSON.stringify(spec.version)} is not a version`);
-	return cliCommand('npm', ['view', '--prefer-online', '--fetch-retries=0', `--fetch-timeout=${FETCH_TIMEOUT_MS}`, '--json', specString(spec), 'version'], os);
+	return cliCommand('npm', ['view', '--prefer-online', '--fetch-retries=0', `--fetch-timeout=${FETCH_TIMEOUT_MS}`, '--json', specString(spec), 'version', 'dist.tarball'], os);
 }
 
 /**
- * Read one finished `npm view --json <name>@<version> version`.
+ * Read one finished `npm view --json <name>@<version> version dist.tarball`.
  *
- * - The version itself, as a JSON string, means the registry serves it.
- * - An `E404` error object means it does not yet. npm gives the same answer for a version the
+ * - An object naming the version and an http(s) `dist.tarball` means the registry lists it, and says
+ *   where its tarball is. Listed is not yet published: the tarball is served separately, and later.
+ * - The version with no usable `dist.tarball` — npm prints a lone field's value bare, so a missing
+ *   one leaves just the version string — gives nothing to download, so it does not count as listed.
+ * - An `E404` error object means it is not listed yet. npm gives the same answer for a version the
  *   registry does not list and for a package it has never heard of, so a package's first release
  *   waits the same way as every later one. Older npm answered a missing version with exit 0 and no
  *   output, which means the same.
- * - Any other error — a network failure, a refused credential — also means not visible, and carries
+ * - Any other error — a network failure, a refused credential — also means not listed, and carries
  *   npm's own summary so the report says why.
  *
  * Anything else throws: npm was not answering the question asked, and a wait that read past it could
@@ -132,9 +143,9 @@ export function npmViewCommand(spec, os) {
 export function readViewAnswer({ status, stdout, stderr }, spec) {
 	const text = stdout.trim();
 	if (text === '') {
-		if (status === 0) return { visible: false, reason: NOT_YET_VISIBLE };
+		if (status === 0) return { listed: false, reason: NOT_YET_VISIBLE };
 		const said = stderr.trim().split(/\r?\n/)[0];
-		return { visible: false, reason: `npm view exited ${status}${said ? `: ${said}` : ' and printed nothing'}` };
+		return { listed: false, reason: `npm view exited ${status}${said ? `: ${said}` : ' and printed nothing'}` };
 	}
 	let answer;
 	try {
@@ -142,14 +153,43 @@ export function readViewAnswer({ status, stdout, stderr }, spec) {
 	} catch (err) {
 		throw new Error(`npm view ${specString(spec)} printed output that is not JSON: ${text}`, { cause: err });
 	}
-	if (status === 0 && answer === spec.version) return { visible: true };
+	if (status === 0) return readListing(answer, spec, text);
 	const code = answer?.error?.code;
-	if (status === 0 || typeof code !== 'string') {
-		throw new Error(`npm view ${specString(spec)} answered something this script does not understand (exit ${status}): ${text}`);
-	}
-	if (code === 'E404') return { visible: false, reason: NOT_YET_VISIBLE };
+	if (typeof code !== 'string') throw notUnderstood(spec, status, text);
+	if (code === 'E404') return { listed: false, reason: NOT_YET_VISIBLE };
 	const summary = answer.error.summary;
-	return { visible: false, reason: `npm view failed with ${code}${typeof summary === 'string' && summary ? `: ${summary}` : ''}` };
+	return { listed: false, reason: `npm view failed with ${code}${typeof summary === 'string' && summary ? `: ${summary}` : ''}` };
+}
+
+/** The parsed output of an `npm view` that succeeded: the version asked for, and its tarball's URL. */
+function readListing(answer, spec, text) {
+	const version = typeof answer === 'string' ? answer : answer?.version;
+	if (version !== spec.version) throw notUnderstood(spec, 0, text);
+	const tarball = answer['dist.tarball'];
+	if (tarball === undefined) return { listed: false, reason: 'npm view listed no dist.tarball' };
+	if (!isHttpUrl(tarball)) return { listed: false, reason: `npm view listed dist.tarball ${JSON.stringify(tarball)}, which is not an http(s) URL` };
+	return { listed: true, tarball };
+}
+
+function isHttpUrl(value) {
+	return typeof value === 'string' && URL.canParse(value) && ['http:', 'https:'].includes(new URL(value).protocol);
+}
+
+function notUnderstood(spec, status, text) {
+	return new Error(`npm view ${specString(spec)} answered something this script does not understand (exit ${status}): ${text}`);
+}
+
+/**
+ * Read the HTTP status of a `HEAD` request for a listed version's tarball. Only 200 means the
+ * download `npm install` makes would succeed now; 404 is the registry not serving it yet.
+ *
+ * @param {number} status
+ * @returns {Visibility}
+ */
+export function readTarballAnswer(status) {
+	if (status === 200) return { visible: true };
+	if (status === 404) return { visible: false, reason: TARBALL_NOT_YET_DOWNLOADABLE };
+	return { visible: false, reason: `tarball answered HTTP ${status}` };
 }
 
 // -- Waiting -------------------------------------------------------------------------------------
@@ -161,7 +201,7 @@ export function readViewAnswer({ status, stdout, stderr }, spec) {
  *
  * @param {object} options
  * @param {PackageSpec[]} options.expected
- * @param {(spec: PackageSpec) => Promise<ViewAnswer>} options.probe  One registry question.
+ * @param {(spec: PackageSpec) => Promise<Visibility>} options.probe  Whether one package counts as published.
  * @param {number} options.timeoutMs
  * @param {number} options.intervalMs
  * @param {() => number} options.now  A millisecond clock.
@@ -206,7 +246,7 @@ export function timeoutReport(stragglers, total, timeoutMs) {
 	return [
 		`${stragglers.length} of ${total} packages still not visible on npm after ${seconds(timeoutMs)}:`,
 		...stragglers.map(({ spec, reason }) => `  ${specString(spec)} — ${reason}`),
-		'The release is not finished: downstream upgrades may still resolve older versions of these.',
+		'The release is not finished: downstream upgrades may still resolve older versions of these, or fail to download them.',
 		'If a publish failed, publish the missing packages, then run `yarn await-published` again.',
 		''
 	].join('\n');

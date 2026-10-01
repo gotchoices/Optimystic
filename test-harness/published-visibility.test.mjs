@@ -13,9 +13,11 @@ import assert from 'node:assert/strict';
 
 import {
 	NOT_YET_VISIBLE,
+	TARBALL_NOT_YET_DOWNLOADABLE,
 	expectedPackages,
 	npmViewCommand,
 	parseWorkspaceList,
+	readTarballAnswer,
 	readViewAnswer,
 	waitForVisibility
 } from '../scripts/published-visibility.mjs';
@@ -46,14 +48,25 @@ describe('npmViewCommand', () => {
 describe('readViewAnswer', () => {
 	const E404 = JSON.stringify({ error: { code: 'E404', summary: 'No match found for version 1.3.0' } }, null, 2);
 
-	it('counts the version echoed back as visible', () => {
-		assert.deepEqual(readViewAnswer({ status: 0, stdout: '"1.3.0"\n', stderr: '' }, CORE), { visible: true });
+	it('reads the version echoed back as listed, with the URL of its tarball', () => {
+		const tarball = 'https://registry.npmjs.org/@optimystic/db-core/-/db-core-1.3.0.tgz';
+		const listing = JSON.stringify({ version: '1.3.0', 'dist.tarball': tarball }, null, 2);
+
+		assert.deepEqual(readViewAnswer({ status: 0, stdout: `${listing}\n`, stderr: '' }, CORE), { listed: true, tarball });
+	});
+
+	it('does not count the version as listed while npm names no tarball for it', () => {
+		// npm prints a lone field's value bare, so a listing without dist.tarball is just the version.
+		const answer = readViewAnswer({ status: 0, stdout: '"1.3.0"\n', stderr: '' }, CORE);
+
+		assert.equal(answer.listed, false);
+		assert.match(answer.reason, /dist\.tarball/);
 	});
 
 	it('counts both ways npm says a version is not there as not yet visible', () => {
 		// Current npm: exit 1 with an E404 object. Older npm: exit 0 and no output.
-		assert.deepEqual(readViewAnswer({ status: 1, stdout: E404, stderr: 'npm error code E404' }, CORE), { visible: false, reason: NOT_YET_VISIBLE });
-		assert.deepEqual(readViewAnswer({ status: 0, stdout: '', stderr: '' }, CORE), { visible: false, reason: NOT_YET_VISIBLE });
+		assert.deepEqual(readViewAnswer({ status: 1, stdout: E404, stderr: 'npm error code E404' }, CORE), { listed: false, reason: NOT_YET_VISIBLE });
+		assert.deepEqual(readViewAnswer({ status: 0, stdout: '', stderr: '' }, CORE), { listed: false, reason: NOT_YET_VISIBLE });
 	});
 
 	it('keeps npm\'s own summary for any other failure', () => {
@@ -61,13 +74,22 @@ describe('readViewAnswer', () => {
 
 		const answer = readViewAnswer({ status: 1, stdout: refused, stderr: '' }, CORE);
 
-		assert.equal(answer.visible, false);
+		assert.equal(answer.listed, false);
 		assert.match(answer.reason, /^npm view failed with ECONNREFUSED: FetchError/);
 	});
 
 	it('throws on an answer to some other question rather than reading past it', () => {
-		assert.throws(() => readViewAnswer({ status: 0, stdout: '"1.2.0"', stderr: '' }, CORE), /does not understand/);
+		const other = JSON.stringify({ version: '1.2.0', 'dist.tarball': 'https://registry.npmjs.org/@optimystic/db-core/-/db-core-1.2.0.tgz' });
+
+		assert.throws(() => readViewAnswer({ status: 0, stdout: other, stderr: '' }, CORE), /does not understand/);
 		assert.throws(() => readViewAnswer({ status: 0, stdout: 'npm notice New major version', stderr: '' }, CORE), /not JSON/);
+	});
+});
+
+describe('readTarballAnswer', () => {
+	it('counts a listed version as published only once its tarball answers 200', () => {
+		assert.deepEqual(readTarballAnswer(200), { visible: true });
+		assert.deepEqual(readTarballAnswer(404), { visible: false, reason: TARBALL_NOT_YET_DOWNLOADABLE });
 	});
 });
 

@@ -85,7 +85,14 @@ version at its own moment: for 1.3.0, `@optimystic/db-core` and `@optimystic/db-
 after the other packages, and a downstream upgrade run in that gap installed a mix of old and new
 versions. So `yarn release` ends with `yarn await-published` (`scripts/await-published.mjs`), which
 asks npm for every public package at the version in its `package.json` every 5 s, with the npm
-configuration `npm publish` used, until all of them are served. Its last line is the one to wait for:
+configuration `npm publish` used, until all of them are served.
+
+"Served" means two things, checked in order. npm must list the version, and the version's tarball —
+the file `npm install` downloads, at the `dist.tarball` URL npm gives — must answer a request with
+200. The registry makes the tarball available separately from the version listing, and later: for
+sereus 1.8.0 every version was listed while three tarballs still answered 404 several minutes
+afterwards, so an install run on the listing alone would have failed. Its last line is the one to
+wait for:
 
 ```
 all 9 packages published and visible on npm at 1.3.0
@@ -94,8 +101,9 @@ all 9 packages published and visible on npm at 1.3.0
 **Upgrade downstream repositories only after that line.** Before it, an upgrade can resolve a mix of
 versions.
 
-If ten minutes pass first, it lists each package still missing, with npm's reason, and exits non-zero:
-the release is not finished. `OPTIMYSTIC_PUBLISH_WAIT_SECONDS` changes the deadline. The script can
+If ten minutes pass first, it lists each package still missing, with the reason — not listed yet,
+listed but its tarball not downloadable yet, or the error npm or the tarball request reported — and
+exits non-zero: the release is not finished. `OPTIMYSTIC_PUBLISH_WAIT_SECONDS` changes the deadline. The script can
 be run on its own at any time — after an interrupted `yarn release`, or after publishing a package
 that failed — and reports on the versions currently in the manifests.
 

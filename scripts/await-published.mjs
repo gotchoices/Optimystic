@@ -10,9 +10,14 @@
  * already dependencies-first (`yarn workspaces foreach -t`), so the spread is registry visibility,
  * not publish order, and nothing printed when `yarn pub` returns could be trusted.
  *
- * This script lists the workspaces `yarn pub` publishes, asks npm for each one at its manifest's
- * version until every one is visible or the deadline passes, and ends with one line saying which.
- * Re-run it after a partial or interrupted publish: it reports the packages still missing.
+ * Listing a version is not the same as serving it. `npm view` reads the package's metadata, while
+ * `npm install` downloads the tarball, which the registry makes available separately and later: for
+ * sereus 1.8.0 every version was listed while three tarballs still answered 404 minutes afterwards.
+ *
+ * This script lists the workspaces `yarn pub` publishes and, for each one at its manifest's version,
+ * asks npm whether it is listed and then whether its tarball can be downloaded. It asks again until
+ * every package passes both or the deadline passes, and ends with one line saying which. Re-run it
+ * after a partial or interrupted publish: it reports the packages still missing.
  *
  * Following `check-libp2p-majors.mjs`: this file is only the shell-out and the printing; the logic is
  * in `scripts/published-visibility.mjs`. Plain .mjs, no build step, no dependencies.
@@ -27,11 +32,13 @@ import { promisify } from 'node:util';
 
 import { cliCommand } from './cli-command.mjs';
 import {
+	FETCH_TIMEOUT_MS,
 	WORKSPACE_LIST_ARGS,
 	expectedPackages,
 	npmViewCommand,
 	parseWorkspaceList,
 	progressLine,
+	readTarballAnswer,
 	readViewAnswer,
 	specString,
 	successLine,
@@ -57,6 +64,16 @@ const INTERVAL_MS = 5_000;
 const PROBE_TIMEOUT_MS = 60_000;
 /** An unchanged waiting line is repeated this often, so a long wait does not look hung. */
 const HEARTBEAT_MS = 30_000;
+/**
+ * Asks every cache between here and the registry to revalidate the tarball rather than answer from
+ * what it holds: an edge that cached the 404 from before the tarball existed would otherwise keep
+ * the wait going after the registry serves it.
+ *
+ * NOTE: a CDN edge is not bound to honour this, and an installer elsewhere reaches its own edge. If a
+ * wait is ever seen to finish while an install elsewhere still 404s the tarball, that edge was stale;
+ * retry from the installer's side, or add a short settle delay after the wait.
+ */
+const REVALIDATE = { 'cache-control': 'no-cache' };
 
 const execFileAsync = promisify(execFile);
 
@@ -83,11 +100,37 @@ async function publishedWorkspaces() {
 	return expectedPackages(parseWorkspaceList(listing.stdout), (location) => JSON.parse(readFileSync(join(ROOT, location, 'package.json'), 'utf8')));
 }
 
+/** Whether `spec` counts as published: npm lists it, and then its tarball can be downloaded. */
 async function probe(spec) {
 	const result = await run(npmViewCommand(spec), PROBE_TIMEOUT_MS);
-	return result.timedOut
-		? { visible: false, reason: `npm view did not answer within ${PROBE_TIMEOUT_MS / 1000} s` }
-		: readViewAnswer(result, spec);
+	if (result.timedOut) return { visible: false, reason: `npm view did not answer within ${PROBE_TIMEOUT_MS / 1000} s` };
+	const view = readViewAnswer(result, spec);
+	return view.listed ? probeTarball(view.tarball) : { visible: false, reason: view.reason };
+}
+
+/**
+ * A `HEAD` of the tarball URL npm gave. Not npm itself: npm has no cheap "does this download exist"
+ * question — `npm pack` and `npm cache add` fetch the whole file into npm's cache, where a later run
+ * could then find it without asking the registry. The URL is npm's own answer, so the registry is
+ * still the one npm publishes to. A failed request is a reason, not an error: the wait asks again.
+ *
+ * NOTE: a plain fetch carries none of npm's credentials, which is fine while every package is
+ * published `--access public`. If one is ever published to a registry that requires auth for
+ * downloads, this answers 401 and the wait times out naming it; then pass the registry token, or ask
+ * npm instead.
+ *
+ * NOTE: nothing checks that the `latest` dist-tag points at the new version, though a downstream
+ * `yarn up` resolves `latest`. `yarn pub` publishes with no `--tag`, so it does; if an upgrade is ever
+ * seen to pick the previous version after this wait succeeded, ask for `dist-tags.latest` in the same
+ * `npm view` call (for non-prerelease versions).
+ */
+async function probeTarball(url) {
+	try {
+		const response = await fetch(url, { method: 'HEAD', headers: REVALIDATE, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+		return readTarballAnswer(response.status);
+	} catch (err) {
+		return { visible: false, reason: `could not reach ${url}: ${[err.message, err.cause?.message].filter(Boolean).join(': ')}` };
+	}
 }
 
 function timeoutMs() {
@@ -133,9 +176,10 @@ async function main() {
 
 if (argv.includes('--help') || argv.includes('-h')) {
 	stdout.write('Usage: node scripts/await-published.mjs\n\n');
-	stdout.write('Waits until npm serves every public workspace at the version in its package.json, then\n');
-	stdout.write('prints one line saying so. Exits non-zero, naming the packages still missing, when the\n');
-	stdout.write(`deadline passes first (default ${DEFAULT_TIMEOUT_S} s; set ${TIMEOUT_ENV} to change it).\n`);
+	stdout.write('Waits until npm lists every public workspace at the version in its package.json and\n');
+	stdout.write('serves the tarball for that version, then prints one line saying so. Exits non-zero,\n');
+	stdout.write('naming the packages still missing, when the deadline passes first\n');
+	stdout.write(`(default ${DEFAULT_TIMEOUT_S} s; set ${TIMEOUT_ENV} to change it).\n`);
 	stdout.write('See docs/releasing.md.\n');
 	exit(0);
 }
