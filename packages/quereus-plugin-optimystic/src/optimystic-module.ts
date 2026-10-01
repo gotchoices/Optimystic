@@ -494,7 +494,12 @@ export class OptimysticVirtualTable extends VirtualTable {
   private networkWatchTagged: boolean;
   /** Whether the table is in the span it watches over: from full initialization until DROP TABLE. */
   private networkWatchArmed = false;
-  /** Closes the open network watch; absent while none is open. */
+  /**
+   * Closes the open network watch; absent while none is open.
+   * NOTE: `CollectionFactory.dispose` closes the watch behind this field's back, so a tag flip on a
+   * table still live after `plugin.dispose()` finds it set and reopens nothing; dispose is end-of-life
+   * for the factory today — if it ever stops being, have dispose tell the tables.
+   */
   private closeNetworkWatch?: () => Promise<void>;
   /**
    * Opening and closing the network watch, one step at a time, so a tag flipped (or the table

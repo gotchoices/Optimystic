@@ -257,10 +257,10 @@ export class CollectionFactory {
     collectionId: CollectionId,
     listener: () => void
   ): Promise<(() => Promise<void>) | undefined> {
-    const transactor = await this.getOrCreateTransactor(options);
     if (options.transactor !== 'network') {
       return undefined;
     }
+    const transactor = await this.getOrCreateTransactor(options);
     const watchService = this.libp2pNodes.get(this.getNodeKey(options))?.node.reactivityWatch;
     if (!watchService) {
       return undefined;
@@ -273,6 +273,9 @@ export class CollectionFactory {
       },
       onChange: listener,
     });
+    // NOTE: a dispose() landing during the await above has already emptied this set, so the handle
+    // escapes it and lives until its table's DROP closes it; if hosts ever dispose while tables are
+    // still initializing, refuse new watches after dispose (or close them on the spot).
     this.networkWatches.add(handle);
     return async () => {
       this.networkWatches.delete(handle);
