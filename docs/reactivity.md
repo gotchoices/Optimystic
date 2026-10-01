@@ -959,9 +959,17 @@ never hard-code drifting numbers.
 > only configuration in which notifications verify today (blocked ticket
 > `reactivity-notifications-need-the-tail-cohort-to-be-the-topic-cohort`).
 >
+> **The real-libp2p `Database.watch` wakeup is exercised too** (`quereus-tables-opt-in-to-network-change-notification`):
+> [`packages/quereus-plugin-optimystic/test/network-change-notification.integration.spec.ts`](../packages/quereus-plugin-optimystic/test/network-change-notification.integration.spec.ts)
+> runs the same three-node, every-machine-in-every-cohort mesh with a Quereus `Database` on each node, over the
+> node handed to the plugin. A table declared `with tags ("optimystic.network_watch" = true)` on the watching
+> node wakes its `Database.watch` after another node inserts a row. The watcher's storage listener is replaced
+> with an inert one, so the wake cannot come from local storage, and as above the case passes only on a wake
+> with no tail read on the watcher between the insert and the wake. An untagged sibling table on the same
+> watcher stays asleep after an insert into it.
+>
 > **Still deferred (tagged, not faked):** the tail-rotation-specific *redirect* on socket delivery
-> (`12.5-reactivity-tail-rotation-transport`) and the real-libp2p `Database.watch` wakeup — the Quereus
-> plugin's use of the watch service (`quereus-tables-opt-in-to-network-change-notification`).
+> (`12.5-reactivity-tail-rotation-transport`).
 
 ---
 

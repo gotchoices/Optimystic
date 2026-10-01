@@ -8,14 +8,14 @@
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
-import type { ParsedOptimysticOptions, RowData } from './types.js';
+import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
 import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
-import type { CollectionChangeEvent, ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
+import type { ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
 import { SchemaManager, columnSetKey, mergeIndexLists, uniqueConstraintKey, uniqueEnforcementTreeName } from './schema/schema-manager.js';
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
@@ -321,6 +321,7 @@ function resolveBinding(
       networkName,
       bootstrapNodes: [],
       linkRoundTripMs: declaredLinkRoundTripMs(aux),
+      cohortTopic: declaredCohortTopic(aux),
     },
     rawStorageFactory,
   };
@@ -335,6 +336,21 @@ function declaredLinkRoundTripMs(aux: Readonly<Record<string, unknown>>): number
   const declared = aux['link_round_trip_ms'];
   if (declared === undefined || typeof declared === 'number') return declared;
   throw new Error(`link_round_trip_ms must be a number of milliseconds; got ${typeof declared} ${String(declared)}`);
+}
+
+/**
+ * The plugin-level `cohort_topic` (the node's `cohortTopic` option), or `undefined` when unset.
+ * Anything that is not an object with a boolean `enabled` throws: ignoring it would build a node
+ * without the watch service a table tagged for network change notification needs. The node itself
+ * validates the rest of the object.
+ */
+function declaredCohortTopic(aux: Readonly<Record<string, unknown>>): LibP2PNodeOptions['cohortTopic'] {
+  const declared = aux['cohort_topic'];
+  if (declared === undefined) return undefined;
+  if (typeof declared === 'object' && declared !== null && typeof (declared as { enabled?: unknown }).enabled === 'boolean') {
+    return declared as LibP2PNodeOptions['cohortTopic'];
+  }
+  throw new Error(`cohort_topic must be an object with a boolean 'enabled' (the node's cohortTopic option); got ${typeof declared} ${String(declared)}`);
 }
 
 /**
@@ -409,6 +425,18 @@ function describePrimaryKey(schema: Pick<StoredTableSchema, 'columns' | 'primary
   return `(${parts.join(', ')})`;
 }
 
+/** The table tag that opts a table into network change notification (README § Reactive Watching). */
+const NETWORK_WATCH_TAG = 'optimystic.network_watch';
+
+/**
+ * Whether a table's tags opt it into network change notification. Read with `=== true`, the rule
+ * Quereus reads its own per-table boolean opt-ins by (`quereus.sync.replicate`): any other value,
+ * a string `'true'` included, is off.
+ */
+function wantsNetworkWatch(tags: Readonly<Record<string, SqlValue>> | undefined): boolean {
+  return tags?.[NETWORK_WATCH_TAG] === true;
+}
+
 /**
  * Production-grade virtual table for Optimystic tree collections
  */
@@ -459,6 +487,22 @@ export class OptimysticVirtualTable extends VirtualTable {
   private changeUnsubscribe?: () => void;
   /** Subscribe-once guard for the collection-change bridge across repeated initialize()/connect(). */
   private changeSubscribed = false;
+  /**
+   * Whether the table's tags opt it into network change notification. Taken from the declaration,
+   * then kept current by the module on every `table_modified` of this table ({@link followTags}).
+   */
+  private networkWatchTagged: boolean;
+  /** Whether the table is in the span it watches over: from full initialization until DROP TABLE. */
+  private networkWatchArmed = false;
+  /** Closes the open network watch; absent while none is open. */
+  private closeNetworkWatch?: () => Promise<void>;
+  /**
+   * Opening and closing the network watch, one step at a time, so a tag flipped (or the table
+   * dropped) while a step is in flight is applied after it rather than beside it.
+   */
+  private networkWatchSteps: Promise<void> = Promise.resolve();
+  /** The "tagged, but no watch service" warning was logged; it is logged once per table. */
+  private networkWatchUnavailableLogged = false;
   public tableSchema: TableSchema; // Changed from private to public to match base class
 
   constructor(
@@ -475,6 +519,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     super(db, module, schemaName, tableName);
     this.tableSchema = tableSchema;
     this.declaredColumns = tableSchema.columns.length > 0;
+    this.networkWatchTagged = wantsNetworkWatch(tableSchema.tags);
     this.options = options;
     this.collectionFactory = collectionFactory;
     this.txnBridge = txnBridge;
@@ -1000,6 +1045,14 @@ export class OptimysticVirtualTable extends VirtualTable {
    *     own collection id; whole-table invalidation re-queries them anyway.
    *   - The plugin-global schema tree (`tree://optimystic/schema`) is skipped —
    *     schema writes are not data-watch events.
+   *
+   * A table tagged `"optimystic.network_watch" = true` also gets a network watch,
+   * which hears commits made on any machine rather than only those this node's
+   * storage applies. It is not awaited — the watch does its network work in the
+   * background — and a failure to open it is logged and leaves the local
+   * subscription working. Opening it here, before any statement reads the table,
+   * is what the watch service asks of its callers: a commit the first read missed
+   * still wakes the watchers.
    */
   private async ensureChangeSubscription(): Promise<void> {
     if (this.changeSubscribed) {
@@ -1011,12 +1064,14 @@ export class OptimysticVirtualTable extends VirtualTable {
     // Set the guard before awaiting so a concurrent initialize() cannot
     // double-subscribe; reset it on failure to allow a later retry.
     this.changeSubscribed = true;
+    this.networkWatchArmed = true;
+    this.reconcileNetworkWatch();
     try {
       const collectionId = this.collectionFactory.getCollectionId(this.options);
       this.changeUnsubscribe = await this.collectionFactory.subscribeToCollectionChanges(
         this.options,
         collectionId,
-        (event) => this.handleCollectionChange(event)
+        () => this.handleCollectionChange()
       );
     } catch (error) {
       this.changeSubscribed = false;
@@ -1028,14 +1083,15 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Translate a collection-change event into a coarse whole-table Quereus watch
-   * invalidation. Errors are isolated and logged — a watch-dispatch failure must
-   * not propagate into the synchronous storage commit callback that invoked this
-   * listener (the StorageRepo already isolates throwing listeners; this is a
-   * second line of defence and, critically, prevents an unhandled rejection from
-   * the async notifyExternalChange).
+   * Translate a collection change — a local commit event, or a network watch's
+   * wake — into a coarse whole-table Quereus watch invalidation. Errors are
+   * isolated and logged — a watch-dispatch failure must not propagate into the
+   * synchronous storage commit callback that invoked this listener (the
+   * StorageRepo already isolates throwing listeners; this is a second line of
+   * defence and, critically, prevents an unhandled rejection from the async
+   * notifyExternalChange).
    */
-  private handleCollectionChange(_event: CollectionChangeEvent): void {
+  private handleCollectionChange(): void {
     try {
       const result = this.db.notifyExternalChange(this.tableName, this.schemaName);
       if (result && typeof (result as Promise<void>).catch === 'function') {
@@ -1077,6 +1133,64 @@ export class OptimysticVirtualTable extends VirtualTable {
       this.changeUnsubscribe = undefined;
     }
     this.changeSubscribed = false;
+    this.networkWatchArmed = false;
+    this.reconcileNetworkWatch();
+  }
+
+  /**
+   * The module's hook for a `table_modified` of this table. Quereus applies a tag
+   * change (`alter table … set tags`, and the same statement `apply schema` emits
+   * for a tag-only change) to its own catalog without calling the module, so this
+   * is how the table learns of it: start or stop the network watch to match the
+   * new tags. Idempotent. A table not yet initialized only records the tags; its
+   * initialization opens the watch.
+   */
+  followTags(tags: Readonly<Record<string, SqlValue>> | undefined): void {
+    this.networkWatchTagged = wantsNetworkWatch(tags);
+    this.reconcileNetworkWatch();
+  }
+
+  /** Queue one step bringing the network watch in line with the tags and the table's lifetime. */
+  private reconcileNetworkWatch(): void {
+    this.networkWatchSteps = this.networkWatchSteps.then(() => this.applyNetworkWatch());
+  }
+
+  private async applyNetworkWatch(): Promise<void> {
+    const wanted = this.networkWatchArmed && this.networkWatchTagged;
+    try {
+      if (wanted && !this.closeNetworkWatch) {
+        await this.openNetworkWatch();
+      } else if (!wanted && this.closeNetworkWatch) {
+        const close = this.closeNetworkWatch;
+        this.closeNetworkWatch = undefined;
+        await close();
+      }
+    } catch (error) {
+      log(
+        `WARN: failed to ${wanted ? 'open' : 'close'} the network watch for '${this.tableName}': ` +
+        `${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async openNetworkWatch(): Promise<void> {
+    const close = await this.collectionFactory.watchCollectionOverNetwork(
+      this.options,
+      this.collectionFactory.getCollectionId(this.options),
+      () => this.handleCollectionChange()
+    );
+    if (close) {
+      this.closeNetworkWatch = close;
+      return;
+    }
+    if (!this.networkWatchUnavailableLogged) {
+      this.networkWatchUnavailableLogged = true;
+      log(
+        `WARN: '${this.tableName}' is tagged ${NETWORK_WATCH_TAG} but transactor '${this.options.transactor}' ` +
+        `has no cohort-topic watch service (a 'network' transactor over a node built with cohort_topic ` +
+        `enabled); only commits this node stores will wake its watchers`
+      );
+    }
   }
 
   /**
@@ -3846,10 +3960,33 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     deferred: Map<SchemaManager, Map<Tree<string, IndexEntry>, { tableKey: string; indexName: string }>>;
   };
 
+  /** Databases whose schema changes this module listens to ({@link followTagChanges}). */
+  private readonly followedDatabases = new WeakSet<Database>();
+
   constructor(
     private collectionFactory: CollectionFactory,
     private txnBridge: TransactionBridge
   ) {}
+
+  /**
+   * Listen, once per `Database`, for `table_modified` and hand a table this module holds
+   * its new tags ({@link OptimysticVirtualTable.followTags}). A tag change never reaches
+   * the module otherwise: Quereus swaps its own catalog entry and announces the swap.
+   * Tables of other modules miss the lookup. (A rename, the one `table_modified` that
+   * changes the name, is refused for this module's tables, so the event's name is the
+   * name the table is held under.)
+   */
+  private followTagChanges(db: Database): void {
+    if (this.followedDatabases.has(db)) {
+      return;
+    }
+    this.followedDatabases.add(db);
+    db.schemaManager.getChangeNotifier().addListener(event => {
+      if (event.type === 'table_modified') {
+        this.tables.get(`${event.schemaName}.${event.objectName}`.toLowerCase())?.followTags(event.newObject.tags);
+      }
+    });
+  }
 
   /**
    * Create a schema manager for a specific table's transactor configuration
@@ -4106,6 +4243,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       return existing;
     }
 
+    this.followTagChanges(db);
     const tableOptions = options ?? this.parseTableSchema(tableSchema);
     const schemaManager = this.createSchemaManager(tableOptions);
     const table = new OptimysticVirtualTable(

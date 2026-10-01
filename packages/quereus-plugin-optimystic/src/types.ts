@@ -1,6 +1,6 @@
 import type { Libp2p } from '@libp2p/interface';
 import type { ITransactor } from '@optimystic/db-core';
-import type { IRawStorage } from '@optimystic/db-p2p';
+import type { IRawStorage, NodeOptions } from '@optimystic/db-p2p';
 
 /**
  * Configuration for the optimystic virtual table
@@ -55,6 +55,14 @@ export interface LibP2PNodeOptions {
    * one network and port shares.
    */
   linkRoundTripMs?: number;
+
+  /**
+   * The node's cohort-topic substrate (`NodeOptions.cohortTopic` in `@optimystic/db-p2p`). Enabling it
+   * gives the node the watch service a table tagged `"optimystic.network_watch" = true` subscribes
+   * through. Set through the plugin-level `cohort_topic` only, for the same reason as
+   * {@link linkRoundTripMs}.
+   */
+  cohortTopic?: NodeOptions['cohortTopic'];
 }
 
 /**

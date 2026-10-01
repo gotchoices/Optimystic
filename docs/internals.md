@@ -884,16 +884,40 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   `notifyExternalChange`. The second is redundant but harmless. v1 does not attempt
   author-suppression; a future refinement could tag events with the authoring
   peer/actionId and let the vtab skip events it just authored.
+- **Double wake from storage and network (accepted).** On a node that both stores
+  a table tagged for network change notification (below) and watches it, another
+  machine's commit wakes watchers twice: once from the storage listener, once from
+  the network notification. Both are whole-table invalidations, so the cost is one
+  extra re-query; neither path suppresses the other.
 - **Lifetime.** The subscription is established once after table init and released
   in `OptimysticModule.destroy` (DROP TABLE). It is deliberately NOT released in
   the per-statement `disconnect()` (a no-op that keeps the table initialized across
   statements) — doing so would kill reactivity after the first scan. Closing a
   `Database` without dropping its tables leaves the storage listener attached until
   the `CollectionFactory` is GC'd; its dispatch becomes a logged no-op once the
-  `Database` is closed.
-- **Host requirement.** Only nodes that host the collection's blocks observe these
-  commits. Edge/client nodes that don't host blocks receive no push subscription
-  and still fetch/poll.
+  `Database` is closed. A tagged table's network watch has the same span — opened by
+  full initialization (never by the provisional committed-read pass), closed by DROP
+  TABLE — and is also closed by `CollectionFactory.dispose` (so by `plugin.dispose()`),
+  which closes every network watch the factory opened. Quereus tells a vtab nothing
+  when a `Database.watch` is added or removed, so the watch runs for the table's
+  whole open life; the tag is the consent to that.
+- **Host requirement.** Without the tag, only nodes that host the collection's
+  blocks observe these commits; edge/client nodes that don't host blocks receive no
+  push subscription and still fetch/poll. A table declared `with tags
+  ("optimystic.network_watch" = true)` also subscribes through its node's
+  `node.reactivityWatch` (`CollectionFactory.watchCollectionOverNetwork` in
+  `packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts`),
+  whose wake is the same `notifyExternalChange` path — so a machine storing nothing
+  of the table wakes too. The tag is read `=== true`, from the declaration and then
+  from every `table_modified` the module hears (`OptimysticModule.followTagChanges`
+  → `OptimysticVirtualTable.followTags`), so `alter table … set tags` starts or stops
+  the watch on a running table. The vtab opens and closes the watch through one
+  serial queue, so a tag flipped while an open is in flight is applied after it. It
+  needs a node built with `cohortTopic.enabled` (the plugin-level `cohort_topic` for
+  a node the plugin builds); without one — or on a non-`network` transactor — the
+  table logs one warning and keeps local wakes only. The node the plugin builds runs
+  `clusterSize: 1`, so its own commits carry no commit certificate and are never
+  announced (see *No retained cert* below): it can watch, but does not wake others.
 
 #### Cohort-Topic Origination Bridge (networked reactivity)
 
@@ -984,8 +1008,8 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
     `Collection.readCommittedTail` in `packages/db-core/src/collection/collection.ts` is the reader a
     host passes — it opens no collection handle, so it cannot replay a table's staged actions, and
     given the tail id the service hands `readTail` it is one request. The stop
-    wrapper stops the service first, ahead of the rotation scheduler and the host. (The Quereus plugin's
-    use of it is ticket `quereus-tables-opt-in-to-network-change-notification`.)
+    wrapper stops the service first, ahead of the rotation scheduler and the host. The Quereus plugin
+    uses it for tables tagged `optimystic.network_watch` (see *Reactive Watch Bridge* above).
   - **Tail rotation is now live** (`reactivity-rotation-host-wiring-e2e`). `ReactivityOriginationManager`
     tracks the last-seen reactivity tail per collection and, when `event.tailId` **changes** between commits,
     fires `forwarderHost.markRotated(oldTopicId, { newTailId, effectiveAtRevision: event.rev }, now)` — the

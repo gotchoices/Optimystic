@@ -1,5 +1,5 @@
 import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, CollectionChangeListener, TransactionSigner } from '@optimystic/db-core';
-import { Tree, NetworkTransactor, isBlockChangeNotifier, bytesToB64url } from '@optimystic/db-core';
+import { Tree, Collection, NetworkTransactor, isBlockChangeNotifier, bytesToB64url } from '@optimystic/db-core';
 import { randomBytes } from '@noble/hashes/utils.js';
 import {
 	createLibp2pNode,
@@ -15,6 +15,7 @@ import {
 	signPeer,
 	DEFAULT_DIAL_TIMEOUT_MS,
 	type OptimysticNodeAttachments,
+	type CollectionWatchHandle,
 } from '@optimystic/db-p2p';
 import { createMesh, buildNetworkTransactor } from '@optimystic/db-p2p/testing';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
@@ -65,6 +66,13 @@ export class CollectionFactory {
    * release them.
    */
   private readCacheLeases: ReadCacheLease[] = [];
+  /**
+   * The network watches this factory opened ({@link watchCollectionOverNetwork}) and nobody has
+   * closed yet. Tracked so {@link dispose} can close them: a host that closes its `Database` and
+   * disposes the plugin without dropping its tables would otherwise leave each watch renewing its
+   * cohort registration until the node stops.
+   */
+  private networkWatches = new Set<CollectionWatchHandle>();
 
   /**
    * Create or get a tree collection, bringing it into existence when nothing has ever
@@ -234,6 +242,45 @@ export class CollectionFactory {
   }
 
   /**
+   * Wake `listener` whenever `collectionId` commits on any machine, through the node's
+   * cohort-topic watch service (`node.reactivityWatch` in `@optimystic/db-p2p`) — as opposed to
+   * {@link subscribeToCollectionChanges}, which hears only commits this node's own storage applies.
+   *
+   * Resolves `undefined` when there is no watch service to use: a transactor other than
+   * `network`, one registered directly with no node behind it, or a node built without
+   * `cohortTopic.enabled` (an injected node may not have been built with it). Otherwise resolves
+   * the watch's close, which is idempotent. The watch itself returns at once and does its network
+   * work in the background, so neither this call nor the close waits on the network.
+   */
+  async watchCollectionOverNetwork(
+    options: ParsedOptimysticOptions,
+    collectionId: CollectionId,
+    listener: () => void
+  ): Promise<(() => Promise<void>) | undefined> {
+    const transactor = await this.getOrCreateTransactor(options);
+    if (options.transactor !== 'network') {
+      return undefined;
+    }
+    const watchService = this.libp2pNodes.get(this.getNodeKey(options))?.node.reactivityWatch;
+    if (!watchService) {
+      return undefined;
+    }
+    const handle = watchService.watch({
+      collectionId,
+      readTail: async (knownTailId) => {
+        const tail = await Collection.readCommittedTail(transactor, collectionId, knownTailId);
+        return tail && { tailId: tail.tailId, revision: tail.rev };
+      },
+      onChange: listener,
+    });
+    this.networkWatches.add(handle);
+    return async () => {
+      this.networkWatches.delete(handle);
+      await handle.close();
+    };
+  }
+
+  /**
    * Create a network transactor
    */
   private async createNetworkTransactor(options: ParsedOptimysticOptions): Promise<ITransactor> {
@@ -247,6 +294,7 @@ export class CollectionFactory {
         networkName: options.libp2pOptions?.networkName ?? 'optimystic',
         bootstrapNodes: options.libp2pOptions?.bootstrapNodes ?? [],
         linkRoundTripMs: options.libp2pOptions?.linkRoundTripMs,
+        cohortTopic: options.libp2pOptions?.cohortTopic,
         fretProfile: 'edge',
         clusterSize: 1,
         clusterPolicy: {
@@ -594,7 +642,7 @@ export class CollectionFactory {
    */
   registerLibp2pNode(networkName: string, node: FactoryNode, coordinatedRepo: IRepo): void {
     const nodeKey = `${networkName}:0`; // Use port 0 as default for registered nodes
-    this.libp2pNodes.set(nodeKey, { node, coordinatedRepo });
+    this.libp2pNodes.set(nodeKey, { node, coordinatedRepo, blockChangeNotifier: node.blockChangeNotifier });
   }
 
   /**
@@ -697,6 +745,10 @@ export class CollectionFactory {
    * evicts them as cold — hygiene, not correctness (the pool always evicts, never refuses, and
    * the warm cache is coherent with every in-process write).
    *
+   * Also closes every network watch still open ({@link watchCollectionOverNetwork}), for the same
+   * reason: a closed `Database`'s tagged tables are never dropped, so nothing else would release
+   * them, and each would keep renewing its cohort registration until the node stops.
+   *
    * Safe to call more than once. A transactor requested afterwards is rebuilt from scratch
    * (the storage factory is invoked again and takes a fresh lease — on a cold cache if nobody
    * else holds one over that store), so a stray statement after dispose is coherent. Does NOT
@@ -705,7 +757,12 @@ export class CollectionFactory {
   async dispose(): Promise<void> {
     const leases = this.readCacheLeases;
     this.readCacheLeases = [];
+    const watches = [...this.networkWatches];
+    this.networkWatches.clear();
     this.transactors.clear();
+    for (const watch of watches) {
+      await watch.close();
+    }
     for (const lease of leases) {
       await lease.release();
     }

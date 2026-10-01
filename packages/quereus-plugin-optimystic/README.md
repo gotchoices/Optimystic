@@ -131,7 +131,9 @@ Tables backed by Optimystic drive Quereus's reactive watch API. When a commit
 lands on a collection's blocks — whether authored locally or replicated from a
 remote peer — the plugin translates it into a `Database.notifyExternalChange`
 call, so `Database.watch` / subscribe consumers fire through the normal reactive
-path. No polling required.
+path. No polling required. By default only commits **this node's storage applies**
+wake a table; a table can opt in to hearing commits made anywhere on the network
+(see *Network change notification* below).
 
 ```typescript
 const scope = db.prepare('select * from users where id = ?').getChangeScope([id]);
@@ -149,13 +151,62 @@ Notes:
   fire with empty hits; `rows`/`rowsByGroup` watches surface their registered key
   literals as possibly-changed. Over-firing only costs an extra re-query — it never
   misses a change.
-- **Host requirement.** Only nodes that **host the collection's blocks** observe
-  these commits and push invalidations. Edge/client nodes that don't host blocks
-  receive no push and continue to fetch on demand.
+- **Host requirement.** Without the tag below, only nodes that **host the
+  collection's blocks** observe these commits and push invalidations. Edge/client
+  nodes that don't host blocks receive no push and continue to fetch on demand.
 - **Transactor support.** Reactive watching works with the `network` transactor
   (the hosting node's storage drives it) and the in-process `local`/`test`
   transactors. `mesh-test` and custom transactors that don't implement
   `IBlockChangeNotifier` degrade gracefully to non-reactive behaviour.
+
+### Network change notification
+
+A table declared with the `optimystic.network_watch` tag also wakes when any other
+machine commits to it — including on a phone or laptop that stores none of the
+table's blocks:
+
+```sql
+create table users (id integer primary key, name text)
+  using optimystic('tree://app/users')
+  with tags ("optimystic.network_watch" = true);
+```
+
+The key is quoted because Quereus reads an unquoted tag key as a single identifier.
+The value must be the boolean `true`; anything else, the string `'true'` included,
+leaves the table on local wakes only. `alter table users set tags (…)` (and an
+`apply schema` whose only change is the tag) starts or stops the network watch on
+the running table; note that this plugin does not yet persist a tag change across
+a restart.
+
+What it needs:
+
+- **A node with the cohort-topic substrate.** The table's node must have been built
+  with `cohortTopic.enabled` (`NodeOptions.cohortTopic` in `@optimystic/db-p2p`).
+  For a node the plugin builds, pass it as the plugin-level `cohort_topic`; a node
+  the host registers (`collectionFactory.registerLibp2pNode`) must have been built
+  with it. A tagged table without one — and any table on a `local`, `test`,
+  `mesh-test` or custom transactor — logs one warning and keeps local wakes only.
+- **Today, every machine in every cohort.** A notification verifies only when the
+  cohort that holds the collection's log tail is also the cohort the notification's
+  topic is served by, which today holds only when every machine is in every cohort:
+  `clusterSize` and `cohortTopic.wantK` equal to the number of machines.
+- **A machine that announces.** A commit is announced by the machine that
+  coordinated it, from the commit certificate its cohort's consensus produced. The
+  node the plugin builds itself runs with `clusterSize: 1`, so its own commits run
+  no consensus and are **never announced**: such a node can *watch* — be woken by
+  other machines' commits — but other machines are not woken by its commits. A
+  node the host builds with a real cluster size both watches and announces.
+
+What it costs: one cohort registration per tagged table for as long as the table
+is open, renewed every 20 s (Edge node) or 30 s (Core node), and one read of the
+collection's log tail at each renewal — the fallback check that turns a lost
+notification into one renewal's delay rather than a missed wake. The first tail
+read after a table opens wakes its watchers once, whether or not anything changed.
+On a machine that both stores the table and watches it, another machine's commit
+wakes watchers twice (once from storage, once from the network); both are coarse
+whole-table invalidations, so the cost is one extra re-query. The watch closes on
+`drop table`, and on `plugin.dispose()` for a `Database` closed without dropping
+its tables.
 
 ## Transaction Engine
 
@@ -209,6 +260,7 @@ The `register(db, config)` call accepts plugin-level defaults (consumed via the 
 | `default_key_network` | Default `keyNetwork` when a table omits the option |
 | `default_port`, `default_network_name` | libp2p defaults |
 | `link_round_trip_ms` | The slowest round trip, in milliseconds, between any two nodes that will talk to each other, relayed hops included. The node the plugin builds derives every network deadline from it, including the dial and cancel deadlines of the plugin's own transactor; see `linkRoundTripMs` under *Slow relayed links* in [the db-p2p readme](../db-p2p/readme.md). Unset keeps the LAN deadlines. A table on a node the host registered takes the dial deadline from that node instead. Plugin-level only: it configures the node, which every table on one network and port shares. |
+| `cohort_topic` | The node's cohort-topic substrate, passed through as `cohortTopic` to the node the plugin builds (`NodeOptions.cohortTopic` in `@optimystic/db-p2p`): an object with a boolean `enabled`, plus the node's optional `wantK` and `host` tuning. Enabling it is what lets a table tagged `"optimystic.network_watch" = true` hear other machines' commits (see *Network change notification*). Anything without a boolean `enabled` is refused. Has no effect on a node the host registered. Plugin-level only, like `link_round_trip_ms`. |
 | `rawStorageFactory` | `() => IRawStorage` — supplies the raw storage backing the `'local'` transactor. Defaults to in-memory `MemoryRawStorage`. Hosts can plug in persistent storage (e.g. RN/MMKV). Function-typed, so it can only be passed via `register()`, not in a `USING` clause. |
 
 ```typescript
@@ -233,7 +285,9 @@ db.close();
 await plugin.dispose();
 ```
 
-`dispose()` releases the plugin's claim on the read cache that sits in front of your
+`dispose()` closes the network watches of tables tagged `optimystic.network_watch`
+(each would otherwise keep renewing its cohort registration until the node stops), and
+releases the plugin's claim on the read cache that sits in front of your
 `rawStorageFactory` storage. That cache is **one per backing store per process**, shared by
 every `Database` registered over the same store — which is what lets two `Database`s over one
 directory see each other's committed writes — and it is only cleared once the last claim on it
