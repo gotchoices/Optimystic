@@ -25,6 +25,9 @@ const { FileStore } = require('metro-cache');
 // metro-file-map stores each file relative to the project root by a case-sensitive prefix comparison,
 // so a `c:` project root beside a `C:` watch folder files the sibling repositories under garbage keys,
 // and "Unable to resolve module p2p-fret" follows when the shell's cwd has a lowercase drive.
+// NOTE: this config alone is not enough. Metro's defaults carry paths Metro resolved from its own
+// location, so whatever loads Metro must load it canonically too, as scripts/rn-bundle-check.mjs does;
+// if anything else (Metro's own CLI, say) ever loads this config, it needs the same care.
 const workspaceDir = fs.realpathSync.native(__dirname);
 const repoRoot = fs.realpathSync.native(path.resolve(workspaceDir, '..', '..'));
 /** Under `node_modules`, so it is gitignored, and private to this workspace rather than the machine-wide `%TEMP%/metro-cache`. */

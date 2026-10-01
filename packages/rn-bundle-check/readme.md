@@ -66,6 +66,6 @@ NOTE: once the oldest React Native version we support is on Hermes V1 (0.84+), m
 - `test/hermes-syntax.test.mjs`: a regular expression with the `v` flag passes Metro and fails `hermesc`, reported against the fixture's own line.
 - `test/node-builtin.test.mjs`: an unshimmed Node built-in fails with a pointer to the readme's shim table.
 - `test/shim-table-parity.test.mjs`: the Metro aliases match the readme's shim table.
-- `test/drive-letter-case.test.mjs` (Windows only; skipped elsewhere): loaded through a lowercase drive letter, `metro.config.cjs` still gives Metro canonical roots, and the script still bundles an entry spelled the same way.
+- `test/drive-letter-case.test.mjs` (Windows only; skipped elsewhere): the script, loaded through a lowercase drive letter, still bundles an entry spelled the same way.
 - `test/hermesc-binary.test.mjs`: each supported platform's binary exists in the installed `hermes-compiler`, and other platforms are refused.
 - `test/route-recorder.test.mjs`: the routing step passes a specifier that resolves where expected, and reports one that resolves elsewhere or is never imported. A second importer of the same specifier is judged too, so a wrong route is reported even when the first importer's route was right.
