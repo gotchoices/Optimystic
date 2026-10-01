@@ -161,8 +161,9 @@ function siblingWatchRoots() {
  * unrelated manifest further up (a `package.json` in the directory that holds every checkout) can never
  * widen the watch to every sibling project on the machine.
  *
- * NOTE: only the "found a workspace root" path runs today (../quereus, ../Fret); both stops are
- * exercised by nothing. If this walk gains another case, move it to a module `test/` can import.
+ * NOTE: only the "found a workspace root" path runs today (../quereus, and ../Fret when linked); both
+ * stops are exercised by nothing. If this walk gains another case, move it to a module `test/` can
+ * import.
  */
 function siblingWorkspaceRoot(target) {
 	for (let dir = target; !isInside(dir, repoRoot); dir = path.dirname(dir)) {
@@ -184,10 +185,10 @@ function declaresWorkspaces(manifestPath) {
 
 /**
  * Real paths of the workspace `node_modules` links that lead outside this repository — today
- * `@quereus/quereus` and `p2p-fret`, which the root `resolutions` portal-link to
- * ../quereus/packages/quereus and ../Fret/packages/fret. Derived by scanning rather than hard-coded
- * (as the sereus reference app does), so a new portal needs no edit here and a checkout that installed
- * them from npm simply finds none.
+ * `@quereus/quereus`, which the root `resolutions` portal-link to ../quereus/packages/quereus, and
+ * `p2p-fret` (../Fret/packages/fret) whenever `yarn dev:link` has linked it. Derived by scanning
+ * rather than hard-coded (as the sereus reference app does), so a new portal needs no edit here and a
+ * checkout that installed them from npm simply finds none.
  */
 function outOfRepoLinkTargets() {
 	const targets = new Set();

@@ -4,7 +4,7 @@ files:
   - packages/db-p2p/package.json (`@chainsafe/libp2p-noise`, `@chainsafe/libp2p-yamux`)
   - packages/db-p2p/src/libp2p-node-base.ts (the `noise` and `yamux` imports; `NodeOptions.noiseCrypto`)
   - packages/db-p2p/src/noise-crypto.ts (`NoiseCryptoInterface`, `noisePureJsCrypto` re-exports)
-  - packages/quereus-plugin-optimystic/package.json (`@chainsafe/libp2p-yamux`; an unused `@libp2p/noise` ^1.0.1 dev dependency)
+  - packages/quereus-plugin-optimystic/package.json (`@chainsafe/libp2p-yamux`; an unused `@libp2p/noise` ^1.0.1 entry under `dependencies`)
   - packages/db-p2p/test (seven specs and `test/util/relay-topology.ts` import the chainsafe packages)
   - scripts/shared-majors.cjs ("WHAT IS DELIBERATELY NOT HERE")
 tradeoffs: The chainsafe releases work today on libp2p 3.3 and nothing is known to be wrong with them, so this is a move made for future fixes rather than a present defect; and it touches the React Native crypto hook that Sereus depends on, which is the riskiest part of the node to change without a device run.
@@ -29,4 +29,4 @@ The same code now continues in the libp2p project's own repository (`libp2p/js-l
 - The React Native default. The readme states that Metro honours the chainsafe package's `browser` field, which maps Noise's default crypto to pure JavaScript. The new package's export map has to be read to see what Metro picks up, and `yarn check:rn` only proves it bundles, not what it runs.
 - The wire protocol. A node on the new packages must still complete a handshake with a node on the old ones; `test/foreign-peer-interop.integration.spec.ts` is the place to pin that with one side on each.
 
-The unused `@libp2p/noise` ^1.0.1 dev dependency in `quereus-plugin-optimystic` (nothing imports it) should go at the same time, whichever way this is decided.
+The unused `@libp2p/noise` ^1.0.1 entry in `quereus-plugin-optimystic` should go at the same time, whichever way this is decided. Nothing imports it, but it sits under `dependencies`, not `devDependencies`, so every application that installs the plugin also installs `@libp2p/noise` 1.0.1 and the `uint8arraylist` 2 it declares.

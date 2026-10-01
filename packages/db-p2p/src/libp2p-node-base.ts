@@ -461,9 +461,9 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 *
 	 * `pingTimeout` is an adaptive-timeout init: the monitor reports each ping's duration back to it
 	 * (`AdaptiveTimeout.cleanUp`, called after every ping), and the next ping's deadline is 1.2 times
-	 * the moving average of those durations, held between `minTimeout` and `maxTimeout`. Setting the
-	 * two equal, as above, pins the deadline at exactly `minTimeout`, which is what the arithmetic in
-	 * the paragraphs above assumes.
+	 * the moving average of those durations (a ping that ran out its deadline is entered at twice its
+	 * duration), held between `minTimeout` and `maxTimeout`. Setting the two equal, as above, pins the
+	 * deadline at exactly `minTimeout`, which is what the arithmetic in the paragraphs above assumes.
 	 *
 	 * NOTE: a `maxTimeout` left ABOVE `minTimeout` lets the deadline adapt upward between the two, but
 	 * for ONE ping only. The average decays over `pingTimeout.interval` (5s by default), which is

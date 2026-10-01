@@ -120,9 +120,9 @@ describe('buildFreshnessProblems', () => {
 	});
 
 	it('sends a sibling repository\'s remedy to that repository, not to this one', () => {
-		// `@quereus/quereus` and `p2p-fret` are `portal:`-resolved into checkouts beside this one, so
-		// `yarn workspace <name> build` run from here would not reach them at all. The remedy has to
-		// name the other checkout — and this is also the case that today fails with an opaque
+		// `@quereus/quereus` (and `p2p-fret`, when linked) is `portal:`-resolved into a checkout beside
+		// this one, so `yarn workspace <name> build` run from here would not reach it at all. The remedy
+		// has to name the other checkout — and this is also the case that today fails with an opaque
 		// `ERR_MODULE_NOT_FOUND` from inside a spec.
 		const { consumerDir } = writeRepo({ link: false });
 		const sibling = tempRoot();

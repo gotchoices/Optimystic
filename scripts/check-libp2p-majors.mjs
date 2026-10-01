@@ -40,7 +40,7 @@ function runYarn({ file, args }) {
 			`\`yarn info\` failed (${err.status != null ? `exit ${err.status}` : err.code}), so the installed tree could not be checked.`,
 			said ? `yarn said:\n${said.replace(/^(?=.)/gm, '  ')}` : 'yarn printed nothing.',
 			'Likely causes: no `yarn install` has run; a sibling checkout that a portal: resolution needs',
-			'(../quereus, ../Fret) is missing; or no package in scripts/shared-majors.cjs is installed at all,',
+			'(../quereus, or ../Fret when it is linked) is missing; or no package in scripts/shared-majors.cjs is installed at all,',
 			'which yarn reports as "No package matched your request".'
 		].join('\n'), { cause: err });
 	}
