@@ -41,7 +41,12 @@ export const DELTA_MAX_EDGE_BYTES = 0;
 export const SUBSCRIBER_TTL_CORE_MS = 90_000;
 /** Subscriber registration TTL on an Edge node (ms), inherited from cohort-topic. */
 export const SUBSCRIBER_TTL_EDGE_MS = 60_000;
-/** Transactions per block — drives tail rotation. Simulator-validated-pending. */
+/** Transactions per block — drives tail rotation. Simulator-validated-pending.
+ *
+ * NOTE: the collection log starts a new tail block every `EntriesPerBlock` (32) entries
+ * (`chain/chain.ts`), not every 64, so on a live node the fill tracker's warm-up and filling signals
+ * fire at the wrong commit counts. Harmless while those signals are only logged; reconcile the two
+ * numbers before anything on a live node acts on them. */
 export const BLOCK_FILL_SIZE_DEFAULT = 64;
 /** Old-tail drain time after rotation (ms). Simulator-validated-pending. */
 export const T_DRAIN_MS = 60_000;

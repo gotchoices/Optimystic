@@ -85,16 +85,12 @@ import type { CohortTopicHost, CoordEngine } from '../src/cohort-topic/host.js';
  * **What is real over the wire here vs. what is honestly deferred.** The piece the mock mesh *stubs* — real
  * FRET cohort assembly + coordinate derivation, the `/sign` threshold-signature collection, the
  * `/membership` cert serve+fetch, and `/cohort-gossip` record replication — is exercised end-to-end over
- * real TCP. Two scenarios in the parent ticket need **production seams that are not yet wired** and are
- * tagged `it.skip` with their tracking tickets rather than faked:
- *   - reactivity notification *socket delivery* (the origination bridge fires `onLocalCommit` and the
- *     verify path is real, but no emit transport / subscriber-delivery protocol is registered in
- *     production — `libp2p-node-base.ts` "installing the origination manager + emit transport is a sibling
- *     ticket"); and
- *   - the matchmaking hang-out walk *converging to a match* (no `QueryV1` RPC handler is registered on a
- *     real node — the seeker walk's `query()` seam is unbound in production).
- * The real, wired pieces of both (the reactivity origination membership gate over real FRET; a matchmaking
- * provider record landing in + replicating across a real cohort) ARE exercised.
+ * real TCP. So are the two application transports built on it: reactivity notification delivery and
+ * recover (resume) over their own sockets, and the matchmaking `QueryV1` RPC with the seeker's hang-out
+ * walk. The last `describe` in this file runs the node's collection watch service with nothing hand-built.
+ * Two scenarios stay tagged `it.skip` rather than faked: the recover redirect a draining old tail returns
+ * after a rotation, and a bare participant `service.register()` walk in the first mesh (the collection
+ * watch case does run that walk, on a mesh of its own).
  *
  * Gated on `OPTIMYSTIC_INTEGRATION=1` (or `RUN_LONG_TESTS=1`) so the default `yarn test` stays fast. Run:
  *   OPTIMYSTIC_INTEGRATION=1 yarn test:integration   (db-p2p)
@@ -1141,10 +1137,10 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		let wakes = 0;
 		const handle = watcher.reactivityWatch!.watch({
 			collectionId: COLLECTION,
-			readTail: async () => {
+			readTail: async (knownTailId) => {
 				reads.started++;
 				try {
-					const tail = await Collection.readCommittedTail(watcherTransactor, COLLECTION);
+					const tail = await Collection.readCommittedTail(watcherTransactor, COLLECTION, knownTailId);
 					return tail === undefined ? undefined : { tailId: tail.tailId, revision: tail.rev };
 				} finally {
 					reads.finished++;
@@ -1166,7 +1162,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 				const engine = writerHost.registry.findServing(topicId, 0);
 				return engine !== undefined && reactivityDirectSubscribers(engine, topicId).includes(watcher.peerId.toString());
 			}, { timeoutMs: 60_000, intervalMs: 250, description: "the watcher's registration replicated to the announcing node" });
-			expect(wakes, 'nothing has changed since the watch opened').to.equal(0);
+			expect(wakes, 'only the first tail read has woken the watch: nothing has changed since it opened').to.equal(1);
 
 			// A wake proves the notification path only if no tail read can account for it, so an attempt during
 			// which the service read the tail (its fallback check, or an early registration retry) proves nothing

@@ -17,6 +17,10 @@
  * renewal cadence, that reads the collection's committed tail and compares it with what it last saw (see
  * {@link ReactivityCollectionWatch.tick}). Every failure above then costs at most one tick of delay.
  *
+ * **What a watcher is promised.** Open the watch before the read it is meant to keep fresh: a commit that
+ * read did not see wakes the watcher. The service cannot know what a caller has read, so the first committed
+ * tail it reads for a collection wakes that collection's watchers once, whether or not anything changed.
+ *
  * **Work on one subscription is serial.** The first attach, each tick, each escalation's re-read and each
  * scheduled move run one at a time per subscription, so two moves never interleave. Delivery is not part of
  * that queue: a notification reaches {@link CollectionWatchRequest.onChange} while a move is in flight.
@@ -53,9 +57,16 @@ export interface CollectionTail {
 export interface CollectionWatchRequest {
 	/** The collection id exactly as blocks carry it (`header.collectionId`, e.g. `app/users`). */
 	readonly collectionId: string;
-	/** Read the collection's committed tail now; `undefined` when the collection has never committed. */
-	readonly readTail: () => Promise<CollectionTail | undefined>;
-	/** Called once per detected change. Coarse: no payload, never awaited, a throw is logged. */
+	/**
+	 * Read the collection's committed tail now; `undefined` when the collection has never committed.
+	 * `knownTailId` is the tail block the service's previous read found, for a reader that reads in one
+	 * request when told it (`Collection.readCommittedTail` takes it as its third argument).
+	 */
+	readonly readTail: (knownTailId?: BlockId) => Promise<CollectionTail | undefined>;
+	/**
+	 * Called once per detected change, and once when the service first reads a committed tail for the
+	 * collection (see the module doc). Coarse: no payload, never awaited, a throw is logged.
+	 */
 	readonly onChange: () => void;
 }
 
@@ -109,8 +120,10 @@ interface Subscription {
 	attached?: Attachment;
 	/** An attachment whose registration is in flight; its handler is already routing notifications. */
 	arriving?: Attachment;
-	/** Highest revision a listener has been woken for (or that the first tail read found). */
+	/** Highest revision the listeners have been woken for; `0` until a committed tail has been read. */
 	lastSeenRevision: number;
+	/** The tail block the last successful tail read found, handed back to the next read. */
+	lastTailId?: BlockId;
 	closed: boolean;
 	cancelTick?: RotationTimerCancel;
 	/** Tail of the serial work queue. */
@@ -151,7 +164,8 @@ export class ReactivityCollectionWatch {
 	/**
 	 * Watch a collection. Returns at once and never throws for network reasons: reading the tail, registering
 	 * with the cohort and everything after run in the background, and a failure there is retried by the tick.
-	 * After {@link stop} the returned handle is inert.
+	 * The caller opens the watch first and reads afterwards (see the module doc). After {@link stop} the
+	 * returned handle is inert.
 	 */
 	watch(req: CollectionWatchRequest): CollectionWatchHandle {
 		if (this.stopped) {
@@ -163,7 +177,7 @@ export class ReactivityCollectionWatch {
 		const sub = existing ?? this.openSubscription(req.collectionId);
 		sub.listeners.add(listener);
 		if (existing === undefined) {
-			void this.enqueue(sub, () => this.start(sub));
+			void this.enqueue(sub, () => this.checkTail(sub));
 			this.armTick(sub);
 		}
 		return {
@@ -180,6 +194,11 @@ export class ReactivityCollectionWatch {
 	/**
 	 * The rotation scheduler's move: its timer for the successor topic `plan.newTopicId` fired. A successor
 	 * no subscription is waiting on (it closed meanwhile) is a logged no-op.
+	 *
+	 * NOTE: a timer for a successor the log has already left (OLD→A→B inside the re-registration jitter, the
+	 * tick having moved the subscription to B) moves it back to A; the tail read that follows the move returns
+	 * it to B, at the cost of two registrations. If rotations ever come that fast, drop a plan whose
+	 * subscription is no longer attached under the manager that surfaced it.
 	 */
 	reRegister(plan: ReRegistrationPlan): Promise<void> {
 		const topicKey = bytesToB64url(plan.newTopicId);
@@ -241,7 +260,14 @@ export class ReactivityCollectionWatch {
 		}
 	}
 
-	/** Run `step` after this subscription's earlier work. A closed subscription runs nothing; a throw is logged. */
+	/**
+	 * Run `step` after this subscription's earlier work. A closed subscription runs nothing; a throw is logged.
+	 *
+	 * NOTE: a step that never settles stalls everything queued behind it, the tick's tail check included. The
+	 * calls a step awaits are bounded today: the register walk and the renewal ping by libp2p's dial and
+	 * stream timeouts, a `Collection.readCommittedTail` reader by the transactor's read deadlines. If a host
+	 * ever passes a `readTail` with no deadline of its own, bound it here.
+	 */
 	private enqueue(sub: Subscription, step: () => Promise<void>): Promise<void> {
 		const run = sub.work.then(async () => {
 			if (sub.closed) {
@@ -259,8 +285,8 @@ export class ReactivityCollectionWatch {
 
 	private armTick(sub: Subscription): void {
 		// NOTE: every tick reads the collection's tail, whether or not anything changed: one read per watched
-		// collection per tick (30 s Core, 20 s Edge), which is one request for a reader that passes
-		// `Collection.readCommittedTail` the tail id it last saw and two otherwise. If that shows up in traffic,
+		// collection per tick (30 s Core, 20 s Edge), which is one request for a reader that hands
+		// `Collection.readCommittedTail` the tail id `readTail` is given and two otherwise. If that shows up in traffic,
 		// lengthen the interval the read runs at (keeping renewal at TTL / 3), or skip the read on a tick since
 		// which a notification arrived.
 		sub.cancelTick = this.setTimer(() => {
@@ -283,6 +309,9 @@ export class ReactivityCollectionWatch {
 	}
 
 	private async renew(sub: Subscription): Promise<void> {
+		// NOTE: a renewal the cohort answers "unknown registration" resolves like any other, so a registration
+		// the cohort has lost is not re-made until the tail moves, and until then the tick alone wakes the
+		// watchers (backlog `bug-a-participant-told-its-registration-is-unknown-never-registers-again`).
 		try {
 			await sub.attached?.manager.renew();
 		} catch (err) {
@@ -290,20 +319,15 @@ export class ReactivityCollectionWatch {
 		}
 	}
 
-	/** The first attach. Its tail read stands in for the caller's own read of the table, so it wakes nobody. */
-	private async start(sub: Subscription): Promise<void> {
-		const tail = await this.readTail(sub);
-		if (tail === undefined) {
-			return; // never committed, or unreadable right now: the tick re-reads until there is a tail
-		}
-		sub.lastSeenRevision = Math.max(sub.lastSeenRevision, tail.revision);
-		await this.moveThenRecheck(sub, reactivityTailBytes(tail.tailId), tail.revision);
-	}
-
+	/**
+	 * Read the tail, wake the listeners if it is news, and attach to its topic. A subscription's first read
+	 * goes through here too and so wakes its listeners: a caller that read the collection before this read
+	 * may have missed a commit this read can see, and nothing later would report that commit.
+	 */
 	private async checkTail(sub: Subscription): Promise<void> {
 		const tail = await this.readTail(sub);
 		if (tail === undefined) {
-			return;
+			return; // never committed, or unreadable right now: the next tick reads again
 		}
 		this.wakeIfNewer(sub, tail.revision);
 		await this.moveThenRecheck(sub, reactivityTailBytes(tail.tailId), tail.revision);
@@ -333,8 +357,12 @@ export class ReactivityCollectionWatch {
 			return undefined;
 		}
 		try {
-			const tail = await listener.readTail();
-			return sub.closed ? undefined : tail;
+			const tail = await listener.readTail(sub.lastTailId);
+			if (sub.closed) {
+				return undefined;
+			}
+			sub.lastTailId = tail?.tailId ?? sub.lastTailId;
+			return tail;
 		} catch (err) {
 			log("tail read failed for collection=%s (no news this round): %o", sub.collectionId, err);
 			return undefined;

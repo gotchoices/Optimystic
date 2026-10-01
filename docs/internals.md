@@ -974,13 +974,16 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
     `watch({ collectionId, readTail, onChange })` returns at once; in the background the service keeps
     one subscription per collection (shared by every watch of it on the node), registers its manager in
     the subscriber registry and with the cohort, renews it, and moves it when the log's tail block
-    changes. Each subscription also ticks at the renewal cadence (30 s Core, 20 s Edge) and reads the
+    changes. The first committed tail the service reads for a collection wakes its watchers once (it
+    cannot know what a caller read before then), so a caller opens the watch and then reads. Each
+    subscription also ticks at the renewal cadence (30 s Core, 20 s Edge) and reads the
     collection's committed tail: a revision above the last one the watchers were woken for wakes them,
     and a different tail block moves the subscription. That check is what turns a lost notification, a
     failed registration, an unannounced rotation or a commit nobody announced into one tick of delay
     instead of a watcher that never wakes; it costs one tail read per watched collection per tick.
     `Collection.readCommittedTail` in `packages/db-core/src/collection/collection.ts` is the reader a
-    host passes — it opens no collection handle, so it cannot replay a table's staged actions. The stop
+    host passes — it opens no collection handle, so it cannot replay a table's staged actions, and
+    given the tail id the service hands `readTail` it is one request. The stop
     wrapper stops the service first, ahead of the rotation scheduler and the host. (The Quereus plugin's
     use of it is ticket `quereus-tables-opt-in-to-network-change-notification`.)
   - **Tail rotation is now live** (`reactivity-rotation-host-wiring-e2e`). `ReactivityOriginationManager`

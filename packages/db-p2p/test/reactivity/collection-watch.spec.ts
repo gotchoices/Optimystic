@@ -107,6 +107,11 @@ async function watchMidMove() {
 }
 
 describe('reactivity / collection watch', () => {
+	it('the first tail read wakes the watcher: a commit made after the caller read but before that read is reported by nothing else', async () => {
+		const { state } = await attachedWatch();
+		expect(state.changes).to.equal(1);
+	});
+
 	it('a notification on the new topic reaches onChange while the new registration is still in flight', async () => {
 		const { registry, state } = await watchMidMove();
 		const before = state.changes;
@@ -148,16 +153,17 @@ describe('reactivity / collection watch', () => {
 		const { service, registry, state, fireTick } = await attachedWatch();
 		service.registrations[0]!.resolve();
 		await settle();
+		const before = state.changes;
 		// Revision 7 arrives with 5 and 6 never delivered: a gap, and this fixture has no recover transport.
 		registry.deliver(topicOf(OLD_TAIL), notification(OLD_TAIL, 7));
 		await settle();
-		expect(state.changes, 'a gap wakes nobody on its own').to.equal(0);
+		expect(state.changes - before, 'a gap wakes nobody on its own').to.equal(0);
 		state.tail = { tailId: OLD_TAIL, revision: 7 };
 		fireTick();
 		await settle();
-		expect(state.changes, 'the tick found the newer revision').to.equal(1);
+		expect(state.changes - before, 'the tick found the newer revision').to.equal(1);
 		registry.deliver(topicOf(OLD_TAIL), notification(OLD_TAIL, 8));
 		await settle();
-		expect(state.changes, 'revision 8 is contiguous with what the tick read').to.equal(2);
+		expect(state.changes - before, 'revision 8 is contiguous with what the tick read').to.equal(2);
 	});
 });

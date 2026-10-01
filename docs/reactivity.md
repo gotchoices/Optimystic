@@ -98,7 +98,7 @@ On a running node an application does not build any of this itself. A node creat
 ```ts
 const handle = node.reactivityWatch.watch({
   collectionId: 'app/users',                      // exactly as blocks carry it
-  readTail: () => /* { tailId, revision } of the committed log, or undefined */,
+  readTail: (knownTailId) => /* { tailId, revision } of the committed log, or undefined */,
   onChange: () => { /* coarse: no payload */ },
 });
 await handle.close();
@@ -106,12 +106,13 @@ await handle.close();
 
 `watch` returns at once and never fails for network reasons; everything else runs in the background:
 
-- **One subscription per collection per node.** Every watch of a collection shares one `ReactivitySubscriptionManager`; the subscription closes with its last handle.
+- **Open the watch, then read.** A commit that the caller's read did not see wakes the watcher. The service cannot know what a caller has read, so the first committed tail it reads for a collection wakes that collection's watchers once, whether or not anything changed: a commit landing between the caller's read and that first tail read would otherwise be reported by nothing.
+- **One subscription per collection per node.** Every watch of a collection shares one subscription (one `ReactivitySubscriptionManager` per tail it has been attached under); the subscription closes with its last handle.
 - **Attach.** The service reads the tail, registers the manager's handler in the node's `ReactivitySubscriberRegistry` for that tail's topic, then registers with the cohort. A registration under a topic nobody has registered under before is normally deferred by the cohort (its members have not yet exchanged the willingness that admits one), and the retry is the next tick, so a first attach measured about 30 s on a three-node Core mesh. The watcher is still woken in the meantime, by the tick below.
 - **The tick.** At the renewal cadence (TTL / 3: 30 s Core, 20 s Edge) the service renews the registration, reads the tail again, wakes the watchers if the revision is above the last one they were woken for, and moves the subscription if the tail block is a different one. This is what bounds every failure the push path cannot rule out — a lost notification, a failed registration, a tail rotation nobody announced, a commit that was never announced at all — to one tick of delay. It costs one tail read per watched collection per tick.
 - **Recovery.** A gap is backfilled over the recover RPC. When the cohort cannot serve the gap, the watchers are woken anyway and the next tail read moves the manager's contiguity head to the revision it read, so one unservable gap does not turn every later notification into another backfill request.
 
-`Collection.readCommittedTail` in `packages/db-core/src/collection/collection.ts` is the `readTail` a host needs: it reads the header and tail block without opening a collection handle.
+`Collection.readCommittedTail` in `packages/db-core/src/collection/collection.ts` is the `readTail` a host needs: it reads the header and tail block without opening a collection handle. The service hands `readTail` the tail block id its previous read found; passed on as `readCommittedTail`'s third argument, it makes the read one request instead of two while the log stays on that block.
 
 **Collection ids on the wire.** A collection id is a path such as `app/users`, which is not base64url, so a notification names its collection by the base64url of the id's UTF-8 bytes (`reactivityCollectionIdBytes` in `packages/db-p2p/src/reactivity/topic-bytes.ts`). Origination (`liveOriginationContext` in `packages/db-p2p/src/reactivity/origination-manager.ts`) and the watch service call that one function; the `topic-bytes-encoding` spec pins that they agree and that the result passes `validateNotificationV1`.
 
