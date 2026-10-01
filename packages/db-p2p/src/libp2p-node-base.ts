@@ -47,7 +47,7 @@ import type { RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
-import { resolveLinkDeadlines, withinRequestBudget, type LinkDeadlines } from './rpc-deadline.js';
+import { resolveLinkDeadlines, withinRequestBudget, type LinkDeadlines, type RpcDeadlineDefaults } from './rpc-deadline.js';
 import type { ClusterLatestCallback } from './repo/coordinator-repo.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
 import { RingSelector } from './storage/ring-selector.js';
@@ -261,8 +261,9 @@ export type NodeOptions = ClusterPolicyOptions & {
 	/**
 	 * Churn-resilient spread protocol tuning. Absent -> enabled with defaults
 	 * (see SpreadOnChurnConfig). Set { enabled: false } to disable spread on this node.
-	 * `pushDialTimeoutMs` and `pushResponseTimeoutMs` default to the RPC deadlines derived from
-	 * {@link NodeOptions.linkRoundTripMs}; a value set here wins.
+	 * `pushDialTimeoutMs` and `pushResponseTimeoutMs` default to the node's RPC deadlines
+	 * ({@link NodeOptions.rpcDeadlines}, else derived from {@link NodeOptions.linkRoundTripMs}); a value
+	 * set here wins.
 	 */
 	spreadOnChurn?: Partial<SpreadOnChurnConfig>;
 
@@ -288,9 +289,9 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * runs whether or not arachnode/FRET rebalancing is enabled. Absent -> enabled with defaults (see
 	 * `UnderReplicationDrainConfig`). Set { enabled: false } to leave the ledger unsent on this node.
 	 * The push deadlines are separate because they bound the wire, not the pass: `pushDialTimeoutMs`
-	 * and `pushResponseTimeoutMs`, which default to the RPC deadlines derived from
-	 * {@link NodeOptions.linkRoundTripMs} (3000 and 10000 when that is undeclared) — the same
-	 * defaults spread-on-churn uses. A value set here wins.
+	 * and `pushResponseTimeoutMs`, which default to the node's RPC deadlines
+	 * ({@link NodeOptions.rpcDeadlines}, else derived from {@link NodeOptions.linkRoundTripMs}; 3000 and
+	 * 10000 when neither is declared) — the same defaults spread-on-churn uses. A value set here wins.
 	 */
 	underReplicationDrain?: Partial<UnderReplicationDrainConfig> & { enabled?: boolean; pushDialTimeoutMs?: number; pushResponseTimeoutMs?: number };
 
@@ -501,9 +502,38 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 *
 	 * NOTE: `dialTimeout` governs only dials that carry no signal. This package's own RPC clients dial
 	 * under their own deadlines, which the same declaration derives (`resolveLinkDeadlines` in
-	 * `rpc-deadline.ts`) and this option does not change.
+	 * `rpc-deadline.ts`) and this option does not change; {@link NodeOptions.rpcDeadlines} sets those.
 	 */
 	connectionManager?: Libp2pConnectionTimeouts;
+
+	/**
+	 * Explicit deadlines for this package's own RPCs, used exactly as given in place of the values
+	 * derived from {@link NodeOptions.linkRoundTripMs} — with no floor, so a value below the derived
+	 * one is honoured too. They reach every RPC client the node builds (cluster consensus, sync,
+	 * dispute, block pushes) and, through `node.linkDeadlines`, a host's `RepoClient` and
+	 * `NetworkTransactor`.
+	 *
+	 * - `dialTimeoutMs` — how long a request may take to connect and negotiate its stream. The rebalance
+	 *   transfer deadline (`transferTimeoutMs`, at least 30 s) and the transaction budget
+	 *   (`transactionTimeoutMs`, at least 30 s and four dials) are derived from it, so they follow an
+	 *   explicit value.
+	 * - `responseTimeoutMs` — how long a request waits for the reply once its stream is open.
+	 *
+	 * A caller's own per-request value wins over these, and so do the `push*` fields of
+	 * {@link NodeOptions.spreadOnChurn} and {@link NodeOptions.underReplicationDrain}; these win over
+	 * the values derived from `linkRoundTripMs`. Time an application adds to every connection — its own
+	 * admission checks at a relay or a target — belongs here and in
+	 * {@link NodeOptions.connectionManager}, on top of what the round trip derives.
+	 *
+	 * Keep `dialTimeoutMs` no longer than `connectionManager.addressDialTimeout`: libp2p applies that
+	 * limit to each address inside every dial, the RPC clients' included, so a longer RPC dial is cut
+	 * off at it. Nothing enforces the relationship.
+	 *
+	 * A field that is not a finite number above zero throws at node construction, as does a
+	 * `dialTimeoutMs` above `MAX_RPC_DIAL_TIMEOUT_MS` (the transaction budget, four dials, has to fit a
+	 * 32-bit timer) or a `responseTimeoutMs` above 2^31 − 1.
+	 */
+	rpcDeadlines?: Partial<RpcDeadlineDefaults>;
 
 	/**
 	 * The slowest round trip, in milliseconds, between any two nodes that will talk to each other,
@@ -520,8 +550,9 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 *
 	 * Declare it on every node, with the same value: each node dials some and is dialed by others.
 	 * An explicit per-deadline setting still wins over the derived value — {@link NodeOptions.connectionManager},
-	 * the `push*` fields of {@link NodeOptions.spreadOnChurn} and {@link NodeOptions.underReplicationDrain},
-	 * `clusterPolicy.cohortQueryTimeoutMs`, and a caller's own `dialTimeoutMs`.
+	 * {@link NodeOptions.rpcDeadlines}, the `push*` fields of {@link NodeOptions.spreadOnChurn} and
+	 * {@link NodeOptions.underReplicationDrain}, `clusterPolicy.cohortQueryTimeoutMs`, and a caller's own
+	 * `dialTimeoutMs`.
 	 *
 	 * A value that is not a finite number above zero, or is above `MAX_LINK_ROUND_TRIP_MS`, throws at
 	 * node construction: falling back to the LAN deadlines would silently keep them on the one
@@ -629,9 +660,9 @@ export async function createLibp2pNodeBase(
 		transports: Libp2pTransports;
 	}
 ): Promise<OptimysticNode> {
-	// First, before anything is acquired: a declared round trip that is not usable throws, and there is
-	// nothing yet to release. Every network deadline below is read off this one result.
-	const linkDeadlines = resolveLinkDeadlines(options.linkRoundTripMs);
+	// First, before anything is acquired: a declared round trip or RPC deadline that is not usable
+	// throws, and there is nothing yet to release. Every network deadline below is read off this one result.
+	const linkDeadlines = resolveLinkDeadlines(options.linkRoundTripMs, options.rpcDeadlines);
 	const { storage: rawStorage, lease } = resolveStorage(options.storage, options.networkName);
 	const kvStore = resolveKvStore(options.kvStore);
 	const underReplicationLedger = new KvUnderReplicationLedger(kvStore);

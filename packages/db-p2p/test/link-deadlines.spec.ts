@@ -8,7 +8,7 @@
  */
 
 import { expect } from 'chai';
-import { MAX_LINK_ROUND_TRIP_MS, resolveLinkDeadlines, type LinkDeadlines } from '../src/rpc-deadline.js';
+import { MAX_LINK_ROUND_TRIP_MS, MAX_RPC_DIAL_TIMEOUT_MS, resolveLinkDeadlines, type LinkDeadlines } from '../src/rpc-deadline.js';
 
 const UNDECLARED: LinkDeadlines = {
 	dialTimeoutMs: 3000,
@@ -72,5 +72,46 @@ describe('resolveLinkDeadlines', () => {
 			5 * deadlines.cohortQueryTimeoutMs
 		);
 		expect(largest).to.be.at.most(2 ** 31 - 1);
+	});
+});
+
+describe('resolveLinkDeadlines with explicit rpcDeadlines', () => {
+	it('an explicit dial deadline replaces the derived one exactly, even below its floor', () => {
+		expect(resolveLinkDeadlines(3000, { dialTimeoutMs: 1000 }).dialTimeoutMs).to.equal(1000);
+	});
+
+	it('the transfer and transaction budgets follow an explicit dial, and nothing else moves', () => {
+		expect(resolveLinkDeadlines(3000, { dialTimeoutMs: 40_000 })).to.deep.equal({
+			...resolveLinkDeadlines(3000),
+			dialTimeoutMs: 40_000,
+			transferTimeoutMs: 40_000,
+			transactionTimeoutMs: 160_000,
+		});
+	});
+
+	it('an explicit response deadline replaces the derived one exactly, and nothing else moves', () => {
+		expect(resolveLinkDeadlines(3000, { responseTimeoutMs: 2500 })).to.deep.equal({
+			...resolveLinkDeadlines(3000),
+			responseTimeoutMs: 2500,
+		});
+	});
+
+	const fields = [
+		{ field: 'dialTimeoutMs', ceiling: MAX_RPC_DIAL_TIMEOUT_MS },
+		{ field: 'responseTimeoutMs', ceiling: 2 ** 31 - 1 },
+	] as const;
+	for (const { field, ceiling } of fields) {
+		for (const declared of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, ceiling + 1]) {
+			it(`throws on ${field} ${String(declared)}`, () => {
+				expect(() => resolveLinkDeadlines(undefined, { [field]: declared }))
+					.to.throw(new RegExp(`rpcDeadlines\\.${field} must be a finite number`));
+			});
+		}
+	}
+
+	it('accepts the dial ceiling itself, and a timer armed 5 s past the transaction budget there fits a 32-bit timer', () => {
+		const deadlines = resolveLinkDeadlines(undefined, { dialTimeoutMs: MAX_RPC_DIAL_TIMEOUT_MS });
+		expect(deadlines.dialTimeoutMs).to.equal(MAX_RPC_DIAL_TIMEOUT_MS);
+		expect(deadlines.transactionTimeoutMs + 5000).to.be.at.most(2 ** 31 - 1);
 	});
 });

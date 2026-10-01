@@ -78,7 +78,8 @@ export const UNDECLARED_RPC_DEADLINES: RpcDeadlineDefaults = Object.freeze({
 
 /**
  * Every network deadline a node derives from its declared link round trip
- * (`NodeOptions.linkRoundTripMs`). All in milliseconds.
+ * (`NodeOptions.linkRoundTripMs`), with the RPC dial and response deadlines replaced by
+ * `NodeOptions.rpcDeadlines` where that sets them. All in milliseconds.
  */
 export type LinkDeadlines = RpcDeadlineDefaults & {
 	/**
@@ -164,23 +165,49 @@ const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 export const MAX_LINK_ROUND_TRIP_MS = Math.floor(MAX_TIMER_DELAY_MS / (TRANSACTION_DIALS * DIAL_ROUND_TRIPS + 1));
 
 /**
+ * The largest explicit `rpcDeadlines.dialTimeoutMs` a node accepts, in milliseconds (about 5 days).
+ * The transaction budget is {@link TRANSACTION_DIALS} dials, and it reaches timers the same way it
+ * does under {@link MAX_LINK_ROUND_TRIP_MS}: a `RepoClient` arms one for what is left of the
+ * expiration the budget stamps, and a cluster member arms one 5 s past that expiration. So the
+ * ceiling is the 32-bit delay `setTimeout` accepts divided by those dials plus one of headroom: for
+ * any dial of at least 5000 ms, `4 × dial + 5000` is at most `5 × dial`, and below 5000 the sum is
+ * far under the limit.
+ */
+export const MAX_RPC_DIAL_TIMEOUT_MS = Math.floor(MAX_TIMER_DELAY_MS / (TRANSACTION_DIALS + 1));
+
+/**
  * Derive every network deadline from the slowest round trip, in milliseconds, between any two
  * nodes that will talk to each other, relayed hops included. Undeclared (`undefined`) yields
  * exactly the undeclared constants, because every derived value floors at the constant it replaces:
  * a node that declares nothing, or declares a round trip fast enough that no multiple exceeds its
  * floor, behaves as it did before the declaration existed.
  *
- * NOTE: a declared value that is not a finite number above zero, or is above
- * {@link MAX_LINK_ROUND_TRIP_MS}, THROWS rather than falling back to the undeclared deadlines, for
- * the reason `resolveCohortQueryTimeoutMs` gives: the one deployment that declared this field did so
- * to escape the LAN deadlines, and a silent fallback would keep them. A fractional value is accepted.
+ * `rpcDeadlines` sets the RPC dial and response deadlines exactly, in place of the derived ones and
+ * with no floor (`NodeOptions.rpcDeadlines`). It is applied before the transfer and transaction
+ * budgets are derived, so both follow an explicit dial; each keeps its own floor.
+ *
+ * NOTE: a declared value that is not a finite number above zero, or is above its ceiling
+ * ({@link MAX_LINK_ROUND_TRIP_MS} for the round trip, {@link MAX_RPC_DIAL_TIMEOUT_MS} for the dial,
+ * the 32-bit timer limit for the response), THROWS rather than falling back to the undeclared
+ * deadlines, for the reason `resolveCohortQueryTimeoutMs` gives: the one deployment that declared
+ * this field did so to escape the LAN deadlines, and a silent fallback would keep them. A fractional
+ * value is accepted. An RPC deadline of `0`, which {@link withRpcDeadlineDefaults} reads as "no
+ * cap" on a single request, is refused here: no cap is not a policy for a whole node.
  */
-export function resolveLinkDeadlines(linkRoundTripMs?: number): LinkDeadlines {
-	const roundTripMs = linkRoundTripMs === undefined ? 0 : validLinkRoundTripMs(linkRoundTripMs);
-	const dialTimeoutMs = Math.max(DEFAULT_DIAL_TIMEOUT_MS, DIAL_ROUND_TRIPS * roundTripMs);
+export function resolveLinkDeadlines(linkRoundTripMs?: number, rpcDeadlines?: Partial<RpcDeadlineDefaults>): LinkDeadlines {
+	const roundTripMs = linkRoundTripMs === undefined
+		? 0
+		: validDeclaredMs('linkRoundTripMs', linkRoundTripMs, MAX_LINK_ROUND_TRIP_MS);
+	const dialTimeoutMs = rpcDeadlines?.dialTimeoutMs === undefined
+		? Math.max(DEFAULT_DIAL_TIMEOUT_MS, DIAL_ROUND_TRIPS * roundTripMs)
+		: validDeclaredMs('rpcDeadlines.dialTimeoutMs', rpcDeadlines.dialTimeoutMs, MAX_RPC_DIAL_TIMEOUT_MS);
+	const responseTimeoutMs = rpcDeadlines?.responseTimeoutMs === undefined
+		? Math.max(DEFAULT_RESPONSE_TIMEOUT_MS, RESPONSE_ROUND_TRIPS * roundTripMs)
+		// Nothing is derived from it; it reaches one `setTimeout` directly (`ProtocolClient.processMessage`).
+		: validDeclaredMs('rpcDeadlines.responseTimeoutMs', rpcDeadlines.responseTimeoutMs, MAX_TIMER_DELAY_MS);
 	return {
 		dialTimeoutMs,
-		responseTimeoutMs: Math.max(DEFAULT_RESPONSE_TIMEOUT_MS, RESPONSE_ROUND_TRIPS * roundTripMs),
+		responseTimeoutMs,
 		libp2pDialTimeoutMs: Math.max(DEFAULT_LIBP2P_DIAL_TIMEOUT_MS, CONNECTION_ROUND_TRIPS * roundTripMs),
 		inboundUpgradeTimeoutMs: Math.max(DEFAULT_INBOUND_UPGRADE_TIMEOUT_MS, INBOUND_UPGRADE_ROUND_TRIPS * roundTripMs),
 		addressDialTimeoutMs: Math.max(DEFAULT_ADDRESS_DIAL_TIMEOUT_MS, CONNECTION_ROUND_TRIPS * roundTripMs),
@@ -191,10 +218,10 @@ export function resolveLinkDeadlines(linkRoundTripMs?: number): LinkDeadlines {
 	};
 }
 
-function validLinkRoundTripMs(declared: number): number {
-	if (!Number.isFinite(declared) || declared <= 0 || declared > MAX_LINK_ROUND_TRIP_MS) {
+function validDeclaredMs(field: string, declared: number, ceiling: number): number {
+	if (!Number.isFinite(declared) || declared <= 0 || declared > ceiling) {
 		throw new Error(
-			`linkRoundTripMs must be a finite number of milliseconds above 0 and no greater than ${MAX_LINK_ROUND_TRIP_MS}; got ${String(declared)}`
+			`${field} must be a finite number of milliseconds above 0 and no greater than ${ceiling}; got ${String(declared)}`
 		);
 	}
 	return declared;

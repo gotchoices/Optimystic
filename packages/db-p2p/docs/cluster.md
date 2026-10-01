@@ -1151,8 +1151,8 @@ block push — has to (the `NOTE:` at the consult's `withinRequestBudget` call i
 member, the coordinator and `reconcilePassTimeoutMs` all read one number, and a declared
 `cohortQueryTimeoutMs` still wins. The cluster client the coordinator dials each cohort member with —
 and the one a member re-sends an expired transaction's reject with — carries the derived dial and reply
-deadlines, so a consensus round on a 3 s link is no longer failed at the 3 s dial before the peer can
-answer.
+deadlines (or `NodeOptions.rpcDeadlines`, when set), so a consensus round on a 3 s link is no longer
+failed at the 3 s dial before the peer can answer.
 
 **Changing a size after the node is running.** Both yardsticks are resolved **once**, by
 `resolveClusterPolicy` at node construction, and every consumer — the cluster member, the coordinator,
