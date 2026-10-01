@@ -91,21 +91,22 @@ configuration `npm publish` used, until all of them are served.
 the file `npm install` downloads, at the `dist.tarball` URL npm gives — must answer a request with
 200. The registry makes the tarball available separately from the version listing, and later: for
 sereus 1.8.0 every version was listed while three tarballs still answered 404 several minutes
-afterwards, so an install run on the listing alone would have failed. Its last line is the one to
-wait for:
+afterwards, so an install run on the listing alone would have failed.
+
+The script's last line is the one to wait for:
 
 ```
 all 9 packages published and visible on npm at 1.3.0
 ```
 
 **Upgrade downstream repositories only after that line.** Before it, an upgrade can resolve a mix of
-versions.
+versions, or fail to download one.
 
 If ten minutes pass first, it lists each package still missing, with the reason — not listed yet,
 listed but its tarball not downloadable yet, or the error npm or the tarball request reported — and
-exits non-zero: the release is not finished. `OPTIMYSTIC_PUBLISH_WAIT_SECONDS` changes the deadline. The script can
-be run on its own at any time — after an interrupted `yarn release`, or after publishing a package
-that failed — and reports on the versions currently in the manifests.
+exits non-zero: the release is not finished. `OPTIMYSTIC_PUBLISH_WAIT_SECONDS` changes the deadline.
+The script can be run on its own at any time — after an interrupted `yarn release`, or after
+publishing a package that failed — and reports on the versions currently in the manifests.
 
 ## Step by Step
 

@@ -171,6 +171,7 @@ function readListing(answer, spec, text) {
 	return { listed: true, tarball };
 }
 
+/** Only http(s) reaches the registry: `fetch` answers a `data:` URL with 200 without asking anyone. */
 function isHttpUrl(value) {
 	return typeof value === 'string' && URL.canParse(value) && ['http:', 'https:'].includes(new URL(value).protocol);
 }
