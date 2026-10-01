@@ -27,14 +27,17 @@ import { fileURLToPath } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 
 import { originalPositionFor, TraceMap } from '@jridgewell/trace-mapping';
-import { loadConfig, mergeConfig, runBuild } from 'metro';
 
 import { buildFreshnessProblems, SKIP_ENV } from '../../../test-harness/build-freshness.mjs';
 
-const require = createRequire(import.meta.url);
-
-const WORKSPACE_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const REPO_ROOT = realpathSync(resolve(WORKSPACE_DIR, '..', '..'));
+/** Spelled as the operating system spells it, as metro.config.cjs explains: Metro's file map is drive-letter-case-sensitive. */
+const WORKSPACE_DIR = realpathSync.native(resolve(dirname(fileURLToPath(import.meta.url)), '..'));
+const require = createRequire(join(WORKSPACE_DIR, 'package.json'));
+// Required from the canonical directory rather than imported: an import resolves Metro under whatever
+// spelling loaded this module, and Metro's defaults hold paths it resolves from its own location (its
+// module-system polyfill among them), which a lowercase drive would set apart from the project root.
+const { loadConfig, mergeConfig, runBuild } = require('metro');
+const REPO_ROOT = realpathSync.native(resolve(WORKSPACE_DIR, '..', '..'));
 const CONFIG_PATH = join(WORKSPACE_DIR, 'metro.config.cjs');
 const ENTRY_PATH = join(WORKSPACE_DIR, 'entry.js');
 /** Parent of every run's private output directory. Under `node_modules`, so git never sees it. */
@@ -81,7 +84,8 @@ export class HermesCompileError extends Error {
  *
  * `onResolve(specifier, filePath, importer)`, when given, sees every module resolution Metro performs.
  * Rejects with Metro's own error, extended with a remedy when the cause is one this repository has met
- * before.
+ * before. `entry` is canonicalized like the config's own paths, so a caller's drive-letter spelling
+ * cannot split Metro's file map.
  */
 export async function bundle({ entry, outDir, onResolve }) {
 	const bundlePath = join(outDir, 'bundle.js');
@@ -89,7 +93,7 @@ export async function bundle({ entry, outDir, onResolve }) {
 	const config = await loadMetroConfig(onResolve);
 	try {
 		await runBuild(config, {
-			entry,
+			entry: realpathSync.native(entry),
 			bundleOut: bundlePath,
 			sourceMap: true,
 			sourceMapOut: sourceMapPath,

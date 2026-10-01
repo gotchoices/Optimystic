@@ -20,8 +20,13 @@ const path = require('node:path');
 const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
 const { FileStore } = require('metro-cache');
 
-const workspaceDir = __dirname;
-const repoRoot = fs.realpathSync(path.resolve(workspaceDir, '..', '..'));
+// Every path handed to Metro goes through `realpathSync.native`, which spells it the way the operating
+// system does (an uppercase drive letter on Windows) whatever spelling this module was loaded under.
+// metro-file-map stores each file relative to the project root by a case-sensitive prefix comparison,
+// so a `c:` project root beside a `C:` watch folder files the sibling repositories under garbage keys,
+// and "Unable to resolve module p2p-fret" follows when the shell's cwd has a lowercase drive.
+const workspaceDir = fs.realpathSync.native(__dirname);
+const repoRoot = fs.realpathSync.native(path.resolve(workspaceDir, '..', '..'));
 /** Under `node_modules`, so it is gitignored, and private to this workspace rather than the machine-wide `%TEMP%/metro-cache`. */
 const cacheDir = path.join(workspaceDir, 'node_modules', '.cache', 'rn-bundle-check');
 
@@ -118,7 +123,7 @@ function directoryPattern(dir) {
  * answers with Node's built-in `buffer`, not the npm package the readme names.
  */
 function packageDir(name) {
-	return path.dirname(require.resolve(`${name}/package.json`));
+	return fs.realpathSync.native(path.dirname(require.resolve(`${name}/package.json`)));
 }
 
 /**
@@ -207,7 +212,7 @@ function packageEntries(nodeModules) {
 function linkTarget(entry) {
 	if (!fs.lstatSync(entry).isSymbolicLink()) return undefined;
 	try {
-		return fs.realpathSync(entry);
+		return fs.realpathSync.native(entry);
 	} catch (error) {
 		throw new Error(`${entry} links to a path that no longer exists; run yarn install`, { cause: error });
 	}
