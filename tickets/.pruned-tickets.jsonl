@@ -118,3 +118,4 @@
 {"slug":"bug-gossipsub-pubsub-service-cannot-work-on-libp2p-3","file":"3-bug-gossipsub-pubsub-service-cannot-work-on-libp2p-3.md","completedAt":"2026-09-01","commit":"bf050ab6eb10a7c11daa386754632a49c8defb23","prunedAt":"2026-10-01T04:22:06.891Z"}
 {"slug":"debt-pend-validation-fail-closed-tests-and-validation","file":"4-debt-pend-validation-fail-closed-tests-and-validation.md","completedAt":"2026-09-01","commit":"058ceb7cc35d2fa10db35e5aec87ad341324b5d3","prunedAt":"2026-10-01T04:22:06.891Z"}
 {"slug":"fret-inbound-rpc-refused-on-relay-connections","file":"fret-inbound-rpc-refused-on-relay-connections.md","completedAt":"2026-09-01","commit":"d03bb878eb35bdc285f49fb322d6abf179914e85","prunedAt":"2026-10-01T04:22:06.891Z"}
+{"slug":"bug-driver-level-cache-invisible-to-read-cache-seam","file":"bug-driver-level-cache-invisible-to-read-cache-seam.md","completedAt":"2026-09-01","commit":"b7bf494ad0d23e75798670d346eb1227a5ebe2b0","prunedAt":"2026-10-01T06:38:41.889Z"}
