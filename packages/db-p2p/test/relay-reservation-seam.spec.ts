@@ -1,7 +1,7 @@
 /**
  * Pins the ONE place `@optimystic/db-p2p` reaches libp2p internals for relay reservations —
  * `findCircuitRelayTransport` in `src/network/relay-reservation.ts` — against the installed
- * `libp2p` 3.1.3 and `@libp2p/circuit-relay-v2` 4.1.3, on real started nodes over loopback.
+ * `libp2p` 3.3.11 and `@libp2p/circuit-relay-v2` 4.2.13, on real started nodes over loopback.
  *
  * TRIPWIRE for a libp2p upgrade. The supervisor reaches through `node.components.transportManager`
  * to the circuit-relay transport's `reservationStore` because libp2p exposes no public "reserve on
@@ -74,7 +74,7 @@ describe('findCircuitRelayTransport (the libp2p internals seam)', function () {
 		expect(transport, 'libp2p internals moved: no transport with a reservationStore on node.components.transportManager').to.not.equal(null);
 		expect(typeof transport!.reservationStore.addRelay).to.equal('function');
 		expect(typeof transport!.reservationStore.hasReservation).to.equal('function');
-		// `relayFilter` is a private field on the 4.1.3 store; `clearRelayFilterEntry` degrades without it,
+		// `relayFilter` is a private field on the 4.2.13 store; `clearRelayFilterEntry` degrades without it,
 		// so this pins that the un-poisoning step is still live rather than silently a no-op.
 		expect(typeof transport!.reservationStore.relayFilter?.remove, 'reservationStore.relayFilter.remove').to.equal('function');
 	});
@@ -106,8 +106,9 @@ describe('findCircuitRelayTransport (the libp2p internals seam)', function () {
 		const store = findCircuitRelayTransport(client)!.reservationStore;
 		await store.addRelay(relay.peerId, 'configured');
 		expect(store.hasReservation(relay.peerId), 'the relay granted the slot').to.equal(true);
-		// Bounded negative: on 4.1.3 the listener returns early for `configured`, so it stays absent. If a
-		// libp2p upgrade makes this pass, the rewrite may no longer be needed — see the NOTE in
+		// Bounded negative: on 4.2.13 a listener applies a `configured` reservation only for the relay it
+		// already published, and this bare one has published nothing, so it stays absent. If a libp2p
+		// upgrade makes this pass, the rewrite may no longer be needed — see the NOTE in
 		// `libp2p-node-base.ts` at `planRelayListenAddrs`.
 		await new Promise(resolve => setTimeout(resolve, 1_000));
 		expect(holdsCircuitVia(client, relay), `a configured reservation was published by a bare listener: ${client.getMultiaddrs().join(', ')}`).to.equal(false);

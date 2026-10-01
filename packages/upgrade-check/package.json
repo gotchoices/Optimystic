@@ -12,8 +12,8 @@
 		"write-fixture": "node scripts/write-fixture.mjs"
 	},
 	"dependencies": {
-		"@libp2p/crypto": "^5.1.19",
-		"@libp2p/interface": "^3.1.0",
+		"@libp2p/crypto": "^5.1.23",
+		"@libp2p/interface": "^3.3.0",
 		"@optimystic/db-core": "workspace:^",
 		"@optimystic/db-p2p": "workspace:^",
 		"@optimystic/db-p2p-storage-fs": "workspace:^",

@@ -57,8 +57,8 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@libp2p/interface": "^3.2.4",
-    "@libp2p/peer-id": "^6.0.4",
+    "@libp2p/interface": "^3.3.0",
+    "@libp2p/peer-id": "^6.0.15",
     "@multiformats/multiaddr": "^13.0.1",
     "@optimystic/db-core": "workspace:^",
     "@optimystic/db-p2p": "workspace:^",

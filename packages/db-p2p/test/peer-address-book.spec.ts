@@ -77,7 +77,7 @@ describe('peer-address-book', () => {
 			{ what: 'a circuit address we dialed through a relay', direction: 'outbound', addr: '/ip4/10.0.0.9/tcp/4001/p2p/{RELAY}/p2p-circuit', publishable: true },
 			{ what: 'the source socket of a direct connection they dialed', direction: 'inbound', addr: '/ip4/127.0.0.1/tcp/58247/ws', publishable: false },
 			// Composed by @libp2p/circuit-relay-v2 as <our own hop to the relay> + /p2p-circuit/p2p/<dialer>
-			// (v4.1.3, dist/src/transport/index.js:272), so it is only dialable if OUR hop was outbound.
+			// (v4.2.13, dist/src/transport/index.js:272), so it is only dialable if OUR hop was outbound.
 			// The decisive reason, though, is the reservation asymmetry: a relay's handleConnect requires
 			// a reservation for the DESTINATION only (dist/src/server/index.js:219-222, status
 			// NO_RESERVATION) — a dialer needs none — so the relay this address names is the one WE hold a

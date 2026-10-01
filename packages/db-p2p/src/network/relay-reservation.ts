@@ -4,19 +4,22 @@
  * A phone or browser reaches its group only through a relay server: it listens on
  * `<relay address>/p2p/<relay id>/p2p-circuit`, holds a slot ("reservation") on that relay, and
  * advertises the circuit address other peers dial. libp2p asks the relay for that slot once, from
- * inside `start()`, and never again. The slot is lost, and the node stays unreachable until the
- * app restarts, whenever the relay restarts, the connection to it drops, or libp2p's own routine
- * renewal of the slot runs — all three verified against the installed `@libp2p/circuit-relay-v2`
- * 4.1.3 (see the `NOTE:` at {@link findCircuitRelayTransport} for the exact mechanics).
+ * inside `start()`, and after that only renews it while the connection to the relay stays up. The
+ * slot is lost, and the node stays unreachable until the app restarts, whenever the relay restarts
+ * or the connection to it drops — both read from the installed `@libp2p/circuit-relay-v2` 4.2.13
+ * (see the `NOTE:` at {@link findCircuitRelayTransport} for the exact mechanics). Through 4.1.3
+ * libp2p's own routine renewal lost the slot as well; 4.2 renews it in place.
  *
  * This module gives the node its own supervisor for every such relay, in two parts:
  *
  * 1. {@link planRelayListenAddrs} rewrites each relay-naming circuit listen address into a bare
  *    `/p2p-circuit` entry and records the relay it named. libp2p treats the bare shape as a
  *    "search" listener: it registers a pending slot and publishes any `discovered` reservation
- *    that fills it, including the re-created one after a renewal. A listener on the relay-naming
- *    ("configured") shape publishes only from inside its own `listen()`, so nothing done after
- *    start can ever bring its address back — which is why the rewrite is not optional.
+ *    that fills it, including the one requested again after the slot was lost. A listener on the
+ *    relay-naming ("configured") shape publishes from inside its own `listen()` and, from 4.2, on
+ *    a later `configured` reservation for the relay it already listened through; it publishes no
+ *    `discovered` one, which is the kind the supervisor asks for, so the rewrite is what lets the
+ *    supervisor bring the address back.
  * 2. {@link superviseRelayReservation} runs one supervisor per recorded relay. It dials the relay,
  *    asks the circuit-relay transport's reservation store for a `discovered` slot on it, waits
  *    until the node advertises a circuit address through it, and repeats that whenever the address
@@ -144,19 +147,21 @@ export interface CircuitRelayTransportLike {
  * The running node's circuit-relay transport, or `null` when it has none.
  *
  * NOTE: the ONE place this package reaches libp2p internals for relay reservations, pinned against
- * `libp2p` 3.1.3 and `@libp2p/circuit-relay-v2` 4.1.3 by `test/relay-reservation-seam.spec.ts`,
+ * `libp2p` 3.3.11 and `@libp2p/circuit-relay-v2` 4.2.13 by `test/relay-reservation-seam.spec.ts`,
  * which must fail loudly if an upgrade moves any of it. There is no public route: the `Libp2p`
  * interface has no `listen`, and nothing public exposes the reservation store. `node.components`
  * is a real public field on libp2p's node class, just not on the interface; `transportManager`
  * is a component; the circuit-relay transport is the one whose `reservationStore` has `addRelay`
- * and `hasReservation`. What the store does on 4.1.3, read from
+ * and `hasReservation`. What the store does on 4.2.13, read from
  * `node_modules/@libp2p/circuit-relay-v2/src/transport/`: `listener.ts` publishes a `configured`
- * reservation only from inside `listen()` and ignores it on `relay:created-reservation`, while a
- * bare listener publishes any `discovered` reservation carrying its pending id; and
+ * reservation from inside `listen()`, and on `relay:created-reservation` only when it is for the
+ * relay that listener already published (a bare listener that has published nothing ignores it),
+ * while a bare listener publishes any `discovered` reservation carrying its pending id; and
  * `reservation-store.ts` drops a reservation on `connection:close`, re-queues the pending id only
- * for `discovered` ones, removes-then-recreates on refresh, and adds a relay whose request failed
- * with `DialError` or `UnsupportedProtocolError` to the private `relayFilter`, refusing it
- * afterwards with "The relay was previously invalid" until the filter is reset.
+ * for `discovered` ones, renews a reservation in place while its relay connection is still open
+ * (4.1.3 removed and re-created it), and adds a relay whose request failed with `DialError` or
+ * `UnsupportedProtocolError` to the private `relayFilter`, refusing it afterwards with "The relay
+ * was previously invalid" until the filter is reset.
  */
 export function findCircuitRelayTransport(node: Libp2p): CircuitRelayTransportLike | null {
 	for (const transport of nodeTransports(node)) {

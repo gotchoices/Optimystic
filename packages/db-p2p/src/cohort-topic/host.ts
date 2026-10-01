@@ -57,7 +57,7 @@
 import type { Libp2p } from "libp2p";
 import type { Connection, PeerId, PrivateKey, Stream } from "@libp2p/interface";
 import type { FretService } from "p2p-fret";
-import { hashPeerId, readFramed, sendFramed } from "p2p-fret";
+import { hashPeerId, sendFramed } from "p2p-fret";
 import {
 	RingHash,
 	createRegistrationStore,
@@ -167,7 +167,7 @@ import { createPoWVerifier, createReputationVerifier, type BootstrapReputationVi
 import { createParentReferenceVerifier, createDefaultParentTopicView, type BootstrapParentTopicView } from "./bootstrap-parent-reference.js";
 import { createBootstrapEvidenceBuilder } from "./bootstrap-evidence-builder.js";
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS, cohortTopicProtocolList, type CohortTopicProtocols } from "./protocols.js";
-import { requestResponse, requireReply, DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
+import { readFrame, requestResponse, requireReply, DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("cohort-topic");
@@ -3213,7 +3213,7 @@ function makeFrameHandler(
 	return (stream: Stream, connection: Connection): void => {
 		void (async (): Promise<void> => {
 			try {
-				const frame = await readFramed(stream, maxBytes);
+				const frame = await readFrame(stream, maxBytes);
 				const reply = await handle(frame, connection.remotePeer);
 				if (reply !== undefined) {
 					sendFramed(stream, reply);

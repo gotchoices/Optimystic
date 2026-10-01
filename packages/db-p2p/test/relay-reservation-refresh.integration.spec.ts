@@ -1,20 +1,22 @@
 /**
- * The third way a relay-only node used to lose its circuit address, and the one that needs no
- * network event at all: libp2p's own routine renewal of the reservation.
+ * The way a relay-only node used to lose its circuit address that needs no network event at all:
+ * libp2p's own routine renewal of the reservation.
  *
- * `@libp2p/circuit-relay-v2` 4.1.3 refreshes a reservation `max(lifetime − 5 min, 30 s)` after it
- * was made, by REMOVING it and re-creating it. A listener on the relay-naming (configured) address
- * withdraws its circuit address on the removal and never re-applies the re-created reservation, so
- * at the relay's default two-hour lifetime every phone went unreachable about 1 h 55 min after it
- * reserved. The bare `/p2p-circuit` listener `planRelayListenAddrs` substitutes re-queues its
- * pending slot on the removal and publishes the re-created reservation, so the address is back
- * within the reservation round trip.
+ * `@libp2p/circuit-relay-v2` refreshes a reservation `max(lifetime − 5 min, 30 s)` after it was
+ * made. Through 4.1.3 it did so by REMOVING the reservation and re-creating it, and a listener on
+ * the relay-naming (configured) address withdrew its circuit address on the removal and never
+ * re-applied the re-created reservation, so at the relay's default two-hour lifetime every phone
+ * went unreachable about 1 h 55 min after it reserved. The bare `/p2p-circuit` listener
+ * `planRelayListenAddrs` substitutes re-queued its pending slot on the removal and published the
+ * re-created reservation. The installed 4.2.13 renews in place while the relay connection is open,
+ * so the address is never withdrawn at all. Either way the claim pinned here is the same: the
+ * supervised shape holds its address through libp2p's renewal.
  *
  * The relay is given a 40 s lifetime so the refresh fires at its 30 s floor; the address is sampled
  * every 250 ms from the moment the node holds it until 38 s later. The round trip on loopback is a
  * few milliseconds, so the assertion is that the address is never absent at two consecutive samples
- * (with the old shape it is absent from 30 s on) — plus that the reservation was in fact renewed,
- * so the run cannot pass by the refresh never happening.
+ * (the configured shape on 4.1.3 was absent from 30 s on) — plus that the reservation was in fact
+ * renewed, so the run cannot pass by the refresh never happening.
  *
  * ~40 s, so gated with the other real-socket specs:
  *   yarn workspace @optimystic/db-p2p test:integration
@@ -92,7 +94,7 @@ describe("libp2p's own reservation refresh does not lose the circuit address", f
 
 		const absent = samples.filter(held => !held).length;
 		console.log(`      ${samples.length} samples over ${WINDOW_MS / 1000} s; address absent at ${absent}; longest absence ${longestAbsence(samples)} sample(s)`);
-		expect(longestAbsence(samples), 'consecutive samples without the circuit address (the old shape loses it for good at 30 s)').to.be.lessThan(2);
+		expect(longestAbsence(samples), 'consecutive samples without the circuit address (the configured shape on 4.1.3 lost it for good at 30 s)').to.be.lessThan(2);
 		expect(samples[samples.length - 1], 'held at the end of the window').to.equal(true);
 		expect(store.hasReservation(relayPeerId), 'the store still holds the reservation').to.equal(true);
 		expect(Number(store.getReservation(relayPeerId)!.expire), 'the reservation was renewed: a later expiry than the one granted at start')

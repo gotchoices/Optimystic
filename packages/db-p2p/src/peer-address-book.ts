@@ -97,7 +97,7 @@ export interface DirectionalConnection {
  *
  * NOTE: accepted tradeoff — making an INBOUND connection's `remoteAddr` publishable when it is a
  * circuit address was proposed (the "at least a relayed dialer has a real address" reading) and
- * declined. Read from `@libp2p/circuit-relay-v2@4.1.3` as vendored under
+ * declined. Read from `@libp2p/circuit-relay-v2@4.2.13` as vendored under
  * `packages/db-p2p/node_modules`: the destination side composes that address as
  * `ourConnectionToTheRelay.remoteAddr` encapsulated with `/p2p-circuit/p2p/<dialer>`
  * (`dist/src/transport/index.js:272`), so the relay it names is the one WE hold a reservation

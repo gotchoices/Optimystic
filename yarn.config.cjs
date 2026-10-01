@@ -21,7 +21,7 @@ const { SHARED_MAJOR } = require('./scripts/shared-majors.cjs')
  * `yarn lint:deps` runs both.
  */
 const SINGLE_RANGE = {
-	'@libp2p/peer-id': '^6.0.4',
+	'@libp2p/peer-id': '^6.0.15',
 	// Declared range must match the root `resolutions` override in package.json
 	// (which already forces every install to ^6.1.1). This only makes the
 	// declaration honest so the guard can pass.

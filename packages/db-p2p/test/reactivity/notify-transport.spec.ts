@@ -4,7 +4,6 @@ import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id';
 import type { PeerId } from '@libp2p/interface';
 import * as lp from 'it-length-prefixed';
 import type { Uint8ArrayList } from 'uint8arraylist';
-import { readFramed } from 'p2p-fret';
 import {
 	bytesToB64url,
 	encodeNotificationV1,
@@ -25,6 +24,7 @@ import {
 	reactivityProtocolList,
 } from '../../src/reactivity/protocols.js';
 import { makeCohortTopicProtocols } from '../../src/cohort-topic/protocols.js';
+import { readFrame } from '../../src/cohort-topic/stream-util.js';
 import { bytesToPeerIdString } from '../../src/cohort-topic/peer-codec.js';
 import { waitFor } from '@optimystic/db-core/test';
 
@@ -58,7 +58,7 @@ interface SentFrame {
 
 /** Unwrap one `sendFramed`-framed chunk back to its body, via FRET's own `readFramed`. */
 function unframe(framed: Uint8Array | Uint8ArrayList): Promise<Uint8Array> {
-	return readFramed((async function* (): AsyncGenerator<Uint8Array | Uint8ArrayList> { yield framed; })(), 1024 * 1024);
+	return readFrame((async function* (): AsyncGenerator<Uint8Array | Uint8ArrayList> { yield framed; })(), 1024 * 1024);
 }
 
 /**
@@ -229,7 +229,7 @@ describe('reactivity / notify transport', () => {
 		expect(body.length, 'the body is larger than the read ceiling').to.be.greaterThan(4);
 		// Pin the mechanism: a properly framed over-ceiling body rejects with the stable
 		// PayloadTooLargeError identity at the varint prefix, before any body byte is pulled.
-		const err = await readFramed(
+		const err = await readFrame(
 			(async function* (): AsyncGenerator<Uint8ArrayList> { yield lp.encode.single(body); })(),
 			4,
 		).then(() => undefined, (e: unknown) => e as Error);

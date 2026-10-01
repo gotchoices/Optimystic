@@ -39,9 +39,9 @@
     "test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec"
   },
   "devDependencies": {
-    "@libp2p/crypto": "^5.1.13",
-    "@libp2p/interface": "^3.1.0",
-    "@libp2p/peer-id": "^6.0.4",
+    "@libp2p/crypto": "^5.1.23",
+    "@libp2p/interface": "^3.3.0",
+    "@libp2p/peer-id": "^6.0.15",
     "@types/chai": "^5.2.3",
     "@types/debug": "^4.1.12",
     "@types/mocha": "^10.0.10",
@@ -59,8 +59,8 @@
     "debug": "^4.4.3"
   },
   "peerDependencies": {
-    "@libp2p/crypto": "^5.1.13",
-    "@libp2p/interface": "^3.1.0",
+    "@libp2p/crypto": "^5.1.23",
+    "@libp2p/interface": "^3.3.0",
     "rn-leveldb": "^3.11.0"
   },
   "peerDependenciesMeta": {

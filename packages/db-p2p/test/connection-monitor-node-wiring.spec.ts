@@ -11,7 +11,7 @@
  * the connection, so the deadline a peer really gets is capped at `pingInterval`.
  *
  * NOTE: that reading rests on `ConnectionMonitor` being the only writer of `Connection.rtt` — true
- * of libp2p 3.1.x, where it is the sole assignment in the tree. If a later libp2p stamps rtt from
+ * of libp2p 3.3.11, where it is the sole assignment in the tree. If a later libp2p stamps rtt from
  * the transport or the upgrader as well, this spec starts passing for a reason that has nothing to
  * do with this option; switch the observation to a distinctive `protocolPrefix` (the monitor dials
  * `/<prefix>/ping/1.0.0`) and a handler counting it on the far side.

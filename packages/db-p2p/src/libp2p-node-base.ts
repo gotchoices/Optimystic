@@ -1,4 +1,4 @@
-import { createLibp2p, type ConnectionManagerInit, type ConnectionMonitorInit, type Libp2p } from 'libp2p';
+import { createLibp2p, type ConnectionMonitorInit, type Libp2p } from 'libp2p';
 import { noise, type ICryptoInterface } from '@chainsafe/libp2p-noise';
 import { yamux } from '@chainsafe/libp2p-yamux';
 import { identify, identifyPush } from '@libp2p/identify';
@@ -459,41 +459,34 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * above. A large `maxTimeout` is not a ten-minute grace period; see the next paragraph for what
 	 * it does.
 	 *
-	 * `pingTimeout` is an adaptive-timeout init, but on this libp2p line `minTimeout` is the only
-	 * field of it that changes the deadline: the monitor never reports a ping's duration back to the
-	 * timeout, so the timeout's moving average stays at zero and the deadline is always exactly
-	 * `minTimeout` — `maxTimeout` is never reached, and setting it alone changes nothing. Setting the
-	 * two equal, as above, is what keeps the deadline exactly `minTimeout` once the adaptation below
-	 * starts working.
+	 * `pingTimeout` is an adaptive-timeout init: the monitor reports each ping's duration back to it
+	 * (`AdaptiveTimeout.cleanUp`, called after every ping), and the next ping's deadline is 1.2 times
+	 * the moving average of those durations, held between `minTimeout` and `maxTimeout`. Setting the
+	 * two equal, as above, pins the deadline at exactly `minTimeout`, which is what the arithmetic in
+	 * the paragraphs above assumes.
 	 *
-	 * NOTE: "always exactly `minTimeout`" holds because `ConnectionMonitor` never calls
-	 * `AdaptiveTimeout.cleanUp` (libp2p 3.1.3 over `@libp2p/utils`), so nothing ever feeds the
-	 * moving average the deadline is computed from. libp2p 3.3 calls it after every ping, so on that
-	 * line a `maxTimeout` left ABOVE `minTimeout` lets the deadline adapt upward between the two —
-	 * but for ONE ping only, and the shape above sets them equal, which pins it at `minTimeout`
-	 * there as well. The average decays over `pingTimeout.interval` (5s by default), which is shorter than
-	 * any ping interval a patient deadline can use, so by the next ping the stalled sample has almost
-	 * fully decayed and one fast reply puts the deadline back at `minTimeout`. A peer that stalls
-	 * intermittently is still dropped (4 of 4, measured on libp2p 3.3.11). So 3.3 buys tolerance of a
-	 * single slow ping, not a deadline that grows toward `maxTimeout`; and since the monitor keeps one
-	 * `AdaptiveTimeout` for all of a node's connections, the one ping it does buy is bought for every
-	 * connection on the node, off whichever peer was slowest. Re-check this paragraph and the matching
-	 * one in the readme's React Native section on that move.
+	 * NOTE: a `maxTimeout` left ABOVE `minTimeout` lets the deadline adapt upward between the two, but
+	 * for ONE ping only. The average decays over `pingTimeout.interval` (5s by default), which is
+	 * shorter than any ping interval a patient deadline can use, so by the next ping the stalled
+	 * sample has almost fully decayed and one fast reply puts the deadline back at `minTimeout`. A
+	 * peer that stalls intermittently is still dropped (4 of 4, measured on libp2p 3.3.11). So the
+	 * adaptation buys tolerance of a single slow ping, not a deadline that grows toward `maxTimeout`;
+	 * and since the monitor keeps one `AdaptiveTimeout` for all of a node's connections, the one ping
+	 * it does buy is bought for every connection on the node, off whichever peer was slowest.
 	 */
 	connectionMonitor?: ConnectionMonitorInit;
 
 	/**
 	 * Explicit connection-manager deadlines, passed to libp2p unchanged. Each one set here overrides
 	 * the value derived from {@link NodeOptions.linkRoundTripMs}; a deployment that declares its link
-	 * round trip has no need to set either.
+	 * round trip has no need to set any of them.
 	 *
 	 * - `dialTimeout` — how long an outbound dial may take, socket through upgrade, when the caller
 	 *   passes no abort signal of its own.
 	 * - `inboundUpgradeTimeout` — how long an inbound connection may take to finish its upgrade
 	 *   (encryption + muxer) before this node discards it.
-	 *
 	 * - `addressDialTimeout` — how long one address of a peer may take to connect, inside any dial,
-	 *   including the RPC clients' own (libp2p 3.3.0 and later; 3.1.x ignores it).
+	 *   including the RPC clients' own.
 	 *
 	 * Unset, the first two are `LinkDeadlines.connectionTimeoutMs`: 10s (libp2p's own default) when no
 	 * round trip is declared, and five round trips when one is. `addressDialTimeout` is
@@ -698,11 +691,12 @@ export async function createLibp2pNodeBase(
 	// reservation drops; the supervisor reports it as `relay-reservation:slot-taken` and retries at its
 	// backoff cap. It happens only when a relay-only node is directly connected to a second relay server,
 	// and Sereus runs with the same behaviour. Revisit on a deployment that connects relay-only nodes to
-	// more than one relay server, or on the libp2p upgrade below.
-	// NOTE: circuit-relay-v2 >= 4.2 (needs @libp2p/interface ^3.3) refreshes reservations in place and
-	// re-applies a configured reservation for its own relay; when the libp2p line moves, revisit keeping
-	// the host's configured address and re-requesting with 'configured', which drops the rewrite and the
-	// discovery side effect.
+	// more than one relay server, or when the ticket below is taken.
+	// NOTE: the installed circuit-relay-v2 (4.2) renews a reservation in place and re-applies a
+	// `configured` reservation for the relay a listener already published. So the supervisor could keep
+	// the host's configured address and ask again with 'configured', which would drop the rewrite and
+	// the discovery side effect above. Not done: ticket
+	// `debt-relay-supervisor-can-keep-the-configured-listen-address`.
 	const relayPlan = planRelayListenAddrs(options.listenAddrs ?? defaults.listenAddrs);
 	assertRelayAddrsAdvertisable(relayPlan.supervisedRelays, options.announceAddrs);
 	const listenAddrs = relayPlan.listenAddrs;
@@ -755,23 +749,6 @@ export async function createLibp2pNodeBase(
 	let blockHoldersTarget: BlockHoldersSink | undefined;
 	const onBlockHolders: BlockHoldersSink = (holders) => blockHoldersTarget?.(holders);
 
-	// Built apart from `libp2pOptions` so the field libp2p 3.1.x's `ConnectionManagerInit` does not
-	// declare (`addressDialTimeout`, read from libp2p 3.3.0) type-checks without a cast.
-	const connectionManager: ConnectionManagerInit & Libp2pConnectionTimeouts = {
-		// `autoDial`, `minConnections`, and `dialQueue` were stale libp2p option keys silently
-		// ignored under the former `libp2pOptions as any` (removed with this change). This libp2p
-		// version has no such keys — auto-dial is now default connection-manager behavior with no
-		// direct replacement — so they are dropped rather than re-cast. See review handoff.
-		maxConnections: 16,
-		// Always explicit, so the undeclared fallback (10_000, libp2p's own default) does not move
-		// with libp2p. Both ends: every node is someone's listener.
-		inboundUpgradeTimeout: options.connectionManager?.inboundUpgradeTimeout ?? linkDeadlines.connectionTimeoutMs,
-		dialTimeout: options.connectionManager?.dialTimeout ?? linkDeadlines.connectionTimeoutMs,
-		// libp2p applies this inside every dial, signalled or not, so left at its 6 s default it cut off
-		// a relayed connection open on a slow link whatever the dial's own deadline said.
-		addressDialTimeout: options.connectionManager?.addressDialTimeout ?? linkDeadlines.addressDialTimeoutMs
-	};
-
 	const libp2pOptions: Libp2pInit = {
 		start: false,
 		privateKey: nodePrivateKey,
@@ -783,7 +760,20 @@ export async function createLibp2pNodeBase(
 			...(options.announceAddrs ? { announce: options.announceAddrs } : {}),
 			...(options.appendAnnounceAddrs ? { appendAnnounce: options.appendAnnounceAddrs } : {})
 		},
-		connectionManager,
+		connectionManager: {
+			// `autoDial`, `minConnections`, and `dialQueue` were stale libp2p option keys silently
+			// ignored under the former `libp2pOptions as any` (removed with this change). This libp2p
+			// version has no such keys — auto-dial is now default connection-manager behavior with no
+			// direct replacement — so they are dropped rather than re-cast. See review handoff.
+			maxConnections: 16,
+			// Always explicit, so the undeclared fallback (10_000, libp2p's own default) does not move
+			// with libp2p. Both ends: every node is someone's listener.
+			inboundUpgradeTimeout: options.connectionManager?.inboundUpgradeTimeout ?? linkDeadlines.connectionTimeoutMs,
+			dialTimeout: options.connectionManager?.dialTimeout ?? linkDeadlines.connectionTimeoutMs,
+			// libp2p applies this inside every dial, signalled or not, so left at its 6 s default it cut off
+			// a relayed connection open on a slow link whatever the dial's own deadline said.
+			addressDialTimeout: options.connectionManager?.addressDialTimeout ?? linkDeadlines.addressDialTimeoutMs
+		},
 		...(options.connectionGater ? { connectionGater: options.connectionGater } : {}),
 		transports,
 		connectionEncrypters: [noise({ crypto: options.noiseCrypto })],
@@ -791,15 +781,7 @@ export async function createLibp2pNodeBase(
 		// "use my defaults", so a default of our own here would silently override them.
 		connectionMonitor: options.connectionMonitor,
 		streamMuxers: [yamux()],
-		// Narrow cast confined to the `services` field, so the rest of `libp2pOptions` stays typed as
-		// `Libp2pInit`: `@libp2p/dcutr` and `@libp2p/autonat` are typed against `@libp2p/interface` 3.2.x
-		// while `libp2p` resolves 3.1.x, and the two minors disagree on `Uint8Array<ArrayBuffer>` vs
-		// `<ArrayBufferLike>` — a type-level artifact of the minor split, not a runtime mismatch.
-		// NOTE: accepted tradeoff — raising this package's `@libp2p/interface` pin to ^3.2 to drop the cast
-		// was declined: the 3.1/3.2 split is deliberate (scripts/shared-majors.cjs), and `libp2p` and its
-		// core services resolve 3.1.0 regardless, so the cast would only move. Revisit when that libp2p
-		// release line itself declares `@libp2p/interface@^3.2` or later.
-		services: ({
+		services: {
 			// `@libp2p/identify` is the ONE service here whose protocol id it builds itself:
 			// `Identify`/`IdentifyPush` both emit `/${protocolPrefix}/id[/push]/1.0.0`, always
 			// prepending the leading slash (its own default is the BARE `'ipfs'`). So this
@@ -990,7 +972,7 @@ export async function createLibp2pNodeBase(
 			// minting throwaway keypairs can forge a synthetic super-majority and pass resolution.
 			// Gate: tickets/backlog/hardening/invalidation-live-wiring-requires-arbitrator-set-anchoring
 			// Wiring plan: tickets/backlog/feat-dispute-subsystem-live-activation
-		}) as unknown as NonNullable<Libp2pInit['services']>,
+		},
 		// Add bootstrap nodes as needed
 		peerDiscovery: [
 			...(options.bootstrapNodes?.length ? [bootstrap({ list: options.bootstrapNodes })] : [])

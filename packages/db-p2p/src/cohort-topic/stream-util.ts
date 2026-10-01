@@ -27,12 +27,31 @@
 
 import type { Libp2p } from "libp2p";
 import type { Connection, PeerId, Stream } from "@libp2p/interface";
+import type { Uint8ArrayList } from "uint8arraylist";
 import { readFramed, sendFramed } from "p2p-fret";
 import { openProtocolStream } from "../network/open-protocol-stream.js";
 import { registerProtocolHandler } from "../network/register-protocol-handler.js";
 
 /** Default per-frame ceiling — matches FRET's 512 KiB maybe-act bound. */
 export const DEFAULT_STREAM_MAX_BYTES = 512 * 1024;
+
+/** What one frame is read from: a libp2p stream, or any iterable of the chunks a stream yields. */
+export type FrameSource = AsyncIterable<Uint8Array | Uint8ArrayList>;
+
+/**
+ * Read one bounded frame through FRET's `readFramed` — every read in this package goes through
+ * here, so this is the only place a libp2p stream is handed to FRET's reader.
+ *
+ * NOTE: the assertion bridges a difference in declared types only. p2p-fret 1.0.0 declares its
+ * source over `uint8arraylist` 2 lists, while a libp2p 3.3 `Stream` (and this package) yields
+ * `uint8arraylist` 3 lists. The two majors mark a list with the same global symbol and read one
+ * another's lists, and FRET reads a real stream through `@libp2p/utils`' `byteStream` without
+ * touching its own list class. Drop the assertion once p2p-fret declares `uint8arraylist` 3
+ * (ticket `fret-checkout-cannot-be-linked-on-the-libp2p-3-3-line`).
+ */
+export function readFrame(source: FrameSource, maxBytes: number): Promise<Uint8Array> {
+	return readFramed(source as Parameters<typeof readFramed>[0], maxBytes);
+}
 
 /**
  * Open `protocol` to `peer`, send `frame`, and read the bounded reply frame.
@@ -64,7 +83,7 @@ export async function requestResponse(
 		stream = await openProtocolStream(node, peer, protocol);
 		sendFramed(stream, frame);
 		await stream.close();
-		const reply = await readFramed(stream, maxBytes);
+		const reply = await readFrame(stream, maxBytes);
 		// NOTE: every zero-length reply maps to "no result". Safe while no protocol has a meaningful empty reply
 		// (cohort frames carry an inner length prefix; query/recover replies are encoded objects). If one ever
 		// needs to answer "empty" as data, it must send a non-empty envelope rather than bare empty bytes.
@@ -140,7 +159,7 @@ export function handleRequestResponse(
 	void registerProtocolHandler(node, protocol, (stream: Stream, connection: Connection) => {
 		void (async (): Promise<void> => {
 			try {
-				const frame = await readFramed(stream, maxBytes);
+				const frame = await readFrame(stream, maxBytes);
 				const reply = await handle(frame, connection.remotePeer);
 				sendFramed(stream, reply ?? new Uint8Array(0));
 				await stream.close();

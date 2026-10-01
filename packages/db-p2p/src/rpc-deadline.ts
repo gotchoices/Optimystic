@@ -94,6 +94,13 @@ export type LinkDeadlines = RpcDeadlineDefaults & {
  *   multiple: one address has to be able to carry a whole relayed connection open.
  * - cohort query: negotiation plus request is two on a reused connection. A fresh relayed connection
  *   does not fit, which is safe: the peer is counted silent and the read is flagged, not misreported.
+ *
+ * NOTE: the connection and dial multiples assume the connection to the relay is already open, which
+ * holds while a node with a reservation keeps its relay connection up. A circuit dial through a relay
+ * this node is NOT connected to opens the relay connection from inside libp2p's per-address limit,
+ * so it pays that open on top of the hop, the stop and the relayed upgrade: more than the five round
+ * trips of the per-address limit, and more than the six of the RPC dial deadline. If relayed dials
+ * ever go through a relay this node is not already connected to, size both for that cold path.
  */
 const DIAL_ROUND_TRIPS = 6;
 const RESPONSE_ROUND_TRIPS = 3;

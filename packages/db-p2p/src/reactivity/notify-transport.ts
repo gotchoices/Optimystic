@@ -23,9 +23,8 @@ import { encodeNotificationV1, decodeNotificationV1 } from "@optimystic/db-core"
 import type { Libp2p } from "libp2p";
 import type { Connection, Stream } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
-import { readFramed } from "p2p-fret";
 import { peerIdToBytes } from "../cohort-topic/peer-codec.js";
-import { sendOneWay, DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic/stream-util.js";
+import { readFrame, sendOneWay, DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic/stream-util.js";
 import { PROTOCOL_REACTIVITY_NOTIFY } from "./protocols.js";
 import { registerProtocolHandler } from "../network/register-protocol-handler.js";
 import { createLogger } from "../logger.js";
@@ -130,7 +129,7 @@ export function registerNotifyHandler(
 	void registerProtocolHandler(node, protocol, (stream: Stream, connection: Connection) => {
 		void (async (): Promise<void> => {
 			try {
-				const frame = await readFramed(stream, maxBytes);
+				const frame = await readFrame(stream, maxBytes);
 				transport.deliver(connection.remotePeer.toString(), frame);
 				await stream.close();
 			} catch {

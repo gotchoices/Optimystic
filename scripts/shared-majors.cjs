@@ -24,22 +24,25 @@
  * The package manager reported success throughout — gossipsub declared `@libp2p/interface` as a plain
  * dependency, so it simply got a private second copy.
  *
- * MINOR DRIFT IS ALLOWED, and for `@libp2p/interface` it is DELIBERATE. 3.1.x and 3.2.x are both major
- * 3, but pull different transitive majors: 3.1.0 -> uint8arraylist@^2 + multiformats@^13, while 3.2.4
- * -> uint8arraylist@^3 + multiformats@^14. db-p2p and its it-length-prefixed / uint8arraylist@^2
- * dependencies build only against the 3.1.x line; db-core builds against 3.2.x. Forcing both onto one
- * minor resurfaces a structural-typing split (Uint8ArrayList v2 vs v3) in db-p2p's build and tests —
- * the split the completed ticket `optimystic-db-p2p-libp2p-dep-skew` deliberately left in place. So the
- * guards enforce only "stays within the major"; a move to another major, by us or by any dependency,
- * still trips them.
+ * MINOR DRIFT IS ALLOWED, though none is left: every workspace declares `@libp2p/interface@^3.3.0`
+ * and the lockfile holds one copy, the minor `libp2p@3.3` itself requires. The guards still enforce
+ * only "stays within the major", because a minor split is a build failure rather than a silent one.
+ * It matters which minor: 3.1.0 pulls uint8arraylist@^2 + multiformats@^13, while 3.2.4 and later
+ * pull uint8arraylist@^3 + multiformats@^14, and a stream typed by one does not unify with a
+ * length-prefixed codec typed by the other. db-p2p sat on the 3.1 line for that reason until it moved
+ * its own `it-length-prefixed` and `uint8arraylist` to the majors the 3.3 line uses.
  *
  * WHAT IS DELIBERATELY NOT HERE — do not add these; both fail on the first run:
  *
- *   - `multiformats`, which resolves to both 13 and 14
  *   - `uint8arraylist`, which resolves to both 2 and 3
+ *   - `multiformats`, which resolves to both 13 and 14
  *
- * Both splits are downstream consequences of the 3.1-versus-3.2 drift above, not independent
- * mismatches. They become guardable once that drift is gone.
+ * Neither split is ours any longer: our workspaces are on uint8arraylist 3 and multiformats 14. The
+ * older majors come from dependencies whose newest releases still declare them —
+ * `@chainsafe/libp2p-noise@17.0.0` and `@chainsafe/libp2p-yamux@8.0.1` (uint8arraylist@^2), and
+ * `p2p-fret@1.0.0` (uint8arraylist@^2, multiformats@^13). The two majors of `uint8arraylist` mark a
+ * list with the same global symbol and read each other's lists, so that split is one of declared
+ * types, not of behaviour. Both become guardable when those three packages move.
  *
  * @type {Record<string, number>}
  */
