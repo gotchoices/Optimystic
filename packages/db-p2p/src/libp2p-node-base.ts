@@ -1272,9 +1272,12 @@ export async function createLibp2pNodeBase(
 			// trips), and when it expires it aborts the open this request started: libp2p 3.3.11 runs a
 			// dial under its first caller's signal, and a later caller joins that dial without extending
 			// it. So a node whose only traffic to a peer is read-path requests (this consult and
-			// `fetchArchiveFromPeer`) never opens a cold relayed connection to it; consensus, sync repair
-			// or FRET's own dials, which have longer deadlines, open it. Fine while those paths exist. If a
-			// read-only node ever has to reach a peer nothing else dials, size this budget for a cold open.
+			// `fetchArchiveFromPeer`, which commit-path reconciliation uses too) never opens a cold relayed
+			// connection to it. The dials that can are the ones under the full RPC dial deadline: consensus
+			// rounds, repo requests and block pushes. FRET's own RPCs cannot either; their deadlines are
+			// fixed at a few seconds whatever the declared round trip. Fine while a coordinator's cohort
+			// members are also its consensus peers. If a node ever has to read from a peer nothing else
+			// dials, size this budget for a cold open.
 			const response = await withinRequestBudget(peerId.toString(), syncClient.getProtocol(), consensusConfig.cohortQueryTimeoutMs,
 				options => syncClient.requestBlock({ blockId, rev: undefined }, options));
 			if (response.success && response.archive) {

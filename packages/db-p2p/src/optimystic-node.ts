@@ -38,8 +38,8 @@ export interface OptimysticNodeAttachments {
 	/**
 	 * Every network deadline the node derived from `NodeOptions.linkRoundTripMs` (the undeclared
 	 * constants when it was not set). A host that dials through the node — a `NetworkTransactor`'s
-	 * `dialTimeoutMs` — reads its deadline here rather than restating one that ignores the
-	 * declaration.
+	 * `dialTimeoutMs`, and its `timeoutMs` from `transactionTimeoutMs` — reads its deadlines here
+	 * rather than restating ones that ignore the declaration.
 	 */
 	linkDeadlines: LinkDeadlines;
 	/**

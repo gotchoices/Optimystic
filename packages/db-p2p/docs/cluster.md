@@ -1144,8 +1144,9 @@ two a request costs on an open connection. A request that has to open a relayed 
 not) does not fit, and that is safe — the peer is counted silent and the read is flagged, never
 misreported. It has one consequence worth knowing: when the budget runs out it also abandons the
 connection open the request started, and libp2p does not let a later dial to the same peer extend that
-open. So read requests alone never open a cold relayed connection; consensus, sync repair or FRET's own
-dials have to (the `NOTE:` at the consult's `withinRequestBudget` call in
+open. So read requests alone, commit-path reconciliation's archive fetches included, never open a cold
+relayed connection; a dial under the full RPC dial deadline — a consensus round, a repo request or a
+block push — has to (the `NOTE:` at the consult's `withinRequestBudget` call in
 `packages/db-p2p/src/libp2p-node-base.ts`). The fill happens before `resolveClusterPolicy`, so the
 member, the coordinator and `reconcilePassTimeoutMs` all read one number, and a declared
 `cohortQueryTimeoutMs` still wins. The cluster client the coordinator dials each cohort member with —
