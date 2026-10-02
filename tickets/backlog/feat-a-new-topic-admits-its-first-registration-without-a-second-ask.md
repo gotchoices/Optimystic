@@ -18,7 +18,7 @@ Until the attach lands the watcher is not asleep: the same tick reads the collec
 
 ## Why it matters more than once
 
-The topic is derived from the log's tail block, and the log starts a new tail block every 32 entries. Each new block is a new topic nobody has registered under, so every move to a new block meets the same decline. That part is read from the code, not measured: the move goes through the same registration call. Together with the delay before a subscriber learns the tail moved (backlog `feat-reactivity-rotation-reaches-current-subscribers`), a collection that commits steadily spends a large share of each block on the fallback check rather than on announcements.
+The topic is derived from the log's tail block, and the log starts a new tail block every 32 entries. Each new block is a new topic nobody has registered under, so every move to a new block meets the same decline. That part is read from the code, not measured: the move goes through the same registration call. Together with the delay before a subscriber learns the tail moved (planned in `reactivity-tiers-below-the-root-use-the-collection-anchor`, which also stops tiers below the root from moving with the tail), a collection that commits steadily spends a large share of each block on the fallback check rather than on announcements.
 
 ## What was tried and why it did not help
 

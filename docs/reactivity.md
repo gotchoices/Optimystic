@@ -488,8 +488,8 @@ Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; c
 > subscribers are already spread over the tick interval. And a subscriber that sends a recover request to
 > the old cohort inside its drain window is redirected (`kind:"rotated"`), which surfaces a `RotationNotice`
 > that the scheduler turns into the same move. Until one of those happens — up to one tick — the subscriber
-> hears nothing from the network and the tick's revision check is what wakes it (backlog
-> `feat-reactivity-rotation-reaches-current-subscribers`). The pre-announce + anticipatory warm-up remain
+> hears nothing from the network and the tick's revision check is what wakes it (planned in
+> `reactivity-tiers-below-the-root-use-the-collection-anchor`). The pre-announce + anticipatory warm-up remain
 > exercised in the **mock-tier harness** (`mesh-tail-rotation.spec.ts`) and the design simulator (both can
 > synthesize the successor id) and are documented as gated on `6.5`; warm-up on a live node is **signal-only**
 > (logged, never fabricating a successor coord). The node composition binds origination's `markRotated` → the
