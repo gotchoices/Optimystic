@@ -40,11 +40,22 @@
  * adversary cannot list real members as `signers` without their keys (the message multisig would not
  * verify), so the quorum-subset test has teeth without demanding brittle full-set equality across churn.
  *
+ * **Root-placed coords** (`docs/cohort-topic.md` §Root placement at a routing key). A verifier that knows a
+ * coord is the root of a root-placed topic passes a `RootPlacement`, and the authority for that coord is
+ * not the FRET cohort of `wantK` but the **root group** — the key network's serving cohort at the coord,
+ * which the host reads into a per-coord snapshot ({@link FretTrustAnchorOptions.rootGroupAt}). The same
+ * signer-subset rule is applied against that group, with two differences. The group is a complete list
+ * sized by storage placement, with no ring neighbours to widen it into, so the churn slack takes the form
+ * of the partial-overlap verdict: a signer that has since rotated out of the group makes the cert
+ * `"unknown"` (chain / TOFU), never `"rejected"`. And a snapshot this node has not read, or one naming
+ * only this node, yields `"unknown"`: the first is nothing to judge against, and the second is what a
+ * cold routing table answers for every key, indistinguishable from a genuine group of one.
+ *
  * **db-core never imports FRET.** This adapter lives in db-p2p and depends only on the narrow
  * {@link FretRingView} (satisfied by `FretService`), keeping the db-core trust gate transport-agnostic.
  */
 
-import type { IMembershipTrustAnchor, MembershipCertV1, RingCoord, TrustAnchorVerdict } from "@optimystic/db-core";
+import type { IMembershipTrustAnchor, MembershipCertV1, RingCoord, RootPlacement, TrustAnchorVerdict } from "@optimystic/db-core";
 import { b64urlToBytes, DEFAULT_MAX_NO_POW_TIER } from "@optimystic/db-core";
 import { bytesToPeerIdString } from "./peer-codec.js";
 
@@ -82,6 +93,14 @@ export interface FretTrustAnchorOptions {
 	 * (`createMembershipSourceRouter` treats tier 0/1 as committed). Default {@link DEFAULT_MAX_NO_POW_TIER}.
 	 */
 	readonly maxCommittedTier?: number;
+	/**
+	 * The root group this node last read for a root-placed coord (peer-id strings, the host's snapshot), or
+	 * `undefined` when it holds none. Consulted only for a cert verified under a `RootPlacement`. Synchronous
+	 * on purpose: `directAnchor` runs inside the verifier's synchronous trust gate, so the host fills the
+	 * snapshot before the verification that needs it and this reads what is held. Absent → every root-placed
+	 * cert is `"unknown"` (a host that serves no root placement cannot judge one).
+	 */
+	readonly rootGroupAt?: (coord: RingCoord) => readonly string[] | undefined;
 }
 
 /**
@@ -100,33 +119,30 @@ export class FretTrustAnchor implements IMembershipTrustAnchor {
 	private readonly selfPeerId: string;
 	private readonly churnSlack: number;
 	private readonly maxCommittedTier: number;
+	private readonly rootGroupAt: ((coord: RingCoord) => readonly string[] | undefined) | undefined;
 
 	constructor(private readonly fret: FretRingView, options: FretTrustAnchorOptions) {
 		this.k = options.k;
 		this.selfPeerId = options.selfPeerId;
 		this.churnSlack = options.churnSlack ?? DEFAULT_CHURN_SLACK;
 		this.maxCommittedTier = options.maxCommittedTier ?? DEFAULT_MAX_NO_POW_TIER;
+		this.rootGroupAt = options.rootGroupAt;
 	}
 
-	directAnchor(cert: MembershipCertV1, tier: number): TrustAnchorVerdict {
-		// Committed tiers (T0/T1) are the tx-log anchor's job, not the FRET ring's — defer.
-		if (tier <= this.maxCommittedTier) {
-			return "unknown";
-		}
+	directAnchor(cert: MembershipCertV1, tier: number, placement?: RootPlacement): TrustAnchorVerdict {
 		try {
 			// A partitioned table is unreliable: never reject a legit cert during a partition — defer to TOFU.
 			if (this.fret.detectPartition?.() === true) {
 				return "unknown";
 			}
 			const coord: RingCoord = b64urlToBytes(cert.cohortCoord);
-			const expected = this.fret.assembleCohort(coord, this.k);
-			// Coverage / local authority: a populated neighborhood the node is itself part of. A cold or
-			// partitioned table yields `< k`; a distant coord the node is nowhere near omits self. Either way
-			// the node cannot judge → `"unknown"` (no regression on coords nothing can anchor).
-			if (expected.length < this.k || !expected.includes(this.selfPeerId)) {
+			// A root-placed coord's authority is the root group, whatever the tier: the placement rule is the
+			// key network's, which this node applies at every tier, so the committed-tier deferral inside
+			// `fretView` (the FRET ring has no say over T0/T1) does not apply to it.
+			const expected = placement === undefined ? this.fretView(tier, coord) : this.rootGroupView(coord);
+			if (expected === undefined) {
 				return "unknown";
 			}
-			const widened = new Set(this.fret.assembleCohort(coord, this.k + this.churnSlack));
 			// Decode the cert's signing quorum into FRET peer-id strings (the same form `assembleCohort` yields).
 			const signers = cert.signers.map((s) => bytesToPeerIdString(b64urlToBytes(s)));
 			if (signers.length === 0) {
@@ -134,7 +150,7 @@ export class FretTrustAnchor implements IMembershipTrustAnchor {
 			}
 			let inRing = 0;
 			for (const signer of signers) {
-				if (widened.has(signer)) {
+				if (expected.has(signer)) {
 					inRing++;
 				}
 			}
@@ -149,5 +165,40 @@ export class FretTrustAnchor implements IMembershipTrustAnchor {
 			// Any decode failure on attacker-supplied bytes → the ring cannot judge it. Total, never throws.
 			return "unknown";
 		}
+	}
+
+	/**
+	 * The slack-widened ring view a default-rule cert's signers are judged against, or `undefined` when this
+	 * node has no authority over `coord`: a committed tier (T0/T1, the tx-log anchor's job), a cold or
+	 * partitioned table (`< k` members), or a distant coord whose neighbourhood omits self. Either way the
+	 * node cannot judge → `"unknown"` (no regression on coords nothing can anchor).
+	 */
+	private fretView(tier: number, coord: RingCoord): ReadonlySet<string> | undefined {
+		if (tier <= this.maxCommittedTier) {
+			return undefined;
+		}
+		const expected = this.fret.assembleCohort(coord, this.k);
+		if (expected.length < this.k || !expected.includes(this.selfPeerId)) {
+			return undefined;
+		}
+		return new Set(this.fret.assembleCohort(coord, this.k + this.churnSlack));
+	}
+
+	/**
+	 * The root group a root-placed cert's signers are judged against, or `undefined` when this node cannot
+	 * judge: no reader, no snapshot read for the coord, a group that omits self (the same local-authority
+	 * rule as the ring view — the group is assembled from this node's own table, accurate only near it), or
+	 * a group of this node alone, which a cold table answers for every key.
+	 *
+	 * NOTE: the group-of-one guard trades away rejection for a genuine `clusterSize: 1` deployment, where
+	 * nothing root-signed by another node ever needs verifying; if a solo group ever has to reject a forged
+	 * root cert, tell the anchor the configured group size so it can separate "full" from "cold".
+	 */
+	private rootGroupView(coord: RingCoord): ReadonlySet<string> | undefined {
+		const group = this.rootGroupAt?.(coord);
+		if (group === undefined || group.length < 2 || !group.includes(this.selfPeerId)) {
+			return undefined;
+		}
+		return new Set(group);
 	}
 }

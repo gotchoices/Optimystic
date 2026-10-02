@@ -51,7 +51,7 @@ import {
 	type Tier,
 	type WalkTrace,
 } from '@optimystic/db-core';
-import { createCohortTopicHost, type CohortTopicAntiDosOptions, type CohortTopicHost, type CoordEngine } from '../cohort-topic/host.js';
+import { createCohortTopicHost, type CohortTopicAntiDosOptions, type CohortTopicHost, type CoordEngine, type RootGroupOptions } from '../cohort-topic/host.js';
 import { peerIdToBytes, bytesToPeerIdString } from '../cohort-topic/peer-codec.js';
 import { signPeer } from '../cohort-topic/peer-sig.js';
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS as PROTOCOLS } from '../cohort-topic/protocols.js';
@@ -272,6 +272,12 @@ export interface MeshOptions {
 	readonly gossipIntervalMs?: number;
 	/** Anti-DoS wiring applied to every node (e.g. a reputation view to force cold-root bootstrap denial). */
 	readonly antiDos?: CohortTopicAntiDosOptions;
+	/**
+	 * Root-placement support per node (`CohortTopicHostOptions.rootGroup`): a fake root group — the member
+	 * ids `membersAt` answers — and the quorum ratio, built per member so a suite can give one node a view
+	 * that differs from the others'. Omitted: no node serves root placement.
+	 */
+	readonly rootGroup?: (member: Member) => RootGroupOptions;
 }
 
 /** One routed probe: the coord key it was issued at and the reply classification the walk saw. */
@@ -464,6 +470,7 @@ export async function buildMesh(members: Member[], opts: MeshOptions): Promise<C
 				? {}
 				: { promotion: { ...(opts.capPromote === undefined ? {} : { capPromote: opts.capPromote }), ...(opts.promotion ?? {}) } }),
 			...(opts.antiDos === undefined ? {} : { antiDos: opts.antiDos }),
+			...(opts.rootGroup === undefined ? {} : { rootGroup: opts.rootGroup(member) }),
 		});
 		mesh.nodes.push({ member, node, host });
 		index++;
@@ -473,7 +480,8 @@ export async function buildMesh(members: Member[], opts: MeshOptions): Promise<C
 
 // --- signed frame builders (real participant peer-key signatures) ---
 
-export async function signedWillingness(from: Member, coord: Uint8Array, epoch: Uint8Array, now: number, willingnessBits = 'f'): Promise<Uint8Array> {
+/** A signed willingness-only gossip frame at `coord`; `rootPlaced` stamps the flag a root-placed cohort's frames carry. */
+export async function signedWillingness(from: Member, coord: Uint8Array, epoch: Uint8Array, now: number, willingnessBits = 'f', rootPlaced = false): Promise<Uint8Array> {
 	const g: CohortGossipV1 = {
 		v: 1,
 		fromMember: bytesToB64url(from.bytes),
@@ -485,6 +493,7 @@ export async function signedWillingness(from: Member, coord: Uint8Array, epoch: 
 		windowSeconds: 60,
 		topicSummaries: [],
 		timestamp: now,
+		...(rootPlaced ? { rootPlaced: true as const } : {}),
 		signature: '',
 	};
 	g.signature = bytesToB64url(await signPeer(from.key, cohortGossipSigningPayload(g)));
@@ -498,6 +507,8 @@ export interface SignedRegisterOptions {
 	/** Follow-on cold-start re-issue (treeTier >= 1); mutually exclusive with bootstrap, so pass `bootstrap: false`. */
 	readonly followOn?: boolean;
 	readonly ttl?: number;
+	/** Root key of a root-placed topic (stamped and signed as `RegisterV1.rootKey`). */
+	readonly rootKey?: Uint8Array;
 }
 
 export async function signedRegister(participant: Member, topic: Uint8Array, now: number, correlationId: string, opts: SignedRegisterOptions = {}): Promise<RegisterV1> {
@@ -510,6 +521,7 @@ export async function signedRegister(participant: Member, topic: Uint8Array, now
 		ttl: opts.ttl ?? 90_000,
 		bootstrap: opts.bootstrap ?? true,
 		...(opts.followOn ? { followOn: true } : {}),
+		...(opts.rootKey === undefined ? {} : { rootKey: bytesToB64url(opts.rootKey) }),
 		timestamp: now,
 		correlationId: bytesToB64url(new TextEncoder().encode(correlationId)),
 	};

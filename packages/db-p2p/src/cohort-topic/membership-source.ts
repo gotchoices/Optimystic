@@ -1,4 +1,4 @@
-import type { IMembershipSource, RingCoord } from "@optimystic/db-core";
+import type { IMembershipSource, MembershipLookupOptions, RingCoord } from "@optimystic/db-core";
 import { bytesToB64url } from "@optimystic/db-core";
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { Libp2p } from "libp2p";
@@ -11,6 +11,13 @@ export interface FretMembershipSourceOptions {
 	/** Cohort fan-out probed on a `fetch`. Default 16. */
 	readonly wants?: number;
 	readonly maxBytes?: number;
+	/**
+	 * The root group at a root-placed coord — the peers a `fetch(coord, { rootPlaced: true })` asks for the
+	 * cert, in the order to try them. The host binds it to its root-group snapshot reader. Absent on a host
+	 * that serves no root placement: such a fetch then finds nobody to ask and resolves `undefined`, so the
+	 * verifier reports the message untrusted rather than consulting a FRET cohort that does not hold the cert.
+	 */
+	readonly rootGroupPeers?: (coord: RingCoord) => Promise<readonly string[]>;
 }
 
 /**
@@ -19,20 +26,27 @@ export interface FretMembershipSourceOptions {
  * `MembershipCertV1`; `fetch` forces one refresh by requesting the cert from an assembled cohort
  * member (the stale-cache retry the participant-side verifier drives). The host feeds inbound certs
  * into the cache via {@link cache}.
+ *
+ * A fetch for the root of a root-placed topic (`{ rootPlaced: true }`) asks the **root group** — the peers
+ * {@link FretMembershipSourceOptions.rootGroupPeers} names — instead of the FRET cohort around the coord,
+ * since those are the peers that publish that cert. The cache is keyed by coord alone: which rule a cached
+ * cert was validated under is the verifier's business, not the source's.
  */
 export class FretMembershipSource implements IMembershipSource {
 	private readonly byCoord = new Map<string, Uint8Array>();
 	private readonly membershipProtocol: string;
 	private readonly wants: number;
 	private readonly maxBytes: number;
+	private readonly rootGroupPeers: ((coord: RingCoord) => Promise<readonly string[]>) | undefined;
 
 	constructor(private readonly node: Libp2p, private readonly resolver: CohortPeerResolver, options: FretMembershipSourceOptions = {}) {
 		this.membershipProtocol = options.membershipProtocol ?? PROTOCOL_COHORT_MEMBERSHIP;
 		this.wants = options.wants ?? 16;
 		this.maxBytes = options.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
+		this.rootGroupPeers = options.rootGroupPeers;
 	}
 
-	current(coord: RingCoord): Promise<Uint8Array | undefined> {
+	current(coord: RingCoord, _opts?: MembershipLookupOptions): Promise<Uint8Array | undefined> {
 		return Promise.resolve(this.byCoord.get(bytesToB64url(coord)));
 	}
 
@@ -45,9 +59,9 @@ export class FretMembershipSource implements IMembershipSource {
 		return this.byCoord.has(bytesToB64url(coord));
 	}
 
-	async fetch(coord: RingCoord): Promise<Uint8Array | undefined> {
+	async fetch(coord: RingCoord, opts?: MembershipLookupOptions): Promise<Uint8Array | undefined> {
 		const request = coord; // the membership request frame is the raw coord bytes
-		for (const peerStr of this.resolver.cohortPeers(coord, this.wants)) {
+		for (const peerStr of await this.holdersOf(coord, opts)) {
 			try {
 				const reply = await requestResponse(this.node, peerIdFromString(peerStr), this.membershipProtocol, request, this.maxBytes);
 				if (reply !== undefined) {
@@ -59,6 +73,14 @@ export class FretMembershipSource implements IMembershipSource {
 			}
 		}
 		return undefined;
+	}
+
+	/** The peers that hold `coord`'s cert: the root group under `{ rootPlaced: true }`, else the FRET cohort. */
+	private async holdersOf(coord: RingCoord, opts?: MembershipLookupOptions): Promise<readonly string[]> {
+		if (opts?.rootPlaced !== true) {
+			return this.resolver.cohortPeers(coord, this.wants);
+		}
+		return this.rootGroupPeers === undefined ? [] : this.rootGroupPeers(coord);
 	}
 
 	/** Cache an encoded cert for its coord (host feeds inbound/served certs here). */

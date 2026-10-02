@@ -95,6 +95,12 @@ export interface CohortThresholdCryptoDeps {
 	 * `false` then makes the quorum genuinely the outgoing cohort. See `cohort-topic-trust-anchor-rotation-production`.
 	 */
 	readonly selfEligible?: () => boolean;
+	/**
+	 * Present (and `true`) when {@link coord} is the root of a root-placed topic: every `/sign` request this
+	 * signer sends carries `SignRequestV1.rootPlaced`, so an endorser derives the root group around the coord
+	 * rather than the FRET cohort (`docs/cohort-topic.md` §Root placement at a routing key). Absent otherwise.
+	 */
+	readonly rootPlaced?: true;
 }
 
 /** A collected, verified per-member signature awaiting concatenation. */
@@ -138,6 +144,7 @@ export class FretCohortThresholdCrypto implements ICohortThresholdCrypto {
 				coord: bytesToB64url(this.deps.coord()),
 				cohortEpoch: bytesToB64url(this.deps.cohortEpoch()),
 				payload: bytesToB64url(payload),
+				...(this.deps.rootPlaced === true ? { rootPlaced: true as const } : {}),
 			};
 			const timeoutMs = this.deps.collectTimeoutMs ?? DEFAULT_SIGN_COLLECT_TIMEOUT_MS;
 			await Promise.all(others.map((peerStr) => this.collectFrom(peerStr, request, payload, collected, timeoutMs)));

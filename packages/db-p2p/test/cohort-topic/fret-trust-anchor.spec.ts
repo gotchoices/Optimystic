@@ -13,11 +13,13 @@
  * part of → `"unknown"`; a 1–2 member stabilization skew within slack → `"anchored"`; partial overlap
  * beyond slack → `"unknown"`; a cold/short ring → `"unknown"`; a partition → `"unknown"`; the committed
  * tiers (T0/T1) → `"unknown"` (the tx-log anchor's job); both FRET tiers (T2/T3) judged; and totality
- * against an undecodable signer.
+ * against an undecodable signer. A **root-placed** cert (verified under a `RootPlacement`) is judged
+ * against the root group the host holds for the coord, whatever the FRET cohort around it says, and is
+ * `"unknown"` whenever the anchor holds no group it can judge by.
  */
 
 import { expect } from 'chai';
-import { bytesToB64url } from '@optimystic/db-core';
+import { bytesToB64url, createRootPlacement } from '@optimystic/db-core';
 import type { MembershipCertV1 } from '@optimystic/db-core';
 import { FretTrustAnchor, type FretRingView } from '../../src/cohort-topic/fret-trust-anchor.js';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
@@ -164,5 +166,33 @@ describe('cohort-topic / FretTrustAnchor (FRET-ring direct anchor)', () => {
 		expect(anchor.directAnchor(certOver(COVERED, ['p0', 'p1', 'p2', 'p4']), FRET_TIER), 'default slack anchors a k+1 skew').to.equal('anchored');
 		expect(anchor.directAnchor(certOver(COVERED, ['adv0', 'adv1', 'adv2', 'adv3']), 1), 'default committed tier defers T1').to.equal('unknown');
 		expect(anchor.directAnchor(certOver(COVERED, ['adv0', 'adv1', 'adv2', 'adv3']), FRET_TIER), 'default still rejects a disjoint quorum at T2').to.equal('rejected');
+	});
+
+	// --- root placement (cohort-topic-host-serves-a-root-at-a-storage-group) ---
+	describe('a root-placed coord', () => {
+		const ROOT = coordOf(90);
+		const PLACEMENT = createRootPlacement(0.75);
+		/** A ring whose `wantK` cohort around ROOT (self included) shares nothing with the root group, over an anchor reading `groups`. */
+		function rootAnchor(groups: Map<string, readonly string[]>): FretTrustAnchor {
+			const ring = new RingStub().set(ROOT, ['p0', 'p9', 'p8', 'p7', 'p6', 'p5', 'p4']);
+			return new FretTrustAnchor(ring, { k: K, selfPeerId: SELF, churnSlack: SLACK, rootGroupAt: (coord): readonly string[] | undefined => groups.get(bytesToB64url(coord)) });
+		}
+		const groupOf = (members: readonly string[]): Map<string, readonly string[]> => new Map([[bytesToB64url(ROOT), members]]);
+
+		it('is judged against the root group, whatever the FRET cohort around the coord says', () => {
+			const anchor = rootAnchor(groupOf(['p0', 'p1', 'p2']));
+			expect(anchor.directAnchor(certOver(ROOT, ['p0', 'p1', 'p2']), 0, PLACEMENT), 'signers = the group → anchored, at the committed tier too').to.equal('anchored');
+			expect(anchor.directAnchor(certOver(ROOT, ['adv0', 'adv1']), 0, PLACEMENT), 'a disjoint keyset → rejected').to.equal('rejected');
+			expect(anchor.directAnchor(certOver(ROOT, ['p0', 'p1', 'p9']), 0, PLACEMENT), 'a signer outside the group (rotated out, or a ring neighbour) → unknown, never rejected').to.equal('unknown');
+			expect(anchor.directAnchor(certOver(ROOT, ['p0', 'p1', 'p2']), FRET_TIER), 'without the placement the ring is consulted, and it does not vouch for the group').to.equal('unknown');
+		});
+
+		it('is "unknown" when the anchor holds no group it can judge by: no snapshot, a group omitting self, a group of self alone, no reader', () => {
+			const cert = certOver(ROOT, ['p0', 'p1', 'p2']);
+			expect(rootAnchor(new Map()).directAnchor(cert, 0, PLACEMENT), 'no snapshot read for the coord').to.equal('unknown');
+			expect(rootAnchor(groupOf(['p1', 'p2', 'p3'])).directAnchor(cert, 0, PLACEMENT), 'a group this node is not in').to.equal('unknown');
+			expect(rootAnchor(groupOf(['p0'])).directAnchor(certOver(ROOT, ['adv0']), 0, PLACEMENT), 'a group of self alone, which a cold table answers for every key').to.equal('unknown');
+			expect(anchorOver(coveredRing()).directAnchor(certOver(COVERED, ['p0', 'p1', 'p2', 'p3']), FRET_TIER, PLACEMENT), 'an anchor with no root-group reader').to.equal('unknown');
+		});
 	});
 });

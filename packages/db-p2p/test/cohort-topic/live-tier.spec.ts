@@ -34,15 +34,18 @@
 
 import { expect } from 'chai';
 import {
+	RingHash,
 	bytesToB64url,
 	b64urlToBytes,
 	compareBytes,
 	encodeCohortMessage,
+	decodeRegisterReplyV1,
 	membershipCertSigningPayload,
 	promotionNoticeSigningPayload,
 	createMembershipVerifier,
 	createMembershipSourceRouter,
 	createCohortSigner,
+	createRootPlacement,
 	CohortBackoffError,
 	type IMembershipSource,
 	type MembershipCertV1,
@@ -53,8 +56,10 @@ import { bytesToPeerIdString } from '../../src/cohort-topic/peer-codec.js';
 import { signPeer } from '../../src/cohort-topic/peer-sig.js';
 import { FretTrustAnchor, type FretRingView } from '../../src/cohort-topic/fret-trust-anchor.js';
 import { createVerifyOnlyThresholdCrypto } from '../../src/cohort-topic/threshold-crypto.js';
-import { verifyAndApplyNotice, transitionKey, type NoticeApplyTarget } from '../../src/cohort-topic/host.js';
+import { requestResponse } from '../../src/cohort-topic/stream-util.js';
+import { cohortEpochOf, verifyAndApplyNotice, transitionKey, type NoticeApplyTarget, type RootGroupOptions } from '../../src/cohort-topic/host.js';
 import {
+	PROTOCOLS,
 	addressing,
 	buildMesh,
 	makeMember,
@@ -64,7 +69,9 @@ import {
 	setupTopic,
 	signedRegister,
 	signedReattach,
+	signedWillingness,
 	waitFor,
+	type CohortMesh,
 	type Member,
 } from '../../src/testing/cohort-topic-mesh-harness.js';
 
@@ -561,6 +568,140 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 			expect(refreshed!.rotationSig, 'and no rotation signature').to.equal(undefined);
 		} finally {
 			await mesh.stop();
+		}
+	});
+
+	// --- root placement (cohort-topic-host-serves-a-root-at-a-storage-group) ---
+	// A topic whose root sits at `H(rootKey)` is served by the ROOT GROUP at that coordinate — the key
+	// network's serving cohort there, here a fake naming 3 of the 5 nodes — under the threshold
+	// `ceil(|group| × quorumRatio)` (3 at 0.75) instead of the mesh's `minSigs` (4), which the group cannot
+	// meet. `sizeEstimate: 16` makes `d_max = 0`, so a walk goes straight to the root step.
+	const ROOT_KEY = new TextEncoder().encode('tail-block-id:root-placement');
+	const QUORUM_RATIO = 0.75;
+	const ringHash = new RingHash();
+
+	/**
+	 * Instantiate the root-placed engine on every group member by feeding each the others' willingness at
+	 * the root coord, flagged `rootPlaced` — the cold-sibling path a real root group bootstraps through —
+	 * and wait until each member's view holds a willing quorum (what `setupTopic` seeds for a FRET cohort).
+	 */
+	async function seedRootGroup(mesh: CohortMesh, group: readonly Member[], rootCoord: Uint8Array): Promise<void> {
+		const epoch = cohortEpochOf(group.map((m) => m.bytes), ringHash);
+		const now = Date.now();
+		for (const node of group) {
+			for (const other of group) {
+				if (other.idStr === node.idStr) {
+					continue;
+				}
+				mesh.nodeOf(node.idStr).node.receive(PROTOCOLS.gossip, await signedWillingness(other, rootCoord, epoch, now, 'f', true), other.peerId);
+			}
+		}
+		const seeded = await waitFor(() => group.every((m) => (mesh.nodeOf(m.idStr).host.registry.findByCoord(rootCoord)?.cohortView().all().size ?? 0) >= group.length - 1), 5_000);
+		expect(seeded, 'every group member instantiated its root-placed engine and merged its siblings\' willingness').to.equal(true);
+	}
+
+	it('12. (root placement) a root-placed register is served by the root group: a non-member answers unwilling_member naming the group, a member accepts, and the root cert verifies only under the placement rule', async function () {
+		this.timeout(15_000);
+		const members = await makeMembers(N);
+		const group = members.slice(0, 3);
+		const groupIds = group.map((m) => m.idStr);
+		const outsider = members[3]!;
+		const participant = members[4]!;
+		// Every node reads the true group — except the participant, whose stale view names the outsider
+		// first, so the frame it routes lands on a node outside the group (as a FRET-routed frame on a ring
+		// shared with another network can).
+		const mesh = await buildMesh(members, {
+			wantK: WANT_K,
+			minSigs: MIN_SIGS,
+			sizeEstimate: 16,
+			rootGroup: (m): RootGroupOptions => ({
+				quorumRatio: QUORUM_RATIO,
+				membersAt: (): Promise<string[]> => Promise.resolve(m.idStr === participant.idStr ? [outsider.idStr, ...groupIds] : [...groupIds]),
+			}),
+		});
+		try {
+			const rootCoord = addressing.rootCoord(ROOT_KEY);
+			await seedRootGroup(mesh, group, rootCoord);
+			for (const g of group) {
+				expect(mesh.nodeOf(g.idStr).host.registry.findByCoord(rootCoord)?.rootPlaced, `${g.idStr} serves the root coord root-placed`).to.equal(true);
+			}
+
+			// The walk's root step dials the outsider first; its `unwilling_member` names the group, and the
+			// walk's member retry dials a real member, which admits.
+			const handle = await mesh.nodeOf(participant.idStr).host.service.register({ topicId: TOPIC, tier: 0 as Tier, rootKey: ROOT_KEY });
+			expect(new Set(handle.cohortMembers.map(bytesToPeerIdString)), 'the accepted reply carries the root group, not a FRET cohort').to.deep.equal(new Set(groupIds));
+			expect(groupIds.includes(bytesToPeerIdString(handle.primary)), 'the primary is a group member').to.equal(true);
+			expect(handle.rootKey, 'the handle carries the root key').to.deep.equal(ROOT_KEY);
+			expect(mesh.nodeOf(outsider.idStr).host.registry.findByCoord(rootCoord), 'the outsider never instantiated an engine for the root').to.equal(undefined);
+
+			// The outsider's reply to a root-placed register landing on it, read directly.
+			const landing = await requestResponse(
+				mesh.nodeOf(participant.idStr).node as never,
+				outsider.peerId,
+				PROTOCOLS.register,
+				encodeCohortMessage(await signedRegister(participant, TOPIC, Date.now(), 'direct-root-0001', { rootKey: ROOT_KEY })),
+			);
+			const reply = decodeRegisterReplyV1(landing!);
+			expect(reply.result, 'a node outside the group refuses as unwilling_member').to.equal('unwilling_member');
+			expect(new Set((reply.candidateMembers ?? []).map((c) => bytesToPeerIdString(b64urlToBytes(c)))), 'naming the group').to.deep.equal(new Set(groupIds));
+
+			// The root's cert: members = the group, signed by all three (the ratio threshold at 0.75).
+			const rootEngine = mesh.nodeOf(groupIds[0]!).host.registry.findByCoord(rootCoord)!;
+			const cert = await rootEngine.onStabilized(Date.now());
+			expect(cert, 'the root group published a cert').to.not.equal(undefined);
+			expect(new Set(cert!.members.map((m) => bytesToPeerIdString(b64urlToBytes(m)))), 'cert members = the group').to.deep.equal(new Set(groupIds));
+			expect(cert!.signers.length, 'ceil(3 × 0.75) = 3 signers').to.equal(3);
+
+			// Another group member verifies it under the placement — fetched from the group over `/membership`
+			// and anchored on the group it holds — and not under the default rule, whose minSigs the group
+			// cannot meet.
+			const verifier = mesh.nodeOf(groupIds[1]!).host.service.verifier();
+			const payload = membershipCertSigningPayload(cert!);
+			const signers = cert!.signers.map(b64urlToBytes);
+			const sig = b64urlToBytes(cert!.thresholdSig);
+			expect(await verifier.verifyMessage(signers, rootCoord, 0, payload, sig, { placement: createRootPlacement(QUORUM_RATIO) }), 'verified under the placement rule').to.equal('verified');
+			expect(await verifier.verifyMessage(signers, rootCoord, 0, payload, sig), 'untrusted under the default rule').to.equal('untrusted');
+		} finally {
+			await mesh.stop();
+		}
+	});
+
+	it('13. (root placement) a root group of one signs its own cert under ceil(1 × ratio) = 1, and a host with no rootGroup refuses a root-placed register', async function () {
+		this.timeout(15_000);
+		const members = await makeMembers(N);
+		const solo = members[0]!;
+		const participant = members[1]!;
+		const mesh = await buildMesh(members, {
+			wantK: WANT_K,
+			minSigs: MIN_SIGS,
+			sizeEstimate: 16,
+			rootGroup: (): RootGroupOptions => ({ quorumRatio: QUORUM_RATIO, membersAt: (): Promise<string[]> => Promise.resolve([solo.idStr]) }),
+		});
+		try {
+			const rootCoord = addressing.rootCoord(ROOT_KEY);
+			const handle = await mesh.nodeOf(participant.idStr).host.service.register({ topicId: TOPIC, tier: 0 as Tier, rootKey: ROOT_KEY });
+			expect(handle.cohortMembers.map(bytesToPeerIdString), 'the group of one is the whole cohort').to.deep.equal([solo.idStr]);
+			const cert = await mesh.nodeOf(solo.idStr).host.registry.findByCoord(rootCoord)!.onStabilized(Date.now());
+			expect(cert!.signers.length, 'the engine signs its own cert: one signer meets ceil(1 × 0.75)').to.equal(1);
+			expect(cert!.members.map((m) => bytesToPeerIdString(b64urlToBytes(m))), 'cert members = the group of one').to.deep.equal([solo.idStr]);
+		} finally {
+			await mesh.stop();
+		}
+
+		// No `rootGroup`: the router has no `routeToRoot`, so the root step falls back to ring routing at the
+		// root coordinate, and the node it lands on refuses every root-placed frame — the walk backs off.
+		const plain = await buildMesh(members, { wantK: WANT_K, minSigs: MIN_SIGS, sizeEstimate: 16 });
+		try {
+			let err: unknown;
+			try {
+				await plain.nodes[0]!.host.service.register({ topicId: TOPIC, tier: 0 as Tier, rootKey: ROOT_KEY });
+			} catch (e) {
+				err = e;
+			}
+			expect(err, 'a host that serves no root placement refuses, and the walk backs off').to.be.instanceOf(CohortBackoffError);
+			expect(plain.routeTrace.some((e) => e.result === 'unwilling_cohort'), 'refused as unwilling_cohort').to.equal(true);
+		} finally {
+			await plain.stop();
 		}
 	});
 });

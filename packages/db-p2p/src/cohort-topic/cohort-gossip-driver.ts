@@ -183,6 +183,12 @@ export interface GossipFrameInputs {
 	readonly childUnlinks: ChildLinkRefV1[];
 	/** Round timestamp, unix ms. */
 	readonly timestamp: number;
+	/**
+	 * Present (and `true`) when the served coord is the root of a root-placed topic — stamped as
+	 * `CohortGossipV1.rootPlaced` so a co-member with no engine for the coord derives the root group around it
+	 * rather than the FRET cohort (`docs/cohort-topic.md` §Root placement at a routing key). Absent otherwise.
+	 */
+	readonly rootPlaced?: true;
 }
 
 /**
@@ -226,6 +232,9 @@ export function buildCohortGossip(i: GossipFrameInputs): CohortGossipV1 | undefi
 	}
 	if (i.childUnlinks.length > 0) {
 		g.childUnlinks = i.childUnlinks;
+	}
+	if (i.rootPlaced === true) {
+		g.rootPlaced = true;
 	}
 	return g;
 }

@@ -46,6 +46,18 @@
  * its tier-`(d − 1)` parent by routing a (child-cohort-signed) {@link ChildLinkV1} over the router; the parent
  * authenticates + records the child and acks, and the forwarder stays `awaiting_parent` until that `linked` ack.
  *
+ * **Root placement (§Tier addressing → Root placement at a routing key).** A topic may put its root at
+ * `H(rootKey)` — a block's storage position — and the cohort there is then the **root group**: the key
+ * network's serving cohort at that coordinate, read through {@link CohortTopicHostOptions.rootGroup}
+ * (`membersAt`), with the signature threshold `ceil(|group| × quorumRatio)` instead of `minSigs`. A root-placed
+ * {@link CoordEngine} reads that group from a per-coord **snapshot** (filled before the engine is created,
+ * refreshed on each gossip round, read on demand for a `/sign` or membership request) everywhere a default
+ * engine assembles the FRET cohort, stamps `rootPlaced` on its `/sign` requests and gossip, and publishes its
+ * cert under the ratio rule. A host with no `rootGroup` refuses every root-placed frame; one that is not in
+ * the group a frame lands on answers `unwilling_member` naming the group, so the walk's member retry dials a
+ * real member. Which rule a coordinate is served under is decided once, when its engine is created, and a
+ * frame claiming the other rule for it is refused (see {@link EnginePlacement}).
+ *
  * **Scope.** `followOn` derivation for a promoted-redirect arrival is parked in backlog
  * (`cohort-topic-followon-derivation`); this milestone serves a **single tier-0 cohort**, so `followOn`
  * stays `false` and tier-0 bootstrap instantiation goes through the `bootstrap: true` path. The
@@ -72,6 +84,8 @@ import {
 	createMembershipSourceRouter,
 	createMembershipCertPublisher,
 	createCohortSigner,
+	createRootPlacement,
+	rootPlacedMinSigs,
 	createCohortMemberEngine,
 	createCohortTopicService,
 	createLoadBarometer,
@@ -125,6 +139,7 @@ import {
 	type CorrelationReplayGuardConfig,
 	type DemotionNoticeV1,
 	type Forwarder,
+	type ICohortThresholdCrypto,
 	type ITopicRouter,
 	type MembershipCertPublisher,
 	type MembershipCertV1,
@@ -141,6 +156,7 @@ import {
 	type RenewReplyV1,
 	type RenewV1,
 	type RingCoord,
+	type RootPlacement,
 	type RotationAttestation,
 	type SignKind,
 	type SignReplyV1,
@@ -259,6 +275,181 @@ export interface CohortTopicHostOptions {
 	 * bound — e.g. `() => Number.POSITIVE_INFINITY` — so its synthetic future timestamps are not rejected.
 	 */
 	readonly now?: () => number;
+	/**
+	 * The one rule root placement rests on: the **root group** at a coordinate is the key network's serving
+	 * cohort there (`docs/cohort-topic.md` §Root placement at a routing key). Supplying it makes this host
+	 * serve root-placed topics — it reads the group into a per-coord snapshot wherever a default engine would
+	 * assemble the FRET cohort, signs and verifies the root under `ceil(|group| × quorumRatio)`, and gives the
+	 * router a `routeToRoot`. Omitted, every root-placed frame is refused (`unwilling_cohort`, "root placement
+	 * not served"), so a node that has not opted in never pretends to be a storage group. The node wiring
+	 * binds it to the key network and `consensusConfig.superMajorityThreshold`; specs use a fake.
+	 */
+	readonly rootGroup?: RootGroupOptions;
+}
+
+/** The root group at a coordinate, as the host reads it (see {@link CohortTopicHostOptions.rootGroup}). */
+export interface RootGroupOptions {
+	/**
+	 * Members (peer-id strings, proximity order) of the root group at `coord` — the key network's
+	 * network-scoped serving cohort there, `clusterSize` wide, self included only when it is one of them.
+	 * Async: it reads the peerStore. A rejection is treated as "group unavailable" by every caller.
+	 */
+	membersAt(coord: RingCoord): Promise<readonly string[]>;
+	/** Threshold ratio for a root-placed cohort: `minSigs = ceil(members × quorumRatio)`, in `(0, 1]`. */
+	readonly quorumRatio: number;
+}
+
+/**
+ * How a {@link CoordEngine} addresses its topic's root — fixed when the engine is created. `rootPlaced` is
+ * the rule the coordinate is served under: its cohort is the root group and its threshold the ratio rule
+ * (tier 0 of a root-placed topic only). `rootKey` is the key the creating frame named, when it named one;
+ * a tier-1 engine addresses its parent at `H(rootKey)` with it and stamps it on its child link. A later
+ * frame for the coordinate that claims the other rule is refused ({@link CoordPlacementMismatchError}):
+ * `H(rootKey)` carries no tier byte or topic id, so a root key can land on a coordinate some
+ * default-addressed topic uses, and whichever frame arrived first must not pick the cohort view and the
+ * threshold for a coordinate another topic depends on.
+ */
+export interface EnginePlacement {
+	readonly rootPlaced: boolean;
+	readonly rootKey?: Uint8Array;
+}
+
+/** The placement of every coordinate that names no root key. */
+const DEFAULT_PLACEMENT: EnginePlacement = { rootPlaced: false };
+
+/** The placement a frame at `treeTier` naming `rootKey` (or not) asks for. */
+function placementOf(treeTier: number, rootKey: Uint8Array | undefined): EnginePlacement {
+	return rootKey === undefined ? DEFAULT_PLACEMENT : { rootPlaced: treeTier === 0, rootKey };
+}
+
+/**
+ * Thrown when a frame claims the other placement rule for a coordinate this node already serves: a
+ * root-placed register, child link, `/sign` or gossip frame at a coord served under the default rule, or
+ * the reverse — including a tier-`d ≥ 1` frame naming a different root key than the engine recorded. The
+ * dispatch paths catch it and answer a clean refusal.
+ */
+export class CoordPlacementMismatchError extends Error {
+	constructor(coord: RingCoord) {
+		super(`cohort-topic coord ${bytesToB64url(coord)} is served under the other placement rule`);
+		this.name = "CoordPlacementMismatchError";
+	}
+}
+
+/**
+ * Thrown by the root-group admission check when a root-placed frame cannot be served here: the host has
+ * no {@link CohortTopicHostOptions.rootGroup} (`not-served`), this node is not a member of the group at
+ * the coord (`not-member`, carrying the group so the reply can name it), or the group could not be read
+ * (`group-unavailable`). Caught by the register / child-link dispatch and mapped to a refusal reply.
+ */
+export class RootPlacementRefusedError extends Error {
+	constructor(
+		readonly refusal: "not-served" | "not-member" | "group-unavailable",
+		readonly candidateMembers: readonly Uint8Array[] = [],
+	) {
+		super(`cohort-topic root placement refused: ${refusal}`);
+		this.name = "RootPlacementRefusedError";
+	}
+}
+
+/**
+ * The root group at one root-placed coordinate as this node last read it, in the shape every cohort site
+ * consumes ({@link CohortSnapshotView}: members as dialable member bytes, epoch `H(sorted members)` — the
+ * same derivation the FRET assembly uses, so a member change rotates the epoch).
+ */
+export interface RootGroupSnapshot extends CohortSnapshotView {
+	/** The members as peer-id strings (the dial / FRET form), in the order `membersAt` returned them. */
+	readonly memberStrs: readonly string[];
+	/** Wall-clock ms this node read the group. */
+	readonly readAt: number;
+}
+
+/**
+ * Per-coord root-group snapshots (`docs/cohort-topic.md` §Root placement at a routing key). Every host
+ * site that assembles a cohort synchronously reads one of these for a root-placed coord instead of the
+ * FRET cohort: it is filled before a root-placed engine is created (register and child-link dispatch are
+ * already async), refreshed by the engine on each gossip round, and read on demand before a `/sign` or
+ * membership request for a coord that has none yet. Bounded like the coord-engine registry (an `LruMap`
+ * of the same cap), and dropped alongside an evicted engine.
+ */
+export interface RootGroupSnapshots {
+	/** The held snapshot for `coord`, or `undefined` when none was read (or it was evicted). Synchronous. */
+	get(coord: RingCoord): RootGroupSnapshot | undefined;
+	/** The held snapshot when it is younger than `maxAgeMs`, else a fresh read. Concurrent reads of one coord share one `membersAt`. */
+	ensure(coord: RingCoord): Promise<RootGroupSnapshot>;
+	/** A fresh read, replacing whatever is held (the gossip-cadence refresh). */
+	refresh(coord: RingCoord): Promise<RootGroupSnapshot>;
+	/** Forget `coord` (its engine was evicted). */
+	drop(coord: RingCoord): void;
+}
+
+/** The epoch of a member set: `H(sorted base64url members joined by "|")`, a pure function of the set. */
+export function cohortEpochOf(members: readonly Uint8Array[], hash: RingHash): Uint8Array {
+	return hash.H(new TextEncoder().encode(members.map(bytesToB64url).sort().join("|")));
+}
+
+function createRootGroupSnapshots(deps: {
+	readonly membersAt: (coord: RingCoord) => Promise<readonly string[]>;
+	readonly hash: RingHash;
+	readonly maxCoords: number;
+	readonly maxAgeMs: number;
+}): RootGroupSnapshots {
+	const held = new LruMap<string, RootGroupSnapshot>(deps.maxCoords);
+	const inFlight = new Map<string, Promise<RootGroupSnapshot>>();
+	const read = (coord: RingCoord, key: string): Promise<RootGroupSnapshot> => {
+		const pending = inFlight.get(key);
+		if (pending !== undefined) {
+			return pending;
+		}
+		const task = (async (): Promise<RootGroupSnapshot> => {
+			// Dedupe in order: `membersAt` is proximity-ordered and the order is what a caller dials in.
+			const memberStrs = [...new Set(await deps.membersAt(coord))];
+			const members = memberStrs.map((m) => peerIdToBytes(m));
+			const snapshot: RootGroupSnapshot = { members, cohortEpoch: cohortEpochOf(members, deps.hash), memberStrs, readAt: Date.now() };
+			held.set(key, snapshot);
+			return snapshot;
+		})().finally(() => inFlight.delete(key));
+		inFlight.set(key, task);
+		return task;
+	};
+	return {
+		get(coord: RingCoord): RootGroupSnapshot | undefined {
+			return held.get(bytesToB64url(coord));
+		},
+		ensure(coord: RingCoord): Promise<RootGroupSnapshot> {
+			const key = bytesToB64url(coord);
+			const current = held.get(key);
+			if (current !== undefined && Date.now() - current.readAt < deps.maxAgeMs) {
+				return Promise.resolve(current);
+			}
+			return read(coord, key);
+		},
+		refresh(coord: RingCoord): Promise<RootGroupSnapshot> {
+			return read(coord, bytesToB64url(coord));
+		},
+		drop(coord: RingCoord): void {
+			held.delete(bytesToB64url(coord));
+		},
+	};
+}
+
+/** What a root-placed engine needs from the host: the ratio rule and the snapshot store (see {@link CoordEngineContext.rootGroup}). */
+interface RootGroupSupport {
+	readonly placement: RootPlacement;
+	readonly snapshots: RootGroupSnapshots;
+}
+
+/**
+ * A {@link CohortSigner} whose assembly threshold is read at each signing: a root group's size is a
+ * configuration constant, but the rule is `ceil(|members| × ratio)` over the members at that moment, and a
+ * default engine's threshold is the node-wide `minSigs`. Verification takes its threshold as an argument,
+ * so it is unchanged.
+ */
+function createDynamicThresholdSigner(crypto: ICohortThresholdCrypto, minSigsNow: () => number): CohortSigner {
+	const verifying = createCohortSigner(crypto, 0); // `verifyThreshold` takes the threshold as an argument; the constructor's is unused there
+	return {
+		thresholdSign: (payload: Uint8Array): Promise<{ thresholdSig: Uint8Array; signers: Uint8Array[] }> => crypto.assemble(payload, minSigsNow()),
+		verifyThreshold: (payload, sig, signers, cert, minSigs): boolean => verifying.verifyThreshold(payload, sig, signers, cert, minSigs),
+	};
 }
 
 // The reputation-view shape the bootstrap-evidence referee verifier consults — `{ isBanned, getScore }`
@@ -357,9 +548,27 @@ export interface CoordEngine {
 	readonly servedCoord: RingCoord;
 	/** Tree tier `d` the served coord was instantiated at (fixed by the first register). */
 	readonly treeTier: number;
+	/**
+	 * True iff this engine serves the root of a root-placed topic: its cohort is the root group at
+	 * {@link servedCoord} and its threshold the ratio rule. Fixed at creation (see {@link EnginePlacement}).
+	 */
+	readonly rootPlaced: boolean;
+	/** The ratio rule this engine signs and verifies under — present iff {@link rootPlaced}. */
+	readonly placement: RootPlacement | undefined;
+	/**
+	 * The topic's root key, when a frame named one: a tier-1 engine addresses its parent at `H(rootKey)`.
+	 * An engine created by a frame without one (a gossip-instantiated cold sibling, a tier-`d ≥ 2` child's
+	 * link) adopts the key from the first frame that carries it ({@link CoordRegistry.forCoord}).
+	 */
+	readonly rootKey: Uint8Array | undefined;
+	/** Record the topic's root key on an engine created without one. Called by the registry only (see {@link rootKey}). */
+	adoptRootKey(rootKey: Uint8Array): void;
 	/** Cohort-side register/renew/sweep engine driven by the protocol handlers + activity callback. */
 	readonly engine: CohortMemberEngine;
-	/** The FRET-assembled cohort around {@link servedCoord} (self prepended, deduped) + epoch. */
+	/**
+	 * The cohort this engine signs and shards with + its epoch: the FRET assembly around {@link servedCoord}
+	 * (self prepended, deduped), or — for a {@link rootPlaced} engine — the root-group snapshot it holds.
+	 */
 	cohort(): CohortSnapshotView;
 	/**
 	 * The cohort member peer-id strings this engine served under `epoch` (the **current** or the
@@ -490,7 +699,11 @@ export interface CoordRegistry {
 	 * The {@link CoordEngine} for `coord`, creating + caching it on first touch. `treeTier` and
 	 * `participantCoord` seed a freshly-created engine's coord-derived tier inputs (ignored if the
 	 * engine already exists). Synchronous, so concurrent activity callbacks for the same coord share
-	 * one engine without a second being constructed.
+	 * one engine without a second being constructed. `placement` is the rule the frame asks for (default:
+	 * the default rule); an existing engine under the other rule — or, at tier `d ≥ 1`, holding a different
+	 * root key — throws {@link CoordPlacementMismatchError}, and one holding no key adopts the frame's. A
+	 * root-placed creation requires the coord's root-group snapshot to have been read already (the caller
+	 * awaits `RootGroupSnapshots.ensure` first — this method stays synchronous).
 	 *
 	 * **Capacity.** The registry is hard-capped (see {@link CohortTopicAntiDosOptions.coordEnginesMax}). A
 	 * lookup that returns an already-resident engine always succeeds. A *creation* over a full registry
@@ -500,7 +713,7 @@ export interface CoordRegistry {
 	 * unbounded — callers on the register / child-link / cold-sibling paths catch it and answer a clean
 	 * capacity refusal.
 	 */
-	forCoord(coord: RingCoord, treeTier: number, participantCoord: Uint8Array): CoordEngine;
+	forCoord(coord: RingCoord, treeTier: number, participantCoord: Uint8Array, placement?: EnginePlacement): CoordEngine;
 	/** The engine holding the record for `(topicId, participantId)`, or `undefined` (renewal dispatch). */
 	findHolder(topicId: Uint8Array, participantId: Uint8Array): CoordEngine | undefined;
 	/**
@@ -604,6 +817,12 @@ interface CoordEngineContext {
 	readonly dialSign: (peerIdStr: string, request: SignRequestV1) => Promise<SignReplyV1>;
 	/** FRET two-sided assembly around `coord`, self prepended + deduped, with a deterministic epoch. */
 	readonly cohortAround: (coord: RingCoord) => CohortSnapshotView;
+	/**
+	 * Root-placement support: the ratio rule and the per-coord root-group snapshots a root-placed engine
+	 * reads its cohort from. Absent when the host was given no {@link CohortTopicHostOptions.rootGroup} —
+	 * the registry then never creates a root-placed engine.
+	 */
+	readonly rootGroup?: RootGroupSupport;
 	/** Verify an inbound `RegisterV1`'s participant peer-key signature (live-signer mode only). */
 	readonly verifyRegisterSig?: (reg: RegisterV1) => boolean;
 	/** Verify a privileged `RenewV1`'s participant peer-key signature — gates both the `reattach`
@@ -616,23 +835,27 @@ interface CoordEngineContext {
 	 */
 	readonly signGossip?: (g: CohortGossipSignable) => Promise<string>;
 	/**
-	 * Authenticate an inbound `CohortGossipV1` for a served `coord`: its `fromMember` peer-key signature
-	 * must verify over the gossip image **and** `fromMember` must be a member of the cohort around `coord`.
-	 * Live-signer mode only; absent → the bus skips the gate (key-less / unit composition).
+	 * Authenticate an inbound `CohortGossipV1` against the cohort it should come from: its `fromMember`
+	 * peer-key signature must verify over the gossip image **and** `fromMember` must be one of `members`
+	 * (peer-id strings — the engine's own cohort view, so a root-placed engine checks against its root
+	 * group). Live-signer mode only; absent → the bus skips the gate (key-less / unit composition).
 	 */
-	readonly verifyGossip?: (g: CohortGossipV1, coord: RingCoord) => boolean;
+	readonly verifyGossip?: (g: CohortGossipV1, members: readonly string[]) => boolean;
 	/**
 	 * Broadcast a freshly threshold-signed promotion/demotion notice this engine produced over the
 	 * `promote` protocol — to the cohort around `servedCoord`, plus the parent coord for a demotion.
-	 * Wired by the host; absent in key-less / unit composition.
+	 * `parentRootPlaced` says the parent coord is a root group (a tier-1 engine of a root-placed topic), so
+	 * the host reads that group before fanning out. Wired by the host; absent in key-less / unit composition.
 	 */
-	readonly broadcastNotice?: (notice: PromotionNoticeV1 | DemotionNoticeV1, servedCoord: RingCoord) => void;
+	readonly broadcastNotice?: (notice: PromotionNoticeV1 | DemotionNoticeV1, servedCoord: RingCoord, parentRootPlaced: boolean) => void;
 	/**
 	 * Hook a freshly published `MembershipCertV1` (from {@link CoordEngine.onStabilized} /
 	 * {@link CoordEngine.pumpMembership}) into the node's verifier cache, so this node can verify inbound
-	 * notices signed by its own cohort without a network refetch. Absent in unit composition.
+	 * notices signed by its own cohort without a network refetch. `placement` is the rule the cert was
+	 * published under (a root-placed engine's), so the cache entry answers calls made under that rule.
+	 * Absent in unit composition.
 	 */
-	readonly onCertPublished?: (cert: MembershipCertV1) => void;
+	readonly onCertPublished?: (cert: MembershipCertV1, placement: RootPlacement | undefined) => void;
 	/**
 	 * Hook fired by the coord-engine registry AFTER it evicts (and closes) an engine, with the evicted
 	 * engine's served coord. The host wires it to `verifier.forget(coord)`: on a keyed node the
@@ -676,18 +899,70 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	const selfCoord = await hashPeerId(node.peerId); // ring position P (the participant gossip handle)
 	const addressing = createTierAddressing(hash, fanout);
 
-	// --- cohort resolver (FRET two-sided assembly around a coord) ---
+	// --- root placement (§Root placement at a routing key) ---
+	// The one rule the design rests on, `options.rootGroup.membersAt`, is read into per-coord snapshots that
+	// every synchronous cohort site consults for a root-placed coord. Absent → no root-placed engine is ever
+	// created and every root-placed frame is refused (see `prepareRootPlacedCoord`).
+	const rootGroup: RootGroupSupport | undefined = options.rootGroup === undefined
+		? undefined
+		: {
+			placement: createRootPlacement(options.rootGroup.quorumRatio),
+			snapshots: createRootGroupSnapshots({
+				membersAt: options.rootGroup.membersAt,
+				hash,
+				maxCoords: options.antiDos?.coordEnginesMax ?? DEFAULT_COORD_ENGINES_MAX,
+				maxAgeMs: gossipIntervalMs,
+			}),
+		};
+	/**
+	 * The root group this node holds for `coord`, or `undefined` when the coord is served (or would be served)
+	 * under the default rule: an engine decides (its own view, so a root-placed engine's broadcasts and the
+	 * anchor's judgement follow the view it signs under); with no engine, a snapshot read on demand decides.
+	 */
+	const rootGroupMembersFor = (coord: RingCoord): readonly string[] | undefined => {
+		if (rootGroup === undefined) {
+			return undefined;
+		}
+		const engine = registry.findByCoord(coord);
+		if (engine !== undefined) {
+			return engine.rootPlaced ? engine.cohort().members.map(bytesToPeerIdString) : undefined;
+		}
+		return rootGroup.snapshots.get(coord)?.memberStrs;
+	};
+
+	// --- cohort resolver (FRET two-sided assembly around a coord; the root group for a root-placed coord) ---
 	const resolver: CohortPeerResolver = {
 		cohortPeers(coord: RingCoord, wants: number): string[] {
-			return fret.assembleCohort(coord, wants);
+			const group = rootGroupMembersFor(coord);
+			return group === undefined ? fret.assembleCohort(coord, wants) : [...group];
 		},
 	};
 
 	// --- ports (node-wide singletons, injected into every coord engine) ---
-	const router = new FretTopicRouter(node, fret, { registerProtocol: protocols.register, maxBytes });
+	// The router's `routeToRoot` exists only on a host that serves root placement; it resolves the group by the
+	// rule that chose it (never by ring routing at the coordinate — see the router) and runs a frame addressed
+	// to this node through the local register handler, since libp2p refuses a self-dial.
+	const router = new FretTopicRouter(node, fret, {
+		registerProtocol: protocols.register,
+		maxBytes,
+		...(rootGroup === undefined ? {} : {
+			rootGroupMembers: (rootKey: Uint8Array): Promise<readonly string[]> =>
+				rootGroup.snapshots.ensure(addressing.rootCoord(rootKey)).then((snapshot) => snapshot.memberStrs),
+			selfPeerId: selfPeerStr,
+			handleLocally: (activity: Uint8Array): Promise<Uint8Array> => handleRegisterFrame(activity),
+		}),
+	});
 	const sizeEstimator = new FretSizeEstimator(fret);
 	const gossipTransport = new FretCohortGossipTransport(node, resolver, { gossipProtocol: protocols.gossip, wants: wantK, selfPeerId: selfPeerStr });
-	const membershipSource = new FretMembershipSource(node, resolver, { membershipProtocol: protocols.membership, wants: wantK, maxBytes });
+	const membershipSource = new FretMembershipSource(node, resolver, {
+		membershipProtocol: protocols.membership,
+		wants: wantK,
+		maxBytes,
+		// A root-placed cert is fetched from the root group, read through the same snapshot the anchor judges by.
+		...(rootGroup === undefined ? {} : {
+			rootGroupPeers: (coord: RingCoord): Promise<readonly string[]> => rootGroup.snapshots.ensure(coord).then((snapshot) => snapshot.memberStrs),
+		}),
+	});
 	const publishSink = new FretMembershipPublishSink();
 
 	const slots = createSlotAssigner(hash);
@@ -704,15 +979,14 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		return validateSignReplyV1(decodeCohortMessage(requireReply(reply, "cohort sign"), maxBytes));
 	};
 
-	/** FRET assembly around `coord`: self prepended + deduped; epoch = H(sorted member join). */
+	/** FRET assembly around `coord`: self prepended + deduped; epoch = H(sorted member join) — a membership change rotates it. */
 	const cohortAround = (coord: RingCoord): CohortSnapshotView => {
 		const peerStrs = fret.assembleCohort(coord, wantK);
 		const members = [selfMemberBytes, ...peerStrs.filter((p) => p !== selfPeerStr).map((p) => peerIdToBytes(p))];
-		// Deterministic epoch from the sorted member set so a membership change rotates the epoch.
-		const epochInput = members.map(bytesToB64url).sort().join("|");
-		const cohortEpoch = hash.H(new TextEncoder().encode(epochInput));
-		return { members, cohortEpoch };
+		return { members, cohortEpoch: cohortEpochOf(members, hash) };
 	};
+	/** The peer-id strings of the FRET cohort around `coord` (the form every membership check compares). */
+	const memberStrsAround = (coord: RingCoord): string[] => cohortAround(coord).members.map(bytesToPeerIdString);
 
 	// --- participant peer-key signing seam (gap 2) ---
 	// The live signer needs the node's libp2p key (libp2p does not expose it off `node.peerId`, so it
@@ -742,19 +1016,17 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	const signGossip = nodeKey === undefined
 		? undefined
 		: async (g: CohortGossipSignable): Promise<string> => bytesToB64url(await signPeer(nodeKey, cohortGossipSigningPayload(g)));
-	const verifyGossip = nodeKey === undefined
+	// The two halves of the gate are separate because the cold-sibling path needs them apart: the signature
+	// is checked before the (possibly async) root-group read, and membership against whichever cohort the
+	// frame's rule names.
+	const verifyGossipSig = nodeKey === undefined
 		? undefined
-		: (g: CohortGossipV1, coord: RingCoord): boolean => {
-			if (g.signature.length === 0) {
-				return false;
-			}
-			const fromBytes = b64urlToBytes(g.fromMember);
-			if (!verifyPeerSig(fromBytes, cohortGossipSigningPayload(g), b64urlToBytes(g.signature))) {
-				return false;
-			}
-			const members = cohortAround(coord).members.map(bytesToPeerIdString);
-			return members.includes(bytesToPeerIdString(fromBytes));
-		};
+		: (g: CohortGossipV1): boolean =>
+			g.signature.length > 0 && verifyPeerSig(b64urlToBytes(g.fromMember), cohortGossipSigningPayload(g), b64urlToBytes(g.signature));
+	const verifyGossip = verifyGossipSig === undefined
+		? undefined
+		: (g: CohortGossipV1, members: readonly string[]): boolean =>
+			verifyGossipSig(g) && members.includes(bytesToPeerIdString(b64urlToBytes(g.fromMember)));
 
 	// Node-level `promote`-handler anti-abuse gate (`cohort-topic-promote-handler-verify-amplification`):
 	// a per-(peer, topic) rate limiter (own instance — the register-path limiter is per-coord inside each
@@ -769,7 +1041,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// `promote` protocol to the cohort around the served coord (siblings adopt the state) and, for a
 	// demotion, additionally to the parent coord (childCohortCount bookkeeping). Reuses the gossip
 	// transport's cohort peer resolution.
-	const broadcastNotice = (notice: PromotionNoticeV1 | DemotionNoticeV1, servedCoord: RingCoord): void => {
+	const broadcastNotice = (notice: PromotionNoticeV1 | DemotionNoticeV1, servedCoord: RingCoord, parentRootPlaced: boolean): void => {
 		// Record the origination in the node-level adopted-transition map BEFORE fanning out: `broadcastOver`
 		// excludes self, so an originated notice never arrives back on the inbound path — this is the ONLY
 		// write for locally-originated transitions. Keyed off the notice's own `cohortCoord` only; the parent
@@ -783,9 +1055,21 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		// additionally resolves `parentCohortCoord` and — on the same threshold verify against the child cohort
 		// cert — calls `parent.unrecordChild(...)`. A parent-only node applies only the unlink; a node serving
 		// both coords applies both. See `noticeBroadcastCoords` / `handleInboundNotice`.
-		for (const coord of noticeBroadcastCoords(notice, servedCoord)) {
-			gossipTransport.broadcastOver(protocols.promote, coord, frame);
+		const fanOut = (): void => {
+			for (const coord of noticeBroadcastCoords(notice, servedCoord)) {
+				gossipTransport.broadcastOver(protocols.promote, coord, frame);
+			}
+		};
+		// A demotion whose parent is a root group: read the group first, so the resolver fans the parent-coord
+		// frame to the group rather than to the FRET cohort around a coordinate nobody serves under that rule.
+		if (parentRootPlaced && rootGroup !== undefined && "parentCohortCoord" in notice) {
+			void rootGroup.snapshots.ensure(b64urlToBytes(notice.parentCohortCoord)).then(fanOut, (err: unknown) => {
+				log("cohort-topic: root group at the demotion's parent coord unavailable, fanning out anyway: %o", err);
+				fanOut();
+			});
+			return;
 		}
+		fanOut();
 	};
 
 	// --- anti-DoS (gap 6) ---
@@ -836,6 +1120,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		promotionConfig: options.promotion,
 		dialSign,
 		cohortAround,
+		...(rootGroup === undefined ? {} : { rootGroup }),
 		verifyRegisterSig,
 		verifyParticipantSig,
 		signGossip,
@@ -855,11 +1140,18 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		// eviction cannot assume "no records → never published". Demotion, however, does NOT release the engine
 		// (a demoted engine keeps its records/forwarder and stays resident), so the demotion-side lock drop
 		// still has no signal to hang off; the strike-counter heuristic remains the recovery there.
-		onCertPublished: (cert: MembershipCertV1): void => verifier.cache(cert),
+		// The placement is the rule the cert was published under: cached without it, a root-placed engine's
+		// cert would answer only default-rule calls, every verification under the placement would miss the
+		// cache and re-validate from the source, and the self-published trust lock would never be used.
+		onCertPublished: (cert: MembershipCertV1, placement: RootPlacement | undefined): void => verifier.cache(cert, placement),
 		// Drop the verifier trust-lock for an evicted engine's coord — unconditional, because on a keyed node
 		// ANY engine (even one holding no records) may have published a cert via the gossip-cadence
-		// `pumpMembership` sweep. A no-op for a coord the verifier holds nothing for.
-		onEngineEvicted: (coord: RingCoord): void => verifier.forget(bytesToB64url(coord)),
+		// `pumpMembership` sweep. A no-op for a coord the verifier holds nothing for. A root-placed engine's
+		// snapshot goes with it (bounded maps only; a later frame reads the group afresh).
+		onEngineEvicted: (coord: RingCoord): void => {
+			verifier.forget(bytesToB64url(coord));
+			rootGroup?.snapshots.drop(coord);
+		},
 		// Node-level adopted-transition reader (engine seeding). Wired unconditionally — key-less hosts also
 		// adopt verified inbound notices, so their recreated engines need the seed just the same.
 		adoptedTransition: (coord: RingCoord, tier: number, topicId: Uint8Array): AdoptedTransition | undefined =>
@@ -892,8 +1184,12 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// state is reclaimed under memory pressure like any other cold engine, and a creation over a
 	// full-of-pinned registry is refused (`CoordEngineRegistryFullError`) and dropped here rather than
 	// crashing the gossip handler.
-	const maybeInstantiateColdSibling = (frame: Uint8Array): void => {
-		if (verifyGossip === undefined) {
+	//
+	// A frame carrying `rootPlaced` names a root group, not a FRET cohort: the group is read (on demand, async)
+	// and the engine is created root-placed — only when this node is one of the group's members. A host that
+	// serves no root placement ignores such frames.
+	const maybeInstantiateColdSibling = async (frame: Uint8Array): Promise<void> => {
+		if (verifyGossip === undefined || verifyGossipSig === undefined) {
 			return; // key-less / interim mode: no co-member gate, so never auto-instantiate
 		}
 		let g: CohortGossipV1;
@@ -914,16 +1210,40 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		if (registry.findByCoord(coord) !== undefined) {
 			return; // already serving this coord — nothing to instantiate
 		}
-		if (!verifyGossip(g, coord)) {
-			return; // co-member gate: bad signature or non-member → do not instantiate
+		if (!verifyGossipSig(g)) {
+			return; // a bad signature never earns a root-group read, let alone an engine
+		}
+		const claimsRoot = g.rootPlaced === true;
+		let members: readonly string[];
+		if (claimsRoot) {
+			if (rootGroup === undefined) {
+				return; // root placement not served here
+			}
+			try {
+				members = (await rootGroup.snapshots.ensure(coord)).memberStrs;
+			} catch (err) {
+				log("cohort-topic: root group unavailable for a cold-sibling frame at %s: %o", g.coord, err);
+				return;
+			}
+			if (!members.includes(selfPeerStr)) {
+				return; // not a member of the root group: this node must not serve the coord
+			}
+		} else {
+			members = memberStrsAround(coord);
+		}
+		if (!verifyGossip(g, members)) {
+			return; // co-member gate: non-member → do not instantiate
+		}
+		if (registry.findByCoord(coord) !== undefined) {
+			return; // created by a register that landed during the root-group read
 		}
 		// The dummy `participantCoord` seeds only the tier-`d > 0` parent-coord derivation, which a tier-0
 		// engine never exercises (demotion is gated on `treeTier > 0`); self's member bytes are a safe filler.
 		try {
-			registry.forCoord(coord, g.treeTier, selfMemberBytes);
+			registry.forCoord(coord, g.treeTier, selfMemberBytes, claimsRoot ? { rootPlaced: true } : DEFAULT_PLACEMENT);
 		} catch (err) {
-			if (err instanceof CoordEngineRegistryFullError) {
-				return; // registry full of live cohorts — drop the cold-sibling instantiation (same as any drop)
+			if (err instanceof CoordEngineRegistryFullError || err instanceof CoordPlacementMismatchError) {
+				return; // registry full of live cohorts, or a rule the coord is not served under — drop, as any drop
 			}
 			throw err;
 		}
@@ -933,24 +1253,51 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// A member dials us to endorse a threshold-signed artifact; we sign the exact request payload iff we
 	// and the requester share the cohort+epoch around `coord`. Exported `handleSignRequest` is the testable
 	// core; here we bind it to this node's key + the FRET assembly around the requested coord.
-	const signEndorse = (request: SignRequestV1, fromPeerStr: string): Promise<SignReplyV1> =>
-		handleSignRequest(request, fromPeerStr, {
+	//
+	// Which cohort the request is about follows the coord's placement rule: a request carrying `rootPlaced`
+	// is answered from the root group (the served engine's view, or a snapshot read on demand), any other from
+	// the FRET assembly — and a request claiming the other rule for a coord this node serves is refused, so
+	// the first frame to arrive never picks the view for a coordinate another topic depends on.
+	const signEndorse = async (request: SignRequestV1, fromPeerStr: string): Promise<SignReplyV1> => {
+		const coord = b64urlToBytes(request.coord);
+		const requestedRoot = request.rootPlaced === true;
+		const served = registry.findByCoord(coord);
+		if (served !== undefined && served.rootPlaced !== requestedRoot) {
+			return { v: 1, refused: true, reason: "coord is served under the other placement rule" };
+		}
+		let view: (coord: RingCoord) => CohortSnapshotView;
+		if (!requestedRoot) {
+			view = cohortAround;
+		} else if (rootGroup === undefined) {
+			return { v: 1, refused: true, reason: "root placement not served" };
+		} else if (served !== undefined) {
+			view = (): CohortSnapshotView => served.cohort();
+		} else {
+			try {
+				const snapshot = await rootGroup.snapshots.ensure(coord);
+				view = (): CohortSnapshotView => snapshot;
+			} catch (err) {
+				log("cohort-topic: root group unavailable for a /sign request at %s: %o", request.coord, err);
+				return { v: 1, refused: true, reason: "root group unavailable" };
+			}
+		}
+		return handleSignRequest(request, fromPeerStr, {
 			privateKey: options.privateKey,
 			selfMember: selfMemberBytes,
-			cohortMembersAround: (coord: RingCoord): string[] => cohortAround(coord).members.map(bytesToPeerIdString),
-			currentEpoch: (coord: RingCoord): Uint8Array => cohortAround(coord).cohortEpoch,
+			cohortMembersAround: (c: RingCoord): string[] => view(c).members.map(bytesToPeerIdString),
+			currentEpoch: (c: RingCoord): Uint8Array => view(c).cohortEpoch,
 			// Rotation endorsement consults the served coord engine's prior-epoch membership history; a coord
 			// this node does not serve has no engine, so the hand-off is refused (no spurious instantiation).
-			priorCohortMembersAt: (coord: RingCoord, epoch: Uint8Array): readonly string[] | undefined =>
-				registry.findByCoord(coord)?.cohortIdentityAt(epoch),
-			// Membership binding: re-derive our own canonical cert fields from the SAME `cohortAround` snapshot
-			// the per-coord publisher signs over, so a falsified `members` / `cohortCoord` / internal-epoch
-			// payload is refused. `stabilizedAt: 0` — the endorser ignores it (it only bounds the value
-			// far-future via `now`), matching the dep contract (cohort-topic-sign-endorsement-payload-binding).
-			expectedMembershipFields: (coord: RingCoord): { cohortCoord: string; cohortEpoch: string; members: string[] } => {
-				const snap = cohortAround(coord);
+			priorCohortMembersAt: (c: RingCoord, epoch: Uint8Array): readonly string[] | undefined =>
+				registry.findByCoord(c)?.cohortIdentityAt(epoch),
+			// Membership binding: re-derive our own canonical cert fields from the SAME view the per-coord
+			// publisher signs over, so a falsified `members` / `cohortCoord` / internal-epoch payload is
+			// refused. `stabilizedAt: 0` — the endorser ignores it (it only bounds the value far-future via
+			// `now`), matching the dep contract (cohort-topic-sign-endorsement-payload-binding).
+			expectedMembershipFields: (c: RingCoord): { cohortCoord: string; cohortEpoch: string; members: string[] } => {
+				const snap = view(c);
 				const { cohortCoord, cohortEpoch, members } = membershipCertSignable({
-					coord,
+					coord: c,
 					cohortEpoch: snap.cohortEpoch,
 					members: snap.members,
 					stabilizedAt: 0,
@@ -961,6 +1308,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			// injects a non-tripping clock (its publish `stabilizedAt` is synthetic, not wall-clock).
 			now: options.now ?? ((): number => Date.now()),
 		});
+	};
 
 	// --- participant-side composition (node scope) ---
 	// The participant service exposes a node-level gossip handle (around the node's own ring position)
@@ -973,7 +1321,8 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		localEpoch: (): Uint8Array => cohortAround(selfCoord).cohortEpoch,
 		// Same per-coord auth gate as the coord engines: only a signed gossip from a member of the cohort
 		// around the node's own ring position merges here (live-signer mode); absent in key-less composition.
-		verifyInbound: verifyGossip === undefined ? undefined : (g): boolean => verifyGossip(g, selfCoord),
+		// The node's own ring position is never a root group, so a frame claiming that rule is refused.
+		verifyInbound: verifyGossip === undefined ? undefined : (g): boolean => g.rootPlaced !== true && verifyGossip(g, memberStrsAround(selfCoord)),
 	});
 	const certSource: IMembershipSource = membershipSource;
 	const membershipRouter = createMembershipSourceRouter({ committed: certSource, fret: certSource });
@@ -984,7 +1333,9 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// cohort `"anchored"`, everything else `"unknown"` (→ chain / TOFU). Committed tiers (T0/T1) stay
 	// `"unknown"` here so this composes with the future tx-log anchor rather than fighting it. `wantK` matches
 	// the cohort size `cohortAround` publishes certs over; `selfPeerStr` is the coverage handle.
-	const trustAnchor = new FretTrustAnchor(fret, { k: wantK, selfPeerId: selfPeerStr });
+	// A root-placed cert is judged against the root group this node holds for the coord (`rootGroupAt`) —
+	// the same view the engine signs under or the source fetched through — and `"unknown"` when it holds none.
+	const trustAnchor = new FretTrustAnchor(fret, { k: wantK, selfPeerId: selfPeerStr, rootGroupAt: rootGroupMembersFor });
 	const verifier = createMembershipVerifier({
 		signer: verifyingSigner,
 		router: membershipRouter,
@@ -1019,32 +1370,93 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		config: { fanout, wantK, minSigs, maxMessageBytes: maxBytes },
 	});
 
+	// --- root-group admission: the check every root-placed frame passes before its engine exists ---
+	/**
+	 * Read the root group at a root-placed `coord` and check this node is one of its members, throwing
+	 * {@link RootPlacementRefusedError} otherwise — and {@link CoordPlacementMismatchError} first when the coord
+	 * is already served under the default rule, so no snapshot is read for such a coord. Resolves to the
+	 * snapshot the engine will be created over (the registry's `forCoord` is synchronous and reads it).
+	 */
+	const prepareRootPlacedCoord = async (coord: RingCoord): Promise<RootGroupSnapshot> => {
+		if (rootGroup === undefined) {
+			throw new RootPlacementRefusedError("not-served");
+		}
+		const existing = registry.findByCoord(coord);
+		if (existing !== undefined && !existing.rootPlaced) {
+			throw new CoordPlacementMismatchError(coord);
+		}
+		let snapshot: RootGroupSnapshot;
+		try {
+			snapshot = await rootGroup.snapshots.ensure(coord);
+		} catch (err) {
+			log("cohort-topic: root group unavailable at %s: %o", bytesToB64url(coord), err);
+			throw new RootPlacementRefusedError("group-unavailable");
+		}
+		if (!snapshot.memberStrs.includes(selfPeerStr)) {
+			// A FRET-routed frame lands on the nearest ring peer, which on a ring shared with another network may
+			// serve that other network; naming the group lets the walk's member retry dial a real member.
+			throw new RootPlacementRefusedError("not-member", snapshot.members);
+		}
+		return snapshot;
+	};
+	/** The reply a register gets when its coord cannot be created or served under the rule it asks for. */
+	const refusalReply = (err: unknown): RegisterReplyV1 | undefined => {
+		if (err instanceof RootPlacementRefusedError) {
+			if (err.refusal === "not-member") {
+				return { v: 1, result: "unwilling_member", candidateMembers: err.candidateMembers.map(bytesToB64url), reason: "not a root group member" };
+			}
+			return { v: 1, result: "unwilling_cohort", retryAfterMs: DEFAULT_RATE_WINDOW_MS, reason: err.refusal === "not-served" ? "root placement not served" : "root group unavailable" };
+		}
+		if (err instanceof CoordPlacementMismatchError) {
+			return { v: 1, result: "unwilling_cohort", retryAfterMs: DEFAULT_RATE_WINDOW_MS, reason: "coord is served under the other placement rule" };
+		}
+		if (err instanceof CoordEngineRegistryFullError) {
+			// Every engine slot holds a live cohort — refuse this new coord cleanly. `unwilling_cohort`
+			// with a back-off is the walk's "retry in time / restart at d_max" signal (§Capacity barometer),
+			// the same shape the per-coord topic budget answers when full-of-populated.
+			log("cohort-topic: register refused — coord-engine registry full");
+			return { v: 1, result: "unwilling_cohort", retryAfterMs: DEFAULT_RATE_WINDOW_MS, reason: "coord-engine registry full" };
+		}
+		return undefined;
+	};
+
 	// --- register dispatch: recompute the served coord and run the cohort decision on its engine ---
 	const dispatchRegister = async (reg: RegisterV1, fretCohort: readonly string[] | undefined, now: number): Promise<RegisterReplyV1> => {
 		const topicId = b64urlToBytes(reg.topicId);
 		const participantCoord = b64urlToBytes(reg.participantCoord);
+		// NOTE: accepted — nothing ties a frame's `rootKey` to its `topicId`. A participant that names a wrong
+		// root key places its own registration at a root group that never announces to it; the only other
+		// effect is choosing which storage group serves a registration, which grinding a topic id already
+		// allowed. The host does check it is in the named group (`prepareRootPlacedCoord`).
+		const rootKey = reg.rootKey === undefined ? undefined : b64urlToBytes(reg.rootKey);
+		if (rootKey !== undefined && rootGroup === undefined) {
+			return refusalReply(new RootPlacementRefusedError("not-served"))!;
+		}
 		// FRET's ActivityHandler does not carry the routed key, so recompute it from the frame. For tier
 		// `d` this equals the participant's `coord_d(self, topicId)` routing key by construction, i.e. the
-		// coordinate FRET routed to (§Tier addressing).
-		const servedCoord = addressing.coord(reg.treeTier, participantCoord, topicId);
+		// coordinate FRET routed to (§Tier addressing) — or, at the root of a root-placed topic, `H(rootKey)`.
+		const servedCoord = addressing.coord(reg.treeTier, participantCoord, topicId, rootKey);
+		const placement = placementOf(reg.treeTier, rootKey);
 		let coordEngine: CoordEngine;
 		try {
-			coordEngine = registry.forCoord(servedCoord, reg.treeTier, participantCoord);
+			if (placement.rootPlaced) {
+				await prepareRootPlacedCoord(servedCoord);
+			}
+			coordEngine = registry.forCoord(servedCoord, reg.treeTier, participantCoord, placement);
 		} catch (err) {
-			if (err instanceof CoordEngineRegistryFullError) {
-				// Every engine slot holds a live cohort — refuse this new coord cleanly. `unwilling_cohort`
-				// with a back-off is the walk's "retry in time / restart at d_max" signal (§Capacity barometer),
-				// the same shape the per-coord topic budget answers when full-of-populated.
-				log("cohort-topic: register refused — coord-engine registry full");
-				return { v: 1, result: "unwilling_cohort", retryAfterMs: DEFAULT_RATE_WINDOW_MS, reason: "coord-engine registry full" };
+			const refused = refusalReply(err);
+			if (refused !== undefined) {
+				return refused;
 			}
 			throw err;
 		}
-		if (fretCohort !== undefined) {
+		// A diagnostic over the FRET cohort; a root group is not one, so there is nothing to compare it to.
+		if (fretCohort !== undefined && !placement.rootPlaced) {
 			crossCheckCohort(fret, wantK, servedCoord, fretCohort);
 		}
-		// `parentCoord` for a cold-start forwarder's parent registration; undefined at the root.
-		const parentCoord = reg.treeTier > 0 ? addressing.coord(reg.treeTier - 1, participantCoord, topicId) : undefined;
+		// `parentCoord` for a cold-start forwarder's parent registration; undefined at the root. A tier-1
+		// cohort of a root-placed topic has the root group, at `H(rootKey)`, as its parent.
+		const parentCoord = reg.treeTier > 0 ? addressing.coord(reg.treeTier - 1, participantCoord, topicId, rootKey) : undefined;
 		// Derive `followOn` straight from the participant-asserted wire flag. This is the information the
 		// child cohort genuinely cannot infer locally (the tier-addressing hash decorrelates parent/child
 		// coords, and FRET carries no breadcrumb of the redirect), so it must be carried on the frame. It is
@@ -1088,16 +1500,43 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			return result === "verified";
 		};
 	const childLinkDeps: DispatchChildLinkDeps = {
-		coord: (tier: number, pc: Uint8Array, topicId: Uint8Array): RingCoord => addressing.coord(tier, pc, topicId),
-		resolveParent: (parentServedCoord: RingCoord, parentTier: number, childParticipantCoord: Uint8Array): CoordEngine =>
-			registry.forCoord(parentServedCoord, parentTier, childParticipantCoord),
+		coord: (tier: number, pc: Uint8Array, topicId: Uint8Array, rootKey?: Uint8Array): RingCoord => addressing.coord(tier, pc, topicId, rootKey),
+		// A tier-1 child of a root-placed topic links to the root group: the parent engine is created
+		// root-placed, after the same admission check a root-placed register passes.
+		resolveParent: async (parentServedCoord: RingCoord, parentTier: number, childParticipantCoord: Uint8Array, rootKey?: Uint8Array): Promise<CoordEngine> => {
+			const placement = placementOf(parentTier, rootKey);
+			if (placement.rootPlaced) {
+				await prepareRootPlacedCoord(parentServedCoord);
+			}
+			return registry.forCoord(parentServedCoord, parentTier, childParticipantCoord, placement);
+		},
 		verifyChildLinkSig,
+	};
+
+	// --- the `/register` protocol body, shared by the inbound handler and the router's local root step ---
+	// A direct dial carries a RenewV1 (ping), a ChildLinkV1 (a child cohort registering with this parent), or
+	// a RegisterV1 (re-attach walk fallback, or the root step of a root-placed topic). The three shapes are
+	// disjoint, so try each in turn.
+	const handleRegisterFrame = async (frame: Uint8Array): Promise<Uint8Array> => {
+		const decoded = decodeCohortMessage(frame, maxBytes);
+		const renew = tryValidate(() => validateRenewV1(decoded));
+		if (renew !== undefined) {
+			return encodeCohortMessage(resolveRenew(registry, renew, Date.now()), maxBytes);
+		}
+		const link = tryValidate(() => validateChildLinkV1(decoded, minSigs));
+		if (link !== undefined) {
+			return encodeCohortMessage(await dispatchChildLink(link, childLinkDeps, Date.now()), maxBytes);
+		}
+		const reg = validateRegisterV1(decoded);
+		// Direct dial (not FRET-routed): no cohort member list to cross-check against.
+		const reply = await dispatchRegister(reg, undefined, Date.now());
+		return encodeCohortMessage(reply, maxBytes);
 	};
 
 	// --- protocol handlers + activity callback ---
 	// Await registration so the host is not returned (and dialed) before the five handlers are live —
 	// and, crucially, before the gossip driver below starts ticking (no tick may run on a half-wired node).
-	await registerCohortTopicProtocols(node, protocols, registry, dispatchRegister, childLinkDeps, minSigs, signEndorse, verifier, promoteGate, gossipTransport, maybeInstantiateColdSibling, publishSink, membershipSource, selfCoord, maxBytes);
+	await registerCohortTopicProtocols(node, protocols, registry, handleRegisterFrame, signEndorse, verifier, promoteGate, gossipTransport, maybeInstantiateColdSibling, publishSink, membershipSource, selfCoord, maxBytes);
 	fret.setActivityHandler(async (activity: string, cohort: string[]): Promise<{ commitCertificate: string }> => {
 		const decoded = decodeCohortMessage(b64urlToBytes(activity), maxBytes);
 		// Decode-and-branch: a `ChildLinkV1` (a child cohort registering with this parent) runs the child-link
@@ -1345,6 +1784,8 @@ interface ForwarderLink {
 	 * ships unsigned and the parent permissive-accepts it).
 	 */
 	readonly signChildLink?: CohortSigner;
+	/** The topic's root key when it is root-placed: a tier-1 link carries it and is delivered to the root group. */
+	readonly rootKey?: Uint8Array;
 }
 
 /**
@@ -1361,6 +1802,9 @@ interface ForwarderLink {
  */
 async function registerForwarderWithParent(ctx: CoordEngineContext, link: ForwarderLink): Promise<void> {
 	const childTier = link.treeTier;
+	// A tier-1 child of a root-placed topic links to the root group: the frame names the root key so the
+	// root recomputes its own served coord, and it is delivered by the rule that chose the group.
+	const toRoot = childTier === 1 && link.rootKey !== undefined ? link.rootKey : undefined;
 	const frame: ChildLinkV1 = {
 		v: 1,
 		topicId: bytesToB64url(link.topicId),
@@ -1372,6 +1816,7 @@ async function registerForwarderWithParent(ctx: CoordEngineContext, link: Forwar
 		thresholdSig: "",
 		signers: [],
 		cohortEpoch: bytesToB64url(link.cohortEpoch()),
+		...(toRoot === undefined ? {} : { rootKey: bytesToB64url(toRoot) }),
 	};
 	// Live-key: threshold-sign over the canonical child-link image (signature covers only the signable fields,
 	// so filling `thresholdSig`/`signers` after does not alter what was signed). Key-less: leave it unsigned.
@@ -1380,7 +1825,10 @@ async function registerForwarderWithParent(ctx: CoordEngineContext, link: Forwar
 		frame.thresholdSig = bytesToB64url(thresholdSig);
 		frame.signers = signers.map(bytesToB64url);
 	}
-	const replyBytes = await ctx.router.routeAndAct(link.parentCoord, encodeCohortMessage(frame, ctx.maxBytes), { wantK: ctx.wantK, minSigs: ctx.minSigs });
+	const encoded = encodeCohortMessage(frame, ctx.maxBytes);
+	const replyBytes = toRoot !== undefined && ctx.router.routeToRoot !== undefined
+		? await ctx.router.routeToRoot(toRoot, encoded)
+		: await ctx.router.routeAndAct(link.parentCoord, encoded, { wantK: ctx.wantK, minSigs: ctx.minSigs });
 	const reply = validateChildLinkReplyV1(decodeCohortMessage(replyBytes, ctx.maxBytes));
 	if (reply.result !== "linked") {
 		throw new Error(`cohort-topic child-link rejected by parent${reply.reason !== undefined ? `: ${reply.reason}` : ""}`);
@@ -1440,6 +1888,26 @@ export const EVICTION_RANK: Record<EngineStateKind, "pinned" | number> = {
 	children: 1,
 	promotion: 1,
 };
+
+/**
+ * Hold `engine` to the rule it was created under: a frame asking for the other rule is refused, a frame
+ * naming a different root key than the engine holds is refused, and a frame naming a key the engine has
+ * none of yet teaches it the key (a gossip-instantiated cold sibling, or a tier-`d ≥ 1` engine a deeper
+ * child's link created, learns its topic's root from the first frame that carries it).
+ */
+function reconcilePlacement(engine: CoordEngine, placement: EnginePlacement): void {
+	if (engine.rootPlaced !== placement.rootPlaced) {
+		throw new CoordPlacementMismatchError(engine.servedCoord);
+	}
+	if (placement.rootKey === undefined) {
+		return;
+	}
+	if (engine.rootKey === undefined) {
+		engine.adoptRootKey(placement.rootKey);
+	} else if (!bytesEqual(engine.rootKey, placement.rootKey)) {
+		throw new CoordPlacementMismatchError(engine.servedCoord);
+	}
+}
 
 /**
  * Build the lazy `servedCoord → CoordEngine` registry over the shared collaborators, hard-capped at
@@ -1529,7 +1997,7 @@ function createCoordRegistry(ctx: CoordEngineContext, maxEngines: number = DEFAU
 	};
 
 	return {
-		forCoord(coord: RingCoord, treeTier: number, participantCoord: Uint8Array): CoordEngine {
+		forCoord(coord: RingCoord, treeTier: number, participantCoord: Uint8Array, placement: EnginePlacement = DEFAULT_PLACEMENT): CoordEngine {
 			const key = bytesToB64url(coord);
 			// Compute-if-absent, synchronously — no async gap, so two concurrent callers for the same coord
 			// share one engine rather than racing to construct a second.
@@ -1541,8 +2009,10 @@ function createCoordRegistry(ctx: CoordEngineContext, maxEngines: number = DEFAU
 					log("cohort-topic: coord-engine registry full (max=%d) — refusing new coord %s", maxEngines, key);
 					throw new CoordEngineRegistryFullError(maxEngines);
 				}
-				engine = createCoordEngine(ctx, coord, treeTier, participantCoord);
+				engine = createCoordEngine(ctx, coord, treeTier, participantCoord, placement);
 				engines.set(key, engine);
+			} else {
+				reconcilePlacement(engine, placement);
 			}
 			touch(key);
 			return engine;
@@ -1792,6 +2262,22 @@ function createChildRegistry(): ChildRegistry {
 }
 
 /**
+ * The root-placement support a root-placed engine is created over, with the snapshot the dispatch path read
+ * for `servedCoord`. Both are invariants of the creation paths (every one of them awaits `ensure` first and
+ * refuses a root-placed frame on a host with no `rootGroup`), so a miss here is a programming error.
+ */
+function requireRootGroup(ctx: CoordEngineContext, servedCoord: RingCoord): RootGroupSupport & { readonly view: RootGroupSnapshot } {
+	if (ctx.rootGroup === undefined) {
+		throw new Error("cohort-topic: a root-placed engine needs the host's rootGroup option");
+	}
+	const view = ctx.rootGroup.snapshots.get(servedCoord);
+	if (view === undefined) {
+		throw new Error(`cohort-topic: root group snapshot for ${bytesToB64url(servedCoord)} must be read before its engine is created`);
+	}
+	return { ...ctx.rootGroup, view };
+}
+
+/**
  * Compose one {@link CoordEngine} bound to `servedCoord`. The cohort it threshold-signs / shards with
  * is the FRET assembly around `servedCoord` (not the node's own ring position). The promotion tier
  * inputs are coord-derived: `treeTier` is fixed at instantiation; `parentCoord` is
@@ -1799,8 +2285,40 @@ function createChildRegistry(): ChildRegistry {
  * routed here yields the same parent); `childCohortCount` is the converged union of recorded child cohorts
  * (per-cohort child registry, gossip-replicated), `0` until this cohort parents a child.
  */
-function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, treeTier: number, participantCoord: Uint8Array): CoordEngine {
+function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, treeTier: number, participantCoord: Uint8Array, placement: EnginePlacement): CoordEngine {
 	const store = createRegistrationStore();
+	// --- placement (§Root placement at a routing key) ---
+	// A root-placed engine's cohort is the root group at `servedCoord`, read from the snapshot the dispatch path
+	// filled before creating it and refreshed on every gossip round; its threshold is the ratio rule. The root
+	// key is kept for a tier-1 engine's parent addressing (and may be adopted later, see `adoptRootKey`).
+	const rootPlaced = placement.rootPlaced;
+	let rootKey = placement.rootKey;
+	const rootGroup = rootPlaced ? requireRootGroup(ctx, servedCoord) : undefined;
+	let rootView: CohortSnapshotView | undefined = rootGroup?.view;
+	const adoptRootKey = (key: Uint8Array): void => {
+		rootKey = key;
+	};
+	/** A tier-1 engine of a root-placed topic has the root group as its parent (a demotion fans to that group). */
+	const parentRootPlaced = treeTier === 1 && rootKey !== undefined;
+	/**
+	 * Re-read the root group (the gossip-cadence refresh). A read that fails keeps the previous snapshot: a
+	 * member change is exactly what rotates the epoch and drives the rotation-attestation and republish paths,
+	 * so nothing more than feeding them the fresh view is needed.
+	 */
+	const refreshRootGroup = async (): Promise<void> => {
+		if (rootGroup === undefined) {
+			return;
+		}
+		try {
+			rootView = await rootGroup.snapshots.refresh(servedCoord);
+		} catch (err) {
+			log("cohort-topic: root group refresh failed at %s, keeping the held snapshot: %o", bytesToB64url(servedCoord), err);
+		}
+	};
+	// NOTE: a root-placed engine whose group rotates past this node keeps serving the records it holds until
+	// the registry evicts it, exactly as a default engine does when the FRET cohort around its coord moves on;
+	// it stops signing as a member (`selfEligible`) and answers later registers `unwilling_member`. If stale
+	// primaries ever show up for root-placed topics, close the engine on a refresh that drops self.
 	// The child cohorts this cohort parents (recorded by the parent-side child-link dispatch). Its `count`
 	// feeds the demotion gate, the gossip summary, and the traffic snapshot below (was hardcoded 0).
 	const childRegistry = createChildRegistry();
@@ -1817,11 +2335,17 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		};
 	};
 	const cohort = (): CohortSnapshotView => {
-		const view = ctx.cohortAround(servedCoord);
+		const view = rootView ?? ctx.cohortAround(servedCoord);
 		rotationState.observe(bytesToB64url(view.cohortEpoch), () => identityOf(view));
 		return view;
 	};
 	const localEpoch = (): Uint8Array => cohort().cohortEpoch;
+	const memberStrs = (): string[] => cohort().members.map(bytesToPeerIdString);
+	const selfStr = bytesToPeerIdString(ctx.selfMemberBytes);
+	/** The assembly threshold now: the ratio rule over the root group, else the node-wide `minSigs`. */
+	const minSigsNow = (): number => rootGroup === undefined ? ctx.minSigs : rootPlacedMinSigs(cohort().members.length, rootGroup.placement);
+	/** The threshold a predecessor-cohort rotation is counted under: over the predecessor's members. */
+	const minSigsOver = (memberCount: number): number => rootGroup === undefined ? ctx.minSigs : rootPlacedMinSigs(memberCount, rootGroup.placement);
 
 	// Inbound gossip is routed to this bus by its `coord`; the optional auth gate (live-signer mode) drops
 	// a frame whose `fromMember` signature is bad or who is not a member of the cohort around THIS coord.
@@ -1830,7 +2354,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		store,
 		coord: servedCoord,
 		localEpoch,
-		verifyInbound: ctx.verifyGossip === undefined ? undefined : (g): boolean => ctx.verifyGossip!(g, servedCoord),
+		// A frame claiming the other placement rule for this coord is refused before its signature is checked.
+		verifyInbound: ctx.verifyGossip === undefined ? undefined : (g): boolean => (g.rootPlaced === true) === rootPlaced && ctx.verifyGossip!(g, memberStrs()),
 		// Sibling-drain half of the topic-budget release: a topic whose participants are sharded onto a
 		// sibling primary drains into this store as a gossip eviction (never this member's own TTL sweep),
 		// so re-`touch` the budget down from the post-delete store count — mirroring the engine's `sweepStale`
@@ -1877,10 +2402,13 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 			selfMember: ctx.selfMemberBytes,
 			coord: (): RingCoord => servedCoord,
 			cohortEpoch: localEpoch,
-			cohortMembers: (): string[] => cohort().members.map(bytesToPeerIdString),
+			cohortMembers: memberStrs,
 			dialSign: ctx.dialSign,
+			// A root group lists its members outright, self among them only while it is one: a node the group
+			// rotated past must not add a chunk the verifier would drop (signer ∉ members).
+			...(rootPlaced ? { rootPlaced: true as const, selfEligible: (): boolean => memberStrs().includes(selfStr) } : {}),
 		});
-		return createCohortSigner(crypto, ctx.minSigs);
+		return createDynamicThresholdSigner(crypto, minSigsNow);
 	};
 	const noticeSigner = makeCoordSigner("promotion");
 	const membershipSigner = makeCoordSigner("membership");
@@ -1930,7 +2458,6 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	 */
 	const produceRotation = async (snapshot: CohortSnapshot, predecessor: CohortIdentity): Promise<RotationAttestation | undefined> => {
 		const payload = membershipCertSigningPayload(membershipCertSignable(snapshot));
-		const selfStr = bytesToPeerIdString(ctx.selfMemberBytes);
 		const crypto = new FretCohortThresholdCrypto({
 			kind: "rotation",
 			privateKey: ctx.privateKey!, // canPublish guard: rotation only runs from a publish, which no-ops key-less
@@ -1940,8 +2467,10 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 			cohortMembers: (): string[] => [...predecessor.memberStrs], // dial the OUTGOING cohort
 			dialSign: ctx.dialSign,
 			selfEligible: (): boolean => predecessor.memberStrs.includes(selfStr),
+			...(rootPlaced ? { rootPlaced: true as const } : {}),
 		});
-		const signer = createCohortSigner(crypto, ctx.minSigs);
+		// The rotation is signed by the PREDECESSOR cohort, so the quorum is counted over its members.
+		const signer = createCohortSigner(crypto, minSigsOver(predecessor.memberStrs.length));
 		try {
 			const { thresholdSig, signers } = await signer.thresholdSign(payload);
 			return { prevEpoch: predecessor.epoch, rotationSig: thresholdSig, rotationSigners: signers };
@@ -1987,7 +2516,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		}
 		if (published !== undefined) {
 			rotationState.recordPublished(current);
-			ctx.onCertPublished?.(published);
+			ctx.onCertPublished?.(published, rootGroup?.placement);
 		}
 		return published;
 	};
@@ -1997,7 +2526,11 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		view,
 		selfMember,
 		primaryTopicCount: (tier: Tier): number => countPrimaryTopics(store, ctx.selfMemberBytes, tier),
-		config: { cohortSize: ctx.wantK },
+		// The willingness quorum is a majority of the cohort size: `wantK` for a FRET cohort, the root group's
+		// size for a root-placed one. The size is read once here, which is exact for a group sized by storage
+		// placement (members rotate, the count does not) and merely permissive for a group still filling on a
+		// small network, where the quorum stays at the smaller count until the engine is recreated.
+		config: { cohortSize: rootGroup === undefined ? ctx.wantK : rootGroup.view.members.length },
 	});
 	const traffic = createTrafficCounters({ view, store, selfMember, childCohortCount: (topicId: Uint8Array): number => childRegistry.count(topicId) });
 	const promotion = createPromotionLifecycle({
@@ -2010,9 +2543,10 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		// demote in turn (`promotion.ts` demotionTriggered).
 		childCohortCount: (topicId: Uint8Array): number => childRegistry.count(topicId),
 		treeTier: (): number => treeTier,
-		// `coord_{d-1}(P, topicId)`; never invoked at the root (demotion is gated on `treeTier > 0`), so
-		// the `d = 0` branch (clamped to `coord_0`) is a well-formed placeholder that the lifecycle skips.
-		parentCoord: (topicId: Uint8Array): Uint8Array => ctx.addressing.coord(Math.max(0, treeTier - 1), participantCoord, topicId),
+		// `coord_{d-1}(P, topicId)` — `H(rootKey)` for a tier-1 engine of a root-placed topic; never invoked at
+		// the root (demotion is gated on `treeTier > 0`), so the `d = 0` branch (clamped to `coord_0`) is a
+		// well-formed placeholder that the lifecycle skips.
+		parentCoord: (topicId: Uint8Array): Uint8Array => ctx.addressing.coord(Math.max(0, treeTier - 1), participantCoord, topicId, rootKey),
 		// The served coord this engine was instantiated at — stamped on every notice as `cohortCoord` and
 		// covered by its threshold signature, so a receiver routes + verifies the notice by exactly this coord.
 		cohortCoord: (): Uint8Array => servedCoord,
@@ -2054,6 +2588,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 					// Live-key: the child threshold-signs the link over its own coord/epoch. Key-less interim: no
 					// signer, so the link ships unsigned and the parent permissive-accepts it.
 					signChildLink: canPublish ? childLinkSigner : undefined,
+					rootKey,
 				}),
 		},
 	});
@@ -2125,7 +2660,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		onAdmit: (rec): void => pending.touch(rec),
 		// A promotion notice signed on an arrival is broadcast to the cohort around this served coord
 		// (and the parent for a demotion). The engine only knows the notice; the host adds the coord.
-		onNotice: (notice): void => ctx.broadcastNotice?.(notice, servedCoord),
+		onNotice: (notice): void => ctx.broadcastNotice?.(notice, servedCoord, parentRootPlaced),
 		log,
 	});
 
@@ -2160,6 +2695,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		if (closed) {
 			return undefined;
 		}
+		await refreshRootGroup();
 		engine.sweepStale(now);
 		const topicSummaries = residentTopics().map((topicId) =>
 			toCohortTopicSummary(topicId, traffic.publish(topicId, now), {
@@ -2219,6 +2755,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 			childLinks,
 			childUnlinks,
 			timestamp: now,
+			...(rootPlaced ? { rootPlaced: true as const } : {}),
 		});
 		if (g === undefined) {
 			return undefined;
@@ -2247,7 +2784,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 				continue;
 			}
 			if (notice !== undefined) {
-				ctx.broadcastNotice?.(notice, servedCoord);
+				ctx.broadcastNotice?.(notice, servedCoord, parentRootPlaced);
 			}
 		}
 	};
@@ -2273,6 +2810,12 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	return {
 		servedCoord,
 		treeTier,
+		rootPlaced,
+		placement: rootGroup?.placement,
+		get rootKey(): Uint8Array | undefined {
+			return rootKey;
+		},
+		adoptRootKey,
 		engine,
 		cohort,
 		cohortIdentityAt: (epoch: Uint8Array): readonly string[] | undefined => rotationState.membersAt(bytesToB64url(epoch)),
@@ -2359,14 +2902,20 @@ export function resolveRenew(registry: CoordRegistry, renew: RenewV1, now: numbe
  * testable without a live node (mirrors {@link handleSignRequest} / {@link verifyAndApplyNotice}).
  */
 export interface DispatchChildLinkDeps {
-	/** Recompute a served coord for a tier — `addressing.coord(tier, participantCoord, topicId)`. */
-	readonly coord: (tier: number, participantCoord: Uint8Array, topicId: Uint8Array) => RingCoord;
 	/**
-	 * Resolve (creating if absent) the parent {@link CoordEngine} for its served coord — `registry.forCoord`.
-	 * Only its {@link CoordEngine.recordChild} is used. May throw {@link CoordEngineRegistryFullError} when
-	 * creating over a full-of-live registry; {@link dispatchChildLink} catches it and replies `rejected`.
+	 * Recompute a served coord for a tier — `addressing.coord(tier, participantCoord, topicId, rootKey)`; with
+	 * a `rootKey` the tier-0 coord is `H(rootKey)` (a tier-1 child of a root-placed topic links to the root group).
 	 */
-	readonly resolveParent: (parentServedCoord: RingCoord, parentTier: number, childParticipantCoord: Uint8Array) => Pick<CoordEngine, "recordChild">;
+	readonly coord: (tier: number, participantCoord: Uint8Array, topicId: Uint8Array, rootKey?: Uint8Array) => RingCoord;
+	/**
+	 * Resolve (creating if absent) the parent {@link CoordEngine} for its served coord — `registry.forCoord`,
+	 * root-placed when `rootKey` names the parent as a root group. Only its {@link CoordEngine.recordChild} is
+	 * used. May throw {@link CoordEngineRegistryFullError} (creating over a full-of-live registry),
+	 * {@link CoordPlacementMismatchError} (the coord is served under the other rule) or
+	 * {@link RootPlacementRefusedError} (this node cannot serve the root group); {@link dispatchChildLink}
+	 * catches each and replies `rejected`. May be synchronous or async.
+	 */
+	readonly resolveParent: (parentServedCoord: RingCoord, parentTier: number, childParticipantCoord: Uint8Array, rootKey?: Uint8Array) => Pick<CoordEngine, "recordChild"> | Promise<Pick<CoordEngine, "recordChild">>;
 	/**
 	 * Verify the child cohort threshold signature against the child cohort's cert (live-key mode). `undefined`
 	 * → key-less-permissive: the link is recorded without a signature check (matching the register-sig
@@ -2392,13 +2941,16 @@ export async function dispatchChildLink(link: ChildLinkV1, deps: DispatchChildLi
 	const topicId = b64urlToBytes(link.topicId);
 	const childParticipantCoord = b64urlToBytes(link.childParticipantCoord);
 	const childCohortCoord = b64urlToBytes(link.childCohortCoord);
+	// A root key is meaningful on a tier-1 link only (its parent is the root); a deeper child's parent keeps the
+	// default addressing whatever the frame says, so the key is ignored there rather than refused.
+	const rootKey = link.rootKey !== undefined && link.childTier === 1 ? b64urlToBytes(link.rootKey) : undefined;
 	// Step 1 — bind the relationship. `validateChildLinkV1` already enforced `childTier >= 1`, so `childTier − 1`
 	// is a well-formed parent tier.
 	const recomputedChild = deps.coord(link.childTier, childParticipantCoord, topicId);
 	if (!bytesEqual(recomputedChild, childCohortCoord)) {
 		return { v: 1, result: "rejected", reason: "coord mismatch" };
 	}
-	const parentServedCoord = deps.coord(link.childTier - 1, childParticipantCoord, topicId);
+	const parentServedCoord = deps.coord(link.childTier - 1, childParticipantCoord, topicId, rootKey);
 	// Step 2 — verify the child cohort threshold signature (live-key). Key-less-permissive short-circuits.
 	if (deps.verifyChildLinkSig !== undefined) {
 		const verified = await deps.verifyChildLinkSig(link, now);
@@ -2412,10 +2964,16 @@ export async function dispatchChildLink(link: ChildLinkV1, deps: DispatchChildLi
 	// unhandled throw on the stream.
 	let parent: Pick<CoordEngine, "recordChild">;
 	try {
-		parent = deps.resolveParent(parentServedCoord, link.childTier - 1, childParticipantCoord);
+		parent = await deps.resolveParent(parentServedCoord, link.childTier - 1, childParticipantCoord, rootKey);
 	} catch (err) {
 		if (err instanceof CoordEngineRegistryFullError) {
 			return { v: 1, result: "rejected", reason: "parent cohort capacity" };
+		}
+		if (err instanceof CoordPlacementMismatchError) {
+			return { v: 1, result: "rejected", reason: "parent coord is served under the other placement rule" };
+		}
+		if (err instanceof RootPlacementRefusedError) {
+			return { v: 1, result: "rejected", reason: `root placement refused: ${err.refusal}` };
 		}
 		throw err;
 	}
@@ -2761,6 +3319,8 @@ export function recordAdoptedTransition(gate: PromoteGate, notice: PromotionNoti
  */
 export interface NoticeApplyTarget {
 	readonly servedCoord: RingCoord;
+	/** The ratio rule the cohort at `servedCoord` signs under (a root-placed engine's); absent for the default rule. */
+	readonly placement?: RootPlacement;
 	applyPromotionNotice(notice: PromotionNoticeV1, now: number): void;
 	applyDemotionNotice(notice: DemotionNoticeV1, now: number): void;
 	unrecordChild(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void;
@@ -2833,9 +3393,11 @@ export async function verifyAndApplyNotice(
 		return "untrusted"; // a signer / sig that is not valid base64url cannot verify
 	}
 	// Narrow on `inbound` (not a destructured `notice`) so the tier field and apply hook are typed per kind.
+	// The notice was signed by the cohort at `target.servedCoord`, under that cohort's rule.
+	const opts = { minRefetchIntervalMs: PROMOTE_REFETCH_MIN_INTERVAL_MS, now, placement: target.placement };
 	if (inbound.kind === "promotion") {
 		const payload = promotionNoticeSigningPayload(inbound.notice);
-		const result = await verifier.verifyMessage(signers, target.servedCoord, inbound.notice.fromTier, payload, sig, { minRefetchIntervalMs: PROMOTE_REFETCH_MIN_INTERVAL_MS, now });
+		const result = await verifier.verifyMessage(signers, target.servedCoord, inbound.notice.fromTier, payload, sig, opts);
 		if (result !== "verified") {
 			return "untrusted";
 		}
@@ -2843,7 +3405,7 @@ export async function verifyAndApplyNotice(
 		return "applied";
 	}
 	const payload = demotionNoticeSigningPayload(inbound.notice);
-	const result = await verifier.verifyMessage(signers, target.servedCoord, inbound.notice.tier, payload, sig, { minRefetchIntervalMs: PROMOTE_REFETCH_MIN_INTERVAL_MS, now });
+	const result = await verifier.verifyMessage(signers, target.servedCoord, inbound.notice.tier, payload, sig, opts);
 	if (result !== "verified") {
 		return "untrusted";
 	}
@@ -3043,6 +3605,8 @@ export function noticeBroadcastCoords(notice: PromotionNoticeV1 | DemotionNotice
  * Cross-check the cohort FRET routed the activity to against the locally recomputed assembly around
  * `servedCoord`. A mismatch (a slightly stale routing table) is logged; the recomputed assembly is
  * trusted, so renewal / gossip / signing — which run outside the activity callback — stay consistent.
+ * A diagnostic over the FRET cohort only: the caller skips it for a root-placed coord, whose cohort is
+ * the root group and would always read as a mismatch.
  */
 function crossCheckCohort(fret: FretService, wantK: number, servedCoord: RingCoord, fretCohort: readonly string[]): void {
 	const assembled = fret.assembleCohort(servedCoord, wantK);
@@ -3099,16 +3663,14 @@ async function registerCohortTopicProtocols(
 	node: Libp2p,
 	protocols: CohortTopicProtocols,
 	registry: CoordRegistry,
-	dispatchRegister: (reg: RegisterV1, fretCohort: readonly string[] | undefined, now: number) => Promise<RegisterReplyV1>,
-	/** Parent-side child-link dispatch deps + the quorum bound used to structurally validate an inbound link. */
-	childLinkDeps: DispatchChildLinkDeps,
-	minSigs: number,
+	/** The `/register` body: a RenewV1, a ChildLinkV1 or a RegisterV1 frame in, the encoded reply out. */
+	handleRegisterFrame: (frame: Uint8Array) => Promise<Uint8Array>,
 	signEndorse: (request: SignRequestV1, fromPeerStr: string) => Promise<SignReplyV1>,
 	verifier: MembershipVerifier,
 	promoteGate: PromoteGate,
 	gossipTransport: FretCohortGossipTransport,
 	/** Instantiate a cold sibling's coord engine off a verified co-member frame (§Cold-start instantiation). */
-	maybeInstantiateColdSibling: (frame: Uint8Array) => void,
+	maybeInstantiateColdSibling: (frame: Uint8Array) => Promise<void>,
 	publishSink: FretMembershipPublishSink,
 	membershipSource: FretMembershipSource,
 	selfCoord: RingCoord,
@@ -3116,29 +3678,15 @@ async function registerCohortTopicProtocols(
 ): Promise<void> {
 	await Promise.all([
 		// register: a direct dial carries a RenewV1 (ping), a ChildLinkV1 (a child cohort registering with this
-		// parent), or a RegisterV1 (re-attach walk fallback). The three shapes are disjoint, so try each in turn.
-		registerProtocolHandler(node, protocols.register, makeRequestHandler(async (frame): Promise<Uint8Array> => {
-			const decoded = decodeCohortMessage(frame, maxBytes);
-			const renew = tryValidate(() => validateRenewV1(decoded));
-			if (renew !== undefined) {
-				return encodeCohortMessage(resolveRenew(registry, renew, Date.now()), maxBytes);
-			}
-			const link = tryValidate(() => validateChildLinkV1(decoded, minSigs));
-			if (link !== undefined) {
-				return encodeCohortMessage(await dispatchChildLink(link, childLinkDeps, Date.now()), maxBytes);
-			}
-			const reg = validateRegisterV1(decoded);
-			// Direct dial (not FRET-routed): no cohort member list to cross-check against.
-			const reply = await dispatchRegister(reg, undefined, Date.now());
-			return encodeCohortMessage(reply, maxBytes);
-		}, maxBytes)),
+		// parent), or a RegisterV1 (re-attach walk fallback, or the root step of a root-placed topic).
+		registerProtocolHandler(node, protocols.register, makeRequestHandler((frame): Promise<Uint8Array> => handleRegisterFrame(frame), maxBytes)),
 
 		// cohort-gossip: feed inbound gossip into the shared transport (one-way). It fans the frame to
 		// every coord engine's bus; per-bus epoch matching governs which engine merges the record deltas.
 		// First, if this is a verified co-member frame for a coord we hold no engine for, instantiate that
 		// engine (§Cold-start instantiation) so its freshly-subscribed bus merges this very frame on `deliver`.
 		registerProtocolHandler(node, protocols.gossip, makeOneWayHandler(async (frame, from): Promise<void> => {
-			maybeInstantiateColdSibling(frame);
+			await maybeInstantiateColdSibling(frame);
 			gossipTransport.deliver(from.toString(), frame);
 		}, maxBytes)),
 
@@ -3219,7 +3767,9 @@ function makeFrameHandler(
 					sendFramed(stream, reply);
 				}
 				await stream.close();
-			} catch {
+			} catch (err) {
+				// The dialer sees only a reset stream; the cause is visible here and nowhere else.
+				log("cohort-topic: protocol handler failed for a frame from %s: %o", connection.remotePeer.toString(), err);
 				try {
 					stream.abort(new Error("cohort-topic handler error"));
 				} catch {
