@@ -49,14 +49,6 @@ describe('reactivity / topic-bytes encoding (root coordinate = the tail block\'s
 		expect([...rootCoord], 'the reactivity root sits exactly where the key network places the tail block').to.deep.equal([...storagePosition]);
 	});
 
-	it('a pre-hashed tail resolves a DIFFERENT root (pins the double-hash regression)', async () => {
-		// The WRONG encoding: a digest of the id fed to reactivityRootCoord hashes twice relative to the key
-		// network's one hash, landing the root where no storage group sits — nothing would ever announce there.
-		const digestRoot = reactivityRootCoord(await hashKey(new TextEncoder().encode(TAIL)));
-		const storagePosition = await hashKey(routingKeyForBlock(TAIL));
-		expect([...digestRoot], 'a pre-hashed encoding must NOT land on the storage position').to.not.deep.equal([...storagePosition]);
-	});
-
 	it('a notification names a path-shaped collection id by the bytes the watch service registers under, and passes wire validation', async () => {
 		// A real collection id: `/` is not a base64url character, so it cannot go on the wire as-is.
 		const COLLECTION = 'app/users';

@@ -1225,6 +1225,13 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
  * registry saw a frame for the topic, and no tail read ran on the watcher between the commit and the wake.
  * The cohort-topic options are the production defaults (`wantK` 16, `minSigs` 14): neither governs a
  * root-placed root, which is the point.
+ *
+ * NOTE: this reproduces the threshold arm of the defect, not the disjoint-group arm. With `wantK` 16 on six
+ * machines the FRET cohort around any coordinate is still the whole mesh, so the old announcing rule would
+ * have passed on every node here and the old build failed only on `minSigs` 14 exceeding a three-member
+ * group's signatures. A second run with `wantK` below the machine count would also put the old announcing
+ * group disjoint from the storage group; add one if the register walk's root step ever regresses to the
+ * FRET cohort, at the cost of another mesh's wall time in this env-gated suite.
  */
 (GATED ? describe : describe.skip)('collection watch over real libp2p (a mesh wider than one storage group)', function () {
 	this.timeout(480_000);

@@ -880,7 +880,7 @@ In addition to the cohort-topic Edge overrides (TTL = 60 s, ping = 20 s, T2/T3 p
 
 `t = 0`: collection `C` has 0 subscribers, tail block `T_0`.
 
-`t = 1`: First subscriber `S_1` registers. `n_est = 1M`, `F = 16`, so `d_max ≈ 4`. `S_1` probes `coord_4(S_1, H(T_0 ‖ "reactivity"))`; cohort there is cold, returns `NoState`. Walk toward root: `d = 3`, `d = 2`, `d = 1`, `d = 0`. The tier-0 cohort (which *is* the tail cohort) accepts; `S_1` is registered as the first subscriber.
+`t = 1`: First subscriber `S_1` registers. `n_est = 1M`, `F = 16`, so `d_max ≈ 4`. `S_1` probes `coord_4(S_1, H(T_0 ‖ "reactivity"))`; cohort there is cold, returns `NoState`. Walk toward root: `d = 3`, `d = 2`, `d = 1`, then the root step to `T_0`'s storage group at `H(T_0)` (the root is placed at the tail's routing key, §Origination point). That group — the tail cohort — accepts; `S_1` is registered as the first subscriber.
 
 `t = 10..60`: `S_2 … S_64` arrive. Each probes `d_max = 4` first; their tier-4 coords differ (different peer-ID prefixes), so the probes fan across the ring. All fall through to the root, which accepts up to `cap_promote = 64`.
 
@@ -900,7 +900,7 @@ Phone app resumes. `lastRevision = 1042`, current revision is 2342. Replay buffe
 
 Collection `C` has 10 000 subscribers, tree depth 3. Tail block `T_5` fills at revision 5400. The notification for revision 5400 carries `rotationHint{ newTailId: T_6, effectiveAtRevision: 5401 }`.
 
-All 10 000 subscribers receive the hint via the existing tree within a few seconds. Each schedules re-registration with random jitter over 30 s. The new tail cohort at `coord_0(_, H(T_6 ‖ "reactivity"))` sees arrival rate ≈ 333 / s; it accepts 64 directly, fast-promotes (`cap_promote_fast = 32`, load bucket hot), and starts redirecting to tier 1. Tier-1 cohorts under `T_6` form during the same window. By `T_drain = 60 s`, the new tree mirrors the old tree's shape under a different root. Forwarder cohorts under `T_5` drain and demote naturally. Continuity is preserved by the monotonic revision sequence; subscribers experience the rotation as a brief pause followed by resumed delivery from the new tree.
+All 10 000 subscribers receive the hint via the existing tree within a few seconds. Each schedules re-registration with random jitter over 30 s. The new tail cohort — `T_6`'s storage group at `H(T_6)` — sees arrival rate ≈ 333 / s; it accepts 64 directly, fast-promotes (`cap_promote_fast = 32`, load bucket hot), and starts redirecting to tier 1. Tier-1 cohorts under `T_6` form during the same window. By `T_drain = 60 s`, the new tree mirrors the old tree's shape under a different root. Forwarder cohorts under `T_5` drain and demote naturally. Continuity is preserved by the monotonic revision sequence; subscribers experience the rotation as a brief pause followed by resumed delivery from the new tree.
 
 > **Measured (validated by simulator).** `TailRotationScenario` (`simulateRotationBurst`) drove a
 > 2,000-subscriber re-registration wave jittered over `T_rejoin_jitter = 30 s`: the new tail's

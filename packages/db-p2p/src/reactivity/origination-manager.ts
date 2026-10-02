@@ -204,8 +204,9 @@ export class ReactivityOriginationManager {
 	 * recover serve begins redirecting to the new tree.
 	 *
 	 * **Encoding contract.** `ctx.tailId` is the reactivity tail anchor bytes the node resolved
-	 * (`reactivityTailBytes(event.tailId)` in production — the SAME raw utf8 encoding origination's membership
-	 * gate and a subscriber's `reactivityTopicId(reactivityTailBytes(tail))` use, never a pre-hashed digest).
+	 * (`reactivityTailBytes(event.tailId)` in production — the SAME raw utf8 encoding the root derivation
+	 * `reactivityRootCoord` and a subscriber's `reactivityTopicId(reactivityTailBytes(tail))` use, never a
+	 * pre-hashed digest).
 	 * So `oldTopicId = reactivityTopicId(oldAnchorBytes)` is byte-identical to the topic a
 	 * subscriber subscribed under — a mismatch would silently never redirect.
 	 */
