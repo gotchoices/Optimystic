@@ -5,7 +5,7 @@ import {
 	createReactivitySubscriber,
 	createNotificationVerifier,
 	createStickyCohortHintCache,
-	reactivityTopicId,
+	reactivityRootCoord,
 	encodeResumeV1,
 	decodeResumeV1,
 	encodeResumeReplyV1,
@@ -24,9 +24,7 @@ import {
 import type { VerifyResult } from '../../src/cohort-topic/membership/verifier.js';
 import { createMembershipVerifier } from '../../src/cohort-topic/membership/verifier.js';
 import { createMembershipSourceRouter } from '../../src/cohort-topic/membership/source.js';
-import { createCohortSigner } from '../../src/cohort-topic/sig/threshold.js';
-import { createTierAddressing } from '../../src/cohort-topic/addressing.js';
-import { createRingHash } from '../../src/cohort-topic/ring-hash.js';
+import { createCohortSigner, createRootPlacement, rootPlacedMinSigs } from '../../src/cohort-topic/sig/threshold.js';
 import { Tier } from '../../src/cohort-topic/tiers.js';
 import { bytesToB64url, b64urlToBytes } from '../../src/cohort-topic/wire/codec.js';
 import { CohortWireError } from '../../src/cohort-topic/wire/validate.js';
@@ -66,11 +64,17 @@ class FakeVerifier implements NotificationVerifier {
 	}
 }
 
-/** A verifier whose raw crypto always passes, so the verdict turns purely on the signer-subset check. */
-function realishVerifier(members: string[], minSigs: number): NotificationVerifier {
+/**
+ * A verifier whose raw crypto always passes, so the verdict turns purely on the signer-subset check. The
+ * cert is cached at the tail's root coordinate under the root placement rule, so the threshold is
+ * `ceil(members × quorumRatio)`: at the default ratio of 1 every member must sign.
+ */
+function realishVerifier(members: string[], quorumRatio = 1): NotificationVerifier {
 	const crypto: ICohortThresholdCrypto = { assemble: () => Promise.reject(new Error('verify-only')), verify: () => true };
 	const empty: IMembershipSource = { current: () => Promise.resolve(undefined), fetch: () => Promise.resolve(undefined) };
-	const expectedCoord = createTierAddressing(createRingHash()).coord0(reactivityTopicId(b64urlToBytes(TAIL)));
+	const placement = createRootPlacement(quorumRatio);
+	const minSigs = rootPlacedMinSigs(members.length, placement);
+	const expectedCoord = reactivityRootCoord(b64urlToBytes(TAIL));
 	const cert: MembershipCertV1 = {
 		v: 1,
 		cohortCoord: bytesToB64url(expectedCoord),
@@ -81,8 +85,8 @@ function realishVerifier(members: string[], minSigs: number): NotificationVerifi
 		signers: members.slice(0, minSigs),
 	};
 	const mv = createMembershipVerifier({ signer: createCohortSigner(crypto, minSigs), router: createMembershipSourceRouter({ committed: empty, fret: empty }), minSigs });
-	mv.cache(cert);
-	return createNotificationVerifier({ verifier: mv, tier: Tier.T3 });
+	mv.cache(cert, placement);
+	return createNotificationVerifier({ verifier: mv, tier: Tier.T3, quorumRatio });
 }
 
 /** A PushState fed `1..count` through the forwarder, so eviction populates the rolling checkpoint. */
@@ -240,7 +244,7 @@ describe('reactivity resume — inherited (cross-rotation) checkpoint', () => {
 	it('subscriber applies a gap-free inherited reply contiguously (no skipped revisions)', async () => {
 		// The end-to-end proof the serve shape is actually recoverable: a subscriber at the inherited window's
 		// low edge applies the reply and ends up current with nothing skipped.
-		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B]);
 		const delivered: number[] = [];
 		const digests: CheckpointSummary[] = [];
 		const state = await fedState(20);
@@ -303,7 +307,7 @@ describe('reactivity resume — inherited (cross-rotation) checkpoint', () => {
 		expect(reply.checkpoints![0]!.mergedDigest).to.equal(inherited.mergedDigest);
 		expect(reply.checkpoints![1]!.mergedDigest).to.equal(rolling.summary()!.mergedDigest);
 		// End-to-end apply still succeeds (the digest is a hint; the endpoints verify).
-		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B]);
 		const delivered: number[] = [];
 		const sub = createReactivitySubscriber({ collectionId: COLLECTION, verifier, deliver: (n) => delivered.push(n.revision), lastKnownRev: 4 });
 		expect(await applyResumeReply(reply, { subscriber: sub, verifier })).to.equal('checkpoint_applied');
@@ -346,7 +350,7 @@ describe('reactivity resume — inherited (cross-rotation) checkpoint', () => {
 		// The serve picks the inherited branch on checkpointCovers (inclusive span), blind to the subscriber's
 		// contiguity head. The subscriber's existing guard must still fire for an inherited summary: a low edge
 		// above `lastRevision + 1` leaves an un-summarized gap, so the reply must not advance state.
-		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B]);
 		const delivered: number[] = [];
 		const chainReads: Array<[string | undefined, number | undefined]> = [];
 		const inherited = inheritedSummary(100, 116); // endpoints verify, but low edge 100 ≫ head 11 + 1
@@ -372,7 +376,7 @@ describe('reactivity resume — subscriber-side apply', () => {
 	});
 
 	it('checkpoint_window: verifies endpoints, applies the digest, rebaselines, replays recent (deduping)', async () => {
-		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B]);
 		const delivered: number[] = [];
 		const digests: CheckpointSummary[] = [];
 		// Subscriber sits at 11 (inside the checkpoint's range); a real PushState gives the reply.
@@ -389,7 +393,7 @@ describe('reactivity resume — subscriber-side apply', () => {
 	});
 
 	it('checkpoint_window: dedupes recent entries at/below the rebaselined head', async () => {
-		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B]);
 		const delivered: number[] = [];
 		const cp = new RollingCheckpoint({ collectionId: COLLECTION, span: 8 });
 		for (let rev = 9; rev <= 16; rev++) cp.retire({ revision: rev, payload: note(rev), receivedAt: 1000 + rev });
@@ -402,7 +406,7 @@ describe('reactivity resume — subscriber-side apply', () => {
 	});
 
 	it('checkpoint_window: a forged endpoint is not applied — falls back to a chain read', async () => {
-		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B]);
 		const delivered: number[] = [];
 		const chainReads: Array<[string | undefined, number | undefined]> = [];
 		const forgedTo = note(16, { signers: [bytesToB64url(new Uint8Array([0xde, 0xad])), bytesToB64url(new Uint8Array([0xbe, 0xef]))] });
@@ -420,7 +424,7 @@ describe('reactivity resume — subscriber-side apply', () => {
 		// Endpoints verify (real committed revisions), but the checkpoint's low edge (100) sits far above the
 		// subscriber's head (last = 11). Rebaselining to 116 would silently skip 12..99. The guard must
 		// reject it and chain-read rather than advance the contiguity head past un-summarized revisions.
-		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B]);
 		const delivered: number[] = [];
 		const chainReads: Array<[string | undefined, number | undefined]> = [];
 		const summary: CheckpointSummary = { collectionId: COLLECTION, fromRevision: 100, toRevision: 116, mergedDigest: bytesToB64url(new Uint8Array([1])), bracketingEntries: [note(100), note(116)] };
@@ -435,7 +439,7 @@ describe('reactivity resume — subscriber-side apply', () => {
 
 	it('checkpoint_window (bridge): applies both links in order, lands current, nothing skipped', async () => {
 		// The gap this ticket exists to close, end-to-end: a two-link [inherited, rolling] chain + the ring.
-		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B]);
 		const delivered: number[] = [];
 		const digests: CheckpointSummary[] = [];
 		const state = await fedState(20); // ring [17..20], rolling checkpoint [9,16]
@@ -454,7 +458,7 @@ describe('reactivity resume — subscriber-side apply', () => {
 	it('checkpoint_window (bridge): a forged endpoint in the SECOND link rejects the whole reply (no partial advance)', async () => {
 		// verify-all-before-apply: a single forged link kills the entire reply — nothing is delivered and
 		// lastRevision is unchanged (in particular, no partial advance to the first link's toRevision 8).
-		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B]);
 		const delivered: number[] = [];
 		const chainReads: Array<[string | undefined, number | undefined]> = [];
 		const inherited = inheritedSummary(1, 8); // first link verifies

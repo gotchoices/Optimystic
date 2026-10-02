@@ -45,6 +45,8 @@ const TAIL = bytesToB64url(new Uint8Array([2, 2, 2, 2]));
 const OTHER_TAIL = bytesToB64url(new Uint8Array([7, 7, 7, 7]));
 const FIXED_NOW = 1_700_000_000_000;
 const TOPIC = reactivityTopicId(b64urlToBytes(TAIL));
+/** The tail bytes a subscription is attached under — what the transports key their root-group read on. */
+const TAIL_BYTES = b64urlToBytes(TAIL);
 
 function note(revision: number): NotificationV1 {
 	return {
@@ -327,10 +329,10 @@ describe('reactivity recover — outbound transport', () => {
 			dialer: handlerDialer(createRecoverRequestHandler(serveDepsFor(ps))),
 			selfPeerId: 'self-peer-not-dialed',
 			cohortHintCache: createStickyCohortHintCache(),
-			resolveCohort: () => [peerId.toString()],
+			resolveCohort: () => Promise.resolve([peerId.toString()]),
 		});
 		const req = await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 14, timestamp: FIXED_NOW });
-		const reply = await transport.backfillTransport(TOPIC, COLLECTION)(req);
+		const reply = await transport.backfillTransport(TAIL_BYTES, COLLECTION)(req);
 		expect(reply.entries.map((e) => e.revision)).to.deep.equal([11, 12, 13, 14]);
 	});
 
@@ -340,10 +342,10 @@ describe('reactivity recover — outbound transport', () => {
 			dialer: handlerDialer(createRecoverRequestHandler(serveDepsFor(ps))),
 			selfPeerId: 'self',
 			cohortHintCache: createStickyCohortHintCache(),
-			resolveCohort: () => [peerId.toString()],
+			resolveCohort: () => Promise.resolve([peerId.toString()]),
 		});
 		const req = await signResume({ v: 1, collectionId: COLLECTION, fromRevision: 12, latestKnownTailId: TAIL, subscriberCoord: COLLECTION, timestamp: FIXED_NOW });
-		const reply = await transport.resumeTransport(TOPIC, COLLECTION)(req);
+		const reply = await transport.resumeTransport(TAIL_BYTES, COLLECTION)(req);
 		expect(reply.result).to.equal('backfill');
 		expect(reply.entries!.map((e) => e.revision)).to.deep.equal([12, 13, 14]);
 	});
@@ -356,10 +358,10 @@ describe('reactivity recover — outbound transport', () => {
 			dialer: handlerDialer(createRecoverRequestHandler(serveDepsFor(ps)), dialed),
 			selfPeerId: 'self',
 			cohortHintCache: hintCacheWith(bytesToB64url(peerIdToBytes(primaryStr))),
-			resolveCohort: () => ['some-walk-member'],
+			resolveCohort: () => Promise.resolve(['some-walk-member']),
 		});
 		const req = await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 12, timestamp: FIXED_NOW });
-		await transport.backfillTransport(TOPIC, COLLECTION)(req);
+		await transport.backfillTransport(TAIL_BYTES, COLLECTION)(req);
 		expect(dialed[0]).to.equal(primaryStr); // sticky primary tried before the walk
 	});
 
@@ -379,10 +381,10 @@ describe('reactivity recover — outbound transport', () => {
 			},
 			selfPeerId: 'self',
 			cohortHintCache: hintCacheWith(stalePrimary),
-			resolveCohort: () => [walkMember],
+			resolveCohort: () => Promise.resolve([walkMember]),
 		});
 		const req = await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 12, timestamp: FIXED_NOW });
-		const reply = await transport.backfillTransport(TOPIC, COLLECTION)(req);
+		const reply = await transport.backfillTransport(TAIL_BYTES, COLLECTION)(req);
 		expect(reply.entries.map((e) => e.revision)).to.deep.equal([11, 12]);
 		expect(dialed).to.have.length(2); // sticky failed, then walk succeeded
 		expect(dialed[1]).to.equal(walkMember);
@@ -402,10 +404,10 @@ describe('reactivity recover — outbound transport', () => {
 			},
 			selfPeerId: selfStr,
 			cohortHintCache: createStickyCohortHintCache(),
-			resolveCohort: () => [selfStr, otherStr],
+			resolveCohort: () => Promise.resolve([selfStr, otherStr]),
 		});
 		const req = await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 12, timestamp: FIXED_NOW });
-		await transport.backfillTransport(TOPIC, COLLECTION)(req);
+		await transport.backfillTransport(TAIL_BYTES, COLLECTION)(req);
 		expect(dialed).to.not.include(selfStr);
 		expect(dialed[0]).to.equal(otherStr);
 	});
@@ -415,11 +417,11 @@ describe('reactivity recover — outbound transport', () => {
 			dialer: { exchange: () => Promise.reject(new Error('should not be called')) },
 			selfPeerId: 'self',
 			cohortHintCache: createStickyCohortHintCache(),
-			resolveCohort: () => [],
+			resolveCohort: () => Promise.resolve([]),
 		});
 		const req = await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 12, timestamp: FIXED_NOW });
 		let threw = false;
-		try { await transport.backfillTransport(TOPIC, COLLECTION)(req); } catch { threw = true; }
+		try { await transport.backfillTransport(TAIL_BYTES, COLLECTION)(req); } catch { threw = true; }
 		expect(threw).to.equal(true);
 	});
 
@@ -433,11 +435,11 @@ describe('reactivity recover — outbound transport', () => {
 			dialer: handlerDialer(handler, dialed),
 			selfPeerId: 'self',
 			cohortHintCache: createStickyCohortHintCache(),
-			resolveCohort: () => [peerId.toString(), secondMember],
+			resolveCohort: () => Promise.resolve([peerId.toString(), secondMember]),
 		});
 		const req = await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 12, timestamp: FIXED_NOW });
 		let caught: unknown;
-		try { await transport.backfillTransport(TOPIC, COLLECTION)(req); } catch (err) { caught = err; }
+		try { await transport.backfillTransport(TAIL_BYTES, COLLECTION)(req); } catch (err) { caught = err; }
 		expect(caught, 'a rotated reply surfaces as a typed RotationRedirectError').to.be.instanceOf(RotationRedirectError);
 		expect((caught as RotationRedirectError).redirect).to.deep.equal(redirect);
 		// Terminal: the dialed member answered authoritatively, so the walk stops (NOT a dial-failure fallthrough).
@@ -451,11 +453,11 @@ describe('reactivity recover — outbound transport', () => {
 			dialer: handlerDialer(createRecoverRequestHandler(serveDepsFor(ps, { rotationFor: () => redirect }))),
 			selfPeerId: 'self',
 			cohortHintCache: createStickyCohortHintCache(),
-			resolveCohort: () => [peerId.toString()],
+			resolveCohort: () => Promise.resolve([peerId.toString()]),
 		});
 		const req = await signResume({ v: 1, collectionId: COLLECTION, fromRevision: 12, latestKnownTailId: TAIL, subscriberCoord: COLLECTION, timestamp: FIXED_NOW });
 		let caught: unknown;
-		try { await transport.resumeTransport(TOPIC, COLLECTION)(req); } catch (err) { caught = err; }
+		try { await transport.resumeTransport(TAIL_BYTES, COLLECTION)(req); } catch (err) { caught = err; }
 		expect(caught).to.be.instanceOf(RotationRedirectError);
 		expect((caught as RotationRedirectError).redirect.effectiveAtRevision).to.equal(99);
 	});
@@ -523,7 +525,7 @@ describe('reactivity recover — a declining member falls through to the next ca
 			dialer: cohortDialer(members, dialed, outcomes),
 			selfPeerId: 'self',
 			cohortHintCache: opts.primary === undefined ? createStickyCohortHintCache() : stickyHintFor(opts.primary),
-			resolveCohort: () => opts.walk,
+			resolveCohort: () => Promise.resolve(opts.walk),
 		});
 		return { transport, dialed, outcomes };
 	}
@@ -559,7 +561,7 @@ describe('reactivity recover — a declining member falls through to the next ca
 			const members = new Map<string, MemberServe>([['member-a', await makeDecliner(req)], ['member-b', servingMember()]]);
 			const { transport, outcomes } = transportOver(members, { walk: ['member-a', 'member-b'] });
 
-			const reply = await transport.backfillTransport(TOPIC, COLLECTION)(req);
+			const reply = await transport.backfillTransport(TAIL_BYTES, COLLECTION)(req);
 
 			expect(reply.entries.map((e) => e.revision)).to.deep.equal([11, 12]);
 			expect(outcomes, 'member-a declined (not a dial failure), then member-b replied').to.deep.equal(['member-a:declined', 'member-b:replied']);
@@ -571,7 +573,7 @@ describe('reactivity recover — a declining member falls through to the next ca
 		const members = new Map<string, MemberServe>([['member-a', emptyMember()], ['member-b', servingMember(seedPushState([10, 11, 12, 13, 14]))]]);
 		const { transport, outcomes } = transportOver(members, { walk: ['member-a', 'member-b'] });
 
-		const reply = await transport.resumeTransport(TOPIC, COLLECTION)(req);
+		const reply = await transport.resumeTransport(TAIL_BYTES, COLLECTION)(req);
 
 		expect(reply.result).to.equal('backfill');
 		expect(outcomes).to.deep.equal(['member-a:declined', 'member-b:replied']);
@@ -581,7 +583,7 @@ describe('reactivity recover — a declining member falls through to the next ca
 		const members = new Map<string, MemberServe>([['primary', emptyMember()], ['walk-member', servingMember()]]);
 		const { transport, dialed } = transportOver(members, { primary: 'primary', walk: ['walk-member'] });
 
-		const reply = await transport.backfillTransport(TOPIC, COLLECTION)(await backfillReq());
+		const reply = await transport.backfillTransport(TAIL_BYTES, COLLECTION)(await backfillReq());
 
 		expect(reply.entries.map((e) => e.revision)).to.deep.equal([11, 12]);
 		expect(dialed, 'the primary is dialed first, then the walk member').to.deep.equal(['primary', 'walk-member']);
@@ -592,7 +594,7 @@ describe('reactivity recover — a declining member falls through to the next ca
 		const members = new Map<string, MemberServe>([['primary', emptyMember()], ['walk-b', servingMember()]]);
 		const { transport, outcomes } = transportOver(members, { primary: 'primary', walk: ['walk-a', 'walk-b'] });
 
-		const reply = await transport.backfillTransport(TOPIC, COLLECTION)(await backfillReq());
+		const reply = await transport.backfillTransport(TAIL_BYTES, COLLECTION)(await backfillReq());
 
 		expect(reply.entries.map((e) => e.revision)).to.deep.equal([11, 12]);
 		expect(outcomes).to.deep.equal(['primary:declined', 'walk-a:dial-failed', 'walk-b:replied']);
@@ -602,7 +604,7 @@ describe('reactivity recover — a declining member falls through to the next ca
 		const members = new Map<string, MemberServe>([['primary', emptyMember()], ['walk-a', emptyMember()], ['walk-b', emptyMember()]]);
 		const { transport, dialed } = transportOver(members, { primary: 'primary', walk: ['walk-a', 'walk-b'] });
 
-		const err = await rejectionOf(transport.backfillTransport(TOPIC, COLLECTION)(await backfillReq()));
+		const err = await rejectionOf(transport.backfillTransport(TAIL_BYTES, COLLECTION)(await backfillReq()));
 
 		expect(err).to.be.instanceOf(NoResultReplyError);
 		expect(dialed, 'each candidate dialed exactly once').to.deep.equal(['primary', 'walk-a', 'walk-b']);
@@ -613,7 +615,7 @@ describe('reactivity recover — a declining member falls through to the next ca
 		const members = new Map<string, MemberServe>([['walk-a', emptyMember()]]);
 		const { transport, dialed } = transportOver(members, { walk: ['walk-a', 'walk-b'] });
 
-		const err = await rejectionOf(transport.backfillTransport(TOPIC, COLLECTION)(await backfillReq()));
+		const err = await rejectionOf(transport.backfillTransport(TAIL_BYTES, COLLECTION)(await backfillReq()));
 
 		expect(err).to.not.be.instanceOf(NoResultReplyError);
 		expect((err as Error).message).to.equal('dial to walk-b failed');
@@ -629,7 +631,7 @@ describe('reactivity recover — a declining member falls through to the next ca
 		]);
 		const { transport, dialed } = transportOver(members, { walk: ['walk-a', 'walk-b', 'walk-c'] });
 
-		const err = await rejectionOf(transport.backfillTransport(TOPIC, COLLECTION)(await backfillReq()));
+		const err = await rejectionOf(transport.backfillTransport(TAIL_BYTES, COLLECTION)(await backfillReq()));
 
 		expect(err).to.be.instanceOf(RotationRedirectError);
 		expect((err as RotationRedirectError).redirect).to.deep.equal(redirect);
@@ -641,7 +643,7 @@ describe('reactivity recover — a declining member falls through to the next ca
 		const members = new Map<string, MemberServe>([['walk-a', () => Promise.resolve(garbage)], ['walk-b', servingMember()]]);
 		const { transport, dialed } = transportOver(members, { walk: ['walk-a', 'walk-b'] });
 
-		const err = await rejectionOf(transport.backfillTransport(TOPIC, COLLECTION)(await backfillReq()));
+		const err = await rejectionOf(transport.backfillTransport(TAIL_BYTES, COLLECTION)(await backfillReq()));
 
 		expect(err, 'the decode failure surfaces as a rejection').to.be.instanceOf(Error);
 		expect(err).to.not.be.instanceOf(NoResultReplyError);
@@ -656,7 +658,7 @@ describe('reactivity recover — a declining member falls through to the next ca
 		const members = new Map<string, MemberServe>([['walk-a', () => Promise.resolve(resumeReplyFrame)], ['walk-b', servingMember()]]);
 		const { transport, dialed } = transportOver(members, { walk: ['walk-a', 'walk-b'] });
 
-		const err = await rejectionOf(transport.backfillTransport(TOPIC, COLLECTION)(await backfillReq()));
+		const err = await rejectionOf(transport.backfillTransport(TAIL_BYTES, COLLECTION)(await backfillReq()));
 
 		expect((err as Error).message).to.match(/does not match request kind/);
 		expect(dialed).to.deep.equal(['walk-a']);
@@ -699,10 +701,10 @@ describe('reactivity recover — declines over the real request/response framing
 			dialer: createLibp2pRecoverDialer(subscriber as never),
 			selfPeerId: peerId.toString(),
 			cohortHintCache: createStickyCohortHintCache(),
-			resolveCohort: () => [decliner.peerId.toString(), server.peerId.toString()],
+			resolveCohort: () => Promise.resolve([decliner.peerId.toString(), server.peerId.toString()]),
 		});
 
-		const reply = await transport.backfillTransport(TOPIC, COLLECTION)(await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 12, timestamp: FIXED_NOW }));
+		const reply = await transport.backfillTransport(TAIL_BYTES, COLLECTION)(await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 12, timestamp: FIXED_NOW }));
 
 		expect(declinerAsked.count, 'the first member really was reached and declined').to.equal(1);
 		expect(reply.entries.map((e) => e.revision)).to.deep.equal([11, 12]);
@@ -720,10 +722,10 @@ describe('reactivity recover — declines over the real request/response framing
 			dialer: createLibp2pRecoverDialer(subscriber as never),
 			selfPeerId: peerId.toString(),
 			cohortHintCache: createStickyCohortHintCache(),
-			resolveCohort: () => [first.peerId.toString(), second.peerId.toString()],
+			resolveCohort: () => Promise.resolve([first.peerId.toString(), second.peerId.toString()]),
 		});
 
-		const err = await transport.backfillTransport(TOPIC, COLLECTION)(await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 12, timestamp: FIXED_NOW }))
+		const err = await transport.backfillTransport(TAIL_BYTES, COLLECTION)(await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 12, timestamp: FIXED_NOW }))
 			.then(() => undefined, (e: unknown) => e);
 
 		expect(asked.count, 'both members were reached').to.equal(2);

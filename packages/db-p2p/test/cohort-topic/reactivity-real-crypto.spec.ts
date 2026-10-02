@@ -9,9 +9,9 @@ import {
 	createMembershipVerifier,
 	createMembershipSourceRouter,
 	createCohortSigner,
-	createTierAddressing,
-	createRingHash,
-	reactivityTopicId,
+	createRootPlacement,
+	rootPlacedMinSigs,
+	reactivityRootCoord,
 	bytesToB64url,
 	b64urlToBytes,
 	Tier,
@@ -98,6 +98,12 @@ const originate = (cert: { signers: readonly string[]; thresholdSig: Uint8Array;
 	});
 
 /** A FRET membership source that holds no cert — forces the verifier onto its cached cert / single refetch. */
+/**
+ * The ratio the root group's commit certificate is captured under (the consensus super-majority
+ * default): three members need `ceil(3 × 0.75) = 3` signatures, so a two-signer cert falls short.
+ */
+const ROOT_QUORUM_RATIO = 0.75;
+
 const emptySource = (): IMembershipSource => ({
 	current: () => Promise.resolve(undefined),
 	fetch: () => Promise.resolve(undefined),
@@ -109,12 +115,13 @@ const emptySource = (): IMembershipSource => ({
  * thresholdSig (production fetch still self-validates), so the membership cert's own sig can be a dummy —
  * what is exercised is the real Ed25519 check over the notification's `digest`.
  */
-const makeVerifier = (members: string[], minSigs: number) => {
+const makeVerifier = (members: string[], quorumRatio = ROOT_QUORUM_RATIO) => {
+	const placement = createRootPlacement(quorumRatio);
 	const crypto: ICohortThresholdCrypto = {
 		assemble: () => Promise.reject(new Error('verify-only')),
 		verify: verifyCollectedMultisig, // REAL Ed25519 collected-multisig — no () => true stub
 	};
-	const expectedCoord = createTierAddressing(createRingHash()).coord0(reactivityTopicId(b64urlToBytes(TAIL)));
+	const expectedCoord = reactivityRootCoord(b64urlToBytes(TAIL));
 	const membershipCert: MembershipCertV1 = {
 		v: 1,
 		cohortCoord: bytesToB64url(expectedCoord),
@@ -125,12 +132,11 @@ const makeVerifier = (members: string[], minSigs: number) => {
 		signers: members,
 	};
 	const membershipVerifier = createMembershipVerifier({
-		signer: createCohortSigner(crypto, minSigs),
+		signer: createCohortSigner(crypto, rootPlacedMinSigs(members.length, placement)),
 		router: createMembershipSourceRouter({ committed: emptySource(), fret: emptySource() }),
-		minSigs,
 	});
-	membershipVerifier.cache(membershipCert);
-	return createNotificationVerifier({ verifier: membershipVerifier, tier: Tier.T3 });
+	membershipVerifier.cache(membershipCert, placement);
+	return createNotificationVerifier({ verifier: membershipVerifier, tier: Tier.T3, quorumRatio });
 };
 
 describe('reactivity: real Ed25519 threshold-verify over digest (seam closed, no pass-crypto stub)', () => {
@@ -147,14 +153,14 @@ describe('reactivity: real Ed25519 threshold-verify over digest (seam closed, no
 		// digest carries exactly the bytes thresholdSig was computed over.
 		expect([...b64urlToBytes(notification.digest)]).to.deep.equal([...new TextEncoder().encode('commitHash-1:approve')]);
 
-		const verifier = makeVerifier([...notification.signers], keys.length);
+		const verifier = makeVerifier([...notification.signers]);
 		expect(await verifier.verify(notification)).to.equal('verified');
 	});
 
 	it('rejects (untrusted) when a single byte of digest is flipped — the signed image no longer matches', async () => {
 		const { cert } = await buildRealCert(keys, 'commitHash-1');
 		const notification = originate(cert);
-		const verifier = makeVerifier([...notification.signers], keys.length);
+		const verifier = makeVerifier([...notification.signers]);
 
 		const tamperedBytes = b64urlToBytes(notification.digest);
 		tamperedBytes[0] = tamperedBytes[0]! ^ 0xff;
@@ -165,7 +171,7 @@ describe('reactivity: real Ed25519 threshold-verify over digest (seam closed, no
 	it('rejects (untrusted) the OLD encoding digest = b64url(utf8(actionId)) — proves real crypto needs the preimage', async () => {
 		const { cert } = await buildRealCert(keys, 'commitHash-1');
 		const notification = originate(cert);
-		const verifier = makeVerifier([...notification.signers], keys.length);
+		const verifier = makeVerifier([...notification.signers]);
 
 		// Reconstruct exactly what pre-12.1 origination produced: digest from the transaction id, not the
 		// signed preimage. The threshold signature is unchanged, but it was never computed over utf8(actionId).
@@ -173,12 +179,12 @@ describe('reactivity: real Ed25519 threshold-verify over digest (seam closed, no
 		expect(await verifier.verify(oldStyle)).to.equal('untrusted');
 	});
 
-	it('rejects (untrusted) when the signer count drops below minSigs', async () => {
-		// A real 2-signer cert, but the verifier requires 3 — below threshold even though both sigs are valid.
+	it('rejects (untrusted) when the signer count drops below the root group threshold ceil(3 × 0.75) = 3', async () => {
+		// A real 2-signer cert, but the three-member root group needs 3 at 0.75 — below threshold even though both sigs are valid.
 		const { cert } = await buildRealCert(keys.slice(0, 2), 'commitHash-1');
 		const notification = originate(cert);
 		const allMembers = keys.map((k) => encodeSigner(k.peerId.toString()));
-		const verifier = makeVerifier(allMembers, 3);
+		const verifier = makeVerifier(allMembers);
 		expect(notification.signers.length).to.equal(2);
 		expect(await verifier.verify(notification)).to.equal('untrusted');
 	});
@@ -186,7 +192,7 @@ describe('reactivity: real Ed25519 threshold-verify over digest (seam closed, no
 	it('rejects (untrusted) when one chunk of thresholdSig is truncated (stride desync)', async () => {
 		const { cert } = await buildRealCert(keys, 'commitHash-1');
 		const notification = originate(cert);
-		const verifier = makeVerifier([...notification.signers], keys.length);
+		const verifier = makeVerifier([...notification.signers]);
 
 		// Drop the last 64-byte chunk: now 2 chunks for 3 signers → length !== signers.length × 64.
 		const truncated = cert.thresholdSig.subarray(0, cert.thresholdSig.length - ED25519_SIG_BYTES);

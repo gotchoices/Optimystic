@@ -87,7 +87,7 @@ function served(state: PushState, collectionId = COLLECTION): number[] {
 interface DriverOpts {
 	live?: ReactivityGossipCollection[];
 	resolve?: (g: PushStateGossipV1) => PushState | undefined;
-	isCohortMember?: (from: string, g: PushStateGossipV1) => boolean;
+	isCohortMember?: (from: string, g: PushStateGossipV1) => boolean | Promise<boolean>;
 	maxBytes?: number;
 	intervalMs?: number;
 	onTruncate?: (info: PushStateGossipTruncation) => void;
@@ -108,7 +108,7 @@ function makeDriver(transport: FakeGossipTransport, opts: DriverOpts = {}): Reac
 // --- tests ------------------------------------------------------------------
 
 describe('reactivity / push-state gossip driver', () => {
-	it('replicates an origin entry so any member serves the same backfill (one round A → B)', () => {
+	it('replicates an origin entry so any member serves the same backfill (one round A → B)', async () => {
 		const a = makePushState();
 		const b = makePushState();
 		const originEntry = ingest(a, 7);
@@ -125,13 +125,13 @@ describe('reactivity / push-state gossip driver', () => {
 
 		// B had nothing; after merging A's frame it serves revision 7 just like A would.
 		expect(served(b), 'B starts empty').to.deep.equal([]);
-		driverB.deliver(MEMBER, transport.broadcasts[0]!.frame);
+		await driverB.deliver(MEMBER, transport.broadcasts[0]!.frame);
 		expect(served(b), 'B now serves the replicated origin entry').to.deep.equal([7]);
 		expect(b.replayBuffer.get(7)!.payload, 'the full signed notification crosses intact').to.deep.equal(originEntry);
 		expect(b.lastRevision).to.equal(7);
 	});
 
-	it('clips an oversized replay ring to stay within maxBytes and surfaces the truncation (no silent cap)', () => {
+	it('clips an oversized replay ring to stay within maxBytes and surfaces the truncation (no silent cap)', async () => {
 		const a = makePushState();
 		for (let rev = 1; rev <= 60; rev++) ingest(a, rev);
 
@@ -159,14 +159,14 @@ describe('reactivity / push-state gossip driver', () => {
 
 		// The kept entries are the most-recent (high-revision) ones — what a lagging subscriber backfills first.
 		const kept = makePushState();
-		makeDriver(new FakeGossipTransport(), { resolve: (): PushState => kept }).deliver(MEMBER, frame);
+		await makeDriver(new FakeGossipTransport(), { resolve: (): PushState => kept }).deliver(MEMBER, frame);
 		const keptRevs = served(kept);
 		expect(keptRevs, 'kept slice is contiguous from the high end').to.deep.equal(
 			Array.from({ length: t.kept }, (_, i) => 60 - t.kept + 1 + i),
 		);
 	});
 
-	it('converges to full overlap over rounds while every frame stays within the bound (streaming ingest)', () => {
+	it('converges to full overlap over rounds while every frame stays within the bound (streaming ingest)', async () => {
 		// W large, bound small: once the ring grows past the bound, each round ships only the most-recent
 		// entries — but because a member is present throughout, every revision is captured while it is recent,
 		// so B converges on A's full ring. (Convergence requires the per-round ingest delta to fit one frame;
@@ -183,7 +183,7 @@ describe('reactivity / push-state gossip driver', () => {
 		for (let rev = 1; rev <= ROUNDS; rev++) {
 			ingest(a, rev);            // one new revision per round (≤ the frame-fitting window)
 			driverA.round();
-			driverB.deliver(MEMBER, transport.broadcasts.at(-1)!.frame);
+			await driverB.deliver(MEMBER, transport.broadcasts.at(-1)!.frame);
 		}
 
 		expect(transport.frames().every((f) => f.length <= maxBytes), 'no frame ever exceeded the bound').to.equal(true);
@@ -192,7 +192,7 @@ describe('reactivity / push-state gossip driver', () => {
 		expect(served(a)).to.deep.equal(Array.from({ length: ROUNDS }, (_, i) => i + 1));
 	});
 
-	it('ignores gossip for a collection this node does not serve (resolve returns undefined)', () => {
+	it('ignores gossip for a collection this node does not serve (resolve returns undefined)', async () => {
 		const a = makePushState();
 		ingest(a, 3);
 		const frame = encodePushStateGossipV1(a.serializeGossip());
@@ -201,11 +201,11 @@ describe('reactivity / push-state gossip driver', () => {
 		const driver = makeDriver(new FakeGossipTransport(), {
 			resolve: (g): PushState | undefined => { resolveCalls++; expect(g.collectionId).to.equal(COLLECTION); return undefined; },
 		});
-		expect(() => driver.deliver(MEMBER, frame)).to.not.throw();
+		await driver.deliver(MEMBER, frame);
 		expect(resolveCalls, 'the resolver was consulted and declined — nothing merged').to.equal(1);
 	});
 
-	it('mergeGossip independently rejects a foreign collection even if the resolver mis-routes it', () => {
+	it('mergeGossip independently rejects a foreign collection even if the resolver mis-routes it', async () => {
 		// Defense-in-depth: a resolver that hands back the wrong push-state must not corrupt it — mergeGossip
 		// guards collectionId/topicId itself.
 		const foreign = makePushState({ collectionId: OTHER_COLLECTION });
@@ -213,11 +213,11 @@ describe('reactivity / push-state gossip driver', () => {
 		ingest(a, 4);
 		const frame = encodePushStateGossipV1(a.serializeGossip());
 
-		makeDriver(new FakeGossipTransport(), { resolve: (): PushState => foreign }).deliver(MEMBER, frame);
+		await makeDriver(new FakeGossipTransport(), { resolve: (): PushState => foreign }).deliver(MEMBER, frame);
 		expect(served(foreign, OTHER_COLLECTION), 'the foreign-collection state stays empty').to.deep.equal([]);
 	});
 
-	it('drops a frame from a non-member sender before any merge (membership gate)', () => {
+	it('drops a frame from a non-member sender before any merge (membership gate)', async () => {
 		const a = makePushState();
 		ingest(a, 5);
 		const frame = encodePushStateGossipV1(a.serializeGossip());
@@ -229,20 +229,20 @@ describe('reactivity / push-state gossip driver', () => {
 			isCohortMember: (from): boolean => from === MEMBER,
 		});
 
-		driver.deliver(STRANGER, frame);
+		await driver.deliver(STRANGER, frame);
 		expect(resolveCalls, 'a non-member is dropped before resolve/merge').to.equal(0);
 		expect(served(b), 'the gated frame never merged').to.deep.equal([]);
 
 		// The same frame from a real member is accepted.
-		driver.deliver(MEMBER, frame);
+		await driver.deliver(MEMBER, frame);
 		expect(resolveCalls).to.equal(1);
 		expect(served(b)).to.deep.equal([5]);
 	});
 
-	it('drops an undecodable inbound frame without throwing or merging', () => {
+	it('drops an undecodable inbound frame without throwing or merging', async () => {
 		const b = makePushState();
 		const driver = makeDriver(new FakeGossipTransport(), { resolve: (): PushState => b });
-		expect(() => driver.deliver(MEMBER, new Uint8Array([0xff, 0x00, 0x01, 0x02]))).to.not.throw();
+		await driver.deliver(MEMBER, new Uint8Array([0xff, 0x00, 0x01, 0x02]));
 		expect(served(b)).to.deep.equal([]);
 	});
 

@@ -80,8 +80,11 @@ export interface ReactivityPushStateGossipDriverDeps {
 	readonly liveCollections: () => Iterable<ReactivityGossipCollection>;
 	/** Resolve the collection owning an inbound frame (by collectionId/topicId) → its {@link PushState}, or undefined. */
 	readonly pushStateForGossip: (g: PushStateGossipV1) => PushState | undefined;
-	/** Inbound authenticity gate: is `fromPeerId` a member of the cohort for the frame's coord? Absent ⇒ accept all. */
-	readonly isCohortMember?: (fromPeerId: string, g: PushStateGossipV1) => boolean;
+	/**
+	 * Inbound authenticity gate: is `fromPeerId` a member of the group the frame's collection is served by (the
+	 * tail's root group, read from the key network — hence async)? A rejection drops the frame. Absent ⇒ accept all.
+	 */
+	readonly isCohortMember?: (fromPeerId: string, g: PushStateGossipV1) => boolean | Promise<boolean>;
 	/** Cadence interval. Default {@link DEFAULT_GOSSIP_INTERVAL_MS}. */
 	readonly intervalMs?: number;
 	/** Per-frame ceiling (frame, including the length prefix, stays within this). Default {@link DEFAULT_STREAM_MAX_BYTES}. */
@@ -102,7 +105,7 @@ export class ReactivityPushStateGossipDriver {
 	private readonly gossipTransport: Pick<FretCohortGossipTransport, "broadcastOver">;
 	private readonly liveCollections: () => Iterable<ReactivityGossipCollection>;
 	private readonly pushStateForGossip: (g: PushStateGossipV1) => PushState | undefined;
-	private readonly isCohortMember?: (fromPeerId: string, g: PushStateGossipV1) => boolean;
+	private readonly isCohortMember?: (fromPeerId: string, g: PushStateGossipV1) => boolean | Promise<boolean>;
 	private readonly intervalMs: number;
 	private readonly maxBytes: number;
 	private readonly onTruncate?: (info: PushStateGossipTruncation) => void;
@@ -162,12 +165,12 @@ export class ReactivityPushStateGossipDriver {
 	}
 
 	/**
-	 * Inbound handler body: decode → membership gate → resolve owning collection → merge. Never throws on a
+	 * Inbound handler body: decode → membership gate → resolve owning collection → merge. Never rejects on a
 	 * bad frame (a malformed/forged/foreign frame is logged and dropped), so a stream handler can call it
 	 * directly. `mergeGossip` independently guards a collection/topic mismatch, so the resolve step is a fast
-	 * pre-filter, not the only line of defense.
+	 * pre-filter, not the only line of defense. Async only for the membership gate's group read.
 	 */
-	deliver(fromPeerId: string, frame: Uint8Array): void {
+	async deliver(fromPeerId: string, frame: Uint8Array): Promise<void> {
 		let g: PushStateGossipV1;
 		try {
 			g = decodePushStateGossipV1(frame, this.maxBytes);
@@ -175,7 +178,7 @@ export class ReactivityPushStateGossipDriver {
 			log("dropped an undecodable push-state gossip frame from %s: %o", fromPeerId, err);
 			return;
 		}
-		if (this.isCohortMember !== undefined && !this.isCohortMember(fromPeerId, g)) {
+		if (!(await this.senderIsMember(fromPeerId, g))) {
 			log("dropped push-state gossip from non-member %s for collection=%s topic=%s", fromPeerId, g.collectionId, g.topicId);
 			return;
 		}
@@ -187,6 +190,19 @@ export class ReactivityPushStateGossipDriver {
 			pushState.mergeGossip(g);
 		} catch (err) {
 			log("push-state mergeGossip threw (isolated) for collection=%s: %o", g.collectionId, err);
+		}
+	}
+
+	/** The gate's verdict for one frame; a gate that throws or rejects answers "not a member" (the frame is dropped). */
+	private async senderIsMember(fromPeerId: string, g: PushStateGossipV1): Promise<boolean> {
+		if (this.isCohortMember === undefined) {
+			return true;
+		}
+		try {
+			return await this.isCohortMember(fromPeerId, g);
+		} catch (err) {
+			log("push-state gossip membership gate failed for %s (frame dropped): %o", fromPeerId, err);
+			return false;
 		}
 	}
 
@@ -277,7 +293,7 @@ export function registerPushStateGossipHandler(
 		void (async (): Promise<void> => {
 			try {
 				const frame = await readFrame(stream, maxBytes);
-				driver.deliver(connection.remotePeer.toString(), frame);
+				await driver.deliver(connection.remotePeer.toString(), frame);
 				await stream.close();
 			} catch {
 				try {

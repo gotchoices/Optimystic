@@ -104,7 +104,7 @@ describe('cohort-topic: stream-util framing round trip', () => {
 		const { client, server, serverPeer } = await makePair();
 		const frame = new Uint8Array([9, 8, 7, 0, 0, 6]);
 		const delivered: Array<{ from: string; frame: Uint8Array }> = [];
-		registerPushStateGossipHandler(server as never, PROTOCOL, { deliver: (from, f) => { delivered.push({ from, frame: f }); } });
+		registerPushStateGossipHandler(server as never, PROTOCOL, { deliver: (from, f) => { delivered.push({ from, frame: f }); return Promise.resolve(); } });
 
 		await sendOneWay(client as never, serverPeer, PROTOCOL, frame);
 		await waitFor(() => delivered.length === 1);

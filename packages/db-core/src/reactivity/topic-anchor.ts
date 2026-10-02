@@ -22,10 +22,17 @@
  *
  * `reactivityTopicId` is the small pure helper the ticket asks for once and the rotation ticket
  * ([reactivity-rotation-backpressure-policy]) reuses per-emission — define it here, not at the call site.
+ *
+ * **The root is placed at the tail, not at the topic** (`docs/reactivity.md` §Origination point). The topic
+ * id above addresses tiers `d ≥ 1`; the tree's root (announcing) group is the tail block's own storage
+ * group, so the root coordinate is `H(tailBytes)` — the ring position the key network derives for the
+ * tail's routing key — not `H(0x00 ‖ topicId)`. {@link reactivityRootCoord} is that derivation, shared by
+ * the notification verifier, the mock-tier harness and every db-p2p site that needs the root group.
  */
 
 import { createRingHash } from "../cohort-topic/ring-hash.js";
-import type { IRingHash } from "../cohort-topic/ports.js";
+import { createTierAddressing } from "../cohort-topic/addressing.js";
+import type { IRingHash, RingCoord } from "../cohort-topic/ports.js";
 
 /** Domain-separation suffix mixed into every reactivity anchor. */
 const REACTIVITY_SUFFIX = "reactivity";
@@ -45,6 +52,18 @@ export function reactivityTopicId(tailId: Uint8Array, hash: IRingHash = createRi
 	input.set(tailId, 0);
 	input.set(suffixBytes, tailId.length);
 	return hash.H(input);
+}
+
+/**
+ * The reactivity root coordinate for a tail: `H(tailId)` over the injected ring hash — the tail block's
+ * own ring position, where its storage group sits. `tailId` is the tail's routing key bytes (the raw utf8
+ * of the block id, `reactivityTailBytes` on a node), so at the default 256-bit ring width this equals the
+ * key network's `hashKey(routingKeyForBlock(tail))` byte for byte; the `topic-bytes-encoding` spec in
+ * db-p2p pins that equality. Every party that derives the root group — the notification verifier, the
+ * subscriber walk's root step, the forwarder's gossip and recover reads — must start from this one value.
+ */
+export function reactivityRootCoord(tailId: Uint8Array, hash: IRingHash = createRingHash()): RingCoord {
+	return createTierAddressing(hash).rootCoord(tailId);
 }
 
 /** Derives the rotating `topicId` for a collection's current tail. */

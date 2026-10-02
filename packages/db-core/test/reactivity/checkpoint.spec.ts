@@ -6,16 +6,14 @@ import {
 	verifyCheckpointEndpoints,
 	validateCheckpointSummary,
 	createNotificationVerifier,
-	reactivityTopicId,
+	reactivityRootCoord,
 	type CheckpointSummary,
 	type NotificationV1,
 	type RevisionEntry,
 } from '../../src/reactivity/index.js';
 import { createMembershipVerifier } from '../../src/cohort-topic/membership/verifier.js';
 import { createMembershipSourceRouter } from '../../src/cohort-topic/membership/source.js';
-import { createCohortSigner } from '../../src/cohort-topic/sig/threshold.js';
-import { createTierAddressing } from '../../src/cohort-topic/addressing.js';
-import { createRingHash } from '../../src/cohort-topic/ring-hash.js';
+import { createCohortSigner, createRootPlacement, rootPlacedMinSigs } from '../../src/cohort-topic/sig/threshold.js';
 import { Tier } from '../../src/cohort-topic/tiers.js';
 import { bytesToB64url, b64urlToBytes } from '../../src/cohort-topic/wire/codec.js';
 import { CohortWireError } from '../../src/cohort-topic/wire/validate.js';
@@ -43,11 +41,17 @@ function note(revision: number, over: Partial<NotificationV1> = {}): Notificatio
 
 const entry = (revision: number, over: Partial<NotificationV1> = {}): RevisionEntry => ({ revision, payload: note(revision, over), receivedAt: 1000 + revision });
 
-/** A verifier whose raw crypto always passes, so the verdict turns purely on the signer-subset check. */
-function realishVerifier(members: string[], minSigs: number) {
+/**
+ * A verifier whose raw crypto always passes, so the verdict turns purely on the signer-subset check. The
+ * cert is cached at the tail's root coordinate under the root placement rule, so the threshold is
+ * `ceil(members × quorumRatio)`: at the default ratio of 1 every member must sign.
+ */
+function realishVerifier(members: string[], quorumRatio = 1) {
 	const crypto: ICohortThresholdCrypto = { assemble: () => Promise.reject(new Error('verify-only')), verify: () => true };
 	const empty: IMembershipSource = { current: () => Promise.resolve(undefined), fetch: () => Promise.resolve(undefined) };
-	const expectedCoord = createTierAddressing(createRingHash()).coord0(reactivityTopicId(b64urlToBytes(TAIL)));
+	const placement = createRootPlacement(quorumRatio);
+	const minSigs = rootPlacedMinSigs(members.length, placement);
+	const expectedCoord = reactivityRootCoord(b64urlToBytes(TAIL));
 	const cert: MembershipCertV1 = {
 		v: 1,
 		cohortCoord: bytesToB64url(expectedCoord),
@@ -58,8 +62,8 @@ function realishVerifier(members: string[], minSigs: number) {
 		signers: members.slice(0, minSigs),
 	};
 	const mv = createMembershipVerifier({ signer: createCohortSigner(crypto, minSigs), router: createMembershipSourceRouter({ committed: empty, fret: empty }), minSigs });
-	mv.cache(cert);
-	return createNotificationVerifier({ verifier: mv, tier: Tier.T3 });
+	mv.cache(cert, placement);
+	return createNotificationVerifier({ verifier: mv, tier: Tier.T3, quorumRatio });
 }
 
 describe('reactivity rolling checkpoint', () => {
@@ -151,20 +155,20 @@ describe('reactivity checkpoint endpoint verification', () => {
 	}
 
 	it('verifies when both bracketing endpoints are real committed revisions', async () => {
-		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B]);
 		const summary = summaryWith(note(100), note(200));
 		expect(await verifyCheckpointEndpoints(summary, verifier)).to.equal('verified');
 	});
 
 	it('rejects a forged endpoint whose signers are not in the cohort membership', async () => {
-		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B]);
 		const forged = note(200, { signers: [bytesToB64url(new Uint8Array([0xde, 0xad])), bytesToB64url(new Uint8Array([0xbe, 0xef]))] });
 		const summary = summaryWith(note(100), forged);
 		expect(await verifyCheckpointEndpoints(summary, verifier)).to.equal('untrusted');
 	});
 
 	it('rejects when a bracketing endpoint revision does not match the summarized bound', async () => {
-		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B]);
 		// The summary claims [100,200] but its `to` endpoint is actually revision 199 — a structural forgery.
 		const summary: CheckpointSummary = { collectionId: COLLECTION, fromRevision: 100, toRevision: 200, mergedDigest: bytesToB64url(new Uint8Array([1])), bracketingEntries: [note(100), note(199)] };
 		expect(await verifyCheckpointEndpoints(summary, verifier)).to.equal('untrusted');

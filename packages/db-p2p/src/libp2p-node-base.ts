@@ -59,7 +59,6 @@ import type { RestoreCallback, BlockArchive } from './storage/struct.js';
 import type { FretService } from 'p2p-fret';
 import { createCohortTopicHost, type CohortTopicHostOptions } from './cohort-topic/host.js';
 import { attachCohortChangeBridge } from './cohort-topic/change-bridge.js';
-import { createReactivitySelfMembershipGate } from './cohort-topic/reactivity-membership-gate.js';
 import { Libp2pReactivityNotifyTransport, registerNotifyHandler } from './reactivity/notify-transport.js';
 import {
 	Libp2pReactivityRecoverTransport,
@@ -83,6 +82,7 @@ import {
 	createCorrelationReplayGuard,
 	createStickyCohortHintCache,
 	reactivityNodePolicy,
+	reactivityRootCoord,
 	createTierAddressing,
 	createRingHash,
 	Tier,
@@ -342,9 +342,11 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * Opt-in cohort-topic substrate activation (reactivity / matchmaking origination). Default OFF →
 	 * the node keeps today's bare `blockChangeNotifier = storageRepo` behavior at zero cohort cost (no
 	 * host, no cert store; a caller-supplied {@link onCommitCertificate} is the only sink). When
-	 * `enabled`, the node-base constructs the cohort-topic host post-assembly, builds a real FRET-backed
-	 * `selfIsCohortMember` gate over `coord_0(H(tailId ‖ "reactivity"))`, and installs the change-notifier
-	 * origination bridge — making reactivity origination live for ALL collections created on the node.
+	 * `enabled`, the node-base constructs the cohort-topic host post-assembly — serving root placement with
+	 * the key network's storage rule as the root group, so a collection's reactivity tree is rooted at the
+	 * group that stores its log tail — and installs the change-notifier origination bridge, which announces
+	 * every commit whose tail this node applied: reactivity origination is live for ALL collections created
+	 * on the node.
 	 *
 	 * A failure to construct the host (or a missing FRET service) **hard-fails** node startup: the
 	 * operator opted in, so silently degrading to the bare notifier would hide misconfiguration.
@@ -353,12 +355,18 @@ export type NodeOptions = ClusterPolicyOptions & {
 		/** Master switch. Absent/`false` → dormant, zero cost. */
 		enabled: boolean;
 		/**
-		 * Requested cohort size; MUST match the host's `wantK` so the membership gate checks the same
-		 * cohort the host serves. Default 16 (the host's default).
+		 * Requested size of every cohort that is NOT a root-placed root — the tiers below a reactivity
+		 * tree's root, and every matchmaking cohort — assembled as the `wantK` FRET peers nearest the
+		 * cohort's coordinate. A reactivity root is the tail block's storage group, `clusterSize` wide, and
+		 * is not governed by this. Default 16 (the host's default).
 		 */
 		wantK?: number;
-		/** Optional pass-through host tuning (profile / minSigs / fanout / gossipIntervalMs / antiDos / promotion). */
-		host?: Omit<CohortTopicHostOptions, 'privateKey' | 'wantK'>;
+		/**
+		 * Optional pass-through host tuning (profile / minSigs / fanout / gossipIntervalMs / antiDos / promotion).
+		 * `rootGroup` is bound by the node to the key network's storage rule and the consensus
+		 * super-majority ratio, so it cannot be supplied here.
+		 */
+		host?: Omit<CohortTopicHostOptions, 'privateKey' | 'wantK' | 'rootGroup'>;
 	};
 
 	/**
@@ -629,8 +637,8 @@ function resolveKvStore(provider: KVStoreProvider | undefined): IKVStore {
  * libp2p `Libp2pFretService` *wrapper*, which re-exports only a subset (`assembleCohort`, `routeAct`, …)
  * and keeps the real engine private behind its lazy `ensure()` accessor. By the time activation runs the
  * engine is already initialized — the wrapper's `Startable.start()` ran during `node.start()` — and the
- * engine and wrapper share one underlying routing store, so the host and the membership gate observe the
- * same cohort state. Returns the engine when reachable; otherwise the value as-is (a test may inject a
+ * engine and wrapper share one underlying routing store, so the host and the forwarder's child-cohort reads
+ * observe the same cohort state. Returns the engine when reachable; otherwise the value as-is (a test may inject a
  * raw engine that needs no unwrapping).
  */
 function resolveFretEngine(fret: FretService | undefined): FretService | undefined {
@@ -744,7 +752,7 @@ export async function createLibp2pNodeBase(
 
 	// --- cohort-topic substrate activation (opt-in; default off → today's bare behavior, zero cost) ---
 	const cohortEnabled = options.cohortTopic?.enabled === true;
-	// Resolve wantK ONCE so the post-assembly host serves and the membership gate checks the SAME cohort.
+	// Resolved once: the host's non-root cohort width, also used by the forwarder's child-cohort reads below.
 	const cohortWantK = options.cohortTopic?.wantK ?? 16;
 	// When enabled, the cluster member records the consensus commit cert into this store synchronously,
 	// BEFORE `storageRepo.commit` emits the change event the bridge's extractor resolves it from (see
@@ -1877,6 +1885,10 @@ export async function createLibp2pNodeBase(
 		if (cohortEnabled) {
 			// The host needs the full FRET engine surface; node.services.fret is the wrapper (see resolveFretEngine).
 			const fret = resolveFretEngine(fretSvc);
+			// The root group at a ring coordinate: the key network's storage rule in coordinate form. One
+			// binding, shared by the host (root placement) and the forwarder-side reads below (push-state
+			// gossip authenticity, recover targets), so no site can derive a root group by a different rule.
+			const rootGroupAt = (coord: Uint8Array): Promise<readonly string[]> => keyNetwork.servingCohortAt(coord);
 			if (!fret) {
 				// Operator opted in; degrading silently to the bare notifier would hide misconfiguration.
 				// (The started node is torn down by the post-start rollback `catch` at the bottom of this function.)
@@ -1901,6 +1913,12 @@ export async function createLibp2pNodeBase(
 				// an operator may still pass one via cohortTopic.host.committedParentTopicReader.
 				privateKey: nodePrivateKey, // real k − x threshold signing
 				wantK: cohortWantK,
+				// Root placement (docs/reactivity.md §Origination point): a root-placed topic's root group is the
+				// key network's serving cohort at the root coordinate — the SAME assembly `findCluster` places a
+				// block with, so a reactivity tree rooted at `H(routingKeyForBlock(tailId))` sits on exactly the
+				// machines that store the tail, which are the machines that apply and announce its commits. The
+				// threshold is the consensus super-majority ratio the commit certificate was captured under.
+				rootGroup: { membersAt: rootGroupAt, quorumRatio: consensusConfig.superMajorityThreshold },
 			});
 
 			// --- Cohort-topic + reactivity + matchmaking teardown ---
@@ -1946,23 +1964,14 @@ export async function createLibp2pNodeBase(
 				};
 			}
 
-			// selfIsCohortMember: this node owns the collection's reactivity-topic fan-out iff it is in the
-			// FRET cohort around coord_0(H(currentTailId ‖ "reactivity")). Uses db-core's default hashes
-			// (createReactivityTopicAnchor / createTierAddressing / createRingHash), byte-identical to the
-			// host's internal `new RingHash()` and the subscriber-side anchor, and the SAME cohortWantK as
-			// the host — so the coord + cohort line up across origination and subscription.
-			const selfIsCohortMember = createReactivitySelfMembershipGate({
-				fret,
-				selfPeerId: node.peerId.toString(),
-				wantK: cohortWantK,
-			});
-
+			// Origination gate: the bridge announces a commit iff this node applied its log tail
+			// (`selfAppliedTail` in change-bridge.ts) — this node is then in the tail's storage group, which is
+			// the topic's root group under the host's root placement above. No ring read is needed.
 			unsubscribeCohortBridge = attachCohortChangeBridge(
 				node as unknown as { blockChangeNotifier?: IBlockChangeNotifier },
 				{
 					source: storageRepo,
 					service: host.service,
-					selfIsCohortMember,
 					extractCommitCert: makeClusterCommitCertExtractor(certStore!),
 				},
 			).unsubscribe;
@@ -1980,13 +1989,14 @@ export async function createLibp2pNodeBase(
 			const selfPeerId = node.peerId.toString();
 			const reactivityProfile = host.profile; // Edge ⇒ subscriber-only via the policy gate; Core forwards.
 			const reactivityPolicy = reactivityNodePolicy(reactivityProfile);
-			// db-core default anchor + tier addressing, byte-identical to the host's `new RingHash()`, the
-			// origination gate, and the subscriber-side anchor — so coord_0 derivation lines up everywhere.
-			const reactivityAddressing = createTierAddressing(createRingHash());
-			// Reactivity's forwarder cohort sits at coord_0 — TREE tier 0 (peer-independent), distinct from the
-			// CAPACITY tier T3 the verifier/willingness use. `registry.findServing` keys on the engine's tree
-			// depth, so the served reactivity engine is found at tree tier 0, never at 3.
+			// Reactivity's forwarder cohort is the root group at the tail's root coordinate — TREE tier 0
+			// (peer-independent), distinct from the CAPACITY tier T3 the verifier/willingness use.
+			// `registry.findServing` keys on the engine's tree depth, so the served reactivity engine is found
+			// at tree tier 0, never at 3.
 			const REACTIVITY_FORWARDER_TREE_TIER = 0;
+			// The ratio every reactivity verifier on this node applies to a root group's signers:
+			// `ceil(|group| × ratio)`, the formula `captureCommitCert` signs the group's commit certificate under.
+			const reactivityQuorumRatio = consensusConfig.superMajorityThreshold;
 
 			// Node-level subscriber registry: a constructed ReactivitySubscriptionManager registers here so a
 			// socket-delivered NotificationV1 reaches it. The collection watch service (step 7 below) is what
@@ -2008,7 +2018,7 @@ export async function createLibp2pNodeBase(
 					tailIdAtJoin: n.tailId,
 					deltaMaxBytes: reactivityPolicy.deltaMaxBytes,
 				}),
-				verifierFor: (): NotificationVerifier => createNotificationVerifier({ verifier: host.service.verifier(), tier: Tier.T3 }),
+				verifierFor: (): NotificationVerifier => createNotificationVerifier({ verifier: host.service.verifier(), tier: Tier.T3, quorumRatio: reactivityQuorumRatio }),
 				directSubscribers: (topicId: Uint8Array): string[] => {
 					// Find the served reactivity engine at TREE tier 0 (see REACTIVITY_FORWARDER_TREE_TIER) and read
 					// its direct-subscriber records. The adapter filters to reactivity appState and maps participantId
@@ -2058,18 +2068,27 @@ export async function createLibp2pNodeBase(
 			origination.install();
 
 			// 4. PushState gossip — periodic intra-cohort convergence so any member (not just the primary) can
-			// serve a replay/backfill. Rides the host's cohort gossip transport (no second transport).
+			// serve a replay/backfill. Rides the host's cohort gossip transport (no second transport). A served
+			// push state's cohort is the root group at its tail's root coordinate: a topic id cannot be inverted,
+			// so each site keys on the tail the push state joined under (`tailIdAtJoin`).
 			pushStateGossip = new ReactivityPushStateGossipDriver({
 				gossipTransport: host.gossipTransport,
 				liveCollections: (): ReactivityGossipCollection[] => forwarderHost.livePushStates().map((pushState) => ({
 					pushState,
-					cohortCoord: reactivityAddressing.coord0(b64urlToBytes(pushState.topicId)),
+					cohortCoord: reactivityRootCoord(b64urlToBytes(pushState.tailIdAtJoin)),
 				})),
 				pushStateForGossip: (g: PushStateGossipV1) => forwarderHost.pushStateFor(b64urlToBytes(g.topicId)),
-				// Authenticity gate: accept gossip only from a member of the cohort around the frame's reactivity
-				// coord (per-frame peer-sig envelope signing is deferred — reactivity-pushstate-gossip's hardening backlog).
-				isCohortMember: (fromPeerId: string, g: PushStateGossipV1): boolean =>
-					fret.assembleCohort(reactivityAddressing.coord0(b64urlToBytes(g.topicId)), cohortWantK).includes(fromPeerId),
+				// Authenticity gate: accept gossip only from a member of the root group serving the frame's topic
+				// (per-frame peer-sig envelope signing is deferred — reactivity-pushstate-gossip's hardening backlog).
+				// A frame for a topic this node serves no push state for is let through: there is nothing to
+				// protect, and the resolve step drops it as unserved.
+				// NOTE: reads the key network's serving cohort per inbound frame (one per collection per member
+				// per gossip round). If it shows in profiles, memoize per tail with a TTL of one gossip interval.
+				isCohortMember: async (fromPeerId: string, g: PushStateGossipV1): Promise<boolean> => {
+					const served = forwarderHost.pushStateFor(b64urlToBytes(g.topicId));
+					if (served === undefined) return true;
+					return (await rootGroupAt(reactivityRootCoord(b64urlToBytes(served.tailIdAtJoin)))).includes(fromPeerId);
+				},
 			});
 			registerPushStateGossipHandler(node, reactivityProtocols.pushStateGossip, pushStateGossip);
 			pushStateGossip.start();
@@ -2086,12 +2105,12 @@ export async function createLibp2pNodeBase(
 			// empty ⇒ the transport falls through to the cohort-walk (any member holding the gossiped PushState
 			// answers); populating the sticky primary is a one-RT optimization, not a correctness need.
 			const reactivityCohortHintCache = createStickyCohortHintCache();
-			// topicId → dialable cohort member peer-id strings: the SAME FRET coord_0 assembly the push-state-gossip
-			// authenticity gate uses (`reactivityAddressing.coord0` → `fret.assembleCohort`), so a recover walk
-			// reaches exactly the cohort that holds the topic's gossiped PushState. `assembleCohort` returns peer-id
-			// strings (the recover dialer's `peerIdFromString` space), matching the notify dial-target space.
-			const resolveReactivityCohort = (topicId: Uint8Array): string[] =>
-				fret.assembleCohort(reactivityAddressing.coord0(topicId), cohortWantK);
+			// tail bytes → dialable root-group member peer-id strings: the SAME root-group read the push-state-gossip
+			// authenticity gate uses (`rootGroupAt` at the tail's root coordinate), so a recover walk reaches exactly
+			// the group that holds the topic's gossiped PushState. The key network returns peer-id strings (the
+			// recover dialer's `peerIdFromString` space), matching the notify dial-target space.
+			const resolveReactivityCohort = (tailId: Uint8Array): Promise<readonly string[]> =>
+				rootGroupAt(reactivityRootCoord(tailId));
 
 			// Outbound transport: exposes the db-core BackfillTransport / ResumeTransport seams against this node.
 			// maxBytes is omitted so the dialer + handler default to DEFAULT_STREAM_MAX_BYTES, matching the notify
@@ -2152,6 +2171,7 @@ export async function createLibp2pNodeBase(
 			reactivityWatch = new ReactivityCollectionWatch({
 				service: host.service,
 				profile: reactivityProfile,
+				quorumRatio: reactivityQuorumRatio,
 				subscribers: reactivitySubscribers,
 				scheduleRotation: (notice): void => scheduler.schedule(notice),
 				recover,
@@ -2172,10 +2192,10 @@ export async function createLibp2pNodeBase(
 			// prereq follow-on `matchmaking-query-rpc-seeker-walk`; only the serve side is live here.
 			registerMatchmakingQueryHandler(node, matchmakingProtocols.query, {
 				registry: host.registry,
-				// Reuse the reactivity addressing: createTierAddressing(createRingHash()) is byte-identical to the
+				// db-core default tier addressing: createTierAddressing(createRingHash()) is byte-identical to the
 				// host's internal addressing for the tier-0 coord (peer- and fanout-independent), and the handler
-				// only ever derives coord_0(topicId).
-				addressing: reactivityAddressing,
+				// only ever derives coord_0(topicId) — matchmaking topics are not root-placed.
+				addressing: createTierAddressing(createRingHash()),
 				// Single-member reply signature over the node peer key (same pattern reactivity uses for its signers).
 				sign: async (payload: Uint8Array): Promise<string> => bytesToB64url(await signPeer(nodePrivateKey, payload)),
 				// Anti-DoS rate-limit seam (backlog matchmaking-query-rate-limit) intentionally left unwired here:

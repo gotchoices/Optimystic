@@ -922,9 +922,10 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
 #### Cohort-Topic Origination Bridge (networked reactivity)
 
 The same `StorageRepo` change signal is also the **origination point** for *networked*
-reactivity (and, later, matchmaking): a commit landing on a node that is a cohort
-member for the collection's reactivity topic is emitted into the cohort-topic substrate
-so notifications can fan out across the network — not just to in-process subscribers.
+reactivity (and, later, matchmaking): a commit landing on a node that applied the
+collection's log tail — a member of the tail block's storage group, which is the reactivity
+topic's root group — is emitted into the cohort-topic substrate so notifications can fan out
+across the network — not just to in-process subscribers.
 
 ```
 ClusterMember.handleConsensus            # consensus reached on a commit op
@@ -933,8 +934,9 @@ ClusterMember.handleConsensus            # consensus reached on a commit op
   → storageRepo.commit(...)              # critical section; emits CollectionChangeEvent at the end
 StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not per-id)
   → makeCohortTopicChangeNotifier        # the bridge (cohort-topic/change-bridge.ts)
-     → selfIsCohortMember(event)?        # non-member / tail-less event → no-op; reads event.tailId to
-                                         #   resolve coord_0(H(tailId ‖ "reactivity")) and check FRET cohort
+     → selfAppliedTail(event)?           # tail-less event, or a commit that landed only non-tail blocks
+                                         #   here → no-op; the tail among event.blockIds means this node is
+                                         #   in the tail's storage group (the announcing group), no ring read
      → extractCommitCert(event)          # makeClusterCommitCertExtractor → CommitCertStore.get
      → CohortTopicService.onLocalCommit(event, commitCert)   # reactivity originates from here
 ```
@@ -962,11 +964,13 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
   host and attaches the bridge when `cohortTopic.enabled` is set (default OFF). On an enabled
   node it: creates a `CommitCertStore` and composes its `put` into the `onCommitCertificate`
   sink threaded to `ClusterMember` (so the consensus cert is retained before the change event
-  emits); post-assembly builds the host (`createCohortTopicHost`) over the running node + FRET;
-  builds `selfIsCohortMember(event)` over real FRET membership for
-  `coord_0(H(event.tailId ‖ "reactivity"))` (db-core default hashes, byte-identical to the host
-  and the subscriber anchor; same `wantK` as the host); and installs the bridge as
-  `node.blockChangeNotifier` via `attachCohortChangeBridge` — making origination live for **all**
+  emits); post-assembly builds the host (`createCohortTopicHost`) over the running node + FRET,
+  with root placement bound to the key network's storage rule (`servingCohortAt` in
+  `packages/db-p2p/src/libp2p-key-network.ts`, the same assembly `findCluster` places a block with)
+  and the consensus `superMajorityThreshold` as the root quorum ratio — so a reactivity topic's root
+  is its tail block's storage group ([reactivity.md § Origination point](reactivity.md#origination-point));
+  and installs the bridge as `node.blockChangeNotifier` via `attachCohortChangeBridge`, whose gate is
+  `selfAppliedTail` — making origination live for **all**
   collections created on the node, since the Quereus collection-factory captures that notifier
   once. The host is exposed as `node.cohortTopicHost`. A node **without** `cohortTopic.enabled`
   keeps the bare `blockChangeNotifier = storageRepo` at zero cohort cost (no host, no cert store).

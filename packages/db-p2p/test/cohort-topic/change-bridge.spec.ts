@@ -3,7 +3,7 @@ import { toString as uint8ArrayToString } from 'uint8arrays';
 import { StorageRepo } from '../../src/storage/storage-repo.js';
 import { BlockStorage } from '../../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../../src/storage/memory-storage.js';
-import { makeCohortTopicChangeNotifier, attachCohortChangeBridge } from '../../src/cohort-topic/change-bridge.js';
+import { makeCohortTopicChangeNotifier, attachCohortChangeBridge, selfAppliedTail } from '../../src/cohort-topic/change-bridge.js';
 import { buildCommitCert, createCommitCertStore, makeClusterCommitCertExtractor } from '../../src/cluster/commit-cert.js';
 import type {
 	BlockId, ActionId, IBlock, BlockHeader, Transforms, CollectionId,
@@ -51,10 +51,12 @@ describe('cohort-topic: local change-notifier bridge', () => {
 	});
 
 	// Pend-then-commit one insert through the real StorageRepo so the catch-all change feed fires
-	// exactly as it would on a consensus-driven commit (StorageRepo is the single commit funnel).
-	const pendAndCommit = async (actionId: string, block: IBlock, rev: number): Promise<void> => {
+	// exactly as it would on a consensus-driven commit (StorageRepo is the single commit funnel). The
+	// committed block is the collection's tail unless `tailId` names another block — the shape of a sweep
+	// commit that lands a collection's data blocks on a group other than the tail's.
+	const pendAndCommit = async (actionId: string, block: IBlock, rev: number, tailId: BlockId = block.header.id): Promise<void> => {
 		await repo.pend({ actionId: actionId as ActionId, transforms: makeInsertTransforms(block.header.id, block), policy: 'c' });
-		const result = await repo.commit({ actionId: actionId as ActionId, blockIds: [block.header.id], tailId: block.header.id, rev });
+		const result = await repo.commit({ actionId: actionId as ActionId, blockIds: [block.header.id], tailId, rev });
 		expect(result.success, 'commit succeeds').to.equal(true);
 	};
 
@@ -65,7 +67,7 @@ describe('cohort-topic: local change-notifier bridge', () => {
 		signedPayload: new TextEncoder().encode('hash-1:approve'),
 	});
 
-	it('a commit on a cohort-member node invokes onLocalCommit with the right collectionId/rev', async () => {
+	it('a commit whose tail this node applied invokes onLocalCommit with the right collectionId/rev', async () => {
 		const service = stubService();
 		const calls: { event: CollectionChangeEvent; cert: CommitCert }[] = [];
 		service.onLocalCommit = (event, cert): void => { calls.push({ event, cert }); };
@@ -74,7 +76,6 @@ describe('cohort-topic: local change-notifier bridge', () => {
 		makeCohortTopicChangeNotifier({
 			source: repo,
 			service,
-			selfIsCohortMember: (e): boolean => e.collectionId === ('collection-1' as CollectionId),
 			extractCommitCert: (): CommitCert => cert,
 		});
 
@@ -87,25 +88,29 @@ describe('cohort-topic: local change-notifier bridge', () => {
 		expect(calls[0]!.event.rev).to.equal(1);
 	});
 
-	it('gates on the whole event — the predicate receives event.tailId (the seam)', async () => {
+	it('originates iff the event names a tail among the blocks this node applied (the tail-applied gate)', async () => {
 		const service = stubService();
 		const calls: CollectionChangeEvent[] = [];
 		service.onLocalCommit = (event): void => { calls.push(event); };
-
-		// Member only when the event carries the expected committed tail — proves the gate sees event.tailId.
-		const seenTails: (BlockId | undefined)[] = [];
 		makeCohortTopicChangeNotifier({
 			source: repo,
 			service,
-			selfIsCohortMember: (e): boolean => { seenTails.push(e.tailId); return e.tailId === ('block-1' as BlockId); },
 			extractCommitCert: (): CommitCert => sampleCert(),
 		});
 
-		await pendAndCommit('a1', makeBlock('block-1'), 1);
+		// A sweep commit landing only a DATA block here, under a tail stored elsewhere: this node holds a
+		// certificate for the action but is not in the tail's storage group, so it must not announce.
+		await pendAndCommit('a1', makeBlock('data-1'), 1, 'tail-1' as BlockId);
+		expect(calls.length, 'a commit that applied no tail here does not originate').to.equal(0);
 
-		expect(seenTails, 'gate observed the committed tail id').to.deep.equal(['block-1']);
-		expect(calls.length, 'origination fired for the tail-matching event').to.equal(1);
-		expect(calls[0]!.tailId).to.equal('block-1');
+		// The commit that lands the tail itself: this node applied it, so it is in the announcing group.
+		await pendAndCommit('a2', makeBlock('tail-1'), 2);
+		expect(calls.length, 'origination fired for the commit that applied the tail').to.equal(1);
+		expect(calls[0]!.tailId).to.equal('tail-1');
+		expect(calls[0]!.blockIds, 'the originating event lists the tail it applied').to.include('tail-1');
+
+		// A tail-less event (a read-driven promotion or a replica push) never originates.
+		expect(selfAppliedTail({ collectionId: 'collection-1' as CollectionId, blockIds: ['tail-1' as BlockId], actionId: 'a3' as ActionId, rev: 3 })).to.equal(false);
 	});
 
 	it('attachCohortChangeBridge installs the notifier and returns a working unsubscribe', async () => {
@@ -117,7 +122,6 @@ describe('cohort-topic: local change-notifier bridge', () => {
 		const { notifier, unsubscribe } = attachCohortChangeBridge(node, {
 			source: repo,
 			service,
-			selfIsCohortMember: (): boolean => true,
 			extractCommitCert: (): CommitCert => sampleCert(),
 		});
 
@@ -144,23 +148,6 @@ describe('cohort-topic: local change-notifier bridge', () => {
 		unsubCollection();
 	});
 
-	it('a non-member commit is a no-op (this node owns no fan-out for the topic)', async () => {
-		const service = stubService();
-		const calls: CollectionChangeEvent[] = [];
-		service.onLocalCommit = (event): void => { calls.push(event); };
-
-		makeCohortTopicChangeNotifier({
-			source: repo,
-			service,
-			selfIsCohortMember: (): boolean => false,
-			extractCommitCert: (): CommitCert => sampleCert(),
-		});
-
-		await pendAndCommit('a1', makeBlock('block-1'), 1);
-
-		expect(calls.length, 'a non-member node must not originate').to.equal(0);
-	});
-
 	it('forwards the threshold signature byte-for-byte unchanged (never re-signs)', async () => {
 		const service = stubService();
 		let received: CommitCert | undefined;
@@ -171,7 +158,6 @@ describe('cohort-topic: local change-notifier bridge', () => {
 		makeCohortTopicChangeNotifier({
 			source: repo,
 			service,
-			selfIsCohortMember: (): boolean => true,
 			extractCommitCert: (): CommitCert => original,
 		});
 
@@ -194,7 +180,6 @@ describe('cohort-topic: local change-notifier bridge', () => {
 		makeCohortTopicChangeNotifier({
 			source: repo,
 			service,
-			selfIsCohortMember: (): boolean => true,
 			extractCommitCert: (): CommitCert => sampleCert(),
 		});
 
@@ -210,7 +195,6 @@ describe('cohort-topic: local change-notifier bridge', () => {
 		makeCohortTopicChangeNotifier({
 			source: repo,
 			service,
-			selfIsCohortMember: (): boolean => true,
 			extractCommitCert: (): CommitCert | undefined => undefined,
 		});
 
@@ -225,7 +209,6 @@ describe('cohort-topic: local change-notifier bridge', () => {
 		makeCohortTopicChangeNotifier({
 			source: repo,
 			service,
-			selfIsCohortMember: (): boolean => true,
 			extractCommitCert: (): CommitCert => { extractCalled = true; return sampleCert(); },
 		});
 
@@ -236,11 +219,10 @@ describe('cohort-topic: local change-notifier bridge', () => {
 	});
 
 	it('still delivers per-collection subscriptions through the decorator (reactive-watch path intact)', async () => {
-		const service = stubService();
+		const service = stubService(); // onLocalCommit stays undefined: origination off; we only test delegation
 		const notifier = makeCohortTopicChangeNotifier({
 			source: repo,
 			service,
-			selfIsCohortMember: (): boolean => false, // origination off; we only test delegation
 			extractCommitCert: (): CommitCert => sampleCert(),
 		});
 
@@ -347,7 +329,6 @@ describe('cohort-topic: cluster commit-cert extraction', () => {
 		makeCohortTopicChangeNotifier({
 			source: repo,
 			service,
-			selfIsCohortMember: (): boolean => true,
 			extractCommitCert: makeClusterCommitCertExtractor(store),
 		});
 

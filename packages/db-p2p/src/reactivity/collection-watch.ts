@@ -84,6 +84,11 @@ export interface ReactivityCollectionWatchOptions {
 	/** The node's `topicId → handlers` table socket-delivered notifications are routed through. */
 	readonly subscribers: ReactivitySubscriberRegistry;
 	/**
+	 * The ratio the root group's commit certificates are signed under (the node's consensus
+	 * `superMajorityThreshold`); each manager verifies notifications at `ceil(|root group| × quorumRatio)`.
+	 */
+	readonly quorumRatio: number;
+	/**
 	 * Arm the jittered timer for a rotation a manager surfaced; the node binds the rotation scheduler's
 	 * `schedule`. When the timer fires the scheduler calls {@link ReactivityCollectionWatch.reRegister}.
 	 */
@@ -442,6 +447,7 @@ export class ReactivityCollectionWatch {
 			tailIdAtAttach: tailBytes,
 			lastKnownRev,
 			profile: this.options.profile,
+			quorumRatio: this.options.quorumRatio,
 			// A wake carries no payload, so there is nothing a delta would be used for.
 			deltaMaxBytes: 0,
 			cohortHintCache: this.options.cohortHintCache,
@@ -455,9 +461,9 @@ export class ReactivityCollectionWatch {
 			onTailRotated: (): void => this.reAnchor(sub),
 			...(recover !== undefined && recoverSigners !== undefined
 				? {
-					backfillTransport: recover.backfillTransport(topicId, collectionIdB64),
+					backfillTransport: recover.backfillTransport(tailBytes, collectionIdB64),
 					signBackfill: recoverSigners.signBackfill,
-					resumeTransport: recover.resumeTransport(topicId, collectionIdB64),
+					resumeTransport: recover.resumeTransport(tailBytes, collectionIdB64),
 					signResume: recoverSigners.signResume,
 				}
 				: {}),

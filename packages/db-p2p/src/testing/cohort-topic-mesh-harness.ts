@@ -51,7 +51,7 @@ import {
 	type Tier,
 	type WalkTrace,
 } from '@optimystic/db-core';
-import { createCohortTopicHost, type CohortTopicAntiDosOptions, type CohortTopicHost, type CoordEngine, type RootGroupOptions } from '../cohort-topic/host.js';
+import { createCohortTopicHost, cohortEpochOf, type CohortTopicAntiDosOptions, type CohortTopicHost, type CoordEngine, type RootGroupOptions } from '../cohort-topic/host.js';
 import { peerIdToBytes, bytesToPeerIdString } from '../cohort-topic/peer-codec.js';
 import { signPeer } from '../cohort-topic/peer-sig.js';
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS as PROTOCOLS } from '../cohort-topic/protocols.js';
@@ -553,8 +553,9 @@ export async function signedReattach(participant: Member, topic: Uint8Array, now
 	return { ...body, signature: bytesToB64url(await signPeer(participant.key, renewSigningPayload(body))) };
 }
 
-export const slots = createSlotAssigner(new RingHash());
-export const addressing = createTierAddressing(new RingHash());
+const ringHash = new RingHash();
+export const slots = createSlotAssigner(ringHash);
+export const addressing = createTierAddressing(ringHash);
 
 // --- walk-trace reconstruction (feeds the db-core anti-flood invariant predicates) ---
 
@@ -682,4 +683,42 @@ export async function setupTopic(mesh: CohortMesh, topic: Uint8Array, tierAddr =
 	}
 	await delay(20); // let the async gossip handlers merge the willingness contributions
 	return { coord0, engines, deciding: decidingNode, decidingEngine: engines.get(decidingNode.member.idStr)!, cohortIds };
+}
+
+/**
+ * Instantiate the **root-placed** tier-0 engine for `topic` on every member of its root group — the group
+ * `membersAt` answers at `rootCoord(rootKey)`, which the caller resolves by the same rule it gave the mesh's
+ * `rootGroup` option — and seed each member's view with every other member's willingness, the cold-sibling
+ * path a real root group bootstraps through (an inbound gossip frame flagged `rootPlaced` makes a member
+ * read the group and create its engine). Waits until every member holds a willing quorum, so the routed
+ * primary can admit a registration. The reactivity harness uses it in place of {@link setupTopic}: a
+ * collection's tree is rooted at its tail block's storage group, not at `coord_0(topicId)`.
+ */
+export async function setupRootPlacedTopic(mesh: CohortMesh, topic: Uint8Array, rootKey: Uint8Array, groupIds: readonly string[], tierAddr = addressing): Promise<TopicSetup> {
+	const rootCoord = tierAddr.rootCoord(rootKey);
+	const group = groupIds.map((id) => mesh.nodeOf(id));
+	const epoch = cohortEpochOf(group.map((n) => n.member.bytes), ringHash);
+	const now = Date.now();
+	for (const node of group) {
+		for (const other of group) {
+			if (other.member.idStr === node.member.idStr) {
+				continue;
+			}
+			node.node.receive(PROTOCOLS.gossip, await signedWillingness(other.member, rootCoord, epoch, now, 'f', true), other.member.peerId);
+		}
+	}
+	const seeded = await waitFor(() => group.every((n) => (n.host.registry.findByCoord(rootCoord)?.cohortView().all().size ?? 0) >= group.length - 1), 5_000);
+	if (!seeded) {
+		throw new Error(`root group at ${bytesToB64url(rootCoord)} did not instantiate on every member within the seed window`);
+	}
+	const engines = new Map<string, CoordEngine>();
+	for (const node of group) {
+		engines.set(node.member.idStr, node.host.registry.findByCoord(rootCoord)!);
+	}
+	const decidingNode = mesh.nodeNearest(rootCoord);
+	const decidingEngine = engines.get(decidingNode.member.idStr);
+	if (decidingEngine === undefined) {
+		throw new Error('the node nearest the root coordinate is not in the root group it was given');
+	}
+	return { coord0: rootCoord, engines, deciding: decidingNode, decidingEngine, cohortIds: groupIds };
 }

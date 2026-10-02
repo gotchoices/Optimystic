@@ -1947,7 +1947,7 @@ Edge nodes (mobile profile) default to:
 
 The cohort-topic layer is a substrate. An application — reactivity, matchmaking, voting, broadcast — implements:
 
-1. **Anchor derivation.** What `topicId` is and whether it rotates. Reactivity uses `H(tailId ‖ "reactivity")` (rotates); matchmaking uses `H("match" ‖ taskId)` (stable).
+1. **Anchor derivation.** What `topicId` is and whether it rotates, and whether the root is placed at a routing key. Reactivity uses `H(tailId ‖ "reactivity")` (rotates) and is the root-placed application: its root key is the tail block's routing key, so the tree's root is the storage group that applies, and so announces, the collection's commits ([reactivity.md §Origination point](reactivity.md#origination-point)); matchmaking uses `H("match" ‖ taskId)` (stable) with the default addressing.
 2. **`appPayload` contents.** What's in the per-registration application slot.
 3. **Tier choice.** Which tier this application operates at (reactivity push is T3; reactivity replay is T1; matchmaking is T2; voting is T2).
 4. **Post-registration RPCs.** Notification delivery, query, voting protocols, etc. These run between participants and their cached `primary`, with the cohort-topic layer providing only the identity. Matchmaking's primary→seeker arrival push ([matchmaking.md §Arrival push on provider arrival](matchmaking.md#arrival-push-on-provider-arrival)) is one such RPC: it fires off the existing gossip-replicated registration records, so it needs no new substrate protocol.

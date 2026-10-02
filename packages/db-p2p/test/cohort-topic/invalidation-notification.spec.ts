@@ -9,9 +9,9 @@ import {
 	createMembershipVerifier,
 	createMembershipSourceRouter,
 	createCohortSigner,
-	createTierAddressing,
-	createRingHash,
-	reactivityTopicId,
+	createRootPlacement,
+	rootPlacedMinSigs,
+	reactivityRootCoord,
 	bytesToB64url,
 	b64urlToBytes,
 	Tier,
@@ -104,17 +104,24 @@ const originate = (cert: { signers: readonly string[]; thresholdSig: Uint8Array;
 		encodeSigner,
 	});
 
+/**
+ * The ratio the root group's commit certificate is captured under (the consensus super-majority
+ * default): three members need `ceil(3 × 0.75) = 3` signatures, so a two-signer cert falls short.
+ */
+const ROOT_QUORUM_RATIO = 0.75;
+
 const emptySource = (): IMembershipSource => ({
 	current: () => Promise.resolve(undefined),
 	fetch: () => Promise.resolve(undefined),
 });
 
-const makeVerifier = (members: string[], minSigs: number) => {
+const makeVerifier = (members: string[], quorumRatio = ROOT_QUORUM_RATIO) => {
+	const placement = createRootPlacement(quorumRatio);
 	const crypto: ICohortThresholdCrypto = {
 		assemble: () => Promise.reject(new Error('verify-only')),
 		verify: verifyCollectedMultisig,
 	};
-	const expectedCoord = createTierAddressing(createRingHash()).coord0(reactivityTopicId(b64urlToBytes(TAIL)));
+	const expectedCoord = reactivityRootCoord(b64urlToBytes(TAIL));
 	const membershipCert: MembershipCertV1 = {
 		v: 1,
 		cohortCoord: bytesToB64url(expectedCoord),
@@ -125,12 +132,11 @@ const makeVerifier = (members: string[], minSigs: number) => {
 		signers: members,
 	};
 	const membershipVerifier = createMembershipVerifier({
-		signer: createCohortSigner(crypto, minSigs),
+		signer: createCohortSigner(crypto, rootPlacedMinSigs(members.length, placement)),
 		router: createMembershipSourceRouter({ committed: emptySource(), fret: emptySource() }),
-		minSigs,
 	});
-	membershipVerifier.cache(membershipCert);
-	return createNotificationVerifier({ verifier: membershipVerifier, tier: Tier.T3 });
+	membershipVerifier.cache(membershipCert, placement);
+	return createNotificationVerifier({ verifier: membershipVerifier, tier: Tier.T3, quorumRatio });
 };
 
 describe('reactivity: invalidation notification (push) — reused cert, real verify, forge-resistant', () => {
@@ -164,14 +170,14 @@ describe('reactivity: invalidation notification (push) — reused cert, real ver
 		expect([...b64urlToBytes(notification.sig)]).to.deep.equal([...cert.thresholdSig]);
 		expect([...b64urlToBytes(notification.digest)]).to.deep.equal([...new TextEncoder().encode('invHash-1:approve')]);
 
-		const verifier = makeVerifier([...notification.signers], keys.length);
+		const verifier = makeVerifier([...notification.signers]);
 		expect(await verifier.verify(notification)).to.equal('verified');
 	});
 
 	it('rejects (untrusted) a forged threshold signature — a forwarder cannot fake an invalidation', async () => {
 		const cert = await buildInvalidationCert(keys, 'invHash-1');
 		const notification = originate(cert);
-		const verifier = makeVerifier([...notification.signers], keys.length);
+		const verifier = makeVerifier([...notification.signers]);
 
 		const forgedSig = b64urlToBytes(notification.sig);
 		forgedSig[0] = forgedSig[0]! ^ 0xff;
@@ -179,11 +185,11 @@ describe('reactivity: invalidation notification (push) — reused cert, real ver
 		expect(await verifier.verify(forged)).to.equal('untrusted');
 	});
 
-	it('rejects (untrusted) when the invalidation cert is below the cohort threshold', async () => {
+	it('rejects (untrusted) when the invalidation cert is below the root group threshold ceil(3 × 0.75) = 3', async () => {
 		const cert = await buildInvalidationCert(keys.slice(0, 2), 'invHash-1');
 		const notification = originate(cert);
 		const allMembers = keys.map((k) => encodeSigner(k.peerId.toString()));
-		const verifier = makeVerifier(allMembers, 3);
+		const verifier = makeVerifier(allMembers);
 		expect(await verifier.verify(notification)).to.equal('untrusted');
 	});
 });

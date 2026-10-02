@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import {
 	createReactivitySubscriber,
 	createNotificationVerifier,
-	reactivityTopicId,
+	reactivityRootCoord,
 	type NotificationV1,
 	type NotificationVerifier,
 } from '../../src/reactivity/index.js';
@@ -10,8 +10,6 @@ import type { VerifyResult } from '../../src/cohort-topic/membership/verifier.js
 import { createMembershipVerifier } from '../../src/cohort-topic/membership/verifier.js';
 import { createMembershipSourceRouter } from '../../src/cohort-topic/membership/source.js';
 import { createCohortSigner } from '../../src/cohort-topic/sig/threshold.js';
-import { createTierAddressing } from '../../src/cohort-topic/addressing.js';
-import { createRingHash } from '../../src/cohort-topic/ring-hash.js';
 import { Tier } from '../../src/cohort-topic/tiers.js';
 import type { ICohortThresholdCrypto, IMembershipSource } from '../../src/cohort-topic/ports.js';
 import type { MembershipCertV1 } from '../../src/cohort-topic/wire/types.js';
@@ -153,11 +151,12 @@ describe('reactivity subscriber delivery', () => {
 				router: createMembershipSourceRouter({ committed: source, fret: source }),
 				minSigs: MIN_SIGS,
 			});
-			const notificationVerifier = createNotificationVerifier({ verifier: membershipVerifier, tier: Tier.T3 });
+			// The root placement rule: ceil(2 members × 1) = 2 = MIN_SIGS, so both signers must be members.
+			const notificationVerifier = createNotificationVerifier({ verifier: membershipVerifier, tier: Tier.T3, quorumRatio: 1 });
 
-			// Sanity: the notification's tail anchors a real coord_0 the verifier resolves.
-			const coord0 = createTierAddressing(createRingHash()).coord0(reactivityTopicId(b64urlToBytes(TAIL)));
-			expect(coord0.length).to.equal(32);
+			// Sanity: the notification's tail anchors a real root coordinate the verifier resolves.
+			const rootCoord = reactivityRootCoord(b64urlToBytes(TAIL));
+			expect(rootCoord.length).to.equal(32);
 
 			const delivered: number[] = [];
 			const sub = createReactivitySubscriber({

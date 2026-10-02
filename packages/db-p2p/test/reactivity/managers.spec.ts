@@ -27,7 +27,7 @@ import {
 	type CommitCert,
 } from '@optimystic/db-core';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
-import { reactivityTailBytes } from '../../src/cohort-topic/reactivity-membership-gate.js';
+import { reactivityTailBytes } from '../../src/reactivity/topic-bytes.js';
 import { ReactivitySubscriptionManager, type ReactivitySubscriptionManagerOptions, type RotationNotice } from '../../src/reactivity/subscription-manager.js';
 import { RotationRedirectError } from '../../src/reactivity/recover-transport.js';
 import { ReactivityOriginationManager } from '../../src/reactivity/origination-manager.js';
@@ -81,6 +81,8 @@ class RecordingService implements CohortTopicService {
 
 const COLLECTION = new Uint8Array([1, 2, 3, 4]);
 const TAIL = new Uint8Array([9, 9, 9, 9]);
+/** The root group's threshold ratio; the fixed-verdict verifiers here never apply it. */
+const QUORUM_RATIO = 0.75;
 
 describe('reactivity / subscription manager', () => {
 	it('registers at tier T3 with the tail-anchored topic and the subscribe payload', async () => {
@@ -89,6 +91,7 @@ describe('reactivity / subscription manager', () => {
 			service,
 			collectionId: COLLECTION,
 			tailIdAtAttach: TAIL,
+			quorumRatio: QUORUM_RATIO,
 			deliver: () => {},
 			profile: coreProfile(),
 		});
@@ -110,6 +113,7 @@ describe('reactivity / subscription manager', () => {
 			service,
 			collectionId: COLLECTION,
 			tailIdAtAttach: TAIL,
+			quorumRatio: QUORUM_RATIO,
 			deliver: () => {},
 			profile: edgeProfile(),
 		});
@@ -124,6 +128,7 @@ describe('reactivity / subscription manager', () => {
 			service,
 			collectionId: COLLECTION,
 			tailIdAtAttach: TAIL,
+			quorumRatio: QUORUM_RATIO,
 			deliver: () => {},
 			profile: coreProfile(),
 		});
@@ -137,6 +142,7 @@ describe('reactivity / subscription manager', () => {
 			service,
 			collectionId: COLLECTION,
 			tailIdAtAttach: TAIL,
+			quorumRatio: QUORUM_RATIO,
 			deliver: () => {},
 			profile: coreProfile(),
 			deltaMaxBytes: 123,
@@ -151,6 +157,7 @@ describe('reactivity / subscription manager', () => {
 			service,
 			collectionId: COLLECTION,
 			tailIdAtAttach: TAIL,
+			quorumRatio: QUORUM_RATIO,
 			deliver: () => {},
 			profile: coreProfile(),
 			ttlMs: 12_345,
@@ -161,7 +168,7 @@ describe('reactivity / subscription manager', () => {
 
 	it('renew is a no-op before the first register; withdraw drops via the substrate', async () => {
 		const service = new RecordingService();
-		const manager = new ReactivitySubscriptionManager({ service, collectionId: COLLECTION, tailIdAtAttach: TAIL, deliver: () => {} });
+		const manager = new ReactivitySubscriptionManager({ service, collectionId: COLLECTION, tailIdAtAttach: TAIL, quorumRatio: QUORUM_RATIO, deliver: () => {} });
 		await manager.renew();
 		expect(service.renews).to.equal(0);
 		await manager.register();
@@ -176,6 +183,7 @@ describe('reactivity / subscription manager', () => {
 			service,
 			collectionId: COLLECTION,
 			tailIdAtAttach: TAIL,
+			quorumRatio: QUORUM_RATIO,
 			deliver: (n) => delivered.push(n.revision),
 			lastKnownRev: 41,
 		});
@@ -201,6 +209,7 @@ describe('reactivity / subscription manager', () => {
 			service,
 			collectionId: COLLECTION,
 			tailIdAtAttach: TAIL,
+			quorumRatio: QUORUM_RATIO,
 			deliver: (n) => delivered.push(n.revision),
 			lastKnownRev: 41,
 		});
@@ -243,6 +252,7 @@ describe('reactivity / subscription manager', () => {
 				service,
 				collectionId: COLLECTION,
 				tailIdAtAttach: TAIL,
+				quorumRatio: QUORUM_RATIO,
 				deliver: (n) => { delivered.push(n.revision); if (n.revision === 14) resolveAll(); },
 				lastKnownRev: 10,
 				signBackfill: (req) => bytesToB64url(new Uint8Array([req.fromRevision & 0xff, req.toRevision & 0xff])),
@@ -270,6 +280,7 @@ describe('reactivity / subscription manager', () => {
 				service,
 				collectionId: COLLECTION,
 				tailIdAtAttach: TAIL,
+				quorumRatio: QUORUM_RATIO,
 				deliver: () => {},
 				lastKnownRev: 10,
 				backfillMaxRetries: 1,
@@ -294,6 +305,7 @@ describe('reactivity / subscription manager', () => {
 				service: new RecordingService(new FixedVerifier('verified')),
 				collectionId: COLLECTION,
 				tailIdAtAttach: TAIL,
+				quorumRatio: QUORUM_RATIO,
 				deliver: (n) => delivered.push(n.revision),
 				lastKnownRev: 17,
 				signResume: () => bytesToB64url(new Uint8Array([1])),
@@ -302,7 +314,7 @@ describe('reactivity / subscription manager', () => {
 			});
 
 		it('throws when no resume transport/signer is configured', async () => {
-			const manager = new ReactivitySubscriptionManager({ service: new RecordingService(), collectionId: COLLECTION, tailIdAtAttach: TAIL, deliver: () => {} });
+			const manager = new ReactivitySubscriptionManager({ service: new RecordingService(), collectionId: COLLECTION, tailIdAtAttach: TAIL, quorumRatio: QUORUM_RATIO, deliver: () => {} });
 			let threw = false;
 			try { await manager.resume(); } catch { threw = true; }
 			expect(threw).to.equal(true);
@@ -355,6 +367,7 @@ describe('reactivity / subscription manager', () => {
 				service: new RecordingService(new FixedVerifier('verified')),
 				collectionId: COLLECTION,
 				tailIdAtAttach: TAIL,
+				quorumRatio: QUORUM_RATIO,
 				deliver: () => {},
 				lastKnownRev: 41,
 				rejoinJitter: createRejoinJitter({ random: () => 0.5 }),
@@ -419,6 +432,7 @@ describe('reactivity / subscription manager', () => {
 				service: new RecordingService(new FixedVerifier('verified')),
 				collectionId: COLLECTION,
 				tailIdAtAttach: TAIL,
+				quorumRatio: QUORUM_RATIO,
 				deliver: () => {},
 				lastKnownRev: 41,
 				signResume: () => bytesToB64url(new Uint8Array([1])),
@@ -445,6 +459,7 @@ describe('reactivity / subscription manager', () => {
 				service: new RecordingService(new FixedVerifier('verified')),
 				collectionId: COLLECTION,
 				tailIdAtAttach: TAIL,
+				quorumRatio: QUORUM_RATIO,
 				deliver: () => {},
 				lastKnownRev: 41,
 				signResume: () => bytesToB64url(new Uint8Array([1])),
@@ -466,6 +481,7 @@ describe('reactivity / subscription manager', () => {
 				service: new RecordingService(new FixedVerifier('verified')),
 				collectionId: COLLECTION,
 				tailIdAtAttach: TAIL,
+				quorumRatio: QUORUM_RATIO,
 				deliver: () => {},
 				lastKnownRev: 41,
 				signResume: () => bytesToB64url(new Uint8Array([1])),
@@ -495,6 +511,7 @@ describe('reactivity / subscription manager', () => {
 				service: new RecordingService(new FixedVerifier('verified')),
 				collectionId: COLLECTION,
 				tailIdAtAttach: TAIL,
+				quorumRatio: QUORUM_RATIO,
 				deliver: () => {},
 				lastKnownRev: 41,
 				signResume: () => bytesToB64url(new Uint8Array([1])),
@@ -514,6 +531,7 @@ describe('reactivity / subscription manager', () => {
 				service: new RecordingService(new FixedVerifier('verified')),
 				collectionId: COLLECTION,
 				tailIdAtAttach: TAIL,
+				quorumRatio: QUORUM_RATIO,
 				deliver: () => {},
 				lastKnownRev: 10,
 				backfillMaxRetries: 1,

@@ -42,6 +42,9 @@ import type { PrivateKey } from "@libp2p/interface";
 import {
 	Tier,
 	reactivityTopicId,
+	reactivityRootCoord,
+	createRootPlacement,
+	rootPlacedMinSigs,
 	createReactivityForwarder,
 	createNotificationVerifier,
 	PushState,
@@ -84,6 +87,7 @@ import {
 	type RotationHintV1,
 	type CheckpointSummary,
 	type ReRegistrationPlan,
+	type RootPlacement,
 	type Transforms,
 } from "@optimystic/db-core";
 import { StorageRepo } from "../storage/storage-repo.js";
@@ -100,7 +104,7 @@ import {
 	buildMesh,
 	delay,
 	makeMembers,
-	setupTopic,
+	setupRootPlacedTopic,
 	type CohortMesh,
 	type Member,
 	type MeshOptions,
@@ -116,10 +120,20 @@ const utf8 = new TextEncoder();
 export interface ReactivityMeshOptions {
 	/** Node count. Default 12. */
 	readonly nodeCount?: number;
-	/** Cohort size `wantK`. Default `min(nodeCount, 8)`. */
+	/**
+	 * Cohort size `wantK`. The mesh models a tail block's storage group as the `wantK` members nearest the
+	 * tail's root coordinate (`clusterSize` = `wantK`), so this is also the root (announcing) group's size.
+	 * Default `min(nodeCount, 8)`.
+	 */
 	readonly wantK?: number;
-	/** Verifier threshold (notifications are signed by all `wantK` tail members; the verifier needs `>= minSigs`). Default `max(1, wantK - 2)`. */
+	/** The cohort-topic threshold for every cohort that is not a reactivity root. Default `max(1, wantK - 2)`. */
 	readonly minSigs?: number;
+	/**
+	 * The ratio a tail's commit certificate is captured under, and so the root group's signature threshold
+	 * `ceil(wantK × quorumRatio)` (notifications are signed by every root-group member). Default 0.75, the
+	 * consensus super-majority default.
+	 */
+	readonly quorumRatio?: number;
 	/** FRET network-size estimate (drives the default walk start tier). Default 256 → `d_max = 1`. */
 	readonly sizeEstimate?: number;
 	/**
@@ -206,7 +220,9 @@ interface CollectionState {
 	readonly collectionIdB64: string;
 	tailId: Uint8Array;
 	topicId: Uint8Array;
-	coord0: Uint8Array;
+	/** The tail's root coordinate `H(tailId)`: where the storage group that announces the collection sits. */
+	rootCoord: Uint8Array;
+	/** The root group: the mesh's storage group for the tail (the `wantK` members nearest {@link rootCoord}). */
 	tailCohort: Member[];
 	/** Cohort setup for the **current** tail; re-established (willingness re-seeded) on each {@link ReactivityMesh.rotateTail}. */
 	setup: TopicSetup;
@@ -273,25 +289,43 @@ export class ReactivityMesh {
 	/** Pending one-shot timers armed against the virtual clock (the rotation scheduler's `setTimer` binding). */
 	private readonly virtualTimers: { fireAt: number; fn: () => void; cancelled: boolean }[] = [];
 
+	/** The root placement rule every verifier and cert cache on this mesh works under. */
+	private readonly placement: RootPlacement;
+
 	private constructor(
 		readonly mesh: CohortMesh,
 		readonly members: Member[],
 		private readonly wantK: number,
-		private readonly minSigs: number,
+		private readonly quorumRatio: number,
 		private readonly profiles: readonly ("edge" | "core")[],
-	) {}
+	) {
+		this.placement = createRootPlacement(quorumRatio);
+	}
 
 	/** Stand up an N-node reactivity mesh and start every host. */
 	static async build(opts: ReactivityMeshOptions = {}): Promise<ReactivityMesh> {
 		const nodeCount = opts.nodeCount ?? 12;
 		const wantK = opts.wantK ?? Math.min(nodeCount, 8);
 		const minSigs = opts.minSigs ?? Math.max(1, wantK - 2);
+		const quorumRatio = opts.quorumRatio ?? 0.75;
 		const sizeEstimate = opts.sizeEstimate ?? 256;
 		const members = await makeMembers(nodeCount);
+		// The mesh's "key network": a tail's storage group is the `wantK` members nearest its root coordinate,
+		// read lazily (the mesh exists only after `buildMesh`; the group is first read on a register).
+		const lazy: { mesh?: CohortMesh } = {};
 		const meshOpts: MeshOptions = {
 			wantK,
 			minSigs,
 			sizeEstimate,
+			rootGroup: () => ({
+				quorumRatio,
+				membersAt: (coord: Uint8Array): Promise<string[]> => {
+					if (lazy.mesh === undefined) {
+						return Promise.reject(new Error("reactivity mesh: root group read before the mesh was built"));
+					}
+					return Promise.resolve(lazy.mesh.assembleCohort(coord, wantK));
+				},
+			}),
 			// Single-tier-0 by default (same rationale as the matchmaking harness): test artifacts register
 			// many subscribers within a few ms, which would otherwise trip the pre-promotion slope predictor.
 			capPromote: opts.capPromote ?? 1_000_000,
@@ -325,8 +359,9 @@ export class ReactivityMesh {
 			...(opts.profiles === undefined ? {} : { profiles: opts.profiles }),
 		};
 		const mesh = await buildMesh(members, meshOpts);
+		lazy.mesh = mesh;
 		const profiles = Array.from({ length: nodeCount }, (_v, i) => opts.profiles?.[i] ?? "core");
-		return new ReactivityMesh(mesh, members, wantK, minSigs, profiles);
+		return new ReactivityMesh(mesh, members, wantK, quorumRatio, profiles);
 	}
 
 	/** The current virtual time (unix ms). */
@@ -365,19 +400,20 @@ export class ReactivityMesh {
 	}
 
 	/**
-	 * Register a collection on the mesh: instantiate its tail-anchored tier-0 cohort (+willingness quorum),
-	 * install the real origination manager behind the real change-notifier bridge over a fresh `StorageRepo`,
-	 * build the tail `PushState` (replay ring + rolling checkpoint + backpressure), and cache the tail
-	 * cohort's `MembershipCertV1` into every node's verifier so end-to-end verification is real Ed25519.
+	 * Register a collection on the mesh: instantiate its root-placed tier-0 engine on the tail's storage
+	 * group (+willingness quorum), install the real origination manager behind the real change-notifier bridge
+	 * over a fresh `StorageRepo`, build the tail `PushState` (replay ring + rolling checkpoint + backpressure),
+	 * and cache the root group's `MembershipCertV1` into every node's verifier under the placement rule so
+	 * end-to-end verification is real Ed25519.
 	 */
 	async registerCollection(name: string, opts: CollectionOptions = {}): Promise<void> {
 		const collectionId = utf8.encode(`reactivity:${name}`);
 		const collectionIdB64 = bytesToB64url(collectionId);
 		const tailId = this.pinTailToCore(`${name}:tail-0`);
 		const topicId = reactivityTopicId(tailId);
-		const coord0 = addressing.coord0(topicId);
-		const setup = await setupTopic(this.mesh, topicId);
-		const tailCohort = this.cohortMembersAround(coord0);
+		const rootCoord = reactivityRootCoord(tailId);
+		const tailCohort = this.cohortMembersAround(rootCoord);
+		const setup = await setupRootPlacedTopic(this.mesh, topicId, tailId, this.mesh.assembleCohort(rootCoord, this.wantK));
 
 		const deltaMaxBytes = opts.deltaMaxBytes ?? deltaMaxForProfile(coreProfile());
 		const w = opts.w ?? 256;
@@ -387,8 +423,8 @@ export class ReactivityMesh {
 		const rawStorage = new MemoryRawStorage();
 		const repo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage));
 
-		// Origination is the tail cohort primary's responsibility — installed on the node nearest coord_0
-		// (the routed tail primary), exactly the node a commit on the tail cluster lands on in production.
+		// Origination is the root group's responsibility — installed on the node nearest the tail's root
+		// coordinate (the group's routed primary), one of the nodes a commit on the tail lands on in production.
 		const originationService = setup.deciding.host.service;
 		const certByAction = new Map<string, CommitCert>();
 		const emitQueue: NotificationV1[] = [];
@@ -400,7 +436,7 @@ export class ReactivityMesh {
 			collectionIdB64,
 			tailId,
 			topicId,
-			coord0,
+			rootCoord,
 			tailCohort,
 			setup,
 			repo,
@@ -436,11 +472,11 @@ export class ReactivityMesh {
 		origination.install();
 		state.origination = origination;
 
-		// The real local-change-notifier bridge: a StorageRepo commit → onLocalCommit → origination.
+		// The real local-change-notifier bridge: a StorageRepo commit → onLocalCommit → origination. The bridge
+		// originates a commit iff the node applied its tail; the harness's commits list the tail first.
 		makeCohortTopicChangeNotifier({
 			source: repo,
 			service: originationService,
-			selfIsCohortMember: (e): boolean => e.collectionId === (collectionIdB64 as unknown as CollectionChangeEvent["collectionId"]),
 			extractCommitCert: (e): CommitCert | undefined => certByAction.get(e.actionId),
 		});
 
@@ -448,9 +484,9 @@ export class ReactivityMesh {
 		this.cacheTailCert(state);
 	}
 
-	/** The reactivity notification verifier over a node's service verifier (real collected-multisig at T3). */
+	/** The reactivity notification verifier over a node's service verifier (real collected-multisig at T3, root placement rule). */
 	private notificationVerifierFor(service: CohortTopicService): NotificationVerifier {
-		return createNotificationVerifier({ verifier: service.verifier(), tier: Tier.T3 });
+		return createNotificationVerifier({ verifier: service.verifier(), tier: Tier.T3, quorumRatio: this.quorumRatio });
 	}
 
 	// NOTE: the harness builds a collection's PushState at registration, so it buffers commits made before anyone
@@ -468,7 +504,7 @@ export class ReactivityMesh {
 		});
 	}
 
-	/** The FRET cohort (the `wantK` nearest members) around a coord. */
+	/** The mesh's storage group at a coord (the `wantK` nearest members) — the root group of a tail placed there. */
 	private cohortMembersAround(coord: Uint8Array): Member[] {
 		const ids = new Set(this.mesh.assembleCohort(coord, this.wantK));
 		return this.members.filter((m) => ids.has(m.idStr));
@@ -482,10 +518,10 @@ export class ReactivityMesh {
 	}
 
 	/**
-	 * Choose a reactivity tail id derived from `baseTail` whose `coord_0` routes nearest a **Core** node.
+	 * Choose a reactivity tail id derived from `baseTail` whose root coordinate routes nearest a **Core** node.
 	 * Reactivity topics serve at tier T3, and an Edge node declines a T3 cold-start by design (it serves no
 	 * forwarder duty — pinned by `cohort-topic-scale-lifecycle` "Edge serves no T3"), so a topic whose
-	 * `coord_0` routes nearest an Edge node can never instantiate its tail cohort: the routed primary returns
+	 * root coordinate routes nearest an Edge node can never instantiate its root group: the routed primary returns
 	 * `no_state`, the walk exhausts, and `register` throws `CohortBackoffError`. Because {@link makeMembers}
 	 * re-randomizes the member ring layout every run, an Edge-profile mesh would otherwise *intermittently*
 	 * seat the Edge node as a collection's tail primary (~1/nodeCount of runs) and flake. In production a
@@ -496,7 +532,7 @@ export class ReactivityMesh {
 	private pinTailToCore(baseTail: string): Uint8Array {
 		for (let nonce = 0; ; nonce++) {
 			const tailId = utf8.encode(nonce === 0 ? baseTail : `${baseTail}#${nonce}`);
-			if (!this.nearestIsEdge(addressing.coord0(reactivityTopicId(tailId)))) {
+			if (!this.nearestIsEdge(reactivityRootCoord(tailId))) {
 				return tailId;
 			}
 		}
@@ -511,15 +547,16 @@ export class ReactivityMesh {
 	}
 
 	/**
-	 * Cache the tail cohort's `MembershipCertV1` (over the FRET cohort around the current tail's coord_0) into
-	 * every node's participant verifier, so a subscriber's notification verify is real Ed25519 against the
-	 * tail membership — mirroring `reactivity-real-crypto.spec.ts`, now over the mesh's real cohort members.
+	 * Cache the root group's `MembershipCertV1` (over the storage group at the current tail's root coordinate)
+	 * into every node's participant verifier under the placement rule, so a subscriber's notification verify
+	 * is real Ed25519 against the group's membership — mirroring `reactivity-real-crypto.spec.ts`, now over
+	 * the mesh's real group members.
 	 */
 	private cacheTailCert(c: CollectionState): void {
 		const members = c.tailCohort.map((m) => bytesToB64url(m.bytes));
 		const cert: MembershipCertV1 = {
 			v: 1,
-			cohortCoord: bytesToB64url(c.coord0),
+			cohortCoord: bytesToB64url(c.rootCoord),
 			cohortEpoch: bytesToB64url(utf8.encode(`${c.name}:${bytesToB64url(c.tailId)}`)),
 			members,
 			stabilizedAt: this.vtime,
@@ -527,7 +564,7 @@ export class ReactivityMesh {
 			signers: members,
 		};
 		for (const node of this.mesh.nodes) {
-			node.host.service.verifier().cache(cert);
+			node.host.service.verifier().cache(cert, this.placement);
 		}
 	}
 
@@ -613,6 +650,7 @@ export class ReactivityMesh {
 			service,
 			collectionId: c.collectionId,
 			tailIdAtAttach: c.tailId,
+			quorumRatio: this.quorumRatio,
 			deliver: (n): void => { handle.delivered.push(n); },
 			profile,
 			lastKnownRev: opts.lastKnownRev ?? 0,
@@ -690,7 +728,7 @@ export class ReactivityMesh {
 		return c.rev;
 	}
 
-	/** Build a real threshold commit cert: every tail-cohort member signs `utf8(commitHash + ":approve")`. */
+	/** Build a real threshold commit cert: every root-group member signs `utf8(commitHash + ":approve")`, captured under the placement ratio as `captureCommitCert` does. */
 	private async buildTailCert(c: CollectionState, rev: number): Promise<CommitCert> {
 		const commitHash = `${c.collectionIdB64}:${rev}`;
 		const signedPayload = utf8.encode(`${commitHash}:approve`);
@@ -706,7 +744,7 @@ export class ReactivityMesh {
 			promises: {},
 			commits,
 		};
-		return buildCommitCert(record, this.minSigs, signedPayload);
+		return buildCommitCert(record, rootPlacedMinSigs(c.tailCohort.length, this.placement), signedPayload);
 	}
 
 	private clusterPeers(cohort: readonly Member[]): ClusterPeers {
@@ -827,14 +865,14 @@ export class ReactivityMesh {
 			jitter,
 		});
 
-		// Roll the topic to the new tail.
+		// Roll the topic to the new tail: a new root coordinate, so a new storage group announces.
 		c.tailId = newTailId;
 		c.topicId = reactivityTopicId(newTailId);
-		c.coord0 = addressing.coord0(c.topicId);
-		c.tailCohort = this.cohortMembersAround(c.coord0);
-		// Re-establish the new tail's cohort (re-seed willingness) so a subscriber can register under it after the
-		// rotation — the new tree forming, modeled deterministically (the real cohort-topic willingness convergence).
-		c.setup = await setupTopic(this.mesh, c.topicId);
+		c.rootCoord = reactivityRootCoord(newTailId);
+		c.tailCohort = this.cohortMembersAround(c.rootCoord);
+		// Re-establish the new tail's root group (re-seed willingness) so a subscriber can register under it after
+		// the rotation — the new tree forming, modeled deterministically (the real cohort-topic willingness convergence).
+		c.setup = await setupRootPlacedTopic(this.mesh, c.topicId, c.tailId, this.mesh.assembleCohort(c.rootCoord, this.wantK));
 		this.cacheTailCert(c);
 		c.pushState = this.makePushState(c.collectionIdB64, c.topicId, c.tailId, c.w, c.wCheckpoint, c.queueMax, c.deltaMaxBytes);
 		c.forwarder = createReactivityForwarder({ state: c.pushState, verifier: this.notificationVerifierFor(c.originationService) });

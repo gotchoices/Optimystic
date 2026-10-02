@@ -85,6 +85,7 @@ async function attachedWatch() {
 	const watch = new ReactivityCollectionWatch({
 		service,
 		profile: coreProfile(),
+		quorumRatio: 0.75,
 		subscribers: registry,
 		scheduleRotation: () => {},
 		setTimer: (fn) => { ticks.push(fn); return () => {}; },

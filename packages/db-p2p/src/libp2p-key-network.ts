@@ -1411,7 +1411,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * them. Both `findCluster` (the replica set) and `findCoordinator` (the pick) derive from
 	 * this one assembly, so the two can never disagree about who is responsible for a block.
 	 *
-	 * The rule, stated once:
+	 * The rule, stated once (step 1 here; the rest in {@link assembleServingCohortAt}):
 	 *
 	 *  1. `coord = hashKey(key)` — the only hash between a block id and its cohort.
 	 *  2. `band = fret.assembleCohort(coord, wants)`: the nearest live ring members, alternating
@@ -1438,9 +1438,27 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * invalidated on every ring change.
 	 */
 	private async assembleServingCohort(key: RoutingKey): Promise<ServingCohort> {
-		const fret = this.getFret()
 		// The only hash between a block id and its cohort: `key` is the id's raw utf8 (`routingKeyForBlock`).
-		const coord = await hashKey(key)
+		return this.assembleServingCohortAt(await hashKey(key), this.toCacheKey(key).substring(0, 12))
+	}
+
+	/**
+	 * The serving cohort at a ring coordinate, as peer-id strings in proximity order: steps 2 to 5 of the
+	 * rule on {@link assembleServingCohort}, for a caller that already holds the coordinate. This is the
+	 * key network's storage rule exposed in coordinate form, for the one consumer that places something
+	 * at a block's ring position without naming the block — the cohort-topic host's root group
+	 * (`RootGroupOptions.membersAt`), which puts a reactivity topic's root on the group that stores the
+	 * collection's log tail. `findCluster` goes through the same assembly, so root placement and storage
+	 * placement cannot drift apart.
+	 */
+	async servingCohortAt(coord: Uint8Array): Promise<string[]> {
+		const assembled = await this.assembleServingCohortAt(coord, u8ToString(coord, 'base64url').substring(0, 12))
+		return assembled.cohort
+	}
+
+	/** Steps 2 to 5 of {@link assembleServingCohort}'s rule, at `coord`; `coordStr` only labels the log line. */
+	private async assembleServingCohortAt(coord: Uint8Array, coordStr: string): Promise<ServingCohort> {
+		const fret = this.getFret()
 		const scoped = this.protocolPrefix != null
 		// When membership scoping is active, over-fetch a wider proximity band so the nearest
 		// peers that SERVE this network are in the candidate pool even if cross-network peers
@@ -1479,7 +1497,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		}
 		const cohort = serving.slice(0, this.clusterSize)
 		this.log('cohort:membership key=%s band=%d serves=%d unknown=%d foreign=%d cohort=%d selfInCohort=%s',
-			this.toCacheKey(key).substring(0, 12), band.length, serving.length, unknown, foreign, cohort.length, cohort.includes(selfId))
+			coordStr, band.length, serving.length, unknown, foreign, cohort.length, cohort.includes(selfId))
 		const protocolsByPeer = Object.fromEntries(Object.entries(peerStoreRecords).map(([id, r]) => [id, r.protocols]))
 		return { cohort, band, peerStoreRecords, protocolsByPeer }
 	}

@@ -1255,8 +1255,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		});
 		// Replica-persist has no CommitRequest, hence no tailId — like a read-driven promotion,
 		// this wakes local onCollectionChange watchers but is cert-gated out of cohort-topic
-		// re-origination downstream (change-bridge selfIsCohortMember treats a tail-less event as
-		// never a member).
+		// re-origination downstream (the change bridge's `selfAppliedTail` gate never originates a
+		// tail-less event).
 		if (landed) {
 			this.emitCollectionChanges(
 				new Map([[landed.collectionId, [blockId]]]),

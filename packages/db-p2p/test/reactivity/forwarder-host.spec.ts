@@ -6,8 +6,9 @@ import {
 	createMembershipVerifier,
 	createMembershipSourceRouter,
 	createCohortSigner,
-	createTierAddressing,
-	createRingHash,
+	createRootPlacement,
+	rootPlacedMinSigs,
+	reactivityRootCoord,
 	encodeSubscribeAppPayload,
 	coreProfile,
 	edgeProfile,
@@ -71,12 +72,16 @@ function note(revision: number, over: Partial<NotificationV1> = {}): Notificatio
 /**
  * A **real** db-core notification verifier (createNotificationVerifier over a real membership verifier)
  * whose raw threshold crypto always passes — so the verdict turns purely on the signer-subset check
- * against the cached tail-cohort cert. Mirrors the db-core reactivity tests' `realishVerifier`.
+ * against the root group's cert, cached at the tail's root coordinate under the placement rule. The
+ * default ratio makes `ceil(2 × 0.5) = 1` the threshold, so one member signer verifies and a stranger
+ * does not. Mirrors the db-core reactivity tests' `realishVerifier`.
  */
-function realVerifier(members: string[], minSigs = 1): NotificationVerifier {
+function realVerifier(members: string[], quorumRatio = 0.5): NotificationVerifier {
+	const placement = createRootPlacement(quorumRatio);
+	const minSigs = rootPlacedMinSigs(members.length, placement);
 	const crypto: ICohortThresholdCrypto = { assemble: () => Promise.reject(new Error('verify-only')), verify: () => true };
 	const empty: IMembershipSource = { current: () => Promise.resolve(undefined), fetch: () => Promise.resolve(undefined) };
-	const expectedCoord = createTierAddressing(createRingHash()).coord0(reactivityTopicId(b64urlToBytes(TAIL)));
+	const expectedCoord = reactivityRootCoord(b64urlToBytes(TAIL));
 	const cert: MembershipCertV1 = {
 		v: 1,
 		cohortCoord: bytesToB64url(expectedCoord),
@@ -87,8 +92,8 @@ function realVerifier(members: string[], minSigs = 1): NotificationVerifier {
 		signers: members.slice(0, minSigs),
 	};
 	const mv = createMembershipVerifier({ signer: createCohortSigner(crypto, minSigs), router: createMembershipSourceRouter({ committed: empty, fret: empty }), minSigs });
-	mv.cache(cert);
-	return createNotificationVerifier({ verifier: mv, tier: Tier.T3 });
+	mv.cache(cert, placement);
+	return createNotificationVerifier({ verifier: mv, tier: Tier.T3, quorumRatio });
 }
 
 /** A captured outbound dial. */

@@ -1,5 +1,4 @@
 import { expect } from 'chai';
-import type { Libp2p } from 'libp2p';
 import type { PrivateKey, PeerId } from '@libp2p/interface';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
@@ -8,8 +7,11 @@ import { hashPeerId, type FretService } from 'p2p-fret';
 import {
 	createTierAddressing,
 	createSlotAssigner,
+	createRootPlacement,
+	DEFAULT_SUPER_MAJORITY_THRESHOLD,
 	RingHash,
 	reactivityTopicId,
+	reactivityRootCoord,
 	membershipCertSigningPayload,
 	registerSigningPayload,
 	renewSigningPayload,
@@ -55,10 +57,9 @@ import { createLibp2pMatchmakingTransport } from '../src/matchmaking/query-trans
 import { SeekerWalkClient, type SeekerWalkResult } from '../src/matchmaking/seeker-walk-client.js';
 import { waitFor, waitForValue } from '@optimystic/db-core/test';
 import { signedWillingness, type Member } from '../src/testing/cohort-topic-mesh-harness.js';
-import { createReactivitySelfMembershipGate, reactivityTailBytes } from '../src/cohort-topic/reactivity-membership-gate.js';
 import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
 import { DEFAULT_REACTIVITY_PROTOCOLS } from '../src/reactivity/protocols.js';
-import { reactivityCollectionIdBytes } from '../src/reactivity/topic-bytes.js';
+import { reactivityCollectionIdBytes, reactivityTailBytes } from '../src/reactivity/topic-bytes.js';
 import { reactivityDirectSubscribers } from '../src/reactivity/forwarder-host.js';
 import {
 	Libp2pReactivityRecoverTransport,
@@ -122,6 +123,9 @@ const WILLING_SIBLINGS_NEEDED = Math.floor(WANT_K / 2);
 const TOPIC = Uint8Array.from({ length: 32 }, (_v, i) => (i * 9 + 5) & 0xff);
 // A collection tail id used for the reactivity-topic anchor derivation.
 const TAIL_ID = 'optimystic/collection/tail-real-libp2p';
+// The rule every reactivity root group on these nodes is verified under: the nodes run the default consensus
+// super-majority, so a root group's commit certificate — and so a notification — needs ceil(|group| × 0.75).
+const ROOT_PLACEMENT = createRootPlacement(DEFAULT_SUPER_MAJORITY_THRESHOLD);
 
 const addressing = createTierAddressing(new RingHash());
 const slots = createSlotAssigner(new RingHash());
@@ -200,7 +204,7 @@ async function signedReattach(participant: Member, topic: Uint8Array, now: numbe
 
 /** One real libp2p substrate node: the running node, its retained key/peer-id, the cohort-topic host, FRET. */
 interface RealNode {
-	readonly node: Libp2p;
+	readonly node: OptimysticNode;
 	readonly key: PrivateKey;
 	readonly peerId: PeerId;
 	readonly idStr: string;
@@ -524,8 +528,8 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		expect(siblingEngine.servesTopic(TOPIC), 'a sibling now serves the topic (warm-failover target exists)').to.equal(true);
 	});
 
-	// --- 4. Reactivity origination membership gate over real FRET + bridge wiring present ---
-	it('the production reactivity origination bridge is wired and its membership gate matches the real FRET cohort', () => {
+	// --- 4. Reactivity root placement: the root group IS the tail's storage group, by one rule, on every node ---
+	it('the production reactivity origination bridge is wired and the root group at a tail\'s root coordinate is its storage group', async () => {
 		// The node-base activation replaced the bare change-notifier with the origination-decorating bridge and
 		// exposed the host (`libp2p-node-base.ts` §Cohort-topic origination activation).
 		for (const n of nodes) {
@@ -533,16 +537,17 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			expect((n.node as unknown as { blockChangeNotifier?: unknown }).blockChangeNotifier, 'change-notifier bridge installed').to.exist;
 		}
 
-		// The real `selfIsCohortMember` gate over real FRET agrees with `assembleCohort(coord_0(reactivityTopicId(tail)))`.
-		const reactivityCoord = addressing.coord0(reactivityTopicId(reactivityTailBytes(TAIL_ID)));
-		const expectedMembers = new Set(nodes[0]!.fret.assembleCohort(reactivityCoord, WANT_K));
+		// The host's root group is bound to the key network's storage rule: the serving cohort at the tail's
+		// root coordinate (what every reactivity party derives) is the cohort `findCluster` stores the tail
+		// block with, on every node. Here `clusterSize` is 1, so the group is one machine — the one that
+		// applies the tail's commits and so announces them.
+		const rootCoord = reactivityRootCoord(reactivityTailBytes(TAIL_ID));
 		for (const n of nodes) {
-			const gate = createReactivitySelfMembershipGate({ fret: n.fret, selfPeerId: n.idStr, wantK: WANT_K });
-			const isMember = gate({ collectionId: 'c', blockIds: [], actionId: 'a', rev: 1, tailId: TAIL_ID });
-			expect(isMember, `node ${n.idStr} gate agrees with its membership in the reactivity cohort`).to.equal(expectedMembers.has(n.idStr));
+			const rootGroup = await n.node.keyNetwork.servingCohortAt(rootCoord);
+			const storageGroup = Object.keys(await n.node.keyNetwork.findCluster(routingKeyForBlock(TAIL_ID)));
+			expect(rootGroup, `node ${n.idStr}: the reactivity root group is the tail's storage group`).to.deep.equal(storageGroup);
+			expect(rootGroup.length, 'a storage group is clusterSize wide').to.equal(1);
 		}
-		// At wantK = N the whole mesh is the reactivity cohort, so every node originates for this tail.
-		expect(expectedMembers.size, 'reactivity tier-0 cohort = whole mesh at wantK = N').to.equal(N);
 	});
 
 	// reactivity notification *socket delivery* end-to-end is now LIVE in production (12.33): the node wires
@@ -555,7 +560,9 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	it('a commit on a real cohort member delivers a NotificationV1 to a remote subscriber over a real socket', async () => {
 		const tailBytes = reactivityTailBytes(TAIL_ID);
 		const topicId = reactivityTopicId(tailBytes);
-		const reactivityCoord = addressing.coord0(topicId);
+		// The topic's root coordinate: the tail's ring position. The engine the subscriber is hand-registered
+		// on sits there, and the verifier derives the same coordinate from the notification's tail.
+		const reactivityCoord = reactivityRootCoord(tailBytes);
 
 		// Instantiate every node's reactivity cohort engine + converge willingness so the primary can admit the
 		// subscriber registration (mirrors the matchmaking provider test's pre-steps).
@@ -611,9 +618,10 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			'origin holds the remote reactivity subscriber record (direct-subscriber read)',
 		).to.equal(true);
 
-		// Cache the tail cohort's MembershipCertV1 (whole mesh at wantK = N) into every node's verifier, so the
-		// origin's own forwarder receive AND the remote subscriber's verify are real Ed25519 against the
-		// membership (cache() trusts the membership list; the notification's own threshold sig is verified).
+		// Cache a root-group MembershipCertV1 naming the whole mesh (the hand-built commit cert below is signed
+		// by every node) into every node's verifier UNDER THE ROOT PLACEMENT RULE, so the origin's own forwarder
+		// receive AND the remote subscriber's verify are real Ed25519 against the membership at the threshold
+		// ceil(N × 0.75) (cache() trusts the membership list; the notification's own threshold sig is verified).
 		const members = nodes.map((n) => bytesToB64url(n.member.bytes));
 		const cert: MembershipCertV1 = {
 			v: 1,
@@ -625,14 +633,14 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			signers: members,
 		};
 		for (const n of nodes) {
-			n.host.service.verifier().cache(cert);
+			n.host.service.verifier().cache(cert, ROOT_PLACEMENT);
 		}
 
 		// Register the remote subscriber in the remote node's reactivity subscriber registry, verifying each
 		// inbound notification with the production notification verifier (real collected-multisig at T3).
 		const received: NotificationV1[] = [];
 		const verdicts: string[] = [];
-		const verifier = createNotificationVerifier({ verifier: remote.host.service.verifier(), tier: Tier.T3 });
+		const verifier = createNotificationVerifier({ verifier: remote.host.service.verifier(), tier: Tier.T3, quorumRatio: DEFAULT_SUPER_MAJORITY_THRESHOLD });
 		const registry = (remote.node as unknown as { reactivitySubscribers: { register(topicId: Uint8Array, h: (n: NotificationV1) => void): () => void } }).reactivitySubscribers;
 		const off = registry.register(topicId, (n) => {
 			received.push(n);
@@ -662,7 +670,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			// emits it → forwarder host → notify socket → the remote node's subscriber registry.
 			const event: CollectionChangeEvent = {
 				collectionId: collectionId as BlockId,
-				blockIds: [],
+				blockIds: [TAIL_ID as BlockId],
 				actionId: 'rx-socket-action' as ActionId,
 				rev: 1,
 				tailId: TAIL_ID as BlockId,
@@ -693,7 +701,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		const RESUME_TAIL = 'optimystic/collection/tail-resume-real-libp2p';
 		const tailBytes = reactivityTailBytes(RESUME_TAIL);
 		const topicId = reactivityTopicId(tailBytes);
-		const reactivityCoord = addressing.coord0(topicId);
+		const reactivityCoord = reactivityRootCoord(tailBytes);
 
 		// Instantiate every node's reactivity cohort engine + converge willingness so the origin admits + serves.
 		engines(reactivityCoord);
@@ -707,13 +715,14 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		const collectionId = 'rx-resume-collection';
 		const collectionIdB64 = bytesToB64url(reactivityCollectionIdBytes(collectionId));
 
-		// The production recover transport's cohort-walk WOULD reach the origin: at wantK = N it is in the resume
-		// topic's FRET cohort (the same coord_0 assembly `resolveReactivityCohort` uses in libp2p-node-base).
-		expect(remote.fret.assembleCohort(reactivityCoord, WANT_K), 'origin is a recover-walk target for the remote').to.include(origin.idStr);
+		// The production recover transport's root-group read WOULD reach the origin: the origin is the nearest
+		// serving peer to the tail's root coordinate, so at clusterSize 1 it is the whole root group (the same
+		// `servingCohortAt` read `resolveReactivityCohort` makes in libp2p-node-base).
+		expect(await remote.node.keyNetwork.servingCohortAt(reactivityCoord), 'origin is a recover target for the remote').to.include(origin.idStr);
 
-		// Cache the tail cohort's MembershipCertV1 (whole mesh at wantK = N) into every node's verifier so the
-		// origin's own forwarder receive (which buffers the originated notification into its PushState replay ring)
-		// verifies with real Ed25519 against the membership.
+		// Cache a root-group MembershipCertV1 naming the whole mesh into every node's verifier under the root
+		// placement rule, so the origin's own forwarder receive (which buffers the originated notification into
+		// its PushState replay ring) verifies with real Ed25519 against the membership.
 		const now = Date.now();
 		const members = nodes.map((n) => bytesToB64url(n.member.bytes));
 		const cert: MembershipCertV1 = {
@@ -726,7 +735,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			signers: members,
 		};
 		for (const n of nodes) {
-			n.host.service.verifier().cache(cert);
+			n.host.service.verifier().cache(cert, ROOT_PLACEMENT);
 		}
 
 		// A node keeps forwarding state only for a topic someone subscribed to, so the remote registers as a direct
@@ -762,7 +771,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		const commitCert: CommitCert = { thresholdSig, signers: sortedSigners.map((n) => n.idStr), minSigs: MIN_SIGS, signedPayload };
 		const event: CollectionChangeEvent = {
 			collectionId: collectionId as BlockId,
-			blockIds: [],
+			blockIds: [RESUME_TAIL as BlockId],
 			actionId: 'rx-resume-action' as ActionId,
 			rev: 1,
 			tailId: RESUME_TAIL as BlockId,
@@ -777,10 +786,10 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			dialer: createLibp2pRecoverDialer(remote.node, DEFAULT_REACTIVITY_PROTOCOLS.recover),
 			selfPeerId: remote.idStr,
 			cohortHintCache: createStickyCohortHintCache(),
-			resolveCohort: () => [origin.idStr],
+			resolveCohort: () => Promise.resolve([origin.idStr]),
 		});
 		const { signResume } = createRecoverRequestSigners(remote.key);
-		const resumeTransport = recover.resumeTransport(topicId, collectionIdB64);
+		const resumeTransport = recover.resumeTransport(tailBytes, collectionIdB64);
 
 		// The remote slept holding nothing past rev 0, so it resumes from rev 1. Poll: origination ingest is async
 		// (serialized off the emit seam), so the origin's PushState may not yet hold rev 1 on the first dial — a
@@ -1043,12 +1052,12 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		// ring via `fret.assembleCohort(coord, k)`. The consistency invariant is: for any coord, every node's
 		// assembly agrees (a single ring, not per-node disagreement) — so a cohort-topic cohort and a
 		// transaction cluster keyed at the same coord are byte-identical, and keyed at different coords they are
-		// each a deterministic slice of the same ring. (The reactivity topic coord and a block's transaction key
-		// hash to *different* coords, so they are different cohorts BY DESIGN; what must hold is same-ring
-		// determinism, which is what a real cross-layer read depends on.)
+		// each a deterministic slice of the same ring. (A reactivity tree's root coordinate IS its tail block's
+		// storage position — case 4 above pins that the root group and the storage group are one assembly;
+		// what must hold here is same-ring determinism, which is what a real cross-layer read depends on.)
 		const probes: RingCoord[] = [
 			coord0,
-			addressing.coord0(reactivityTopicId(reactivityTailBytes(TAIL_ID))),
+			reactivityRootCoord(reactivityTailBytes(TAIL_ID)),
 			addressing.coord0(Uint8Array.from({ length: 32 }, (_v, i) => (i * 13 + 1) & 0xff)),
 		];
 		for (const coord of probes) {
@@ -1075,10 +1084,9 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
  * handed straight to a cohort engine. This one fakes none of them: a real `NetworkTransactor` commits a row
  * through cluster consensus on one node, and a watch opened through another node's `reactivityWatch` wakes.
  *
- * Every machine is in every cohort (`clusterSize` = `wantK` = the node count, `minSigs` below it): the only
- * configuration in which a notification verifies today, because the machines that store a collection's log
- * and the machines that announce its changes are otherwise different groups (blocked ticket
- * `reactivity-notifications-need-the-tail-cohort-to-be-the-topic-cohort`).
+ * Every machine is in every cohort (`clusterSize` = `wantK` = the node count, `minSigs` below it) — the small
+ * deployment shape, in which the root group is the whole mesh. The describe after this one runs the same
+ * watch on a mesh wider than one storage group.
  *
  * The wake still crosses a real socket. In a three-member cohort the two members that do not coordinate a
  * commit apply it holding two of the three commit signatures, below the certificate threshold, so they
@@ -1197,6 +1205,152 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			}
 			expect(wokeByNotification, 'a commit on another node woke the watch with no tail read between the commit and the wake').to.equal(true);
 		} finally {
+			await handle.close();
+		}
+	});
+});
+
+/**
+ * **The watch on a mesh wider than one storage group** — the reproduction of the defect this ticket fixes
+ * (`reactivity-notifications-need-the-tail-cohort-to-be-the-topic-cohort`). Six machines with `clusterSize`
+ * 3: a collection's log tail is stored by three of them, and the other three store nothing of it. Before
+ * root placement the announcing group was a FRET cohort around a hash of the topic, disjoint from the
+ * storage group on a ring this wide, so no commit was announced and none would have verified. Now the
+ * topic's root is the tail's storage group: a watch opened on a machine OUTSIDE that group registers with
+ * the group (the walk's root step dials its members), a commit coordinated by a group member is announced
+ * by that member, and the notification reaches the watcher over the notify socket and verifies against
+ * the group's membership at `ceil(3 × 0.75) = 3` signatures.
+ *
+ * The case passes only on a wake that a delivered notification accounts for: the watcher's subscriber
+ * registry saw a frame for the topic, and no tail read ran on the watcher between the commit and the wake.
+ * The cohort-topic options are the production defaults (`wantK` 16, `minSigs` 14): neither governs a
+ * root-placed root, which is the point.
+ */
+(GATED ? describe : describe.skip)('collection watch over real libp2p (a mesh wider than one storage group)', function () {
+	this.timeout(480_000);
+
+	const WIDE_NETWORK = 'collection-watch-wide-real-libp2p-it';
+	const MACHINES = 6;
+	const CLUSTER_SIZE = 3;
+	const COLLECTION = 'app/wide-watched-rows';
+	interface WatchedRow { key: number; value: string }
+
+	const nodes: OptimysticNode[] = [];
+
+	after(async () => {
+		await Promise.allSettled(nodes.splice(0, nodes.length).map((n) => n.stop()));
+	});
+
+	async function spawnMachine(bootstrapNodes: string[]): Promise<OptimysticNode> {
+		const node = await createLibp2pNode({
+			port: 0,
+			networkName: WIDE_NETWORK,
+			bootstrapNodes,
+			fretProfile: bootstrapNodes.length === 0 ? 'edge' : 'core',
+			clusterSize: CLUSTER_SIZE,
+			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
+			arachnode: { enableRingZulu: true },
+			cohortTopic: { enabled: true },
+		});
+		nodes.push(node);
+		return node;
+	}
+
+	/** Every node connected to every other, and each assembling a `CLUSTER_SIZE`-wide cohort for a block. */
+	async function stabilizedMesh(): Promise<void> {
+		const seed = await spawnMachine([]);
+		const seedAddr = pickLocalTcpMultiaddr(seed);
+		for (let i = 1; i < MACHINES; i++) {
+			await spawnMachine([seedAddr]);
+		}
+		const addrs = nodes.map(pickLocalTcpMultiaddr);
+		for (const n of nodes) {
+			for (const addr of addrs) {
+				try { await n.dial(multiaddr(addr)); } catch { /* self, or a peer that already dialed us */ }
+			}
+		}
+		await waitFor(() => nodes.every((n) => n.getPeers().length >= MACHINES - 1), { timeoutMs: 60_000, intervalMs: 250, description: 'the mesh fully connected' });
+		await waitFor(async () => {
+			for (const n of nodes) {
+				if (Object.keys(await n.keyNetwork.findCluster(routingKeyForBlock('wide-watch-probe'))).length !== CLUSTER_SIZE) return false;
+			}
+			return true;
+		}, { timeoutMs: 90_000, intervalMs: 500, description: 'every node assembles a clusterSize-wide cohort' });
+	}
+
+	it('a watch on a node outside the tail\'s storage group is woken by a notification from the group', async () => {
+		await stabilizedMesh();
+		// The collection has to exist before it can be watched: a watch anchors on the log's tail block.
+		const creator = nodes[0]!;
+		const creatorTree = await Tree.createOrOpen<number, WatchedRow>(transactorFor(creator, WIDE_NETWORK), COLLECTION, (row) => row.key);
+		await creatorTree.replace([[1, { key: 1, value: 'before the watch' }]]);
+
+		// The tail's storage group, by the one rule: the writer is a group member (it then coordinates its own
+		// commits, so it is the node that retains the certificate and announces); the watcher is outside it.
+		const tail = await Collection.readCommittedTail(transactorFor(creator, WIDE_NETWORK), COLLECTION);
+		expect(tail, 'the collection has a committed tail').to.not.equal(undefined);
+		const groupIds = Object.keys(await creator.keyNetwork.findCluster(routingKeyForBlock(tail!.tailId)));
+		expect(groupIds.length, 'the tail is stored by one storage group').to.equal(CLUSTER_SIZE);
+		const writer = nodes.find((n) => groupIds.includes(n.peerId.toString()))!;
+		const watcher = nodes.find((n) => !groupIds.includes(n.peerId.toString()))!;
+		expect(watcher, 'a mesh wider than one storage group has a node outside the group').to.not.equal(undefined);
+		expect(await watcher.keyNetwork.servingCohortAt(reactivityRootCoord(reactivityTailBytes(tail!.tailId))), 'the watcher derives the same root group').to.have.members(groupIds);
+
+		const writerTree = await Tree.createOrOpen<number, WatchedRow>(transactorFor(writer, WIDE_NETWORK), COLLECTION, (row) => row.key);
+		const watcherTransactor = transactorFor(watcher, WIDE_NETWORK);
+		const reads = { started: 0, finished: 0 };
+		let wakes = 0;
+		// Count the frames the watcher's subscriber registry receives for the tail's topic: a wake that one of
+		// these accounts for came over the notify socket, not from the watch service's own tail read.
+		const topicId = reactivityTopicId(reactivityTailBytes(tail!.tailId));
+		let delivered = 0;
+		const watcherRegistry = (watcher as unknown as { reactivitySubscribers: { register(topicId: Uint8Array, h: (n: NotificationV1) => void): () => void } }).reactivitySubscribers;
+		const offCount = watcherRegistry.register(topicId, () => { delivered++; });
+		const handle = watcher.reactivityWatch!.watch({
+			collectionId: COLLECTION,
+			readTail: async (knownTailId) => {
+				reads.started++;
+				try {
+					const t = await Collection.readCommittedTail(watcherTransactor, COLLECTION, knownTailId);
+					return t === undefined ? undefined : { tailId: t.tailId, revision: t.rev };
+				} finally {
+					reads.finished++;
+				}
+			},
+			onChange: () => { wakes++; },
+		});
+		try {
+			await waitFor(() => watcher.reactivityWatch!.isAttached(COLLECTION), { timeoutMs: 180_000, intervalMs: 250, description: 'the watch registered with the root group through the real register walk' });
+
+			// The watcher's registration landed on one group member and replicates to the rest over cohort
+			// gossip; the writer announces to the registrations its own engine holds.
+			const writerHost = (writer as unknown as { cohortTopicHost: CohortTopicHost }).cohortTopicHost;
+			await waitFor(() => {
+				const engine = writerHost.registry.findServing(topicId, 0);
+				return engine !== undefined && reactivityDirectSubscribers(engine, topicId).includes(watcher.peerId.toString());
+			}, { timeoutMs: 60_000, intervalMs: 250, description: "the watcher's registration replicated to the announcing group member" });
+			expect(wakes, 'only the first tail read has woken the watch: nothing has changed since it opened').to.equal(1);
+
+			// An attempt proves the notification path only if a delivered frame accounts for the wake and no tail
+			// read ran in between; an attempt with no wake is repeated (the group's membership certificate is
+			// published on its next gossip round, and the announcing node verifies against it).
+			let wokeByNotification = false;
+			for (let attempt = 0; attempt < 4 && !wokeByNotification; attempt++) {
+				await waitFor(() => reads.started === reads.finished, { timeoutMs: 30_000, intervalMs: 50, description: 'no tail read in flight' });
+				const readsBeforeCommit = reads.started;
+				const wakesBeforeCommit = wakes;
+				const deliveredBeforeCommit = delivered;
+				await writerTree.replace([[attempt + 2, { key: attempt + 2, value: `after the watch, attempt ${attempt}` }]]);
+				try {
+					await waitFor(() => wakes > wakesBeforeCommit, { timeoutMs: 10_000, intervalMs: 50, description: 'the watch woke' });
+				} catch {
+					continue;
+				}
+				wokeByNotification = reads.started === readsBeforeCommit && delivered > deliveredBeforeCommit;
+			}
+			expect(wokeByNotification, 'a commit coordinated inside the storage group woke a watcher outside it by a delivered notification, with no tail read in between').to.equal(true);
+		} finally {
+			offCount();
 			await handle.close();
 		}
 	});

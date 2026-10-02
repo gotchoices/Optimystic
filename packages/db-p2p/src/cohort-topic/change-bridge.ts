@@ -18,15 +18,24 @@ export interface CohortTopicChangeNotifierDeps {
 	readonly source: ChangeBridgeSource;
 	/** The cohort-topic substrate whose `onLocalCommit` origination hook receives member commits. */
 	readonly service: CohortTopicService;
-	/**
-	 * True iff this node is a cohort member responsible for this change event's reactivity-topic fan-out.
-	 * Receives the whole {@link CollectionChangeEvent} (not just the collection id) because the reactivity
-	 * topic is tail-anchored — `H(event.tailId ‖ "reactivity")` — so the gate needs `event.tailId` to
-	 * derive the topic's `coord_0` cohort. A tail-less event (a read-driven promotion) is never a member.
-	 */
-	readonly selfIsCohortMember: (event: CollectionChangeEvent) => boolean;
 	/** Resolve the pass-through commit cert for a change event (e.g. the cluster commit-cert store). */
 	readonly extractCommitCert: (event: CollectionChangeEvent) => CommitCert | undefined;
+}
+
+/**
+ * Whether this node applied the commit's log tail block — the origination gate
+ * (`docs/reactivity.md` §Origination point).
+ *
+ * A collection's announcing group is its tail block's storage group, and a commit lands its tail on exactly
+ * that group (the coordinator chose it by the tail's routing key). So a change event originates here iff it
+ * names a tail **and** that tail is among the blocks this node applied: the node is then in the tail's
+ * storage group as the commit's coordinator saw it, with no ring read of its own. The cases this excludes
+ * are the ones that must not announce: a read-driven promotion (no `tailId`); the sweep commit that lands a
+ * collection's data blocks — or the old tail's `nextId` rewrite on a rollover — on another group, which
+ * holds a certificate for the same action but did not apply the tail; and a replica push (no `tailId`).
+ */
+export function selfAppliedTail(event: CollectionChangeEvent): boolean {
+	return event.tailId !== undefined && event.blockIds.includes(event.tailId);
 }
 
 /**
@@ -34,12 +43,13 @@ export interface CohortTopicChangeNotifierDeps {
  * primitive into the networked cohort-topic substrate.
  *
  * On EVERY commit landing on this node (via the catch-all {@link ChangeBridgeSource.onAnyCollectionChange}
- * feed), if this node is a cohort member for the collection's reactivity topic, the bridge hands the
- * `CollectionChangeEvent` plus the pass-through {@link CommitCert} to `service.onLocalCommit` —
- * reactivity reuses the commit cert's threshold signature directly and never re-signs. A commit on a
- * non-member node (no fan-out responsibility) or one for which no cert is retained (nothing
- * authoritative to forward) is a no-op. A throwing downstream hook is isolated + logged so
- * origination can never break the commit (matching the {@link IBlockChangeNotifier} listener contract).
+ * feed), if this node applied the collection's log tail ({@link selfAppliedTail} — it is in the tail's
+ * storage group, the topic's root), the bridge hands the `CollectionChangeEvent` plus the pass-through
+ * {@link CommitCert} to `service.onLocalCommit` — reactivity reuses the commit cert's threshold signature
+ * directly and never re-signs. A commit that landed only non-tail blocks here (no announcing duty) or one
+ * for which no cert is retained (nothing authoritative to forward) is a no-op. A throwing downstream hook
+ * is isolated + logged so origination can never break the commit (matching the {@link IBlockChangeNotifier}
+ * listener contract).
  *
  * The returned value IS an {@link IBlockChangeNotifier}: it is what `network-transactor` takes as its
  * `localChangeNotifier`, so per-collection {@link IBlockChangeNotifier.onCollectionChange} subscribers
@@ -67,11 +77,11 @@ function buildCohortTopicChangeBridge(deps: CohortTopicChangeNotifierDeps): { no
 	return { notifier, unsubscribe };
 }
 
-/** Run the membership gate, cert extraction, and origination hook for one change event, isolating throws. */
+/** Run the tail-applied gate, cert extraction, and origination hook for one change event, isolating throws. */
 function originate(deps: CohortTopicChangeNotifierDeps, event: CollectionChangeEvent): void {
 	try {
-		if (!deps.selfIsCohortMember(event)) {
-			return; // not responsible for this topic's fan-out
+		if (!selfAppliedTail(event)) {
+			return; // this node did not apply the tail: not in the announcing group for this commit
 		}
 		const hook = deps.service.onLocalCommit;
 		if (!hook) {
@@ -91,7 +101,7 @@ function originate(deps: CohortTopicChangeNotifierDeps, event: CollectionChangeE
  * Wire the cohort-topic origination bridge as `node`'s `blockChangeNotifier` (the value the
  * `NetworkTransactor` consumes as its `localChangeNotifier`). Call this from the node assembly once a
  * {@link CohortTopicService} is running on the node, passing the node's `StorageRepo` as `source` and
- * the membership + cert-extraction seams.
+ * the cert-extraction seam.
  *
  * Returns the installed `notifier` plus an idempotent `unsubscribe` that tears down the catch-all
  * origination subscription — the node assembly calls it on node stop (alongside `host.stop()`) so the

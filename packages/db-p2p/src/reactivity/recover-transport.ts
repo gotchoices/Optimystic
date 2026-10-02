@@ -12,10 +12,11 @@
  *
  *  - {@link Libp2pReactivityRecoverTransport} — the **outbound** side. Supplies the two db-core seams
  *    (`BackfillTransport` / `ResumeTransport`) against one node: pick a target (sticky cohort-hint primary
- *    first for the one-RT happy path, else a cohort-walk member), frame the request, exchange it over the
- *    recover protocol, and return the inner reply. The wire exchange is injected as a {@link RecoverDialer}
- *    so the target-selection + framing logic tests without a real socket; {@link createLibp2pRecoverDialer}
- *    is the production libp2p-backed implementation.
+ *    first for the one-RT happy path, else a member of the tail's root group — the storage group that
+ *    serves the topic's push state), frame the request, exchange it over the recover protocol, and return
+ *    the inner reply. The wire exchange is injected as a {@link RecoverDialer} so the target-selection +
+ *    framing logic tests without a real socket; {@link createLibp2pRecoverDialer} is the production
+ *    libp2p-backed implementation.
  *  - {@link createRecoverRequestHandler} / {@link registerRecoverHandler} — the **inbound** serve handler.
  *    Decode (bounded) → verify the request's peer-key signature against the dialing peer → reject a
  *    replay/stale request → resolve the live `PushState` → `serveBackfill` / `serveResume` → reply. Any
@@ -29,8 +30,8 @@
  * {@link requestResponse} needs a `peerIdFromString`-parseable peer-id **string**. Feeding the raw
  * base64url straight to `peerIdFromString` throws → the dial is swallowed → recovery silently never
  * reaches the cohort. {@link decodeCohortHintTarget} pins the conversion
- * (`bytesToPeerIdString(b64urlToBytes(primary))`); the `resolveCohort` walk, by contrast, already returns
- * peer-id strings (the cohort-topic `CohortPeerResolver` space) and is used as-is.
+ * (`bytesToPeerIdString(b64urlToBytes(primary))`); the `resolveCohort` root-group read, by contrast,
+ * already returns peer-id strings (the key network's serving-cohort space) and is used as-is.
  */
 
 import type { Libp2p } from "libp2p";
@@ -158,8 +159,12 @@ export interface Libp2pReactivityRecoverTransportOptions {
 	readonly selfPeerId: string;
 	/** Sticky cohort-hint cache, shared with the subscription manager (the one-RT primary for the happy path). */
 	readonly cohortHintCache: StickyCohortHintCache;
-	/** FRET cohort-walk fallback: a topic id → dialable cohort member peer-id strings. */
-	readonly resolveCohort: (topicId: Uint8Array) => string[];
+	/**
+	 * Root-group fallback: the tail's routing key bytes → the dialable peer-id strings of the group that
+	 * stores that tail block (the topic's root, which holds its gossiped push state). Async because it reads
+	 * the key network; a rejection fails the recover like an empty group does.
+	 */
+	readonly resolveCohort: (tailId: Uint8Array) => Promise<readonly string[]>;
 	/** Per-frame ceiling for encode/decode; default {@link DEFAULT_STREAM_MAX_BYTES}. */
 	readonly maxBytes?: number;
 }
@@ -167,17 +172,20 @@ export interface Libp2pReactivityRecoverTransportOptions {
 /**
  * The outbound recover transport: one instance per node, exposing the two db-core function seams against it.
  * Each returned transport dials the **sticky primary first** (one round trip after a brief flap), falling
- * back to a **cohort-walk** member on a dial failure *or* when the dialed member declines (any member that
+ * back to the **root group's** members on a dial failure *or* when the dialed member declines (any member that
  * holds the topic's gossiped `PushState` can answer, so one member with nothing to serve must not end the
  * walk). A kind mismatch, an undecodable reply, or every target failing / declining surfaces as a rejection
  * so the caller's retry/escalation policy (the subscription manager's backfill escalation, or
  * `manager.resume()`'s caller) takes over.
+ *
+ * Both seams are keyed on the **tail** the subscription is attached under, not on its topic id: a topic id
+ * cannot be inverted, and the root group is derived from the tail's routing key.
  */
 export class Libp2pReactivityRecoverTransport {
 	private readonly dialer: RecoverDialer;
 	private readonly selfPeerId: string;
 	private readonly cohortHintCache: StickyCohortHintCache;
-	private readonly resolveCohort: (topicId: Uint8Array) => string[];
+	private readonly resolveCohort: (tailId: Uint8Array) => Promise<readonly string[]>;
 	private readonly maxBytes: number;
 
 	constructor(options: Libp2pReactivityRecoverTransportOptions) {
@@ -188,11 +196,11 @@ export class Libp2pReactivityRecoverTransport {
 		this.maxBytes = options.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
 	}
 
-	/** The db-core {@link BackfillTransport} for `(topicId, collectionId)` — frames + dials a signed {@link BackfillV1}. */
-	backfillTransport(topicId: Uint8Array, collectionId: string): BackfillTransport {
+	/** The db-core {@link BackfillTransport} for `(tailId, collectionId)` — frames + dials a signed {@link BackfillV1}. */
+	backfillTransport(tailId: Uint8Array, collectionId: string): BackfillTransport {
 		return async (req: BackfillV1): Promise<BackfillReplyV1> => {
 			const frame = encodeRecoverRequestV1({ v: 1, kind: "backfill", backfill: req }, this.maxBytes);
-			const reply = await this.exchange("backfill", frame, topicId, collectionId);
+			const reply = await this.exchange("backfill", frame, tailId, collectionId);
 			if (reply.backfillReply === undefined) {
 				throw new Error("reactivity recover: backfill reply missing its body");
 			}
@@ -200,11 +208,11 @@ export class Libp2pReactivityRecoverTransport {
 		};
 	}
 
-	/** The {@link ResumeTransport} for `(topicId, collectionId)` — frames + dials a signed {@link ResumeV1}. */
-	resumeTransport(topicId: Uint8Array, collectionId: string): ResumeTransport {
+	/** The {@link ResumeTransport} for `(tailId, collectionId)` — frames + dials a signed {@link ResumeV1}. */
+	resumeTransport(tailId: Uint8Array, collectionId: string): ResumeTransport {
 		return async (req: ResumeV1) => {
 			const frame = encodeRecoverRequestV1({ v: 1, kind: "resume", resume: req }, this.maxBytes);
-			const reply = await this.exchange("resume", frame, topicId, collectionId);
+			const reply = await this.exchange("resume", frame, tailId, collectionId);
 			if (reply.resumeReply === undefined) {
 				throw new Error("reactivity recover: resume reply missing its body");
 			}
@@ -213,7 +221,7 @@ export class Libp2pReactivityRecoverTransport {
 	}
 
 	/**
-	 * Exchange one recover frame with the first target that answers: sticky primary, then each cohort-walk
+	 * Exchange one recover frame with the first target that answers: sticky primary, then each root-group
 	 * member. A **dial failure** and a **declined** request (the member had no result — no served state, a
 	 * failed signature / replay check, an undecodable request) both fall through to the next candidate. A
 	 * reply frame is **terminal** (the member answered for the cohort): a `kind: "rotated"` redirect throws
@@ -221,8 +229,8 @@ export class Libp2pReactivityRecoverTransport {
 	 * protocol error. When no candidate answers, throws the last candidate's outcome — a
 	 * {@link NoResultReplyError} if it declined, its dial error if it failed to dial.
 	 */
-	private async exchange(kind: RecoverKind, frame: Uint8Array, topicId: Uint8Array, collectionId: string): Promise<RecoverReplyV1> {
-		const targets = this.selectTargets(topicId, collectionId);
+	private async exchange(kind: RecoverKind, frame: Uint8Array, tailId: Uint8Array, collectionId: string): Promise<RecoverReplyV1> {
+		const targets = await this.selectTargets(tailId, collectionId);
 		if (targets.length === 0) {
 			throw new Error("reactivity recover: no serving cohort target resolved");
 		}
@@ -261,10 +269,10 @@ export class Libp2pReactivityRecoverTransport {
 
 	/**
 	 * Ordered dial candidates for a recover: the sticky primary (decoded from its base64url-of-bytes form)
-	 * first, then the cohort-walk members. Self is never dialed (a co-located serve is the node wiring's
-	 * concern), and duplicates collapse.
+	 * first, then the tail's root-group members. Self is never dialed (a co-located serve is the node
+	 * wiring's concern), and duplicates collapse.
 	 */
-	private selectTargets(topicId: Uint8Array, collectionId: string): string[] {
+	private async selectTargets(tailId: Uint8Array, collectionId: string): Promise<string[]> {
 		const seen = new Set<string>();
 		const targets: string[] = [];
 		const add = (target: string | undefined): void => {
@@ -282,7 +290,7 @@ export class Libp2pReactivityRecoverTransport {
 				log("recover: malformed sticky primary for %s, skipping to cohort-walk: %o", collectionId, err);
 			}
 		}
-		for (const member of this.resolveCohort(topicId)) {
+		for (const member of await this.resolveCohort(tailId)) {
 			add(member);
 		}
 		return targets;

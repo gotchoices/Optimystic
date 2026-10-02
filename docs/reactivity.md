@@ -46,14 +46,15 @@ Reactivity uses a rotating topic anchor so the tree's root cohort changes with t
 topicId(collection C, tail T) = H(T.blockId ‖ "reactivity")
 ```
 
-The cohort-topic layer's tier addressing then proceeds normally:
+The tree's **root is placed at the tail block's own ring position**, and the cohort-topic layer's tier addressing covers the tiers below it:
 
 ```
-coord_0(_, topicId)   = H(0x00 ‖ topicId)
+coord_0               = the routing coordinate the key network assigns routingKeyForBlock(tailId)
+                      = H(tailId)   (the tail's routing key is the raw utf8 of its id; see §Origination point)
 coord_d(P, topicId)   = H(d ‖ prefix(H(P), d·log₂F) ‖ topicId)   for d ≥ 1
 ```
 
-When the tail rotates (the current tail block fills and a new tail block is born), `topicId` changes. The cohort-topic layer treats the new `topicId` as an entirely new topic; reactivity manages the migration of subscribers and replay state explicitly (see [Tail rotation](#tail-rotation)).
+The root (announcing) group is therefore the tail block's storage group — the `clusterSize` serving peers nearest that coordinate — rather than a cohort of `wantK` peers around a hash of the topic; the tail's routing key travels as the topic's `rootKey` ([cohort-topic.md §Root placement at a routing key](cohort-topic.md#root-placement-at-a-routing-key)). When the tail rotates (the current tail block fills and a new tail block is born), `topicId` changes and the root moves to the new tail's storage group. The cohort-topic layer treats the new `topicId` as an entirely new topic; reactivity manages the migration of subscribers and replay state explicitly (see [Tail rotation](#tail-rotation)).
 
 ### Why not anchor on the stable `collectionId`?
 
@@ -66,6 +67,7 @@ Stable anchoring would concentrate notification production at a single coord for
 Subscribing to collection `C` is a normal cohort-topic registration with:
 
 - `topicId` = `H(currentTailId(C) ‖ "reactivity")`
+- `rootKey` = `routingKeyForBlock(currentTailId(C))` — the walk's root step goes to the tail's storage group (§Origination point)
 - `tier` = `T3` (luxury)
 - `appPayload` = `SubscribeAppPayloadV1` (see [Wire formats](#wire-formats))
 - `ttl` = configured TTL (Edge default 60 s, Core default 90 s)
@@ -160,10 +162,11 @@ The direct-subscriber list is the cohort-topic layer's `RegistrationRecord` set 
 >
 > The manager's `emit` seam is now bound to live fan-out (`12.33-reactivity-notification-transport`): the
 > node assembly installs the hook and routes each built `NotificationV1` into `ReactivityForwarderHost.ingest`,
-> so origination travels over the notify protocol to subscribers. Origination derives the topic's `coord_0`
-> from `reactivityTailBytes(tailId) = utf8(tailId)` — the tail's routing key (`routingKeyForBlock`), never a pre-hashed digest; the
-> subscriber side MUST feed `reactivityTopicId` the **same** bytes (see §Propagation) or it resolves a
-> different coord and never receives — pinned by `topic-bytes-encoding.spec.ts`.
+> so origination travels over the notify protocol to subscribers. Every party derives the tree's root
+> coordinate from `reactivityTailBytes(tailId) = utf8(tailId)` — the tail's routing key (`routingKeyForBlock`),
+> never a pre-hashed digest — through `reactivityRootCoord` in `packages/db-core/src/reactivity/topic-anchor.ts`;
+> `topic-bytes-encoding.spec.ts` pins that this equals the key network's `hashKey(routingKeyForBlock(tail))`,
+> the cross-implementation contract the whole placement rests on.
 
 When the tail cohort commits a transaction, the commit machinery in the transaction layer ([transactions.md](transactions.md)) already produces a threshold-signed commit certificate. Reactivity reuses that certificate without additional cohort signing:
 
@@ -176,26 +179,62 @@ NotificationV1 {
   digest:       bytes                       // commit-vote signed payload utf8(commitHash + ":approve"); the exact bytes sig was computed over
   delta?:       bytes                       // optional, bounded; opt-in per collection
   timestamp:    int64
-  sig:          thresholdSig                // = commit cert; signers ≥ minSigs = k − x
+  sig:          thresholdSig                // = commit cert; signers ≥ ceil(|root group| × superMajorityThreshold)
   signers:      PeerId[]
   rotationHint?: { newTailId, effectiveAtRevision }   // see Tail rotation
 }
 ```
 
-The `sig` field is bit-for-bit the same threshold signature the transaction layer produces. A subscriber cryptographically threshold-verifies it against the tail cohort's membership — the same trust root it must already accept to trust the collection at all — over `b64urlToBytes(digest)`, the exact `utf8(commitHash + ":approve")` image each cohort member signed. So notifications introduce **no new signing authority** beyond the commit certificate, yet are not trusted blindly: the verify runs against real Ed25519 (see [Authentication and integrity](#authentication-and-integrity)).
+The `sig` field is bit-for-bit the same threshold signature the transaction layer produces. A subscriber cryptographically threshold-verifies it against the root group's membership — the tail block's storage group, the same trust root it must already accept to trust the collection at all — over `b64urlToBytes(digest)`, the exact `utf8(commitHash + ":approve")` image each group member signed. So notifications introduce **no new signing authority** beyond the commit certificate, yet are not trusted blindly: the verify runs against real Ed25519 (see [Authentication and integrity](#authentication-and-integrity)).
 
 ### Notification kinds: commit vs. invalidation
 
 A notification announces one of two committed changes, distinguished by an optional typed marker:
 
 - a **commit** (the marker is absent) — the subscriber refreshes to the new revision;
-- an **invalidation** (`invalidation: true`, plus `invalidatedActionId`) — a durable reversal of a previously-committed action proven invalid by dispute (`docs/right-is-right.md` §Durable Invalidation, §Client Notification). An invalidation is a committed collection change like any other, so it rides this same path and reuses the **invalidation's** own commit cert as `sig`, verified by the subscriber exactly like a commit notification (a forwarder can drop it but cannot forge one — it lacks the `k − x` threshold signature).
+- an **invalidation** (`invalidation: true`, plus `invalidatedActionId`) — a durable reversal of a previously-committed action proven invalid by dispute (`docs/right-is-right.md` §Durable Invalidation, §Client Notification). An invalidation is a committed collection change like any other, so it rides this same path and reuses the **invalidation's** own commit cert as `sig`, verified by the subscriber exactly like a commit notification (a forwarder can drop it but cannot forge one — it lacks the root group's threshold signature).
 
 The marker is a **hint, not a gate** — the same contract the `delta` field already carries. It lets an invalidation-aware client *react* (drop derived results and resubmit through the optimistic loop) rather than merely refresh, and lets it coalesce the several notifications one dispute's cascade can emit by `invalidatedActionId`. A subscriber that ignores the marker still converges: it re-reads the authoritative reverted state, and the durable `committed-invalidated` status is always available on a pull (`NetworkTransactor.getStatus`). Correctness never depends on the push arriving. The marker round-trips through the wire codec (`NotificationV1.invalidation` / `invalidatedActionId`); `buildNotificationV1` sets it from the `CollectionChangeEvent`.
 
 ### Origination point
 
-The tail cohort's primary for the collection (the cohort-topic primary at `coord_0(_, topicId)`) is the notification origin. It is by definition the tail cohort because `topicId` is derived from `tailId`. When this cohort is also serving as the transaction-layer tail-cluster — which it is, since they share the same coordinate — origination is a side-effect of commit: as soon as the threshold signature on the commit is assembled, the primary emits the notification.
+**Root at the tail's storage group.** A collection's reactivity tree is rooted at its log tail block's own ring position: `coord_0` for a reactivity topic is the routing coordinate the key network assigns `routingKeyForBlock(tailId)`, not `H(0x00 ‖ topicId)`. The root (announcing) group is the tail block's storage group, chosen by the same rule the key network uses for storage — `findCluster`'s network-scoped selection, with reactivity's root `wantK` equal to `clusterSize` — so the machines that apply a commit are exactly the machines that announce it. Every party that derives the root group — the origination gate, the notification verifier, the subscriber's registration walk and the forwarder — uses that one rule.
+
+**Threshold from the verifier's side.** A notification carries the commit certificate as its signature. A verifier accepts it when its signers are members of the root group it derived itself and number at least `ceil(|root group| × superMajorityThreshold)` — the same threshold the commit certificate is captured under (`captureCommitCert`). The threshold is never read from the notification. The cohort-topic default `minSigs` (14) does not apply to the reactivity root.
+
+> **Implemented.** The key network exposes its storage rule in coordinate form (`servingCohortAt` in
+> `packages/db-p2p/src/libp2p-key-network.ts`, the same assembly `findCluster` builds a block's cohort with),
+> and the node binds it as the cohort-topic host's `rootGroup` together with the consensus
+> `superMajorityThreshold` (`createLibp2pNodeBase` in `packages/db-p2p/src/libp2p-node-base.ts`). The
+> origination gate is `selfAppliedTail` in `packages/db-p2p/src/cohort-topic/change-bridge.ts`: a change event
+> originates iff it names a tail and that tail is among the blocks this node applied — the node is then in
+> the tail's storage group as the commit's coordinator chose it, with no ring read of its own. That excludes a
+> read-driven promotion (no tail) and the sweep commit that lands a collection's data blocks, or the old
+> tail's `nextId` rewrite on a rollover, on another group: that group holds a certificate for the same action
+> but did not apply the tail. The verifier (`createNotificationVerifier` in
+> `packages/db-core/src/reactivity/verify.ts`) derives the root coordinate from the notification's tail and
+> verifies under a `RootPlacement` built from the node's own ratio; the subscriber's register names the tail
+> as `rootKey` (`ReactivitySubscriptionManager.register`), so the walk's root step dials the storage group;
+> the push-state gossip gate and the recover transport read the root group of the tail each push state joined
+> under. The mock-tier harness models a tail's storage group as the `wantK` members nearest its root
+> coordinate (`setupRootPlacedTopic` in `packages/db-p2p/src/testing/cohort-topic-mesh-harness.ts`).
+>
+> **What still only the coordinator announces.** In a storage group of three or fewer, only the member that
+> coordinated a commit retains a full certificate (the `NOTE:` at `captureCommitCert` in
+> `packages/db-p2p/src/cluster/cluster-repo.ts`), so one member originates per commit. A group of one
+> (`clusterSize: 1`, the Quereus plugin's node) never produces a certificate and never announces; the watch
+> service's tail check is what wakes a watcher of such a collection.
+>
+> **Two views of the group.** The certificate's signers come from the coordinator's `findCluster`; the
+> membership a verifier checks them against comes from the root node's own view. Under churn the two can
+> differ: a signer outside the published group makes the notification untrusted, and the watch service's
+> tail check (about 30 s) still wakes the watcher. `superMajorityThreshold` is likewise each verifier's own
+> value; consensus already requires one value per deployment, and reactivity adds no check of its own.
+>
+> **Reversibility and cost.** Reversible until announcements ship to deployments on mixed versions; after that
+> any anchor change is a protocol break — a subscriber on an older build registers and verifies at the old
+> coordinate and does not interoperate with a root on this one. The root group already handles every commit;
+> it now also serves its direct subscribers.
 
 ### Delta payloads
 
@@ -227,14 +266,14 @@ The `delta` field is optional and bounded by `delta_max` (default: 4 KB at Core 
 > with `bytesToPeerIdString`, never base64url. Specs: `node-wiring.spec.ts`, `topic-bytes-encoding.spec.ts`,
 > and the env-gated real-socket delivery in `substrate-real-libp2p.integration.spec.ts`.
 
-The tail cohort's primary delivers the signed notification to:
+The root group member that applied the commit delivers the signed notification to:
 
 - Every direct subscriber (via each subscriber's primary assignment as held in the cohort-topic registration record).
 - Every entry in `childCohorts`, addressed to that child's primary.
 
 A receiving forwarder cohort's primary:
 
-1. Verifies the threshold signature against the tail cohort's `MembershipCertV1` ([cohort-topic.md §Membership snapshots](cohort-topic.md#membership-snapshots-and-signature-verification)).
+1. Verifies the threshold signature against the root group's `MembershipCertV1` ([cohort-topic.md §Membership snapshots](cohort-topic.md#membership-snapshots-and-signature-verification)), under the root placement threshold (§Origination point).
 2. Runs the dedupe check (see below).
 3. Appends to the replay buffer.
 4. Forwards the unmodified notification to its own direct subscribers and child cohorts.
@@ -299,7 +338,7 @@ This isolates slow subscribers: one phone with a flaky connection does not stall
 
 A subscriber receiving a notification:
 
-1. Verifies `sig` against the cached `MembershipCertV1` for the tail cohort (with one fetch-and-retry fallback for stale-cache cases).
+1. Verifies `sig` against the cached `MembershipCertV1` for the root group — the tail's storage group — at `ceil(|group| × superMajorityThreshold)` (with one fetch-and-retry fallback for stale-cache cases).
 2. Checks `revision == lastRevision + 1`. If not equal, requests `BackfillV1{from: lastRevision + 1, to: revision}` from `primary`.
 3. Updates `lastRevision` once revisions are contiguous.
 4. Surfaces the notification to the application layer.
@@ -532,7 +571,7 @@ For collections with `block_fill_size = 64` and one commit per minute, rotation 
 
 ## Authentication and integrity
 
-- **Notifications** carry the tail cohort's threshold signature, which *is* the commit certificate from the transaction layer. Signature verification uses the standard cohort-topic membership-snapshot path ([cohort-topic.md §Membership snapshots](cohort-topic.md#membership-snapshots-and-signature-verification)).
+- **Notifications** carry the root group's threshold signature, which *is* the commit certificate from the transaction layer. Signature verification uses the standard cohort-topic membership-snapshot path ([cohort-topic.md §Membership snapshots](cohort-topic.md#membership-snapshots-and-signature-verification)) under the root placement rule: the verifier derives the root coordinate from the notification's tail and requires `ceil(|root group| × superMajorityThreshold)` signers, its own ratio, never the cohort-topic `minSigs` and never a value off the wire (§Origination point).
 - **Subscribe / renew RPCs** are signed by the subscriber's peer key and include `correlationId` and `timestamp`; replay protection is handled by the cohort-topic layer (they ride a real `RegisterV1`/`RenewV1` envelope).
 - **Recover RPCs (`BackfillV1` / `ResumeV1`)** are signed by the subscriber's peer key over a canonical signing payload (`backfillSigningPayload` / `resumeSigningPayload` — an explicitly-ordered, type-tagged JSON array, mirroring the cohort-topic `registerSigningPayload`). The serving handler verifies the signature against the **dialing peer** (the dialer's peer id *is* the signer — no signer-id field on the wire) and runs a node-level `CorrelationReplayGuard` keyed on the **signature bytes** + the request `timestamp` (the signature is a unique, authenticated token, so no separate `correlationId` is needed). A captured request cannot be replayed with a forged-fresh timestamp — the forged value invalidates the signature.
   - **Subscriber-side signing is synchronous.** The subscription manager's `signBackfill` / `signResume` seam is `(unsigned) => string` (the db-core backfill driver builds the unsigned image internally, so a pre-signed value is impossible), but libp2p's `PrivateKey.sign` is async. The seam is fed by `createRecoverRequestSigners(privateKey)` (db-p2p `recover-transport.ts`), which signs with the synchronous `signPeerSig` (`cohort-topic/peer-sig.ts`) — `@noble/curves/ed25519` over the node's raw Ed25519 seed, the mirror of the synchronous `verifyPeerSig`. noble's RFC8032 signatures are byte-identical to libp2p's async signer for the same key + payload, so the serving handler's verify accepts them. These signers + the `Libp2pReactivityRecoverTransport` are composed into the running node by the recover node wiring (`reactivity-recover-node-wiring`): `libp2p-node-base.ts`'s `cohortTopic`-enabled block registers the recover request-reply handler (`registerRecoverHandler`) against the forwarder host's live `PushState`s, constructs the outbound transport over the production dialer, and exposes the transport + signers + a node-level sticky cohort-hint cache (`reactivityRecover` / `reactivityRecoverSigners` / `reactivityCohortHintCache`) for the subscribe factory that constructs managers (the deferred Quereus `Database.watch` bridge).
@@ -541,7 +580,7 @@ For collections with `block_fill_size = 64` and one commit per minute, rotation 
 - **Replay-buffer entries** retain the original signature. Backfill responses are verifiable end-to-end.
 - **Checkpoint summaries** carry their two endpoints as the **full** bracketing notifications (each retaining its original threshold signature), so a subscriber verifies them with the same end-to-end notification verifier it uses for live notifications — proving both endpoints are real committed revisions. The merged digest is computed deterministically from the bracketed range and is a **hint only** (checked against application-level expectations, never trusted as authority). A forged or tampered endpoint fails verification and the subscriber falls back to the chain — a checkpoint never advances state on its own.
 
-A subscriber needs no trust in any forwarder. The trust root is the tail cohort's membership, which derives from the transaction log.
+A subscriber needs no trust in any forwarder. The trust root is the root group's membership — the tail block's storage group, which derives from the transaction log. A subscriber distant from the group trusts the membership the group publishes on first use; anchoring it to the commit log is `feat-reactivity-root-membership-anchored-by-the-commit-log`.
 
 ---
 
@@ -885,10 +924,11 @@ Tail cohort emits notification for revision 7800. Tier-1 forwarder `F_a` receive
 > (layered on the cohort-topic mesh harness): real commits flow through the real
 > `local-change-notifier-bridge` → real origination (commit cert reused **unchanged**) → real forwarder
 > receive path (verify → dedupe → `W`-ring + rolling checkpoint) → the real `ReactivitySubscriptionManager`
-> delivery, **verified end-to-end against the tail cohort's `MembershipCertV1` with real Ed25519
-> collected-multisig crypto** (no pass-crypto stub). The harness *models* only the notification transport
-> (the application protocol that would dial each subscriber's primary / child cohort) and, like the
-> matchmaking mock tier, the **single-tier-0 reach**. The suites cover
+> delivery, **verified end-to-end against the root group's `MembershipCertV1` with real Ed25519
+> collected-multisig crypto** (no pass-crypto stub) under the root placement rule. The harness *models* the
+> notification transport (the application protocol that would dial each subscriber's primary / child
+> cohort), a tail's storage group (the `wantK` members nearest its root coordinate, so the root is placed
+> and verified exactly as on a node) and, like the matchmaking mock tier, the **single-tier-0 reach**. The suites cover
 > the reactivity surface at scale; the real-libp2p wakeup of a watch is covered in §Real-libp2p e2e
 > coverage, and a `Database.watch` consumer's by ticket
 > `quereus-tables-opt-in-to-network-change-notification`.
@@ -926,18 +966,18 @@ never hard-code drifting numbers.
 > [`packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts`](../packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts)
 > (env-gated) stands up 3–16 production `cohortTopic`-enabled libp2p nodes over real TCP. The **reactivity
 > origination wiring** is confirmed real: the production node installs the cohort-topic origination bridge
-> (`blockChangeNotifier` is the decorating notifier, not the bare `StorageRepo`), and the real
-> `selfIsCohortMember` gate over real FRET agrees node-for-node with `assembleCohort(coord_0(H(tailId ‖
-> "reactivity")), wantK)` — the §Anchor membership decision that gates every origination. The notification
-> **verify** path is likewise real (the cohort's threshold-signed `MembershipCertV1` is fetched over the real
-> `/membership` protocol and verified with real Ed25519 collected-multisig — see cohort-topic §Validation;
-> the digest-preimage half is `cohort-topic/reactivity-real-crypto.spec.ts`).
+> (`blockChangeNotifier` is the decorating notifier, not the bare `StorageRepo`), and on every node the root
+> group at a tail's root coordinate (`servingCohortAt`) is the cohort `findCluster` stores the tail with —
+> the one placement rule of §Origination point. The notification **verify** path is likewise real (the
+> group's threshold-signed `MembershipCertV1` is fetched over the real `/membership` protocol and verified
+> with real Ed25519 collected-multisig under the root placement rule — see cohort-topic §Validation; the
+> digest-preimage half is `cohort-topic/reactivity-real-crypto.spec.ts`).
 >
 > **Notification socket delivery is now wired and exercised** (`12.33-reactivity-notification-transport`): a
 > commit on a real tail-cohort member fires a `NotificationV1` that reaches a remote subscriber over the real
 > `/optimystic/reactivity/1.0.0/notify` socket — the subscriber is constructed against the remote node's
 > `ReactivitySubscriberRegistry`, receives the frame, and verifies it end-to-end with real Ed25519 against the
-> tail cohort's membership. `libp2p-node-base.ts` now installs the origination manager's `emit` →
+> root group's membership. `libp2p-node-base.ts` now installs the origination manager's `emit` →
 > `ReactivityForwarderHost.ingest`, registers the notify + push-state-gossip protocol handlers, and routes
 > inbound frames to the registry. **No real-network observation here contradicts the simulator** — the design
 > (anchor derivation, cert reuse, verify, socket fan-out) is confirmed on real libp2p.
@@ -960,9 +1000,16 @@ never hard-code drifting numbers.
 > the cases above hand-build. The case passes only on a wake with no tail read between the commit and the
 > wake, so the fallback tick cannot be what passed it. It also runs the real collection id (`app/watched-rows`)
 > through the wire, which the earlier cases avoided by inventing ids that were already base64url. The mesh is
-> configured so every machine is in every cohort (`clusterSize` = `cohortTopic.wantK` = 3, `minSigs` 2), the
-> only configuration in which notifications verify today (blocked ticket
-> `reactivity-notifications-need-the-tail-cohort-to-be-the-topic-cohort`).
+> configured so every machine is in every cohort (`clusterSize` = `cohortTopic.wantK` = 3, `minSigs` 2).
+>
+> **The same watch on a mesh wider than one storage group** is the reproduction of the defect root placement
+> fixes (`reactivity-notifications-need-the-tail-cohort-to-be-the-topic-cohort`): six machines with
+> `clusterSize` 3 and the production cohort-topic defaults (`wantK` 16, `minSigs` 14, neither of which governs
+> a root). A watch opened on a machine outside the tail's storage group registers with the group through
+> the walk's root step, a commit coordinated by a group member is announced by it, and the watcher is woken
+> by a frame its subscriber registry received, with no tail read in between. Before root placement the
+> announcing group was a FRET cohort disjoint from the storage group on a ring this wide, so no commit was
+> announced and none would have verified.
 >
 > **The real-libp2p `Database.watch` wakeup is exercised too** (`quereus-tables-opt-in-to-network-change-notification`):
 > [`packages/quereus-plugin-optimystic/test/network-change-notification.integration.spec.ts`](../packages/quereus-plugin-optimystic/test/network-change-notification.integration.spec.ts)

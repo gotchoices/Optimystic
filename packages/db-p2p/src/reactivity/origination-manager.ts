@@ -56,7 +56,7 @@ export interface OriginationCollectionContext {
 
 /**
  * The origination context a live node resolves for one committed change, or `undefined` for a tail-less
- * event (a read-driven promotion never originates; the membership gate also returns before this).
+ * event (a read-driven promotion never originates; the bridge's tail-applied gate also returns before this).
  *
  * Both ids go on the notification in the pinned encodings of `reactivity/topic-bytes.ts`, the SAME ones a
  * subscriber registers under — a different encoding on either side and origination silently never reaches

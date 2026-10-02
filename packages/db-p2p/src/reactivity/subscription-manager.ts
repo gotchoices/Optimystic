@@ -8,8 +8,14 @@
  * tail-anchored `topicId = H(tailId ‖ "reactivity")`, the {@link SubscribeAppPayloadV1}, and the
  * subscriber-side verify/deliver path ({@link ReactivitySubscriber}).
  *
+ * **The topic's root is the tail's storage group** (`docs/reactivity.md` §Origination point): the register
+ * walk names the tail's routing key as the topic's `rootKey`, so its root step reaches the group of peers
+ * that store the tail block — the machines that apply, and so announce, the collection's commits — and
+ * notifications are verified against that group's membership under the root placement threshold
+ * `ceil(|group| × quorumRatio)`, the formula the commit certificate they reuse was captured under.
+ *
  * Inbound notifications are handed to {@link ReactivitySubscriptionManager.onNotification}, which runs
- * the db-core delivery path (verify against the cached tail-cohort `MembershipCertV1` with one
+ * the db-core delivery path (verify against the cached root-group `MembershipCertV1` with one
  * fetch-and-retry, revision-contiguity, gap → backfill seam, `(collectionId, revision)` dedupe, surface).
  * The notification transport (the reactivity application protocol that delivers `NotificationV1` frames
  * to a subscriber's primary) is the sibling tickets' concern; this manager owns attach + delivery logic.
@@ -82,16 +88,23 @@ export interface ReactivitySubscriptionManagerOptions {
 	readonly collectionId: Uint8Array;
 	/**
 	 * Tail block id at attach time (raw bytes); anchors the rotating topic (`reactivityTopicId` is applied to
-	 * it) and detects rotation.
+	 * it), is the topic's root key (the walk's root step goes to the tail's storage group), and detects
+	 * rotation.
 	 *
 	 * **Load-bearing encoding contract.** A host converting a `BlockId` tail to these bytes (the node's
-	 * `ReactivityCollectionWatch` does) MUST use `reactivityTailBytes(tailId)` (`reactivity/topic-bytes.ts`) — the SAME function
-	 * origination's membership gate uses — never a pre-hashed digest of the id, which would double-hash.
-	 * Origination derives the topic's `coord_0` cohort from `reactivityTopicId(reactivityTailBytes(
-	 * tailId))`; if this side feeds differently-encoded bytes it subscribes to a *different* coord and
-	 * origination silently never reaches it (the `topic-bytes-encoding` spec pins the coord-equality).
+	 * `ReactivityCollectionWatch` does) MUST use `reactivityTailBytes(tailId)` (`reactivity/topic-bytes.ts`) —
+	 * the tail's routing key, the bytes the key network places the block by — never a pre-hashed digest of
+	 * the id. The root group is the serving cohort at `H(these bytes)`; a differently-encoded tail registers
+	 * at a different ring position, with a group that announces nothing for this collection (the
+	 * `topic-bytes-encoding` spec pins the equality with the key network's placement).
 	 */
 	readonly tailIdAtAttach: Uint8Array;
+	/**
+	 * The ratio the root group's commit certificates are signed under — the node's consensus
+	 * `superMajorityThreshold`. A notification verifies when its signers are root-group members numbering at
+	 * least `ceil(|group| × quorumRatio)`; the value is this node's own, never read from a notification.
+	 */
+	readonly quorumRatio: number;
 	/** Surface a verified, contiguous notification to the application. */
 	readonly deliver: (n: NotificationV1) => void;
 	/**
@@ -202,8 +215,9 @@ export class ReactivitySubscriptionManager {
 		this.rejoinJitter = options.rejoinJitter ?? createRejoinJitter();
 		this.subscriberCoordIsFallback = options.subscriberCoord === undefined;
 		this.subscriberCoord = options.subscriberCoord ?? this.collectionIdB64;
-		// Verify against the tail cohort's membership cert (the verifier owns the one fetch-and-retry).
-		this.verifier = createNotificationVerifier({ verifier: this.service.verifier(), tier: Tier.T3 });
+		// Verify against the root group's membership cert under the placement rule (the verifier owns the one
+		// fetch-and-retry; the root coordinate is derived from each notification's own tail).
+		this.verifier = createNotificationVerifier({ verifier: this.service.verifier(), tier: Tier.T3, quorumRatio: options.quorumRatio });
 		this.subscriber = createReactivitySubscriber({
 			collectionId: this.collectionIdB64,
 			verifier: this.verifier,
@@ -300,7 +314,11 @@ export class ReactivitySubscriptionManager {
 		this.subscriber.rebaseline(revision);
 	}
 
-	/** Register the subscriber at tier T3 with the reactivity `appPayload`. */
+	/**
+	 * Register the subscriber at tier T3 with the reactivity `appPayload`. The tail bytes are the topic's
+	 * root key: the walk's root step goes to the tail's storage group (`ITopicRouter.routeToRoot`), not to
+	 * the FRET cohort around a hash of the topic id, so the subscriber lands on the machines that announce.
+	 */
 	async register(): Promise<RegistrationHandle> {
 		const appPayload = subscribeAppPayloadBytes({
 			collectionId: bytesToB64url(this.collectionId),
@@ -313,6 +331,7 @@ export class ReactivitySubscriptionManager {
 			tier: Tier.T3,
 			appPayload,
 			ttl: this.ttlMs,
+			rootKey: this.tailIdAtAttach,
 		});
 		return this.handle;
 	}
