@@ -3,7 +3,7 @@ architecture: docs/reactivity.md#origination-point
 files: docs/reactivity.md, docs/cohort-topic.md, packages/db-p2p/src/cohort-topic/reactivity-membership-gate.ts, packages/db-p2p/src/cohort-topic/change-bridge.ts, packages/db-core/src/reactivity/verify.ts, packages/db-core/src/reactivity/topic-anchor.ts, packages/db-core/src/cohort-topic/addressing.ts, packages/db-core/src/cohort-topic/sig/threshold.ts, packages/db-p2p/src/cluster/cluster-repo.ts, packages/db-p2p/src/libp2p-key-network.ts, packages/db-p2p/src/libp2p-node-base.ts
 ----
 
-**Blocked: architecture is contradictory.** Unblocks when a human accepts (or edits) the proposed text below, or accepts the small-group limit as the documented scope. The proposed text was revised with the maintainer after a scaling review (1 machine → very large networks); the maintainer agreed with its direction and is to confirm the wording.
+**Decision accepted (maintainer, 2026-10-02):** adopt the proposed text below as written — the root sits at the tail block's storage group, the verifier derives the threshold, and only the root of the tree moves on rotation (tiers d ≥ 1 use the stable `collectionTopicId`). Plan the implementation, including the `docs/reactivity.md` and `docs/cohort-topic.md` updates. `backlog/feat-reactivity-rotation-reaches-current-subscribers` is largely superseded by the non-rotating tiers; resolve or retire it as part of planning.
 
 ## The contradiction
 
