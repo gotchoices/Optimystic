@@ -12,6 +12,10 @@
  *
  * Both back-ends present the same {@link IMembershipSource} surface; this router picks between them by
  * tier. db-p2p supplies the two concrete sources (tx-log reader and FRET cert source).
+ *
+ * The router picks a source and nothing more: the per-call lookup options a verifier passes to
+ * `current` / `fetch` (`{ rootPlaced: true }` for the root of a root-placed topic) go to the chosen
+ * source untouched, and it is that source which decides where a root-placed coord's cert is fetched from.
  */
 
 import type { IMembershipSource } from "../ports.js";

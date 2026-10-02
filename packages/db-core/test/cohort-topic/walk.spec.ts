@@ -70,7 +70,7 @@ function fixedDMax(d: number): DMaxComputer {
 /** A factory that emits a deterministic signed-shaped RegisterV1 (signature/crypto are out of scope here). */
 function factoryFor(self: Uint8Array): RegisterMessageFactory {
 	return {
-		build: async ({ topicId, tier, treeTier, bootstrap, followOn, probe, appPayload }) => ({
+		build: async ({ topicId, tier, treeTier, bootstrap, followOn, probe, appPayload, rootKey }) => ({
 			v: 1,
 			topicId: bytesToB64url(topicId),
 			tier,
@@ -81,6 +81,7 @@ function factoryFor(self: Uint8Array): RegisterMessageFactory {
 			...(followOn ? { followOn: true } : {}),
 			...(probe ? { probe: true } : {}),
 			...(appPayload ? { appPayload: bytesToB64url(appPayload) } : {}),
+			...(rootKey ? { rootKey: bytesToB64url(rootKey) } : {}),
 			timestamp: 1_000,
 			correlationId: bytesToB64url(bytes('corr')),
 			signature: bytesToB64url(bytes('sig', 8)),
@@ -481,5 +482,38 @@ describe('cohort-topic / walk-toward-root', () => {
 		expect(outcome.kind, 'no untried candidate → temporal back-off').to.equal('retry_later');
 		// Exactly one dial (the sibling, once); the second reply finds it already tried and backs off.
 		expect(router.probes.filter((p) => p.mode === 'dial').length, 'the lone sibling is dialed exactly once').to.equal(1);
+	});
+
+	it('a root-placed topic reaches its root through routeToRoot, and at H(rootKey) on a router without it', async () => {
+		const self = bytes('root-placed-participant');
+		const rootKey = new TextEncoder().encode('tail-block-routing-key');
+		const rootKeyB64 = bytesToB64url(rootKey);
+
+		// Tier 1 is cold and the root accepts, so the walk makes one ring-routed step and one root step.
+		const replies = [noState, accepted];
+		const steps: { via: 'coord' | 'root'; key: Uint8Array; frameRootKey?: string }[] = [];
+		const answer = (via: 'coord' | 'root', key: Uint8Array, activity: Uint8Array): Uint8Array => {
+			steps.push({ via, key, frameRootKey: decodeRegisterV1(activity).rootKey });
+			return encodeCohortMessage(replies[steps.length - 1]!);
+		};
+		const rootAware: ITopicRouter = {
+			routeAndAct: async (key, activity) => answer('coord', key, activity),
+			routeToRoot: async (key, activity) => answer('root', key, activity),
+			dialMember: async () => { throw new Error('no member dial expected'); },
+		};
+		const engine = createWalkEngine({ router: rootAware, addressing, dmax: fixedDMax(1), self, factory: factoryFor(self) });
+		expect((await engine.register(TOPIC, 1, undefined, { rootKey })).kind).to.equal('accepted');
+
+		expect(steps.map((s) => s.via)).to.deep.equal(['coord', 'root']);
+		expect(bytesEqual(steps[0]!.key, addressing.coord(1, self, TOPIC)), 'tier 1 keeps its usual coord').to.be.true;
+		expect(bytesEqual(steps[1]!.key, rootKey), 'the root step hands the router the raw key').to.be.true;
+		expect(steps.map((s) => s.frameRootKey), 'every tier\'s frame carries the key').to.deep.equal([rootKeyB64, rootKeyB64]);
+
+		// A router with no routeToRoot gets the root step by ring routing, at the hash of the key alone —
+		// the position the key network derives for that routing key.
+		const plain = new ScriptedRouter([accepted]);
+		const fallback = createWalkEngine({ router: plain, addressing, dmax: fixedDMax(0), self, factory: factoryFor(self) });
+		expect((await fallback.register(TOPIC, 1, undefined, { rootKey })).kind).to.equal('accepted');
+		expect(bytesEqual(plain.probes[0]!.coord!, sha256(rootKey)), 'root coord is H(rootKey)').to.be.true;
 	});
 });

@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { createCohortSigner } from '../../src/cohort-topic/sig/threshold.js';
+import { createCohortSigner, createRootPlacement } from '../../src/cohort-topic/sig/threshold.js';
 import { membershipCertSigningPayload } from '../../src/cohort-topic/sig/payloads.js';
 import { createMembershipVerifier } from '../../src/cohort-topic/membership/verifier.js';
 import { createMembershipSourceRouter } from '../../src/cohort-topic/membership/source.js';
@@ -166,6 +166,50 @@ describe('cohort-topic / membership verification', () => {
 		expect(r3).to.equal('untrusted');
 		expect(fret.currentCalls, 'T3 used FRET source').to.equal(1);
 		expect(committed.currentCalls, 'T3 did not touch committed source').to.equal(1);
+	});
+
+	describe('root-placed coords', () => {
+		// A root group of three, all of whom signed its cert. At ratio 0.75 the threshold is ceil(2.25) = 3.
+		const GROUP = MEMBERS.slice(0, 3);
+		const GROUP_CERT = buildCert(GROUP);
+		const placement = createRootPlacement(0.75);
+
+		it('uses ceil(members × quorumRatio) under a placement, and the default minSigs without one', async () => {
+			const encoded = encodeCohortMessage(GROUP_CERT);
+			const { v } = verifier(new MockSource(encoded, encoded));
+			expect(await v.verifyMessage(GROUP, COORD, 2, PAYLOAD, SIG, { placement }), 'three of three meets the ratio').to.equal('verified');
+			expect(await v.verifyMessage(GROUP.slice(0, 2), COORD, 2, PAYLOAD, SIG, { placement }), 'two of three does not').to.equal('untrusted');
+			expect(await v.verifyMessage(GROUP, COORD, 2, PAYLOAD, SIG), 'three signers never reach the default 14').to.equal('untrusted');
+
+			// A cert only two of its three members signed is not self-consistent under the ratio either.
+			const underSigned = encodeCohortMessage({ ...GROUP_CERT, signers: GROUP_CERT.signers.slice(0, 2) });
+			const { v: fresh } = verifier(new MockSource(underSigned, underSigned));
+			expect(await fresh.verifyMessage(GROUP, COORD, 2, PAYLOAD, SIG, { placement })).to.equal('untrusted');
+		});
+
+		it('re-validates a cert cached under one rule instead of reusing it under the other', async () => {
+			// Cached under the placement, then asked for under the default rule: the cache is not consulted
+			// (the source is), and the placement entry survives the failed default-rule check.
+			const encoded = encodeCohortMessage(GROUP_CERT);
+			const placedSource = new MockSource(encoded, encoded);
+			const { v: placed } = verifier(placedSource);
+			expect(await placed.verifyMessage(GROUP, COORD, 2, PAYLOAD, SIG, { placement })).to.equal('verified');
+			expect(placedSource.currentCalls).to.equal(1);
+			expect(await placed.verifyMessage(GROUP, COORD, 2, PAYLOAD, SIG)).to.equal('untrusted');
+			expect(placedSource.currentCalls, 'the default-rule call went back to the source').to.equal(2);
+			expect(await placed.verifyMessage(GROUP, COORD, 2, PAYLOAD, SIG, { placement })).to.equal('verified');
+			expect(placedSource.currentCalls, 'the placement entry is still cached').to.equal(2);
+
+			// The other direction. GOOD (16 members, 14 signers) is cached as trusted under the default rule and
+			// would pass the ratio's threshold of 12 if it were reused — but the source has nothing to offer, so a
+			// call under the placement finds no cert at all.
+			const emptySource = new MockSource();
+			const { v: byDefault } = verifier(emptySource);
+			byDefault.cache(GOOD);
+			expect(await byDefault.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG, { placement })).to.equal('untrusted');
+			expect(emptySource.currentCalls, 'the placement call went to the source').to.equal(1);
+			expect(await byDefault.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG), 'the default entry is intact').to.equal('verified');
+		});
 	});
 });
 

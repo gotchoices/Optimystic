@@ -122,6 +122,22 @@ export function optBool(obj: Record<string, unknown>, key: string, what: string)
 }
 
 /**
+ * Return `true` when `obj[key]` is literally `true`, `undefined` when absent; throw on anything else —
+ * `false` included. For a presence flag whose only legal value is `true`, so an absent flag and a
+ * `false` one cannot be two spellings of the same thing in a signed image.
+ */
+export function optTrue(obj: Record<string, unknown>, key: string, what: string): true | undefined {
+	const value = obj[key];
+	if (value === undefined) {
+		return undefined;
+	}
+	if (value !== true) {
+		failWire(`${what}: field "${key}" must be true when present`);
+	}
+	return true;
+}
+
+/**
  * Require `obj[key]` to be an integer `>= min` (and `<= max` when supplied); returns it. Reads and
  * finite-checks the field itself (via {@link reqFiniteNumber}) so callers pass the object + key rather
  * than a pre-extracted value — this composes with the other `req*` helpers.
@@ -176,6 +192,20 @@ export function b64urlField(value: string, key: string, what: string): string {
 		b64urlToBytes(value);
 	} catch {
 		failWire(`${what}: field "${key}" is not valid base64url`);
+	}
+	return value;
+}
+
+/** Assert a base64url string decodes cleanly to between `min` and `max` bytes inclusive; returns it unchanged. */
+export function b64urlBoundedLen(value: string, key: string, min: number, max: number, what: string): string {
+	let bytes: Uint8Array;
+	try {
+		bytes = b64urlToBytes(value);
+	} catch {
+		return failWire(`${what}: field "${key}" is not valid base64url`);
+	}
+	if (bytes.length < min || bytes.length > max) {
+		failWire(`${what}: field "${key}" must decode to ${min}..${max} bytes, got ${bytes.length}`);
 	}
 	return value;
 }

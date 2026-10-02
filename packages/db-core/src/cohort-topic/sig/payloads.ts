@@ -47,13 +47,18 @@ export function demotionNoticeSigningPayload(n: DemotionSignable): Uint8Array {
 }
 
 /** Fields of a `ChildLinkV1` covered by the child cohort's threshold signature. */
-export type ChildLinkSignable = Pick<ChildLinkV1, "topicId" | "childCohortCoord" | "childParticipantCoord" | "childTier" | "tier" | "effectiveAt" | "cohortEpoch">;
+export type ChildLinkSignable = Pick<ChildLinkV1, "topicId" | "childCohortCoord" | "childParticipantCoord" | "childTier" | "tier" | "effectiveAt" | "cohortEpoch" | "rootKey">;
 
 /**
  * Canonical signed byte image of a child-link frame. `cohortEpoch` stays **last** so the `/sign` endorser
  * (`handleSignRequest`) reads the embedded epoch positionally as `image[image.length - 1]`, exactly as it
  * does for a promotion / demotion notice.
+ *
+ * `rootKey` (a tier-1 child of a root-placed topic) is covered only when present, and is inserted **before**
+ * `cohortEpoch` for that same reason. A link without one keeps the eight-element image unchanged; one
+ * with it signs nine elements, so stripping or swapping the key fails verification.
  */
 export function childLinkSigningPayload(n: ChildLinkSignable): Uint8Array {
-	return utf8.encode(JSON.stringify(["ChildLinkV1", n.topicId, n.childCohortCoord, n.childParticipantCoord, n.childTier, n.tier, n.effectiveAt, n.cohortEpoch]));
+	const rootKey = n.rootKey === undefined ? [] : [n.rootKey];
+	return utf8.encode(JSON.stringify(["ChildLinkV1", n.topicId, n.childCohortCoord, n.childParticipantCoord, n.childTier, n.tier, n.effectiveAt, ...rootKey, n.cohortEpoch]));
 }

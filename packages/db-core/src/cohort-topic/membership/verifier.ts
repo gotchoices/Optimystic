@@ -42,14 +42,25 @@
  * from the coord alone; the caller already knows the tier (it computed the coord from the message's
  * claimed tier/topic). The `tier` is threaded into the gate so the direct anchor is consulted with the
  * same tier the router used (the binding is tier-scoped).
+ *
+ * **Root-placed coords (§Tier addressing → Root placement at a routing key).** Everything above says
+ * "`≥ minSigs`" for the node-wide threshold. The root of a root-placed topic is a different kind of
+ * cohort — the group responsible for a routing key, typically smaller than `minSigs` — so a caller that
+ * knows the coord is root-placed passes a {@link RootPlacement}, and the verifier then uses
+ * `ceil(members × quorumRatio)` of the cert being checked against for **every** threshold it applies at
+ * that coord: the cert's self-consistency, the rotation-chain quorum (over the predecessor's members),
+ * and the message itself. The ratio is the caller's own configuration, never read off a message or cert.
+ * The placement is also handed to the membership source and the direct anchor, which need it to find
+ * and judge the root group. A cached cert remembers the rule it was validated under, and a call under a
+ * different rule does not see it — see {@link CachingMembershipVerifier.heldUnder}.
  */
 
-import type { IMembershipTrustAnchor, RingCoord, TrustRoot } from "../ports.js";
+import type { IMembershipTrustAnchor, MembershipLookupOptions, RingCoord, RootPlacement, TrustRoot } from "../ports.js";
 import { noAuthorityTrustAnchor } from "../ports.js";
 import { b64urlToBytes, bytesToB64url, decodeMembershipCertV1 } from "../wire/codec.js";
 import { CohortWireError } from "../wire/validate.js";
 import type { MembershipCertV1 } from "../wire/types.js";
-import { DEFAULT_MIN_SIGS, type CohortSigner } from "../sig/threshold.js";
+import { DEFAULT_MIN_SIGS, rootPlacedMinSigs, type CohortSigner } from "../sig/threshold.js";
 import { membershipCertSigningPayload } from "../sig/payloads.js";
 import type { IMembershipSourceRouter } from "./source.js";
 import { LruMap } from "../../utility/lru-map.js";
@@ -67,8 +78,12 @@ export type VerifyResult = "verified" | "untrusted";
 
 /** Caches certs per coord and verifies threshold-signed messages with one stale-cert refetch. */
 export interface MembershipVerifier {
-	/** Cache `cert` as the latest known membership for its coord. */
-	cache(cert: MembershipCertV1): void;
+	/**
+	 * Cache `cert` as the latest known membership for its coord. `placement` is the rule the cert was
+	 * published under — pass it for a root-placed coord, so later calls carrying the same placement use
+	 * the entry; omit it for every other coord.
+	 */
+	cache(cert: MembershipCertV1, placement?: RootPlacement): void;
 	/**
 	 * Drop everything cached for `cohortCoord` (base64url form, as on a cert's `cohortCoord`): the cached
 	 * cert — including a *trusted* self-published one, i.e. the trust lock — and any stale-gap strike
@@ -88,8 +103,11 @@ export interface MembershipVerifier {
 	 * Eventual refetch is *preserved*: a cold cache or a membership rotation still re-fetches once the
 	 * interval elapses (unlike outright suppression). Omit `opts` (the default, and every existing caller)
 	 * for the unbounded exactly-one-refetch behavior.
+	 *
+	 * `opts.placement` declares `expectedCoord` root-placed: the threshold is then
+	 * `ceil(members × quorumRatio)` instead of the verifier's `minSigs` (see the module header).
 	 */
-	verifyMessage(signers: readonly Uint8Array[], expectedCoord: RingCoord, tier: number, payload: Uint8Array, sig: Uint8Array, opts?: RefetchBound): Promise<VerifyResult>;
+	verifyMessage(signers: readonly Uint8Array[], expectedCoord: RingCoord, tier: number, payload: Uint8Array, sig: Uint8Array, opts?: VerifyMessageOptions): Promise<VerifyResult>;
 }
 
 /**
@@ -101,6 +119,16 @@ export interface RefetchBound {
 	readonly minRefetchIntervalMs?: number;
 	/** Current wall clock (ms) for the interval comparison. */
 	readonly now?: number;
+}
+
+/** Per-call options of {@link MembershipVerifier.verifyMessage}: the refetch bound, plus the coord's placement. */
+export interface VerifyMessageOptions extends RefetchBound {
+	/**
+	 * Present when `expectedCoord` is the root of a root-placed topic. Its threshold is then
+	 * `ceil(cert.members.length × quorumRatio)` — the formula a storage group's commit certificate uses —
+	 * rather than the verifier's constructor `minSigs`. Build it with `createRootPlacement`.
+	 */
+	readonly placement?: RootPlacement;
 }
 
 export interface MembershipVerifierDeps {
@@ -154,6 +182,11 @@ interface CachedCert {
 	cert: MembershipCertV1;
 	/** True only when the cert passed via trust-root / direct-anchor / chain, or was self-published (`cache`). */
 	trusted: boolean;
+	/**
+	 * The threshold rule the cert was validated (or self-published) under: the root-placement quorum ratio,
+	 * or `undefined` for the default `minSigs` rule. See {@link CachingMembershipVerifier.heldUnder}.
+	 */
+	quorumRatio: number | undefined;
 }
 
 /** A {@link TrustRoot} pre-normalized to the cert's base64url form for cheap matching. */
@@ -200,10 +233,10 @@ class CachingMembershipVerifier implements MembershipVerifier {
 		this.staleGapStrikes = new LruMap(maxCoords);
 	}
 
-	cache(cert: MembershipCertV1): void {
+	cache(cert: MembershipCertV1, placement?: RootPlacement): void {
 		// The public cache feeds this node its OWN freshly-published cert — a node trusts a cert it itself
 		// published, so it is marked trusted and may anchor the next rotation in the attestation chain.
-		this.byCoord.set(cert.cohortCoord, { cert, trusted: true });
+		this.byCoord.set(cert.cohortCoord, { cert, trusted: true, quorumRatio: placement?.quorumRatio });
 	}
 
 	forget(cohortCoord: string): void {
@@ -224,17 +257,20 @@ class CachingMembershipVerifier implements MembershipVerifier {
 		this.staleGapStrikes.delete(cohortCoord);
 	}
 
-	async verifyMessage(signers: readonly Uint8Array[], expectedCoord: RingCoord, tier: number, payload: Uint8Array, sig: Uint8Array, opts?: RefetchBound): Promise<VerifyResult> {
+	async verifyMessage(signers: readonly Uint8Array[], expectedCoord: RingCoord, tier: number, payload: Uint8Array, sig: Uint8Array, opts?: VerifyMessageOptions): Promise<VerifyResult> {
 		const coordKey = bytesToB64url(expectedCoord);
 		const source = this.deps.router.for(tier);
+		const placement = opts?.placement;
+		const lookup = lookupOptionsFor(placement);
 
 		// Seed from the cheap cached view if we hold nothing yet. A cached cert already passed the gate when
-		// it was loaded (or was self-published via `cache`), so it is used directly for message verification.
-		let cert = this.byCoord.get(coordKey)?.cert;
+		// it was loaded (or was self-published via `cache`), so it is used directly for message verification
+		// — provided it passed under the rule this call applies (see `heldUnder`).
+		let cert = this.heldUnder(coordKey, placement)?.cert;
 		if (cert === undefined) {
-			cert = await this.loadFrom(source.current(expectedCoord), tier);
+			cert = await this.loadFrom(source.current(expectedCoord, lookup), tier, placement);
 		}
-		if (cert !== undefined && this.messageVerifies(cert, signers, payload, sig)) {
+		if (cert !== undefined && this.messageVerifies(cert, signers, payload, sig, placement)) {
 			this.staleGapStrikes.delete(coordKey); // a verify resets the consecutive stale-gap strike count
 			return "verified";
 		}
@@ -247,12 +283,29 @@ class CachingMembershipVerifier implements MembershipVerifier {
 		if (!this.refetchAllowed(coordKey, opts)) {
 			return "untrusted";
 		}
-		const refreshed = await this.loadFrom(source.fetch(expectedCoord), tier);
-		if (refreshed !== undefined && this.messageVerifies(refreshed, signers, payload, sig)) {
+		const refreshed = await this.loadFrom(source.fetch(expectedCoord, lookup), tier, placement);
+		if (refreshed !== undefined && this.messageVerifies(refreshed, signers, payload, sig, placement)) {
 			this.staleGapStrikes.delete(coordKey); // a verify resets the consecutive stale-gap strike count
 			return "verified";
 		}
 		return "untrusted";
+	}
+
+	/**
+	 * The cached entry for `coordKey`, **only if it was validated under the rule this call applies** — the
+	 * same root-placement ratio, or both the default rule. An entry held under any other rule reads as
+	 * absent, for every purpose: message verification, the attestation-chain predecessor, and the trust
+	 * lock. So a cert that passed one threshold is never taken as having passed another, and the call
+	 * re-validates from the source under its own rule instead.
+	 */
+	private heldUnder(coordKey: string, placement: RootPlacement | undefined): CachedCert | undefined {
+		const held = this.byCoord.get(coordKey);
+		return held !== undefined && held.quorumRatio === placement?.quorumRatio ? held : undefined;
+	}
+
+	/** The signature threshold over `cert`'s members: `ceil(members × quorumRatio)` for a root-placed coord, else the node-wide `minSigs`. */
+	private minSigsFor(cert: MembershipCertV1, placement: RootPlacement | undefined): number {
+		return placement === undefined ? this.minSigs : rootPlacedMinSigs(cert.members.length, placement);
 	}
 
 	/**
@@ -281,7 +334,7 @@ class CachingMembershipVerifier implements MembershipVerifier {
 	 * cert (failed self-consistency, a `"rejected"` direct anchor, or an un-anchored cert for an
 	 * already-trusted coord) is treated exactly like an absent cert, so the single refetch still fires.
 	 */
-	private async loadFrom(pending: Promise<Uint8Array | undefined>, tier: number): Promise<MembershipCertV1 | undefined> {
+	private async loadFrom(pending: Promise<Uint8Array | undefined>, tier: number, placement: RootPlacement | undefined): Promise<MembershipCertV1 | undefined> {
 		const encoded = await pending;
 		if (encoded === undefined) {
 			return undefined;
@@ -290,7 +343,7 @@ class CachingMembershipVerifier implements MembershipVerifier {
 		let trust: CertTrust;
 		try {
 			cert = decodeMembershipCertV1(encoded, this.deps.maxMessageBytes);
-			trust = this.certIsTrusted(cert, tier);
+			trust = this.certIsTrusted(cert, tier, placement);
 		} catch (err) {
 			if (err instanceof CohortWireError) {
 				return undefined; // a malformed cert (or non-base64url signer) is treated as no cert
@@ -300,10 +353,29 @@ class CachingMembershipVerifier implements MembershipVerifier {
 		if (trust === "reject") {
 			return undefined;
 		}
+		if (this.lockedUnderAnotherRule(cert.cohortCoord, placement)) {
+			return cert; // usable for this call's message check, but it must not displace the lock
+		}
 		// Only a `"trusted"` cert may anchor a successor in the attestation chain; a `"tofu"` cert is cached
 		// for message verification but must never launder trust into a rotation.
-		this.byCoord.set(cert.cohortCoord, { cert, trusted: trust === "trusted" });
+		this.byCoord.set(cert.cohortCoord, { cert, trusted: trust === "trusted", quorumRatio: placement?.quorumRatio });
 		return cert;
+	}
+
+	/**
+	 * Whether the coord holds a **trusted** cert validated under a rule other than this call's. Such an entry
+	 * is invisible to this call ({@link heldUnder}), so the trust gate ran as if the coord were cold and may
+	 * have accepted the cert on first use. Caching that result would erase the trust lock through a side
+	 * door — a call under one rule downgrading what another rule established — so it is used for the
+	 * current message only.
+	 *
+	 * NOTE: a coord has one rule by construction (it follows from how the coord was derived), so two rules
+	 * meeting at one coord is an anomaly, and the cost here — a source read on every call under the second
+	 * rule — is not paid in normal operation. If it ever is, key the cache by `(coord, rule)` instead.
+	 */
+	private lockedUnderAnotherRule(coordKey: string, placement: RootPlacement | undefined): boolean {
+		const held = this.byCoord.get(coordKey);
+		return held !== undefined && held.trusted && held.quorumRatio !== placement?.quorumRatio;
 	}
 
 	/**
@@ -312,14 +384,14 @@ class CachingMembershipVerifier implements MembershipVerifier {
 	 * fallback (first-use only). Returns whether the cert is a trusted anchor (`"trusted"`), an interim
 	 * TOFU acceptance (`"tofu"`), or rejected (`"reject"`).
 	 */
-	private certIsTrusted(cert: MembershipCertV1, tier: number): CertTrust {
-		if (!this.certIsSelfConsistent(cert)) {
+	private certIsTrusted(cert: MembershipCertV1, tier: number, placement: RootPlacement | undefined): CertTrust {
+		if (!this.certIsSelfConsistent(cert, placement)) {
 			return "reject"; // internal well-formedness is the precondition for any trust path
 		}
 		if (this.matchesTrustRoot(cert)) {
 			return "trusted"; // a configured genesis root is authoritative, checked before the direct anchor
 		}
-		const verdict = this.anchor.directAnchor(cert, tier);
+		const verdict = this.anchor.directAnchor(cert, tier, placement);
 		if (verdict === "anchored") {
 			return "trusted";
 		}
@@ -327,10 +399,10 @@ class CachingMembershipVerifier implements MembershipVerifier {
 			return "reject"; // a contradicted binding is a forgery — fatal, overrides the TOFU fallback
 		}
 		// verdict === "unknown": no local authority for this coord. Try the attestation chain, else fall back.
-		if (this.hasRotationAttestation(cert) && this.chainGrantsTrust(cert)) {
+		if (this.hasRotationAttestation(cert) && this.chainGrantsTrust(cert, placement)) {
 			return "trusted";
 		}
-		const fallback = this.fallbackTrust(cert);
+		const fallback = this.fallbackTrust(cert, placement);
 		if (fallback !== "reject") {
 			return fallback; // first-use TOFU (coord not locked): no stale lock to recover from
 		}
@@ -338,7 +410,7 @@ class CachingMembershipVerifier implements MembershipVerifier {
 		// did not chain-verify — the state that strands a former cohort member forever. Consult the stale-gap
 		// recovery counter, which releases the lock only on a demonstrated chain gap (never a forged rotation
 		// off the current predecessor). See {@link staleGapRecovery}.
-		return this.staleGapRecovery(cert);
+		return this.staleGapRecovery(cert, placement);
 	}
 
 	/**
@@ -361,9 +433,9 @@ class CachingMembershipVerifier implements MembershipVerifier {
 	 * reach the source, so a {@link RefetchBound}-suppressed refetch observes no cert and recovery paces itself
 	 * with the (bounded) refetch rate — intended, do not "fix" that pacing.
 	 */
-	private staleGapRecovery(cert: MembershipCertV1): CertTrust {
+	private staleGapRecovery(cert: MembershipCertV1, placement: RootPlacement | undefined): CertTrust {
 		const coordKey = cert.cohortCoord;
-		const locked = this.byCoord.get(coordKey);
+		const locked = this.heldUnder(coordKey, placement);
 		// Recovery-eligible only on an explicit rotation gap: a full attestation whose prevEpoch is neither the
 		// cert's own epoch (a self-referential rotation) nor the cached trusted epoch (a forgery off the current
 		// predecessor — the case the lock exists to reject).
@@ -394,8 +466,8 @@ class CachingMembershipVerifier implements MembershipVerifier {
 	 * cert (a failed/absent rotation, including a forged rotation off a trusted predecessor) is **rejected**
 	 * — no silent TOFU downgrade — which is what gives the attestation chain its teeth.
 	 */
-	private fallbackTrust(cert: MembershipCertV1): CertTrust {
-		return this.byCoord.get(cert.cohortCoord)?.trusted ? "reject" : "tofu";
+	private fallbackTrust(cert: MembershipCertV1, placement: RootPlacement | undefined): CertTrust {
+		return this.heldUnder(cert.cohortCoord, placement)?.trusted ? "reject" : "tofu";
 	}
 
 	/** Whether a cert carries a full rotation attestation (all three fields; validated all-or-nothing on the wire). */
@@ -409,12 +481,12 @@ class CachingMembershipVerifier implements MembershipVerifier {
 	 * quorum over this cert's signing payload via `rotationSig`. A predecessor that only reached the cache via
 	 * TOFU (not trusted) must not anchor the successor — the trusted-cache invariant.
 	 */
-	private chainGrantsTrust(cert: MembershipCertV1): boolean {
+	private chainGrantsTrust(cert: MembershipCertV1, placement: RootPlacement | undefined): boolean {
 		const prevEpoch = cert.prevEpoch!;
 		if (prevEpoch === cert.cohortEpoch) {
 			return false; // a cert cannot rotate from itself
 		}
-		const predecessor = this.byCoord.get(cert.cohortCoord);
+		const predecessor = this.heldUnder(cert.cohortCoord, placement);
 		if (predecessor === undefined || !predecessor.trusted || predecessor.cert.cohortEpoch !== prevEpoch) {
 			return false;
 		}
@@ -425,7 +497,8 @@ class CachingMembershipVerifier implements MembershipVerifier {
 			b64urlToBytes(cert.rotationSig!),
 			cert.rotationSigners!.map((s) => b64urlToBytes(s)),
 			predecessor.cert,
-			this.minSigs,
+			// The rotation is signed by the PREDECESSOR cohort, so the quorum is counted over its members.
+			this.minSigsFor(predecessor.cert, placement),
 		);
 	}
 
@@ -440,7 +513,7 @@ class CachingMembershipVerifier implements MembershipVerifier {
 	}
 
 	/** A cert is self-consistent only if its own threshold signature is a valid quorum of its members. */
-	private certIsSelfConsistent(cert: MembershipCertV1): boolean {
+	private certIsSelfConsistent(cert: MembershipCertV1, placement: RootPlacement | undefined): boolean {
 		// `signers` is validated only as a string array (not per-element base64url), so `b64urlToBytes`
 		// below may throw `CohortWireError` on a malformed signer — `loadFrom`'s try/catch turns that
 		// into "no cert" rather than letting it escape.
@@ -449,13 +522,18 @@ class CachingMembershipVerifier implements MembershipVerifier {
 			b64urlToBytes(cert.thresholdSig),
 			cert.signers.map((s) => b64urlToBytes(s)),
 			cert,
-			this.minSigs,
+			this.minSigsFor(cert, placement),
 		);
 	}
 
-	private messageVerifies(cert: MembershipCertV1, signers: readonly Uint8Array[], payload: Uint8Array, sig: Uint8Array): boolean {
-		return this.deps.signer.verifyThreshold(payload, sig, signers, cert, this.minSigs);
+	private messageVerifies(cert: MembershipCertV1, signers: readonly Uint8Array[], payload: Uint8Array, sig: Uint8Array, placement: RootPlacement | undefined): boolean {
+		return this.deps.signer.verifyThreshold(payload, sig, signers, cert, this.minSigsFor(cert, placement));
 	}
+}
+
+/** The membership-source options for a call: `{ rootPlaced: true }` under a placement, none otherwise. */
+function lookupOptionsFor(placement: RootPlacement | undefined): MembershipLookupOptions | undefined {
+	return placement === undefined ? undefined : { rootPlaced: true };
 }
 
 /** Pre-normalize a {@link TrustRoot} (raw bytes) to the cert's base64url form for cheap matching. */

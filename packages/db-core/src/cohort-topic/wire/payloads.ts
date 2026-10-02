@@ -13,6 +13,12 @@
  * `followOn`→`false`, `appPayload`→`null`, `bootstrapEvidence`→`null` with an empty string treated as
  * absent, `reattach`→`false`, `withdraw`→`false`) so an absent optional and a present-but-default
  * optional can never disagree across the wire round-trip.
+ *
+ * The root-placement fields (`RegisterV1.rootKey`, `CohortGossipV1.rootPlaced`) are the exception: each
+ * is appended to its image **only when present**, with no placeholder. A frame without the field
+ * therefore signs exactly the bytes it signed before the field existed, and the two forms cannot be
+ * confused — they differ in array length, and neither field has a "present but default" spelling (the
+ * validator rejects an empty `rootKey` and a `rootPlaced` other than `true`).
  */
 
 import type { CohortGossipV1, RegisterV1, RenewV1 } from "./types.js";
@@ -53,7 +59,15 @@ export function registerSigningPayload(body: RegisterSignable): Uint8Array {
 		// signer (participant) + verifier (db-p2p cohort) agree byte-for-byte. Safe to append: no register
 		// signatures are persisted (each is recomputed per verify), so there is no cross-version image concern.
 		body.followOn ?? false,
+		// The root key of a root-placed topic, appended only when present: a frame without one keeps the
+		// image above byte-for-byte, and stripping or swapping the key changes the image and fails verify.
+		...presentOnly(body.rootKey),
 	]));
+}
+
+/** `[value]` when the optional field is present, `[]` when absent — for a signed-image tail element with no placeholder. */
+function presentOnly<T>(value: T | undefined): T[] {
+	return value === undefined ? [] : [value];
 }
 
 /** Canonical signed byte image of a `RenewV1` body (every field except `signature`). */
@@ -86,6 +100,8 @@ export type CohortGossipSignable = Omit<CohortGossipV1, "signature">;
  * the signer and the receiver (which re-derives this image from the validated frame) agree byte-for-byte.
  * Absent optionals (`records`/`evicted`/`childLinks`/`childUnlinks`) normalize to `[]`, and `appState` to
  * `null`. `childLinks`/`childUnlinks` are covered so a MITM cannot strip or inject a child link/unlink.
+ * `rootPlaced` is appended after `timestamp` only when present, so a gossip for a default-addressed coord
+ * keeps its image unchanged and the flag cannot be added to, or removed from, a signed frame.
  */
 export function cohortGossipSigningPayload(g: CohortGossipSignable): Uint8Array {
 	return utf8.encode(JSON.stringify([
@@ -122,5 +138,6 @@ export function cohortGossipSigningPayload(g: CohortGossipSignable): Uint8Array 
 		(g.childLinks ?? []).map((c) => [c.topicId, c.childCohortCoord, c.effectiveAt]),
 		(g.childUnlinks ?? []).map((c) => [c.topicId, c.childCohortCoord, c.effectiveAt]),
 		g.timestamp,
+		...presentOnly(g.rootPlaced),
 	]));
 }

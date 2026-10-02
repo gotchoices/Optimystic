@@ -109,6 +109,71 @@ This is the only addressing scheme used by the layer. It replaces older bit-shif
 > distinct `(tier, H(P)-shard, topic)` triples never alias, and same-H(P)-prefix peers converge.
 > (Evidence: `addressing.spec.ts` "H(P)-shard collision rate".)
 
+### Root placement at a routing key
+
+A topic may put its root somewhere other than `H(0x00 ‖ topicId)`. It names a **root key** — raw bytes;
+for the application this exists for, the routing key of a block — and two rules change, for that topic
+only:
+
+```
+coord_0                     = H(rootKey)                               (root placement)
+minSigs at the root         = ceil(memberCount × quorumRatio)          (root quorum)
+```
+
+- **Root placement.** The root key is hashed exactly once, with no tier byte in front. That makes
+  `coord_0` the same ring position the key network derives for the same routing key (FRET's `hashKey`
+  is SHA-256 of the key bytes, and `RingHash` in `packages/db-core/src/cohort-topic/ring-hash.ts` is the
+  same digest at the default 256-bit ring width). The root cohort of such a topic is therefore the
+  group of peers responsible for that key — a block's storage group — instead of the FRET cohort of
+  `wantK` peers around a hash of the topic. Tiers `d ≥ 1` keep `coord_d(P, topicId)` unchanged.
+- **Root quorum.** A storage group is sized by storage placement, not by `wantK`, and is usually
+  smaller than the node-wide `minSigs`. So the root of a root-placed topic signs, and is verified, under
+  `ceil(memberCount × quorumRatio)`, where `memberCount` is the size of the member list the signers are
+  checked against and `quorumRatio` is **the verifying node's own configuration** — never a value read
+  from a message or a certificate. It is the formula a storage group's commit certificate is signed
+  under (`captureCommitCert` in `packages/db-p2p/src/cluster/cluster-repo.ts`), written the same way,
+  so the two agree on the threshold whenever they are given the same ratio: one member needs 1, four
+  members at `0.75` need 3. Every cohort that is not a root-placed root keeps `minSigs`.
+
+Both overrides are **per-topic data carried on the frames**, so every party derives the same answer
+without a registry of which topics are root-placed:
+
+| Field | Carried by | What it tells the receiver |
+| --- | --- | --- |
+| `RegisterV1.rootKey` | every tier's register frame of the topic | the root sits at `H(rootKey)`; a tier-1 cohort needs it to find its parent |
+| `ChildLinkV1.rootKey` | a tier-1 child's link to the root | the parent's served coord is `H(rootKey)`, not `coord_0(topicId)` |
+| `SignRequestV1.rootPlaced` | a sign request for a root-placed coord | derive the root group around the coord, not the FRET cohort |
+| `CohortGossipV1.rootPlaced` | gossip for a root-placed coord | the same, for a co-member with no engine for the coord yet |
+
+All four are optional and absent for a topic that uses the default addressing, which then computes
+exactly what it computed before they existed. Matchmaking does not use them. The two `rootKey` fields
+and the gossip flag are covered by their frame's signature — appended to the signed image only when
+present, so a frame without one signs the same bytes as before and the field cannot be stripped or
+swapped in transit. The sign-request flag is not signed (the request itself is not), and forging it
+gains nothing: the endorser applies its own member and epoch checks to whatever group it derives.
+
+A participant reaches a root-placed root by the rule that chose the group, not by nearest-peer ring
+routing: on a ring shared with another network the nearest peer to `H(rootKey)` can belong to that other
+network. `ITopicRouter` in `packages/db-core/src/cohort-topic/ports.ts` therefore has an optional
+`routeToRoot`, which the walk uses for the tier-0 step of a root-placed topic; a router without it gets
+the same frame by `routeAndAct` at `H(rootKey)`.
+
+> **Implementation (db-core).** `rootCoord` in `packages/db-core/src/cohort-topic/addressing.ts` is the
+> hash; `coord(d, P, topicId, rootKey?)` dispatches to it at `d = 0`. A participant names the key on
+> `RegisterRequest` or as the third argument of `lookup` (`packages/db-core/src/cohort-topic/service.ts`);
+> the walk stamps it on every frame and a renewal's re-walk reuses it, so a registration re-attaches at
+> the same root. A key is 1 to `MAX_ROOT_KEY_BYTES` (256) bytes
+> (`packages/db-core/src/cohort-topic/wire/validate.ts`). The threshold is `rootPlacedMinSigs` in
+> `packages/db-core/src/cohort-topic/sig/threshold.ts`, applied by the membership verifier when its
+> caller passes a `RootPlacement` (§Membership fetch). `createRootPlacement`, in the same file, rejects a
+> ratio outside `(0, 1]` where the rule is built rather than during verification.
+>
+> **A root key is not bound to its topic id.** `H(rootKey)` carries no tier byte or topic id by design —
+> that is what lets it equal the storage position — so nothing in the addressing stops a root key whose
+> hash lands on a coordinate some default-addressed topic also uses (the bytes `0x00 ‖ topicId` are a
+> valid root key). A node that serves coordinates must therefore treat "root-placed" as a property of
+> the cohort it serves at a coordinate, and refuse a frame that claims the other rule for it.
+
 ### Maximum useful depth
 
 A participant computes an upper bound on tree depth from FRET's network-size estimate:
@@ -531,6 +596,8 @@ A participant verifies a notification or threshold-signed message as follows:
 3. Look up the most recent `MembershipCertV1` for that coord, cached locally or fetched from any cohort member.
 4. Verify (a) the certificate is current, signed, and consistent with FRET stabilization, and (b) the signers in the message are a `≥ minSigs` subset of the certificate's members.
 
+**The threshold at a root-placed coord.** `minSigs` above is the node-wide `k − x`. For the root of a root-placed topic ([§Root placement at a routing key](#root-placement-at-a-routing-key)) the verifier instead uses `ceil(members × quorumRatio)`, where `members` is the member count of the certificate the signers are checked against and `quorumRatio` comes from the verifier's own configuration. The caller says which rule applies — it knows whether it derived the coord from a root key — by passing a `RootPlacement` to `verifyMessage`. The ratio rule then replaces `minSigs` in all three threshold checks made at that coord: the certificate's own signature, a rotation attestation (counted over the predecessor's members), and the message.
+
 `MembershipCertV1` is refreshed by the cohort every `T_membership_refresh` (default 5 minutes) and on any stabilization event that changes the cohort membership — i.e. any change to the epoch `H(sorted members)`, head or tail. Participants cache the latest one they've seen per coord; verification against a slightly stale cert is acceptable as long as the cert's signers overlap with the current cohort by quorum.
 
 > **Implementation.** Cohort-side publication (at stabilization, on any epoch change — any member
@@ -551,6 +618,17 @@ A participant verifies a notification or threshold-signed message as follows:
 > §Bootstrapping trust, below, for the trust gate that distinguishes a legitimate cohort from a
 > self-consistent forgery. The threshold-signature primitive is reused from FRET's `minSigs = k − x`
 > cohort-signature assembly via an injected port (db-core never imports FRET).
+>
+> **Root placement in the verifier.** Given a `RootPlacement`, the verifier applies the ratio threshold
+> (`minSigsFor` in `packages/db-core/src/cohort-topic/membership/verifier.ts`) and hands the placement on
+> to the two ports that need it to find and judge a root group: the membership source
+> (`current` / `fetch` receive `{ rootPlaced: true }`; `createMembershipSourceRouter` picks the source by
+> tier and leaves the option untouched) and the direct trust anchor (`directAnchor(cert, tier, placement)`).
+> A cached cert remembers the rule it was validated under, and a call under a different rule — a
+> placement where there was none, none where there was one, or another ratio — does not see the entry
+> (`heldUnder`, same file): it re-validates from the source under its own rule, so a cert that passed one
+> threshold is never taken as having passed another. A cert accepted that way does not displace a
+> *trusted* entry held under the other rule, so a call under the wrong rule cannot erase a trust lock.
 
 ### Bootstrapping trust
 
@@ -1416,6 +1494,7 @@ interface RegisterV1 {
   probe?:          boolean            // read-only lookup: classify + return the cohort snapshot, admit nothing
   appPayload?:     string             // opaque, application-defined
   bootstrapEvidence?: string          // cold-start evidence envelope, base64url (see note); on bootstrap OR followOn
+  rootKey?:        string             // root key of a root-placed topic, 1..256 bytes; on every tier's frame (see note)
   timestamp:       number             // unix ms
   correlationId:   string             // 16 bytes random
   signature:       string             // participant peer-key signature over the body (minus signature)
@@ -1445,6 +1524,13 @@ interface RegisterV1 {
 > non-replayable across topic / tier / peer / time. The envelope + bound image + PoW preimage/difficulty
 > are crypto-free db-core (`antidos/bootstrap-evidence-envelope.ts`); db-p2p binds the hashing and the
 > PoW / reputation / parent-reference verifiers.
+>
+> **Root key (`rootKey`).** Present on every frame of a root-placed topic
+> ([§Root placement at a routing key](#root-placement-at-a-routing-key)) and absent otherwise. The
+> validator rejects one that is empty, not base64url, or longer than 256 bytes. It is **covered by
+> `signature`**, but unlike the flags above it has no placeholder: it is appended to
+> `registerSigningPayload` only when present, so a frame without one signs the image it always signed, and
+> removing or replacing the key in transit changes the image and fails verification.
 
 > **Participant signature.** `signature` is the participant's libp2p peer-key (Ed25519) signature over
 > the deterministic byte image of the body **minus** the `signature` field
@@ -1552,6 +1638,7 @@ interface ChildLinkV1 {
   thresholdSig:          string     // child cohort threshold sig over childLinkSigningPayload (empty in key-less interim)
   signers:               string[]   // PeerIds, ≥ minSigs (empty in key-less interim)
   cohortEpoch:           string     // 32 bytes — the child cohort epoch the sig was collected under (LAST in the signing image)
+  rootKey?:              string     // root key of a root-placed topic, 1..256 bytes; set by a tier-1 child so the root can recompute its own coord
 }
 
 interface ChildLinkReplyV1 {
@@ -1569,7 +1656,8 @@ interface ChildLinkReplyV1 {
 > as a promotion notice), permissive only in the key-less interim; a live parent rejects an unsigned link
 > rather than silently record it. The signing image (`childLinkSigningPayload`) keeps `cohortEpoch` **last**
 > so the `/sign` endorser (kind `"childlink"`) reads the embedded epoch positionally, exactly like a
-> promotion / demotion notice.
+> promotion / demotion notice. A `rootKey`, when present, is covered by the same signature and is inserted
+> just **before** `cohortEpoch` for that reason; a link without one keeps its image unchanged.
 
 ### Promotion notice
 
@@ -1649,6 +1737,7 @@ interface CohortGossipV1 {
     childCohortCoord:   string
     effectiveAt:        number
   }[]
+  rootPlaced?:        true            // coord is the root of a root-placed topic (signed when present; never false)
   timestamp:          number
   signature:          string
 }

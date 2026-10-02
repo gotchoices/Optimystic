@@ -20,6 +20,17 @@
  *
  * The db-p2p binding is responsible for ensuring the coord byte layout (ring width) matches FRET's
  * `RING_BITS` so the routing keys produced here line up with FRET's ring on the wire.
+ *
+ * **Root placement at a routing key** (§Tier addressing → Root placement at a routing key). A topic may
+ * name a **root key** — raw bytes, e.g. a block's routing key — and then its tier-0 coordinate is
+ *
+ * ```
+ * coord_0 = H(rootKey)
+ * ```
+ *
+ * instead of `H(0x00 ‖ topicId)`. Tiers `d ≥ 1` are unchanged. The root key is hashed exactly once, with
+ * no tier byte in front, so the result is the same ring position the key network derives for that
+ * routing key — which is what puts the root on the peers that store the block.
  */
 
 import type { IRingHash, RingCoord } from "./ports.js";
@@ -30,10 +41,19 @@ export interface TierAddressing {
 	readonly F: number;
 	/** Tier-0 root coordinate: `H(0x00 ‖ topicId)`. Peer-independent. */
 	coord0(topicId: Uint8Array): RingCoord;
+	/**
+	 * `H(rootKey)` — the root coordinate of a root-placed topic. Byte-identical to FRET's
+	 * `hashKey(rootKey)` at the default ring width, so it is the position the key network places that
+	 * routing key at. Throws `RangeError` on an empty key (no block has an empty routing key).
+	 */
+	rootCoord(rootKey: Uint8Array): RingCoord;
 	/** Tier-`d` coordinate for `d ≥ 1`: `H(d ‖ prefix(H(P), d·log₂F) ‖ topicId)` where `H(P)` is the ring-hash of `peerId`. */
 	coordD(d: number, peerId: Uint8Array, topicId: Uint8Array): RingCoord;
-	/** Dispatches `d === 0` to {@link coord0}, otherwise to {@link coordD}. */
-	coord(d: number, peerId: Uint8Array, topicId: Uint8Array): RingCoord;
+	/**
+	 * Dispatches `d === 0` to {@link coord0} — or to {@link rootCoord} when the topic names a `rootKey` —
+	 * and every other tier to {@link coordD}. A `rootKey` at `d ≥ 1` does not change the coordinate.
+	 */
+	coord(d: number, peerId: Uint8Array, topicId: Uint8Array, rootKey?: Uint8Array): RingCoord;
 }
 
 /** Default fan-out per tier (`log₂16 = 4`). */
@@ -91,6 +111,13 @@ export class HashTierAddressing implements TierAddressing {
 		return this.hash.H(input);
 	}
 
+	rootCoord(rootKey: Uint8Array): RingCoord {
+		if (rootKey.length === 0) {
+			throw new RangeError("rootCoord requires a non-empty root key");
+		}
+		return this.hash.H(rootKey);
+	}
+
 	coordD(d: number, peerId: Uint8Array, topicId: Uint8Array): RingCoord {
 		if (!Number.isInteger(d) || d < 1) {
 			throw new RangeError(`coordD requires an integer tier d ≥ 1, got ${d}`);
@@ -109,8 +136,11 @@ export class HashTierAddressing implements TierAddressing {
 		return this.hash.H(input);
 	}
 
-	coord(d: number, peerId: Uint8Array, topicId: Uint8Array): RingCoord {
-		return d === 0 ? this.coord0(topicId) : this.coordD(d, peerId, topicId);
+	coord(d: number, peerId: Uint8Array, topicId: Uint8Array, rootKey?: Uint8Array): RingCoord {
+		if (d !== 0) {
+			return this.coordD(d, peerId, topicId);
+		}
+		return rootKey === undefined ? this.coord0(topicId) : this.rootCoord(rootKey);
 	}
 }
 

@@ -40,6 +40,41 @@ export interface ITopicRouter {
 	routeAndAct(key: RingCoord, activity: Uint8Array, opts: { wantK: number; minSigs: number }): Promise<Uint8Array>;
 	/** Direct dial to a cached primary; falls back to {@link routeAndAct} on failure (caller decides). */
 	dialMember(member: PeerRef, activity: Uint8Array): Promise<Uint8Array>;
+	/**
+	 * Deliver `activity` to the **root group** of a root-placed topic — the peers responsible for
+	 * `rootKey` — and return the encoded reply. Optional: the walk uses it for the tier-0 step of a
+	 * root-placed topic when the router has it, and otherwise falls back to
+	 * `routeAndAct(rootCoord(rootKey), …)`.
+	 *
+	 * It exists because the two can disagree: `routeAndAct` lands on the ring's nearest peer to the
+	 * coordinate, which on a ring shared with another network may be a peer of that other network, whereas
+	 * the root group is chosen by the rule storage placement uses. db-p2p binds this to the key network.
+	 */
+	routeToRoot?(rootKey: Uint8Array, activity: Uint8Array): Promise<Uint8Array>;
+}
+
+/**
+ * The per-coord rule for a **root-placed** cohort — the root of a topic whose tier-0 coordinate is
+ * `H(rootKey)` (see `addressing.ts`). Such a cohort is the group of peers responsible for the root key
+ * rather than the FRET cohort of `wantK`, so the node-wide `minSigs` does not describe it: its signature
+ * threshold is `ceil(memberCount × quorumRatio)`.
+ *
+ * `quorumRatio` is always the **verifying node's own** configuration, never a value read off a message or
+ * a certificate. Build one with `createRootPlacement` (`sig/threshold.ts`), which rejects a ratio outside
+ * `(0, 1]`.
+ */
+export interface RootPlacement {
+	/** Fraction of a root-placed cohort's members whose signatures make a quorum, in `(0, 1]`. */
+	readonly quorumRatio: number;
+}
+
+/** Options for a membership-cert lookup ({@link IMembershipSource}). */
+export interface MembershipLookupOptions {
+	/**
+	 * The coord is the root of a root-placed topic, so its cert is held by (and must be fetched from) the
+	 * root group rather than the FRET cohort around the coord.
+	 */
+	readonly rootPlaced?: true;
 }
 
 /** Intra-cohort gossip transport (FRET cohort gossip underneath). */
@@ -53,9 +88,9 @@ export interface ICohortGossipTransport {
 /** Authoritative cohort membership snapshots (FRET `MembershipCertV1` / stabilization underneath). */
 export interface IMembershipSource {
 	/** Current cached membership cert for `coord`, encoded; `undefined` if none is cached. */
-	current(coord: RingCoord): Promise<Uint8Array | undefined>;
+	current(coord: RingCoord, opts?: MembershipLookupOptions): Promise<Uint8Array | undefined>;
 	/** Force one refresh of `coord`'s membership cert (stale-cache retry); encoded, or `undefined`. */
-	fetch(coord: RingCoord): Promise<Uint8Array | undefined>;
+	fetch(coord: RingCoord, opts?: MembershipLookupOptions): Promise<Uint8Array | undefined>;
 }
 
 /**
@@ -113,8 +148,12 @@ export type TrustAnchorVerdict = "anchored" | "rejected" | "unknown";
  * for the db-core default (every coord `"unknown"`).
  */
 export interface IMembershipTrustAnchor {
-	/** Judge, from a directly-trusted source, whether `cert.members` is authoritative for `cert.cohortCoord` at `tier`. */
-	directAnchor(cert: MembershipCertV1, tier: number): TrustAnchorVerdict;
+	/**
+	 * Judge, from a directly-trusted source, whether `cert.members` is authoritative for `cert.cohortCoord`
+	 * at `tier`. `placement` is present when the verifier was told the coord is root-placed, so the anchor
+	 * compares against the root group (and its threshold) rather than the FRET cohort around the coord.
+	 */
+	directAnchor(cert: MembershipCertV1, tier: number, placement?: RootPlacement): TrustAnchorVerdict;
 }
 
 /**
@@ -139,7 +178,7 @@ export interface TrustRoot {
  * the interim TOFU behavior (no regression) until db-p2p binds a real anchor.
  */
 export const noAuthorityTrustAnchor: IMembershipTrustAnchor = {
-	directAnchor(_cert: MembershipCertV1, _tier: number): TrustAnchorVerdict {
+	directAnchor(_cert: MembershipCertV1, _tier: number, _placement?: RootPlacement): TrustAnchorVerdict {
 		return "unknown";
 	},
 };

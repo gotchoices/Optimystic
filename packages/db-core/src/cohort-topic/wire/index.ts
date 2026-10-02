@@ -3,6 +3,7 @@ export * from "./codec.js";
 export * from "./payloads.js";
 export { CohortWireError } from "./validate.js";
 export {
+	MAX_ROOT_KEY_BYTES,
 	validateRegisterV1,
 	validateRegisterReplyV1,
 	validateRenewV1,

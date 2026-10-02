@@ -25,6 +25,11 @@
  *   `afterMs` — which begins again at `d_max`, decorrelating retries across the ring (§Anti-flood
  *   claim 4: never re-hit the declined coord immediately).
  *
+ * **Root-placed topics.** A walk given a `rootKey` (§Tier addressing → Root placement at a routing key)
+ * stamps it on every frame it builds and addresses its tier-0 step at `H(rootKey)` — delivered through
+ * {@link ITopicRouter.routeToRoot} when the router has it, else `routeAndAct` at that coord. Every other
+ * step, reply and back-off rule above is unchanged.
+ *
  * This module is FRET-free: it drives the {@link ITopicRouter} port (db-p2p binds it to FRET's
  * `RouteAndMaybeAct` / direct dial) and the {@link TierAddressing} math, and delegates building +
  * signing the {@link RegisterV1} to the injected {@link RegisterMessageFactory} (participant identity
@@ -84,6 +89,7 @@ export interface RegisterMessageFactory {
 	 * (§Anti-DoS — a follow-on is gated identically to a bootstrap) via the injected builder seam before
 	 * signing — keyed off `bootstrap`/`followOn`, so no extra parameter is needed (the walk decides both
 	 * internally, not the application). `bootstrap`, `followOn`, and `probe` are mutually exclusive.
+	 * A `rootKey` is stamped on the frame as `RegisterV1.rootKey` **before** signing, at every tier.
 	 */
 	build(params: {
 		topicId: Uint8Array;
@@ -95,7 +101,17 @@ export interface RegisterMessageFactory {
 		/** Read-only lookup probe: the factory stamps `RegisterV1.probe` and never mints cold-start evidence. */
 		probe: boolean;
 		appPayload?: Uint8Array;
+		/** Root key of a root-placed topic; absent for the default addressing. */
+		rootKey?: Uint8Array;
 	}): Promise<RegisterV1>;
+}
+
+/** Per-walk options for {@link WalkEngine.register}. */
+export interface WalkOptions {
+	/** Read-only lookup: classify without admitting, and never cold-start. */
+	readonly probe?: boolean;
+	/** Root key of a root-placed topic: the walk's tier-0 step targets `H(rootKey)` and every frame carries the key. */
+	readonly rootKey?: Uint8Array;
 }
 
 export interface WalkConfig {
@@ -139,9 +155,9 @@ export interface WalkEngine {
 	 * redirects outward. Resolves with the terminal {@link WalkOutcome}. With `opts.probe` the walk is a
 	 * **read-only lookup**: identical routing discipline, but the terminal cohort classifies rather than
 	 * admits and the root `no_state` branch backs off instead of issuing a `bootstrap: true` cold-start
-	 * (a probe never instantiates a cold root).
+	 * (a probe never instantiates a cold root). With `opts.rootKey` the topic is root-placed.
 	 */
-	register(topicId: Uint8Array, tier: number, appPayload?: Uint8Array, opts?: { probe?: boolean }): Promise<WalkOutcome>;
+	register(topicId: Uint8Array, tier: number, appPayload?: Uint8Array, opts?: WalkOptions): Promise<WalkOutcome>;
 }
 
 /**
@@ -172,10 +188,11 @@ class RouterWalkEngine implements WalkEngine {
 		this.maxMessageBytes = cfg.maxMessageBytes;
 	}
 
-	async register(topicId: Uint8Array, tier: number, appPayload?: Uint8Array, opts?: { probe?: boolean }): Promise<WalkOutcome> {
+	async register(topicId: Uint8Array, tier: number, appPayload?: Uint8Array, opts?: WalkOptions): Promise<WalkOutcome> {
 		const dMax = this.deps.dmax.dMax();
 		const maxSteps = this.configuredMaxSteps ?? 2 * (dMax + 2) + this.maxMemberRetries + 8;
 		const probe = opts?.probe ?? false;
+		const rootKey = opts?.rootKey;
 
 		let d = dMax;
 		let bootstrap = false;
@@ -200,14 +217,11 @@ class RouterWalkEngine implements WalkEngine {
 				return { kind: "retry_later", afterMs: backoffRetryMs(0) };
 			}
 
-			const reg = await this.deps.factory.build({ topicId, tier, treeTier: d, bootstrap, followOn, probe, appPayload });
+			const reg = await this.deps.factory.build({ topicId, tier, treeTier: d, bootstrap, followOn, probe, appPayload, rootKey });
 			const activity = encodeCohortMessage(reg, this.maxMessageBytes);
 			const raw = dialTarget !== undefined
 				? await this.deps.router.dialMember(dialTarget, activity)
-				: await this.deps.router.routeAndAct(this.deps.addressing.coord(d, this.deps.self, topicId), activity, {
-					wantK: this.wantK,
-					minSigs: this.minSigs,
-				});
+				: await this.routeToTier(d, topicId, rootKey, activity);
 			const reply = decodeRegisterReplyV1(raw, this.maxMessageBytes);
 
 			switch (reply.result) {
@@ -317,6 +331,22 @@ class RouterWalkEngine implements WalkEngine {
 				}
 			}
 		}
+	}
+
+	/**
+	 * Route one probe to the cohort at tier `d`. The root of a root-placed topic goes through the router's
+	 * `routeToRoot` when it has one, so the frame reaches the root group by the rule that chose it; a router
+	 * without it (a mock, an older binding) gets the same frame at `rootCoord(rootKey)` by ring routing.
+	 */
+	private routeToTier(d: number, topicId: Uint8Array, rootKey: Uint8Array | undefined, activity: Uint8Array): Promise<Uint8Array> {
+		const router = this.deps.router;
+		if (d === 0 && rootKey !== undefined && router.routeToRoot !== undefined) {
+			return router.routeToRoot(rootKey, activity);
+		}
+		return router.routeAndAct(this.deps.addressing.coord(d, this.deps.self, topicId, rootKey), activity, {
+			wantK: this.wantK,
+			minSigs: this.minSigs,
+		});
 	}
 }
 

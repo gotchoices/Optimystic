@@ -12,6 +12,7 @@ import { DEFAULT_D_MAX_CAP } from "../dmax.js";
 import {
 	assignDefined,
 	asObject,
+	b64urlBoundedLen,
 	b64urlField,
 	b64urlFixedLen,
 	COORD_BYTES,
@@ -20,6 +21,7 @@ import {
 	optFiniteNumber,
 	optString,
 	optStringArray,
+	optTrue,
 	reqBool,
 	reqEnum,
 	reqFiniteNumber,
@@ -79,6 +81,20 @@ function treeTier(value: number, what: string): number {
 /** Correlation-id byte width (a 16-byte nonce minted per walk probe / renew). */
 const CORRELATION_BYTES = 16;
 
+/**
+ * Ceiling on a decoded `rootKey` (the root key of a root-placed topic). A root key is a block's routing
+ * key — the UTF-8 of its block id, 43 bytes for a generated id — so 256 leaves room for a named block
+ * while keeping a hostile frame from carrying an arbitrarily large key into a hash input and a stored
+ * per-engine field.
+ */
+export const MAX_ROOT_KEY_BYTES = 256;
+
+/** Validate an optional `rootKey`: base64url of 1..{@link MAX_ROOT_KEY_BYTES} bytes, or absent. */
+function optRootKey(obj: Record<string, unknown>, what: string): string | undefined {
+	const rootKey = optString(obj, "rootKey", what);
+	return rootKey === undefined ? undefined : b64urlBoundedLen(rootKey, "rootKey", 1, MAX_ROOT_KEY_BYTES, what);
+}
+
 const REGISTER_RESULTS: readonly RegisterResult[] = [
 	"accepted",
 	"no_state",
@@ -136,6 +152,7 @@ export function validateRegisterV1(value: unknown): RegisterV1 {
 	if (bootstrapEvidence !== undefined && bootstrapEvidence !== "") {
 		out.bootstrapEvidence = b64urlField(bootstrapEvidence, "bootstrapEvidence", what);
 	}
+	assignDefined(out, "rootKey", optRootKey(obj, what));
 	return out;
 }
 
@@ -259,7 +276,8 @@ export function validateDemotionNoticeV1(value: unknown): DemotionNoticeV1 {
  * coord is not always 32 raw bytes, e.g. a multihash-encoded peer id in tests). When `minSigs`
  * is supplied AND the frame carries a threshold signature (`thresholdSig` non-empty), `signers.length` must
  * be `>= minSigs`; a key-less-interim frame carries neither, so that cross-field bound is skipped. `minSigs`
- * is optional so a bare structural decode (no quorum context) still narrows the frame.
+ * is optional so a bare structural decode (no quorum context) still narrows the frame. An optional
+ * `rootKey` (a tier-1 child of a root-placed topic) is bounded to 1..{@link MAX_ROOT_KEY_BYTES} bytes.
  */
 export function validateChildLinkV1(value: unknown, minSigs?: number): ChildLinkV1 {
 	const what = "ChildLinkV1";
@@ -274,7 +292,7 @@ export function validateChildLinkV1(value: unknown, minSigs?: number): ChildLink
 	if (minSigs !== undefined && thresholdSig.length > 0 && signers.length < minSigs) {
 		fail(`${what}: a signed child-link needs signers.length >= ${minSigs}, got ${signers.length}`);
 	}
-	return {
+	const out: ChildLinkV1 = {
 		v: 1,
 		topicId: b64urlFixedLen(reqString(obj, "topicId", what), "topicId", COORD_BYTES, what),
 		childCohortCoord: b64urlFixedLen(reqString(obj, "childCohortCoord", what), "childCohortCoord", COORD_BYTES, what),
@@ -286,6 +304,8 @@ export function validateChildLinkV1(value: unknown, minSigs?: number): ChildLink
 		signers,
 		cohortEpoch: b64urlFixedLen(reqString(obj, "cohortEpoch", what), "cohortEpoch", COORD_BYTES, what),
 	};
+	assignDefined(out, "rootKey", optRootKey(obj, what));
+	return out;
 }
 
 /** Validate a {@link ChildLinkReplyV1}: `result` in `linked | rejected`, optional human-readable `reason`. */
@@ -424,6 +444,7 @@ export function validateCohortGossipV1(value: unknown): CohortGossipV1 {
 		}
 		out.childUnlinks = childUnlinks.map(validateChildLinkRefV1);
 	}
+	assignDefined(out, "rootPlaced", optTrue(obj, "rootPlaced", what));
 	return out;
 }
 
@@ -433,13 +454,15 @@ export function validateSignRequestV1(value: unknown): SignRequestV1 {
 	const what = "SignRequestV1";
 	const obj = asObject(value, what);
 	requireV1(obj, what);
-	return {
+	const out: SignRequestV1 = {
 		v: 1,
 		kind: reqEnum(obj, "kind", SIGN_KINDS, what),
 		coord: b64urlFixedLen(reqString(obj, "coord", what), "coord", COORD_BYTES, what),
 		cohortEpoch: b64urlFixedLen(reqString(obj, "cohortEpoch", what), "cohortEpoch", COORD_BYTES, what),
 		payload: b64urlField(reqString(obj, "payload", what), "payload", what),
 	};
+	assignDefined(out, "rootPlaced", optTrue(obj, "rootPlaced", what));
+	return out;
 }
 
 export function validateSignReplyV1(value: unknown): SignReplyV1 {

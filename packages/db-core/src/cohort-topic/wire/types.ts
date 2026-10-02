@@ -67,6 +67,16 @@ export interface RegisterV1 {
 	 * absent (it normalizes to the same signed-image placeholder as an absent field).
 	 */
 	bootstrapEvidence?: string;
+	/**
+	 * Root key of a **root-placed** topic, base64url of the raw key bytes (1..`MAX_ROOT_KEY_BYTES`) — for
+	 * reactivity, the routing key of the collection's log tail block. When present the topic's tier-0
+	 * coordinate is `H(rootKey)` instead of `H(0x00 ‖ topicId)` (§Tier addressing → Root placement at a
+	 * routing key). Set on **every** tier's frame of such a topic, not only the root's: tiers `d ≥ 1` keep
+	 * their usual coordinate, but a tier-1 cohort needs the key to find its parent. Absent for every topic
+	 * that uses the default addressing. Covered by `signature` (appended to `registerSigningPayload` only
+	 * when present) so a MITM cannot strip or swap it.
+	 */
+	rootKey?: string;
 	/** Unix ms. */
 	timestamp: number;
 	/** 16 random bytes, base64url. */
@@ -197,6 +207,13 @@ export interface ChildLinkV1 {
 	signers: string[];
 	/** Child cohort epoch, 32 bytes base64url (the epoch the threshold sig was collected under). */
 	cohortEpoch: string;
+	/**
+	 * Root key of a root-placed topic (see {@link RegisterV1.rootKey}), base64url. Set by a **tier-1** child
+	 * of such a topic so its parent — the root, which sits at `H(rootKey)` rather than `coord_0(topicId)` —
+	 * can recompute its own served coord when binding the parent-child relationship. Absent otherwise.
+	 * Covered by the child cohort's threshold signature (`childLinkSigningPayload`, only when present).
+	 */
+	rootKey?: string;
 }
 
 /** Parent → child ack. `linked` flips the child `awaiting_parent → serving`; `rejected` keeps it awaiting. */
@@ -363,6 +380,13 @@ export interface CohortGossipV1 {
 	 * converges to unlinked regardless of arrival order.
 	 */
 	childUnlinks?: ChildLinkRefV1[];
+	/**
+	 * Present (and literally `true`) when {@link coord} is the root of a root-placed topic. It tells a
+	 * co-member that has no engine for the coord yet to derive the **root group** around it rather than the
+	 * FRET cohort (§Tier addressing → Root placement at a routing key). Absent for every other coord.
+	 * Covered by {@link signature} when present.
+	 */
+	rootPlaced?: true;
 	timestamp: number;
 	signature: string;
 }
@@ -410,6 +434,15 @@ export interface SignRequestV1 {
 	cohortEpoch: string;
 	/** The already-canonical signing bytes (the requester's `sig/payloads.ts` image), base64url. */
 	payload: string;
+	/**
+	 * Present (and literally `true`) when `coord` is the root of a root-placed topic, so an endorser with no
+	 * engine for the coord derives the root group around it rather than the FRET cohort. The request is not
+	 * itself signed, so the flag is forgeable — harmlessly: the endorser still applies its own member and
+	 * epoch checks against the group it derives, and a signature set collected from a root group has at
+	 * most that group's size, which falls short of the default threshold a verifier applies to a coord it
+	 * was not told is root-placed (a storage group is smaller than the default `minSigs` of 14).
+	 */
+	rootPlaced?: true;
 }
 
 /** A member's endorsement of a {@link SignRequestV1}: its peer-key signature over the request payload. */

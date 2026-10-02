@@ -32,6 +32,7 @@ import type { CohortGossipBus } from "./gossip/bus.js";
 import type { MembershipVerifier } from "./membership/verifier.js";
 import type { Tier } from "./tiers.js";
 import { bytesToB64url, b64urlToBytes, decodeRenewReplyV1, encodeCohortMessage } from "./wire/codec.js";
+import { MAX_ROOT_KEY_BYTES } from "./wire/validate.js";
 import type { RegisterReplyV1, RegisterV1, RenewReplyV1, TopicTrafficV1 } from "./wire/types.js";
 import type { CollectionChangeEvent, CommitCert } from "../transactor/change-notifier.js";
 
@@ -48,6 +49,12 @@ export interface CohortHint {
 	readonly cohortMembers: Uint8Array[];
 	/** Coarse traffic barometer, when the cohort attached one. */
 	readonly topicTraffic?: TopicTrafficV1;
+	/**
+	 * The root key the topic was resolved under, when it is root-placed (its tier-0 cohort sits at
+	 * `H(rootKey)`). Absent for the default addressing. A caller verifying a message signed by that root
+	 * needs it to know the root's threshold rule applies.
+	 */
+	readonly rootKey?: Uint8Array;
 }
 
 /** A live registration: a {@link CohortHint} plus the participant-side renewal handle behind it. */
@@ -85,6 +92,13 @@ export interface RegisterRequest {
 	readonly ttl?: number;
 	/** Mark this a cold-root bootstrap request. */
 	readonly bootstrap?: boolean;
+	/**
+	 * Place this topic's root at a routing key: raw key bytes (1..`MAX_ROOT_KEY_BYTES`), e.g. a block's
+	 * routing key. The topic's tier-0 cohort is then the group responsible for that key, at `H(rootKey)`,
+	 * instead of the cohort at `H(0x00 ‖ topicId)` (§Tier addressing → Root placement at a routing key).
+	 * Every participant of one topic must name the same key. Absent → the default addressing.
+	 */
+	readonly rootKey?: Uint8Array;
 }
 
 /** The substrate's participant-facing contract. */
@@ -93,8 +107,11 @@ export interface CohortTopicService {
 	register(req: RegisterRequest): Promise<RegistrationHandle>;
 	/** Run one `ttl/3` renewal cycle for `handle` (handles `primary_moved` + crash-failover). */
 	renew(handle: RegistrationHandle): Promise<void>;
-	/** Resolve the cohort for `topicId` at `tier` without keeping a live registration. */
-	lookup(topicId: Uint8Array, tier: Tier): Promise<CohortHint>;
+	/**
+	 * Resolve the cohort for `topicId` at `tier` without keeping a live registration. `rootKey` names the
+	 * root of a root-placed topic (see {@link RegisterRequest.rootKey}).
+	 */
+	lookup(topicId: Uint8Array, tier: Tier, rootKey?: Uint8Array): Promise<CohortHint>;
 	/** Stop renewing `handle` and send a best-effort signed withdraw tombstone so the cohort frees the
 	 * record immediately (TTL expiry remains the fallback if the primary is unreachable). */
 	withdraw(handle: RegistrationHandle): Promise<void>;
@@ -213,21 +230,23 @@ class WalkRegisterService implements CohortTopicService {
 	}
 
 	async register(req: RegisterRequest): Promise<RegistrationHandle> {
-		const outcome = await this.walk.register(req.topicId, req.tier, req.appPayload);
+		assertRootKey(req.rootKey);
+		const outcome = await this.walk.register(req.topicId, req.tier, req.appPayload, { rootKey: req.rootKey });
 		return this.handleFromOutcome(req, outcome);
 	}
 
-	async lookup(topicId: Uint8Array, tier: Tier): Promise<CohortHint> {
+	async lookup(topicId: Uint8Array, tier: Tier, rootKey?: Uint8Array): Promise<CohortHint> {
+		assertRootKey(rootKey);
 		// A read-only probe: it walks to the responsible cohort exactly as a register would and returns the
 		// same cohort snapshot, but admits NOTHING — no soft-state record, no arrival, no promotion trigger,
 		// no topic-budget touch, and never a cold-start instantiation. A topic served nowhere resolves to a
 		// `CohortBackoffError` (the probe never bootstraps a cold root), so a lookup leaves no throwaway
 		// registration behind to TTL-expire (§Application policies; the lookup-as-register interim is gone).
-		const outcome = await this.walk.register(topicId, tier, undefined, { probe: true });
+		const outcome = await this.walk.register(topicId, tier, undefined, { probe: true, rootKey });
 		if (outcome.kind !== "accepted") {
 			throw new CohortBackoffError(outcome.kind === "retry_later" ? outcome.afterMs : 0);
 		}
-		return this.hintFromReply(topicId, tier, outcome.reply);
+		return this.hintFromReply(topicId, tier, outcome.reply, rootKey);
 	}
 
 	async renew(handle: RegistrationHandle): Promise<void> {
@@ -274,7 +293,7 @@ class WalkRegisterService implements CohortTopicService {
 		if (outcome.kind !== "accepted") {
 			throw new CohortBackoffError(outcome.kind === "retry_later" ? outcome.afterMs : 0);
 		}
-		const hint = this.hintFromReply(req.topicId, req.tier, outcome.reply);
+		const hint = this.hintFromReply(req.topicId, req.tier, outcome.reply, req.rootKey);
 		const renewal = this.startRenewal(req, hint, outcome.correlationId);
 		return { ...hint, renewal };
 	}
@@ -324,12 +343,13 @@ class WalkRegisterService implements CohortTopicService {
 				return decodeRenewReplyV1(raw, this.maxMessageBytes);
 			},
 			relookup: async (): Promise<void> => {
-				await this.walk.register(req.topicId, req.tier, req.appPayload);
+				// The re-walk carries the original request's root key, so it re-registers at the same root.
+				await this.walk.register(req.topicId, req.tier, req.appPayload, { rootKey: req.rootKey });
 			},
 		};
 	}
 
-	private hintFromReply(topicId: Uint8Array, tier: Tier, reply: RegisterReplyV1): CohortHint {
+	private hintFromReply(topicId: Uint8Array, tier: Tier, reply: RegisterReplyV1, rootKey: Uint8Array | undefined): CohortHint {
 		if (reply.primary === undefined || reply.cohortEpoch === undefined) {
 			throw new CohortBackoffError(0);
 		}
@@ -341,6 +361,7 @@ class WalkRegisterService implements CohortTopicService {
 			cohortEpoch: b64urlToBytes(reply.cohortEpoch),
 			cohortMembers: (reply.cohortMembers ?? []).map(b64urlToBytes),
 			topicTraffic: reply.topicTraffic,
+			...(rootKey === undefined ? {} : { rootKey }),
 		};
 	}
 
@@ -398,6 +419,9 @@ class WalkRegisterService implements CohortTopicService {
 				if (params.appPayload !== undefined) {
 					body.appPayload = bytesToB64url(params.appPayload);
 				}
+				if (params.rootKey !== undefined) {
+					body.rootKey = bytesToB64url(params.rootKey);
+				}
 				return { ...body, signature: await this.deps.signer.signRegister(body) };
 			},
 		};
@@ -407,6 +431,16 @@ class WalkRegisterService implements CohortTopicService {
 	 * keys on it — so it cannot be derived from the clock (two probes in the same ms would collide). */
 	private freshCorrelationId(): string {
 		return bytesToB64url(randomBytes(16));
+	}
+}
+
+/**
+ * Reject a root key no cohort would accept. The wire validator refuses an empty or over-long `rootKey`,
+ * so sending one would only surface as a remote decode failure; it is a caller error, raised here.
+ */
+function assertRootKey(rootKey: Uint8Array | undefined): void {
+	if (rootKey !== undefined && (rootKey.length === 0 || rootKey.length > MAX_ROOT_KEY_BYTES)) {
+		throw new RangeError(`cohort-topic: rootKey must be 1..${MAX_ROOT_KEY_BYTES} bytes, got ${rootKey.length}`);
 	}
 }
 

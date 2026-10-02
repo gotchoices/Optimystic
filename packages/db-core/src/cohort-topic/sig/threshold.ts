@@ -12,12 +12,39 @@
  * the signature must verify against the payload. Either failure → not verified.
  */
 
-import type { ICohortThresholdCrypto } from "../ports.js";
+import type { ICohortThresholdCrypto, RootPlacement } from "../ports.js";
 import { bytesToB64url } from "../wire/codec.js";
 import type { MembershipCertV1 } from "../wire/types.js";
 
-/** Default cohort-signature threshold, `k − x` (see §Configuration). */
+/** Default cohort-signature threshold, `k − x` (see §Configuration). The rule for every coord that is not root-placed. */
 export const DEFAULT_MIN_SIGS = 14;
+
+/**
+ * Build the {@link RootPlacement} for a root-placed cohort from this node's own quorum ratio. A ratio
+ * outside `(0, 1]` (or not a number) is a configuration error and throws here, at construction, so
+ * verification never has to judge a malformed rule.
+ */
+export function createRootPlacement(quorumRatio: number): RootPlacement {
+	if (!(quorumRatio > 0 && quorumRatio <= 1)) {
+		throw new RangeError(`root placement quorumRatio must be in (0, 1], got ${quorumRatio}`);
+	}
+	return { quorumRatio };
+}
+
+/**
+ * Signature threshold of a root-placed cohort of `memberCount` members: `ceil(memberCount × quorumRatio)`.
+ *
+ * This is the formula `captureCommitCert` (`packages/db-p2p/src/cluster/cluster-repo.ts`) applies to a
+ * storage group's commit certificate — `ceil(|group| × superMajorityThreshold)` — written the same way on
+ * purpose (same multiplication, same rounding), so a commit certificate and a verifier given the same ratio
+ * agree on the threshold by construction. One member needs 1; four members at `0.75` need 3.
+ *
+ * The floor of 1 only matters for an empty member list, where the formula would yield 0 and "no signers"
+ * would count as a quorum; with it, a cert naming no members can never verify.
+ */
+export function rootPlacedMinSigs(memberCount: number, placement: RootPlacement): number {
+	return Math.max(1, Math.ceil(memberCount * placement.quorumRatio));
+}
 
 /** Threshold signer/verifier over the injected cohort crypto. Peer ids are raw bytes. */
 export interface CohortSigner {

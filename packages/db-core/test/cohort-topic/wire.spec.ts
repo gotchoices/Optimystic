@@ -640,6 +640,43 @@ describe('cohort-topic wire', () => {
 		});
 	});
 
+	describe('root key signing coverage', () => {
+		const imageOf = (payload: Uint8Array): unknown[] => JSON.parse(new TextDecoder().decode(payload)) as unknown[];
+
+		it('registerSigningPayload keeps its image without a rootKey, and binds one that is present', () => {
+			const { bootstrap: _b, ...base } = sampleRegister();
+			// A frame with no root key signs exactly the image it signed before the field existed.
+			expect(imageOf(registerSigningPayload(base))).to.deep.equal([
+				'RegisterV1', 1, base.topicId, base.tier, base.treeTier, base.participantCoord, base.ttl,
+				false, base.appPayload, null, base.timestamp, base.correlationId, false, false,
+			]);
+
+			const keyed: RegisterV1 = { ...base, rootKey: b64(43, 60) };
+			const signed = registerSigningPayload(keyed);
+			expect([...signed], 'stripping the key changes the image').to.not.deep.equal([...registerSigningPayload(base)]);
+			expect([...signed], 'swapping the key changes the image')
+				.to.not.deep.equal([...registerSigningPayload({ ...keyed, rootKey: b64(43, 61) })]);
+			// The verifier re-derives the image from the decoded frame, so the key must survive the round-trip.
+			expect([...registerSigningPayload(decodeRegisterV1(encodeCohortMessage(keyed)))]).to.deep.equal([...signed]);
+		});
+
+		it('childLinkSigningPayload keeps its image without a rootKey, and binds one that is present before the epoch', () => {
+			const link = sampleChildLink();
+			expect(imageOf(childLinkSigningPayload(link))).to.deep.equal([
+				'ChildLinkV1', link.topicId, link.childCohortCoord, link.childParticipantCoord, link.childTier, link.tier,
+				link.effectiveAt, link.cohortEpoch,
+			]);
+
+			const keyed: ChildLinkV1 = { ...link, rootKey: b64(43, 62) };
+			const image = imageOf(childLinkSigningPayload(keyed));
+			expect(image, 'the key is covered').to.include(keyed.rootKey);
+			expect(image[image.length - 1], 'cohortEpoch stays last (the /sign positional read)').to.equal(link.cohortEpoch);
+			expect(image, 'swapping the key changes the image')
+				.to.not.deep.equal(imageOf(childLinkSigningPayload({ ...keyed, rootKey: b64(43, 63) })));
+			expect(imageOf(childLinkSigningPayload(decodeChildLinkV1(encodeCohortMessage(keyed))))).to.deep.equal(image);
+		});
+	});
+
 	describe('MembershipCert rotation attestation', () => {
 		const withRotation = (): MembershipCertV1 => ({
 			...sampleMembershipCert(),
