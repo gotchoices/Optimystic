@@ -139,7 +139,6 @@ import {
 	type CorrelationReplayGuardConfig,
 	type DemotionNoticeV1,
 	type Forwarder,
-	type ICohortThresholdCrypto,
 	type ITopicRouter,
 	type MembershipCertPublisher,
 	type MembershipCertV1,
@@ -436,20 +435,6 @@ function createRootGroupSnapshots(deps: {
 interface RootGroupSupport {
 	readonly placement: RootPlacement;
 	readonly snapshots: RootGroupSnapshots;
-}
-
-/**
- * A {@link CohortSigner} whose assembly threshold is read at each signing: a root group's size is a
- * configuration constant, but the rule is `ceil(|members| × ratio)` over the members at that moment, and a
- * default engine's threshold is the node-wide `minSigs`. Verification takes its threshold as an argument,
- * so it is unchanged.
- */
-function createDynamicThresholdSigner(crypto: ICohortThresholdCrypto, minSigsNow: () => number): CohortSigner {
-	const verifying = createCohortSigner(crypto, 0); // `verifyThreshold` takes the threshold as an argument; the constructor's is unused there
-	return {
-		thresholdSign: (payload: Uint8Array): Promise<{ thresholdSig: Uint8Array; signers: Uint8Array[] }> => crypto.assemble(payload, minSigsNow()),
-		verifyThreshold: (payload, sig, signers, cert, minSigs): boolean => verifying.verifyThreshold(payload, sig, signers, cert, minSigs),
-	};
 }
 
 // The reputation-view shape the bootstrap-evidence referee verifier consults — `{ isBanned, getScore }`
@@ -2270,6 +2255,10 @@ function requireRootGroup(ctx: CoordEngineContext, servedCoord: RingCoord): Root
 	if (ctx.rootGroup === undefined) {
 		throw new Error("cohort-topic: a root-placed engine needs the host's rootGroup option");
 	}
+	// NOTE: the snapshot store is one LruMap shared with on-demand `/sign` reads, so a flood of root-placed
+	// sign requests at distinct coords landing between a dispatch path's `ensure` and this read could evict
+	// the entry it just filled; the register then fails on the stream instead of being served. If that ever
+	// shows up, hand the snapshot through `EnginePlacement` rather than re-reading it from the store here.
 	const view = ctx.rootGroup.snapshots.get(servedCoord);
 	if (view === undefined) {
 		throw new Error(`cohort-topic: root group snapshot for ${bytesToB64url(servedCoord)} must be read before its engine is created`);
@@ -2298,8 +2287,11 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	const adoptRootKey = (key: Uint8Array): void => {
 		rootKey = key;
 	};
-	/** A tier-1 engine of a root-placed topic has the root group as its parent (a demotion fans to that group). */
-	const parentRootPlaced = treeTier === 1 && rootKey !== undefined;
+	/**
+	 * A tier-1 engine of a root-placed topic has the root group as its parent (a demotion fans to that group).
+	 * Read at each use: the key may be adopted after creation (`adoptRootKey`).
+	 */
+	const parentRootPlaced = (): boolean => treeTier === 1 && rootKey !== undefined;
 	/**
 	 * Re-read the root group (the gossip-cadence refresh). A read that fails keeps the previous snapshot: a
 	 * member change is exactly what rotates the epoch and drives the rotation-attestation and republish paths,
@@ -2408,7 +2400,9 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 			// rotated past must not add a chunk the verifier would drop (signer ∉ members).
 			...(rootPlaced ? { rootPlaced: true as const, selfEligible: (): boolean => memberStrs().includes(selfStr) } : {}),
 		});
-		return createDynamicThresholdSigner(crypto, minSigsNow);
+		// The threshold is read at each signing: a root group's rule is `ceil(|members| × ratio)` over the members
+		// at that moment, a default engine's the node-wide `minSigs`.
+		return createCohortSigner(crypto, minSigsNow);
 	};
 	const noticeSigner = makeCoordSigner("promotion");
 	const membershipSigner = makeCoordSigner("membership");
@@ -2660,7 +2654,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		onAdmit: (rec): void => pending.touch(rec),
 		// A promotion notice signed on an arrival is broadcast to the cohort around this served coord
 		// (and the parent for a demotion). The engine only knows the notice; the host adds the coord.
-		onNotice: (notice): void => ctx.broadcastNotice?.(notice, servedCoord, parentRootPlaced),
+		onNotice: (notice): void => ctx.broadcastNotice?.(notice, servedCoord, parentRootPlaced()),
 		log,
 	});
 
@@ -2784,7 +2778,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 				continue;
 			}
 			if (notice !== undefined) {
-				ctx.broadcastNotice?.(notice, servedCoord, parentRootPlaced);
+				ctx.broadcastNotice?.(notice, servedCoord, parentRootPlaced());
 			}
 		}
 	};

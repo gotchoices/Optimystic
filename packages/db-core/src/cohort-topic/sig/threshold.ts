@@ -58,10 +58,10 @@ export interface CohortSigner {
 }
 
 class CryptoCohortSigner implements CohortSigner {
-	constructor(private readonly crypto: ICohortThresholdCrypto, private readonly minSigs: number) {}
+	constructor(private readonly crypto: ICohortThresholdCrypto, private readonly minSigsNow: () => number) {}
 
 	thresholdSign(payload: Uint8Array): Promise<{ thresholdSig: Uint8Array; signers: Uint8Array[] }> {
-		return this.crypto.assemble(payload, this.minSigs);
+		return this.crypto.assemble(payload, this.minSigsNow());
 	}
 
 	verifyThreshold(payload: Uint8Array, sig: Uint8Array, signers: readonly Uint8Array[], cert: MembershipCertV1, minSigs: number): boolean {
@@ -85,7 +85,12 @@ class CryptoCohortSigner implements CohortSigner {
 	}
 }
 
-/** Build a {@link CohortSigner} over the FRET-backed (in db-p2p) threshold crypto. */
-export function createCohortSigner(crypto: ICohortThresholdCrypto, minSigs: number = DEFAULT_MIN_SIGS): CohortSigner {
-	return new CryptoCohortSigner(crypto, minSigs);
+/**
+ * Build a {@link CohortSigner} over the FRET-backed (in db-p2p) threshold crypto. `minSigs` is the assembly
+ * threshold: a number for a cohort whose threshold is fixed (the node-wide `k − x`), or a function read at
+ * each signing for one whose threshold follows its member count (a root-placed cohort under
+ * {@link rootPlacedMinSigs}). Verification takes its threshold as an argument either way.
+ */
+export function createCohortSigner(crypto: ICohortThresholdCrypto, minSigs: number | (() => number) = DEFAULT_MIN_SIGS): CohortSigner {
+	return new CryptoCohortSigner(crypto, typeof minSigs === "number" ? (): number => minSigs : minSigs);
 }
