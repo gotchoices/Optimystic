@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
+import { bytesToB64url, encodeCohortMessage } from '@optimystic/db-core';
 import { MockNode } from '../../src/testing/cohort-topic-mesh-harness.js';
 import { handleRequestResponse } from '../../src/cohort-topic/stream-util.js';
 import { FretMembershipSource } from '../../src/cohort-topic/membership-source.js';
@@ -9,11 +10,16 @@ import { PROTOCOL_COHORT_MEMBERSHIP } from '../../src/cohort-topic/protocols.js'
 /**
  * `FretMembershipSource.fetch` over the real request/response framing. A cohort member with no published
  * certificate answers with no result (host.ts's membership responder replies `new Uint8Array(0)`), and fetch
- * must move on to the next member rather than caching or returning an empty certificate.
+ * must move on to the next member rather than caching or returning an empty certificate. A member that answers
+ * with a certificate for another coordinate is skipped the same way.
  */
 describe('cohort-topic: membership source fetch', () => {
 	const coord = new Uint8Array(32).fill(9);
-	const cert = new Uint8Array([0, 0, 0, 2, 0x7b, 0x7d]);
+	/** An encoded certificate naming `forCoord` (fetch checks only that it decodes and names the coord asked for). */
+	const certFor = (forCoord: Uint8Array): Uint8Array => encodeCohortMessage({
+		v: 1, cohortCoord: bytesToB64url(forCoord), cohortEpoch: bytesToB64url(new Uint8Array(32)), members: [], stabilizedAt: 0, thresholdSig: '', signers: [],
+	});
+	const cert = certFor(coord);
 
 	/** `n` in-process nodes on one registry, so a dial from one drives another's real handler. */
 	async function makeNodes(n: number): Promise<MockNode[]> {
@@ -36,18 +42,19 @@ describe('cohort-topic: membership source fetch', () => {
 		});
 	}
 
-	it('skips a member with no certificate and returns + caches the next member\'s', async () => {
-		const [client, empty, holder] = await makeNodes(3) as [MockNode, MockNode, MockNode];
+	it('skips members with no certificate or a certificate for another coordinate, and returns + caches the next one', async () => {
+		const [client, empty, wrong, holder] = await makeNodes(4) as [MockNode, MockNode, MockNode, MockNode];
 		const asked: string[] = [];
 		serveMembership(empty, new Uint8Array(0), asked); // host.ts's "no certificate" reply
+		serveMembership(wrong, certFor(new Uint8Array(32).fill(7)), asked);
 		serveMembership(holder, cert, asked);
 		const source = new FretMembershipSource(client as never, {
-			cohortPeers: () => [empty.peerId.toString(), holder.peerId.toString()],
+			cohortPeers: () => [empty.peerId.toString(), wrong.peerId.toString(), holder.peerId.toString()],
 		});
 
 		const fetched = await source.fetch(coord);
 
-		expect(asked, 'the empty member was asked first, then the holder').to.deep.equal([empty.peerId.toString(), holder.peerId.toString()]);
+		expect(asked, 'each member was asked in turn until the holder').to.deep.equal([empty.peerId.toString(), wrong.peerId.toString(), holder.peerId.toString()]);
 		expect([...fetched!], 'fetch returns the holder\'s certificate').to.deep.equal([...cert]);
 		expect(source.has(coord), 'the fetched certificate is cached').to.equal(true);
 		expect([...(await source.current(coord))!]).to.deep.equal([...cert]);

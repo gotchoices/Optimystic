@@ -5,7 +5,10 @@
  * a threshold-signed message:
  *
  * 1. takes the message's `signers`, the cohort `coord` the signers should belong to, and the tier;
- * 2. looks up the cached `MembershipCertV1` for that coord (or pulls the source's `current`);
+ * 2. looks up the cached `MembershipCertV1` for that coord (or pulls the source's `current`); a
+ *    fetched cert is considered only if its own `cohortCoord` names that coord — a cert for any other
+ *    coord is treated as no cert, since the trust gate and the cache would otherwise be consulted for
+ *    the coord the cert names rather than the one being verified;
  * 3. checks the signers are a `≥ minSigs` subset of the cert's members and the signature verifies;
  * 4. **on failure against a cached/stale cert, re-fetches the cert from any cohort member exactly
  *    once and retries**; still failing → the message is untrusted.
@@ -268,7 +271,7 @@ class CachingMembershipVerifier implements MembershipVerifier {
 		// — provided it passed under the rule this call applies (see `heldUnder`).
 		let cert = this.heldUnder(coordKey, placement)?.cert;
 		if (cert === undefined) {
-			cert = await this.loadFrom(source.current(expectedCoord, lookup), tier, placement);
+			cert = await this.loadFrom(source.current(expectedCoord, lookup), coordKey, tier, placement);
 		}
 		if (cert !== undefined && this.messageVerifies(cert, signers, payload, sig, placement)) {
 			this.staleGapStrikes.delete(coordKey); // a verify resets the consecutive stale-gap strike count
@@ -283,7 +286,7 @@ class CachingMembershipVerifier implements MembershipVerifier {
 		if (!this.refetchAllowed(coordKey, opts)) {
 			return "untrusted";
 		}
-		const refreshed = await this.loadFrom(source.fetch(expectedCoord, lookup), tier, placement);
+		const refreshed = await this.loadFrom(source.fetch(expectedCoord, lookup), coordKey, tier, placement);
 		if (refreshed !== undefined && this.messageVerifies(refreshed, signers, payload, sig, placement)) {
 			this.staleGapStrikes.delete(coordKey); // a verify resets the consecutive stale-gap strike count
 			return "verified";
@@ -330,11 +333,14 @@ class CachingMembershipVerifier implements MembershipVerifier {
 
 	/**
 	 * Decode an encoded cert, run it through the trust gate, cache it (with its trusted status), and return
-	 * it for message verification; `undefined` if absent, malformed, or rejected by the gate. A rejected
-	 * cert (failed self-consistency, a `"rejected"` direct anchor, or an un-anchored cert for an
-	 * already-trusted coord) is treated exactly like an absent cert, so the single refetch still fires.
+	 * it for message verification; `undefined` if absent, malformed, for a coord other than `coordKey`, or
+	 * rejected by the gate. A rejected cert (failed self-consistency, a `"rejected"` direct anchor, or an
+	 * un-anchored cert for an already-trusted coord) is treated exactly like an absent cert, so the single
+	 * refetch still fires. The coord check runs before the gate: the gate, the direct anchor and the cache
+	 * are all keyed on the cert's own `cohortCoord`, so a self-consistent cert for an unrelated coord would
+	 * otherwise pass as trust-on-first-use there and then verify a message for `coordKey`.
 	 */
-	private async loadFrom(pending: Promise<Uint8Array | undefined>, tier: number, placement: RootPlacement | undefined): Promise<MembershipCertV1 | undefined> {
+	private async loadFrom(pending: Promise<Uint8Array | undefined>, coordKey: string, tier: number, placement: RootPlacement | undefined): Promise<MembershipCertV1 | undefined> {
 		const encoded = await pending;
 		if (encoded === undefined) {
 			return undefined;
@@ -343,6 +349,9 @@ class CachingMembershipVerifier implements MembershipVerifier {
 		let trust: CertTrust;
 		try {
 			cert = decodeMembershipCertV1(encoded, this.deps.maxMessageBytes);
+			if (cert.cohortCoord !== coordKey) {
+				return undefined;
+			}
 			trust = this.certIsTrusted(cert, tier, placement);
 		} catch (err) {
 			if (err instanceof CohortWireError) {

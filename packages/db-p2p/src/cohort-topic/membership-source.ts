@@ -1,10 +1,13 @@
 import type { IMembershipSource, MembershipLookupOptions, RingCoord } from "@optimystic/db-core";
-import { bytesToB64url } from "@optimystic/db-core";
+import { bytesToB64url, decodeMembershipCertV1, CohortWireError } from "@optimystic/db-core";
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { Libp2p } from "libp2p";
 import type { CohortPeerResolver } from "./cohort-gossip-transport.js";
 import { requestResponse, DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
 import { PROTOCOL_COHORT_MEMBERSHIP } from "./protocols.js";
+import { createLogger } from "../logger.js";
+
+const log = createLogger("cohort-topic");
 
 export interface FretMembershipSourceOptions {
 	readonly membershipProtocol?: string;
@@ -54,25 +57,55 @@ export class FretMembershipSource implements IMembershipSource {
 	 * Synchronous local existence read over the in-memory cache: true iff a `MembershipCertV1` is cached for
 	 * `coord` (no network I/O). The parent-reference bootstrap-evidence verifier's existence view consults
 	 * this — an admission gate must never dial — so it reads the same `byCoord` map `current()` resolves from.
+	 *
+	 * NOTE: a cert cached here by {@link fetch} is only checked to *name* `coord`, never to be trusted — its
+	 * signatures and anchoring are the verifier's job. This is an existence hint, not a trust decision.
 	 */
 	has(coord: RingCoord): boolean {
 		return this.byCoord.has(bytesToB64url(coord));
 	}
 
+	/**
+	 * Ask `coord`'s holders in turn for its cert and cache the first reply that decodes and names `coord`. A
+	 * reply that fails to decode or names another coordinate is skipped and the next holder asked: the
+	 * verifier would discard it anyway, and a node in several cohorts may answer with the wrong one's cert.
+	 */
 	async fetch(coord: RingCoord, opts?: MembershipLookupOptions): Promise<Uint8Array | undefined> {
 		const request = coord; // the membership request frame is the raw coord bytes
+		const coordKey = bytesToB64url(coord);
 		for (const peerStr of await this.holdersOf(coord, opts)) {
+			let reply: Uint8Array | undefined;
 			try {
-				const reply = await requestResponse(this.node, peerIdFromString(peerStr), this.membershipProtocol, request, this.maxBytes);
-				if (reply !== undefined) {
-					this.cache(coord, reply);
-					return reply;
-				}
-			} catch {
-				// Try the next member; a stale-cache refetch tolerates an unreachable holder.
+				reply = await requestResponse(this.node, peerIdFromString(peerStr), this.membershipProtocol, request, this.maxBytes);
+			} catch (err) {
+				log("membership fetch: holder %s unreachable for %s: %o", peerStr, coordKey, err);
+				continue;
+			}
+			if (reply !== undefined && this.namesCoord(reply, coordKey, peerStr)) {
+				this.cache(coord, reply);
+				return reply;
 			}
 		}
 		return undefined;
+	}
+
+	/** Whether `reply` decodes as a membership cert for `coordKey`; logs and returns false otherwise. */
+	private namesCoord(reply: Uint8Array, coordKey: string, peerStr: string): boolean {
+		let cohortCoord: string;
+		try {
+			cohortCoord = decodeMembershipCertV1(reply, this.maxBytes).cohortCoord;
+		} catch (err) {
+			if (!(err instanceof CohortWireError)) {
+				throw err;
+			}
+			log("membership fetch: holder %s sent an undecodable cert for %s: %s", peerStr, coordKey, err.message);
+			return false;
+		}
+		if (cohortCoord !== coordKey) {
+			log("membership fetch: holder %s sent a cert for %s when asked for %s", peerStr, cohortCoord, coordKey);
+			return false;
+		}
+		return true;
 	}
 
 	/** The peers that hold `coord`'s cert: the root group under `{ rootPlaced: true }`, else the FRET cohort. */

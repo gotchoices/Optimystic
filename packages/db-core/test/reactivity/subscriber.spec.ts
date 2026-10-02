@@ -123,7 +123,8 @@ describe('reactivity subscriber delivery', () => {
 
 		const cert = (members: string[]): MembershipCertV1 => ({
 			v: 1,
-			cohortCoord: bytesToB64url(new Uint8Array(32)),
+			// The cert must name the coord the notification is verified at — its tail's reactivity root.
+			cohortCoord: bytesToB64url(reactivityRootCoord(b64urlToBytes(TAIL))),
 			cohortEpoch: bytesToB64url(new Uint8Array(32).fill(7)),
 			members,
 			stabilizedAt: 1_700_000_000_000,

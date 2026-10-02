@@ -416,6 +416,19 @@ describe('cohort-topic / membership trust anchoring', () => {
 		expect(r).to.equal('untrusted');
 	});
 
+	it('refuses a self-consistent cert that names another coord, and does not cache it there', async () => {
+		const otherCoord: RingCoord = sha256(new TextEncoder().encode('unrelated-coord')).slice(0, 32);
+		const foreign = buildCertOver({ coord: otherCoord, epoch: EPOCH, members: ADV });
+		const source = new MockSource(encodeCohortMessage(foreign), encodeCohortMessage(foreign));
+		// The anchor rejects any forgery for COORD and can say nothing about the unrelated coord.
+		const anchor: IMembershipTrustAnchor = { directAnchor: (cert) => (cert.cohortCoord === bytesToB64url(COORD) ? 'rejected' : 'unknown') };
+		const v = makeVerifier(source, { anchor });
+		expect(await v.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG))).to.equal('untrusted');
+		// Had the cert been cached under its own coord, this call would be served without asking the source.
+		await v.verifyMessage(advSignersFirstKx, otherCoord, 2, MSG, sign(MSG));
+		expect(source.currentCalls, 'the foreign cert was not cached under its own coord').to.equal(2);
+	});
+
 	it('accepts a cert the direct anchor vouches for ("anchored")', async () => {
 		const source = new MockSource(encodeCohortMessage(GOOD));
 		const v = makeVerifier(source, { anchor: constAnchor('anchored') });
