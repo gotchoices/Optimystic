@@ -112,10 +112,11 @@ export interface ICohortThresholdCrypto {
 /**
  * Sink the cohort uses to publish a `MembershipCertV1` (over FRET's `/membership` protocol).
  * db-core's publisher builds + threshold-signs the cert and hands it here; db-p2p serves it.
+ * A node serves one cohort per coordinate it is in, so a cert is published under its coordinate.
  */
 export interface IMembershipPublishSink {
-	/** Publish (advertise/serve) an already-signed membership certificate, encoded. */
-	publish(encodedCert: Uint8Array): void;
+	/** Publish (advertise/serve) an already-signed membership certificate, encoded, for cohort coord `coord`. */
+	publish(coord: RingCoord, encodedCert: Uint8Array): void;
 }
 
 /** Network-size estimate feeding `d_max`. */

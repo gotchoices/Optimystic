@@ -150,7 +150,7 @@ class SigningMembershipCertPublisher implements MembershipCertPublisher {
 			cert.rotationSig = bytesToB64url(rotation.rotationSig);
 			cert.rotationSigners = rotation.rotationSigners.map(bytesToB64url);
 		}
-		this.deps.sink.publish(encodeCohortMessage(cert, this.deps.maxMessageBytes));
+		this.deps.sink.publish(snapshot.coord, encodeCohortMessage(cert, this.deps.maxMessageBytes));
 		this.lastEpoch = bytesToB64url(snapshot.cohortEpoch);
 		this.lastPublishedAt = now;
 		return cert;

@@ -257,7 +257,7 @@ describe('cohort-topic: published MembershipCertV1 verifies via MembershipVerifi
 		const snapshot = { coord: COORD, cohortEpoch: EPOCH, members: members.map((m) => m.bytes), stabilizedAt: 2_000 };
 		const cert = await publisher.onStabilized(snapshot, 2_000);
 		expect(cert, 'publisher produced a cert').to.not.equal(undefined);
-		const encoded = sink.latest();
+		const encoded = sink.certFor(COORD);
 		expect(encoded, 'cert was served through the sink').to.not.equal(undefined);
 
 		// A participant-side verifier pulling the cert from a (mock) source must accept it for real.

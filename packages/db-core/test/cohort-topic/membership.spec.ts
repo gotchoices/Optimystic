@@ -229,7 +229,7 @@ describe('cohort-topic / membership cert publication', () => {
 
 	function capturingSink() {
 		const published: MembershipCertV1[] = [];
-		return { published, sink: { publish: (encoded: Uint8Array) => { published.push(decodeMembershipCertV1(encoded)); } } };
+		return { published, sink: { publish: (_coord: Uint8Array, encoded: Uint8Array) => { published.push(decodeMembershipCertV1(encoded)); } } };
 	}
 
 	// The cohort epoch is a pure function of the sorted member SET (production: `cohortEpoch = H(sorted all

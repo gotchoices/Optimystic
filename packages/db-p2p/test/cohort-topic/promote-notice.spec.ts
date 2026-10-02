@@ -102,7 +102,7 @@ async function encodedCertOver(members: Member[], byId: Map<string, Member>, min
 	const signer = createCohortSigner(assemblerFor(members[0]!, members, byId, 'membership'), minSigs);
 	const publisher = createMembershipCertPublisher({ signer, sink, minSigs });
 	await publisher.onStabilized({ coord: COORD, cohortEpoch: EPOCH, members: members.map((m) => m.bytes), stabilizedAt: 1_000 }, 1_000);
-	return sink.latest()!;
+	return sink.certFor(COORD)!;
 }
 
 /** A participant-side verify-only verifier reading cohort membership from `source`. */

@@ -16,6 +16,7 @@ import {
 	bytesToB64url,
 	b64urlToBytes,
 	encodeCohortMessage,
+	decodeMembershipCertV1,
 	registerSigningPayload,
 	renewSigningPayload,
 	cohortGossipSigningPayload,
@@ -108,6 +109,27 @@ function deliverGossip(node: FakeNode, frame: Uint8Array, from: PeerId): void {
 		throw new Error('node has no cohort-gossip handler');
 	}
 	handler(singleFrameStream(frame), { remotePeer: from });
+}
+
+/** Invoke `node`'s real `/membership` responder with `request`, as if `from` had asked; resolves to the reply body. */
+async function requestMembership(node: FakeNode, request: Uint8Array, from: PeerId): Promise<Uint8Array> {
+	const handler = node.handlers.get(DEFAULT_COHORT_TOPIC_PROTOCOLS.membership);
+	if (handler === undefined) {
+		throw new Error('node has no membership handler');
+	}
+	const sent: Uint8ArrayList[] = [];
+	await new Promise<void>((resolve, reject) => {
+		handler({
+			...singleFrameStream(request),
+			send: (data: Uint8ArrayList): boolean => { sent.push(data); return true; },
+			close: (): Promise<void> => { resolve(); return Promise.resolve(); },
+			abort: (err: Error): void => reject(err),
+		}, { remotePeer: from });
+	});
+	for await (const body of lp.decode(sent)) {
+		return body.subarray();
+	}
+	throw new Error('the membership responder closed without a reply frame');
 }
 
 /** A fake FRET whose `assembleCohort` returns `cohortFor(coord)` (host prepends self + dedupes). */
@@ -413,6 +435,32 @@ describe('cohort-topic: two-coord inbound routing isolation', () => {
 
 		expect(eA.holds(TOPIC, participant.bytes), 'coord A merged the record').to.equal(true);
 		expect(eB.holds(TOPIC, participant.bytes), 'coord B (same epoch) did NOT — routing isolates by coord').to.equal(false);
+
+		await host.stop();
+	});
+
+	it('a /membership request is answered with the cert published for the coordinate asked — not another served cohort’s', async () => {
+		const self = await makeMember();
+		const node = makeFakeNode(self.peerId);
+		const host = await createCohortTopicHost(node as never, makeFakeFret(() => []) as never, {
+			privateKey: self.key,
+			wantK: 1,
+			minSigs: 1,
+			gossipIntervalMs: 3_600_000,
+		});
+		const coordA = addressing.coord0(TOPIC);
+		const coordB = addressing.coord0(TOPIC2);
+		for (const coord of [coordA, coordB]) {
+			expect(await host.registry.forCoord(coord, 0 as Tier, self.bytes).onStabilized(1_000), 'each engine published its cert').to.not.equal(undefined);
+		}
+
+		for (const coord of [coordA, coordB]) {
+			const reply = await requestMembership(node, coord, self.peerId);
+			expect(decodeMembershipCertV1(reply).cohortCoord, 'the answer is the cert for the coordinate asked').to.equal(bytesToB64url(coord));
+		}
+		const unpublished = addressing.coord0(new Uint8Array(32).fill(1));
+		expect((await requestMembership(node, unpublished, self.peerId)).length, 'an unpublished coordinate gets the empty reply').to.equal(0);
+		expect((await requestMembership(node, new Uint8Array(5), self.peerId)).length, 'a request that is not a coordinate gets the empty reply').to.equal(0);
 
 		await host.stop();
 	});

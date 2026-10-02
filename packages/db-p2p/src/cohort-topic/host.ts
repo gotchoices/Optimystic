@@ -72,6 +72,7 @@ import type { FretService } from "p2p-fret";
 import { hashPeerId, sendFramed } from "p2p-fret";
 import {
 	RingHash,
+	RING_BITS,
 	createRegistrationStore,
 	createSlotAssigner,
 	createCohortGossipBus,
@@ -778,7 +779,7 @@ interface CoordEngineContext {
 	readonly maxBytes: number;
 	/** `T_willingness_heartbeat` (ms): idle-but-willing heartbeat throttle (§Cold-start instantiation). */
 	readonly willingnessHeartbeatMs: number;
-	/** Membership-cert sink the per-coord publisher serves through (node-wide; serves this node's cohort). */
+	/** Membership-cert sink the per-coord publishers serve through (node-wide; one cert per served coord). */
 	readonly publishSink: FretMembershipPublishSink;
 	/**
 	 * The node's libp2p key, threaded so each coord engine's threshold signer can add self's own chunk.
@@ -948,7 +949,12 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			rootGroupPeers: (coord: RingCoord): Promise<readonly string[]> => rootGroup.snapshots.ensure(coord).then((snapshot) => snapshot.memberStrs),
 		}),
 	});
-	const publishSink = new FretMembershipPublishSink();
+	// A cert this node publishes is also cached in its own membership source under the cert's coordinate, so
+	// the parent-reference existence view (`membershipSource.has`) knows the coordinates this node serves.
+	// NOTE: an evicted engine's cert stays in the source cache (unbounded, like every fetched cert there) —
+	// `publishSink.forget` drops only what this node serves. If the source cache ever needs a bound, evict it
+	// beside `publishSink.forget` in `onEngineEvicted`.
+	const publishSink = new FretMembershipPublishSink((coord, encoded) => membershipSource.cache(coord, encoded));
 
 	const slots = createSlotAssigner(hash);
 	const barometer = createLoadBarometer();
@@ -1132,10 +1138,12 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		// Drop the verifier trust-lock for an evicted engine's coord — unconditional, because on a keyed node
 		// ANY engine (even one holding no records) may have published a cert via the gossip-cadence
 		// `pumpMembership` sweep. A no-op for a coord the verifier holds nothing for. A root-placed engine's
-		// snapshot goes with it (bounded maps only; a later frame reads the group afresh).
+		// snapshot goes with it (bounded maps only; a later frame reads the group afresh), and the coord's cert
+		// stops being served.
 		onEngineEvicted: (coord: RingCoord): void => {
 			verifier.forget(bytesToB64url(coord));
 			rootGroup?.snapshots.drop(coord);
+			publishSink.forget(coord);
 		},
 		// Node-level adopted-transition reader (engine seeding). Wired unconditionally — key-less hosts also
 		// adopt verified inbound notices, so their recreated engines need the seed just the same.
@@ -1521,7 +1529,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// --- protocol handlers + activity callback ---
 	// Await registration so the host is not returned (and dialed) before the five handlers are live —
 	// and, crucially, before the gossip driver below starts ticking (no tick may run on a half-wired node).
-	await registerCohortTopicProtocols(node, protocols, registry, handleRegisterFrame, signEndorse, verifier, promoteGate, gossipTransport, maybeInstantiateColdSibling, publishSink, membershipSource, selfCoord, maxBytes);
+	await registerCohortTopicProtocols(node, protocols, registry, handleRegisterFrame, signEndorse, verifier, promoteGate, gossipTransport, maybeInstantiateColdSibling, publishSink, maxBytes);
 	fret.setActivityHandler(async (activity: string, cohort: string[]): Promise<{ commitCertificate: string }> => {
 		const decoded = decodeCohortMessage(b64urlToBytes(activity), maxBytes);
 		// Decode-and-branch: a `ChildLinkV1` (a child cohort registering with this parent) runs the child-link
@@ -2411,11 +2419,28 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	// then emits an UNSIGNED link and the parent permissive-accepts it, matching the register-sig fallback).
 	const childLinkSigner = makeCoordSigner("childlink");
 
+	// Set by `close()` (registry eviction, or host `stop()`); makes every time-driven entry point below inert.
+	// The gossip-cadence driver iterates a `registry.all()` SNAPSHOT and awaits between engines, so an inbound
+	// register / child-link / cold-sibling frame landing in one of those awaits can evict — and close — an
+	// engine the tick is still walking. Driving a closed engine afterwards is not merely wasted work: a
+	// `pumpMembership` would publish a cert and re-run `onCertPublished` → `verifier.cache`, re-locking the very
+	// coord `onEngineEvicted` → `verifier.forget` had just released, for a coord this node no longer serves.
+	// Guarding here rather than in the driver keeps the invariant total: a closed engine does nothing, whoever
+	// still holds a reference to it. A publish already awaiting its threshold signature when the engine closes
+	// is dropped at the sink and at `onCertPublished`, so it cannot re-add what eviction just forgot.
+	let closed = false;
+
 	// Cohort-side membership-cert publisher: threshold-signs a MembershipCertV1 over this coord's cohort
 	// and serves it through the node's publish sink. Driven by the onStabilized / pumpMembership hooks.
 	const membershipPublisher: MembershipCertPublisher = createMembershipCertPublisher({
 		signer: membershipSigner,
-		sink: ctx.publishSink,
+		sink: {
+			publish: (coord: RingCoord, encodedCert: Uint8Array): void => {
+				if (!closed) {
+					ctx.publishSink.publish(coord, encodedCert);
+				}
+			},
+		},
 		minSigs: ctx.minSigs,
 		maxMessageBytes: ctx.maxBytes,
 	});
@@ -2474,16 +2499,6 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		}
 	};
 
-	// Set by `close()` (registry eviction, or host `stop()`); makes every time-driven entry point below inert.
-	// The gossip-cadence driver iterates a `registry.all()` SNAPSHOT and awaits between engines, so an inbound
-	// register / child-link / cold-sibling frame landing in one of those awaits can evict — and close — an
-	// engine the tick is still walking. Driving a closed engine afterwards is not merely wasted work: a
-	// `pumpMembership` would publish a cert and re-run `onCertPublished` → `verifier.cache`, re-locking the very
-	// coord `onEngineEvicted` → `verifier.forget` had just released, for a coord this node no longer serves.
-	// Guarding here rather than in the driver keeps the invariant total: a closed engine does nothing, whoever
-	// still holds a reference to it.
-	let closed = false;
-
 	/**
 	 * Publish (or refresh) this cohort's membership cert, attaching a rotation attestation when the cohort
 	 * identity (epoch) changed since the last publish. `refresh` selects the publisher path: `false` for a
@@ -2508,7 +2523,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		} else {
 			published = await (refresh ? membershipPublisher.tick(snapshot, now) : membershipPublisher.onStabilized(snapshot, now));
 		}
-		if (published !== undefined) {
+		if (published !== undefined && !closed) {
 			rotationState.recordPublished(current);
 			ctx.onCertPublished?.(published, rootGroup?.placement);
 		}
@@ -3666,8 +3681,6 @@ async function registerCohortTopicProtocols(
 	/** Instantiate a cold sibling's coord engine off a verified co-member frame (§Cold-start instantiation). */
 	maybeInstantiateColdSibling: (frame: Uint8Array) => Promise<void>,
 	publishSink: FretMembershipPublishSink,
-	membershipSource: FretMembershipSource,
-	selfCoord: RingCoord,
 	maxBytes: number,
 ): Promise<void> {
 	await Promise.all([
@@ -3692,14 +3705,11 @@ async function registerCohortTopicProtocols(
 			await handleInboundNotice(frame, peerIdToBytes(from), registry, verifier, promoteGate, Date.now(), maxBytes);
 		}, maxBytes)),
 
-		// membership: serve this node's latest published cert; cache any cert the requester returns.
-		registerProtocolHandler(node, protocols.membership, makeRequestHandler(async (frame): Promise<Uint8Array> => {
-			void frame; // request frame is the raw coord; this node serves its own cohort cert
-			const latest = publishSink.latest();
-			if (latest !== undefined) {
-				membershipSource.cache(selfCoord, latest);
-			}
-			return latest ?? new Uint8Array(0);
+		// membership: the request frame is the raw coord; serve the cert this node published for it, or the empty
+		// "no result" reply when it published none (or the frame is not a coord).
+		registerProtocolHandler(node, protocols.membership, makeRequestHandler((frame): Promise<Uint8Array> => {
+			const cert = frame.length === RING_BITS / 8 ? publishSink.certFor(frame) : undefined;
+			return Promise.resolve(cert ?? new Uint8Array(0));
 		}, maxBytes)),
 
 		// sign: per-member endorsement for threshold-signature assembly. Validate the request, run the
