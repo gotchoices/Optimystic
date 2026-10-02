@@ -200,15 +200,20 @@ describe('cohort-topic / membership verification', () => {
 			expect(await placed.verifyMessage(GROUP, COORD, 2, PAYLOAD, SIG, { placement })).to.equal('verified');
 			expect(placedSource.currentCalls, 'the placement entry is still cached').to.equal(2);
 
-			// The other direction. GOOD (16 members, 14 signers) is cached as trusted under the default rule and
-			// would pass the ratio's threshold of 12 if it were reused — but the source has nothing to offer, so a
-			// call under the placement finds no cert at all.
-			const emptySource = new MockSource();
-			const { v: byDefault } = verifier(emptySource);
+			// The other direction. GOOD (16 members, 14 signers) is self-published — trusted, the trust lock — under
+			// the default rule, and would pass the ratio's threshold of 12 if it were reused. A call under the
+			// placement must not reuse it: it goes to the source, and the group cert the source offers is used for
+			// that message but does NOT replace the lock, so the default rule still answers from GOOD without a
+			// source read and a second placement call reads the source again.
+			const groupSource = new MockSource(encoded, encoded);
+			const { v: byDefault } = verifier(groupSource);
 			byDefault.cache(GOOD);
-			expect(await byDefault.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG, { placement })).to.equal('untrusted');
-			expect(emptySource.currentCalls, 'the placement call went to the source').to.equal(1);
+			expect(await byDefault.verifyMessage(GROUP, COORD, 2, PAYLOAD, SIG, { placement })).to.equal('verified');
+			expect(groupSource.currentCalls, 'the placement call went to the source').to.equal(1);
 			expect(await byDefault.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG), 'the default entry is intact').to.equal('verified');
+			expect(groupSource.currentCalls, 'the lock answered without a source read').to.equal(1);
+			expect(await byDefault.verifyMessage(GROUP, COORD, 2, PAYLOAD, SIG, { placement })).to.equal('verified');
+			expect(groupSource.currentCalls, 'the group cert was not cached over the lock').to.equal(2);
 		});
 	});
 });

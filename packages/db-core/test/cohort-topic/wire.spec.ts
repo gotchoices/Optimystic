@@ -675,6 +675,15 @@ describe('cohort-topic wire', () => {
 				.to.not.deep.equal(imageOf(childLinkSigningPayload({ ...keyed, rootKey: b64(43, 63) })));
 			expect(imageOf(childLinkSigningPayload(decodeChildLinkV1(encodeCohortMessage(keyed))))).to.deep.equal(image);
 		});
+
+		it('cohortGossipSigningPayload covers rootPlaced only when present', () => {
+			const base = sampleGossip();
+			const flagged: CohortGossipV1 = { ...base, rootPlaced: true };
+			const image = imageOf(cohortGossipSigningPayload(flagged));
+			expect(image.length, 'the flag is one extra trailing element').to.equal(imageOf(cohortGossipSigningPayload(base)).length + 1);
+			expect(image[image.length - 1]).to.equal(true);
+			expect(imageOf(cohortGossipSigningPayload(decodeCohortGossipV1(encodeCohortMessage(flagged))))).to.deep.equal(image);
+		});
 	});
 
 	describe('MembershipCert rotation attestation', () => {

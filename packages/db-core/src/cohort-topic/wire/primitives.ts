@@ -205,21 +205,13 @@ export function b64urlBoundedLen(value: string, key: string, min: number, max: n
 		return failWire(`${what}: field "${key}" is not valid base64url`);
 	}
 	if (bytes.length < min || bytes.length > max) {
-		failWire(`${what}: field "${key}" must decode to ${min}..${max} bytes, got ${bytes.length}`);
+		const expected = min === max ? `${min}` : `${min}..${max}`;
+		failWire(`${what}: field "${key}" must decode to ${expected} bytes, got ${bytes.length}`);
 	}
 	return value;
 }
 
 /** Assert a base64url string decodes cleanly to exactly `len` bytes; returns it unchanged. */
 export function b64urlFixedLen(value: string, key: string, len: number, what: string): string {
-	let bytes: Uint8Array;
-	try {
-		bytes = b64urlToBytes(value);
-	} catch {
-		return failWire(`${what}: field "${key}" is not valid base64url`);
-	}
-	if (bytes.length !== len) {
-		failWire(`${what}: field "${key}" must decode to ${len} bytes, got ${bytes.length}`);
-	}
-	return value;
+	return b64urlBoundedLen(value, key, len, len, what);
 }

@@ -65,8 +65,12 @@ export function registerSigningPayload(body: RegisterSignable): Uint8Array {
 	]));
 }
 
-/** `[value]` when the optional field is present, `[]` when absent — for a signed-image tail element with no placeholder. */
-function presentOnly<T>(value: T | undefined): T[] {
+/**
+ * `[value]` when the optional field is present, `[]` when absent — spread into a signed image for an optional
+ * element with no placeholder, so a frame without the field keeps the image it signed before the field existed.
+ * Shared with the threshold-signature images in `sig/payloads.ts`.
+ */
+export function presentOnly<T>(value: T | undefined): T[] {
 	return value === undefined ? [] : [value];
 }
 

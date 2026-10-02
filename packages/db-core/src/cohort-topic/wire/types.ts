@@ -441,6 +441,10 @@ export interface SignRequestV1 {
 	 * epoch checks against the group it derives, and a signature set collected from a root group has at
 	 * most that group's size, which falls short of the default threshold a verifier applies to a coord it
 	 * was not told is root-placed (a storage group is smaller than the default `minSigs` of 14).
+	 *
+	 * NOTE: that last step rests on `clusterSize` (default 10) staying below `DEFAULT_MIN_SIGS` (14). A
+	 * deployment whose storage groups reach 14 members loses it; sign the request (or fold the flag into the
+	 * endorsed payload) before raising `clusterSize` that far.
 	 */
 	rootPlaced?: true;
 }

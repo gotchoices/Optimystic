@@ -18,6 +18,7 @@
  * version to negotiate).
  */
 
+import { presentOnly } from "../wire/payloads.js";
 import type { ChildLinkV1, DemotionNoticeV1, MembershipCertV1, PromotionNoticeV1 } from "../wire/types.js";
 
 const utf8 = new TextEncoder();
@@ -59,6 +60,5 @@ export type ChildLinkSignable = Pick<ChildLinkV1, "topicId" | "childCohortCoord"
  * with it signs nine elements, so stripping or swapping the key fails verification.
  */
 export function childLinkSigningPayload(n: ChildLinkSignable): Uint8Array {
-	const rootKey = n.rootKey === undefined ? [] : [n.rootKey];
-	return utf8.encode(JSON.stringify(["ChildLinkV1", n.topicId, n.childCohortCoord, n.childParticipantCoord, n.childTier, n.tier, n.effectiveAt, ...rootKey, n.cohortEpoch]));
+	return utf8.encode(JSON.stringify(["ChildLinkV1", n.topicId, n.childCohortCoord, n.childParticipantCoord, n.childTier, n.tier, n.effectiveAt, ...presentOnly(n.rootKey), n.cohortEpoch]));
 }

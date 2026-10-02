@@ -156,7 +156,10 @@ A participant reaches a root-placed root by the rule that chose the group, not b
 routing: on a ring shared with another network the nearest peer to `H(rootKey)` can belong to that other
 network. `ITopicRouter` in `packages/db-core/src/cohort-topic/ports.ts` therefore has an optional
 `routeToRoot`, which the walk uses for the tier-0 step of a root-placed topic; a router without it gets
-the same frame by `routeAndAct` at `H(rootKey)`.
+the same frame by `routeAndAct` at `H(rootKey)` — addressed by coordinate, as every other tier is, which
+through the FRET binding today does **not** reach the storage group: that binding hashes the key it is
+handed once more (backlog `bug-cohort-topic-router-hashes-a-coordinate-as-a-key`), so only `routeToRoot`
+gets there.
 
 > **Implementation (db-core).** `rootCoord` in `packages/db-core/src/cohort-topic/addressing.ts` is the
 > hash; `coord(d, P, topicId, rootKey?)` dispatches to it at `d = 0`. A participant names the key on

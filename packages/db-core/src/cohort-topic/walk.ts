@@ -337,6 +337,11 @@ class RouterWalkEngine implements WalkEngine {
 	 * Route one probe to the cohort at tier `d`. The root of a root-placed topic goes through the router's
 	 * `routeToRoot` when it has one, so the frame reaches the root group by the rule that chose it; a router
 	 * without it (a mock, an older binding) gets the same frame at `rootCoord(rootKey)` by ring routing.
+	 *
+	 * NOTE: the fallback addresses the root exactly as every other tier is addressed — by its coordinate —
+	 * and inherits whatever the binding does with a coordinate. The FRET binding hashes the key it is handed
+	 * once more, so through it this step lands at `H(H(rootKey))`, not at the storage group (backlog
+	 * `bug-cohort-topic-router-hashes-a-coordinate-as-a-key`); only `routeToRoot` reaches the group there.
 	 */
 	private routeToTier(d: number, topicId: Uint8Array, rootKey: Uint8Array | undefined, activity: Uint8Array): Promise<Uint8Array> {
 		const router = this.deps.router;
