@@ -27,8 +27,8 @@ export interface FretMembershipSourceOptions {
  * FRET-backed {@link IMembershipSource}: cohort membership snapshots over
  * `/optimystic/cohort-topic/1.0.0/membership`. `current` serves the locally-cached encoded
  * `MembershipCertV1`; `fetch` forces one refresh by requesting the cert from an assembled cohort
- * member (the stale-cache retry the participant-side verifier drives). The host feeds inbound certs
- * into the cache via {@link cache}.
+ * member (the stale-cache retry the participant-side verifier drives), caching the reply. Only fetched
+ * certs land in the cache: this node's own published certs are served from the publish sink, not cached here.
  *
  * A fetch for the root of a root-placed topic (`{ rootPlaced: true }`) asks the **root group** — the peers
  * {@link FretMembershipSourceOptions.rootGroupPeers} names — instead of the FRET cohort around the coord,
@@ -116,7 +116,7 @@ export class FretMembershipSource implements IMembershipSource {
 		return this.rootGroupPeers === undefined ? [] : this.rootGroupPeers(coord);
 	}
 
-	/** Cache an encoded cert for its coord (host feeds inbound/served certs here). */
+	/** Cache an encoded cert for its coord ({@link fetch} feeds it; the host exposes it for test seeding). */
 	cache(coord: RingCoord, encodedCert: Uint8Array): void {
 		this.byCoord.set(bytesToB64url(coord), encodedCert);
 	}

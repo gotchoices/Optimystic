@@ -2,3 +2,4 @@ warning: in the working copy of 'tickets/plan/1-reactivity-notifications-need-th
 [runner] .pre-existing-known.md: 1 entry-shaped line(s), none parsed — the ledger is tracking nothing (pruning resolved entries).
 warning: in the working copy of 'packages/db-core/test/reactivity/subscriber.spec.ts', CRLF will be replaced by LF the next time Git touches it
 warning: in the working copy of 'packages/db-p2p/test/cohort-topic/membership-source.spec.ts', CRLF will be replaced by LF the next time Git touches it
+  ⚠ refresh-index failed: database is locked

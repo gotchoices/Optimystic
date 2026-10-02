@@ -45,3 +45,7 @@ today). That deliberately leaves a real node admitting **any** evidence-less T0/
 `createCohortTopicHost({ committedParentTopicReader })`, which flips the host's `hasCommittedParentBacking`
 to `true` and re-enables the real T0/T1 parent-reference gate with no further host change. Wiring that
 reader is part of *this* work — don't land the content check without re-closing the T0/T1 gate.
+
+## Evidence: "the parent exists" is cheap to manufacture today
+
+(Added in the review of `membership-protocol-serves-the-certificate-for-the-coordinate-asked`.) The host creates a coord engine for any register frame *before* the engine's anti-DoS gate judges it (`dispatchRegister` → `registry.forCoord` in `packages/db-p2p/src/cohort-topic/host.ts`), and on a keyed node the gossip-cadence sweep (`pumpMembership`) publishes a membership cert for every engine, record-less ones included. So a register for topic X that the gate refuses still leaves X's tier-0 cohort serving a cert, and any node that later fetches it (for example while verifying a forged notice naming `coord_0(X)`) caches it, after which `FretMembershipSource.has(coord_0(X))` admits a T2/T3 parent reference to X. The review deliberately kept a node's *own* published certs out of that cache (`NOTE:` at `publishSink` in `createCohortTopicHost`), which would have made this a one-frame step on the deciding node itself; the fetched-cert path remains. A content check of the kind this ticket describes closes both; a narrower fix is to count a parent only when its cohort holds at least one admitted registration.

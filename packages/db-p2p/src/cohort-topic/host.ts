@@ -72,7 +72,6 @@ import type { FretService } from "p2p-fret";
 import { hashPeerId, sendFramed } from "p2p-fret";
 import {
 	RingHash,
-	RING_BITS,
 	createRegistrationStore,
 	createSlotAssigner,
 	createCohortGossipBus,
@@ -949,12 +948,11 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			rootGroupPeers: (coord: RingCoord): Promise<readonly string[]> => rootGroup.snapshots.ensure(coord).then((snapshot) => snapshot.memberStrs),
 		}),
 	});
-	// A cert this node publishes is also cached in its own membership source under the cert's coordinate, so
-	// the parent-reference existence view (`membershipSource.has`) knows the coordinates this node serves.
-	// NOTE: an evicted engine's cert stays in the source cache (unbounded, like every fetched cert there) —
-	// `publishSink.forget` drops only what this node serves. If the source cache ever needs a bound, evict it
-	// beside `publishSink.forget` in `onEngineEvicted`.
-	const publishSink = new FretMembershipPublishSink((coord, encoded) => membershipSource.cache(coord, encoded));
+	// NOTE: deliberately NOT fed into `membershipSource`. That cache backs the T2/T3 parent-reference existence
+	// view (`membershipSource.has`), and an engine — which publishes on every gossip tick — is created by any
+	// register frame before the anti-DoS gate judges it, so self-caching would let a refused register make its
+	// topic "exist" here as a parent. If a self-served parent should ever count, gate it on admitted records.
+	const publishSink = new FretMembershipPublishSink();
 
 	const slots = createSlotAssigner(hash);
 	const barometer = createLoadBarometer();
@@ -3706,11 +3704,9 @@ async function registerCohortTopicProtocols(
 		}, maxBytes)),
 
 		// membership: the request frame is the raw coord; serve the cert this node published for it, or the empty
-		// "no result" reply when it published none (or the frame is not a coord).
-		registerProtocolHandler(node, protocols.membership, makeRequestHandler((frame): Promise<Uint8Array> => {
-			const cert = frame.length === RING_BITS / 8 ? publishSink.certFor(frame) : undefined;
-			return Promise.resolve(cert ?? new Uint8Array(0));
-		}, maxBytes)),
+		// "no result" reply when it published none (a frame that is not a coord names nothing published).
+		registerProtocolHandler(node, protocols.membership, makeRequestHandler((frame): Promise<Uint8Array> =>
+			Promise.resolve(publishSink.certFor(frame) ?? new Uint8Array(0)), maxBytes)),
 
 		// sign: per-member endorsement for threshold-signature assembly. Validate the request, run the
 		// endorsement policy, and reply with this node's peer-key signature over the request payload (or a

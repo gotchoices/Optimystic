@@ -14,12 +14,8 @@ import { bytesToB64url } from "@optimystic/db-core";
 export class FretMembershipPublishSink implements IMembershipPublishSink {
 	private readonly byCoord = new Map<string, Uint8Array>();
 
-	/** `onPublish` sees every published cert after it is stored (the host feeds its membership source from it). */
-	constructor(private readonly onPublish?: (coord: RingCoord, encodedCert: Uint8Array) => void) {}
-
 	publish(coord: RingCoord, encodedCert: Uint8Array): void {
 		this.byCoord.set(bytesToB64url(coord), encodedCert);
-		this.onPublish?.(coord, encodedCert);
 	}
 
 	/** The encoded cert this node published for `coord`, or `undefined` if it has published none. */
