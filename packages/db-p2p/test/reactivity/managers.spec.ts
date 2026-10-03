@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import {
 	Tier,
-	reactivityTopicId,
+	reactivityCollectionTopicId,
 	decodeSubscribeAppPayload,
 	bytesToB64url,
 	coreProfile,
@@ -42,9 +42,11 @@ class FixedVerifier implements MembershipVerifier {
 	}
 }
 
-/** Recording mock cohort-topic service (mirrors the matchmaking manager tests). */
+/** Recording mock cohort-topic service (mirrors the matchmaking manager tests). Every registration lands at the root. */
 class RecordingService implements CohortTopicService {
 	readonly registers: RegisterRequest[] = [];
+	/** Every `moveRoot`: the root key the handle was moved to. */
+	readonly moves: Uint8Array[] = [];
 	renews = 0;
 	withdraws = 0;
 	onLocalCommit?: (event: CollectionChangeEvent, commitCert: CommitCert) => void;
@@ -56,9 +58,12 @@ class RecordingService implements CohortTopicService {
 		return {
 			topicId: req.topicId,
 			tier: req.tier,
+			treeTier: 0,
+			rootKey: req.rootKey,
 			primary: new Uint8Array(32),
 			backups: [],
 			cohortEpoch: new Uint8Array(32),
+			cohortMembers: [],
 			renewal: {},
 		} as unknown as RegistrationHandle;
 	}
@@ -71,8 +76,8 @@ class RecordingService implements CohortTopicService {
 	async withdraw(): Promise<void> {
 		this.withdraws++;
 	}
-	moveRoot(): never {
-		throw new Error('moveRoot not used by managers');
+	moveRoot(_handle: RegistrationHandle, rootKey: Uint8Array): void {
+		this.moves.push(rootKey);
 	}
 	cohortGossip(): never {
 		throw new Error('cohortGossip not used by managers');
@@ -88,12 +93,12 @@ const TAIL = new Uint8Array([9, 9, 9, 9]);
 const QUORUM_RATIO = 0.75;
 
 describe('reactivity / subscription manager', () => {
-	it('registers at tier T3 with the tail-anchored topic and the subscribe payload', async () => {
+	it('registers at tier T3 on the collection topic, with the tail as the root key and the subscribe payload', async () => {
 		const service = new RecordingService();
 		const manager = new ReactivitySubscriptionManager({
 			service,
 			collectionId: COLLECTION,
-			tailIdAtAttach: TAIL,
+			tail: TAIL,
 			quorumRatio: QUORUM_RATIO,
 			deliver: () => {},
 			profile: coreProfile(),
@@ -102,7 +107,8 @@ describe('reactivity / subscription manager', () => {
 		expect(service.registers).to.have.length(1);
 		const req = service.registers[0]!;
 		expect(req.tier).to.equal(Tier.T3);
-		expect([...req.topicId]).to.deep.equal([...reactivityTopicId(TAIL)]);
+		expect([...req.topicId], 'the topic is the collection\'s, not the tail\'s').to.deep.equal([...reactivityCollectionTopicId(COLLECTION)]);
+		expect([...req.rootKey!], 'the tail is the root key').to.deep.equal([...TAIL]);
 		expect(req.ttl).to.equal(SUBSCRIBER_TTL_CORE_MS);
 		const payload = decodeSubscribeAppPayload(req.appPayload!);
 		expect(payload.kind).to.equal('reactivity');
@@ -115,7 +121,7 @@ describe('reactivity / subscription manager', () => {
 		const manager = new ReactivitySubscriptionManager({
 			service,
 			collectionId: COLLECTION,
-			tailIdAtAttach: TAIL,
+			tail: TAIL,
 			quorumRatio: QUORUM_RATIO,
 			deliver: () => {},
 			profile: edgeProfile(),
@@ -130,7 +136,7 @@ describe('reactivity / subscription manager', () => {
 		const manager = new ReactivitySubscriptionManager({
 			service,
 			collectionId: COLLECTION,
-			tailIdAtAttach: TAIL,
+			tail: TAIL,
 			quorumRatio: QUORUM_RATIO,
 			deliver: () => {},
 			profile: coreProfile(),
@@ -144,7 +150,7 @@ describe('reactivity / subscription manager', () => {
 		const manager = new ReactivitySubscriptionManager({
 			service,
 			collectionId: COLLECTION,
-			tailIdAtAttach: TAIL,
+			tail: TAIL,
 			quorumRatio: QUORUM_RATIO,
 			deliver: () => {},
 			profile: coreProfile(),
@@ -159,7 +165,7 @@ describe('reactivity / subscription manager', () => {
 		const manager = new ReactivitySubscriptionManager({
 			service,
 			collectionId: COLLECTION,
-			tailIdAtAttach: TAIL,
+			tail: TAIL,
 			quorumRatio: QUORUM_RATIO,
 			deliver: () => {},
 			profile: coreProfile(),
@@ -171,7 +177,7 @@ describe('reactivity / subscription manager', () => {
 
 	it('renew is a no-op before the first register; withdraw drops via the substrate', async () => {
 		const service = new RecordingService();
-		const manager = new ReactivitySubscriptionManager({ service, collectionId: COLLECTION, tailIdAtAttach: TAIL, quorumRatio: QUORUM_RATIO, deliver: () => {} });
+		const manager = new ReactivitySubscriptionManager({ service, collectionId: COLLECTION, tail: TAIL, quorumRatio: QUORUM_RATIO, deliver: () => {} });
 		await manager.renew();
 		expect(service.renews).to.equal(0);
 		await manager.register();
@@ -185,7 +191,7 @@ describe('reactivity / subscription manager', () => {
 		const manager = new ReactivitySubscriptionManager({
 			service,
 			collectionId: COLLECTION,
-			tailIdAtAttach: TAIL,
+			tail: TAIL,
 			quorumRatio: QUORUM_RATIO,
 			deliver: (n) => delivered.push(n.revision),
 			lastKnownRev: 41,
@@ -211,7 +217,7 @@ describe('reactivity / subscription manager', () => {
 		const manager = new ReactivitySubscriptionManager({
 			service,
 			collectionId: COLLECTION,
-			tailIdAtAttach: TAIL,
+			tail: TAIL,
 			quorumRatio: QUORUM_RATIO,
 			deliver: (n) => delivered.push(n.revision),
 			lastKnownRev: 41,
@@ -254,7 +260,7 @@ describe('reactivity / subscription manager', () => {
 			const manager = new ReactivitySubscriptionManager({
 				service,
 				collectionId: COLLECTION,
-				tailIdAtAttach: TAIL,
+				tail: TAIL,
 				quorumRatio: QUORUM_RATIO,
 				deliver: (n) => { delivered.push(n.revision); if (n.revision === 14) resolveAll(); },
 				lastKnownRev: 10,
@@ -282,7 +288,7 @@ describe('reactivity / subscription manager', () => {
 			const manager = new ReactivitySubscriptionManager({
 				service,
 				collectionId: COLLECTION,
-				tailIdAtAttach: TAIL,
+				tail: TAIL,
 				quorumRatio: QUORUM_RATIO,
 				deliver: () => {},
 				lastKnownRev: 10,
@@ -307,7 +313,7 @@ describe('reactivity / subscription manager', () => {
 			new ReactivitySubscriptionManager({
 				service: new RecordingService(new FixedVerifier('verified')),
 				collectionId: COLLECTION,
-				tailIdAtAttach: TAIL,
+				tail: TAIL,
 				quorumRatio: QUORUM_RATIO,
 				deliver: (n) => delivered.push(n.revision),
 				lastKnownRev: 17,
@@ -317,7 +323,7 @@ describe('reactivity / subscription manager', () => {
 			});
 
 		it('throws when no resume transport/signer is configured', async () => {
-			const manager = new ReactivitySubscriptionManager({ service: new RecordingService(), collectionId: COLLECTION, tailIdAtAttach: TAIL, quorumRatio: QUORUM_RATIO, deliver: () => {} });
+			const manager = new ReactivitySubscriptionManager({ service: new RecordingService(), collectionId: COLLECTION, tail: TAIL, quorumRatio: QUORUM_RATIO, deliver: () => {} });
 			let threw = false;
 			try { await manager.resume(); } catch { threw = true; }
 			expect(threw).to.equal(true);
@@ -363,13 +369,46 @@ describe('reactivity / subscription manager', () => {
 		});
 	});
 
+	describe('followTail (the subscription follows the collection\'s tail)', () => {
+		const NEW_TAIL = new Uint8Array([6, 6, 6, 6]);
+
+		it('records the latest tail: a re-registration at the root names it as root key and payload tail, a later resume as latestKnownTailId, and a repeat follow sends nothing', async () => {
+			const service = new RecordingService(new FixedVerifier('verified'));
+			let sent: ResumeV1 | undefined;
+			const manager = new ReactivitySubscriptionManager({
+				service,
+				collectionId: COLLECTION,
+				tail: TAIL,
+				quorumRatio: QUORUM_RATIO,
+				deliver: () => {},
+				lastKnownRev: 17,
+				signResume: () => bytesToB64url(new Uint8Array([1])),
+				resumeTransport: (req) => { sent = req; return Promise.resolve({ v: 1, result: 'out_of_window', currentTailId: bytesToB64url(NEW_TAIL), currentRevision: 18 } as ResumeReplyV1); },
+			});
+			expect(await manager.followTail(TAIL), 'the first follow is the first registration').to.equal(true);
+			expect(service.registers).to.have.length(1);
+			expect(await manager.followTail(TAIL), 'the same tail again registers nothing').to.equal(false);
+			expect(service.registers).to.have.length(1);
+
+			expect(await manager.followTail(NEW_TAIL), 'a registration at the root registers again at the moved root').to.equal(true);
+			expect(service.registers).to.have.length(2);
+			expect([...service.registers[1]!.rootKey!]).to.deep.equal([...NEW_TAIL]);
+			expect(decodeSubscribeAppPayload(service.registers[1]!.appPayload!).tailIdAtAttach, 'the payload carries the tail at this registration').to.equal(bytesToB64url(NEW_TAIL));
+			expect([...manager.tail]).to.deep.equal([...NEW_TAIL]);
+			expect(service.moves, 'a registration at the root is never moved in place').to.have.length(0);
+
+			await manager.resume();
+			expect(sent!.latestKnownTailId, 'a resume names the latest followed tail').to.equal(bytesToB64url(NEW_TAIL));
+		});
+	});
+
 	describe('tail-rotation detection on delivery', () => {
 		const NEW_TAIL = new Uint8Array([6, 6, 6, 6]);
 		const makeRotationManager = (notices: RotationNotice[]) =>
 			new ReactivitySubscriptionManager({
 				service: new RecordingService(new FixedVerifier('verified')),
 				collectionId: COLLECTION,
-				tailIdAtAttach: TAIL,
+				tail: TAIL,
 				quorumRatio: QUORUM_RATIO,
 				deliver: () => {},
 				lastKnownRev: 41,
@@ -394,7 +433,7 @@ describe('reactivity / subscription manager', () => {
 			expect(notices[0]!.preAnnounced).to.equal(true);
 			expect(notices[0]!.newTailId).to.equal(bytesToB64url(NEW_TAIL));
 			expect(notices[0]!.plan.lastRevision).to.equal(43); // continuous across the rotation
-			expect([...notices[0]!.plan.newTopicId]).to.deep.equal([...reactivityTopicId(NEW_TAIL)]);
+			expect([...notices[0]!.plan.newTailId], 'the plan names the new root key').to.deep.equal([...NEW_TAIL]);
 			// the cached primary is under the now-stale tree — dropped so re-registration re-walks.
 			expect(manager.cohortHint.get(bytesToB64url(COLLECTION))).to.equal(undefined);
 		});
@@ -424,7 +463,7 @@ describe('reactivity / subscription manager', () => {
 			v: 1,
 			result: 'rotated',
 			newTailId: bytesToB64url(REDIRECT_TAIL),
-			newTopicId: bytesToB64url(reactivityTopicId(REDIRECT_TAIL)),
+			newTopicId: bytesToB64url(reactivityCollectionTopicId(COLLECTION)),
 			effectiveAtRevision: 50,
 			...over,
 		});
@@ -434,7 +473,7 @@ describe('reactivity / subscription manager', () => {
 			const manager = new ReactivitySubscriptionManager({
 				service: new RecordingService(new FixedVerifier('verified')),
 				collectionId: COLLECTION,
-				tailIdAtAttach: TAIL,
+				tail: TAIL,
 				quorumRatio: QUORUM_RATIO,
 				deliver: () => {},
 				lastKnownRev: 41,
@@ -452,7 +491,7 @@ describe('reactivity / subscription manager', () => {
 			expect(notices[0]!.preAnnounced, 'recover-driven, not a pre-announce').to.equal(false);
 			expect(notices[0]!.newTailId).to.equal(bytesToB64url(REDIRECT_TAIL));
 			expect(notices[0]!.plan.lastRevision, 'plan carries lastRevision (continuous across the rotation)').to.equal(41);
-			expect([...notices[0]!.plan.newTopicId], 'plan targets the new tree topic').to.deep.equal([...reactivityTopicId(REDIRECT_TAIL)]);
+			expect([...notices[0]!.plan.newTailId], 'plan names the new root key').to.deep.equal([...REDIRECT_TAIL]);
 			expect(manager.cohortHint.get(bytesToB64url(COLLECTION)), 'sticky cohort-hint cache invalidated').to.equal(undefined);
 		});
 
@@ -461,7 +500,7 @@ describe('reactivity / subscription manager', () => {
 			const manager = new ReactivitySubscriptionManager({
 				service: new RecordingService(new FixedVerifier('verified')),
 				collectionId: COLLECTION,
-				tailIdAtAttach: TAIL,
+				tail: TAIL,
 				quorumRatio: QUORUM_RATIO,
 				deliver: () => {},
 				lastKnownRev: 41,
@@ -483,7 +522,7 @@ describe('reactivity / subscription manager', () => {
 			const manager = new ReactivitySubscriptionManager({
 				service: new RecordingService(new FixedVerifier('verified')),
 				collectionId: COLLECTION,
-				tailIdAtAttach: TAIL,
+				tail: TAIL,
 				quorumRatio: QUORUM_RATIO,
 				deliver: () => {},
 				lastKnownRev: 41,
@@ -513,7 +552,7 @@ describe('reactivity / subscription manager', () => {
 			const manager = new ReactivitySubscriptionManager({
 				service: new RecordingService(new FixedVerifier('verified')),
 				collectionId: COLLECTION,
-				tailIdAtAttach: TAIL,
+				tail: TAIL,
 				quorumRatio: QUORUM_RATIO,
 				deliver: () => {},
 				lastKnownRev: 41,
@@ -533,7 +572,7 @@ describe('reactivity / subscription manager', () => {
 			const manager = new ReactivitySubscriptionManager({
 				service: new RecordingService(new FixedVerifier('verified')),
 				collectionId: COLLECTION,
-				tailIdAtAttach: TAIL,
+				tail: TAIL,
 				quorumRatio: QUORUM_RATIO,
 				deliver: () => {},
 				lastKnownRev: 10,

@@ -38,7 +38,7 @@ The layer holds *only soft state*. Authority over any underlying truth (transact
 ## Concepts
 
 - **Topic** — the unit of attachment. A topic is identified by an opaque `topicId` (32 bytes). What `topicId` *means* is application-defined; the layer treats it as a label.
-- **Topic anchor** — the value the layer hashes to derive tier coordinates. For most applications the anchor *is* `topicId` and is stable; for the reactivity push tree the anchor rotates with the tail block. Anchor rotation is opaque to this layer: when an application reports a new anchor, the layer treats it as a new topic.
+- **Topic anchor** — the value the layer hashes to derive tier coordinates. For every application the anchor *is* `topicId` and is stable; the reactivity push tree additionally places its root at a routing key — the collection's log tail block — and moves only that root when the tail block changes (§Root placement at a routing key). Anchor rotation, were an application to do it, is opaque to this layer: when an application reports a new anchor, the layer treats it as a new topic.
 - **Tier** `d` — the layer of the tree, with `d = 0` at the root. Tier `d` partitions participating peers into `F^d` groups by peer-ID prefix, where `F` is the fan-out (default 16).
 - **Tier coordinate** `coord_d(P, topicId)` — the FRET ring coordinate at which the cohort responsible for tier `d` and peer-prefix sharing `P`'s first `d·log₂F` bits sits.
 - **Cohort** — the FRET two-sided cohort of `k` peers (default 16) around a tier coordinate. (Distinct from [`cluster.md`](../packages/db-p2p/docs/cluster.md)'s use of "cohort" for a block's much smaller cluster/replica-set peers.)
@@ -1960,24 +1960,24 @@ Edge nodes (mobile profile) default to:
 
 The cohort-topic layer is a substrate. An application — reactivity, matchmaking, voting, broadcast — implements:
 
-1. **Anchor derivation.** What `topicId` is and whether it rotates, and whether the root is placed at a routing key. Reactivity uses `H(tailId ‖ "reactivity")` (rotates) and is the root-placed application: its root key is the tail block's routing key, so the tree's root is the storage group that applies, and so announces, the collection's commits ([reactivity.md §Origination point](reactivity.md#origination-point)); matchmaking uses `H("match" ‖ taskId)` (stable) with the default addressing.
+1. **Anchor derivation.** What `topicId` is and whether it rotates, and whether the root is placed at a routing key. Reactivity's anchor is per collection — `H(collectionId ‖ "reactivity")`, stable — and it is the root-placed application: its root key is the tail block's routing key, so the tree's root is the storage group that applies, and so announces, the collection's commits, and that root moves with the tail block while the topic stays ([reactivity.md §Origination point](reactivity.md#origination-point)); matchmaking uses `H("match" ‖ taskId)` (stable) with the default addressing.
 2. **`appPayload` contents.** What's in the per-registration application slot.
 3. **Tier choice.** Which tier this application operates at (reactivity push is T3; reactivity replay is T1; matchmaking is T2; voting is T2).
 4. **Post-registration RPCs.** Notification delivery, query, voting protocols, etc. These run between participants and their cached `primary`, with the cohort-topic layer providing only the identity. Matchmaking's primary→seeker arrival push ([matchmaking.md §Arrival push on provider arrival](matchmaking.md#arrival-push-on-provider-arrival)) is one such RPC: it fires off the existing gossip-replicated registration records, so it needs no new substrate protocol.
 5. **Replay or caching.** If the application needs durable buffering (reactivity does, matchmaking generally doesn't), it manages that state inside the cohort using the layer's existing gossip channel.
-6. **Anchor rotation handling.** If the anchor changes (tail rotation), the application detects via its own logic and re-registers under the new `topicId`; the layer treats the new anchor as a new topic. A root-placed application has a second shape available: keep the topic and move only its root (§Root placement at a routing key, *The root can move*). A registration below the root calls `moveRoot` and stays where it is; one at the root (`treeTier` 0) registers again with the new root key.
+6. **Anchor rotation handling.** If an application's anchor changes, it detects that via its own logic and re-registers under the new `topicId`; the layer treats the new anchor as a new topic. A root-placed application has a second shape, the one reactivity uses for tail rotation: keep the topic and move only its root (§Root placement at a routing key, *The root can move*). A registration below the root calls `moveRoot` and stays where it is; one at the root (`treeTier` 0) registers again with the new root key.
 
-> **Reactivity interaction — tail rotation is a fresh topic.** When a reactivity collection's tail block
-> fills, its anchor `H(tailId ‖ "reactivity")` changes, so the new `topicId` is — from this layer's
-> perspective — an **entirely new topic**: a fresh tree at a new tier-0 ring coord, with no relationship to
-> the old one. The two trees coexist for the rotation's drain window. The **old** tree drains and shrinks
-> via the standard demotion protocol (§Promotion and demotion lifecycle): its forwarder cohorts watch their
-> direct-subscriber count fall as subscribers re-register elsewhere and demote naturally — no state is
-> migrated through this layer. The **new** tree forms via ordinary registration + promotion (§Tree growth
-> and lookup), absorbing the re-registration wave; reactivity staggers that wave over `T_rejoin_jitter` so
-> the new root stays within `cap_promote_fast` (§Configuration `cap_promote_fast = 32`). The only state
-> reactivity migrates across the rotation (a replay-buffer→checkpoint handoff) rides reactivity's own logic,
-> not this layer; see [reactivity.md §Tail rotation](reactivity.md#tail-rotation).
+> **Reactivity interaction — tail rotation moves the root of one topic.** When a reactivity collection's tail
+> block fills, the collection's topic is unchanged and its root key becomes the new tail block's routing key,
+> so — from this layer's perspective — the topic's root moved (*The root can move*, §Root placement at a
+> routing key) while every tier below it stays at `coord_d(P, topicId)`. A registration at the root
+> registers again under the new key (the old record expires by TTL at the old root; no tombstone is sent); a
+> registration below the root calls `moveRoot` and keeps its place. Nothing under the old root drains or
+> re-forms; the old root simply stops receiving commits. Reactivity staggers the root-direct
+> re-registrations over `T_rejoin_jitter`, and at most `cap_promote` of them exist, since the root promotes
+> past that. The only state reactivity migrates across the rotation (a replay-buffer→checkpoint handoff)
+> rides reactivity's own logic, not this layer; see
+> [reactivity.md §Tail rotation](reactivity.md#tail-rotation).
 
 The layer's contract to applications is: given a `topicId` and a `tier`, you will reliably find a willing primary (or fail with a clear back-off signal); registrations persist within their TTL; cohort identity and membership are verifiable. Everything else — content, ordering, durability, semantics — is the application's responsibility.
 
@@ -1987,7 +1987,7 @@ The layer's contract to applications is: given a `topicId` and a `tier`, you wil
 
 - **FRET** ([../../Fret/docs/fret.md](../../Fret/docs/fret.md)) — provides ring coordinates, cohort assembly, `RouteAndMaybeAct`, stabilization, network-size estimation, and membership advertisements.
 - **Transaction log** ([transactions.md](transactions.md)) — T0/T1 cohort memberships are committed as part of normal block production. The layer reads these but never writes.
-- **Reactivity** ([reactivity.md](reactivity.md)) — push-tree application; uses rotating anchors and replay buffers on top of this layer.
+- **Reactivity** ([reactivity.md](reactivity.md)) — push-tree application; one topic per collection whose root moves with the log's tail block, with replay buffers, on top of this layer.
 - **Matchmaking** ([matchmaking.md](matchmaking.md)) — directory application; stable anchors, provider/seeker registrations.
 - **Partition healing** ([partition-healing.md](partition-healing.md)) — cohort merge after partition is handled by FRET stabilization; the layer reacts via `cohortEpoch` refresh.
 - **Reputation** (see [architecture.md](architecture.md)) — bootstrap-time evidence for cold root instantiation may reference reputation scores; persistent `UnwillingCohort` from a cohort known to be honest is also a signal the reputation subsystem may consume.

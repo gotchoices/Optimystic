@@ -1004,13 +1004,14 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
     `ReactivityCollectionWatch` in `packages/db-p2p/src/reactivity/collection-watch.ts` is the typed,
     host-facing surface over all of the above — present exactly when `cohortTopic.enabled` built a host.
     `watch({ collectionId, readTail, onChange })` returns at once; in the background the service keeps
-    one subscription per collection (shared by every watch of it on the node), registers its manager in
-    the subscriber registry and with the cohort, renews it, and moves it when the log's tail block
-    changes. The first committed tail the service reads for a collection wakes its watchers once (it
+    one subscription per collection (shared by every watch of it on the node), registers its one manager in
+    the subscriber registry under the collection's topic and with the cohort under the tail block as the
+    root key, renews it, and has it follow the tail when the log starts a new block (a registration at the
+    root registers again under the new root key; one below the root only updates its root key). The first committed tail the service reads for a collection wakes its watchers once (it
     cannot know what a caller read before then), so a caller opens the watch and then reads. Each
     subscription also ticks at the renewal cadence (30 s Core, 20 s Edge) and reads the
     collection's committed tail: a revision above the last one the watchers were woken for wakes them,
-    and a different tail block moves the subscription. That check is what turns a lost notification, a
+    and a different tail block is followed. That check is what turns a lost notification, a
     failed registration, an unannounced rotation or a commit nobody announced into one tick of delay
     instead of a watcher that never wakes; it costs one tail read per watched collection per tick.
     `Collection.readCommittedTail` in `packages/db-core/src/collection/collection.ts` is the reader a
@@ -1035,10 +1036,11 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
     unref'd-timer `RotationReRegistrationScheduler` as `node.reactivityRotation` (torn down in the stop wrapper
     before `host.stop()`). The scheduler is driven by the watch service: a manager that learns of a
     rotation schedules through it, and its `reRegister(plan)` is `ReactivityCollectionWatch.reRegister`,
-    which registers the new topic's handler before the old one is dropped. A manager learns of a rotation
-    only from a recover redirect, though — a subscriber under the old tail is not sent the new tail's
-    notifications — so the usual mover is the watch service's own tick, which reads the tail and
-    re-registers under whatever block it finds. Anticipatory warm-up on a live node is signal-only
+    which has the collection's one manager follow the new tail: the topic is stable, so the handler stays
+    and only a registration at the root sends a new register frame. A manager learns of a rotation only
+    from a recover redirect, though — a subscriber at the old root is not sent the new root's
+    notifications — so the usual mover is the watch service's own tick, which reads the tail and follows
+    whatever block it finds. Anticipatory warm-up on a live node is signal-only
     (logged; no successor coord is fabricated).
 
 ## Mutation Contracts

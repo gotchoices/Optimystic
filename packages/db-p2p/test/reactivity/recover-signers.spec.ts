@@ -4,7 +4,7 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import {
 	PushState,
-	reactivityTopicId,
+	reactivityCollectionTopicId,
 	bytesToB64url,
 	b64urlToBytes,
 	createCorrelationReplayGuard,
@@ -39,7 +39,7 @@ function note(revision: number): NotificationV1 {
 }
 
 function seedPushState(revs: number[]): PushState {
-	const topicId = reactivityTopicId(b64urlToBytes(TAIL));
+	const topicId = reactivityCollectionTopicId(b64urlToBytes(COLLECTION));
 	const ps = new PushState({ collectionId: COLLECTION, topicId: bytesToB64url(topicId), tailIdAtJoin: TAIL });
 	for (const rev of revs) {
 		ps.replayBuffer.append({ revision: rev, payload: note(rev), receivedAt: 1000 + rev });

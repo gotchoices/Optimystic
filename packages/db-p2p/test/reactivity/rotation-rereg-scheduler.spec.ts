@@ -6,7 +6,6 @@ import type { RotationNotice } from '../../src/reactivity/subscription-manager.j
 // --- fixtures ---------------------------------------------------------------
 
 const TAIL_A = new Uint8Array([0xa1, 0xa2]);
-const TOPIC = new Uint8Array([0x10, 0x11]); // every successor shares it: the scheduler de-duplicates by successor tail
 const TAIL_B = new Uint8Array([0xb1, 0xb2]);
 
 interface NoticeOver {
@@ -21,7 +20,6 @@ function notice(over: NoticeOver = {}): RotationNotice {
 	const newTailId = over.newTailId ?? TAIL_A;
 	const plan: ReRegistrationPlan = {
 		newTailId,
-		newTopicId: TOPIC,
 		lastRevision: over.lastRevision ?? 100,
 		fireAt: over.fireAt ?? 5_000,
 	};

@@ -67,7 +67,7 @@ export interface SubscribeAppPayloadV1 {
 
 /** The tail cohort's rotation pre-announce, carried inside (and signed by) a {@link NotificationV1}. */
 export interface RotationHintV1 {
-	/** New tail block id the topic anchor is rotating to, base64url. */
+	/** New tail block id the collection's root is moving to, base64url. */
 	newTailId: string;
 	/** Revision at which the new tail becomes effective. */
 	effectiveAtRevision: number;

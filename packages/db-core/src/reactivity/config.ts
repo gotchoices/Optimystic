@@ -6,8 +6,8 @@
  * simulator fold-back ([fold-simulator-findings-into-design-docs]) can retune `W` / `dedupe_window`
  * without touching origination, forwarding, the replay buffer, or delivery.
  *
- * **Simulator-validated-pending.** `W` (replay buffer depth), `dedupe_window`, `T_drain`, `queue_max`,
- * and `block_fill_size` are *provisional* pending the design simulator ([simulator-reactivity-replay],
+ * **Simulator-validated-pending.** `W` (replay buffer depth), `dedupe_window`, `T_drain` and `queue_max`
+ * are *provisional* pending the design simulator ([simulator-reactivity-replay],
  * folded back by [fold-simulator-findings-into-design-docs]). The simulator's REVISED guidance is that `W`
  * SHOULD become adaptive per measured commit-rate on hot collections (`W ≈ ⌈min_coverage × cps⌉`); the
  * static `W = 256` is kept as the Edge/low-rate default. {@link resolveW} exposes that hook; the
@@ -24,6 +24,7 @@
 
 import type { NodeProfile } from "../cohort-topic/tiers.js";
 import { DEFAULT_T_REJOIN_JITTER_MS } from "../cohort-topic/antiflood/jitter.js";
+import { EntriesPerBlock } from "../chain/chain.js";
 
 /** Replay buffer depth (revisions per cohort, per collection). Simulator-validated-pending. */
 export const W_DEFAULT = 256;
@@ -41,13 +42,12 @@ export const DELTA_MAX_EDGE_BYTES = 0;
 export const SUBSCRIBER_TTL_CORE_MS = 90_000;
 /** Subscriber registration TTL on an Edge node (ms), inherited from cohort-topic. */
 export const SUBSCRIBER_TTL_EDGE_MS = 60_000;
-/** Transactions per block — drives tail rotation. Simulator-validated-pending.
- *
- * NOTE: the collection log starts a new tail block every `EntriesPerBlock` (32) entries
- * (`chain/chain.ts`), not every 64, so on a live node the fill tracker's warm-up and filling signals
- * fire at the wrong commit counts. Harmless while those signals are only logged; reconcile the two
- * numbers before anything on a live node acts on them. */
-export const BLOCK_FILL_SIZE_DEFAULT = 64;
+/**
+ * Entries per log block — drives tail rotation. The collection log starts a new tail block every
+ * `EntriesPerBlock` entries (`chain/chain.ts`), so this is that number, not a tunable of its own: the fill
+ * tracker's warm-up and filling signals fire at the commit counts the log actually rotates at.
+ */
+export const BLOCK_FILL_SIZE_DEFAULT = EntriesPerBlock;
 /** Old-tail drain time after rotation (ms). Simulator-validated-pending. */
 export const T_DRAIN_MS = 60_000;
 /** Transactions remaining in tail before anticipatory warm-up. Owned by the rotation ticket. */
@@ -73,7 +73,7 @@ export interface ReactivityConfig {
 	readonly subscriberTtlCoreMs: number;
 	/** Subscriber TTL on an Edge node (ms). */
 	readonly subscriberTtlEdgeMs: number;
-	/** Transactions per block — drives tail rotation. Simulator-validated-pending. */
+	/** Entries per log block — drives tail rotation; the log's `EntriesPerBlock`. */
 	readonly blockFillSize: number;
 	/** Old-tail drain time after rotation (ms). Simulator-validated-pending. */
 	readonly tDrainMs: number;

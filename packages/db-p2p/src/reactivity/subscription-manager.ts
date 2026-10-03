@@ -1,29 +1,35 @@
 /**
  * Reactivity — subscription manager (db-p2p, wires to the cohort-topic substrate).
  *
- * Drives a subscriber's lifecycle against the participant-facing {@link CohortTopicService}: register at
- * cohort-topic tier **T3 (luxury)** with the reactivity `appPayload`, renew to keep the registration
- * alive within its TTL (Edge 60 s / Core 90 s), and withdraw by ceasing renewal — all the cohort-topic
- * standard (`docs/reactivity.md` §Subscription). The reactivity-specific shape lives in db-core: the
- * tail-anchored `topicId = H(tailId ‖ "reactivity")`, the {@link SubscribeAppPayloadV1}, and the
- * subscriber-side verify/deliver path ({@link ReactivitySubscriber}).
+ * Drives one collection subscription's lifecycle against the participant-facing {@link CohortTopicService}
+ * for the subscription's whole life: register at cohort-topic tier **T3 (luxury)** with the reactivity
+ * `appPayload`, renew to keep the registration alive within its TTL (Edge 60 s / Core 90 s), follow the
+ * collection's log tail as it moves ({@link ReactivitySubscriptionManager.followTail}), and withdraw by
+ * ceasing renewal — all the cohort-topic standard (`docs/reactivity.md` §Subscription). The
+ * reactivity-specific shape lives in db-core: the collection topic `topicId = H(collectionId ‖
+ * "reactivity")` (stable), the {@link SubscribeAppPayloadV1}, and the subscriber-side verify/deliver path
+ * ({@link ReactivitySubscriber}).
  *
- * **The topic's root is the tail's storage group** (`docs/reactivity.md` §Origination point): the register
- * walk names the tail's routing key as the topic's `rootKey`, so its root step reaches the group of peers
- * that store the tail block — the machines that apply, and so announce, the collection's commits — and
- * notifications are verified against that group's membership under the root placement threshold
- * `ceil(|group| × quorumRatio)`, the formula the commit certificate they reuse was captured under.
+ * **The topic's root is the tail's storage group, and it moves** (`docs/reactivity.md` §Origination point,
+ * §Tail rotation): the register walk names the tail's routing key as the topic's `rootKey`, so its root step
+ * reaches the group of peers that store the tail block — the machines that apply, and so announce, the
+ * collection's commits — and notifications are verified against that group's membership under the root
+ * placement threshold `ceil(|group| × quorumRatio)`, the formula the commit certificate they reuse was
+ * captured under. When the log starts a new tail block only the root moves: a registration at the root
+ * registers again under the new root key, one below the root keeps its place and updates the key a later
+ * re-walk would use. The manager holds the **latest tail it has followed**, which is what a resume names as
+ * `latestKnownTailId`, what rotation detection compares against, and what the recover transports target.
  *
  * Inbound notifications are handed to {@link ReactivitySubscriptionManager.onNotification}, which runs
  * the db-core delivery path (verify against the cached root-group `MembershipCertV1` with one
  * fetch-and-retry, revision-contiguity, gap → backfill seam, `(collectionId, revision)` dedupe, surface).
  * The notification transport (the reactivity application protocol that delivers `NotificationV1` frames
- * to a subscriber's primary) is the sibling tickets' concern; this manager owns attach + delivery logic.
+ * to a subscriber's primary) is the forwarder host's; this manager owns attach + follow + delivery logic.
  */
 
 import {
 	Tier,
-	reactivityTopicId,
+	reactivityCollectionTopicId,
 	subscribeAppPayloadBytes,
 	subscriberTtlForProfile,
 	deltaMaxForProfile,
@@ -63,16 +69,16 @@ const log = createLogger("reactivity-subscription");
 export type ResumeTransport = (req: ResumeV1) => Promise<ResumeReplyV1>;
 
 /**
- * A detected tail rotation surfaced to the host so it can schedule the jittered re-registration timer
+ * A detected tail rotation surfaced to the host so it can schedule the jittered follow timer
  * (`docs/reactivity.md` §Tail rotation). The manager has already invalidated the sticky cohort-hint cache
- * (the cached primary is under the old tree).
+ * (the cached primary is at the old root).
  */
 export interface RotationNotice {
-	/** The new tail block id the topic rotated to, base64url. */
+	/** The new tail block id the root moved to, base64url. */
 	readonly newTailId: string;
 	/** True iff this was a pre-announce (`rotationHint` on a still-current-tail notification). */
 	readonly preAnnounced: boolean;
-	/** The jittered re-registration plan (new topicId + `fireAt` + carried `lastRevision`) for the host to schedule. */
+	/** The jittered follow plan (new tail + `fireAt` + carried `lastRevision`) for the host to schedule. */
 	readonly plan: ReRegistrationPlan;
 }
 
@@ -81,15 +87,15 @@ export interface ReactivitySubscriptionManagerOptions {
 	/** Participant-facing cohort-topic substrate API. */
 	readonly service: CohortTopicService;
 	/**
-	 * Stable collection identity, raw bytes. Inbound notifications are matched against their base64url, so
-	 * these MUST be the bytes origination encodes onto a notification: `reactivityCollectionIdBytes(id)`
-	 * (`reactivity/topic-bytes.ts`) on a node.
+	 * Stable collection identity, raw bytes. The topic is derived from them, and inbound notifications are
+	 * matched against their base64url, so these MUST be the bytes origination encodes onto a notification:
+	 * `reactivityCollectionIdBytes(id)` (`reactivity/topic-bytes.ts`) on a node.
 	 */
 	readonly collectionId: Uint8Array;
 	/**
-	 * Tail block id at attach time (raw bytes); anchors the rotating topic (`reactivityTopicId` is applied to
-	 * it), is the topic's root key (the walk's root step goes to the tail's storage group), and detects
-	 * rotation.
+	 * The collection's tail block id at construction (raw bytes): the topic's root key the first registration
+	 * names (the walk's root step goes to the tail's storage group). {@link ReactivitySubscriptionManager.followTail}
+	 * replaces it as the log moves; {@link ReactivitySubscriptionManager.tail} is the latest.
 	 *
 	 * **Load-bearing encoding contract.** A host converting a `BlockId` tail to these bytes (the node's
 	 * `ReactivityCollectionWatch` does) MUST use `reactivityTailBytes(tailId)` (`reactivity/topic-bytes.ts`) —
@@ -98,7 +104,7 @@ export interface ReactivitySubscriptionManagerOptions {
 	 * at a different ring position, with a group that announces nothing for this collection (the
 	 * `topic-bytes-encoding` spec pins the equality with the key network's placement).
 	 */
-	readonly tailIdAtAttach: Uint8Array;
+	readonly tail: Uint8Array;
 	/**
 	 * The ratio the root group's commit certificates are signed under — the node's consensus
 	 * `superMajorityThreshold`. A notification verifies when its signers are root-group members numbering at
@@ -116,7 +122,9 @@ export interface ReactivitySubscriptionManagerOptions {
 	/**
 	 * Backfill RPC transport (the reactivity application protocol dialing the serving cohort). When
 	 * supplied, the manager wires the subscriber's gap-detection seam to the {@link BackfillV1} RPC,
-	 * replaying the reply through the delivery path. Requires {@link signBackfill}.
+	 * replaying the reply through the delivery path. Requires {@link signBackfill}. A transport that targets
+	 * the root group should resolve the root from {@link ReactivitySubscriptionManager.tail} per request, so
+	 * it follows the root after a rotation.
 	 */
 	readonly backfillTransport?: BackfillTransport;
 	/** Sign a {@link BackfillV1} over its unsigned image (subscriber peer key); base64url. */
@@ -145,7 +153,7 @@ export interface ReactivitySubscriptionManagerOptions {
 	readonly onCheckpointDigest?: (summary: CheckpointSummary) => void;
 	/** Chain-read + fresh subscribe fallback (out_of_window, or an untrusted checkpoint). */
 	readonly onChainRead?: (currentTailId: string | undefined, currentRevision: number | undefined) => void;
-	/** Re-register under the rotated tail (tail_rotated); also invalidates the sticky cohort-hint cache. */
+	/** Follow the moved root (tail_rotated); also invalidates the sticky cohort-hint cache. */
 	readonly onTailRotated?: (newTailId: string, newRevisionAtRotation: number) => void;
 	/** Escalation when a backfill's `available` window fell past the gap's low edge (escalate to resume/chain). */
 	readonly onBackfillUnderflow?: (requested: { from: number; to: number }, available: { fromRevision: number; toRevision: number }) => void;
@@ -154,8 +162,8 @@ export interface ReactivitySubscriptionManagerOptions {
 	/**
 	 * Tail-rotation observer (`docs/reactivity.md` §Tail rotation). Fired once per successor tail when an
 	 * inbound notification reveals a rotation (delivered `tailId` differs, or a `rotationHint` pre-announce):
-	 * the manager invalidates the sticky cohort-hint cache and hands the host a jittered re-registration plan
-	 * to schedule. Absent ⇒ rotation is detected and the cache invalidated, but no plan is surfaced.
+	 * the manager invalidates the sticky cohort-hint cache and hands the host a jittered follow plan to
+	 * schedule. Absent ⇒ rotation is detected and the cache invalidated, but no plan is surfaced.
 	 */
 	readonly onRotation?: (notice: RotationNotice) => void;
 	/** Re-registration jitter for the rotation plan's `fireAt`; defaults to the `T_rejoin_jitter` curve. */
@@ -172,12 +180,10 @@ export interface ReactivitySubscriptionManagerOptions {
 	readonly profile?: NodeProfile;
 }
 
-/** Wires one reactivity subscription to the cohort-topic substrate at tier T3. */
+/** Wires one collection's reactivity subscription to the cohort-topic substrate at tier T3, for its whole life. */
 export class ReactivitySubscriptionManager {
 	private readonly service: CohortTopicService;
-	private readonly collectionId: Uint8Array;
 	private readonly collectionIdB64: string;
-	private readonly tailIdAtAttach: Uint8Array;
 	private readonly topicId: Uint8Array;
 	private readonly ttlMs: number;
 	private readonly deltaMaxBytes: number;
@@ -187,12 +193,14 @@ export class ReactivitySubscriptionManager {
 	private readonly options: ReactivitySubscriptionManagerOptions;
 	private readonly cohortHintCache: StickyCohortHintCache;
 	private readonly clock: () => number;
-	private readonly tailIdAtAttachB64: string;
 	private readonly rejoinJitter: RejoinJitter;
 	/** Resolved ring coordinate signed into a {@link ResumeV1} (real coord, or the collectionId placeholder). */
 	private readonly subscriberCoord: string;
 	/** True iff {@link subscriberCoord} fell back to the collectionId placeholder (no real coord supplied). */
 	private readonly subscriberCoordIsFallback: boolean;
+	/** The latest tail this subscription has followed — the topic's current root key (see {@link tail}). */
+	private latestTail: Uint8Array;
+	private latestTailB64: string;
 	/** The successor tail a rotation has already been surfaced for, so the notice fires once per rotation. */
 	private rotationHandledFor?: string;
 	/** Memoized db-core backfill driver (built on first gap, once `this.subscriber` is assigned). */
@@ -202,16 +210,15 @@ export class ReactivitySubscriptionManager {
 	constructor(options: ReactivitySubscriptionManagerOptions) {
 		this.options = options;
 		this.service = options.service;
-		this.collectionId = options.collectionId;
 		this.collectionIdB64 = bytesToB64url(options.collectionId);
-		this.tailIdAtAttach = options.tailIdAtAttach;
-		this.topicId = reactivityTopicId(options.tailIdAtAttach);
+		this.topicId = reactivityCollectionTopicId(options.collectionId);
+		this.latestTail = options.tail;
+		this.latestTailB64 = bytesToB64url(options.tail);
 		this.ttlMs = options.ttlMs ?? (options.profile !== undefined ? subscriberTtlForProfile(options.profile) : undefined) ?? DEFAULT_SUBSCRIBER_TTL_MS;
 		this.deltaMaxBytes = options.deltaMaxBytes ?? (options.profile !== undefined ? deltaMaxForProfile(options.profile) : DEFAULT_EDGE_SAFE_DELTA_MAX);
 		this.lastKnownRev = options.lastKnownRev ?? 0;
 		this.cohortHintCache = options.cohortHintCache ?? createStickyCohortHintCache();
 		this.clock = options.clock ?? ((): number => Date.now());
-		this.tailIdAtAttachB64 = bytesToB64url(options.tailIdAtAttach);
 		this.rejoinJitter = options.rejoinJitter ?? createRejoinJitter();
 		this.subscriberCoordIsFallback = options.subscriberCoord === undefined;
 		this.subscriberCoord = options.subscriberCoord ?? this.collectionIdB64;
@@ -274,7 +281,7 @@ export class ReactivitySubscriptionManager {
 				return; // a re-attempt closed (or underflow-escalated) the gap
 			} catch (err) {
 				if (err instanceof RotationRedirectError) {
-					// The serving cohort's outgoing tail rotated: move to the new tree (no chain-read fallback).
+					// The serving cohort's outgoing root rotated: follow the new root (no chain-read fallback).
 					this.honorRotationRedirect(err);
 					return;
 				}
@@ -299,6 +306,15 @@ export class ReactivitySubscriptionManager {
 		return this.handle;
 	}
 
+	/**
+	 * The latest tail this subscription has followed (raw bytes, `reactivityTailBytes` encoding): the topic's
+	 * current root key. A resume names it as `latestKnownTailId`, rotation detection compares against it, and
+	 * a recover transport that targets the root group resolves the group from it per request.
+	 */
+	get tail(): Uint8Array {
+		return this.latestTail;
+	}
+
 	/** Last contiguously-delivered revision. */
 	get lastRevision(): number {
 		return this.subscriber.lastRevision;
@@ -315,14 +331,17 @@ export class ReactivitySubscriptionManager {
 	}
 
 	/**
-	 * Register the subscriber at tier T3 with the reactivity `appPayload`. The tail bytes are the topic's
-	 * root key: the walk's root step goes to the tail's storage group (`ITopicRouter.routeToRoot`), not to
-	 * the FRET cohort around a hash of the topic id, so the subscriber lands on the machines that announce.
+	 * Register the subscriber at tier T3 with the reactivity `appPayload`, under the current {@link tail} as the
+	 * topic's root key: the walk's root step goes to the tail's storage group (`ITopicRouter.routeToRoot`), not
+	 * to the FRET cohort around a hash of the topic id, so the subscriber lands on the machines that announce.
+	 * A second registration for the same topic displaces the first at the service (its renewals stop; no
+	 * tombstone is sent, the old record expires by TTL at the old root — see the `NOTE:` at `startRenewal` in
+	 * db-core's cohort-topic service). The payload's `tailIdAtAttach` is the tail at this registration.
 	 */
 	async register(): Promise<RegistrationHandle> {
 		const appPayload = subscribeAppPayloadBytes({
-			collectionId: bytesToB64url(this.collectionId),
-			tailIdAtAttach: bytesToB64url(this.tailIdAtAttach),
+			collectionId: this.collectionIdB64,
+			tailIdAtAttach: this.latestTailB64,
 			lastKnownRev: this.lastKnownRev,
 			deltaMaxBytes: this.deltaMaxBytes,
 		});
@@ -331,9 +350,55 @@ export class ReactivitySubscriptionManager {
 			tier: Tier.T3,
 			appPayload,
 			ttl: this.ttlMs,
-			rootKey: this.tailIdAtAttach,
+			rootKey: this.latestTail,
 		});
 		return this.handle;
+	}
+
+	/**
+	 * Follow the collection's log to `tail` (raw bytes, `reactivityTailBytes` encoding): record it as the
+	 * latest tail, then put the registration where the moved root wants it. Resolves `true` iff a registration
+	 * landed on this call.
+	 *
+	 * - No registration yet → {@link register}.
+	 * - A registration **at the root** (`treeTier` 0) whose root key is not `tail` → {@link register} again
+	 *   under the new root key; the service displaces the old registration, which expires by TTL at the old
+	 *   root. A failure throws and leaves the old registration renewing; the same condition re-fires on the
+	 *   next call (the handle's root key still differs from the tail), so a deferred first registration at a
+	 *   cold new root is retried by the host's next tick.
+	 * - A registration **below the root** (`treeTier ≥ 1`) whose root key is not `tail` → `service.moveRoot`:
+	 *   nothing is sent and nothing re-registers; its cohort sits at `coord_d(P, topicId)`, which the rotation
+	 *   does not move, and a later renewal failover re-walks with the new root key.
+	 * - A registration already naming `tail` as its root key, at either tier → nothing (the host's tick calls
+	 *   this for every tail read, most of which find the tail unchanged).
+	 *
+	 * The tail is recorded first, whatever the registration does: the data a resume or backfill asks for now
+	 * lives at the new root, and a notification announced there is not a rotation.
+	 *
+	 * NOTE: the handle's `treeTier` can be stale after a renewal failover re-walk (the service does not track a
+	 * relookup's landing; backlog `bug-a-participant-told-its-registration-is-unknown-never-registers-again`).
+	 * A handle that says 0 but sits at tier 1 re-registers needlessly on the next move; one that says ≥ 1 but
+	 * re-walked to the root stays at that root until its next relookup, which `moveRoot` keeps pointed at the
+	 * current root. Either way the subscriber keeps a live registration, and the watch service's tail check
+	 * wakes it regardless.
+	 */
+	async followTail(tail: Uint8Array): Promise<boolean> {
+		this.latestTail = tail;
+		this.latestTailB64 = bytesToB64url(tail);
+		const handle = this.handle;
+		if (handle === undefined) {
+			await this.register();
+			return true;
+		}
+		if (handle.rootKey !== undefined && bytesToB64url(handle.rootKey) === this.latestTailB64) {
+			return false; // the registration already names this root
+		}
+		if (handle.treeTier === 0) {
+			await this.register();
+			return true;
+		}
+		this.service.moveRoot(handle, tail);
+		return false;
 	}
 
 	/** Run one renewal cycle (keep-alive touch). No-op before the first {@link register}. */
@@ -354,13 +419,13 @@ export class ReactivitySubscriptionManager {
 
 	/**
 	 * Resume after a sleep/flap (`docs/reactivity.md` §Resume). Sends one {@link ResumeV1} from
-	 * `lastRevision + 1` to the serving cohort over the injected {@link ResumeTransport} and applies the
-	 * classified reply via the db-core {@link applyResumeReply}: a `backfill` / `checkpoint_window` reply
-	 * replays its entries through the delivery path (verified, deduped); `out_of_window` and an untrusted
-	 * checkpoint escalate to {@link ReactivitySubscriptionManagerOptions.onChainRead}; `tail_rotated`
-	 * escalates to {@link ReactivitySubscriptionManagerOptions.onTailRotated} and invalidates the sticky
-	 * cohort-hint cache (the cached primary is under the old tree). Throws if no resume transport/signer
-	 * was configured.
+	 * `lastRevision + 1`, naming the latest followed {@link tail} as `latestKnownTailId`, to the serving cohort
+	 * over the injected {@link ResumeTransport} and applies the classified reply via the db-core
+	 * {@link applyResumeReply}: a `backfill` / `checkpoint_window` reply replays its entries through the
+	 * delivery path (verified, deduped); `out_of_window` and an untrusted checkpoint escalate to
+	 * {@link ReactivitySubscriptionManagerOptions.onChainRead}; `tail_rotated` escalates to
+	 * {@link ReactivitySubscriptionManagerOptions.onTailRotated} and invalidates the sticky cohort-hint cache
+	 * (the cached primary is at the old root). Throws if no resume transport/signer was configured.
 	 *
 	 * The sticky cohort-hint cache (Edge) lets a resume after a brief flap dial the cached primary directly
 	 * for a one-RT recovery instead of re-walking from `d_max`; it is the transport's to consult via
@@ -378,7 +443,7 @@ export class ReactivitySubscriptionManager {
 			v: 1,
 			collectionId: this.collectionIdB64,
 			fromRevision: this.subscriber.lastRevision + 1,
-			latestKnownTailId: bytesToB64url(this.tailIdAtAttach),
+			latestKnownTailId: this.latestTailB64,
 			subscriberCoord: this.subscriberCoord,
 			timestamp: this.clock(),
 		};
@@ -388,7 +453,7 @@ export class ReactivitySubscriptionManager {
 			reply = await resumeTransport(req);
 		} catch (err) {
 			if (err instanceof RotationRedirectError) {
-				// The resume reached the serving cohort's outgoing (draining) tail: honor the redirect (surface
+				// The resume reached the serving cohort's outgoing (draining) root: honor the redirect (surface
 				// the rotation through onRotation, invalidate the sticky cache) and resolve as a tail rotation —
 				// never throw the redirect out to the caller / the gap seam's commit-delivery path.
 				this.honorRotationRedirect(err);
@@ -402,7 +467,7 @@ export class ReactivitySubscriptionManager {
 			onCheckpointDigest: this.options.onCheckpointDigest,
 			onChainRead: this.options.onChainRead,
 			onTailRotated: (newTailId, newRevisionAtRotation): void => {
-				// The cached primary is under the now-stale tree; drop it so the re-registration re-walks.
+				// The cached primary is at the now-stale root; drop it so the follow re-walks.
 				this.cohortHintCache.invalidate(this.collectionIdB64);
 				this.options.onTailRotated?.(newTailId, newRevisionAtRotation);
 			},
@@ -416,10 +481,10 @@ export class ReactivitySubscriptionManager {
 
 	/**
 	 * Run the db-core delivery path for one inbound notification, then check for tail rotation
-	 * (`docs/reactivity.md` §Tail rotation): a delivered `tailId` that differs from `tailIdAtAttach`, or a
-	 * `rotationHint` pre-announce, invalidates the sticky cohort-hint cache (the cached primary is under the
-	 * old tree) and surfaces a jittered re-registration plan via {@link ReactivitySubscriptionManagerOptions.onRotation}.
-	 * Fired at most once per successor tail.
+	 * (`docs/reactivity.md` §Tail rotation): a delivered `tailId` that differs from the latest followed
+	 * {@link tail}, or a `rotationHint` pre-announce, invalidates the sticky cohort-hint cache (the cached
+	 * primary is at the old root) and surfaces a jittered follow plan via
+	 * {@link ReactivitySubscriptionManagerOptions.onRotation}. Fired at most once per successor tail.
 	 */
 	async onNotification(n: NotificationV1): Promise<DeliveryOutcome> {
 		const outcome = await this.subscriber.onNotification(n);
@@ -429,7 +494,7 @@ export class ReactivitySubscriptionManager {
 
 	/** Detect a tail rotation from an inbound notification and surface it once per successor tail. */
 	private checkRotation(n: NotificationV1): void {
-		const detection = detectRotation(this.tailIdAtAttachB64, n);
+		const detection = detectRotation(this.latestTailB64, n);
 		if (!detection.rotated || detection.newTailId === undefined) {
 			return;
 		}
@@ -438,19 +503,19 @@ export class ReactivitySubscriptionManager {
 
 	/**
 	 * Surface a rotation to the host **once per successor tail** (`docs/reactivity.md` §Tail rotation):
-	 * invalidate the sticky cohort-hint cache (the cached primary is under the now-stale tree, so a later
+	 * invalidate the sticky cohort-hint cache (the cached primary is at the now-stale root, so a later
 	 * resume re-walks) and — when an {@link ReactivitySubscriptionManagerOptions.onRotation} observer is
-	 * configured — hand it a jittered re-registration plan carrying `lastRevision` (continuous across the
-	 * rotation). The single seam both the notification-driven detection ({@link checkRotation}) and the
-	 * recover-driven {@link RotationRedirectError} ({@link honorRotationRedirect}) end in; the
-	 * {@link rotationHandledFor} guard self-corrects across a chained OLD→A→B rotation.
+	 * configured — hand it a jittered follow plan carrying `lastRevision` (continuous across the rotation).
+	 * The single seam both the notification-driven detection ({@link checkRotation}) and the recover-driven
+	 * {@link RotationRedirectError} ({@link honorRotationRedirect}) end in; the {@link rotationHandledFor}
+	 * guard self-corrects across a chained OLD→A→B rotation.
 	 */
 	private surfaceRotation(newTailId: string, preAnnounced: boolean): void {
 		if (newTailId === this.rotationHandledFor) {
 			return; // already surfaced this successor
 		}
 		this.rotationHandledFor = newTailId;
-		// The cached primary is under the now-stale tree; drop it so the re-registration re-walks.
+		// The cached primary is at the now-stale root; drop it so the follow re-walks.
 		this.cohortHintCache.invalidate(this.collectionIdB64);
 		if (this.options.onRotation === undefined) {
 			return;
@@ -465,10 +530,10 @@ export class ReactivitySubscriptionManager {
 	}
 
 	/**
-	 * Honor a recover-surfaced {@link RotationRedirectError}: the serving cohort's outgoing tail rotated and
-	 * bounced this request to the new tree. Route it through the **same** {@link surfaceRotation} seam a
+	 * Honor a recover-surfaced {@link RotationRedirectError}: the serving cohort's outgoing root rotated and
+	 * bounced this request to the new root. Route it through the **same** {@link surfaceRotation} seam a
 	 * delivered pre-announce uses (`preAnnounced: false`), so both the notify-driven and recover-driven
-	 * rotation paths converge on one `RotationNotice` for the host's re-registration scheduler to consume.
+	 * rotation paths converge on one `RotationNotice` for the host's follow scheduler to consume.
 	 */
 	private honorRotationRedirect(err: RotationRedirectError): void {
 		this.surfaceRotation(err.redirect.newTailId, false);

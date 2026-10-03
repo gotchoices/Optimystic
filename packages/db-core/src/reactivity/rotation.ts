@@ -1,49 +1,47 @@
 /**
- * Reactivity — tail rotation lifecycle (`docs/reactivity.md` §Rotating tail anchor, §Tail rotation).
+ * Reactivity — tail rotation lifecycle (`docs/reactivity.md` §Anchor, §Tail rotation).
  *
- * `topicId = H(tailId ‖ "reactivity")` is derived per emission ({@link reactivityTopicId}). When the tail
- * block fills (`block_fill_size` transactions, default 64) a new tail block is born and `tailId` — hence
- * `topicId` — changes; the cohort-topic layer treats the new `topicId` as an **entirely new topic** (fresh
- * tree, new ring coord). Reactivity manages the subscriber/replay-state migration explicitly. This module
- * owns that lifecycle:
+ * A collection's topic is stable (`reactivityCollectionTopicId`, `topic-anchor.ts`); what rotates is its
+ * **root**. When the tail block fills (`block_fill_size` entries, the log's `EntriesPerBlock`) a new tail
+ * block is born and the root — the tail's storage group at `H(tailId)` — moves to the new tail's group. The
+ * tiers below the root sit at `coord_d(P, topicId)` and never move, so a rotation is "same topic, the root
+ * moved": a registration at the root re-registers under the new root key; one below the root keeps its place
+ * and only updates the root key a later re-walk would use (`CohortTopicService.moveRoot`). This module owns
+ * the subscriber- and root-side lifecycle around that move:
  *
  *  - **Pre-announce** — the block-filling commit's notification carries {@link RotationHintV1}; built here
  *    by {@link buildRotationHint} and detected subscriber-side by {@link detectRotation}.
  *  - **Block-fill tracking** — {@link BlockFillTracker} counts transactions in the current tail block and
  *    fires anticipatory **warm-up** at `block_fill_size − warm_threshold` and the **filling** signal at
  *    `block_fill_size` (the commit that carries the hint).
- *  - **Drain** — {@link TailDrainGate} keeps the outgoing tail serving renewals/replays for `T_drain` while
- *    bouncing *new* subscriptions with a `Promoted`-shaped {@link RotationRedirectV1} to the new tree.
+ *  - **Drain** — {@link TailDrainGate} keeps the outgoing root serving renewals/replays for `T_drain` while
+ *    bouncing *new* subscriptions with a `Promoted`-shaped {@link RotationRedirectV1} naming the new tail.
  *  - **Jittered re-registration** — {@link planReRegistration} / {@link planReRegistrationWave} schedule a
- *    subscriber's move to the new `topicId` over `T_rejoin_jitter` (the cohort-topic {@link RejoinJitter}),
+ *    subscriber's follow of the new tail over `T_rejoin_jitter` (the cohort-topic {@link RejoinJitter}),
  *    carrying its existing `lastRevision` (revisions are continuous across rotations).
- *  - **Buffer-to-checkpoint handoff** — {@link buildRotationHandoffCheckpoint} folds the outgoing tail's
+ *  - **Buffer-to-checkpoint handoff** — {@link buildRotationHandoffCheckpoint} folds the outgoing root's
  *    replay buffer into a final {@link CheckpointSummary} covering `[lastCheckpoint.toRevision + 1,
  *    rotationRevision]`, the **only** state migrated across a rotation; {@link applyRotationHandoff} lands it
- *    at the new tail so a `ResumeV1` spanning the rotation is recoverable.
+ *    at the new root so a `ResumeV1` spanning the rotation is recoverable.
  *
- * Forwarder draining is *emergent*: forwarders under the old tail watch their direct-subscriber count drop
- * as subscribers re-register elsewhere and demote naturally per the cohort-topic demotion protocol (no
- * state migrates; the new tree rebuilds via re-registration). It needs no code here.
+ * Tiers below the root do not drain on a rotation: only the old root stops receiving commits and releases its
+ * state after `T_drain`. It needs no code here.
  *
  * Coordination with [reactivity-backfill-resume-checkpoints]: that ticket owns the `ResumeReplyV1.TailRotated`
- * variant and the `latestKnownTailId`-staleness classification; this ticket produces the handoff checkpoint
- * and the rotation *condition*. The new tail's {@link PushState.inheritedCheckpoint} (set by
+ * variant and the `latestKnownTailId`-staleness classification; this module produces the handoff checkpoint
+ * and the rotation *condition*. The new root's {@link PushState.inheritedCheckpoint} (set by
  * {@link applyRotationHandoff}) is the seam the resume classifier consults to answer a checkpoint-window
- * resume whose span crosses the rotation: `classifyResume`/`serveResume` now read it (after the rolling
+ * resume whose span crosses the rotation: `classifyResume`/`serveResume` read it (after the rolling
  * `checkpoint` misses) and serve the inherited summary, so a cross-rotation resume no longer falls to
  * `out_of_window` (`docs/reactivity.md` §Resume, §Tail rotation step 5). The drain-window redirect a new
  * subscription receives, {@link RotationRedirectV1}, is serialized by {@link validateRotationRedirectV1} and
  * rides the recover reply envelope as `kind: "rotated"` ({@link import("./recover.js").RecoverReplyV1}).
  */
 
-import { bytesToB64url, b64urlToBytes } from "../cohort-topic/wire/codec.js";
-import { createRingHash } from "../cohort-topic/ring-hash.js";
-import type { IRingHash } from "../cohort-topic/ports.js";
+import { b64urlToBytes } from "../cohort-topic/wire/codec.js";
 import type { RejoinJitter } from "../cohort-topic/antiflood/jitter.js";
 import { BLOCK_FILL_SIZE_DEFAULT, T_DRAIN_MS, WARM_THRESHOLD_DEFAULT } from "./config.js";
 import { buildCheckpointSummary, type CheckpointSummary } from "./checkpoint.js";
-import { reactivityTopicId } from "./topic-anchor.js";
 import type { PushState } from "./push-state.js";
 import type { NotificationV1, RotationHintV1 } from "./wire.js";
 import { asObject, b64urlField, failWire, reqIntInRange, reqString, requireV1 } from "./wire-validate.js";
@@ -67,25 +65,25 @@ export interface RotationDetection {
 	/** The tail id to re-register under, base64url — present iff `rotated`. */
 	readonly newTailId?: string;
 	/**
-	 * True iff this is a **pre-announce**: the delivered `tailId` still matches `tailIdAtAttach`, but the
-	 * notification's `rotationHint.newTailId` names a different successor. (False when the delivered tail
-	 * already differs — the tree has *already* migrated.)
+	 * True iff this is a **pre-announce**: the delivered `tailId` still matches the tail the subscriber follows,
+	 * but the notification's `rotationHint.newTailId` names a different successor. (False when the delivered
+	 * tail already differs — the root has *already* moved.)
 	 */
 	readonly preAnnounced: boolean;
 }
 
 /**
- * Detect tail rotation for a subscriber attached at `tailIdAtAttach` (base64url) from a delivered
- * notification. Rotation is signaled when the delivered `tailId` **or** the `rotationHint.newTailId`
- * differs from `tailIdAtAttach` (`docs/reactivity.md` §Rotating tail anchor). An already-rotated delivery
+ * Detect tail rotation for a subscriber following `followedTailId` (base64url, the latest tail it has
+ * followed) from a delivered notification. Rotation is signaled when the delivered `tailId` **or** the
+ * `rotationHint.newTailId` differs from it (`docs/reactivity.md` §Tail rotation). An already-rotated delivery
  * (different `tailId`) takes precedence over a pre-announce.
  */
-export function detectRotation(tailIdAtAttach: string, n: Pick<NotificationV1, "tailId" | "rotationHint">): RotationDetection {
-	if (n.tailId !== tailIdAtAttach) {
-		// The delivered notification rides the *new* tree already — a hard rotation, not a pre-announce.
+export function detectRotation(followedTailId: string, n: Pick<NotificationV1, "tailId" | "rotationHint">): RotationDetection {
+	if (n.tailId !== followedTailId) {
+		// The delivered notification was announced at the *new* root already — a hard rotation, not a pre-announce.
 		return { rotated: true, newTailId: n.tailId, preAnnounced: false };
 	}
-	if (n.rotationHint !== undefined && n.rotationHint.newTailId !== tailIdAtAttach) {
+	if (n.rotationHint !== undefined && n.rotationHint.newTailId !== followedTailId) {
 		return { rotated: true, newTailId: n.rotationHint.newTailId, preAnnounced: true };
 	}
 	return { rotated: false, preAnnounced: false };
@@ -111,7 +109,7 @@ export type BlockFillSignal =
 
 /** Construction inputs for a {@link BlockFillTracker}. */
 export interface BlockFillTrackerInit {
-	/** Transactions per block before the tail rotates (default {@link BLOCK_FILL_SIZE_DEFAULT}). */
+	/** Entries per log block before the tail rotates (default {@link BLOCK_FILL_SIZE_DEFAULT}, the log's `EntriesPerBlock`). */
 	readonly blockFillSize?: number;
 	/** Transactions remaining in the tail when anticipatory warm-up fires (default {@link WARM_THRESHOLD_DEFAULT}). */
 	readonly warmThreshold?: number;
@@ -186,16 +184,17 @@ export type DrainOp =
 	| "replay";
 
 /**
- * A `Promoted`-shaped redirect to the rotated tree (`docs/reactivity.md` §Tail rotation step 2). Unlike the
- * cohort-topic tier-based `Promoted`, this redirects to an entirely **new topic** — the new tail's tree at
- * `coord_0(_, newTopicId)` — so it carries the successor's `newTailId` + derived `newTopicId`.
+ * A `Promoted`-shaped redirect to the moved root (`docs/reactivity.md` §Tail rotation step 2). Unlike the
+ * cohort-topic tier-based `Promoted`, this redirects to the same topic's **new root** — the new tail's storage
+ * group at `H(newTailId)` — so a receiver acts on `newTailId`. `newTopicId` stays on the wire and carries the
+ * collection's unchanged topic (the field predates the stable topic; it is not a redirect target).
  */
 export interface RotationRedirectV1 {
 	readonly v: 1;
 	readonly result: "rotated";
-	/** New tail block id the topic anchor rotated to, base64url. */
+	/** New tail block id the root moved to, base64url — the new root key. */
 	readonly newTailId: string;
-	/** `H(newTailId ‖ "reactivity")` — the new tree's topic id, base64url (the redirect target). */
+	/** The collection's topic id, base64url — unchanged by a rotation. */
 	readonly newTopicId: string;
 	/** Revision at which the rotation took effect. */
 	readonly effectiveAtRevision: number;
@@ -237,19 +236,19 @@ export type DrainDecision =
 export interface TailDrainGateInit {
 	/** Unix ms the rotation took effect (drain starts here). */
 	readonly rotatedAt: number;
-	/** New tail block id the topic rotated to, base64url. */
+	/** New tail block id the root moved to, base64url. */
 	readonly newTailId: string;
+	/** The collection's topic id, base64url — carried unchanged on the redirect. */
+	readonly topicId: string;
 	/** Revision at which the rotation took effect. */
 	readonly effectiveAtRevision: number;
 	/** Drain duration `T_drain` (ms, default {@link T_DRAIN_MS}). */
 	readonly tDrainMs?: number;
-	/** Ring hash for the `newTopicId` derivation (must match cohort-topic routing). Default db-core SHA-256. */
-	readonly hash?: IRingHash;
 }
 
 /**
- * The outgoing tail's drain state machine. For `T_drain` after a rotation it accepts **renewals** and
- * serves **replays**, but bounces **new subscriptions** with a {@link RotationRedirectV1} to the new tree;
+ * The outgoing root's drain state machine. For `T_drain` after a rotation it accepts **renewals** and
+ * serves **replays**, but bounces **new subscriptions** with a {@link RotationRedirectV1} to the new root;
  * after `T_drain` it reports `drained` for everything (the subscriber re-registers from `d_max`).
  */
 export class TailDrainGate {
@@ -264,13 +263,11 @@ export class TailDrainGate {
 		}
 		this.rotatedAt = init.rotatedAt;
 		this.tDrainMs = tDrainMs;
-		const hash = init.hash ?? createRingHash();
-		const newTopicId = bytesToB64url(reactivityTopicId(b64urlToBytes(init.newTailId), hash));
 		this.redirect = {
 			v: 1,
 			result: "rotated",
 			newTailId: init.newTailId,
-			newTopicId,
+			newTopicId: init.topicId,
 			effectiveAtRevision: init.effectiveAtRevision,
 		};
 	}
@@ -292,7 +289,7 @@ export class TailDrainGate {
 
 	/**
 	 * Classify an inbound request. Within the drain window: `new_subscribe` → redirect, `renew`/`replay` →
-	 * serve. After the window: `drained` (the old tail has released its forwarder state).
+	 * serve. After the window: `drained` (the old root has released its forwarder state).
 	 */
 	classify(op: DrainOp, now: number): DrainDecision {
 		if (!this.isDraining(now)) {
@@ -302,17 +299,15 @@ export class TailDrainGate {
 	}
 }
 
-// --- jittered re-registration (subscriber moves to the new tree) -------------
+// --- jittered re-registration (a subscriber follows the new root) -------------
 
-/** A subscriber's planned re-registration at the rotated tree. */
+/** A subscriber's planned follow of the moved root. */
 export interface ReRegistrationPlan {
-	/** New tail block id (raw bytes) to attach under. */
+	/** New tail block id (raw bytes) — the new root key to follow. */
 	readonly newTailId: Uint8Array;
-	/** `H(newTailId ‖ "reactivity")` (raw bytes) — the new tree's topic id to register at. */
-	readonly newTopicId: Uint8Array;
 	/** The subscriber's existing `lastRevision`, carried so revisions stay continuous across the rotation. */
 	readonly lastRevision: number;
-	/** Unix ms at which to fire the re-registration (jittered over `T_rejoin_jitter`). */
+	/** Unix ms at which to fire the follow (jittered over `T_rejoin_jitter`). */
 	readonly fireAt: number;
 }
 
@@ -320,32 +315,23 @@ export interface ReRegistrationPlan {
 interface ReRegistrationTarget {
 	/** The rotation hint (or any object carrying the successor `newTailId`), base64url. */
 	readonly hint: Pick<RotationHintV1, "newTailId">;
-	/** Ring hash for the `newTopicId` derivation. Default db-core SHA-256. */
-	readonly hash?: IRingHash;
-}
-
-/** Resolve `(newTailId, newTopicId)` raw bytes for a rotation target. */
-function resolveRotationTarget(target: ReRegistrationTarget): { newTailId: Uint8Array; newTopicId: Uint8Array } {
-	const newTailId = b64urlToBytes(target.hint.newTailId);
-	const newTopicId = reactivityTopicId(newTailId, target.hash ?? createRingHash());
-	return { newTailId, newTopicId };
 }
 
 /**
- * Plan **one** subscriber's re-registration at the rotated tree: derive the new `topicId` from the hint's
- * `newTailId`, carry the subscriber's `lastRevision`, and draw a jittered `fireAt` over `T_rejoin_jitter`
- * via the cohort-topic {@link RejoinJitter} (`scheduleRejoin` — a uniform offset, decorrelating this
- * subscriber's re-join from its peers).
+ * Plan **one** subscriber's follow of the moved root: carry the hint's `newTailId` and the subscriber's
+ * `lastRevision`, and draw a jittered `fireAt` over `T_rejoin_jitter` via the cohort-topic
+ * {@link RejoinJitter} (`scheduleRejoin` — a uniform offset, decorrelating this subscriber's re-join from
+ * its peers). Only a registration at the root sends anything when the plan fires; one below the root
+ * updates its root key locally.
  */
 export function planReRegistration(opts: ReRegistrationTarget & { lastRevision: number; now: number; jitter: RejoinJitter }): ReRegistrationPlan {
-	const { newTailId, newTopicId } = resolveRotationTarget(opts);
-	return { newTailId, newTopicId, lastRevision: opts.lastRevision, fireAt: opts.jitter.scheduleRejoin(opts.now) };
+	return { newTailId: b64urlToBytes(opts.hint.newTailId), lastRevision: opts.lastRevision, fireAt: opts.jitter.scheduleRejoin(opts.now) };
 }
 
 /**
- * Plan a **whole wave** of subscribers' re-registrations at the rotated tree. Uses the
+ * Plan a **whole wave** of subscribers' follows of the moved root. Uses the
  * {@link RejoinJitter.scheduleWave} hard-bound staggering so any `T_rejoin_jitter`-long window holds at
- * most the injected jitter's `capPromote` arrivals — the new tail never sees more than
+ * most the injected jitter's `capPromote` arrivals — the new root never sees more than
  * `capPromote / T_rejoin_jitter` re-registrations per second.
  *
  * **Caller contract:** rotation is governed by the *fast-promote* bound, so the host MUST build this `jitter`
@@ -357,14 +343,14 @@ export function planReRegistration(opts: ReRegistrationTarget & { lastRevision: 
 export function planReRegistrationWave(
 	opts: ReRegistrationTarget & { subscribers: readonly { readonly lastRevision: number }[]; now: number; jitter: RejoinJitter },
 ): ReRegistrationPlan[] {
-	const { newTailId, newTopicId } = resolveRotationTarget(opts);
+	const newTailId = b64urlToBytes(opts.hint.newTailId);
 	const fireAts = opts.jitter.scheduleWave(opts.subscribers.length, opts.now);
-	return opts.subscribers.map((s, i) => ({ newTailId, newTopicId, lastRevision: s.lastRevision, fireAt: fireAts[i]! }));
+	return opts.subscribers.map((s, i) => ({ newTailId, lastRevision: s.lastRevision, fireAt: fireAts[i]! }));
 }
 
 // --- buffer-to-checkpoint handoff (the only state migrated across a rotation) -
 
-/** The state migrated from the outgoing tail to the new tail on rotation. */
+/** The state migrated from the outgoing root to the new root on rotation. */
 export interface RotationHandoff {
 	/** The final checkpoint covering `[lastCheckpoint.toRevision + 1, rotationRevision]`. */
 	readonly checkpoint: CheckpointSummary;
@@ -373,7 +359,7 @@ export interface RotationHandoff {
 }
 
 /**
- * Fold the outgoing tail's replay buffer into the final {@link CheckpointSummary} handed to the new tail
+ * Fold the outgoing root's replay buffer into the final {@link CheckpointSummary} handed to the new root
  * (`docs/reactivity.md` §Tail rotation step 5 — the **only** state migration across a rotation). The
  * handoff covers `[lastCheckpoint.toRevision + 1, rotationRevision]`: the revisions still live in the
  * replay ring (above the rolling checkpoint's high edge) up to the rotation revision. Returns `undefined`
@@ -400,10 +386,10 @@ export function buildRotationHandoffCheckpoint(state: PushState, opts: { rotatio
 }
 
 /**
- * Land a {@link RotationHandoff} at the new tail's {@link PushState}: record the inherited checkpoint so a
- * `ResumeV1` whose span crosses the rotation is recoverable from the new tail (the new tail "holds the old
+ * Land a {@link RotationHandoff} at the new root's {@link PushState}: record the inherited checkpoint so a
+ * `ResumeV1` whose span crosses the rotation is recoverable from the new root (the new root "holds the old
  * checkpoint", `docs/reactivity.md` §Tail rotation step 5). The handoff is a one-time migration — it does
- * not feed the new tail's rolling checkpoint (that rolls from the new tree's own replay-ring eviction).
+ * not feed the new root's rolling checkpoint (that rolls from the new root's own replay-ring eviction).
  */
 export function applyRotationHandoff(newTailState: PushState, handoff: RotationHandoff): void {
 	newTailState.adoptRotationCheckpoint(handoff.checkpoint);

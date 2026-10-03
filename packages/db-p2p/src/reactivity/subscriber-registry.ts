@@ -8,13 +8,17 @@
  * manager registered for it, and a constructed manager registers its `onNotification` keyed by the reactivity
  * `topicId` it subscribed under.
  *
- * Keyed by topicId-base64url. A manager subscribes under `topicId = reactivityTopicId(reactivityTailBytes(
- * tailId))` (the same anchor origination derives), so a notification's topic — derived by the forwarder host
- * from the notification's tail anchor — routes to exactly the managers watching that tail's collection.
+ * Keyed by topicId-base64url. A manager subscribes under the collection's stable topic
+ * `topicId = reactivityCollectionTopicId(reactivityCollectionIdBytes(id))` (the same anchor origination
+ * derives), so a notification's topic — derived by the forwarder host from the notification's collection id —
+ * routes to exactly the managers watching that collection, whichever tail block it was announced at. One
+ * handler serves a collection subscription for its whole life: a tail move changes the topic's root, not the
+ * topic, so nothing here changes on a rotation.
  *
  * **Scope.** This delivers socket-routed notifications into a manager that was *already constructed* and
- * registered. Constructing managers, and registering and unregistering them here as a collection's tail
- * moves, is the collection watch service's ({@link import("./collection-watch.js").ReactivityCollectionWatch}).
+ * registered. Constructing managers, and registering them here when a collection's subscription opens and
+ * dropping them when it closes, is the collection watch service's
+ * ({@link import("./collection-watch.js").ReactivityCollectionWatch}).
  */
 
 import { bytesToB64url, type NotificationV1 } from "@optimystic/db-core";

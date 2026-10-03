@@ -23,8 +23,9 @@
  * **Per-root state.** Everything this host keeps for a topic — the served {@link PushState}, the ingest
  * serialization chain, the rotation drain gate — is kept per **root**: per tail block the notification was
  * announced at, keyed by that tail (`NotificationV1.tailId`, the base64url of `reactivityTailBytes(tail)`).
- * While a topic is derived from its tail the two keys partition state identically; keying by the root is what
- * keeps two roots of one topic apart once a topic outlives its tail.
+ * A collection's topic is stable and has one root per log tail block over its life, so on a machine serving
+ * two of them (the outgoing root during its drain window and the new one) the root key is what keeps their
+ * replay rings, dedupe sets and gates apart.
  *
  * **Subscriber-id space.** `selfPeerId`, the {@link ReactivityForwarderHostDeps.directSubscribers} output,
  * the {@link CohortRef.primary} child targets, and every {@link ReactivityNotifyTransport.send} target are
@@ -41,7 +42,7 @@
  */
 
 import {
-	reactivityTopicId,
+	reactivityCollectionTopicId,
 	b64urlToBytes,
 	bytesToB64url,
 	createReactivityForwarder,
@@ -67,12 +68,13 @@ import { createLogger } from "../logger.js";
 const log = createLogger("reactivity-forwarder-host");
 
 /**
- * The reactivity topic id a notification belongs to: `H(tailId ‖ "reactivity")` over the notification's
- * tail anchor. Kept in one place so it matches origination's `reactivityTailBytes` encoding and the
- * subscriber/forwarder verifier's coord derivation byte-for-byte (both decode `tailId` as base64url first).
+ * The reactivity topic id a notification belongs to: `H(collectionId ‖ "reactivity")` over the notification's
+ * collection id — the collection's stable topic, which its tail does not enter. The one place both roles
+ * (forwarder ingest, inbound routing, local delivery) derive a notification's topic, so it matches the topic a
+ * subscriber registers under byte for byte: both decode the base64url of `reactivityCollectionIdBytes(id)`.
  */
 export function reactivityNotificationTopicId(n: NotificationV1): Uint8Array {
-	return reactivityTopicId(b64urlToBytes(n.tailId));
+	return reactivityCollectionTopicId(b64urlToBytes(n.collectionId));
 }
 
 /** Where a notification belongs: the root it was announced at (its tail) and the topic it is announced on. */
@@ -84,7 +86,7 @@ interface NotificationRoute {
 	readonly topicId: Uint8Array;
 }
 
-/** Route a notification; throws on an undecodable `tailId`. */
+/** Route a notification; throws on an undecodable `tailId` or `collectionId`. */
 function routeOf(n: NotificationV1): NotificationRoute {
 	const rootTail = b64urlToBytes(n.tailId);
 	return { rootTail, rootKey: rootKeyOf(rootTail), topicId: reactivityNotificationTopicId(n) };
@@ -144,14 +146,15 @@ export interface ReactivityForwarderHostDeps {
 	/**
 	 * Direct-subscriber member ids for `topicId` at the root whose tail bytes are `rootTail` — e.g.
 	 * {@link reactivityDirectSubscribers} over the engine serving that root. The root, not the topic alone, names
-	 * the cohort: a topic can have a root per tail block, and only that root's subscribers are its to fan out to.
+	 * the cohort: a topic has a root per tail block over its life, and only that root's subscribers are its to
+	 * fan out to.
 	 */
 	readonly directSubscribers: (topicId: Uint8Array, rootTail: Uint8Array) => string[];
 	/** Resolve a child cohort's dialable primary when {@link CohortRef.primary} is absent (e.g. a FRET resolver). */
 	readonly resolveChildPrimary?: (ref: CohortRef) => string | undefined;
 	/**
 	 * Route an inbound notification to a co-located subscription manager, when this node also subscribes the
-	 * topic. **Must be idempotent on `(collectionId, revision)`**: on the {@link ReactivityForwarderHost.onInbound}
+	 * collection. **Must be idempotent on `(collectionId, revision)`**: on the {@link ReactivityForwarderHost.onInbound}
 	 * path a node that is both a cohort member *and* a subscriber invokes this **twice** for the same
 	 * notification — once in the subscriber role (directly) and once in the forwarder role (when `self` is in
 	 * {@link directSubscribers}, via `fanOut`'s self-delivery). The db-core subscriber's `(collectionId,
@@ -161,6 +164,16 @@ export interface ReactivityForwarderHostDeps {
 	readonly deliverLocal?: (topicId: Uint8Array, n: NotificationV1) => void;
 	/** Wall clock (unix ms) stamped on `receive`. Default `Date.now`. */
 	readonly clock?: () => number;
+}
+
+/** What {@link ReactivityForwarderHost.markRotated} is told about a root's move: the successor and the collection's topic. */
+export interface RootRotation {
+	/** The new tail block id the root moved to, base64url (`reactivityTailBytes` encoding). */
+	readonly newTailId: string;
+	/** Revision at which the rotation took effect. */
+	readonly effectiveAtRevision: number;
+	/** The collection's topic id, base64url — carried unchanged on the drain redirect. */
+	readonly topicId: string;
 }
 
 /** A root this node forwards for: its live {@link PushState} and the forwarder driving the receive path over it. */
@@ -204,7 +217,7 @@ export class ReactivityForwarderHost {
 	 * Per **old-root** drain gate: set by {@link markRotated} when this node observes the collection's log move
 	 * past a tail, keyed by that outgoing tail (base64url). For `T_drain` after the rotation
 	 * {@link rotationRedirectFor} answers a recover request reaching the outgoing root with the gate's
-	 * {@link RotationRedirectV1} ("this moved — go to the new tree"); once the window closes the entry is
+	 * {@link RotationRedirectV1} ("this moved — go to the new root"); once the window closes the entry is
 	 * evicted along with the root's served `PushState`.
 	 */
 	private readonly rotationGates = new Map<string, TailDrainGate>();
@@ -233,7 +246,7 @@ export class ReactivityForwarderHost {
 		try {
 			route = routeOf(n);
 		} catch (err) {
-			log("ingest: undecodable tailId on rev=%d (dropped): %o", n.revision, err);
+			log("ingest: undecodable tailId or collectionId on rev=%d (dropped): %o", n.revision, err);
 			return Promise.resolve();
 		}
 		const key = route.rootKey;
@@ -283,7 +296,7 @@ export class ReactivityForwarderHost {
 		try {
 			topicId = reactivityNotificationTopicId(n);
 		} catch (err) {
-			log("onInbound: undecodable tailId on rev=%d (dropped): %o", n.revision, err);
+			log("onInbound: undecodable collectionId on rev=%d (dropped): %o", n.revision, err);
 			return;
 		}
 		// Subscriber role first: deliver in-process to a co-located subscription manager, if any.
@@ -342,17 +355,19 @@ export class ReactivityForwarderHost {
 
 	/**
 	 * Record that the root at the tail whose bytes are `oldTail` has **rotated** to a successor tail, starting a
-	 * {@link TailDrainGate} so the outgoing root bounces recover requests to the new tree for `T_drain`
-	 * (`docs/reactivity.md` §Tail rotation step 2). db-core derives the redirect's `newTopicId` internally via
-	 * `reactivityTopicId(newTailId)`. The trigger is origination seeing a commit that names a later tail
-	 * (`ReactivityOriginationManager.observeTailCommit`); this seam is called directly in unit tests.
+	 * {@link TailDrainGate} so the outgoing root bounces recover requests to the new root for `T_drain`
+	 * (`docs/reactivity.md` §Tail rotation step 2). The redirect carries the collection's `topicId` (base64url)
+	 * unchanged — a rotation moves the root, not the topic — which the caller supplies because a root this node
+	 * never built served state for has no push state to read it from. The trigger is origination seeing a commit
+	 * that names a later tail (`ReactivityOriginationManager.observeTailCommit`); this seam is called directly in
+	 * unit tests.
 	 *
 	 * **Idempotent / chained.** A second `markRotated` for the **same** successor is a no-op; a `markRotated`
 	 * to a **later** successor (higher `effectiveAtRevision`) replaces the gate — so a chained OLD→A→B rotation
 	 * advances the redirect to the most recent successor and restarts its drain window from `now`. An earlier
 	 * (or equal) successor leaves the existing gate untouched.
 	 */
-	markRotated(oldTail: Uint8Array, redirect: { newTailId: string; effectiveAtRevision: number }, now: number): void {
+	markRotated(oldTail: Uint8Array, redirect: RootRotation, now: number): void {
 		this.releaseDrainedRoots(now);
 		const key = rootKeyOf(oldTail);
 		const existing = this.rotationGates.get(key);
@@ -362,6 +377,7 @@ export class ReactivityForwarderHost {
 		this.rotationGates.set(key, new TailDrainGate({
 			rotatedAt: now,
 			newTailId: redirect.newTailId,
+			topicId: redirect.topicId,
 			effectiveAtRevision: redirect.effectiveAtRevision,
 		}));
 	}

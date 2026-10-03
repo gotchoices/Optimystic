@@ -10,7 +10,7 @@ import {
 	createRootPlacement,
 	DEFAULT_SUPER_MAJORITY_THRESHOLD,
 	RingHash,
-	reactivityTopicId,
+	reactivityCollectionTopicId,
 	reactivityRootCoord,
 	membershipCertSigningPayload,
 	registerSigningPayload,
@@ -591,7 +591,6 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	// which builds subscription managers, is exercised by the collection-watch case at the end of this file.)
 	it('a commit on a real cohort member delivers a NotificationV1 to a remote subscriber over a real socket', async () => {
 		const tailBytes = reactivityTailBytes(TAIL_ID);
-		const topicId = reactivityTopicId(tailBytes);
 		// The topic's root coordinate: the tail's ring position. The root group there is the tail's storage group
 		// — at clusterSize 1 one machine, the origin, which applies and so announces the tail's commits — and the
 		// verifier derives the same coordinate from the notification's tail.
@@ -608,6 +607,8 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		// the pinned bytes, which is what origination puts on the notification.
 		const collectionId = 'rx-socket-collection';
 		const collectionIdB64 = bytesToB64url(reactivityCollectionIdBytes(collectionId));
+		// The topic is the collection's, whatever tail block the commit lands on; the tail only places the root.
+		const topicId = reactivityCollectionTopicId(reactivityCollectionIdBytes(collectionId));
 		const now = Date.now();
 		const appPayload = subscribeAppPayloadBytes({
 			collectionId: collectionIdB64,
@@ -703,7 +704,6 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	it('a remote subscriber resumes past the tail over a real recover socket and is brought current (backfill)', async () => {
 		const RESUME_TAIL = 'optimystic/collection/tail-resume-real-libp2p';
 		const tailBytes = reactivityTailBytes(RESUME_TAIL);
-		const topicId = reactivityTopicId(tailBytes);
 		const reactivityCoord = reactivityRootCoord(tailBytes);
 		// The root group at the tail's root coordinate: at clusterSize 1, the one machine that stores the tail.
 		const origin = await rootMemberFor(reactivityCoord);
@@ -713,6 +713,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		// did not match what origination put on the notification would find no served state.
 		const collectionId = 'rx-resume-collection';
 		const collectionIdB64 = bytesToB64url(reactivityCollectionIdBytes(collectionId));
+		const topicId = reactivityCollectionTopicId(reactivityCollectionIdBytes(collectionId));
 
 		// The production recover transport's root-group read WOULD reach the origin: the origin is the nearest
 		// serving peer to the tail's root coordinate, so at clusterSize 1 it is the whole root group (the same
@@ -786,7 +787,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			resolveCohort: () => Promise.resolve([origin.idStr]),
 		});
 		const { signResume } = createRecoverRequestSigners(remote.key);
-		const resumeTransport = recover.resumeTransport(tailBytes, collectionIdB64);
+		const resumeTransport = recover.resumeTransport(() => tailBytes, collectionIdB64);
 
 		// The remote slept holding nothing past rev 0, so it resumes from rev 1. Poll: origination ingest is async
 		// (serialized off the emit seam), so the origin's PushState may not yet hold rev 1 on the first dial — a
@@ -1173,8 +1174,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			// (see captureCommitCert in cluster-repo.ts), so only the writer announces. It fans an announcement out
 			// to the registrations its own cohort engine holds, and the watcher's reaches it over cohort gossip
 			// unless the writer happens to be the topic's primary.
-			const tail = await Collection.readCommittedTail(watcherTransactor, COLLECTION);
-			const topicId = reactivityTopicId(reactivityTailBytes(tail!.tailId));
+			const topicId = reactivityCollectionTopicId(reactivityCollectionIdBytes(COLLECTION));
 			const writerHost = (writer as unknown as { cohortTopicHost: CohortTopicHost }).cohortTopicHost;
 			await waitFor(() => {
 				const engine = writerHost.registry.findServing(topicId, 0);
@@ -1304,9 +1304,9 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		const watcherTransactor = transactorFor(watcher, WIDE_NETWORK);
 		const reads = { started: 0, finished: 0 };
 		let wakes = 0;
-		// Count the frames the watcher's subscriber registry receives for the tail's topic: a wake that one of
-		// these accounts for came over the notify socket, not from the watch service's own tail read.
-		const topicId = reactivityTopicId(reactivityTailBytes(tail!.tailId));
+		// Count the frames the watcher's subscriber registry receives for the collection's topic: a wake that one
+		// of these accounts for came over the notify socket, not from the watch service's own tail read.
+		const topicId = reactivityCollectionTopicId(reactivityCollectionIdBytes(COLLECTION));
 		let delivered = 0;
 		const watcherRegistry = (watcher as unknown as { reactivitySubscribers: { register(topicId: Uint8Array, h: (n: NotificationV1) => void): () => void } }).reactivitySubscribers;
 		const offCount = watcherRegistry.register(topicId, () => { delivered++; });

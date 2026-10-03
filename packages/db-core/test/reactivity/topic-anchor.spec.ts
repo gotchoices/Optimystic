@@ -1,44 +1,32 @@
 import { expect } from 'chai';
-import { reactivityTopicId, createReactivityTopicAnchor } from '../../src/reactivity/index.js';
+import { reactivityCollectionTopicId, reactivityRootCoord } from '../../src/reactivity/index.js';
 import { createRingHash } from '../../src/cohort-topic/ring-hash.js';
 
-function seededBytes(len: number, seed: number): Uint8Array {
-	const out = new Uint8Array(len);
-	let s = (seed * 2654435761) >>> 0;
-	for (let i = 0; i < len; i++) {
-		s = (s * 1664525 + 1013904223) >>> 0;
-		out[i] = (s >>> 24) & 0xff;
-	}
-	return out;
-}
+const utf8 = new TextEncoder();
 
 describe('reactivity topic anchor', () => {
-	it('is deterministic for identical tail ids', () => {
-		const tailId = seededBytes(32, 1);
-		expect([...reactivityTopicId(tailId)]).to.deep.equal([...reactivityTopicId(tailId)]);
+	it('is a function of the collection id alone: the same collection under two tails has one topic', () => {
+		const collection = utf8.encode('app/users');
+		const a = reactivityCollectionTopicId(collection);
+		const b = reactivityCollectionTopicId(utf8.encode('app/users'));
+		expect([...a]).to.deep.equal([...b]);
+		// Nothing about a tail enters the derivation; the root coordinate is the only thing a rotation moves.
+		expect([...reactivityRootCoord(utf8.encode('tail-block-1'))]).to.not.deep.equal([...reactivityRootCoord(utf8.encode('tail-block-2'))]);
 	});
 
-	it('rotates the topic id when the tail id changes', () => {
-		const a = reactivityTopicId(seededBytes(32, 1));
-		const b = reactivityTopicId(seededBytes(32, 2));
-		expect([...a]).to.not.deep.equal([...b]);
+	it('two collections have different topics', () => {
+		expect([...reactivityCollectionTopicId(utf8.encode('app/users'))]).to.not.deep.equal([...reactivityCollectionTopicId(utf8.encode('app/orders'))]);
 	});
 
 	it('produces a ring-width (32-byte) topic id at the default ring bits', () => {
-		expect(reactivityTopicId(seededBytes(32, 3)).length).to.equal(32);
+		expect(reactivityCollectionTopicId(utf8.encode('app/users')).length).to.equal(32);
 	});
 
-	it('domain-separates from a bare hash of the tail id (suffix is mixed in)', () => {
+	it('is domain-separated from the root coordinate and from a bare hash of the same bytes', () => {
 		const hash = createRingHash();
-		const tailId = seededBytes(32, 4);
-		const anchored = reactivityTopicId(tailId, hash);
-		const bare = hash.H(tailId);
-		expect([...anchored]).to.not.deep.equal([...bare]);
-	});
-
-	it('the anchor object agrees with the free function', () => {
-		const anchor = createReactivityTopicAnchor();
-		const tailId = seededBytes(32, 5);
-		expect([...anchor.topicId(tailId)]).to.deep.equal([...reactivityTopicId(tailId)]);
+		const bytes = utf8.encode('shared-bytes');
+		const topic = reactivityCollectionTopicId(bytes, hash);
+		expect([...topic], 'the suffix keeps a collection topic apart from a root placed at the same bytes').to.not.deep.equal([...reactivityRootCoord(bytes, hash)]);
+		expect([...topic]).to.not.deep.equal([...hash.H(bytes)]);
 	});
 });

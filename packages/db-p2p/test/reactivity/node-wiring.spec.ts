@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id';
-import { bytesToB64url, reactivityTopicId } from '@optimystic/db-core';
+import { bytesToB64url } from '@optimystic/db-core';
 import { createLibp2pNode } from '../../src/libp2p-node.js';
 import { ReactivitySubscriberRegistry } from '../../src/reactivity/subscriber-registry.js';
 import { expectWellFormedProtocolIds } from '../util/protocol-ids.js';
@@ -36,7 +36,7 @@ function fakeRotationNotice(): RotationNotice {
 	return {
 		newTailId: bytesToB64url(newTailId),
 		preAnnounced: false,
-		plan: { newTailId, newTopicId: reactivityTopicId(newTailId), lastRevision: 0, fireAt: Date.now() + 3_600_000 },
+		plan: { newTailId, lastRevision: 0, fireAt: Date.now() + 3_600_000 },
 	};
 }
 

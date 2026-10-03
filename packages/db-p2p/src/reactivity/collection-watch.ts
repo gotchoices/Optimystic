@@ -2,19 +2,26 @@
  * Reactivity — node-level collection watch service (`docs/reactivity.md` §Subscription, §Tail rotation).
  *
  * The one call an application makes to be woken when a collection changes anywhere on the network:
- * {@link ReactivityCollectionWatch.watch}. Behind it the service builds a
- * {@link ReactivitySubscriptionManager} under the collection's current log tail, routes socket-delivered
- * notifications to it through the node's {@link ReactivitySubscriberRegistry}, keeps the cohort registration
- * renewed, and moves the subscription when the log starts a new tail block.
+ * {@link ReactivityCollectionWatch.watch}. Behind it the service builds one
+ * {@link ReactivitySubscriptionManager} for the collection, routes socket-delivered notifications to it
+ * through the node's {@link ReactivitySubscriberRegistry} under the collection's topic, keeps the cohort
+ * registration renewed, and has the manager follow the log's tail when it starts a new block.
  *
- * **One subscription per collection.** Every watch of one collection on this node shares one subscription,
- * which closes with its last handle. Sharing is also what keeps the node's rotation scheduler correct: it
- * de-duplicates by successor tail, and two subscriptions of one collection would share successor tails.
+ * **One subscription per collection.** Every watch of one collection on this node shares one subscription
+ * — one manager and one registry handler for its whole life, both created at its first attach and released
+ * at close — which closes with its last handle. Sharing is also what keeps the node's rotation scheduler
+ * correct: it de-duplicates by successor tail, and two subscriptions of one collection would share
+ * successor tails.
+ *
+ * **A tail move is a follow, not a re-attach.** The collection's topic is stable, so the handler stays
+ * registered where it is; the manager's `followTail` decides what the cohort needs: a registration at the
+ * root registers again under the new root key, one below the root sends nothing and only updates the key a
+ * re-walk would use.
  *
  * **Nothing here is trusted to arrive.** A notification can be lost, a registration can fail, a tail can
- * move with nobody told (a subscriber registered under the old tail's topic is not sent the new tail's
- * notifications), and a commit may never be announced at all. So each subscription also runs a tick, at the
- * renewal cadence, that reads the collection's committed tail and compares it with what it last saw (see
+ * move with nobody told (a subscriber registered at the old root is not sent the new root's notifications),
+ * and a commit may never be announced at all. So each subscription also runs a tick, at the renewal cadence,
+ * that reads the collection's committed tail and compares it with what it last saw (see
  * {@link ReactivityCollectionWatch.tick}). Every failure above then costs at most one tick of delay.
  *
  * **What a watcher is promised.** Open the watch before the read it is meant to keep fresh: a commit that
@@ -22,14 +29,14 @@
  * tail it reads for a collection wakes that collection's watchers once, whether or not anything changed.
  *
  * **Work on one subscription is serial.** The first attach, each tick, each escalation's re-read and each
- * scheduled move run one at a time per subscription, so two moves never interleave. Delivery is not part of
- * that queue: a notification reaches {@link CollectionWatchRequest.onChange} while a move is in flight.
+ * scheduled follow run one at a time per subscription, so two follows never interleave. Delivery is not part
+ * of that queue: a notification reaches {@link CollectionWatchRequest.onChange} while a follow is in flight.
  */
 
 import {
 	bytesToB64url,
 	pingIntervalMs,
-	reactivityTopicId,
+	reactivityCollectionTopicId,
 	subscriberTtlForProfile,
 	type BlockId,
 	type CohortTopicService,
@@ -77,7 +84,7 @@ export interface CollectionWatchHandle {
 
 /** Construction inputs for a {@link ReactivityCollectionWatch}. */
 export interface ReactivityCollectionWatchOptions {
-	/** Participant-facing cohort-topic substrate API (register / renew / withdraw). */
+	/** Participant-facing cohort-topic substrate API (register / renew / moveRoot / withdraw). */
 	readonly service: CohortTopicService;
 	/** The node's profile: sets the registration TTL, and so the tick interval (TTL / 3). */
 	readonly profile: NodeProfile;
@@ -109,22 +116,15 @@ export interface ReactivityCollectionWatchOptions {
 /** One watcher of a collection: its change callback and its way to read the committed tail. */
 type Listener = Pick<CollectionWatchRequest, "readTail" | "onChange">;
 
-/** A manager under one tail's topic, with the registry entry that routes that topic's notifications to it. */
-interface Attachment {
-	readonly topicKey: string;
-	readonly manager: ReactivitySubscriptionManager;
-	readonly unregisterHandler: () => void;
-}
-
 /** The one subscription all of this node's watchers of a collection share. */
 interface Subscription {
 	readonly collectionId: string;
 	readonly collectionIdBytes: Uint8Array;
 	readonly listeners: Set<Listener>;
-	/** The attachment the cohort holds a registration for, which renewals go to; absent until one succeeds. */
-	attached?: Attachment;
-	/** An attachment whose registration is in flight; its handler is already routing notifications. */
-	arriving?: Attachment;
+	/** The collection's one manager, built at the first attach; it follows the tail for the subscription's life. */
+	manager?: ReactivitySubscriptionManager;
+	/** Drops the manager's handler from the registry; registered under the collection's topic before the first register. */
+	unregisterHandler?: () => void;
 	/** Highest revision the listeners have been woken for; `0` until a committed tail has been read. */
 	lastSeenRevision: number;
 	/** The tail block the last successful tail read found, handed back to the next read. */
@@ -147,7 +147,7 @@ export class ReactivityCollectionWatch {
 	private readonly subscriptions = new Map<string, Subscription>();
 	/**
 	 * Successor tail (base64url of the plan's `newTailId`) → the subscription a scheduled rotation timer will move
-	 * there. Keyed by tail, the key the scheduler de-duplicates by, because a topic can outlive its tail.
+	 * there. Keyed by tail, the key the scheduler de-duplicates by, because a topic outlives its tail.
 	 */
 	private readonly rotationTargets = new Map<string, Subscription>();
 	private stopped = false;
@@ -166,7 +166,7 @@ export class ReactivityCollectionWatch {
 
 	/** Whether `collectionId`'s subscription holds a cohort registration right now. Diagnostic / test seam. */
 	isAttached(collectionId: string): boolean {
-		return this.subscriptions.get(collectionId)?.attached !== undefined;
+		return this.subscriptions.get(collectionId)?.manager?.registration !== undefined;
 	}
 
 	/**
@@ -200,13 +200,15 @@ export class ReactivityCollectionWatch {
 	}
 
 	/**
-	 * The rotation scheduler's move: its timer for the successor tail `plan.newTailId` fired. A successor
-	 * no subscription is waiting on (it closed meanwhile) is a logged no-op.
+	 * The rotation scheduler's move: its timer for the successor tail `plan.newTailId` fired, so the
+	 * subscription follows that tail. A successor no subscription is waiting on (it closed meanwhile) is a
+	 * logged no-op.
 	 *
 	 * NOTE: a timer for a successor the log has already left (OLD→A→B inside the re-registration jitter, the
-	 * tick having moved the subscription to B) moves it back to A; the tail read that follows the move returns
-	 * it to B, at the cost of two registrations. If rotations ever come that fast, drop a plan whose
-	 * subscription is no longer attached under the manager that surfaced it.
+	 * tick having followed the subscription to B) moves a registration at the root back to A; the tail read
+	 * that follows the move returns it to B, at the cost of two registrations (a registration below the root
+	 * only has its root key set twice). If rotations ever come that fast, drop a plan whose tail is not the
+	 * one the subscription's manager last followed.
 	 */
 	reRegister(plan: ReRegistrationPlan): Promise<void> {
 		const tailKey = bytesToB64url(plan.newTailId);
@@ -260,11 +262,10 @@ export class ReactivityCollectionWatch {
 			}
 		}
 		sub.listeners.clear();
-		sub.arriving?.unregisterHandler();
-		if (sub.attached !== undefined) {
-			sub.attached.unregisterHandler();
-			this.withdraw(sub, sub.attached.manager);
-			sub.attached = undefined;
+		sub.unregisterHandler?.();
+		sub.unregisterHandler = undefined;
+		if (sub.manager?.registration !== undefined) {
+			this.withdraw(sub, sub.manager);
 		}
 	}
 
@@ -308,8 +309,8 @@ export class ReactivityCollectionWatch {
 
 	/**
 	 * Keep the registration alive, then check the collection's tail: wake the listeners if its revision is
-	 * above the last one they were woken for, and attach to its topic if the subscription is not already
-	 * there — which is also how a registration that failed is retried.
+	 * above the last one they were woken for, and follow the tail if the registration is not where its root
+	 * is — which is also how a registration that failed is retried.
 	 */
 	private async tick(sub: Subscription): Promise<void> {
 		await this.renew(sub);
@@ -321,16 +322,16 @@ export class ReactivityCollectionWatch {
 		// the cohort has lost is not re-made until the tail moves, and until then the tick alone wakes the
 		// watchers (backlog `bug-a-participant-told-its-registration-is-unknown-never-registers-again`).
 		try {
-			await sub.attached?.manager.renew();
+			await sub.manager?.renew();
 		} catch (err) {
 			log("renewal failed for collection=%s: %o", sub.collectionId, err);
 		}
 	}
 
 	/**
-	 * Read the tail, wake the listeners if it is news, and attach to its topic. A subscription's first read
-	 * goes through here too and so wakes its listeners: a caller that read the collection before this read
-	 * may have missed a commit this read can see, and nothing later would report that commit.
+	 * Read the tail, wake the listeners if it is news, and follow it. A subscription's first read goes through
+	 * here too and so wakes its listeners: a caller that read the collection before this read may have missed a
+	 * commit this read can see, and nothing later would report that commit.
 	 */
 	private async checkTail(sub: Subscription): Promise<void> {
 		const tail = await this.readTail(sub);
@@ -342,9 +343,9 @@ export class ReactivityCollectionWatch {
 	}
 
 	/**
-	 * Move to a tail's topic and, if a registration landed, look at the tail once more: a commit made while
-	 * the registration was in flight was announced to a topic the cohort did not yet hold this subscriber
-	 * under, so nothing else would report it before the next tick.
+	 * Follow a tail and, if a registration landed, look at the tail once more: a commit made while the
+	 * registration was in flight was announced by a root that did not yet hold this subscriber, so nothing
+	 * else would report it before the next tick.
 	 */
 	private async moveThenRecheck(sub: Subscription, tailBytes: Uint8Array, lastRevision: number): Promise<void> {
 		if (!(await this.moveTo(sub, tailBytes, lastRevision))) {
@@ -378,65 +379,58 @@ export class ReactivityCollectionWatch {
 	}
 
 	/**
-	 * Put the subscription on the topic of the tail whose bytes are `tailBytes`, the first attach included.
-	 * `lastRevision` is a revision known to be committed (read from the log, or delivered).
+	 * Follow the tail whose bytes are `tailBytes`, the first attach included. `lastRevision` is a revision
+	 * known to be committed (read from the log, or delivered); the manager's contiguity head is moved to it
+	 * before the follow, so a notification arriving mid-registration for the next revision is delivered rather
+	 * than read as a gap. Without that, a gap the cohort could not backfill would re-request a backfill on every
+	 * later notification.
 	 *
-	 * The new topic's handler is registered before the cohort is asked to register the subscriber and before
-	 * the old topic's handler is dropped, so a notification is routed to a manager at every moment of the
-	 * move. A registration that fails removes the new handler and leaves the old attachment as it was.
+	 * The first attach builds the manager and registers its handler under the collection's topic before the
+	 * cohort is asked to register the subscriber, so a notification is routed from the first moment; the
+	 * handler then stays for the subscription's life. A registration that fails leaves the manager as it was
+	 * (an existing registration keeps renewing at its root) and the next tick follows again.
 	 *
-	 * @returns true iff a registration landed (the subscription is now attached under the new topic).
+	 * @returns true iff a registration landed (the first one, or a re-registration at a moved root).
 	 */
 	private async moveTo(sub: Subscription, tailBytes: Uint8Array, lastRevision: number): Promise<boolean> {
-		const topicId = reactivityTopicId(tailBytes);
-		const topicKey = bytesToB64url(topicId);
-		const previous = sub.attached;
-		if (previous?.topicKey === topicKey) {
-			// Already there (a tick's re-anchor and a scheduled timer can both name one successor). The revision
-			// is still news to the manager: without it, a gap the cohort could not backfill would re-request a
-			// backfill on every later notification.
-			previous.manager.rebaseline(lastRevision);
-			return false;
-		}
-		const manager = this.buildManager(sub, tailBytes, topicId, Math.max(lastRevision, previous?.manager.lastRevision ?? 0));
-		const arriving: Attachment = {
-			topicKey,
-			manager,
-			unregisterHandler: this.options.subscribers.register(topicId, (n) => manager.onNotification(n)),
-		};
-		sub.arriving = arriving;
+		const manager = sub.manager ?? this.attachManager(sub, tailBytes, lastRevision);
+		manager.rebaseline(lastRevision);
+		let landed: boolean;
 		try {
-			await manager.register();
+			landed = await manager.followTail(tailBytes);
 		} catch (err) {
-			arriving.unregisterHandler();
-			// NOTE: accepted tradeoff — a topic nobody has registered under before normally defers its first
+			// NOTE: accepted tradeoff — a root nobody has registered under before normally defers its first
 			// registration (`CohortBackoffError`, "retry after 1000ms") while its members exchange the willingness
-			// that admits one, so the first attach to each new tail lands on the next tick (30 s Core), not now.
+			// that admits one, so the first registration at each new tail lands on the next tick (30 s Core), not now.
 			// Retrying on the cohort's delay was measured and is slower: retries at 1 s, 3 s and 7 s were all
 			// deferred too, and the attach then landed at 60 s instead of 30 s. A cohort allows one peer four
-			// register frames per topic per minute and a walk on a new topic sends two, so early retries spend
+			// register frames per topic per minute and a walk on a new root sends two, so early retries spend
 			// the allowance before the cohort is ready. Revisit if the cohort's answer starts naming a delay that
 			// reflects when it will be ready (backlog
 			// `feat-a-new-topic-admits-its-first-registration-without-a-second-ask`).
-			log("registration under topic=%s failed for collection=%s (retried by the next tick): %o", topicKey, sub.collectionId, err);
+			log("registration at tail=%s failed for collection=%s (retried by the next tick): %o", bytesToB64url(tailBytes), sub.collectionId, err);
 			return false;
-		} finally {
-			sub.arriving = undefined;
 		}
 		if (sub.closed) {
-			// The close already dropped the handler; the registration that just landed is all that is left.
-			this.withdraw(sub, manager);
+			// The close already dropped the handler and withdrew the registration it knew of; one that landed
+			// after it is all that is left.
+			if (landed) {
+				this.withdraw(sub, manager);
+			}
 			return false;
 		}
-		sub.attached = arriving;
-		if (previous !== undefined) {
-			previous.unregisterHandler();
-			this.withdraw(sub, previous.manager);
-		}
-		return true;
+		return landed;
 	}
 
-	private buildManager(sub: Subscription, tailBytes: Uint8Array, topicId: Uint8Array, lastKnownRev: number): ReactivitySubscriptionManager {
+	/** Build the collection's one manager and route the collection's topic to it, ahead of its first registration. */
+	private attachManager(sub: Subscription, tailBytes: Uint8Array, lastKnownRev: number): ReactivitySubscriptionManager {
+		const manager = this.buildManager(sub, tailBytes, lastKnownRev);
+		sub.manager = manager;
+		sub.unregisterHandler = this.options.subscribers.register(reactivityCollectionTopicId(sub.collectionIdBytes), (n) => manager.onNotification(n));
+		return manager;
+	}
+
+	private buildManager(sub: Subscription, tailBytes: Uint8Array, lastKnownRev: number): ReactivitySubscriptionManager {
 		const { recover, recoverSigners } = this.options;
 		const collectionIdB64 = bytesToB64url(sub.collectionIdBytes);
 		// The manager could not replay what its listeners missed, so wake them, then find out where the log is.
@@ -444,10 +438,14 @@ export class ReactivityCollectionWatch {
 			this.notify(sub);
 			this.reAnchor(sub);
 		};
-		return new ReactivitySubscriptionManager({
+		// The recover transports target the root group of the tail the manager has followed most recently, read
+		// per request, so a backfill or resume after a rotation reaches the group that holds the data.
+		let manager: ReactivitySubscriptionManager;
+		const currentTail = (): Uint8Array => manager.tail;
+		manager = new ReactivitySubscriptionManager({
 			service: this.options.service,
 			collectionId: sub.collectionIdBytes,
-			tailIdAtAttach: tailBytes,
+			tail: tailBytes,
 			lastKnownRev,
 			profile: this.options.profile,
 			quorumRatio: this.options.quorumRatio,
@@ -464,13 +462,14 @@ export class ReactivityCollectionWatch {
 			onTailRotated: (): void => this.reAnchor(sub),
 			...(recover !== undefined && recoverSigners !== undefined
 				? {
-					backfillTransport: recover.backfillTransport(tailBytes, collectionIdB64),
+					backfillTransport: recover.backfillTransport(currentTail, collectionIdB64),
 					signBackfill: recoverSigners.signBackfill,
-					resumeTransport: recover.resumeTransport(tailBytes, collectionIdB64),
+					resumeTransport: recover.resumeTransport(currentTail, collectionIdB64),
 					signResume: recoverSigners.signResume,
 				}
 				: {}),
 		});
+		return manager;
 	}
 
 	private onDelivered(sub: Subscription, n: NotificationV1): void {
@@ -486,7 +485,7 @@ export class ReactivityCollectionWatch {
 		this.options.scheduleRotation(notice);
 	}
 
-	/** Queue one re-read of the tail (wake if newer, move if it names another topic). */
+	/** Queue one re-read of the tail (wake if newer, follow if it names another tail). */
 	private reAnchor(sub: Subscription): void {
 		if (sub.closed || sub.reAnchorQueued) {
 			return;

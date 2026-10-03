@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import {
 	Tier,
-	reactivityTopicId,
+	reactivityCollectionTopicId,
 	createNotificationVerifier,
 	createMembershipVerifier,
 	createMembershipSourceRouter,
@@ -39,6 +39,8 @@ import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id';
 // --- fixtures ---------------------------------------------------------------
 
 const COLLECTION = bytesToB64url(new Uint8Array([1, 2, 3, 4]));
+/** The collection's topic, base64url — the same whichever tail a notification is announced at. */
+const TOPIC_B64 = bytesToB64url(reactivityCollectionTopicId(b64urlToBytes(COLLECTION)));
 const TAIL = bytesToB64url(new Uint8Array([9, 9, 9, 9]));
 const ROOT = b64urlToBytes(TAIL); // the root the fixture notifications are announced at
 
@@ -72,27 +74,28 @@ function note(revision: number, over: Partial<NotificationV1> = {}): Notificatio
 /**
  * A **real** db-core notification verifier (createNotificationVerifier over a real membership verifier)
  * whose raw threshold crypto always passes — so the verdict turns purely on the signer-subset check
- * against the root group's cert, cached at the tail's root coordinate under the placement rule. The
+ * against the root group's cert, cached at each given tail's root coordinate under the placement rule. The
  * default ratio makes `ceil(2 × 0.5) = 1` the threshold, so one member signer verifies and a stranger
  * does not. Mirrors the db-core reactivity tests' `realishVerifier`.
  */
-function realVerifier(members: string[], quorumRatio = 0.5): NotificationVerifier {
+function realVerifier(members: string[], quorumRatio = 0.5, tails: readonly string[] = [TAIL]): NotificationVerifier {
 	const placement = createRootPlacement(quorumRatio);
 	const minSigs = rootPlacedMinSigs(members.length, placement);
 	const crypto: ICohortThresholdCrypto = { assemble: () => Promise.reject(new Error('verify-only')), verify: () => true };
 	const empty: IMembershipSource = { current: () => Promise.resolve(undefined), fetch: () => Promise.resolve(undefined) };
-	const expectedCoord = reactivityRootCoord(b64urlToBytes(TAIL));
-	const cert: MembershipCertV1 = {
-		v: 1,
-		cohortCoord: bytesToB64url(expectedCoord),
-		cohortEpoch: bytesToB64url(new Uint8Array(32).fill(7)),
-		members,
-		stabilizedAt: NOW,
-		thresholdSig: bytesToB64url(new Uint8Array([0])),
-		signers: members.slice(0, minSigs),
-	};
 	const mv = createMembershipVerifier({ signer: createCohortSigner(crypto, minSigs), router: createMembershipSourceRouter({ committed: empty, fret: empty }), minSigs });
-	mv.cache(cert, placement);
+	for (const tail of tails) {
+		const cert: MembershipCertV1 = {
+			v: 1,
+			cohortCoord: bytesToB64url(reactivityRootCoord(b64urlToBytes(tail))),
+			cohortEpoch: bytesToB64url(new Uint8Array(32).fill(7)),
+			members,
+			stabilizedAt: NOW,
+			thresholdSig: bytesToB64url(new Uint8Array([0])),
+			signers: members.slice(0, minSigs),
+		};
+		mv.cache(cert, placement);
+	}
 	return createNotificationVerifier({ verifier: mv, tier: Tier.T3, quorumRatio });
 }
 
@@ -132,11 +135,13 @@ class FakeTransport implements ReactivityNotifyTransport {
 function makeHost(over: Partial<ReactivityForwarderHostDeps> & {
 	transport?: FakeTransport;
 	verifierMembers?: string[];
+	/** Tails whose root group the verifier holds a cert for (default the fixture TAIL). */
+	verifierTails?: readonly string[];
 	queueMax?: number;
 	childCohorts?: CohortRef[];
 } = {}): { host: ReactivityForwarderHost; transport: FakeTransport } {
 	const transport = over.transport ?? new FakeTransport();
-	const verifier = realVerifier(over.verifierMembers ?? [SIGNER_A, SIGNER_B]);
+	const verifier = realVerifier(over.verifierMembers ?? [SIGNER_A, SIGNER_B], 0.5, over.verifierTails);
 	const deps: ReactivityForwarderHostDeps = {
 		transport,
 		selfPeerId: over.selfPeerId ?? SELF,
@@ -376,22 +381,55 @@ describe('reactivity / forwarder host', () => {
 	});
 });
 
+describe('reactivity / forwarder host — two roots of one topic on one machine', () => {
+	const TAIL_B = bytesToB64url(new Uint8Array([8, 8, 8, 8]));
+	const ROOT_B = b64urlToBytes(TAIL_B);
+
+	it('keeps a push state per root, asks for each root\'s own subscribers, and a drained rotation releases only the old root', async () => {
+		const asked: string[] = [];
+		const { host, transport } = makeHost({
+			verifierTails: [TAIL, TAIL_B],
+			directSubscribers: (topicId, rootTail): string[] => {
+				expect([...topicId], 'both roots are asked on the one collection topic').to.deep.equal([...b64urlToBytes(TOPIC_B64)]);
+				asked.push(bytesToB64url(rootTail));
+				return [SUB_A];
+			},
+		});
+		await host.ingest(note(1)); // announced at root A (the collection's tail before the rollover)
+		await host.ingest(note(2, { tailId: TAIL_B })); // announced at root B (after it), same collection → same topic
+
+		expect(host.pushStateForRoot(ROOT)!.replayBuffer.entries().map((e) => e.revision), 'root A buffered its own revision').to.deep.equal([1]);
+		expect(host.pushStateForRoot(ROOT_B)!.replayBuffer.entries().map((e) => e.revision), 'root B buffered its own').to.deep.equal([2]);
+		expect(host.pushStateForRoot(ROOT)!.topicId, 'one topic across both roots').to.equal(host.pushStateForRoot(ROOT_B)!.topicId);
+		expect(host.pushStateForRoot(ROOT)!.topicId).to.equal(TOPIC_B64);
+		expect(asked, 'directSubscribers was asked with each root\'s tail').to.include.members([TAIL, TAIL_B]);
+		expect(transport.sent.map((s) => s.n.revision), 'each root fanned its revision out once').to.deep.equal([1, 2]);
+
+		// Root A rotated to B. Once its drain window closes only A's state goes; B's is untouched.
+		host.markRotated(ROOT, { newTailId: TAIL_B, effectiveAtRevision: 2, topicId: TOPIC_B64 }, NOW);
+		expect(host.pushStateForRoot(ROOT), 'A is still served while draining').to.not.equal(undefined);
+		expect(host.rotationRedirectFor(ROOT, NOW + T_DRAIN_MS)).to.equal(undefined);
+		expect(host.pushStateForRoot(ROOT), 'the drained old root is released').to.equal(undefined);
+		expect(host.pushStateForRoot(ROOT_B), 'the new root keeps its state').to.not.equal(undefined);
+		expect(host.livePushStates()).to.have.length(1);
+	});
+});
+
 describe('reactivity / forwarder host — rotation drain', () => {
 	const NEW_TAIL = bytesToB64url(new Uint8Array([0x60, 0x60]));
 	const NEW_TAIL_2 = bytesToB64url(new Uint8Array([0x70, 0x70]));
-	const newTopicOf = (tail: string): string => bytesToB64url(reactivityTopicId(b64urlToBytes(tail)));
 
-	it('markRotated → rotationRedirectFor returns the redirect (derived newTopicId) throughout the drain window', () => {
+	it('markRotated → rotationRedirectFor returns the redirect (naming the new tail, carrying the unchanged topic) throughout the drain window', () => {
 		const { host } = makeHost();
-		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 5401 }, NOW);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 5401, topicId: TOPIC_B64 }, NOW);
 
 		const mid = host.rotationRedirectFor(ROOT, NOW + 30_000);
 		expect(mid, 'a request mid-drain is told to move').to.not.equal(undefined);
 		expect(mid!.result).to.equal('rotated');
 		expect(mid!.newTailId).to.equal(NEW_TAIL);
 		expect(mid!.effectiveAtRevision).to.equal(5401);
-		// db-core derives newTopicId = H(newTailId ‖ "reactivity"); the host never supplies it.
-		expect(mid!.newTopicId).to.equal(newTopicOf(NEW_TAIL));
+		// A rotation moves the root, not the topic: the redirect carries the collection's topic unchanged.
+		expect(mid!.newTopicId).to.equal(TOPIC_B64);
 	});
 
 	it('a root that never rotated has no redirect', () => {
@@ -401,7 +439,7 @@ describe('reactivity / forwarder host — rotation drain', () => {
 
 	it('strict drain boundary: redirect at rotatedAt + T_drain − 1, none (evicted) at exactly rotatedAt + T_drain', () => {
 		const { host } = makeHost();
-		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 1 }, NOW);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 1, topicId: TOPIC_B64 }, NOW);
 		expect(host.rotationRedirectFor(ROOT, NOW + T_DRAIN_MS - 1), 'still draining just inside the window').to.not.equal(undefined);
 		expect(host.rotationRedirectFor(ROOT, NOW + T_DRAIN_MS), 'drained at exactly the boundary (isDraining is strict <)').to.equal(undefined);
 		// The gate entry was evicted: a later in-window-relative-to-a-fresh-mark query still sees nothing.
@@ -414,7 +452,7 @@ describe('reactivity / forwarder host — rotation drain', () => {
 		await host.ingest(note(1));
 		expect(host.pushStateForRoot(ROOT), 'the outgoing tail is served before rotation').to.not.equal(undefined);
 
-		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 2 }, NOW);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 2, topicId: TOPIC_B64 }, NOW);
 		// While draining the served state is retained (renewals/replays could still be answered by the redirect).
 		expect(host.rotationRedirectFor(ROOT, NOW + 10_000)).to.not.equal(undefined);
 		expect(host.pushStateForRoot(ROOT), 'served state retained during drain').to.not.equal(undefined);
@@ -428,37 +466,37 @@ describe('reactivity / forwarder host — rotation drain', () => {
 	it('releases a drained tail no recover request ever asked about on the next rotation it observes', async () => {
 		const { host } = makeHost({ directSubscribers: (): string[] => [SUB_A] });
 		await host.ingest(note(1));
-		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 2 }, NOW);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 2, topicId: TOPIC_B64 }, NOW);
 
 		// Another collection's rotation after the window closed: the old tail is released without a recover query.
-		host.markRotated(b64urlToBytes(NEW_TAIL_2), { newTailId: NEW_TAIL, effectiveAtRevision: 9 }, NOW + T_DRAIN_MS);
+		host.markRotated(b64urlToBytes(NEW_TAIL_2), { newTailId: NEW_TAIL, effectiveAtRevision: 9, topicId: TOPIC_B64 }, NOW + T_DRAIN_MS);
 		expect(host.pushStateForRoot(ROOT), 'served state of the drained tail reclaimed').to.equal(undefined);
 		expect(host.livePushStates()).to.have.length(0);
 	});
 
 	it('is idempotent for the same successor (no-op; drain window not restarted)', () => {
 		const { host } = makeHost();
-		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 100 }, NOW);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 100, topicId: TOPIC_B64 }, NOW);
 		// A second mark to the SAME successor (even much later) must not restart the drain window.
-		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 100 }, NOW + 50_000);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 100, topicId: TOPIC_B64 }, NOW + 50_000);
 		// If the window had restarted, this query (NOW + T_drain) would still be draining; it must be drained.
 		expect(host.rotationRedirectFor(ROOT, NOW + T_DRAIN_MS), 'window anchored at the first mark, not the second').to.equal(undefined);
 	});
 
 	it('advances to a later successor on a chained rotation (OLD→A→B), replacing the gate', () => {
 		const { host } = makeHost();
-		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 100 }, NOW);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 100, topicId: TOPIC_B64 }, NOW);
 		expect(host.rotationRedirectFor(ROOT, NOW + 1_000)!.newTailId).to.equal(NEW_TAIL);
 
 		// A second rotation to a LATER successor (higher effectiveAtRevision) replaces the gate and restarts drain.
-		host.markRotated(ROOT, { newTailId: NEW_TAIL_2, effectiveAtRevision: 200 }, NOW + 5_000);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL_2, effectiveAtRevision: 200, topicId: TOPIC_B64 }, NOW + 5_000);
 		const redirect = host.rotationRedirectFor(ROOT, NOW + 6_000);
 		expect(redirect!.newTailId, 'redirect advanced to the later successor').to.equal(NEW_TAIL_2);
-		expect(redirect!.newTopicId).to.equal(newTopicOf(NEW_TAIL_2));
+		expect(redirect!.newTopicId, 'the topic does not change across a chained rotation either').to.equal(TOPIC_B64);
 		expect(redirect!.effectiveAtRevision).to.equal(200);
 
 		// An EARLIER successor (lower effectiveAtRevision) is ignored — the gate stays on B.
-		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 50 }, NOW + 7_000);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 50, topicId: TOPIC_B64 }, NOW + 7_000);
 		expect(host.rotationRedirectFor(ROOT, NOW + 8_000)!.newTailId, 'earlier successor ignored').to.equal(NEW_TAIL_2);
 	});
 });
@@ -505,7 +543,9 @@ describe('reactivity / direct-subscriber adapter', () => {
 		expect(() => peerIdFromString(out[0]!), 'the target is a valid dialable peer-id string').to.not.throw();
 	});
 
-	it('reactivityNotificationTopicId matches the verifier/origination tail-anchor derivation', () => {
-		expect([...reactivityNotificationTopicId(note(1))]).to.deep.equal([...reactivityTopicId(b64urlToBytes(TAIL))]);
+	it('reactivityNotificationTopicId is the collection topic, whatever tail the notification was announced at', () => {
+		const expected = [...reactivityCollectionTopicId(b64urlToBytes(COLLECTION))];
+		expect([...reactivityNotificationTopicId(note(1))]).to.deep.equal(expected);
+		expect([...reactivityNotificationTopicId(note(1, { tailId: bytesToB64url(new Uint8Array([8, 8, 8, 8])) }))], 'the tail does not enter the topic').to.deep.equal(expected);
 	});
 });

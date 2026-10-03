@@ -1,9 +1,10 @@
 /**
  * Reactivity — push-based change notifications on the cohort-topic substrate.
  *
- * See `docs/reactivity.md`. This module lands the reactivity hot path — the rotating tail-anchored topic,
- * the subscribe `appPayload`, notification origination (reusing the commit cert unchanged), the forwarder
- * receive path (verify → dedupe → buffer → forward), the `W`-entry replay ring with cohort gossip, the
+ * See `docs/reactivity.md`. This module lands the reactivity hot path — the collection anchor (one topic per
+ * collection, a root at the tail block's storage group), the subscribe `appPayload`, notification
+ * origination (reusing the commit cert unchanged), the forwarder receive path (verify → dedupe → buffer →
+ * forward), the `W`-entry replay ring with cohort gossip, the
  * sliding `(revision, sigDigest)` dedupe window, and subscriber-side verify/deliver with gap detection
  * ([reactivity-origination-replay-delivery]) — plus **recovery beyond the live stream**
  * ([reactivity-backfill-resume-checkpoints]): the {@link ./backfill.js} RPC served from the replay ring,

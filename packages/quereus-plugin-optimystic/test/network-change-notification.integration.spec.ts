@@ -19,12 +19,12 @@
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import { multiaddr } from '@multiformats/multiaddr';
-import { Collection, reactivityTopicId, routingKeyForBlock, type IBlockChangeNotifier, type ITransactor } from '@optimystic/db-core';
+import { Collection, reactivityCollectionTopicId, routingKeyForBlock, type IBlockChangeNotifier, type ITransactor } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import {
 	createLibp2pNode,
+	reactivityCollectionIdBytes,
 	reactivityDirectSubscribers,
-	reactivityTailBytes,
 	type CohortTopicHost,
 	type OptimysticNode,
 } from '@optimystic/db-p2p';
@@ -175,8 +175,7 @@ describe('Network change notification for a tagged table over real libp2p', func
 		// Only the node that coordinates a commit announces it, to the registrations its own cohort engine
 		// holds; the watcher's reaches the writer over cohort gossip unless the writer is the topic's primary.
 		const watcherTransactor = await watcher.plugin.collectionFactory.getOrCreateTransactor(networkOptions(WATCHED_URI));
-		const tail = await Collection.readCommittedTail(watcherTransactor, WATCHED_ID);
-		const topicId = reactivityTopicId(reactivityTailBytes(tail!.tailId));
+		const topicId = reactivityCollectionTopicId(reactivityCollectionIdBytes(WATCHED_ID));
 		const writerHost = (writerNode as unknown as { cohortTopicHost: CohortTopicHost }).cohortTopicHost;
 		await waitFor(() => {
 			const engine = writerHost.registry.findServing(topicId, 0);

@@ -659,17 +659,28 @@ export async function pumpMeshGossip(mesh: CohortMesh, now: number, settleMs = 3
 }
 
 export async function setupTopic(mesh: CohortMesh, topic: Uint8Array, tierAddr = addressing): Promise<TopicSetup> {
-	const coord0 = tierAddr.coord0(topic);
-	const seedParticipant = mesh.nodes[0]!.member.bytes; // dummy participantCoord (unused at tier 0)
-	// Resolve the cohort the host actually assembles around coord_0 from any node (they all agree).
-	const decidingNode = mesh.nodeNearest(coord0);
-	const probeEngine = decidingNode.host.registry.forCoord(coord0, 0 as Tier, seedParticipant);
+	// dummy participantCoord (unused at tier 0)
+	return setupCohortAt(mesh, tierAddr.coord0(topic), 0, mesh.nodes[0]!.member.bytes);
+}
+
+/**
+ * Instantiate the engine serving `coord` at tree tier `treeTier` on every member of the FRET cohort around
+ * it and seed each one's gossip view with every other member's willingness, so the routed primary meets the
+ * willingness quorum. {@link setupTopic} is this at `coord_0(topic)`; a reactivity suite uses it at
+ * `coord_1(P, topicId)` to let a subscriber `P`'s walk land at tier 1 once the root has promoted (the walk's
+ * `followOn` re-issue instantiates the cold child only where a willing quorum exists). The returned
+ * {@link TopicSetup.coord0} is `coord` whatever the tier.
+ */
+export async function setupCohortAt(mesh: CohortMesh, coord: RingCoord, treeTier: number, participantCoord: Uint8Array): Promise<TopicSetup> {
+	// Resolve the cohort the host actually assembles around the coord from any node (they all agree).
+	const decidingNode = mesh.nodeNearest(coord);
+	const probeEngine = decidingNode.host.registry.forCoord(coord, treeTier, participantCoord);
 	const cohortIds = probeEngine.cohort().members.map((m) => bytesToPeerIdString(m));
 	const cohortNodes = cohortIds.map((id) => mesh.nodeOf(id)).filter((n): n is HostNode => n !== undefined);
 
 	const engines = new Map<string, CoordEngine>();
 	for (const node of cohortNodes) {
-		engines.set(node.member.idStr, node.host.registry.forCoord(coord0, 0 as Tier, seedParticipant));
+		engines.set(node.member.idStr, node.host.registry.forCoord(coord, treeTier, participantCoord));
 	}
 	const now = Date.now();
 	for (const node of cohortNodes) {
@@ -678,11 +689,11 @@ export async function setupTopic(mesh: CohortMesh, topic: Uint8Array, tierAddr =
 			if (other.member.idStr === node.member.idStr) {
 				continue;
 			}
-			node.node.receive(PROTOCOLS.gossip, await signedWillingness(other.member, coord0, epoch, now), other.member.peerId);
+			node.node.receive(PROTOCOLS.gossip, await signedWillingness(other.member, coord, epoch, now), other.member.peerId);
 		}
 	}
 	await delay(20); // let the async gossip handlers merge the willingness contributions
-	return { coord0, engines, deciding: decidingNode, decidingEngine: engines.get(decidingNode.member.idStr)!, cohortIds };
+	return { coord0: coord, engines, deciding: decidingNode, decidingEngine: engines.get(decidingNode.member.idStr)!, cohortIds };
 }
 
 /**
@@ -692,7 +703,8 @@ export async function setupTopic(mesh: CohortMesh, topic: Uint8Array, tierAddr =
  * path a real root group bootstraps through (an inbound gossip frame flagged `rootPlaced` makes a member
  * read the group and create its engine). Waits until every member holds a willing quorum, so the routed
  * primary can admit a registration. The reactivity harness uses it in place of {@link setupTopic}: a
- * collection's tree is rooted at its tail block's storage group, not at `coord_0(topicId)`.
+ * collection's tree is rooted at its tail block's storage group, not at `coord_0(topicId)`. Nothing here is
+ * keyed by the topic, so one topic's root is set up afresh at each root key it moves to (a tail rotation).
  */
 export async function setupRootPlacedTopic(mesh: CohortMesh, topic: Uint8Array, rootKey: Uint8Array, groupIds: readonly string[], tierAddr = addressing): Promise<TopicSetup> {
 	const rootCoord = tierAddr.rootCoord(rootKey);

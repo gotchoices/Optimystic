@@ -116,7 +116,7 @@ export function createRecoverRequestSigners(privateKey: PrivateKey): RecoverRequ
 /**
  * Thrown out of {@link Libp2pReactivityRecoverTransport.backfillTransport} / `resumeTransport` when the
  * dialed cohort answered with a `kind: "rotated"` recover reply: the outgoing tail this request reached has
- * rotated and is draining, so it bounced the request to the new tree (`docs/reactivity.md` §Tail rotation).
+ * rotated and is draining, so it bounced the request to the new root (`docs/reactivity.md` §Tail rotation).
  * It carries the {@link RotationRedirectV1} so the subscription manager can move itself to the successor.
  *
  * A `kind: "rotated"` reply is **terminal** for the cohort-walk — the dialed member spoke authoritatively for
@@ -177,8 +177,9 @@ export interface Libp2pReactivityRecoverTransportOptions {
  * so the caller's retry/escalation policy (the subscription manager's backfill escalation, or
  * `manager.resume()`'s caller) takes over.
  *
- * Both seams are keyed on the **tail** the subscription is attached under, not on its topic id: a topic id
- * cannot be inverted, and the root group is derived from the tail's routing key.
+ * Both seams take a **tail getter**, not a fixed tail or a topic id: the root group is derived from the tail's
+ * routing key (a topic id cannot be inverted), and a subscription follows its collection's tail as the log
+ * moves, so each request resolves the root group of the tail the subscription has followed most recently.
  */
 export class Libp2pReactivityRecoverTransport {
 	private readonly dialer: RecoverDialer;
@@ -195,11 +196,15 @@ export class Libp2pReactivityRecoverTransport {
 		this.maxBytes = options.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
 	}
 
-	/** The db-core {@link BackfillTransport} for `(tailId, collectionId)` — frames + dials a signed {@link BackfillV1}. */
-	backfillTransport(tailId: Uint8Array, collectionId: string): BackfillTransport {
+	/**
+	 * The db-core {@link BackfillTransport} for a collection subscription — frames + dials a signed
+	 * {@link BackfillV1}. `tail` is read per request: the routing-key bytes of the tail the subscription
+	 * currently follows, whose root group is the fallback target.
+	 */
+	backfillTransport(tail: () => Uint8Array, collectionId: string): BackfillTransport {
 		return async (req: BackfillV1): Promise<BackfillReplyV1> => {
 			const frame = encodeRecoverRequestV1({ v: 1, kind: "backfill", backfill: req }, this.maxBytes);
-			const reply = await this.exchange("backfill", frame, tailId, collectionId);
+			const reply = await this.exchange("backfill", frame, tail(), collectionId);
 			if (reply.backfillReply === undefined) {
 				throw new Error("reactivity recover: backfill reply missing its body");
 			}
@@ -207,11 +212,11 @@ export class Libp2pReactivityRecoverTransport {
 		};
 	}
 
-	/** The {@link ResumeTransport} for `(tailId, collectionId)` — frames + dials a signed {@link ResumeV1}. */
-	resumeTransport(tailId: Uint8Array, collectionId: string): ResumeTransport {
+	/** The {@link ResumeTransport} for a collection subscription — frames + dials a signed {@link ResumeV1}; `tail` as for {@link backfillTransport}. */
+	resumeTransport(tail: () => Uint8Array, collectionId: string): ResumeTransport {
 		return async (req: ResumeV1) => {
 			const frame = encodeRecoverRequestV1({ v: 1, kind: "resume", resume: req }, this.maxBytes);
-			const reply = await this.exchange("resume", frame, tailId, collectionId);
+			const reply = await this.exchange("resume", frame, tail(), collectionId);
 			if (reply.resumeReply === undefined) {
 				throw new Error("reactivity recover: resume reply missing its body");
 			}
@@ -315,7 +320,7 @@ export interface RecoverServeDeps {
 	 * `ReactivityForwarderHost.rotationRedirectFor`, resolving the old root from the request: a **resume**
 	 * carries it as `tailId` (the bytes of its `latestKnownTailId`); for a **backfill** (no `tailId`) the binding
 	 * resolves the collection's current served root. When it returns a redirect the serve replies
-	 * `kind: "rotated"` instead of serving data, moving the subscriber to the new tree. Absent ⇒ never redirect.
+	 * `kind: "rotated"` instead of serving data, moving the subscriber to the new root. Absent ⇒ never redirect.
 	 */
 	readonly rotationFor?: (req: { tailId?: Uint8Array; collectionId: string }, now: number) => RotationRedirectV1 | undefined;
 	/** Unix-ms clock for the replay-guard window. Default `Date.now`. */
@@ -367,7 +372,7 @@ function serveBackfillReply(deps: RecoverServeDeps, req: BackfillV1, now: number
 /**
  * Serve a resume against the live `PushState`. A resume reaching the **outgoing (draining)** root — its
  * `latestKnownTailId` names a tail this node has marked rotated — is answered with the drain redirect
- * (`kind: "rotated"`), moving the subscriber to the new tree. Otherwise prefer the root at the request's
+ * (`kind: "rotated"`), moving the subscriber to the new root. Otherwise prefer the root at the request's
  * `latestKnownTailId` (so a non-rotated subscriber classifies into backfill/checkpoint/out_of_window); if this
  * node no longer serves that root, fall back to the collection's current tail so the cohort can still answer
  * `tail_rotated` (its `currentTailId` differs from the request's stale tail) or, for a span that crosses a

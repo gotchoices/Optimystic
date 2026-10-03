@@ -5,8 +5,9 @@
  *
  * The tail bytes are the topic's **root key**: `reactivityRootCoord(tailBytes)` (db-core) is `H(tailBytes)`,
  * the ring position the key network stores the tail block at, so the topic's root group is that block's
- * storage group (`docs/reactivity.md` §Origination point). `reactivityTopicId` hashes
- * `H(tailBytes ‖ "reactivity")` for the tiers below the root. The subscriber side (the watch service, which
+ * storage group (`docs/reactivity.md` §Origination point). The collection-id bytes are what the topic itself
+ * is derived from: `reactivityCollectionTopicId` hashes `H(collectionIdBytes ‖ "reactivity")`, stable for the
+ * collection's life, and addresses the tiers below the root. The subscriber side (the watch service, which
  * converts a `BlockId` tail to the bytes {@link import("./subscription-manager.js").ReactivitySubscriptionManager}
  * registers under), the notification verifier and every forwarder-side root-group read MUST use the **same**
  * bytes for a given tail, or they land on a different ring position than the announcing group.
@@ -21,7 +22,7 @@ import type { BlockId } from "@optimystic/db-core";
 import { routingKeyForBlock } from "@optimystic/db-core";
 
 /**
- * The pinned `BlockId` → raw tail bytes encoding fed into `reactivityRootCoord` and `reactivityTopicId`: the
+ * The pinned `BlockId` → raw tail bytes encoding fed into `reactivityRootCoord` (the topic's root key): the
  * tail's routing key, i.e. the **raw** utf8 bytes of the tail block-id string (never a pre-hashed digest).
  *
  * Load-bearing: the subscriber side, the verifier and the forwarder reads must call this **same** function
@@ -37,7 +38,8 @@ const utf8 = new TextEncoder();
 /**
  * The pinned collection-id → raw bytes encoding: the utf8 of the id exactly as blocks carry it
  * (`header.collectionId`, e.g. `app/users`). A notification names its collection by the base64url of these
- * bytes, and a subscriber registers under, and matches inbound notifications against, the same bytes.
+ * bytes; a subscriber derives the collection's topic (`reactivityCollectionTopicId`) from them, registers
+ * under it, and matches inbound notifications against the same bytes.
  *
  * Load-bearing: origination and the subscriber side must call this **same** function for a given
  * collection. A collection id is a path, not base64url, so putting it on the wire unencoded fails the

@@ -11,7 +11,6 @@ import {
 	checkpointCovers,
 	validateRotationRedirectV1,
 	verifyCheckpointEndpoints,
-	reactivityTopicId,
 	PushState,
 	BLOCK_FILL_SIZE_DEFAULT,
 	WARM_THRESHOLD_DEFAULT,
@@ -27,6 +26,8 @@ import { CohortWireError } from '../../src/cohort-topic/wire/validate.js';
 const b = (n: number): string => bytesToB64url(new Uint8Array([n]));
 const TAIL_OLD = b(5);
 const TAIL_NEW = b(6);
+/** The collection's topic: stable across the rotation, carried unchanged on the redirect. */
+const TOPIC = b(3);
 
 function note(revision: number, over: Partial<NotificationV1> = {}): NotificationV1 {
 	return {
@@ -49,7 +50,7 @@ const fixedVerifier = (verdict: 'verified' | 'untrusted' = 'verified'): Notifica
 
 describe('reactivity tail rotation', () => {
 	describe('subscriber-side detection', () => {
-		it('detects a hard rotation when the delivered tailId differs from tailIdAtAttach', () => {
+		it('detects a hard rotation when the delivered tailId differs from the followed tail', () => {
 			const d = detectRotation(TAIL_OLD, note(100, { tailId: TAIL_NEW }));
 			expect(d.rotated).to.equal(true);
 			expect(d.newTailId).to.equal(TAIL_NEW);
@@ -81,11 +82,11 @@ describe('reactivity tail rotation', () => {
 	});
 
 	describe('BlockFillTracker (warm-up + filling signal)', () => {
-		it('uses the documented defaults (fill 64, warm 8 → warm at 56)', () => {
+		it('uses the documented defaults (fill = the log block size 32, warm 8 → warm at 24)', () => {
 			const t = new BlockFillTracker();
 			expect(t.blockFillSize).to.equal(BLOCK_FILL_SIZE_DEFAULT);
 			expect(t.warmThreshold).to.equal(WARM_THRESHOLD_DEFAULT);
-			expect(t.warmAt).to.equal(56);
+			expect(t.warmAt).to.equal(24);
 		});
 
 		it('fires warmup at block_fill_size − warm_threshold and filling at block_fill_size, then resets', () => {
@@ -114,17 +115,16 @@ describe('reactivity tail rotation', () => {
 	});
 
 	describe('TailDrainGate (serve renewals/replays, bounce new subscriptions)', () => {
-		const gate = (): TailDrainGate => new TailDrainGate({ rotatedAt: 1000, newTailId: TAIL_NEW, effectiveAtRevision: 5401, tDrainMs: 60_000 });
+		const gate = (): TailDrainGate => new TailDrainGate({ rotatedAt: 1000, newTailId: TAIL_NEW, topicId: TOPIC, effectiveAtRevision: 5401, tDrainMs: 60_000 });
 
-		it('redirects a new subscription to the new tree with the derived topicId during the drain', () => {
+		it('redirects a new subscription to the new root; the topic on the redirect is the collection topic, unchanged', () => {
 			const decision = gate().classify('new_subscribe', 1000 + 30_000); // mid-drain
 			expect(decision.kind).to.equal('redirect');
 			if (decision.kind !== 'redirect') throw new Error('unreachable');
 			expect(decision.redirect.result).to.equal('rotated');
 			expect(decision.redirect.newTailId).to.equal(TAIL_NEW);
 			expect(decision.redirect.effectiveAtRevision).to.equal(5401);
-			const expectedTopic = bytesToB64url(reactivityTopicId(b64urlToBytes(TAIL_NEW)));
-			expect(decision.redirect.newTopicId).to.equal(expectedTopic);
+			expect(decision.redirect.newTopicId, 'a rotation moves the root, not the topic').to.equal(TOPIC);
 		});
 
 		it('serves renewals and replays through the drain window', () => {
@@ -144,17 +144,16 @@ describe('reactivity tail rotation', () => {
 		});
 
 		it('defaults the drain window to T_drain', () => {
-			const g = new TailDrainGate({ rotatedAt: 0, newTailId: TAIL_NEW, effectiveAtRevision: 1 });
+			const g = new TailDrainGate({ rotatedAt: 0, newTailId: TAIL_NEW, topicId: TOPIC, effectiveAtRevision: 1 });
 			expect(g.drainEndsAt).to.equal(T_DRAIN_MS);
 		});
 	});
 
 	describe('jittered re-registration', () => {
-		it('plans one re-registration at the new topic carrying lastRevision, within the jitter window', () => {
+		it('plans one follow of the new root carrying lastRevision, within the jitter window', () => {
 			const jitter = createRejoinJitter({ tRejoinJitterMs: T_REJOIN_JITTER_MS, random: () => 0.999 });
 			const plan = planReRegistration({ hint: { newTailId: TAIL_NEW }, lastRevision: 5400, now: 1000, jitter });
 			expect([...plan.newTailId]).to.deep.equal([...b64urlToBytes(TAIL_NEW)]);
-			expect([...plan.newTopicId]).to.deep.equal([...reactivityTopicId(b64urlToBytes(TAIL_NEW))]);
 			expect(plan.lastRevision).to.equal(5400); // revisions continuous across the rotation
 			expect(plan.fireAt).to.be.greaterThan(1000);
 			expect(plan.fireAt).to.be.lessThan(1000 + T_REJOIN_JITTER_MS);
@@ -170,8 +169,8 @@ describe('reactivity tail rotation', () => {
 			const plans = planReRegistrationWave({ hint: { newTailId: TAIL_NEW }, subscribers, now: 0, jitter });
 
 			expect(plans).to.have.length(40);
-			// every plan re-registers at the same new tree, each carrying its own lastRevision.
-			expect(plans.every((p) => [...p.newTopicId].join() === [...reactivityTopicId(b64urlToBytes(TAIL_NEW))].join())).to.equal(true);
+			// every plan follows the same new root, each carrying its own lastRevision.
+			expect(plans.every((p) => [...p.newTailId].join() === [...b64urlToBytes(TAIL_NEW)].join())).to.equal(true);
 			expect(plans.map((p) => p.lastRevision)).to.deep.equal(subscribers.map((s) => s.lastRevision));
 
 			// any 30 s sliding window holds at most cap_promote_fast arrivals.
@@ -245,7 +244,7 @@ describe('reactivity tail rotation', () => {
 			v: 1,
 			result: 'rotated',
 			newTailId: TAIL_NEW,
-			newTopicId: bytesToB64url(reactivityTopicId(b64urlToBytes(TAIL_NEW))),
+			newTopicId: TOPIC,
 			effectiveAtRevision: 5401,
 		};
 

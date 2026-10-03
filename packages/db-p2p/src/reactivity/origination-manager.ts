@@ -24,6 +24,7 @@ import {
 	buildNotificationV1,
 	bytesToB64url,
 	b64urlToBytes,
+	reactivityCollectionTopicId,
 	BlockFillTracker,
 	type BlockFillTrackerInit,
 	type CohortTopicService,
@@ -35,6 +36,7 @@ import {
 import { peerIdToBytes } from "../cohort-topic/peer-codec.js";
 import { selfAppliedTail } from "../cohort-topic/change-bridge.js";
 import { reactivityCollectionIdBytes, reactivityTailBytes } from "./topic-bytes.js";
+import type { RootRotation } from "./forwarder-host.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("reactivity-origination");
@@ -63,8 +65,8 @@ export interface OriginationCollectionContext {
  * event (a read-driven promotion never originates; the bridge's tail-applied gate also returns before this).
  *
  * Both ids go on the notification in the pinned encodings of `reactivity/topic-bytes.ts`, the SAME ones a
- * subscriber registers under — a different encoding on either side and origination silently never reaches
- * it. `rotationHint` stays absent on a live node: the successor tail id is not knowable at the filling
+ * subscriber derives its topic from and registers under — a different encoding on either side and
+ * origination silently never reaches it. `rotationHint` stays absent on a live node: the successor tail id is not knowable at the filling
  * commit (random block ids; gated on `6.5-block-id-derivation`), so the observable rotation signal is a
  * commit naming a later tail, which the manager reports through `markRotated` (`observeTailCommit`).
  */
@@ -98,10 +100,12 @@ export interface ReactivityOriginationManagerOptions {
 	 * §Tail rotation and the `6.5-block-id-derivation` gate). The node binds this to
 	 * {@link import("./forwarder-host.js").ReactivityForwarderHost.markRotated} so the old root's recover serve
 	 * begins redirecting. `oldTail` is the **previous** tail in the reactivity tail encoding
-	 * (`reactivityTailBytes`) — the bytes the forwarder host keys that root's state by. Absent ⇒ rotation
-	 * observation is inert.
+	 * (`reactivityTailBytes`) — the bytes the forwarder host keys that root's state by; the redirect carries the
+	 * collection's topic (`reactivityCollectionTopicId` over `reactivityCollectionIdBytes(event.collectionId)`,
+	 * the topic a subscriber registers under), which a rotation leaves unchanged. Absent ⇒ rotation observation
+	 * is inert.
 	 */
-	readonly markRotated?: (oldTail: Uint8Array, redirect: { newTailId: string; effectiveAtRevision: number }, now: number) => void;
+	readonly markRotated?: (oldTail: Uint8Array, redirect: RootRotation, now: number) => void;
 	/**
 	 * Per-collection {@link BlockFillTracker} tuning for the anticipatory **warm-up** signal. The warm-up is
 	 * best-effort and **signal-only** on a live node (the next `tailId` is not knowable, so no successor coord
@@ -118,7 +122,7 @@ export class ReactivityOriginationManager {
 	private readonly service: CohortTopicService;
 	private readonly resolveContext: (event: CollectionChangeEvent) => OriginationCollectionContext | undefined;
 	private readonly emit: (notification: NotificationV1) => void;
-	private readonly markRotated?: (oldTail: Uint8Array, redirect: { newTailId: string; effectiveAtRevision: number }, now: number) => void;
+	private readonly markRotated?: (oldTail: Uint8Array, redirect: RootRotation, now: number) => void;
 	private readonly blockFill?: BlockFillTrackerInit;
 	private readonly clock: () => number;
 
@@ -210,7 +214,8 @@ export class ReactivityOriginationManager {
 				if (event.rev <= last.rev) {
 					return;
 				}
-				this.markRotated?.(b64urlToBytes(last.tail), { newTailId: tail, effectiveAtRevision: event.rev }, this.clock());
+				const topicId = bytesToB64url(reactivityCollectionTopicId(reactivityCollectionIdBytes(event.collectionId)));
+				this.markRotated?.(b64urlToBytes(last.tail), { newTailId: tail, effectiveAtRevision: event.rev, topicId }, this.clock());
 				this.lastAnnouncedTail.delete(key);
 			}
 			if (selfAppliedTail(event) && (last?.tail !== tail || event.rev > last.rev)) {

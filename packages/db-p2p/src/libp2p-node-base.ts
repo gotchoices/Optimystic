@@ -1984,9 +1984,9 @@ export async function createLibp2pNodeBase(
 			// `ceil(|group| × ratio)`, the formula `captureCommitCert` signs the group's commit certificate under.
 			const reactivityQuorumRatio = consensusConfig.superMajorityThreshold;
 
-			// Node-level subscriber registry: a constructed ReactivitySubscriptionManager registers here so a
-			// socket-delivered NotificationV1 reaches it. The collection watch service (step 7 below) is what
-			// constructs managers and registers them.
+			// Node-level subscriber registry, keyed by the collection's topic: a constructed
+			// ReactivitySubscriptionManager registers here so a socket-delivered NotificationV1 reaches it. The
+			// collection watch service (step 7 below) is what constructs managers and registers them.
 			const reactivitySubscribers = new ReactivitySubscriberRegistry();
 			(node as any).reactivitySubscribers = reactivitySubscribers;
 
@@ -2008,7 +2008,7 @@ export async function createLibp2pNodeBase(
 				directSubscribers: (topicId: Uint8Array, rootTail: Uint8Array): string[] => {
 					// Read the direct-subscriber records of the engine serving THIS root: the one at the root
 					// coordinate of the notification's tail, placed as a root. Looking up by topic alone would also
-					// find an older root's engine of the same topic once a topic outlives its tail. The adapter
+					// find the outgoing root's engine of the same topic during its drain window. The adapter
 					// filters to reactivity appState and maps participantId bytes → dialable peer-id strings (the
 					// transport's `peerIdFromString` space) — NOT base64url, which would silently fail to dial. No
 					// engine here (no subscriber has registered at this root) ⇒ [].
@@ -2044,13 +2044,14 @@ export async function createLibp2pNodeBase(
 				// under (see liveOriginationContext); a tail-less event never originates.
 				resolveContext: (event) => liveOriginationContext(event, reactivityPolicy.deltaMaxBytes),
 				// The host ingests at the root n.tailId names, on reactivityNotificationTopicId(n) =
-				// reactivityTopicId(b64urlToBytes(n.tailId)); since n.tailId = b64url(reactivityTailBytes(tail)), this
-				// is the SAME topic a subscriber registers under and the verifier derives — closing the encoding loop.
+				// reactivityCollectionTopicId(b64urlToBytes(n.collectionId)); since n.collectionId =
+				// b64url(reactivityCollectionIdBytes(id)), this is the SAME topic a subscriber registers under — closing
+				// the encoding loop. The root the verifier derives comes from n.tailId = b64url(reactivityTailBytes(tail)).
 				emit: (n): void => { void forwarderHost.ingest(n); },
 				// Observe-rotation: when a commit names a tail other than the one this node last announced at, the
-				// old root has rotated. Start its drain so the recover serve begins redirecting to the new tree (the
+				// old root has rotated. Start its drain so the recover serve begins redirecting to the new root (the
 				// `reactivity-rotation-recover-redirect-drain` markRotated seam). `oldTail` is in the reactivity tail
-				// encoding the host keys a root's state by.
+				// encoding the host keys a root's state by; the redirect carries the collection's unchanged topic.
 				markRotated: (oldTail, redirect, now): void => forwarderHost.markRotated(oldTail, redirect, now),
 			});
 			origination.install();
@@ -2142,7 +2143,7 @@ export async function createLibp2pNodeBase(
 				replayGuard: createCorrelationReplayGuard(),
 				rotationFor: (req, now) => {
 					// Drain-window redirect: a recover reaching an OLD (rotated, still-draining) root is bounced to
-					// the new tree (reactivity-rotation-recover-redirect-drain). A resume names the stale root (its
+					// the new root (reactivity-rotation-recover-redirect-drain). A resume names the stale root (its
 					// latestKnownTailId); a backfill names none, so resolve the collection's current served root.
 					// rotationRedirectFor returns the gate's redirect while draining and undefined once drained (then
 					// evicting the gate + the old root's served PushState).
@@ -2153,8 +2154,8 @@ export async function createLibp2pNodeBase(
 
 			// The subscriber's synchronous request signers over the node's Ed25519 key (resolves the recover wiring's
 			// lone design point — see recover-transport.ts §createRecoverRequestSigners). The collection watch
-			// service feeds them to each manager alongside recover.backfillTransport(topicId, collectionId) /
-			// recover.resumeTransport(topicId, collectionId).
+			// service feeds them to each manager alongside recover.backfillTransport(() => manager.tail, collectionId)
+			// / recover.resumeTransport(() => manager.tail, collectionId), so a recover targets the current root.
 			const recoverSigners = createRecoverRequestSigners(nodePrivateKey);
 
 			// The recover seams stay exposed for diagnostics and tests (mirrors `reactivitySubscribers` above).
@@ -2165,18 +2166,20 @@ export async function createLibp2pNodeBase(
 			// 6. Rotation re-registration scheduler — the host timer that moves a subscriber to the rotated tree
 			// when its manager surfaces a `RotationNotice` (`reactivity-rotation-rereg-scheduler`). Constructed with
 			// the default unref'd `setTimeout` timer so an idle re-registration never pins the process. ONE scheduler
-			// serves every subscription on the node: it de-duplicates by successor topic, which is sound because the
+			// serves every subscription on the node: it de-duplicates by successor tail, which is sound because the
 			// watch service keeps one subscription per collection. The MOVE is the watch service's: it finds the
-			// subscription waiting on the successor topic and re-registers it there (a timer that fires before the
-			// service exists, which only a throw mid-wiring could produce, finds nothing to move).
+			// subscription waiting on the successor tail and has its manager follow it — a registration at the root
+			// registers again, one below the root only updates its root key (a timer that fires before the service
+			// exists, which only a throw mid-wiring could produce, finds nothing to move).
 			reactivityRotation = new RotationReRegistrationScheduler({
 				reRegister: (plan): Promise<void> => reactivityWatch?.reRegister(plan) ?? Promise.resolve(),
 			});
 			(node as any).reactivityRotation = reactivityRotation;
 
 			// 7. Collection watch service — the host-facing surface of everything above: one call per collection an
-			// application wants to be woken for. It builds the subscription managers, registers them in
-			// `reactivitySubscribers`, renews them, and moves them on a tail rotation (driving the scheduler above).
+			// application wants to be woken for. It builds one subscription manager per collection, registers it in
+			// `reactivitySubscribers` under the collection's topic, renews it, and has it follow the tail on a
+			// rotation (driving the scheduler above).
 			const scheduler = reactivityRotation;
 			reactivityWatch = new ReactivityCollectionWatch({
 				service: host.service,

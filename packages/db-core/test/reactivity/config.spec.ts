@@ -18,6 +18,7 @@ import {
 	DELTA_MAX_EDGE_BYTES,
 } from '../../src/reactivity/index.js';
 import { coreProfile, edgeProfile } from '../../src/cohort-topic/tiers.js';
+import { EntriesPerBlock } from '../../src/chain/chain.js';
 
 describe('reactivity config', () => {
 	it('exposes the documented defaults from a single table', () => {
@@ -30,12 +31,14 @@ describe('reactivity config', () => {
 
 	it('consolidates the rotation/backpressure defaults this ticket owns', () => {
 		expect(QUEUE_MAX_DEFAULT).to.equal(32);
-		expect(BLOCK_FILL_SIZE_DEFAULT).to.equal(64);
+		// The log starts a new tail block every EntriesPerBlock entries, so the fill size is that number.
+		expect(BLOCK_FILL_SIZE_DEFAULT).to.equal(EntriesPerBlock);
+		expect(BLOCK_FILL_SIZE_DEFAULT).to.equal(32);
 		expect(T_DRAIN_MS).to.equal(60_000);
 		expect(WARM_THRESHOLD_DEFAULT).to.equal(8);
 		expect(T_REJOIN_JITTER_MS).to.equal(30_000); // inherited from cohort-topic
 		expect(DEFAULT_REACTIVITY_CONFIG.queueMax).to.equal(32);
-		expect(DEFAULT_REACTIVITY_CONFIG.blockFillSize).to.equal(64);
+		expect(DEFAULT_REACTIVITY_CONFIG.blockFillSize).to.equal(EntriesPerBlock);
 		expect(DEFAULT_REACTIVITY_CONFIG.tDrainMs).to.equal(60_000);
 		expect(DEFAULT_REACTIVITY_CONFIG.warmThreshold).to.equal(8);
 		expect(DEFAULT_REACTIVITY_CONFIG.tRejoinJitterMs).to.equal(30_000);
