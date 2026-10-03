@@ -4,6 +4,13 @@ architecture: docs/reactivity.md#authentication-and-integrity
 files: packages/db-core/src/cohort-topic/ports.ts, packages/db-core/src/cohort-topic/sig/threshold.ts, packages/db-core/src/cohort-topic/membership/verifier.ts, packages/db-core/src/reactivity/verify.ts, packages/db-p2p/src/cohort-topic/commit-log-trust-anchor.ts (new), packages/db-p2p/src/cohort-topic/fret-trust-anchor.ts, packages/db-p2p/src/cohort-topic/host.ts, packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/cluster/certified-claims.ts, packages/db-p2p/src/cluster/commit-proof.ts, packages/db-p2p/src/storage/block-archive.ts, packages/db-core/test/cohort-topic/membership.spec.ts, packages/db-core/test/reactivity/ (verify spec), packages/db-p2p/test/cohort-topic/commit-log-trust-anchor.spec.ts (new), docs/reactivity.md, docs/cohort-topic.md, docs/internals.md, tickets/backlog/hardening/cohort-topic-trust-anchor-fret-stabilization-proof.md
 difficulty: hard
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-10-03T03:18:58.149Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\2-feat-reactivity-root-membership-anchored-by-the-commit-log.implement.2026-10-03T03-18-58-147Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 
 # Anchor the reactivity root's membership to the tail block's commit proof
 
