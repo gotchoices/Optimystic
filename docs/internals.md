@@ -1021,9 +1021,10 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
   - **Tail rotation is now live** (`reactivity-rotation-host-wiring-e2e`). The bridge hands every commit
     event that names a tail — ahead of, and whatever becomes of, its tail-applied gate — to
     `ReactivityOriginationManager.observeTailCommit`, which remembers per collection the tail this node last
-    applied a commit for and, when an event names a different tail, fires
+    applied a commit for and, when a later event names a different tail, fires
     `forwarderHost.markRotated(oldTail, { newTailId, effectiveAtRevision: event.rev }, now)`, keyed by the
-    old tail as the forwarder host keys a root's state. It sees every tail-bearing commit, not only the ones
+    old tail as the forwarder host keys a root's state (an older commit naming the old tail that lands after
+    the rollover is ignored). It sees every tail-bearing commit, not only the ones
     this node announces, because a machine only in the old tail's group never applies a commit naming the new
     tail: what it applies is the rollover's rewrite of the old tail block's `nextId`, whose event names the
     new tail. So that machine drains and releases the old root too. This is the authoritative live-node

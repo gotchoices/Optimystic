@@ -124,9 +124,14 @@ export class ReactivityOriginationManager {
 
 	/**
 	 * Per collection, the tail this node last applied a commit for — the root it last announced at — as the
-	 * base64url of `reactivityTailBytes(tail)`. The baseline {@link observeTailCommit} detects a rotation against.
+	 * base64url of `reactivityTailBytes(tail)`, with the highest revision it applied there. The baseline
+	 * {@link observeTailCommit} detects a rotation against.
+	 *
+	 * NOTE: an entry is dropped only when its rotation is marked, so a node that leaves a tail's group before the
+	 * rollover keeps it (as `fillTrackers` keeps one per collection). If that shows in memory, age out entries with
+	 * no tail-bearing commit for longer than `T_drain`.
 	 */
-	private readonly lastAnnouncedTail = new Map<string, string>();
+	private readonly lastAnnouncedTail = new Map<string, { readonly tail: string; readonly rev: number }>();
 	/** Per-collection block-fill tracker driving the anticipatory warm-up signal (signal-only on a live node). */
 	private readonly fillTrackers = new Map<string, BlockFillTracker>();
 
@@ -183,6 +188,9 @@ export class ReactivityOriginationManager {
 	 * - Anything else — the same tail without having applied it (a data-block sweep landing on a member of the
 	 *   tail's group) — leaves the baseline alone; forgetting it there would lose what the rollover is measured
 	 *   against.
+	 * - An event at or below the baseline's revision that names another tail is an older commit landing late
+	 *   (a sweep round delayed past the rollover), not a move, and is ignored: marking it would drain the live
+	 *   root and redirect its recover requests to the tail the log already left.
 	 *
 	 * A tail-less event (replica push, read-driven promotion) is ignored. Isolated: logs, never throws.
 	 *
@@ -198,12 +206,15 @@ export class ReactivityOriginationManager {
 			const key = event.collectionId;
 			const tail = bytesToB64url(reactivityTailBytes(event.tailId));
 			const last = this.lastAnnouncedTail.get(key);
-			if (last !== undefined && last !== tail) {
-				this.markRotated?.(b64urlToBytes(last), { newTailId: tail, effectiveAtRevision: event.rev }, this.clock());
+			if (last !== undefined && last.tail !== tail) {
+				if (event.rev <= last.rev) {
+					return;
+				}
+				this.markRotated?.(b64urlToBytes(last.tail), { newTailId: tail, effectiveAtRevision: event.rev }, this.clock());
 				this.lastAnnouncedTail.delete(key);
 			}
-			if (selfAppliedTail(event)) {
-				this.lastAnnouncedTail.set(key, tail);
+			if (selfAppliedTail(event) && (last?.tail !== tail || event.rev > last.rev)) {
+				this.lastAnnouncedTail.set(key, { tail, rev: event.rev });
 			}
 		} catch (err) {
 			log("tail observation failed for collection=%s rev=%d (isolated): %o", event.collectionId, event.rev, err);

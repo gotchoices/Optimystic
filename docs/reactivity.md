@@ -524,7 +524,9 @@ Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; c
 > in the old group never applies a commit naming the new tail. What it applies is the rollover's rewrite of
 > the old tail block's `nextId`, whose event names the new tail — so that machine marks the rotation, drains
 > and releases the old root too. A same-tail event this node did not apply (a data-block sweep landing on a
-> member of the tail's group) leaves the remembered tail in place. **A subscriber registered under the old
+> member of the tail's group) leaves the remembered tail in place, and an event at or below the remembered
+> revision that names another tail — an older commit's sweep landing after the rollover — is ignored, so a late
+> event can never mark the live root rotated back to a tail the log left. **A subscriber registered under the old
 > tail is not sent the new tail's notifications**, so on a live node a delivered `tailId` never differs from
 > the one it attached under
 > (that detection, `detectRotation` → `RotationNotice`, fires only where a successor can be pre-announced).
@@ -546,7 +548,7 @@ Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; c
 > db-p2p `mesh-tail-rotation.spec.ts` (redirect-driven re-registration with no gap; cross-rotation resume from
 > the inherited checkpoint), `node-wiring.spec.ts` (scheduler exposed + torn down), `managers.spec.ts`
 > (`observeTailCommit` marks the old tail in the reactivity tail encoding, including on a machine that only
-> rewrote the old tail, and keeps its baseline through a sweep), `change-bridge.spec.ts` (the observer sees
+> rewrote the old tail, keeps its baseline through a sweep, and ignores a late older commit), `change-bridge.spec.ts` (the observer sees
 > events the origination gate drops), `collection-watch.spec.ts` (the move's handler ordering, a failed move,
 > a close during a move).
 

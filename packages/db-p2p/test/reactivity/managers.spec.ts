@@ -706,5 +706,16 @@ describe('reactivity / origination manager', () => {
 			expect(calls, 'the baseline survived the sweep, so the rollover still marks').to.have.length(1);
 			expect([...calls[0]!.oldTail]).to.deep.equal([...reactivityTailBytes('block-tail-old')]);
 		});
+
+		it('ignores an older commit naming the previous tail that lands after the rollover (a late sweep)', () => {
+			const { manager, calls } = setup();
+			manager.observeTailCommit(eventOn('block-tail-old', 7));
+			manager.observeTailCommit(eventOn('block-tail-new', 8)); // in both groups: marks old → new, baseline new@8
+			manager.observeTailCommit(eventOn('block-tail-old', 7, ['data-block'])); // rev 7's sweep, delayed
+			expect(calls, 'the live root is not marked rotated back to the tail the log left').to.have.length(1);
+			manager.observeTailCommit(eventOn('block-tail-next', 9));
+			expect(calls, 'the baseline survived the late event').to.have.length(2);
+			expect([...calls[1]!.oldTail]).to.deep.equal([...reactivityTailBytes('block-tail-new')]);
+		});
 	});
 });
