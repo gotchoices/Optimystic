@@ -170,6 +170,13 @@ export class CommitLogTrustAnchor implements IMembershipTrustAnchor {
 	/**
 	 * The anchoring set for `tailId`: the held one inside its reuse window, else one fetch shared by every
 	 * concurrent caller. Absence is held too, so a tail with no certified proof is re-asked once per window.
+	 *
+	 * NOTE: a held set can be one commit behind. A certificate from a group that changed since is judged
+	 * against the older cohort until the window ends — `"rejected"` if the group turned over completely,
+	 * `"unknown"` if partly — and the watch's renewal-tick tail read covers the notification that failed.
+	 * Refetching on a mismatch would let forged notifications drive group queries, which the window exists
+	 * to bound. If missed wakes after a membership change show up, refetch once on a mismatch against a set
+	 * older than some minimum age.
 	 */
 	private async anchoringSetFor(tailId: BlockId, coord: RingCoord): Promise<ReadonlySet<string> | undefined> {
 		const held = this.byTail.get(tailId);
@@ -189,6 +196,9 @@ export class CommitLogTrustAnchor implements IMembershipTrustAnchor {
 		let set: AnchoringSet;
 		try {
 			set = await this.establishAnchoringSet(tailId, coord);
+			// The only trace of a fetch that found no set: without it a root that fell back to first use
+			// looks the same as an anchored one.
+			log("commit-log-anchor:set tail=%s rev=%s peers=%d", tailId, set.rev ?? "none", set.peerIds?.size ?? 0);
 		} catch (err) {
 			// `membersAt` or an unexpected fault: hold the absence for the window, as for "no proof served",
 			// so a failing group read is asked again once per window rather than on every verify.
@@ -207,7 +217,9 @@ export class CommitLogTrustAnchor implements IMembershipTrustAnchor {
 
 	/** Every member's answer, settled together; the certified ones, with the cohort each proof names. */
 	private async certifiedClaimsFrom(members: readonly string[], tailId: BlockId): Promise<CertifiedTailClaim[]> {
-		const answers = await Promise.allSettled(members.map((peer) => this.options.latestClaimFrom(peer, tailId)));
+		// `async`, so a callback that throws before it returns a promise (an unparseable peer id) is that
+		// peer's silence rather than a failed fetch for the whole group.
+		const answers = await Promise.allSettled(members.map(async (peer) => this.options.latestClaimFrom(peer, tailId)));
 		const certified: CertifiedTailClaim[] = [];
 		for (const [i, answer] of answers.entries()) {
 			if (answer.status !== "fulfilled") {

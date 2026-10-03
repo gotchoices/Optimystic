@@ -56,3 +56,7 @@ is itself a stub would be building on sand. When that source is real, this becom
 
 Not urgent, not blocking any current correctness property. Promote once the committed-tier membership
 source lands.
+
+## A third place that accepts a commit proof without knowing who its signers should be
+
+Added by `feat-reactivity-root-membership-anchored-by-the-commit-log`. Besides the two block-repair paths, the reactivity trust anchor (`CommitLogTrustAnchor` in `packages/db-p2p/src/cohort-topic/commit-log-trust-anchor.ts`) now decides from a commit proof: it takes the peer list of the highest-revision proof that verifies as the group allowed to sign a collection's change announcements. A proof verifies when the peers it lists signed it, whoever they are. So one machine in the group that stores a collection's log tail can sign a proof with keys it made up, at a revision above the real one, and serve it. A subscriber outside the group then refuses the real group's announcements, and learns of changes only from its periodic check of the log tail (every 20 to 30 seconds) until that machine stops. The same machine can already mislead block repair the same way. When this ticket gives proofs a membership anchor, apply it in `CommitLogTrustAnchor.certifyAnswer` as well.

@@ -472,6 +472,28 @@ describe('cohort-topic / membership trust anchoring', () => {
 		expect(await locking.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'a later un-anchored cert for the locked coord is rejected').to.equal('untrusted');
 	});
 
+	it('an un-anchored load in flight beside an anchored one sees the lock it established', async () => {
+		// Two verifies of one cold coord cross the asynchronous anchor together: the first loaded GOOD, which
+		// the anchor vouches for, the second a forged cert the anchor cannot judge. The forged load's first-use
+		// check must run after the anchored load's cache write, not between its gate and that write.
+		const forged = encodeCohortMessage(buildCertOver({ epoch: EPOCH, members: ADV }));
+		const seeds = [encodeCohortMessage(GOOD), forged];
+		const source: IMembershipSource = {
+			current: () => Promise.resolve(seeds.shift()),
+			fetch: () => Promise.resolve(forged),
+		};
+		const anchor: IMembershipTrustAnchor = {
+			directAnchor: (cert) => Promise.resolve(cert.members[0] === bytesToB64url(MEMBERS[0]!) ? 'anchored' : 'unknown'),
+		};
+		const v = createMembershipVerifier({ signer, router: createMembershipSourceRouter({ committed: source, fret: source }), anchor });
+		const [genuine, forgery] = await Promise.all([
+			v.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG),
+			v.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG)),
+		]);
+		expect(genuine).to.equal('verified');
+		expect(forgery, 'the forged cert is not accepted on first use beside an anchored one').to.equal('untrusted');
+	});
+
 	it('TOFU-accepts a self-consistent cert on an "unknown" coord (no regression where nothing can anchor)', async () => {
 		const source = new MockSource(encodeCohortMessage(GOOD));
 		const v = makeVerifier(source, { anchor: constAnchor('unknown') });
