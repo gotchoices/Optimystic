@@ -27,7 +27,7 @@
  *
  * **Root-placed topics.** A walk given a `rootKey` (§Tier addressing → Root placement at a routing key)
  * stamps it on every frame it builds and addresses its tier-0 step at `H(rootKey)` — delivered through
- * {@link ITopicRouter.routeToRoot} when the router has it, else `routeAndAct` at that coord. Every other
+ * {@link ITopicRouter.routeToRoot} when the router has it, else `routeAndAct` on the root key. Every other
  * step, reply and back-off rule above is unchanged.
  *
  * This module is FRET-free: it drives the {@link ITopicRouter} port (db-p2p binds it to FRET's
@@ -336,21 +336,21 @@ class RouterWalkEngine implements WalkEngine {
 	}
 
 	/**
-	 * Route one probe to the cohort at tier `d`. The root of a root-placed topic goes through the router's
-	 * `routeToRoot` when it has one, so the frame reaches the root group by the rule that chose it; a router
-	 * without it (a mock, an older binding) gets the same frame at `rootCoord(rootKey)` by ring routing.
+	 * Route one probe to the cohort at tier `d`, on that tier's route key — the router hashes it once into
+	 * `coord_d`. The root of a root-placed topic goes through the router's `routeToRoot` when it has one, so
+	 * the frame reaches the root group by the rule that chose it; a router without it (a mock, an older
+	 * binding) routes the same frame on the root key itself, which lands at the root coordinate `H(rootKey)`.
 	 *
-	 * NOTE: the fallback addresses the root exactly as every other tier is addressed — by its coordinate —
-	 * and inherits whatever the binding does with a coordinate. The FRET binding hashes the key it is handed
-	 * once more, so through it this step lands at `H(H(rootKey))`, not at the storage group (backlog
-	 * `bug-cohort-topic-router-hashes-a-coordinate-as-a-key`); only `routeToRoot` reaches the group there.
+	 * NOTE: the fallback reaches the root coordinate by ring routing, which is the root group whenever the
+	 * ring's nearest peers to `H(rootKey)` are the key network's storage group for that key. `routeToRoot`
+	 * exists only because the two can differ on a ring shared with another network.
 	 */
 	private routeToTier(d: number, topicId: Uint8Array, rootKey: Uint8Array | undefined, activity: Uint8Array): Promise<Uint8Array> {
 		const router = this.deps.router;
 		if (d === 0 && rootKey !== undefined && router.routeToRoot !== undefined) {
 			return router.routeToRoot(rootKey, activity);
 		}
-		return router.routeAndAct(this.deps.addressing.coord(d, this.deps.self, topicId, rootKey), activity, {
+		return router.routeAndAct(this.deps.addressing.routeKey(d, this.deps.self, topicId, rootKey), activity, {
 			wantK: this.wantK,
 			minSigs: this.minSigs,
 		});

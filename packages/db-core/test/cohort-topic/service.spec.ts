@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { createCohortTopicService } from '../../src/cohort-topic/service.js';
 import { createRingHash } from '../../src/cohort-topic/ring-hash.js';
-import type { ITopicRouter, ISizeEstimator, PeerRef, RingCoord } from '../../src/cohort-topic/ports.js';
+import type { ITopicRouter, ISizeEstimator, PeerRef, TopicRouteKey } from '../../src/cohort-topic/ports.js';
 import { bytesToB64url, encodeCohortMessage, decodeRegisterV1, decodeRenewV1 } from '../../src/cohort-topic/wire/codec.js';
 import type { RegisterReplyV1, RenewReplyV1 } from '../../src/cohort-topic/wire/types.js';
 import type { CohortGossipBus } from '../../src/cohort-topic/gossip/bus.js';
@@ -46,7 +46,7 @@ describe('CohortTopicService / stale handle isolation', () => {
 	it('withdraw on a superseded handle is a no-op and does not evict the live registration', async () => {
 		let dialCallCount = 0;
 		const router: ITopicRouter = {
-			routeAndAct: async (_key: RingCoord, _activity: Uint8Array, _opts: { wantK: number; minSigs: number }) =>
+			routeAndAct: async (_key: TopicRouteKey, _activity: Uint8Array, _opts: { wantK: number; minSigs: number }) =>
 				encodeCohortMessage(acceptedReply),
 			dialMember: async (_peer: PeerRef, _activity: Uint8Array) => {
 				dialCallCount++;
@@ -72,7 +72,7 @@ describe('CohortTopicService / stale handle isolation', () => {
 		let dialCallCount = 0;
 		const okRenewReply: RenewReplyV1 = { v: 1, result: 'ok' };
 		const router: ITopicRouter = {
-			routeAndAct: async (_key: RingCoord, _activity: Uint8Array, _opts: { wantK: number; minSigs: number }) =>
+			routeAndAct: async (_key: TopicRouteKey, _activity: Uint8Array, _opts: { wantK: number; minSigs: number }) =>
 				encodeCohortMessage(acceptedReply),
 			dialMember: async (_peer: PeerRef, _activity: Uint8Array) => {
 				dialCallCount++;
@@ -96,7 +96,7 @@ describe('CohortTopicService / stale handle isolation', () => {
 	it('a second withdraw of the same live handle is idempotent (no second tombstone)', async () => {
 		let dialCallCount = 0;
 		const router: ITopicRouter = {
-			routeAndAct: async (_key: RingCoord, _activity: Uint8Array, _opts: { wantK: number; minSigs: number }) =>
+			routeAndAct: async (_key: TopicRouteKey, _activity: Uint8Array, _opts: { wantK: number; minSigs: number }) =>
 				encodeCohortMessage(acceptedReply),
 			dialMember: async (_peer: PeerRef, _activity: Uint8Array) => {
 				dialCallCount++;
@@ -119,7 +119,7 @@ describe('CohortTopicService / stale handle isolation', () => {
 		let renewCount = 0;
 		let withdrawCount = 0;
 		const router: ITopicRouter = {
-			routeAndAct: async (_key: RingCoord, _activity: Uint8Array, _opts: { wantK: number; minSigs: number }) =>
+			routeAndAct: async (_key: TopicRouteKey, _activity: Uint8Array, _opts: { wantK: number; minSigs: number }) =>
 				encodeCohortMessage(acceptedReply),
 			dialMember: async (_peer: PeerRef, activity: Uint8Array) => {
 				// The withdraw tombstone and a renew both go through dialMember; the count that matters is
@@ -147,7 +147,7 @@ describe('CohortTopicService / renew echoes the register correlationId', () => {
 		let registerCorrelationId: string | undefined;
 		let renewCorrelationId: string | undefined;
 		const router: ITopicRouter = {
-			routeAndAct: async (_key: RingCoord, activity: Uint8Array, _opts: { wantK: number; minSigs: number }) => {
+			routeAndAct: async (_key: TopicRouteKey, activity: Uint8Array, _opts: { wantK: number; minSigs: number }) => {
 				// The register walk builds a fresh correlationId per probe; capture the one the cohort admits.
 				registerCorrelationId = decodeRegisterV1(activity).correlationId;
 				return encodeCohortMessage(acceptedReply);
@@ -173,7 +173,7 @@ describe('CohortTopicService / moveRoot', () => {
 		const NEW_ROOT = bytes('new-root', 16);
 		const walkedWith: (string | undefined)[] = [];
 		const router: ITopicRouter = {
-			routeAndAct: async (_key: RingCoord, activity: Uint8Array, _opts: { wantK: number; minSigs: number }) => {
+			routeAndAct: async (_key: TopicRouteKey, activity: Uint8Array, _opts: { wantK: number; minSigs: number }) => {
 				walkedWith.push(decodeRegisterV1(activity).rootKey);
 				return encodeCohortMessage(acceptedReply);
 			},

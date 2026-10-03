@@ -25,7 +25,7 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PrivateKey, PeerId } from '@libp2p/interface';
 import * as lp from 'it-length-prefixed';
 import type { Uint8ArrayList } from 'uint8arraylist';
-import { hashPeerId, type RouteAndMaybeActV1, type NearAnchorV1 } from 'p2p-fret';
+import { hashKey, hashPeerId, type RouteAndMaybeActV1, type NearAnchorV1 } from 'p2p-fret';
 import {
 	RingHash,
 	createSlotAssigner,
@@ -280,9 +280,9 @@ export interface MeshOptions {
 	readonly rootGroup?: (member: Member) => RootGroupOptions;
 }
 
-/** One routed probe: the coord key it was issued at and the reply classification the walk saw. */
+/** One routed probe: the coord it landed at (base64url) and the reply classification the walk saw. */
 export interface RouteTraceEntry {
-	readonly key: string;
+	readonly coord: string;
 	readonly result: RegisterResult;
 	/**
 	 * Whether the routed frame carried a participant signature. A participant's own walk probes are always
@@ -295,9 +295,12 @@ export interface RouteTraceEntry {
 
 export class CohortMesh {
 	readonly nodes: HostNode[] = [];
-	/** Coords every `routeAct` was keyed at (a walk's probe trail); a test clears + inspects it. */
-	readonly routeKeys: string[] = [];
-	/** Per-probe (key, reply-result) trace — richer than {@link routeKeys} for anti-flood walk assertions. */
+	/**
+	 * Coords (base64url) every `routeAct` landed at — the hash of the routed key, as FRET derives it — so a
+	 * walk's probe trail compares directly against `coord_d`. A test clears + inspects it.
+	 */
+	readonly routedCoords: string[] = [];
+	/** Per-probe (coord, reply-result) trace — richer than {@link routedCoords} for anti-flood walk assertions. */
 	readonly routeTrace: RouteTraceEntry[] = [];
 	private readonly registry = new Map<string, MockNode>();
 	private readonly activity = new Map<string, (activity: string, cohort: string[], minSigs: number, correlationId: string) => Promise<{ commitCertificate: string }>>();
@@ -357,21 +360,27 @@ export class CohortMesh {
 		this.down.delete(idStr);
 	}
 
+	/**
+	 * Route the way FRET's `routeAct` does: the wire key is hashed once into the ring position, and the
+	 * activity runs at the node nearest that position with the cohort assembled around it. A fake that took
+	 * the key as the position would hide a caller handing it a coordinate.
+	 */
 	private async routeAct(msg: RouteAndMaybeActV1): Promise<NearAnchorV1 | { commitCertificate: string }> {
-		const key = b64urlToBytes(msg.key);
-		this.routeKeys.push(msg.key);
+		const position = await hashKey(b64urlToBytes(msg.key));
+		const coord = bytesToB64url(position);
+		this.routedCoords.push(coord);
 		const signed = routedFrameIsSigned(msg.activity);
-		const target = this.nearest(key);
+		const target = this.nearest(position);
 		const handler = this.activity.get(target.idStr);
 		if (handler === undefined || this.down.has(target.idStr)) {
 			// No in-cluster activity to run (cold / unreachable target) → a bare anchor hint; the walk
 			// treats it as `no_state`.
-			this.routeTrace.push({ key: msg.key, result: 'no_state', signed });
+			this.routeTrace.push({ coord, result: 'no_state', signed });
 			return { v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: this.members.length, confidence: 1 };
 		}
-		const cohort = this.assembleCohort(key, msg.want_k);
+		const cohort = this.assembleCohort(position, msg.want_k);
 		const reply = await handler(msg.activity ?? '', cohort, msg.min_sigs, msg.correlation_id);
-		this.routeTrace.push({ key: msg.key, result: replyResult(reply), signed });
+		this.routeTrace.push({ coord, result: replyResult(reply), signed });
 		return reply;
 	}
 
@@ -394,7 +403,7 @@ export class CohortMesh {
 	}
 
 	clearRouteLog(): void {
-		this.routeKeys.length = 0;
+		this.routedCoords.length = 0;
 		this.routeTrace.length = 0;
 	}
 
@@ -584,8 +593,8 @@ export function coordTierMap(participant: Member, topic: Uint8Array, dMax: numbe
  */
 export function walkTraceFrom(routeTrace: readonly RouteTraceEntry[], tierMap: Map<string, number>, dMax: number): WalkTrace {
 	const probes = routeTrace
-		.filter((e) => tierMap.has(e.key) && e.signed)
-		.map((e) => ({ treeTier: tierMap.get(e.key)!, result: e.result }));
+		.filter((e) => tierMap.has(e.coord) && e.signed)
+		.map((e) => ({ treeTier: tierMap.get(e.coord)!, result: e.result }));
 	return { dMax, probes };
 }
 

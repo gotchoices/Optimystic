@@ -85,8 +85,10 @@ This is the only addressing scheme used by the layer. It replaces older bit-shif
 > `HashTierAddressing`, default `F = 16`) implements the formula exactly: `coord_d` ring-hashes `P`
 > via `this.hash.H(peerId)` before calling `prefixBits`, building `d ‖ prefix(H(P), d·log₂F) ‖ topicId`
 > and hashing it through the injected `IRingHash` (db-core's own SHA-256 truncated to the ring width —
-> **not** a FRET import; the db-p2p binding makes the ring width match FRET's `RING_BITS` so routing
-> keys line up). `prefix(H(P), n)` extracts the `n` MSBs MSB-first, left-padding when `H(P)` is
+> **not** a FRET import; the db-p2p binding makes the ring width match FRET's `RING_BITS` so the
+> coordinates line up). The bytes each coordinate hashes are exposed as `routeKey`, typed
+> `TopicRouteKey` (`packages/db-core/src/cohort-topic/ports.ts`), and every coordinate is computed as the
+> hash of its route key, so the two cannot disagree (§RouteAndMaybeAct usage). `prefix(H(P), n)` extracts the `n` MSBs MSB-first, left-padding when `H(P)` is
 > shorter than `n` bits. `coord(0, …)` dispatches to `coord_0 = H(0x00 ‖ topicId)`, which is
 > peer-independent and unchanged. **Validated:** the spec `addressing.spec.ts` ("H(P)-shard collision
 > rate") confirms distinct `(tier, H(P)-shard, topic)` triples never alias, and that the raw
@@ -164,13 +166,14 @@ A participant reaches a root-placed root by the rule that chose the group, not b
 routing: on a ring shared with another network the nearest peer to `H(rootKey)` can belong to that other
 network. `ITopicRouter` in `packages/db-core/src/cohort-topic/ports.ts` therefore has an optional
 `routeToRoot`, which the walk uses for the tier-0 step of a root-placed topic; a router without it gets
-the same frame by `routeAndAct` at `H(rootKey)` — addressed by coordinate, as every other tier is, which
-through the FRET binding today does **not** reach the storage group: that binding hashes the key it is
-handed once more (backlog `bug-cohort-topic-router-hashes-a-coordinate-as-a-key`), so only `routeToRoot`
-gets there.
+the same frame by `routeAndAct` on the root key itself, the tier's routing key (§RouteAndMaybeAct usage),
+which FRET hashes into `H(rootKey)`. That reaches the storage group whenever the ring's nearest peers to
+`H(rootKey)` are the group, which is every ring not shared with another network; `routeToRoot` exists for
+the ring where they are not.
 
 > **Implementation (db-core).** `rootCoord` in `packages/db-core/src/cohort-topic/addressing.ts` is the
-> hash; `coord(d, P, topicId, rootKey?)` dispatches to it at `d = 0`. A participant names the key on
+> hash; `coord(d, P, topicId, rootKey?)` dispatches to it at `d = 0`, and `routeKey` with the same
+> arguments returns the root key itself. A participant names the key on
 > `RegisterRequest` or as the third argument of `lookup` (`packages/db-core/src/cohort-topic/service.ts`);
 > the walk stamps it on every frame and a renewal's re-walk reuses it — or the key `moveRoot` (same file)
 > last named, so a re-walk after the root moved lands at the new root. The accepted walk outcome and the
@@ -191,7 +194,7 @@ gets there.
 > valid root key). A node that serves coordinates must therefore treat "root-placed" as a property of
 > the cohort it serves at a coordinate, and refuse a frame that claims the other rule for it.
 
-> **Implementation (db-p2p host).** `createCohortTopicHost` in `packages/db-p2p/src/cohort-topic/host.ts` serves root placement when given a `RootGroupOptions` (same file): `membersAt(coord)` is the root group at a coordinate — the key network's serving cohort there — and `quorumRatio` is the ratio the threshold is taken from. The host reads the group into a per-coord snapshot (`RootGroupSnapshots`, same file) that every site which otherwise assembles the FRET cohort consults for a root-placed coord: the engine's cohort view, its threshold signers and cert publisher, the `/sign` endorser, the gossip co-member gate and cold-sibling instantiation, the gossip and notice broadcast targets, the membership fetch (`FretMembershipSource` in `packages/db-p2p/src/cohort-topic/membership-source.ts` asks the group, not the FRET cohort), and the direct trust anchor (`FretTrustAnchor` in `packages/db-p2p/src/cohort-topic/fret-trust-anchor.ts`, which judges a root-placed cert against the group it holds and answers "unknown" when it holds none, when the group omits this node, or when the group is this node alone — what a cold routing table answers for every key; the host then asks the anchor its `trustAnchor` option names, the node's `CommitLogTrustAnchor`, §Bootstrapping trust). A snapshot is filled before a root-placed engine is created, refreshed by that engine on every gossip round (`gossipIntervalMs`, 5 s by default), and read on demand for a `/sign` or membership request at a coordinate with no engine; the store is bounded like the engine registry and dropped with an evicted engine. A root-placed engine's `/sign` requests and gossip carry the `rootPlaced` flag, its cert is cached in the verifier under the placement, and its willingness quorum is a majority of the group rather than of `wantK`. Without the option every root-placed frame is refused (`unwilling_cohort`, "root placement not served"); a frame landing on a node outside the group it names is answered `unwilling_member` naming the group, which the walk's member retry then dials. Which rule a coordinate is served under is decided once, when its engine is created (`EnginePlacement`, same file), and a later register, child link, `/sign` or gossip frame claiming the other rule for it is refused. The *key* is not fixed in the same way: a tier-`d ≥ 1` engine takes the root key of the newest frame that names one (`reconcilePlacement`, same file), since the topic's root can move while that engine stays put, and only a root-placed engine refuses a frame naming a key other than its own. The root step of a root-placed walk is the `routeToRoot` of `FretTopicRouter` in `packages/db-p2p/src/cohort-topic/topic-router.ts`, present only on a host with the option: it resolves the group by `membersAt` and dials each member's `/register` in order — a member that is this node is served in process, since libp2p refuses a self-dial — returning the first reply, and never ring-routes at the coordinate. A tier-1 cohort of such a topic links to the root group the same way, with the key on its `ChildLinkV1`.
+> **Implementation (db-p2p host).** `createCohortTopicHost` in `packages/db-p2p/src/cohort-topic/host.ts` serves root placement when given a `RootGroupOptions` (same file): `membersAt(coord)` is the root group at a coordinate — the key network's serving cohort there — and `quorumRatio` is the ratio the threshold is taken from. The host reads the group into a per-coord snapshot (`RootGroupSnapshots`, same file) that every site which otherwise assembles the FRET cohort consults for a root-placed coord: the engine's cohort view, its threshold signers and cert publisher, the `/sign` endorser, the gossip co-member gate and cold-sibling instantiation, the gossip and notice broadcast targets, the membership fetch (`FretMembershipSource` in `packages/db-p2p/src/cohort-topic/membership-source.ts` asks the group, not the FRET cohort), and the direct trust anchor (`FretTrustAnchor` in `packages/db-p2p/src/cohort-topic/fret-trust-anchor.ts`, which judges a root-placed cert against the group it holds and answers "unknown" when it holds none, when the group omits this node, or when the group is this node alone — what a cold routing table answers for every key; the host then asks the anchor its `trustAnchor` option names, the node's `CommitLogTrustAnchor`, §Bootstrapping trust). A snapshot is filled before a root-placed engine is created, refreshed by that engine on every gossip round (`gossipIntervalMs`, 5 s by default), and read on demand for a `/sign` or membership request at a coordinate with no engine; the store is bounded like the engine registry and dropped with an evicted engine. A root-placed engine's `/sign` requests and gossip carry the `rootPlaced` flag, its cert is cached in the verifier under the placement, and its willingness quorum is a majority of the group rather than of `wantK`. Without the option every root-placed frame is refused (`unwilling_cohort`, "root placement not served"); a frame landing on a node outside the group it names is answered `unwilling_member` naming the group, which the walk's member retry then dials. Which rule a coordinate is served under is decided once, when its engine is created (`EnginePlacement`, same file), and a later register, child link, `/sign` or gossip frame claiming the other rule for it is refused. The *key* is not fixed in the same way: a tier-`d ≥ 1` engine takes the root key of the newest frame that names one (`reconcilePlacement`, same file), since the topic's root can move while that engine stays put, and only a root-placed engine refuses a frame naming a key other than its own. The root step of a root-placed walk is the `routeToRoot` of `FretTopicRouter` in `packages/db-p2p/src/cohort-topic/topic-router.ts`, present only on a host with the option: it resolves the group by `membersAt` and dials each member's `/register` in order — a member that is this node is served in process, since libp2p refuses a self-dial — returning the first reply, and never ring-routes. A tier-1 cohort of such a topic links to the root group the same way, with the key on its `ChildLinkV1`.
 
 ### Maximum useful depth
 
@@ -238,8 +241,8 @@ A participant walks *toward the root* from `d_max`:
 ```
 d = d_max
 loop:
-  C = coord_d(self, topicId)
-  reply = RouteAndMaybeAct(key = C, activity = RegisterV1{...})
+  K = routeKey_d(self, topicId)        # the bytes coord_d hashes; FRET hashes K into C = coord_d(self, topicId)
+  reply = RouteAndMaybeAct(key = K, activity = RegisterV1{...})
   match reply:
     Accepted(primary, backups, cohortEpoch)
       → done
@@ -282,8 +285,8 @@ Key points:
 > **Implementation.** The participant-side walk is
 > [`packages/db-core/src/cohort-topic/walk.ts`](../packages/db-core/src/cohort-topic/walk.ts)
 > (`WalkEngine` / `createWalkEngine`). It drives the injected `ITopicRouter` port — **not** a direct
-> FRET import — keying each probe at `coord_d(self, topicId)` (via `TierAddressing`) with
-> `wantK = k`, `minSigs = k − x`, decoding the `RegisterReplyV1` and dispatching: `no_state` → step
+> FRET import — routing each probe on the tier's route key (`TierAddressing.routeKey`), which the
+> router hashes into `coord_d(self, topicId)` (§RouteAndMaybeAct usage), with `wantK = k`, `minSigs = k − x`, decoding the `RegisterReplyV1` and dispatching: `no_state` → step
 > inward (`d − 1`), with the root case re-issuing once at tier 0 with `bootstrap: true`, **and the
 > after-a-`Promoted`-redirect case re-issuing once at the same child tier with `followOn: true`** (then
 > backing off if that too returns `no_state`); `promoted(targetTier)` → the one outward move, recomputing
@@ -1378,17 +1381,24 @@ Application-specific protocols (notification delivery for reactivity, query for 
 
 Registration uses FRET's `RouteAndMaybeAct` pipeline directly:
 
-- `key` = `coord_d(self, topicId)`
+- `key` = the tier's **routing key** — the bytes `coord_d` is the hash of:
+  - `0x00 ‖ topicId` at tier 0 under the default addressing;
+  - `rootKey` at tier 0 of a root-placed topic;
+  - `d ‖ prefix(H(P), d·log₂F) ‖ topicId` at tier `d ≥ 1`.
+
+  FRET hashes the key once into `coord_d`.
 - `activity` = serialized `RegisterV1`
 - `wantK` = configured cohort size `k` (default 16)
 - `minSigs` = threshold `k − x` (default 14) — used only for promotion/demotion responses
 - Acceptance / redirect / willingness response runs inside the cohort's activity callback
 
+The key is the preimage rather than the coordinate because FRET's `routeAct` hashes the key it is handed into the ring position it routes to — at the origin and again at every forwarding hop, each of which re-derives the position from the key on the wire. Handed `coord_d`, it would act near `H(coord_d)`, a position with no relation to the cohort that serves the topic: on a ring wider than one cohort the two cohorts usually share no member. `TierAddressing.routeKey` (`packages/db-core/src/cohort-topic/addressing.ts`) builds the key, and the `TopicRouteKey` type it returns is the only key `ITopicRouter.routeAndAct` accepts, so a coordinate does not type-check there. A cold-start forwarder's child link to its parent rides the same path, on the parent tier's routing key. The FRET fakes the tests route through (`CohortMesh` in `packages/db-p2p/src/testing/cohort-topic-mesh-harness.ts` among them) hash the wire key the same way, since a fake that took the key as the position would hide a caller handing it a coordinate.
+
 Post-registration traffic (pings, application-specific RPCs) dials the cached `primary` directly and falls back to `RouteAndMaybeAct` only when the primary is unreachable.
 
 ### Cohort assembly
 
-The layer uses FRET's two-sided cohort assembly without modification: alternating successor/predecessor walk, automatic adaptation when `n < k`, threshold signatures via `minSigs = k − x`. The cohort at any given `coord_d` is whichever set of `k` peers FRET names.
+The layer uses FRET's two-sided cohort assembly without modification: alternating successor/predecessor walk, automatic adaptation when `n < k`, threshold signatures via `minSigs = k − x`. The cohort at any given `coord_d` is whichever set of `k` peers FRET names. The serving side assembles it around `coord_d` itself — `assembleCohort` takes an already-hashed ring position — which is the same position `H(routing key)` routes to (§RouteAndMaybeAct usage).
 
 ### Validation
 

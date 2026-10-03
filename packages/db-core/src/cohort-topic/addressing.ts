@@ -19,7 +19,13 @@
  * shorter. `F` is the fan-out (default 16, `log₂F = 4`); tier `d` has exactly `F^d` coordinates.
  *
  * The db-p2p binding is responsible for ensuring the coord byte layout (ring width) matches FRET's
- * `RING_BITS` so the routing keys produced here line up with FRET's ring on the wire.
+ * `RING_BITS` so the coordinates produced here line up with FRET's ring on the wire.
+ *
+ * **Routing keys.** Each coordinate is `H(<preimage>)`, and the preimage is what a frame is routed on
+ * ({@link TierAddressing.routeKey}): FRET's `routeAct` hashes the key it is handed, once, into the ring
+ * position it routes to, so handing it the preimage lands the frame on the coordinate, while handing it the
+ * coordinate lands it at `H(coord)`. Every coordinate here is computed as the hash of its route key, so the
+ * two cannot drift apart.
  *
  * **Root placement at a routing key** (§Tier addressing → Root placement at a routing key). A topic may
  * name a **root key** — raw bytes, e.g. a block's routing key — and then its tier-0 coordinate is
@@ -33,9 +39,9 @@
  * routing key — which is what puts the root on the peers that store the block.
  */
 
-import type { IRingHash, RingCoord } from "./ports.js";
+import type { IRingHash, RingCoord, TopicRouteKey } from "./ports.js";
 
-/** Tier-addressing surface — derives the ring coordinate for tier `d` of a topic. */
+/** Tier-addressing surface — derives the ring coordinate for tier `d` of a topic, and the key that routes to it. */
 export interface TierAddressing {
 	/** Fan-out per tier (default 16). */
 	readonly F: number;
@@ -54,6 +60,12 @@ export interface TierAddressing {
 	 * and every other tier to {@link coordD}. A `rootKey` at `d ≥ 1` does not change the coordinate.
 	 */
 	coord(d: number, peerId: Uint8Array, topicId: Uint8Array, rootKey?: Uint8Array): RingCoord;
+	/**
+	 * The bytes {@link coord} hashes for the same inputs — `0x00 ‖ topicId`, `rootKey`, or
+	 * `d ‖ prefix(H(P), d·log₂F) ‖ topicId` — which is what a frame for that cohort is routed on: the router
+	 * hashes it once into the coordinate. Same validation as {@link coord}.
+	 */
+	routeKey(d: number, peerId: Uint8Array, topicId: Uint8Array, rootKey?: Uint8Array): TopicRouteKey;
 }
 
 /** Default fan-out per tier (`log₂16 = 4`). */
@@ -104,43 +116,61 @@ export class HashTierAddressing implements TierAddressing {
 	}
 
 	coord0(topicId: Uint8Array): RingCoord {
-		// H(0x00 ‖ topicId)
-		const input = new Uint8Array(1 + topicId.length);
-		input[0] = 0x00;
-		input.set(topicId, 1);
-		return this.hash.H(input);
+		return this.hash.H(this.tier0Key(topicId));
 	}
 
 	rootCoord(rootKey: Uint8Array): RingCoord {
-		if (rootKey.length === 0) {
-			throw new RangeError("rootCoord requires a non-empty root key");
-		}
-		return this.hash.H(rootKey);
+		return this.hash.H(this.rootRouteKey(rootKey));
 	}
 
 	coordD(d: number, peerId: Uint8Array, topicId: Uint8Array): RingCoord {
+		return this.hash.H(this.tierDKey(d, peerId, topicId));
+	}
+
+	coord(d: number, peerId: Uint8Array, topicId: Uint8Array, rootKey?: Uint8Array): RingCoord {
+		return this.hash.H(this.routeKey(d, peerId, topicId, rootKey));
+	}
+
+	routeKey(d: number, peerId: Uint8Array, topicId: Uint8Array, rootKey?: Uint8Array): TopicRouteKey {
+		if (d !== 0) {
+			return this.tierDKey(d, peerId, topicId);
+		}
+		return rootKey === undefined ? this.tier0Key(topicId) : this.rootRouteKey(rootKey);
+	}
+
+	/** `0x00 ‖ topicId` — the preimage of {@link coord0}. */
+	private tier0Key(topicId: Uint8Array): TopicRouteKey {
+		const key = new Uint8Array(1 + topicId.length);
+		key[0] = 0x00;
+		key.set(topicId, 1);
+		return key as TopicRouteKey;
+	}
+
+	/** The root key itself — the preimage of {@link rootCoord}, hashed with no tier byte in front. */
+	private rootRouteKey(rootKey: Uint8Array): TopicRouteKey {
+		if (rootKey.length === 0) {
+			throw new RangeError("a root key must be non-empty");
+		}
+		return rootKey as TopicRouteKey;
+	}
+
+	/** `d ‖ prefix(H(P), d·log₂F) ‖ topicId` — the preimage of {@link coordD}. */
+	private tierDKey(d: number, peerId: Uint8Array, topicId: Uint8Array): TopicRouteKey {
 		if (!Number.isInteger(d) || d < 1) {
-			throw new RangeError(`coordD requires an integer tier d ≥ 1, got ${d}`);
+			throw new RangeError(`a tier-d coordinate requires an integer d ≥ 1, got ${d}`);
 		}
 		if (d > 255) {
 			throw new RangeError(`tier d must fit in one byte (≤ 255), got ${d}`);
 		}
-		// H(d ‖ prefix(H(P), d·log₂F) ‖ topicId)  — ring-hash P first so the shard input is uniform
-		// NOTE: re-hashes peerId on every coordD call; a walk over a tier ladder recomputes H(self) per
-		// tier. Negligible today (walk steps are network-bound); if coord becomes hot, cache H(peerId).
+		// Ring-hash P first so the shard input is uniform.
+		// NOTE: re-hashes peerId on every call; a walk over a tier ladder recomputes H(self) per tier.
+		// Negligible today (walk steps are network-bound); if coord becomes hot, cache H(peerId).
 		const prefix = prefixBits(this.hash.H(peerId), d * this.log2F);
-		const input = new Uint8Array(1 + prefix.length + topicId.length);
-		input[0] = d;
-		input.set(prefix, 1);
-		input.set(topicId, 1 + prefix.length);
-		return this.hash.H(input);
-	}
-
-	coord(d: number, peerId: Uint8Array, topicId: Uint8Array, rootKey?: Uint8Array): RingCoord {
-		if (d !== 0) {
-			return this.coordD(d, peerId, topicId);
-		}
-		return rootKey === undefined ? this.coord0(topicId) : this.rootCoord(rootKey);
+		const key = new Uint8Array(1 + prefix.length + topicId.length);
+		key[0] = d;
+		key.set(prefix, 1);
+		key.set(topicId, 1 + prefix.length);
+		return key as TopicRouteKey;
 	}
 }
 

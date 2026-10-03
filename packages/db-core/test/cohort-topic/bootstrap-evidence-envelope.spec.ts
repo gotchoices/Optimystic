@@ -17,7 +17,7 @@ import { validateRegisterV1, CohortWireError } from '../../src/cohort-topic/wire
 import { createCohortTopicService, type CohortTopicServiceDeps, type ParticipantSigner } from '../../src/cohort-topic/service.js';
 import { createRingHash } from '../../src/cohort-topic/ring-hash.js';
 import { encodeCohortMessage, decodeRegisterV1 } from '../../src/cohort-topic/wire/codec.js';
-import type { ITopicRouter, PeerRef, RingCoord, ISizeEstimator } from '../../src/cohort-topic/ports.js';
+import type { ITopicRouter, PeerRef, TopicRouteKey, ISizeEstimator } from '../../src/cohort-topic/ports.js';
 import type { CohortGossipBus } from '../../src/cohort-topic/gossip/bus.js';
 import type { MembershipVerifier } from '../../src/cohort-topic/membership/verifier.js';
 import type { RegisterReplyV1, RegisterV1 } from '../../src/cohort-topic/wire/types.js';
@@ -338,7 +338,7 @@ describe('cohort-topic / bootstrap-evidence envelope', () => {
 			readonly registers: RegisterV1[] = [];
 			private i = 0;
 			constructor(private readonly replies: readonly RegisterReplyV1[]) {}
-			async routeAndAct(_key: RingCoord, activity: Uint8Array): Promise<Uint8Array> {
+			async routeAndAct(_key: TopicRouteKey, activity: Uint8Array): Promise<Uint8Array> {
 				this.registers.push(decodeRegisterV1(activity));
 				return encodeCohortMessage(this.next());
 			}

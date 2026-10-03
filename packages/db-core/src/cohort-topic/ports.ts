@@ -22,6 +22,21 @@ import type { MembershipCertV1 } from "./wire/types.js";
  */
 export type RingCoord = Uint8Array;
 
+declare const topicRouteKeyBrand: unique symbol;
+
+/**
+ * The bytes a cohort-topic frame is routed on: FRET hashes them exactly once into the cohort's ring
+ * coordinate. FRET's `routeAct` hashes the key it is handed — at the origin and again at every forwarding
+ * hop — so handing it a coordinate lands the frame at the hash of that coordinate, a ring position no
+ * cohort serves. Branded so the only way to obtain one is `TierAddressing.routeKey`, which builds the
+ * preimage of `TierAddressing.coord` for the same inputs; a {@link RingCoord} does not type-check where a
+ * route key belongs.
+ *
+ * A separate brand from `RoutingKey` (`network/routing-key.ts`): that one is obtainable only from a block
+ * id, and these preimages are not block keys.
+ */
+export type TopicRouteKey = Uint8Array & { readonly [topicRouteKeyBrand]: true };
+
 /** A peer, referenced only by its opaque byte-array id. No multiaddr, no libp2p PeerId here. */
 export interface PeerRef {
 	readonly id: Uint8Array;
@@ -33,18 +48,19 @@ export interface PeerRef {
  */
 export interface ITopicRouter {
 	/**
-	 * Route `activity` to the cohort owning `key` and run the cohort's activity callback,
-	 * collecting up to `wantK` participants and at least `minSigs` signatures.
+	 * Route `activity` to the cohort at `H(key)` and run the cohort's activity callback,
+	 * collecting up to `wantK` participants and at least `minSigs` signatures. The router hashes `key`
+	 * once; build it with `TierAddressing.routeKey` so that hash is the tier's coordinate.
 	 * @returns the encoded cohort reply.
 	 */
-	routeAndAct(key: RingCoord, activity: Uint8Array, opts: { wantK: number; minSigs: number }): Promise<Uint8Array>;
+	routeAndAct(key: TopicRouteKey, activity: Uint8Array, opts: { wantK: number; minSigs: number }): Promise<Uint8Array>;
 	/** Direct dial to a cached primary; falls back to {@link routeAndAct} on failure (caller decides). */
 	dialMember(member: PeerRef, activity: Uint8Array): Promise<Uint8Array>;
 	/**
 	 * Deliver `activity` to the **root group** of a root-placed topic — the peers responsible for
 	 * `rootKey` — and return the encoded reply. Optional: the walk uses it for the tier-0 step of a
-	 * root-placed topic when the router has it, and otherwise falls back to
-	 * `routeAndAct(rootCoord(rootKey), …)`.
+	 * root-placed topic when the router has it, and otherwise falls back to ring routing on the root key,
+	 * which reaches the root coordinate `H(rootKey)`.
 	 *
 	 * It exists because the two can disagree: `routeAndAct` lands on the ring's nearest peer to the
 	 * coordinate, which on a ring shared with another network may be a peer of that other network, whereas

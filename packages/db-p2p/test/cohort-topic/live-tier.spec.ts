@@ -241,8 +241,8 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 			}
 			expect(backoff, 'the post-promotion walk terminates with a temporal back-off, not a hang').to.be.instanceOf(CohortBackoffError);
 			const coord1 = addressing.coord(1, walker.member.bytes, TOPIC);
-			expect(mesh.routeKeys.includes(bytesToB64url(coord1)), 'the walk recomputed coord_1 and probed it').to.equal(true);
-			expect(mesh.routeKeys.includes(bytesToB64url(coord0)), 'the walk also (re)probed coord_0 (the promoted redirect)').to.equal(true);
+			expect(mesh.routedCoords.includes(bytesToB64url(coord1)), 'the walk recomputed coord_1 and probed it').to.equal(true);
+			expect(mesh.routedCoords.includes(bytesToB64url(coord0)), 'the walk also (re)probed coord_0 (the promoted redirect)').to.equal(true);
 		} finally {
 			await mesh.stop();
 		}

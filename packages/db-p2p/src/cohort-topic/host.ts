@@ -162,6 +162,7 @@ import {
 	type SignRequestV1,
 	type Tier,
 	type TopicBudgetConfig,
+	type TopicRouteKey,
 	type TopicTrafficV1,
 	type IMembershipSource,
 	type IMembershipTrustAnchor,
@@ -946,8 +947,9 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 
 	// --- ports (node-wide singletons, injected into every coord engine) ---
 	// The router's `routeToRoot` exists only on a host that serves root placement; it resolves the group by the
-	// rule that chose it (never by ring routing at the coordinate — see the router) and runs a frame addressed
-	// to this node through the local register handler, since libp2p refuses a self-dial.
+	// rule that chose it (never by ring routing, whose nearest peers can differ from the storage group on a
+	// shared ring — see the router) and runs a frame addressed to this node through the local register
+	// handler, since libp2p refuses a self-dial.
 	const router = new FretTopicRouter(node, fret, {
 		registerProtocol: protocols.register,
 		maxBytes,
@@ -1448,8 +1450,8 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		if (rootKey !== undefined && rootGroup === undefined) {
 			return refusalReply(new RootPlacementRefusedError("not-served"))!;
 		}
-		// FRET's ActivityHandler does not carry the routed key, so recompute it from the frame. For tier
-		// `d` this equals the participant's `coord_d(self, topicId)` routing key by construction, i.e. the
+		// FRET's ActivityHandler does not carry the routed key, so recompute the coordinate from the frame. For
+		// tier `d` this is the hash of the participant's route key for that tier by construction, i.e. the
 		// coordinate FRET routed to (§Tier addressing) — or, at the root of a root-placed topic, `H(rootKey)`.
 		const servedCoord = addressing.coord(reg.treeTier, participantCoord, topicId, rootKey);
 		const placement = placementOf(reg.treeTier, rootKey);
@@ -1808,7 +1810,8 @@ interface ForwarderLink {
  * Route a child-cohort→parent link to `parentCoord` and resolve **only on a `linked` ack**.
  *
  * The frame is a dedicated {@link ChildLinkV1} (not a participant `RegisterV1`) routed over
- * {@link ITopicRouter.routeAndAct} keyed at the parent coord: it carries the child's served coord
+ * {@link ITopicRouter.routeAndAct} on the parent's route key (see {@link parentRouteKey}), which the router
+ * hashes into the parent coord: it carries the child's served coord
  * (`childCohortCoord`) and its seed `childParticipantCoord`, so the parent recomputes
  * `coord_{d−1}(childParticipantCoord, topicId) == parentCoord` and `coord_d(...) == childCohortCoord`,
  * binding the relationship. In live-key mode the child cohort threshold-signs the link over its own coord
@@ -1844,11 +1847,26 @@ async function registerForwarderWithParent(ctx: CoordEngineContext, link: Forwar
 	const encoded = encodeCohortMessage(frame, ctx.maxBytes);
 	const replyBytes = toRoot !== undefined && ctx.router.routeToRoot !== undefined
 		? await ctx.router.routeToRoot(toRoot, encoded)
-		: await ctx.router.routeAndAct(link.parentCoord, encoded, { wantK: ctx.wantK, minSigs: ctx.minSigs });
+		: await ctx.router.routeAndAct(parentRouteKey(ctx, link), encoded, { wantK: ctx.wantK, minSigs: ctx.minSigs });
 	const reply = validateChildLinkReplyV1(decodeCohortMessage(replyBytes, ctx.maxBytes));
 	if (reply.result !== "linked") {
 		throw new Error(`cohort-topic child-link rejected by parent${reply.reason !== undefined ? `: ${reply.reason}` : ""}`);
 	}
+}
+
+/**
+ * The route key of a link's parent cohort, built from the link's own fields — the preimage whose hash is
+ * `link.parentCoord`. The two are derived on different paths (the coordinate from the instantiating frame,
+ * the key from this engine's seed participant and the root key it holds now), so a key that does not hash to
+ * `parentCoord` would deliver the link to a cohort other than the parent it names; that refuses the link,
+ * leaving the forwarder `awaiting_parent`, rather than routing it there.
+ */
+function parentRouteKey(ctx: CoordEngineContext, link: ForwarderLink): TopicRouteKey {
+	const key = ctx.addressing.routeKey(link.treeTier - 1, link.participantCoord, link.topicId, link.rootKey);
+	if (!bytesEqual(ctx.hash.H(key), link.parentCoord)) {
+		throw new Error(`cohort-topic child-link: the parent route key does not hash to the parent coord ${bytesToB64url(link.parentCoord)}`);
+	}
+	return key;
 }
 
 /** Clamp an op tier to the valid T0–T3 range so the link frame validates at a (future) real parent. */
@@ -2637,7 +2655,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	// registers with its tier-`(d − 1)` parent cohort at `parentCoord` so the parent counts it as a child;
 	// the ColdStartManager holds the forwarder in `awaiting_parent` (accepts participants, holds
 	// parent-involving ops) until this resolves. This supplies the TRANSPORT: route a forwarder-link frame
-	// to `parentCoord` over the same `RouteAndMaybeAct` path a participant register rides. A resolved
+	// to `parentCoord` over the same `RouteAndMaybeAct` path a participant register rides, on the parent's
+	// route key. A resolved
 	// round-trip is the parent ack (flip to `serving`); a rejected/timed-out route leaves the forwarder
 	// `awaiting_parent` for a later retry and never crashes the instantiating register (cold-start fires
 	// this fire-and-forget). The parent-side child-cohort RECORDING (`childCohortCount`, a dedicated

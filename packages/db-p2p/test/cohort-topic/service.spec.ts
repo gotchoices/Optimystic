@@ -39,6 +39,7 @@ import {
 	type RenewV1,
 	type RingCoord,
 	type Tier,
+	type TopicRouteKey,
 } from '@optimystic/db-core';
 import { CoordPlacementMismatchError, createCohortTopicHost, resolveRenew, type CoordEngine, type CohortTopicHost } from '../../src/cohort-topic/host.js';
 import { bytesToPeerIdString } from '../../src/cohort-topic/peer-codec.js';
@@ -141,7 +142,7 @@ function buildMockService(engine: CohortMemberEngine, member: Uint8Array, onDial
 	const self = hash.H(new TextEncoder().encode('participant-self'));
 
 	const router: ITopicRouter = {
-		routeAndAct: async (_key: RingCoord, activity: Uint8Array): Promise<Uint8Array> => {
+		routeAndAct: async (_key: TopicRouteKey, activity: Uint8Array): Promise<Uint8Array> => {
 			const reg = validateRegisterV1(decodeCohortMessage(activity));
 			const reply = await engine.handleRegister(reg, { followOn: reg.bootstrap === true, treeTier: reg.treeTier }, clock());
 			return encodeCohortMessage(reply);

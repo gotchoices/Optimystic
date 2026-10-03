@@ -3,6 +3,7 @@ import { waitFor, delay } from '@optimystic/db-core/test';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { Connection, PeerId, PrivateKey, Stream } from '@libp2p/interface';
+import { hashKey } from 'p2p-fret';
 import {
 	RingHash,
 	createTierAddressing,
@@ -106,7 +107,8 @@ type ActivityHandler = (activity: string, cohort: string[]) => Promise<{ commitC
 
 /**
  * A fake FRET. `assembleCohort` returns `cohortFor(coord)` (host prepends self + dedupes). `routeAct`
- * records each call (so a test can assert what coord a forwarder→parent link routed to). When
+ * records each call (so a test can assert what a forwarder→parent link routed to) and, as FRET does, hashes
+ * the wire key into the position it routes to. When
  * `invokeActivity` is set it faithfully drives the host's captured activity handler with the routed frame
  * (so a routed child-link actually reaches the parent engine's dispatch and its real
  * {@link ChildLinkReplyV1} comes back); otherwise it returns a canned `linked` ack. `routeActReject` makes
@@ -132,7 +134,7 @@ function makeFakeFret(opts: {
 			// Faithful path: run the host's activity handler on the routed frame (so a child-link reaches the
 			// parent engine's dispatch and records the child), returning its real reply.
 			if (opts.invokeActivity === true && activityHandler !== undefined) {
-				return activityHandler(msg.activity, cohortFor(b64urlToBytes(msg.key)));
+				return activityHandler(msg.activity, cohortFor(await hashKey(b64urlToBytes(msg.key))));
 			}
 			// Canned ack: a `linked` ChildLinkReplyV1 (the child-link's success-ack shape).
 			return Promise.resolve({ commitCertificate: bytesToB64url(encodeCohortMessage({ v: 1, result: 'linked' })) });
@@ -490,10 +492,13 @@ describe('cohort-topic: host cold-start parent registration (gap 7)', () => {
 		expect(ce.forwarder(TOPIC)!.phase(), 'the forwarder flips to serving on the parent linked ack').to.equal('serving');
 		expect(ce.forwarder(TOPIC)!.servesParentOps()).to.equal(true);
 
-		// It routed a ChildLinkV1 to the CORRECT parent coordinate (coord_0(topic)), not the served coord.
-		const linkCall = routeActCalls.find((c) => c.key === bytesToB64url(parentCoord));
-		expect(linkCall, 'the link routed to coord_{d-1}(participant, topic)').to.not.equal(undefined);
-		expect(routeActCalls.some((c) => c.key === bytesToB64url(servedCoord)), 'it did NOT route to the served coord').to.equal(false);
+		// It routed a ChildLinkV1 to the CORRECT parent coordinate (coord_0(topic)), not the served coord: the key it
+		// handed FRET hashes to the parent coord, as FRET's routing hashes it.
+		const routedCoords = await Promise.all(routeActCalls.map(async (c) => bytesToB64url(await hashKey(b64urlToBytes(c.key)))));
+		const linkIndex = routedCoords.indexOf(bytesToB64url(parentCoord));
+		expect(linkIndex, 'the link routed to coord_{d-1}(participant, topic)').to.not.equal(-1);
+		expect(routedCoords.includes(bytesToB64url(servedCoord)), 'it did NOT route to the served coord').to.equal(false);
+		const linkCall = routeActCalls[linkIndex];
 		const linked = validateChildLinkV1(decodeCohortMessage(b64urlToBytes(linkCall!.activity)));
 		expect(linked.childTier, 'the frame is a child-link stamped at the child tree tier (d)').to.equal(1);
 		expect(linked.topicId).to.equal(bytesToB64url(TOPIC));

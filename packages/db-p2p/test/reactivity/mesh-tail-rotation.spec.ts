@@ -264,7 +264,7 @@ describe('reactivity / mesh — tail rotation continuity', function () {
 		expect(c.registration!.treeTier).to.equal(1);
 		expect([...c.registration!.rootKey!], 'moveRoot pointed its next re-walk at the new root').to.deep.equal([...rotation.newTailId]);
 		expect(tierOne.engine.holds(topicId, rx.members[3]!.bytes), 'the tier-1 cohort still holds it').to.equal(true);
-		expect(rx.mesh.routeKeys.includes(bytesToB64url(tierOne.coord)), 'the rotation routed no register frame to the tier-1 cohort').to.equal(false);
+		expect(rx.mesh.routedCoords.includes(bytesToB64url(tierOne.coord)), 'the rotation routed no register frame to the tier-1 cohort').to.equal(false);
 
 		// Delivery continues across the move for everyone.
 		await rx.commit('tiers', 2);

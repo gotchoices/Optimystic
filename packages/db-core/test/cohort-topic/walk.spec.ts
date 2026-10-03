@@ -4,7 +4,7 @@ import { createWalkEngine, type RegisterMessageFactory } from '../../src/cohort-
 import { createTierAddressing } from '../../src/cohort-topic/addressing.js';
 import { createRingHash } from '../../src/cohort-topic/ring-hash.js';
 import type { DMaxComputer } from '../../src/cohort-topic/dmax.js';
-import type { ITopicRouter, PeerRef, RingCoord } from '../../src/cohort-topic/ports.js';
+import type { ITopicRouter, PeerRef, RingCoord, TopicRouteKey } from '../../src/cohort-topic/ports.js';
 import {
 	bytesToB64url,
 	encodeCohortMessage,
@@ -18,11 +18,13 @@ function bytes(label: string, len = 16): Uint8Array {
 }
 
 const TOPIC = bytes('walk-topic', 32);
-const addressing = createTierAddressing(createRingHash());
+const ringHash = createRingHash();
+const addressing = createTierAddressing(ringHash);
 
 /** A recorded probe — whether it was routed (by coord) or directly dialed (by member), plus the decoded register fields. */
 interface Probe {
 	readonly mode: 'route' | 'dial';
+	/** Where a routed probe lands: the hash of the key the walk handed the router, as FRET's routing derives it. */
 	readonly coord?: RingCoord;
 	readonly member?: Uint8Array;
 	readonly treeTier: number;
@@ -41,9 +43,9 @@ class ScriptedRouter implements ITopicRouter {
 
 	constructor(private readonly replies: readonly RegisterReplyV1[]) {}
 
-	async routeAndAct(key: RingCoord, activity: Uint8Array): Promise<Uint8Array> {
+	async routeAndAct(key: TopicRouteKey, activity: Uint8Array): Promise<Uint8Array> {
 		const reg = decodeRegisterV1(activity);
-		this.probes.push({ mode: 'route', coord: key, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, followOn: reg.followOn === true, probe: reg.probe === true });
+		this.probes.push({ mode: 'route', coord: ringHash.H(key), treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, followOn: reg.followOn === true, probe: reg.probe === true });
 		return encodeCohortMessage(this.next());
 	}
 
@@ -105,10 +107,11 @@ class SingleCohortRouter implements ITopicRouter {
 
 	constructor(private readonly promotedCoord: RingCoord) {}
 
-	async routeAndAct(key: RingCoord, activity: Uint8Array): Promise<Uint8Array> {
+	async routeAndAct(key: TopicRouteKey, activity: Uint8Array): Promise<Uint8Array> {
 		const reg = decodeRegisterV1(activity);
-		this.probes.push({ mode: 'route', coord: key, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, followOn: reg.followOn === true, probe: reg.probe === true });
-		const reply: RegisterReplyV1 = bytesEqual(key, this.promotedCoord) ? { v: 1, result: 'promoted', targetTier: 1 } : noState;
+		const coord = ringHash.H(key);
+		this.probes.push({ mode: 'route', coord, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, followOn: reg.followOn === true, probe: reg.probe === true });
+		const reply: RegisterReplyV1 = bytesEqual(coord, this.promotedCoord) ? { v: 1, result: 'promoted', targetTier: 1 } : noState;
 		return encodeCohortMessage(reply);
 	}
 
@@ -507,12 +510,12 @@ describe('cohort-topic / walk-toward-root', () => {
 		expect((await engine.register(TOPIC, 1, undefined, { rootKey })).kind).to.equal('accepted');
 
 		expect(steps.map((s) => s.via)).to.deep.equal(['coord', 'root']);
-		expect(bytesEqual(steps[0]!.key, addressing.coord(1, self, TOPIC)), 'tier 1 keeps its usual coord').to.be.true;
+		expect(bytesEqual(ringHash.H(steps[0]!.key), addressing.coord(1, self, TOPIC)), 'tier 1 keeps its usual coord').to.be.true;
 		expect(bytesEqual(steps[1]!.key, rootKey), 'the root step hands the router the raw key').to.be.true;
 		expect(steps.map((s) => s.frameRootKey), 'every tier\'s frame carries the key').to.deep.equal([rootKeyB64, rootKeyB64]);
 
-		// A router with no routeToRoot gets the root step by ring routing, at the hash of the key alone —
-		// the position the key network derives for that routing key.
+		// A router with no routeToRoot gets the root step by ring routing on the key itself, landing at the hash
+		// of the key alone — the position the key network derives for that routing key.
 		const plain = new ScriptedRouter([accepted]);
 		const fallback = createWalkEngine({ router: plain, addressing, dmax: fixedDMax(0), self, factory: factoryFor(self) });
 		expect((await fallback.register(TOPIC, 1, undefined, { rootKey })).kind).to.equal('accepted');

@@ -1,4 +1,4 @@
-import type { ITopicRouter, PeerRef, RingCoord } from "@optimystic/db-core";
+import type { ITopicRouter, PeerRef, TopicRouteKey } from "@optimystic/db-core";
 import { bytesToB64url, b64urlToBytes, encodeCohortMessage } from "@optimystic/db-core";
 import type { Libp2p } from "libp2p";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -28,9 +28,10 @@ export interface FretTopicRouterOptions {
 	 * The root group of a root-placed topic, by root key: the peer-id strings responsible for the key under
 	 * the rule storage placement uses, in the order to try them. Supplying it gives the router a
 	 * {@link ITopicRouter.routeToRoot}; omitting it leaves that method absent, so the walk falls back to ring
-	 * routing at the root coordinate (which through this binding does not reach the group — see
-	 * `routeToTier` in `packages/db-core/src/cohort-topic/walk.ts`). The host binds it to its root-group
-	 * option, keyed by the coordinate `H(rootKey)`.
+	 * routing on the root key, which reaches the ring's nearest peers to the root coordinate `H(rootKey)` —
+	 * the group itself unless the ring is shared with another network (see `routeToTier` in
+	 * `packages/db-core/src/cohort-topic/walk.ts`). The host binds it to its root-group option, keyed by the
+	 * coordinate `H(rootKey)`.
 	 */
 	readonly rootGroupMembers?: (rootKey: Uint8Array) => Promise<readonly string[]>;
 	/**
@@ -47,8 +48,10 @@ export interface FretTopicRouterOptions {
  * FRET-backed {@link ITopicRouter}.
  *
  * `routeAndAct` maps onto FRET's `RouteAndMaybeAct` (`FretService.routeAct`): the `RegisterV1` frame
- * rides the `activity` field (base64url), routed to the cohort owning `key = coord_d(self, topicId)`,
- * collecting `want_k = k` participants and `min_sigs = k − x`. The cohort's activity callback (set by
+ * rides the `activity` field (base64url), and `key` is the tier's route key — the bytes `coord_d(self,
+ * topicId)` is the hash of — because FRET hashes the key it is handed into the ring position it routes to,
+ * at the origin and at every forwarding hop. The frame therefore lands at `coord_d`, collecting
+ * `want_k = k` participants and `min_sigs = k − x`. The cohort's activity callback (set by
  * the host) runs the willingness / cold-start / admission decision and returns the encoded
  * `RegisterReplyV1` as the `commitCertificate`; this adapter decodes it back to bytes. A bare
  * `NearAnchorV1` (no in-cluster activity ran) is surfaced to the walk as `no_state`.
@@ -58,11 +61,11 @@ export interface FretTopicRouterOptions {
  *
  * `routeToRoot` — present only when the router was given {@link FretTopicRouterOptions.rootGroupMembers} —
  * is the tier-0 step of a root-placed topic (`docs/cohort-topic.md` §Root placement at a routing key). It
- * is deliberately **not** built on `routeAndAct`: FRET's `routeAct` hashes whatever key it is handed, so
- * the root coordinate `H(rootKey)` would land at `H(H(rootKey))`, never at the storage group (backlog
- * `bug-cohort-topic-router-hashes-a-coordinate-as-a-key`). Instead it resolves the group by the rule that
- * chose it and dials each member's `/register` directly, in order, returning the first reply it gets —
- * including an `unwilling_member`, which the walk's own member retry then acts on.
+ * is deliberately **not** built on `routeAndAct`: ring routing on the root key reaches the ring's nearest
+ * peers to `H(rootKey)`, which on a ring shared with another network may be that network's peers rather
+ * than the storage group. Instead it resolves the group by the rule that chose it and dials each member's
+ * `/register` directly, in order, returning the first reply it gets — including an `unwilling_member`,
+ * which the walk's own member retry then acts on.
  */
 export class FretTopicRouter implements ITopicRouter {
 	private readonly registerProtocol: string;
@@ -86,7 +89,7 @@ export class FretTopicRouter implements ITopicRouter {
 		}
 	}
 
-	async routeAndAct(key: RingCoord, activity: Uint8Array, opts: { wantK: number; minSigs: number }): Promise<Uint8Array> {
+	async routeAndAct(key: TopicRouteKey, activity: Uint8Array, opts: { wantK: number; minSigs: number }): Promise<Uint8Array> {
 		const now = this.clock();
 		const msg: RouteAndMaybeActV1 = {
 			v: 1,
