@@ -318,9 +318,6 @@ export class ReactivityCollectionWatch {
 	}
 
 	private async renew(sub: Subscription): Promise<void> {
-		// NOTE: a renewal the cohort answers "unknown registration" resolves like any other, so a registration
-		// the cohort has lost is not re-made until the tail moves, and until then the tick alone wakes the
-		// watchers (backlog `bug-a-participant-told-its-registration-is-unknown-never-registers-again`).
 		try {
 			await sub.manager?.renew();
 		} catch (err) {

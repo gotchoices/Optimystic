@@ -3,7 +3,13 @@
  *
  * Per `docs/cohort-topic.md` §TTL and renewal and §Failure modes:
  *
- * - Participant pings `primary` every `ttl/3`. Success → primary touches `lastPing` and gossips it.
+ * - Participant pings `primary` every `ttl/3`. The four replies:
+ *   - `ok` — the primary touched `lastPing` and gossips it; the failure count resets.
+ *   - `primary_moved` — a rotation moved the slot; the participant adopts the named primary/backups/epoch
+ *     and the failure count resets.
+ *   - `unknown_registration` / `withdrawn` — the member holds no record for this participant (it restarted,
+ *     the record expired, a stale withdraw removed it, or gossip has not reached it yet). Counted as a failed
+ *     ping, exactly like no answer: an answer from a member that does not hold the record keeps nothing alive.
  * - Three consecutive ping failures → participant promotes `backups[0]` via a re-attach RPC: a renew
  *   carrying a **signed `reattach` flag** (no full re-registration). The backup accepts when it holds
  *   the record locally *and* is a computed backup under the current epoch — re-stamping `primary` to
@@ -13,7 +19,11 @@
  *   payload instead of promoting the contacted backup (ignoring a reply that points back at the dead
  *   primary). **Resolved (GROUNDING):** the participant's `cohortEpoch` hint refreshes lazily — on the
  *   *next* ping/renewal after failover, not eagerly at failover time.
- * - All of primary + backups fail → participant re-runs lookup from `d_max` (walk ticket, injected).
+ * - All of primary + backups fail → participant re-runs lookup from `d_max` (injected) and adopts where the
+ *   re-walk landed — primary, backups, epoch hint and the accepted register's correlation id. A walk that is
+ *   not accepted keeps the old assignment. Either way the failure count resets, so the next re-walk is at
+ *   least {@link MAX_PING_FAILURES} pings away: at most one per TTL, under the cohort's per-peer register
+ *   rate limit, and a one-off `unknown_registration` from replication lag clears on the next ping.
  * - Cohort-side: evict where `now − lastPing > ttl`; eviction is gossiped so members converge.
  *
  * Both sides take their transport/gossip by injection so storage + sharding + TTL stay unit-testable
@@ -57,12 +67,24 @@ export interface RenewalParticipant {
 /** The unsigned body of a renew/re-attach RPC; the injected signer turns it into a {@link RenewV1}. */
 export type UnsignedRenew = Omit<RenewV1, "signature">;
 
+/** Where a re-run register walk placed the registration; the participant adopts it in place of its own. */
+export interface RenewalAssignment {
+	readonly primary: Uint8Array;
+	readonly backups: readonly Uint8Array[];
+	readonly cohortEpoch: Uint8Array;
+	/** The accepted register's correlation id, base64url — echoed on every later renew. */
+	readonly correlationId: string;
+}
+
 /** Transport the participant drives; supplied by db-p2p (FRET dial / RouteAndMaybeAct underneath). */
 export interface RenewalParticipantTransport {
 	/** Send a renew/re-attach to `target`; resolves with the reply, rejects on RPC failure. */
 	send(target: Uint8Array, msg: RenewV1): Promise<RenewReplyV1>;
-	/** Primary + all backups unreachable: re-run lookup from `d_max` (walk ticket owns the body). */
-	relookup(): Promise<void>;
+	/**
+	 * Primary + all backups failed: re-run the register walk from `d_max`. Resolves the accepted walk's
+	 * assignment, or `undefined` when the walk was not accepted (a back-off or redirect it could not finish).
+	 */
+	relookup(): Promise<RenewalAssignment | undefined>;
 }
 
 export interface RenewalParticipantDeps {
@@ -71,7 +93,7 @@ export interface RenewalParticipantDeps {
 	clock: () => number;
 	/** Signs the renew body; db-p2p supplies the (async) peer-key signature. */
 	sign: (body: UnsignedRenew) => Promise<string>;
-	/** Correlation id matching the original RegisterV1, base64url. */
+	/** Correlation id matching the original RegisterV1, base64url; replaced when a relookup lands. */
 	correlationId: string;
 	/** Initial cohort-epoch hint from the registration reply (refreshed lazily thereafter). */
 	initialCohortEpoch?: Uint8Array;
@@ -81,10 +103,12 @@ class TtlRenewalParticipant implements RenewalParticipant {
 	private consecutiveFailures = 0;
 	private current: RegistrationRecord;
 	private epochHint: Uint8Array | undefined;
+	private correlationId: string;
 
 	constructor(initial: RegistrationRecord, private readonly deps: RenewalParticipantDeps) {
 		this.current = initial;
 		this.epochHint = deps.initialCohortEpoch;
+		this.correlationId = deps.correlationId;
 	}
 
 	get record(): RegistrationRecord {
@@ -101,15 +125,10 @@ class TtlRenewalParticipant implements RenewalParticipant {
 
 	async pingLoop(): Promise<void> {
 		const reply = await this.trySend(this.current.primary);
-		if (reply !== undefined) {
-			this.onPingSuccess(reply);
+		if (reply !== undefined && this.acceptPingReply(reply)) {
 			return;
 		}
-		this.consecutiveFailures++;
-		if (this.consecutiveFailures < MAX_PING_FAILURES) {
-			return;
-		}
-		await this.failover();
+		await this.strike();
 	}
 
 	async reattach(target: Uint8Array): Promise<RenewReplyV1> {
@@ -136,11 +155,37 @@ class TtlRenewalParticipant implements RenewalParticipant {
 		}
 	}
 
-	private onPingSuccess(reply: RenewReplyV1): void {
-		this.consecutiveFailures = 0;
-		if (reply.result === "primary_moved") {
-			// Lazy cohortEpoch refresh lands here: a move discovered on a normal ping updates the hint.
-			this.applyPrimaryMoved(reply);
+	/**
+	 * Act on the primary's answer to a plain ping. Returns `false` when the answer says the member holds no
+	 * record for this participant — a failed ping, which the caller counts as a strike.
+	 */
+	private acceptPingReply(reply: RenewReplyV1): boolean {
+		switch (reply.result) {
+			case "ok": {
+				this.consecutiveFailures = 0;
+				return true;
+			}
+			case "primary_moved": {
+				this.consecutiveFailures = 0;
+				// Lazy cohortEpoch refresh lands here: a move discovered on a normal ping updates the hint.
+				this.applyPrimaryMoved(reply);
+				return true;
+			}
+			case "unknown_registration":
+			case "withdrawn":
+				return false;
+			default: {
+				const unexpected: never = reply.result;
+				throw new Error(`cohort-topic: unexpected renew result ${String(unexpected)}`);
+			}
+		}
+	}
+
+	/** Count a failed ping; the {@link MAX_PING_FAILURES}th in a row fails over. */
+	private async strike(): Promise<void> {
+		this.consecutiveFailures++;
+		if (this.consecutiveFailures >= MAX_PING_FAILURES) {
+			await this.failover();
 		}
 	}
 
@@ -149,7 +194,7 @@ class TtlRenewalParticipant implements RenewalParticipant {
 	 * backup accepted the crash-failover promotion → promote it locally. A `primary_moved` means a real
 	 * rotation moved primary to a different live member → adopt that payload (not the contacted backup),
 	 * **unless** it points back at the just-failed primary (the bounce guard) — then keep trying. All
-	 * backups exhausted → re-run lookup from `d_max`.
+	 * backups exhausted → re-run lookup from `d_max` and adopt where it landed.
 	 */
 	private async failover(): Promise<void> {
 		const failedPrimary = this.current.primary;
@@ -177,11 +222,29 @@ class TtlRenewalParticipant implements RenewalParticipant {
 			}
 			// unknown_registration (replication lag) or anything else: try the next backup.
 		}
-		await this.deps.transport.relookup();
-		// relookup is a terminal recovery action (it owns re-establishing the registration out of
-		// band); reset the counter so a still-dead primary backs off to one relookup per
-		// MAX_PING_FAILURES cycles rather than re-running the d_max walk on every subsequent ping.
-		this.consecutiveFailures = 0;
+		// Reset the counter however the relookup ends — landed, not accepted, or thrown — so a registration
+		// that stays unreachable backs off to one d_max walk per MAX_PING_FAILURES pings rather than one per
+		// ping. A throw still propagates to the caller of `pingLoop`.
+		try {
+			const landing = await this.deps.transport.relookup();
+			if (landing !== undefined) {
+				this.adopt(landing);
+			}
+		} finally {
+			this.consecutiveFailures = 0;
+		}
+	}
+
+	/** Take a re-walk's assignment as the registration: later pings go to its primary under its correlation id. */
+	private adopt(landing: RenewalAssignment): void {
+		this.current = {
+			...this.current,
+			primary: landing.primary,
+			backups: [...landing.backups],
+			lastPing: this.deps.clock(),
+		};
+		this.epochHint = landing.cohortEpoch;
+		this.correlationId = landing.correlationId;
 	}
 
 	private async tryReattach(target: Uint8Array): Promise<RenewReplyV1 | undefined> {
@@ -228,7 +291,7 @@ class TtlRenewalParticipant implements RenewalParticipant {
 			v: 1,
 			topicId: bytesKey(this.current.topicId),
 			participantId: bytesKey(this.current.participantId),
-			correlationId: this.deps.correlationId,
+			correlationId: this.correlationId,
 			timestamp: this.deps.clock(),
 		};
 		if (opts.reattach === true) {

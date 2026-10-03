@@ -9,6 +9,7 @@ import {
 	createRenewalCohortSide,
 } from '../../src/cohort-topic/registration/renewal.js';
 import type {
+	RenewalAssignment,
 	RenewalGossip,
 	RenewalParticipantTransport,
 } from '../../src/cohort-topic/registration/renewal.js';
@@ -125,6 +126,8 @@ class MockParticipantTransport implements RenewalParticipantTransport {
 	public readonly sentTo: string[] = [];
 	public readonly sent: RenewV1[] = [];
 	public relookups = 0;
+	/** What the next relookups resolve — `undefined` is a walk that was not accepted. */
+	public landing: RenewalAssignment | undefined;
 	constructor(private readonly behavior: SendBehavior) {}
 	async send(target: Uint8Array, msg: RenewV1): Promise<RenewReplyV1> {
 		this.sentTo.push(bytesKey(target));
@@ -133,8 +136,9 @@ class MockParticipantTransport implements RenewalParticipantTransport {
 		if (r === 'fail') throw new Error('rpc failed');
 		return r;
 	}
-	async relookup(): Promise<void> {
+	async relookup(): Promise<RenewalAssignment | undefined> {
 		this.relookups++;
+		return this.landing;
 	}
 }
 
@@ -199,6 +203,34 @@ describe('cohort-topic / renewal participant', () => {
 		// Six consecutive failing pings: relookup fires on the 3rd and again on the 6th, not every cycle.
 		for (let i = 0; i < 6; i++) await p.pingLoop();
 		expect(t.relookups).to.equal(2);
+	});
+
+	it('counts an unknown_registration answer as a failed ping: the third in a row fails over', async () => {
+		const unknown: RenewReplyV1 = { v: 1, result: 'unknown_registration' };
+		const t = new MockParticipantTransport(() => unknown);
+		const p = participant(t);
+		await p.pingLoop();
+		await p.pingLoop();
+		expect(t.sent.some((m) => m.reattach === true), 'no re-attach before the third strike').to.be.false;
+		expect(t.relookups, 'no relookup before the third strike').to.equal(0);
+		await p.pingLoop();
+		const reattachedTo = t.sent.flatMap((m, i) => (m.reattach === true ? [t.sentTo[i]] : []));
+		expect(reattachedTo, 'every backup re-attached').to.deep.equal(record().backups.map(bytesKey));
+		expect(t.relookups, 'then the register walk re-runs once').to.equal(1);
+	});
+
+	it('adopts the assignment a relookup lands: later pings go to its primary under its correlationId', async () => {
+		const newPrimary = bytes('member-relooked');
+		const t = new MockParticipantTransport((target) => (bytesEqual(target, newPrimary) ? okReply : 'fail'));
+		const newEpoch = bytes('epoch-relooked', 32);
+		t.landing = { primary: newPrimary, backups: [bytes('member-relooked-b')], cohortEpoch: newEpoch, correlationId: 'corr-relooked' };
+		const p = participant(t);
+		for (let i = 0; i < 3; i++) await p.pingLoop(); // third strike → backups fail → relookup lands
+		expect(bytesEqual(p.cohortEpochHint!, newEpoch), 'epoch hint from the landing').to.be.true;
+		await p.pingLoop();
+		expect(t.sentTo[t.sentTo.length - 1], 'pings the landed primary').to.equal(bytesKey(newPrimary));
+		expect(t.sent[t.sent.length - 1]!.correlationId, 'under the landed correlationId').to.equal('corr-relooked');
+		expect(t.relookups, 'the landed primary answers, so no further relookup').to.equal(1);
 	});
 
 	it('refreshes the cohortEpoch hint lazily: not at failover, but on the next primary_moved ping', async () => {

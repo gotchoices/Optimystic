@@ -195,3 +195,39 @@ describe('CohortTopicService / moveRoot', () => {
 		expect(walkedWith, 'every re-walk frame names the moved root').to.deep.equal(walkedWith.map(() => bytesToB64url(NEW_ROOT)));
 	});
 });
+
+describe('CohortTopicService / renewal re-walk', () => {
+	it('a re-walk that lands at another tree tier and primary moves the handle there', async () => {
+		const NEW_PRIMARY = bytes('rewalk-primary', 8);
+		const NEW_EPOCH = bytes('rewalk-epoch', 32);
+		let rewalking = false;
+		const router: ITopicRouter = {
+			routeAndAct: async (_key: TopicRouteKey, activity: Uint8Array, _opts: { wantK: number; minSigs: number }) => {
+				if (!rewalking) {
+					return encodeCohortMessage(acceptedReply);
+				}
+				// The re-walk finds no state at the tier the registration was made at and lands at the root.
+				const reply: RegisterReplyV1 = decodeRegisterV1(activity).treeTier > 0
+					? { v: 1, result: 'no_state' }
+					: { ...acceptedReply, primary: bytesToB64url(NEW_PRIMARY), cohortEpoch: bytesToB64url(NEW_EPOCH) };
+				return encodeCohortMessage(reply);
+			},
+			dialMember: async () => {
+				throw new Error('primary unreachable');
+			},
+		};
+
+		const service = makeService(router);
+		const handle = await service.register({ topicId: TOPIC, tier: 1 });
+		expect(handle.treeTier, 'registered below the root').to.be.greaterThan(0);
+		rewalking = true;
+
+		// Three failed pings with no backup to re-attach to: the renewal re-runs the register walk.
+		for (let i = 0; i < 3; i++) {
+			await service.renew(handle);
+		}
+		expect(handle.treeTier, 'the handle names the tier the re-walk landed at').to.equal(0);
+		expect(bytesToB64url(handle.primary), 'and its primary').to.equal(bytesToB64url(NEW_PRIMARY));
+		expect(bytesToB64url(handle.cohortEpoch), 'and its epoch').to.equal(bytesToB64url(NEW_EPOCH));
+	});
+});

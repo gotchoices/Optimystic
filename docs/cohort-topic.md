@@ -523,12 +523,16 @@ The record is replicated across all `~k` cohort members via standard FRET cohort
 
 ### TTL and renewal
 
-The participant pings `primary` every `ttl / 3` (default 30s):
+The participant pings `primary` every `ttl / 3` (default 30s). What it does with each reply (`TtlRenewalParticipant` in `packages/db-core/src/cohort-topic/registration/renewal.ts`):
 
-- Success → primary updates `lastPing`, gossips the touch to the cohort.
+- `ok` → the primary updated `lastPing` and gossips the touch to the cohort; the participant's failure count resets.
+- `primary_moved` → a rotation moved the participant's slot; the participant adopts the named primary, backups and `cohortEpoch`, and its failure count resets.
+- `unknown_registration` or `withdrawn` → the member holds no record for the participant. It restarted (records are kept in memory), the record expired while renewals were not getting through, a withdraw for an earlier registration of the same topic removed it, or the member that admitted the register was not the computed primary and gossip has not yet brought the record to the primary. The participant counts the reply as a **failed ping**, exactly like no answer: a reply from a member that does not hold the record keeps nothing alive. (A correct member answers `withdrawn` only to a withdraw tombstone, never to a plain ping; it is counted because it too says there is no record here.)
 - Three consecutive failures → participant promotes `backups[0]` to primary by sending a re-attach RPC. This is a renew carrying a **signed `reattach` flag** (`reattach: true`, part of the signed body so a member can trust the attestation and a stray/MITM'd ping can never silently usurp a live primary). The backup accepts when it both holds the record in its local replica *and* is a computed backup for it under the current epoch: it re-stamps `primary` to itself, gossips the new assignment, and replies `ok`. A plain ping (no `reattach`) on a backup that holds the record is never a promotion — it replies `primary_moved`.
-- All of `primary` and `backups` fail → participant re-runs the lookup from `d_max`.
+- All of `primary` and `backups` fail → participant re-runs the lookup from `d_max` and **adopts where it lands**: the accepted walk's primary, backups, `cohortEpoch` and tree tier, and the accepted register's correlation id, which later renews echo. A walk that is not accepted (a back-off) leaves the old assignment in place. Either way the failure count resets, so a registration that stays lost is re-walked at most once every three pings — about once per TTL. A restarted primary usually recovers at the first step, since a backup still holds the record and promotes itself; an expired or withdrawn record recovers at the re-walk, which registers again.
 - A participant holds one registration per topic: a second register for the same topic displaces the first, and **no withdraw tombstone is sent for the displaced record** — it expires by TTL at its cohort. That is deliberate. When a root-placed topic's root moves, a participant that re-registers at the new root leaves a record at the old one, and a member in both roots' groups then holds two records for one participant under one topic. A renew (and a re-attach or a withdraw tombstone) carries no tree tier, so the member resolves it by the record it holds, and of two it picks the **newer**: the later `attachedAt` (stamped by the accepting member at admission and carried unchanged through gossip), ties to the later `lastPing` (`findHolder` in `packages/db-p2p/src/cohort-topic/host.ts`). A tombstone for the displaced registration would resolve to the live one and evict it. The two stamps come from different members' clocks, so a skew larger than the time between the two registrations picks the wrong record; the live one then expires one TTL later and the participant's renewal failover registers again.
+
+> **Why an `unknown_registration` waits for three strikes.** A lost registration is re-made about one TTL after the first `unknown_registration` (three pings; 90 s at the default TTL), not on the next ping. Failing over on the first such reply would recover two ping intervals sooner, but it has no back-off. One case answers `unknown_registration` honestly and briefly: with the minimum 10 s TTL the first ping goes out about 3.3 s after the register, before the 5 s gossip round has brought the record to a primary that did not admit it. That case, or a re-walk that is not accepted, would then re-run the register walk on every ping, which for short TTLs exceeds the per-peer register rate limit (§Anti-DoS, "Per-peer rate limits per cohort") and turns a harmless lag into rate-limit refusals. Counting strikes reuses the failover's back-off, at most one re-walk per three pings, and lets a one-off lag answer clear on the next ping. The cost is the one-TTL gap: a collection watch's periodic tail check wakes its watchers through it ([reactivity.md §The node's watch service](reactivity.md#the-nodes-watch-service)), and a matchmaking provider is absent from seeker results for it.
 
 > **Resolved.** Backup failover refreshes the participant's `cohortEpoch` hint **lazily** — on the *next* ping/renewal after failover (when a `primary_moved` reply carries the fresh epoch), not eagerly at failover time. Promoting `backups[0]` keeps the existing epoch hint; the new primary corrects it on the following round.
 >
@@ -1643,6 +1647,7 @@ interface RenewV1 {
   correlationId:   string             // matches original RegisterV1
   timestamp:       number
   reattach?:       boolean            // true on a crash-failover re-attach (signed; absent on a normal ping)
+  withdraw?:       boolean            // true on a leave tombstone (signed; absent on a normal ping)
   signature:       string             // participant peer-key signature over the body (minus signature)
 }
 ```
@@ -1671,7 +1676,7 @@ interface RenewV1 {
 ```
 interface RenewReplyV1 {
   v:               1
-  result:          "ok" | "unknown_registration" | "primary_moved"
+  result:          "ok" | "unknown_registration" | "primary_moved" | "withdrawn"
   // primary_moved:
   newPrimary?:     string
   newBackups?:     string[]

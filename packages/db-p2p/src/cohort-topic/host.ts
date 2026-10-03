@@ -2979,8 +2979,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
  * Resolve an inbound `RenewV1` to the coord engine holding its record and run the renewal. A `RenewV1`
  * carries no `treeTier`, so the held record — not a recomputed coord — names the cohort. If no engine
  * on this host holds it (cross-node renewal, post-restart eviction, or replication lag), reply
- * `unknown_registration` so the participant's failover loop tries its backups and ultimately re-runs
- * the `d_max` lookup (§TTL and renewal) — never throw.
+ * `unknown_registration`, which the participant counts as a failed ping: three in a row run its failover,
+ * which re-attaches its backups and then re-runs the `d_max` lookup (§TTL and renewal) — never throw.
  */
 export function resolveRenew(registry: CoordRegistry, renew: RenewV1, now: number): RenewReplyV1 {
 	const topicId = b64urlToBytes(renew.topicId);

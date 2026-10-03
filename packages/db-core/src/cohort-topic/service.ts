@@ -24,7 +24,13 @@ import { makeDMaxComputer, type DMaxComputer } from "./dmax.js";
 import { DEFAULT_FANOUT } from "./addressing.js";
 import type { ISizeEstimator, ITopicRouter, IRingHash } from "./ports.js";
 import { createWalkEngine, type AcceptedWalkOutcome, type RegisterMessageFactory, type WalkEngine, type WalkOutcome } from "./walk.js";
-import { createRenewalParticipant, type RenewalParticipant, type RenewalParticipantTransport, type UnsignedRenew } from "./registration/renewal.js";
+import {
+	createRenewalParticipant,
+	type RenewalAssignment,
+	type RenewalParticipant,
+	type RenewalParticipantTransport,
+	type UnsignedRenew,
+} from "./registration/renewal.js";
 import type { RegistrationRecord } from "./registration/types.js";
 import { DEFAULT_TTL_MS } from "./registration/types.js";
 import { recordKey } from "./registration/bytes.js";
@@ -213,10 +219,22 @@ interface RootKeySlot {
 	key: Uint8Array | undefined;
 }
 
-/** A live registration's renewal driver and the root key its re-walk reads. */
+/**
+ * What the walk that last placed a registration reported beyond its primary, backups and epoch — set by the
+ * register, replaced by each renewal re-walk. The participant's record stays the authority for primary,
+ * backups and epoch, since later `primary_moved` replies change those without a walk.
+ */
+interface WalkLanding {
+	treeTier: number;
+	cohortMembers: Uint8Array[];
+	topicTraffic: TopicTrafficV1 | undefined;
+}
+
+/** A live registration's renewal driver, the root key its re-walk reads, and where it last landed. */
 interface LiveRenewal {
 	readonly renewal: RenewalParticipant;
 	readonly root: RootKeySlot;
+	readonly landing: WalkLanding;
 }
 
 class WalkRegisterService implements CohortTopicService {
@@ -280,11 +298,12 @@ class WalkRegisterService implements CohortTopicService {
 		// Act only if this handle is still the live entry. A stale handle (superseded by a second
 		// register() for the same pair) must not drive the new registration's ping loop, and a
 		// withdrawn handle must not silently re-start it.
-		if (this.liveRenewal(handle) === undefined) {
+		const live = this.liveRenewal(handle);
+		if (live === undefined) {
 			return;
 		}
 		await handle.renewal.pingLoop();
-		this.syncHandle(handle);
+		this.syncHandle(handle, live.landing);
 	}
 
 	moveRoot(handle: RegistrationHandle, rootKey: Uint8Array): void {
@@ -357,7 +376,8 @@ class WalkRegisterService implements CohortTopicService {
 			appState: req.appPayload,
 		};
 		const root: RootKeySlot = { key: req.rootKey };
-		const transport = this.renewalTransport(req, root);
+		const landing: WalkLanding = { treeTier: hint.treeTier, cohortMembers: hint.cohortMembers, topicTraffic: hint.topicTraffic };
+		const transport = this.renewalTransport(req, root, landing);
 		const renewal = createRenewalParticipant(initial, {
 			transport,
 			clock: this.clock,
@@ -378,23 +398,32 @@ class WalkRegisterService implements CohortTopicService {
 		// record still lives at the old one, and a machine in both roots' storage groups holds both; a
 		// tombstone resolves through the host's `findHolder`, which picks the newer record there, so it would
 		// evict the live registration. The displaced record expires by TTL at its cohort.
-		this.renewals.set(recordKey(req.topicId, this.participantId), { renewal, root });
+		this.renewals.set(recordKey(req.topicId, this.participantId), { renewal, root, landing });
 		return renewal;
 	}
 
 	/**
 	 * Renewal transport: dial the cached primary directly; a full failure re-runs the register walk. The
 	 * re-walk reads the root key from `root` when it runs, so after {@link CohortTopicService.moveRoot} it
-	 * lands at the topic's current root rather than the one it registered under.
+	 * lands at the topic's current root rather than the one it registered under. An accepted re-walk records
+	 * its tree tier, cohort and traffic in `landing` and hands its assignment to the participant to adopt.
 	 */
-	private renewalTransport(req: RegisterRequest, root: RootKeySlot): RenewalParticipantTransport {
+	private renewalTransport(req: RegisterRequest, root: RootKeySlot, landing: WalkLanding): RenewalParticipantTransport {
 		return {
 			send: async (target: Uint8Array, msg): Promise<RenewReplyV1> => {
 				const raw = await this.deps.router.dialMember({ id: target }, encodeCohortMessage(msg, this.maxMessageBytes));
 				return decodeRenewReplyV1(raw, this.maxMessageBytes);
 			},
-			relookup: async (): Promise<void> => {
-				await this.walk.register(req.topicId, req.tier, req.appPayload, { rootKey: root.key });
+			relookup: async (): Promise<RenewalAssignment | undefined> => {
+				const outcome = await this.walk.register(req.topicId, req.tier, req.appPayload, { rootKey: root.key });
+				if (outcome.kind !== "accepted") {
+					return undefined;
+				}
+				const hint = this.hintFromReply(req.topicId, req.tier, outcome, root.key);
+				landing.treeTier = hint.treeTier;
+				landing.cohortMembers = hint.cohortMembers;
+				landing.topicTraffic = hint.topicTraffic;
+				return { primary: hint.primary, backups: hint.backups, cohortEpoch: hint.cohortEpoch, correlationId: outcome.correlationId };
 			},
 		};
 	}
@@ -417,7 +446,8 @@ class WalkRegisterService implements CohortTopicService {
 		};
 	}
 
-	private syncHandle(handle: RegistrationHandle): void {
+	/** Copy the registration's current placement onto `handle`: the participant's record, and the last walk's landing. */
+	private syncHandle(handle: RegistrationHandle, landing: WalkLanding): void {
 		const rec = handle.renewal.record;
 		(handle as { primary: Uint8Array }).primary = rec.primary;
 		(handle as { backups: Uint8Array[] }).backups = [...rec.backups];
@@ -425,6 +455,9 @@ class WalkRegisterService implements CohortTopicService {
 		if (epoch !== undefined) {
 			(handle as { cohortEpoch: Uint8Array }).cohortEpoch = epoch;
 		}
+		(handle as { treeTier: number }).treeTier = landing.treeTier;
+		(handle as { cohortMembers: Uint8Array[] }).cohortMembers = landing.cohortMembers;
+		(handle as { topicTraffic?: TopicTrafficV1 }).topicTraffic = landing.topicTraffic;
 	}
 
 	/** The per-probe `RegisterV1` builder: stamps participant coord/ttl/correlation and signs. */

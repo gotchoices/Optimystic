@@ -383,12 +383,8 @@ export class ReactivitySubscriptionManager {
 	 * The tail is recorded first, whatever the registration does: the data a resume or backfill asks for now
 	 * lives at the new root, and a notification announced there is not a rotation.
 	 *
-	 * NOTE: the handle's `treeTier` can be stale after a renewal failover re-walk (the service does not track a
-	 * relookup's landing; backlog `bug-a-participant-told-its-registration-is-unknown-never-registers-again`).
-	 * A handle that says 0 but sits at tier 1 re-registers needlessly on the next move; one that says ≥ 1 but
-	 * re-walked to the root stays at that root until its next relookup, which `moveRoot` keeps pointed at the
-	 * current root. Either way the subscriber keeps a live registration, and the watch service's tail check
-	 * wakes it regardless.
+	 * The handle's `treeTier` is the tier the registration last landed at: a renewal failover that re-walks
+	 * updates it, so a registration the re-walk moved to the root is re-registered on the next move.
 	 */
 	async followTail(tail: Uint8Array): Promise<boolean> {
 		this.latestTail = tail;
