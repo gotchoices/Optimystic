@@ -164,6 +164,7 @@ import {
 	type TopicBudgetConfig,
 	type TopicTrafficV1,
 	type IMembershipSource,
+	type IMembershipTrustAnchor,
 	type TrustRoot,
 } from "@optimystic/db-core";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -284,6 +285,15 @@ export interface CohortTopicHostOptions {
 	 * binds it to the key network and `consensusConfig.superMajorityThreshold`; specs use a fake.
 	 */
 	readonly rootGroup?: RootGroupOptions;
+	/**
+	 * A second direct trust anchor for the membership verifier, consulted only where the host's own
+	 * `FretTrustAnchor` answers `"unknown"` — a coord this node does not serve. The node binds its
+	 * `CommitLogTrustAnchor` (`commit-log-trust-anchor.ts`), which judges a reactivity root's certificate
+	 * against the tail block's commit proof, so a subscriber far from the tail's group is anchored too. The
+	 * port may answer asynchronously. Omitted, the FRET anchor alone judges and a distant root stays
+	 * trust-on-first-use, as before.
+	 */
+	readonly trustAnchor?: IMembershipTrustAnchor;
 }
 
 /** The root group at a coordinate, as the host reads it (see {@link CohortTopicHostOptions.rootGroup}). */
@@ -1337,7 +1347,10 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// the cohort size `cohortAround` publishes certs over; `selfPeerStr` is the coverage handle.
 	// A root-placed cert is judged against the root group this node holds for the coord (`rootGroupAt`) —
 	// the same view the engine signs under or the source fetched through — and `"unknown"` when it holds none.
-	const trustAnchor = new FretTrustAnchor(fret, { k: wantK, selfPeerId: selfPeerStr, rootGroupAt: rootGroupMembersFor });
+	// Where it holds none — this node is not in the group, the ordinary case for a reactivity subscriber —
+	// the injected anchor (the node's commit-log anchor) is asked next; see `composeTrustAnchors`.
+	const fretAnchor = new FretTrustAnchor(fret, { k: wantK, selfPeerId: selfPeerStr, rootGroupAt: rootGroupMembersFor });
+	const trustAnchor = composeTrustAnchors(fretAnchor, options.trustAnchor);
 	const verifier = createMembershipVerifier({
 		signer: verifyingSigner,
 		router: membershipRouter,
@@ -3840,4 +3853,28 @@ function tryValidate<T>(fn: () => T): T | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * FRET first, then the injected anchor. The FRET anchor judges from the group snapshot this node holds —
+ * local authority, no network — so its `"anchored"` or `"rejected"` is final; only its `"unknown"` (this
+ * node is not in the group, or holds no snapshot for the coord) hands the cert to `fallback`, which may
+ * answer asynchronously (the commit-log anchor asks the tail's group for its commit proof). With no fallback
+ * the FRET anchor alone judges, exactly as before.
+ *
+ * NOTE: a transient `"unknown"` from the fallback — no group member answered inside its budget, or a tail
+ * revision with no retained proof — still lets a self-consistent root cert in on first use, and the verifier
+ * keeps that cert TOFU-cached until a verify-miss refetches it. If first-use acceptance after an anchor
+ * timeout ever shows up, re-run the gate on a TOFU-cached root cert at the next renewal tick.
+ */
+function composeTrustAnchors(local: FretTrustAnchor, fallback: IMembershipTrustAnchor | undefined): IMembershipTrustAnchor {
+	if (fallback === undefined) {
+		return local;
+	}
+	return {
+		directAnchor(cert, tier, placement) {
+			const verdict = local.directAnchor(cert, tier, placement);
+			return verdict === "unknown" ? fallback.directAnchor(cert, tier, placement) : verdict;
+		},
+	};
 }

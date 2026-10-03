@@ -20,6 +20,12 @@
  * hash — see {@link import("./notification.js").buildNotificationV1}). `signers` arrive base64url-encoded
  * as the cohort member-id bytes the verifier compares against `cert.members`; a custom `signersToBytes`
  * seam is exposed for bindings that carry signers in a different encoding.
+ *
+ * **The placement names the tail.** Every `verifyMessage` call carries a {@link RootPlacement} whose
+ * `rootKey` is the notification's tail bytes — the same bytes the root coordinate is derived from — so a
+ * direct anchor that can fetch the tail's own commit proof (db-p2p's commit-log anchor) knows which block to
+ * ask the root group about. Without the key that anchor answers `"unknown"` and a distant verifier is back
+ * to trusting the group's certificate on first use, with no other symptom; the verify spec pins the key.
  */
 
 import { createRingHash } from "../cohort-topic/ring-hash.js";
@@ -69,11 +75,14 @@ class MembershipNotificationVerifier implements NotificationVerifier {
 	}
 
 	async verify(n: NotificationV1): Promise<VerifyResult> {
-		const expectedCoord = reactivityRootCoord(b64urlToBytes(n.tailId), this.hash);
+		const tailBytes = b64urlToBytes(n.tailId);
+		const expectedCoord = reactivityRootCoord(tailBytes, this.hash);
 		const signers = n.signers.map(this.signersToBytes);
 		const payload = b64urlToBytes(n.digest);
 		const sig = b64urlToBytes(n.sig);
-		return this.deps.verifier.verifyMessage(signers, expectedCoord, this.tier, payload, sig, { placement: this.placement });
+		// The ratio was validated once at construction; the key is per notification, so spread it per call.
+		const placement: RootPlacement = { ...this.placement, rootKey: tailBytes };
+		return this.deps.verifier.verifyMessage(signers, expectedCoord, this.tier, payload, sig, { placement });
 	}
 }
 

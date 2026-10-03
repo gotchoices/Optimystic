@@ -66,6 +66,14 @@ export interface ITopicRouter {
 export interface RootPlacement {
 	/** Fraction of a root-placed cohort's members whose signatures make a quorum, in `(0, 1]`. */
 	readonly quorumRatio: number;
+	/**
+	 * The routing key whose ring position is the root coordinate, when the caller knows it — for a reactivity
+	 * root, the tail block's routing key (`routingKeyForBlock(tailId)`, the raw UTF-8 of the id). A direct
+	 * anchor that can locate the group's own commit record from the key (db-p2p's commit-log anchor) needs it;
+	 * one that cannot ignores it. It takes no part in cache identity: a coordinate is the hash of its key, so
+	 * one coordinate has one key, and the verifier keys its cache by `quorumRatio` alone.
+	 */
+	readonly rootKey?: Uint8Array;
 }
 
 /** Options for a membership-cert lookup ({@link IMembershipSource}). */
@@ -142,19 +150,27 @@ export type TrustAnchorVerdict = "anchored" | "rejected" | "unknown";
  * Direct (base-case) trust anchor for a {@link MembershipCertV1}'s `coord → keyset` binding.
  *
  * db-core owns the chain-of-attestations and trust-root logic; the **direct** anchor is
- * tier/transport-specific (FRET ring agreement for T2/T3, tx-log commit certificate for T0/T1) and
- * is therefore delegated through this port. db-p2p binds it; **db-core never imports FRET**. A node
- * with no local authority for the coord returns `"unknown"` so the verifier falls through to the
- * chain / interim fallback instead of breaking distant verification. See {@link noAuthorityTrustAnchor}
- * for the db-core default (every coord `"unknown"`).
+ * tier/transport-specific and is therefore delegated through this port. db-p2p binds two: the FRET ring
+ * agreement for a coord this node serves (`FretTrustAnchor`), and, for a reactivity root — a root-placed
+ * coord whose placement names its key — the tail block's own commit proof, fetched from the tail's storage
+ * group (`CommitLogTrustAnchor`); the host asks the first and falls through to the second on `"unknown"`.
+ * **db-core never imports FRET.** A node with no authority for the coord returns `"unknown"` so the
+ * verifier falls through to the chain / interim fallback instead of breaking distant verification. See
+ * {@link noAuthorityTrustAnchor} for the db-core default (every coord `"unknown"`).
+ *
+ * **The verdict may be asynchronous.** An anchor that judges from local state answers synchronously; one
+ * that has to ask the network (the commit-log anchor) returns a promise, and the verifier's trust gate
+ * awaits either. An anchor is total: it never throws or rejects, and answers `"unknown"` for anything it
+ * cannot decode or reach.
  */
 export interface IMembershipTrustAnchor {
 	/**
 	 * Judge, from a directly-trusted source, whether `cert.members` is authoritative for `cert.cohortCoord`
 	 * at `tier`. `placement` is present when the verifier was told the coord is root-placed, so the anchor
-	 * compares against the root group (and its threshold) rather than the FRET cohort around the coord.
+	 * compares against the root group (and its threshold) rather than the FRET cohort around the coord; its
+	 * `rootKey`, when the caller knew it, is what lets an anchor locate that group's own records.
 	 */
-	directAnchor(cert: MembershipCertV1, tier: number, placement?: RootPlacement): TrustAnchorVerdict;
+	directAnchor(cert: MembershipCertV1, tier: number, placement?: RootPlacement): TrustAnchorVerdict | Promise<TrustAnchorVerdict>;
 }
 
 /**

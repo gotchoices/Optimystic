@@ -213,7 +213,7 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 
 | Sub-namespace          | What it covers                                                                           |
 |------------------------|---------------------------------------------------------------------------------------------|
-| `cohort-topic`         | The cohort-topic host wired into a db-p2p node: promotion and demotion notices (adopted, stale, rate-limited, untrusted, undecodable), coord-engine registry caps, gossip-tick failures, and warnings when register/renew bodies are unsigned or the bootstrap-evidence gate is permissive. Distinct from the `optimystic:cohort-topic:*` substrate namespaces listed above |
+| `cohort-topic`         | The cohort-topic host wired into a db-p2p node: promotion and demotion notices (adopted, stale, rate-limited, untrusted, undecodable), coord-engine registry caps, gossip-tick failures, warnings when register/renew bodies are unsigned or the bootstrap-evidence gate is permissive, and the commit-log trust anchor's `commit-log-anchor:*` lines (`equivocation` — two certified actions at one tail revision, a key compromise or fork, never a shortage; `proof-uncertified`; `fetch-failed`). Distinct from the `optimystic:cohort-topic:*` substrate namespaces listed above |
 | `cohort-change-bridge` | The collection-change to origination bridge: origination hooks that threw, per collection and revision |
 
 Address learning is reported from two places: the inbound path (a cluster record arriving from a

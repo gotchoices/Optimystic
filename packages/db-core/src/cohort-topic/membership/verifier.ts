@@ -36,9 +36,18 @@
  * behavior, so there is strictly no regression on coords no node can verify today (distant T2/T3, and
  * T0/T1 until the committed-index binding lands). Once a coord *does* hold a trusted cert, the chain
  * governs successors: an un-anchored cert for an already-trusted coord is rejected (no TOFU downgrade),
- * which is what gives the rotation chain its teeth. The FRET / tx-log direct-anchor bindings that close
- * the remaining TOFU gap are tracked in `cohort-topic-trust-anchor-fret-binding` and the backlog
- * `...-fret-stabilization-proof` / `...-txlog-committed-binding` tickets.
+ * which is what gives the rotation chain its teeth. Two direct-anchor bindings in db-p2p close parts of
+ * the gap: `FretTrustAnchor` judges a coord this node serves against its own ring view, and
+ * `CommitLogTrustAnchor` judges a reactivity root — a root-placed coord whose placement names its key —
+ * against the tail block's commit proof, fetched from the tail's storage group, so a distant subscriber
+ * is anchored too. What remains TOFU is a distant coord under neither (other T2/T3 coords a node does
+ * not serve, tracked in the backlog `...-fret-stabilization-proof`, and T0/T1 until
+ * `...-txlog-committed-binding`).
+ *
+ * **The gate is asynchronous because the anchor may be.** `directAnchor` may return a promise (the
+ * commit-log anchor asks the network), so {@link CachingMembershipVerifier.certIsTrusted} awaits it.
+ * Everything the gate reads or writes in the per-coord maps happens after that `await`, in one
+ * synchronous run — see the comment at the `await`.
  *
  * **Deviation from the ticket sketch (documented):** `verifyMessage` takes the cohort `tier`. A coord
  * is an opaque hash, so the T0/T1-vs-T2/T3 source dispatch the same ticket mandates cannot be derived
@@ -352,7 +361,7 @@ class CachingMembershipVerifier implements MembershipVerifier {
 			if (cert.cohortCoord !== coordKey) {
 				return undefined;
 			}
-			trust = this.certIsTrusted(cert, tier, placement);
+			trust = await this.certIsTrusted(cert, tier, placement);
 		} catch (err) {
 			if (err instanceof CohortWireError) {
 				return undefined; // a malformed cert (or non-base64url signer) is treated as no cert
@@ -393,14 +402,19 @@ class CachingMembershipVerifier implements MembershipVerifier {
 	 * fallback (first-use only). Returns whether the cert is a trusted anchor (`"trusted"`), an interim
 	 * TOFU acceptance (`"tofu"`), or rejected (`"reject"`).
 	 */
-	private certIsTrusted(cert: MembershipCertV1, tier: number, placement: RootPlacement | undefined): CertTrust {
+	private async certIsTrusted(cert: MembershipCertV1, tier: number, placement: RootPlacement | undefined): Promise<CertTrust> {
 		if (!this.certIsSelfConsistent(cert, placement)) {
 			return "reject"; // internal well-formedness is the precondition for any trust path
 		}
 		if (this.matchesTrustRoot(cert)) {
 			return "trusted"; // a configured genesis root is authoritative, checked before the direct anchor
 		}
-		const verdict = this.anchor.directAnchor(cert, tier, placement);
+		// The one `await` on the load path. Two loads of one coord can be in flight across it, so every read of
+		// `byCoord` / `staleGapStrikes` the gate makes — the chain, the fallback, the stale-gap recovery — and
+		// `loadFrom`'s `lockedUnderAnotherRule` read and cache write all run AFTER it, in one synchronous run,
+		// so one load cannot interleave a state read with another load's write. Nothing above this line reads
+		// those maps: self-consistency is pure and the trust roots are fixed at construction. Keep it that way.
+		const verdict = await this.anchor.directAnchor(cert, tier, placement);
 		if (verdict === "anchored") {
 			return "trusted";
 		}

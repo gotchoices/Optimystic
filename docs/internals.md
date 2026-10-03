@@ -690,6 +690,12 @@ Failures return a distinguishable `ProofFailure` reason and are never a reputati
 malformed or unbound signer means the identity was not proven, mirroring
 `ClusterMember.verifySignature`'s discipline.
 
+Besides the two repair paths, the reactivity trust anchor consumes proofs: `CommitLogTrustAnchor`
+(`packages/db-p2p/src/cohort-topic/commit-log-trust-anchor.ts`) fetches the tail block's latest
+certified proof from its storage group and judges the root group's membership certificate against
+the cohort it names, so a subscriber far from the group no longer trusts that certificate on first
+use ([reactivity.md § Authentication and integrity](reactivity.md#authentication-and-integrity)).
+
 **What a passing verdict does not say.** It says *the cohort listed in `peerIds` agreed*, not *that
 is the right cohort for this block* — an attacker holding N keys can stand up their own cohort and
 self-certify any block id at any revision. No offline check can close that: a block's cohort is

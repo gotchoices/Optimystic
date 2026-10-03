@@ -454,6 +454,24 @@ describe('cohort-topic / membership trust anchoring', () => {
 		expect(calls[0]).to.deep.equal({ cohortCoord: bytesToB64url(COORD), cohortEpoch: bytesToB64url(EPOCH), tier: 3 });
 	});
 
+	it('awaits an asynchronous anchor: a promised "rejected" is fatal and a promised "anchored" trusts and locks the coord', async () => {
+		// The commit-log anchor asks the network, so the port may answer with a promise; the gate must await it
+		// rather than compare the promise object against a verdict string (which would read as "unknown" → TOFU).
+		const forged = buildCertOver({ epoch: EPOCH, members: ADV });
+		const rejecting = makeVerifier(new MockSource(encodeCohortMessage(forged), encodeCohortMessage(forged)), {
+			anchor: { directAnchor: () => Promise.resolve('rejected') },
+		});
+		expect(await rejecting.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'a promised rejection overrides TOFU').to.equal('untrusted');
+
+		// GOOD is vouched for asynchronously; the forged cert the refetch then returns is not → the lock holds.
+		const anchoring: IMembershipTrustAnchor = {
+			directAnchor: (cert) => Promise.resolve(cert.cohortEpoch === bytesToB64url(EPOCH) && cert.members[0] === bytesToB64url(MEMBERS[0]!) ? 'anchored' : 'unknown'),
+		};
+		const locking = makeVerifier(new MockSource(encodeCohortMessage(GOOD), encodeCohortMessage(forged)), { anchor: anchoring });
+		expect(await locking.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG), 'a promised anchored verdict trusts the cert').to.equal('verified');
+		expect(await locking.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'a later un-anchored cert for the locked coord is rejected').to.equal('untrusted');
+	});
+
 	it('TOFU-accepts a self-consistent cert on an "unknown" coord (no regression where nothing can anchor)', async () => {
 		const source = new MockSource(encodeCohortMessage(GOOD));
 		const v = makeVerifier(source, { anchor: constAnchor('unknown') });

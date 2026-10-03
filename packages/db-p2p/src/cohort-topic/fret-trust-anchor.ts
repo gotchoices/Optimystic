@@ -19,7 +19,10 @@
  * **The rule (`directAnchor(cert, tier)`):**
  *
  * - **Committed tiers (T0/T1)** route to the tx-log commit certificate, not the FRET ring, so this anchor
- *   returns `"unknown"` for them — it composes with (does not fight) the future tx-log anchor.
+ *   returns `"unknown"` for them — it composes with (does not fight) a committed-tier anchor. The host asks
+ *   this anchor first and hands every `"unknown"` to the anchor it was given (`composeTrustAnchors` in
+ *   `host.ts`): today `CommitLogTrustAnchor` (`commit-log-trust-anchor.ts`), which judges a reactivity root
+ *   this node is not in against the tail block's commit proof.
  * - **No local authority** — the node cannot cover the coord (cold/partitioned table, or a distant coord the
  *   node is nowhere near, so `assembleCohort` does not yield a populated neighborhood the node is part of) →
  *   `"unknown"`. The db-core gate then falls through to the chain / interim TOFU, so distant verification is
@@ -96,9 +99,11 @@ export interface FretTrustAnchorOptions {
 	/**
 	 * The root group this node last read for a root-placed coord (peer-id strings, the host's snapshot), or
 	 * `undefined` when it holds none. Consulted only for a cert verified under a `RootPlacement`. Synchronous
-	 * on purpose: `directAnchor` runs inside the verifier's synchronous trust gate, so the host fills the
-	 * snapshot before the verification that needs it and this reads what is held. Absent → every root-placed
-	 * cert is `"unknown"` (a host that serves no root placement cannot judge one).
+	 * on purpose: this anchor is local authority — it reads the snapshot the host filled before the
+	 * verification that needs it and never asks the network — so its verdict is immediate even though the
+	 * verifier's trust gate awaits the port; a group this node holds no snapshot for is `"unknown"`, which
+	 * the host hands to the commit-log anchor. Absent → every root-placed cert is `"unknown"` (a host that
+	 * serves no root placement cannot judge one).
 	 */
 	readonly rootGroupAt?: (coord: RingCoord) => readonly string[] | undefined;
 }

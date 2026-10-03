@@ -54,3 +54,4 @@ proof is therefore a **p2p-fret feature**, not something db-core/db-p2p can synt
   work; the epoch-rotation chain still protects rotations once any cert for a coord is trusted, and the
   `promote`/host path is fully anchored via the local ring check.
 - Coordinate with whoever owns p2p-fret — this likely starts as a FRET RFC, not an Optimystic change.
+- The headline case above — a distant reactivity subscriber verifying the tail cohort's certificate — is now covered for reactivity roots by `CommitLogTrustAnchor` (`packages/db-p2p/src/cohort-topic/commit-log-trust-anchor.ts`), which judges the root certificate against the tail block's commit proof (`feat-reactivity-root-membership-anchored-by-the-commit-log`). This ticket still matters for every other distant T2/T3 coordinate, which has no commit record to anchor to.

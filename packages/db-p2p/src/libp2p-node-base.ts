@@ -58,6 +58,8 @@ import { ArachnodeFretAdapter } from './storage/arachnode-fret-adapter.js';
 import type { RestoreCallback, BlockArchive } from './storage/struct.js';
 import type { FretService } from 'p2p-fret';
 import { createCohortTopicHost, type CohortTopicHostOptions } from './cohort-topic/host.js';
+import { CommitLogTrustAnchor } from './cohort-topic/commit-log-trust-anchor.js';
+import { proofThresholds } from './cluster/certified-claims.js';
 import { attachCohortChangeBridge } from './cohort-topic/change-bridge.js';
 import { Libp2pReactivityNotifyTransport, registerNotifyHandler } from './reactivity/notify-transport.js';
 import {
@@ -1898,6 +1900,20 @@ export async function createLibp2pNodeBase(
 				throw new Error('cohortTopic enabled but the FRET service is unavailable on the node');
 			}
 
+			// The reactivity root's membership anchor for a node OUTSIDE the tail's group (the ordinary
+			// subscriber): the host's FRET anchor can judge a root cert only from a group snapshot this node is
+			// in, so without this every distant root cert was trusted on first use. This anchor asks the tail's
+			// storage group — `rootGroupAt`, the same rule the host serves the root under — for the tail block's
+			// latest certified commit proof, through the node's own latest-revision consult (same per-peer
+			// budget, self served from local storage), and judges the cert's signers against the cohort that
+			// proof names. `docs/reactivity.md` §Authentication and integrity.
+			const commitLogAnchor = new CommitLogTrustAnchor({
+				membersAt: rootGroupAt,
+				latestClaimFrom: (peerIdStr, blockId) => clusterLatestCallback(peerIdFromString(peerIdStr), blockId),
+				thresholds: proofThresholds(consensusConfig.superMajorityThreshold),
+				hash: createRingHash(),
+			});
+
 			const host = await createCohortTopicHost(node, fret, {
 				...(options.cohortTopic!.host ?? {}),
 				// Wire the node's reputation service in as the production backing for the bootstrap-evidence
@@ -1922,6 +1938,8 @@ export async function createLibp2pNodeBase(
 				// machines that store the tail, which are the machines that apply and announce its commits. The
 				// threshold is the consensus super-majority ratio the commit certificate was captured under.
 				rootGroup: { membersAt: rootGroupAt, quorumRatio: consensusConfig.superMajorityThreshold },
+				// FRET first, then this; a caller's own anchor (a harness) replaces the commit-log one.
+				trustAnchor: options.cohortTopic!.host?.trustAnchor ?? commitLogAnchor,
 			});
 
 			// --- Cohort-topic + reactivity + matchmaking teardown ---

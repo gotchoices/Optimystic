@@ -22,13 +22,15 @@ export const DEFAULT_MIN_SIGS = 14;
 /**
  * Build the {@link RootPlacement} for a root-placed cohort from this node's own quorum ratio. A ratio
  * outside `(0, 1]` (or not a number) is a configuration error and throws here, at construction, so
- * verification never has to judge a malformed rule.
+ * verification never has to judge a malformed rule. `rootKey` is the routing key the root coordinate is
+ * the hash of, when the caller knows it (see {@link RootPlacement.rootKey}); it is carried, never checked
+ * here — the anchor that uses it checks that it hashes to the coordinate being judged.
  */
-export function createRootPlacement(quorumRatio: number): RootPlacement {
+export function createRootPlacement(quorumRatio: number, rootKey?: Uint8Array): RootPlacement {
 	if (!(quorumRatio > 0 && quorumRatio <= 1)) {
 		throw new RangeError(`root placement quorumRatio must be in (0, 1], got ${quorumRatio}`);
 	}
-	return { quorumRatio };
+	return rootKey === undefined ? { quorumRatio } : { quorumRatio, rootKey };
 }
 
 /**
