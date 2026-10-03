@@ -934,6 +934,7 @@ ClusterMember.handleConsensus            # consensus reached on a commit op
   → storageRepo.commit(...)              # critical section; emits CollectionChangeEvent at the end
 StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not per-id)
   → makeCohortTopicChangeNotifier        # the bridge (cohort-topic/change-bridge.ts)
+     → observeTailCommit(event)          # every event naming a tail, gate or no gate: rotation detection
      → selfAppliedTail(event)?           # tail-less event, or a commit that landed only non-tail blocks
                                          #   here → no-op; the tail among event.blockIds means this node is
                                          #   in the tail's storage group (the announcing group), no ring read
@@ -986,9 +987,9 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
     the reactivity notification transport onto the host: a `ReactivityOriginationManager` installs
     `onLocalCommit` (so the bridge's invocation builds a `NotificationV1` from `(event, commitCert)`),
     a `ReactivityForwarderHost` fans that frame out over the `/optimystic/reactivity/1.0.0/notify`
-    protocol to direct subscribers + child cohorts (keeping per-collection forwarding state only for a
-    topic with at least one subscriber — see
-    [reactivity.md § Forwarder-cohort state](reactivity.md#forwarder-cohort-state-per-collection-served)),
+    protocol to direct subscribers + child cohorts (keeping forwarding state per root — per log tail block
+    it served, keyed by that tail — and only for a root with at least one subscriber — see
+    [reactivity.md § Forwarder-cohort state](reactivity.md#forwarder-cohort-state-per-root-served)),
     inbound notify frames route by topic to a
     node-level `ReactivitySubscriberRegistry` (exposed as `node.reactivitySubscribers`) for the
     subscriber role, and a `ReactivityPushStateGossipDriver` rides the host's cohort gossip transport
@@ -1017,10 +1018,16 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
     given the tail id the service hands `readTail` it is one request. The stop
     wrapper stops the service first, ahead of the rotation scheduler and the host. The Quereus plugin
     uses it for tables tagged `optimystic.network_watch` (see *Reactive Watch Bridge* above).
-  - **Tail rotation is now live** (`reactivity-rotation-host-wiring-e2e`). `ReactivityOriginationManager`
-    tracks the last-seen reactivity tail per collection and, when `event.tailId` **changes** between commits,
-    fires `forwarderHost.markRotated(oldTopicId, { newTailId, effectiveAtRevision: event.rev }, now)` — the
-    authoritative live-node rotation signal, because the pre-announce `rotationHint` cannot be built without a
+  - **Tail rotation is now live** (`reactivity-rotation-host-wiring-e2e`). The bridge hands every commit
+    event that names a tail — ahead of, and whatever becomes of, its tail-applied gate — to
+    `ReactivityOriginationManager.observeTailCommit`, which remembers per collection the tail this node last
+    applied a commit for and, when an event names a different tail, fires
+    `forwarderHost.markRotated(oldTail, { newTailId, effectiveAtRevision: event.rev }, now)`, keyed by the
+    old tail as the forwarder host keys a root's state. It sees every tail-bearing commit, not only the ones
+    this node announces, because a machine only in the old tail's group never applies a commit naming the new
+    tail: what it applies is the rollover's rewrite of the old tail block's `nextId`, whose event names the
+    new tail. So that machine drains and releases the old root too. This is the authoritative live-node
+    rotation signal, because the pre-announce `rotationHint` cannot be built without a
     knowable successor tail id (random block ids; gated on `6.5-block-id-derivation`). The enabled block binds
     that `markRotated` seam, binds the recover serve's `rotationFor` to `forwarderHost.rotationRedirectFor` (so
     a recover reaching the draining old tail returns a `kind:"rotated"` redirect), and constructs + exposes an

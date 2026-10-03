@@ -3,11 +3,11 @@ import { toString as uint8ArrayToString } from 'uint8arrays';
 import { StorageRepo } from '../../src/storage/storage-repo.js';
 import { BlockStorage } from '../../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../../src/storage/memory-storage.js';
-import { makeCohortTopicChangeNotifier, attachCohortChangeBridge, selfAppliedTail } from '../../src/cohort-topic/change-bridge.js';
+import { makeCohortTopicChangeNotifier, attachCohortChangeBridge, selfAppliedTail, type ChangeBridgeSource } from '../../src/cohort-topic/change-bridge.js';
 import { buildCommitCert, createCommitCertStore, makeClusterCommitCertExtractor } from '../../src/cluster/commit-cert.js';
 import type {
 	BlockId, ActionId, IBlock, BlockHeader, Transforms, CollectionId,
-	CollectionChangeEvent, CommitCert, CohortTopicService, ClusterRecord, ClusterPeers, Signature,
+	CollectionChangeEvent, CollectionChangeListener, CommitCert, CohortTopicService, ClusterRecord, ClusterPeers, Signature,
 	IBlockChangeNotifier,
 } from '@optimystic/db-core';
 
@@ -111,6 +111,39 @@ describe('cohort-topic: local change-notifier bridge', () => {
 
 		// A tail-less event (a read-driven promotion or a replica push) never originates.
 		expect(selfAppliedTail({ collectionId: 'collection-1' as CollectionId, blockIds: ['tail-1' as BlockId], actionId: 'a3' as ActionId, rev: 3 })).to.equal(false);
+	});
+
+	it('hands the tail observer every event naming a tail, the ones the gate drops included, and no tail-less one', () => {
+		let feed: CollectionChangeListener | undefined;
+		const source: ChangeBridgeSource = {
+			onCollectionChange: () => () => {},
+			onAnyCollectionChange: (listener) => { feed = listener; return () => {}; },
+		};
+		const service = stubService();
+		const originated: CollectionChangeEvent[] = [];
+		service.onLocalCommit = (event): void => { originated.push(event); };
+		const observed: CollectionChangeEvent[] = [];
+		makeCohortTopicChangeNotifier({
+			source,
+			service,
+			extractCommitCert: (): CommitCert => sampleCert(),
+			observeTailCommit: (event): void => { observed.push(event); },
+		});
+		const event = (tailId: BlockId | undefined): CollectionChangeEvent => ({
+			collectionId: 'collection-1' as CollectionId,
+			blockIds: ['old-tail' as BlockId],
+			actionId: 'a1' as ActionId,
+			rev: 1,
+			tailId,
+		});
+
+		// The old tail's `nextId` rewrite on a rollover: it names the new tail, which this node did not apply.
+		feed!(event('new-tail' as BlockId));
+		expect(originated, 'the gate drops it: this node did not apply the tail').to.have.length(0);
+		expect(observed.map((e) => e.tailId), 'the observer still sees it').to.deep.equal(['new-tail']);
+
+		feed!(event(undefined));
+		expect(observed, 'a tail-less event is not observed').to.have.length(1);
 	});
 
 	it('attachCohortChangeBridge installs the notifier and returns a working unsubscribe', async () => {

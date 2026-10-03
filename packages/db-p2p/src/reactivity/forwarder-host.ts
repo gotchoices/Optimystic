@@ -17,8 +17,14 @@
  *
  * It owns the per-subscriber dequeue→dial delivery loop, the bounded-queue backpressure interaction,
  * subscriber-queue eviction (the memory bound — a departed subscriber's queue is reclaimed lazily each
- * fan-out round), and per-topic serialization so the replay ring + dedupe set never interleave across two
+ * fan-out round), and per-root serialization so the replay ring + dedupe set never interleave across two
  * concurrent notifications for the same collection.
+ *
+ * **Per-root state.** Everything this host keeps for a topic — the served {@link PushState}, the ingest
+ * serialization chain, the rotation drain gate — is kept per **root**: per tail block the notification was
+ * announced at, keyed by that tail (`NotificationV1.tailId`, the base64url of `reactivityTailBytes(tail)`).
+ * While a topic is derived from its tail the two keys partition state identically; keying by the root is what
+ * keeps two roots of one topic apart once a topic outlives its tail.
  *
  * **Subscriber-id space.** `selfPeerId`, the {@link ReactivityForwarderHostDeps.directSubscribers} output,
  * the {@link CohortRef.primary} child targets, and every {@link ReactivityNotifyTransport.send} target are
@@ -69,6 +75,26 @@ export function reactivityNotificationTopicId(n: NotificationV1): Uint8Array {
 	return reactivityTopicId(b64urlToBytes(n.tailId));
 }
 
+/** Where a notification belongs: the root it was announced at (its tail) and the topic it is announced on. */
+interface NotificationRoute {
+	/** The root's tail bytes (`reactivityTailBytes(tail)`), which the root's cohort coordinate is derived from. */
+	readonly rootTail: Uint8Array;
+	/** {@link rootTail} as base64url — the key every per-root map is kept under. */
+	readonly rootKey: string;
+	readonly topicId: Uint8Array;
+}
+
+/** Route a notification; throws on an undecodable `tailId`. */
+function routeOf(n: NotificationV1): NotificationRoute {
+	const rootTail = b64urlToBytes(n.tailId);
+	return { rootTail, rootKey: rootKeyOf(rootTail), topicId: reactivityNotificationTopicId(n) };
+}
+
+/** The key a root's state is kept under: the base64url of its tail bytes (a notification's `tailId`). */
+function rootKeyOf(tail: Uint8Array): string {
+	return bytesToB64url(tail);
+}
+
 /** The minimal cohort read the {@link reactivityDirectSubscribers} adapter needs (a {@link CoordEngine} satisfies it). */
 export interface ReactivityRecordSource {
 	/** This cohort's locally-known direct registration records for `topicId`. */
@@ -115,8 +141,12 @@ export interface ReactivityForwarderHostDeps {
 	readonly pushStateInit: (topicId: Uint8Array, n: NotificationV1) => PushStateInit;
 	/** The notification verifier for a topic (a db-core `createNotificationVerifier` over the host's service verifier, T3). */
 	readonly verifierFor: (topicId: Uint8Array) => NotificationVerifier;
-	/** Direct-subscriber member ids (base64url) for a topic — e.g. {@link reactivityDirectSubscribers} over the cohort. */
-	readonly directSubscribers: (topicId: Uint8Array) => string[];
+	/**
+	 * Direct-subscriber member ids for `topicId` at the root whose tail bytes are `rootTail` — e.g.
+	 * {@link reactivityDirectSubscribers} over the engine serving that root. The root, not the topic alone, names
+	 * the cohort: a topic can have a root per tail block, and only that root's subscribers are its to fan out to.
+	 */
+	readonly directSubscribers: (topicId: Uint8Array, rootTail: Uint8Array) => string[];
 	/** Resolve a child cohort's dialable primary when {@link CohortRef.primary} is absent (e.g. a FRET resolver). */
 	readonly resolveChildPrimary?: (ref: CohortRef) => string | undefined;
 	/**
@@ -133,8 +163,8 @@ export interface ReactivityForwarderHostDeps {
 	readonly clock?: () => number;
 }
 
-/** A topic this node forwards: its live {@link PushState} and the forwarder driving the receive path over it. */
-interface ServedTopic {
+/** A root this node forwards for: its live {@link PushState} and the forwarder driving the receive path over it. */
+interface ServedRoot {
 	readonly pushState: PushState;
 	readonly forwarder: ReactivityForwarder;
 }
@@ -151,27 +181,31 @@ export class ReactivityForwarderHost {
 	private readonly profile: NodeProfile;
 	private readonly pushStateInit: (topicId: Uint8Array, n: NotificationV1) => PushStateInit;
 	private readonly verifierFor: (topicId: Uint8Array) => NotificationVerifier;
-	private readonly directSubscribers: (topicId: Uint8Array) => string[];
+	private readonly directSubscribers: (topicId: Uint8Array, rootTail: Uint8Array) => string[];
 	private readonly resolveChildPrimary?: (ref: CohortRef) => string | undefined;
 	private readonly deliverLocal?: (topicId: Uint8Array, n: NotificationV1) => void;
 	private readonly clock: () => number;
 
 	/**
-	 * Per-topic served state. `ServedTopic` ⇒ forwards; `null` ⇒ resolved subscriber-only (Edge); absent ⇒
-	 * unresolved, or no demand yet (see {@link hasDemand}).
+	 * Per-root served state, keyed by the root's tail (base64url). `ServedRoot` ⇒ forwards; `null` ⇒ resolved
+	 * subscriber-only (Edge); absent ⇒ unresolved, or no demand yet (see {@link hasDemand}).
 	 *
-	 * NOTE: a `ServedTopic` outlives its last subscriber — it is reclaimed only once a tail rotation's drain window
-	 * has closed ({@link releaseDrainedTopics}). If memory ever shows it, evict on a {@link hasDemand} check at ingest.
+	 * NOTE: a `ServedRoot` outlives its last subscriber — it is reclaimed only once a tail rotation's drain window
+	 * has closed ({@link releaseDrainedRoots}). If memory ever shows it, evict on a {@link hasDemand} check at ingest.
+	 * A root this node never sees a later tail for is never released at all: when one coordinator covers every
+	 * block, the rollover's other blocks commit on the new tail's cohort, so a machine in the old tail's group but
+	 * outside that cohort may never observe the rollover. If that shows in memory, release a served root that has
+	 * had no ingest for longer than `T_drain`.
 	 */
-	private readonly served = new Map<string, ServedTopic | null>();
-	/** Per-topic serialization tail: an ingest chains onto its topic's prior ingest so the ring/dedupe never interleave. */
+	private readonly served = new Map<string, ServedRoot | null>();
+	/** Per-root serialization tail: an ingest chains onto its root's prior ingest so the ring/dedupe never interleave. */
 	private readonly ingestTails = new Map<string, Promise<void>>();
 	/**
-	 * Per **old-topic** drain gate: set by {@link markRotated} when this node observes the collection's tail
-	 * rotate, keyed by the outgoing tail's topicId (base64url). For `T_drain` after the rotation
-	 * {@link rotationRedirectFor} answers a recover request reaching the outgoing tail with the gate's
+	 * Per **old-root** drain gate: set by {@link markRotated} when this node observes the collection's log move
+	 * past a tail, keyed by that outgoing tail (base64url). For `T_drain` after the rotation
+	 * {@link rotationRedirectFor} answers a recover request reaching the outgoing root with the gate's
 	 * {@link RotationRedirectV1} ("this moved — go to the new tree"); once the window closes the entry is
-	 * evicted along with the topic's served `PushState`.
+	 * evicted along with the root's served `PushState`.
 	 */
 	private readonly rotationGates = new Map<string, TailDrainGate>();
 
@@ -189,22 +223,30 @@ export class ReactivityForwarderHost {
 
 	/**
 	 * Local origination emit **and** the inbound forwarder path: receive → forward → fan-out for one
-	 * notification on `topicId`. Ingests for one topic run strictly in sequence (verify is async and the
-	 * replay ring + dedupe set must not interleave); ingests for different topics proceed concurrently.
-	 * Never rejects — a fan-out fault can never surface as a commit failure on the origination seam.
+	 * notification, at the root its `tailId` names and on the topic {@link reactivityNotificationTopicId}
+	 * derives. Ingests at one root run strictly in sequence (verify is async and the replay ring + dedupe set
+	 * must not interleave); ingests at different roots proceed concurrently. Never rejects — a fan-out fault can
+	 * never surface as a commit failure on the origination seam.
 	 */
-	ingest(topicId: Uint8Array, n: NotificationV1): Promise<void> {
-		const key = this.topicKey(topicId);
+	ingest(n: NotificationV1): Promise<void> {
+		let route: NotificationRoute;
+		try {
+			route = routeOf(n);
+		} catch (err) {
+			log("ingest: undecodable tailId on rev=%d (dropped): %o", n.revision, err);
+			return Promise.resolve();
+		}
+		const key = route.rootKey;
 		const prev = this.ingestTails.get(key) ?? Promise.resolve();
 		// Run regardless of the prior ingest's outcome; `ingestSerialized` isolates its own throws, so the
 		// chain never accumulates a rejection that would leak out of a later `ingest`.
 		const next = prev.then(
-			() => this.ingestSerialized(topicId, n, key),
-			() => this.ingestSerialized(topicId, n, key),
+			() => this.ingestSerialized(route, n),
+			() => this.ingestSerialized(route, n),
 		);
 		this.ingestTails.set(key, next);
 		// Drop the tail once it settles with nothing chained behind it: every collection this node originates for
-		// passes through here, one topic per log tail block, so a kept entry would grow with the commit count.
+		// passes through here, one root per log tail block, so a kept entry would grow with the commit count.
 		void next.then(() => {
 			if (this.ingestTails.get(key) === next) {
 				this.ingestTails.delete(key);
@@ -214,9 +256,9 @@ export class ReactivityForwarderHost {
 	}
 
 	/** One serialized ingest: resolve served state, run receive, fan out on `"forward"`. Isolates all throws. */
-	private async ingestSerialized(topicId: Uint8Array, n: NotificationV1, key: string): Promise<void> {
+	private async ingestSerialized(route: NotificationRoute, n: NotificationV1): Promise<void> {
 		try {
-			const served = this.resolveServed(topicId, n, key);
+			const served = this.resolveServed(route, n);
 			if (served === undefined) {
 				return; // Edge, or nobody subscribed: nothing to forward (local delivery rides onInbound → deliverLocal).
 			}
@@ -224,9 +266,9 @@ export class ReactivityForwarderHost {
 			if (decision !== "forward") {
 				return; // "duplicate" (already buffered) or "untrusted" (dropped before any state mutation).
 			}
-			this.fanOut(topicId, served.pushState, n);
+			this.fanOut(route, served.pushState, n);
 		} catch (err) {
-			log("ingest failed for topic=%s rev=%d (isolated): %o", key, n.revision, err);
+			log("ingest failed for root=%s rev=%d (isolated): %o", route.rootKey, n.revision, err);
 		}
 	}
 
@@ -247,12 +289,15 @@ export class ReactivityForwarderHost {
 		// Subscriber role first: deliver in-process to a co-located subscription manager, if any.
 		this.deliverInProcess(topicId, n);
 		// Forwarder role: ingest self-gates (Edge, or no subscriber here ⇒ no PushState, no fan-out).
-		await this.ingest(topicId, n);
+		await this.ingest(n);
 	}
 
-	/** The live {@link PushState} for a served topic, or `undefined` (Edge, no demand, or not yet ingested). Test/diagnostic. */
-	pushStateFor(topicId: Uint8Array): PushState | undefined {
-		const served = this.served.get(this.topicKey(topicId));
+	/**
+	 * The live {@link PushState} this node serves for the root whose tail bytes are `tail`
+	 * (`reactivityTailBytes(tail)`), or `undefined` (Edge, no demand, or not yet ingested).
+	 */
+	pushStateForRoot(tail: Uint8Array): PushState | undefined {
+		const served = this.served.get(rootKeyOf(tail));
 		return served === undefined || served === null ? undefined : served.pushState;
 	}
 
@@ -275,10 +320,10 @@ export class ReactivityForwarderHost {
 
 	/**
 	 * The live {@link PushState} this node serves for `collectionId` (base64url), or `undefined` if none.
-	 * The served map is keyed by **topicId**, but a backfill request carries only a collectionId and a
+	 * The served map is keyed by **root tail**, but a backfill request carries only a collectionId and a
 	 * resume that lost its tail must still resolve the collection's current tail — so this scans for the
-	 * served topic whose `PushState.collectionId` matches. Across a tail-rotation **drain window** a
-	 * collection can briefly have two served topics (the outgoing and incoming tail); the one with the
+	 * served root whose `PushState.collectionId` matches. Across a tail-rotation **drain window** a
+	 * collection can briefly have two served roots (the outgoing and incoming tail); the one with the
 	 * highest `lastRevision` is the current tail, so that is the one returned. (The precise drain-window
 	 * redirect choreography is `reactivity-tail-rotation-transport`'s; this picks the current tail.)
 	 */
@@ -296,20 +341,20 @@ export class ReactivityForwarderHost {
 	}
 
 	/**
-	 * Record that the topic anchored on `oldTopicId` has **rotated** to a successor tail, starting a
-	 * {@link TailDrainGate} so the outgoing tail bounces recover requests to the new tree for `T_drain`
+	 * Record that the root at the tail whose bytes are `oldTail` has **rotated** to a successor tail, starting a
+	 * {@link TailDrainGate} so the outgoing root bounces recover requests to the new tree for `T_drain`
 	 * (`docs/reactivity.md` §Tail rotation step 2). db-core derives the redirect's `newTopicId` internally via
-	 * `reactivityTopicId(newTailId)`. The trigger is origination observing the collection's `event.tailId`
-	 * change ({@link reactivity-rotation-host-wiring-e2e}); this seam is called directly in unit tests.
+	 * `reactivityTopicId(newTailId)`. The trigger is origination seeing a commit that names a later tail
+	 * (`ReactivityOriginationManager.observeTailCommit`); this seam is called directly in unit tests.
 	 *
 	 * **Idempotent / chained.** A second `markRotated` for the **same** successor is a no-op; a `markRotated`
 	 * to a **later** successor (higher `effectiveAtRevision`) replaces the gate — so a chained OLD→A→B rotation
 	 * advances the redirect to the most recent successor and restarts its drain window from `now`. An earlier
 	 * (or equal) successor leaves the existing gate untouched.
 	 */
-	markRotated(oldTopicId: Uint8Array, redirect: { newTailId: string; effectiveAtRevision: number }, now: number): void {
-		this.releaseDrainedTopics(now);
-		const key = this.topicKey(oldTopicId);
+	markRotated(oldTail: Uint8Array, redirect: { newTailId: string; effectiveAtRevision: number }, now: number): void {
+		this.releaseDrainedRoots(now);
+		const key = rootKeyOf(oldTail);
 		const existing = this.rotationGates.get(key);
 		if (existing !== undefined && redirect.effectiveAtRevision <= existing.rotationRedirect.effectiveAtRevision) {
 			return; // same or earlier successor — the gate already points at this-or-a-later tail.
@@ -322,16 +367,16 @@ export class ReactivityForwarderHost {
 	}
 
 	/**
-	 * The drain-window redirect for a recover request that reached the outgoing tail anchored on `oldTopicId`,
-	 * or `undefined` if this topic never rotated / its drain window has elapsed. While the gate is draining
-	 * (`isDraining(now)`) returns its {@link RotationRedirectV1}; once `T_drain` closes, evicts the gate **and**
-	 * the topic's served `PushState` (the old tail originates nothing further — this also reclaims the
+	 * The drain-window redirect for a recover request that reached the outgoing root at the tail whose bytes are
+	 * `oldTail`, or `undefined` if that root never rotated / its drain window has elapsed. While the gate is
+	 * draining (`isDraining(now)`) returns its {@link RotationRedirectV1}; once `T_drain` closes, evicts the gate
+	 * **and** the root's served `PushState` (the old tail originates nothing further — this also reclaims the
 	 * `served` / `ingestTails` maps the 12.31 review flagged as un-evicted on rotation) and returns `undefined`,
 	 * so this member declines the next request and the subscriber's transport tries the next cohort member
 	 * (re-walking / chain-reading only once every member declines).
 	 */
-	rotationRedirectFor(oldTopicId: Uint8Array, now: number): RotationRedirectV1 | undefined {
-		const key = this.topicKey(oldTopicId);
+	rotationRedirectFor(oldTail: Uint8Array, now: number): RotationRedirectV1 | undefined {
+		const key = rootKeyOf(oldTail);
 		const gate = this.rotationGates.get(key);
 		if (gate === undefined) {
 			return undefined;
@@ -339,26 +384,26 @@ export class ReactivityForwarderHost {
 		if (gate.isDraining(now)) {
 			return gate.rotationRedirect;
 		}
-		this.releaseDrainedTopic(key);
+		this.releaseDrainedRoot(key);
 		return undefined;
 	}
 
 	/**
-	 * Release every outgoing tail whose drain window has closed. Run on each {@link markRotated}: the origination
-	 * manager marks a rotation for every collection this node originates for, watched or not, and a recover
-	 * request — the only other release point — never reaches the old tail of a collection nobody watches, so
+	 * Release every outgoing root whose drain window has closed. Run on each {@link markRotated}: the origination
+	 * manager marks a rotation for every collection this node announced for, watched or not, and a recover
+	 * request — the only other release point — never reaches the old root of a collection nobody watches, so
 	 * without this sweep the gates (and any served state behind them) would accumulate one per filled log block.
 	 */
-	private releaseDrainedTopics(now: number): void {
+	private releaseDrainedRoots(now: number): void {
 		for (const [key, gate] of [...this.rotationGates]) {
 			if (!gate.isDraining(now)) {
-				this.releaseDrainedTopic(key);
+				this.releaseDrainedRoot(key);
 			}
 		}
 	}
 
-	/** The outgoing tail is done: drop its gate and reclaim its served state so the per-topic maps don't leak across rotations. */
-	private releaseDrainedTopic(key: string): void {
+	/** The outgoing root is done: drop its gate and reclaim its served state so the per-root maps don't leak across rotations. */
+	private releaseDrainedRoot(key: string): void {
 		this.rotationGates.delete(key);
 		this.served.delete(key);
 		this.ingestTails.delete(key);
@@ -369,8 +414,8 @@ export class ReactivityForwarderHost {
 	 * (drop-oldest under pressure), drain each queue and deliver (self in-process, others dialed, per-target
 	 * isolated), then dial each resolved child cohort. One slow/dead target never blocks the loop for the rest.
 	 */
-	private fanOut(topicId: Uint8Array, pushState: PushState, n: NotificationV1): void {
-		const subscriberIds = this.directSubscribers(topicId);
+	private fanOut(route: NotificationRoute, pushState: PushState, n: NotificationV1): void {
+		const subscriberIds = this.directSubscribers(route.topicId, route.rootTail);
 
 		// Memory bound: drop any per-subscriber queue whose id left the live set (departed / TTL-expired /
 		// withdrawn). The map can never grow past the live subscriber set + the current round (lazy GC, so it
@@ -387,7 +432,7 @@ export class ReactivityForwarderHost {
 				continue;
 			}
 			for (const m of queue.drain()) {
-				this.deliverTo(topicId, subId, m);
+				this.deliverTo(route.topicId, subId, m);
 			}
 		}
 
@@ -448,43 +493,39 @@ export class ReactivityForwarderHost {
 	}
 
 	/**
-	 * Resolve the served state for a topic, instantiating it once behind the Edge gate and the demand check.
+	 * Resolve the served state for a root, instantiating it once behind the Edge gate and the demand check.
 	 * `undefined` ⇒ nothing to forward. A no-demand answer is deliberately not remembered, so the first ingest
 	 * after a subscriber registers builds the state.
 	 */
-	private resolveServed(topicId: Uint8Array, n: NotificationV1, key: string): ServedTopic | undefined {
-		const existing = this.served.get(key);
+	private resolveServed(route: NotificationRoute, n: NotificationV1): ServedRoot | undefined {
+		const existing = this.served.get(route.rootKey);
 		if (existing !== undefined) {
-			return existing ?? undefined; // a `ServedTopic`, or a remembered Edge `null`
+			return existing ?? undefined; // a `ServedRoot`, or a remembered Edge `null`
 		}
 		if (!mayServeAsReactivityForwarder(this.profile)) {
-			this.served.set(key, null); // Edge node: remember it never forwards this topic.
+			this.served.set(route.rootKey, null); // Edge node: remember it never forwards at this root.
 			return undefined;
 		}
-		if (!this.hasDemand(topicId)) {
+		if (!this.hasDemand(route)) {
 			return undefined;
 		}
-		const pushState = requireForwarderPushState(this.profile, this.pushStateInit(topicId, n));
-		const served: ServedTopic = {
+		const pushState = requireForwarderPushState(this.profile, this.pushStateInit(route.topicId, n));
+		const served: ServedRoot = {
 			pushState,
-			forwarder: createReactivityForwarder({ state: pushState, verifier: this.verifierFor(topicId) }),
+			forwarder: createReactivityForwarder({ state: pushState, verifier: this.verifierFor(route.topicId) }),
 		};
-		this.served.set(key, served);
+		this.served.set(route.rootKey, served);
 		return served;
 	}
 
 	/**
-	 * Whether anyone downstream wants `topicId`'s notifications: at least one direct subscriber. Child cohorts
+	 * Whether anyone downstream wants the root's notifications: at least one direct subscriber. Child cohorts
 	 * join as a second clause once the parent/child link ([cohort-topic-parent-child-link]) supplies them
-	 * ahead of any {@link PushState}. Costs what one fan-out's subscriber read costs (in the node wiring, a scan of
-	 * the served cohort engines and then of one engine's records), once per ingest of a topic without state —
-	 * cheap enough not to cache.
+	 * ahead of any {@link PushState}. Costs what one fan-out's subscriber read costs (in the node wiring, one
+	 * lookup of the engine at the root's coordinate and a scan of its records), once per ingest at a root without
+	 * state — cheap enough not to cache.
 	 */
-	private hasDemand(topicId: Uint8Array): boolean {
-		return this.directSubscribers(topicId).length > 0;
-	}
-
-	private topicKey(topicId: Uint8Array): string {
-		return bytesToB64url(topicId);
+	private hasDemand(route: NotificationRoute): boolean {
+		return this.directSubscribers(route.topicId, route.rootTail).length > 0;
 	}
 }

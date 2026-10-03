@@ -631,71 +631,80 @@ describe('reactivity / origination manager', () => {
 		expect(emitted[0]!.rotationHint).to.deep.equal({ newTailId, effectiveAtRevision: event.rev + 1 });
 	});
 
-	describe('observe-rotation (markRotated fires on a tail-id change)', () => {
-		// Production-shaped resolveContext: ctx.tailId = reactivityTailBytes(event.tailId) (the membership-gate
-		// encoding), so the manager's oldTopicId is byte-identical to the topic a subscriber subscribes under.
-		const liveResolveContext = (e: CollectionChangeEvent) =>
-			e.tailId === undefined ? undefined : { tailId: reactivityTailBytes(e.tailId), deltaMaxBytes: 0 };
-		const eventOn = (tailId: string | undefined, rev: number): CollectionChangeEvent => ({
+	describe('tail observation (observeTailCommit → markRotated)', () => {
+		/** A commit event naming `tailId` whose blocks this node applied are `applied` (the tail among them ⇒ in its group). */
+		const eventOn = (tailId: string | undefined, rev: number, applied: string[] = tailId === undefined ? ['data-block'] : [tailId]): CollectionChangeEvent => ({
 			collectionId: bytesToB64url(COLLECTION),
-			blockIds: [bytesToB64url(new Uint8Array([5, 6]))],
+			blockIds: applied,
 			actionId: `action-${rev}`,
 			rev,
 			tailId,
 		});
-		interface RotationCall { oldTopicId: Uint8Array; newTailId: string; effectiveAtRevision: number; now: number; }
+		interface RotationCall { oldTail: Uint8Array; newTailId: string; effectiveAtRevision: number; now: number; }
 		const setup = () => {
-			const service = new RecordingService();
 			const calls: RotationCall[] = [];
 			const manager = new ReactivityOriginationManager({
-				service,
-				resolveContext: liveResolveContext,
+				service: new RecordingService(),
+				resolveContext: () => undefined,
 				emit: () => {},
 				clock: () => 5_000,
-				markRotated: (oldTopicId, redirect, now) => calls.push({ oldTopicId, newTailId: redirect.newTailId, effectiveAtRevision: redirect.effectiveAtRevision, now }),
+				markRotated: (oldTail, redirect, now) => calls.push({ oldTail, newTailId: redirect.newTailId, effectiveAtRevision: redirect.effectiveAtRevision, now }),
 			});
-			manager.install();
-			return { service, calls };
+			return { manager, calls };
 		};
 
 		it('records the baseline on the first commit (no rotation)', () => {
-			const { service, calls } = setup();
-			service.onLocalCommit!(eventOn('block-tail-old', 7), cert);
+			const { manager, calls } = setup();
+			manager.observeTailCommit(eventOn('block-tail-old', 7));
 			expect(calls, 'the first commit records the baseline, fires nothing').to.have.length(0);
 		});
 
-		it('fires markRotated with the correctly-encoded old topicId on a tail-id change', () => {
-			const { service, calls } = setup();
-			service.onLocalCommit!(eventOn('block-tail-old', 7), cert);
-			service.onLocalCommit!(eventOn('block-tail-new', 8), cert);
-			expect(calls, 'a tail-id change fires markRotated exactly once').to.have.length(1);
-			// The oldTopicId MUST be reactivityTopicId(reactivityTailBytes(oldTail)) — the SAME topic a subscriber
-			// subscribes under — never a pre-hashed digest (a double hash). A mismatch would silently never redirect.
-			expect([...calls[0]!.oldTopicId], 'oldTopicId equals the topic the subscriber subscribed under').to.deep.equal([...reactivityTopicId(reactivityTailBytes('block-tail-old'))]);
+		it('fires markRotated for the old tail, in the reactivity tail encoding, when a commit names a new tail', () => {
+			const { manager, calls } = setup();
+			manager.observeTailCommit(eventOn('block-tail-old', 7));
+			manager.observeTailCommit(eventOn('block-tail-new', 8));
+			expect(calls, 'a tail change fires markRotated exactly once').to.have.length(1);
+			// The old tail MUST be reactivityTailBytes(oldTail) — the bytes a notification's tailId encodes and the
+			// forwarder host keys the root's state by. A mismatch would silently never redirect.
+			expect([...calls[0]!.oldTail], 'oldTail is the root the forwarder host served').to.deep.equal([...reactivityTailBytes('block-tail-old')]);
 			expect(calls[0]!.newTailId, 'redirect names the new tail (reactivityTailBytes encoding)').to.equal(bytesToB64url(reactivityTailBytes('block-tail-new')));
 			expect(calls[0]!.effectiveAtRevision, 'effective at the rev the new tail first appeared').to.equal(8);
 			expect(calls[0]!.now, 'stamped from the manager clock').to.equal(5_000);
 		});
 
 		it('does not fire on same-tail commits; a tail-less commit never disturbs the retained baseline', () => {
-			const { service, calls } = setup();
-			service.onLocalCommit!(eventOn('block-tail-old', 7), cert);
-			service.onLocalCommit!(eventOn('block-tail-old', 8), cert); // same tail → no rotation
-			service.onLocalCommit!(eventOn(undefined, 9), cert); // tail-less → context undefined, never recorded/cleared
+			const { manager, calls } = setup();
+			manager.observeTailCommit(eventOn('block-tail-old', 7));
+			manager.observeTailCommit(eventOn('block-tail-old', 8)); // same tail → no rotation
+			manager.observeTailCommit(eventOn(undefined, 9)); // tail-less → ignored, never recorded/cleared
 			expect(calls, 'no rotation on same-tail or tail-less commits').to.have.length(0);
-			service.onLocalCommit!(eventOn('block-tail-new', 10), cert); // the tail changes from the retained baseline
+			manager.observeTailCommit(eventOn('block-tail-new', 10)); // the tail changes from the retained baseline
 			expect(calls, 'the tail-less commit did not clear the baseline; the later change still fires once').to.have.length(1);
-			expect([...calls[0]!.oldTopicId]).to.deep.equal([...reactivityTopicId(reactivityTailBytes('block-tail-old'))]);
+			expect([...calls[0]!.oldTail]).to.deep.equal([...reactivityTailBytes('block-tail-old')]);
 		});
 
-		it('with markRotated absent, origination is unchanged (rotation observation is inert)', () => {
-			const service = new RecordingService();
-			const emitted: NotificationV1[] = [];
-			const manager = new ReactivityOriginationManager({ service, resolveContext: liveResolveContext, emit: (n) => emitted.push(n), clock: () => 1 });
-			manager.install();
-			service.onLocalCommit!(eventOn('block-tail-old', 7), cert);
-			service.onLocalCommit!(eventOn('block-tail-new', 8), cert);
-			expect(emitted, 'both commits still originate normally').to.have.length(2);
+		it('a machine only in the old tail\'s group marks the rotation from the rollover rewriting the old tail', () => {
+			const { manager, calls } = setup();
+			manager.observeTailCommit(eventOn('block-tail-old', 7)); // announced at the old tail
+			// The rollover lands here only as the old tail block's nextId rewrite: it names the new tail, which this
+			// node did not apply.
+			manager.observeTailCommit(eventOn('block-tail-new', 8, ['block-tail-old']));
+			expect(calls, 'the outgoing root sees the move').to.have.length(1);
+			expect([...calls[0]!.oldTail]).to.deep.equal([...reactivityTailBytes('block-tail-old')]);
+			expect(calls[0]!.newTailId).to.equal(bytesToB64url(reactivityTailBytes('block-tail-new')));
+			// Never having applied the new tail, it holds no baseline: a later commit it sees marks nothing.
+			manager.observeTailCommit(eventOn('block-tail-later', 9, ['data-block']));
+			expect(calls, 'no root of this node is behind the later tail').to.have.length(1);
+		});
+
+		it('keeps its baseline through a commit that names its tail without applying it (a data-block sweep)', () => {
+			const { manager, calls } = setup();
+			manager.observeTailCommit(eventOn('block-tail-old', 7));
+			manager.observeTailCommit(eventOn('block-tail-old', 8, ['data-block'])); // same tail, not applied here
+			expect(calls).to.have.length(0);
+			manager.observeTailCommit(eventOn('block-tail-new', 9, ['block-tail-old']));
+			expect(calls, 'the baseline survived the sweep, so the rollover still marks').to.have.length(1);
+			expect([...calls[0]!.oldTail]).to.deep.equal([...reactivityTailBytes('block-tail-old')]);
 		});
 	});
 });

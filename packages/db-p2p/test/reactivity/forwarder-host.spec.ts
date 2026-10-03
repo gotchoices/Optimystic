@@ -40,7 +40,7 @@ import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id';
 
 const COLLECTION = bytesToB64url(new Uint8Array([1, 2, 3, 4]));
 const TAIL = bytesToB64url(new Uint8Array([9, 9, 9, 9]));
-const TOPIC = reactivityTopicId(b64urlToBytes(TAIL));
+const ROOT = b64urlToBytes(TAIL); // the root the fixture notifications are announced at
 
 const SIGNER_A = bytesToB64url(new Uint8Array([0xa1, 0xa1]));
 const SIGNER_B = bytesToB64url(new Uint8Array([0xb2, 0xb2]));
@@ -164,7 +164,7 @@ describe('reactivity / forwarder host', () => {
 	it('fans out a verified notification to each direct subscriber exactly once, byte-identical frame', async () => {
 		const { host, transport } = makeHost();
 		const n = note(1);
-		await host.ingest(TOPIC, n);
+		await host.ingest(n);
 
 		expect(transport.targets().sort()).to.deep.equal([SUB_A, SUB_B, SUB_C].sort());
 		expect(transport.sent, 'one dial per subscriber, no duplicates').to.have.length(3);
@@ -172,25 +172,25 @@ describe('reactivity / forwarder host', () => {
 			expect(s.n, 'the unmodified frame is fanned out (same reference — forwarders never re-sign)').to.equal(n);
 		}
 		// The receive path buffered the revision for replay.
-		expect(host.pushStateFor(TOPIC)!.replayBuffer.entries().map((e) => e.revision)).to.deep.equal([1]);
+		expect(host.pushStateForRoot(ROOT)!.replayBuffer.entries().map((e) => e.revision)).to.deep.equal([1]);
 	});
 
 	it('fans out on "forward" but not on "duplicate" or "untrusted"', async () => {
 		const { host, transport } = makeHost({ directSubscribers: (): string[] => [SUB_A] });
 
 		// forward
-		await host.ingest(TOPIC, note(1));
+		await host.ingest(note(1));
 		expect(transport.sent).to.have.length(1);
 
 		// duplicate (same revision + sig) → no further fan-out, buffer unchanged
-		await host.ingest(TOPIC, note(1));
+		await host.ingest(note(1));
 		expect(transport.sent, 'a duplicate is not re-fanned out').to.have.length(1);
-		expect(host.pushStateFor(TOPIC)!.replayBuffer.entries().map((e) => e.revision)).to.deep.equal([1]);
+		expect(host.pushStateForRoot(ROOT)!.replayBuffer.entries().map((e) => e.revision)).to.deep.equal([1]);
 
 		// untrusted (signer not in the cohort cert) → dropped before any buffer/dedupe mutation, no fan-out
-		await host.ingest(TOPIC, note(2, { signers: [SIGNER_X] }));
+		await host.ingest(note(2, { signers: [SIGNER_X] }));
 		expect(transport.sent, 'an untrusted notification is never fanned out').to.have.length(1);
-		expect(host.pushStateFor(TOPIC)!.replayBuffer.entries().map((e) => e.revision), 'untrusted never reaches the ring').to.deep.equal([1]);
+		expect(host.pushStateForRoot(ROOT)!.replayBuffer.entries().map((e) => e.revision), 'untrusted never reaches the ring').to.deep.equal([1]);
 	});
 
 	it('a node that is both subscriber and primary delivers locally AND fans out — self is never dialed', async () => {
@@ -200,7 +200,7 @@ describe('reactivity / forwarder host', () => {
 			deliverLocal: (_topicId, n): void => { delivered.push(n); },
 		});
 		const n = note(1);
-		await host.ingest(TOPIC, n);
+		await host.ingest(n);
 
 		expect(delivered, 'the co-located subscriber is delivered in-process').to.deep.equal([n]);
 		expect(transport.targets().sort(), 'self is never dialed; the two remote subscribers are').to.deep.equal([SUB_A, SUB_B].sort());
@@ -252,8 +252,8 @@ describe('reactivity / forwarder host', () => {
 		const { host, transport } = makeHost({ directSubscribers: (): string[] => [SUB_A, SUB_B], queueMax });
 
 		// First fan-out instantiates the PushState and drains both subscribers' queues empty.
-		await host.ingest(TOPIC, note(1));
-		const pushState = host.pushStateFor(TOPIC)!;
+		await host.ingest(note(1));
+		const pushState = host.pushStateForRoot(ROOT)!;
 
 		// Model SUB_A as a backed-up slow subscriber: pre-fill its queue to capacity (its prior dials never
 		// drained). The host fires sends fire-and-forget, so a real "slow dial" backlog is simulated directly.
@@ -263,7 +263,7 @@ describe('reactivity / forwarder host', () => {
 		expect(slowQueue.full).to.equal(true);
 
 		const before = transport.sent.length;
-		await host.ingest(TOPIC, note(2));
+		await host.ingest(note(2));
 
 		expect(pushState.perSubscriberQueue.peekQueue(SUB_A)!.dropped, 'the slow subscriber dropped its oldest').to.equal(1);
 		// SUB_B (fast) still received revision 2 — its delivery is not stalled by SUB_A's backlog.
@@ -275,13 +275,13 @@ describe('reactivity / forwarder host', () => {
 		let subs = [SUB_A, SUB_B];
 		const { host } = makeHost({ directSubscribers: (): string[] => subs });
 
-		await host.ingest(TOPIC, note(1));
-		const pushState = host.pushStateFor(TOPIC)!;
+		await host.ingest(note(1));
+		const pushState = host.pushStateForRoot(ROOT)!;
 		expect(pushState.perSubscriberQueue.subscriberCount).to.equal(2);
 
 		// SUB_B departs (TTL-expired / withdrawn): the live set shrinks to [SUB_A].
 		subs = [SUB_A];
-		await host.ingest(TOPIC, note(2));
+		await host.ingest(note(2));
 
 		expect(pushState.perSubscriberQueue.subscriberCount, 'the departed subscriber\'s queue is reclaimed').to.equal(1);
 		expect(pushState.perSubscriberQueue.peekQueue(SUB_B), 'SUB_B has no queue').to.equal(undefined);
@@ -293,7 +293,7 @@ describe('reactivity / forwarder host', () => {
 		// (a) CohortRef.primary present → dialed directly.
 		const childA: CohortRef = { coord: bytesToB64url(new Uint8Array([0x30])), primary: CHILD_PRIMARY };
 		const { host: hostA, transport: txA } = makeHost({ directSubscribers: (): string[] => [SUB_A], childCohorts: [childA] });
-		await hostA.ingest(TOPIC, note(1));
+		await hostA.ingest(note(1));
 		expect(txA.sent.map((s) => s.target), 'child primary dialed after the direct subscriber').to.deep.equal([SUB_A, CHILD_PRIMARY]);
 		expect(txA.sent[1]!.n, 'the child gets the unmodified frame').to.equal(txA.sent[0]!.n);
 
@@ -304,7 +304,7 @@ describe('reactivity / forwarder host', () => {
 			childCohorts: [childB],
 			resolveChildPrimary: (ref): string | undefined => (ref.coord === childB.coord ? CHILD_PRIMARY : undefined),
 		});
-		await hostB.ingest(TOPIC, note(1));
+		await hostB.ingest(note(1));
 		expect(txB.sent.map((s) => s.target)).to.deep.equal([SUB_A, CHILD_PRIMARY]);
 	});
 
@@ -312,14 +312,14 @@ describe('reactivity / forwarder host', () => {
 		let subs: string[] = [];
 		const { host, transport } = makeHost({ directSubscribers: (): string[] => subs });
 
-		await host.ingest(TOPIC, note(1));
-		expect(host.pushStateFor(TOPIC), 'no subscriber ⇒ no PushState').to.equal(undefined);
+		await host.ingest(note(1));
+		expect(host.pushStateForRoot(ROOT), 'no subscriber ⇒ no PushState').to.equal(undefined);
 		expect(host.livePushStates(), 'nothing to gossip').to.have.length(0);
 		expect(transport.sent).to.have.length(0);
 
 		subs = [SUB_A];
-		await host.ingest(TOPIC, note(2));
-		expect(host.pushStateFor(TOPIC)!.replayBuffer.entries().map((e) => e.revision), 'only the watched revision is buffered').to.deep.equal([2]);
+		await host.ingest(note(2));
+		expect(host.pushStateForRoot(ROOT)!.replayBuffer.entries().map((e) => e.revision), 'only the watched revision is buffered').to.deep.equal([2]);
 		expect(host.livePushStates()).to.have.length(1);
 		expect(transport.sent.map((s) => [s.target, s.n.revision]), 'fanned out to the new subscriber').to.deep.equal([[SUB_A, 2]]);
 	});
@@ -333,8 +333,8 @@ describe('reactivity / forwarder host', () => {
 		});
 
 		// ingest path: an Edge node never instantiates a PushState and never fans out.
-		await host.ingest(TOPIC, note(1));
-		expect(host.pushStateFor(TOPIC), 'Edge instantiates no forwarder PushState').to.equal(undefined);
+		await host.ingest(note(1));
+		expect(host.pushStateForRoot(ROOT), 'Edge instantiates no forwarder PushState').to.equal(undefined);
 		expect(transport.sent, 'Edge never fans out').to.have.length(0);
 
 		// onInbound still delivers in-process (pure subscriber).
@@ -347,7 +347,7 @@ describe('reactivity / forwarder host', () => {
 		const transport = new FakeTransport(new Set([SUB_B])); // SUB_B's dial rejects
 		const { host } = makeHost({ transport, directSubscribers: (): string[] => [SUB_A, SUB_B, SUB_C] });
 
-		await host.ingest(TOPIC, note(1)); // must not reject despite SUB_B failing
+		await host.ingest(note(1)); // must not reject despite SUB_B failing
 		expect(transport.targets().sort(), 'all three were attempted; the failure was swallowed').to.deep.equal([SUB_A, SUB_B, SUB_C].sort());
 	});
 
@@ -355,14 +355,14 @@ describe('reactivity / forwarder host', () => {
 		const { host, transport } = makeHost({ directSubscribers: (): string[] => [SUB_A] });
 
 		// Five notifications ingested concurrently for the same topic must serialize into a contiguous ring.
-		await Promise.all([1, 2, 3, 4, 5].map((rev) => host.ingest(TOPIC, note(rev))));
-		const pushState = host.pushStateFor(TOPIC)!;
+		await Promise.all([1, 2, 3, 4, 5].map((rev) => host.ingest(note(rev))));
+		const pushState = host.pushStateForRoot(ROOT)!;
 		expect(pushState.replayBuffer.entries().map((e) => e.revision), 'ring is contiguous and ordered').to.deep.equal([1, 2, 3, 4, 5]);
 		expect(pushState.lastRevision).to.equal(5);
 		expect(transport.sent, 'each fresh revision fanned out exactly once').to.have.length(5);
 
 		// A concurrent duplicate of an already-buffered revision is deduped (no double-append, no extra dial).
-		await Promise.all([host.ingest(TOPIC, note(3)), host.ingest(TOPIC, note(6))]);
+		await Promise.all([host.ingest(note(3)), host.ingest(note(6))]);
 		expect(pushState.replayBuffer.entries().map((e) => e.revision)).to.deep.equal([1, 2, 3, 4, 5, 6]);
 		expect(transport.sent, 'only the fresh revision 6 added a dial').to.have.length(6);
 	});
@@ -371,7 +371,7 @@ describe('reactivity / forwarder host', () => {
 		const throwingVerifier: NotificationVerifier = { verify: () => Promise.reject(new Error('boom')) };
 		const { host, transport } = makeHost({ verifierFor: (): NotificationVerifier => throwingVerifier });
 
-		await host.ingest(TOPIC, note(1)); // resolves (does not reject)
+		await host.ingest(note(1)); // resolves (does not reject)
 		expect(transport.sent, 'a verifier fault drops the notification, no fan-out').to.have.length(0);
 	});
 });
@@ -383,9 +383,9 @@ describe('reactivity / forwarder host — rotation drain', () => {
 
 	it('markRotated → rotationRedirectFor returns the redirect (derived newTopicId) throughout the drain window', () => {
 		const { host } = makeHost();
-		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 5401 }, NOW);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 5401 }, NOW);
 
-		const mid = host.rotationRedirectFor(TOPIC, NOW + 30_000);
+		const mid = host.rotationRedirectFor(ROOT, NOW + 30_000);
 		expect(mid, 'a request mid-drain is told to move').to.not.equal(undefined);
 		expect(mid!.result).to.equal('rotated');
 		expect(mid!.newTailId).to.equal(NEW_TAIL);
@@ -394,73 +394,72 @@ describe('reactivity / forwarder host — rotation drain', () => {
 		expect(mid!.newTopicId).to.equal(newTopicOf(NEW_TAIL));
 	});
 
-	it('a topic that never rotated has no redirect', () => {
+	it('a root that never rotated has no redirect', () => {
 		const { host } = makeHost();
-		expect(host.rotationRedirectFor(TOPIC, NOW)).to.equal(undefined);
+		expect(host.rotationRedirectFor(ROOT, NOW)).to.equal(undefined);
 	});
 
 	it('strict drain boundary: redirect at rotatedAt + T_drain − 1, none (evicted) at exactly rotatedAt + T_drain', () => {
 		const { host } = makeHost();
-		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 1 }, NOW);
-		expect(host.rotationRedirectFor(TOPIC, NOW + T_DRAIN_MS - 1), 'still draining just inside the window').to.not.equal(undefined);
-		expect(host.rotationRedirectFor(TOPIC, NOW + T_DRAIN_MS), 'drained at exactly the boundary (isDraining is strict <)').to.equal(undefined);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 1 }, NOW);
+		expect(host.rotationRedirectFor(ROOT, NOW + T_DRAIN_MS - 1), 'still draining just inside the window').to.not.equal(undefined);
+		expect(host.rotationRedirectFor(ROOT, NOW + T_DRAIN_MS), 'drained at exactly the boundary (isDraining is strict <)').to.equal(undefined);
 		// The gate entry was evicted: a later in-window-relative-to-a-fresh-mark query still sees nothing.
-		expect(host.rotationRedirectFor(TOPIC, NOW + 1)).to.equal(undefined);
+		expect(host.rotationRedirectFor(ROOT, NOW + 1)).to.equal(undefined);
 	});
 
 	it('evicts the served PushState (and ingest tail) once the drain window closes', async () => {
 		const { host } = makeHost({ directSubscribers: (): string[] => [SUB_A] });
 		// Serve the outgoing tail: ingest instantiates its PushState (and its ingest-serialization tail).
-		await host.ingest(TOPIC, note(1));
-		expect(host.pushStateFor(TOPIC), 'the outgoing tail is served before rotation').to.not.equal(undefined);
+		await host.ingest(note(1));
+		expect(host.pushStateForRoot(ROOT), 'the outgoing tail is served before rotation').to.not.equal(undefined);
 
-		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 2 }, NOW);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 2 }, NOW);
 		// While draining the served state is retained (renewals/replays could still be answered by the redirect).
-		expect(host.rotationRedirectFor(TOPIC, NOW + 10_000)).to.not.equal(undefined);
-		expect(host.pushStateFor(TOPIC), 'served state retained during drain').to.not.equal(undefined);
+		expect(host.rotationRedirectFor(ROOT, NOW + 10_000)).to.not.equal(undefined);
+		expect(host.pushStateForRoot(ROOT), 'served state retained during drain').to.not.equal(undefined);
 
 		// After the window closes the next query evicts the gate AND reclaims the served PushState (12.31 leak).
-		expect(host.rotationRedirectFor(TOPIC, NOW + T_DRAIN_MS)).to.equal(undefined);
-		expect(host.pushStateFor(TOPIC), 'served PushState reclaimed on drain-elapsed eviction').to.equal(undefined);
+		expect(host.rotationRedirectFor(ROOT, NOW + T_DRAIN_MS)).to.equal(undefined);
+		expect(host.pushStateForRoot(ROOT), 'served PushState reclaimed on drain-elapsed eviction').to.equal(undefined);
 		expect(host.livePushStates(), 'no live forwarder state lingers for the drained tail').to.have.length(0);
 	});
 
 	it('releases a drained tail no recover request ever asked about on the next rotation it observes', async () => {
 		const { host } = makeHost({ directSubscribers: (): string[] => [SUB_A] });
-		await host.ingest(TOPIC, note(1));
-		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 2 }, NOW);
+		await host.ingest(note(1));
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 2 }, NOW);
 
 		// Another collection's rotation after the window closed: the old tail is released without a recover query.
-		const otherTopic = reactivityTopicId(b64urlToBytes(NEW_TAIL_2));
-		host.markRotated(otherTopic, { newTailId: NEW_TAIL, effectiveAtRevision: 9 }, NOW + T_DRAIN_MS);
-		expect(host.pushStateFor(TOPIC), 'served state of the drained tail reclaimed').to.equal(undefined);
+		host.markRotated(b64urlToBytes(NEW_TAIL_2), { newTailId: NEW_TAIL, effectiveAtRevision: 9 }, NOW + T_DRAIN_MS);
+		expect(host.pushStateForRoot(ROOT), 'served state of the drained tail reclaimed').to.equal(undefined);
 		expect(host.livePushStates()).to.have.length(0);
 	});
 
 	it('is idempotent for the same successor (no-op; drain window not restarted)', () => {
 		const { host } = makeHost();
-		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 100 }, NOW);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 100 }, NOW);
 		// A second mark to the SAME successor (even much later) must not restart the drain window.
-		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 100 }, NOW + 50_000);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 100 }, NOW + 50_000);
 		// If the window had restarted, this query (NOW + T_drain) would still be draining; it must be drained.
-		expect(host.rotationRedirectFor(TOPIC, NOW + T_DRAIN_MS), 'window anchored at the first mark, not the second').to.equal(undefined);
+		expect(host.rotationRedirectFor(ROOT, NOW + T_DRAIN_MS), 'window anchored at the first mark, not the second').to.equal(undefined);
 	});
 
 	it('advances to a later successor on a chained rotation (OLD→A→B), replacing the gate', () => {
 		const { host } = makeHost();
-		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 100 }, NOW);
-		expect(host.rotationRedirectFor(TOPIC, NOW + 1_000)!.newTailId).to.equal(NEW_TAIL);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 100 }, NOW);
+		expect(host.rotationRedirectFor(ROOT, NOW + 1_000)!.newTailId).to.equal(NEW_TAIL);
 
 		// A second rotation to a LATER successor (higher effectiveAtRevision) replaces the gate and restarts drain.
-		host.markRotated(TOPIC, { newTailId: NEW_TAIL_2, effectiveAtRevision: 200 }, NOW + 5_000);
-		const redirect = host.rotationRedirectFor(TOPIC, NOW + 6_000);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL_2, effectiveAtRevision: 200 }, NOW + 5_000);
+		const redirect = host.rotationRedirectFor(ROOT, NOW + 6_000);
 		expect(redirect!.newTailId, 'redirect advanced to the later successor').to.equal(NEW_TAIL_2);
 		expect(redirect!.newTopicId).to.equal(newTopicOf(NEW_TAIL_2));
 		expect(redirect!.effectiveAtRevision).to.equal(200);
 
 		// An EARLIER successor (lower effectiveAtRevision) is ignored — the gate stays on B.
-		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 50 }, NOW + 7_000);
-		expect(host.rotationRedirectFor(TOPIC, NOW + 8_000)!.newTailId, 'earlier successor ignored').to.equal(NEW_TAIL_2);
+		host.markRotated(ROOT, { newTailId: NEW_TAIL, effectiveAtRevision: 50 }, NOW + 7_000);
+		expect(host.rotationRedirectFor(ROOT, NOW + 8_000)!.newTailId, 'earlier successor ignored').to.equal(NEW_TAIL_2);
 	});
 });
 

@@ -105,10 +105,10 @@ const rotationRedirect = (over: Partial<RotationRedirectV1> = {}): RotationRedir
 	...over,
 });
 
-/** Serve deps backed by one PushState resolved by exact topic and by collection. */
+/** Serve deps backed by one PushState resolved by its root's tail and by collection. */
 function serveDepsFor(ps: PushState, over: Partial<RecoverServeDeps> = {}): RecoverServeDeps {
 	return {
-		pushStateFor: (topicId) => (bytesToB64url(topicId) === ps.topicId ? ps : undefined),
+		pushStateForRoot: (tail) => (bytesToB64url(tail) === ps.tailIdAtJoin ? ps : undefined),
 		pushStateForCollection: (collectionId) => (collectionId === ps.collectionId ? ps : undefined),
 		replayGuard: createCorrelationReplayGuard(),
 		clock: () => FIXED_NOW,
@@ -175,38 +175,37 @@ describe('reactivity recover — inbound serve handler', () => {
 		});
 	}
 
-	it('answers a stale-tail resume from the collection lookup when the exact topic is unserved (→ tail_rotated)', async () => {
-		// Serve only the CURRENT tail; the request carries a stale (rotated-away) tail whose topic is unserved.
+	it('answers a stale-tail resume from the collection lookup when the exact root is unserved (→ tail_rotated)', async () => {
+		// Serve only the CURRENT tail; the request carries a stale (rotated-away) tail whose root is unserved.
 		const ps = seedPushState([20, 21, 22]); // current tail = TAIL
-		const staleTopic = reactivityTopicId(b64urlToBytes(OTHER_TAIL));
 		const handler = createRecoverRequestHandler({
-			pushStateFor: (topicId) => (bytesToB64url(topicId) === ps.topicId ? ps : undefined), // unserved for the stale tail
+			pushStateForRoot: (tail) => (bytesToB64url(tail) === ps.tailIdAtJoin ? ps : undefined), // unserved for the stale tail
 			pushStateForCollection: () => ps,
 			replayGuard: createCorrelationReplayGuard(),
 			clock: () => FIXED_NOW,
 		});
 		const req = await signResume({ v: 1, collectionId: COLLECTION, fromRevision: 5, latestKnownTailId: OTHER_TAIL, subscriberCoord: COLLECTION, timestamp: FIXED_NOW });
-		expect(bytesToB64url(staleTopic)).to.not.equal(ps.topicId); // sanity: the stale topic is not the served one
+		expect(OTHER_TAIL).to.not.equal(ps.tailIdAtJoin); // sanity: the stale root is not the served one
 		const reply = decodeRecoverReplyV1((await handler(encodeRecoverRequestV1({ v: 1, kind: 'resume', resume: req }), peerId))!);
 		expect(reply.resumeReply!.result).to.equal('tail_rotated');
 		expect(reply.resumeReply!.newTailId).to.equal(TAIL);
 	});
 
-	it('resume reaching a draining old tail is answered with the kind:"rotated" redirect (consulting the stale tail topic)', async () => {
+	it('resume reaching a draining old tail is answered with the kind:"rotated" redirect (consulting the stale tail)', async () => {
 		const ps = seedPushState([10, 11, 12, 13, 14]);
 		const redirect = rotationRedirect();
-		let seenTopic: Uint8Array | undefined;
+		let seenTail: Uint8Array | undefined;
 		let seenNow: number | undefined;
 		const deps = serveDepsFor(ps, {
-			rotationFor: (req, now) => { seenTopic = req.topicId; seenNow = now; return redirect; },
+			rotationFor: (req, now) => { seenTail = req.tailId; seenNow = now; return redirect; },
 		});
 		const handler = createRecoverRequestHandler(deps);
 		const req = await signResume({ v: 1, collectionId: COLLECTION, fromRevision: 12, latestKnownTailId: TAIL, subscriberCoord: COLLECTION, timestamp: FIXED_NOW });
 		const reply = decodeRecoverReplyV1((await handler(encodeRecoverRequestV1({ v: 1, kind: 'resume', resume: req }), peerId))!);
 		expect(reply.kind).to.equal('rotated');
 		expect(reply.rotated).to.deep.equal(redirect);
-		// The redirect lookup is keyed by the request's stale tail topic: reactivityTopicId(latestKnownTailId).
-		expect([...seenTopic!]).to.deep.equal([...reactivityTopicId(b64urlToBytes(TAIL))]);
+		// The redirect lookup is keyed by the request's stale tail: the bytes of latestKnownTailId.
+		expect([...seenTail!]).to.deep.equal([...b64urlToBytes(TAIL)]);
 		expect(seenNow).to.equal(FIXED_NOW); // consulted against the injected serve clock
 	});
 
@@ -229,10 +228,10 @@ describe('reactivity recover — inbound serve handler', () => {
 		expect(bareReply.resumeReply!.result).to.equal('out_of_window');
 	});
 
-	it('backfill reaching a node serving only the draining old tail is answered with the redirect (keyed by collectionId, no topicId)', async () => {
+	it('backfill reaching a node serving only the draining old tail is answered with the redirect (keyed by collectionId, no tailId)', async () => {
 		const ps = seedPushState([10, 11, 12]);
 		const redirect = rotationRedirect();
-		let seenReq: { topicId?: Uint8Array; collectionId: string } | undefined;
+		let seenReq: { tailId?: Uint8Array; collectionId: string } | undefined;
 		const deps = serveDepsFor(ps, {
 			rotationFor: (req) => { seenReq = req; return redirect; },
 		});
@@ -242,8 +241,8 @@ describe('reactivity recover — inbound serve handler', () => {
 		const reply = decodeRecoverReplyV1((await handler(encodeRecoverRequestV1({ v: 1, kind: 'backfill', backfill: req }), peerId))!);
 		expect(reply.kind).to.equal('rotated');
 		expect(reply.rotated).to.deep.equal(redirect);
-		// Backfill defers the topic resolution to the binding: it passes collectionId only, no topicId.
-		expect(seenReq!.topicId).to.equal(undefined);
+		// Backfill defers the root resolution to the binding: it passes collectionId only, no tailId.
+		expect(seenReq!.tailId).to.equal(undefined);
 		expect(seenReq!.collectionId).to.equal(COLLECTION);
 	});
 
@@ -287,7 +286,7 @@ describe('reactivity recover — inbound serve handler', () => {
 
 	it('sends no reply when this node serves no PushState for the request', async () => {
 		const handler = createRecoverRequestHandler({
-			pushStateFor: () => undefined,
+			pushStateForRoot: () => undefined,
 			pushStateForCollection: () => undefined,
 			replayGuard: createCorrelationReplayGuard(),
 			clock: () => FIXED_NOW,
@@ -500,7 +499,7 @@ describe('reactivity recover — a declining member falls through to the next ca
 	/** A member holding no served `PushState` for the collection. */
 	function emptyMember(): MemberServe {
 		const handler = createRecoverRequestHandler({
-			pushStateFor: () => undefined,
+			pushStateForRoot: () => undefined,
 			pushStateForCollection: () => undefined,
 			replayGuard: createCorrelationReplayGuard(),
 			clock: () => FIXED_NOW,
@@ -682,7 +681,7 @@ describe('reactivity recover — declines over the real request/response framing
 	/** Serve deps for a member with no served state, counting how often it was asked to resolve one. */
 	function decliningDeps(asked: { count: number }): RecoverServeDeps {
 		return {
-			pushStateFor: () => undefined,
+			pushStateForRoot: () => undefined,
 			pushStateForCollection: () => { asked.count++; return undefined; },
 			replayGuard: createCorrelationReplayGuard(),
 			clock: () => FIXED_NOW,

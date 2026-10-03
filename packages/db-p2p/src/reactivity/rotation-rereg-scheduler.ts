@@ -35,7 +35,8 @@
  * not pin an otherwise-idle process, mirroring the push-state-gossip driver's unref'd timer
  * ({@link import("./push-state-gossip.js").ReactivityPushStateGossipDriver}).
  *
- * **Idempotence.** De-duped by successor `newTopicId` (base64url): a second notice for a successor already
+ * **Idempotence.** De-duped by successor **tail** (`plan.newTailId`, base64url) — not by its topic, which a
+ * topic that outlives its tail would share across every successor: a second notice for a successor already
  * scheduled or fired is ignored. The manager already fires once per successor (its `rotationHandledFor`
  * guard), but a redirect and a pre-announce can surface the **same** successor near-simultaneously, so the
  * scheduler is independently idempotent. The de-dupe ledger (`seen`) survives the timer fire (so a late
@@ -108,7 +109,7 @@ export interface RotationReRegistrationSchedulerOptions {
  * Hosts the per-successor one-shot timers that move a subscriber to the rotated tree. Bind {@link schedule}
  * to a manager's {@link import("./subscription-manager.js").ReactivitySubscriptionManagerOptions.onRotation}
  * observer. One scheduler may serve many managers as long as no two of them can name the same successor
- * topic — a node shares one across every collection, which holds because the watch service keeps one
+ * tail — a node shares one across every collection, which holds because the watch service keeps one
  * subscription per collection; two subscriptions of ONE collection would collide in the de-dupe ledger.
  *
  * See the module doc for where the re-registration stagger actually lives (the manager's `rejoinJitter`; this
@@ -119,7 +120,7 @@ export class RotationReRegistrationScheduler {
 	private readonly setTimer: (fn: () => void, delayMs: number) => RotationTimerCancel;
 	private readonly now: () => number;
 
-	/** Successors with a still-pending timer, keyed by base64url `newTopicId` → its cancel handle. */
+	/** Successors with a still-pending timer, keyed by base64url `newTailId` → its cancel handle. */
 	private readonly pending = new Map<string, RotationTimerCancel>();
 	/**
 	 * Successors recently scheduled (pending **or** already fired) — the idempotence ledger that survives fire.
@@ -149,18 +150,18 @@ export class RotationReRegistrationScheduler {
 	}
 
 	/**
-	 * Schedule the re-registration timer for a rotation notice. De-duped by successor `newTopicId`: a second
-	 * notice for an already-scheduled-or-fired successor is a no-op (a redirect and a pre-announce can surface
-	 * the same successor). The delay is `max(0, plan.fireAt - now())`, so a `fireAt` already in the past fires
-	 * on the next tick (clamped to 0, never negative). A no-op once {@link stop} has run.
+	 * Schedule the re-registration timer for a rotation notice. De-duped by successor tail (`plan.newTailId`): a
+	 * second notice for an already-scheduled-or-fired successor is a no-op (a redirect and a pre-announce can
+	 * surface the same successor). The delay is `max(0, plan.fireAt - now())`, so a `fireAt` already in the past
+	 * fires on the next tick (clamped to 0, never negative). A no-op once {@link stop} has run.
 	 */
 	schedule(notice: RotationNotice): void {
 		if (this.stopped) {
 			return;
 		}
-		const key = bytesToB64url(notice.plan.newTopicId);
+		const key = bytesToB64url(notice.plan.newTailId);
 		if (this.seen.has(key)) {
-			log("rotation re-registration already scheduled/fired for successor topic=%s — ignoring duplicate notice (preAnnounced=%s)", key, notice.preAnnounced);
+			log("rotation re-registration already scheduled/fired for successor tail=%s — ignoring duplicate notice (preAnnounced=%s)", key, notice.preAnnounced);
 			return;
 		}
 		this.seen.add(key);
@@ -175,17 +176,17 @@ export class RotationReRegistrationScheduler {
 		// one non-pending candidate whenever `pending` is at the cap, and would be wrongly evicted then immediately
 		// re-added to `pending` — a pending key absent from `seen`, which a duplicate notice could then re-arm over.
 		this.evictSeenOverCap();
-		log("scheduled rotation re-registration for successor topic=%s in %dms (preAnnounced=%s)", key, delayMs, notice.preAnnounced);
+		log("scheduled rotation re-registration for successor tail=%s in %dms (preAnnounced=%s)", key, delayMs, notice.preAnnounced);
 	}
 
 	/**
-	 * Cancel a single pending timer (by successor `newTopicId`) or, when called with no argument, **all**
-	 * pending timers (teardown). Cancelling an already-fired or unknown successor is a safe no-op. A cancelled
-	 * successor is forgotten (dropped from the idempotence ledger), so a later notice for it would reschedule;
-	 * use {@link stop} for permanent teardown.
+	 * Cancel a single pending timer (by successor tail, the plan's `newTailId`) or, when called with no argument,
+	 * **all** pending timers (teardown). Cancelling an already-fired or unknown successor is a safe no-op. A
+	 * cancelled successor is forgotten (dropped from the idempotence ledger), so a later notice for it would
+	 * reschedule; use {@link stop} for permanent teardown.
 	 */
-	cancel(newTopicId?: Uint8Array): void {
-		if (newTopicId === undefined) {
+	cancel(newTailId?: Uint8Array): void {
+		if (newTailId === undefined) {
 			for (const cancelTimer of this.pending.values()) {
 				cancelTimer();
 			}
@@ -193,7 +194,7 @@ export class RotationReRegistrationScheduler {
 			this.seen.clear();
 			return;
 		}
-		const key = bytesToB64url(newTopicId);
+		const key = bytesToB64url(newTailId);
 		const cancelTimer = this.pending.get(key);
 		if (cancelTimer !== undefined) {
 			cancelTimer();
@@ -230,7 +231,7 @@ export class RotationReRegistrationScheduler {
 			for (const key of this.seen) { // insertion order: oldest first
 				if (!this.pending.has(key)) {
 					this.seen.delete(key);
-					log("rotation re-registration ledger at cap (%d) — evicted oldest fired successor topic=%s", SEEN_LEDGER_CAP, key);
+					log("rotation re-registration ledger at cap (%d) — evicted oldest fired successor tail=%s", SEEN_LEDGER_CAP, key);
 					evicted = true;
 					break;
 				}
@@ -256,10 +257,10 @@ export class RotationReRegistrationScheduler {
 		// collection's tail and re-attaches wherever it finds it.
 		try {
 			void this.reRegister(plan).catch((err: unknown) => {
-				log("rotation re-registration rejected for successor topic=%s (isolated, not retried): %o", key, err);
+				log("rotation re-registration rejected for successor tail=%s (isolated, not retried): %o", key, err);
 			});
 		} catch (err) {
-			log("rotation re-registration threw synchronously for successor topic=%s (isolated): %o", key, err);
+			log("rotation re-registration threw synchronously for successor tail=%s (isolated): %o", key, err);
 		}
 	}
 }

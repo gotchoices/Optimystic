@@ -66,7 +66,7 @@ import {
 	registerRecoverHandler,
 	createRecoverRequestSigners,
 } from './reactivity/recover-transport.js';
-import { ReactivityForwarderHost, reactivityDirectSubscribers, reactivityNotificationTopicId } from './reactivity/forwarder-host.js';
+import { ReactivityForwarderHost, reactivityDirectSubscribers } from './reactivity/forwarder-host.js';
 import { ReactivityOriginationManager, liveOriginationContext } from './reactivity/origination-manager.js';
 import { ReactivityPushStateGossipDriver, registerPushStateGossipHandler, type ReactivityGossipCollection } from './reactivity/push-state-gossip.js';
 import { RotationReRegistrationScheduler } from './reactivity/rotation-rereg-scheduler.js';
@@ -90,6 +90,7 @@ import {
 	bytesToB64url,
 	type NotificationV1,
 	type CohortRef,
+	type PushState,
 	type PushStateGossipV1,
 	type PushStateInit,
 	type NotificationVerifier,
@@ -650,16 +651,16 @@ function resolveFretEngine(fret: FretService | undefined): FretService | undefin
 }
 
 /**
- * The raw topic id bytes of a collection's current served reactivity {@link PushState}, or `undefined` if the
- * node serves none. The forwarder host keys its served map by topicId, but a **backfill** recover request
- * carries only a collectionId — so the drain-redirect binding resolves the collection's current tail topic
- * here (the highest-`lastRevision` served PushState) before consulting `rotationRedirectFor`. While the old
- * tail is the only served state this resolves it (and its drain gate redirects); once the new tail is served
- * this resolves the new tail (no gate → no redirect), exactly as the recover serve's backfill path intends.
+ * The tail bytes of the root a collection's current served reactivity {@link PushState} belongs to, or
+ * `undefined` if the node serves none. The forwarder host keys its served map by root tail, but a **backfill**
+ * recover request carries only a collectionId — so the drain-redirect binding resolves the collection's current
+ * root here (the highest-`lastRevision` served PushState) before consulting `rotationRedirectFor`. While the
+ * old root is the only served state this resolves it (and its drain gate redirects); once the new root is
+ * served this resolves the new one (no gate → no redirect), exactly as the recover serve's backfill path intends.
  */
-function resolveCurrentServedTopic(forwarderHost: ReactivityForwarderHost, collectionId: string): Uint8Array | undefined {
+function resolveCurrentServedRoot(forwarderHost: ReactivityForwarderHost, collectionId: string): Uint8Array | undefined {
 	const ps = forwarderHost.pushStateForCollection(collectionId);
-	return ps === undefined ? undefined : b64urlToBytes(ps.topicId);
+	return ps === undefined ? undefined : b64urlToBytes(ps.tailIdAtJoin);
 }
 
 export async function createLibp2pNodeBase(
@@ -1888,6 +1889,8 @@ export async function createLibp2pNodeBase(
 			// The root group at a ring coordinate: the key network's storage rule in coordinate form. One
 			// binding, shared by the host (root placement) and the forwarder-side reads below (push-state
 			// gossip authenticity, recover targets), so no site can derive a root group by a different rule.
+			// The change bridge (installed below, beside the origination manager it feeds) is what makes
+			// origination live on this node.
 			const rootGroupAt = (coord: Uint8Array): Promise<readonly string[]> => keyNetwork.servingCohortAt(coord);
 			if (!fret) {
 				// Operator opted in; degrading silently to the bare notifier would hide misconfiguration.
@@ -1964,18 +1967,6 @@ export async function createLibp2pNodeBase(
 				};
 			}
 
-			// Origination gate: the bridge announces a commit iff this node applied its log tail
-			// (`selfAppliedTail` in change-bridge.ts) — this node is then in the tail's storage group, which is
-			// the topic's root group under the host's root placement above. No ring read is needed.
-			unsubscribeCohortBridge = attachCohortChangeBridge(
-				node as unknown as { blockChangeNotifier?: IBlockChangeNotifier },
-				{
-					source: storageRepo,
-					service: host.service,
-					extractCommitCert: makeClusterCommitCertExtractor(certStore!),
-				},
-			).unsubscribe;
-
 			// Expose the host so the reactivity origination wiring (and the activation test) can install
 			// `CohortTopicService.onLocalCommit`.
 			(node as any).cohortTopicHost = host;
@@ -1989,11 +1980,6 @@ export async function createLibp2pNodeBase(
 			const selfPeerId = node.peerId.toString();
 			const reactivityProfile = host.profile; // Edge ⇒ subscriber-only via the policy gate; Core forwards.
 			const reactivityPolicy = reactivityNodePolicy(reactivityProfile);
-			// Reactivity's forwarder cohort is the root group at the tail's root coordinate — TREE tier 0
-			// (peer-independent), distinct from the CAPACITY tier T3 the verifier/willingness use.
-			// `registry.findServing` keys on the engine's tree depth, so the served reactivity engine is found
-			// at tree tier 0, never at 3.
-			const REACTIVITY_FORWARDER_TREE_TIER = 0;
 			// The ratio every reactivity verifier on this node applies to a root group's signers:
 			// `ceil(|group| × ratio)`, the formula `captureCommitCert` signs the group's commit certificate under.
 			const reactivityQuorumRatio = consensusConfig.superMajorityThreshold;
@@ -2019,13 +2005,15 @@ export async function createLibp2pNodeBase(
 					deltaMaxBytes: reactivityPolicy.deltaMaxBytes,
 				}),
 				verifierFor: (): NotificationVerifier => createNotificationVerifier({ verifier: host.service.verifier(), tier: Tier.T3, quorumRatio: reactivityQuorumRatio }),
-				directSubscribers: (topicId: Uint8Array): string[] => {
-					// Find the served reactivity engine at TREE tier 0 (see REACTIVITY_FORWARDER_TREE_TIER) and read
-					// its direct-subscriber records. The adapter filters to reactivity appState and maps participantId
-					// bytes → dialable peer-id strings (the transport's `peerIdFromString` space) — NOT base64url,
-					// which would silently fail to dial. `undefined` (no subscriber has registered here yet) ⇒ [].
-					const engine = host.registry.findServing(topicId, REACTIVITY_FORWARDER_TREE_TIER);
-					return engine === undefined ? [] : reactivityDirectSubscribers(engine, topicId);
+				directSubscribers: (topicId: Uint8Array, rootTail: Uint8Array): string[] => {
+					// Read the direct-subscriber records of the engine serving THIS root: the one at the root
+					// coordinate of the notification's tail, placed as a root. Looking up by topic alone would also
+					// find an older root's engine of the same topic once a topic outlives its tail. The adapter
+					// filters to reactivity appState and maps participantId bytes → dialable peer-id strings (the
+					// transport's `peerIdFromString` space) — NOT base64url, which would silently fail to dial. No
+					// engine here (no subscriber has registered at this root) ⇒ [].
+					const engine = host.registry.findByCoord(reactivityRootCoord(rootTail));
+					return engine === undefined || !engine.rootPlaced ? [] : reactivityDirectSubscribers(engine, topicId);
 				},
 				// No childCohorts until cohort-topic-parent-child-link populates PushState.childCohorts (single
 				// tier-0 reach today); wire the resolver anyway. A child cohort's primary is the FRET-nearest member
@@ -2055,37 +2043,59 @@ export async function createLibp2pNodeBase(
 				// The collection id and tail go on the notification in the pinned encodings a subscriber registers
 				// under (see liveOriginationContext); a tail-less event never originates.
 				resolveContext: (event) => liveOriginationContext(event, reactivityPolicy.deltaMaxBytes),
-				// reactivityNotificationTopicId(n) = reactivityTopicId(b64urlToBytes(n.tailId)); since
-				// n.tailId = b64url(reactivityTailBytes(tail)), this is the SAME topicId the gate assembled coord_0
-				// around and the subscriber/forwarder verifier derives — closing the encoding loop.
-				emit: (n): void => { void forwarderHost.ingest(reactivityNotificationTopicId(n), n); },
-				// Observe-rotation: when a collection's tail id changes between commits the OLD tail's reactivity
-				// topic has rotated. Start its drain so the recover serve begins redirecting to the new tree (the
-				// `reactivity-rotation-recover-redirect-drain` markRotated seam). `oldTopicId` is byte-identical to
-				// the topic a subscriber subscribed under (both `reactivityTopicId(reactivityTailBytes(tail))`).
-				markRotated: (oldTopicId, redirect, now): void => forwarderHost.markRotated(oldTopicId, redirect, now),
+				// The host ingests at the root n.tailId names, on reactivityNotificationTopicId(n) =
+				// reactivityTopicId(b64urlToBytes(n.tailId)); since n.tailId = b64url(reactivityTailBytes(tail)), this
+				// is the SAME topic a subscriber registers under and the verifier derives — closing the encoding loop.
+				emit: (n): void => { void forwarderHost.ingest(n); },
+				// Observe-rotation: when a commit names a tail other than the one this node last announced at, the
+				// old root has rotated. Start its drain so the recover serve begins redirecting to the new tree (the
+				// `reactivity-rotation-recover-redirect-drain` markRotated seam). `oldTail` is in the reactivity tail
+				// encoding the host keys a root's state by.
+				markRotated: (oldTail, redirect, now): void => forwarderHost.markRotated(oldTail, redirect, now),
 			});
 			origination.install();
 
+			// Origination gate: the bridge announces a commit iff this node applied its log tail
+			// (`selfAppliedTail` in change-bridge.ts) — this node is then in the tail's storage group, which is
+			// the topic's root group under the host's root placement above. No ring read is needed. Every commit
+			// naming a tail also reaches the origination manager's tail observer, gate or no gate, so a machine in
+			// the old tail's group but not the new one still sees its root rotate.
+			unsubscribeCohortBridge = attachCohortChangeBridge(
+				node as unknown as { blockChangeNotifier?: IBlockChangeNotifier },
+				{
+					source: storageRepo,
+					service: host.service,
+					extractCommitCert: makeClusterCommitCertExtractor(certStore!),
+					observeTailCommit: (event): void => origination.observeTailCommit(event),
+				},
+			).unsubscribe;
+
 			// 4. PushState gossip — periodic intra-cohort convergence so any member (not just the primary) can
 			// serve a replay/backfill. Rides the host's cohort gossip transport (no second transport). A served
-			// push state's cohort is the root group at its tail's root coordinate: a topic id cannot be inverted,
-			// so each site keys on the tail the push state joined under (`tailIdAtJoin`).
+			// push state belongs to one root, and that root's cohort is the root group at its tail's root
+			// coordinate: a topic id cannot be inverted, so each site keys on the tail the push state joined under
+			// (`tailIdAtJoin`), which every gossip frame carries.
+			// A frame resolves to this node's push state at the root it names, and only if that state is for the
+			// frame's topic: a frame naming a root this node serves under another topic is dropped, never merged.
+			const servedPushStateForGossip = (g: PushStateGossipV1): PushState | undefined => {
+				const served = forwarderHost.pushStateForRoot(b64urlToBytes(g.tailIdAtJoin));
+				return served !== undefined && served.topicId === g.topicId ? served : undefined;
+			};
 			pushStateGossip = new ReactivityPushStateGossipDriver({
 				gossipTransport: host.gossipTransport,
 				liveCollections: (): ReactivityGossipCollection[] => forwarderHost.livePushStates().map((pushState) => ({
 					pushState,
 					cohortCoord: reactivityRootCoord(b64urlToBytes(pushState.tailIdAtJoin)),
 				})),
-				pushStateForGossip: (g: PushStateGossipV1) => forwarderHost.pushStateFor(b64urlToBytes(g.topicId)),
-				// Authenticity gate: accept gossip only from a member of the root group serving the frame's topic
+				pushStateForGossip: servedPushStateForGossip,
+				// Authenticity gate: accept gossip only from a member of the root group serving the frame's root
 				// (per-frame peer-sig envelope signing is deferred — reactivity-pushstate-gossip's hardening backlog).
-				// A frame for a topic this node serves no push state for is let through: there is nothing to
+				// A frame for a root this node serves no push state for is let through: there is nothing to
 				// protect, and the resolve step drops it as unserved.
 				// NOTE: reads the key network's serving cohort per inbound frame (one per collection per member
 				// per gossip round). If it shows in profiles, memoize per tail with a TTL of one gossip interval.
 				isCohortMember: async (fromPeerId: string, g: PushStateGossipV1): Promise<boolean> => {
-					const served = forwarderHost.pushStateFor(b64urlToBytes(g.topicId));
+					const served = servedPushStateForGossip(g);
 					if (served === undefined) return true;
 					return (await rootGroupAt(reactivityRootCoord(b64urlToBytes(served.tailIdAtJoin)))).includes(fromPeerId);
 				},
@@ -2127,17 +2137,17 @@ export async function createLibp2pNodeBase(
 			// failure; the subscriber's transport tries the next cohort member). One node-level replay guard is shared
 			// across all recover requests — a plain pruned-on-access map, so no new timer to tear down.
 			registerRecoverHandler(node, reactivityProtocols.recover, {
-				pushStateFor: forwarderHost.pushStateFor.bind(forwarderHost),
+				pushStateForRoot: forwarderHost.pushStateForRoot.bind(forwarderHost),
 				pushStateForCollection: forwarderHost.pushStateForCollection.bind(forwarderHost),
 				replayGuard: createCorrelationReplayGuard(),
 				rotationFor: (req, now) => {
-					// Drain-window redirect: a recover reaching an OLD (rotated, still-draining) tail is bounced to
-					// the new tree (reactivity-rotation-recover-redirect-drain). A resume carries the stale topic
-					// (topicId = reactivityTopicId(latestKnownTailId)); a backfill carries no topic, so resolve the
-					// collection's current served topic. rotationRedirectFor returns the gate's redirect while
-					// draining and undefined once drained (then evicting the gate + the old tail's served PushState).
-					const oldTopicId = req.topicId ?? resolveCurrentServedTopic(forwarderHost, req.collectionId);
-					return oldTopicId === undefined ? undefined : forwarderHost.rotationRedirectFor(oldTopicId, now);
+					// Drain-window redirect: a recover reaching an OLD (rotated, still-draining) root is bounced to
+					// the new tree (reactivity-rotation-recover-redirect-drain). A resume names the stale root (its
+					// latestKnownTailId); a backfill names none, so resolve the collection's current served root.
+					// rotationRedirectFor returns the gate's redirect while draining and undefined once drained (then
+					// evicting the gate + the old root's served PushState).
+					const oldTail = req.tailId ?? resolveCurrentServedRoot(forwarderHost, req.collectionId);
+					return oldTail === undefined ? undefined : forwarderHost.rotationRedirectFor(oldTail, now);
 				},
 			});
 

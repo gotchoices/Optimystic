@@ -40,7 +40,6 @@ import { peerIdFromString } from "@libp2p/peer-id";
 import {
 	b64urlToBytes,
 	bytesToB64url,
-	reactivityTopicId,
 	serveBackfill,
 	serveResume,
 	backfillSigningPayload,
@@ -301,21 +300,24 @@ export class Libp2pReactivityRecoverTransport {
 
 /** Live `PushState` resolvers + replay guard the recover serve handler dispatches against. */
 export interface RecoverServeDeps {
-	/** Resolve the served `PushState` for an exact reactivity topic id (resume's stale-tail lookup). */
-	readonly pushStateFor: (topicId: Uint8Array) => PushState | undefined;
+	/**
+	 * Resolve the `PushState` this node serves for the root at the tail whose bytes are `tail`
+	 * (`reactivityTailBytes(tail)`) — resume's stale-tail lookup.
+	 */
+	readonly pushStateForRoot: (tail: Uint8Array) => PushState | undefined;
 	/** Resolve the served `PushState` for a collection id — the current tail (backfill, and rotated resume). */
 	readonly pushStateForCollection: (collectionId: string) => PushState | undefined;
 	/** Node-level freshness + anti-replay gate keyed on the request signature bytes. */
 	readonly replayGuard: CorrelationReplayGuard;
 	/**
-	 * The drain-window redirect for a request that reached an **outgoing (rotated)** tail still in its drain
-	 * window, or `undefined` if the resolved topic never rotated / has drained. The node wiring binds this to
-	 * `ReactivityForwarderHost.rotationRedirectFor`, resolving the old topic from the request: for **resume**
-	 * the request carries `topicId = reactivityTopicId(latestKnownTailId)`; for **backfill** (no `topicId`)
-	 * the binding resolves the collection's current served topic. When it returns a redirect the serve replies
+	 * The drain-window redirect for a request that reached an **outgoing (rotated)** root still in its drain
+	 * window, or `undefined` if the resolved root never rotated / has drained. The node wiring binds this to
+	 * `ReactivityForwarderHost.rotationRedirectFor`, resolving the old root from the request: a **resume**
+	 * carries it as `tailId` (the bytes of its `latestKnownTailId`); for a **backfill** (no `tailId`) the binding
+	 * resolves the collection's current served root. When it returns a redirect the serve replies
 	 * `kind: "rotated"` instead of serving data, moving the subscriber to the new tree. Absent ⇒ never redirect.
 	 */
-	readonly rotationFor?: (req: { topicId?: Uint8Array; collectionId: string }, now: number) => RotationRedirectV1 | undefined;
+	readonly rotationFor?: (req: { tailId?: Uint8Array; collectionId: string }, now: number) => RotationRedirectV1 | undefined;
 	/** Unix-ms clock for the replay-guard window. Default `Date.now`. */
 	readonly clock?: () => number;
 	/** Per-frame decode ceiling; default {@link DEFAULT_STREAM_MAX_BYTES}. */
@@ -363,22 +365,22 @@ function serveBackfillReply(deps: RecoverServeDeps, req: BackfillV1, now: number
 }
 
 /**
- * Serve a resume against the live `PushState`. A resume reaching the **outgoing (draining)** tail — its
- * `latestKnownTailId` anchors a topic this node has marked rotated — is answered with the drain redirect
- * (`kind: "rotated"`), moving the subscriber to the new tree. Otherwise prefer the exact topic the request's
- * `latestKnownTailId` anchors (so a non-rotated subscriber classifies into backfill/checkpoint/out_of_window);
- * if this node no longer serves that tail's topic, fall back to the collection's current tail so the cohort
- * can still answer `tail_rotated` (its `currentTailId` differs from the request's stale tail) or, for a span
- * that crosses a rotation, serve from the new tail's `inheritedCheckpoint`. `undefined` ⇒ no served state.
+ * Serve a resume against the live `PushState`. A resume reaching the **outgoing (draining)** root — its
+ * `latestKnownTailId` names a tail this node has marked rotated — is answered with the drain redirect
+ * (`kind: "rotated"`), moving the subscriber to the new tree. Otherwise prefer the root at the request's
+ * `latestKnownTailId` (so a non-rotated subscriber classifies into backfill/checkpoint/out_of_window); if this
+ * node no longer serves that root, fall back to the collection's current tail so the cohort can still answer
+ * `tail_rotated` (its `currentTailId` differs from the request's stale tail) or, for a span that crosses a
+ * rotation, serve from the new tail's `inheritedCheckpoint`. `undefined` ⇒ no served state.
  */
 function serveResumeReply(deps: RecoverServeDeps, req: ResumeV1, now: number): Uint8Array | undefined {
 	const maxBytes = deps.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
-	const staleTopic = reactivityTopicId(b64urlToBytes(req.latestKnownTailId));
-	const redirect = deps.rotationFor?.({ topicId: staleTopic, collectionId: req.collectionId }, now);
+	const staleTail = b64urlToBytes(req.latestKnownTailId);
+	const redirect = deps.rotationFor?.({ tailId: staleTail, collectionId: req.collectionId }, now);
 	if (redirect !== undefined) {
 		return encodeRecoverReplyV1({ v: 1, kind: "rotated", rotated: redirect }, maxBytes);
 	}
-	const ps = deps.pushStateFor(staleTopic) ?? deps.pushStateForCollection(req.collectionId);
+	const ps = deps.pushStateForRoot(staleTail) ?? deps.pushStateForCollection(req.collectionId);
 	if (ps === undefined) {
 		return undefined;
 	}

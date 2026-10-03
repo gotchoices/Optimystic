@@ -29,6 +29,8 @@ import {
 	b64urlToBytes,
 	bytesEqual,
 	encodeCohortMessage,
+	decodeCohortMessage,
+	validateRegisterReplyV1,
 	Tier,
 	type RingCoord,
 	type MembershipCertV1,
@@ -158,6 +160,8 @@ interface SignedRegisterOptions {
 	 * unaffected; `registerSigningPayload` covers it, so it is attached before the final register sign.
 	 */
 	readonly appPayload?: Uint8Array;
+	/** The root key of a root-placed topic (a reactivity topic's tail bytes): the root is served at `H(rootKey)`. */
+	readonly rootKey?: Uint8Array;
 }
 
 // Signed register/renew builders for real participants (mirror the mock harness's, but kept local so the
@@ -174,6 +178,7 @@ async function signedRegister(participant: Member, topic: Uint8Array, now: numbe
 		timestamp: now,
 		correlationId: bytesToB64url(new TextEncoder().encode(correlationId)),
 		...(opts.appPayload !== undefined ? { appPayload: bytesToB64url(opts.appPayload) } : {}),
+		...(opts.rootKey !== undefined ? { rootKey: bytesToB64url(opts.rootKey) } : {}),
 	};
 	// `bootstrapBoundImage` binds only (topicId, tier, participantCoord, timestamp), so the self-vouch
 	// endorsement is identical on `baseBody` and the evidence-bearing body; attach it BEFORE the final
@@ -285,6 +290,33 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	function primaryFor(coord: RingCoord): RealNode {
 		const primaryId = nodes[0]!.fret.assembleCohort(coord, WANT_K)[0]!;
 		return nodes.find((n) => n.idStr === primaryId) ?? nodes[0]!;
+	}
+
+	/** The machine the root group at `rootCoord` consists of: `clusterSize` is 1 here, so a storage group is one node. */
+	async function rootMemberFor(rootCoord: RingCoord): Promise<RealNode> {
+		const group = await nodes[0]!.node.keyNetwork.servingCohortAt(rootCoord);
+		const member = nodes.find((n) => n.idStr === group[0]);
+		if (member === undefined) {
+			throw new Error(`no node of this mesh serves the root group at ${bytesToB64url(rootCoord)}`);
+		}
+		return member;
+	}
+
+	/**
+	 * Register `participant` as a direct reactivity subscriber at the root of the topic whose root key is
+	 * `tailBytes`, the way a subscription does: a T3 register naming the tail as its root key, dialed straight to
+	 * the root group's member over the real register protocol. The host serves that root with a root-placed engine
+	 * at the tail's root coordinate, which is the engine a node's forwarder reads a root's subscribers from.
+	 * `correlationId` must be 16 characters: the wire validator requires 16 bytes.
+	 */
+	async function registerAtRoot(participant: RealNode, rootMember: RealNode, topicId: Uint8Array, tailBytes: Uint8Array, appPayload: Uint8Array, correlationId: string): Promise<CoordEngine> {
+		const reg = await signedRegister(participant.member, topicId, Date.now(), correlationId, { tier: Tier.T3, selfVouch: true, appPayload, rootKey: tailBytes });
+		const replyFrame = await requestResponse(participant.node, rootMember.peerId, DEFAULT_COHORT_TOPIC_PROTOCOLS.register, encodeCohortMessage(reg), DEFAULT_STREAM_MAX_BYTES);
+		const reply = validateRegisterReplyV1(decodeCohortMessage(replyFrame!));
+		expect(reply.result, 'the reactivity subscriber registration was admitted at the root').to.equal('accepted');
+		const engine = rootMember.host.registry.findByCoord(reactivityRootCoord(tailBytes));
+		expect(engine?.rootPlaced, 'the root is served by a root-placed engine at the tail\'s root coordinate').to.equal(true);
+		return engine!;
 	}
 
 	/** Seed the willingness quorum for `coord`: every member signs+sends a willingness frame to every other. */
@@ -560,19 +592,17 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	it('a commit on a real cohort member delivers a NotificationV1 to a remote subscriber over a real socket', async () => {
 		const tailBytes = reactivityTailBytes(TAIL_ID);
 		const topicId = reactivityTopicId(tailBytes);
-		// The topic's root coordinate: the tail's ring position. The engine the subscriber is hand-registered
-		// on sits there, and the verifier derives the same coordinate from the notification's tail.
+		// The topic's root coordinate: the tail's ring position. The root group there is the tail's storage group
+		// — at clusterSize 1 one machine, the origin, which applies and so announces the tail's commits — and the
+		// verifier derives the same coordinate from the notification's tail.
 		const reactivityCoord = reactivityRootCoord(tailBytes);
+		const origin = await rootMemberFor(reactivityCoord);
 
-		// Instantiate every node's reactivity cohort engine + converge willingness so the primary can admit the
-		// subscriber registration (mirrors the matchmaking provider test's pre-steps).
-		engines(reactivityCoord);
-		const origin = primaryFor(reactivityCoord);
-		const originEngine = engineOf(origin, reactivityCoord);
-		expect(await quorumOn(originEngine, reactivityCoord), 'willingness converged for the reactivity topic').to.equal(true);
-
-		// The remote subscriber is a different real node; register it as a direct reactivity subscriber on the
-		// origin's cohort engine so origin's `directSubscribers(topicId)` → [remote] and origin dials it.
+		// The remote subscriber is a different real node; register it as a direct reactivity subscriber at the
+		// root so origin's `directSubscribers(topicId, tail)` → [remote] and origin dials it. T3 bootstrap is always
+		// gated on the production node, so the register carries a self-vouch reputation endorsement (admitted via
+		// the `PoW || reputation || parent-ref` disjunction: the origin's reputation view sees an unseen,
+		// non-banned peer).
 		const remote = nodes.find((n) => n.idStr !== origin.idStr)!;
 		// The event carries the collection id as blocks do (raw); the subscriber side names it by the base64url of
 		// the pinned bytes, which is what origination puts on the notification.
@@ -585,34 +615,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			lastKnownRev: 0,
 			deltaMaxBytes: 0,
 		});
-		const regBody: Omit<RegisterV1, 'signature'> = {
-			v: 1,
-			topicId: bytesToB64url(topicId),
-			tier: Tier.T3,
-			treeTier: 0,
-			participantCoord: bytesToB64url(remote.member.bytes),
-			ttl: 90_000,
-			bootstrap: true,
-			timestamp: now,
-			correlationId: bytesToB64url(new TextEncoder().encode('rx-socket-sub')),
-			appPayload: bytesToB64url(appPayload),
-		};
-		// T3 (`tier > maxNoPowTier`) bootstrap is always gated on the production node (cohort-topic-bootstrap-
-		// coldstart-origination-regression keeps only T0/T1 permissive). Attach a self-vouch reputation
-		// endorsement: the registrant peer-key-signs its own bootstrapBoundImage as the referee, and the origin's
-		// reputation view sees an unseen, non-banned peer (score 0 < deprioritize) → admitted via the
-		// `PoW || reputation || parent-ref` disjunction. bootstrapBoundImage binds only (topicId, tier,
-		// participantCoord, timestamp), so it is identical on regBody and the evidence-bearing body; attach the
-		// evidence to the body BEFORE the final register sign (registerSigningPayload covers bootstrapEvidence).
-		const repSig = await signPeer(remote.member.key, bootstrapBoundImage(regBody));
-		const evidence = serializeBootstrapEvidenceEnvelope({
-			v: 1,
-			reputation: { referee: bytesToB64url(remote.member.bytes), sig: bytesToB64url(repSig) },
-		});
-		const regBodyWithEv: Omit<RegisterV1, 'signature'> = { ...regBody, bootstrapEvidence: evidence };
-		const reg: RegisterV1 = { ...regBodyWithEv, signature: bytesToB64url(await signPeer(remote.member.key, registerSigningPayload(regBodyWithEv))) };
-		const accept = await originEngine.engine.handleRegister(reg, { followOn: false, treeTier: 0 }, now);
-		expect(accept.result, 'the reactivity subscriber registration was admitted on the origin cohort engine').to.equal('accepted');
+		const originEngine = await registerAtRoot(remote, origin, topicId, tailBytes, appPayload, 'rx-socket-subscr');
 		expect(
 			originEngine.records(topicId).some((r) => r.appState !== undefined && bytesEqual(r.participantId, remote.member.bytes)),
 			'origin holds the remote reactivity subscriber record (direct-subscriber read)',
@@ -702,12 +705,8 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		const tailBytes = reactivityTailBytes(RESUME_TAIL);
 		const topicId = reactivityTopicId(tailBytes);
 		const reactivityCoord = reactivityRootCoord(tailBytes);
-
-		// Instantiate every node's reactivity cohort engine + converge willingness so the origin admits + serves.
-		engines(reactivityCoord);
-		const origin = primaryFor(reactivityCoord);
-		const originEngine = engineOf(origin, reactivityCoord);
-		expect(await quorumOn(originEngine, reactivityCoord), 'willingness converged for the resume topic').to.equal(true);
+		// The root group at the tail's root coordinate: at clusterSize 1, the one machine that stores the tail.
+		const origin = await rootMemberFor(reactivityCoord);
 
 		const remote = nodes.find((n) => n.idStr !== origin.idStr)!;
 		// Raw on the event, encoded for the subscriber (see the notify case above): a resume whose collection id
@@ -738,18 +737,16 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			n.host.service.verifier().cache(cert, ROOT_PLACEMENT);
 		}
 
-		// A node keeps forwarding state only for a topic someone subscribed to, so the remote registers as a direct
-		// reactivity subscriber on the origin's cohort engine first: originated with no subscriber, rev 1 would be
-		// buffered nowhere and there would be nothing to backfill.
+		// A node keeps forwarding state only for a root someone subscribed to, so the remote registers as a direct
+		// reactivity subscriber at the root first: originated with no subscriber, rev 1 would be buffered nowhere
+		// and there would be nothing to backfill.
 		const appPayload = subscribeAppPayloadBytes({
 			collectionId: collectionIdB64,
 			tailIdAtAttach: bytesToB64url(tailBytes),
 			lastKnownRev: 0,
 			deltaMaxBytes: 0,
 		});
-		const reg = await signedRegister(remote.member, topicId, now, 'rx-resume-sub', { tier: Tier.T3, selfVouch: true, appPayload });
-		const accept = await originEngine.engine.handleRegister(reg, { followOn: false, treeTier: 0 }, now);
-		expect(accept.result, 'the remote registered as a reactivity subscriber on the origin cohort engine').to.equal('accepted');
+		await registerAtRoot(remote, origin, topicId, tailBytes, appPayload, 'rx-resume-subscr');
 
 		// Originate rev 1 on the origin: the production onLocalCommit builds a NotificationV1 and ingests it into
 		// the origin's forwarder host, filling its PushState replay ring with rev 1 — the live tail's last
@@ -819,7 +816,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	});
 
 	// reactivity tail-rotation REDIRECT over a real recover socket (`reactivity-rotation-host-wiring-e2e` §D):
-	// after a tail-id change the origination manager fires `forwarderHost.markRotated(oldTopicId, …)`, so a recover
+	// after a commit naming a new tail the origination manager fires `forwarderHost.markRotated(oldTail, …)`, so a recover
 	// dialed at the OLD cohort returns a `kind:"rotated"` frame (the outbound transport raises a terminal
 	// `RotationRedirectError`). The drain seam + the observe-on-tail-id-change wiring are exercised end-to-end at
 	// the mock tier (`reactivity/mesh-tail-rotation.spec.ts`) and unit-pinned (`managers.spec.ts` markRotated
@@ -1081,7 +1078,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 /**
  * **The collection watch service over a real network.** The cases above each fake one end of reactivity — a
  * hand-built commit certificate fed to `onLocalCommit`, a membership certificate cached by hand, a registration
- * handed straight to a cohort engine. This one fakes none of them: a real `NetworkTransactor` commits a row
+ * dialed straight to the root group's member rather than walked there. This one fakes none of them: a real `NetworkTransactor` commits a row
  * through cluster consensus on one node, and a watch opened through another node's `reactivityWatch` wakes.
  *
  * Every machine is in every cohort (`clusterSize` = `wantK` = the node count, `minSigs` below it) — the small

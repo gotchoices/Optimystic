@@ -9,7 +9,7 @@
  *
  * **One subscription per collection.** Every watch of one collection on this node shares one subscription,
  * which closes with its last handle. Sharing is also what keeps the node's rotation scheduler correct: it
- * de-duplicates by successor topic, and two subscriptions of one collection would share successor topics.
+ * de-duplicates by successor tail, and two subscriptions of one collection would share successor tails.
  *
  * **Nothing here is trusted to arrive.** A notification can be lost, a registration can fail, a tail can
  * move with nobody told (a subscriber registered under the old tail's topic is not sent the new tail's
@@ -145,7 +145,10 @@ export class ReactivityCollectionWatch {
 	private readonly tickIntervalMs: number;
 
 	private readonly subscriptions = new Map<string, Subscription>();
-	/** Successor topic (base64url) → the subscription a scheduled rotation timer will move there. */
+	/**
+	 * Successor tail (base64url of the plan's `newTailId`) → the subscription a scheduled rotation timer will move
+	 * there. Keyed by tail, the key the scheduler de-duplicates by, because a topic can outlive its tail.
+	 */
 	private readonly rotationTargets = new Map<string, Subscription>();
 	private stopped = false;
 
@@ -197,7 +200,7 @@ export class ReactivityCollectionWatch {
 	}
 
 	/**
-	 * The rotation scheduler's move: its timer for the successor topic `plan.newTopicId` fired. A successor
+	 * The rotation scheduler's move: its timer for the successor tail `plan.newTailId` fired. A successor
 	 * no subscription is waiting on (it closed meanwhile) is a logged no-op.
 	 *
 	 * NOTE: a timer for a successor the log has already left (OLD→A→B inside the re-registration jitter, the
@@ -206,11 +209,11 @@ export class ReactivityCollectionWatch {
 	 * subscription is no longer attached under the manager that surfaced it.
 	 */
 	reRegister(plan: ReRegistrationPlan): Promise<void> {
-		const topicKey = bytesToB64url(plan.newTopicId);
-		const sub = this.rotationTargets.get(topicKey);
-		this.rotationTargets.delete(topicKey);
+		const tailKey = bytesToB64url(plan.newTailId);
+		const sub = this.rotationTargets.get(tailKey);
+		this.rotationTargets.delete(tailKey);
 		if (sub === undefined || sub.closed) {
-			log("rotation re-registration fired for successor topic=%s but no open subscription is waiting on it", topicKey);
+			log("rotation re-registration fired for successor tail=%s but no open subscription is waiting on it", tailKey);
 			return Promise.resolve();
 		}
 		return this.enqueue(sub, () => this.moveThenRecheck(sub, plan.newTailId, plan.lastRevision));
@@ -251,9 +254,9 @@ export class ReactivityCollectionWatch {
 		sub.closed = true;
 		sub.cancelTick?.();
 		this.subscriptions.delete(sub.collectionId);
-		for (const [topicKey, target] of this.rotationTargets) {
+		for (const [tailKey, target] of this.rotationTargets) {
 			if (target === sub) {
-				this.rotationTargets.delete(topicKey);
+				this.rotationTargets.delete(tailKey);
 			}
 		}
 		sub.listeners.clear();
@@ -479,7 +482,7 @@ export class ReactivityCollectionWatch {
 		if (sub.closed) {
 			return;
 		}
-		this.rotationTargets.set(bytesToB64url(notice.plan.newTopicId), sub);
+		this.rotationTargets.set(bytesToB64url(notice.plan.newTailId), sub);
 		this.options.scheduleRotation(notice);
 	}
 

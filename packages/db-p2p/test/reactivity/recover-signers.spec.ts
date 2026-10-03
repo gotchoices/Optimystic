@@ -50,7 +50,7 @@ function seedPushState(revs: number[]): PushState {
 
 function serveDepsFor(ps: PushState): RecoverServeDeps {
 	return {
-		pushStateFor: (topicId) => (bytesToB64url(topicId) === ps.topicId ? ps : undefined),
+		pushStateForRoot: (tail) => (bytesToB64url(tail) === ps.tailIdAtJoin ? ps : undefined),
 		pushStateForCollection: (collectionId) => (collectionId === ps.collectionId ? ps : undefined),
 		replayGuard: createCorrelationReplayGuard(),
 		clock: () => FIXED_NOW,

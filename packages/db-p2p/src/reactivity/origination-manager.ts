@@ -14,13 +14,16 @@
  * manager supplies `encodeSigner = s ⇒ bytesToB64url(peerIdToBytes(s))`, the inverse the subscriber's
  * {@link createNotificationVerifier} default (`b64urlToBytes`) consumes — closing the encoding loop end
  * to end.
+ *
+ * It also watches for the log moving to a new tail block ({@link ReactivityOriginationManager.observeTailCommit}),
+ * which the change bridge feeds every tail-bearing commit — not only the ones this node announces — so a
+ * machine that is in the old tail's group but not the new one still sees its root rotate.
  */
 
 import {
 	buildNotificationV1,
 	bytesToB64url,
 	b64urlToBytes,
-	reactivityTopicId,
 	BlockFillTracker,
 	type BlockFillTrackerInit,
 	type CohortTopicService,
@@ -30,6 +33,7 @@ import {
 	type RotationHintV1,
 } from "@optimystic/db-core";
 import { peerIdToBytes } from "../cohort-topic/peer-codec.js";
+import { selfAppliedTail } from "../cohort-topic/change-bridge.js";
 import { reactivityCollectionIdBytes, reactivityTailBytes } from "./topic-bytes.js";
 import { createLogger } from "../logger.js";
 
@@ -61,8 +65,8 @@ export interface OriginationCollectionContext {
  * Both ids go on the notification in the pinned encodings of `reactivity/topic-bytes.ts`, the SAME ones a
  * subscriber registers under — a different encoding on either side and origination silently never reaches
  * it. `rotationHint` stays absent on a live node: the successor tail id is not knowable at the filling
- * commit (random block ids; gated on `6.5-block-id-derivation`), so the observable rotation signal is
- * `event.tailId` changing, which the manager reports through `markRotated`.
+ * commit (random block ids; gated on `6.5-block-id-derivation`), so the observable rotation signal is a
+ * commit naming a later tail, which the manager reports through `markRotated` (`observeTailCommit`).
  */
 export function liveOriginationContext(event: CollectionChangeEvent, deltaMaxBytes: number): OriginationCollectionContext | undefined {
 	if (event.tailId === undefined) {
@@ -87,16 +91,17 @@ export interface ReactivityOriginationManagerOptions {
 	/** Fan the built notification out to direct subscribers and child cohorts (the reactivity transport). */
 	readonly emit: (notification: NotificationV1) => void;
 	/**
-	 * Start the **outgoing** tail's drain when this manager observes a collection's tail id **change**
-	 * between commits (the authoritative, observable live-node rotation signal — the pre-announce
-	 * `rotationHint{ newTailId }` cannot be built on a live node because the successor tail id is not knowable
-	 * at the filling commit; see `docs/reactivity.md` §Tail rotation and the `6.5-block-id-derivation` gate).
-	 * The node binds this to {@link import("./forwarder-host.js").ReactivityForwarderHost.markRotated} so the
-	 * old cohort's recover serve begins redirecting. `oldTopicId` is the **previous** tail's reactivity topic
-	 * id (`reactivityTopicId` over the resolved tail bytes — the SAME encoding a subscriber subscribes under).
-	 * Absent ⇒ origination is unchanged (rotation observation is inert), preserving existing callers/tests.
+	 * Start the **outgoing** root's drain when {@link ReactivityOriginationManager.observeTailCommit} sees a
+	 * commit naming a tail other than the one this node last announced for the collection (the authoritative,
+	 * observable live-node rotation signal — the pre-announce `rotationHint{ newTailId }` cannot be built on a
+	 * live node because the successor tail id is not knowable at the filling commit; see `docs/reactivity.md`
+	 * §Tail rotation and the `6.5-block-id-derivation` gate). The node binds this to
+	 * {@link import("./forwarder-host.js").ReactivityForwarderHost.markRotated} so the old root's recover serve
+	 * begins redirecting. `oldTail` is the **previous** tail in the reactivity tail encoding
+	 * (`reactivityTailBytes`) — the bytes the forwarder host keys that root's state by. Absent ⇒ rotation
+	 * observation is inert.
 	 */
-	readonly markRotated?: (oldTopicId: Uint8Array, redirect: { newTailId: string; effectiveAtRevision: number }, now: number) => void;
+	readonly markRotated?: (oldTail: Uint8Array, redirect: { newTailId: string; effectiveAtRevision: number }, now: number) => void;
 	/**
 	 * Per-collection {@link BlockFillTracker} tuning for the anticipatory **warm-up** signal. The warm-up is
 	 * best-effort and **signal-only** on a live node (the next `tailId` is not knowable, so no successor coord
@@ -113,12 +118,15 @@ export class ReactivityOriginationManager {
 	private readonly service: CohortTopicService;
 	private readonly resolveContext: (event: CollectionChangeEvent) => OriginationCollectionContext | undefined;
 	private readonly emit: (notification: NotificationV1) => void;
-	private readonly markRotated?: (oldTopicId: Uint8Array, redirect: { newTailId: string; effectiveAtRevision: number }, now: number) => void;
+	private readonly markRotated?: (oldTail: Uint8Array, redirect: { newTailId: string; effectiveAtRevision: number }, now: number) => void;
 	private readonly blockFill?: BlockFillTrackerInit;
 	private readonly clock: () => number;
 
-	/** Last-seen reactivity tail anchor (base64url of the resolved tail bytes) per collection — the rotation signal. */
-	private readonly lastSeenTail = new Map<string, string>();
+	/**
+	 * Per collection, the tail this node last applied a commit for — the root it last announced at — as the
+	 * base64url of `reactivityTailBytes(tail)`. The baseline {@link observeTailCommit} detects a rotation against.
+	 */
+	private readonly lastAnnouncedTail = new Map<string, string>();
 	/** Per-collection block-fill tracker driving the anticipatory warm-up signal (signal-only on a live node). */
 	private readonly fillTrackers = new Map<string, BlockFillTracker>();
 
@@ -143,9 +151,9 @@ export class ReactivityOriginationManager {
 			if (ctx === undefined) {
 				return; // not the origination point for this collection (tail-less / non-member)
 			}
-			// Observe the tail (rotation detection + block-fill warm-up) BEFORE emit, fully isolated so neither
-			// ever blocks the notification — the delivery-critical path.
-			this.observeTail(event, ctx);
+			// Block-fill warm-up BEFORE emit, fully isolated so it never blocks the notification — the
+			// delivery-critical path.
+			this.trackBlockFill(event);
 			const notification = buildNotificationV1(event, commitCert, {
 				collectionId: ctx.collectionId === undefined ? undefined : bytesToB64url(ctx.collectionId),
 				tailId: bytesToB64url(ctx.tailId),
@@ -162,16 +170,43 @@ export class ReactivityOriginationManager {
 	}
 
 	/**
-	 * Track the collection's reactivity tail and drive the rotation + warm-up signals. Isolated so a fault
-	 * here never blocks the notification emit. Only reached for commits this node originates (a defined `ctx`),
-	 * so a tail-less (read-driven) commit never records or clears the last-seen tail (the early-return holds).
+	 * Watch one commit for the log moving past the tail this node last announced at. The change bridge calls
+	 * this for **every** commit event that names a tail, ahead of and independently of its origination gate,
+	 * because the machines that announced at the old tail — its storage group — and the ones that will announce
+	 * at the new tail are mostly different machines once the network is wider than one group. A machine only in
+	 * the old group never applies a commit naming the new tail, but it does apply the rollover commit's rewrite
+	 * of the old tail block's `nextId`, and that event names the new tail.
+	 *
+	 * - An event naming a tail other than the baseline: the root at the baseline has rotated, so fire
+	 *   {@link markRotated} for it (effective at this event's revision) and forget the baseline.
+	 * - An event whose tail this node applied: it is in that tail's group, so that tail becomes the baseline.
+	 * - Anything else — the same tail without having applied it (a data-block sweep landing on a member of the
+	 *   tail's group) — leaves the baseline alone; forgetting it there would lose what the rollover is measured
+	 *   against.
+	 *
+	 * A tail-less event (replica push, read-driven promotion) is ignored. Isolated: logs, never throws.
+	 *
+	 * **Encoding contract.** Tails are compared and reported as `reactivityTailBytes(event.tailId)` — the bytes a
+	 * notification's `tailId` encodes and the forwarder host keys a root's state by. A mismatch would silently
+	 * never redirect.
 	 */
-	private observeTail(event: CollectionChangeEvent, ctx: OriginationCollectionContext): void {
+	observeTailCommit(event: CollectionChangeEvent): void {
 		try {
-			this.trackBlockFill(event);
-			this.detectTailRotation(event, ctx);
+			if (event.tailId === undefined) {
+				return;
+			}
+			const key = event.collectionId;
+			const tail = bytesToB64url(reactivityTailBytes(event.tailId));
+			const last = this.lastAnnouncedTail.get(key);
+			if (last !== undefined && last !== tail) {
+				this.markRotated?.(b64urlToBytes(last), { newTailId: tail, effectiveAtRevision: event.rev }, this.clock());
+				this.lastAnnouncedTail.delete(key);
+			}
+			if (selfAppliedTail(event)) {
+				this.lastAnnouncedTail.set(key, tail);
+			}
 		} catch (err) {
-			log("rotation/warm-up observation failed for collection=%s rev=%d (isolated): %o", event.collectionId, event.rev, err);
+			log("tail observation failed for collection=%s rev=%d (isolated): %o", event.collectionId, event.rev, err);
 		}
 	}
 
@@ -180,44 +215,25 @@ export class ReactivityOriginationManager {
 	 * signal-only** on a live node: the next `tailId` is not knowable (block ids are random until
 	 * `6.5-block-id-derivation`), so the anticipatory pre-dial bias is logged, never fabricated into a
 	 * successor coord (`docs/reactivity.md` §Anticipatory warm-up). The `filling` signal cannot pre-announce a
-	 * hint on a live node for the same reason — it is logged only.
+	 * hint on a live node for the same reason — it is logged only. Isolated so a fault here never blocks the
+	 * notification emit.
 	 */
 	private trackBlockFill(event: CollectionChangeEvent): void {
-		const key = event.collectionId;
-		let tracker = this.fillTrackers.get(key);
-		if (tracker === undefined) {
-			tracker = new BlockFillTracker(this.blockFill);
-			this.fillTrackers.set(key, tracker);
+		try {
+			const key = event.collectionId;
+			let tracker = this.fillTrackers.get(key);
+			if (tracker === undefined) {
+				tracker = new BlockFillTracker(this.blockFill);
+				this.fillTrackers.set(key, tracker);
+			}
+			const signal = tracker.onCommit();
+			if (signal.kind === "warmup") {
+				log("block-fill warm-up for collection=%s (%d committed, %d remaining) — anticipatory pre-dial is signal-only on a live node (successor tail not knowable; gated on 6.5-block-id-derivation)", key, signal.count, signal.remaining);
+			} else if (signal.kind === "filling") {
+				log("block-fill filling commit for collection=%s (%d committed) — no live pre-announce (successor tail id not knowable; rotation observed on the next commit naming a new tail)", key, signal.count);
+			}
+		} catch (err) {
+			log("block-fill warm-up observation failed for collection=%s rev=%d (isolated): %o", event.collectionId, event.rev, err);
 		}
-		const signal = tracker.onCommit();
-		if (signal.kind === "warmup") {
-			log("block-fill warm-up for collection=%s (%d committed, %d remaining) — anticipatory pre-dial is signal-only on a live node (successor tail not knowable; gated on 6.5-block-id-derivation)", key, signal.count, signal.remaining);
-		} else if (signal.kind === "filling") {
-			log("block-fill filling commit for collection=%s (%d committed) — no live pre-announce (successor tail id not knowable; rotation observed on the next commit's tail-id change)", key, signal.count);
-		}
-	}
-
-	/**
-	 * Detect a tail rotation by comparing the resolved tail anchor against the last-seen one for the
-	 * collection. The first commit records the baseline (no rotation). On a **change**, the previous tail's
-	 * reactivity topic has rotated to this one: fire {@link markRotated} for the OLD topic so the old cohort's
-	 * recover serve begins redirecting to the new tree.
-	 *
-	 * **Encoding contract.** `ctx.tailId` is the reactivity tail anchor bytes the node resolved
-	 * (`reactivityTailBytes(event.tailId)` in production — the SAME raw utf8 encoding the root derivation
-	 * `reactivityRootCoord` and a subscriber's `reactivityTopicId(reactivityTailBytes(tail))` use, never a
-	 * pre-hashed digest).
-	 * So `oldTopicId = reactivityTopicId(oldAnchorBytes)` is byte-identical to the topic a
-	 * subscriber subscribed under — a mismatch would silently never redirect.
-	 */
-	private detectTailRotation(event: CollectionChangeEvent, ctx: OriginationCollectionContext): void {
-		const key = event.collectionId;
-		const newTailB64 = bytesToB64url(ctx.tailId);
-		const lastTailB64 = this.lastSeenTail.get(key);
-		if (lastTailB64 !== undefined && lastTailB64 !== newTailB64) {
-			const oldTopicId = reactivityTopicId(b64urlToBytes(lastTailB64));
-			this.markRotated?.(oldTopicId, { newTailId: newTailB64, effectiveAtRevision: event.rev }, this.clock());
-		}
-		this.lastSeenTail.set(key, newTailB64);
 	}
 }

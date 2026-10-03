@@ -6,13 +6,11 @@ import type { RotationNotice } from '../../src/reactivity/subscription-manager.j
 // --- fixtures ---------------------------------------------------------------
 
 const TAIL_A = new Uint8Array([0xa1, 0xa2]);
-const TOPIC_A = new Uint8Array([0x10, 0x11]);
+const TOPIC = new Uint8Array([0x10, 0x11]); // every successor shares it: the scheduler de-duplicates by successor tail
 const TAIL_B = new Uint8Array([0xb1, 0xb2]);
-const TOPIC_B = new Uint8Array([0x20, 0x21]);
 
 interface NoticeOver {
 	newTailId?: Uint8Array;
-	newTopicId?: Uint8Array;
 	lastRevision?: number;
 	fireAt?: number;
 	preAnnounced?: boolean;
@@ -23,7 +21,7 @@ function notice(over: NoticeOver = {}): RotationNotice {
 	const newTailId = over.newTailId ?? TAIL_A;
 	const plan: ReRegistrationPlan = {
 		newTailId,
-		newTopicId: over.newTopicId ?? TOPIC_A,
+		newTopicId: TOPIC,
 		lastRevision: over.lastRevision ?? 100,
 		fireAt: over.fireAt ?? 5_000,
 	};
@@ -79,19 +77,19 @@ class FakeScheduler {
 	}
 }
 
-/** A recording `reRegister` seam; optionally rejects (or synchronously throws) for chosen successor topics. */
-function recorder(opts: { rejectTopics?: Uint8Array[]; throwTopics?: Uint8Array[] } = {}): {
+/** A recording `reRegister` seam; optionally rejects (or synchronously throws) for chosen successor tails. */
+function recorder(opts: { rejectTails?: Uint8Array[]; throwTails?: Uint8Array[] } = {}): {
 	calls: ReRegistrationPlan[];
 	reRegister: (plan: ReRegistrationPlan) => Promise<void>;
 } {
 	const calls: ReRegistrationPlan[] = [];
-	const rejectKeys = new Set((opts.rejectTopics ?? []).map((t) => bytesToB64url(t)));
-	const throwKeys = new Set((opts.throwTopics ?? []).map((t) => bytesToB64url(t)));
+	const rejectKeys = new Set((opts.rejectTails ?? []).map((t) => bytesToB64url(t)));
+	const throwKeys = new Set((opts.throwTails ?? []).map((t) => bytesToB64url(t)));
 	return {
 		calls,
 		reRegister: (plan: ReRegistrationPlan): Promise<void> => {
 			calls.push(plan);
-			const key = bytesToB64url(plan.newTopicId);
+			const key = bytesToB64url(plan.newTailId);
 			if (throwKeys.has(key)) {
 				throw new Error(`synchronous reRegister failure for ${key}`);
 			}
@@ -106,8 +104,8 @@ function recorder(opts: { rejectTopics?: Uint8Array[]; throwTopics?: Uint8Array[
 /** Flush the microtask + macrotask queue so a swallowed rejection settles before the assertion. */
 const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
-/** A distinct 2-byte successor topic for index `i` (little-endian) — 65 536 distinct values, plenty for ≥10k. */
-const topicForIndex = (i: number): Uint8Array => new Uint8Array([i & 0xff, (i >> 8) & 0xff]);
+/** A distinct 2-byte successor tail for index `i` (little-endian) — 65 536 distinct values, plenty for ≥10k. */
+const tailForIndex = (i: number): Uint8Array => new Uint8Array([i & 0xff, (i >> 8) & 0xff]);
 
 // --- tests ------------------------------------------------------------------
 
@@ -149,8 +147,8 @@ describe('reactivity / rotation re-registration scheduler', () => {
 		const rec = recorder();
 		const sched = new RotationReRegistrationScheduler({ reRegister: rec.reRegister, setTimer: clock.setTimer, now: clock.clock });
 
-		sched.schedule(notice({ newTopicId: TOPIC_A, preAnnounced: true })); // pre-announce
-		sched.schedule(notice({ newTopicId: TOPIC_A, preAnnounced: false })); // redirect for the SAME successor
+		sched.schedule(notice({ newTailId: TAIL_A, preAnnounced: true })); // pre-announce
+		sched.schedule(notice({ newTailId: TAIL_A, preAnnounced: false })); // redirect for the SAME successor
 		expect(sched.pendingCount, 'only one timer for the successor').to.equal(1);
 		expect(clock.delays, 'the duplicate never scheduled a second timer').to.have.length(1);
 
@@ -163,11 +161,11 @@ describe('reactivity / rotation re-registration scheduler', () => {
 		const rec = recorder();
 		const sched = new RotationReRegistrationScheduler({ reRegister: rec.reRegister, setTimer: clock.setTimer, now: clock.clock });
 
-		sched.schedule(notice({ newTopicId: TOPIC_A }));
+		sched.schedule(notice({ newTailId: TAIL_A }));
 		clock.advance(5_000);
 		expect(rec.calls, 'fired once').to.have.length(1);
 
-		sched.schedule(notice({ newTopicId: TOPIC_A })); // re-surfaced after it already fired
+		sched.schedule(notice({ newTailId: TAIL_A })); // re-surfaced after it already fired
 		expect(sched.pendingCount, 'no new timer for an already-fired successor').to.equal(0);
 		clock.advance(5_000);
 		expect(rec.calls, 'still only the one fire').to.have.length(1);
@@ -178,14 +176,14 @@ describe('reactivity / rotation re-registration scheduler', () => {
 		const rec = recorder();
 		const sched = new RotationReRegistrationScheduler({ reRegister: rec.reRegister, setTimer: clock.setTimer, now: clock.clock });
 
-		sched.schedule(notice({ newTailId: TAIL_A, newTopicId: TOPIC_A, fireAt: 3_000 }));
-		sched.schedule(notice({ newTailId: TAIL_B, newTopicId: TOPIC_B, fireAt: 6_000 })); // A→B before A's timer fires
+		sched.schedule(notice({ newTailId: TAIL_A, fireAt: 3_000 }));
+		sched.schedule(notice({ newTailId: TAIL_B, fireAt: 6_000 })); // A→B before A's timer fires
 		expect(sched.pendingCount, 'A and B are distinct successors → two timers').to.equal(2);
 
 		clock.advance(10_000);
-		expect(rec.calls.map((p) => bytesToB64url(p.newTopicId)), 'both fired (superseded A is not cancelled)').to.deep.equal([
-			bytesToB64url(TOPIC_A),
-			bytesToB64url(TOPIC_B),
+		expect(rec.calls.map((p) => bytesToB64url(p.newTailId)), 'both fired (superseded A is not cancelled)').to.deep.equal([
+			bytesToB64url(TAIL_A),
+			bytesToB64url(TAIL_B),
 		]);
 	});
 
@@ -215,18 +213,18 @@ describe('reactivity / rotation re-registration scheduler', () => {
 		expect(rec.calls).to.have.length(0);
 	});
 
-	it('cancel(newTopicId) drops one pending timer, leaving the others', () => {
+	it('cancel(newTailId) drops one pending timer, leaving the others', () => {
 		const clock = new FakeScheduler();
 		const rec = recorder();
 		const sched = new RotationReRegistrationScheduler({ reRegister: rec.reRegister, setTimer: clock.setTimer, now: clock.clock });
 
-		sched.schedule(notice({ newTailId: TAIL_A, newTopicId: TOPIC_A, fireAt: 4_000 }));
-		sched.schedule(notice({ newTailId: TAIL_B, newTopicId: TOPIC_B, fireAt: 4_000 }));
-		sched.cancel(TOPIC_A);
+		sched.schedule(notice({ newTailId: TAIL_A, fireAt: 4_000 }));
+		sched.schedule(notice({ newTailId: TAIL_B, fireAt: 4_000 }));
+		sched.cancel(TAIL_A);
 		expect(sched.pendingCount, 'only B remains pending').to.equal(1);
 
 		clock.advance(5_000);
-		expect(rec.calls.map((p) => bytesToB64url(p.newTopicId)), 'only B fired').to.deep.equal([bytesToB64url(TOPIC_B)]);
+		expect(rec.calls.map((p) => bytesToB64url(p.newTailId)), 'only B fired').to.deep.equal([bytesToB64url(TAIL_B)]);
 	});
 
 	it('cancel() with no argument drops every pending timer', () => {
@@ -234,8 +232,8 @@ describe('reactivity / rotation re-registration scheduler', () => {
 		const rec = recorder();
 		const sched = new RotationReRegistrationScheduler({ reRegister: rec.reRegister, setTimer: clock.setTimer, now: clock.clock });
 
-		sched.schedule(notice({ newTopicId: TOPIC_A, fireAt: 4_000 }));
-		sched.schedule(notice({ newTopicId: TOPIC_B, fireAt: 4_000 }));
+		sched.schedule(notice({ newTailId: TAIL_A, fireAt: 4_000 }));
+		sched.schedule(notice({ newTailId: TAIL_B, fireAt: 4_000 }));
 		sched.cancel();
 		expect(sched.pendingCount).to.equal(0);
 		clock.advance(5_000);
@@ -247,24 +245,24 @@ describe('reactivity / rotation re-registration scheduler', () => {
 		const rec = recorder();
 		const sched = new RotationReRegistrationScheduler({ reRegister: rec.reRegister, setTimer: clock.setTimer, now: clock.clock });
 
-		sched.schedule(notice({ newTopicId: TOPIC_A }));
+		sched.schedule(notice({ newTailId: TAIL_A }));
 		clock.advance(5_000);
 		expect(rec.calls, 'fired').to.have.length(1);
 
-		expect(() => sched.cancel(TOPIC_A), 'cancel after fire does not throw').to.not.throw();
-		expect(() => sched.cancel(TOPIC_A), 'cancel twice does not throw').to.not.throw();
-		expect(() => sched.cancel(TOPIC_B), 'cancel of an unknown successor does not throw').to.not.throw();
+		expect(() => sched.cancel(TAIL_A), 'cancel after fire does not throw').to.not.throw();
+		expect(() => sched.cancel(TAIL_A), 'cancel twice does not throw').to.not.throw();
+		expect(() => sched.cancel(TAIL_B), 'cancel of an unknown successor does not throw').to.not.throw();
 		expect(sched.pendingCount).to.equal(0);
 	});
 
-	it('cancel(newTopicId) forgets the successor so a fresh notice reschedules it', () => {
+	it('cancel(newTailId) forgets the successor so a fresh notice reschedules it', () => {
 		const clock = new FakeScheduler();
 		const rec = recorder();
 		const sched = new RotationReRegistrationScheduler({ reRegister: rec.reRegister, setTimer: clock.setTimer, now: clock.clock });
 
-		sched.schedule(notice({ newTopicId: TOPIC_A, fireAt: 5_000 }));
-		sched.cancel(TOPIC_A);
-		sched.schedule(notice({ newTopicId: TOPIC_A, fireAt: 6_000 })); // re-surfaced after an explicit cancel
+		sched.schedule(notice({ newTailId: TAIL_A, fireAt: 5_000 }));
+		sched.cancel(TAIL_A);
+		sched.schedule(notice({ newTailId: TAIL_A, fireAt: 6_000 })); // re-surfaced after an explicit cancel
 		expect(sched.pendingCount, 'a cancelled successor can be rescheduled').to.equal(1);
 
 		clock.advance(10_000);
@@ -273,36 +271,36 @@ describe('reactivity / rotation re-registration scheduler', () => {
 
 	it('isolates a rejecting / synchronously-throwing reRegister — other timers still fire', async () => {
 		const clock = new FakeScheduler();
-		const rec = recorder({ rejectTopics: [TOPIC_A], throwTopics: [TOPIC_B] });
+		const rec = recorder({ rejectTails: [TAIL_A], throwTails: [TAIL_B] });
 		const sched = new RotationReRegistrationScheduler({ reRegister: rec.reRegister, setTimer: clock.setTimer, now: clock.clock });
 
-		const cleanTopic = new Uint8Array([0x30, 0x31]);
-		sched.schedule(notice({ newTopicId: TOPIC_A, fireAt: 1_000 })); // rejects
-		sched.schedule(notice({ newTopicId: TOPIC_B, fireAt: 2_000 })); // throws synchronously
-		sched.schedule(notice({ newTopicId: cleanTopic, fireAt: 3_000 })); // resolves
+		const cleanTail = new Uint8Array([0x30, 0x31]);
+		sched.schedule(notice({ newTailId: TAIL_A, fireAt: 1_000 })); // rejects
+		sched.schedule(notice({ newTailId: TAIL_B, fireAt: 2_000 })); // throws synchronously
+		sched.schedule(notice({ newTailId: cleanTail, fireAt: 3_000 })); // resolves
 
 		expect(() => clock.advance(5_000), 'a throwing seam never escapes the timer callback').to.not.throw();
-		expect(rec.calls.map((p) => bytesToB64url(p.newTopicId)), 'every move was attempted').to.deep.equal([
-			bytesToB64url(TOPIC_A),
-			bytesToB64url(TOPIC_B),
-			bytesToB64url(cleanTopic),
+		expect(rec.calls.map((p) => bytesToB64url(p.newTailId)), 'every move was attempted').to.deep.equal([
+			bytesToB64url(TAIL_A),
+			bytesToB64url(TAIL_B),
+			bytesToB64url(cleanTail),
 		]);
 		await flush(); // a swallowed rejection must not surface as an unhandled rejection
 	});
 
 	it('a re-notice after a FAILED move stays deduped (no implicit retry to the same successor)', async () => {
 		const clock = new FakeScheduler();
-		const rec = recorder({ rejectTopics: [TOPIC_A] });
+		const rec = recorder({ rejectTails: [TAIL_A] });
 		const sched = new RotationReRegistrationScheduler({ reRegister: rec.reRegister, setTimer: clock.setTimer, now: clock.clock });
 
-		sched.schedule(notice({ newTopicId: TOPIC_A, fireAt: 1_000 })); // will reject
+		sched.schedule(notice({ newTailId: TAIL_A, fireAt: 1_000 })); // will reject
 		clock.advance(1_000);
 		expect(rec.calls, 'the move was attempted once').to.have.length(1);
 		await flush(); // let the rejection settle
 
 		// The same successor re-surfaces (e.g. a later notification for the still-current rotation). Because the
 		// move failed but `seen` retains the key, this is a no-op — recovery is the recover/re-walk path, not a retry.
-		sched.schedule(notice({ newTopicId: TOPIC_A, fireAt: 2_000 }));
+		sched.schedule(notice({ newTailId: TAIL_A, fireAt: 2_000 }));
 		expect(sched.pendingCount, 'a failed successor is not rescheduled by a re-notice').to.equal(0);
 		clock.advance(5_000);
 		expect(rec.calls, 'still only the one (failed) attempt — no implicit retry').to.have.length(1);
@@ -328,7 +326,7 @@ describe('reactivity / rotation re-registration scheduler', () => {
 		for (let i = 0; i < ROTATIONS; i++) {
 			// Each successor schedules, then its timer fires before the next — the realistic long-lived shape where
 			// `pending` drops back to ~0 between successors, so the bound is purely `SEEN_LEDGER_CAP`.
-			sched.schedule(notice({ newTopicId: topicForIndex(i), fireAt: clock.now + 1_000 }));
+			sched.schedule(notice({ newTailId: tailForIndex(i), fireAt: clock.now + 1_000 }));
 			expect(sched.pendingCount, 'exactly one pending timer between fires').to.equal(1);
 			clock.advance(1_000); // fire this successor's timer before scheduling the next
 			expect(sched.pendingCount, 'pending drops back to 0 after the fire').to.equal(0);
@@ -348,7 +346,7 @@ describe('reactivity / rotation re-registration scheduler', () => {
 		// skip every one of them and the ledger is allowed to grow with `pending` past the cap.
 		const total = SEEN_LEDGER_CAP + 50;
 		for (let i = 0; i < total; i++) {
-			sched.schedule(notice({ newTopicId: topicForIndex(i), fireAt: 5_000 }));
+			sched.schedule(notice({ newTailId: tailForIndex(i), fireAt: 5_000 }));
 		}
 		expect(sched.pendingCount, 'all successors are still pending (none fired)').to.equal(total);
 		expect(sched.seenCount, 'ledger grew with pending rather than evicting a live key').to.equal(total);
@@ -356,7 +354,7 @@ describe('reactivity / rotation re-registration scheduler', () => {
 
 		// Re-issue a duplicate notice for the FIRST (oldest) successor — if it had been evicted from `seen`, this
 		// would pass the `seen.has` check and arm a SECOND timer over the live one. It must instead be a no-op.
-		sched.schedule(notice({ newTopicId: topicForIndex(0), fireAt: 9_999 }));
+		sched.schedule(notice({ newTailId: tailForIndex(0), fireAt: 9_999 }));
 		expect(sched.pendingCount, 'the oldest pending key was not evicted → duplicate is a no-op').to.equal(total);
 		expect(clock.delays, 'no second timer armed for the oldest pending successor').to.have.length(total);
 
@@ -374,7 +372,7 @@ describe('reactivity / rotation re-registration scheduler', () => {
 		// last `SEEN_LEDGER_CAP` indices remain in the ledger.
 		const total = SEEN_LEDGER_CAP + 200;
 		for (let i = 0; i < total; i++) {
-			sched.schedule(notice({ newTopicId: topicForIndex(i), fireAt: clock.now + 1_000 }));
+			sched.schedule(notice({ newTailId: tailForIndex(i), fireAt: clock.now + 1_000 }));
 			clock.advance(1_000);
 		}
 		expect(sched.pendingCount, 'all fired — nothing pending').to.equal(0);
@@ -384,13 +382,13 @@ describe('reactivity / rotation re-registration scheduler', () => {
 		// The most-recently-fired successor (last index) is still in `seen` → a re-surface within the cap window is
 		// still a no-op: no new timer, no extra move. This is the "within-cap re-surface stays deduped" guarantee
 		// holding even though eviction has been running.
-		sched.schedule(notice({ newTopicId: topicForIndex(total - 1), fireAt: clock.now + 1_000 }));
+		sched.schedule(notice({ newTailId: tailForIndex(total - 1), fireAt: clock.now + 1_000 }));
 		expect(sched.pendingCount, 'a within-cap fired successor re-surface is still deduped').to.equal(0);
 		expect(rec.calls, 'no extra re-register for the still-remembered successor').to.have.length(movesAfterDrain);
 
 		// The oldest successor (index 0) was evicted long ago → its re-surface is no longer remembered and degrades
 		// to exactly one harmless idempotent re-register (the documented acceptable behavior past the cap window).
-		sched.schedule(notice({ newTopicId: topicForIndex(0), fireAt: clock.now + 1_000 }));
+		sched.schedule(notice({ newTailId: tailForIndex(0), fireAt: clock.now + 1_000 }));
 		expect(sched.pendingCount, 'an evicted successor re-surface reschedules (one timer)').to.equal(1);
 		clock.advance(1_000);
 		expect(rec.calls, 'exactly one extra re-register for the evicted successor — no more').to.have.length(movesAfterDrain + 1);

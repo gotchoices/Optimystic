@@ -20,6 +20,13 @@ export interface CohortTopicChangeNotifierDeps {
 	readonly service: CohortTopicService;
 	/** Resolve the pass-through commit cert for a change event (e.g. the cluster commit-cert store). */
 	readonly extractCommitCert: (event: CollectionChangeEvent) => CommitCert | undefined;
+	/**
+	 * Watch every commit event that names a tail, whether or not this node applied that tail — called ahead of
+	 * and independently of the origination gate. The node binds the reactivity origination manager's
+	 * `observeTailCommit`, which is how a machine in the old tail's group but not the new one sees its root
+	 * rotate. A throw is isolated and never stops origination.
+	 */
+	readonly observeTailCommit?: (event: CollectionChangeEvent) => void;
 }
 
 /**
@@ -49,7 +56,8 @@ export function selfAppliedTail(event: CollectionChangeEvent): boolean {
  * directly and never re-signs. A commit that landed only non-tail blocks here (no announcing duty) or one
  * for which no cert is retained (nothing authoritative to forward) is a no-op. A throwing downstream hook
  * is isolated + logged so origination can never break the commit (matching the {@link IBlockChangeNotifier}
- * listener contract).
+ * listener contract). Ahead of that gate, every event naming a tail also goes to the optional
+ * {@link CohortTopicChangeNotifierDeps.observeTailCommit}, so rotation is seen by machines that do not announce.
  *
  * The returned value IS an {@link IBlockChangeNotifier}: it is what `network-transactor` takes as its
  * `localChangeNotifier`, so per-collection {@link IBlockChangeNotifier.onCollectionChange} subscribers
@@ -70,11 +78,26 @@ export function makeCohortTopicChangeNotifier(deps: CohortTopicChangeNotifierDep
  * itself idempotent), so the node assembly can release it on node stop alongside `host.stop()`.
  */
 function buildCohortTopicChangeBridge(deps: CohortTopicChangeNotifierDeps): { notifier: IBlockChangeNotifier; unsubscribe: () => void } {
-	const unsubscribe = deps.source.onAnyCollectionChange((event) => originate(deps, event));
+	const unsubscribe = deps.source.onAnyCollectionChange((event) => {
+		observeTailCommit(deps, event);
+		originate(deps, event);
+	});
 	const notifier: IBlockChangeNotifier = {
 		onCollectionChange: (collectionId, listener): (() => void) => deps.source.onCollectionChange(collectionId, listener),
 	};
 	return { notifier, unsubscribe };
+}
+
+/** Hand a tail-bearing event to the tail observer, whatever the origination gate makes of it; isolates throws. */
+function observeTailCommit(deps: CohortTopicChangeNotifierDeps, event: CollectionChangeEvent): void {
+	if (event.tailId === undefined || deps.observeTailCommit === undefined) {
+		return;
+	}
+	try {
+		deps.observeTailCommit(event);
+	} catch (err) {
+		log('tail observer threw for collection=%s rev=%d: %o', event.collectionId, event.rev, err);
+	}
 }
 
 /** Run the tail-applied gate, cert extraction, and origination hook for one change event, isolating throws. */
