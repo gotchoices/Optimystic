@@ -39,3 +39,7 @@ A participant that is told its registration is unknown ends up registered again 
 The reply handling should make a missing case impossible to write: `onPingSuccess` branches on one of four reply kinds with an `if`, which is how this one went unhandled. An exhaustive `switch` over `RenewReplyV1.result` would have failed to compile.
 
 `docs/cohort-topic.md` § TTL and renewal should say what a participant does with each reply.
+
+## Second arm, same site: a re-walk's result is thrown away
+
+Found while planning `cohort-topic-a-topics-root-can-move`. When the renewal falls back to re-registering (`relookup` in `renewalTransport`, `packages/db-core/src/cohort-topic/service.ts`), it runs the register walk and discards the outcome: the participant's renewal record keeps the failed primary and backups, so the next three pings fail again and the walk re-runs, and the handle's tree tier (added by that ticket) keeps the tier of the original registration. Read from the code, not reproduced. A fix to the unknown-registration path will call `relookup` more often, so it should make `relookup` adopt the accepted walk's primary, backups, epoch and tree tier.

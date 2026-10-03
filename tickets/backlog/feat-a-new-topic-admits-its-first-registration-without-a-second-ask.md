@@ -18,7 +18,9 @@ Until the attach lands the watcher is not asleep: the same tick reads the collec
 
 ## Why it matters more than once
 
-The topic is derived from the log's tail block, and the log starts a new tail block every 32 entries. Each new block is a new topic nobody has registered under, so every move to a new block meets the same decline. That part is read from the code, not measured: the move goes through the same registration call. Together with the delay before a subscriber learns the tail moved (planned in `reactivity-tiers-below-the-root-use-the-collection-anchor`, which also stops tiers below the root from moving with the tail), a collection that commits steadily spends a large share of each block on the fallback check rather than on announcements.
+The topic is derived from the log's tail block, and the log starts a new tail block every 32 entries. Each new block is a new topic nobody has registered under, so every move to a new block meets the same decline. That part is read from the code, not measured: the move goes through the same registration call. Together with the delay before a subscriber learns the tail moved, a collection that commits steadily spends a large share of each block on the fallback check rather than on announcements.
+
+Once `reactivity-topic-is-the-collection-anchor` lands the topic stops changing per block, but the root still moves to the new tail's storage group, which is a coordinate nobody has registered at — so the same decline still meets every move, now only for the subscribers registered directly at the root (at most `cap_promote` = 64). `reactivity-per-root-state-is-keyed-by-the-tail` declined to have the outgoing root tell those subscribers about the move early, because this decline would still hold them for about 30 s; if this ticket lands, revisit that decision (recorded in `docs/reactivity.md` § Tail rotation).
 
 ## What was tried and why it did not help
 
