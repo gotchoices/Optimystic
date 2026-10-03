@@ -2,6 +2,7 @@ import type { ITopicRouter, PeerRef, TopicRouteKey } from "@optimystic/db-core";
 import { bytesToB64url, b64urlToBytes, encodeCohortMessage } from "@optimystic/db-core";
 import type { Libp2p } from "libp2p";
 import { peerIdFromString } from "@libp2p/peer-id";
+import { randomBytes } from "@libp2p/crypto";
 import type { FretService, RouteAndMaybeActV1, NearAnchorV1 } from "p2p-fret";
 import { bytesToPeerId } from "./peer-codec.js";
 import { requestResponse, requireReply, DEFAULT_STREAM_MAX_BYTES, type NoResultReplyError } from "./stream-util.js";
@@ -98,7 +99,10 @@ export class FretTopicRouter implements ITopicRouter {
 			min_sigs: opts.minSigs,
 			ttl: this.ttl,
 			activity: bytesToB64url(activity),
-			correlation_id: bytesToB64url(key) + ":" + now,
+			// A fresh nonce, not the key: FRET answers a repeated `correlation_id` from its dedup cache, so a key-
+			// derived id hands one participant's reply to another routing the same tier in the same millisecond, and
+			// FRET refuses an id over 256 characters at every forwarding hop, which a long root key would exceed.
+			correlation_id: bytesToB64url(randomBytes(16)) + ":" + now,
 			timestamp: now,
 			signature: "",
 		};

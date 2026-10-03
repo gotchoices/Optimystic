@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
-import { hashKey, type NearAnchorV1, type RouteAndMaybeActV1 } from 'p2p-fret';
+import { hashKey, parseRouteAndMaybeAct, type NearAnchorV1, type RouteAndMaybeActV1 } from 'p2p-fret';
 import {
 	bytesToB64url,
 	b64urlToBytes,
@@ -9,6 +9,7 @@ import {
 	createTierAddressing,
 	createWalkEngine,
 	decodeRegisterV1,
+	MAX_ROOT_KEY_BYTES,
 	type RegisterMessageFactory,
 } from '@optimystic/db-core';
 import { MockNode } from '../../src/testing/cohort-topic-mesh-harness.js';
@@ -123,5 +124,25 @@ describe('cohort-topic: topic router lands each walk step on its tier coordinate
 				expect(bytesToB64url(position), `${label}: tier ${treeTier} lands on coord_${treeTier}`).to.equal(bytesToB64url(served));
 			}
 		}
+	});
+
+	it('a frame on the longest root key the wire admits passes the FRET forwarding-hop check, and each frame has its own correlation id', async () => {
+		const routed: RouteAndMaybeActV1[] = [];
+		const fret = {
+			routeAct: async (msg: RouteAndMaybeActV1): Promise<NearAnchorV1> => {
+				routed.push(msg);
+				return { v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 0, confidence: 0 };
+			},
+		};
+		const router = new FretTopicRouter({} as never, fret as never, { clock: () => 1_000 });
+		const key = addressing.routeKey(0, self, topicId, new Uint8Array(MAX_ROOT_KEY_BYTES).fill(9));
+		const opts = { wantK: 16, minSigs: 14 };
+		await router.routeAndAct(key, new Uint8Array(1), opts);
+		await router.routeAndAct(key, new Uint8Array(1), opts);
+		for (const msg of routed) {
+			expect(parseRouteAndMaybeAct(msg), 'a forwarding hop would refuse this frame').to.not.equal(undefined);
+		}
+		// Same key, same millisecond: a shared id would let FRET's dedup cache answer the second with the first's reply.
+		expect(routed[0]!.correlation_id).to.not.equal(routed[1]!.correlation_id);
 	});
 });

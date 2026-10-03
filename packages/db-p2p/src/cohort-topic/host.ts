@@ -1860,6 +1860,11 @@ async function registerForwarderWithParent(ctx: CoordEngineContext, link: Forwar
  * the key from this engine's seed participant and the root key it holds now), so a key that does not hash to
  * `parentCoord` would deliver the link to a cohort other than the parent it names; that refuses the link,
  * leaving the forwarder `awaiting_parent`, rather than routing it there.
+ *
+ * NOTE: reachable by input, not only by a fault — a tier-1 engine on a host without root-group support that
+ * adopted a root key, then instantiated by a frame naming none (`parentCoord` = `coord_0`, key = the root key).
+ * The link frame names the root key, so the key is the consistent target; if this throw ever shows up in logs,
+ * derive `parentCoord` from the engine's current root key instead of from the instantiating frame.
  */
 function parentRouteKey(ctx: CoordEngineContext, link: ForwarderLink): TopicRouteKey {
 	const key = ctx.addressing.routeKey(link.treeTier - 1, link.participantCoord, link.topicId, link.rootKey);
