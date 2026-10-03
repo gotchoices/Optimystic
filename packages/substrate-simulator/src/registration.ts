@@ -245,8 +245,9 @@ export interface ParticipantRenewalOptions {
 
 /**
  * Participant-side renewal loop (cohort-topic.md §TTL and renewal). Pings the cached primary every
- * `ttl/3`; three consecutive unreachable pings promote the first reachable backup via re-attach;
- * if primary *and* all backups are unreachable it re-runs the lookup (re-registers). A
+ * `ttl/3`; three consecutive failed pings — unreachable, or answered `unknown_registration` — fail over: an
+ * unreachable primary promotes the first reachable backup via re-attach, and a lost record or primary *and*
+ * all backups unreachable re-runs the lookup (re-registers). A
  * `primary_moved` reply repoints the cache within one renewal window. Counters expose the observed
  * dynamics for the failover tests.
  */
@@ -346,7 +347,12 @@ export class ParticipantRenewal {
 				break;
 			}
 			case 'unknown_registration': {
-				this.reLookup(now);
+				// The cohort holds no record for this participant: a failed ping, like no answer. The cohort keeps
+				// one record for all its members, so no backup holds it either — the third strike re-runs the lookup.
+				this.consecutiveFailures++;
+				if (this.consecutiveFailures >= 3) {
+					this.reLookup(now);
+				}
 				break;
 			}
 		}

@@ -415,6 +415,9 @@ class WalkRegisterService implements CohortTopicService {
 				return decodeRenewReplyV1(raw, this.maxMessageBytes);
 			},
 			relookup: async (): Promise<RenewalAssignment | undefined> => {
+				// NOTE: re-sends the first registration's `appPayload` (for a collection watch, its `tailIdAtAttach`
+				// and `lastKnownRev`). No cohort reads those fields off a held record today; if one ever does, the
+				// re-walk needs a fresh payload from the registering caller.
 				const outcome = await this.walk.register(req.topicId, req.tier, req.appPayload, { rootKey: root.key });
 				if (outcome.kind !== "accepted") {
 					return undefined;
