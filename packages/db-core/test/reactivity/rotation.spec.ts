@@ -50,26 +50,36 @@ const fixedVerifier = (verdict: 'verified' | 'untrusted' = 'verified'): Notifica
 
 describe('reactivity tail rotation', () => {
 	describe('subscriber-side detection', () => {
-		it('detects a hard rotation when the delivered tailId differs from the followed tail', () => {
-			const d = detectRotation(TAIL_OLD, note(100, { tailId: TAIL_NEW }));
+		/** A subscriber following the old tail that has seen everything up to revision 99. */
+		const following = { tailId: TAIL_OLD, newestRevision: 99 };
+
+		it('detects a hard rotation when the delivered tailId differs from the followed tail at a newer revision', () => {
+			const d = detectRotation(following, note(100, { tailId: TAIL_NEW }));
 			expect(d.rotated).to.equal(true);
 			expect(d.newTailId).to.equal(TAIL_NEW);
 			expect(d.preAnnounced).to.equal(false);
 		});
 
+		it('reads a differing tailId at or below the newest revision seen as a late delivery from an earlier tail, not a rotation', () => {
+			// The subscriber followed the new tail at revision 100; the last notification announced at the old tail arrives afterwards.
+			const d = detectRotation({ tailId: TAIL_NEW, newestRevision: 100 }, note(100, { tailId: TAIL_OLD }));
+			expect(d.rotated).to.equal(false);
+			expect(d.newTailId).to.equal(undefined);
+		});
+
 		it('detects a pre-announce from rotationHint on a still-current-tail notification', () => {
-			const d = detectRotation(TAIL_OLD, note(100, { rotationHint: { newTailId: TAIL_NEW, effectiveAtRevision: 101 } }));
+			const d = detectRotation(following, note(100, { rotationHint: { newTailId: TAIL_NEW, effectiveAtRevision: 101 } }));
 			expect(d.rotated).to.equal(true);
 			expect(d.newTailId).to.equal(TAIL_NEW);
 			expect(d.preAnnounced).to.equal(true);
 		});
 
 		it('reports no rotation for a same-tail notification with no hint', () => {
-			expect(detectRotation(TAIL_OLD, note(100)).rotated).to.equal(false);
+			expect(detectRotation(following, note(100)).rotated).to.equal(false);
 		});
 
 		it('treats an already-rotated delivery as a hard rotation even if a hint is also present', () => {
-			const d = detectRotation(TAIL_OLD, note(100, { tailId: TAIL_NEW, rotationHint: { newTailId: b(7), effectiveAtRevision: 200 } }));
+			const d = detectRotation(following, note(100, { tailId: TAIL_NEW, rotationHint: { newTailId: b(7), effectiveAtRevision: 200 } }));
 			expect(d.preAnnounced).to.equal(false);
 			expect(d.newTailId).to.equal(TAIL_NEW);
 		});

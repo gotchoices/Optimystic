@@ -485,9 +485,12 @@ Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; c
 > fillingRevision)` builds the `rotationHint{ newTailId, effectiveAtRevision = fillingRevision + 1 }`, fired
 > on the block-filling commit detected by `BlockFillTracker` (which also fires anticipatory **warm-up** at
 > `block_fill_size − warm_threshold`); origination carries it through unchanged (`OriginationContext.rotationHint`).
-> **Detection**: `detectRotation(tail, n)` flags a rotation when the delivered `tailId` *or* the
-> `rotationHint.newTailId` differs from the tail the subscriber last followed (db-p2p's `ReactivitySubscriptionManager` invalidates
-> the sticky cohort-hint cache and surfaces a `RotationNotice` once per successor tail). **Drain**:
+> **Detection**: `detectRotation(followed, n)` flags a rotation when the delivered `tailId` differs from the
+> tail the subscriber last followed at a revision above any it has seen, *or* the `rotationHint.newTailId`
+> differs from that tail; a differing `tailId` at a revision already seen is a late delivery from a tail the
+> subscriber has moved past, since the old and the new root deliver independently (db-p2p's
+> `ReactivitySubscriptionManager` invalidates the sticky cohort-hint cache and surfaces a `RotationNotice` once
+> per successor tail, and only for a notification that verified). **Drain**:
 > `TailDrainGate` serves renewals/replays for `T_drain` while bouncing new subscriptions with a
 > `Promoted`-shaped `RotationRedirectV1` naming the new tail (its `newTopicId` is the collection's unchanged
 > topic); after `T_drain` it reports `drained`.
@@ -524,9 +527,12 @@ Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; c
 > member of the tail's group) leaves the remembered tail in place, and an event at or below the remembered
 > revision that names another tail — an older commit's sweep landing after the rollover — is ignored, so a late
 > event can never mark the live root rotated back to a tail the log left. **A subscriber registered at the old
-> root is not sent the new root's notifications**, so on a live node a delivered `tailId` never differs from
-> the tail it last followed
-> (that detection, `detectRotation` → `RotationNotice`, fires only where a successor can be pre-announced).
+> root is not sent the new root's notifications**, so on a live node a delivered `tailId` never names a later
+> tail than the one it last followed (that detection, `detectRotation` → `RotationNotice`, fires only where a
+> successor can be pre-announced). It can name an *earlier* one: the old root's last notifications and the new
+> root's first are sent by different machines, so one announced at the old tail can arrive after the
+> subscriber followed the new one, and `detectRotation` tells it apart by revision rather than following it
+> back.
 > A live subscriber moves in one of two ways. The watch service's tick (§Subscription) reads the collection's
 > tail and, finding a different tail block, has the manager follow it — a registration at the root registers
 > again under the new root key, one below the root only updates its root key — with no added jitter, since each subscription's tick started when its watch opened and

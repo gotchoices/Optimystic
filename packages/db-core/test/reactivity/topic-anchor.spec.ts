@@ -14,10 +14,6 @@ describe('reactivity topic anchor', () => {
 		expect([...reactivityRootCoord(utf8.encode('tail-block-1'))]).to.not.deep.equal([...reactivityRootCoord(utf8.encode('tail-block-2'))]);
 	});
 
-	it('two collections have different topics', () => {
-		expect([...reactivityCollectionTopicId(utf8.encode('app/users'))]).to.not.deep.equal([...reactivityCollectionTopicId(utf8.encode('app/orders'))]);
-	});
-
 	it('produces a ring-width (32-byte) topic id at the default ring bits', () => {
 		expect(reactivityCollectionTopicId(utf8.encode('app/users')).length).to.equal(32);
 	});

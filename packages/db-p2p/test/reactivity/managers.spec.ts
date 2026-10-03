@@ -455,6 +455,36 @@ describe('reactivity / subscription manager', () => {
 			expect(notices).to.have.length(1);
 			expect(notices[0]!.preAnnounced).to.equal(false);
 		});
+
+		it('a late delivery announced at the tail the subscription already left is not a rotation back to it', async () => {
+			const notices: RotationNotice[] = [];
+			const manager = makeRotationManager(notices);
+			await manager.onNotification(noteB64(42)); // announced at TAIL
+			// The host read the log at revision 43 on NEW_TAIL and had the manager follow it.
+			manager.rebaseline(43);
+			await manager.followTail(NEW_TAIL);
+			// Revision 43 was the last one announced at TAIL; its delivery arrives after the follow.
+			await manager.onNotification(noteB64(43));
+			expect(notices, 'an older tail at a revision already seen surfaces nothing').to.have.length(0);
+			// A revision above everything seen, announced at a third tail, is a rotation.
+			await manager.onNotification({ ...noteB64(44), tailId: bytesToB64url(new Uint8Array([7, 7, 7, 7])) });
+			expect(notices).to.have.length(1);
+		});
+
+		it('a notification that does not verify surfaces no rotation', async () => {
+			const notices: RotationNotice[] = [];
+			const manager = new ReactivitySubscriptionManager({
+				service: new RecordingService(new FixedVerifier('untrusted')),
+				collectionId: COLLECTION,
+				tail: TAIL,
+				quorumRatio: QUORUM_RATIO,
+				deliver: () => {},
+				lastKnownRev: 41,
+				onRotation: (n) => notices.push(n),
+			});
+			expect(await manager.onNotification({ ...noteB64(42), tailId: bytesToB64url(NEW_TAIL) })).to.equal('untrusted');
+			expect(notices).to.have.length(0);
+		});
 	});
 
 	describe('rotation redirect honored over recover (RotationRedirectError)', () => {

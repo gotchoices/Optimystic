@@ -60,7 +60,7 @@ export function buildRotationHint(newTailId: string, fillingRevision: number): R
 
 /** The subscriber-side rotation verdict for one delivered notification. */
 export interface RotationDetection {
-	/** True iff the subscriber's tree has rotated (delivered tail differs) or a rotation is pre-announced. */
+	/** True iff the subscriber's root has moved (delivered tail differs, at a newer revision) or a rotation is pre-announced. */
 	readonly rotated: boolean;
 	/** The tail id to re-register under, base64url — present iff `rotated`. */
 	readonly newTailId?: string;
@@ -72,18 +72,40 @@ export interface RotationDetection {
 	readonly preAnnounced: boolean;
 }
 
+/** What a subscriber knows of the collection's log when a notification arrives, for {@link detectRotation}. */
+export interface FollowedTail {
+	/** The latest tail the subscriber has followed, base64url. */
+	readonly tailId: string;
+	/**
+	 * The newest revision the subscriber has seen: delivered or verified from a notification, replayed by a
+	 * backfill or resume, or read from the log by its host. Revisions are allocated in order and the tail only
+	 * moves forward, so no revision at or below it was announced at a tail newer than the newest tail the
+	 * subscriber has seen a notification for.
+	 */
+	readonly newestRevision: number;
+}
+
 /**
- * Detect tail rotation for a subscriber following `followedTailId` (base64url, the latest tail it has
- * followed) from a delivered notification. Rotation is signaled when the delivered `tailId` **or** the
- * `rotationHint.newTailId` differs from it (`docs/reactivity.md` §Tail rotation). An already-rotated delivery
- * (different `tailId`) takes precedence over a pre-announce.
+ * Detect tail rotation for a subscriber following `followed.tailId` from a delivered notification. Rotation
+ * is signaled when the delivered `tailId` **or** the `rotationHint.newTailId` differs from it
+ * (`docs/reactivity.md` §Tail rotation). An already-rotated delivery (different `tailId`) takes precedence
+ * over a pre-announce.
+ *
+ * A differing `tailId` at a revision at or below `followed.newestRevision` is **not** a rotation: the
+ * notification was announced at a tail the subscriber has already moved past. The old and the new root are
+ * different machines delivering independently, so the last notification announced at the old tail can arrive
+ * after the subscriber followed the new one; without the revision check it would read as a rotation back to
+ * the old tail and cost a registration at a root that announces nothing further.
  */
-export function detectRotation(followedTailId: string, n: Pick<NotificationV1, "tailId" | "rotationHint">): RotationDetection {
-	if (n.tailId !== followedTailId) {
+export function detectRotation(followed: FollowedTail, n: Pick<NotificationV1, "tailId" | "rotationHint" | "revision">): RotationDetection {
+	if (n.tailId !== followed.tailId) {
+		if (n.revision <= followed.newestRevision) {
+			return { rotated: false, preAnnounced: false };
+		}
 		// The delivered notification was announced at the *new* root already — a hard rotation, not a pre-announce.
 		return { rotated: true, newTailId: n.tailId, preAnnounced: false };
 	}
-	if (n.rotationHint !== undefined && n.rotationHint.newTailId !== followedTailId) {
+	if (n.rotationHint !== undefined && n.rotationHint.newTailId !== followed.tailId) {
 		return { rotated: true, newTailId: n.rotationHint.newTailId, preAnnounced: true };
 	}
 	return { rotated: false, preAnnounced: false };

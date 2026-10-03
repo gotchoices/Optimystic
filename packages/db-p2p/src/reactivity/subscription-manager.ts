@@ -201,6 +201,12 @@ export class ReactivitySubscriptionManager {
 	/** The latest tail this subscription has followed — the topic's current root key (see {@link tail}). */
 	private latestTail: Uint8Array;
 	private latestTailB64: string;
+	/**
+	 * The newest revision a verified notification has carried, whether delivered, a duplicate or ahead of the
+	 * contiguity head. With {@link lastRevision} (which backfill and resume replays advance) it is what tells a
+	 * late delivery announced at a tail already left from a rotation (see {@link checkRotation}).
+	 */
+	private newestNotified: number;
 	/** The successor tail a rotation has already been surfaced for, so the notice fires once per rotation. */
 	private rotationHandledFor?: string;
 	/** Memoized db-core backfill driver (built on first gap, once `this.subscriber` is assigned). */
@@ -217,6 +223,7 @@ export class ReactivitySubscriptionManager {
 		this.ttlMs = options.ttlMs ?? (options.profile !== undefined ? subscriberTtlForProfile(options.profile) : undefined) ?? DEFAULT_SUBSCRIBER_TTL_MS;
 		this.deltaMaxBytes = options.deltaMaxBytes ?? (options.profile !== undefined ? deltaMaxForProfile(options.profile) : DEFAULT_EDGE_SAFE_DELTA_MAX);
 		this.lastKnownRev = options.lastKnownRev ?? 0;
+		this.newestNotified = this.lastKnownRev;
 		this.cohortHintCache = options.cohortHintCache ?? createStickyCohortHintCache();
 		this.clock = options.clock ?? ((): number => Date.now());
 		this.rejoinJitter = options.rejoinJitter ?? createRejoinJitter();
@@ -328,6 +335,7 @@ export class ReactivitySubscriptionManager {
 	 */
 	rebaseline(revision: number): void {
 		this.subscriber.rebaseline(revision);
+		this.newestNotified = Math.max(this.newestNotified, revision);
 	}
 
 	/**
@@ -482,19 +490,34 @@ export class ReactivitySubscriptionManager {
 	/**
 	 * Run the db-core delivery path for one inbound notification, then check for tail rotation
 	 * (`docs/reactivity.md` §Tail rotation): a delivered `tailId` that differs from the latest followed
-	 * {@link tail}, or a `rotationHint` pre-announce, invalidates the sticky cohort-hint cache (the cached
-	 * primary is at the old root) and surfaces a jittered follow plan via
-	 * {@link ReactivitySubscriptionManagerOptions.onRotation}. Fired at most once per successor tail.
+	 * {@link tail} at a revision above any this subscription has seen, or a `rotationHint` pre-announce,
+	 * invalidates the sticky cohort-hint cache (the cached primary is at the old root) and surfaces a jittered
+	 * follow plan via {@link ReactivitySubscriptionManagerOptions.onRotation}. Fired at most once per successor
+	 * tail, and only for a notification that verified: `tailId` is not covered by the threshold signature, but
+	 * a frame nobody in a root group signed must not be able to send this subscription walking to a root key
+	 * of the sender's choosing.
 	 */
 	async onNotification(n: NotificationV1): Promise<DeliveryOutcome> {
+		// Read before delivery: a contiguous `n` advances the subscriber's head to its own revision, and `n` must
+		// be judged against what came before it.
+		const newestBefore = this.newestRevision();
 		const outcome = await this.subscriber.onNotification(n);
-		this.checkRotation(n);
+		if (outcome === "untrusted" || outcome === "foreign") {
+			return outcome;
+		}
+		this.checkRotation(n, newestBefore);
+		this.newestNotified = Math.max(this.newestNotified, n.revision);
 		return outcome;
 	}
 
-	/** Detect a tail rotation from an inbound notification and surface it once per successor tail. */
-	private checkRotation(n: NotificationV1): void {
-		const detection = detectRotation(this.latestTailB64, n);
+	/** The newest revision this subscription knows of: notified, replayed by a backfill or resume, or read by its host. */
+	private newestRevision(): number {
+		return Math.max(this.newestNotified, this.subscriber.lastRevision);
+	}
+
+	/** Detect a tail rotation from a verified inbound notification and surface it once per successor tail. */
+	private checkRotation(n: NotificationV1, newestRevision: number): void {
+		const detection = detectRotation({ tailId: this.latestTailB64, newestRevision }, n);
 		if (!detection.rotated || detection.newTailId === undefined) {
 			return;
 		}
