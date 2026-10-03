@@ -197,6 +197,31 @@ describe('cohort-topic / willingness check', () => {
 		expect(out.retryAfterMs).to.equal(4_000);
 	});
 
+	it('tells a quorum short for want of unheard members (awaitingMembers) from one whose members answered unwilling', () => {
+		const view = createCohortView();
+		const self = bytesToB64url(peer('self'));
+		const sibA = bytesToB64url(peer('sib-A'));
+		const sibB = bytesToB64url(peer('sib-B'));
+		const check = createWillingnessCheck({
+			barometer: createLoadBarometer(),
+			view,
+			selfMember: self,
+			cohortMembers: () => [self, sibA, sibB],
+			primaryTopicCount: () => 0,
+			config: { cohortSize: 3, quorum: 2 },
+		});
+		const evaluate = (): unknown => check.evaluate(reg(Tier.T1), coreProfile(), 5_000);
+
+		// Nobody heard: self willing + two unheard could reach quorum 2.
+		expect(evaluate()).to.include({ kind: 'unwilling_cohort', awaitingMembers: true });
+		// One sibling answered unwilling: it is heard, but the other could still fill the quorum.
+		addSibling(view, sibA, 0);
+		expect(evaluate()).to.include({ kind: 'unwilling_cohort', awaitingMembers: true });
+		// Both answered unwilling: the answers are in and short.
+		addSibling(view, sibB, 0);
+		expect(evaluate()).to.include({ kind: 'unwilling_cohort', awaitingMembers: false });
+	});
+
 	it('sheds the tier via the per-tier primary-topic budget even when load is idle', () => {
 		const view = createCohortView();
 		addSibling(view, bytesToB64url(peer('sib-budget-1')), 0b1111);

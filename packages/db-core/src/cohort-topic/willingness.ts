@@ -13,7 +13,9 @@
  * - **{@link UnwillingCohortOutcome}** — fewer than a quorum of members are willing to serve the
  *   tier, so the cohort declines the tier entirely; the caller backs off in *time* (no spatial
  *   move — see §Why the caller doesn't walk on UnwillingCohort). The `retryAfterMs` follows the
- *   capped-doubling curve in {@link backoffRetryMs}.
+ *   capped-doubling curve in {@link backoffRetryMs}. The outcome also says whether the quorum is short
+ *   only for want of members that have not gossiped yet (`awaitingMembers`), which the member engine
+ *   answers by holding the request for their gossip rather than declining at once.
  *
  * A member's *live* willingness for a tier is: its profile serves the tier, the tier's load bucket
  * is below `overloadBucket`, **and** it is under its per-tier primary-topic budget. The coarse 1-bit
@@ -43,6 +45,14 @@ export interface UnwillingMemberOutcome {
 export interface UnwillingCohortOutcome {
 	readonly kind: "unwilling_cohort";
 	readonly retryAfterMs: number;
+	/**
+	 * True iff the quorum is short only because cohort members have not gossiped yet: it would be met if
+	 * every member this check holds no contribution from turned out willing. A member that has gossiped
+	 * *unwilling* counts as heard, so a cohort whose answers are in and short reports `false` — as does an
+	 * unserviceable tier, and a check given no {@link WillingnessDeps.cohortMembers}. The cohort side may hold
+	 * the request briefly for those answers instead of declining (§Cold-start instantiation).
+	 */
+	readonly awaitingMembers: boolean;
 }
 
 export type WillingnessOutcome = AcceptedOutcome | UnwillingMemberOutcome | UnwillingCohortOutcome;
@@ -146,6 +156,12 @@ export interface WillingnessDeps {
 	view: CohortView;
 	/** This member's own id, base64url (the `fromMember` key) — excluded from the sibling scan. */
 	selfMember: string;
+	/**
+	 * The cohort's current members, base64url (the form {@link selfMember} and the view keys use), read at
+	 * each evaluation. It tells a member that has not gossiped yet apart from one that gossiped unwilling
+	 * ({@link UnwillingCohortOutcome.awaitingMembers}). Absent → no member counts as unheard.
+	 */
+	cohortMembers?: () => readonly string[];
 	/** Count of topics this member is already `primary` for at `tier` (the budget gate input). */
 	primaryTopicCount: (tier: Tier) => number;
 	/**
@@ -182,7 +198,7 @@ class GossipWillingnessCheck implements WillingnessCheck {
 		const tier = reg.tier as Tier;
 		if (!ALL_TIERS.includes(tier)) {
 			// An op tier outside T0..T3 is not serviceable; treat as a cohort-level decline.
-			return { kind: "unwilling_cohort", retryAfterMs: backoffRetryMs(this.attempts(reg), this.backoff) };
+			return this.declineCohort(reg, false);
 		}
 
 		const selfWilling = this.selfLiveWilling(self, tier);
@@ -192,13 +208,28 @@ class GossipWillingnessCheck implements WillingnessCheck {
 		// Quorum gate (§Tier ladder): the cohort takes on tier-T duties only if a quorum of members
 		// is willing; otherwise registrations get UnwillingCohort and the caller backs off in time.
 		if (willingCount < this.quorum) {
-			return { kind: "unwilling_cohort", retryAfterMs: backoffRetryMs(this.attempts(reg), this.backoff) };
+			return this.declineCohort(reg, willingCount + this.unheardMemberCount() >= this.quorum);
 		}
 		if (selfWilling) {
 			return { kind: "accepted" };
 		}
 		// Quorum holds and self is unwilling → some sibling will serve.
 		return { kind: "unwilling_member", candidateMembers: siblings.map((m) => b64urlToBytes(m)) };
+	}
+
+	private declineCohort(reg: RegisterV1, awaitingMembers: boolean): UnwillingCohortOutcome {
+		return { kind: "unwilling_cohort", retryAfterMs: backoffRetryMs(this.attempts(reg), this.backoff), awaitingMembers };
+	}
+
+	/** Cohort members other than self this check holds no gossiped contribution from. */
+	private unheardMemberCount(): number {
+		const unheard = new Set<string>();
+		for (const member of this.deps.cohortMembers?.() ?? []) {
+			if (member !== this.deps.selfMember && this.deps.view.get(member) === undefined) {
+				unheard.add(member);
+			}
+		}
+		return unheard.size;
 	}
 
 	/** Live willingness of *this* member for `tier`: profile ∧ load-under-threshold ∧ under budget. */

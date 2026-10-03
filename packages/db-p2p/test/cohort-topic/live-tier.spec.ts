@@ -277,7 +277,7 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 		}
 	});
 
-	it('5b. (cold bootstrap) a brand-new cohort with NO willingness pre-seed admits its first registration after heartbeats propagate, and a sibling instantiates + replicates the record', async function () {
+	it('5b. (cold bootstrap) a brand-new cohort with NO willingness pre-seed admits its FIRST registration on the same request, and a sibling instantiates + replicates the record', async function () {
 		this.timeout(15_000);
 		const members = await makeMembers(N);
 		// d_max = 0 (sizeEstimate < F²) so the walk goes straight to coord_0, keeping the repro off tier 1.
@@ -286,46 +286,27 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 			const coord0 = addressing.coord0(TOPIC);
 			const deciding = mesh.nodeNearest(coord0);
 			const sibling = mesh.nodes.find((n) => n.member.idStr !== deciding.member.idStr)!;
+			const participant = mesh.nodes[0]!;
 
-			// --- the cold-start deadlock (repro) ---
-			// No `setupTopic`: every node is idle and holds no engine. FRET lands the first bootstrap register on
-			// the ONE nearest member, which instantiates its engine but — with an empty willingness view — cannot
-			// meet the quorum, so it declines. That is the deadlock the heartbeat + cold-sibling instantiation break.
-			let firstErr: unknown;
-			try {
-				await mesh.nodes[0]!.host.service.register({ topicId: TOPIC, tier: 0 as Tier });
-			} catch (err) {
-				firstErr = err;
-			}
-			expect(firstErr, 'a cold cohort declines its first registration (unwilling_cohort → temporal back-off)').to.be.instanceOf(CohortBackoffError);
-			const decidingEngine = deciding.host.registry.findByCoord(coord0);
-			expect(decidingEngine, 'the routed member instantiated its engine on the first register').to.not.equal(undefined);
-			expect(sibling.host.registry.findByCoord(coord0), 'a sibling holds no engine yet (never routed to)').to.equal(undefined);
-
-			// --- willingness heartbeat + cold-sibling instantiation bootstrap the cohort ---
-			// Wave 1: the deciding engine's first idle round emits a willingness heartbeat; every sibling
-			// instantiates its own coord-0 engine off that verified co-member frame and merges its willingness.
-			const now = Date.now();
-			await pumpMeshGossip(mesh, now);
-			expect(sibling.host.registry.findByCoord(coord0), 'a sibling instantiated its engine off the willingness heartbeat (change B)').to.not.equal(undefined);
-
-			// Wave 2: the freshly-instantiated siblings heartbeat their own willingness back, filling the deciding
-			// member's view to a quorum (self + ≥ ⌊k/2⌋ siblings). No admission-policy relaxation — the existing
-			// quorum gate is now satisfied honestly.
-			await pumpMeshGossip(mesh, now);
+			// No `setupTopic`, and no gossip round is pumped before the register: every node is idle and holds no
+			// engine. FRET lands the bootstrap register on the ONE nearest member, whose willingness view is empty.
+			// Rather than decline, it asks its siblings to gossip their willingness now and holds the request: each
+			// sibling instantiates its coord-0 engine off that frame and, hearing the routed member for the first
+			// time, answers at once. The quorum fills and the same request is admitted.
+			const handle = await participant.host.service.register({ topicId: TOPIC, tier: 0 as Tier });
+			expect(new Set(handle.cohortMembers.map(bytesToPeerIdString)), 'the first register is accepted, carrying the whole cohort').to.deep.equal(new Set(members.map((m) => m.idStr)));
 			expect(
-				await waitFor(() => decidingEngine!.cohortView().all().size >= 2, 5_000),
-				'the deciding member now sees enough willing siblings for the quorum',
+				await waitFor(() => sibling.host.registry.findByCoord(coord0) !== undefined, 5_000),
+				'a sibling instantiated its engine off the willingness advert the routed member sent',
 			).to.equal(true);
-
-			// --- register-once → accepted (the deadlock is broken) ---
-			const handle = await mesh.nodes[1]!.host.service.register({ topicId: TOPIC, tier: 0 as Tier });
-			expect(new Set(handle.cohortMembers.map(bytesToPeerIdString)), 'the accepted reply carries the whole cohort').to.deep.equal(new Set(members.map((m) => m.idStr)));
 
 			// --- a sibling replicates the admitted record (the real failover path, not the harness seed) ---
 			await pumpMeshGossip(mesh, Date.now());
 			const siblingEngine = sibling.host.registry.findByCoord(coord0)!;
-			expect(siblingEngine.holds(TOPIC, mesh.nodes[1]!.member.bytes), 'a sibling replicated the admitted record within a couple of rounds').to.equal(true);
+			expect(
+				await waitFor(() => siblingEngine.holds(TOPIC, participant.member.bytes), 5_000),
+				'a sibling replicated the admitted record in the round after the admission',
+			).to.equal(true);
 		} finally {
 			await mesh.stop();
 		}

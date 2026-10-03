@@ -46,6 +46,13 @@
  * its tier-`(d − 1)` parent by routing a (child-cohort-signed) {@link ChildLinkV1} over the router; the parent
  * authenticates + records the child and acks, and the forwarder stays `awaiting_parent` until that `linked` ack.
  *
+ * **Cold-start quorum wait (§Cold-start instantiation).** A cohort that has just started serving a topic has
+ * not heard its members' willingness yet. Rather than decline the register that woke it, a tier-0
+ * {@link CoordEngine} on a live-signer host broadcasts its own willingness at once — the frame an idle round's
+ * heartbeat sends — and holds the register ({@link createColdQuorumWait}) while its siblings instantiate
+ * their engines off that frame and answer the member they have heard for the first time. The register is
+ * then decided again on the same request. {@link CohortTopicHostOptions.coldQuorumWaitMs} bounds the hold.
+ *
  * **Root placement (§Tier addressing → Root placement at a routing key).** A topic may put its root at
  * `H(rootKey)` — a block's storage position — and the cohort there is then the **root group**: the key
  * network's serving cohort at that coordinate, read through {@link CohortTopicHostOptions.rootGroup}
@@ -130,6 +137,7 @@ import {
 	type ChildLinkReplyV1,
 	type CohortGossipV1,
 	type CohortGossipSignable,
+	type CohortTopicSummary,
 	type CohortTopicService,
 	type CohortMemberEngine,
 	type CohortSnapshot,
@@ -171,7 +179,8 @@ import {
 import { peerIdFromString } from "@libp2p/peer-id";
 import { FretTopicRouter } from "./topic-router.js";
 import { FretCohortGossipTransport, type CohortPeerResolver } from "./cohort-gossip-transport.js";
-import { buildCohortGossip, createPendingDeltas, DEFAULT_GOSSIP_INTERVAL_MS, DEFAULT_WILLINGNESS_HEARTBEAT_MS } from "./cohort-gossip-driver.js";
+import { buildCohortGossip, createPendingDeltas, DEFAULT_GOSSIP_INTERVAL_MS, DEFAULT_WILLINGNESS_HEARTBEAT_MS, type GossipDeltas } from "./cohort-gossip-driver.js";
+import { createColdQuorumWait, DEFAULT_COLD_QUORUM_WAIT_MS } from "./cold-quorum-wait.js";
 import { FretMembershipSource } from "./membership-source.js";
 import { FretMembershipPublishSink } from "./membership-publish-sink.js";
 import { FretCohortThresholdCrypto, createVerifyOnlyThresholdCrypto } from "./threshold-crypto.js";
@@ -219,6 +228,18 @@ export interface CohortTopicHostOptions {
 	 * cadence): the tick can fire fast while heartbeats stay throttled.
 	 */
 	readonly willingnessHeartbeatMs?: number;
+	/**
+	 * `T_cold_quorum_wait` (ms): how long a tier-0 {@link CoordEngine} holds a register whose willingness
+	 * quorum is short only because members have not gossiped yet, while it asks them to gossip now and their
+	 * answers arrive (§Cold-start instantiation). The register is then decided again on the same request, so
+	 * a new topic's first registration is admitted without a second ask. Default
+	 * {@link DEFAULT_COLD_QUORUM_WAIT_MS} (2 s); `0` disables the wait, and such a register is declined at once.
+	 *
+	 * Keep it well under 5 s. The participant reads the reply under p2p-fret's `RPC_TIMEOUT_MS` (5 s), on a
+	 * FRET-routed register and on a direct root-group dial alike, and a hold that outlasts it turns an
+	 * admission into a failed walk. Needs {@link privateKey}: a key-less host never waits.
+	 */
+	readonly coldQuorumWaitMs?: number;
 	/**
 	 * The node's libp2p Ed25519 private key. Required for the live participant signer: register/renew
 	 * bodies are peer-key-signed over their canonical image, and inbound register/`reattach` signatures
@@ -800,6 +821,10 @@ interface CoordEngineContext {
 	readonly maxBytes: number;
 	/** `T_willingness_heartbeat` (ms): idle-but-willing heartbeat throttle (§Cold-start instantiation). */
 	readonly willingnessHeartbeatMs: number;
+	/** The gossip-round cadence (ms): an engine sends at most one out-of-band willingness advert per interval. */
+	readonly gossipIntervalMs: number;
+	/** `T_cold_quorum_wait` (ms): how long a register is held for members' willingness; `0` → never held. */
+	readonly coldQuorumWaitMs: number;
 	/** Membership-cert sink the per-coord publishers serve through (node-wide; one cert per served coord). */
 	readonly publishSink: FretMembershipPublishSink;
 	/**
@@ -899,6 +924,10 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	const maxBytes = options.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
 	const gossipIntervalMs = options.gossipIntervalMs ?? DEFAULT_GOSSIP_INTERVAL_MS;
 	const willingnessHeartbeatMs = options.willingnessHeartbeatMs ?? DEFAULT_WILLINGNESS_HEARTBEAT_MS;
+	const coldQuorumWaitMs = options.coldQuorumWaitMs ?? DEFAULT_COLD_QUORUM_WAIT_MS;
+	if (!Number.isFinite(coldQuorumWaitMs) || coldQuorumWaitMs < 0) {
+		throw new RangeError(`coldQuorumWaitMs must be a non-negative number of milliseconds, got ${coldQuorumWaitMs}`);
+	}
 
 	const hash = new RingHash();
 	const selfPeerStr = node.peerId.toString();
@@ -1120,6 +1149,8 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		minSigs,
 		maxBytes,
 		willingnessHeartbeatMs,
+		gossipIntervalMs,
+		coldQuorumWaitMs,
 		publishSink,
 		privateKey: options.privateKey,
 		router,
@@ -2619,6 +2650,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		barometer: ctx.barometer,
 		view,
 		selfMember,
+		// The members a short quorum may still be waiting to hear from, in the form the view is keyed by.
+		cohortMembers: (): string[] => cohort().members.map(bytesToB64url),
 		primaryTopicCount: (tier: Tier): number => countPrimaryTopics(store, ctx.selfMemberBytes, tier),
 		// The willingness quorum is a majority of the cohort size: `wantK` for a FRET cohort, the root group's
 		// size for a root-placed one. The size is read once here, which is exact for a group sized by storage
@@ -2728,6 +2761,104 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		freshness: ctx.antiDos.replayGuard,
 	});
 
+	// --- frame emission: the round's frame and the out-of-band willingness advert (§Cold-start instantiation) ---
+
+	// Timestamp of the last frame this engine actually emitted (any frame carries willingness). Drives the
+	// idle-but-willing heartbeat throttle: an idle round heartbeats only if this engine has never emitted
+	// (first idle round → immediate) or `T_willingness_heartbeat` has elapsed. A record-carrying round emits
+	// every round and updates this clock, so the throttle governs only genuinely-idle engines; a willingness
+	// advert updates it too, so the round after one does not repeat it. `undefined` until the first emit.
+	// NOTE: re-broadcasts willingness for every idle-but-willing cohort every T_willingness_heartbeat; if a
+	// node ever serves very many idle cohorts, batch the heartbeats or lengthen the interval.
+	let lastGossipAt: number | undefined;
+
+	// Timestamp of the last willingness advert: an engine sends at most one per gossip interval, however many
+	// registers and newly heard members ask for one.
+	let lastAdvertAt: number | undefined;
+
+	/** This engine's frame at `now` over `topicSummaries` and `deltas`, or `undefined` when it has nothing to say. */
+	const frameAt = (now: number, heartbeat: boolean, topicSummaries: CohortTopicSummary[], deltas: GossipDeltas): CohortGossipV1 | undefined =>
+		buildCohortGossip({
+			fromMember: selfMember,
+			coord: bytesToB64url(servedCoord),
+			cohortEpoch: bytesToB64url(localEpoch()),
+			treeTier,
+			heartbeat,
+			profile: ctx.profile,
+			barometer: ctx.barometer,
+			windowSeconds: DEFAULT_TRAFFIC_WINDOW_SECONDS,
+			topicSummaries,
+			...deltas,
+			timestamp: now,
+			...(rootPlaced ? { rootPlaced: true as const } : {}),
+		});
+
+	/** Sign `g` (live-signer hosts) and broadcast it to the cohort. An engine closed while signing sends nothing. */
+	const signAndBroadcast = async (g: CohortGossipV1): Promise<void> => {
+		if (ctx.signGossip !== undefined) {
+			g.signature = await ctx.signGossip(g);
+		}
+		if (!closed) {
+			bus.broadcast(g);
+		}
+	};
+
+	/**
+	 * Tell the cohort this member's willingness at `at`, outside the round cadence, and say whether a frame
+	 * went out. The advert is the frame an idle round's heartbeat sends — no summaries, no deltas, nothing
+	 * drained from `pending`, no sweep — so a round racing it neither double-sends a delta nor heartbeats again.
+	 *
+	 * Only an idle engine (no records, nothing queued) adverts. A member's contribution replaces its previous
+	 * one in a sibling's view as a whole, so a summary-less frame from an engine holding records would blank
+	 * its topic summaries there until its next round — and such an engine gossips every round anyway. Only a
+	 * live-signer host adverts: without a key there is no co-member gate on the frames it would be answering.
+	 */
+	const advertiseWillingness = (at: number): boolean => {
+		const askedRecently = lastAdvertAt !== undefined && at - lastAdvertAt < ctx.gossipIntervalMs;
+		if (closed || ctx.signGossip === undefined || askedRecently || store.listAll().length > 0 || !pending.isEmpty()) {
+			return false;
+		}
+		const advert = frameAt(at, true, [], { records: [], evicted: [], childLinks: [], childUnlinks: [] });
+		if (advert === undefined) {
+			return false; // willing for no tier: nothing to advertise
+		}
+		lastAdvertAt = at;
+		lastGossipAt = at;
+		void signAndBroadcast(advert).catch((err: unknown) => {
+			log("cohort-topic: willingness advert failed at coord %s: %o", bytesToB64url(servedCoord), err);
+		});
+		return true;
+	};
+
+	// The one shared wait for registers this engine declines only because members have not gossiped yet. It
+	// opens by sending the advert, which doubles as the solicitation: a sibling with no engine for the coord
+	// instantiates one off it and, hearing this member for the first time, answers at once (below).
+	const coldQuorumWait = createColdQuorumWait({ waitMs: ctx.coldQuorumWaitMs, solicit: advertiseWillingness });
+	// Waiting is offered only where answers can arrive — a tier-0 engine on a live-signer host, the two
+	// conditions under which a sibling instantiates off a co-member's frame (`maybeInstantiateColdSibling`).
+	// Anywhere else it would only delay the decline.
+	const waitsForMembers = treeTier === 0 && ctx.signGossip !== undefined && ctx.coldQuorumWaitMs > 0;
+
+	if (ctx.signGossip !== undefined) {
+		// Members (self excluded) this engine has merged a frame from. One heard for the first time is answered
+		// with this engine's willingness at once, which is what makes a cold sibling answer the member that woke
+		// it within one delivery rather than on its next tick, and lets a member newly rotated into the cohort
+		// learn its siblings' willingness without waiting out a heartbeat. The set holds only members that passed
+		// the bus's co-member gate, so it grows as the gossip view it shadows does.
+		// NOTE: first contact stands in for "please answer". A member that restarts is not heard for the first
+		// time by siblings whose engines outlived it, so they answer on their idle heartbeat (up to
+		// T_willingness_heartbeat away) and its first register after the restart is declined as before. If that
+		// shows up, carry a signed "please answer" bit on the gossip frame instead of inferring it.
+		const heardMembers = new Set<string>();
+		bus.onGossip((g: CohortGossipV1): void => {
+			coldQuorumWait.recheck();
+			if (g.fromMember !== selfMember && !heardMembers.has(g.fromMember)) {
+				heardMembers.add(g.fromMember);
+				advertiseWillingness(Date.now());
+			}
+		});
+	}
+
 	const engine = createCohortMemberEngine({
 		self: ctx.selfMemberBytes,
 		profile: ctx.profile,
@@ -2741,6 +2872,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		renewal,
 		cohort,
 		quorumWilling: (tier: Tier): boolean => ctx.profile.willingTiers.has(tier),
+		quorumWait: waitsForMembers ? coldQuorumWait : undefined,
 		// Anti-DoS guards (gap 6): per-coord rate/replay/budget; node-level bootstrap-evidence policy.
 		rateLimiter,
 		// Dedicated probe-path rate limiter (independent budget from `rateLimiter`).
@@ -2767,15 +2899,6 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		}
 		return [...byKey.values()];
 	};
-
-	// Timestamp of the last frame this engine actually emitted (any frame carries willingness). Drives the
-	// idle-but-willing heartbeat throttle: an idle round heartbeats only if this engine has never emitted
-	// (first idle round → immediate, so bootstrap converges fast) or `T_willingness_heartbeat` has elapsed.
-	// A record-carrying round emits every round and updates this clock, so the throttle governs only
-	// genuinely-idle engines. `undefined` until the first emit.
-	// NOTE: re-broadcasts willingness for every idle-but-willing cohort every T_willingness_heartbeat; if a
-	// node ever serves very many idle cohorts, batch the heartbeats or lengthen the interval.
-	let lastGossipAt: number | undefined;
 
 	// Timestamp of the last round in which this engine re-advertised its linked child set, or `undefined` if it
 	// never has. Bounds child-set resync to one frame per `T_willingness_heartbeat`, not one per gossip round.
@@ -2831,35 +2954,16 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 				lastChildReadvertAt = now;
 			}
 		}
-		const { records, evicted, childLinks, childUnlinks } = pending.drain();
-		const idle = topicSummaries.length === 0 && records.length === 0 && evicted.length === 0
-			&& childLinks.length === 0 && childUnlinks.length === 0;
+		const deltas = pending.drain();
+		const idle = topicSummaries.length === 0 && deltas.records.length === 0 && deltas.evicted.length === 0
+			&& deltas.childLinks.length === 0 && deltas.childUnlinks.length === 0;
 		const heartbeat = idle && (lastGossipAt === undefined || now - lastGossipAt >= ctx.willingnessHeartbeatMs);
-		const g = buildCohortGossip({
-			fromMember: selfMember,
-			coord: bytesToB64url(servedCoord),
-			cohortEpoch: bytesToB64url(localEpoch()),
-			treeTier,
-			heartbeat,
-			profile: ctx.profile,
-			barometer: ctx.barometer,
-			windowSeconds: DEFAULT_TRAFFIC_WINDOW_SECONDS,
-			topicSummaries,
-			records,
-			evicted,
-			childLinks,
-			childUnlinks,
-			timestamp: now,
-			...(rootPlaced ? { rootPlaced: true as const } : {}),
-		});
+		const g = frameAt(now, heartbeat, topicSummaries, deltas);
 		if (g === undefined) {
 			return undefined;
 		}
 		lastGossipAt = now;
-		if (ctx.signGossip !== undefined) {
-			g.signature = await ctx.signGossip(g);
-		}
-		bus.broadcast(g);
+		await signAndBroadcast(g);
 		return g;
 	};
 
@@ -2970,6 +3074,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		demotionTick,
 		close: (): void => {
 			closed = true;
+			// A register held for members' gossip is answered now rather than at the wait's deadline.
+			coldQuorumWait.close();
 			bus.close();
 		},
 	};

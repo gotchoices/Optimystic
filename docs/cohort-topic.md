@@ -373,6 +373,8 @@ When a registration arrives at a cohort, FRET's `RouteAndMaybeAct` lands it on o
 
 The cohort gossips a coarse "willingness vector" (one bit per tier per member, refreshed every gossip round) so any member can answer `UnwillingMember` vs `UnwillingCohort` without polling siblings. Stale gossip is acceptable; over-reporting unwillingness costs a temporal retry, not a flood.
 
+Because the quorum is counted from gossip, a member whose gossip has not arrived yet is not the same as a member that gossiped unwilling, and the check tells them apart. It is given the cohort's current members, and when the quorum is short it also reports whether it would be met if every member not yet heard from turned out willing (`awaitingMembers` on `UnwillingCohortOutcome` in `packages/db-core/src/cohort-topic/willingness.ts`): `willing + unheard ≥ quorum`, where a member that has gossiped unwilling counts as heard. A cohort whose answers are in and short declines with `UnwillingCohort` at once. A cohort that is only waiting on answers does not decline at once: the routed member asks its members to gossip now and holds the request briefly for them (§Cold-start instantiation → *Bootstrapping a cold multi-node cohort*).
+
 An **idle** member — one holding no registrations — still advertises its willingness on a slow heartbeat (§Cold-start instantiation → *Bootstrapping a cold multi-node cohort*), rather than going silent. Without this a brand-new all-idle cohort could never reach a willingness quorum, so its first registration would be declined forever.
 
 > **Resolved (decided).** Willingness stays at **1 bit per tier** — no finer T3 gradations (e.g.
@@ -924,17 +926,19 @@ and the first registration is declined `UnwillingCohort` forever. Because FRET r
 for a coord to the *same* nearest member, the siblings are never independently woken either — the cohort
 never gets off the ground.
 
-Two coordinated mechanisms break this deadlock. Both are scoped to the single **tier-0** cohort this
+Two coordinated mechanisms break this deadlock, and two more let the first registration land on the request
+that started it rather than on a later retry. All four are scoped to the single **tier-0** cohort this
 milestone serves; tier-`d > 0` bootstrap needs the topic/`participantCoord` context a bare willingness
 frame lacks and is deferred to the parent-child link work (`cohort-topic-parent-child-link`).
 
 1. **Idle-but-willing willingness heartbeat.** An idle engine that is willing for at least one tier
    (`selfWillingnessBits ≠ 0`) still emits a *willingness/load-only* gossip frame (empty `topicSummaries`,
    no record/eviction deltas) so siblings hear that it will serve. It emits **immediately on the first idle
-   round after the engine is created** (so bootstrap converges in ≈ 2 rounds) and thereafter at most once
-   per `T_willingness_heartbeat` (§Configuration). A record-carrying (non-idle) round already ships
-   willingness every round and resets that clock, so the throttle governs only genuinely-idle engines; an
-   engine willing for *nothing* stays silent (it has nothing to bootstrap).
+   round after the engine is created** and thereafter at most once per `T_willingness_heartbeat`
+   (§Configuration). A record-carrying (non-idle) round already ships willingness every round and resets
+   that clock, so the throttle governs only genuinely-idle engines; an engine willing for *nothing* stays
+   silent (it has nothing to bootstrap). On its own this converges a cold cohort in about two gossip
+   rounds; mechanisms 3 and 4 send the same frame without waiting for a round.
 
 2. **Cold-sibling engine instantiation.** When a node receives a `/cohort-gossip` frame (e.g. the heartbeat
    above) for a coord it holds **no engine** for, it instantiates that engine so it joins the cohort's
@@ -944,11 +948,43 @@ frame lacks and is deferred to the parent-child link work (`cohort-topic-parent-
    assembly agrees you both serve. This bounds the DoS surface; without it, cold siblings would materialise
    only when independently routed to, which never happens.
 
-Convergence: the routed member's first idle round heartbeats → each sibling instantiates its own coord
-engine and merges the willingness → the siblings' next heartbeat fills the routed member's view → the
-retried registration meets the quorum and is admitted **through the existing quorum gate** (no
-admission-policy relaxation) → the admitted record replicates to the now-materialised siblings, restoring
-real warm replicas and failover.
+3. **Willingness advert and the quorum wait.** When the routed member's willingness check is short only
+   because members have not gossiped yet (`awaitingMembers`, §Willingness), the member does not decline. It
+   broadcasts the heartbeat frame of (1) at once, outside the round cadence — the **willingness advert** —
+   and holds the register for up to `T_cold_quorum_wait` (§Configuration). Each gossip frame it merges
+   re-runs the check for every held register; a register whose quorum is no longer waiting on members is
+   decided again from the top of the served-topic path, at the time the wait settled: a topic promoted
+   meanwhile answers `Promoted`, a topic whose forwarder the topic budget evicted meanwhile answers
+   `UnwillingCohort`, and otherwise the willingness check runs again and admits or declines. A register
+   waits at most once. The wait is one per engine: registers arriving while it is open share it, up to 64,
+   and the rest are declined at once. The advert is sent only by an **idle** engine (no records, nothing
+   queued for the next round), because a member's contribution replaces its previous one in a sibling's
+   view as a whole and a summary-less frame from an engine holding records would blank its topic summaries
+   there until its next round; a non-idle engine gossips every round anyway. An engine sends at most one
+   advert per gossip round interval, and when it may not send one no wait opens — which is what keeps a
+   member that never answers from turning every register on the engine into a full-length hold. The wait
+   is offered only where an answer can arrive: a tier-0 engine on a live-signer host, the conditions (2)
+   needs.
+
+4. **Answering a member heard for the first time.** Each engine remembers which members it has merged a
+   gossip frame from. The first frame from a member it had not heard is answered with the same advert, under
+   the same idle rule and throttle. A sibling instantiated by (2) has, by construction, just heard the member
+   that woke it for the first time, so it answers within one delivery rather than on its next round. The
+   same rule lets a member newly rotated into a cohort learn its siblings' willingness at once. It fires at
+   most once per newly heard member per engine. First contact stands in for an explicit request, which has
+   one gap: a member that restarts is not heard for the first time by siblings whose engines outlived it,
+   so they answer on their idle heartbeat and its first register after the restart is declined as it was
+   before (the "first contact stands in for" note in `packages/db-p2p/src/cohort-topic/host.ts` records the
+   remedy).
+
+Convergence: a bootstrap register reaches the routed member → it instantiates the forwarder, finds the
+quorum short only for want of members it has not heard, sends the advert and holds the request → each
+sibling instantiates its own coord engine off that frame, merges it and, hearing the routed member for the
+first time, adverts back → the routed member merges enough answers to meet the quorum and admits the
+registration **on the same request, through the existing quorum gate** (no admission-policy relaxation) →
+the admitted record replicates to the now-materialised siblings on the next round, restoring real warm
+replicas and failover. If too few members answer inside `T_cold_quorum_wait` the register is declined
+`UnwillingCohort` as before, and the participant's retry is admitted once their heartbeats have arrived.
 
 > **Implementation.** The heartbeat is the `heartbeat` branch of `buildCohortGossip`
 > ([`cohort-gossip-driver.ts`](../packages/db-p2p/src/cohort-topic/cohort-gossip-driver.ts)), driven by a
@@ -961,9 +997,15 @@ real warm replicas and failover.
 > `treeTier` rides `CohortGossipV1` — a coord is a hash and cannot be inverted to recover its tier, and every
 > member of a coord shares one `treeTier` by construction — and is **covered by the frame signature** so it
 > cannot be spoofed; instantiation is gated to `treeTier === 0` (a tier-`d > 0` frame for an unknown coord
-> falls through to today's drop). Specs: `gossip-cadence.spec.ts` (the willingness-only heartbeat frame),
-> `live-tier.spec.ts` 5b (cold-bootstrap end-to-end: cold cohort declines, heartbeats propagate, a sibling
-> instantiates, register-once → `accepted`, and the record replicates).
+> falls through to today's drop). The wait is the port `QuorumWait` in
+> `packages/db-core/src/cohort-topic/member-engine.ts`, which the member engine calls once per register
+> before deciding again; the host implements it with `createColdQuorumWait` in
+> `packages/db-p2p/src/cohort-topic/cold-quorum-wait.ts`, and `advertiseWillingness` in
+> `packages/db-p2p/src/cohort-topic/host.ts` builds, signs and broadcasts the advert for both the wait and
+> the first-heard answer. Specs: `gossip-cadence.spec.ts` (the willingness-only heartbeat frame),
+> `live-tier.spec.ts` 5b (cold-bootstrap end-to-end: a cold cohort's first register is accepted with no
+> gossip round pumped, a sibling instantiates, and the record replicates), `willingness.spec.ts`
+> (`awaitingMembers`) and `member-engine.spec.ts` (the wait-then-decide-again step).
 >
 > **Cost (tripwires).** The coord-engine registry is hard-capped (`createCoordRegistry`,
 > `coordEnginesMax`, default 2048) with **ranked** LRU eviction, so cold-sibling instantiation is no longer a
@@ -1157,6 +1199,8 @@ The layer relies on a small handful of structural defenses against malicious reg
 - **Per-cohort topic budget.** A cohort holds at most `topics_max` (default 2048) topics with forwarder state. When the budget is exhausted, new topic instantiations are refused with `UnwillingCohort`; existing topics continue. Eviction within the budget is LRU by participant count; topics with zero recent registrations are dropped first. Evicting a topic also tears down its cold-start forwarder and traffic window (via the budget's `onEvict` hook), so the served-topic set stays bounded by the budget — otherwise the leftover forwarder would keep the cohort serving the topic with no budget slot.
 - **Signed registrations.** Every `RegisterV1` carries a `correlationId` (16 random bytes) and a signature from the participant's peer key over `(topicId, tier, correlationId, timestamp)`. Stale-timestamp or replayed-correlationId messages are dropped. The replay guard's remembered-id map carries a hard `maxKeys` LRU cap (default 100 000, like the rate limiter), evicting the oldest-inserted — i.e. nearest-to-stale — id when full, so a flood of fresh admitted ids cannot grow it without bound. The register pipeline runs the rate limiter **before** the replay guard records anything, so a frame the rate limiter sheds inserts no `correlationId` and cannot drive replay-guard memory at attack speed.
 - **Cold-start requires evidence (bootstrap *and* follow-on).** A cold cohort accepting a cold-start register requires the registration to carry one of: a small proof-of-work, a signature from a peer with a sufficient reputation score ([architecture.md](architecture.md) §Reputation), or a signed reference to a parent topic that does exist. This gate fires on **both** cold-start flags: a `bootstrap: true` root register *and* a `followOn: true` deeper-tier register (the redirect-target instantiation) are gated identically — a follow-on is participant-asserted on the wire (the cold child cannot infer it; §Cold-start instantiation), so its safety rests on paying the same anti-abuse cost, not on provenance. Specifics depend on the application's tier — T0/T1 topics generally don't need PoW because they correspond to committed work; T2/T3 topics do. The evidence rides in a **dedicated, signature-covered** `RegisterV1.bootstrapEvidence` field — a versioned `BootstrapEvidenceEnvelopeV1` (`{ v, pow?, parentRef?, reputation? }`), base64url-encoded — **not** in the opaque `appPayload` slot (which the cohort copies verbatim into the registration's `appState` and replicates cluster-wide; overloading it would displace the real appState on the very register that needs it). Every kind binds the same canonical `(topicId, tier, participantCoord, timestamp)` tuple so a captured proof cannot be replayed for a different topic, tier, peer, or (within the replay window) time. The envelope format and the PoW preimage/difficulty are db-core (`antidos/bootstrap-evidence-envelope.ts`, crypto-free); the actual hashing and signature checks are db-p2p-injected.
+
+- **The cold-start wait adds a bounded hold, not new work.** A cohort that has just started serving a topic holds its first register while its members answer (§Cold-start instantiation → *Bootstrapping a cold multi-node cohort*). Three things bound what that gives a sender. It costs no new frames per cold start: the routed member's first idle heartbeat and each sibling's first heartbeat were already sent, and are now sent sooner; answering a member heard for the first time adds at most one frame per newly heard member per engine, under a per-engine throttle of one advert per gossip round interval. The wait runs only after every gate above has passed — participant signature, rate limit, cold-start evidence, replay guard, topic budget — so making many cohorts start up costs exactly what it did. And what a register can hold is one stream for at most `T_cold_quorum_wait`, only while its engine has members it has not heard from, with at most one wait opened per engine per gossip round interval and at most 64 registers in it.
 
 > **Follow-on hardening (deferred, tripwire — not a queued ticket).** PoW-gating a follow-on makes a
 > redirect-target cold-start exactly as costly as a root bootstrap, which is sufficient today. It is
@@ -1900,6 +1944,7 @@ interface MembershipCertV1 {
 | `ping_interval` | 30 s | Participant ping cadence (`ttl / 3`) |
 | `T_membership_refresh` | 5 min | Default refresh interval for membership certs |
 | `T_willingness_heartbeat` | 30 s | Slow re-broadcast interval, shared by **two** periodic re-advertisements. (1) An idle-but-willing engine's willingness heartbeat (§Cold-start instantiation): first idle round emits immediately; a record-carrying round resets the clock. (2) A parent engine's child-set resync (§Cohort gossip): the linked child set is re-advertised at most once per interval, which bounds how long a rotated-in parent member reads `childCohortCount == 0`. Cost/latency tradeoff: shorter converges a cold cohort *and* a rotated-in parent faster, but re-broadcasts more often — for every idle willing cohort and for every parent with children. Setting it longer than `gossip_round` is required for the throttle to bite at all; shorter than a round and every round re-advertises. |
+| `T_cold_quorum_wait` | 2 s | How long a tier-0 cohort member holds a register whose willingness quorum is short only for want of members it has not heard from, while it asks them to gossip now (§Cold-start instantiation). Host option `coldQuorumWaitMs`; `0` disables the wait and such a register is declined at once. It must stay well under the 5 s a participant waits for the reply (p2p-fret's `RPC_TIMEOUT_MS`, on a FRET-routed register and on a direct root-group dial alike), with room for the hops in front of it. |
 | `d_max_cap` | 60 | Hard cap on walk-toward-root start tier |
 | `confidence_min` | 0.3 | Below this `n_est` confidence, cap `d_max` at ⌊d_max_cap/2⌋ (upper bound) |
 | `topics_max` | 2048 | Max topics with forwarder state per cohort |

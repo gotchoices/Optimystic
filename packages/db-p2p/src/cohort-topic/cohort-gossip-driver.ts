@@ -45,8 +45,10 @@ export const DEFAULT_GOSSIP_INTERVAL_MS = 5_000;
  * On the order of the ping interval (~30 s, `ttl/3` Core) — a few gossip rounds at the 5 s cadence. A
  * record-carrying (non-idle) round already ships willingness every round and resets this clock, so the
  * throttle governs only engines with nothing else to say. The very first idle round after an engine is
- * created emits immediately (no wait), so bootstrap converges in ~2 rounds; the throttle only paces the
- * steady-state re-broadcast of an idle willing cohort.
+ * created emits immediately (no wait); the throttle only paces the steady-state re-broadcast of an idle
+ * willing cohort. A cold cohort does not wait on these rounds to converge: the member a first registration
+ * lands on sends the same frame at once, out of band, and each member answers a member it hears for the
+ * first time the same way (the host's willingness advert, §Cold-start instantiation).
  */
 export const DEFAULT_WILLINGNESS_HEARTBEAT_MS = 30_000;
 
@@ -73,7 +75,15 @@ export interface PendingDeltas {
 	/** True iff nothing is queued. */
 	isEmpty(): boolean;
 	/** Drain the queue into wire-shaped deltas, clearing it. */
-	drain(): { records: GossipRecordV1[]; evicted: GossipRecordRefV1[]; childLinks: ChildLinkRefV1[]; childUnlinks: ChildLinkRefV1[] };
+	drain(): GossipDeltas;
+}
+
+/** One round's registration-record and child-cohort deltas, in wire shape. */
+export interface GossipDeltas {
+	records: GossipRecordV1[];
+	evicted: GossipRecordRefV1[];
+	childLinks: ChildLinkRefV1[];
+	childUnlinks: ChildLinkRefV1[];
 }
 
 /** A queued child link/unlink: the wire ref plus whether it is a link (`true`) or an unlink (`false`). */
@@ -127,7 +137,7 @@ export function createPendingDeltas(): PendingDeltas {
 		isEmpty(): boolean {
 			return records.size === 0 && evicted.size === 0 && childDeltas.size === 0;
 		},
-		drain(): { records: GossipRecordV1[]; evicted: GossipRecordRefV1[]; childLinks: ChildLinkRefV1[]; childUnlinks: ChildLinkRefV1[] } {
+		drain(): GossipDeltas {
 			const childLinks: ChildLinkRefV1[] = [];
 			const childUnlinks: ChildLinkRefV1[] = [];
 			for (const delta of childDeltas.values()) {

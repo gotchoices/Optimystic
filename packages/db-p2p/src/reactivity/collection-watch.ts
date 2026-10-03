@@ -396,15 +396,15 @@ export class ReactivityCollectionWatch {
 		try {
 			landed = await manager.followTail(tailBytes);
 		} catch (err) {
-			// NOTE: accepted tradeoff — a root nobody has registered under before normally defers its first
-			// registration (`CohortBackoffError`, "retry after 1000ms") while its members exchange the willingness
-			// that admits one, so the first registration at each new tail lands on the next tick (30 s Core), not now.
-			// Retrying on the cohort's delay was measured and is slower: retries at 1 s, 3 s and 7 s were all
-			// deferred too, and the attach then landed at 60 s instead of 30 s. A cohort allows one peer four
-			// register frames per topic per minute and a walk on a new root sends two, so early retries spend
-			// the allowance before the cohort is ready. Revisit if the cohort's answer starts naming a delay that
-			// reflects when it will be ready (backlog
-			// `feat-a-new-topic-admits-its-first-registration-without-a-second-ask`).
+			// NOTE: accepted tradeoff — a failed registration is retried by the next tick (30 s Core), not sooner.
+			// A root nobody has registered under before admits its first registration on the request that asks:
+			// the member it lands on holds it while the other members answer with their willingness. So a
+			// `CohortBackoffError` here means too few of them answered inside that wait (2 s), or the cohort
+			// declined for a reason of its own. Retrying on the delay the cohort names (1000 ms) is not an
+			// improvement: a cohort allows one peer four register frames per topic per minute and a walk on a
+			// new root sends two, so early retries spend the allowance, and when the retries were measured
+			// against a cohort that was not ready the attach landed later, not sooner. Revisit if the cohort's
+			// answer starts naming a delay that reflects when it will be ready.
 			log("registration at tail=%s failed for collection=%s (retried by the next tick): %o", bytesToB64url(tailBytes), sub.collectionId, err);
 			return false;
 		}

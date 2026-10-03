@@ -14,7 +14,10 @@ import { DEFAULT_TTL_MS, MIN_TTL_MS, MAX_TTL_MS } from '../../src/cohort-topic/r
 import type { RegistrationRecord } from '../../src/cohort-topic/registration/types.js';
 import { createColdStartManager } from '../../src/cohort-topic/coldstart.js';
 import { createTrafficCounters } from '../../src/cohort-topic/traffic.js';
-import { createCohortView } from '../../src/cohort-topic/gossip/view.js';
+import { createCohortView, type MutableCohortView } from '../../src/cohort-topic/gossip/view.js';
+import { createWillingnessCheck } from '../../src/cohort-topic/willingness.js';
+import { createLoadBarometer } from '../../src/cohort-topic/load/barometer.js';
+import { coreProfile } from '../../src/cohort-topic/tiers.js';
 import type { RegisterV1, RenewV1 } from '../../src/cohort-topic/wire/types.js';
 
 function bytes(label: string, len = 32): Uint8Array {
@@ -241,7 +244,7 @@ describe('cohort-topic / member-engine: onAdmit fires on accept', () => {
 			hash,
 			store,
 			slots,
-			willingness: { evaluate: (): { kind: 'unwilling_cohort'; retryAfterMs: number } => ({ kind: 'unwilling_cohort', retryAfterMs: 1_000 }) },
+			willingness: { evaluate: (): { kind: 'unwilling_cohort'; retryAfterMs: number; awaitingMembers: boolean } => ({ kind: 'unwilling_cohort', retryAfterMs: 1_000, awaitingMembers: false }) },
 			promotion: unused('promotion'),
 			coldStart,
 			traffic: { recordArrival: (): void => {} } as never,
@@ -269,6 +272,107 @@ describe('cohort-topic / member-engine: onAdmit fires on accept', () => {
 		const result = await engine.handleRegister(reg, { followOn: false, treeTier: 0 }, 1_000);
 		expect(result.result, 'registration declined').to.equal('unwilling_cohort');
 		expect(admitCalled, 'onAdmit must not fire on rejection').to.equal(false);
+	});
+});
+
+describe('cohort-topic / member-engine: a register waits once for members not heard from', () => {
+	const hash = createRingHash();
+	const slots = createSlotAssigner(hash);
+	const self = bytes('wait-self', 16);
+	const sibling = bytes('wait-sibling', 16);
+	const members = [self, sibling, bytes('wait-silent-sibling', 16)];
+	const cohortEpoch = bytes('wait-epoch', 32);
+	const cohort = (): { members: readonly Uint8Array[]; cohortEpoch: Uint8Array } => ({ members, cohortEpoch });
+	const ARRIVED_AT = 1_000;
+	const SETTLED_AT = 1_400;
+
+	/**
+	 * A three-member cohort (quorum 2) over the real willingness check and an empty gossip view, so a cold
+	 * bootstrap register is first declined `awaitingMembers`. `duringWait` stands in for what the host's wait
+	 * does while the request is held; the fake reports what `ready()` said before and after it.
+	 */
+	function makeEngine(duringWait: (view: MutableCohortView) => void): {
+		engine: ReturnType<typeof createCohortMemberEngine>;
+		store: ReturnType<typeof createRegistrationStore>;
+		readiness: () => { before: boolean; after: boolean } | undefined;
+	} {
+		const store = createRegistrationStore();
+		const view = createCohortView();
+		let readiness: { before: boolean; after: boolean } | undefined;
+		const engine = createCohortMemberEngine({
+			self,
+			profile: coreProfile(),
+			hash,
+			store,
+			slots,
+			willingness: createWillingnessCheck({
+				barometer: createLoadBarometer(),
+				view,
+				selfMember: bytesKey(self),
+				cohortMembers: (): string[] => members.map(bytesKey),
+				primaryTopicCount: (): number => 0,
+				config: { cohortSize: members.length },
+			}),
+			promotion: {
+				onParticipantCountChange: (): Promise<undefined> => Promise.resolve(undefined),
+				maybeDemote: (): Promise<undefined> => Promise.resolve(undefined),
+				isPromoted: (): boolean => false,
+				applyPromotionNotice: (): void => {},
+				applyDemotionNotice: (): void => {},
+				hasAdoptedState: (): boolean => false,
+			},
+			coldStart: createColdStartManager({ parentRegistrar: { registerWithParent: (): Promise<void> => Promise.resolve() } }),
+			traffic: {
+				recordArrival: (): void => {},
+				snapshot: (): { windowSeconds: number; arrivalsPerMin: number; queriesPerMin: number; directParticipants: number; childCohortCount: number } =>
+					({ windowSeconds: 60, arrivalsPerMin: 0, queriesPerMin: 0, directParticipants: 0, childCohortCount: 0 }),
+			} as never,
+			renewal: unused('renewal'),
+			cohort,
+			quorumWilling: (): boolean => true,
+			quorumWait: {
+				until: (ready): Promise<number> => {
+					const before = ready();
+					duringWait(view);
+					readiness = { before, after: ready() };
+					return Promise.resolve(SETTLED_AT);
+				},
+			},
+		});
+		return { engine, store, readiness: (): { before: boolean; after: boolean } | undefined => readiness };
+	}
+
+	function bootstrapReg(topic: Uint8Array, participant: Uint8Array): RegisterV1 {
+		return {
+			v: 1,
+			topicId: bytesKey(topic),
+			tier: 0,
+			treeTier: 0,
+			participantCoord: bytesKey(participant),
+			ttl: 90_000,
+			bootstrap: true,
+			timestamp: ARRIVED_AT,
+			correlationId: bytesKey(bytes('cid-wait')),
+			signature: '',
+		};
+	}
+
+	it('admits on the same request once a sibling answers willing during the wait, and declines when none does', async () => {
+		const TOPIC = bytes('wait-topic');
+		const participant = bytes('wait-participant', 16);
+
+		const answered = makeEngine((view) => {
+			view.merge(bytesKey(sibling), { cohortEpoch, willingness: 0b1111, loadBuckets: [0, 0, 0, 0], windowSeconds: 60, topicSummaries: [], timestamp: ARRIVED_AT });
+		});
+		const accepted = await answered.engine.handleRegister(bootstrapReg(TOPIC, participant), { followOn: false, treeTier: 0 }, ARRIVED_AT);
+		expect(accepted.result, 'the sibling\'s answer fills the quorum inside the request').to.equal('accepted');
+		expect(answered.readiness(), 'the wait is ready exactly when the quorum no longer awaits members').to.deep.equal({ before: false, after: true });
+		expect(answered.store.getByParticipant(TOPIC, participant)?.attachedAt, 'the record is stamped with the clock the wait settled at').to.equal(SETTLED_AT);
+
+		const silent = makeEngine(() => {});
+		const declined = await silent.engine.handleRegister(bootstrapReg(TOPIC, participant), { followOn: false, treeTier: 0 }, ARRIVED_AT);
+		expect(declined.result, 'no answer inside the wait is the plain decline').to.equal('unwilling_cohort');
+		expect(silent.store.getByParticipant(TOPIC, participant), 'a declined register stores nothing').to.equal(undefined);
 	});
 });
 

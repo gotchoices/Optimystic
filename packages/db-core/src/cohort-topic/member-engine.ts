@@ -19,7 +19,9 @@
  *    cold-start gate decides whether to instantiate, else `no_state` (walk steps toward the root).
  * 3. **Admission** — on `accepted`, assign the deterministic primary/backup slots, persist the
  *    soft-state record, count the arrival, run the promotion trigger, and attach the topic-traffic
- *    signal to the reply.
+ *    signal to the reply. A decline that only reflects members not heard from yet — a cohort that has
+ *    just started serving the topic — is held on the injected {@link QuorumWait} while they answer,
+ *    then decided again, once.
  *
  * Every collaborator is injected, so the engine unit-tests without FRET or libp2p.
  */
@@ -62,6 +64,20 @@ export interface RegisterContext {
 	readonly parentCoord?: Uint8Array;
 }
 
+/**
+ * Holds a register whose cohort has not heard from enough of its members yet, so it can be admitted on the
+ * same request once they answer (§Cold-start instantiation). db-p2p's host implements it over the cohort
+ * gossip: it asks the members to gossip their willingness now and resolves as their frames merge.
+ */
+export interface QuorumWait {
+	/**
+	 * Resolve when `ready()` turns true or the wait's deadline passes, with the clock at which it settled.
+	 * Resolves at once (with `now`) when no wait can be opened — the engine is closed, the members were
+	 * asked too recently to be asked again, or too many registers are already waiting.
+	 */
+	until(ready: () => boolean, now: number): Promise<number>;
+}
+
 /** Current cohort snapshot — the FRET host fills this from the membership source. */
 export interface CohortSnapshotView {
 	readonly members: readonly Uint8Array[];
@@ -93,6 +109,11 @@ export interface CohortMemberEngineDeps {
 	readonly cohort: () => CohortSnapshotView;
 	/** Whether a quorum of members is willing to serve `tier` (the cold-start gate input). */
 	readonly quorumWilling: (tier: Tier) => boolean;
+	/**
+	 * Where a register declined only for want of members' gossip (`awaitingMembers`) waits for it, once,
+	 * before the decision is made again. Absent → such a register is declined at once.
+	 */
+	readonly quorumWait?: QuorumWait;
 	// --- anti-DoS guards (all optional; absent = that gate is skipped) ---
 	readonly rateLimiter?: RegisterRateLimiter;
 	/**
@@ -172,11 +193,7 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 
 		// 2. Hot path: this cohort already serves the topic.
 		if (this.serves(topicId)) {
-			if (this.deps.promotion.isPromoted(topicId)) {
-				// Promoted: bounce same-tier registrations onward (the cheap single-RPC redirect).
-				return promotedRedirectReply(ctx.treeTier + 1, this.deps.traffic.snapshot(topicId));
-			}
-			return this.admitOrDecline(reg, topicId, participantId, tier, ctx, now);
+			return this.decideServed(reg, topicId, participantId, tier, ctx, now, true);
 		}
 
 		// 3. Cold path: instantiate only at a legitimate growth point with a willing quorum. `ctx.followOn`
@@ -192,7 +209,7 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 			return this.unwillingCohort(reg, now);
 		}
 		this.deps.coldStart.instantiate(topicId, ctx.treeTier, ctx.parentCoord, tier);
-		return this.admitOrDecline(reg, topicId, participantId, tier, ctx, now);
+		return this.admitOrDecline(reg, topicId, participantId, tier, ctx, now, true);
 	}
 
 	/**
@@ -284,7 +301,28 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 
 	// --- admission ---
 
-	/** Run the willingness check; on `accepted` persist the record and attach the traffic signal. */
+	/** The decision for a topic this cohort serves: a promoted topic redirects onward, any other runs admission. */
+	private async decideServed(
+		reg: RegisterV1,
+		topicId: Uint8Array,
+		participantId: Uint8Array,
+		tier: Tier,
+		ctx: RegisterContext,
+		now: number,
+		mayWait: boolean,
+	): Promise<RegisterReplyV1> {
+		if (this.deps.promotion.isPromoted(topicId)) {
+			// Promoted: bounce same-tier registrations onward (the cheap single-RPC redirect).
+			return promotedRedirectReply(ctx.treeTier + 1, this.deps.traffic.snapshot(topicId));
+		}
+		return this.admitOrDecline(reg, topicId, participantId, tier, ctx, now, mayWait);
+	}
+
+	/**
+	 * Run the willingness check; on `accepted` persist the record and attach the traffic signal. A quorum
+	 * short only for want of members' gossip is waited for when `mayWait` — which the decision made after
+	 * that wait never is, so one register waits at most once.
+	 */
 	private async admitOrDecline(
 		reg: RegisterV1,
 		topicId: Uint8Array,
@@ -292,6 +330,7 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 		tier: Tier,
 		ctx: RegisterContext,
 		now: number,
+		mayWait: boolean,
 	): Promise<RegisterReplyV1> {
 		const outcome = this.deps.willingness.evaluate(reg, this.deps.profile, now);
 		switch (outcome.kind) {
@@ -299,6 +338,9 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 				return { v: 1, result: "unwilling_member", candidateMembers: outcome.candidateMembers.map(bytesKey) };
 			}
 			case "unwilling_cohort": {
+				if (mayWait && outcome.awaitingMembers && this.deps.quorumWait !== undefined) {
+					return this.decideOnceMembersAnswer(this.deps.quorumWait, reg, topicId, participantId, tier, ctx, now);
+				}
 				return { v: 1, result: "unwilling_cohort", retryAfterMs: outcome.retryAfterMs };
 			}
 			case "accepted": {
@@ -308,6 +350,33 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 				return this.unwillingCohort(reg, now);
 			}
 		}
+	}
+
+	/**
+	 * Hold `reg` until the members it is waiting on have gossiped (or the wait gives up), then decide again
+	 * from the top of the served-topic path at the clock the wait settled at: the topic can have been
+	 * promoted, or lost its forwarder to a topic-budget eviction, while the request was held.
+	 */
+	private async decideOnceMembersAnswer(
+		wait: QuorumWait,
+		reg: RegisterV1,
+		topicId: Uint8Array,
+		participantId: Uint8Array,
+		tier: Tier,
+		ctx: RegisterContext,
+		now: number,
+	): Promise<RegisterReplyV1> {
+		const settledAt = await wait.until(() => !this.awaitsMembers(reg, now), now);
+		if (!this.serves(topicId)) {
+			return this.unwillingCohort(reg, settledAt);
+		}
+		return this.decideServed(reg, topicId, participantId, tier, ctx, settledAt, false);
+	}
+
+	/** True while `reg` is still declined only for want of members' gossip. */
+	private awaitsMembers(reg: RegisterV1, now: number): boolean {
+		const outcome = this.deps.willingness.evaluate(reg, this.deps.profile, now);
+		return outcome.kind === "unwilling_cohort" && outcome.awaitingMembers;
 	}
 
 	private async accept(

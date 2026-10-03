@@ -106,7 +106,7 @@ await handle.close();
 
 - **Open the watch, then read.** A commit that the caller's read did not see wakes the watcher. The service cannot know what a caller has read, so the first committed tail it reads for a collection wakes that collection's watchers once, whether or not anything changed: a commit landing between the caller's read and that first tail read would otherwise be reported by nothing.
 - **One subscription per collection per node.** Every watch of a collection shares one subscription — one `ReactivitySubscriptionManager` and one handler in the node's `ReactivitySubscriberRegistry`, both for the subscription's whole life; the subscription closes with its last handle.
-- **Attach.** The service reads the tail, registers the manager's handler under the collection's topic, then registers with the cohort under the tail as the root key. A registration under a topic nobody has registered under before is normally deferred by the cohort (its members have not yet exchanged the willingness that admits one), and the retry is the next tick, so a first attach measured about 30 s on a three-node Core mesh. The watcher is still woken in the meantime, by the tick below.
+- **Attach.** The service reads the tail, registers the manager's handler under the collection's topic, then registers with the cohort under the tail as the root key. A registration under a root nobody has registered under before is admitted on the same request: the root group's member asks the others for their willingness and holds the register while they answer ([cohort-topic.md §Cold-start instantiation](cohort-topic.md#cold-start-instantiation)), which took 22–111 ms on a three-machine mesh over real sockets. What the subscriber waits for is its own side of that register. A cold-start register at reactivity's tier carries a proof of work ([cohort-topic.md §Anti-DoS](cohort-topic.md#anti-dos)), which the subscriber computes before it sends it, so a first attach on that mesh measured between 0.3 s and 17 s, 3 s at the median, nearly all of it the proof. If too few members answer inside the cohort's wait (2 s) the registration is deferred, and the retry is the next tick. The watcher is still woken in the meantime, by the tick below.
 - **The tick.** At the renewal cadence (TTL / 3: 30 s Core, 20 s Edge) the service renews the registration, reads the tail again, wakes the watchers if the revision is above the last one they were woken for, and has the manager follow the tail if the block is a different one: a registration at the root registers again under the new root key, one below the root sends nothing and only updates the root key a later re-walk would use (`moveRoot`). This is what bounds every failure the push path cannot rule out — a lost notification, a failed registration, a tail rotation nobody announced, a commit that was never announced at all — to one tick of delay. It costs one tail read per watched collection per tick.
 - **Recovery.** A gap is backfilled over the recover RPC. When the cohort cannot serve the gap, the watchers are woken anyway and the next tail read moves the manager's contiguity head to the revision it read, so one unservable gap does not turn every later notification into another backfill request.
 
@@ -560,14 +560,14 @@ Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; c
 - **Decided, not built: the outgoing root does not tell its direct subscribers.** A machine in the old tail's
   group could, at the rollover commit, send its direct subscribers a notification under the old tail carrying
   `rotationHint{ newTailId }`, so they learn of the move at once instead of at their next tail check. The move
-  it would trigger still waits on the subscriber's re-registration jitter (`T_rejoin_jitter`, 30 s uniform) and
-  on the new root deferring a first registration (backlog
-  `feat-a-new-topic-admits-its-first-registration-without-a-second-ask`, about 30 s measured) — the same order
-  as the tail check it would replace — so it would save about one notification's latency per log block, at
-  the cost of a second notification path that runs only on old-group machines holding a certificate for the
-  rollover commit (in a group of three or fewer, only the coordinator does). Revisit if the cold-start deferral
-  is removed and the root's direct subscribers on busy collections show the tail check as their dominant wake
-  latency.
+  it would trigger still waits on the subscriber's re-registration jitter (`T_rejoin_jitter`, 30 s uniform) —
+  the same order as the tail check it would replace — so it would save about one notification's latency per
+  log block, at the cost of a second notification path that runs only on old-group machines holding a
+  certificate for the rollover commit (in a group of three or fewer, only the coordinator does). The revisit
+  condition had two halves. The first is met: the new root no longer defers a first registration to a later
+  tick, it admits it on the request that asks (*Attach* above). The second is not measured: nothing yet
+  shows the tail check as the dominant wake latency for the root's direct subscribers on busy collections.
+  The decision stands until that is measured.
 
 The tail block changes when a block fills (`block_fill_size`, the log's `EntriesPerBlock` of 32 entries). Rotation moves the tree's root — and only the root — to the new tail block's ring coordinate; the topic and the tiers below the root stay.
 
