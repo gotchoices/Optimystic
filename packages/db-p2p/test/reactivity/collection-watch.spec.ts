@@ -52,6 +52,9 @@ class HeldRegistrationService implements CohortTopicService {
 	async withdraw(): Promise<void> {
 		this.withdraws++;
 	}
+	moveRoot(): never {
+		throw new Error('moveRoot is not used by the watch service');
+	}
 	cohortGossip(): never {
 		throw new Error('cohortGossip is not used by the watch service');
 	}

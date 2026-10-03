@@ -60,6 +60,9 @@ class RecordingService implements CohortTopicService {
 	async withdraw(): Promise<void> {
 		this.withdraws++;
 	}
+	moveRoot(): never {
+		throw new Error('moveRoot not used');
+	}
 	cohortGossip(): never {
 		throw new Error('cohortGossip not used');
 	}

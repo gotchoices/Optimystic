@@ -54,6 +54,8 @@ export interface AcceptedWalkOutcome {
 	 * probe carries a distinct correlationId; this is the one the cohort admitted.
 	 */
 	readonly correlationId: string;
+	/** The tree tier `d` of the register frame the cohort accepted — where the registration landed. */
+	readonly treeTier: number;
 }
 
 /**
@@ -228,7 +230,7 @@ class RouterWalkEngine implements WalkEngine {
 				case "accepted": {
 					// Surface the accepted probe's correlationId so the participant's renewals can echo it
 					// (RenewV1 correlationId "matches original RegisterV1"). `reg` is the frame just admitted.
-					return { kind: "accepted", reply, correlationId: reg.correlationId };
+					return { kind: "accepted", reply, correlationId: reg.correlationId, treeTier: reg.treeTier };
 				}
 				case "no_state": {
 					// Step toward the root. The cohort served nothing here; no spatial sibling state.

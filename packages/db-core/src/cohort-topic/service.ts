@@ -23,7 +23,7 @@ import { createTierAddressing, type TierAddressing } from "./addressing.js";
 import { makeDMaxComputer, type DMaxComputer } from "./dmax.js";
 import { DEFAULT_FANOUT } from "./addressing.js";
 import type { ISizeEstimator, ITopicRouter, IRingHash, RingCoord } from "./ports.js";
-import { createWalkEngine, type RegisterMessageFactory, type WalkEngine, type WalkOutcome } from "./walk.js";
+import { createWalkEngine, type AcceptedWalkOutcome, type RegisterMessageFactory, type WalkEngine, type WalkOutcome } from "./walk.js";
 import { createRenewalParticipant, type RenewalParticipant, type RenewalParticipantTransport, type UnsignedRenew } from "./registration/renewal.js";
 import type { RegistrationRecord } from "./registration/types.js";
 import { DEFAULT_TTL_MS } from "./registration/types.js";
@@ -33,13 +33,19 @@ import type { MembershipVerifier } from "./membership/verifier.js";
 import type { Tier } from "./tiers.js";
 import { bytesToB64url, b64urlToBytes, decodeRenewReplyV1, encodeCohortMessage } from "./wire/codec.js";
 import { MAX_ROOT_KEY_BYTES } from "./wire/validate.js";
-import type { RegisterReplyV1, RegisterV1, RenewReplyV1, TopicTrafficV1 } from "./wire/types.js";
+import type { RegisterV1, RenewReplyV1, TopicTrafficV1 } from "./wire/types.js";
 import type { CollectionChangeEvent, CommitCert } from "../transactor/change-notifier.js";
 
 /** A resolved cohort for a topic/tier — the return of {@link CohortTopicService.lookup}. */
 export interface CohortHint {
 	readonly topicId: Uint8Array;
 	readonly tier: Tier;
+	/**
+	 * The tree tier `d` the walk landed at: `0` is the topic's root cohort, `d ≥ 1` a cohort below it. A
+	 * root-placed topic's root can move while the tiers below it stay put, so a caller following a moved
+	 * root reads this to choose between {@link CohortTopicService.moveRoot} and registering again.
+	 */
+	readonly treeTier: number;
 	/** Serving cohort member. */
 	readonly primary: Uint8Array;
 	/** Warm-failover cohort members (1..2). */
@@ -115,6 +121,15 @@ export interface CohortTopicService {
 	/** Stop renewing `handle` and send a best-effort signed withdraw tombstone so the cohort frees the
 	 * record immediately (TTL expiry remains the fallback if the primary is unreachable). */
 	withdraw(handle: RegistrationHandle): Promise<void>;
+	/**
+	 * The topic's root moved to `rootKey` (a root-placed topic only — a handle registered without a root key
+	 * throws). Nothing is sent: a registration at a tier below the root stays where it is. A later re-walk of
+	 * this registration (renewal failover) names the new key, so it lands at the new root rather than the old
+	 * one. A registration AT the root (`handle.treeTier === 0`) is left at the old root by this call and must
+	 * be re-registered instead — `register` with the new key displaces it (see the NOTE at `startRenewal`).
+	 * A stale handle (no longer the live registration for its topic) is a no-op.
+	 */
+	moveRoot(handle: RegistrationHandle, rootKey: Uint8Array): void;
 	/** Origination hook the change-notifier bridge invokes per local member commit; see {@link LocalChangeHook}. */
 	onLocalCommit?: LocalChangeHook;
 	/** Cohort gossip bus — applications fold app state into the existing gossip. */
@@ -192,6 +207,17 @@ export interface CohortTopicServiceDeps {
 	readonly config?: CohortServiceConfig;
 }
 
+/** The root key a renewal's re-walk names — mutable, so {@link CohortTopicService.moveRoot} can re-point it. */
+interface RootKeySlot {
+	key: Uint8Array | undefined;
+}
+
+/** A live registration's renewal driver and the root key its re-walk reads. */
+interface LiveRenewal {
+	readonly renewal: RenewalParticipant;
+	readonly root: RootKeySlot;
+}
+
 class WalkRegisterService implements CohortTopicService {
 	public onLocalCommit?: LocalChangeHook;
 
@@ -201,8 +227,8 @@ class WalkRegisterService implements CohortTopicService {
 	private readonly clock: () => number;
 	private readonly ttl: number;
 	private readonly maxMessageBytes?: number;
-	/** Live renewal drivers, keyed by `(topicId, participantId)` so renew/withdraw find their handle. */
-	private readonly renewals = new Map<string, RenewalParticipant>();
+	/** Live renewals, keyed by `(topicId, participantId)` so renew/withdraw/moveRoot find their handle. */
+	private readonly renewals = new Map<string, LiveRenewal>();
 	private readonly participantId: Uint8Array;
 
 	constructor(private readonly deps: CohortTopicServiceDeps) {
@@ -246,18 +272,31 @@ class WalkRegisterService implements CohortTopicService {
 		if (outcome.kind !== "accepted") {
 			throw new CohortBackoffError(outcome.kind === "retry_later" ? outcome.afterMs : 0);
 		}
-		return this.hintFromReply(topicId, tier, outcome.reply, rootKey);
+		return this.hintFromReply(topicId, tier, outcome, rootKey);
 	}
 
 	async renew(handle: RegistrationHandle): Promise<void> {
 		// Act only if this handle is still the live entry. A stale handle (superseded by a second
 		// register() for the same pair) must not drive the new registration's ping loop, and a
 		// withdrawn handle must not silently re-start it.
-		if (this.renewals.get(recordKey(handle.topicId, this.participantId)) !== handle.renewal) {
+		if (this.liveRenewal(handle) === undefined) {
 			return;
 		}
 		await handle.renewal.pingLoop();
 		this.syncHandle(handle);
+	}
+
+	moveRoot(handle: RegistrationHandle, rootKey: Uint8Array): void {
+		assertRootKey(rootKey);
+		if (handle.rootKey === undefined) {
+			throw new Error("cohort-topic: moveRoot needs a root-placed registration; this one was registered without a rootKey");
+		}
+		const live = this.liveRenewal(handle);
+		if (live === undefined) {
+			return;
+		}
+		live.root.key = rootKey;
+		(handle as { rootKey?: Uint8Array }).rootKey = rootKey;
 	}
 
 	async withdraw(handle: RegistrationHandle): Promise<void> {
@@ -266,17 +305,16 @@ class WalkRegisterService implements CohortTopicService {
 		// primary so the cohort frees the record immediately instead of holding it for up to a full TTL.
 		// The delete happens FIRST so a concurrent renew() already no-ops before the tombstone is sent. If
 		// the tombstone send fails (primary unreachable), the cohort soft-state TTL-expires as the
-		// fallback — withdraw never throws on a transport failure. Idempotent: a second withdraw finds
-		// `renewal !== handle.renewal` (undefined ≠ any object) and no-ops.
+		// fallback — withdraw never throws on a transport failure. Idempotent: a second withdraw finds no
+		// live entry for the handle and no-ops.
 		// Guard: act only if this handle is still the live entry. A stale handle must not evict the
 		// new registration or send a tombstone on its behalf.
-		const key = recordKey(handle.topicId, this.participantId);
-		const renewal = this.renewals.get(key);
-		if (renewal !== handle.renewal) {
+		const live = this.liveRenewal(handle);
+		if (live === undefined) {
 			return;
 		}
-		this.renewals.delete(key);
-		await renewal.withdraw();
+		this.renewals.delete(recordKey(handle.topicId, this.participantId));
+		await live.renewal.withdraw();
 	}
 
 	cohortGossip(): CohortGossipBus {
@@ -293,9 +331,15 @@ class WalkRegisterService implements CohortTopicService {
 		if (outcome.kind !== "accepted") {
 			throw new CohortBackoffError(outcome.kind === "retry_later" ? outcome.afterMs : 0);
 		}
-		const hint = this.hintFromReply(req.topicId, req.tier, outcome.reply, req.rootKey);
+		const hint = this.hintFromReply(req.topicId, req.tier, outcome, req.rootKey);
 		const renewal = this.startRenewal(req, hint, outcome.correlationId);
 		return { ...hint, renewal };
+	}
+
+	/** The live renewal `handle` drives, or `undefined` when a later register displaced it or it was withdrawn. */
+	private liveRenewal(handle: RegistrationHandle): LiveRenewal | undefined {
+		const live = this.renewals.get(recordKey(handle.topicId, this.participantId));
+		return live?.renewal === handle.renewal ? live : undefined;
 	}
 
 	private startRenewal(req: RegisterRequest, hint: CohortHint, correlationId: string): RenewalParticipant {
@@ -311,7 +355,8 @@ class WalkRegisterService implements CohortTopicService {
 			ttl,
 			appState: req.appPayload,
 		};
-		const transport = this.renewalTransport(req);
+		const root: RootKeySlot = { key: req.rootKey };
+		const transport = this.renewalTransport(req, root);
 		const renewal = createRenewalParticipant(initial, {
 			transport,
 			clock: this.clock,
@@ -326,36 +371,42 @@ class WalkRegisterService implements CohortTopicService {
 			correlationId,
 			initialCohortEpoch: hint.cohortEpoch,
 		});
-		// NOTE: a second register() for the same (topicId, participantId) overwrites the map entry here,
-		// orphaning the prior renewal. renew()/withdraw() on the stale handle now no-op (identity guard),
-		// but no tombstone is sent for the superseded record — the cohort frees it via TTL expiry. Harmless
-		// for occasional re-registers; if callers ever churn-register the same pair, send a withdraw for the
-		// displaced renewal here so the cohort reclaims immediately instead of holding up to a full TTL.
-		this.renewals.set(recordKey(req.topicId, this.participantId), renewal);
+		// NOTE: accepted — a second register() for the same (topicId, participantId) displaces the first:
+		// renew()/withdraw()/moveRoot() on the displaced handle no-op (identity guard), and NO tombstone is
+		// sent for the displaced record, by design. A participant re-registers at a moved root while its old
+		// record still lives at the old one, and a machine in both roots' storage groups holds both; a
+		// tombstone resolves through the host's `findHolder`, which picks the newer record there, so it would
+		// evict the live registration. The displaced record expires by TTL at its cohort.
+		this.renewals.set(recordKey(req.topicId, this.participantId), { renewal, root });
 		return renewal;
 	}
 
-	/** Renewal transport: dial the cached primary directly; a full failure re-runs the register walk. */
-	private renewalTransport(req: RegisterRequest): RenewalParticipantTransport {
+	/**
+	 * Renewal transport: dial the cached primary directly; a full failure re-runs the register walk. The
+	 * re-walk reads the root key from `root` when it runs, so after {@link CohortTopicService.moveRoot} it
+	 * lands at the topic's current root rather than the one it registered under.
+	 */
+	private renewalTransport(req: RegisterRequest, root: RootKeySlot): RenewalParticipantTransport {
 		return {
 			send: async (target: Uint8Array, msg): Promise<RenewReplyV1> => {
 				const raw = await this.deps.router.dialMember({ id: target }, encodeCohortMessage(msg, this.maxMessageBytes));
 				return decodeRenewReplyV1(raw, this.maxMessageBytes);
 			},
 			relookup: async (): Promise<void> => {
-				// The re-walk carries the original request's root key, so it re-registers at the same root.
-				await this.walk.register(req.topicId, req.tier, req.appPayload, { rootKey: req.rootKey });
+				await this.walk.register(req.topicId, req.tier, req.appPayload, { rootKey: root.key });
 			},
 		};
 	}
 
-	private hintFromReply(topicId: Uint8Array, tier: Tier, reply: RegisterReplyV1, rootKey: Uint8Array | undefined): CohortHint {
+	private hintFromReply(topicId: Uint8Array, tier: Tier, outcome: AcceptedWalkOutcome, rootKey: Uint8Array | undefined): CohortHint {
+		const reply = outcome.reply;
 		if (reply.primary === undefined || reply.cohortEpoch === undefined) {
 			throw new CohortBackoffError(0);
 		}
 		return {
 			topicId,
 			tier,
+			treeTier: outcome.treeTier,
 			primary: b64urlToBytes(reply.primary),
 			backups: (reply.backups ?? []).map(b64urlToBytes),
 			cohortEpoch: b64urlToBytes(reply.cohortEpoch),

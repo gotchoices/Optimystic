@@ -299,14 +299,17 @@ export interface RootGroupOptions {
 }
 
 /**
- * How a {@link CoordEngine} addresses its topic's root — fixed when the engine is created. `rootPlaced` is
- * the rule the coordinate is served under: its cohort is the root group and its threshold the ratio rule
- * (tier 0 of a root-placed topic only). `rootKey` is the key the creating frame named, when it named one;
- * a tier-1 engine addresses its parent at `H(rootKey)` with it and stamps it on its child link. A later
- * frame for the coordinate that claims the other rule is refused ({@link CoordPlacementMismatchError}):
- * `H(rootKey)` carries no tier byte or topic id, so a root key can land on a coordinate some
- * default-addressed topic uses, and whichever frame arrived first must not pick the cohort view and the
- * threshold for a coordinate another topic depends on.
+ * How a {@link CoordEngine} addresses its topic's root. `rootPlaced` is the rule the coordinate is served
+ * under, fixed when the engine is created: its cohort is the root group and its threshold the ratio rule
+ * (tier 0 of a root-placed topic only). A later frame for the coordinate that claims the other rule is
+ * refused ({@link CoordPlacementMismatchError}): `H(rootKey)` carries no tier byte or topic id, so a root key
+ * can land on a coordinate some default-addressed topic uses, and whichever frame arrived first must not
+ * pick the cohort view and the threshold for a coordinate another topic depends on.
+ *
+ * `rootKey` is the topic's root key, when a frame named one. At a root-placed engine it is the preimage of
+ * the coordinate itself, so it never changes there. At a tier-`d ≥ 1` engine it follows the newest frame
+ * that names one, because a root-placed topic's root can move while its tiers below stay put: a tier-1
+ * engine addresses its parent at `H(rootKey)` with it and stamps it on its child link.
  */
 export interface EnginePlacement {
 	readonly rootPlaced: boolean;
@@ -324,8 +327,8 @@ function placementOf(treeTier: number, rootKey: Uint8Array | undefined): EngineP
 /**
  * Thrown when a frame claims the other placement rule for a coordinate this node already serves: a
  * root-placed register, child link, `/sign` or gossip frame at a coord served under the default rule, or
- * the reverse — including a tier-`d ≥ 1` frame naming a different root key than the engine recorded. The
- * dispatch paths catch it and answer a clean refusal.
+ * the reverse — including a frame naming a different root key at a root-placed engine, whose key is the
+ * coordinate's own preimage. The dispatch paths catch it and answer a clean refusal.
  */
 export class CoordPlacementMismatchError extends Error {
 	constructor(coord: RingCoord) {
@@ -543,10 +546,11 @@ export interface CoordEngine {
 	/**
 	 * The topic's root key, when a frame named one: a tier-1 engine addresses its parent at `H(rootKey)`.
 	 * An engine created by a frame without one (a gossip-instantiated cold sibling, a tier-`d ≥ 2` child's
-	 * link) adopts the key from the first frame that carries it ({@link CoordRegistry.forCoord}).
+	 * link) adopts the key from the first frame that carries it, and a tier-`d ≥ 1` engine follows the newest
+	 * frame's key when the topic's root moves ({@link CoordRegistry.forCoord}, {@link EnginePlacement}).
 	 */
 	readonly rootKey: Uint8Array | undefined;
-	/** Record the topic's root key on an engine created without one. Called by the registry only (see {@link rootKey}). */
+	/** Record the topic's root key, replacing any it held. Called by the registry only (see {@link rootKey}). */
 	adoptRootKey(rootKey: Uint8Array): void;
 	/** Cohort-side register/renew/sweep engine driven by the protocol handlers + activity callback. */
 	readonly engine: CohortMemberEngine;
@@ -578,8 +582,10 @@ export interface CoordEngine {
 	 * either is never an eviction candidate at all (see {@link EVICTION_RANK}).
 	 */
 	hasForwarders(): boolean;
-	/** True iff this engine holds the record for `(topicId, participantId)` — the renewal lookup key. */
+	/** True iff this engine holds the record for `(topicId, participantId)` (= `heldRecord(...) !== undefined`). */
 	holds(topicId: Uint8Array, participantId: Uint8Array): boolean;
+	/** The record this engine holds for `(topicId, participantId)` — the renewal lookup key — or `undefined`. */
+	heldRecord(topicId: Uint8Array, participantId: Uint8Array): RegistrationRecord | undefined;
 	/**
 	 * This cohort's locally-known direct registration records for `topicId` (the cohort-side read the
 	 * matchmaking `QueryV1` handler / aggregate-count producer serve from — `docs/matchmaking.md`
@@ -685,8 +691,9 @@ export interface CoordRegistry {
 	 * `participantCoord` seed a freshly-created engine's coord-derived tier inputs (ignored if the
 	 * engine already exists). Synchronous, so concurrent activity callbacks for the same coord share
 	 * one engine without a second being constructed. `placement` is the rule the frame asks for (default:
-	 * the default rule); an existing engine under the other rule — or, at tier `d ≥ 1`, holding a different
-	 * root key — throws {@link CoordPlacementMismatchError}, and one holding no key adopts the frame's. A
+	 * the default rule); an existing engine under the other rule — or a root-placed one naming a different
+	 * root key — throws {@link CoordPlacementMismatchError}, and a tier-`d ≥ 1` engine takes the frame's key
+	 * whether it held none or a different one (the topic's root moved; see {@link EnginePlacement}). A
 	 * root-placed creation requires the coord's root-group snapshot to have been read already (the caller
 	 * awaits `RootGroupSnapshots.ensure` first — this method stays synchronous).
 	 *
@@ -699,7 +706,11 @@ export interface CoordRegistry {
 	 * capacity refusal.
 	 */
 	forCoord(coord: RingCoord, treeTier: number, participantCoord: Uint8Array, placement?: EnginePlacement): CoordEngine;
-	/** The engine holding the record for `(topicId, participantId)`, or `undefined` (renewal dispatch). */
+	/**
+	 * The engine holding the record for `(topicId, participantId)`, or `undefined` (renewal dispatch). When
+	 * several engines hold one — the participant re-registered at a moved root and this node is in both
+	 * roots' groups — the one holding the newer record: greatest `attachedAt`, ties to greatest `lastPing`.
+	 */
 	findHolder(topicId: Uint8Array, participantId: Uint8Array): CoordEngine | undefined;
 	/**
 	 * The already-instantiated engine for `coord`, or `undefined` — a pure lookup that (unlike
@@ -1416,9 +1427,10 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		const topicId = b64urlToBytes(reg.topicId);
 		const participantCoord = b64urlToBytes(reg.participantCoord);
 		// NOTE: accepted — nothing ties a frame's `rootKey` to its `topicId`. A participant that names a wrong
-		// root key places its own registration at a root group that never announces to it; the only other
-		// effect is choosing which storage group serves a registration, which grinding a topic id already
-		// allowed. The host does check it is in the named group (`prepareRootPlacedCoord`).
+		// root key places its own registration at a root group that never announces to it; the other effects
+		// are choosing which storage group serves a registration, which grinding a topic id already allowed,
+		// and re-pointing a tier-1 cohort's parent until the next honest frame (see the NOTE in
+		// `reconcilePlacement`). The host does check it is in the named group (`prepareRootPlacedCoord`).
 		const rootKey = reg.rootKey === undefined ? undefined : b64urlToBytes(reg.rootKey);
 		if (rootKey !== undefined && rootGroup === undefined) {
 			return refusalReply(new RootPlacementRefusedError("not-served"))!;
@@ -1881,23 +1893,53 @@ export const EVICTION_RANK: Record<EngineStateKind, "pinned" | number> = {
 };
 
 /**
- * Hold `engine` to the rule it was created under: a frame asking for the other rule is refused, a frame
- * naming a different root key than the engine holds is refused, and a frame naming a key the engine has
- * none of yet teaches it the key (a gossip-instantiated cold sibling, or a tier-`d ≥ 1` engine a deeper
- * child's link created, learns its topic's root from the first frame that carries it).
+ * Hold `engine` to the rule it was created under: a frame asking for the other rule is refused. A frame
+ * naming a root key teaches it to an engine holding none (a gossip-instantiated cold sibling, or a
+ * tier-`d ≥ 1` engine a deeper child's link created, learns its topic's root from the first frame that
+ * carries it). A frame naming a different key than the engine holds replaces it at a tier-`d ≥ 1` engine —
+ * the topic's root moved, and the newest frame wins — and is refused at a root-placed engine, whose key is
+ * the coordinate's own preimage.
  */
 function reconcilePlacement(engine: CoordEngine, placement: EnginePlacement): void {
 	if (engine.rootPlaced !== placement.rootPlaced) {
 		throw new CoordPlacementMismatchError(engine.servedCoord);
 	}
-	if (placement.rootKey === undefined) {
+	if (placement.rootKey === undefined || (engine.rootKey !== undefined && bytesEqual(engine.rootKey, placement.rootKey))) {
 		return;
 	}
 	if (engine.rootKey === undefined) {
 		engine.adoptRootKey(placement.rootKey);
-	} else if (!bytesEqual(engine.rootKey, placement.rootKey)) {
+		return;
+	}
+	if (engine.rootPlaced) {
 		throw new CoordPlacementMismatchError(engine.servedCoord);
 	}
+	// NOTE: accepted — a tier-`d ≥ 1` engine adopts the root key of the newest frame that names one, so a
+	// participant naming a wrong key re-addresses this cohort's parent (cold-start parent registration,
+	// demotion fan-out, child link) until the next honest frame; nothing ties a root key to its topic (see the
+	// NOTE in `dispatchRegister`). The authenticated re-link of a child cohort to a moved root is backlog
+	// `feat-reactivity-notifications-reach-child-cohorts`; revisit this when it lands.
+	log("cohort-topic: coord %s follows its topic's root to a new key", bytesToB64url(engine.servedCoord));
+	engine.adoptRootKey(placement.rootKey);
+}
+
+/**
+ * True iff `candidate` is a newer registration than `incumbent` for one participant under one topic: a later
+ * `attachedAt`, ties broken by a later `lastPing`. A participant holds one registration per topic (the service
+ * keys its renewals by `(topicId, participant)` and a second register displaces the first), so of two records
+ * for one participant the one registered later is the live one. `attachedAt` is stamped by the accepting
+ * member at admission, carried unchanged through gossip (`toGossipRecord` in
+ * `packages/db-core/src/cohort-topic/gossip/records.ts`), and preserved by a renewal touch.
+ *
+ * NOTE: the two records were stamped by different members' clocks, so a skew larger than the time between
+ * the two registrations orders them the wrong way round. The live record then goes unrenewed and expires one
+ * TTL after the move, and the participant's next re-registration (renewal failover) restores it.
+ */
+function isNewerRegistration(candidate: RegistrationRecord, incumbent: RegistrationRecord): boolean {
+	if (candidate.attachedAt !== incumbent.attachedAt) {
+		return candidate.attachedAt > incumbent.attachedAt;
+	}
+	return candidate.lastPing > incumbent.lastPing;
 }
 
 /**
@@ -2017,13 +2059,21 @@ function createCoordRegistry(ctx: CoordEngineContext, maxEngines: number = DEFAU
 			return engine;
 		},
 		findHolder(topicId: Uint8Array, participantId: Uint8Array): CoordEngine | undefined {
+			// NOTE: every renew now visits every resident engine (it used to stop at the first holder), since a
+			// later engine may hold the newer record — bounded by `coordEnginesMax`. If renew dispatch ever shows
+			// up in a profile, index records by `(topicId, participantId)` across engines instead of scanning.
+			let holder: { key: string; engine: CoordEngine; record: RegistrationRecord } | undefined;
 			for (const [key, engine] of engines) {
-				if (engine.holds(topicId, participantId)) {
-					touch(key);
-					return engine;
+				const record = engine.heldRecord(topicId, participantId);
+				if (record !== undefined && (holder === undefined || isNewerRegistration(record, holder.record))) {
+					holder = { key, engine, record };
 				}
 			}
-			return undefined;
+			if (holder === undefined) {
+				return undefined;
+			}
+			touch(holder.key);
+			return holder.engine;
 		},
 		findServing(topicId: Uint8Array, treeTier: number): CoordEngine | undefined {
 			for (const [key, engine] of engines) {
@@ -2285,7 +2335,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	// --- placement (§Root placement at a routing key) ---
 	// A root-placed engine's cohort is the root group at `servedCoord`, read from the snapshot the dispatch path
 	// filled before creating it and refreshed on every gossip round; its threshold is the ratio rule. The root
-	// key is kept for a tier-1 engine's parent addressing (and may be adopted later, see `adoptRootKey`).
+	// key is kept for a tier-1 engine's parent addressing (adopted later, or replaced when the topic's root
+	// moves — see `adoptRootKey`), so every parent-addressing read below reads it at use, never at creation.
 	const rootPlaced = placement.rootPlaced;
 	let rootKey = placement.rootKey;
 	const rootGroup = rootPlaced ? requireRootGroup(ctx, servedCoord) : undefined;
@@ -2295,7 +2346,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	};
 	/**
 	 * A tier-1 engine of a root-placed topic has the root group as its parent (a demotion fans to that group).
-	 * Read at each use: the key may be adopted after creation (`adoptRootKey`).
+	 * Read at each use: the key may be adopted or replaced after creation (`adoptRootKey`).
 	 */
 	const parentRootPlaced = (): boolean => treeTier === 1 && rootKey !== undefined;
 	/**
@@ -2838,6 +2889,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		hasForwarders: (): boolean => liveness().forwarders,
 		holds: (topicId: Uint8Array, participantId: Uint8Array): boolean =>
 			store.getByParticipant(topicId, participantId) !== undefined,
+		heldRecord: (topicId: Uint8Array, participantId: Uint8Array): RegistrationRecord | undefined =>
+			store.getByParticipant(topicId, participantId),
 		records: (topicId: Uint8Array): readonly RegistrationRecord[] => store.listByTopic(topicId),
 		topicTraffic: (topicId: Uint8Array): TopicTrafficV1 => traffic.snapshot(topicId),
 		// NOTE: the only production caller today is the matchmaking QueryV1 serve handler

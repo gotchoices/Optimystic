@@ -132,6 +132,7 @@ describe('cohort-topic / walk-toward-root', () => {
 			const engine = createWalkEngine({ router, addressing, dmax: fixedDMax(dMax), self, factory: factoryFor(self) });
 			const outcome = await engine.register(TOPIC, 1);
 			expect(outcome.kind, `participant ${p} attaches at the root`).to.equal('accepted');
+			expect(outcome.kind === 'accepted' && outcome.treeTier, 'the outcome names the tier it landed at').to.equal(0);
 
 			// Single-direction: probes step strictly inward d_max → 0, never outward, never repeating a coord.
 			expect(router.probes.map((x) => x.treeTier)).to.deep.equal([3, 2, 1, 0]);
@@ -162,6 +163,7 @@ describe('cohort-topic / walk-toward-root', () => {
 		const outcome = await engine.register(TOPIC, 1);
 
 		expect(outcome.kind).to.equal('accepted');
+		expect(outcome.kind === 'accepted' && outcome.treeTier, 'landed at the redirect target, not the root it stepped through').to.equal(1);
 		// Inward to root, then the one outward move back to tier 1 (the redirect target).
 		expect(router.probes.map((x) => x.treeTier)).to.deep.equal([1, 0, 1]);
 		const coord1 = addressing.coord(1, self, TOPIC);

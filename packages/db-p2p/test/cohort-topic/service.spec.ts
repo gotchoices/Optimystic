@@ -40,7 +40,7 @@ import {
 	type RingCoord,
 	type Tier,
 } from '@optimystic/db-core';
-import { createCohortTopicHost, resolveRenew } from '../../src/cohort-topic/host.js';
+import { CoordPlacementMismatchError, createCohortTopicHost, resolveRenew, type CoordEngine, type CohortTopicHost } from '../../src/cohort-topic/host.js';
 import { bytesToPeerIdString } from '../../src/cohort-topic/peer-codec.js';
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from '../../src/cohort-topic/protocols.js';
 
@@ -479,5 +479,110 @@ describe('cohort-topic: per-served-coord scoping', () => {
 		expect(bytesToB64url(holder!.servedCoord), 'served by coord_0(topic), not selfCoord').to.equal(bytesToB64url(coord0Topic));
 
 		await host.stop();
+	});
+
+	describe('a topic whose root moved', () => {
+		const participantCoord = new TextEncoder().encode('participant-M');
+		const participantId = participantCoord;
+		const OLD_ROOT = new TextEncoder().encode('tail-block:old');
+		const NEW_ROOT = new TextEncoder().encode('tail-block:new');
+
+		/** Admit this participant's registration at `engine` at `now` (a single-member tier-0 cohort admits a bootstrap). */
+		async function admitAt(engine: CoordEngine, now: number, label: string): Promise<void> {
+			const reg: RegisterV1 = {
+				v: 1,
+				topicId: bytesToB64url(TOPIC),
+				tier: 0,
+				treeTier: 0,
+				participantCoord: bytesToB64url(participantCoord),
+				ttl: 90_000,
+				bootstrap: true,
+				timestamp: now,
+				correlationId: cid16(label),
+				signature: '',
+			};
+			const reply = await engine.engine.handleRegister(reg, { followOn: false, treeTier: 0 }, now);
+			expect(reply.result, `${label} admits`).to.equal('accepted');
+		}
+
+		function renewAt(now: number): RenewV1 {
+			return { v: 1, topicId: bytesToB64url(TOPIC), participantId: bytesToB64url(participantId), correlationId: cid16('renew'), timestamp: now, signature: '' };
+		}
+
+		/** Two engines at distinct coords on one self-only host — the old root's and the new root's. */
+		async function twoRootsHost(): Promise<{ host: CohortTopicHost; first: CoordEngine; second: CoordEngine }> {
+			const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret(() => []) as never, { wantK: 1 });
+			const addressing = createTierAddressing(new RingHash());
+			const first = host.registry.forCoord(addressing.rootCoord(OLD_ROOT), 0 as Tier, participantCoord);
+			const second = host.registry.forCoord(addressing.rootCoord(NEW_ROOT), 0 as Tier, participantCoord);
+			return { host, first, second };
+		}
+
+		it('a renew resolves to the newer of two records for one participant, whichever engine was created first', async () => {
+			const t0 = Date.now();
+			for (const newerOnFirst of [false, true]) {
+				const { host, first, second } = await twoRootsHost();
+				const [older, newer] = newerOnFirst ? [second, first] : [first, second];
+				await admitAt(older, t0, 'old-root-registration');
+				await admitAt(newer, t0 + 1_000, 'new-root-registration');
+
+				expect(host.registry.findHolder(TOPIC, participantId), `the later attachedAt wins (newer on first: ${newerOnFirst})`).to.equal(newer);
+				expect(resolveRenew(host.registry, renewAt(t0 + 2_000), t0 + 2_000).result).to.equal('ok');
+				expect(newer.heldRecord(TOPIC, participantId)!.lastPing, 'the renew touched the newer record').to.equal(t0 + 2_000);
+				expect(older.heldRecord(TOPIC, participantId)!.lastPing, 'and left the displaced one to expire').to.equal(t0);
+				await host.stop();
+			}
+		});
+
+		it('two records attached at the same instant: the later lastPing wins', async () => {
+			const t0 = Date.now();
+			const { host, first, second } = await twoRootsHost();
+			await admitAt(first, t0, 'first-registration');
+			await admitAt(second, t0, 'second-registration');
+			expect(second.engine.handleRenew(renewAt(t0 + 500), t0 + 500).result).to.equal('ok');
+
+			expect(host.registry.findHolder(TOPIC, participantId), 'the tie on attachedAt goes to the later lastPing').to.equal(second);
+			await host.stop();
+		});
+
+		it('a tier-1 engine follows a frame naming a different root key; a root-placed engine still refuses one', async () => {
+			let activityHandler: ActivityHandler | undefined;
+			const peerId = await makePeerId();
+			const host = await createCohortTopicHost(makeFakeNode(peerId) as never, makeFakeFret(() => [], (h) => { activityHandler = h; }) as never, {
+				wantK: 1,
+				rootGroup: { quorumRatio: 1, membersAt: (): Promise<string[]> => Promise.resolve([peerId.toString()]) },
+			});
+			const addressing = createTierAddressing(new RingHash());
+
+			// Below the root: the engine adopts the newest frame's key (the topic's root moved).
+			const coord1 = addressing.coord(1, participantCoord, TOPIC);
+			const tier1 = host.registry.forCoord(coord1, 1 as Tier, participantCoord, { rootPlaced: false, rootKey: OLD_ROOT });
+			expect(host.registry.forCoord(coord1, 1 as Tier, participantCoord, { rootPlaced: false, rootKey: NEW_ROOT }), 'accepted, same engine').to.equal(tier1);
+			expect(tier1.rootKey, 'the tier-1 engine now addresses its parent at the new root').to.deep.equal(NEW_ROOT);
+
+			// At the root: the key is the coordinate's preimage, so a different one is a mismatch. A root-placed
+			// register through the dispatch path reads the root group and creates the engine first.
+			const reg: RegisterV1 = {
+				v: 1,
+				topicId: bytesToB64url(TOPIC),
+				tier: 0,
+				treeTier: 0,
+				participantCoord: bytesToB64url(participantCoord),
+				ttl: 90_000,
+				bootstrap: true,
+				timestamp: Date.now(),
+				correlationId: cid16('root-placed'),
+				signature: '',
+				rootKey: bytesToB64url(NEW_ROOT),
+			};
+			await activityHandler!(bytesToB64url(encodeCohortMessage(reg)), []);
+			const rootCoord = addressing.rootCoord(NEW_ROOT);
+			const root = host.registry.findByCoord(rootCoord);
+			expect(root?.rootPlaced, 'the dispatch created the root-placed engine').to.equal(true);
+			expect(() => host.registry.forCoord(rootCoord, 0 as Tier, participantCoord, { rootPlaced: true, rootKey: OLD_ROOT })).to.throw(CoordPlacementMismatchError);
+			expect(root!.rootKey, 'the root engine kept its own key').to.deep.equal(NEW_ROOT);
+
+			await host.stop();
+		});
 	});
 });

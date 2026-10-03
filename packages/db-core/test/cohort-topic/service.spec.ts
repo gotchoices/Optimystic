@@ -166,3 +166,32 @@ describe('CohortTopicService / renew echoes the register correlationId', () => {
 		expect(renewCorrelationId, 'the renew echoes the accepted register\'s correlationId').to.equal(registerCorrelationId);
 	});
 });
+
+describe('CohortTopicService / moveRoot', () => {
+	it('a renewal re-walk after moveRoot names the new root key', async () => {
+		const OLD_ROOT = bytes('old-root', 16);
+		const NEW_ROOT = bytes('new-root', 16);
+		const walkedWith: (string | undefined)[] = [];
+		const router: ITopicRouter = {
+			routeAndAct: async (_key: RingCoord, activity: Uint8Array, _opts: { wantK: number; minSigs: number }) => {
+				walkedWith.push(decodeRegisterV1(activity).rootKey);
+				return encodeCohortMessage(acceptedReply);
+			},
+			dialMember: async () => {
+				throw new Error('primary unreachable');
+			},
+		};
+
+		const service = makeService(router);
+		const handle = await service.register({ topicId: TOPIC, tier: 1, rootKey: OLD_ROOT });
+		service.moveRoot(handle, NEW_ROOT);
+		walkedWith.length = 0;
+
+		// Three failed pings with no backup to re-attach to: the renewal re-runs the register walk.
+		for (let i = 0; i < 3; i++) {
+			await service.renew(handle);
+		}
+		expect(walkedWith, 'the failover re-walked').to.not.be.empty;
+		expect(walkedWith, 'every re-walk frame names the moved root').to.deep.equal(walkedWith.map(() => bytesToB64url(NEW_ROOT)));
+	});
+});
