@@ -22,7 +22,7 @@ import { randomBytes } from "@noble/hashes/utils.js";
 import { createTierAddressing, type TierAddressing } from "./addressing.js";
 import { makeDMaxComputer, type DMaxComputer } from "./dmax.js";
 import { DEFAULT_FANOUT } from "./addressing.js";
-import type { ISizeEstimator, ITopicRouter, IRingHash, RingCoord } from "./ports.js";
+import type { ISizeEstimator, ITopicRouter, IRingHash } from "./ports.js";
 import { createWalkEngine, type AcceptedWalkOutcome, type RegisterMessageFactory, type WalkEngine, type WalkOutcome } from "./walk.js";
 import { createRenewalParticipant, type RenewalParticipant, type RenewalParticipantTransport, type UnsignedRenew } from "./registration/renewal.js";
 import type { RegistrationRecord } from "./registration/types.js";
@@ -57,8 +57,9 @@ export interface CohortHint {
 	readonly topicTraffic?: TopicTrafficV1;
 	/**
 	 * The root key the topic was resolved under, when it is root-placed (its tier-0 cohort sits at
-	 * `H(rootKey)`). Absent for the default addressing. A caller verifying a message signed by that root
-	 * needs it to know the root's threshold rule applies.
+	 * `H(rootKey)`) — on a handle, the key {@link CohortTopicService.moveRoot} last named, which a handle at
+	 * the root (`treeTier` 0) holds before it has registered there. Absent for the default addressing. A
+	 * caller verifying a message signed by that root needs it to know the root's threshold rule applies.
 	 */
 	readonly rootKey?: Uint8Array;
 }
