@@ -108,6 +108,18 @@ describe('cohort-topic / CommitLogTrustAnchor (commit-log direct anchor)', () =>
 		expect(await anchorOver(group).directAnchor(certOver(TAIL_COORD, [cohort[0]!, newcomer!]), 3, placement)).to.equal('unknown');
 	});
 
+	it('is unknown for a cert signed by fewer of the committing cohort than its quorum (one member listing itself alone)', async () => {
+		// A root-placed cert's own threshold is a ratio of the members it lists, so a single real member is a
+		// full quorum of a one-member list; the anchor counts the quorum against the committing cohort instead.
+		const { keyPairs, proof } = await makeSignedProof(4, commitOf(3, 'a3'));
+		const cohort = ids(keyPairs);
+		const claim: CertifiedActionRev = { actionId: 'a3', rev: 3, proof };
+		const group = new GroupStub(cohort, Object.fromEntries(cohort.map((id) => [id, claim])));
+		const anchor = anchorOver(group);
+		expect(await anchor.directAnchor(certOver(TAIL_COORD, [cohort[0]!]), 3, placement), 'one of four').to.equal('unknown');
+		expect(await anchor.directAnchor(certOver(TAIL_COORD, cohort.slice(0, 2)), 3, placement), 'two of four, under ceil(4 × 0.75)').to.equal('unknown');
+	});
+
 	it('is unknown when no member serves a proof (pre-proof tail, or every peer silent)', async () => {
 		const cohort = ids(await makeKeyPairs(3));
 		const group = new GroupStub(cohort, {

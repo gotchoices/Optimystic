@@ -19,10 +19,13 @@
  * of the id, `routingKeyForBlock`). The **anchoring set** is the `peerIds` of the highest-revision certified
  * proof the tail's group returns (below); none → `"unknown"`. The certificate's `signers` — the quorum that
  * actually signed, which a forger cannot populate with real members without their keys, the same reasoning
- * as `FretTrustAnchor` — are decoded to peer-id strings and compared: every signer in the set →
- * `"anchored"`; no signer in the set → `"rejected"`; a partial overlap → `"unknown"`, because membership can
- * churn between the tail's last commit and the certificate, and over-rejecting would silence a legitimate
- * group where the chain or the next commit settles it. Total: any decode failure on attacker-supplied bytes
+ * as `FretTrustAnchor` — are decoded to peer-id strings and compared (`judgeSigners`, shared with that
+ * anchor): every signer in the set, and at least `ceil(|set| × quorumRatio)` of them → `"anchored"`; no
+ * signer in the set → `"rejected"`; a partial overlap → `"unknown"`, because membership can churn between
+ * the tail's last commit and the certificate, and over-rejecting would silence a legitimate group where the
+ * chain or the next commit settles it. Too few signers is `"unknown"` as well: the certificate's own
+ * threshold is a ratio of the members IT lists, so without the count against the set one group member could
+ * list itself alone and be vouched for. Total: any decode failure on attacker-supplied bytes
  * is `"unknown"`, and nothing here throws or rejects.
  *
  * **The anchoring set.** Every member of the root group at the coordinate (`membersAt`, the node's
@@ -35,7 +38,7 @@
  * loses to a current one; two certified proofs at that revision under different action ids are an
  * **equivocation** (`commit-log-anchor:equivocation`) and yield no set. Two certified proofs at one revision
  * under one action id can legitimately name different cohorts — a torn action is re-sent at the same action
- * id and revision, possibly to a group that rotated between the attempts — so their `peerIds` are united.
+ * id and revision, possibly to a group that rotated between the attempts — so their `peerIds` are united (a united set is larger, so it raises the quorum a certificate must reach: the union can only turn `"anchored"` into `"unknown"`).
  * `peerIds` rather than the proof's verified signers: it is the whole committing cohort, attested by the
  * super-majority that signed over its digest, and a certificate signer who was in the cohort but did not
  * vote in that one commit is still a legitimate member.
@@ -70,6 +73,7 @@ import { certifyClaim } from "../cluster/certified-claims.js";
 import type { ProofThresholds } from "../cluster/commit-proof.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
 import { bytesToPeerIdString } from "./peer-codec.js";
+import { judgeSigners, rootGroupQuorum } from "./signer-verdict.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("cohort-topic");
@@ -145,7 +149,7 @@ export class CommitLogTrustAnchor implements IMembershipTrustAnchor {
 	async directAnchor(cert: MembershipCertV1, _tier: number, placement?: RootPlacement): Promise<TrustAnchorVerdict> {
 		try {
 			const rootKey = placement?.rootKey;
-			if (rootKey === undefined || rootKey.length === 0) {
+			if (placement === undefined || rootKey === undefined || rootKey.length === 0) {
 				return "unknown"; // not a root-placed cert whose key the caller knew: nothing to locate
 			}
 			const coord: RingCoord = b64urlToBytes(cert.cohortCoord);
@@ -158,7 +162,7 @@ export class CommitLogTrustAnchor implements IMembershipTrustAnchor {
 				return "unknown"; // a self-consistent cert always has signers; defensive
 			}
 			const anchoring = await this.anchoringSetFor(utf8Decoder().decode(rootKey) as BlockId, coord);
-			return anchoring === undefined ? "unknown" : judgeSigners(signers, anchoring);
+			return anchoring === undefined ? "unknown" : judgeSigners(signers, anchoring, rootGroupQuorum(anchoring, placement));
 		} catch (err) {
 			// Any decode failure on attacker-supplied bytes, or an unexpected fault below: this anchor cannot
 			// judge the cert. Total, never throws — the verifier falls through to the chain / TOFU.
@@ -271,21 +275,4 @@ function chooseAnchoringSet(tailId: BlockId, claims: readonly CertifiedTailClaim
 		return { peerIds: undefined, rev: undefined };
 	}
 	return { peerIds: new Set(atTop.flatMap((c) => c.peerIds)), rev: top };
-}
-
-/** Every signer in the set → anchored; none → rejected; some → unknown (churn between commit and cert). */
-function judgeSigners(signers: readonly string[], anchoring: ReadonlySet<string>): TrustAnchorVerdict {
-	let inSet = 0;
-	for (const signer of signers) {
-		if (anchoring.has(signer)) {
-			inSet++;
-		}
-	}
-	if (inSet === signers.length) {
-		return "anchored";
-	}
-	if (inSet === 0) {
-		return "rejected";
-	}
-	return "unknown";
 }

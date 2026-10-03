@@ -697,8 +697,11 @@ A participant joining the network gets its initial trust roots (the cohorts resp
    > every member of the root group (the node's `rootGroupAt`) for the tail's latest claim and proof through
    > the node's own latest-revision consult, certifies each proof against the claim the peer made
    > (`certifyClaim`, so a proof for another block or revision is ignored), and takes the `peerIds` of the
-   > highest certified revision as the committing cohort. The cert's **signers** are judged against it: all in
-   > → `"anchored"`; none in → `"rejected"`; some in → `"unknown"` (membership churned between the commit and
+   > highest certified revision as the committing cohort. The cert's **signers** are judged against it: all in,
+   > and at least `ceil(|cohort| × quorumRatio)` of them (`judgeSigners` in
+   > `packages/db-p2p/src/cohort-topic/signer-verdict.ts`, which `FretTrustAnchor` applies to a root group the
+   > same way — a root-placed cert's own threshold is a ratio of the members it lists, so one member listing
+   > itself alone must not be vouched for) → `"anchored"`; none in → `"rejected"`; some in, or too few → `"unknown"` (membership churned between the commit and
    > the cert; the chain or the next commit settles it). Two certified actions at the top revision are an
    > equivocation (`commit-log-anchor:equivocation`) and anchor nothing. One anchoring set — or its absence —
    > is held per tail for the renewal cadence, with one in-flight fetch shared by concurrent calls, and the

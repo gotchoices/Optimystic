@@ -47,7 +47,9 @@
  * coord is the root of a root-placed topic passes a `RootPlacement`, and the authority for that coord is
  * not the FRET cohort of `wantK` but the **root group** — the key network's serving cohort at the coord,
  * which the host reads into a per-coord snapshot ({@link FretTrustAnchorOptions.rootGroupAt}). The same
- * signer-subset rule is applied against that group, with two differences. The group is a complete list
+ * signer-subset rule is applied against that group, with three differences. The signers must also number
+ * at least `ceil(|group| × quorumRatio)`, else `"unknown"`: a root-placed cert's own threshold is a ratio of
+ * the members it lists, so one group member listing itself alone would otherwise be vouched for. The group is a complete list
  * sized by storage placement, with no ring neighbours to widen it into, so the churn slack takes the form
  * of the partial-overlap verdict: a signer that has since rotated out of the group makes the cert
  * `"unknown"` (chain / TOFU), never `"rejected"`. And a snapshot this node has not read, or one naming
@@ -61,6 +63,7 @@
 import type { IMembershipTrustAnchor, MembershipCertV1, RingCoord, RootPlacement, TrustAnchorVerdict } from "@optimystic/db-core";
 import { b64urlToBytes, DEFAULT_MAX_NO_POW_TIER } from "@optimystic/db-core";
 import { bytesToPeerIdString } from "./peer-codec.js";
+import { judgeSigners, rootGroupQuorum } from "./signer-verdict.js";
 
 /**
  * The minimal slice of `FretService` the trust anchor needs: the ring's local two-sided cohort assembly
@@ -153,19 +156,9 @@ export class FretTrustAnchor implements IMembershipTrustAnchor {
 			if (signers.length === 0) {
 				return "unknown"; // nothing to judge (a self-consistent cert always has signers; defensive)
 			}
-			let inRing = 0;
-			for (const signer of signers) {
-				if (expected.has(signer)) {
-					inRing++;
-				}
-			}
-			if (inRing === signers.length) {
-				return "anchored"; // the whole signing quorum is a subset of a reasonable ring view
-			}
-			if (inRing === 0) {
-				return "rejected"; // a wholly-disjoint quorum — the ring knows a different cohort owns this coord
-			}
-			return "unknown"; // partial overlap beyond the slack — ambiguous churn; defer rather than over-reject
+			// A root-placed cert's own threshold is a ratio of the members it lists, so its quorum is counted
+			// against the group this node holds; the default rule's `minSigs` is node-wide and already fixed.
+			return judgeSigners(signers, expected, placement === undefined ? 1 : rootGroupQuorum(expected, placement));
 		} catch {
 			// Any decode failure on attacker-supplied bytes → the ring cannot judge it. Total, never throws.
 			return "unknown";

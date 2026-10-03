@@ -184,6 +184,7 @@ describe('cohort-topic / FretTrustAnchor (FRET-ring direct anchor)', () => {
 			expect(anchor.directAnchor(certOver(ROOT, ['p0', 'p1', 'p2']), 0, PLACEMENT), 'signers = the group → anchored, at the committed tier too').to.equal('anchored');
 			expect(anchor.directAnchor(certOver(ROOT, ['adv0', 'adv1']), 0, PLACEMENT), 'a disjoint keyset → rejected').to.equal('rejected');
 			expect(anchor.directAnchor(certOver(ROOT, ['p0', 'p1', 'p9']), 0, PLACEMENT), 'a signer outside the group (rotated out, or a ring neighbour) → unknown, never rejected').to.equal('unknown');
+			expect(anchor.directAnchor(certOver(ROOT, ['p1']), 0, PLACEMENT), 'one group member listing itself alone is under the quorum of the group → unknown').to.equal('unknown');
 			expect(anchor.directAnchor(certOver(ROOT, ['p0', 'p1', 'p2']), FRET_TIER), 'without the placement the ring is consulted, and it does not vouch for the group').to.equal('unknown');
 		});
 
