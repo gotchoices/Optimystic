@@ -774,14 +774,15 @@ A cohort promotes for topic `T` when, for a quorum of members:
 
 The cohort threshold-signs a `PromotionNoticeV1` and stores it as part of its forwarder state for `T`. Future registrations get `Promoted(d+1)` responses derived from the notice; existing participants are unaffected.
 
-A cohort may also pre-promote on observing rapid growth: if the slope of `directParticipants(T)` over a gossip window predicts crossing `cap_promote` within `T_promote_lookahead` (default 30s), promotion fires now. This avoids the gossip-lag race where a cohort over-shoots its cap before promotion can land.
+A cohort may also pre-promote on observing rapid growth: if the slope of `directParticipants(T)` over a gossip window predicts crossing `cap_promote` within `T_promote_lookahead` (default 30s), promotion fires now. This avoids the gossip-lag race where a cohort over-shoots its cap before promotion can land. The slope trigger fires only when `directParticipants(T) > cap_demote`: overshoot only matters near the cap; a promotion at or below `cap_demote` would put the cohort in a state the demotion rule already calls under-loaded, contradicting the `cap_promote`/`cap_demote` hysteresis; and two or three samples in under a second are noise, not a growth rate. Without the floor, two registrations under ~0.5 s apart extrapolate past `cap_promote` (`2 + 30 s / Δ ≥ 64` for `Δ ≤ 483 ms`) and promote a root that never demotes, sending every later registration on a small network to a tier `d+1` that cannot gather `minSigs` signatures. With the defaults the slope trigger can fire only at 17+ direct participants, the fast path at 32+ and the cap at 64+ — and since participants are distinct peers, a network of a few machines never promotes.
 
 > **Implementation.** The promotion/demotion state machine is
 > [`packages/db-core/src/cohort-topic/promotion.ts`](../packages/db-core/src/cohort-topic/promotion.ts)
 > (`PromotionLifecycle` / `createPromotionLifecycle`), keyed by `topicId` across every topic a cohort
 > serves. `onParticipantCountChange` (called eagerly per arrival/eviction) refreshes the growth + low-load
 > clocks and fires the cap / hot-fast-path (`cap_promote_fast` at `bucket ≥ bucket_overload`) / slope
-> triggers; `maybeDemote` (called on the gossip tick) enforces the `cap_demote` floor held for
+> triggers, the slope trigger floored at `count > cap_demote` (`promotionTriggered`; the simulator's
+> `packages/substrate-simulator/src/topic-tree.ts` mirrors the floor); `maybeDemote` (called on the gossip tick) enforces the `cap_demote` floor held for
 > `T_demote`, the no-live-children requirement, the `T_promote_sticky` floor, and the root-never-demotes
 > rule. Both transitions threshold-sign their notice via the gossip ticket's `CohortSigner`
 > (`sig/threshold.ts` + `sig/payloads.ts`) over the injected `ICohortThresholdCrypto` port, so the

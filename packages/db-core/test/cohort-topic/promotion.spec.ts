@@ -133,6 +133,17 @@ describe('cohort-topic / promotion lifecycle', () => {
 		expect(life.isPromoted(TOPIC)).to.be.true;
 	});
 
+	it('a burst of two registrations at the root does not pre-promote on slope', async () => {
+		// Two arrivals 400 ms apart extrapolate to 2 + 30000/400 = 77 ≥ cap_promote within the lookahead; the
+		// cap_demote floor keeps this burst from promoting a root that never demotes.
+		const knobs: Knobs = { count: 1, loadBucket: 0, children: 0, treeTier: 0 };
+		const life = lifecycleWith(knobs);
+		expect(await life.onParticipantCountChange(TOPIC, 0)).to.equal(undefined);
+		knobs.count = 2;
+		expect(await life.onParticipantCountChange(TOPIC, 400), 'two samples are noise, not a growth rate').to.equal(undefined);
+		expect(life.isPromoted(TOPIC)).to.be.false;
+	});
+
 	it('does not flap: stays promoted through a count drop within T_promote_sticky', async () => {
 		const knobs: Knobs = { count: DEFAULT_CAP_PROMOTE, loadBucket: 0, children: 0, treeTier: 1 };
 		const life = lifecycleWith(knobs);

@@ -247,7 +247,9 @@ export class TopicTree {
 		if (hot && state.directParticipants >= this.cfg.capPromoteFast) {
 			return true;
 		}
-		return this.slopePredictsCrossing(state, now);
+		// Floored at cap_demote, mirroring db-core's promotion lifecycle: a few arrivals in a burst are noise,
+		// and a promotion the demotion rule would call under-loaded contradicts the hysteresis.
+		return state.directParticipants > this.cfg.capDemote && this.slopePredictsCrossing(state, now);
 	}
 
 	/** Linear extrapolation over the growth window: will we cross `cap_promote` within lookahead? */

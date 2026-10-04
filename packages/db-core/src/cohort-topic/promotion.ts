@@ -12,8 +12,9 @@
  * - `directParticipants(T) ≥ cap_promote` (64), OR
  * - `loadBucket[tier(T)] ≥ bucket_overload` (6) AND `directParticipants(T) ≥ cap_promote_fast` (32)
  *   — the hot-load fast path from the capacity-barometer ticket, OR
- * - the growth **slope** predicts crossing `cap_promote` within `T_promote_lookahead` (30s) — fires
- *   early to avoid the gossip-lag overshoot (`§Promotion`: pre-promotion on slope).
+ * - `directParticipants(T) > cap_demote` (16) AND the growth **slope** predicts crossing `cap_promote`
+ *   within `T_promote_lookahead` (30s) — fires early to avoid the gossip-lag overshoot (`§Promotion`:
+ *   pre-promotion on slope); the floor keeps a burst of a few arrivals from reading as a flood.
  *
  * Once promoted, the state is **sticky** for ≥ `T_promote_sticky` (60s) before it can be reconsidered
  * for demotion, so transient count drops don't flap a cohort back to accepting.
@@ -318,7 +319,13 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 		if (this.deps.loadBucket(topicId) >= this.bucketOverload && count >= this.capPromoteFast) {
 			return true;
 		}
-		return this.slopePredictsCrossing(state, count);
+		// The slope trigger is floored at cap_demote. Pre-promotion exists to avoid overshooting cap_promote
+		// under gossip lag, which only matters near the cap; a promotion at or below cap_demote would put the
+		// cohort in a state the demotion rule already calls under-loaded (contradicting the cap_promote /
+		// cap_demote hysteresis), and two or three samples in under a second are noise, not a growth rate.
+		// Without the floor, two registrations < ~0.5 s apart promoted a root a small network can never serve
+		// past — the root never demotes, so every later watcher was redirected to an unformable tier 1.
+		return count > this.capDemote && this.slopePredictsCrossing(state, count);
 	}
 
 	/**
@@ -350,6 +357,11 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 		// NOTE: no guard here against fromTier === DEFAULT_D_MAX_CAP (60). At that depth toTier = 61 exceeds the
 		// tree-tier ceiling, so validatePromotionNoticeV1 rejects the notice on every receiver. Unreachable today
 		// (tree tier 60 is pathological); if the tree can ever reach the cap, gate promotion below the cap here.
+		// NOTE: promotion assumes tier fromTier+1 can form a cohort that signs at minSigs. With the defaults no trigger fires at or
+		// below cap_demote distinct participants, which implies enough peers only while participants are peers
+		// willing to serve that tier and cap_demote ≥ minSigs; if either stops holding (an edge-heavy network
+		// whose edge profiles keep deeper-tier willingness off, or a lowered cap_demote), gate promotion on the
+		// network-size estimate.
 		const topicB64 = bytesToB64url(topicId);
 		const epochB64 = bytesToB64url(this.deps.cohortEpoch());
 		const cohortB64 = bytesToB64url(this.deps.cohortCoord());
