@@ -1936,7 +1936,7 @@ interface MembershipCertV1 {
 | `cap_promote` | 64 | Direct-participant cap before promotion |
 | `cap_promote_fast` | 32 | Cap when load barometer is hot |
 | `bucket_overload` | 6 | Load-barometer bucket triggering fast promotion |
-| `cap_demote` | 16 | Direct-participant floor for demotion |
+| `cap_demote` | 16 | Direct-participant floor for demotion; the slope pre-promotion fires only above it |
 | `T_demote` | 5 min | Hysteresis window before demotion |
 | `T_promote_lookahead` | 30 s | Pre-promotion slope window |
 | `T_promote_sticky` | 60 s | Minimum time a cohort stays promoted before re-evaluating |
