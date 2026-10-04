@@ -186,10 +186,11 @@ What it needs:
   the host registers (`collectionFactory.registerLibp2pNode`) must have been built
   with it. A tagged table without one — and any table on a `local`, `test`,
   `mesh-test` or custom transactor — logs one warning and keeps local wakes only.
-- **Today, every machine in every cohort.** A notification verifies only when the
-  cohort that holds the collection's log tail is also the cohort the notification's
-  topic is served by, which today holds only when every machine is in every cohort:
-  `clusterSize` and `cohortTopic.wantK` equal to the number of machines.
+- **A registration at the tail's root.** A collection's notifications are rooted at
+  the storage group of its log tail block, so a watcher outside that group is woken
+  too; `clusterSize` and `cohortTopic.wantK` need not equal the number of machines.
+  What a watcher needs is a live registration at that root (see
+  [docs/reactivity.md](../../docs/reactivity.md) §Origination point).
 - **A machine that announces.** A commit is announced by the machine that
   coordinated it, from the commit certificate its cohort's consensus produced. The
   node the plugin builds itself runs with `clusterSize: 1`, so its own commits run
