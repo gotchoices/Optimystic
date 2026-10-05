@@ -76,14 +76,6 @@ pushing.
      a co-developer must not commit them. If this bites someone, a pre-commit
      guard rejecting a `portal:` resolution is a reasonable future hardening. -->
 
-`p2p-fret` cannot be linked this way at present. Its checkout declares
-`it-length-prefixed` 10 and `uint8arraylist` 2, where `@optimystic/db-p2p` is on
-11 and 3 (the majors libp2p 3.3 uses), and Yarn refuses a portal whose
-dependencies conflict with the package it is linked into (`YN0071`, and the
-install fails). Until Fret moves to the same majors, link Quereus alone with
-`yarn link ../quereus/packages/quereus`. Ticket
-`fret-checkout-cannot-be-linked-on-the-libp2p-3-3-line` tracks it.
-
 ## How to use:
 
 ### Host a stand-alone node

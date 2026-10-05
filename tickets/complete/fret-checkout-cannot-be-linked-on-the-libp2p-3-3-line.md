@@ -51,3 +51,7 @@ In the FRET repository: move `uint8arraylist` to ^3.0.2, `it-length-prefixed` to
 ## If nothing is done
 
 Users and CI are unaffected: they install `p2p-fret` from npm, as this repository now does, and every suite passes that way. What is lost is developing FRET and Optimystic side by side through the portal, and the assertion stays. Everything here is reversible.
+
+## Resolution (2026-10-05)
+
+Resolved by `p2p-fret` 1.0.1 (uint8arraylist ^3.0.2, it-length-prefixed ^11.0.1, multiformats ^14, built for libp2p 3.3). Here: `p2p-fret` raised to ^1.0.1 in db-p2p and substrate-simulator; the `p2p-fret` portal entry restored in root `resolutions` beside Quereus's (installs cleanly, `yarn build` passes linked); the assertion in `readFrame` removed; the README "cannot be linked" paragraph removed; `multiformats` 14 added to `scripts/shared-majors.cjs` (`yarn lint:deps` passes) and the "not here" note narrowed to `uint8arraylist`.

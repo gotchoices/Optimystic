@@ -32,17 +32,15 @@
  * length-prefixed codec typed by the other. db-p2p sat on the 3.1 line for that reason until it moved
  * its own `it-length-prefixed` and `uint8arraylist` to the majors the 3.3 line uses.
  *
- * WHAT IS DELIBERATELY NOT HERE — do not add these; both fail on the first run:
+ * WHAT IS DELIBERATELY NOT HERE — do not add it; it fails on the first run:
  *
  *   - `uint8arraylist`, which resolves to both 2 and 3
- *   - `multiformats`, which resolves to both 13 and 14
  *
- * Neither split is ours any longer: our workspaces are on uint8arraylist 3 and multiformats 14. The
- * older majors come from dependencies whose newest releases still declare them —
- * `@chainsafe/libp2p-noise@17.0.0` and `@chainsafe/libp2p-yamux@8.0.1` (uint8arraylist@^2), and
- * `p2p-fret@1.0.0` (uint8arraylist@^2, multiformats@^13). The two majors of `uint8arraylist` mark a
- * list with the same global symbol and read each other's lists, so that split is one of declared
- * types, not of behaviour. Both become guardable when those three packages move.
+ * The split is not ours: our workspaces and `p2p-fret@1.0.1` are on uint8arraylist 3. The older
+ * major comes from `@chainsafe/libp2p-noise@17.0.0` and `@chainsafe/libp2p-yamux@8.0.1`, whose
+ * newest releases still declare uint8arraylist@^2. The two majors mark a list with the same global
+ * symbol and read each other's lists, so the split is one of declared types, not of behaviour. It
+ * becomes guardable when those two packages move.
  *
  * @type {Record<string, number>}
  */
@@ -57,6 +55,8 @@ const SHARED_MAJOR = {
 	'@libp2p/peer-id': 6,
 	// Already forced to one version by the root `resolutions` entry; guarding it makes that honest.
 	'uint8arrays': 6,
+	// Every workspace and p2p-fret (from 1.0.1) are on 14; a second major splits CID/multihash types.
+	'multiformats': 14,
 }
 
 module.exports = { SHARED_MAJOR }

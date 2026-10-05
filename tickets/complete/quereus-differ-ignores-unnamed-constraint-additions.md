@@ -34,3 +34,7 @@ The differ matches unnamed CHECKs by their normalised expression (and column-lev
 Rejected alternative: require names on all constraints in declarative schemas — simpler, but breaks existing declarations that rely on unnamed constraints being accepted.
 
 If nothing is done: applications must name every constraint they might add in a later version; the plugin README should say so. Fully reversible — a differ change only affects future applies.
+
+## Resolution (2026-10-05)
+
+Fixed upstream in quereus v4.20.1 (the declarative differ now matches and emits added unnamed constraints). Here: `@quereus/quereus` ranges raised to ^4.20.1. Nothing in Optimystic needed changing: the stored catalog record is written from what `apply schema` produces, so it now converges on upgraded and fresh machines alike.

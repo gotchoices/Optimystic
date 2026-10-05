@@ -39,3 +39,7 @@ Optimystic's virtual table has the same gap at the same shape, tracked as `imple
 
 - Patch quereus upstream, cut a release, bump the dependency here. Removes the divergence and the corruption.
 - Leave it, and accept that the in-memory module is not a uniqueness-correct reference for `insert or replace`. Optimystic's fix stands either way; only cross-module comparison tests are affected.
+
+## Resolution (2026-10-05)
+
+Fixed upstream in quereus v4.20.1 (`performInsert` and `performUpdateWithPrimaryKeyChange` now check secondary UNIQUEs after a PK REPLACE, excluding the displaced row). Here: `@quereus/quereus` ranges raised to ^4.20.1 (dev, peer, `engines.quereus`); the divergence NOTE on `resolvePkMoveDecision` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts` rewritten. Optimystic's own arm had already landed (`complete/insert-or-replace-on-pk-resolves-secondary-unique`) and excludes the displaced row the same way, so no arm remains. No spec here was skipped around the bug.

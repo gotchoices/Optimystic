@@ -2369,15 +2369,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    * stages once both decisions are in, so a rejection on either front leaves the
    * trees untouched.
    *
-   * NOTE: deliberate divergence from the memory module. Memory's
-   * `performUpdateWithPrimaryKeyChange` (UPDATE) and `performInsert`'s PK-REPLACE arm
-   * (INSERT) both return as soon as a PK REPLACE resolves and never check the
-   * secondary UNIQUE constraints, so a write that also duplicates a UNIQUE value
-   * leaves the duplicate in place. Here both paths still resolve them (SQLite's
-   * semantics), reporting `replacedRow` and `evictedRows` together when both apply —
-   * the executor handles the pair (see quereus's common/types.ts on their
-   * co-occurrence). The two modules disagree until the upstream arm lands
-   * (blocked/quereus-memory-vtab-pk-replace-skips-unique-check).
+   * Both paths still resolve the secondary UNIQUE constraints after a PK REPLACE
+   * (SQLite's semantics), reporting `replacedRow` and `evictedRows` together when both
+   * apply — the executor handles the pair (see quereus's common/types.ts on their
+   * co-occurrence). Quereus's memory module does the same from 4.20.1 on.
    */
   private async resolvePkMoveDecision(
     newKey: string,

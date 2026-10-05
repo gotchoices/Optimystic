@@ -39,7 +39,7 @@
     "@libp2p/peer-id": "^6.0.15",
     "@multiformats/multiaddr": "^13.0.1",
     "@optimystic/db-p2p-storage-fs": "workspace:^",
-    "@quereus/quereus": "^4.20.0",
+    "@quereus/quereus": "^4.20.1",
     "@types/chai": "^5.2.3",
     "@types/debug": "^4.1.12",
     "@types/mocha": "^10.0.10",
@@ -69,11 +69,11 @@
     "uint8arrays": "^6.1.1"
   },
   "peerDependencies": {
-    "@quereus/quereus": "^4.20.0"
+    "@quereus/quereus": "^4.20.1"
   },
   "engines": {
     "node": ">=20.6.0",
-    "quereus": "^4.20.0"
+    "quereus": "^4.20.1"
   },
   "keywords": [
     "quereus-plugin",

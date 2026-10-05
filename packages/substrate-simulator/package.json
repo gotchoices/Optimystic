@@ -36,7 +36,7 @@
     "@libp2p/interface": "^3.3.0",
     "@libp2p/peer-id": "^6.0.15",
     "libp2p": "^3.3.11",
-    "p2p-fret": "^1.0.0"
+    "p2p-fret": "^1.0.1"
   },
   "devDependencies": {
     "@types/chai": "^5.2.3",

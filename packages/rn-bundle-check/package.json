@@ -18,7 +18,7 @@
     "@optimystic/db-p2p": "workspace:^",
     "@optimystic/db-p2p-storage-rn": "workspace:^",
     "@optimystic/quereus-plugin-optimystic": "workspace:^",
-    "@quereus/quereus": "^4.20.0"
+    "@quereus/quereus": "^4.20.1"
   },
   "devDependencies": {
     "@babel/core": "^7.29.0",

@@ -1510,7 +1510,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@libp2p/logger@npm:^6.2.13, @libp2p/logger@npm:^6.2.2, @libp2p/logger@npm:^6.2.4":
+"@libp2p/logger@npm:^6.2.13, @libp2p/logger@npm:^6.2.4":
   version: 6.2.13
   resolution: "@libp2p/logger@npm:6.2.13"
   dependencies:
@@ -1581,7 +1581,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@libp2p/peer-record@npm:^9.0.16, @libp2p/peer-record@npm:^9.0.5":
+"@libp2p/peer-record@npm:^9.0.16":
   version: 9.0.16
   resolution: "@libp2p/peer-record@npm:9.0.16"
   dependencies:
@@ -1661,7 +1661,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@libp2p/utils@npm:^7.0.0, @libp2p/utils@npm:^7.0.1, @libp2p/utils@npm:^7.0.10, @libp2p/utils@npm:^7.4.1":
+"@libp2p/utils@npm:^7.0.0, @libp2p/utils@npm:^7.0.1, @libp2p/utils@npm:^7.4.1":
   version: 7.4.1
   resolution: "@libp2p/utils@npm:7.4.1"
   dependencies:
@@ -1969,7 +1969,7 @@ __metadata:
     libp2p: "npm:^3.3.11"
     mocha: "npm:^11.7.5"
     multiformats: "npm:^14.0.5"
-    p2p-fret: "npm:^1.0.0"
+    p2p-fret: "npm:^1.0.1"
     rimraf: "npm:^6.1.2"
     ts-node: "npm:^10.9.2"
     typescript: "npm:^5.9.3"
@@ -2015,7 +2015,7 @@ __metadata:
   dependencies:
     "@noble/curves": "npm:^2.0.1"
     "@noble/hashes": "npm:^2.0.1"
-    "@quereus/quereus": "npm:^4.20.0"
+    "@quereus/quereus": "npm:^4.20.1"
     "@types/chai": "npm:^5.2.3"
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.2.0"
@@ -2028,7 +2028,7 @@ __metadata:
     typescript: "npm:^5.9.3"
     uint8arrays: "npm:^6.1.1"
   peerDependencies:
-    "@quereus/quereus": ^4.20.0
+    "@quereus/quereus": ^4.20.1
   languageName: unknown
   linkType: soft
 
@@ -2050,7 +2050,7 @@ __metadata:
     "@optimystic/db-core": "workspace:^"
     "@optimystic/db-p2p": "workspace:^"
     "@optimystic/db-p2p-storage-fs": "workspace:^"
-    "@quereus/quereus": "npm:^4.20.0"
+    "@quereus/quereus": "npm:^4.20.1"
     "@types/chai": "npm:^5.2.3"
     "@types/debug": "npm:^4.1.12"
     "@types/mocha": "npm:^10.0.10"
@@ -2066,7 +2066,7 @@ __metadata:
     typescript: "npm:^5.9.3"
     uint8arrays: "npm:^6.1.1"
   peerDependencies:
-    "@quereus/quereus": ^4.20.0
+    "@quereus/quereus": ^4.20.1
   languageName: unknown
   linkType: soft
 
@@ -2113,7 +2113,7 @@ __metadata:
     "@optimystic/db-p2p": "workspace:^"
     "@optimystic/db-p2p-storage-rn": "workspace:^"
     "@optimystic/quereus-plugin-optimystic": "workspace:^"
-    "@quereus/quereus": "npm:^4.20.0"
+    "@quereus/quereus": "npm:^4.20.1"
     "@react-native/babel-preset": "npm:0.83.10"
     "@react-native/metro-config": "npm:0.83.10"
     buffer: "npm:^6.0.3"
@@ -2136,7 +2136,7 @@ __metadata:
     chai: "npm:^6.2.2"
     libp2p: "npm:^3.3.11"
     mocha: "npm:^11.7.5"
-    p2p-fret: "npm:^1.0.0"
+    p2p-fret: "npm:^1.0.1"
     rimraf: "npm:^6.1.2"
     ts-node: "npm:^10.9.2"
     typescript: "npm:^5.9.3"
@@ -2154,7 +2154,7 @@ __metadata:
     "@optimystic/db-p2p-storage-fs": "workspace:^"
     "@optimystic/db-p2p-storage-rn": "workspace:^"
     "@optimystic/quereus-plugin-optimystic": "workspace:^"
-    "@quereus/quereus": "npm:^4.20.0"
+    "@quereus/quereus": "npm:^4.20.1"
     "@types/chai": "npm:^5.2.3"
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.1.0"
@@ -4589,19 +4589,6 @@ __metadata:
   languageName: node
   linkType: hard
 
-"it-length-prefixed@npm:^10.0.1":
-  version: 10.0.1
-  resolution: "it-length-prefixed@npm:10.0.1"
-  dependencies:
-    it-reader: "npm:^6.0.1"
-    it-stream-types: "npm:^2.0.1"
-    uint8-varint: "npm:^2.0.1"
-    uint8arraylist: "npm:^2.0.0"
-    uint8arrays: "npm:^5.0.1"
-  checksum: 10c0/9b32946eee33296f77718423a183ad09654d3dfc9b1a06efe91bd650c83285dd7201268ad40dc1040cd25f5a0c5e28349c1a5ca121ca3fc9dd52ab4e272a0711
-  languageName: node
-  linkType: hard
-
 "it-length-prefixed@npm:^11.0.1":
   version: 11.0.1
   resolution: "it-length-prefixed@npm:11.0.1"
@@ -4697,16 +4684,6 @@ __metadata:
     p-defer: "npm:^4.0.1"
     race-signal: "npm:^1.1.3"
   checksum: 10c0/cbada861f024fe2dfd4feeba043e48dee5a543e972531d39a67355a8a11d3a2ff75e90e1ef7e041861cfc249c8e3cdc216ff7da44f271e770d883593239178ee
-  languageName: node
-  linkType: hard
-
-"it-reader@npm:^6.0.1":
-  version: 6.0.4
-  resolution: "it-reader@npm:6.0.4"
-  dependencies:
-    it-stream-types: "npm:^2.0.1"
-    uint8arraylist: "npm:^2.0.0"
-  checksum: 10c0/7c87be7df0d573fa2fc3bd29ec7b5c34e3ec722bb65d7f19a25c52f3bfd2e0170073850f2ebde2c8b48156c4fd9cc684583f63ca601c6dad53c31859f6b1c275
   languageName: node
   linkType: hard
 
@@ -5597,13 +5574,6 @@ __metadata:
   languageName: node
   linkType: hard
 
-"multiformats@npm:^13.4.2":
-  version: 13.4.2
-  resolution: "multiformats@npm:13.4.2"
-  checksum: 10c0/b7be09b8bf8198d601c8f8c9a358b9a6aca5a14d61239a84f88d8266322e4e7c3015fe7bdf88b589b9993a4abb752defabb932719d1b457a53277e264c4cee11
-  languageName: node
-  linkType: hard
-
 "multiformats@npm:^14.0.0, multiformats@npm:^14.0.5":
   version: 14.0.5
   resolution: "multiformats@npm:14.0.5"
@@ -5864,27 +5834,27 @@ __metadata:
   languageName: node
   linkType: hard
 
-"p2p-fret@npm:^1.0.0":
-  version: 1.0.0
-  resolution: "p2p-fret@npm:1.0.0"
+"p2p-fret@portal:../Fret/packages/fret::locator=%40optimystic%2Foptimystic%40workspace%3A.":
+  version: 0.0.0-use.local
+  resolution: "p2p-fret@portal:../Fret/packages/fret::locator=%40optimystic%2Foptimystic%40workspace%3A."
   dependencies:
-    "@libp2p/logger": "npm:^6.2.2"
-    "@libp2p/peer-record": "npm:^9.0.5"
-    "@libp2p/utils": "npm:^7.0.10"
-    "@multiformats/multiaddr": "npm:^13.0.1"
+    "@libp2p/logger": "npm:^6.2.13"
+    "@libp2p/peer-record": "npm:^9.0.16"
+    "@libp2p/utils": "npm:^7.4.1"
+    "@multiformats/multiaddr": "npm:^13.0.3"
     digitree: "npm:^1.4.6"
-    it-length-prefixed: "npm:^10.0.1"
-    multiformats: "npm:^13.4.2"
-    uint8-varint: "npm:^2.0.4"
-    uint8arraylist: "npm:^2.4.8"
-    uint8arrays: "npm:^5.1.0"
+    it-length-prefixed: "npm:^11.0.1"
+    main-event: "npm:^1.0.1"
+    multiformats: "npm:^14.0.5"
+    uint8-varint: "npm:^3.0.0"
+    uint8arraylist: "npm:^3.0.2"
+    uint8arrays: "npm:^6.1.1"
   peerDependencies:
-    "@libp2p/interface": ^3.1.0
-    "@libp2p/peer-id": ^6.0.4
-    libp2p: ^3.1.3
-  checksum: 10c0/f8766674b90a73b43098a3cbe4cb725bacdb6b4328b7fac23900e97b157ca182e4c566f67a8e9cf651b42e014c74d06e6a5311c534f543632962d1c98f637b61
+    "@libp2p/interface": ^3.3.0
+    "@libp2p/peer-id": ^6.0.15
+    libp2p: ^3.3.11
   languageName: node
-  linkType: hard
+  linkType: soft
 
 "package-json-from-dist@npm:^1.0.0, package-json-from-dist@npm:^1.0.1":
   version: 1.0.1
@@ -6975,16 +6945,6 @@ __metadata:
   version: 1.6.1
   resolution: "ufo@npm:1.6.1"
   checksum: 10c0/5a9f041e5945fba7c189d5410508cbcbefef80b253ed29aa2e1f8a2b86f4bd51af44ee18d4485e6d3468c92be9bf4a42e3a2b72dcaf27ce39ce947ec994f1e6b
-  languageName: node
-  linkType: hard
-
-"uint8-varint@npm:^2.0.1, uint8-varint@npm:^2.0.4":
-  version: 2.0.4
-  resolution: "uint8-varint@npm:2.0.4"
-  dependencies:
-    uint8arraylist: "npm:^2.0.0"
-    uint8arrays: "npm:^5.0.0"
-  checksum: 10c0/850bce72c2b639d317db6af2c30544f7f8c6451fa328d674aca74d7e263a9510acd3af555ed04ffbc20b9ff68fd5d2e06b91a5c9ffde781cf6ee6233606f34dc
   languageName: node
   linkType: hard
 
