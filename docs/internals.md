@@ -1880,18 +1880,20 @@ saveMaterializedBlock(block): store(structuredClone(block));
   | what the repair pass found | flag |
   | --- | --- |
   | whole cohort answered "holds nothing" (the routine new-collection probe) | none — authoritative absent |
-  | there was nobody to ask: `findCluster` returned an empty cohort, or only this node — and the read carried no floor for the block | none — authoritative absent |
+  | there was nobody to ask: `findCluster` returned an empty cohort, or only this node — the read carried no floor for the block, and the node is not waiting on a bootstrap peer | none — authoritative absent |
   | there was nobody to ask, but the read carried a floor for the block (`BlockGets.floors`): the asker's own log names it | `'named-by-log'` |
+  | there was nobody to ask and no floor, but a bootstrap peer this node was configured with has never been heard from | `'cohort-unreachable'` |
   | part of the cohort answered, part was silent — or the consult threw outright | `'peers-unreachable'` |
   | this node knows of cohort members outside itself and could reach none of them | `'cohort-unreachable'` |
   | a peer positively claimed a revision that was neither corroborated to a quorum nor acquired | `'claimed-elsewhere'` |
 
-  Note the second row: `'cohort-unreachable'` is *silence from a cohort this node knows about*, not
-  isolation in general. A node whose routing view yields no cohort member at all — a cold boot with
-  an empty routing table — consults nobody, and its local emptiness is served as an authoritative
-  absent, unflagged, unless the read carried a floor (the third row). So a consumer relying on
-  `'cohort-unreachable'` to detect isolation must also tolerate the unflagged absent; the two differ
-  only in whether FRET still remembers peers.
+  Note the second row: `'cohort-unreachable'` is *silence from machines this node knows about*, not
+  isolation in general. A node whose routing view yields no cohort member at all, and whose
+  configuration names no bootstrap peer — a founder or a one-machine deployment on a cold boot —
+  consults nobody, and its local emptiness is served as an authoritative absent, unflagged, unless
+  the read carried a floor (the third row). So a consumer relying on `'cohort-unreachable'` to
+  detect isolation must also tolerate the unflagged absent; the two differ only in whether the node
+  knows of anyone else: peers FRET still remembers, or bootstrap peers it was configured with.
 
   The third row exists because "nobody to ask" is not evidence the block was never created: a
   self-only view is also what `findCluster` returns while genuine peers are still unidentified. On
@@ -1911,6 +1913,52 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `packages/db-p2p/src/repo/coordinator-repo.ts`). A consulted cohort whose every member answers
   "holds nothing" under a floor is the same contradiction with a weaker cause (every reachable
   member is behind) and stays an authoritative absent.
+
+  The fourth row is the configured case. A node built with `bootstrapNodes` knows from its own
+  configuration of other machines it was told to join through, and until it has heard from them a
+  self-only view is what it would see whether or not they hold the block. This is the other half of
+  GitHub issue #27: a joining node opened the shared table catalog in the instant after start,
+  before it had dialed the machine it was told to join, found nothing, founded its own catalog and
+  committed it alone, and the two catalogs collided once its cohort widened. Three things close
+  that window, in the order a start-up meets them:
+
+  - **The bootstrap peers are dialed the moment the node has started** (`BootstrapContactTracker`
+    in `packages/db-p2p/src/network/bootstrap-contact.ts`, driven by `createLibp2pNodeBase`). Left
+    to `@libp2p/bootstrap`, the first dial comes from a timer one second after start, and a node
+    that opens anything inside that second opens it alone.
+  - **A cohort assembly that finds this node alone waits, bounded, and is made again**
+    (`bootstrapContactImminent` in `packages/db-p2p/src/libp2p-key-network.ts`). It waits only on
+    evidence available now: a dial of a bootstrap peer or identify on a connection to one still in
+    flight, or a connected bootstrap peer that has been identified as serving this network and
+    that FRET has not admitted to the ring yet. The bound is
+    `NodeOptions.bootstrapContactTimeoutMs`, and the first time the wait ends without contact it is
+    closed for the life of the process, so a node whose bootstrap peer is down pays for one failed
+    dial, once, and a node with no bootstrap peers never pays.
+  - **While any configured bootstrap peer has never been heard from, a view that asked nobody does
+    not rule a block absent** (`absenceFlagFor` in `packages/db-p2p/src/repo/coordinator-repo.ts`,
+    which asks the key network's `awaitingBootstrapContact`).
+
+  **Heard from means identify has settled what the peer is**, in this process: it answered with its
+  protocol list, whatever the list says, or it refused this network's identify protocol; or its
+  serving verdict was restored from persisted state. The refusal matters because a bootstrap peer
+  is often infrastructure, a relay or another group's node on a different network, and identify
+  here is network-namespaced, so such a peer never completes it. Its refusal is the one definite
+  "not one of ours", and it arrives one round trip after the connection opens, so a node alone on
+  its own network behind such a peer founds what it needs without waiting. A connection is not an
+  answer, and neither is the peerStore's protocol list: libp2p adds every protocol a stream
+  negotiates, in either direction, to that list, so a peer of this network shows a partial list,
+  which reads as foreign, for the moment before its identify lands. The built-in identify trigger
+  discards the exchange's outcome, so the node runs identify on connection open itself and
+  observes it (`identifyOnConnectionOpen` in `packages/db-p2p/src/network/identify-on-open.ts`).
+
+  `Collection.createOrOpen` and `Collection.open` already throw `BlockUnavailableError` on a flagged
+  header probe, so a joiner that cannot reach its bootstrap peer fails to open, retryably, and
+  commits nothing; one that can reach it consults it and finds the existing collection. A read that
+  also carried a floor keeps `'named-by-log'`, the sharper evidence. The cost is recorded at
+  `absenceFlagFor`: a node configured with a bootstrap peer that is permanently gone, and holding
+  no persisted network state, can neither create a collection nor read a block it lacks until that
+  peer is heard from or taken out of its configuration. Out of scope here: a write to a collection
+  the node already holds, made before contact, still commits alone.
 
   "Remembers" has to cover which of those peers serve this network, not only that they exist. The
   cohort admits only peers positively classified as serving, and the classification reads each

@@ -79,8 +79,8 @@ describe('createLogger peer-id namespacing', () => {
 	it('Libp2pKeyPeerNetwork instances with different peer ids log under different namespaces', async () => {
 		const peerA = await makePeerId();
 		const peerB = await makePeerId();
-		const networkA = new Libp2pKeyPeerNetwork(createMockLibp2p(peerA), 16, undefined, 'forming');
-		const networkB = new Libp2pKeyPeerNetwork(createMockLibp2p(peerB), 16, undefined, 'forming');
+		const networkA = new Libp2pKeyPeerNetwork(createMockLibp2p(peerA), 16, undefined, undefined);
+		const networkB = new Libp2pKeyPeerNetwork(createMockLibp2p(peerB), 16, undefined, undefined);
 
 		expect(namespaceOf(networkA)).to.not.equal(namespaceOf(networkB));
 		expect(namespaceOf(networkA)).to.equal(`optimystic:db-p2p:libp2p-key-network:${peerA.toString().substring(0, 12)}`);

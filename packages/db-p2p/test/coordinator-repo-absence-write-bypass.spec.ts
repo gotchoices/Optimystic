@@ -181,6 +181,9 @@ const buildHarness = async (remoteCount: number) => {
 		/** The `onCall`-th `findCluster` (1-based, counted from harness creation) blocks until `gate`
 		 *  resolves — a slow cohort lookup at one chosen point; every other lookup is instant. */
 		gateLookups: (gate: Promise<void>, onCall: number) => { lookupGate = { gate, onCall }; },
+		/** Whether the key network reports a configured bootstrap peer it has never heard from. A
+		 *  harness that never calls this has a key network without the method, as a founder's is. */
+		setAwaitingContact: (awaiting: boolean) => { keyNetwork.awaitingBootstrapContact = async () => awaiting; },
 		growCohort: () => { for (const p of remotes) cluster[p.toString()] = peerEntry(p); },
 		shrinkToSelf: () => { for (const p of remotes) delete cluster[p.toString()]; },
 		callsTo: (peer: PeerId) => calls.filter(c => c.peer === peer.toString()).length,
@@ -323,6 +326,26 @@ describe('CoordinatorRepo never serves a stale absent after a write that bypasse
 			h.setClock(BASE_TIME + 1_000);
 			const r = await h.repo.get({ blockIds: [blockId], floors: { [blockId]: 3 } });
 			expect(r[blockId]?.unavailable, `a floored read: ${JSON.stringify(r[blockId])}`).to.equal('named-by-log');
+		});
+	});
+
+	describe('unit: a bootstrap peer this node was configured with has never answered (GitHub issue #27)', () => {
+		it('a self-only absent is flagged cohort-unreachable while awaiting contact, and authoritative once the peer has been heard from', async () => {
+			// The joiner's first header probe: nothing held, nobody in view but itself, and the
+			// machine it was told to join has not answered. Ruling the block absent here is what
+			// let a joiner found a second copy of a collection.
+			const h = await buildHarness(0);
+			h.setAwaitingContact(true);
+			const awaiting = (await h.read(blockId))[blockId];
+			expect(awaiting?.unavailable, `while awaiting contact: ${JSON.stringify(awaiting)}`).to.equal('cohort-unreachable');
+
+			// The asker's own log naming the block is the sharper evidence, and keeps its reason.
+			const floored = (await h.repo.get({ blockIds: [blockId], floors: { [blockId]: 3 } }))[blockId];
+			expect(floored?.unavailable, `a floored read: ${JSON.stringify(floored)}`).to.equal('named-by-log');
+
+			h.setAwaitingContact(false);
+			const heard = (await h.read(blockId))[blockId];
+			expect(isUnflaggedAbsent(heard), `once heard from: ${JSON.stringify(heard)}`).to.equal(true);
 		});
 	});
 

@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
-import { Tree, routingKeyForBlock } from '@optimystic/db-core';
+import { BlockUnavailableError, Tree, routingKeyForBlock } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import { multiaddr } from '@multiformats/multiaddr';
 import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
@@ -139,5 +139,70 @@ describe('Two-node convergence over real libp2p', function () {
 		await treeA.sync();
 		expect(await treeA.get(4), "A sees the joiner's row").to.deep.equal({ key: 4, value: 'from-B' });
 		expect(await treeB.get(2), "the joiner sees A's earlier rows").to.deep.equal({ key: 2, value: 'from-A-2' });
+	});
+
+	// GitHub issue #27. Every case above waits for the mesh before opening anything, which is why
+	// none of them saw this: a joiner that opens a collection the moment its node exists used to do
+	// so before it had dialed the machine it was told to join, found nothing locally, and founded
+	// its own copy at revision 1.
+	it('a joiner that opens a collection the moment it starts finds the founder\'s, not its own', async function () {
+		const a = await spawnNode();
+		const treeId = 'two-node-conv-cold-joiner';
+		const treeA = await Tree.createOrOpen<number, TestEntry>(transactorFor(a, NETWORK_NAME), treeId, keyFn);
+		await treeA.replace([[1, { key: 1, value: 'from-A' }]]);
+
+		const b = await spawnNode({ bootstrapNodes: [pickLocalTcpMultiaddr(a)], fretProfile: 'core' });
+		const treeB = await Tree.createOrOpen<number, TestEntry>(transactorFor(b, NETWORK_NAME), treeId, keyFn);
+		await treeB.replace([[2, { key: 2, value: 'from-B' }]]);
+
+		expect(await treeB.get(1), "the joiner sees the founder's row").to.deep.equal({ key: 1, value: 'from-A' });
+		await treeA.sync();
+		expect(await treeA.get(2), "the founder sees the joiner's row").to.deep.equal({ key: 2, value: 'from-B' });
+
+		// The header block's id is the collection id, and only the commit that creates the collection
+		// writes it. So the joiner holding the founder's action there is the joiner never having
+		// committed a revision 1 of its own.
+		const headerOn = async (node: OptimysticNode) => (await node.storageRepo.get({ blockIds: [treeId] }))[treeId]?.state.latest;
+		const founded = await headerOn(a);
+		expect(founded?.rev, 'the founder created the collection at revision 1').to.equal(1);
+		expect(await headerOn(b), "the joiner holds the founder's header").to.deep.equal(founded);
+	});
+
+	// A bootstrap peer is often infrastructure rather than a member: a relay or another group's
+	// node, serving a different network. Such a peer refuses this network's identify, and that
+	// refusal is its answer: a node alone on its own network then founds what it needs, at once.
+	it('a node that bootstraps through a peer on another network founds its collection without waiting out the deadline', async function () {
+		const infrastructure = await spawnNode({ networkName: `${NETWORK_NAME}-other` });
+		const founder = await spawnNode({ bootstrapNodes: [pickLocalTcpMultiaddr(infrastructure)], fretProfile: 'core' });
+		const treeId = 'two-node-conv-foreign-bootstrap';
+
+		const started = Date.now();
+		const tree = await Tree.createOrOpen<number, TestEntry>(transactorFor(founder, NETWORK_NAME), treeId, keyFn);
+		await tree.replace([[1, { key: 1, value: 'founded' }]]);
+		expect(await tree.get(1)).to.deep.equal({ key: 1, value: 'founded' });
+		// The bootstrap contact wait is 10 s here. Half of it is far above anything a loopback
+		// identify takes and far below a wait that ran to its deadline.
+		expect(Date.now() - started, 'did not wait for the deadline').to.be.below(5_000);
+	});
+
+	// The other half of the rule: with the machine it was told to join unreachable, the joiner has
+	// no basis for "this collection does not exist yet", so it must not found one.
+	it('a joiner whose bootstrap peer never answers refuses to found a collection', async function () {
+		const a = await spawnNode();
+		const unreachable = pickLocalTcpMultiaddr(a);
+		await a.stop();
+
+		const b = await spawnNode({ bootstrapNodes: [unreachable], fretProfile: 'core' });
+		const treeId = 'two-node-conv-unreachable-founder';
+
+		let refusal: unknown;
+		try {
+			await Tree.createOrOpen<number, TestEntry>(transactorFor(b, NETWORK_NAME), treeId, keyFn);
+		} catch (err) {
+			refusal = err;
+		}
+		expect(refusal, 'the open is refused').to.be.instanceOf(BlockUnavailableError);
+		expect((refusal as BlockUnavailableError).reason).to.equal('cohort-unreachable');
+		expect((await b.storageRepo.get({ blockIds: [treeId] }))[treeId]?.state.latest, 'nothing was committed').to.equal(undefined);
 	});
 });

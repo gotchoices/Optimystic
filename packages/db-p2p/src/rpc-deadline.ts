@@ -110,6 +110,13 @@ export type LinkDeadlines = RpcDeadlineDefaults & {
 	 * one over this node. The node itself applies it nowhere.
 	 */
 	transactionTimeoutMs: number;
+	/**
+	 * `NodeOptions.bootstrapContactTimeoutMs` when that field is not declared: the most a cohort
+	 * lookup that would come back self-only waits for a configured bootstrap peer to join this
+	 * node's view. One connection open, as {@link LinkDeadlines.libp2pDialTimeoutMs} allows the
+	 * start-up bootstrap dial, plus identify on the opened connection.
+	 */
+	bootstrapContactTimeoutMs: number;
 };
 
 /**
@@ -141,6 +148,9 @@ export type LinkDeadlines = RpcDeadlineDefaults & {
  *   coordinator that runs out its deadline, the cold dial to the coordinator picked next, that
  *   coordinator's own cold dial to a cohort member, and a fourth for the warm round trips of the
  *   consensus rounds.
+ * - bootstrap contact: the connection open the start-up bootstrap dial runs under (10), then
+ *   identify on that connection: one to open its stream and one for the reply. It floors at the
+ *   connection deadline's own floor, whose margin on a fast link covers identify.
  */
 const CONNECTION_ROUND_TRIPS = 10;
 const DIAL_ROUND_TRIPS = CONNECTION_ROUND_TRIPS + 1;
@@ -148,6 +158,7 @@ const INBOUND_UPGRADE_ROUND_TRIPS = 5;
 const RESPONSE_ROUND_TRIPS = 3;
 const COHORT_QUERY_ROUND_TRIPS = 3;
 const TRANSACTION_DIALS = 4;
+const BOOTSTRAP_CONTACT_ROUND_TRIPS = CONNECTION_ROUND_TRIPS + 2;
 
 /**
  * The largest delay `setTimeout` accepts on every platform this runs on; a larger one fires almost
@@ -216,7 +227,24 @@ export function resolveLinkDeadlines(linkRoundTripMs?: number, rpcDeadlines?: Pa
 		// A transfer is a dial like any other, so it may never be the shorter of the two.
 		transferTimeoutMs: Math.max(DEFAULT_TRANSFER_TIMEOUT_MS, dialTimeoutMs),
 		transactionTimeoutMs: Math.max(DEFAULT_TRANSACTION_TIMEOUT_MS, TRANSACTION_DIALS * dialTimeoutMs),
+		bootstrapContactTimeoutMs: Math.max(DEFAULT_LIBP2P_DIAL_TIMEOUT_MS, BOOTSTRAP_CONTACT_ROUND_TRIPS * roundTripMs),
 	};
+}
+
+/**
+ * The bootstrap contact wait a node applies: `NodeOptions.bootstrapContactTimeoutMs` when declared,
+ * else the value derived from the link round trip. `0` is accepted and means "never wait". Any
+ * other value that is not a finite number of milliseconds within the 32-bit timer limit throws,
+ * for the reason {@link resolveLinkDeadlines} gives.
+ */
+export function resolveBootstrapContactTimeoutMs(declared: number | undefined, deadlines: LinkDeadlines): number {
+	if (declared === undefined) return deadlines.bootstrapContactTimeoutMs;
+	if (!Number.isFinite(declared) || declared < 0 || declared > MAX_TIMER_DELAY_MS) {
+		throw new Error(
+			`bootstrapContactTimeoutMs must be a finite number of milliseconds from 0 to ${MAX_TIMER_DELAY_MS}; got ${String(declared)}`
+		);
+	}
+	return declared;
 }
 
 function validDeclaredMs(field: string, declared: number, ceiling: number): number {

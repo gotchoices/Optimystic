@@ -596,6 +596,34 @@ Without `servingPeers` a restored table would still give a self-only cohort
 until every remembered peer reconnected and re-identified, and the node would
 answer reads of blocks it lacks as absent rather than as unreachable.
 
+#### Joining through bootstrap peers
+
+`bootstrapNodes` is both where the node dials and a statement that those peers may hold what the
+node is about to look for. The node dials them the moment it has started
+(`BootstrapContactTracker` in `src/network/bootstrap-contact.ts`), and holds itself to the
+statement in two ways:
+
+- A lookup of who is responsible for a block that would come back with nobody but this node waits
+  while a bootstrap peer is on its way into view: its dial, or identify on its connection, is in
+  flight. The wait is bounded by `bootstrapContactTimeoutMs` (derived from `linkRoundTripMs`, 10 s
+  when that is not declared) and is taken at most once per process; on a LAN it lasts a few tens
+  of milliseconds.
+- Until every bootstrap peer has been heard from at least once, the node does not conclude that a
+  block it lacks was never created. Opening or creating a collection then fails with a
+  `BlockUnavailableError` whose `reason` is `'cohort-unreachable'` instead of founding a second
+  copy of a collection another machine already holds. The error is retryable: it clears once the
+  peer answers.
+
+A peer has been heard from once identify has settled what it is. A peer on another network, such
+as a relay or another group's node used as infrastructure, refuses this network's identify, and
+that refusal is its answer: the node then founds what it needs without waiting. What does keep a
+node waiting is a peer it cannot reach at all, including one its own `connectionGater` refuses to
+dial. So a peer that is gone for good should be taken out of `bootstrapNodes`, and a node meant to
+found its own network before talking to anyone is built with an empty list and dials later. An
+entry naming the node itself is ignored, so one list can be shared by every machine of a
+deployment. With `options.persistence`, a bootstrap peer the node saw serving before a restart
+counts as heard from after it.
+
 #### Custom transports (including React Native)
 
 By default, `createLibp2pNode()` uses TCP + circuit-relay transport.

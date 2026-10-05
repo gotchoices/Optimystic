@@ -13,6 +13,7 @@ import {
 	PERSISTED_STATE_VERSION,
 	SelfRelayOnlyAddressesError,
 	SELF_RELAY_ONLY_ERROR_CODE,
+	type BootstrapContactOptions,
 	type FindCoordinatorErrorCode,
 	type NetworkStatePersistence,
 	type PersistedNetworkState,
@@ -52,6 +53,18 @@ function stubConnection(peerId: PeerId, direction: 'inbound' | 'outbound', addr:
 /** The conventional stub address for a peer in these specs: an outbound-dialed direct TCP address. */
 function outboundConnTo(peerId: PeerId): Connection {
 	return stubConnection(peerId, 'outbound', `/ip4/10.0.0.1/tcp/4001/p2p/${peerId.toString()}`);
+}
+
+/**
+ * The constructor's bootstrap argument for a node configured with a bootstrap peer whose start-up
+ * dial has already settled without reaching it: nothing is in flight and nothing is connected, so
+ * no lookup waits. The cases that drive the wait itself build their own dials.
+ */
+function unreachedBootstrap(peerIds: string[] = ['unreached-bootstrap-peer']): BootstrapContactOptions {
+	return {
+		contact: { peerIds, answerOf: () => undefined, inFlight: () => 0, nextSettled: () => Promise.resolve() },
+		contactTimeoutMs: 10_000
+	};
 }
 
 /** Minimal mock Libp2p that satisfies Libp2pKeyPeerNetwork's usage */
@@ -109,7 +122,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 	// The inter-attempt sleep is worth paying only when something could arrive during it. The
 	// verdict comes from evidence available at the moment of the call — a non-self candidate we
 	// route to, or a dial libp2p is actually attempting — never from construction-time config
-	// (`networkMode`) or a monotonic history mark (`networkHighWaterMark`), both of which kept
+	// (whether bootstrap peers were configured) or a monotonic history mark (`networkHighWaterMark`), both of which kept
 	// the window open forever on nodes that could never fill it.
 	describe('retryCouldImprove()', () => {
 		const improve = (network: Libp2pKeyPeerNetwork, ids: string[]): boolean =>
@@ -117,25 +130,25 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('returns false for a self-only candidate list with an empty dial queue', () => {
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			expect(improve(network, [selfPeerId.toString()])).to.be.false;
 		});
 
 		it('returns false for an empty candidate list with an empty dial queue', () => {
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			expect(improve(network, [])).to.be.false;
 		});
 
 		it('returns true when a dial is active, even with a self-only candidate list', () => {
 			const libp2p = createMockLibp2p(selfPeerId, { dialQueue: [pendingDial('active')] });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			expect(improve(network, [selfPeerId.toString()])).to.be.true;
 		});
 
 		it('returns true when a dial is queued', () => {
 			const libp2p = createMockLibp2p(selfPeerId, { dialQueue: [pendingDial('queued')] });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			expect(improve(network, [selfPeerId.toString()])).to.be.true;
 		});
 
@@ -145,19 +158,19 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const libp2p = createMockLibp2p(selfPeerId, {
 				dialQueue: [pendingDial('error', 'd0'), pendingDial('success', 'd1')]
 			});
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			expect(improve(network, [selfPeerId.toString()])).to.be.false;
 		});
 
 		it('returns true when the candidate list holds a non-self id', () => {
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			expect(improve(network, [selfPeerId.toString(), 'other-peer-id'])).to.be.true;
 		});
 
 		it('returns false for a joining node with HWM>1 that knows no peer and dials nobody', async () => {
-			// The regression this test exists for: configuration ('joining' — a bootstrap
-			// address was configured) and history (HWM 10 — this node once saw a 10-peer
+			// The regression this test exists for: configuration (a bootstrap address was
+			// configured) and history (HWM 10 — this node once saw a 10-peer
 			// network) both used to force the window open. Neither says a peer can arrive in
 			// the next 500ms; the empty FRET neighbourhood and empty dial queue say it cannot.
 			const persistence = new MemoryPersistence({
@@ -167,7 +180,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				consecutiveIsolatedSessions: 0
 			});
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'joining', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, unreachedBootstrap(), persistence);
 			await network.initFromPersistedState();
 			expect(improve(network, [selfPeerId.toString()])).to.be.false;
 		});
@@ -176,7 +189,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 	describe('initFromPersistedState()', () => {
 		it('does nothing when no persistence is configured', async () => {
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			// Should not throw
 			await network.initFromPersistedState();
 		});
@@ -184,7 +197,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 		it('does nothing when persistence returns undefined', async () => {
 			const persistence = new MemoryPersistence(undefined);
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence);
 			await network.initFromPersistedState();
 			// HWM should remain at default (1)
 			expect((network as any).networkHighWaterMark).to.equal(1);
@@ -211,7 +224,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			} as unknown as PersistedNetworkState;
 			const persistence = new MemoryPersistence(stale);
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence);
 			await network.initFromPersistedState();
 
 			// Defaults, not the persisted values: HWM stays 1 and the isolated-session counter is
@@ -229,7 +242,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				consecutiveIsolatedSessions: 2
 			});
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence);
 			await network.initFromPersistedState();
 
 			expect((network as any).networkHighWaterMark).to.equal(50);
@@ -246,7 +259,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				fretTable: { v: 1, peerId: selfPeerId.toString(), timestamp: Date.now(), entries: [] }
 			});
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence);
 			await network.initFromPersistedState();
 
 			expect((network as any).consecutiveIsolatedSessions).to.equal(1);
@@ -260,7 +273,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				consecutiveIsolatedSessions: 0
 			});
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence);
 			await network.initFromPersistedState();
 
 			expect((network as any).consecutiveIsolatedSessions).to.equal(0);
@@ -286,7 +299,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				}
 			});
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence);
 			await network.initFromPersistedState();
 
 			// Should stay at 1, not increment
@@ -297,7 +310,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 	describe('persistState()', () => {
 		it('does nothing when no persistence is configured', () => {
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			// Should not throw
 			(network as any).persistState();
 		});
@@ -310,7 +323,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				consecutiveIsolatedSessions: 1
 			});
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence);
 			await network.initFromPersistedState();
 
 			// Trigger persist
@@ -341,7 +354,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			};
 			const persistence = new MemoryPersistence();
 			const libp2p = createMockLibp2p(selfPeerId, { fret: mockFret });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence);
 
 			(network as any).persistState();
 			await waitFor(() => persistence.saved !== undefined, { description: 'the fire-and-forget persistState() save captured the FRET table' });
@@ -354,7 +367,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 	describe('shouldAllowSelfCoordination()', () => {
 		it('allows when HWM<=1 (bootstrap node)', () => {
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const decision = network.shouldAllowSelfCoordination();
 			expect(decision.allow).to.be.true;
 			expect(decision.reason).to.equal('bootstrap-node');
@@ -363,7 +376,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 		it('blocks when disabled', () => {
 			const libp2p = createMockLibp2p(selfPeerId);
 			const config: SelfCoordinationConfig = { allowSelfCoordination: false };
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, config, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, config, undefined);
 			const decision = network.shouldAllowSelfCoordination();
 			expect(decision.allow).to.be.false;
 			expect(decision.reason).to.equal('disabled');
@@ -377,7 +390,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				consecutiveIsolatedSessions: 2 // will be incremented to 3 since HWM>1 and no FRET
 			});
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence);
 			await network.initFromPersistedState();
 
 			expect((network as any).consecutiveIsolatedSessions).to.equal(3);
@@ -396,7 +409,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			});
 			const libp2p = createMockLibp2p(selfPeerId);
 			const config: SelfCoordinationConfig = { gracePeriodMs: 60000 };
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, config, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, config, undefined, persistence);
 			await network.initFromPersistedState();
 
 			expect((network as any).consecutiveIsolatedSessions).to.equal(1);
@@ -424,7 +437,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				exportTable: () => undefined
 			};
 			const libp2p = createMockLibp2p(selfPeerId, { fret });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence);
 			await network.initFromPersistedState();
 
 			const write = network.shouldAllowSelfCoordination('write');
@@ -453,7 +466,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				exportTable: () => undefined
 			};
 			const libp2p = createMockLibp2p(selfPeerId, { fret });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence);
 			await network.initFromPersistedState();
 
 			const write = network.shouldAllowSelfCoordination('write');
@@ -469,7 +482,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('marks a disabled denial hard for BOTH intents', () => {
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, { allowSelfCoordination: false }, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, { allowSelfCoordination: false }, undefined);
 			for (const intent of ['read', 'write'] as const) {
 				const decision = network.shouldAllowSelfCoordination(intent);
 				expect(decision.allow, `disabled blocks ${intent}`).to.be.false;
@@ -491,7 +504,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const otherPeerId = await makePeerId();
 			const mockConnection = stubConnection(otherPeerId, 'outbound', '/ip4/127.0.0.1/tcp/8000');
 			const libp2p = createMockLibp2p(selfPeerId, { connections: [mockConnection] });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence);
 			await network.initFromPersistedState();
 
 			// consecutiveIsolatedSessions was 2, incremented to 3 (HWM>1, no FRET entries)
@@ -514,7 +527,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				exportTable: () => undefined
 			};
 			const libp2p = createMockLibp2p(selfPeerId, { fret });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const key = routingKeyForBlock('optimystic/schema');
 			const result = await network.findCoordinator(key);
 			expect(result.toString()).to.equal(selfPeerId.toString());
@@ -528,7 +541,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				exportTable: () => undefined
 			};
 			const libp2p = createMockLibp2p(selfPeerId, { fret });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const key = routingKeyForBlock('optimystic/schema');
 
 			let caught: unknown;
@@ -562,7 +575,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				exportTable: () => undefined
 			};
 			const libp2p = createMockLibp2p(selfPeerId, { fret });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence);
 			await network.initFromPersistedState();
 
 			const key = routingKeyForBlock('some-block');
@@ -627,7 +640,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				connections: [],
 				neighbors: [selfPeerId.toString()]
 			});
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const key = routingKeyForBlock('collection-tree-key');
 
 			// Boot-time read, no connections yet → self is picked (correct at this instant).
@@ -646,7 +659,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				connections: [],
 				neighbors: [selfPeerId.toString()]
 			});
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const key = routingKeyForBlock('collection-tree-key');
 
 			const result = await network.findCoordinator(key);
@@ -665,7 +678,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				connections: [],
 				neighbors: [peerA.toString()]
 			});
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const key = routingKeyForBlock('redirected-key');
 
 			network.recordCoordinator(key, selfPeerId);
@@ -686,7 +699,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				connections: [outboundConnTo(peerA)],
 				neighbors: [selfPeerId.toString()]
 			});
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const key = routingKeyForBlock('collection-tree-key');
 
 			const first = await network.findCoordinator(key);
@@ -709,7 +722,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				connections: [outboundConnTo(peerA)],
 				neighbors: [peerA.toString()]
 			});
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const key = routingKeyForBlock('remote-coordinated-key');
 
 			network.recordCoordinator(key, peerB);
@@ -739,7 +752,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				sizeEstimate: 5,
 				partitioned: true
 			});
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence);
 			await network.initFromPersistedState();
 
 			// Precondition: the guard really does refuse for this node, and refuses HARD.
@@ -773,7 +786,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				neighbors: [selfPeerId.toString(), peerA.toString()]
 			});
 			state.connections = [outboundConnTo(peerA)];
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, { allowSelfCoordination: false }, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, { allowSelfCoordination: false }, undefined);
 			expect(network.shouldAllowSelfCoordination().allow).to.be.false;
 
 			const result = await network.findCoordinator(routingKeyForBlock('collection-tree-key'));
@@ -789,7 +802,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				connections: [],
 				neighbors: [selfPeerId.toString()]
 			});
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const key = routingKeyForBlock('solo-key');
 
 			const t0 = Date.now();
@@ -834,7 +847,8 @@ describe('Libp2pKeyPeerNetwork', () => {
 			dialInFlight?: boolean;
 			/** Persisted high-water mark; >1 is the "has seen a real network" shape. */
 			highWaterMark?: number;
-			networkMode?: 'forming' | 'joining';
+			/** Configured with a bootstrap peer it never reached. */
+			joining?: boolean;
 			/** FRET neighbours of the key; defaults to self (plus `connectedPeer`, when given). */
 			neighbors?: string[];
 		}) {
@@ -873,7 +887,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				services: { fret }
 			} as unknown as Libp2p;
 			const network = new Libp2pKeyPeerNetwork(
-				libp2p, 16, undefined, options?.networkMode ?? 'forming', persistence
+				libp2p, 16, undefined, options?.joining ? unreachedBootstrap() : undefined, persistence
 			);
 			await network.initFromPersistedState();
 			return { network, state, attemptCount: () => attempts };
@@ -915,12 +929,12 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('a solo node that never had company also skips the window (joining mode, HWM 1)', async () => {
 			// The reported case: a node configured with a bootstrap address it has never
-			// reached. `networkMode` is fixed at construction ('joining' the moment any
-			// bootstrap address is configured) and used to force the window open forever;
-			// nothing about it says a peer can arrive in the next 500ms. FRET is empty here —
+			// reached. That it was configured with one is fixed at construction and used to
+			// force the window open forever; nothing about it says a peer can arrive in the
+			// next 500ms. FRET is empty here —
 			// not even self — so no tier can pick anything before the last-resort self degrade.
 			const { network, attemptCount } = await justDisconnectedNode({
-				networkMode: 'joining',
+				joining: true,
 				highWaterMark: 1,
 				neighbors: []
 			});
@@ -1069,7 +1083,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 						} as unknown as Libp2p
 					};
 				})();
-				const network = new Libp2pKeyPeerNetwork(libp2p, 16, { allowSelfCoordination: false }, 'forming');
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, { allowSelfCoordination: false }, undefined);
 				let caught: unknown;
 				try {
 					await network.findCoordinator(KEY, { intent });
@@ -1104,7 +1118,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				};
 				const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(remote)], fret });
 				// Default high-water mark of 1: the guard allows self as a bootstrap node.
-				const network = new Libp2pKeyPeerNetwork(libp2p, clusterSize, undefined, 'forming');
+				const network = new Libp2pKeyPeerNetwork(libp2p, clusterSize, undefined, undefined);
 				network.recordCoordinator(KEY, remote);
 				return network;
 			};
@@ -1123,18 +1137,162 @@ describe('Libp2pKeyPeerNetwork', () => {
 		});
 	});
 
-	describe('networkMode defaults', () => {
-		it('defaults to forming when not specified', () => {
-			const libp2p = createMockLibp2p(selfPeerId);
-			// clusterSize is stated (it has no default any more); this case is about networkMode.
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16);
-			expect((network as any).networkMode).to.equal('forming');
+	// A node configured with a bootstrap peer knows of a machine it was told to join through. Two
+	// rules follow (GitHub issue #27): a lookup that would find the node alone waits, bounded and
+	// only on evidence, while that peer is on its way into view; and until the peer has been heard
+	// from, the node reports that it is still awaiting contact.
+	describe('bootstrap contact', () => {
+		const PREFIX = '/optimystic/netA';
+		const SERVES = [`${PREFIX}/cluster/1.0.0`, `${PREFIX}/repo/1.0.0`];
+		const KEY = routingKeyForBlock('cold-joiner-block');
+		const pause = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+		/**
+		 * A joining node and the one peer it was configured with. `world` is what a case moves: how
+		 * many dials or identify exchanges with the peer are in flight, what identify has answered,
+		 * whether the peer is connected, what its peerStore protocol list says, and whether FRET
+		 * holds it in the ring. `settle()` is one of those flights settling.
+		 */
+		async function joiner(options?: { contactTimeoutMs?: number; restoredAsServing?: boolean }) {
+			const partner = await makePeerId();
+			const world = {
+				inFlight: 1,
+				answer: undefined as 'identified' | 'foreign' | undefined,
+				connected: false,
+				protocols: [] as string[],
+				inRing: false
+			};
+			let waiters: Array<() => void> = [];
+			const settle = (): void => {
+				const woken = waiters;
+				waiters = [];
+				for (const wake of woken) wake();
+			};
+			let assemblies = 0;
+			const fret = {
+				assembleCohort: () => {
+					assemblies++;
+					return world.inRing ? [partner.toString(), selfPeerId.toString()] : [selfPeerId.toString()];
+				},
+				getNetworkSizeEstimate: () => ({ size_estimate: 1, confidence: 0 }),
+				detectPartition: () => false,
+				exportTable: () => undefined
+			};
+			const peerStore = {
+				get: async (pid: { toString(): string }) =>
+					({ protocols: pid.toString() === partner.toString() ? world.protocols : [], addresses: [] })
+			};
+			const libp2p = {
+				peerId: selfPeerId,
+				getConnections: () => world.connected ? [outboundConnTo(partner)] : [],
+				getDialQueue: () => [],
+				getMultiaddrs: () => [],
+				addEventListener: () => {},
+				removeEventListener: () => {},
+				peerStore,
+				services: { fret }
+			} as unknown as Libp2p;
+			const bootstrap: BootstrapContactOptions = {
+				contact: {
+					peerIds: [partner.toString()],
+					answerOf: () => world.answer,
+					inFlight: () => world.inFlight,
+					nextSettled: () => new Promise<void>(resolve => { waiters.push(resolve); })
+				},
+				contactTimeoutMs: options?.contactTimeoutMs ?? 10_000
+			};
+			const persistence = options?.restoredAsServing
+				? new MemoryPersistence({
+					version: PERSISTED_STATE_VERSION,
+					networkHighWaterMark: 2,
+					lastConnectedTimestamp: Date.now(),
+					consecutiveIsolatedSessions: 0,
+					servingPeers: [partner.toString()]
+				})
+				: undefined;
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, bootstrap, persistence, undefined, PREFIX);
+			await network.initFromPersistedState();
+			const cohort = async (): Promise<string[]> => Object.keys(await network.findCluster(KEY));
+			return { network, partner, world, settle, cohort, assemblies: () => assemblies };
+		}
+
+		it('a lookup made before the bootstrap peer has joined the view waits, and answers with the peer in the cohort', async () => {
+			const { partner, world, settle, cohort } = await joiner();
+			let answered = false;
+			const lookup = cohort().finally(() => { answered = true; });
+
+			// The dial connects and identify starts on the connection: still one flight. The peer's
+			// list already shows a protocol libp2p recorded from a negotiated stream, which is not
+			// the peer's answer.
+			world.connected = true;
+			world.protocols = [`${PREFIX}/id/1.0.0`];
+			settle();
+			await pause(80);
+			expect(answered, 'held while identify is in flight').to.equal(false);
+
+			// Identify lands. FRET has not admitted the peer to the ring yet.
+			world.inFlight = 0;
+			world.answer = 'identified';
+			world.protocols = SERVES;
+			settle();
+			await pause(80);
+			expect(answered, 'held while an identified, serving peer is not in the ring yet').to.equal(false);
+
+			world.inRing = true;
+			expect(await lookup).to.deep.equal([partner.toString(), selfPeerId.toString()]);
 		});
 
-		it('accepts joining mode', () => {
-			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'joining');
-			expect((network as any).networkMode).to.equal('joining');
+		it('a bootstrap peer on another network ends the wait when it refuses identify, and is no longer awaited', async () => {
+			const { network, world, settle, cohort } = await joiner();
+			const lookup = cohort();
+			world.connected = true;
+			world.inFlight = 0;
+			world.answer = 'foreign';
+			settle();
+			expect(await lookup).to.deep.equal([selfPeerId.toString()]);
+			expect(await network.awaitingBootstrapContact(), 'a refusal is an answer').to.equal(false);
+		});
+
+		it('a failed bootstrap dial ends the wait, leaves the peer awaited, and the wait is not entered again', async () => {
+			const { network, world, settle, cohort, assemblies } = await joiner();
+			const lookup = cohort();
+			world.inFlight = 0; // settled with nothing connected: the dial failed
+			settle();
+			expect(await lookup).to.deep.equal([selfPeerId.toString()]);
+			expect(await network.awaitingBootstrapContact(), 'the peer never answered').to.equal(true);
+
+			// A flight is evidence the first time round. The wait has closed, so a later lookup
+			// reads the view once and answers.
+			world.inFlight = 1;
+			const before = assemblies();
+			expect(await cohort()).to.deep.equal([selfPeerId.toString()]);
+			expect(assemblies() - before, 'one reading of the view, no wait').to.equal(1);
+		});
+
+		it('the deadline ends the wait while a dial is still in flight, and the wait is not entered again', async () => {
+			const { cohort, assemblies } = await joiner({ contactTimeoutMs: 60 });
+			const started = Date.now();
+			expect(await cohort()).to.deep.equal([selfPeerId.toString()]);
+			expect(Date.now() - started, 'waited for the deadline').to.be.at.least(50);
+
+			const before = assemblies();
+			await cohort();
+			expect(assemblies() - before, 'one reading of the view, no wait').to.equal(1);
+		});
+
+		it('awaits contact until identify has answered: a connection and a protocol list are not an answer', async () => {
+			const { network, world } = await joiner();
+			world.connected = true;
+			world.protocols = SERVES;
+			expect(await network.awaitingBootstrapContact()).to.equal(true);
+
+			world.answer = 'identified';
+			expect(await network.awaitingBootstrapContact()).to.equal(false);
+		});
+
+		it('does not await a peer whose serving verdict was restored from persisted state', async () => {
+			const { network } = await joiner({ restoredAsServing: true });
+			expect(await network.awaitingBootstrapContact()).to.equal(false);
 		});
 	});
 
@@ -1191,7 +1349,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			} as unknown as Connection;
 
 			const libp2p = createLibp2pWithConnect({ connections: [mockConn] });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const otherPeerId = await makePeerId();
 
 			const stream = await network.connect(otherPeerId, PROTOCOL);
@@ -1219,7 +1377,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 					return Promise.resolve(FAKE_STREAM);
 				}
 			});
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const otherPeerId = await makePeerId();
 
 			const stream = await network.connect(otherPeerId, PROTOCOL);
@@ -1239,7 +1397,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 					return Promise.resolve(FAKE_STREAM);
 				}
 			});
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const otherPeerId = await makePeerId();
 
 			const stream = await network.connect(otherPeerId, PROTOCOL);
@@ -1270,7 +1428,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			} as unknown as Connection;
 
 			const libp2p = createLibp2pWithConnect({ connections: [limitedConn, directConn] });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const otherPeerId = await makePeerId();
 
 			const stream = await network.connect(otherPeerId, PROTOCOL);
@@ -1298,7 +1456,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			} as unknown as Connection;
 
 			const libp2p = createLibp2pWithConnect({ connections: [circuitConn, directConn] });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const otherPeerId = await makePeerId();
 
 			const stream = await network.connect(otherPeerId, PROTOCOL);
@@ -1319,7 +1477,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			} as unknown as Connection;
 
 			const libp2p = createLibp2pWithConnect({ connections: [limitedOnly] });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const otherPeerId = await makePeerId();
 
 			const stream = await network.connect(otherPeerId, PROTOCOL);
@@ -1338,7 +1496,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			} as unknown as Connection;
 
 			const libp2p = createLibp2pWithConnect({ connections: [mockConn] });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const otherPeerId = await makePeerId();
 			const controller = new AbortController();
 
@@ -1369,7 +1527,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 					dialProtocol: () => { dialed = true; return Promise.resolve(FAKE_STREAM); },
 					peerStoreAddrs: { [otherPeerId.toString()]: [selfRelay(otherPeerId)] }
 				});
-				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 
 				const err = await network.connect(otherPeerId, PROTOCOL).then(
 					() => undefined,
@@ -1396,7 +1554,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 						]
 					}
 				});
-				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 
 				expect(await network.connect(otherPeerId, PROTOCOL)).to.equal(FAKE_STREAM);
 				expect(dialed).to.equal(true);
@@ -1410,7 +1568,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 					dialProtocol: () => { dialed = true; return Promise.resolve(FAKE_STREAM); },
 					peerStoreAddrs: {}
 				});
-				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 
 				expect(await network.connect(otherPeerId, PROTOCOL)).to.equal(FAKE_STREAM);
 				expect(dialed, 'never-taught-an-address is a different condition; libp2p still owns it').to.equal(true);
@@ -1423,7 +1581,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 					connections: [],
 					dialProtocol: () => { dialed = true; return Promise.resolve(FAKE_STREAM); }
 				});
-				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 
 				expect(await network.connect(otherPeerId, PROTOCOL)).to.equal(FAKE_STREAM);
 				expect(dialed).to.equal(true);
@@ -1442,7 +1600,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 					peerStoreAddrs: { [otherPeerId.toString()]: [selfRelay(otherPeerId)] },
 					onPeerStoreRead: () => { throw new Error('datastore unavailable'); }
 				});
-				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 
 				expect(await network.connect(otherPeerId, PROTOCOL)).to.equal(FAKE_STREAM);
 				expect(dialed, 'an unreadable peerStore must not become a refusal').to.equal(true);
@@ -1462,7 +1620,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 						[otherPeerId.toString()]: [`/ip4/10.0.0.9/tcp/4001/p2p/${otherRelay.toString()}/p2p-circuit/p2p/${otherPeerId.toString()}`]
 					}
 				});
-				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 
 				expect(await network.connect(otherPeerId, PROTOCOL)).to.equal(FAKE_STREAM);
 				expect(dialed).to.equal(true);
@@ -1485,7 +1643,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 					peerStoreAddrs: { [otherPeerId.toString()]: [selfRelay(otherPeerId)] },
 					onPeerStoreRead: () => { peerStoreReads++; }
 				});
-				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 
 				expect(await network.connect(otherPeerId, PROTOCOL)).to.equal(FAKE_STREAM);
 				expect(peerStoreReads, 'the warm path must not pay a peerStore read').to.equal(0);
@@ -1500,7 +1658,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 					peerStoreAddrs: { [otherPeerId.toString()]: [selfRelay(otherPeerId)] },
 					onPeerStoreRead: () => { controller.abort(cancelled); }
 				});
-				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 
 				const err = await network.connect(otherPeerId, PROTOCOL, { signal: controller.signal }).then(
 					() => undefined,
@@ -1549,7 +1707,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				services: { fret }
 			} as unknown as Libp2p;
 
-			const network = new Libp2pKeyPeerNetwork(libp2p, 4, undefined, 'joining');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 4, undefined, unreachedBootstrap());
 			const key = routingKeyForBlock('some-key');
 			const cluster = await network.findCluster(key);
 			expect(cluster[svcA.toString()]).to.exist;
@@ -1601,7 +1759,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 		 *  membership filter is a no-op here, so the cohort member is retained on address grounds
 		 *  alone and nothing else can explain a missing entry. */
 		async function findClusterWithLog(libp2p: Libp2p): Promise<{ cluster: Record<string, { multiaddrs: string[] }>, captured: unknown[][] }> {
-			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, unreachedBootstrap());
 			let cluster: Record<string, { multiaddrs: string[] }> = {};
 			const captured = await captureLog('libp2p-key-network', async () => {
 				cluster = await network.findCluster(KEY);
@@ -1836,7 +1994,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				[crossNet.toString()]: { protocols: [] } // identify never completed across networks
 			});
 			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(crossNet), outboundConnTo(sameNet)], fret, peerStore });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', undefined, undefined, PREFIX);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, undefined, undefined, PREFIX);
 			const result = await network.findCoordinator(routingKeyForBlock('block-near-crossnet'));
 			expect(result.toString()).to.equal(sameNet.toString());
 		});
@@ -1846,7 +2004,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const fret = baseFret({ assembleCohort: () => [crossNet.toString(), selfPeerId.toString()] });
 			const peerStore = peerStoreOf({ [crossNet.toString()]: { protocols: [] } });
 			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(crossNet)], fret, peerStore });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', undefined, undefined, PREFIX);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, undefined, undefined, PREFIX);
 			const result = await network.findCoordinator(routingKeyForBlock('block-near-crossnet'));
 			expect(result.toString()).to.equal(selfPeerId.toString());
 		});
@@ -1863,7 +2021,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const fret = baseFret({ assembleCohort: () => [foreign.toString()] });
 			const peerStore = peerStoreOf({ [foreign.toString()]: { protocols: ['/optimystic/netB/cluster/1.0.0'] } });
 			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(foreign)], fret, peerStore });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence, undefined, PREFIX);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence, undefined, PREFIX);
 			await network.initFromPersistedState();
 
 			let caught: unknown;
@@ -1887,8 +2045,8 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const fret = baseFret({ assembleCohort: () => [crossNet.toString()] });
 			const peerStore = peerStoreOf({ [crossNet.toString()]: { protocols: [] } });
 			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(crossNet)], fret, peerStore });
-			// 'forming' + default HWM<=1 → self-coordination allowed (bootstrap-node); self NOT excluded.
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', undefined, undefined, PREFIX);
+			// Default HWM<=1 → self-coordination allowed (bootstrap-node); self NOT excluded.
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, undefined, undefined, PREFIX);
 			const result = await network.findCoordinator(routingKeyForBlock('block-near-crossnet'));
 			expect(result.toString(), 'self-coordinates rather than picking the cross-network peer').to.equal(selfPeerId.toString());
 		});
@@ -1908,7 +2066,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const fret = baseFret({ assembleCohort: () => [crossNet.toString()] });
 			const peerStore = peerStoreOf({ [crossNet.toString()]: { protocols: [] } }); // identify never completed across networks
 			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(crossNet)], fret, peerStore });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence, undefined, PREFIX);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence, undefined, PREFIX);
 			await network.initFromPersistedState();
 
 			let caught: unknown;
@@ -1952,7 +2110,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				consecutiveIsolatedSessions: 0
 			});
 			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(flipPeer)], fret, peerStore });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence, undefined, PREFIX);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined, persistence, undefined, PREFIX);
 			await network.initFromPersistedState();
 			const result = await network.findCoordinator(routingKeyForBlock('block-flip'), { excludedPeers: [selfPeerId] });
 			expect(result.toString(), 'selects the same-network peer once it flips to serves').to.equal(flipPeer.toString());
@@ -1969,7 +2127,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
 			// clusterSize 2 → the nearest serving peer (sameNet) plus self, the only other serving
 			// member, fill the cohort; crossNet ('unknown') is never admitted.
-			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining', undefined, undefined, PREFIX);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, unreachedBootstrap(), undefined, undefined, PREFIX);
 			const cluster = await network.findCluster(routingKeyForBlock('some-key'));
 			expect(Object.keys(cluster), 'proximity order: the serving peer is nearer than self').to.deep.equal([sameNet.toString(), selfPeerId.toString()]);
 			expect(cluster[crossNet.toString()], 'cross-network peer excluded').to.not.exist;
@@ -1991,7 +2149,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				[s3.toString()]: { protocols: servesProto(PREFIX), addresses: [`/ip4/10.0.0.13/tcp/4001/p2p/${s3.toString()}`] }
 			});
 			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining', undefined, undefined, PREFIX);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, unreachedBootstrap(), undefined, undefined, PREFIX);
 			const cluster = await network.findCluster(routingKeyForBlock('populated-key'));
 			expect(Object.keys(cluster), 'the two nearest serving peers, in proximity order').to.deep.equal([s1.toString(), s2.toString()]);
 			expect(cluster[selfPeerId.toString()], 'self is farther than clusterSize serving peers, so it is not responsible').to.not.exist;
@@ -2004,7 +2162,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				[foreign.toString()]: { protocols: ['/optimystic/netB/cluster/1.0.0'], addresses: [`/ip4/10.0.0.9/tcp/4001/p2p/${foreign.toString()}`] }
 			});
 			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining', undefined, undefined, PREFIX);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, unreachedBootstrap(), undefined, undefined, PREFIX);
 			const cluster = await network.findCluster(routingKeyForBlock('k'));
 			expect(Object.keys(cluster)).to.deep.equal([selfPeerId.toString()]);
 		});
@@ -2025,7 +2183,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			});
 			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
 			// clusterSize 3, no serving peers → cohort is self-only; both 'unknown' members excluded.
-			const network = new Libp2pKeyPeerNetwork(libp2p, 3, undefined, 'joining', undefined, undefined, PREFIX);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 3, undefined, unreachedBootstrap(), undefined, undefined, PREFIX);
 			const cluster = await network.findCluster(routingKeyForBlock('k'));
 			expect(Object.keys(cluster)).to.deep.equal([selfPeerId.toString()]);
 			expect(cluster[freshA.toString()], 'not-yet-identified peer excluded').to.not.exist;
@@ -2045,7 +2203,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				[crossNet.toString()]: { protocols: [], addresses: [`/ip4/10.0.0.7/tcp/4001/p2p/${crossNet.toString()}`] }
 			});
 			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining', undefined, undefined, PREFIX);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, unreachedBootstrap(), undefined, undefined, PREFIX);
 			const cluster = await network.findCluster(routingKeyForBlock('k'));
 			expect(Object.keys(cluster)).to.deep.equal([selfPeerId.toString()]);
 			expect(cluster[crossNet.toString()], 'cross-network peer excluded').to.not.exist;
@@ -2060,7 +2218,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				[sameNet.toString()]: { protocols: servesProto(PREFIX), addresses: [`/ip4/10.0.0.8/tcp/4001/p2p/${sameNet.toString()}`] }
 			});
 			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 1, undefined, 'joining', undefined, undefined, PREFIX);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 1, undefined, unreachedBootstrap(), undefined, undefined, PREFIX);
 			const cluster = await network.findCluster(routingKeyForBlock('k'));
 			expect(Object.keys(cluster)).to.deep.equal([sameNet.toString()]);
 			expect(cluster[selfPeerId.toString()], 'the one slot goes to the nearest serving peer').to.not.exist;
@@ -2090,7 +2248,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const before = new Libp2pKeyPeerNetwork(createMockLibp2p(selfPeerId, {
 				fret: fret(),
 				peerStore: peerStoreOf({ [remote.toString()]: { protocols: servesProto(PREFIX) } })
-			}), 2, undefined, 'forming', persistence, undefined, PREFIX);
+			}), 2, undefined, undefined, persistence, undefined, PREFIX);
 			expect(Object.keys(await before.findCluster(KEY))).to.include(remote.toString());
 			await waitFor(() => persistence.saved?.servingPeers?.includes(remote.toString()) === true,
 				{ description: 'the serving verdict for remote was saved' });
@@ -2098,7 +2256,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const after = new Libp2pKeyPeerNetwork(createMockLibp2p(selfPeerId, {
 				fret: fret(),
 				peerStore: peerStoreOf({})
-			}), 2, undefined, 'forming', persistence, undefined, PREFIX);
+			}), 2, undefined, undefined, persistence, undefined, PREFIX);
 			await after.initFromPersistedState();
 			expect(Object.keys(await after.findCluster(KEY)), 'the restarted node assembles the cohort it had before')
 				.to.deep.equal([remote.toString(), selfPeerId.toString()]);
@@ -2112,7 +2270,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			});
 			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
 			// No protocolPrefix → membership filter is a no-op → member retained as before.
-			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, unreachedBootstrap());
 			const cluster = await network.findCluster(routingKeyForBlock('k'));
 			expect(cluster[crossNet.toString()]).to.exist;
 		});
@@ -2122,7 +2280,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const fret = baseFret({ assembleCohort: () => [peerA.toString()] });
 			const peerStore = peerStoreOf({ [peerA.toString()]: { protocols: [] } });
 			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(peerA)], fret, peerStore });
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const result = await network.findCoordinator(routingKeyForBlock('k'));
 			expect(result.toString()).to.equal(peerA.toString());
 		});
@@ -2195,7 +2353,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			it('a solo node (FRET knows nobody) gets a self-only cohort, on both the scoped and the unscoped path', async () => {
 				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => []), peerStore: peerStoreServing([]) });
 				for (const prefix of [undefined, PREFIX]) {
-					const network = new Libp2pKeyPeerNetwork(libp2p, 3, undefined, 'forming', undefined, undefined, prefix);
+					const network = new Libp2pKeyPeerNetwork(libp2p, 3, undefined, undefined, undefined, undefined, prefix);
 					expect(ids(await network.findCluster(KEY)), `prefix=${prefix}`).to.deep.equal([selfPeerId.toString()]);
 				}
 			});
@@ -2205,7 +2363,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				// At HEAD the unscoped path unioned self in and the scoped path put self FIRST.
 				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => strs([a, b, c])), peerStore: peerStoreServing([a, b, c]) });
 				for (const prefix of [undefined, PREFIX]) {
-					const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, prefix);
+					const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, undefined, undefined, undefined, prefix);
 					expect(ids(await network.findCluster(KEY)), `prefix=${prefix}`).to.deep.equal(strs([a, b]));
 				}
 			});
@@ -2214,7 +2372,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				// Band [a, self, b]: self is the second-nearest. clusterSize 2 → [a, self]; b is out.
 				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => [a.toString(), selfPeerId.toString(), b.toString()]), peerStore: peerStoreServing([a, b]) });
 				for (const prefix of [undefined, PREFIX]) {
-					const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, prefix);
+					const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, undefined, undefined, undefined, prefix);
 					expect(ids(await network.findCluster(KEY)), `prefix=${prefix}`).to.deep.equal([a.toString(), selfPeerId.toString()]);
 				}
 			});
@@ -2224,7 +2382,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				// serving self absent from the band is appended LAST (it is the farthest member).
 				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => strs([a, b])), peerStore: peerStoreServing([a, b]) });
 				for (const prefix of [undefined, PREFIX]) {
-					const network = new Libp2pKeyPeerNetwork(libp2p, 3, undefined, 'forming', undefined, undefined, prefix);
+					const network = new Libp2pKeyPeerNetwork(libp2p, 3, undefined, undefined, undefined, undefined, prefix);
 					expect(ids(await network.findCluster(KEY)), `prefix=${prefix}`).to.deep.equal([a.toString(), b.toString(), selfPeerId.toString()]);
 				}
 			});
@@ -2232,26 +2390,26 @@ describe('Libp2pKeyPeerNetwork', () => {
 			it('a nearer cross-network peer does not displace self: the cohort is the nearest clusterSize SERVING members', async () => {
 				// Band [c (unidentified), a, self, b], clusterSize 2 → serving [a, self, b] → [a, self].
 				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => [c.toString(), a.toString(), selfPeerId.toString(), b.toString()]), peerStore: peerStoreServing([a, b]) });
-				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, undefined, undefined, undefined, PREFIX);
 				expect(ids(await network.findCluster(KEY))).to.deep.equal([a.toString(), selfPeerId.toString()]);
 			});
 
 			it('a node that does not serve this network is in no cohort at any width, and its cohort may be empty', async () => {
 				const alone = withOwnProtocols(createMockLibp2p(selfPeerId, { fret: fretWithBand(() => []), peerStore: peerStoreServing([]) }), clientOnlyProto);
-				const solo = new Libp2pKeyPeerNetwork(alone, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				const solo = new Libp2pKeyPeerNetwork(alone, 2, undefined, undefined, undefined, undefined, PREFIX);
 				expect(ids(await solo.findCluster(KEY)), 'no serving peer known: an EMPTY cohort, not a self-only one').to.deep.equal([]);
 
 				// FRET's ring holds this node regardless of what it stores, so it can list self
 				// nearest; self is removed wherever it sits.
 				const near = withOwnProtocols(createMockLibp2p(selfPeerId, { fret: fretWithBand(() => [selfPeerId.toString(), a.toString()]), peerStore: peerStoreServing([a]) }), clientOnlyProto);
-				const wide = new Libp2pKeyPeerNetwork(near, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				const wide = new Libp2pKeyPeerNetwork(near, 2, undefined, undefined, undefined, undefined, PREFIX);
 				expect(ids(await wide.findCluster(KEY)), 'self removed from the band even when FRET ranks it nearest').to.deep.equal([a.toString()]);
 			});
 
 			it('a libp2p double without getProtocols counts as serving, the convention every optional mock surface follows', async () => {
 				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => []), peerStore: peerStoreServing([]) });
 				expect((libp2p as unknown as { getProtocols?: unknown }).getProtocols, 'precondition: the double has no getProtocols').to.equal(undefined);
-				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, undefined, undefined, undefined, PREFIX);
 				expect(ids(await network.findCluster(KEY))).to.deep.equal([selfPeerId.toString()]);
 			});
 		});
@@ -2265,7 +2423,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				// is connected, serving, and listed ahead of a by getNeighbors.
 				const fret = { ...fretWithBand(() => [selfPeerId.toString(), a.toString()]), getNeighbors: () => [selfPeerId.toString(), b.toString(), a.toString()] };
 				const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(b), outboundConnTo(a)], fret, peerStore: peerStoreServing([a, b]) });
-				const network = new Libp2pKeyPeerNetwork(libp2p, 2, { allowSelfCoordination: false }, 'forming', undefined, undefined, PREFIX);
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, { allowSelfCoordination: false }, undefined, undefined, undefined, PREFIX);
 				expect((await network.findCoordinator(KEY)).toString()).to.equal(a.toString());
 			});
 
@@ -2274,7 +2432,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				// b is picked — an unstable sort here would let two writers name different coordinators.
 				const fret = fretWithBand(() => [b.toString(), a.toString(), selfPeerId.toString()]);
 				const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(a), outboundConnTo(b)], fret, peerStore: peerStoreServing([a, b]) });
-				const network = new Libp2pKeyPeerNetwork(libp2p, 3, undefined, 'forming', undefined, undefined, PREFIX);
+				const network = new Libp2pKeyPeerNetwork(libp2p, 3, undefined, undefined, undefined, undefined, PREFIX);
 				expect((await network.findCoordinator(KEY)).toString()).to.equal(b.toString());
 			});
 
@@ -2284,7 +2442,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				const fret = fretWithBand(() => strs([b, a, c]));
 				const reputation = { getScore: (id: string) => id === b.toString() ? 5 : 0, isBanned: () => false } as unknown as IPeerReputation;
 				const libp2p = createMockLibp2p(selfPeerId, { connections: [a, b, c].map(outboundConnTo), fret, peerStore: peerStoreServing([a, b, c]) });
-				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, reputation, PREFIX);
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, undefined, undefined, reputation, PREFIX);
 				expect((await network.findCoordinator(KEY)).toString()).to.equal(a.toString());
 			});
 
@@ -2293,7 +2451,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				// which is what let self win at HEAD; now a heads the cohort and self is not in it.
 				const fret = fretWithBand(() => strs([a, b]));
 				const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(a), outboundConnTo(b)], fret, peerStore: peerStoreServing([a, b]) });
-				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, undefined, undefined, undefined, PREFIX);
 				expect(network.shouldAllowSelfCoordination().allow, 'precondition: the guard is not what keeps self out').to.equal(true);
 				expect((await network.findCoordinator(KEY)).toString()).to.equal(a.toString());
 			});
@@ -2304,7 +2462,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				// over failing the caller.
 				const fret = fretWithBand(() => [a.toString(), selfPeerId.toString()]);
 				const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(b)], fret, peerStore: peerStoreServing([a, b]) });
-				const network = new Libp2pKeyPeerNetwork(libp2p, 2, { allowSelfCoordination: false }, 'forming', undefined, undefined, PREFIX);
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, { allowSelfCoordination: false }, undefined, undefined, undefined, PREFIX);
 				expect((await network.findCoordinator(KEY)).toString()).to.equal(b.toString());
 			});
 
@@ -2316,7 +2474,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				this.timeout(5_000);
 				const fret = fretWithBand(() => strs([a, b]));
 				const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore: peerStoreServing([a, b]) });
-				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, undefined, undefined, undefined, PREFIX);
 				expect(network.shouldAllowSelfCoordination().allow, 'precondition: the guard would allow self').to.equal(true);
 				const err = await expectCode(() => network.findCoordinator(KEY), FIND_COORDINATOR_ERROR_CODES.NO_COORDINATOR_AVAILABLE, 'outsider');
 				expect(err.message).to.match(/not among the responsible peers/);
@@ -2327,18 +2485,18 @@ describe('Libp2pKeyPeerNetwork', () => {
 				// tier: no self fallback for a block this node is not responsible for.
 				this.timeout(5_000);
 				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => strs([a, b])), peerStore: peerStoreServing([a, b]) });
-				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, undefined, undefined, undefined, PREFIX);
 				await expectCode(() => network.findCoordinator(KEY, { intent: 'read' }), FIND_COORDINATOR_ERROR_CODES.NO_COORDINATOR_AVAILABLE, 'outsider read');
 			});
 
 			it('without a FRET service the cohort is underivable: no self last resort, but the connected fallback still routes', async () => {
 				// No production node lacks FRET (`libp2p-node-base.ts` always registers it), and such a
 				// node's findCluster throws, so a self pick could never complete a write anyway.
-				const isolated = new Libp2pKeyPeerNetwork(createMockLibp2p(selfPeerId, { peerStore: peerStoreServing([]) }), 2, undefined, 'forming', undefined, undefined, PREFIX);
+				const isolated = new Libp2pKeyPeerNetwork(createMockLibp2p(selfPeerId, { peerStore: peerStoreServing([]) }), 2, undefined, undefined, undefined, undefined, PREFIX);
 				const err = await expectCode(() => isolated.findCoordinator(KEY), FIND_COORDINATOR_ERROR_CODES.NO_COORDINATOR_AVAILABLE, 'no FRET, no peers');
 				expect(err.message).to.match(/could not be derived/);
 
-				const connected = new Libp2pKeyPeerNetwork(createMockLibp2p(selfPeerId, { connections: [outboundConnTo(a)], peerStore: peerStoreServing([a]) }), 2, undefined, 'forming', undefined, undefined, PREFIX);
+				const connected = new Libp2pKeyPeerNetwork(createMockLibp2p(selfPeerId, { connections: [outboundConnTo(a)], peerStore: peerStoreServing([a]) }), 2, undefined, undefined, undefined, undefined, PREFIX);
 				expect((await connected.findCoordinator(KEY)).toString()).to.equal(a.toString());
 			});
 
@@ -2349,23 +2507,23 @@ describe('Libp2pKeyPeerNetwork', () => {
 				// Solo client: FRET's ring lists only self. At HEAD every tier's fallback returned self;
 				// now there is nobody responsible to route to, so the lookup fails in one attempt.
 				for (const intent of ['read', 'write'] as const) {
-					const alone = new Libp2pKeyPeerNetwork(client([selfPeerId.toString()], [], []), 2, undefined, 'forming', undefined, undefined, PREFIX);
+					const alone = new Libp2pKeyPeerNetwork(client([selfPeerId.toString()], [], []), 2, undefined, undefined, undefined, undefined, PREFIX);
 					await expectCode(() => alone.findCoordinator(KEY, { intent }), FIND_COORDINATOR_ERROR_CODES.NO_COORDINATOR_AVAILABLE, `solo client, intent=${intent}`);
 				}
 
 				// The only connected peer has not completed identify: dropped as unconfirmed, and the
 				// error names that as the cause rather than the generic code.
-				const unconfirmed = new Libp2pKeyPeerNetwork(client([selfPeerId.toString(), c.toString()], [outboundConnTo(c)], []), 2, undefined, 'forming', undefined, undefined, PREFIX);
+				const unconfirmed = new Libp2pKeyPeerNetwork(client([selfPeerId.toString(), c.toString()], [outboundConnTo(c)], []), 2, undefined, undefined, undefined, undefined, PREFIX);
 				await expectCode(() => unconfirmed.findCoordinator(KEY), FIND_COORDINATOR_ERROR_CODES.NO_NETWORK_COORDINATOR, 'unconfirmed peer only');
 
 				// A connected serving peer is picked through the cohort tier as usual.
-				const served = new Libp2pKeyPeerNetwork(client([selfPeerId.toString(), a.toString()], [outboundConnTo(a)], [a]), 2, undefined, 'forming', undefined, undefined, PREFIX);
+				const served = new Libp2pKeyPeerNetwork(client([selfPeerId.toString(), a.toString()], [outboundConnTo(a)], [a]), 2, undefined, undefined, undefined, undefined, PREFIX);
 				expect((await served.findCoordinator(KEY)).toString()).to.equal(a.toString());
 			});
 
 			it('SELF_COORDINATION_EXHAUSTED keeps its meaning: the caller excluded self on a solo node', async () => {
 				const libp2p = createMockLibp2p(selfPeerId, { fret: fretWithBand(() => [selfPeerId.toString()]), peerStore: peerStoreServing([]) });
-				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'forming', undefined, undefined, PREFIX);
+				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, undefined, undefined, undefined, PREFIX);
 				await expectCode(() => network.findCoordinator(KEY, { excludedPeers: [selfPeerId] }), FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_EXHAUSTED, 'self excluded');
 			});
 		});
@@ -2420,7 +2578,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('asks libp2p for its own addresses once across many findCluster calls', async () => {
 			const mock = soloLibp2p(`/ip4/10.0.0.99/tcp/4001/ws/p2p/${selfPeerId.toString()}`);
-			const network = new Libp2pKeyPeerNetwork(mock.libp2p, 1, undefined, 'joining');
+			const network = new Libp2pKeyPeerNetwork(mock.libp2p, 1, undefined, unreachedBootstrap());
 
 			for (let i = 0; i < 25; i++) await network.findCluster(KEY);
 
@@ -2431,7 +2589,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 		it('still reports the same addresses on every call', async () => {
 			const addr = `/ip4/10.0.0.99/tcp/4001/ws/p2p/${selfPeerId.toString()}`;
 			const mock = soloLibp2p(addr);
-			const network = new Libp2pKeyPeerNetwork(mock.libp2p, 1, undefined, 'joining');
+			const network = new Libp2pKeyPeerNetwork(mock.libp2p, 1, undefined, unreachedBootstrap());
 
 			const first = await network.findCluster(KEY);
 			const second = await network.findCluster(KEY);
@@ -2445,7 +2603,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			// relay reservation AFTER its first findCluster must publish the new address; a cache
 			// with no invalidation would keep advertising the old one forever.
 			const mock = soloLibp2p(`/ip4/10.0.0.99/tcp/4001/ws/p2p/${selfPeerId.toString()}`);
-			const network = new Libp2pKeyPeerNetwork(mock.libp2p, 1, undefined, 'joining');
+			const network = new Libp2pKeyPeerNetwork(mock.libp2p, 1, undefined, unreachedBootstrap());
 
 			await network.findCluster(KEY);
 			await network.findCluster(KEY);
@@ -2464,7 +2622,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			// cached array itself would let one caller's push land in every later cluster record.
 			const addr = `/ip4/10.0.0.99/tcp/4001/ws/p2p/${selfPeerId.toString()}`;
 			const mock = soloLibp2p(addr);
-			const network = new Libp2pKeyPeerNetwork(mock.libp2p, 1, undefined, 'joining');
+			const network = new Libp2pKeyPeerNetwork(mock.libp2p, 1, undefined, unreachedBootstrap());
 
 			const first = await network.findCluster(KEY);
 			first[selfPeerId.toString()]!.multiaddrs.push('/ip4/6.6.6.6/tcp/1/ws');

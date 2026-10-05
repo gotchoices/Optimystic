@@ -31,7 +31,7 @@ import { assertClusterSizeCoupling } from './cluster/cluster-size-coupling.js';
 import type { Libp2pConnectionTimeouts } from './connection-monitor.js';
 import { createCommitCertStore, makeClusterCommitCertExtractor, type CommitCertStore } from './cluster/commit-cert.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
-import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
+import { Libp2pKeyPeerNetwork, type BootstrapContactOptions, type NetworkStatePersistence } from './libp2p-key-network.js';
 import { mergePeerAddresses, publishableAddrsForPeer, type AddressLog } from './peer-address-book.js';
 import type { OptimysticNode, OptimysticNodeAttachments } from './optimystic-node.js';
 import { ClusterClient } from './cluster/client.js';
@@ -39,6 +39,8 @@ import type { IRepo, ICluster, ITransactionValidator, BlockId, IBlockChangeNotif
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
 import { networkManagerService, type NetworkManagerService } from './network/network-manager-service.js';
 import { assertCircuitRelayTransport, assertRelayAddrsAdvertisable, planRelayListenAddrs, superviseRelayReservations } from './network/relay-reservation.js';
+import { BootstrapContactTracker, planBootstrapTargets } from './network/bootstrap-contact.js';
+import { identifyOnConnectionOpen, type IdentifyOnOpenHost } from './network/identify-on-open.js';
 import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
 import { BlockTransferCoordinator } from './cluster/block-transfer.js';
 import { pushBlockToPeers } from './cluster/block-transfer-service.js';
@@ -47,7 +49,7 @@ import type { RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
-import { resolveLinkDeadlines, withinRequestBudget, type LinkDeadlines, type RpcDeadlineDefaults } from './rpc-deadline.js';
+import { resolveBootstrapContactTimeoutMs, resolveLinkDeadlines, withinRequestBudget, type LinkDeadlines, type RpcDeadlineDefaults } from './rpc-deadline.js';
 import type { ClusterLatestCallback } from './repo/coordinator-repo.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
 import { RingSelector } from './storage/ring-selector.js';
@@ -193,7 +195,41 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * Ignored when `transports`/`listenAddrs` are explicitly provided.
 	 */
 	disableTcp?: boolean;
+	/**
+	 * Multiaddrs of peers this node joins its network through; each must end in the peer's
+	 * `/p2p/<id>`. A circuit address (`<relay>/p2p/<relay id>/p2p-circuit/p2p/<partner id>`) names
+	 * the partner behind the relay. An entry naming this node itself is ignored.
+	 *
+	 * The node dials them the moment it has started. Naming a peer here tells the node that the
+	 * peer may hold what the node is about to look for, and the node holds itself to that:
+	 *
+	 * - A cohort lookup that would come back with nobody but this node in it waits, once and
+	 *   bounded by {@link NodeOptions.bootstrapContactTimeoutMs}, while one of these peers is on
+	 *   its way into view (its dial, or identify on its connection, is in flight).
+	 * - Until every one of them has been heard from at least once, the node does not conclude
+	 *   that a block it lacks was never created. Opening or creating a collection on it then
+	 *   fails with a `BlockUnavailableError` whose reason is `'cohort-unreachable'`, which is
+	 *   retryable, instead of founding a second copy of a collection another machine already
+	 *   holds. So a peer that is gone for good should be taken out of this list; an empty list
+	 *   is a node that founds its own network.
+	 *
+	 * Heard from means identify has settled what the peer is. A peer on another network (a relay,
+	 * another group's node used as infrastructure) refuses this network's identify, and that
+	 * refusal is its answer: the node then knows the peer holds nothing of its own, and founds
+	 * what it needs. A host whose connection gater refuses the dial has kept the node from
+	 * hearing from the peer, and the second rule applies until something else connects them.
+	 */
 	bootstrapNodes: string[];
+	/**
+	 * The most a cohort lookup waits for a bootstrap peer to join this node's view, in
+	 * milliseconds; see {@link NodeOptions.bootstrapNodes}. Unset, it is derived from the declared
+	 * link round trip (`LinkDeadlines.bootstrapContactTimeoutMs`): twelve round trips, ten for the
+	 * connection open the bootstrap dial runs under and two for identify, and never less than 10 s.
+	 * A host that raises `connectionManager.dialTimeout` should raise this with it. `0` never
+	 * waits, and is safe: the second rule there still holds. A value that is not a finite number
+	 * of milliseconds from 0 up throws at node construction.
+	 */
+	bootstrapContactTimeoutMs?: number;
 	networkName: string;
 	fretProfile?: 'edge' | 'core';
 	id?: string; // optional peer id
@@ -675,6 +711,8 @@ export async function createLibp2pNodeBase(
 	// First, before anything is acquired: a declared round trip or RPC deadline that is not usable
 	// throws, and there is nothing yet to release. Every network deadline below is read off this one result.
 	const linkDeadlines = resolveLinkDeadlines(options.linkRoundTripMs, options.rpcDeadlines);
+	const bootstrapContactTimeoutMs = resolveBootstrapContactTimeoutMs(options.bootstrapContactTimeoutMs, linkDeadlines);
+	const bootstrapTargets = planBootstrapTargets(options.bootstrapNodes ?? []);
 	const { storage: rawStorage, lease } = resolveStorage(options.storage, options.networkName);
 	const kvStore = resolveKvStore(options.kvStore);
 	const underReplicationLedger = new KvUnderReplicationLedger(kvStore);
@@ -841,8 +879,13 @@ export async function createLibp2pNodeBase(
 			// (cluster/repo/sync/blockTransfer) concatenates its own template literal and so
 			// takes the slash-PREFIXED `protocolPrefix` form; do not unify the two.
 			// Locked by `identify-protocol-id.spec.ts`.
+			// `runOnConnectionOpen: false` because this node runs identify on connection open itself
+			// (`identifyOnConnectionOpen`, installed below before `start()`): the same call on the
+			// same event, with its outcome observed. The built-in trigger discards the one outcome
+			// that says a peer is not on this network at all.
 			identify: identify({
-				protocolPrefix: `optimystic/${options.networkName}`
+				protocolPrefix: `optimystic/${options.networkName}`,
+				runOnConnectionOpen: false
 			}),
 			// identify/push propagates *later* address/protocol changes (relay reservation,
 			// AutoNAT-learned observed addr, a service registered post-start) to already-connected
@@ -1024,7 +1067,12 @@ export async function createLibp2pNodeBase(
 			// Gate: tickets/backlog/hardening/invalidation-live-wiring-requires-arbitrator-set-anchoring
 			// Wiring plan: tickets/backlog/feat-dispute-subsystem-live-activation
 		},
-		// Add bootstrap nodes as needed
+		// The node dials its bootstrap peers itself, the moment it has started (`bootstrapContact`
+		// below). This discovery entry stays for what it writes to the peerStore a second later:
+		// each bootstrap address, which is what lets FRET re-probe by peer id a bootstrap peer that
+		// was down at start, and the `bootstrap` tag, which keeps that peer's connection from being
+		// pruned first under `maxConnections`. Its own dial at that point reuses the connection
+		// ours opened, or is one more attempt when ours failed.
 		peerDiscovery: [
 			...(options.bootstrapNodes?.length ? [bootstrap({ list: options.bootstrapNodes })] : [])
 		],
@@ -1071,12 +1119,25 @@ export async function createLibp2pNodeBase(
 	// attachment itself arrives after start(), and until then checkRedirect handles locally.
 	wired.repo.setLibp2p(node);
 
+	// What this node establishes about its configured bootstrap peers, from its first connection on:
+	// built here so it observes identify (which this node triggers itself, see the `identify`
+	// service above) before anything can connect.
+	const bootstrapContact = new BootstrapContactTracker(node.peerId, bootstrapTargets);
+	identifyOnConnectionOpen(node as unknown as IdentifyOnOpenHost, bootstrapContact);
+
 	// A relay-naming listen address with no circuit-relay transport can never be reserved on. Checked
 	// here, before start(), so the caller sees the omission by name rather than libp2p's generic
 	// unsupported-listen-address error for the bare `/p2p-circuit` the plan substituted.
 	assertCircuitRelayTransport(node, relayPlan.supervisedRelays);
 
 	await node.start();
+
+	// Reach for the configured bootstrap peers at once. Left to the discovery entry above, the
+	// first dial is a second away, and for that second this node believes it is alone: whatever it
+	// opens and does not find locally, it founds from scratch (GitHub issue #27). Not awaited, and
+	// nothing to release: the key network below reads the contact's progress, and stopping the
+	// node aborts any dial still in flight.
+	bootstrapContact.dial(node);
 
 	// Everything from here to the `return` runs against an ALREADY STARTED node (open transports,
 	// listening addresses, running services). A rejection out of that span used to hand the caller an
@@ -1107,14 +1168,16 @@ export async function createLibp2pNodeBase(
 		const reputation = new PeerReputationService({ selfPeerId: node.peerId.toString() });
 
 		// Initialize cluster coordination components
-		const networkMode: NetworkMode = (options.bootstrapNodes?.length ?? 0) > 0 ? 'joining' : 'forming';
+		const bootstrap: BootstrapContactOptions | undefined = bootstrapContact.peerIds.length > 0
+			? { contact: bootstrapContact, contactTimeoutMs: bootstrapContactTimeoutMs }
+			: undefined;
 		// Network-namespaced protocol prefix, threaded into the key network so coordinator/
 		// cohort selection is scoped to peers that serve THIS network's cluster/repo protocol.
 		// A peer that only belongs to another network sharing the same physical nodes/
 		// bootstraps registers a different (network-namespaced) identify protocol, so it is
 		// never selected and can't drag this network's super-majority below quorum.
 		const protocolPrefix = `/optimystic/${options.networkName}`;
-		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, networkMode, options.persistence, reputation, protocolPrefix);
+		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, bootstrap, options.persistence, reputation, protocolPrefix);
 		await keyNetwork.initFromPersistedState();
 		const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
 

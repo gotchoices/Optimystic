@@ -85,5 +85,5 @@ export function ringKeyNetworkOf(self: PeerId, peers: PeerId[], store: DigitreeS
 			}
 		}
 	} as unknown as Libp2p;
-	return new Libp2pKeyPeerNetwork(libp2p, options.clusterSize, undefined, 'forming', undefined, undefined, options.scoped ? RING_PROTOCOL_PREFIX : undefined);
+	return new Libp2pKeyPeerNetwork(libp2p, options.clusterSize, undefined, undefined, undefined, undefined, options.scoped ? RING_PROTOCOL_PREFIX : undefined);
 }

@@ -62,4 +62,13 @@ export type IKeyNetwork = {
 	 * @param ttlMs Optional time-to-live for the cached hint, in ms
 	 */
 	recordCoordinator?(key: RoutingKey, peerId: PeerId, ttlMs?: number): void;
+
+	/**
+	 * Optionally report that this node was configured with peers to join through and has not yet
+	 * heard from all of them. While true, a `findCluster` answer naming nobody but this node is
+	 * what the node would see whether or not those peers hold a block, so a repo must not treat
+	 * its own lack of the block as proof the block was never created. Implementations with no
+	 * such configuration omit this, which reads as "not awaiting".
+	 */
+	awaitingBootstrapContact?(): Promise<boolean>;
 }

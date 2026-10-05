@@ -96,7 +96,7 @@ describe('openProtocolStream: connection selection across every entry point', ()
 		['cohort-topic sendOneWay', (node, peer) => sendOneWay(node, peer, PROTOCOL, FRAME)],
 		[
 			'Libp2pKeyPeerNetwork.connect',
-			(node, peer) => new Libp2pKeyPeerNetwork(node, 16, undefined, 'forming').connect(peer, PROTOCOL),
+			(node, peer) => new Libp2pKeyPeerNetwork(node, 16, undefined, undefined).connect(peer, PROTOCOL),
 		],
 	];
 

@@ -387,7 +387,11 @@ export type BlockUnavailableReason =
 	/** Nothing is held locally and NO cohort member outside the answering node could be
 	 *  asked at all. Distinct from `peers-unreachable` in exactly the way that matters to
 	 *  a caller: there is no better-connected coordinator to re-ask, so the answer will
-	 *  not improve until that node's connectivity does. Its local view is all there is. */
+	 *  not improve until that node's connectivity does. Its local view is all there is.
+	 *  Also the answer of a node whose cohort view holds only itself while a peer it was
+	 *  configured to join through has never been heard from
+	 *  (`IKeyNetwork.awaitingBootstrapContact`): it knows of a machine outside itself and
+	 *  has not reached it. */
 	| 'cohort-unreachable'
 	/** Nothing is held locally, but a cohort peer positively CLAIMED a revision of this
 	 *  block, and the answering node could neither corroborate that claim to a quorum nor

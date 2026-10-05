@@ -19,6 +19,7 @@ const UNDECLARED: LinkDeadlines = {
 	cohortQueryTimeoutMs: 1000,
 	transferTimeoutMs: 30_000,
 	transactionTimeoutMs: 30_000,
+	bootstrapContactTimeoutMs: 10_000,
 };
 
 describe('resolveLinkDeadlines', () => {
@@ -45,6 +46,8 @@ describe('resolveLinkDeadlines', () => {
 			cohortQueryTimeoutMs: 9000,
 			transferTimeoutMs: 33_000,
 			transactionTimeoutMs: 132_000,
+			// The connection open the bootstrap dial runs under, plus identify's two round trips.
+			bootstrapContactTimeoutMs: 36_000,
 		});
 	});
 
@@ -69,7 +72,8 @@ describe('resolveLinkDeadlines', () => {
 			deadlines.addressDialTimeoutMs,
 			deadlines.transferTimeoutMs,
 			deadlines.transactionTimeoutMs + 5000,
-			5 * deadlines.cohortQueryTimeoutMs
+			5 * deadlines.cohortQueryTimeoutMs,
+			deadlines.bootstrapContactTimeoutMs
 		);
 		expect(largest).to.be.at.most(2 ** 31 - 1);
 	});

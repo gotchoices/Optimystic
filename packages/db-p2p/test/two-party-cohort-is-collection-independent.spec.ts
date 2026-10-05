@@ -65,7 +65,7 @@ async function partyView(self: PeerId, partner: PeerId, relay: PeerId, partnerPr
 			}
 		}
 	} as unknown as Libp2p;
-	return new Libp2pKeyPeerNetwork(libp2p, DEFAULT_CLUSTER_SIZE, undefined, 'forming', undefined, undefined, PREFIX);
+	return new Libp2pKeyPeerNetwork(libp2p, DEFAULT_CLUSTER_SIZE, undefined, undefined, undefined, undefined, PREFIX);
 }
 
 async function cohortsByBlock(network: Libp2pKeyPeerNetwork): Promise<Map<string, string[]>> {

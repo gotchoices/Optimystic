@@ -99,7 +99,7 @@ describe('identify/push — late protocol registration reaches already-connected
 		expect(before, 'the late protocol is genuinely absent before registration').to.not.include(LATE_CLUSTER_PROTOCOL);
 
 		// The classification B would make of A right now, scoped to the network A has not joined yet.
-		const keyNetwork = new Libp2pKeyPeerNetwork(b, 1, undefined, 'forming', undefined, undefined, LATE_PREFIX);
+		const keyNetwork = new Libp2pKeyPeerNetwork(b, 1, undefined, undefined, undefined, undefined, LATE_PREFIX);
 		const membershipOf = (protocols: string[]): string =>
 			(keyNetwork as any).membershipOf(a!.peerId.toString(), protocols);
 		expect(membershipOf(before), 'A serves some network, but not this one, before the late handler')

@@ -8,10 +8,26 @@ import { createLogger, verbose } from './logger.js'
 import { classifySelfDialability, mergePeerAddresses, publishableConnectionAddr, unionPublishableAddrs, type AddressLog } from './peer-address-book.js'
 import type { IPeerReputation } from './reputation/types.js'
 import { openProtocolStream } from './network/open-protocol-stream.js'
+import type { BootstrapContact } from './network/bootstrap-contact.js'
 
 interface WithFretService { services?: { fret?: FretService } }
 
 export type NetworkMode = 'forming' | 'joining';
+
+/**
+ * The peers a node was configured to join through, as {@link Libp2pKeyPeerNetwork} needs them.
+ * Passed only when the configuration names at least one peer other than the node itself.
+ */
+export interface BootstrapContactOptions {
+	/** What the node has established about those peers since it started (`BootstrapContactTracker` in `network/bootstrap-contact.ts`). */
+	contact: BootstrapContact;
+	/**
+	 * The most a cohort lookup that would come back with nobody but this node in it waits for one
+	 * of those peers to join this node's view, in milliseconds, counted from the key network's
+	 * construction. `0` never waits. See `Libp2pKeyPeerNetwork.bootstrapContactImminent`.
+	 */
+	contactTimeoutMs: number;
+}
 
 /**
  * Error codes surfaced by {@link Libp2pKeyPeerNetwork.findCoordinator}. Callers
@@ -223,6 +239,13 @@ interface ServingCohort {
 	peerStoreRecords?: Record<string, PeerStoreRecord>
 	/** Scoped path only: the `protocols` half of `peerStoreRecords`, in the shape `filterByMembership` takes. */
 	protocolsByPeer?: Record<string, string[]>
+	/**
+	 * No member of the band other than this node serves this network. On a ring no wider than the
+	 * band that is the same answer for every key: this node knows of nobody else to hold anything.
+	 * It is also what a joining node sees before the peers it was configured with have arrived, so
+	 * it is the trigger for the bootstrap contact wait.
+	 */
+	alone: boolean
 }
 
 export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
@@ -231,17 +254,29 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	private lastConnectedTime = Date.now();
 	private consecutiveIsolatedSessions = 0;
 	/**
-	 * NOTE: diagnostic-only — no decision consults this any more. It used to gate the
-	 * coordinator retry window, but it is computed once at construction
-	 * (`bootstrapNodes.length > 0` in `libp2p-node-base.ts`) and never re-derived, so a node
-	 * configured with a bootstrap address it has never reached read as "company is coming"
-	 * forever; {@link retryCouldImprove} asks libp2p for live evidence instead. It still earns
-	 * its keep in the `retry-futile` log line ("configured
-	 * to expect company" vs. "solo by design"). Drop it, or re-derive it from live state, when
-	 * the constructor becomes an options bag — removing the positional parameter now would
-	 * churn ~50 construction sites in `test/libp2p-key-network.spec.ts` for no behaviour change.
+	 * This node's configured bootstrap peers, when it has any other than itself. Two rules read
+	 * it, and they answer different questions:
+	 *
+	 *  - {@link bootstrapContactImminent}: a cohort lookup that would come back with nobody but
+	 *    this node in it waits, bounded, while one of these peers is demonstrably on its way into
+	 *    this node's view.
+	 *  - {@link awaitingBootstrapContact}: until every one of them has been heard from, this
+	 *    node's self-only view is not evidence that a block was never created.
+	 *
+	 * NOTE: a frozen "bootstrap peers were configured" flag once gated the coordinator retry
+	 * window from this slot, and was removed from that decision because it never changed: a node
+	 * configured with a bootstrap address it never reached read as "company is coming" forever
+	 * and paid the retry sleep on every lookup ({@link retryCouldImprove} asks libp2p for live
+	 * evidence instead). Neither rule above brings that back. The wait is entered only on
+	 * evidence available now, never on the configuration alone; it is bounded by
+	 * `contactTimeoutMs`; and the first time it ends without contact it is closed for the life
+	 * of the process. The awaiting-contact answer costs a lookup no time at all.
 	 */
-	private readonly networkMode: NetworkMode;
+	private readonly bootstrap?: BootstrapContactOptions;
+	/** When the bootstrap contact wait gives up, as a `Date.now()` value. */
+	private readonly bootstrapWaitDeadline: number;
+	/** Why the bootstrap contact wait ended without contact, once it has; it is never entered again. */
+	private bootstrapWaitClosed?: 'deadline' | 'nothing-arriving';
 	private readonly persistence?: NetworkStatePersistence;
 
 	// NOTE: seven positional parameters, and the list stays that way for now — converting to an
@@ -258,7 +293,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		 */
 		private readonly clusterSize: number,
 		selfCoordinationConfig?: SelfCoordinationConfig,
-		networkMode?: NetworkMode,
+		bootstrap?: BootstrapContactOptions,
 		persistence?: NetworkStatePersistence,
 		private readonly reputation?: IPeerReputation,
 		/**
@@ -295,10 +330,19 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			shrinkageThreshold: selfCoordinationConfig?.shrinkageThreshold ?? 0.5,
 			allowSelfCoordination: selfCoordinationConfig?.allowSelfCoordination ?? true
 		};
-		this.networkMode = networkMode ?? 'forming';
+		this.bootstrap = bootstrap;
+		this.bootstrapWaitDeadline = Date.now() + (bootstrap?.contactTimeoutMs ?? 0);
 		this.persistence = persistence;
 		this.setupConnectionTracking();
 		this.setupSelfAddressTracking();
+	}
+
+	/**
+	 * Diagnostic label for the `retry-futile` log line: configured to join through other peers
+	 * (`'joining'`) or not (`'forming'`). No decision reads it.
+	 */
+	private get networkMode(): NetworkMode {
+		return this.bootstrap ? 'joining' : 'forming';
 	}
 
 	/** The cluster size this instance actually resolved to, for `assertClusterSizeCoupling`. */
@@ -459,9 +503,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * when the current attempt found no candidate and the node holds zero connections — i.e.
 	 * purely to decide whether the 500ms inter-attempt sleep is worth paying.
 	 *
-	 * Answered from evidence available NOW, never from configuration or history (`networkMode`
-	 * is frozen at construction and `networkHighWaterMark` is monotonic, so both used to keep
-	 * the window open forever on a node that could never fill it):
+	 * Answered from evidence available NOW, never from configuration or history (whether
+	 * bootstrap peers were configured is frozen at construction and `networkHighWaterMark` is
+	 * monotonic, so both used to keep the window open forever on a node that could never fill it):
 	 *  - a non-self candidate in the FRET neighbourhood for this key — a peer we know of and
 	 *    route to; a connection to it landing during the sleep makes it selectable.
 	 *  - a dial in flight (`queued` / `active` in libp2p's dial queue) — a connection attempt
@@ -1377,6 +1421,14 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 *
 	 * A non-empty protocol list always wins and updates {@link rememberedServing}; an empty one
 	 * falls back to it.
+	 *
+	 * NOTE: a non-empty list is not necessarily identify's list. libp2p adds every protocol a
+	 * stream negotiates with a peer, in either direction, to that peer's list, so between a
+	 * connection opening and identify landing a peer of this network can show a partial list and
+	 * read `foreign` here. The next reading corrects it, and the cost is one cohort assembly that
+	 * leaves the peer out. Anything that must not act on that moment reads identify's outcome
+	 * instead, as {@link heardFromBootstrapPeer} does; if a second such decision appears, have
+	 * `identifyOnConnectionOpen` report for every peer rather than for bootstrap peers alone.
 	 */
 	private membershipOf(idStr: string, protocols: string[] | undefined): NetworkMembership {
 		if (this.protocolPrefix == null) return 'serves'
@@ -1403,6 +1455,111 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		if (serves) this.rememberedServing.add(idStr)
 		else this.rememberedServing.delete(idStr)
 		this.schedulePersist()
+	}
+
+	/**
+	 * Is this node still waiting to hear from a peer it was configured to join through?
+	 *
+	 * A node built with bootstrap peers knows, from its own configuration, of other machines it
+	 * was told to join. Until it has heard from them, a view of a cohort with nobody but itself
+	 * in it is what it would see whether or not those machines hold the block, so it is no basis
+	 * for "this block was never created" (GitHub issue #27: a joining node asked in the instant
+	 * after start, found its catalog missing, and founded a second one). `CoordinatorRepo` asks
+	 * this before it rules a block absent on a view that consulted nobody.
+	 *
+	 * True while ANY configured peer is unheard ({@link heardFromBootstrapPeer}); a node with no
+	 * bootstrap peers always answers false. Async only because the interface it implements is.
+	 */
+	async awaitingBootstrapContact(): Promise<boolean> {
+		return this.unheardBootstrapPeers().length > 0
+	}
+
+	/**
+	 * Has this bootstrap peer been heard from? Yes once identify has settled what it is, in this
+	 * process: it answered with its protocol list, whatever the list says, or it refused this
+	 * network's identify protocol, which is how a relay or another network's node answers. Yes
+	 * also when its serving verdict was restored from persisted state ({@link rememberedServing}).
+	 *
+	 * A connection is not an answer, and neither is a non-empty peerStore protocol list: libp2p
+	 * adds each negotiated stream's protocol to it, so for a moment before identify lands a peer
+	 * of this network shows a partial list that reads as foreign.
+	 */
+	private heardFromBootstrapPeer(idStr: string): boolean {
+		return this.bootstrap?.contact.answerOf(idStr) !== undefined || this.rememberedServing.has(idStr)
+	}
+
+	private unheardBootstrapPeers(): string[] {
+		return (this.bootstrap?.contact.peerIds ?? []).filter(id => !this.heardFromBootstrapPeer(id))
+	}
+
+	/**
+	 * Longest a lookup held by {@link bootstrapContactImminent} goes without re-reading its view.
+	 * A dial or an identify exchange settling wakes it at once; FRET admitting an identified peer
+	 * to the ring raises no event this class hears, so that is found by re-reading at this
+	 * interval.
+	 */
+	private static readonly BOOTSTRAP_RECHECK_MS = 25
+
+	/**
+	 * Is a configured bootstrap peer demonstrably on its way into this node's view right now?
+	 * Asked only by a cohort assembly that came back {@link ServingCohort.alone}; while the answer
+	 * is yes the assembly waits ({@link nextBootstrapSignal}) and is made again, so a joining node
+	 * that opens something in the instant after start consults the machine it was told about
+	 * instead of concluding it is alone.
+	 *
+	 * Yes only on evidence available now, the rule {@link retryCouldImprove} follows:
+	 *  - a dial of a bootstrap peer, or identify on a connection to one, is still in flight, or
+	 *  - a connected bootstrap peer has been identified and serves this network, in which case
+	 *    FRET is about to admit it to the ring.
+	 *
+	 * The first no, and the deadline, close the wait for the life of the process: a node whose
+	 * bootstrap peer is down pays for one failed dial at most, once; one whose bootstrap peer is
+	 * on another network pays for one refused identify; and a node with no bootstrap peers never
+	 * pays. Closing it gives up only the WAIT. While a peer is still unheard,
+	 * {@link awaitingBootstrapContact} keeps the absence of a block from being ruled on.
+	 */
+	private async bootstrapContactImminent(): Promise<boolean> {
+		if (this.bootstrap == null || this.bootstrapWaitClosed !== undefined) return false
+		if (Date.now() >= this.bootstrapWaitDeadline) return this.closeBootstrapWait('deadline')
+		if (this.bootstrap.contact.inFlight() > 0) return true
+		if (await this.identifiedBootstrapPeerJoiningRing(this.bootstrap.contact)) return true
+		return this.closeBootstrapWait('nothing-arriving')
+	}
+
+	private closeBootstrapWait(reason: 'deadline' | 'nothing-arriving'): false {
+		this.bootstrapWaitClosed = reason
+		this.log('bootstrap-wait:closed reason=%s unheard=%d', reason, this.unheardBootstrapPeers().length)
+		return false
+	}
+
+	/**
+	 * The second kind of evidence {@link bootstrapContactImminent} names.
+	 *
+	 * NOTE: this holds a lookup until the wait's deadline, once, if FRET never admits a connected,
+	 * identified, serving bootstrap peer to the ring (it holds the peer dead, or evicted it at
+	 * capacity). Not observed. If a start is ever seen waiting out the whole deadline after an
+	 * `answer:identified` line, stop counting a peer here once FRET has had a stabilization tick
+	 * to admit it.
+	 */
+	private async identifiedBootstrapPeerJoiningRing(contact: BootstrapContact): Promise<boolean> {
+		const connected = new Set((this.libp2p.getConnections?.() ?? []).map(c => c.remotePeer.toString()))
+		const candidates = contact.peerIds.filter(id => connected.has(id) && contact.answerOf(id) === 'identified')
+		if (candidates.length === 0) return false
+		const protocols = await this.getPeerStoreProtocolsByPeer(candidates)
+		return candidates.some(id => this.membershipOf(id, protocols[id]) === 'serves')
+	}
+
+	/** Resolves at the next thing worth re-reading the view for: a dial or identify exchange settling, the re-check interval, or the wait's deadline. */
+	private nextBootstrapSignal(contact: BootstrapContact): Promise<void> {
+		return new Promise<void>(resolve => {
+			const untilDeadline = Math.max(0, this.bootstrapWaitDeadline - Date.now())
+			const timer = setTimeout(resolve, Math.min(Libp2pKeyPeerNetwork.BOOTSTRAP_RECHECK_MS, untilDeadline))
+			if (contact.inFlight() === 0) return
+			void contact.nextSettled().then(() => {
+				clearTimeout(timer)
+				resolve()
+			})
+		})
 	}
 
 	/**
@@ -1456,8 +1613,22 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return assembled.cohort
 	}
 
-	/** Steps 2 to 5 of {@link assembleServingCohort}'s rule, at `coord`; `coordStr` only labels the log line. */
+	/**
+	 * Steps 2 to 5 of {@link assembleServingCohort}'s rule, at `coord`; `coordStr` only labels the
+	 * log line. An assembly that finds this node alone is made again for as long as a configured
+	 * bootstrap peer is on its way into view ({@link bootstrapContactImminent}).
+	 */
 	private async assembleServingCohortAt(coord: Uint8Array, coordStr: string): Promise<ServingCohort> {
+		let assembled = await this.assembleServingCohortOnce(coord, coordStr)
+		while (assembled.alone && this.bootstrap != null && await this.bootstrapContactImminent()) {
+			await this.nextBootstrapSignal(this.bootstrap.contact)
+			assembled = await this.assembleServingCohortOnce(coord, coordStr)
+		}
+		return assembled
+	}
+
+	/** One reading of the ring and the peerStore for {@link assembleServingCohortAt}. */
+	private async assembleServingCohortOnce(coord: Uint8Array, coordStr: string): Promise<ServingCohort> {
 		const fret = this.getFret()
 		const scoped = this.protocolPrefix != null
 		// When membership scoping is active, over-fetch a wider proximity band so the nearest
@@ -1469,7 +1640,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		const band = this.selfServes()
 			? (nearest.includes(selfId) ? nearest : [...nearest, selfId])
 			: nearest.filter(id => id !== selfId)
-		if (!scoped) return { cohort: band.slice(0, this.clusterSize), band }
+		if (!scoped) return { cohort: band.slice(0, this.clusterSize), band, alone: !band.some(id => id !== selfId) }
 
 		// Network-membership scoping: a band member that serves a DIFFERENT network's protocol
 		// can never negotiate THIS network's cluster/repo dial, so it guarantees a super-majority
@@ -1499,7 +1670,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		this.log('cohort:membership key=%s band=%d serves=%d unknown=%d foreign=%d cohort=%d selfInCohort=%s',
 			coordStr, band.length, serving.length, unknown, foreign, cohort.length, cohort.includes(selfId))
 		const protocolsByPeer = Object.fromEntries(Object.entries(peerStoreRecords).map(([id, r]) => [id, r.protocols]))
-		return { cohort, band, peerStoreRecords, protocolsByPeer }
+		return { cohort, band, peerStoreRecords, protocolsByPeer, alone: !serving.some(id => id !== selfId) }
 	}
 
 	/**

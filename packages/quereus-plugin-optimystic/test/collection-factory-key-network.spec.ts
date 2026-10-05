@@ -93,7 +93,7 @@ describe('CollectionFactory network transactor key network', () => {
 		// What `createLibp2pNode` attaches: a key network carrying this network's
 		// configured cluster size and protocol prefix.
 		(node as unknown as { keyNetwork: Libp2pKeyPeerNetwork }).keyNetwork = new Libp2pKeyPeerNetwork(
-			node, CONFIGURED_CLUSTER_SIZE, undefined, 'joining', undefined, undefined, PROTOCOL_PREFIX
+			node, CONFIGURED_CLUSTER_SIZE, undefined, undefined, undefined, undefined, PROTOCOL_PREFIX
 		);
 
 		factory = new CollectionFactory();

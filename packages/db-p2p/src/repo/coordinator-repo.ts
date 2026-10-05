@@ -279,10 +279,12 @@ type AbsenceVerdict =
 	| 'confirmed'
 	/** Nobody was asked: the cohort view was empty, or only this node. Not the same fact as
 	 *  `confirmed` — a self-only view is also what `findCluster` returns while real peers are
-	 *  still unidentified — so the caller weighs it against what the READ knows: with no floor
-	 *  on the block it stays an authoritative absent (a one-machine deployment's one-round
-	 *  probe); with one, the asker's own log names the block and it is flagged
-	 *  `'named-by-log'` (see `unavailableReasonFor`). Produced only by exits that ask nobody, so it
+	 *  still unidentified — so the caller weighs it against what else is known. A floor on the
+	 *  read means the asker's own log names the block, and it is flagged `'named-by-log'` (see
+	 *  `unavailableReasonFor`). A configured bootstrap peer this node has never heard from means
+	 *  it knows of a machine it has not reached, and it is flagged `'cohort-unreachable'` (see
+	 *  `CoordinatorRepo.absenceFlagFor`). With neither it stays an authoritative absent (a
+	 *  one-machine deployment's one-round probe). Produced only by exits that ask nobody, so it
 	 *  never competes with the verdicts below. */
 	| 'unasked'
 	/** Some of the cohort answered and some could not be asked. (A consult that THROWS produces
@@ -304,10 +306,12 @@ type AbsenceVerdict =
  *
  *  - `confirmed`: the whole cohort answered "holds nothing", so the new-collection probe against a
  *    healthy cohort stays one round trip.
- *  - `unasked`: authoritative unless the asker's own log names the block. A floor on a block this
- *    node does not hold at all means the asker walked a log entry committing a revision of it, so
- *    "never created" would contradict what it already knows; flagging it earns the transactor's
- *    second-chance round against another machine (GitHub issue #27).
+ *  - `unasked`: authoritative here unless the asker's own log names the block. A floor on a block
+ *    this node does not hold at all means the asker walked a log entry committing a revision of it,
+ *    so "never created" would contradict what it already knows; flagging it earns the transactor's
+ *    second-chance round against another machine (GitHub issue #27). The caller adds a second
+ *    exception this function cannot see, a bootstrap peer never heard from
+ *    (`CoordinatorRepo.absenceFlagFor`).
  *  - `unconfirmed` → 'peers-unreachable': part of the cohort was silent; another coordinator may
  *    know better.
  *  - `isolated` → 'cohort-unreachable': no cohort member outside this node could be asked; there is
@@ -918,7 +922,7 @@ export class CoordinatorRepo implements IRepo {
 			}
 			// A still-missing block the consult could not rule out must not pose as an
 			// authoritative absent; the reason names what the consult established.
-			const unavailable = isMissing ? unavailableReasonFor(absence, floor) : undefined;
+			const unavailable = isMissing ? await this.absenceFlagFor(absence, floor) : undefined;
 			if (unavailable !== undefined) this.flagUnconfirmedAbsence(results, blockId, unavailable);
 			// A PRESENT block served below a cohort claim the repair could not settle is
 			// the mirror lie: real content posing as confirmed-current. A consult that
@@ -953,6 +957,36 @@ export class CoordinatorRepo implements IRepo {
 				this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
 			}
 		}
+	}
+
+	/**
+	 * {@link unavailableReasonFor}, plus the one fact only the key network holds: whether this
+	 * node is still waiting to hear from a peer it was configured to join through
+	 * (`IKeyNetwork.awaitingBootstrapContact`). While it is, a view that asked nobody is what the
+	 * node would see whether or not that peer holds the block, so the absence is flagged
+	 * `'cohort-unreachable'`: this node knows of a machine outside itself and has not reached it.
+	 * Without this a joining node that opened a collection in the instant after start found the
+	 * header missing, founded its own, and committed it alone (GitHub issue #27).
+	 *
+	 * A floor on the read still answers `'named-by-log'`: the asker's own log naming the block is
+	 * the sharper evidence, and it ranks higher in the transactor's merge.
+	 *
+	 * NOTE: accepted tradeoff — a node configured with a bootstrap peer that is permanently gone,
+	 * and holding no persisted network state, can neither create a collection nor read a block it
+	 * lacks: both fail with `'cohort-unreachable'` for as long as that peer is never heard from.
+	 * Blocks it holds are served as before. This is the cost `membershipOf` in
+	 * `libp2p-key-network.ts` already accepts for a remembered peer that never returns, extended
+	 * to a peer the node was configured with. Settling the view once the key network's bounded
+	 * wait gives up was weighed and rejected: it founds a second copy of a collection whenever the
+	 * bootstrap peer is slower than that deadline. Revisit if a deployment reports it cannot
+	 * create collections because a configured bootstrap peer is permanently gone; the remedies
+	 * are a declared member list (backlog `feat-declared-membership-feeds-cohort-assembly`) or the
+	 * host building the node without that peer.
+	 */
+	private async absenceFlagFor(absence: AbsenceVerdict, floor: number | undefined): Promise<BlockUnavailableReason | undefined> {
+		const reason = unavailableReasonFor(absence, floor);
+		if (reason !== undefined || absence !== 'unasked') return reason;
+		return await this.keyNetwork.awaitingBootstrapContact?.() ? 'cohort-unreachable' : undefined;
 	}
 
 	/**
