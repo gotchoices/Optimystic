@@ -3,6 +3,8 @@ files: packages/quereus-plugin-optimystic/test/secondary-unique.spec.ts
 repro: verified
 ----
 
+**Upstream:** reconfirmed against quereus v4.20.0 on 2026-10-04 and filed as quereus `tickets/fix/memory-vtab-pk-replace-skips-unique-check.md` (quereus commit ad2a8add8). Unblocks when a quereus release containing that fix is consumed here.
+
 # The quereus in-memory table module commits a duplicate under `insert or replace`
 
 ## Why this is in your inbox

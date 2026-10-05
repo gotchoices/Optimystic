@@ -3,6 +3,8 @@ files: ../quereus/packages/quereus/src/schema/schema-differ.ts
 repro: verified
 ----
 
+**Upstream:** reconfirmed against quereus v4.20.0 on 2026-10-04 and filed as quereus `tickets/fix/declarative-differ-ignores-unnamed-constraint-additions.md` (quereus commit ad2a8add8). Unblocks when a quereus release containing that fix is consumed here.
+
 **Blocked: dependency outside this repo.** Unblocks when quereus's declarative differ emits (or explicitly refuses) added unnamed constraints and a quereus release containing that is consumed here.
 
 # What happens
