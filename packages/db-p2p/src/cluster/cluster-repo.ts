@@ -727,7 +727,9 @@ export class ClusterMember implements ICluster {
 		// super-majority is sent the commit round, has voted, and throws, which the coordinator charges
 		// as a commit-round `ConsensusTimeout`. If that penalty ever shows up against skewed members, let
 		// a member whose own promise was an expiry vote sign the commit the cohort decided on.
-		if (currentRecord.promises[ourId] && expiryOf(currentRecord)) {
+		// A record whose signed votes already prove it dead is let through: the phase loop adds no vote
+		// to it, only clears it, which is what the coordinator's abandonment broadcast is for.
+		if (currentRecord.promises[ourId] && expiryOf(currentRecord) && !(await this.provenAbandoned(currentRecord))) {
 			throw new Error('Transaction expired');
 		}
 
@@ -1175,6 +1177,15 @@ export class ClusterMember implements ICluster {
 			// Malformed signature bytes / key decode failure: reject, but do not penalize on unparseable input.
 			return { valid: false, penalize: false };
 		}
+	}
+
+	/**
+	 * Whether `record`'s signed votes put it in a terminal refusal phase. Only meaningful for a record
+	 * this member has already voted on, where {@link getTransactionPhase} has no side effects.
+	 */
+	private async provenAbandoned(record: ClusterRecord): Promise<boolean> {
+		const { phase } = await this.getTransactionPhase(record);
+		return phase === TransactionPhase.Rejected || phase === TransactionPhase.ConflictSuperseded;
 	}
 
 	private async getTransactionPhase(record: ClusterRecord): Promise<PhaseResult> {

@@ -1218,7 +1218,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `CoordinatorRepo` returns to the writer as an `ExpiredFailure` (see *Pend retryability is an
   explicit field* below). A member that has *already* voted still refuses an expired delivery
   by throwing, since voting again would replace its vote (`detectEquivocation`); that is the
-  slow-transaction case, not the skew case. See
+  slow-transaction case, not the skew case. The one delivery it applies is one whose signed votes
+  already prove the record rejected (the abandonment broadcast), since that only clears it. See
   [correctness.md §7.4 Clock Assumptions](correctness.md#74-clock-assumptions).
 - **A pend rejection is returned only when local storage confirms a revision loss.** When
   enough members vote reject, `ClusterCoordinator` throws a typed `ValidatorRejectionError`

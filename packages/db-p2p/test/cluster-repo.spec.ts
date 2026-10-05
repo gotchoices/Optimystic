@@ -1090,6 +1090,27 @@ describe('ClusterMember', () => {
 			expect((caught as Error | undefined)?.message).to.equal('Transaction expired');
 		});
 
+		it('clears an expired record it voted on when the delivery proves it rejected', async () => {
+			// The coordinator's abandonment broadcast after expiry votes sank the write: this member
+			// approved, its clock has since passed the expiration, and the signed rejects already make
+			// super-majority unreachable. Nothing is asked of it but to drop the record.
+			const ourId = selfKeyPair.peerId.toString();
+			const [p2, p3, p4] = await Promise.all([makeKeyPair(), makeKeyPair(), makeKeyPair()]);
+			const peers = makeClusterPeers([selfKeyPair, p2, p3, p4]);
+			const base = await createClusterRecord(peers, makeGetOperation(['block-1']), {}, {}, Date.now() - 1);
+			const record: ClusterRecord = {
+				...base,
+				promises: {
+					[ourId]: await makeSignedPromise(selfKeyPair.privateKey, base),
+					[p2.peerId.toString()]: await makeSignedPromise(p2.privateKey, base, 'reject', 'transaction-expired: x'),
+					[p3.peerId.toString()]: await makeSignedPromise(p3.privateKey, base, 'reject', 'transaction-expired: x')
+				}
+			};
+
+			const result = await clusterMemberInstance.update(record);
+			expect(Object.keys(result.commits)).to.deep.equal([]);
+		});
+
 		it('accepts transactions with future expiration', async () => {
 			const ourId = selfKeyPair.peerId.toString();
 			const peers = makeClusterPeers([selfKeyPair]);
