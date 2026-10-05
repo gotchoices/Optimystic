@@ -622,11 +622,18 @@ export class ReactivityMesh {
 	 * accepted with `treeTier` 1. Returns the coordinate and the engine serving it on the routed primary.
 	 */
 	async seedTierOneCohort(nodeIndex: number, collection: string): Promise<{ coord: RingCoord; engine: CoordEngine }> {
-		const c = this.collection(collection);
-		const member = this.members[nodeIndex]!;
-		const coord = addressing.coord(1, member.bytes, c.topicId);
-		const setup = await setupCohortAt(this.mesh, coord, 1, member.bytes);
+		const coord = this.tierOneCoord(nodeIndex, collection);
+		const setup = await setupCohortAt(this.mesh, coord, 1, this.members[nodeIndex]!.bytes);
 		return { coord, engine: setup.decidingEngine };
+	}
+
+	/**
+	 * `coord_1(P, topicId)` for node `nodeIndex`'s member `P` — its tier-1 shard. Member keys are generated per
+	 * mesh, so two nodes share a shard by chance (about one pair in `F`); a walk from either lands at the same
+	 * tier-1 cohort once that cohort serves the topic.
+	 */
+	tierOneCoord(nodeIndex: number, collection: string): RingCoord {
+		return addressing.coord(1, this.members[nodeIndex]!.bytes, this.collection(collection).topicId);
 	}
 
 	/** Whether a node profile may serve as a reactivity forwarder (T3 producer) — Edge never can. */

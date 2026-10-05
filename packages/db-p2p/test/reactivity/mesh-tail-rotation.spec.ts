@@ -28,6 +28,17 @@ import { buildReactivityMesh, type ReactivityMesh } from '../../src/testing/reac
 
 const range = (lo: number, hi: number): number[] => Array.from({ length: hi - lo + 1 }, (_v, i) => lo + i);
 
+/** The first node index above every one of `others` whose tier-1 shard (`coord_1(P, topicId)`) none of them shares. */
+function shardApartFrom(rx: ReactivityMesh, collection: string, others: readonly number[]): number {
+	const taken = new Set(others.map((i) => bytesToB64url(rx.tierOneCoord(i, collection))));
+	for (let i = Math.max(...others) + 1; i < rx.members.length; i++) {
+		if (!taken.has(bytesToB64url(rx.tierOneCoord(i, collection)))) {
+			return i;
+		}
+	}
+	throw new Error(`every node shares a tier-1 shard with one of nodes ${others.join(', ')}`);
+}
+
 describe('reactivity / mesh — tail rotation continuity', function () {
 	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound. The suite runs serially in a single
 	// ~7-minute Node process, so tests near the back face large GC-pressured heaps and wall-clock variance
@@ -236,12 +247,16 @@ describe('reactivity / mesh — tail rotation continuity', function () {
 		await rx.stabilizeCohort('tiers');
 		expect(rx.isPromoted('tiers'), 'the root promoted once its direct subscribers crossed cap_promote').to.equal(true);
 
-		const tierOne = await rx.seedTierOneCohort(3, 'tiers');
-		const c = await rx.subscribe(3, 'tiers');
+		// A root-direct subscriber's follow re-walks from d_max, and a walk that meets a tier-1 cohort serving the
+		// topic in its own shard lands there — correctly. So the tier-1 subscriber must sit in a shard neither
+		// root-direct subscriber shares, or one of them leaves the root on the rotation. Keys are random per mesh.
+		const tierOneIndex = shardApartFrom(rx, 'tiers', [1, 2]);
+		const tierOne = await rx.seedTierOneCohort(tierOneIndex, 'tiers');
+		const c = await rx.subscribe(tierOneIndex, 'tiers');
 		expect(a.registration!.treeTier, 'the first subscribers landed at the root').to.equal(0);
 		expect(b.registration!.treeTier).to.equal(0);
 		expect(c.registration!.treeTier, 'the third was redirected and landed at tier 1').to.equal(1);
-		expect(tierOne.engine.holds(topicId, rx.members[3]!.bytes), 'its record sits in the tier-1 cohort at coord_1(P, topicId)').to.equal(true);
+		expect(tierOne.engine.holds(topicId, rx.members[tierOneIndex]!.bytes), 'its record sits in the tier-1 cohort at coord_1(P, topicId)').to.equal(true);
 		// NOTE: the harness models the notification transport as fan-out to every tracked subscriber; a running node
 		// does not yet reach a subscriber below the root (backlog `feat-reactivity-notifications-reach-child-cohorts`).
 		await rx.commit('tiers', 2);
@@ -263,7 +278,7 @@ describe('reactivity / mesh — tail rotation continuity', function () {
 		expect(c.registration, 'a registration below the root is kept').to.equal(before.c);
 		expect(c.registration!.treeTier).to.equal(1);
 		expect([...c.registration!.rootKey!], 'moveRoot pointed its next re-walk at the new root').to.deep.equal([...rotation.newTailId]);
-		expect(tierOne.engine.holds(topicId, rx.members[3]!.bytes), 'the tier-1 cohort still holds it').to.equal(true);
+		expect(tierOne.engine.holds(topicId, rx.members[tierOneIndex]!.bytes), 'the tier-1 cohort still holds it').to.equal(true);
 		expect(rx.mesh.routedCoords.includes(bytesToB64url(tierOne.coord)), 'the rotation routed no register frame to the tier-1 cohort').to.equal(false);
 
 		// Delivery continues across the move for everyone.
