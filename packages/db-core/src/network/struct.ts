@@ -184,9 +184,50 @@ export type StaleFailure = {
 	 * the presence of this field.
 	 */
 	staleAt?: { blockId: BlockId; rev: number };
+	/** Never set on a lost race — an expiry is its own failure shape, {@link ExpiredFailure}. */
+	expired?: never;
 };
 
-export type PendResult = PendSuccess | StaleFailure;
+/**
+ * Why a cohort refused a write as expired: by each refusing member's own clock, the transaction's
+ * `expiration` had already passed when the record reached it. Plain data, so it crosses the JSON repo
+ * protocol intact. `TransactionExpiredError` is built from it, wherever it is raised.
+ */
+export type TransactionExpiry = {
+	/** The transaction's expiration (unix ms), as the writer's transactor set it from its own clock. */
+	expiration: number;
+	/** Per refusing cohort member (peer-id string), the clock reading (unix ms) it signed when it
+	 *  judged the record expired (`Signature.expiredAt`). Never empty. */
+	memberClocks: Record<string, number>;
+	/** The coordinating node's clock (unix ms) when it concluded the refusal. */
+	coordinatorClock: number;
+};
+
+/**
+ * The cohort refused the write because the transaction had already EXPIRED by the members' clocks —
+ * a clock disagreement between the writer and the cohort, not a lost race and not a judgement of the
+ * write. Never retryable: every retry carries an expiration set by the same clock, and is refused the
+ * same way until a clock is corrected. A sibling of {@link StaleFailure} rather than a field on it,
+ * because "lost to a newer revision" is exactly what this is not; the fields it can never carry are
+ * typed `never`, so a consumer reads `reason`, `missing` or `staleAt` off either shape unnarrowed.
+ * Tell the two apart with `isExpiryFailure`, never by reading `reason`.
+ */
+export type ExpiredFailure = {
+	success: false;
+	/** The coordinator's description of the refusal, for a log line. Never branch on it. */
+	reason?: string;
+	/** Always false: an expiry is never a conflict a re-read can win. */
+	conflict: false;
+	expired: TransactionExpiry;
+	missing?: never;
+	pending?: never;
+	staleAt?: never;
+};
+
+/** Every way a pend or a commit can be refused with an answer rather than a throw. */
+export type WriteFailure = StaleFailure | ExpiredFailure;
+
+export type PendResult = PendSuccess | WriteFailure;
 
 /** What one block will materialize to at the committing revision, declared by the client that
  *  authored the transforms. */
@@ -265,7 +306,7 @@ export type InvalidateRequest = {
 	resolution: DisputeResolutionProof;
 };
 
-export type CommitResult = CommitSuccess | StaleFailure;
+export type CommitResult = CommitSuccess | WriteFailure;
 
 export type CommitSuccess = {
 	success: true;

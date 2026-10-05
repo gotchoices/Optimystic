@@ -1,6 +1,6 @@
 import { peerIdFromString } from "@libp2p/peer-id";
-import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, StaleFailure } from "@optimystic/db-core";
-import { CURRENT_MEMBERSHIP_VERSION, computeClusterMessageHash, isConflictFailure, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
+import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, WriteFailure } from "@optimystic/db-core";
+import { CURRENT_MEMBERSHIP_VERSION, TransactionExpiredError, computeClusterMessageHash, isConflictFailure, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
 import { createLogger, verbose } from '../logger.js'
@@ -11,7 +11,6 @@ import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 import { ResponsibilityRefusalError } from "./responsibility.js";
 import { unrefTimer } from "../unref-timer.js";
-import { formatInstant } from "../format-instant.js";
 
 const log = createLogger('cluster')
 
@@ -99,50 +98,6 @@ export class ValidatorRejectionError extends Error {
 }
 
 /**
- * A {@link ValidatorRejectionError} in which every reject was an **expiry vote**: each refusing member
- * signed that, by its own clock, the record's `message.expiration` had already passed (the structured
- * `Signature.expiredAt`, never the prose). Nobody judged the write's content; the clocks disagree. Either
- * the writer's clock, which set the expiration, is behind, or the refusing members' clocks are ahead —
- * this node cannot tell which, so the remedy is the clock of whichever side is wrong, and retrying
- * changes nothing while the disagreement lasts.
- *
- * A subclass rather than a sibling on purpose: everything that handles a validator rejection keeps
- * handling this one exactly the same way, `CoordinatorRepo`'s two stale-rejection classifiers most
- * importantly. An expiry is not a revision loss, so unless local storage independently shows one, it
- * stays a throw there. How the writer is told it by name is ticket
- * `a-writer-is-told-its-transaction-expired-by-name`.
- */
-export class TransactionExpiredError extends ValidatorRejectionError {
-	/**
-	 * The largest `memberClocks[peer] − coordinatorClock`: how far ahead of this node the most-skewed
-	 * refusing member's clock appeared. An estimate, inflated by the round trip — a member's reading was
-	 * taken before its answer travelled back. Where it is negative the member was not ahead at all, and
-	 * the writer's clock, or a transaction that outlived its deadline, is the likelier cause.
-	 */
-	readonly apparentSkewMs: number;
-
-	constructor(
-		message: string,
-		rejectReasons: Record<string, string>,
-		/** The record's `message.expiration` (unix ms), as the writer's clock set it. */
-		readonly expiration: number,
-		/** Per refusing peer, the clock reading (unix ms) it signed when it judged the record expired. */
-		readonly memberClocks: Record<string, number>,
-		/** This node's `Date.now()` when it raised the error. */
-		readonly coordinatorClock: number
-	) {
-		super(message, rejectReasons);
-		this.name = 'TransactionExpiredError';
-		this.apparentSkewMs = apparentSkewMs(memberClocks, coordinatorClock);
-	}
-}
-
-/** See {@link TransactionExpiredError.apparentSkewMs}. */
-function apparentSkewMs(memberClocks: Record<string, number>, coordinatorClock: number): number {
-	return Math.max(...Object.values(memberClocks).map(clock => clock - coordinatorClock));
-}
-
-/**
  * The structured expiry claim of every reject in `promises`, keyed by peer: `undefined` unless there is
  * at least one reject and each one is an expiry vote. A mix stays a plain validator rejection — some
  * member judged the content, and that verdict must not be reported as a clock problem.
@@ -158,23 +113,6 @@ function expiryRejectionClocks(promises: ClusterRecord['promises']): Record<stri
 		clocks[peerId] = sig.expiredAt;
 	}
 	return rejects.length > 0 ? clocks : undefined;
-}
-
-/**
- * The human half of a {@link TransactionExpiredError}. Deliberately free of the shortfall error's text
- * ("Failed to get super-majority"), which a downstream repository matches to retry a silent cohort: a
- * clock disagreement is neither silence nor transient.
- */
-function transactionExpiredMessage(expiration: number, memberClocks: Record<string, number>, coordinatorClock: number, peerCount: number): string {
-	const seconds = (ms: number) => (ms / 1000).toFixed(1);
-	const refusing = Object.keys(memberClocks).length;
-	const leadMs = expiration - coordinatorClock;
-	const lowerBound = leadMs > 0
-		? `their clocks are at least ${seconds(leadMs)}s ahead of this node's (apparent skew ${seconds(apparentSkewMs(memberClocks, coordinatorClock))}s, inflated by round-trip latency)`
-		: `this node's clock also has it ${seconds(-leadMs)}s past, so the writer's clock may be behind or the transaction outlived its deadline`;
-	return `Transaction expired by member clocks: ${refusing}/${peerCount} member(s) judged its expiration (${formatInstant(expiration)}) already past; `
-		+ `${lowerBound}. This is a clock disagreement, not a validation failure or an unreachable cohort — `
-		+ `correct the clock of whichever side is wrong (the writer that set the expiration, or the refusing members); this node cannot tell which.`;
 }
 
 /**
@@ -534,7 +472,7 @@ export class ClusterCoordinator {
 		 * member-side commit-promise guard (`validateCommitAgainstRefusedPend`) is the backstop for
 		 * that path.
 		 */
-		cohortPendRefusals?: { [peerId: string]: StaleFailure };
+		cohortPendRefusals?: { [peerId: string]: WriteFailure };
 		/**
 		 * What OTHER cohort members reported about durably holding a commit after applying it at
 		 * consensus (`ClusterRecord.applyOutcomes[peer].commit`), keyed by peer id — successes AND
@@ -631,7 +569,7 @@ export class ClusterCoordinator {
 			// fault, a malformed entry) is dropped instead of being handed to a caller that would read
 			// it as a retryable conflict.
 			const selfId = this.localCluster?.peerId.toString();
-			const cohortPendRefusals: { [peerId: string]: StaleFailure } = {};
+			const cohortPendRefusals: { [peerId: string]: WriteFailure } = {};
 			// The commit arm is re-checked the same way, to the shape the gate reads: a plain
 			// `success: true`, or an object whose `success` is `false`. Anything else off the wire is
 			// dropped rather than counted as a holder.
@@ -747,10 +685,11 @@ export class ClusterCoordinator {
 			// need not trust us: it verifies the signatures it is shown.
 			this.broadcastAbandonment(promised.record, 'rejected-by-validators');
 			if (memberClocks !== undefined && record.message.expiration !== undefined) {
+				// The db-core class, not a `ValidatorRejectionError`: nobody judged the write, and
+				// `CoordinatorRepo` returns it to the writer as a refusal before its validator-rejection
+				// classifiers run (see the class).
 				const coordinatorClock = Date.now();
-				throw new TransactionExpiredError(
-					transactionExpiredMessage(record.message.expiration, memberClocks, coordinatorClock, peerCount),
-					rejectReasonsByPeer, record.message.expiration, memberClocks, coordinatorClock);
+				throw new TransactionExpiredError({ expiration: record.message.expiration, memberClocks, coordinatorClock }, coordinatorClock);
 			}
 			throw new ValidatorRejectionError(
 				`Transaction rejected by validators (${rejectionCount}/${peerCount} rejected): ${rejectReasons}`,

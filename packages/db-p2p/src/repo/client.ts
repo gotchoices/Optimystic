@@ -1,5 +1,5 @@
 import type {
-	IRepo, GetBlockResults, PendSuccess, StaleFailure, ActionBlocks, MessageOptions, CommitResult,
+	IRepo, GetBlockResults, PendResult, ActionBlocks, MessageOptions, CommitResult,
 	PendRequest, CommitRequest, BlockGets, IPeerNetwork, PeerId, BlockId
 } from "@optimystic/db-core";
 import type { RepoMessage } from "@optimystic/db-core";
@@ -26,8 +26,8 @@ export class RepoClient extends ProtocolClient implements IRepo {
 		);
 	}
 
-	async pend(request: PendRequest, options: MessageOptions): Promise<PendSuccess | StaleFailure> {
-		return this.processRepoMessage<PendSuccess | StaleFailure>(
+	async pend(request: PendRequest, options: MessageOptions): Promise<PendResult> {
+		return this.processRepoMessage<PendResult>(
 			[{ pend: request }],
 			options
 		);

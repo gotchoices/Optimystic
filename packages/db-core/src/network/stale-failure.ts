@@ -1,5 +1,5 @@
 import type { ActionId, ActionRev } from "../collection/action.js";
-import type { StaleFailure } from "./struct.js";
+import type { ExpiredFailure, StaleFailure, WriteFailure } from "./struct.js";
 
 /**
  * The single rule for "is this non-success retryable after a re-read?" Both write paths and the
@@ -7,10 +7,23 @@ import type { StaleFailure } from "./struct.js";
  *
  * {@link StaleFailure.conflict} is authoritative when present. The `missing`/`pending` fallback
  * covers producers that have not been taught the field, including a remote peer on an older build
- * (the repo protocol is plain JSON, so an unset field simply arrives absent).
+ * (the repo protocol is plain JSON, so an unset field simply arrives absent). An expiry is never a
+ * conflict ({@link isExpiryFailure}), whatever else arrived beside it.
  */
-export function isConflictFailure(failure: StaleFailure): boolean {
+export function isConflictFailure(failure: WriteFailure): boolean {
+	if (isExpiryFailure(failure)) return false;
 	return failure.conflict ?? Boolean(failure.missing?.length || failure.pending?.length);
+}
+
+/**
+ * The single rule for "did the cohort refuse this write because the transaction had already expired
+ * by the members' clocks?" ({@link ExpiredFailure}). Every write path stops on it rather than
+ * retrying, since a retry's expiration comes from the same clock. Decided by the structured field,
+ * never the reason text; a peer on a build that predates the field never sends it, and its refusal
+ * reads as the shape it always had.
+ */
+export function isExpiryFailure(failure: WriteFailure): failure is ExpiredFailure {
+	return failure.expired !== undefined;
 }
 
 /**

@@ -13,7 +13,8 @@ import { TransactorSource, answeredBlock, servedRevision } from "../transactor/t
 import { BlockFloors } from "../transactor/block-floors.js";
 import type { WriteDurability } from "../network/struct.js";
 import { mergeDurability } from "../network/durability.js";
-import { highestStaleAt } from "../network/stale-failure.js";
+import { highestStaleAt, isExpiryFailure } from "../network/stale-failure.js";
+import { TransactionExpiredError } from "../network/transaction-expired-error.js";
 import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions, TornActionReason } from "./index.js";
 import { CollectionHeaderVanishedError, SyncRetryExhaustedError, SyncRevisionStalledError, TornActionError } from "./struct.js";
 import type { ActionContext } from "./action.js";
@@ -742,6 +743,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// documented as never a retryability signal (docs/internals.md). It is the same kind of use
 		// `syncAttempts`' stall check makes: it can only END a retry, never start one.
 		const rivalConfirmed = result.staleAt !== undefined || (result.missing?.length ?? 0) > 0;
+		// NOTE: an expiry refusal of the re-send (`isExpiryFailure`) lands in the "can clear" arm and
+		// is re-sent each round, though it clears only if a clock is corrected meanwhile. Reaching it
+		// needs the clocks to start disagreeing between a write's attempts, since an expiry on the
+		// attempt itself ends the write before any refresh. If it is ever seen burning a budget,
+		// settle it at once beside the confirmed rival.
 		// NOTE: a confirmed rival settles at once, even with retry budget left: re-sending is
 		// pointless, but the lineage question is asked only this once, so a member that is silent
 		// just now makes the answer `final: false`. If unsettled outcomes ever show up often under
@@ -1895,6 +1901,19 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// First attempt has consecutiveFailures == 0, so priority 0 — the common pend is unchanged.
 			const attempt = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id, clampPriority(consecutiveFailures), blockDigests, baseRevs);
 			if (!attempt.success) {
+				if (isExpiryFailure(attempt)) {
+					// The next attempt's expiration comes from the same clock, so it would be refused the
+					// same way; stop here by name. Nothing on this instance has been touched — the attempt
+					// ran on a snapshot tracker — so the staged actions are still staged for a sync after
+					// the clock is fixed.
+					// NOTE: an expiry refusing a commit SWEEP (`NetworkTransactor.commitTailThenSweep`)
+					// arrives after the log tail was stored, and no refresh follows this throw, so that
+					// attempt's log entry stays behind with none of its data — the state the budget-exhausted
+					// exit below leaves too. Needs a sweep cohort whose clocks disagree while the tail's agree;
+					// tracked with the other leftover-entry exits in
+					// tickets/backlog/bug-a-refused-write-can-leave-its-log-entry-behind.
+					throw new TransactionExpiredError(attempt.expired);
+				}
 				consecutiveFailures++;
 				lastReason = attempt.reason ?? lastReason;
 				// Highest-wins, not last-wins: the next request has to clear EVERY holder, so a later

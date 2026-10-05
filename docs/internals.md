@@ -1213,8 +1213,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   reject rather than an escape: a throw reaches the coordinator as silence — no vote, a
   `ConsensusTimeout` penalty against an honest member, and the "super-majority" shortfall a writer
   retries as an unreachable cohort. With a vote, the coordinator counts a rejection, and raises
-  `TransactionExpiredError` (a `ValidatorRejectionError`) when every reject that sank the
-  transaction is an expiry vote. A member that has *already* voted still refuses an expired delivery
+  `TransactionExpiredError` (db-core's, the one class every layer raises — deliberately not a
+  `ValidatorRejectionError`) when every reject that sank the transaction is an expiry vote, which
+  `CoordinatorRepo` returns to the writer as an `ExpiredFailure` (see *Pend retryability is an
+  explicit field* below). A member that has *already* voted still refuses an expired delivery
   by throwing, since voting again would replace its vote (`detectEquivocation`); that is the
   slow-transaction case, not the skew case. See
   [correctness.md §7.4 Clock Assumptions](correctness.md#74-clock-assumptions).
@@ -1484,9 +1486,19 @@ saveMaterializedBlock(block): store(structuredClone(block));
   absent). This is why the confirmed-loss response above needs no `missing` list: the local
   re-read knows the revision is taken but not which actions took it, and nothing rebases from
   `missing` anyway (it is only counted and logged). `NetworkTransactor.pend` *rebuilds* its
-  aggregate `StaleFailure` from the per-batch responses, so it re-derives `conflict` across them
-  — any conflicting batch makes the aggregate a conflict. The commit side is deliberately
-  untouched: it keys on `CommitResult` shape (next bullet), and no commit producer sets `conflict`.
+  aggregate refusal from the per-batch responses (`refusalFrom`, which the commit side shares), so
+  it re-derives `conflict` across them — any conflicting batch makes the aggregate a conflict. The
+  commit side is deliberately untouched: it keys on `CommitResult` shape (next bullet).
+  **Beside `conflict` sits the one refusal that is never retryable: an expiry.** A pend or commit the
+  cohort refused because the transaction had already expired by its members' clocks comes back as
+  its own failure shape, `ExpiredFailure` (a sibling of `StaleFailure` in `PendResult` and
+  `CommitResult`, carrying the clocks as `TransactionExpiry`), decided by the one predicate
+  `isExpiryFailure` in the same file. `CoordinatorRepo.pend` and `.commit` return it ahead of their
+  stale classifiers, because a thrown answer reaches a remote writer as a reset stream; the rebuild
+  makes an expiry in any batch the whole answer; `isConflictFailure` is false for it; and
+  `Collection.syncAttempts`, `TransactionCoordinator`'s pend phase and its commit phase all stop on
+  it with `TransactionExpiredError` instead of re-driving — a retry's expiration comes from the same
+  clock. See [correctness.md §7.4 Clock Assumptions](correctness.md#74-clock-assumptions).
 - **The revision a writer lost to travels as data, not prose.** `StaleFailure.staleAt`
   (`{ blockId, rev }`) carries the one machine-readable fact inside the free-form reject text, so a
   losing writer never has to parse it. Set **only** where the producer read the revision out of its

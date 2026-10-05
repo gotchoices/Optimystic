@@ -26,9 +26,9 @@ import { expect } from 'chai';
 import type {
 	IRepo, IKeyNetwork, ClusterPeers, BlockGets, GetBlockResults, PendRequest, PendResult,
 	CommitRequest, CommitResult, ActionBlocks, MessageOptions, BlockId, ActionId, ActionRev,
-	ClusterRecord, StaleFailure, RepoMessage
+	ClusterRecord, StaleFailure, RepoMessage, WriteFailure, TransactionExpiry
 } from '@optimystic/db-core';
-import { isConflictFailure, localDurability } from '@optimystic/db-core';
+import { isConflictFailure, isExpiryFailure, localDurability, TransactionExpiredError } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { CoordinatorRepo, type ICoordinatorClusterSeam } from '../src/repo/coordinator-repo.js';
@@ -368,5 +368,24 @@ describe('CoordinatorRepo commit — locally-executed consensus consults the ret
 		expect((await makeLocalExecutedRepo(storageRepo, undefined, 2).commit(REQUEST)).success).to.equal(true);
 		expectNotDurable(await makeLocalExecutedRepo(storageRepo, undefined, 1).commit(REQUEST));
 		expect(gets(), 'no verdict, no classification read').to.equal(0);
+	});
+});
+
+describe('CoordinatorRepo — an expiry refusal is returned, not thrown', () => {
+	it('answers pend and commit with the expiry and its numbers, ahead of the stale classifiers', async () => {
+		// A thrown pend or commit aborts the repo stream, so a remote writer would see only a reset.
+		// Local storage shows a rival at the requested revision, which either stale classifier would
+		// confirm as a lost race; every reject was a clock verdict, so the expiry must win.
+		const expiry: TransactionExpiry = { expiration: 1_000, memberClocks: { 'peer-2': 40_000 }, coordinatorClock: 2_000 };
+		const repo = makeRepo(makeStorageRepo({ rev: 2, actionId: RIVAL_ACTION }), new TransactionExpiredError(expiry));
+		const pend: PendRequest = { actionId: OUR_ACTION, rev: 2, transforms: { inserts: {}, updates: { [BLOCK]: [] }, deletes: [] }, policy: 'c' };
+
+		for (const result of [await repo.pend(pend), await repo.commit(REQUEST)]) {
+			expect(result.success).to.equal(false);
+			const refusal = result as WriteFailure;
+			expect(isExpiryFailure(refusal), 'the refusal names the expiry').to.equal(true);
+			expect(refusal.expired, 'the numbers cross the wire as data').to.deep.equal(expiry);
+			expect(isConflictFailure(refusal), 'and is never retryable').to.equal(false);
+		}
 	});
 });

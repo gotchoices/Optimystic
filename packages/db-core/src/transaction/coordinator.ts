@@ -1,7 +1,8 @@
 import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, CommitRequest, ActionId } from "../index.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
-import { isConflictFailure } from "../network/stale-failure.js";
+import { isConflictFailure, isExpiryFailure } from "../network/stale-failure.js";
+import { TransactionExpiredError } from "../network/transaction-expired-error.js";
 import type { Collection, CollectionSnapshot, RefreshReport } from "../collection/collection.js";
 import type { SyncOptions } from "../collection/index.js";
 import { TornActionError } from "../collection/struct.js";
@@ -304,7 +305,10 @@ export class TransactionCoordinator {
 	 * still never re-drive a partial landing itself. A partial landing on a HARD failure (the
 	 * transport budget spent, a structural rejection) escapes at once as
 	 * {@link CoordinatorPartialCommitError}, and any other failure (expired transaction,
-	 * unavailable transactor, unreachable cluster) also propagates without retry.
+	 * unavailable transactor, unreachable cluster) also propagates without retry — including a pend
+	 * or commit the cohort refused because the transaction had expired by its members' clocks, which
+	 * surfaces as {@link TransactionExpiredError} (inside a partial commit's `reason` once a sibling
+	 * has landed).
 	 *
 	 * A participant can also be SAVED between attempts: an attempt that reported a loss may still
 	 * have stored that participant's log tail, and the refresh before the next attempt then finishes
@@ -719,6 +723,7 @@ export class TransactionCoordinator {
 			committedCollections?: Set<CollectionId>;
 			failedCollections?: Set<CollectionId>;
 			staleLoss?: boolean;
+			expired?: TransactionExpiredError;
 		};
 		try {
 			for (const { collectionId, collection } of collectionData) {
@@ -835,7 +840,7 @@ export class TransactionCoordinator {
 				// stamp tracking (the success path does the same at the end) and surface the
 				// structured signal for reconciliation at once.
 				this.stampData.delete(transaction.stamp.id);
-				throw new CoordinatorPartialCommitError([...committed], failed, coordResult.error);
+				throw new CoordinatorPartialCommitError([...committed], failed, coordResult.expired ?? coordResult.error);
 			}
 
 			// EMPTY committed set: PEND failed, or the whole commit failed cleanly with
@@ -850,6 +855,11 @@ export class TransactionCoordinator {
 			// immediately (preserving the historical fail-fast behaviour for hard failures).
 			if (coordResult.staleLoss) {
 				throw new CoordinatorStaleLossError([...(coordResult.failedCollections ?? new Set(allCollectionIds))], coordResult.error);
+			}
+			// An expiry is surfaced by name and never re-driven: the retry's pend would carry an
+			// expiration from the same clock.
+			if (coordResult.expired !== undefined) {
+				throw coordResult.expired;
 			}
 			throw new Error(`Transaction commit failed: ${coordResult.error}`);
 		}
@@ -1416,6 +1426,9 @@ export class TransactionCoordinator {
 		/** True when the failure was a clean optimistic-concurrency conflict (stale loss / pending
 		 * contention) with nothing durable — i.e. safe to re-drive after a re-read. */
 		staleLoss?: boolean;
+		/** Present when a pend or a commit was refused because the transaction had expired by the
+		 * cohort's clocks: the error the commit surfaces, never a stale loss. */
+		expired?: TransactionExpiredError;
 	}> {
 		const trxId = transaction.id;
 		const t0 = Date.now();
@@ -1467,6 +1480,7 @@ export class TransactionCoordinator {
 				committedCollections: commitResult.committedCollections,
 				failedCollections: commitResult.failedCollections,
 				staleLoss: commitResult.staleLoss,
+				...(commitResult.expired === undefined ? {} : { expired: commitResult.expired }),
 			};
 		}
 
@@ -1539,7 +1553,7 @@ export class TransactionCoordinator {
 		collectionTransforms: ReadonlyMap<CollectionId, Transforms>,
 		pendedRevs: ReadonlyMap<CollectionId, number>,
 		superclusterNominees: ReadonlySet<PeerId> | null
-	): Promise<{ success: boolean; error?: string; pendedBlockIds?: Map<CollectionId, BlockId[]>; staleLoss?: boolean }> {
+	): Promise<{ success: boolean; error?: string; pendedBlockIds?: Map<CollectionId, BlockId[]>; staleLoss?: boolean; expired?: TransactionExpiredError }> {
 		if (collectionTransforms.size === 0) {
 			return { success: false, error: 'No transforms to pend' };
 		}
@@ -1569,6 +1583,8 @@ export class TransactionCoordinator {
 		// re-driving it would just burn the retry budget — fail fast instead.
 		let anyConflict = false;
 		let anyHard = false;
+		// An expiry is a hard failure too, and is carried whole: it is the error the commit surfaces.
+		let expired: TransactionExpiredError | undefined;
 		for (const outcome of outcomes) {
 			if (outcome.status === 'fulfilled') {
 				pendedBlockIds.set(outcome.value.collectionId, outcome.value.blockIds);
@@ -1578,6 +1594,7 @@ export class TransactionCoordinator {
 				}
 				if (outcome.reason instanceof PendRejectedError && outcome.reason.conflict) anyConflict = true;
 				else anyHard = true;
+				if (outcome.reason instanceof TransactionExpiredError) expired ??= outcome.reason;
 			}
 		}
 
@@ -1587,7 +1604,7 @@ export class TransactionCoordinator {
 			// only those started before the failure. Cancels are best-effort (cancelPhase
 			// swallows their errors) so they cannot mask the original pend failure.
 			await this.cancelPhase(actionId, pendedBlockIds);
-			return { success: false, error: failure, staleLoss: anyConflict && !anyHard };
+			return { success: false, error: failure, staleLoss: anyConflict && !anyHard, ...(expired === undefined ? {} : { expired }) };
 		}
 
 		return { success: true, pendedBlockIds };
@@ -1643,6 +1660,9 @@ export class TransactionCoordinator {
 
 		const pendResult = await this.transactor.pend(pendRequest);
 		if (!pendResult.success) {
+			if (isExpiryFailure(pendResult)) {
+				throw new TransactionExpiredError(pendResult.expired);
+			}
 			// Retryability comes from the response itself: a producer that classified the failure sets
 			// `conflict`, and only where no producer set it do we fall back to inferring from
 			// `missing`/`pending`. Either way a conflict is an optimistic-concurrency loss, clearable
@@ -1671,6 +1691,7 @@ export class TransactionCoordinator {
 		committedCollections: Set<CollectionId>;
 		failedCollections: Set<CollectionId>;
 		staleLoss?: boolean;
+		expired?: TransactionExpiredError;
 	}> {
 		// Fan out the independent per-collection commit-with-retry concurrently, then
 		// aggregate the committed/failed partition from the settled results.
@@ -1689,6 +1710,7 @@ export class TransactionCoordinator {
 		// re-driving.
 		let anyStale = false;
 		let anyHard = false;
+		let expired: TransactionExpiredError | undefined;
 		for (const outcome of outcomes) {
 			if (outcome.status === 'fulfilled') {
 				const { collectionId, committed, error, stale } = outcome.value;
@@ -1698,6 +1720,7 @@ export class TransactionCoordinator {
 					failedCollections.add(collectionId);
 					if (error) errors.push(error);
 					if (stale) anyStale = true; else anyHard = true;
+					expired ??= outcome.value.expired;
 				}
 			} else {
 				// commitCollection resolves rather than rejects, but treat any unexpected
@@ -1714,6 +1737,7 @@ export class TransactionCoordinator {
 				committedCollections,
 				failedCollections,
 				staleLoss: anyStale && !anyHard,
+				...(expired === undefined ? {} : { expired }),
 			};
 		}
 
@@ -1734,7 +1758,7 @@ export class TransactionCoordinator {
 		 * family as pendCollection's: recomputing `getNextRev()` here, after the pend round
 		 * trips, could stamp the CommitRequest with a different number than the pend named. */
 		rev: number
-	): Promise<{ collectionId: CollectionId; committed: boolean; error?: string; stale?: boolean }> {
+	): Promise<{ collectionId: CollectionId; committed: boolean; error?: string; stale?: boolean; expired?: TransactionExpiredError }> {
 		const collection = this.collections.get(collectionId);
 		if (!collection) {
 			return { collectionId, committed: false, error: `Collection not found: ${collectionId}` };
@@ -1778,6 +1802,11 @@ export class TransactionCoordinator {
 				if (commitResult.success) {
 					return { collectionId, committed: true };
 				}
+				if (isExpiryFailure(commitResult)) {
+					// Not a stale loss: a re-drive's expiration comes from the same clock.
+					const expired = new TransactionExpiredError(commitResult.expired);
+					return { collectionId, committed: false, error: expired.message, expired };
+				}
 				// Permanent stale failure: do not retry here. It IS a clean stale loss, though, so
 				// mark it retryable at the coordinator level (after a re-read advances the rev).
 				// NOTE: deliberately does NOT consult `isConflictFailure` / `StaleFailure.conflict`
@@ -1791,7 +1820,8 @@ export class TransactionCoordinator {
 				// stale-commit rejections as `{ success:false, conflict:true }` (returning, not
 				// throwing, is what keeps them out of the verbatim retry above) — but every returned
 				// failure still maps to `stale: true` here, and `isConflictFailure` covers that new
-				// shape, so no behavior change is needed. If a commit producer ever starts returning
+				// shape, so no behavior change is needed. The one returned refusal that is NOT a stale
+				// loss, an expiry, is split off above. If a commit producer ever starts returning other
 				// hard commit rejections (validator policy, storage fault) as results too, gate
 				// `stale` on isConflictFailure here.
 				return {

@@ -1,7 +1,7 @@
 import { expect } from 'chai';
-import { ClusterCoordinator, TransactionExpiredError, ValidatorRejectionError } from '../src/repo/cluster-coordinator.js';
+import { ClusterCoordinator } from '../src/repo/cluster-coordinator.js';
 import { PenaltyReason, type IPeerReputation } from '../src/reputation/types.js';
-import type { ClusterRecord, ClusterPeers, IKeyNetwork, ICluster, RepoMessage, ClusterConsensusConfig, BlockId } from '@optimystic/db-core';
+import { TransactionExpiredError, type ClusterRecord, type ClusterPeers, type IKeyNetwork, type ICluster, type RepoMessage, type ClusterConsensusConfig, type BlockId } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
@@ -107,7 +107,6 @@ describe('ClusterCoordinator — a member refusing an expired record is a clock 
 		}
 
 		expect(caught).to.be.instanceOf(TransactionExpiredError);
-		expect(caught, 'still a validator rejection to everything above the coordinator').to.be.instanceOf(ValidatorRejectionError);
 		const error = caught as TransactionExpiredError;
 		expect(error.message, 'never the text a downstream repo retries as a silent cohort').to.not.include('super-majority');
 		expect(error.expiration).to.equal(message.expiration);

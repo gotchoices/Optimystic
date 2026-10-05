@@ -1,7 +1,7 @@
 import type { IRepo, ClusterRecord, ClusterPeers, Signature, ClusterVote, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, PendRequest, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest, MemberApplyOutcome } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
-import { blockIdsForTransforms, transformForBlockId, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability } from "@optimystic/db-core";
+import { blockIdsForTransforms, transformForBlockId, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability, formatInstant } from "@optimystic/db-core";
 import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest, clusterVoteSigningPayload, clusterVoteVerificationPayload } from "@optimystic/db-core";
 import { verifyInvalidationCertificate, type ArbitratorSetRecompute } from "../dispute/invalidation.js";
 import { buildCommitCert, invalidationActionId } from "./commit-cert.js";
@@ -21,7 +21,6 @@ import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDig
 import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
 import { StuckReservationTracker } from "../repo/stuck-reservation.js";
 import { checkPendValidation, TRANSACTION_EXPIRED } from "../pend-validation.js";
-import { formatInstant } from "../format-instant.js";
 import { getAffectedBlockIds } from "./record-operations.js";
 import { operationsConflict, resolveRace } from "./race-resolution.js";
 import { buildBlockCommitProof, mintSoloCommitProof, type BlockCommitProof } from "./commit-proof.js";

@@ -7,4 +7,5 @@ export * from "./repo-protocol.js";
 export * from "./routing-key.js";
 export * from "./stale-failure.js";
 export * from "./struct.js";
+export * from "./transaction-expired-error.js";
 export * from "./types.js";

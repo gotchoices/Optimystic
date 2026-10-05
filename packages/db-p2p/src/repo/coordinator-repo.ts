@@ -1,5 +1,5 @@
-import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
-import { LruMap, blockIdsForTransforms, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability } from "@optimystic/db-core";
+import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
+import { LruMap, blockIdsForTransforms, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, TransactionExpiredError } from "@optimystic/db-core";
 import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -515,7 +515,7 @@ export interface ICoordinatorClusterSeam {
 		localPendResult?: PendResult;
 		localCommitResult?: CommitResult;
 		/** Other cohort members' conflict-shaped pend refusals; see `ClusterCoordinator.executeClusterTransaction`. */
-		cohortPendRefusals?: { [peerId: string]: StaleFailure };
+		cohortPendRefusals?: { [peerId: string]: WriteFailure };
 		/** Other cohort members' post-reconcile commit durability reports; see `ClusterCoordinator.executeClusterTransaction`. */
 		cohortCommitOutcomes?: { [peerId: string]: CommitResult };
 	}>;
@@ -2209,7 +2209,8 @@ export class CoordinatorRepo implements IRepo {
 	/** The cluster half of {@link pend}, after responsibility is verified: consensus, the local-verdict
 	 *  arms, and the catch that turns each optimistic-concurrency refusal into a retryable answer —
 	 *  the two signed-evidence ones ({@link ConflictRaceLostError}, {@link BlocksHeldError}) directly,
-	 *  and a validator rejection only through {@link classifyStaleRejection}. */
+	 *  and a validator rejection only through {@link classifyStaleRejection} — and an expiry into the
+	 *  non-retryable answer that names it. */
 	private async pendThroughCluster(request: PendRequest, allBlockIds: BlockId[], options?: MessageOptions): Promise<PendResult> {
 		const coordinatingBlockIds = options?.coordinatingBlockIds ?? allBlockIds;
 
@@ -2326,6 +2327,15 @@ export class CoordinatorRepo implements IRepo {
 			});
 		} catch (error) {
 			this.log('coordinator-repo:pend-error', { actionId: request.actionId, error: (error as Error).message });
+			// An expiry is returned, not thrown, and ahead of the stale classifier. Returned because a
+			// thrown pend aborts the repo stream, so a remote writer would see only a reset — and its
+			// transactor would re-pick another coordinator for a refusal every coordinator repeats.
+			// Ahead of the classifier because every reject that sank the write was a clock verdict:
+			// even where local storage also shows a newer revision, a re-read and re-pend would be
+			// refused by the same clocks.
+			if (error instanceof TransactionExpiredError) {
+				return error.toFailure();
+			}
 			// A lost conflict race is an optimistic-concurrency loss, not a fault: surface it as the
 			// StaleFailure shape the retry machinery already understands (`Collection.sync` and the
 			// multi-collection pendPhase retry it via `isConflictFailure`), exactly as a confirmed
@@ -2879,6 +2889,11 @@ export class CoordinatorRepo implements IRepo {
 			}
 		} catch (error) {
 			this.log('coordinator-repo:commit-error', { actionId: request.actionId, error: (error as Error).message });
+			// Returned for the reasons `pendThroughCluster` gives. Nothing of the commit applied: the
+			// cohort refused it at the promise round, before any member could apply.
+			if (error instanceof TransactionExpiredError) {
+				return error.toFailure();
+			}
 			// A lost commit-consensus race is an optimistic-concurrency loss, not a fault — mirror
 			// `pend`'s conversion above. At the moment this is thrown, zero members approved and the
 			// members hold the winner: nothing of the loser landed, so a retryable-conflict answer is

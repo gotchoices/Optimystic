@@ -20,6 +20,7 @@ import {
 	TransactionCoordinator,
 	CoordinatorPartialCommitError,
 	CoordinatorStaleLossError,
+	TransactionExpiredError,
 	TransactionSession,
 	TransactionValidator,
 	Tree,
@@ -4404,7 +4405,12 @@ describe('Transaction', () => {
 		class PartialLossTransactor extends DelegatingTransactor {
 			commitCalls = 0;
 			private readonly poison = new Set<BlockId>();
-			constructor(inner: TestTransactor, private readonly poisonCollectionId: string, private refusals = Infinity) { super(inner); }
+			constructor(
+				inner: TestTransactor,
+				private readonly poisonCollectionId: string,
+				private refusals = Infinity,
+				private readonly refusal: () => CommitResult = () => ({ success: false, reason: `forced loss: ${poisonCollectionId}` }),
+			) { super(inner); }
 			override async pend(request: PendRequest): Promise<PendResult> {
 				const firstInsert = Object.values(request.transforms.inserts ?? {})[0] as IBlock | undefined;
 				if (firstInsert?.header.collectionId === this.poisonCollectionId) {
@@ -4416,7 +4422,7 @@ describe('Transaction', () => {
 				this.commitCalls++;
 				if (request.blockIds.some(id => this.poison.has(id)) && this.refusals > 0) {
 					this.refusals--;
-					return { success: false, reason: `forced loss: ${this.poisonCollectionId}` };
+					return this.refusal();
 				}
 				return this.inner.commit(request);
 			}
@@ -4433,6 +4439,7 @@ describe('Transaction', () => {
 				inner: TestTransactor,
 				private readonly conflictCollectionId: string,
 				private readonly hardCollectionId: string,
+				private readonly hardRefusal: PendResult = { success: false, reason: 'storage full' },
 			) {
 				super(inner);
 			}
@@ -4445,8 +4452,8 @@ describe('Transaction', () => {
 					return { success: false, pending: [{} as any], reason: 'pending contention' };
 				}
 				if (cid === this.hardCollectionId) {
-					// A bare reason (no missing/pending) ⇒ hard rejection, not retryable.
-					return { success: false, reason: 'storage full' };
+					// By default a bare reason (no missing/pending) ⇒ hard rejection, not retryable.
+					return this.hardRefusal;
 				}
 				return this.inner.pend(request);
 			}
@@ -4611,6 +4618,43 @@ describe('Transaction', () => {
 			// Never reached COMMIT, nothing durable.
 			expect(transactor.commitCalls, 'pend failed before any commit').to.equal(0);
 			expect(inner.getCommittedActions().size, 'nothing durably committed').to.equal(0);
+		});
+
+		const expiry = { expiration: 1_000, memberClocks: { 'member-1': 40_000 }, coordinatorClock: 2_000 };
+
+		it('a pend refused as EXPIRED surfaces TransactionExpiredError at once, even beside a retryable conflict', async () => {
+			const inner = new TestTransactor();
+			const transactor = new MixedPendTransactor(inner, 'users', 'posts', new TransactionExpiredError(expiry).toFailure());
+			const { coordinator, transaction } = await makeMultiCollection(transactor);
+
+			let err: unknown;
+			try {
+				await coordinator.commit(transaction, { maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 });
+			} catch (e) {
+				err = e;
+			}
+
+			expect(err).to.be.instanceOf(TransactionExpiredError);
+			expect((err as TransactionExpiredError).memberClocks).to.deep.equal(expiry.memberClocks);
+			expect([transactor.pendCalls.get('users'), transactor.pendCalls.get('posts')], 'no retry round').to.deep.equal([1, 1]);
+		});
+
+		it('a commit refused as EXPIRED after a sibling landed is not re-driven: the partial commit carries the expiry', async () => {
+			const inner = new TestTransactor();
+			const transactor = new PartialLossTransactor(inner, 'posts', Infinity, () => new TransactionExpiredError(expiry).toFailure());
+			const { coordinator, transaction } = await makeMultiCollection(transactor);
+
+			let err: unknown;
+			try {
+				await coordinator.commit(transaction, { maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 });
+			} catch (e) {
+				err = e;
+			}
+
+			expect(err).to.be.instanceOf(CoordinatorPartialCommitError);
+			expect([...(err as CoordinatorPartialCommitError).committedCollections]).to.deep.equal(['users']);
+			expect((err as CoordinatorPartialCommitError).reason).to.be.instanceOf(TransactionExpiredError);
+			expect(transactor.commitCalls, 'one commit per collection, no re-drive of the expired one').to.equal(2);
 		});
 
 		it('an always-losing transaction exhausts maxAttempts and surfaces a terminal error (no infinite loop)', async () => {

@@ -1,10 +1,10 @@
 import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
-import { highestStaleAt, isConflictFailure } from "../network/stale-failure.js";
+import { highestStaleAt, isConflictFailure, isExpiryFailure } from "../network/stale-failure.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import { mergeDurability, withTornBlocks } from "../network/durability.js";
 import { judgeCohortLineage, type CohortLineage, type MemberLineage } from "../network/lineage.js";
-import type { ActionTransforms, ActionBlocks, ActionLineage, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, GetBlockResult, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, BlockBaseRevs, WriteDurability } from "../index.js";
+import type { ActionTransforms, ActionBlocks, ActionLineage, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, WriteFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, GetBlockResult, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, BlockBaseRevs, WriteDurability } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
 import { Tracker } from "../transform/tracker.js";
@@ -727,35 +727,9 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			const stale = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
 			if (stale.length > 0) {	// Any active stale failures should preempt reporting connection or other potential transient errors (we have information)
 				log('pend:stale actionId=%s staleCount=%d', blockAction.actionId, stale.length);
-				// Carry the first available reject reason through: `SyncRetryExhaustedError.lastReason`
-				// and the multi-collection writer's failure message both read it, and it is the only
-				// diagnostic that survives an exhausted retry budget.
-				const reason = stale.map(b => (b.request!.response! as StaleFailure).reason).find(r => r !== undefined);
-				// This response is REBUILT from the per-batch ones rather than forwarded, so
-				// retryability has to be carried explicitly or it is lost: a batch whose failure was
-				// a confirmed lost race can arrive with neither `missing` nor `pending` (see
-				// CoordinatorRepo.classifyStaleRejection), and the aggregate would then look like a
-				// hard rejection to `isConflictFailure`. Any conflicting batch makes the aggregate a
-				// conflict — the pend failed as a whole, and a re-read/rebase can clear it.
-				// NOTE: `some`, not `every`, so a pend whose batches mix a lost race with a genuine hard
-				// rejection is reported retryable and burns its (bounded, backed-off) retry budget before
-				// failing. Deliberate: an unclassified reason-only response from an older peer is
-				// indistinguishable from a hard rejection here, and `every` would refuse to retry a real
-				// race whenever one batch came from such a peer. Revisit if every producer sets `conflict`
-				// (then `every` is both safe and tighter), or if mixed-outcome pends show up as wasted
-				// retry latency in practice.
-				const conflict = stale.some(b => isConflictFailure(b.request!.response! as StaleFailure));
-				// Deliberately NOT first-wins like `reason` above — `highestStaleAt` takes the largest
-				// confirmed revision, which is the binding constraint on the client's next request.
-				// Its doc comment carries the rule and the one-pend-one-collection assumption it rests on.
-				const staleAt = highestStaleAt(stale.map(b => (b.request!.response! as StaleFailure).staleAt));
-				return {
-					success: false,
-					conflict,
-					...(reason === undefined ? {} : { reason }),
-					...(staleAt === undefined ? {} : { staleAt }),
-					missing: distinctBlockActionTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing).filter((x): x is ActionTransforms => x !== undefined)),
-				};
+				// This response is REBUILT from the per-batch ones rather than forwarded, by the same
+				// rule the commit side uses — see `refusalFrom` for what is carried and why.
+				return refusalFrom(stale.map(b => b.request!.response! as WriteFailure));
 			}
 			throw error;	// No stale failures, report the original error
 		}
@@ -1101,9 +1075,9 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * sweep — both must distinguish a confirmed conflict (return it; the caller cancels and
 	 * re-drives) from a transient fault (throw / tolerate).
 	 */
-	private staleFromBatches(batches: CoordinatorBatch<BlockId[], CommitResult>[]): StaleFailure | undefined {
+	private staleFromBatches(batches: CoordinatorBatch<BlockId[], CommitResult>[]): WriteFailure | undefined {
 		const stale = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
-		return stale.length === 0 ? undefined : refusalFrom(stale.map(b => b.request!.response! as StaleFailure));
+		return stale.length === 0 ? undefined : refusalFrom(stale.map(b => b.request!.response! as WriteFailure));
 	}
 
 	/**
@@ -1440,14 +1414,33 @@ function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult
 }
 
 /**
- * One {@link StaleFailure} standing for every refused commit response in `responses`, rebuilt the
- * same way {@link NetworkTransactor.pend}'s aggregate is: `reason` is the first one any response gave
- * (the only diagnostic that survives into the coordinator's error text — a refusal whose reason is
- * `commit-not-durable` must not read as "stale commit", a rival's win), `conflict` holds when any
- * response was a classified conflict, and `staleAt` is the highest confirmed revision. A reason-only
- * refusal (no `missing`) comes out with `missing: []` and its reason intact.
+ * One refusal standing for every refused response in `responses` — the single rebuild both
+ * {@link NetworkTransactor.pend} and the commit paths use, since the action-level answer is rebuilt
+ * from per-batch ones rather than forwarded, and anything not carried here is lost.
+ *
+ * - An **expiry** anywhere ({@link isExpiryFailure}) is the answer, verbatim — the first one. No
+ *   retry can succeed while that cohort's clocks disagree with the writer's, so a conflict beside it
+ *   must not make the write look retryable, and its numbers must reach the writer whole.
+ * - Otherwise a {@link StaleFailure}: `reason` is the first one any response gave (the only diagnostic
+ *   that survives an exhausted retry budget and the coordinator's error text — a refusal whose reason
+ *   is `commit-not-durable` must not read as "stale commit", a rival's win); `staleAt` is the highest
+ *   confirmed revision (`highestStaleAt`, the binding constraint on the next request); and `conflict`
+ *   holds when ANY response was a conflict, because a batch whose failure was a confirmed lost race
+ *   can arrive with neither `missing` nor `pending` (`CoordinatorRepo.classifyStaleRejection`), so
+ *   retryability has to be carried explicitly. A reason-only refusal comes out with `missing: []`.
+ *
+ * NOTE: `some`, not `every`, for `conflict`, so a write whose batches mix a lost race with a genuine
+ * hard rejection is reported retryable and burns its (bounded, backed-off) retry budget before
+ * failing. Deliberate: an unclassified reason-only response from an older peer is indistinguishable
+ * from a hard rejection here, and `every` would refuse to retry a real race whenever one batch came
+ * from such a peer. Revisit if every producer sets `conflict` (then `every` is both safe and tighter),
+ * or if mixed-outcome writes show up as wasted retry latency in practice.
  */
-function refusalFrom(responses: StaleFailure[]): StaleFailure {
+function refusalFrom(responses: WriteFailure[]): WriteFailure {
+	const expired = responses.find(isExpiryFailure);
+	if (expired !== undefined) {
+		return expired;
+	}
 	const staleAt = highestStaleAt(responses.map(r => r.staleAt));
 	const reason = responses.map(r => r.reason).find(r => r !== undefined);
 	return {
