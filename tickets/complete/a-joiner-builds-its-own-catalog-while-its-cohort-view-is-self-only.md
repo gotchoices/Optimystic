@@ -71,11 +71,50 @@ The rule was not weakened to make sereus pass. `tickets/blocked/sereus-cannot-st
 - The reporter's script exactly as published (one store shared by both databases) was not re-run; it would stop at the same start-up refusal.
 - The partial-protocol-list window (departure one, part b) is established from libp2p's source and pinned by a unit test with a fake; no test puts latency on a real link to hit it.
 - No integration test bootstraps through a real circuit address. The planning rule is unit-tested, and the existing relay lifecycle spec passes.
-- `resolveBootstrapContactTimeoutMs` has no test of its refusal of a bad value.
-- Two tripwires are parked as `NOTE:`s in `libp2p-key-network.ts`: at `identifiedBootstrapPeerJoiningRing` (a peer FRET never admits holds one lookup to the deadline, once) and at `membershipOf` (the partial-list reading, which still affects ordinary cohort assembly for one reading).
 - Scope limits from the ticket stand: a write to a collection the node already holds, made before contact, still commits alone; existing forks are not repaired.
 
 ## For the reporter (posting is a human's call)
 
 - The "cohort of one for the whole trial" seen on 1.8.1 was not reproduced at HEAD and is not explained by this work.
 - The published script hands one `MemoryRawStorage` to every scope, so its control and strand databases share a catalog block. The fork does not depend on that, but an application wired the same way has two databases overwriting one catalog.
+
+## Review findings
+
+Reviewed the diff of `ticket(implement): a-joiner-builds-its-own-catalog-while-its-cohort-view-is-self-only` before the handoff text: every source file, the new specs, and the docs it touched.
+
+### Checked, nothing to change
+
+- **The node triggering identify itself.** Compared with the installed `@libp2p/identify` source: the built-in trigger is exactly `identify(connection).catch(() => {})` on `connection:open`, so `identifyOnConnectionOpen` is the same call on the same event and loses nothing. The listener is installed before `start()`, so no connection opens unobserved.
+- **No moment where a successful dial looks like "nothing is arriving".** libp2p dispatches `connection:open` before `dial()` resolves, and the listener counts the identify exchange as in flight synchronously, so the in-flight count does not touch zero between the dial settling and identify starting.
+- **A transient identify failure does not strand the node.** A peer whose identify timed out on a connection that stays open is not re-identified, but a later stream on this network's protocol puts that protocol in its peerStore list, the next cohort assembly reads it as serving, and that verdict counts as heard from.
+- **The wait loop's resources.** The 25 ms re-check timer is cleared when a flight settles first; a waiter left behind when the timer fires first is released at the next settle, which the dial timeout bounds. The flight counter cannot go negative (`settled` follows every `started`, and both apply the same bootstrap-peer filter). A node stopped mid-wait has its dials aborted, which ends the wait.
+- **Founder path.** A node with no bootstrap peers passes no options, never enters the loop, and `absenceFlagFor` returns the earlier answer; confirmed by the unchanged one-round specs.
+- **The four departures the implementer asked to have weighed.** Identify outcome as the definition of "heard from", keeping `'named-by-log'` on a floored read, and reusing the constructor slot are all sound and are described in `docs/internals.md`. "Any unheard peer keeps the node awaiting" follows the plan ticket's wording; its cost is narrower than the handoff says (it binds only when the node's cohort view for the block is itself alone) and is now stated at the accepted-tradeoff `NOTE:`.
+- **Docs.** `docs/internals.md`, `docs/debugging.md`, `docs/transactions.md`, `docs/optimystic.md`, `packages/db-p2p/readme.md` and `packages/db-p2p/docs/cluster.md` match the code; `yarn lint:docs` resolves every citation.
+- **Tests.** The new specs each pin branching behaviour or reproduce the bug; none restates a mock. Nothing cut.
+- **The cast `node as unknown as IdentifyOnOpenHost`.** Tried removing it: the node's service map is untyped at that point, so it does not compile without it. Left.
+
+### Minor, fixed in this pass
+
+- **`resolveBootstrapContactTimeoutMs` had no test** (listed as a known gap). Added to `packages/db-p2p/test/link-deadlines.spec.ts`: undeclared is the derived value, a declared value including `0` is taken exactly, and a negative, non-finite or over-limit value throws.
+- **`NodeOptions.bootstrapContactTimeoutMs` said `0` "is safe".** Reworded to say what `0` does: opens made before the peer answers are refused where they would have waited.
+- **The accepted-tradeoff `NOTE:` at `absenceFlagFor`** now says the refusal applies only when the cohort view is self-only, that one unheard peer among several is enough, and why "one heard is enough" was rejected.
+
+### Tripwires (parked, not filed)
+
+- **Heard from versus admitted to the ring.** The refusal lifts when identify answers; the cohort includes the peer only once FRET holds it. FRET's `peer:connect` and `peer:identify` handlers normally finish before the identify call returns, so the two coincide, and where they do not, only the bounded wait covers the difference. With the wait closed or set to `0`, a lookup in that interval could come back self-only and unflagged. Tried to produce it with eight no-wait joins over real sockets that retried the open in a tight loop: every one found the founder's collection with no refusal, because the transactor's own coordinator lookup already sleeps 500 ms while a dial is in flight. Parked as a `NOTE:` at `awaitingBootstrapContact` in `packages/db-p2p/src/libp2p-key-network.ts`, with the remedy. The probe test was not kept: it passes for a reason other than the one it would claim to pin.
+- The implementer's two tripwires stand as written, at `identifiedBootstrapPeerJoiningRing` and `membershipOf` in the same file.
+
+### Major
+
+None found. The one consequence of size, sereus being unable to start a second machine on this build, was already filed by the implementer as `tickets/blocked/sereus-cannot-start-a-machine-that-was-given-a-peer-to-join-through.md` and is unchanged.
+
+### Not done
+
+- File size: `libp2p-key-network.ts` is 1710 lines, `libp2p-node-base.ts` 2314, `coordinator-repo.ts` 3351 (`wc -l`). All three were large before this ticket, which put its new logic in two new small files; no split filed from here.
+
+### Validation (2026-10-05, Windows)
+
+- `yarn lint`, `yarn lint:docs`, `yarn build`, `yarn typecheck`: clean.
+- db-p2p `yarn test`: 3221 passing, 68 pending, 0 failing. db-p2p `yarn test:integration`: 49 passing, 2 pending.
+- db-core and quereus-plugin-optimystic suites were not re-run: this pass changed only comments and one spec inside db-p2p.

@@ -1469,6 +1469,16 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 *
 	 * True while ANY configured peer is unheard ({@link heardFromBootstrapPeer}); a node with no
 	 * bootstrap peers always answers false. Async only because the interface it implements is.
+	 *
+	 * NOTE: "heard from" is settled by identify, and the cohort admits a peer only once FRET holds
+	 * it in the ring. FRET upserts on `peer:connect` and classifies on `peer:identify`, both before
+	 * the identify call returns, so the two normally coincide; where they do not, only the bounded
+	 * wait ({@link bootstrapContactImminent}) covers the difference. With that wait closed or set to
+	 * `0`, a lookup landing between the two comes back self-only and unflagged, and an open made
+	 * then founds a second copy. Not observed (eight no-wait joins on loopback all found the
+	 * founder's collection). If a fork is ever seen after an `answer:identified` line with the wait
+	 * closed, also answer true here while a connected bootstrap peer identified as serving is
+	 * missing from the ring.
 	 */
 	async awaitingBootstrapContact(): Promise<boolean> {
 		return this.unheardBootstrapPeers().length > 0

@@ -8,7 +8,7 @@
  */
 
 import { expect } from 'chai';
-import { MAX_LINK_ROUND_TRIP_MS, MAX_RPC_DIAL_TIMEOUT_MS, resolveLinkDeadlines, type LinkDeadlines } from '../src/rpc-deadline.js';
+import { MAX_LINK_ROUND_TRIP_MS, MAX_RPC_DIAL_TIMEOUT_MS, resolveBootstrapContactTimeoutMs, resolveLinkDeadlines, type LinkDeadlines } from '../src/rpc-deadline.js';
 
 const UNDECLARED: LinkDeadlines = {
 	dialTimeoutMs: 3000,
@@ -77,6 +77,22 @@ describe('resolveLinkDeadlines', () => {
 		);
 		expect(largest).to.be.at.most(2 ** 31 - 1);
 	});
+});
+
+describe('resolveBootstrapContactTimeoutMs', () => {
+	const deadlines = resolveLinkDeadlines(3000);
+
+	it('undeclared is the derived value, and a declared one replaces it exactly, 0 ("never wait") included', () => {
+		expect(resolveBootstrapContactTimeoutMs(undefined, deadlines)).to.equal(deadlines.bootstrapContactTimeoutMs);
+		expect(resolveBootstrapContactTimeoutMs(250, deadlines)).to.equal(250);
+		expect(resolveBootstrapContactTimeoutMs(0, deadlines)).to.equal(0);
+	});
+
+	for (const declared of [-1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
+		it(`throws on ${String(declared)} rather than waiting an unusable time`, () => {
+			expect(() => resolveBootstrapContactTimeoutMs(declared, deadlines)).to.throw(/bootstrapContactTimeoutMs must be a finite number/);
+		});
+	}
 });
 
 describe('resolveLinkDeadlines with explicit rpcDeadlines', () => {

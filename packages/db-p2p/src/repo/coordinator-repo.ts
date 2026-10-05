@@ -973,7 +973,11 @@ export class CoordinatorRepo implements IRepo {
 	 *
 	 * NOTE: accepted tradeoff — a node configured with a bootstrap peer that is permanently gone,
 	 * and holding no persisted network state, can neither create a collection nor read a block it
-	 * lacks: both fail with `'cohort-unreachable'` for as long as that peer is never heard from.
+	 * lacks whenever its cohort view for that block is itself alone: both fail with
+	 * `'cohort-unreachable'` for as long as that peer is never heard from. ONE unheard peer is
+	 * enough, however many others have answered, so this also binds a node running
+	 * `clusterSize: 1` beside live peers. "One serving peer heard is enough" was weighed and
+	 * rejected: at `clusterSize: 1` the unheard peer may be the block's only holder.
 	 * Blocks it holds are served as before. This is the cost `membershipOf` in
 	 * `libp2p-key-network.ts` already accepts for a remembered peer that never returns, extended
 	 * to a peer the node was configured with. Settling the view once the key network's bounded

@@ -226,7 +226,8 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * link round trip (`LinkDeadlines.bootstrapContactTimeoutMs`): twelve round trips, ten for the
 	 * connection open the bootstrap dial runs under and two for identify, and never less than 10 s.
 	 * A host that raises `connectionManager.dialTimeout` should raise this with it. `0` never
-	 * waits, and is safe: the second rule there still holds. A value that is not a finite number
+	 * waits; the second rule there still holds, and is then the only one, so an open made before
+	 * the peer has answered is refused where it would have waited. A value that is not a finite number
 	 * of milliseconds from 0 up throws at node construction.
 	 */
 	bootstrapContactTimeoutMs?: number;
