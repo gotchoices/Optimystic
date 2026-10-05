@@ -90,8 +90,7 @@ out
 .mesh
 packages/reference-peer/.optimystic-node.json
 
-# Yarn configuration with secrets
-.yarnrc.yml
+# Yarn local state (.yarnrc.yml is committed; the npm token comes from NPM_TOKEN)
 .yarn
 
 tasks/.logs/

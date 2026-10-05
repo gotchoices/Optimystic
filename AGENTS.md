@@ -129,8 +129,7 @@ is a release step ([docs/releasing.md](docs/releasing.md)).
 workspace bundles the React Native entry and both Quereus plugin entries with Metro (React Native's
 bundler) and compiles the bundle with `hermesc` (the Hermes engine's compiler), both pinned to the
 React Native 0.83 toolchain, so syntax a phone app's build rejects fails here. It needs `dist/` — it refuses a stale build the same
-way the test guard does — and Yarn's `nodeLinker: node-modules`, which a fresh clone lacks because
-`.yarnrc.yml` is not committed. It never runs the bundle, so a green result says nothing about
+way the test guard does — and Yarn's `nodeLinker: node-modules`, which the committed `.yarnrc.yml` sets. It never runs the bundle, so a green result says nothing about
 globals, polyfills, native modules or a device; see
 [packages/rn-bundle-check/readme.md](packages/rn-bundle-check/readme.md).
 
