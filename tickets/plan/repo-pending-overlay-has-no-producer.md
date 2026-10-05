@@ -1,10 +1,10 @@
-description: A read request can carry "…and also show me this change I made but haven't finalised yet", and the storage layer knows how to answer it — but nothing in this codebase ever fills that part of the request in, so the feature does not work end to end. Someone needs to decide whether to finish wiring it up or to remove it.
+description: Finish wiring the pending-overlay read (`ActionContext.actionId`): give it a producer so a writer or validator can read through its own pending change and abandon a transaction that is certain to fail before commit, fix the self-contradictory-request throw in `StorageRepo.get`, and reconcile the docs.
 prereq:
 files: packages/db-core/src/collection/action.ts, packages/db-core/src/collection/collection.ts, packages/db-core/src/transactor/transactor-source.ts, packages/db-core/src/testing/test-transactor.ts, packages/db-p2p/src/storage/storage-repo.ts, docs/internals.md, docs/transactions.md
 difficulty: medium
 ----
 
-# A read can ask for a not-yet-finalised change, but nothing ever asks
+# Finish wiring the pending-overlay read (a read can ask for a not-yet-finalised change, but nothing ever asks)
 
 ## The plain version
 
@@ -40,8 +40,7 @@ node-to-node repair logic, which does not name a pending change and is very much
 
 But the user-facing story that motivated the fix ("the writer can now read its own change back")
 cannot be true today, because no writer ever asks. That is not something the implementing agent got
-wrong so much as something nobody had checked; it needs a human decision rather than another round of
-code.
+wrong so much as something nobody had checked.
 
 ## The concrete defect hiding in the unreachable code
 
@@ -59,29 +58,40 @@ Verified by running it (a scratch test, not committed): pend an insert, then rea
 named in both places → throws. Serving the now-committed content would be the obvious right answer.
 
 This is not a regression from the recent work — it behaves the same way before that change — and it
-is unreachable for the same reason as everything else here. It is listed because whichever way the
-decision below goes, it is the thing that has to be fixed or deleted.
+is unreachable for the same reason as everything else here. It must be fixed as part of this work.
 
-## The decision
+## Decision (maintainer, 2026-10-04)
 
-Two coherent directions; they need a human to pick, because the code has already committed to the
-feature in its documentation and structure while never actually shipping the caller:
+"Finish wiring it. That can short-circuit an inevitable transaction failure." Direction A is chosen;
+removal (B) and deferral are rejected.
 
-**A — finish it.** Have the client populate the field when it wants to see its own outstanding
-change, fix the throw described above, and add an end-to-end test that goes through the real
-collection layer rather than calling the storage layer directly. This is the direction the existing
-comments, docs, and the `TODO` all assume.
+Rationale: a read that lays a pending change over committed content lets the writer (or a validator
+re-executing its statements) observe its own uncommitted effect as the storage side sees it. A
+transaction whose outcome is already determined to fail — its pend conflicts, a guard or constraint
+will refuse it, or what it reads through its own pending change contradicts what it assumed — can then
+be detected and abandoned (cancelling its pending records) early, instead of spending the commit round
+and failing there.
 
-**B — remove it.** Delete the field, both implementations' handling of it, and the tests that pin
-them, on the grounds that a client already holds its own uncommitted content in its local cache and
-does not need to ask a remote node for it. This shrinks the wire surface and removes a branch a
-remote peer can currently reach (the read request is forwarded as-is, unvalidated) but no local code
-can.
+## What the plan stage must produce
 
-Neither is obviously right, which is why this is here and not in `backlog/`. A maintainer might also
-reasonably defer entirely: nothing is broken for users today precisely because the path is dormant,
-and the cost of leaving it is a small amount of unreachable code plus documentation that overstates
-what works.
+1. **Producer sites.** Identify where `ActionContext.actionId` should be set. Candidates to evaluate:
+   the `TransactorSource` a `Collection` reads through between a successful pend and its commit (the
+   in-flight action is already held as `Collection.inFlightActionId`); `TransactionCoordinator` /
+   `TransactionSession` between pend and commit across collections; and validator re-execution of a
+   transaction's recorded statements at pend time. Also the client half of the `TODO` in
+   `TransactorSource.tryGet` ("if the state reports that there is a pending action, record this").
+2. **The failure short-circuited.** Name concretely which inevitable failures become detectable
+   early (e.g. a pending overlay that materializes nothing / is refused, a rival pending holding the
+   block, a guard re-check against the overlaid state) and what the early exit does — cancel and
+   surface which error, without regressing the retry semantics in `Collection.syncAttempts` and the
+   coordinator's stale-loss handling.
+3. **Fix the throw** below: a request naming the same action as both committed and pending must serve
+   the committed content per block, never fail the batch.
+4. **Cache interaction.** Overlay reads must never be retained in `CacheSource` as committed content
+   (see "Staged Edits Keep Their Base" and floors in `docs/internals.md`).
+5. **Security.** The field arrives from remote peers unvalidated today; decide what a remote asker
+   may overlay (only its own action?) before making the path live.
+6. An end-to-end test through the real collection layer, and reconcile `docs/internals.md` /
+   `docs/transactions.md` with what ships.
 
-Whichever is chosen, `docs/internals.md` and `docs/transactions.md` describe the pending-overlay read
-as working machinery and should be reconciled with the outcome.
+Split into `prereq:`-chained implement tickets as needed.
