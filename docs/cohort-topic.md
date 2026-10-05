@@ -345,7 +345,7 @@ Every cohort-topic operation belongs to one of four system-wide tiers, in priori
 | **T2 — functional** | Matchmaking and voting directories, capability discovery, capacity gossip | Per-member decline allowed; caller backs off in time, not space. |
 | **T3 — luxury** | Reactivity push forwarding, anticipatory warm-up, optional delta payloads | Declined freely; dropped first when shedding state. |
 
-Tier is a property of the *operation*, not of the node. A node's profile is the set of tiers it advertises capacity for. Cohort admission for tier T requires a quorum of members willing to serve T; if quorum can't be reached, the cohort doesn't take on T duties for that topic at all and registrations get `UnwillingCohort`.
+Tier is a property of the *operation*, not of the node. A node's profile is the set of tiers it advertises capacity for. Cohort admission for tier T requires the **admission quorum** — by default a strict majority of the cohort — to be willing to serve T ([§Admission quorum](#admission-quorum)); if it can't be reached, the cohort doesn't take on T duties for that topic at all and registrations get `UnwillingCohort`.
 
 The Edge/Core distinction inherited from FRET is:
 
@@ -353,6 +353,18 @@ The Edge/Core distinction inherited from FRET is:
 - **Core** nodes (servers, fixed infrastructure): T0 + T1 + T2 + T3. Subject to per-node configuration; an operator can restrict a core node to fewer tiers.
 
 Cohort assembly under FRET is tier-blind — a cohort may contain a mix of Edge and Core members. The willingness check inside the cohort sorts out who actually serves what.
+
+### Admission quorum
+
+The admission quorum is how many cohort members must be willing to serve a tier before the cohort takes that tier on for a topic. It is a **strict majority of the cohort, `⌊k/2⌋ + 1`** — 9 at the default `k = 16`. The count is the routed member itself when it is live-willing, plus every sibling whose gossiped willingness bit for the tier is set (§Willingness). It is the one quorum behind every "willing quorum" in this document: the `UnwillingCohort` decision, the cold-start admission gate (§Cold-start instantiation), and the cold-start quorum wait.
+
+The cohort size the majority is taken of is the cohort the check serves: `k` (`wantK`) for a FRET cohort, and the root group's member count for the root of a root-placed topic ([§Root placement at a routing key](#root-placement-at-a-routing-key)) — a majority of the group, not of `wantK`, since a storage group is sized by storage placement. That root signs under its own threshold, `ceil(memberCount × quorumRatio)`, and admits under the group majority; the two are separate there too. The db-p2p host reads the size once, when it creates the engine for the coordinate (`createCohortTopicHost` in `packages/db-p2p/src/cohort-topic/host.ts`).
+
+The rule is `defaultQuorum` in `packages/db-core/src/cohort-topic/willingness.ts`. A caller that builds the check itself can override it with `WillingnessConfig.quorum` (same file); the db-p2p host passes only the cohort size, so a node built through it always uses the majority.
+
+**It is not `minSigs`, on purpose.** The threshold-signature `minSigs = k − x` (14 at the defaults) bounds who can *sign* for the cohort — promotion and demotion notices, membership certificates — and is high because a forged signature is a safety failure. The admission quorum is a capacity gate on an unsigned, per-registration decision the routed member makes alone from gossip, so it answers a different question and the two numbers differ deliberately; do not merge them. `k − x` was considered as the admission quorum and rejected: Edge members never set their T2 and T3 bits (§Tier ladder), so a cohort with three Edge members could count at most 13 willing members for those tiers and would answer `UnwillingCohort` while 13 members would serve. Per-tier ratios were also considered and rejected for now — more configuration with no evidence that any tier needs a different value. Majority is the simplest default that still keeps a tier from being taken on by a cohort most of whose members shed it.
+
+Revisit the default — with per-tier ratios, or a value that accounts for the cohort's Edge/Core mix — if mixed cohorts are seen accepting a tier while many of their members shed it.
 
 ---
 
@@ -365,15 +377,15 @@ Within a cohort serving topic `T` at tier `d`, each member independently decides
 - Per-topic budget: how many topics this member is already primary for at this tier.
 - Operator-supplied configuration overrides.
 
-When a registration arrives at a cohort, FRET's `RouteAndMaybeAct` lands it on one member (the routing target). That member runs the willingness check:
+When a registration arrives at a cohort, FRET's `RouteAndMaybeAct` lands it on one member (the routing target). That member runs the willingness check. The [admission quorum](#admission-quorum) is tested first, so a willing member in a cohort that falls short of it still declines:
 
+- **Fewer than the admission quorum willing** (the member itself plus its gossiped-willing siblings) → return `UnwillingCohort(retryAfter)`. Caller backs off in time.
 - **Willing** → become `primary` for this registration; assign two backups by the cohort's deterministic hash (see [Primary and backup sharding](#primary-and-backup-sharding)); return `Accepted`.
-- **Unwilling personally, but knows other members will serve** → return `UnwillingMember(candidateMembers)`. Caller retries the same coord at a named alternative member.
-- **Unwilling, and gossip indicates no member of this cohort will serve** → return `UnwillingCohort(retryAfter)`. Caller backs off in time.
+- **Unwilling personally, but enough siblings are willing to meet the quorum** → return `UnwillingMember(candidateMembers)`. Caller retries the same coord at a named alternative member.
 
 The cohort gossips a coarse "willingness vector" (one bit per tier per member, refreshed every gossip round) so any member can answer `UnwillingMember` vs `UnwillingCohort` without polling siblings. Stale gossip is acceptable; over-reporting unwillingness costs a temporal retry, not a flood.
 
-Because the quorum is counted from gossip, a member whose gossip has not arrived yet is not the same as a member that gossiped unwilling, and the check tells them apart. It is given the cohort's current members, and when the quorum is short it also reports whether it would be met if every member not yet heard from turned out willing (`awaitingMembers` on `UnwillingCohortOutcome` in `packages/db-core/src/cohort-topic/willingness.ts`): `willing + unheard ≥ quorum`, where a member that has gossiped unwilling counts as heard. A cohort whose answers are in and short declines with `UnwillingCohort` at once. A cohort that is only waiting on answers does not decline at once: the routed member asks its members to gossip now and holds the request briefly for them (§Cold-start instantiation → *Bootstrapping a cold multi-node cohort*).
+Because the admission quorum is counted from gossip, a member whose gossip has not arrived yet is not the same as a member that gossiped unwilling, and the check tells them apart. It is given the cohort's current members, and when the quorum is short it also reports whether it would be met if every member not yet heard from turned out willing (`awaitingMembers` on `UnwillingCohortOutcome` in `packages/db-core/src/cohort-topic/willingness.ts`): `willing + unheard ≥ quorum`, where a member that has gossiped unwilling counts as heard. A cohort whose answers are in and short declines with `UnwillingCohort` at once. A cohort that is only waiting on answers does not decline at once: the routed member asks its members to gossip now and holds the request briefly for them (§Cold-start instantiation → *Bootstrapping a cold multi-node cohort*).
 
 An **idle** member — one holding no registrations — still advertises its willingness on a slow heartbeat (§Cold-start instantiation → *Bootstrapping a cold multi-node cohort*), rather than going silent. Without this a brand-new all-idle cohort could never reach a willingness quorum, so its first registration would be declined forever.
 
@@ -767,7 +779,7 @@ The verifier recovers on its own via **bounded re-TOFU on a demonstrated chain g
 
 ### Promotion (cohort grows)
 
-A cohort promotes for topic `T` when, for a quorum of members:
+A cohort promotes for topic `T` when the following hold, ratified by the cohort's threshold signature — `minSigs` members sign the `PromotionNoticeV1` (the signing threshold, not the [admission quorum](#admission-quorum)):
 
 - `directParticipants(T) ≥ cap_promote`, OR
 - `loadBarometer[tier(T)].bucket ≥ bucket_overload` AND `directParticipants(T) ≥ cap_promote_fast`
@@ -849,7 +861,7 @@ A cohort may also pre-promote on observing rapid growth: if the slope of `direct
 
 ### Demotion (cohort shrinks)
 
-A cohort demotes for topic `T` when, for a quorum of members:
+A cohort demotes for topic `T` when the following hold, ratified the same way — `minSigs` members sign the `DemotionNoticeV1`:
 
 - `directParticipants(T) ≤ cap_demote` (default = `cap_promote / 4`), AND
 - The above has held for at least `T_demote` (default 5 minutes), AND
@@ -863,7 +875,7 @@ A cold cohort instantiates as a forwarder for `T` when:
 
 - It receives a `RegisterV1` for `T` it doesn't yet serve, AND
 - The registering participant's `bootstrap: true` flag is set (root case) or the registration arrives as a follow-on to a parent's `Promoted` redirect, AND
-- A quorum of cohort members is willing to serve `T` at the registration's tier.
+- The [admission quorum](#admission-quorum) of cohort members is willing to serve `T` at the registration's tier.
 
 The newly-instantiated forwarder registers itself with its tier-(d−1) parent on first opportunity by sending a **child-link** the parent authenticates and records; until that link is acked (`linked`), the cohort accepts participants but holds notifications/queries that would require parent involvement.
 
@@ -1438,7 +1450,7 @@ Registration uses FRET's `RouteAndMaybeAct` pipeline directly:
   FRET hashes the key once into `coord_d`.
 - `activity` = serialized `RegisterV1`
 - `wantK` = configured cohort size `k` (default 16)
-- `minSigs` = threshold `k − x` (default 14) — used only for promotion/demotion responses
+- `minSigs` = threshold `k − x` (default 14) — used only for promotion/demotion responses; registration admission counts the separate [admission quorum](#admission-quorum)
 - Acceptance / redirect / willingness response runs inside the cohort's activity callback
 
 The key is the preimage rather than the coordinate because FRET's `routeAct` hashes the key it is handed into the ring position it routes to — at the origin and again at every forwarding hop, each of which re-derives the position from the key on the wire. Handed `coord_d`, it would act near `H(coord_d)`, a position with no relation to the cohort that serves the topic: on a ring wider than one cohort the two cohorts usually share no member. `TierAddressing.routeKey` (`packages/db-core/src/cohort-topic/addressing.ts`) builds the key, and the `TopicRouteKey` type it returns is the only key `ITopicRouter.routeAndAct` accepts, so a coordinate does not type-check there. A cold-start forwarder's child link to its parent rides the same path, on the parent tier's routing key. The FRET fakes the tests route through (`CohortMesh` in `packages/db-p2p/src/testing/cohort-topic-mesh-harness.ts` among them) hash the wire key the same way, since a fake that took the key as the position would hide a caller handing it a coordinate.
@@ -1932,7 +1944,8 @@ interface MembershipCertV1 {
 |---|---|---|
 | `F` | 16 | Fan-out per tier |
 | `k` | 16 | Cohort size |
-| `k − x` | 14 | Threshold for cohort signatures |
+| `k − x` | 14 | Threshold for cohort signatures (`minSigs`) |
+| admission quorum | `⌊k/2⌋ + 1` (9) | Willing members a cohort needs before it takes on a tier for a topic: a strict majority of the cohort — of the root group, at the root of a root-placed topic. Deliberately not `k − x`: Edge members never serve T2/T3, so a cohort with a few Edge members would decline those tiers with most of its members willing. Override with `WillingnessConfig.quorum`; revisit (per-tier ratios, or an Edge/Core-aware value) if mixed cohorts accept tiers that many of their members shed. See [§Admission quorum](#admission-quorum). |
 | `cap_promote` | 64 | Direct-participant cap before promotion |
 | `cap_promote_fast` | 32 | Cap when load barometer is hot |
 | `bucket_overload` | 6 | Load-barometer bucket triggering fast promotion |

@@ -133,9 +133,10 @@ export interface WillingnessConfig {
 	/** Cohort size `k` (drives the default quorum). Default 16. */
 	cohortSize?: number;
 	/**
-	 * Members that must be willing to serve a tier for the cohort to take it on. Default: strict
-	 * majority of `cohortSize` (`⌊k/2⌋ + 1`). Not pinned by `docs/cohort-topic.md` — §Tier ladder
-	 * only requires "a quorum"; configurable here, revisitable by the Edge/Core policy ticket.
+	 * Members that must be willing to serve a tier for the cohort to take it on (the admission quorum,
+	 * `docs/cohort-topic.md` §Admission quorum). Default: strict majority of `cohortSize`
+	 * ({@link defaultQuorum}). Deliberately not the threshold-signature `minSigs = k − x` — see the doc
+	 * for why the two differ and when to revisit the default.
 	 */
 	quorum?: number;
 	/** Load bucket at/above which a tier is shed. Default {@link DEFAULT_OVERLOAD_BUCKET} (6). */
