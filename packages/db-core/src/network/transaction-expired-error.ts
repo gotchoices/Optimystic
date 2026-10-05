@@ -39,6 +39,10 @@ export class TransactionExpiredError extends Error {
 		 *  raised it, the writer's where a write path raised it from a returned refusal. */
 		readonly localClock: number = Date.now(),
 	) {
+		// NOTE: `expiry` off the wire is trusted as shaped (`isExpiryFailure` checks only presence), so a
+		// malformed coordinator answer gives NaN here, or a TypeError when `memberClocks` is missing,
+		// instead of this error. Either still ends the write; if hostile coordinators become a concern,
+		// validate the shape where the refusal is received.
 		const apparentSkewMs = Math.max(...Object.values(expiry.memberClocks)) - localClock;
 		super(transactionExpiredMessage(expiry, localClock, apparentSkewMs));
 		this.name = 'TransactionExpiredError';

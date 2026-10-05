@@ -266,6 +266,13 @@ Key aspects of the sync process:
   `maxStalledAttempts` to `maxAttempts` to restore the pre-existing whole-budget behaviour. This
   makes the failure fast and correctly named — it does not make the write land; `sync()` never
   adopts the confirmed revision, because it is a bare number rather than the history behind it.
+- **No retry on an expired transaction**: when the cohort refuses an attempt because, by its
+  members' clocks, the transaction had already expired (an `ExpiredFailure`, see
+  [transactor.md](transactor.md)), `sync()` throws `TransactionExpiredError` after that one attempt
+  — every retry would carry an expiration set by the same clock. It carries `expiration`,
+  `memberClocks`, `coordinatorClock` and `apparentSkewMs` (how far the refusing members' clocks
+  appear to be from this device's), and its message is written for a person. The staged actions
+  stay staged, so a `sync()` after the clock is corrected sends them.
 - **A half-landed write is finished before it is acknowledged**: a write's log tail is committed
   before its other blocks, and a commit can answer "failed" after the tail was stored (the tail's
   revision is held by fewer than a majority, or a later block lost a race). The retry's refresh then

@@ -257,7 +257,22 @@ win". Read it through `isConflictFailure` (`src/network/stale-failure.ts`), neve
 predicate treats `conflict` as authoritative when present and falls back to inferring from
 `missing`/`pending` for producers that never set it, including a peer on an older build. Producers
 set it only on genuine lost races and leave it absent on hard rejections (validation, storage,
-policy). Commit-side failures never set it — see [internals.md](../../../docs/internals.md).
+policy). The commit side does not read it: a returned commit failure other than an expiry (below) is
+re-driven whatever it says —
+see [internals.md](../../../docs/internals.md).
+
+#### The one refusal that is never retryable (`ExpiredFailure`)
+
+A pend or commit the cohort refused because, by its members' clocks, the transaction had already
+expired comes back as a sibling of `StaleFailure` rather than as one:
+`ExpiredFailure` (`src/network/struct.ts`), `{ success: false, conflict: false, reason?, expired }`,
+where `expired` (`TransactionExpiry`) carries the transaction's `expiration`, each refusing member's
+signed clock reading and the coordinator's clock. Test for it with `isExpiryFailure`, never by reading
+`reason`; `isConflictFailure` is false for it. When `NetworkTransactor` rebuilds one answer from
+several per-batch refusals, an expiry in any batch is returned as the whole answer. Both write paths
+stop on it with `TransactionExpiredError` (`src/network/transaction-expired-error.ts`) instead of
+retrying, since a retry's expiration comes from the same clock — see
+[correctness.md §7.4](../../../docs/correctness.md#74-clock-assumptions).
 
 #### The lost-to revision (`staleAt`)
 
