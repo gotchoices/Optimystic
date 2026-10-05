@@ -350,7 +350,8 @@ For the full dialect reference, see the [Quereus SQL Reference](https://github.c
 
 Optimystic's storage layer raises *typed* read failures so a caller can branch on the
 reason rather than parse a sentence — `BlockUnavailableError` carries `reason`
-(`'unmaterializable'`, `'peers-unreachable'`, `'cohort-unreachable'`, `'claimed-elsewhere'`)
+(`'unmaterializable'`, `'peers-unreachable'`, `'cohort-unreachable'`, `'claimed-elsewhere'`,
+`'named-by-log'`)
 and `BlockPossiblyStaleError` carries `claimedRev` (see
 [docs/transactions.md](../../docs/transactions.md) § Unavailable reads).
 
