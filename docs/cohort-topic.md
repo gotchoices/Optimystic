@@ -356,7 +356,7 @@ Cohort assembly under FRET is tier-blind — a cohort may contain a mix of Edge 
 
 ### Admission quorum
 
-The admission quorum is how many cohort members must be willing to serve a tier before the cohort takes that tier on for a topic. It is a **strict majority of the cohort, `⌊k/2⌋ + 1`** — 9 at the default `k = 16`. The count is the routed member itself when it is live-willing, plus every sibling whose gossiped willingness bit for the tier is set (§Willingness). It is the one quorum behind every "willing quorum" in this document: the `UnwillingCohort` decision, the cold-start admission gate (§Cold-start instantiation), and the cold-start quorum wait.
+The admission quorum is how many cohort members must be willing to serve a tier before the cohort takes that tier on for a topic. It is a **strict majority of the cohort, `⌊k/2⌋ + 1`** — 9 at the default `k = 16`. The count is the routed member itself when it is live-willing, plus every sibling whose gossiped willingness bit for the tier is set (§Willingness). It is the one quorum behind every "willing quorum" in this document: the `UnwillingCohort` decision, including the decision on the register that cold-starts a forwarder (§Cold-start instantiation), and the cold-start quorum wait. It is not part of the cold-start instantiation gate itself, which asks only whether the routed member will serve the tier — the forwarder has to exist before its first register can be held for the quorum.
 
 The cohort size the majority is taken of is the cohort the check serves: `k` (`wantK`) for a FRET cohort, and the root group's member count for the root of a root-placed topic ([§Root placement at a routing key](#root-placement-at-a-routing-key)) — a majority of the group, not of `wantK`, since a storage group is sized by storage placement. That root signs under its own threshold, `ceil(memberCount × quorumRatio)`, and admits under the group majority; the two are separate there too. The db-p2p host reads the size once, when it creates the engine for the coordinate (`createCohortTopicHost` in `packages/db-p2p/src/cohort-topic/host.ts`).
 
@@ -875,7 +875,9 @@ A cold cohort instantiates as a forwarder for `T` when:
 
 - It receives a `RegisterV1` for `T` it doesn't yet serve, AND
 - The registering participant's `bootstrap: true` flag is set (root case) or the registration arrives as a follow-on to a parent's `Promoted` redirect, AND
-- The [admission quorum](#admission-quorum) of cohort members is willing to serve `T` at the registration's tier.
+- The routed member is itself willing to serve `T` at the registration's tier — the db-p2p host answers this from the member's profile alone.
+
+The [admission quorum](#admission-quorum) is not part of this gate. The register that instantiated the forwarder is then admitted or declined under the admission quorum like any other (§Willingness); instantiating first is what lets a cohort whose quorum is short only for want of its members' gossip hold that register while their willingness arrives (*Bootstrapping a cold multi-node cohort*, below), rather than answering `NoState`.
 
 The newly-instantiated forwarder registers itself with its tier-(d−1) parent on first opportunity by sending a **child-link** the parent authenticates and records; until that link is acked (`linked`), the cohort accepts participants but holds notifications/queries that would require parent involvement.
 
@@ -888,7 +890,7 @@ The newly-instantiated forwarder registers itself with its tier-(d−1) parent o
 
 > **Implementation.** Cold-start lives in
 > [`packages/db-core/src/cohort-topic/coldstart.ts`](../packages/db-core/src/cohort-topic/coldstart.ts).
-> `shouldInstantiate({ bootstrap, followOn, quorumWilling })` is the admission gate
+> `shouldInstantiate({ bootstrap, followOn, quorumWilling })` is the instantiation gate
 > (`(bootstrap ∨ followOn) ∧ quorumWilling`) — a speculative `d_max` probe (neither flag) yields
 > `false`, so the walk gets `NoState` instead of forking a parallel branch. `followOn` **is a signed wire
 > flag** on `RegisterV1`: the child cohort a `Promoted` redirect points at is at an *uncorrelated* ring
@@ -930,8 +932,8 @@ The newly-instantiated forwarder registers itself with its tier-(d−1) parent o
 
 #### Bootstrapping a cold multi-node cohort (willingness heartbeat + cold-sibling instantiation)
 
-The gate above (`(bootstrap ∨ followOn) ∧ quorumWilling`) assumes the routed member can actually *see* a
-willing quorum. A brand-new multi-node cohort — every member freshly brought up and holding no
+Admitting the register that passed the gate above (`(bootstrap ∨ followOn) ∧ quorumWilling`) assumes the
+routed member can actually *see* a willing quorum. A brand-new multi-node cohort — every member freshly brought up and holding no
 registrations (**idle**) — cannot: the willingness quorum is read from gossiped sibling willingness
 (§Willingness), and an idle engine that holds no registrations otherwise builds no gossip frame. So nobody
 advertises willingness, the routed member counts only itself, its self-willingness never reaches a quorum,

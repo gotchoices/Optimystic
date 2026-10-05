@@ -107,7 +107,11 @@ export interface CohortMemberEngineDeps {
 	readonly renewal: RenewalCohortSide;
 	/** Live cohort snapshot (members + epoch). */
 	readonly cohort: () => CohortSnapshotView;
-	/** Whether a quorum of members is willing to serve `tier` (the cold-start gate input). */
+	/**
+	 * Whether this cohort may instantiate forwarder state for `tier` (the cold-start gate input). The db-p2p host
+	 * answers from the routed member's own profile; the admission quorum is applied afterwards, to the register
+	 * itself, so a register short only for want of members' gossip can be held on the new forwarder.
+	 */
 	readonly quorumWilling: (tier: Tier) => boolean;
 	/**
 	 * Where a register declined only for want of members' gossip (`awaitingMembers`) waits for it, once,

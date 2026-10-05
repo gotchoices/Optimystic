@@ -48,15 +48,19 @@ export interface ColdStartTrigger {
 	readonly bootstrap: boolean;
 	/** This register arrived as a follow-on to a parent's `Promoted` redirect (db-p2p-determined). */
 	readonly followOn: boolean;
-	/** A quorum of cohort members is willing to serve the topic at this tier. */
+	/**
+	 * The cohort will take the topic on at this tier — in the db-p2p host, the routed member's profile serves
+	 * it. Not the admission quorum, which then decides the register itself (`docs/cohort-topic.md`
+	 * §Cold-start instantiation).
+	 */
 	readonly quorumWilling: boolean;
 }
 
 /**
  * Whether a cold cohort should instantiate forwarder state for an inbound register: it must be a
- * legitimate growth point (`bootstrap` root case **or** a `Promoted` follow-on) **and** have a willing
- * quorum. A speculative `d_max` probe (neither flag set) yields `false`, so the walk gets `NoState`
- * and steps toward the root instead of forking a parallel branch (§Cold-start; §Why the caller
+ * legitimate growth point (`bootstrap` root case **or** a `Promoted` follow-on) **and** be willing to serve
+ * the tier ({@link ColdStartTrigger.quorumWilling}). A speculative `d_max` probe (neither flag set) yields
+ * `false`, so the walk gets `NoState` and steps toward the root instead of forking a parallel branch (§Cold-start; §Why the caller
  * doesn't walk on UnwillingCohort).
  */
 export function shouldInstantiate(trigger: ColdStartTrigger): boolean {
