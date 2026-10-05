@@ -35,6 +35,10 @@
  *
  * TRAP (same as the sibling absence specs): keep every read INSIDE ten seconds of the first probe,
  * the window a memo would use. A memo that has lapsed passes every case here, which proves nothing.
+ *
+ * The cases marked #27 (ticket a-joiner-reads-a-missing-block-from-a-self-only-cohort-view) pin the
+ * one exception to "a self-only view answers an authoritative absent": a read whose floor says the
+ * asker's own log names the block.
  */
 
 import { expect } from 'chai';
@@ -310,6 +314,18 @@ describe('CoordinatorRepo never serves a stale absent after a write that bypasse
 		});
 	});
 
+	describe('unit: the asker\'s floor names a block this node lacks (GitHub issue #27)', () => {
+		it('a floored read on a self-only view is flagged named-by-log; the same read without a floor stays authoritative', async () => {
+			// The floor says the asker walked a log entry committing this block at revision 3. A
+			// self-only view asked nobody, so "never created" would contradict what the asker knows.
+			const h = await buildHarness(0);
+			await probeAlone(h, blockId);
+			h.setClock(BASE_TIME + 1_000);
+			const r = await h.repo.get({ blockIds: [blockId], floors: { [blockId]: 3 } });
+			expect(r[blockId]?.unavailable, `a floored read: ${JSON.stringify(r[blockId])}`).to.equal('named-by-log');
+		});
+	});
+
 	describe('unit: a local write while the probing consult is in flight', () => {
 		it('the next read still consults', async () => {
 			// At beta.3 this was a bounded race named at the memo's stamp site: a `CoordinatorRepo.pend`
@@ -357,13 +373,15 @@ describe('CoordinatorRepo never serves a stale absent after a write that bypasse
 			// coordinator and member keep the real per-node view): the write is steered to a remote
 			// coordinator (issue #20's `findCoordinator:done … source=cache`), the read to self. The
 			// transactor routes a pend by `findCluster` (greedy cover over the cohort) and a read by
-			// `findCoordinator`, so both are steered.
+			// `findCoordinator`, so both are steered. A retry that excludes the steered peer goes where
+			// the shared view sends it, as production's would.
 			const shared = mesh.keyNetwork;
 			mesh.keyNetwork = {
 				findCluster: async key => coordinatorOverride
 					? { [coordinatorOverride.toString()]: (await shared.findCluster(key))[coordinatorOverride.toString()]! }
 					: shared.findCluster(key),
 				findCoordinator: (key, opts) => coordinatorOverride
+					&& !opts?.excludedPeers?.some(p => p.toString() === coordinatorOverride!.toString())
 					? Promise.resolve(coordinatorOverride)
 					: shared.findCoordinator(key, opts)
 			};
@@ -469,6 +487,29 @@ describe('CoordinatorRepo never serves a stale absent after a write that bypasse
 			const r = await readThroughA(headerId);
 			expectNotStaleAbsent(r[headerId], 'read through A after its view grew');
 			expect(r[headerId]?.state?.latest?.rev, 'A promotes its pending against the corroborated rev').to.equal(1);
+		});
+
+		it('(#27): a floored read routed to A while A still sees itself alone is answered by another machine', async () => {
+			// Issue #27's joiner: its log walk floored a block it does not hold, and its cohort view
+			// never grows past itself. A's answer must send the read to a second machine, not end it.
+			const headerId: BlockId = 'issue-27-header';
+			clock = BASE_TIME + 1_000;
+			const transactor = buildNetworkTransactor(mesh, { timeoutMs: 3_000, abortOrCancelTimeoutMs: 3_000 });
+			coordinatorOverride = nodeB.peerId;
+			mesh.failures.failingPeers = new Set([nodeA.peerId.toString()]);
+			const pend = await transactor.pend({ actionId: 'issue-27-action' as ActionId, policy: 'c', transforms: insertOf(headerId) });
+			expect(pend.success, `pend through B: ${JSON.stringify(pend)}`).to.equal(true);
+			const commit = await transactor.commit({ actionId: 'issue-27-action' as ActionId, blockIds: [headerId], tailId: headerId, rev: 1 });
+			expect(commit.success, `commit through B: ${JSON.stringify(commit)}`).to.equal(true);
+			mesh.failures.failingPeers = undefined;
+			const onA = (await nodeA.storageRepo.get({ blockIds: [headerId] }))[headerId];
+			expect(isUnflaggedAbsent(onA), 'precondition: the write never reached A').to.equal(true);
+
+			coordinatorOverride = nodeA.peerId;
+			clock = BASE_TIME + 2_000;
+			const r = await transactor.get({ blockIds: [headerId], floors: { [headerId]: 1 } });
+			expect(r[headerId]?.state?.latest?.rev, `served by B or C on the second-chance round: ${JSON.stringify(r[headerId])}`).to.equal(1);
+			expect(r[headerId]?.block, 'with its content').to.not.equal(undefined);
 		});
 	});
 });

@@ -272,10 +272,19 @@ function soleHolderMessage(cohortPeers: number): string {
  * Ordered by how firmly the block is ruled out; `get` consults it only on the missing path.
  */
 type AbsenceVerdict =
-	/** Nobody to ask (empty cohort, or solo-self), or every non-self cohort member answered
-	 *  "I hold nothing". As confirmed as an absence gets — stays authoritative, which is what
-	 *  keeps the routine new-collection probe at one round trip. */
+	/** Every non-self cohort member answered "I hold nothing". As confirmed as an absence gets —
+	 *  stays authoritative, which is what keeps the routine new-collection probe at one round trip.
+	 *  Also the answer of a coordinator with no `clusterLatestCallback`, which has no cohort by
+	 *  construction. */
 	| 'confirmed'
+	/** Nobody was asked: the cohort view was empty, or only this node. Not the same fact as
+	 *  `confirmed` — a self-only view is also what `findCluster` returns while real peers are
+	 *  still unidentified — so the caller weighs it against what the READ knows: with no floor
+	 *  on the block it stays an authoritative absent (a one-machine deployment's one-round
+	 *  probe); with one, the asker's own log names the block and it is flagged
+	 *  `'named-by-log'` (see `unavailableReasonFor`). Produced only by exits that ask nobody, so it
+	 *  never competes with the verdicts below. */
+	| 'unasked'
 	/** Some of the cohort answered and some could not be asked. (A consult that THROWS produces
 	 *  no verdict at all — `get`'s catch arm reports it directly.) */
 	| 'unconfirmed'
@@ -287,6 +296,40 @@ type AbsenceVerdict =
 	/** A peer claimed a revision this pass did not converge onto — quorum declined it, or a
 	 *  quorum corroborated it and acquisition failed. */
 	| 'claimed';
+
+/**
+ * The `unavailable` reason a block still missing after its repair pass earns, or `undefined` when
+ * its absence stands as authoritative. `floor` is the asker's floor for the block
+ * (`BlockGets.floors`), which matters only when nobody was asked.
+ *
+ *  - `confirmed`: the whole cohort answered "holds nothing", so the new-collection probe against a
+ *    healthy cohort stays one round trip.
+ *  - `unasked`: authoritative unless the asker's own log names the block. A floor on a block this
+ *    node does not hold at all means the asker walked a log entry committing a revision of it, so
+ *    "never created" would contradict what it already knows; flagging it earns the transactor's
+ *    second-chance round against another machine (GitHub issue #27).
+ *  - `unconfirmed` → 'peers-unreachable': part of the cohort was silent; another coordinator may
+ *    know better.
+ *  - `isolated` → 'cohort-unreachable': no cohort member outside this node could be asked; there is
+ *    no better-connected coordinator to re-ask.
+ *  - `claimed` → 'claimed-elsewhere': a peer positively claimed a revision this pass could neither
+ *    corroborate nor acquire.
+ *
+ * NOTE: a log entry is not proof its blocks landed (backlog
+ * `bug-a-refused-write-can-leave-its-log-entry-behind`), so on a one-machine deployment a floored
+ * read of an inserted block that landed nowhere now ends in `BlockUnavailableError` where it used to
+ * end in an untyped `Missing block` — still an error, now typed. Revisit if log entries become proof
+ * their blocks landed: the floor would then be proof of existence and this flag never wrong.
+ */
+function unavailableReasonFor(absence: AbsenceVerdict, floor: number | undefined): BlockUnavailableReason | undefined {
+	switch (absence) {
+		case 'confirmed': return undefined;
+		case 'unasked': return floor === undefined ? undefined : 'named-by-log';
+		case 'unconfirmed': return 'peers-unreachable';
+		case 'isolated': return 'cohort-unreachable';
+		case 'claimed': return 'claimed-elsewhere';
+	}
+}
 
 /**
  * What one consult established about whether this node's copy is CURRENT — the currency
@@ -773,7 +816,7 @@ export class CoordinatorRepo implements IRepo {
 		// unflagged absent means the cohort was consulted before answering. When the consult
 		// FAILS outright — or runs without ruling the block out and the block stays
 		// missing — the entry is flagged `unavailable` below with a reason naming what
-		// the consult established (see AbsenceVerdict and the mapping in `readRepairBlock`),
+		// the consult established (see AbsenceVerdict and `unavailableReasonFor`),
 		// which re-enables the transactor-level retry against a different peer. If a
 		// coordinator is configured WITHOUT clusterLatestCallback, there is no cohort to
 		// consult and the local answer IS the whole truth — it stays authoritative, with
@@ -818,10 +861,12 @@ export class CoordinatorRepo implements IRepo {
 		const localEntry = results[blockId];
 		const localRev = localEntry?.state?.latest?.rev;
 		const isMissing = !localEntry?.state?.latest;
-		// The asker's floor for this block, when it sent one (`BlockGets.floors`). It is a second
-		// trigger for the consult below, never a verdict on the answer: a copy still below the
-		// floor after the pass is served exactly as any other, labelled with its `materialized`
-		// revision, and the asker's own check and retry handle it.
+		// The asker's floor for this block, when it sent one (`BlockGets.floors`). For a present
+		// block it is a second trigger for the consult below, never a verdict on the answer: a copy
+		// still below the floor after the pass is served exactly as any other, labelled with its
+		// `materialized` revision, and the asker's own check and retry handle it. For a missing
+		// block whose consult asked nobody it is the evidence that the block exists
+		// (`unavailableReasonFor`).
 		const floor = blockGets.floors?.[blockId];
 		const windowDemands = !isMissing && this.shouldReadRepair(blockId);
 		const floorDemands = !isMissing && this.floorDemandsConsult(blockId, floor, localRev);
@@ -871,23 +916,10 @@ export class CoordinatorRepo implements IRepo {
 					this.log('cluster-tx:read-repair-noop', { blockId });
 				}
 			}
-			// The consult ran but could not rule the block out, and the verdict names the
-			// evidence (see AbsenceVerdict): part of the cohort was silent (`unconfirmed`
-			// → 'peers-unreachable' — another coordinator may know better), no cohort
-			// member outside this node could be asked at all (`isolated` →
-			// 'cohort-unreachable' — there is no better-connected coordinator to re-ask),
-			// or a peer positively claimed a revision this pass could neither corroborate
-			// nor acquire (`claimed` → 'claimed-elsewhere' — the block is known to exist
-			// somewhere). Either way a still-missing block must not pose as an
-			// authoritative absent. When the whole cohort answers "holds nothing" the
-			// absent stays authoritative (`confirmed`) — the new-collection probe against
-			// a healthy cohort stays one round-trip.
-			if (isMissing && absence !== 'confirmed') {
-				this.flagUnconfirmedAbsence(results, blockId,
-					absence === 'claimed' ? 'claimed-elsewhere'
-						: absence === 'isolated' ? 'cohort-unreachable'
-							: 'peers-unreachable');
-			}
+			// A still-missing block the consult could not rule out must not pose as an
+			// authoritative absent; the reason names what the consult established.
+			const unavailable = isMissing ? unavailableReasonFor(absence, floor) : undefined;
+			if (unavailable !== undefined) this.flagUnconfirmedAbsence(results, blockId, unavailable);
 			// A PRESENT block served below a cohort claim the repair could not settle is
 			// the mirror lie: real content posing as confirmed-current. A consult that
 			// REACHED THE CLAIMANTS is the authority on that claim, so it replaces whatever
@@ -926,7 +958,7 @@ export class CoordinatorRepo implements IRepo {
 	/**
 	 * Downgrade an absence the coordinator could not confirm to the given `unavailable` reason —
 	 * a flag `NetworkTransactor.get` retries against another peer instead of taking as final.
-	 * The reason names the evidence (see {@link AbsenceVerdict} for the mapping in {@link readRepairBlock}); this
+	 * The reason names the evidence (see {@link unavailableReasonFor}); this
 	 * method only decides WHETHER the entry may carry a flag at all.
 	 *
 	 * No-op once the entry carries a real answer (the consult restored the block) or a sharper flag
@@ -1226,9 +1258,10 @@ export class CoordinatorRepo implements IRepo {
 	 * Returns the two things `get` needs beyond the storage side effects:
 	 *  - `absence` — the verdict on this node's local absence of the block (see
 	 *    {@link AbsenceVerdict}): whether the pass may rule the block out, and on what evidence.
-	 *    Only `'confirmed'` lets a still-missing block be reported as an authoritative absent.
-	 *    Paths that consult nobody (no cohort, solo-self) are `'confirmed'`: there, the local
-	 *    answer genuinely is the whole truth. When several verdicts apply at once the sharpest
+	 *    `'confirmed'` lets a still-missing block be reported as an authoritative absent, and so
+	 *    does `'unasked'` unless the read carried a floor for it. Paths that consult nobody (no
+	 *    cohort, solo-self) are `'unasked'`: the local answer is the whole truth only if nothing
+	 *    the asker knows says otherwise. When several verdicts apply at once the sharpest
 	 *    evidence wins: `claimed` > `isolated` > `unconfirmed` > `confirmed` — a peer positively
 	 *    saying "it exists" outranks any amount of silence.
 	 *  - `currency` — the verdict on whether what this node holds is CURRENT (see
@@ -1278,7 +1311,7 @@ export class CoordinatorRepo implements IRepo {
 		// blip, and re-entering costs no network work beyond the `findCluster` the read already
 		// makes. Do not "fix" this by symmetry with the solo-self exit.
 		// Currency: nobody was asked, so nothing was refuted — an earlier pass's unsettled claim stands.
-		if (peerIds.length === 0) return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
+		if (peerIds.length === 0) return { absence: 'unasked', currency: { kind: 'no-evidence' } };
 
 		// Solo-cluster short-circuit: the only responsible peer is us. There is no
 		// remote to sync from, so skip the callback entirely. Querying ourselves
@@ -1320,7 +1353,9 @@ export class CoordinatorRepo implements IRepo {
 			// and deliberate — the window damps repair EFFORT, not honesty — and it is the same
 			// coupling the comment at the final exit below describes. Arming the window and keeping
 			// the memo are answers to different questions; do not collapse them.
-			return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
+			// Absence: `unasked`, for the same reason — this view may simply not have identified its
+			// peers yet, which only the asker's floor can contradict (see `unavailableReasonFor`).
+			return { absence: 'unasked', currency: { kind: 'no-evidence' } };
 		}
 
 		const { corroborated, corroboration, local, silent, answered, claims, uncorroboratedRev, deadlock } = await this.queryClusterForLatest(peerIds, blockId, context, asker);

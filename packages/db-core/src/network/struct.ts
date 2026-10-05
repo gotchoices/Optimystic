@@ -393,7 +393,15 @@ export type BlockUnavailableReason =
 	 *  block, and the answering node could neither corroborate that claim to a quorum nor
 	 *  acquire the content. The block is known to exist somewhere; reporting it absent
 	 *  would be a lie regardless of whether anyone was silent. */
-	| 'claimed-elsewhere';
+	| 'claimed-elsewhere'
+	/** Nothing is held locally and the answering node had nobody to ask (its cohort view
+	 *  was empty, or only itself), but the read carried a floor for the block
+	 *  ({@link BlockGets.floors}): the asker walked a log entry committing a revision of it.
+	 *  The block is known to exist, from the asker's own evidence, so "never created" would
+	 *  contradict what the asker already knows. Unlike `cohort-unreachable` this is never
+	 *  "the local view is all there is": another machine may hold the block, and asking one
+	 *  is the remedy. */
+	| 'named-by-log';
 
 export type GetBlockResult = {
 	/** The retrieved block - undefined if the block was deleted	 */

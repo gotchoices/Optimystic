@@ -310,9 +310,9 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// it: 'cohort-unreachable' is the one reason a caller may treat permissively (the
 		// answering node reached nobody, so its own view is all it has), and a partitioned
 		// coordinator answering first must not mask a well-connected one that positively
-		// established the block EXISTS ('claimed-elsewhere', or 'unmaterializable' — records
-		// held here). 'peers-unreachable' sits between: it establishes that some of the cohort
-		// was reachable, without settling existence.
+		// established the block EXISTS ('claimed-elsewhere', 'named-by-log' — the caller's own
+		// floor names it — or 'unmaterializable' — records held here). 'peers-unreachable' sits
+		// between: it establishes that some of the cohort was reachable, without settling existence.
 		const unavailableRank = (reason: BlockUnavailableReason): number =>
 			reason === 'cohort-unreachable' ? 0 : reason === 'peers-unreachable' ? 1 : 2;
 		const rankOf = (r: unknown): number => {

@@ -1880,7 +1880,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   | what the repair pass found | flag |
   | --- | --- |
   | whole cohort answered "holds nothing" (the routine new-collection probe) | none — authoritative absent |
-  | there was nobody to ask: `findCluster` returned an empty cohort, or only this node | none — authoritative absent |
+  | there was nobody to ask: `findCluster` returned an empty cohort, or only this node — and the read carried no floor for the block | none — authoritative absent |
+  | there was nobody to ask, but the read carried a floor for the block (`BlockGets.floors`): the asker's own log names it | `'named-by-log'` |
   | part of the cohort answered, part was silent — or the consult threw outright | `'peers-unreachable'` |
   | this node knows of cohort members outside itself and could reach none of them | `'cohort-unreachable'` |
   | a peer positively claimed a revision that was neither corroborated to a quorum nor acquired | `'claimed-elsewhere'` |
@@ -1888,8 +1889,28 @@ saveMaterializedBlock(block): store(structuredClone(block));
   Note the second row: `'cohort-unreachable'` is *silence from a cohort this node knows about*, not
   isolation in general. A node whose routing view yields no cohort member at all — a cold boot with
   an empty routing table — consults nobody, and its local emptiness is served as an authoritative
-  absent, unflagged. So a consumer relying on `'cohort-unreachable'` to detect isolation must also
-  tolerate the unflagged absent; the two differ only in whether FRET still remembers peers.
+  absent, unflagged, unless the read carried a floor (the third row). So a consumer relying on
+  `'cohort-unreachable'` to detect isolation must also tolerate the unflagged absent; the two differ
+  only in whether FRET still remembers peers.
+
+  The third row exists because "nobody to ask" is not evidence the block was never created: a
+  self-only view is also what `findCluster` returns while genuine peers are still unidentified. On
+  its own the node has nothing to weigh against that, so a floor-less read keeps the authoritative
+  absent — which keeps a one-machine deployment's `createOrOpen` probe at one round. A floor is the
+  asker's evidence: it walked a log entry committing a revision of the block, so on a block this node
+  does not hold at all, "never created" contradicts what the asker already knows. Seen as GitHub
+  issue #27, a joining node whose cohort view stayed self-only read a catalog block its own log had
+  just named and failed with `Missing block`. Flagged instead, the read earns the transactor's
+  second-chance round with this node excluded, which can reach a connected peer that holds the
+  block, and when none can it ends in `BlockUnavailableError` rather than an untyped `Missing block`.
+  `'named-by-log'` ranks with `'claimed-elsewhere'` in the transactor's merge: both say the block
+  exists. One cost: a log entry is not proof its blocks landed (backlog
+  `bug-a-refused-write-can-leave-its-log-entry-behind`), so on a one-machine deployment a floored
+  read of an inserted block that landed nowhere now ends in that typed error where it ended in
+  `Missing block` (the `NOTE:` at `unavailableReasonFor` in
+  `packages/db-p2p/src/repo/coordinator-repo.ts`). A consulted cohort whose every member answers
+  "holds nothing" under a floor is the same contradiction with a weaker cause (every reachable
+  member is behind) and stays an authoritative absent.
 
   "Remembers" has to cover which of those peers serve this network, not only that they exist. The
   cohort admits only peers positively classified as serving, and the classification reads each
