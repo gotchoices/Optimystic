@@ -88,6 +88,8 @@ const NO_MODULE_SCOPE_TEXT_DECODER = {
 // stopped every db-p2p node from starting off Node (GitHub issue #28). Every first-party `unref` goes
 // through `unrefTimer` in packages/db-p2p/src/unref-timer.ts. The guarded spelling is banned too, on
 // purpose: one site to read, one place to change. Timer `.ref()` has no first-party call site.
+// NOTE: the rule covers every package but the helper lives in db-p2p, which db-core cannot import;
+// if a package below db-p2p ever needs to unref a timer, move `unrefTimer` to db-core and re-export it.
 const NO_TIMER_UNREF = {
 	selector: "MemberExpression[property.name='unref']",
 	message: 'Timer handles are numbers in browsers and React Native, which have no `unref`. Call `unrefTimer` from packages/db-p2p/src/unref-timer.ts instead.',
