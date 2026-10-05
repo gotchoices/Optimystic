@@ -11,7 +11,19 @@ import type { CommitResult, PendResult } from "../network/struct.js";
  */
 export type Signature =
 	| { type: 'approve'; signature: string }
-	| { type: 'reject'; signature: string; rejectReason?: string }
+	| {
+		type: 'reject';
+		signature: string;
+		rejectReason?: string;
+		/**
+		 * Present only on an **expiry vote**: the member refused because, by its own clock, the record's
+		 * `message.expiration` had already passed. The value is the member's wall-clock reading (unix ms)
+		 * when it judged so. Structured, so a coordinator can tell a clock disagreement from a validity
+		 * judgement without reading `rejectReason` (free-form prose that must never become control flow).
+		 * Still a `reject` in every count — the record really is dead for this member.
+		 */
+		expiredAt?: number;
+	}
 	/**
 	 * This member refuses the transaction *for now*: it holds a conflicting transaction that won
 	 * the deterministic race (`resolveRace`). Retryable — NOT a validity judgement, and never
@@ -39,12 +51,30 @@ export type Signature =
 	 */
 	| { type: 'held'; signature: string; heldBy: string };
 
+/** {@link Signature}'s variant `S` without its signature bytes; distributes over the union. */
+type Unsigned<S> = S extends Signature ? Omit<S, 'signature'> : never;
+
 /**
- * The exact bytes a vote signature covers: `<hash>:<type>[:<extra>]`, where `extra` is the variant's
- * own payload — a reject's `rejectReason`, a conflict's `conflictWith`, a held's `heldBy`, nothing
- * for an approve. Folding the extra in is what makes it integrity-protected in transit rather than
- * free-floating prose. Each variant's extra is a single string, so the preimage needs no encoding
- * scheme; a variant that ever needs two fields must define one rather than concatenating here.
+ * A vote as its author decides it, before signing: every field of a {@link Signature} except the
+ * signature bytes. This is what {@link clusterVoteSigningPayload} encodes, so the signer and the
+ * verifier build the preimage from the same object, and a field one side signs cannot be one the
+ * other forgets.
+ */
+export type ClusterVote = Unsigned<Signature>;
+
+/**
+ * The exact bytes a vote signature covers: `<hash>:<tag>[:<extra>]`. The tag is the vote's `type`, and
+ * `extra` is the variant's own payload — a reject's `rejectReason`, a conflict's `conflictWith`, a
+ * held's `heldBy`, nothing for an approve. Folding the extra in is what makes it integrity-protected in
+ * transit rather than free-floating prose.
+ *
+ * One variant carries two fields: an expiry vote, a `reject` with {@link Signature} `expiredAt`. It is
+ * encoded `<hash>:reject-expired:<json>`, where `<json>` is `JSON.stringify([expiredAt, rejectReason ??
+ * null])`. Two properties make that unambiguous: the tag differs from every other vote's at the
+ * character after `reject` (a hash is base64url, so the first `:` always ends it), and a JSON array
+ * cannot be read as a different pair of values. A reason that itself contains `:` — `"x:5"` — can
+ * therefore never verify as reason `"x"` with `expiredAt: 5`, and a string smuggled into `expiredAt`
+ * changes the bytes. Every vote without `expiredAt` encodes exactly as before the field existed.
  *
  * Producers and verifiers must both build the preimage here. It lives beside {@link Signature}
  * rather than in either consumer because a second copy that forgets a variant does not fail loudly:
@@ -53,18 +83,33 @@ export type Signature =
  * "Cluster" in the name distinguishes these consensus votes from the dispute subsystem's
  * arbitration votes, which have their own unrelated preimage (`dispute/invalidation.ts`).
  */
-export function clusterVoteSigningPayload(hash: string, type: Signature['type'], extra?: string): Uint8Array {
-	return new TextEncoder().encode(hash + ':' + type + (extra ? ':' + extra : ''));
+export function clusterVoteSigningPayload(hash: string, vote: ClusterVote): Uint8Array {
+	return new TextEncoder().encode(hash + ':' + voteTagAndExtra(vote));
 }
 
-/** Verifier-side {@link clusterVoteSigningPayload}: reads each variant's signed extra off the vote itself. */
+/**
+ * Verifier-side {@link clusterVoteSigningPayload}: every signed field is read off the vote itself, so
+ * this is the signing payload of the vote as received.
+ */
 export function clusterVoteVerificationPayload(hash: string, signature: Signature): Uint8Array {
-	switch (signature.type) {
-		case 'reject': return clusterVoteSigningPayload(hash, 'reject', signature.rejectReason);
-		case 'conflict': return clusterVoteSigningPayload(hash, 'conflict', signature.conflictWith);
-		case 'held': return clusterVoteSigningPayload(hash, 'held', signature.heldBy);
-		default: return clusterVoteSigningPayload(hash, signature.type);
+	return clusterVoteSigningPayload(hash, signature);
+}
+
+function voteTagAndExtra(vote: ClusterVote): string {
+	switch (vote.type) {
+		case 'reject':
+			return vote.expiredAt === undefined
+				? withExtra('reject', vote.rejectReason)
+				: 'reject-expired:' + JSON.stringify([vote.expiredAt, vote.rejectReason ?? null]);
+		case 'conflict': return withExtra('conflict', vote.conflictWith);
+		case 'held': return withExtra('held', vote.heldBy);
+		// `approve`, and any type off the wire this code does not know (which no honest key signed).
+		default: return (vote as { type: string }).type;
 	}
+}
+
+function withExtra(tag: string, extra: string | undefined): string {
+	return tag + (extra ? ':' + extra : '');
 }
 
 export type ClusterPeers = {

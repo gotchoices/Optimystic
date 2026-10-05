@@ -16,6 +16,14 @@ export const PEND_NOT_VALIDATABLE = 'pend-not-validatable';
 export const VALIDATOR_FAULT = 'validator-fault';
 
 /**
+ * Stable, greppable prefix on the reason a cluster member signs when it refuses a record whose
+ * `message.expiration` its own clock has already passed. Prose for humans only: the vote that carries
+ * it also carries the structured `Signature.expiredAt`, which is what a coordinator classifies by.
+ * Kept beside its siblings so an operator meets every stable refusal prefix in one place.
+ */
+export const TRANSACTION_EXPIRED = 'transaction-expired';
+
+/**
  * One re-check attempt: hand the pend's `validation` pair to whatever checker this tier holds
  * (a `ClusterMember`'s `ITransactionValidator`, a `StorageRepo`'s `validatePend` hook) and
  * return its verdict. Throwing is allowed — {@link checkPendValidation} converts a throw into a

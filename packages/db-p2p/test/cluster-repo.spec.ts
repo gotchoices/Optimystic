@@ -4,13 +4,14 @@ import { resolveRace } from '../src/cluster/race-resolution.js';
 import { MemoryTransactionStateStore } from '../src/cluster/memory-transaction-state-store.js';
 import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, Transforms, IBlock, BlockId, BlockHeader, ClusterConsensusConfig } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
-import { MaxPriority, localDurability } from '@optimystic/db-core';
+import { MaxPriority, localDurability, clusterVoteVerificationPayload } from '@optimystic/db-core';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { base58btc } from 'multiformats/bases/base58';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
+import { fromString as uint8ArrayFromString } from 'uint8arrays/from-string';
 import { waitFor, delay } from '@optimystic/db-core/test';
 
 // ─── Canonical JSON for deterministic hashing ───
@@ -386,30 +387,6 @@ describe('ClusterMember', () => {
 
 			// Transaction is in rejected state
 			expect(result).to.not.equal(undefined);
-		});
-	});
-
-	describe('update - expiration', () => {
-		it('rejects expired transactions', async () => {
-			const peers = makeClusterPeers([selfKeyPair]);
-
-			const record: ClusterRecord = {
-				messageHash: 'expired-hash',
-				message: {
-					operations: makeGetOperation(['block-1']),
-					expiration: Date.now() - 1000 // Already expired
-				},
-				peers,
-				promises: {},
-				commits: {}
-			};
-
-			try {
-				await clusterMemberInstance.update(record);
-				expect.fail('Should have thrown');
-			} catch (err) {
-				expect((err as Error).message.toLowerCase()).to.include('expired');
-			}
 		});
 	});
 
@@ -1067,42 +1044,50 @@ describe('ClusterMember', () => {
 	});
 
 	describe('transaction expiration (TEST-5.1.2)', () => {
-		it('rejects transactions with past expiration', async () => {
-			const peers = makeClusterPeers([selfKeyPair]);
+		// A member whose clock has passed the expiration answers with a signed vote saying so. It used to
+		// throw, and a throw reaches the coordinator as silence: no vote, a penalty against an honest peer,
+		// and a "super-majority" failure the writer retries as if the cohort were unreachable.
+		it('answers a record whose expiration has just passed with a signed expiry vote, not a throw', async () => {
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, await makeKeyPair()]);
+			const expiration = Date.now() - 1;
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']), {}, {}, expiration);
 
-			const record = await createClusterRecord(
-				peers,
-				makeGetOperation(['block-1']),
-				{},
-				{},
-				Date.now() - 5000
-			);
+			const result = await clusterMemberInstance.update(record);
 
-			try {
-				await clusterMemberInstance.update(record);
-				expect.fail('Should have thrown');
-			} catch (err) {
-				expect((err as Error).message.toLowerCase()).to.include('expired');
-			}
+			const vote = result.promises[ourId];
+			expect(vote?.type).to.equal('reject');
+			if (vote?.type !== 'reject') return;
+			expect(vote.expiredAt, 'the member signs its own clock reading').to.be.a('number').and.at.least(expiration);
+			expect(vote.rejectReason).to.match(/^transaction-expired: /);
+			const verifies = await selfKeyPair.peerId.publicKey!.verify(
+				clusterVoteVerificationPayload(await computePromiseHash(record), vote),
+				uint8ArrayFromString(vote.signature, 'base64url'));
+			expect(verifies, 'expiredAt is covered by the signature').to.equal(true);
 		});
 
-		it('rejects transactions expiring at exactly now', async () => {
-			const peers = makeClusterPeers([selfKeyPair]);
+		it('still refuses by throwing once it has voted, rather than replace its vote', async () => {
+			// The clock ran out between rounds. Answering with an expiry vote now would contradict the
+			// approve this member already cast — equivocation — so the delivery is refused as before.
+			const ourId = selfKeyPair.peerId.toString();
+			const other = await makeKeyPair();
+			const peers = makeClusterPeers([selfKeyPair, other]);
+			const base = await createClusterRecord(peers, makeGetOperation(['block-1']), {}, {}, Date.now() - 1);
+			const record: ClusterRecord = {
+				...base,
+				promises: {
+					[ourId]: await makeSignedPromise(selfKeyPair.privateKey, base),
+					[other.peerId.toString()]: await makeSignedPromise(other.privateKey, base)
+				}
+			};
 
-			const record = await createClusterRecord(
-				peers,
-				makeGetOperation(['block-1']),
-				{},
-				{},
-				Date.now() - 1
-			);
-
+			let caught: unknown;
 			try {
 				await clusterMemberInstance.update(record);
-				expect.fail('Should have thrown');
 			} catch (err) {
-				expect((err as Error).message.toLowerCase()).to.include('expired');
+				caught = err;
 			}
+			expect((caught as Error | undefined)?.message).to.equal('Transaction expired');
 		});
 
 		it('accepts transactions with future expiration', async () => {

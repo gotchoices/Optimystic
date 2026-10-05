@@ -1006,6 +1006,15 @@ Logged under `optimystic:db-p2p:cluster` when a transaction's cohort is smaller 
 - `admit: true` — admitted only because the operator opted in with `allowUnvalidatedSmallCluster`, as a single-node or local-development setup knowingly running below the safe floor would. `cluster-tx:small-cluster-validated` follows.
 - `admit: false` — refused, failing closed. `cluster-tx:reject-too-small` follows, and the transaction throws.
 
+### `cluster-tx:rejected-by-validators` — a verdict on the write, or a clock disagreement?
+
+Logged under `optimystic:db-p2p:cluster` when enough cohort members vote `reject` that the transaction can no longer reach its super-majority (`executeTransaction` in `packages/db-p2p/src/repo/cluster-coordinator.ts`). Fields: `messageHash`, `peerCount`, `rejections`, `maxAllowed`, `reasons`, and, only on an expiry refusal, `expiredAt` and `expiration`.
+
+- `expiredAt` absent — at least one member judged the write itself (a stale revision, a failed re-check, a membership refusal; `reasons` says which). The writer receives `ValidatorRejectionError`.
+- `expiredAt` present, as `{ <peer id>: <unix ms> }` — **every** reject was an expiry vote: by each named member's own clock, the record's `expiration` (also logged) had already passed, and the value is that clock's reading. The writer receives `TransactionExpiredError`, whose message gives the skew estimate. Each member also logged `cluster-member:validation-expired` with the two instants in `reason` (`transaction-expired: expiration …, member clock …`). Nobody judged the write, nothing is penalized, and a retry will be refused the same way: **the remedy is a clock**, either the writer's (it set `expiration`, from its own clock plus the transaction timeout, 30 s by default) or the refusing members'. The coordinator cannot tell which, so compare each machine against a reference time.
+
+If one writer's transactions are refused this way by many different members, that writer's clock is the likely culprit; if the lines keep naming the same member across writers, that member's clock is. A mix of expiry and other rejects is logged without `expiredAt` and reported as an ordinary validator rejection, because some member did judge the content. Before this distinction existed, a skewed member threw instead of voting, and the same situation surfaced as `cluster-tx:supermajority-failed` with `rejections: 0` and a `ConsensusTimeout` penalty against the member; seeing that shape now means the member really did not answer.
+
 ## Common DEBUG patterns
 
 Every filter below is also a valid `enableOptimysticLogging` argument (see *Turning logging on*) — pass the quoted string as it is.

@@ -1,4 +1,4 @@
-import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, PendRequest, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest, MemberApplyOutcome } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, ClusterPeers, Signature, ClusterVote, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, PendRequest, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest, MemberApplyOutcome } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms, transformForBlockId, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability } from "@optimystic/db-core";
@@ -20,7 +20,8 @@ import type { ITransactionStateStore } from "./i-transaction-state-store.js";
 import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister, type IRevisionActionReader, type IPendingClaimReader } from "../storage/storage-repo.js";
 import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
 import { StuckReservationTracker } from "../repo/stuck-reservation.js";
-import { checkPendValidation } from "../pend-validation.js";
+import { checkPendValidation, TRANSACTION_EXPIRED } from "../pend-validation.js";
+import { formatInstant } from "../format-instant.js";
 import { getAffectedBlockIds } from "./record-operations.js";
 import { operationsConflict, resolveRace } from "./race-resolution.js";
 import { buildBlockCommitProof, mintSoloCommitProof, type BlockCommitProof } from "./commit-proof.js";
@@ -89,17 +90,76 @@ type VerifyOutcome =
  *
  * `reason` stays optional on the `invalid` arm because it is signed: it is folded into the vote
  * payload verbatim, and an absent reason and an empty one must keep producing the bytes they do today.
+ *
+ * `expired` is the third kind: by this member's own clock the record's `message.expiration` has
+ * passed. It becomes a `reject` vote — the record is dead for this member — that also carries the
+ * structured `expiredAt`, so the coordinator can report a clock disagreement by name. Before this kind
+ * existed the member threw instead, and a throw reaches the coordinator as silence: no vote, a
+ * `ConsensusTimeout` penalty against an honest peer, and a "super-majority" failure a writer retries.
  */
 type PromiseVerdict =
 	| { valid: true }
 	| { valid: false; kind: 'invalid'; reason?: string }
 	/** `heldBy` is the rival's ACTION id (storage's pending list), never a messageHash — see {@link Signature}. */
-	| { valid: false; kind: 'held'; reason: string; heldBy: ActionId };
+	| { valid: false; kind: 'held'; reason: string; heldBy: ActionId }
+	/** `expiredAt` is this member's wall-clock reading when it judged the record expired. */
+	| { valid: false; kind: 'expired'; reason: string; expiredAt: number };
 
 /** A refusal that judges the record invalid — the permanent kind, and every kind but the pending-conflict one. */
 function invalidVerdict(reason?: string): PromiseVerdict {
 	return { valid: false, kind: 'invalid', reason };
 }
+
+/** The two instants an expiry judgement compares, both unix ms. */
+interface Expiry {
+	expiration: number;
+	memberClock: number;
+}
+
+/**
+ * Both instants when `record` is past its `message.expiration` by this node's wall clock, else
+ * `undefined`. A record with no expiration never expires. An expiration exactly equal to the clock
+ * reading counts as passed.
+ */
+function expiryOf(record: ClusterRecord): Expiry | undefined {
+	const expiration = record.message.expiration;
+	const memberClock = Date.now();
+	return expiration && expiration <= memberClock ? { expiration, memberClock } : undefined;
+}
+
+/** The expiry refusal: `expiredAt` is structured for the coordinator, the reason is for a human. */
+function expiredVerdict({ expiration, memberClock }: Expiry): PromiseVerdict {
+	return {
+		valid: false,
+		kind: 'expired',
+		// `formatInstant`, not `toISOString`: `expiration` is whatever the coordinator sent, and a throw
+		// here would cost the member its vote.
+		reason: `${TRANSACTION_EXPIRED}: expiration ${formatInstant(expiration)}, member clock ${formatInstant(memberClock)}`,
+		expiredAt: memberClock
+	};
+}
+
+/**
+ * The one mapping from a {@link PromiseVerdict} to the vote it is signed as, so a new refusal kind
+ * cannot reach the wire as the wrong vote: the coordinator's thresholds read only `Signature.type`.
+ */
+function voteFor(verdict: PromiseVerdict): ClusterVote {
+	if (verdict.valid) {
+		return { type: 'approve' };
+	}
+	switch (verdict.kind) {
+		case 'held': return { type: 'held', heldBy: verdict.heldBy };
+		case 'expired': return { type: 'reject', rejectReason: verdict.reason, expiredAt: verdict.expiredAt };
+		case 'invalid': return { type: 'reject', rejectReason: verdict.reason };
+	}
+}
+
+/** The log line naming each refusal kind; an operator reads them as three different events. */
+const refusalLogTag: Record<Extract<PromiseVerdict, { valid: false }>['kind'], string> = {
+	invalid: 'cluster-member:validation-rejected',
+	held: 'cluster-member:validation-held',
+	expired: 'cluster-member:validation-expired'
+};
 
 /**
  * Widen a boolean-plus-prose check into a {@link PromiseVerdict}. Every check written this way judges
@@ -246,9 +306,10 @@ export const BASE_DECLARATION_DISAGREES = 'base-declaration-disagrees';
  * {@link checkPendValidation}: `PEND_NOT_VALIDATABLE` for a pend carrying no `validation` payload
  * under `ClusterConsensusConfig.unvalidatablePendPolicy: 'reject'`, and `VALIDATOR_FAULT` for a
  * checker that threw. Defined in `pend-validation.ts` (which the storage tier runs too, so both
- * tiers refuse with the same prefixes) and re-exported here next to its siblings above.
+ * tiers refuse with the same prefixes) and re-exported here next to its siblings above, together
+ * with `TRANSACTION_EXPIRED`, the prose prefix of this member's expiry vote.
  */
-export { PEND_NOT_VALIDATABLE, VALIDATOR_FAULT } from "../pend-validation.js";
+export { PEND_NOT_VALIDATABLE, VALIDATOR_FAULT, TRANSACTION_EXPIRED } from "../pend-validation.js";
 
 interface ClusterMemberComponents {
 	storageRepo: IRepo;
@@ -657,6 +718,20 @@ export class ClusterMember implements ICluster {
 			});
 		}
 
+		// NOTE: a member that has ALREADY voted on this record still refuses it by throwing once its
+		// clock passes the expiration, as every member did before expiry became a promise verdict.
+		// Answering with a vote instead would mean replacing the one it cast — equivocation, which
+		// `detectEquivocation` penalizes. This is the slow-transaction case (the clock ran out between
+		// rounds), not the clock-skew case: a skewed member meets a fresh record at its promise vote and
+		// answers with a signed expiry vote (`expiryOf` in `getTransactionPhase` and `evaluatePromise`).
+		// One skew shape still lands here: a member whose expiry vote was a minority under a
+		// super-majority is sent the commit round, has voted, and throws, which the coordinator charges
+		// as a commit-round `ConsensusTimeout`. If that penalty ever shows up against skewed members, let
+		// a member whose own promise was an expiry vote sign the commit the cohort decided on.
+		if (currentRecord.promises[ourId] && expiryOf(currentRecord)) {
+			throw new Error('Transaction expired');
+		}
+
 		// Drive the phase machine to a FIXPOINT rather than handling one phase per delivery. Each
 		// vote this member adds can put the record straight into the next phase (our promise
 		// completes super-majority ⇒ our commit is due; our commit completes the majority ⇒
@@ -981,10 +1056,10 @@ export class ClusterMember implements ICluster {
 		// Validate signatures
 		await this.validateSignatures(record);
 
-		// Validate expiration
-		if (record.message.expiration && record.message.expiration < Date.now()) {
-			throw new Error('Transaction expired');
-		}
+		// Expiry is deliberately NOT judged here. Every check above is a fault in the record itself;
+		// expiry is this member's clock disagreeing with the writer's, and a throw from here reaches the
+		// coordinator as silence. A member that still owes its vote answers it as a verdict instead
+		// (`evaluatePromise`); one that has voted refuses in `processUpdate`.
 	}
 
 	/**
@@ -1047,9 +1122,9 @@ export class ClusterMember implements ICluster {
 		return computeClusterCommitHash(record.messageHash, record.message, record.promises, recordMembershipDigest(record));
 	}
 
-	private async signVote(hash: string, type: Signature['type'], extra?: string): Promise<string> {
-		const sigBytes = await this.privateKey.sign(clusterVoteSigningPayload(hash, type, extra));
-		return uint8ArrayToString(sigBytes, 'base64url');
+	private async signVote(hash: string, vote: ClusterVote): Promise<Signature> {
+		const sigBytes = await this.privateKey.sign(clusterVoteSigningPayload(hash, vote));
+		return { ...vote, signature: uint8ArrayToString(sigBytes, 'base64url') };
 	}
 
 	/**
@@ -1137,6 +1212,11 @@ export class ClusterMember implements ICluster {
 		// a retry must be a fresh transaction (new messageHash), which `CoordinatorRepo.pend`
 		// already mints per call.
 		if (!record.promises[ourId]) {
+			// Expiry is answered ahead of the race: an expired record can never win, and running
+			// `findConflict` on it could still clear a live rival's reservation it beats on the tie-breaks.
+			if (expiryOf(record)) {
+				return { phase: TransactionPhase.OurPromiseNeeded };
+			}
 			const conflict = this.findConflict(record);
 			if (conflict) {
 				return { phase: TransactionPhase.OurConflictVoteNeeded, conflictsWith: conflict.blockedBy };
@@ -1199,16 +1279,16 @@ export class ClusterMember implements ICluster {
 		const verdict = await this.evaluatePromise(record);
 
 		if (!verdict.valid) {
-			// Two tags, because the two refusals are two different events for an operator: one says the
-			// cohort judged a write invalid, the other says a write queued behind a live reservation.
-			log(verdict.kind === 'held' ? 'cluster-member:validation-held' : 'cluster-member:validation-rejected', {
+			// One tag per refusal kind: a write judged invalid, a write queued behind a live reservation,
+			// and a write this member's clock says has expired are three different events for an operator.
+			log(refusalLogTag[verdict.kind], {
 				messageHash: record.messageHash,
 				reason: verdict.reason
 			});
 		}
 
 		const promiseHash = await this.computePromiseHash(record);
-		const signature = await this.signPromiseVerdict(promiseHash, verdict);
+		const signature = await this.signVote(promiseHash, voteFor(verdict));
 
 		return {
 			...record,
@@ -1217,23 +1297,6 @@ export class ClusterMember implements ICluster {
 				[this.peerId.toString()]: signature
 			}
 		};
-	}
-
-	/**
-	 * Turn a {@link PromiseVerdict} into this member's signed promise vote — one vote kind per refusal
-	 * kind. The single place the mapping lives, so a new refusal kind cannot reach the wire as the
-	 * wrong vote: the coordinator's thresholds read only `Signature.type`, and until `held` existed the
-	 * transient refusal had nowhere to go but `reject`.
-	 */
-	private async signPromiseVerdict(promiseHash: string, verdict: PromiseVerdict): Promise<Signature> {
-		if (verdict.valid) {
-			return { type: 'approve', signature: await this.signVote(promiseHash, 'approve') };
-		}
-		if (verdict.kind === 'held') {
-			return { type: 'held', signature: await this.signVote(promiseHash, 'held', verdict.heldBy), heldBy: verdict.heldBy };
-		}
-		const rejectReason = verdict.reason;
-		return { type: 'reject', signature: await this.signVote(promiseHash, 'reject', rejectReason), rejectReason };
 	}
 
 	/**
@@ -1251,8 +1314,7 @@ export class ClusterMember implements ICluster {
 			conflictWith
 		});
 		const promiseHash = await this.computePromiseHash(record);
-		const sig = await this.signVote(promiseHash, 'conflict', conflictWith);
-		const signature: Signature = { type: 'conflict', signature: sig, conflictWith };
+		const signature = await this.signVote(promiseHash, { type: 'conflict', conflictWith });
 
 		return {
 			...record,
@@ -1273,8 +1335,15 @@ export class ClusterMember implements ICluster {
 	 * dispute path) than a stale-revision / custom-validator reject, which is different again from a
 	 * `content-digest-mismatch` (see {@link validateCommitOperations}). A record carries pend OR commit
 	 * operations, so in practice exactly one of the latter two has anything to inspect.
+	 *
+	 * Expiry is judged before all of them: a record this member's clock says has expired is dead
+	 * whatever its membership or operations, and judging that needs no cohort derivation or storage read.
 	 */
 	private async evaluatePromise(record: ClusterRecord): Promise<PromiseVerdict> {
+		const expiry = expiryOf(record);
+		if (expiry) {
+			return expiredVerdict(expiry);
+		}
 		const admission = await this.admitMembership(record);
 		if (!admission.admit) {
 			return invalidVerdict(admission.reason ?? MEMBERSHIP_NOT_ADMITTED);
@@ -2297,11 +2366,7 @@ export class ClusterMember implements ICluster {
 			return record;
 		}
 		const commitHash = await this.computeCommitHash(record);
-		const sig = await this.signVote(commitHash, 'approve');
-		const signature: Signature = {
-			type: 'approve',
-			signature: sig
-		};
+		const signature = await this.signVote(commitHash, { type: 'approve' });
 
 		return {
 			...record,
@@ -2514,7 +2579,7 @@ export class ClusterMember implements ICluster {
 			// Gated on the sink: with no reactivity wired the preimage has no consumer, so a sink-less
 			// node pays neither the extra `sha256` nor the extra microtask — the true zero-cost default.
 			if (this.onCommitCertificate) {
-				const commitSignedPayload = clusterVoteSigningPayload(await this.computeCommitHash(record), 'approve');
+				const commitSignedPayload = clusterVoteSigningPayload(await this.computeCommitHash(record), { type: 'approve' });
 				this.captureCommitCert(record, commit.actionId, commitSignedPayload);
 			}
 			// Project the consensus record into a durable BlockCommitProof and hand it down the commit
@@ -2797,7 +2862,7 @@ export class ClusterMember implements ICluster {
 		// {@link invalidationActionId} the invalidation's change event also carries, so the bridge's
 		// cert extractor resolves it. Gated on the sink — a node with no reactivity wired pays nothing.
 		if (this.onCommitCertificate) {
-			const invSignedPayload = clusterVoteSigningPayload(await this.computeCommitHash(record), 'approve');
+			const invSignedPayload = clusterVoteSigningPayload(await this.computeCommitHash(record), { type: 'approve' });
 			this.captureCommitCert(record, invalidationActionId(request.invalidatedActionId, request.resolution.disputeId), invSignedPayload);
 		}
 
@@ -3059,15 +3124,13 @@ export class ClusterMember implements ICluster {
 		const state = this.activeTransactions.get(messageHash);
 		if (!state) return;
 
-		if (!state.record.promises[this.peerId.toString()]) {
-			const rejectReason = 'Transaction expired';
+		// The same expiry vote a fresh record gets at its promise round, so a timer-driven expiry and an
+		// arrival-time one look identical to the coordinator. Judged again on the wall clock rather than
+		// trusted from the timer, which a clock adjustment can fire before the expiration.
+		const expiry = expiryOf(state.record);
+		if (expiry && !state.record.promises[this.peerId.toString()]) {
 			const promiseHash = await this.computePromiseHash(state.record);
-			const sig = await this.signVote(promiseHash, 'reject', rejectReason);
-			const signature: Signature = {
-				type: 'reject',
-				signature: sig,
-				rejectReason
-			};
+			const signature = await this.signVote(promiseHash, voteFor(expiredVerdict(expiry)));
 
 			const updatedRecord = {
 				...state.record,

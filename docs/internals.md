@@ -1203,6 +1203,21 @@ saveMaterializedBlock(block): store(structuredClone(block));
   approval either); what they buy is classification, signed evidence, and an operator-visible count
   of how much traffic went unchecked. A node with no checker configured is unaffected by the policy.
   No composition root supplies a checker today (backlog `feat-no-deployment-validates-transactions-at-pend`).
+- **An expired record is answered with a vote, not a throw.** Expiry is a promise *verdict*, decided
+  first in `ClusterMember.evaluatePromise` (and ahead of the conflict race in `getTransactionPhase`,
+  so an expired record cannot clear a live rival's reservation), never a check in `validateRecord`,
+  which keeps only the faults of the record itself (membership digest, hash, signatures). A member
+  whose clock has passed `message.expiration` signs a `reject` carrying `expiredAt`, its own clock
+  reading, folded into the signed bytes (`clusterVoteSigningPayload`); the timer-driven
+  `handleExpiration` signs the same vote. The reason is the same one that makes a checker fault a
+  reject rather than an escape: a throw reaches the coordinator as silence — no vote, a
+  `ConsensusTimeout` penalty against an honest member, and the "super-majority" shortfall a writer
+  retries as an unreachable cohort. With a vote, the coordinator counts a rejection, and raises
+  `TransactionExpiredError` (a `ValidatorRejectionError`) when every reject that sank the
+  transaction is an expiry vote. A member that has *already* voted still refuses an expired delivery
+  by throwing, since voting again would replace its vote (`detectEquivocation`); that is the
+  slow-transaction case, not the skew case. See
+  [correctness.md §7.4 Clock Assumptions](correctness.md#74-clock-assumptions).
 - **A pend rejection is returned only when local storage confirms a revision loss.** When
   enough members vote reject, `ClusterCoordinator` throws a typed `ValidatorRejectionError`
   carrying the (free-form, wire-visible) reject reasons. `CoordinatorRepo.pend` then

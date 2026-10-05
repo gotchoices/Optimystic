@@ -5,7 +5,7 @@ import {
 	clusterVoteSigningPayload, computeClusterCommitHash, computeClusterMessageHash,
 	computeClusterPromiseHash, membershipDigest
 } from '@optimystic/db-core';
-import type { ClusterPeers, ClusterRecord, CommitRequest, RepoMessage, Signature } from '@optimystic/db-core';
+import type { ClusterPeers, ClusterRecord, ClusterVote, CommitRequest, RepoMessage, Signature } from '@optimystic/db-core';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
@@ -51,9 +51,10 @@ export const makeClusterPeers = (keyPairs: KeyPair[]): ClusterPeers => {
 export const signVote = async (
 	privateKey: PrivateKey, hash: string, type: 'approve' | 'reject' = 'approve', reason?: string
 ): Promise<Signature> => {
+	const vote: ClusterVote = type === 'approve' ? { type } : { type, rejectReason: reason };
 	const signature = uint8ArrayToString(
-		await privateKey.sign(clusterVoteSigningPayload(hash, type, reason)), 'base64url');
-	return type === 'approve' ? { type, signature } : { type, signature, rejectReason: reason };
+		await privateKey.sign(clusterVoteSigningPayload(hash, vote)), 'base64url');
+	return { ...vote, signature };
 };
 
 export const makeMessage = (commit: CommitRequest): RepoMessage => ({

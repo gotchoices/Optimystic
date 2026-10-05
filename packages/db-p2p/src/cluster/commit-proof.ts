@@ -115,7 +115,7 @@ export async function mintSoloCommitProof(
 	const messageHash = await computeClusterMessageHash(message, membershipDigest);
 	const signApprove = async (hash: string): Promise<Signature> => ({
 		type: 'approve',
-		signature: uint8ArrayToString(await privateKey.sign(clusterVoteSigningPayload(hash, 'approve')), 'base64url')
+		signature: uint8ArrayToString(await privateKey.sign(clusterVoteSigningPayload(hash, { type: 'approve' })), 'base64url')
 	});
 	const promiseHash = await computeClusterPromiseHash(messageHash, message, membershipDigest);
 	const promises: Record<string, Signature> = { [peerId]: await signApprove(promiseHash) };
