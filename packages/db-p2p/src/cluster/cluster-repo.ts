@@ -26,6 +26,7 @@ import { operationsConflict, resolveRace } from "./race-resolution.js";
 import { buildBlockCommitProof, mintSoloCommitProof, type BlockCommitProof } from "./commit-proof.js";
 import { reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs } from "./cluster-policy.js";
 import type { BlockHolders } from "./rebalance-monitor.js";
+import { unrefTimer } from "../unref-timer.js";
 
 const log = createLogger('cluster-member')
 
@@ -494,12 +495,10 @@ export class ClusterMember implements ICluster {
 			membershipAdmissionFraction: this.membershipAdmissionFraction,
 			allowUnvalidatedSmallCluster: this.allowUnvalidatedSmallCluster
 		});
-		// Periodically clean up expired transactions (.unref() so tests/short-lived processes can exit)
-		this.expirationInterval = setInterval(() => this.queueExpiredTransactions(), 60000);
-		this.expirationInterval.unref();
+		// Periodically clean up expired transactions (unref'd so tests/short-lived processes can exit)
+		this.expirationInterval = unrefTimer(setInterval(() => this.queueExpiredTransactions(), 60000));
 		// Process cleanup queue
-		this.cleanupInterval = setInterval(() => this.processCleanupQueue(), 1000);
-		this.cleanupInterval.unref();
+		this.cleanupInterval = unrefTimer(setInterval(() => this.processCleanupQueue(), 1000));
 	}
 
 	/**
@@ -602,9 +601,9 @@ export class ClusterMember implements ICluster {
 			return result;
 		} finally {
 			// Remove from pending updates after a short delay to allow concurrent calls to see it
-			setTimeout(() => {
+			unrefTimer(setTimeout(() => {
 				this.pendingUpdates.delete(record.messageHash);
-			}, 100).unref();
+			}, 100));
 		}
 	}
 
@@ -2931,11 +2930,10 @@ export class ClusterMember implements ICluster {
 	private withReconcileTimeout<T>(promise: Promise<T>, blockId: BlockId): Promise<T> {
 		let timer: NodeJS.Timeout | undefined;
 		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(
+			timer = unrefTimer(setTimeout(
 				() => reject(new Error(`reconcile for block ${blockId} timed out after ${this.reconcileTimeoutMs}ms`)),
 				this.reconcileTimeoutMs
-			);
-			timer.unref();
+			));
 		});
 		return Promise.race([promise, timeout]).finally(() => {
 			if (timer) clearTimeout(timer);
@@ -2952,14 +2950,14 @@ export class ClusterMember implements ICluster {
 		}
 
 		return {
-			promiseTimeout: setTimeout(
+			promiseTimeout: unrefTimer(setTimeout(
 				() => this.handleExpiration(record.messageHash),
 				record.message.expiration - Date.now()
-			).unref(),
-			resolutionTimeout: setTimeout(
+			)),
+			resolutionTimeout: unrefTimer(setTimeout(
 				() => this.resolveWithPeers(record.messageHash),
 				record.message.expiration + 5000 - Date.now()
-			).unref()
+			))
 		};
 	}
 

@@ -1,4 +1,5 @@
 import { DEFAULT_COHORT_QUERY_TIMEOUT_MS } from '@optimystic/db-core';
+import { unrefTimer } from './unref-timer.js';
 
 /**
  * Per-RPC deadline knobs shared by the simple {@link ProtocolClient} subclasses
@@ -288,8 +289,7 @@ export async function withinRequestBudget<T>(
 	request: (options: RpcDeadlineOptions) => Promise<T>
 ): Promise<T> {
 	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(new RequestBudgetExceededError(peer, protocol, budgetMs)), budgetMs);
-	(timer as { unref?: () => void }).unref?.();
+	const timer = unrefTimer(setTimeout(() => controller.abort(new RequestBudgetExceededError(peer, protocol, budgetMs)), budgetMs));
 	try {
 		return await request({ signal: controller.signal, dialTimeoutMs: 0, responseTimeoutMs: 0 });
 	} finally {

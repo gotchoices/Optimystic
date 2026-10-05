@@ -83,9 +83,18 @@ const NO_MODULE_SCOPE_TEXT_DECODER = {
 	selector: "NewExpression[callee.name='TextDecoder']:not(:function NewExpression, PropertyDefinition[static=false] > NewExpression)",
 	message: 'Do not construct TextDecoder at module load: Hermes/React Native has no native TextDecoder, so the import itself throws before the host polyfill runs. Construct it on first use and memoize — see decoder() in db-p2p/src/storage/raw-store-codec.ts.',
 };
+// Browsers and React Native return a number from `setTimeout`/`setInterval`, so `.unref` is
+// `undefined` there and an unguarded call throws — a `ClusterMember` constructor doing exactly that
+// stopped every db-p2p node from starting off Node (GitHub issue #28). Every first-party `unref` goes
+// through `unrefTimer` in packages/db-p2p/src/unref-timer.ts. The guarded spelling is banned too, on
+// purpose: one site to read, one place to change. Timer `.ref()` has no first-party call site.
+const NO_TIMER_UNREF = {
+	selector: "MemberExpression[property.name='unref']",
+	message: 'Timer handles are numbers in browsers and React Native, which have no `unref`. Call `unrefTimer` from packages/db-p2p/src/unref-timer.ts instead.',
+};
 
 // NOTE: this Hermes-global guard is deliberately not exhaustive. `TextDecoder` (beyond the
-// module-scope construction banned above)/`structuredClone`/timer `.ref()`/`.unref()`/
+// module-scope construction banned above)/`structuredClone`/
 // `AbortSignal.prototype.throwIfAborted` are all used too pervasively (and are already required,
 // declared polyfills per readme.md § React Native) to ban outright without either breaking real
 // call sites or demanding a repo-wide rewrite. `TextEncoder` needs no rule at all — Hermes provides
@@ -162,7 +171,7 @@ export default tseslint.config(
 		// `test/support/capture-log.ts` legitimately imports `debug` — that is its whole job.
 		files: ['packages/*/src/**/*.ts'],
 		rules: {
-			'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_DIRECT_DEBUG_IMPORT, NO_STATIC_BLOCK, NO_ABORT_SIGNAL_TIMEOUT, NO_ABORT_SIGNAL_ANY, NO_PROMISE_WITH_RESOLVERS, NO_DOM_EXCEPTION, NO_MODULE_SCOPE_TEXT_DECODER],
+			'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_DIRECT_DEBUG_IMPORT, NO_STATIC_BLOCK, NO_ABORT_SIGNAL_TIMEOUT, NO_ABORT_SIGNAL_ANY, NO_PROMISE_WITH_RESOLVERS, NO_DOM_EXCEPTION, NO_MODULE_SCOPE_TEXT_DECODER, NO_TIMER_UNREF],
 			'no-restricted-globals': ['error', NO_BUFFER_GLOBAL],
 			// `no-restricted-globals` only sees the bare identifier; close the qualified spellings too.
 			'no-restricted-properties': ['error',
@@ -181,7 +190,15 @@ export default tseslint.config(
 		// `'off'`: flat config replaces the whole rule config, and these files have no business
 		// reaching for libp2p's component logger either.
 		files: ['packages/*/src/logger.ts', 'packages/reference-peer/src/cli.ts'],
-		rules: { 'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_STATIC_BLOCK] },
+		rules: { 'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_STATIC_BLOCK, NO_TIMER_UNREF] },
+	},
+	{
+		// The one sanctioned `.unref` site — the guarded helper every other timer goes through.
+		// Re-declares the full selector list minus NO_TIMER_UNREF (flat config replaces the whole rule config).
+		files: ['packages/db-p2p/src/unref-timer.ts'],
+		rules: {
+			'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_DIRECT_DEBUG_IMPORT, NO_STATIC_BLOCK, NO_ABORT_SIGNAL_TIMEOUT, NO_ABORT_SIGNAL_ANY, NO_PROMISE_WITH_RESOLVERS, NO_DOM_EXCEPTION, NO_MODULE_SCOPE_TEXT_DECODER],
+		},
 	},
 	{
 		// Intentional terminal output — CLI, entry scripts, demo, tooling, tests.

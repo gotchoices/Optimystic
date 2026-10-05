@@ -10,6 +10,7 @@ import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 import { ResponsibilityRefusalError } from "./responsibility.js";
+import { unrefTimer } from "../unref-timer.js";
 
 const log = createLogger('cluster')
 
@@ -161,9 +162,8 @@ export type TimerCancel = () => void;
  * re-registration scheduler's `defaultSetTimer` (see reactivity/rotation-rereg-scheduler.ts).
  */
 function defaultSetTimer(fn: () => void, delayMs: number): TimerCancel {
-	const handle = setTimeout(fn, delayMs);
 	// An idle retry/cleanup timer must not pin a process (mirror rotation re-registration + push-state gossip).
-	(handle as { unref?: () => void }).unref?.();
+	const handle = unrefTimer(setTimeout(fn, delayMs));
 	return (): void => clearTimeout(handle);
 }
 

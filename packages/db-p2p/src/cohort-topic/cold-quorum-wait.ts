@@ -8,6 +8,7 @@
  */
 
 import type { QuorumWait } from "@optimystic/db-core";
+import { unrefTimer } from "../unref-timer.js";
 
 /**
  * Default `T_cold_quorum_wait` (ms): how long a register is held for the cohort's members to answer. It has
@@ -73,7 +74,7 @@ export function createColdQuorumWait(deps: ColdQuorumWaitDeps): ColdQuorumWait {
 		}
 		deadline = setTimeout((): void => settle((): boolean => true), deps.waitMs);
 		// A held register must not keep an otherwise idle process alive.
-		(deadline as { unref?: () => void }).unref?.();
+		unrefTimer(deadline);
 		return true;
 	};
 

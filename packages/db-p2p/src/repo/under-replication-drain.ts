@@ -6,6 +6,7 @@ import type { PushBlockOutcome } from '../cluster/block-transfer-service.js';
 import { buildBlockTransferProtocol } from '../cluster/block-transfer-service.js';
 import type { IUnderReplicationLedger, UnderReplicatedEntry } from './i-under-replication-ledger.js';
 import { createLogger } from '../logger.js';
+import { unrefTimer } from '../unref-timer.js';
 
 const log = createLogger('under-replication-drain');
 
@@ -248,7 +249,7 @@ export class UnderReplicationDrain implements Startable {
 			this.debounceTimer = null;
 			this.maybeRun(trigger);
 		}, this.config.debounceMs);
-		unref(this.debounceTimer);
+		unrefTimer(this.debounceTimer);
 	}
 
 	/** Run now, or defer to the end of the minimum interval — a trigger is never dropped. */
@@ -276,7 +277,7 @@ export class UnderReplicationDrain implements Startable {
 			this.timer = null;
 			this.maybeRun(trigger);
 		}, delayMs);
-		unref(this.timer);
+		unrefTimer(this.timer);
 	}
 
 	private clearTimer(): void {
@@ -574,9 +575,4 @@ export class UnderReplicationDrain implements Startable {
 			if (!listed.has(blockId)) this.forgetBlock(blockId);
 		}
 	}
-}
-
-/** Never hold the process open for a drain timer. */
-function unref(timer: ReturnType<typeof setTimeout>): void {
-	(timer as unknown as { unref?: () => void }).unref?.();
 }

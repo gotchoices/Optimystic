@@ -60,6 +60,7 @@
 import { bytesToB64url, type ReRegistrationPlan } from "@optimystic/db-core";
 import type { RotationNotice } from "./subscription-manager.js";
 import { createLogger } from "../logger.js";
+import { unrefTimer } from "../unref-timer.js";
 
 const log = createLogger("reactivity-rotation-rereg");
 
@@ -81,10 +82,9 @@ export type RotationTimerCancel = () => void;
  * an already-fired/cleared timeout is a no-op). Shared with the collection watch service's tick.
  */
 export function setUnrefTimer(fn: () => void, delayMs: number): RotationTimerCancel {
-	const handle = setTimeout(fn, delayMs);
 	// Node timers keep the event loop alive; an idle reactivity timer must not pin a process (mirror push-state
-	// gossip). The guard is for runtimes whose timer handle has no `unref` (browsers, React Native).
-	(handle as { unref?: () => void }).unref?.();
+	// gossip).
+	const handle = unrefTimer(setTimeout(fn, delayMs));
 	return (): void => clearTimeout(handle);
 }
 

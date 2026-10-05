@@ -6,6 +6,7 @@ import type { IKeyNetwork } from '@optimystic/db-core'
 import type { PartitionDetector } from './partition-detector.js'
 import type { ArachnodeFretAdapter, ArachnodeInfo } from '../storage/arachnode-fret-adapter.js'
 import { createLogger } from '../logger.js'
+import { unrefTimer } from '../unref-timer.js'
 
 const log = createLogger('rebalance-monitor')
 
@@ -491,7 +492,7 @@ export class RebalanceMonitor implements Startable {
 				.catch(err => { log('recheck error: %O', err) })
 				.finally(() => this.updateRecheckTimer())
 		}, this.growthRecheckIntervalMs)
-		;(this.recheckTimer as unknown as { unref?: () => void }).unref?.()
+		unrefTimer(this.recheckTimer)
 	}
 
 	private handleTopologyChange(): void {
@@ -580,7 +581,7 @@ export class RebalanceMonitor implements Startable {
 			this.deferredCheckTimer = null
 			void this.maybeRebalance().catch(err => { log('deferred check error: %O', err) })
 		}, delayMs)
-		;(this.deferredCheckTimer as unknown as { unref?: () => void }).unref?.()
+		unrefTimer(this.deferredCheckTimer)
 	}
 
 	private async performRebalanceCheck(triggeredAt: number): Promise<RebalanceEvent | null> {

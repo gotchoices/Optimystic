@@ -44,6 +44,7 @@ import type { Libp2p } from 'libp2p';
 import type { PeerId } from '@libp2p/interface';
 import { routesThroughRelay } from '../peer-address-book.js';
 import { createLogger } from '../logger.js';
+import { unrefTimer } from '../unref-timer.js';
 
 const log = createLogger('relay-reservation');
 
@@ -361,15 +362,10 @@ const remaining = (deadline: number): number => Math.max(0, deadline - Date.now(
 
 const errorMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
-/** A pending timer must not keep a stopped Node process alive; browsers and React Native have no `unref`. */
-function unref(timer: ReturnType<typeof setTimeout>): void {
-	(timer as { unref?: () => void }).unref?.();
-}
-
 /** Resolve after `ms`, on an unref'd timer. */
 function delay(ms: number): Promise<void> {
 	return new Promise(resolve => {
-		unref(setTimeout(resolve, ms));
+		unrefTimer(setTimeout(resolve, ms));
 	});
 }
 
@@ -541,7 +537,7 @@ class RelayReservationLoop implements RelayReservationSupervisor {
 		const controller = new AbortController();
 		this.dialAbort = controller;
 		const timer = setTimeout(() => controller.abort(), remaining(deadline));
-		unref(timer);
+		unrefTimer(timer);
 		try {
 			await this.node.dial(multiaddr(this.relay.dialAddr), { signal: controller.signal });
 			return null;
@@ -564,7 +560,7 @@ class RelayReservationLoop implements RelayReservationSupervisor {
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const expired = new Promise<typeof DEADLINE_PASSED>(resolve => {
 			timer = setTimeout(() => resolve(DEADLINE_PASSED), remaining(deadline));
-			unref(timer);
+			unrefTimer(timer);
 		});
 		try {
 			const outcome = await Promise.race([store.addRelay(this.relayPeerId, 'discovered'), expired]);
@@ -624,7 +620,7 @@ class RelayReservationLoop implements RelayReservationSupervisor {
 			this.timer = null;
 			void this.tick('timer');
 		}, ms);
-		unref(this.timer);
+		unrefTimer(this.timer);
 	}
 
 	private clearTimer(): void {

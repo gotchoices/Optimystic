@@ -46,6 +46,7 @@ import { DEFAULT_STREAM_MAX_BYTES, readFrame } from "../cohort-topic/stream-util
 import { PROTOCOL_REACTIVITY_PUSH_STATE_GOSSIP } from "./protocols.js";
 import { registerProtocolHandler } from "../network/register-protocol-handler.js";
 import { createLogger } from "../logger.js";
+import { unrefTimer } from "../unref-timer.js";
 
 const log = createLogger("reactivity-push-state-gossip");
 
@@ -134,7 +135,7 @@ export class ReactivityPushStateGossipDriver {
 			this.round();
 		}, this.intervalMs);
 		// Node timers keep the event loop alive; push-state gossip must not pin a process that is otherwise idle.
-		(timer as { unref?: () => void }).unref?.();
+		unrefTimer(timer);
 		this.timer = timer;
 	}
 

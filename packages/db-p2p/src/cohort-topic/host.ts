@@ -195,6 +195,7 @@ import { createBootstrapEvidenceBuilder } from "./bootstrap-evidence-builder.js"
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS, cohortTopicProtocolList, type CohortTopicProtocols } from "./protocols.js";
 import { readFrame, requestResponse, requireReply, DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
 import { createLogger } from "../logger.js";
+import { unrefTimer } from "../unref-timer.js";
 
 const log = createLogger("cohort-topic");
 
@@ -1638,7 +1639,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		void driveTick();
 	}, gossipIntervalMs);
 	// Node timers keep the event loop alive; cohort gossip should not pin a process that is otherwise idle.
-	(timer as { unref?: () => void }).unref?.();
+	unrefTimer(timer);
 
 	return {
 		service,
