@@ -75,24 +75,20 @@ export class TestTransactor implements ITransactor {
 				let materializedRev: number | undefined;
 				// A named pending is overlaid only where this block holds it; every other block gets the
 				// plain answer for the same context (mirrors StorageRepo.get).
+				const pin = blockGets.context?.rev;
 				const namedPending = blockGets.context?.actionId !== undefined
 					? blockState.pendingActions.get(blockGets.context.actionId) : undefined;
 				if (namedPending) {
 					// Overlay over the committed base at the context's pin, as StorageRepo does.
-					const base = blockGets.context?.rev !== undefined
-						? latestMaterializedAt(blockState, blockGets.context.rev)
-						: (blockState.materializedBlocks.has(blockState.latestRev)
-							? { block: blockState.materializedBlocks.get(blockState.latestRev)!, rev: blockState.latestRev }
-							: undefined);
+					const base = committedAt(blockState, pin);
 					block = applyTransformSafe(base?.block, namedPending);
 					// A pending carries no revision of its own — report the committed base it was
 					// applied over. Absent when there was no base (a pending-only insert).
 					materializedRev = base?.rev;
-				} else if (blockGets.context?.committed) {
-					// Check context.committed for matching pending actions — mirrors coordinator
-					// behavior: context.committed proves the action succeeded, so pending blocks
-					// for that action should be served.
-					for (const { actionId: cId } of blockGets.context.committed) {
+				} else {
+					// context.committed proves its actions succeeded, so a block still holding one of them
+					// pending is served with it applied — mirrors the coordinator's read-driven promotion.
+					for (const { actionId: cId } of blockGets.context?.committed ?? []) {
 						const pendingTransform = blockState.pendingActions.get(cId);
 						if (pendingTransform) {
 							const baseBlock = blockState.materializedBlocks.get(blockState.latestRev);
@@ -101,28 +97,13 @@ export class TestTransactor implements ITransactor {
 							break;
 						}
 					}
-					// Fall through to standard resolution if no pending match
+					// Otherwise the committed content at the highest revision ≤ the pin, or the latest.
 					if (block === undefined) {
-						if (blockGets.context.rev !== undefined) {
-							const found = latestMaterializedAt(blockState, blockGets.context.rev);
-							block = structuredClone(found?.block);
-							materializedRev = found?.rev;
-						} else {
-							block = structuredClone(blockState.materializedBlocks.get(blockState.latestRev));
-							if (block) materializedRev = blockState.latestRev;
-						}
+						const found = committedAt(blockState, pin);
+						block = structuredClone(found?.block);
+						materializedRev = found?.rev;
 					}
-				} else if (blockGets.context?.rev !== undefined) {
-					// Return the materialized block at the highest revision ≤ requested
-					const found = latestMaterializedAt(blockState, blockGets.context.rev);
-					block = structuredClone(found?.block);
-					materializedRev = found?.rev;
-				} else {
-					// Otherwise return latest materialized block
-					block = structuredClone(blockState.materializedBlocks.get(blockState.latestRev));
-					if (block) materializedRev = blockState.latestRev;
 				}
-
 
 				const actionId = blockState.revisionActions.get(blockState.latestRev);
 				// The materialized revision travels WITH its action id (one field, so the pair can
@@ -960,6 +941,14 @@ function newBlockState(): BlockState {
 function latestActionRev(blockState: BlockState): ActionRev | undefined {
 	const actionId = blockState.revisionActions.get(blockState.latestRev);
 	return actionId === undefined ? undefined : { actionId, rev: blockState.latestRev };
+}
+
+/** The committed content a read at `pin` sees — the highest materialized revision at or below
+ *  it — or the latest revision's content when the read is unpinned. */
+function committedAt(blockState: BlockState, pin: number | undefined): { block: IBlock, rev: number } | undefined {
+	if (pin !== undefined) return latestMaterializedAt(blockState, pin);
+	const block = blockState.materializedBlocks.get(blockState.latestRev);
+	return block ? { block, rev: blockState.latestRev } : undefined;
 }
 
 /** Returns the materialized block at the highest revision ≤ the given revision, together with
