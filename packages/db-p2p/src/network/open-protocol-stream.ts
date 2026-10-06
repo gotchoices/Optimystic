@@ -269,6 +269,14 @@ class StreamOpenRace {
 		attempt.controller.signal.throwIfAborted();
 		// `force`: without it libp2p's dialer hands back an existing connection — most likely the one
 		// every connection path is already waiting on.
+		// NOTE: on a link whose round trip exceeds the hedge delay but that declares none (an
+		// undeclared link above 250 ms), a peer with ONE healthy connection reaches this path on every
+		// request, since its stream negotiation takes a round trip: a forced dial starts and is
+		// cancelled when the first path opens, costing one half-made connection (a new relay circuit,
+		// for a relayed peer) per request. Bounded — a second connection that does complete is hedged
+		// onto ahead of the dial next time, so connections do not accumulate — and the remedy is the
+		// standing rule, declare `linkRoundTripMs`. If undeclared mid-latency links turn out to be
+		// common, give the dial path a longer hedge than the connection paths.
 		return await this.node.dialProtocol(this.peer, [this.protocol], { ...streamOptions, force: true });
 	}
 

@@ -120,14 +120,16 @@ describe('a half-open connection does not strand a connected peer', function () 
 			a = await spawnNode(true);
 			b = await spawnNode(false);
 
-			const first = await b.dial(a.getMultiaddrs()[0]!);
+			await b.dial(a.getMultiaddrs()[0]!);
 			await sleep(500);
 			// `force`: without it libp2p hands back the connection it already holds.
 			const second = await b.dial(a.getMultiaddrs()[0]!, { force: true });
 			await sleep(500);
 			abortOnOwnSide(second);
 			await sleep(500);
-			live = a.getConnections(b.peerId).find(c => c.remoteAddr.equals(first.remoteAddr) || c.id !== second.id)!;
+			// `a`'s connection ids and remote addresses are its own, not `b`'s: the live connection is
+			// the older of the two `a` holds, the one the first dial opened.
+			live = [...a.getConnections(b.peerId)].sort((x, y) => x.timeline.open - y.timeline.open)[0]!;
 		});
 
 		after(async () => {
