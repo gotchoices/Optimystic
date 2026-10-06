@@ -6,16 +6,17 @@
  * renews its registration while it hangs out and withdraws it when it leaves a tier
  * (`docs/matchmaking.md` §Push channel, §Hang-out vs. continue). One {@link SeekerKeepAlive} per walk
  * remembers the registration last `accepted` — its tier, the `RegisterV1.correlationId` the cohort
- * accepted, and its slot primary — and sends signed {@link RenewV1} frames to that slot primary: a plain
- * ping from {@link SeekerKeepAlive.renew}, a `withdraw` tombstone from {@link SeekerKeepAlive.withdraw}.
+ * accepted, the member that admitted it, and its slot primary — and sends signed {@link RenewV1} frames: a
+ * plain ping to the slot primary from {@link SeekerKeepAlive.renew}, a `withdraw` tombstone to the admitting
+ * member (then the slot primary) from {@link SeekerKeepAlive.withdraw}.
  *
  * The walk calls `renew` on every hang-out wake (every `requery_interval_ms` on the poll path), so the
  * keep-alive throttles itself to one ping per `ttl / 3`, the substrate's renewal cadence; the `accepted`
  * register counts as the first keep-alive. Neither call throws: a failed keep-alive costs only the push
  * optimisation, never the walk.
  *
- * How a frame reaches the slot primary (a dial over the cohort-topic `register` protocol, or an
- * in-process hook when the slot primary is this node) is injected as {@link SeekerKeepAliveDeps.send}.
+ * How a frame reaches a member (a dial over the cohort-topic `register` protocol, or an
+ * in-process hook when that member is this node) is injected as {@link SeekerKeepAliveDeps.send}.
  */
 
 import {
@@ -40,10 +41,10 @@ export interface SeekerKeepAliveDeps {
 	/** Sign a {@link renewSigningPayload} image with the seeker's peer key; resolves the base64url signature. */
 	readonly sign: (payload: Uint8Array) => Promise<string>;
 	/**
-	 * Deliver `renew` to the slot primary `primary` (a peer-id string) and resolve its reply, or `undefined`
+	 * Deliver `renew` to the cohort member `member` (a peer-id string) and resolve its reply, or `undefined`
 	 * when no reply could be had (the sender logs why).
 	 */
-	readonly send: (primary: string, renew: RenewV1) => Promise<RenewReplyV1 | undefined>;
+	readonly send: (member: string, renew: RenewV1) => Promise<RenewReplyV1 | undefined>;
 	/** Logger (the transport binds its `matchmaking-query` namespace). */
 	readonly log: Log;
 }
@@ -52,6 +53,8 @@ export interface SeekerKeepAliveDeps {
 interface LiveRegistration {
 	readonly treeTier: number;
 	readonly correlationId: string;
+	/** Peer-id string of the member that admitted the register: it holds the record from the moment it accepted. */
+	readonly admittedBy: string;
 	/** Peer-id string of the member a renew goes to; follows `primary_moved`. */
 	primary: string;
 }
@@ -79,7 +82,7 @@ export class SeekerKeepAlive {
 	 * whose `primary_moved` names the slot primary.
 	 */
 	accepted(treeTier: number, correlationId: string, slotPrimary: string | undefined, routedMember: string): void {
-		this.live = { treeTier, correlationId, primary: this.memberPeerId(slotPrimary) ?? routedMember };
+		this.live = { treeTier, correlationId, admittedBy: routedMember, primary: this.memberPeerId(slotPrimary) ?? routedMember };
 		this.lastKeepAliveAt = Date.now();
 	}
 
@@ -106,9 +109,11 @@ export class SeekerKeepAlive {
 	}
 
 	/**
-	 * Send a `withdraw` tombstone for the live registration (any holder honours it) and forget the
-	 * registration. Best effort; without it the record ages out by TTL. A no-op with no live registration.
-	 * Never throws.
+	 * Send a `withdraw` tombstone for the live registration and forget the registration. Any holder honours a
+	 * withdraw and gossips the eviction, so it goes first to the member that admitted the register, which
+	 * holds the record even when the walk escalates before admission gossip reaches the slot primary; the slot
+	 * primary is tried only if that one did not withdraw it. Best effort; without it the record ages out by TTL.
+	 * A no-op with no live registration. Never throws.
 	 */
 	async withdraw(): Promise<void> {
 		const live = this.live;
@@ -117,10 +122,17 @@ export class SeekerKeepAlive {
 		}
 		this.live = undefined;
 		try {
-			const reply = await this.deps.send(live.primary, await this.frame(live, true));
-			if (reply !== undefined && reply.result !== "withdrawn") {
-				this.log("matchmaking withdraw at tier %d answered %s by %s; the record ages out by TTL", live.treeTier, reply.result, live.primary);
+			const frame = await this.frame(live, true);
+			for (const holder of new Set([live.admittedBy, live.primary])) {
+				const reply = await this.deps.send(holder, frame);
+				if (reply?.result === "withdrawn") {
+					return;
+				}
+				if (reply !== undefined) {
+					this.log("matchmaking withdraw at tier %d answered %s by %s", live.treeTier, reply.result, holder);
+				}
 			}
+			this.log("matchmaking withdraw at tier %d: no holder withdrew it; the record ages out by TTL", live.treeTier);
 		} catch (err) {
 			this.log("matchmaking withdraw failed (tier %d); the record ages out by TTL: %o", live.treeTier, err);
 		}

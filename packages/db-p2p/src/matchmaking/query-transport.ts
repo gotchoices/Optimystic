@@ -431,21 +431,21 @@ export function createLibp2pMatchmakingTransport(deps: Libp2pMatchmakingTranspor
 		return out;
 	};
 
-	/** Deliver a renew or withdraw to the slot primary: in process when that is this node, else over `/register`. */
-	const sendRenew = async (primary: string, renew: RenewV1): Promise<RenewReplyV1 | undefined> => {
+	/** Deliver a renew or withdraw to a cohort member: in process when that is this node, else over `/register`. */
+	const sendRenew = async (member: string, renew: RenewV1): Promise<RenewReplyV1 | undefined> => {
 		const what = renew.withdraw === true ? "matchmaking withdraw" : "matchmaking renew";
-		if (primary === selfPeerId) {
+		if (member === selfPeerId) {
 			if (selfServe?.renew === undefined) {
-				log("%s: the slot primary is this node and no selfServe.renew is bound; skipped", what);
+				log("%s: the cohort member to send it to is this node and no selfServe.renew is bound; skipped", what);
 				return undefined;
 			}
 			return selfServe.renew(renew);
 		}
 		try {
-			const frame = await requestResponse(node, peerIdFromString(primary), registerProtocol, encodeCohortMessage(renew, maxBytes), maxBytes);
+			const frame = await requestResponse(node, peerIdFromString(member), registerProtocol, encodeCohortMessage(renew, maxBytes), maxBytes);
 			return decodeRenewReplyV1(requireReply(frame, what), maxBytes);
 		} catch (err) {
-			log("%s: dial/decode failed for slot primary %s: %o", what, primary, err);
+			log("%s: dial/decode failed for cohort member %s: %o", what, member, err);
 			return undefined;
 		}
 	};
