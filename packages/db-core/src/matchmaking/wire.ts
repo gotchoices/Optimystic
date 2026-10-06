@@ -11,9 +11,10 @@
  *     which base64url-encodes them on the wire. They are therefore **not** length-framed here — the
  *     cohort-topic `RegisterV1` frame wraps them.
  *
- *  2. **Query-protocol messages** ({@link QueryV1} / {@link QueryReplyV1} / {@link AggregateCountV1})
- *     sent as standalone RPCs over the matchmaking application protocol. These ride the same
- *     length-prefixed UTF-8 JSON framing as cohort-topic messages ({@link encodeCohortMessage}).
+ *  2. **Standalone RPC messages** — the query protocol ({@link QueryV1} / {@link QueryReplyV1} /
+ *     {@link AggregateCountV1}) and the arrival push ({@link ArrivalPushV1} / {@link ArrivalPushAckV1})
+ *     — sent over the matchmaking application protocols. These ride the same length-prefixed UTF-8
+ *     JSON framing as cohort-topic messages ({@link encodeCohortMessage}).
  *
  * Conventions (matching the cohort-topic wire conventions): all JSON, byte fields base64url (no
  * padding), unix-millisecond timestamps, per-message structural validation on decode. Byte fidelity
@@ -34,10 +35,13 @@ import {
 	b64urlField,
 	b64urlFixedLen,
 	COORD_BYTES,
+	CORRELATION_BYTES,
 	failWire as fail,
 	optBool,
 	optFiniteNumber,
+	optString,
 	reqBool,
+	reqEnum,
 	reqFiniteNumber,
 	reqIntInRange,
 	reqString,
@@ -75,6 +79,15 @@ export interface SeekerAppPayloadV1 {
 	contactHint: string;
 	/** Opt into arrival pushes; default false (poll path). */
 	pushOnArrival?: boolean;
+	/**
+	 * The registration id an {@link ArrivalPushV1} is bound to, 16 bytes, base64url. Required when
+	 * `pushOnArrival` is `true`; accepted and ignored otherwise. Riding in the payload puts it in the
+	 * cohort's gossip-replicated record, so any member can derive the seeker's push binding after a
+	 * failover. Deliberately outside {@link seekerSigningPayload} (a forwarded {@link SeekerEntryV1}
+	 * does not carry it); it is still authenticated, because the cohort admits the payload only inside
+	 * a peer-key-signed `RegisterV1`, whose signing image covers `appPayload`.
+	 */
+	correlationId?: string;
 	/** base64url. */
 	signature: string;
 }
@@ -181,6 +194,44 @@ export interface AggregateBucketV1 {
 	count: number;
 }
 
+// --- Arrival push (cohort member → push-opted seeker) ---
+
+/**
+ * A cohort member's notification to a push-opted seeker that fresh matchable providers arrived
+ * (`docs/matchmaking.md` §Arrival push on provider arrival). Advisory, with the same trust model as
+ * {@link QueryReplyV1}: `signature` is the pushing member's single peer-key signature over
+ * {@link arrivalPushSigningPayload}, and the seeker re-validates every entry's `registrationSig`
+ * ({@link verifyProviderEntry}) before dialing.
+ */
+export interface ArrivalPushV1 {
+	v: 1;
+	/** Topic id, 32 bytes, base64url. */
+	topicId: string;
+	/** Cohort epoch the push was computed under, 32 bytes, base64url. */
+	cohortEpoch: string;
+	/** The seeker registration this push is bound to ({@link SeekerAppPayloadV1.correlationId}), 16 bytes, base64url. */
+	correlationId: string;
+	/** The fresh, filter-matched, coalesced batch: `1..QUERY_LIMIT_MAX` entries. */
+	providers: ProviderEntryV1[];
+	/** Current traffic snapshot, so the seeker can re-run its hang-out math without a poll. */
+	topicTraffic: TopicTrafficV1;
+	/** The pushing member's single peer-key signature (NOT threshold), base64url. */
+	signature: string;
+}
+
+/** The outcomes a seeker may report for an {@link ArrivalPushV1}. */
+export const ARRIVAL_PUSH_RESULTS = ["ok", "unknown_seeker"] as const;
+export type ArrivalPushResult = typeof ARRIVAL_PUSH_RESULTS[number];
+
+/**
+ * A seeker's reply to an {@link ArrivalPushV1}. `unknown_seeker` says the push's `correlationId` is not
+ * the seeker's current registration (it re-registered, or finished), so the pusher drops the binding.
+ */
+export interface ArrivalPushAckV1 {
+	v: 1;
+	result: ArrivalPushResult;
+}
+
 // --- matchmaking-local wire state (generic validation primitives live in cohort-topic/wire/primitives.js) ---
 
 const utf8Encoder = new TextEncoder();
@@ -247,6 +298,13 @@ export function validateSeekerAppPayloadV1(value: unknown): SeekerAppPayloadV1 {
 	const pushOnArrival = optBool(obj, "pushOnArrival", what);
 	if (pushOnArrival !== undefined) {
 		out.pushOnArrival = pushOnArrival;
+	}
+	const correlationId = optString(obj, "correlationId", what);
+	if (correlationId !== undefined) {
+		out.correlationId = b64urlFixedLen(correlationId, "correlationId", CORRELATION_BYTES, what);
+	}
+	if (out.pushOnArrival === true && out.correlationId === undefined) {
+		fail(`${what}: field "correlationId" is required when "pushOnArrival" is true`);
 	}
 	return out;
 }
@@ -433,6 +491,34 @@ export function validateAggregateCountV1(value: unknown): AggregateCountV1 {
 	};
 }
 
+/** Narrow an already-parsed value to {@link ArrivalPushV1}, throwing on any defect. */
+export function validateArrivalPushV1(value: unknown): ArrivalPushV1 {
+	const what = "ArrivalPushV1";
+	const obj = asObject(value, what);
+	requireV1(obj, what);
+	const providers = obj["providers"];
+	if (!Array.isArray(providers) || providers.length < 1 || providers.length > QUERY_LIMIT_MAX) {
+		fail(`${what}: field "providers" must be an array of 1..${QUERY_LIMIT_MAX} entries`);
+	}
+	return {
+		v: 1,
+		topicId: b64urlFixedLen(reqString(obj, "topicId", what), "topicId", COORD_BYTES, what),
+		cohortEpoch: b64urlFixedLen(reqString(obj, "cohortEpoch", what), "cohortEpoch", COORD_BYTES, what),
+		correlationId: b64urlFixedLen(reqString(obj, "correlationId", what), "correlationId", CORRELATION_BYTES, what),
+		providers: providers.map(validateProviderEntryV1),
+		topicTraffic: validateTopicTrafficV1(obj["topicTraffic"], `${what}.topicTraffic`),
+		signature: b64urlField(reqString(obj, "signature", what), "signature", what),
+	};
+}
+
+/** Narrow an already-parsed value to {@link ArrivalPushAckV1}, throwing on any defect. */
+export function validateArrivalPushAckV1(value: unknown): ArrivalPushAckV1 {
+	const what = "ArrivalPushAckV1";
+	const obj = asObject(value, what);
+	requireV1(obj, what);
+	return { v: 1, result: reqEnum(obj, "result", ARRIVAL_PUSH_RESULTS, what) };
+}
+
 /** Encode a {@link QueryV1} as a length-prefixed UTF-8 JSON frame. */
 export function encodeQueryV1(msg: QueryV1, maxMessageBytes: number = DEFAULT_MAX_MESSAGE_BYTES): Uint8Array {
 	return encodeCohortMessage(validateQueryV1(msg), maxMessageBytes);
@@ -461,6 +547,26 @@ export function encodeAggregateCountV1(msg: AggregateCountV1, maxMessageBytes: n
 /** Decode a length-prefixed {@link AggregateCountV1} frame. */
 export function decodeAggregateCountV1(bytes: Uint8Array, maxMessageBytes?: number): AggregateCountV1 {
 	return validateAggregateCountV1(decodeCohortMessage(bytes, maxMessageBytes));
+}
+
+/** Encode an {@link ArrivalPushV1} as a length-prefixed UTF-8 JSON frame. */
+export function encodeArrivalPushV1(msg: ArrivalPushV1, maxMessageBytes: number = DEFAULT_MAX_MESSAGE_BYTES): Uint8Array {
+	return encodeCohortMessage(validateArrivalPushV1(msg), maxMessageBytes);
+}
+
+/** Decode a length-prefixed {@link ArrivalPushV1} frame. */
+export function decodeArrivalPushV1(bytes: Uint8Array, maxMessageBytes?: number): ArrivalPushV1 {
+	return validateArrivalPushV1(decodeCohortMessage(bytes, maxMessageBytes));
+}
+
+/** Encode an {@link ArrivalPushAckV1} as a length-prefixed UTF-8 JSON frame. */
+export function encodeArrivalPushAckV1(msg: ArrivalPushAckV1, maxMessageBytes: number = DEFAULT_MAX_MESSAGE_BYTES): Uint8Array {
+	return encodeCohortMessage(validateArrivalPushAckV1(msg), maxMessageBytes);
+}
+
+/** Decode a length-prefixed {@link ArrivalPushAckV1} frame. */
+export function decodeArrivalPushAckV1(bytes: Uint8Array, maxMessageBytes?: number): ArrivalPushAckV1 {
+	return validateArrivalPushAckV1(decodeCohortMessage(bytes, maxMessageBytes));
 }
 
 // --- canonical participant-signature payloads (provider/seeker registration sigs) ---
@@ -558,16 +664,34 @@ export function queryReplySigningPayload(reply: Omit<QueryReplyV1, "signature">)
 		reply.v,
 		reply.cohortEpoch,
 		reply.truncated,
-		[
-			reply.topicTraffic.windowSeconds,
-			reply.topicTraffic.arrivalsPerMin,
-			reply.topicTraffic.queriesPerMin,
-			reply.topicTraffic.directParticipants,
-			reply.topicTraffic.childCohortCount,
-		],
+		topicTrafficImage(reply.topicTraffic),
 		(reply.providers ?? []).map((p) => p.participantId),
 		(reply.seekers ?? []).map((s) => s.participantId),
 	]));
+}
+
+/**
+ * Canonical signed byte image of an {@link ArrivalPushV1} — the pushing member's single-member
+ * signature, mirroring {@link queryReplySigningPayload}. It binds the topic, epoch, the seeker
+ * registration the push is addressed to, the traffic snapshot, and the providers' participant ids
+ * (order-sensitive); the per-entry signatures stay outside it, since the seeker re-validates each entry
+ * on its own ({@link verifyProviderEntry}).
+ */
+export function arrivalPushSigningPayload(unsigned: Omit<ArrivalPushV1, "signature">): Uint8Array {
+	return utf8Encoder.encode(JSON.stringify([
+		"ArrivalPushV1",
+		unsigned.v,
+		unsigned.topicId,
+		unsigned.cohortEpoch,
+		unsigned.correlationId,
+		topicTrafficImage(unsigned.topicTraffic),
+		unsigned.providers.map((p) => p.participantId),
+	]));
+}
+
+/** The traffic snapshot as an explicitly ordered array, shared by the single-member signing images. */
+function topicTrafficImage(t: TopicTrafficV1): number[] {
+	return [t.windowSeconds, t.arrivalsPerMin, t.queriesPerMin, t.directParticipants, t.childCohortCount];
 }
 
 // --- aggregate-count log-bucketing + canonical threshold-signing image (multi-cohort sweep) ---

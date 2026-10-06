@@ -23,6 +23,12 @@ import { b64urlToBytes } from "./codec.js";
  */
 export const COORD_BYTES = 32;
 
+/**
+ * Correlation-id byte width: the 16-byte nonce the cohort-topic substrate mints per walk probe / renew,
+ * and the matchmaking seeker registration id an arrival push is bound to.
+ */
+export const CORRELATION_BYTES = 16;
+
 /** Thrown for any malformed, oversized, or structurally invalid cohort-topic frame. */
 export class CohortWireError extends Error {
 	constructor(message: string) {

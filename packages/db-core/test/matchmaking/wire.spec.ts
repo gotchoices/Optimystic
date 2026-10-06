@@ -10,6 +10,10 @@ import {
 	decodeQueryReplyV1,
 	encodeAggregateCountV1,
 	decodeAggregateCountV1,
+	encodeArrivalPushV1,
+	decodeArrivalPushV1,
+	encodeArrivalPushAckV1,
+	decodeArrivalPushAckV1,
 	providerSigningPayload,
 	seekerSigningPayload,
 	DEFAULT_MAX_APP_PAYLOAD_BYTES,
@@ -21,6 +25,9 @@ import type {
 	QueryV1,
 	QueryReplyV1,
 	AggregateCountV1,
+	ArrivalPushV1,
+	ArrivalPushAckV1,
+	ProviderEntryV1,
 } from '../../src/matchmaking/index.js';
 import { bytesToB64url, encodeCohortMessage } from '../../src/cohort-topic/wire/codec.js';
 import { CohortWireError } from '../../src/cohort-topic/wire/validate.js';
@@ -53,6 +60,7 @@ const sampleSeeker = (): SeekerAppPayloadV1 => ({
 	filter: { must: ['pdf-render'], mustNot: ['deprecated'], minBudget: 1 },
 	contactHint: '/ip4/10.0.0.2/tcp/4001/p2p/12D3KooWSeeker',
 	pushOnArrival: true,
+	correlationId: b64(16, 16),
 	signature: b64(64, 2),
 });
 
@@ -95,6 +103,25 @@ const sampleQueryReply = (): QueryReplyV1 => ({
 	signature: b64(64, 8),
 });
 
+const pushEntry = (i: number): ProviderEntryV1 => ({
+	participantId: `12D3KooWP${i}`,
+	capabilities: ['pdf-render'],
+	capacityBudget: 1,
+	contactHint: `/ip4/10.0.1.${i % 256}/tcp/4001`,
+	attachedAt: 1_700_000_003_000 + i,
+	registrationSig: b64(64, 100 + i),
+});
+
+const sampleArrivalPush = (): ArrivalPushV1 => ({
+	v: 1,
+	topicId: b64(32, 17),
+	cohortEpoch: b64(32, 18),
+	correlationId: b64(16, 19),
+	providers: [pushEntry(1), pushEntry(2)],
+	topicTraffic: { windowSeconds: 60, arrivalsPerMin: 12, queriesPerMin: 1, directParticipants: 9, childCohortCount: 0 },
+	signature: b64(64, 20),
+});
+
 const sampleAggregate = (): AggregateCountV1 => ({
 	v: 1,
 	topicId: b64(32, 9),
@@ -127,11 +154,16 @@ describe('matchmaking wire', () => {
 		});
 
 		it('round-trips a seeker payload without optional filter/pushOnArrival', () => {
-			const { filter: _f, pushOnArrival: _p, ...minimal } = sampleSeeker();
+			const { filter: _f, pushOnArrival: _p, correlationId: _c, ...minimal } = sampleSeeker();
 			const decoded = decodeSeekerAppPayload(encodeSeekerAppPayload(minimal));
 			expect(decoded).to.not.have.property('filter');
 			expect(decoded).to.not.have.property('pushOnArrival');
 			expect(decoded).to.deep.equal(minimal);
+		});
+
+		it('rejects a push-opted seeker payload without a correlationId', () => {
+			const { correlationId: _c, ...bad } = sampleSeeker();
+			expect(() => decodeSeekerAppPayload(new TextEncoder().encode(JSON.stringify(bad)))).to.throw(CohortWireError, /correlationId/);
 		});
 
 		it('preserves capacityBudget = 0 (listed-but-full) exactly', () => {
@@ -247,6 +279,48 @@ describe('matchmaking wire', () => {
 				expect(() => decodeAggregateCountV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /cohortEpoch/);
 			});
 		}
+	});
+
+	describe('arrival push (length-framed)', () => {
+		it('round-trips an ArrivalPush byte-stably', () => {
+			const once = encodeArrivalPushV1(sampleArrivalPush());
+			const decoded = decodeArrivalPushV1(once);
+			expect(decoded).to.deep.equal(sampleArrivalPush());
+			expect([...encodeArrivalPushV1(decoded)]).to.deep.equal([...once]);
+		});
+
+		it('round-trips an ArrivalPushAck byte-stably', () => {
+			const ack: ArrivalPushAckV1 = { v: 1, result: 'unknown_seeker' };
+			const once = encodeArrivalPushAckV1(ack);
+			const decoded = decodeArrivalPushAckV1(once);
+			expect(decoded).to.deep.equal(ack);
+			expect([...encodeArrivalPushAckV1(decoded)]).to.deep.equal([...once]);
+		});
+
+		it('rejects a push carrying no providers', () => {
+			const bad = { ...sampleArrivalPush(), providers: [] };
+			expect(() => decodeArrivalPushV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /providers/);
+		});
+
+		it('rejects a push carrying more than query_limit_max providers', () => {
+			const bad = { ...sampleArrivalPush(), providers: Array.from({ length: QUERY_LIMIT_MAX + 1 }, (_, i) => pushEntry(i)) };
+			expect(() => decodeArrivalPushV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /providers/);
+		});
+
+		it('rejects a wrong-length topicId', () => {
+			const bad = { ...sampleArrivalPush(), topicId: b64(31, 21) };
+			expect(() => decodeArrivalPushV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /topicId/);
+		});
+
+		it('rejects a wrong-length correlationId', () => {
+			const bad = { ...sampleArrivalPush(), correlationId: b64(32, 22) };
+			expect(() => decodeArrivalPushV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /correlationId/);
+		});
+
+		it('rejects an unknown ack result', () => {
+			const bad = { v: 1 as const, result: 'rejected' };
+			expect(() => decodeArrivalPushAckV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /result/);
+		});
 	});
 
 	describe('byte fidelity', () => {

@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import { sha256 } from '@noble/hashes/sha2.js';
 import {
 	bytesToB64url,
+	DEFAULT_HANG_OUT_CONFIG,
 	matchTopicId,
 	providerSigningPayload,
 	type CapabilityFilter,
@@ -275,7 +276,7 @@ describe('matchmaking / seeker walk client', () => {
 			wantCount: 8,
 			dMax: 0,
 			patienceMs: 1_000,
-			config: { contentionFactorCap: 4.0, requeryIntervalMs: 500 },
+			config: { ...DEFAULT_HANG_OUT_CONFIG, requeryIntervalMs: 500 },
 		}).run();
 		expect(result.metWantCount).to.equal(false);
 		expect(h.sleeps).to.deep.equal([500, 500]);

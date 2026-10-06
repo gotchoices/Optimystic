@@ -10,8 +10,9 @@
  * The TTL/limit constants are wire-stable and do **not** depend on simulator findings; the hang-out
  * rows DO (folded via `fold-simulator-findings-into-design-docs`) — they carry the simulator-validated
  * defaults (`contention_factor_cap = 4.0`, `mean_want_count = 3`, …; see `docs/matchmaking.md`
- * §Configuration "Defaults validated by simulator"). The `push_*` rows belong to the arrival-push
- * path (a separate slice) and are intentionally not modeled here.
+ * §Configuration "Defaults validated by simulator"). Of the arrival-push rows, `push_safety_poll_ms` is
+ * seeker-side and lives on {@link HangOutConfig}; `push_coalesce_ms` is the one cohort-side knob and
+ * lives on {@link ArrivalPushConfig}.
  */
 
 import type { NodeProfile } from "../cohort-topic/tiers.js";
@@ -61,12 +62,26 @@ export interface HangOutConfig {
 	readonly contentionFactorCap: number;
 	/** Hang-out poll cadence on the non-push path. */
 	readonly requeryIntervalMs: number;
+	/** Sparse safety-poll cadence beneath the pushes, for a seeker that set `pushOnArrival`. */
+	readonly pushSafetyPollMs: number;
 }
 
 /** The default hang-out decision config (simulator-validated). */
 export const DEFAULT_HANG_OUT_CONFIG: HangOutConfig = {
 	contentionFactorCap: CONTENTION_FACTOR_CAP,
 	requeryIntervalMs: REQUERY_INTERVAL_MS,
+	pushSafetyPollMs: PUSH_SAFETY_POLL_MS,
+};
+
+/** Cohort-side arrival-push tuning (`docs/matchmaking.md` §Coalescing). */
+export interface ArrivalPushConfig {
+	/** Window the pushing member batches fresh matchable arrivals per seeker before flushing one push. */
+	readonly coalesceMs: number;
+}
+
+/** The default arrival-push config. */
+export const DEFAULT_ARRIVAL_PUSH_CONFIG: ArrivalPushConfig = {
+	coalesceMs: PUSH_COALESCE_MS,
 };
 
 /** The full matchmaking config, with the documented defaults. */

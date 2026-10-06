@@ -15,6 +15,7 @@
  */
 
 import { randomBytes } from "@noble/hashes/utils.js";
+import { bytesToB64url } from "../cohort-topic/wire/codec.js";
 import { seekerSigningPayload, type CapabilityFilter, type SeekerAppPayloadV1, encodeSeekerAppPayload } from "./wire.js";
 
 /** Construction inputs for a {@link MatchmakingSeeker}. */
@@ -27,11 +28,14 @@ export interface MatchmakingSeekerOptions {
 	readonly contactHint: string;
 	/** Optional capability filter (evaluated cohort-side in the next ticket; carried here). */
 	readonly filter?: CapabilityFilter;
-	/** Opt into arrival pushes; default false (poll path). Consumed by the next ticket. */
+	/** Opt into arrival pushes; default false (poll path). */
 	readonly pushOnArrival?: boolean;
 	/** Sign the canonical registration image; resolves the base64url signature. */
 	readonly sign: (payload: Uint8Array) => Promise<string>;
-	/** 16-byte registration correlation id (not signature-bound); default fresh CSPRNG bytes. */
+	/**
+	 * 16-byte registration correlation id (not signature-bound); default fresh CSPRNG bytes. Sent in the
+	 * payload when `pushOnArrival` is set, as the id arrival pushes are bound to.
+	 */
 	readonly correlationId?: Uint8Array;
 	/** CSPRNG source (injectable for deterministic tests). Default `@noble/hashes` `randomBytes`. */
 	readonly randomBytes?: (n: number) => Uint8Array;
@@ -75,6 +79,9 @@ export class MatchmakingSeeker {
 		}
 		if (this.pushOnArrival !== undefined) {
 			payload.pushOnArrival = this.pushOnArrival;
+		}
+		if (this.pushOnArrival === true) {
+			payload.correlationId = bytesToB64url(this.correlationId);
 		}
 		return payload;
 	}

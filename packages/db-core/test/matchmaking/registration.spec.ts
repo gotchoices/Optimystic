@@ -114,6 +114,7 @@ describe('matchmaking / seeker state', () => {
 		expect(decoded.wantCount).to.equal(8);
 		expect(decoded.filter).to.deep.equal({ must: ['eligible'], mustNot: [] });
 		expect(decoded.pushOnArrival).to.equal(true);
+		expect(decoded.correlationId).to.equal(bytesToB64url(seededBytes(16, 2)));
 	});
 
 	it('rejects wantCount below 1', () => {

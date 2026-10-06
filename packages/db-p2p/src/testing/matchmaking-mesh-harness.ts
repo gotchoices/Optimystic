@@ -34,6 +34,7 @@
 
 import { Tier, providerTtlForProfile } from '@optimystic/db-core';
 import {
+	DEFAULT_HANG_OUT_CONFIG,
 	MatchmakingProvider,
 	MatchmakingSeeker,
 	matchTopicId,
@@ -440,7 +441,7 @@ export class MatchmakingMesh {
 			clock: vt.clock,
 			sleep: vt.sleep,
 			...(opts.filter !== undefined ? { filter: opts.filter } : {}),
-			...(opts.requeryIntervalMs !== undefined ? { config: { contentionFactorCap: 4.0, requeryIntervalMs: opts.requeryIntervalMs } } : {}),
+			...(opts.requeryIntervalMs !== undefined ? { config: { ...DEFAULT_HANG_OUT_CONFIG, requeryIntervalMs: opts.requeryIntervalMs } } : {}),
 		});
 		const result = await client.run();
 		return {

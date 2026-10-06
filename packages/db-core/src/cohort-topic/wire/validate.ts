@@ -16,6 +16,7 @@ import {
 	b64urlField,
 	b64urlFixedLen,
 	COORD_BYTES,
+	CORRELATION_BYTES,
 	failWire as fail,
 	optBool,
 	optFiniteNumber,
@@ -77,9 +78,6 @@ function treeTier(value: number, what: string): number {
 	}
 	return value;
 }
-
-/** Correlation-id byte width (a 16-byte nonce minted per walk probe / renew). */
-const CORRELATION_BYTES = 16;
 
 /**
  * Ceiling on a decoded `rootKey` (the root key of a root-placed topic). A root key is a block's routing

@@ -522,6 +522,12 @@ On a fresh matchable arrival, the primary notifies the **`min(provider.capacityB
 
 A fresh arrival with `capacityBudget == 0` is skipped entirely — a "listed but full" provider ([§Provider self-throttling](#provider-self-throttling)) is not a new matchable slot.
 
+**Who computes the set, and who sends.** The set is a pure function of the cohort's gossip-replicated records (`selectArrivalPushTargets` in `packages/db-core/src/matchmaking/arrival-push.ts`), so every member computes the same one: push-opted seekers that carry a `correlationId`, match the provider's filter, and attached no later than the provider; sorted by `attachedAt`, ties by `participantId`; the first `capacityBudget` of them. Each member then delivers only to the selected seekers whose slot primary it is, so the cohort as a whole notifies `capacityBudget` seekers, not `capacityBudget` per member. A seeker's push binding — its `contactHint`, filter, `wantCount`, `correlationId` and `attachedAt` — travels in its signed registration payload and so in the replicated record; only the per-seeker "already pushed" set and the coalescing batch are local to the pushing member, which is why a failover needs no new replication.
+
+**A provider is not pushed to a seeker that attached after it.** That provider was already answerable by the seeker's own first `QueryV1`. Without the rule, a member that receives the whole record set at once — a new member catching up by gossip, or one pulling records in a rotation handoff — would see every existing provider as an arrival and push it to every seeker. A provider the rule misses is still found by the seeker's safety poll.
+
+The ranking reads only replicated state, so it cannot see which seekers are already satisfied, have finished their walk, or answered `unknown_seeker` to their own primary. Such a seeker keeps a fan-out slot until its record leaves the cohort (it withdraws on finish, or its `seeker_ttl` expires), under-filling that arrival's fan-out; members whose gossip views differ can likewise over- or under-fill by a few. Both are accepted: excluding them would mean gossiping per-seeker push state, and the safety poll covers what is missed.
+
 ### Coalescing — per-seeker batch over a short window
 
 The primary accumulates fresh matchable arrivals per target seeker and flushes **one** `ArrivalPushV1` carrying the batch, rather than one push per (arrival × seeker). A flush fires when either a `push_coalesce_ms` timer (default 250 ms) elapses **or** the batch reaches the seeker's outstanding need (`wantCount −` matches already pushed). This collapses an arrival burst to ≤ one push per seeker per window.
@@ -545,6 +551,7 @@ Because the same fresh provider can surface in both a push and a later safety/fi
 
 - **Renewal vs. fresh arrival.** Only a *fresh* provider registration (a `participantId` not previously held for this topic at this cohort) triggers a push; a renewal of an already-known provider must not — seekers already saw it. Because `arrivalsPerMin` combines fresh registrations and renewals ([cohort-topic.md §Topic traffic signal](cohort-topic.md#topic-traffic-signal)), the trigger keys off the record set transitioning absent→present, **not** off the arrivals counter.
 - **`capacityBudget == 0` arrival.** Skipped (listed-but-full is not a new slot).
+- **Provider attached before the seeker.** Not pushed to that seeker (it was answerable by the seeker's own first query); a provider attached at the same instant is eligible. See [§Fairness](#fairness--fcfs-by-attachedat-fan-out-bounded-by-capacitybudget).
 - **Filter miss.** A fresh arrival that fails a seeker's `filter` produces no push to that seeker and does not count toward fan-out.
 - **`minBudget` filter vs. fan-out.** A seeker whose `filter.minBudget` exceeds the arriving provider's `capacityBudget` is not a match — excluded from both the matching set and the FCFS fan-out count.
 - **Burst exceeding remaining need.** Several providers arriving within one coalesce window are carried in one batched push; the seeker dials up to its outstanding `wantCount`.
@@ -668,6 +675,8 @@ interface SeekerAppPayloadV1 {
   filter?:        CapabilityFilter
   contactHint:    string
   pushOnArrival?: boolean             // NEW — opt into arrival pushes; default false (poll path)
+  correlationId?: string              // 16 bytes — the id arrival pushes are bound to; required when
+                                      //   pushOnArrival is true, ignored otherwise; not in the signed image
   signature:      string              // base64url, over (topicId, wantCount) — see the signing-scope note below
 }
 
@@ -735,6 +744,10 @@ The query reply is signed by the cohort primary (single-member signature, not th
 > verification: `verifyProviderEntry` / `verifySeekerEntry`
 > (`packages/db-core/src/matchmaking/wire.ts`; spec `entry-verify.spec.ts` covers the
 > sign → forward → verify round trip and tamper rejection).
+>
+> The seeker payload's own `correlationId` (the arrival-push binding) is outside the signed image for
+> the same reason. It is still authenticated: the cohort admits an `appPayload` only inside a `RegisterV1`
+> the participant peer-key signed, and `registerSigningPayload` covers `appPayload`.
 
 ### Arrival push (cohort-primary → seeker)
 
@@ -747,12 +760,13 @@ A seeker that set `pushOnArrival` receives arrival notifications over a dedicate
 ```
 interface ArrivalPushV1 {
   v:            1
-  topicId:      string
+  topicId:      string                // 32 bytes
   cohortEpoch:  string                // 32 bytes
-  correlationId: string            // the seeker registration this push is bound to; a
+  correlationId: string            // 16 bytes — the seeker registration this push is bound to
+                                   //   (SeekerAppPayloadV1.correlationId); a
                                    //   seeker that has since re-registered under a new
                                    //   correlationId acks unknown_seeker (see §Edge cases)
-  providers:    ProviderEntryV1[]   // fresh, filter-matched, coalesced batch
+  providers:    ProviderEntryV1[]   // fresh, filter-matched, coalesced batch; 1..query_limit_max
   topicTraffic: TopicTrafficV1      // current snapshot — lets the seeker re-run its
                                     //   hang-out math and observe childCohortCount>0
                                     //   (promotion → descend) without a separate poll
@@ -769,6 +783,8 @@ interface ArrivalPushAckV1 {
 ```
 
 Folding `topicTraffic` into the push means a hanging-out seeker re-evaluates hang-out-vs-continue (and sees promotion via `childCohortCount`) on every push, so the structural-change handling the poll loop got for free is preserved. See [§Arrival push on provider arrival](#arrival-push-on-provider-arrival) for fairness, coalescing, and failure semantics.
+
+Codecs and validation are `ArrivalPushV1` and `ArrivalPushAckV1` in `packages/db-core/src/matchmaking/wire.ts`. The push's signed image (`arrivalPushSigningPayload`) mirrors the query reply's: an explicitly ordered array of `v`, `topicId`, `cohortEpoch`, `correlationId`, the traffic fields, and the providers' participant ids in order — the per-entry signatures stay outside it, since the seeker re-validates each entry on its own.
 
 ### Aggregated provider counts (root cohort, multi-cohort sweep)
 
