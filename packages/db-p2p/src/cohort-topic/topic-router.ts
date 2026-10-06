@@ -8,6 +8,7 @@ import { bytesToPeerId } from "./peer-codec.js";
 import { requestResponse, requireReply, DEFAULT_STREAM_MAX_BYTES, type NoResultReplyError } from "./stream-util.js";
 import { PROTOCOL_COHORT_REGISTER } from "./protocols.js";
 import { createLogger } from "../logger.js";
+import type { StreamOpenDeadlines } from "../rpc-deadline.js";
 
 const log = createLogger("cohort-topic");
 
@@ -43,6 +44,8 @@ export interface FretTopicRouterOptions {
 	readonly selfPeerId?: string;
 	/** The `/register` body this node runs for a frame addressed to itself (see {@link selfPeerId}). */
 	readonly handleLocally?: (activity: Uint8Array) => Promise<Uint8Array>;
+	/** The stream-open delays for the direct dials (`requestResponse` in `stream-util.ts`); the node's where the host has them. */
+	readonly streamOpen?: StreamOpenDeadlines;
 }
 
 /**
@@ -75,6 +78,7 @@ export class FretTopicRouter implements ITopicRouter {
 	private readonly clock: () => number;
 	private readonly selfPeerId: string | undefined;
 	private readonly handleLocally: ((activity: Uint8Array) => Promise<Uint8Array>) | undefined;
+	private readonly streamOpen: StreamOpenDeadlines | undefined;
 	readonly routeToRoot?: (rootKey: Uint8Array, activity: Uint8Array) => Promise<Uint8Array>;
 
 	constructor(private readonly node: Libp2p, private readonly fret: FretService, options: FretTopicRouterOptions = {}) {
@@ -84,6 +88,7 @@ export class FretTopicRouter implements ITopicRouter {
 		this.clock = options.clock ?? ((): number => Date.now());
 		this.selfPeerId = options.selfPeerId;
 		this.handleLocally = options.handleLocally;
+		this.streamOpen = options.streamOpen;
 		const rootGroupMembers = options.rootGroupMembers;
 		if (rootGroupMembers !== undefined) {
 			this.routeToRoot = (rootKey, activity): Promise<Uint8Array> => this.dialRootGroup(rootGroupMembers, rootKey, activity);
@@ -126,7 +131,7 @@ export class FretTopicRouter implements ITopicRouter {
 	 */
 	async dialMember(member: PeerRef, activity: Uint8Array): Promise<Uint8Array> {
 		const peer = bytesToPeerId(member.id);
-		const reply = await requestResponse(this.node, peer, this.registerProtocol, activity, this.maxBytes);
+		const reply = await requestResponse(this.node, peer, this.registerProtocol, activity, this.maxBytes, this.streamOpen);
 		return requireReply(reply, "cohort-topic register dial");
 	}
 
@@ -145,7 +150,7 @@ export class FretTopicRouter implements ITopicRouter {
 				return this.handleLocally(activity);
 			}
 			try {
-				const reply = await requestResponse(this.node, peerIdFromString(peerStr), this.registerProtocol, activity, this.maxBytes);
+				const reply = await requestResponse(this.node, peerIdFromString(peerStr), this.registerProtocol, activity, this.maxBytes, this.streamOpen);
 				if (reply !== undefined) {
 					return reply;
 				}

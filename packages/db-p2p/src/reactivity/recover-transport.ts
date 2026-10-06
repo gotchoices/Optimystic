@@ -67,6 +67,7 @@ import { peerIdToBytes, bytesToPeerIdString } from "../cohort-topic/peer-codec.j
 import { PROTOCOL_REACTIVITY_RECOVER } from "./protocols.js";
 import type { ResumeTransport } from "./subscription-manager.js";
 import { createLogger } from "../logger.js";
+import type { StreamOpenDeadlines } from "../rpc-deadline.js";
 
 const log = createLogger("reactivity-recover");
 
@@ -143,10 +144,18 @@ export interface RecoverDialer {
 	exchange(target: string, frame: Uint8Array): Promise<Uint8Array | undefined>;
 }
 
-/** Build the production libp2p-backed {@link RecoverDialer} over {@link requestResponse}. */
-export function createLibp2pRecoverDialer(node: Libp2p, recoverProtocol: string = PROTOCOL_REACTIVITY_RECOVER, maxBytes: number = DEFAULT_STREAM_MAX_BYTES): RecoverDialer {
+/**
+ * Build the production libp2p-backed {@link RecoverDialer} over {@link requestResponse}. `streamOpen` is
+ * the stream-open delays each exchange dials under: the node's `LinkDeadlines` where the host has them.
+ */
+export function createLibp2pRecoverDialer(
+	node: Libp2p,
+	recoverProtocol: string = PROTOCOL_REACTIVITY_RECOVER,
+	maxBytes: number = DEFAULT_STREAM_MAX_BYTES,
+	streamOpen?: StreamOpenDeadlines,
+): RecoverDialer {
 	return {
-		exchange: (target, frame) => requestResponse(node, peerIdFromString(target), recoverProtocol, frame, maxBytes),
+		exchange: (target, frame) => requestResponse(node, peerIdFromString(target), recoverProtocol, frame, maxBytes, streamOpen),
 	};
 }
 

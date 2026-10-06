@@ -196,6 +196,7 @@ import { DEFAULT_COHORT_TOPIC_PROTOCOLS, cohortTopicProtocolList, type CohortTop
 import { readFrame, requestResponse, requireReply, DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
 import { createLogger } from "../logger.js";
 import { unrefTimer } from "../unref-timer.js";
+import type { StreamOpenDeadlines } from "../rpc-deadline.js";
 
 const log = createLogger("cohort-topic");
 
@@ -212,6 +213,12 @@ export interface CohortTopicHostOptions {
 	readonly fanout?: number;
 	/** Per-frame ceiling. Default {@link DEFAULT_STREAM_MAX_BYTES}. */
 	readonly maxBytes?: number;
+	/**
+	 * The hedge and dead-connection delays every dial this host makes (register, membership fetch,
+	 * gossip, `/sign`) opens its stream under — the node's `LinkDeadlines`, which `libp2p-node-base.ts`
+	 * passes. Omitted, the undeclared defaults (`UNDECLARED_STREAM_OPEN_DEADLINES` in `rpc-deadline.ts`).
+	 */
+	readonly streamOpen?: StreamOpenDeadlines;
 	/**
 	 * Gossip-round cadence in ms (the periodic driver tick). Default {@link DEFAULT_GOSSIP_INTERVAL_MS}
 	 * (~one round). Each tick drives every live {@link CoordEngine}'s gossip broadcast, TTL sweep,
@@ -923,6 +930,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	const minSigs = options.minSigs ?? DEFAULT_MIN_SIGS;
 	const fanout = options.fanout ?? 16;
 	const maxBytes = options.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
+	const streamOpen = options.streamOpen;
 	const gossipIntervalMs = options.gossipIntervalMs ?? DEFAULT_GOSSIP_INTERVAL_MS;
 	const willingnessHeartbeatMs = options.willingnessHeartbeatMs ?? DEFAULT_WILLINGNESS_HEARTBEAT_MS;
 	const coldQuorumWaitMs = options.coldQuorumWaitMs ?? DEFAULT_COLD_QUORUM_WAIT_MS;
@@ -983,6 +991,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	const router = new FretTopicRouter(node, fret, {
 		registerProtocol: protocols.register,
 		maxBytes,
+		streamOpen,
 		...(rootGroup === undefined ? {} : {
 			rootGroupMembers: (rootKey: Uint8Array): Promise<readonly string[]> =>
 				rootGroup.snapshots.ensure(addressing.rootCoord(rootKey)).then((snapshot) => snapshot.memberStrs),
@@ -991,11 +1000,12 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		}),
 	});
 	const sizeEstimator = new FretSizeEstimator(fret);
-	const gossipTransport = new FretCohortGossipTransport(node, resolver, { gossipProtocol: protocols.gossip, wants: wantK, selfPeerId: selfPeerStr });
+	const gossipTransport = new FretCohortGossipTransport(node, resolver, { gossipProtocol: protocols.gossip, wants: wantK, selfPeerId: selfPeerStr, streamOpen });
 	const membershipSource = new FretMembershipSource(node, resolver, {
 		membershipProtocol: protocols.membership,
 		wants: wantK,
 		maxBytes,
+		streamOpen,
 		// A root-placed cert is fetched from the root group, read through the same snapshot the anchor judges by.
 		...(rootGroup === undefined ? {} : {
 			rootGroupPeers: (coord: RingCoord): Promise<readonly string[]> => rootGroup.snapshots.ensure(coord).then((snapshot) => snapshot.memberStrs),
@@ -1017,7 +1027,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// Collect one cohort member's `/sign` endorsement over the new fifth protocol. The `/sign` responder always
 	// writes a frame, so a no-result reply is a non-conforming peer: reject, and `collectFrom` counts no signature.
 	const dialSign = async (peerIdStr: string, request: SignRequestV1): Promise<SignReplyV1> => {
-		const reply = await requestResponse(node, peerIdFromString(peerIdStr), protocols.sign, encodeCohortMessage(request, maxBytes), maxBytes);
+		const reply = await requestResponse(node, peerIdFromString(peerIdStr), protocols.sign, encodeCohortMessage(request, maxBytes), maxBytes, streamOpen);
 		return validateSignReplyV1(decodeCohortMessage(requireReply(reply, "cohort sign"), maxBytes));
 	};
 

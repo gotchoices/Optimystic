@@ -31,6 +31,7 @@ import type { Uint8ArrayList } from "uint8arraylist";
 import { readFramed, sendFramed } from "p2p-fret";
 import { openProtocolStream } from "../network/open-protocol-stream.js";
 import { registerProtocolHandler } from "../network/register-protocol-handler.js";
+import type { StreamOpenDeadlines } from "../rpc-deadline.js";
 
 /** Default per-frame ceiling — matches FRET's 512 KiB maybe-act bound. */
 export const DEFAULT_STREAM_MAX_BYTES = 512 * 1024;
@@ -56,12 +57,16 @@ export function readFrame(source: FrameSource, maxBytes: number): Promise<Uint8A
  * protocol always carries a reply. Genuine failures still reject — a dial failure, a stream the peer
  * aborted (`FrameTruncationError`), an over-ceiling reply (`PayloadTooLargeError`).
  *
+ * `streamOpen` is the hedge and dead-connection delays the open runs under: the node's
+ * `LinkDeadlines` where the caller has them (the cohort-topic host and the reactivity transports are
+ * handed theirs by `libp2p-node-base.ts`), and the undeclared defaults otherwise.
+ *
  * NOTE: takes no `AbortSignal`, so a caller cannot set its own deadline. Bounded today anyway —
- * `readFramed` self-times-out at 5s and `dialProtocol` falls back to libp2p's default dial
- * timeout (~30s) — so an unresponsive peer is slow, not hung. If a caller ever needs a tighter
- * deadline (`membership-source.fetch` walks candidate peers *sequentially*, so its worst case is
- * peers × dial-timeout), pass one through {@link openProtocolStream}'s `signal` the way
- * `libp2p-key-network.ts#connect` does.
+ * `readFramed` self-times-out at 5s, an open on an existing connection is bounded by the
+ * dead-connection delay and a fresh dial by libp2p's dial timeout — so an unresponsive peer is slow,
+ * not hung. If a caller ever needs a tighter deadline (`membership-source.fetch` walks candidate
+ * peers *sequentially*, so its worst case is peers × dial-timeout), pass one through
+ * {@link openProtocolStream}'s `signal` the way `libp2p-key-network.ts#connect` does.
  */
 export async function requestResponse(
 	node: Libp2p,
@@ -69,11 +74,12 @@ export async function requestResponse(
 	protocol: string,
 	frame: Uint8Array,
 	maxBytes = DEFAULT_STREAM_MAX_BYTES,
+	streamOpen?: StreamOpenDeadlines,
 ): Promise<Uint8Array | undefined> {
 	let stream: Stream | undefined;
 	try {
 		// `negotiateFully` deliberately omitted — see the accepted tradeoff in the module docblock.
-		stream = await openProtocolStream(node, peer, protocol);
+		stream = await openProtocolStream(node, peer, protocol, { deadlines: streamOpen });
 		sendFramed(stream, frame);
 		await stream.close();
 		const reply = await readFrame(stream, maxBytes);
@@ -111,12 +117,15 @@ export function requireReply(reply: Uint8Array | undefined, context: string): Ui
 	return reply;
 }
 
-/** Open `protocol` to `peer` and send `frame` without awaiting a reply (fire-and-forget gossip). */
-export async function sendOneWay(node: Libp2p, peer: PeerId, protocol: string, frame: Uint8Array): Promise<void> {
+/**
+ * Open `protocol` to `peer` and send `frame` without awaiting a reply (fire-and-forget gossip).
+ * `streamOpen` as on {@link requestResponse}.
+ */
+export async function sendOneWay(node: Libp2p, peer: PeerId, protocol: string, frame: Uint8Array, streamOpen?: StreamOpenDeadlines): Promise<void> {
 	let stream: Stream | undefined;
 	try {
 		// `negotiateFully` deliberately omitted — see the accepted tradeoff in the module docblock.
-		stream = await openProtocolStream(node, peer, protocol);
+		stream = await openProtocolStream(node, peer, protocol, { deadlines: streamOpen });
 		sendFramed(stream, frame);
 		await stream.close();
 	} finally {

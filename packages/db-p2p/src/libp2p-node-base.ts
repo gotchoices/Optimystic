@@ -1178,7 +1178,7 @@ export async function createLibp2pNodeBase(
 		// bootstraps registers a different (network-namespaced) identify protocol, so it is
 		// never selected and can't drag this network's super-majority below quorum.
 		const protocolPrefix = `/optimystic/${options.networkName}`;
-		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, bootstrap, options.persistence, reputation, protocolPrefix);
+		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, bootstrap, options.persistence, reputation, protocolPrefix, linkDeadlines);
 		await keyNetwork.initFromPersistedState();
 		const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
 
@@ -2004,6 +2004,8 @@ export async function createLibp2pNodeBase(
 				rootGroup: { membersAt: rootGroupAt, quorumRatio: consensusConfig.superMajorityThreshold },
 				// FRET first, then this; a caller's own anchor (a harness) replaces the commit-log one.
 				trustAnchor: options.cohortTopic!.host?.trustAnchor ?? commitLogAnchor,
+				// The host's dials open streams under this node's hedge and dead-connection delays.
+				streamOpen: options.cohortTopic!.host?.streamOpen ?? linkDeadlines,
 			});
 
 			// --- Cohort-topic + reactivity + matchmaking teardown ---
@@ -2073,7 +2075,7 @@ export async function createLibp2pNodeBase(
 			(node as any).reactivitySubscribers = reactivitySubscribers;
 
 			// 1. Notify transport — unicast NotificationV1 send + inbound subscribe. selfPeerId guards self-dials.
-			const notify = new Libp2pReactivityNotifyTransport(node, { selfPeerId });
+			const notify = new Libp2pReactivityNotifyTransport(node, { selfPeerId, streamOpen: linkDeadlines });
 
 			// 2. Forwarder host — turns the forward decision into live fan-out over the notify transport.
 			const forwarderHost = new ReactivityForwarderHost({
@@ -2206,10 +2208,11 @@ export async function createLibp2pNodeBase(
 				rootGroupAt(reactivityRootCoord(tailId));
 
 			// Outbound transport: exposes the db-core BackfillTransport / ResumeTransport seams against this node.
-			// maxBytes is omitted so the dialer + handler default to DEFAULT_STREAM_MAX_BYTES, matching the notify
-			// transport's default (constructed above without an override) — one frame ceiling across the family.
+			// maxBytes is left undefined so the dialer + handler default to DEFAULT_STREAM_MAX_BYTES, matching the
+			// notify transport's default (constructed above without an override) — one frame ceiling across the
+			// family. The dials open streams under this node's hedge and dead-connection delays.
 			const recover = new Libp2pReactivityRecoverTransport({
-				dialer: createLibp2pRecoverDialer(node, reactivityProtocols.recover),
+				dialer: createLibp2pRecoverDialer(node, reactivityProtocols.recover, undefined, linkDeadlines),
 				selfPeerId,
 				cohortHintCache: reactivityCohortHintCache,
 				resolveCohort: resolveReactivityCohort,

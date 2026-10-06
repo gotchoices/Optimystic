@@ -1485,7 +1485,10 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect(observedOpts?.runOnLimitedConnection).to.equal(true);
 		});
 
-		it('forwards the caller AbortSignal on the reuse path', async () => {
+		it('opens on an existing connection under the helper\'s own signal, so the caller\'s deadline never judges the connection', async () => {
+			// GitHub #32: whether a connection is dead is decided by the dead-connection delay
+			// (`open-protocol-stream.spec.ts`), never by a caller's deadline — a 1 s cohort consult
+			// giving up is no evidence against the connection it was waiting on.
 			let observedSignal: AbortSignal | undefined;
 			const mockConn = {
 				status: 'open',
@@ -1501,7 +1504,10 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const controller = new AbortController();
 
 			await network.connect(otherPeerId, PROTOCOL, { signal: controller.signal });
-			expect(observedSignal).to.equal(controller.signal);
+			expect(observedSignal).to.be.instanceOf(AbortSignal);
+			expect(observedSignal).to.not.equal(controller.signal);
+			controller.abort(new Error('caller gave up'));
+			expect(observedSignal?.aborted, 'the caller giving up does not end the open on the connection').to.equal(false);
 		});
 
 		// --- The cold path when every address we hold routes back through us --------

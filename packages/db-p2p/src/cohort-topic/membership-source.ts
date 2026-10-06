@@ -6,6 +6,7 @@ import type { CohortPeerResolver } from "./cohort-gossip-transport.js";
 import { requestResponse, DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
 import { PROTOCOL_COHORT_MEMBERSHIP } from "./protocols.js";
 import { createLogger } from "../logger.js";
+import type { StreamOpenDeadlines } from "../rpc-deadline.js";
 
 const log = createLogger("cohort-topic");
 
@@ -14,6 +15,8 @@ export interface FretMembershipSourceOptions {
 	/** Cohort fan-out probed on a `fetch`. Default 16. */
 	readonly wants?: number;
 	readonly maxBytes?: number;
+	/** The stream-open delays for a `fetch`'s dials (`requestResponse` in `stream-util.ts`); the node's where the host has them. */
+	readonly streamOpen?: StreamOpenDeadlines;
 	/**
 	 * The root group at a root-placed coord — the peers a `fetch(coord, { rootPlaced: true })` asks for the
 	 * cert, in the order to try them. The host binds it to its root-group snapshot reader. Absent on a host
@@ -41,12 +44,14 @@ export class FretMembershipSource implements IMembershipSource {
 	private readonly wants: number;
 	private readonly maxBytes: number;
 	private readonly rootGroupPeers: ((coord: RingCoord) => Promise<readonly string[]>) | undefined;
+	private readonly streamOpen: StreamOpenDeadlines | undefined;
 
 	constructor(private readonly node: Libp2p, private readonly resolver: CohortPeerResolver, options: FretMembershipSourceOptions = {}) {
 		this.membershipProtocol = options.membershipProtocol ?? PROTOCOL_COHORT_MEMBERSHIP;
 		this.wants = options.wants ?? 16;
 		this.maxBytes = options.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
 		this.rootGroupPeers = options.rootGroupPeers;
+		this.streamOpen = options.streamOpen;
 	}
 
 	current(coord: RingCoord, _opts?: MembershipLookupOptions): Promise<Uint8Array | undefined> {
@@ -76,7 +81,7 @@ export class FretMembershipSource implements IMembershipSource {
 		for (const peerStr of await this.holdersOf(coord, opts)) {
 			let reply: Uint8Array | undefined;
 			try {
-				reply = await requestResponse(this.node, peerIdFromString(peerStr), this.membershipProtocol, request, this.maxBytes);
+				reply = await requestResponse(this.node, peerIdFromString(peerStr), this.membershipProtocol, request, this.maxBytes, this.streamOpen);
 			} catch (err) {
 				log("membership fetch: holder %s unreachable for %s: %o", peerStr, coordKey, err);
 				continue;

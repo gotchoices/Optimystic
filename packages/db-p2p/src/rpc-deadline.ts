@@ -63,6 +63,40 @@ export const DEFAULT_TRANSFER_TIMEOUT_MS = 30_000;
 export const DEFAULT_TRANSACTION_TIMEOUT_MS = 30_000;
 
 /**
+ * How long a stream open on the preferred connection to a peer may stay pending before
+ * `openProtocolStream` starts one on the next path as well, on a node that declares no link round
+ * trip; the floor of the derived one. Kept well under `DEFAULT_COHORT_QUERY_TIMEOUT_MS` (1000 ms) so
+ * a cohort consult on an undeclared link that meets a dead connection first still finishes on the
+ * live one inside its own deadline — the field failure of GitHub #32.
+ */
+export const DEFAULT_STREAM_HEDGE_DELAY_MS = 250;
+
+/**
+ * The two delays `openProtocolStream` (`network/open-protocol-stream.ts`) runs a stream open under.
+ * A node resolves them with the rest of its deadlines ({@link LinkDeadlines} is assignable here); a
+ * caller built without a node passes {@link UNDECLARED_STREAM_OPEN_DEADLINES}.
+ */
+export type StreamOpenDeadlines = {
+	/**
+	 * How long the stream open on the latest path tried may stay pending before the next path (the
+	 * next open connection to the peer, then a fresh dial) is started as well, without cancelling it.
+	 */
+	hedgeDelayMs: number;
+	/**
+	 * How long a stream open on an existing connection may stay pending before that connection is
+	 * judged dead and aborted. It is the RPC dial deadline, the bound this package already puts on one
+	 * connection open plus negotiation — so on a link that takes longer than that to negotiate a
+	 * stream a live connection is judged dead, which is why such a link declares its round trip.
+	 */
+	deadConnectionDelayMs: number;
+};
+
+export const UNDECLARED_STREAM_OPEN_DEADLINES: StreamOpenDeadlines = Object.freeze({
+	hedgeDelayMs: DEFAULT_STREAM_HEDGE_DELAY_MS,
+	deadConnectionDelayMs: DEFAULT_DIAL_TIMEOUT_MS,
+});
+
+/**
  * The fallback deadlines a {@link ProtocolClient} subclass applies to a request whose caller
  * supplied none. A client is built with the node's resolved values ({@link LinkDeadlines} is
  * assignable here), or with {@link UNDECLARED_RPC_DEADLINES} when nothing was declared.
@@ -82,7 +116,7 @@ export const UNDECLARED_RPC_DEADLINES: RpcDeadlineDefaults = Object.freeze({
  * (`NodeOptions.linkRoundTripMs`), with the RPC dial and response deadlines replaced by
  * `NodeOptions.rpcDeadlines` where that sets them. All in milliseconds.
  */
-export type LinkDeadlines = RpcDeadlineDefaults & {
+export type LinkDeadlines = RpcDeadlineDefaults & StreamOpenDeadlines & {
 	/**
 	 * libp2p's connection-manager `dialTimeout`: the whole of a dial that carries no signal of its own,
 	 * a cold relayed one included. Never shorter than {@link LinkDeadlines.addressDialTimeoutMs}, since
@@ -151,6 +185,15 @@ export type LinkDeadlines = RpcDeadlineDefaults & {
  * - bootstrap contact: the connection open the start-up bootstrap dial runs under (10), then
  *   identify on that connection: one to open its stream and one for the reply. It floors at the
  *   connection deadline's own floor, whose margin on a fast link covers identify.
+ * - stream hedge: one and a half, so a connection whose negotiation runs a little past one round
+ *   trip is merely slow and keeps its chance, while a dead one costs half a round trip on top of the
+ *   live one's negotiation. The residual on a declared link: a cohort consult (3) that meets a dead
+ *   connection first spends 1.5 on the hedge, 1 negotiating and 1 on the request over the live one,
+ *   3.5 of its 3, so that one consult can still miss. The dead connection is then aborted within
+ *   the dial deadline and the next consult succeeds. The floors leave an undeclared link 250 ms of
+ *   its 1000.
+ * - dead connection: the dial deadline itself, the bound already placed on one connection open plus
+ *   negotiation; it follows an explicit `rpcDeadlines.dialTimeoutMs` as the transfer budget does.
  */
 const CONNECTION_ROUND_TRIPS = 10;
 const DIAL_ROUND_TRIPS = CONNECTION_ROUND_TRIPS + 1;
@@ -159,6 +202,7 @@ const RESPONSE_ROUND_TRIPS = 3;
 const COHORT_QUERY_ROUND_TRIPS = 3;
 const TRANSACTION_DIALS = 4;
 const BOOTSTRAP_CONTACT_ROUND_TRIPS = CONNECTION_ROUND_TRIPS + 2;
+const STREAM_HEDGE_ROUND_TRIPS = 1.5;
 
 /**
  * The largest delay `setTimeout` accepts on every platform this runs on; a larger one fires almost
@@ -228,6 +272,8 @@ export function resolveLinkDeadlines(linkRoundTripMs?: number, rpcDeadlines?: Pa
 		transferTimeoutMs: Math.max(DEFAULT_TRANSFER_TIMEOUT_MS, dialTimeoutMs),
 		transactionTimeoutMs: Math.max(DEFAULT_TRANSACTION_TIMEOUT_MS, TRANSACTION_DIALS * dialTimeoutMs),
 		bootstrapContactTimeoutMs: Math.max(DEFAULT_LIBP2P_DIAL_TIMEOUT_MS, BOOTSTRAP_CONTACT_ROUND_TRIPS * roundTripMs),
+		hedgeDelayMs: Math.max(DEFAULT_STREAM_HEDGE_DELAY_MS, STREAM_HEDGE_ROUND_TRIPS * roundTripMs),
+		deadConnectionDelayMs: dialTimeoutMs,
 	};
 }
 

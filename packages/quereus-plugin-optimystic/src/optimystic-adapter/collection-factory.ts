@@ -539,7 +539,9 @@ export class CollectionFactory {
         // in its key network rather than have one guessed from defaults here. If a real host
         // ever needs a cluster size other than the default, widen `registerLibp2pNode` to take
         // the node's own key network (or its cluster size) rather than growing more guesses.
-        return new Libp2pKeyPeerNetwork(libp2pNode, DEFAULT_CLUSTER_SIZE, undefined, undefined, undefined, undefined, protocolPrefix);
+        // The node's own deadlines where it carries them (a db-p2p node attaches `linkDeadlines`); the
+        // key network falls back to the undeclared defaults otherwise.
+        return new Libp2pKeyPeerNetwork(libp2pNode, DEFAULT_CLUSTER_SIZE, undefined, undefined, undefined, undefined, protocolPrefix, libp2pNode.linkDeadlines);
       }
       default: {
         const CustomKeyNetwork = this.customKeyNetworkCtors.get(type);

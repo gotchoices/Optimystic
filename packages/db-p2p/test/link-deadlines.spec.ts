@@ -20,6 +20,8 @@ const UNDECLARED: LinkDeadlines = {
 	transferTimeoutMs: 30_000,
 	transactionTimeoutMs: 30_000,
 	bootstrapContactTimeoutMs: 10_000,
+	hedgeDelayMs: 250,
+	deadConnectionDelayMs: 3000,
 };
 
 describe('resolveLinkDeadlines', () => {
@@ -28,7 +30,8 @@ describe('resolveLinkDeadlines', () => {
 	});
 
 	it('a round trip fast enough that no multiple exceeds its floor changes nothing', () => {
-		expect(resolveLinkDeadlines(250)).to.deep.equal(UNDECLARED);
+		// 100 ms: eleven round trips stay under the 3 s dial floor, and one and a half under the 250 ms hedge floor.
+		expect(resolveLinkDeadlines(100)).to.deep.equal(UNDECLARED);
 	});
 
 	it('a 3 s round trip scales each deadline by its own number of round trips', () => {
@@ -48,6 +51,10 @@ describe('resolveLinkDeadlines', () => {
 			transactionTimeoutMs: 132_000,
 			// The connection open the bootstrap dial runs under, plus identify's two round trips.
 			bootstrapContactTimeoutMs: 36_000,
+			// One and a half round trips: a slow negotiation keeps its chance, a dead one costs half a trip.
+			hedgeDelayMs: 4500,
+			// The dial deadline: one connection open plus negotiation is already the bound on a dead connection.
+			deadConnectionDelayMs: 33_000,
 		});
 	});
 
@@ -100,12 +107,13 @@ describe('resolveLinkDeadlines with explicit rpcDeadlines', () => {
 		expect(resolveLinkDeadlines(3000, { dialTimeoutMs: 1000 }).dialTimeoutMs).to.equal(1000);
 	});
 
-	it('the transfer and transaction budgets follow an explicit dial, and nothing else moves', () => {
+	it('the transfer and transaction budgets and the dead-connection delay follow an explicit dial, and nothing else moves', () => {
 		expect(resolveLinkDeadlines(3000, { dialTimeoutMs: 40_000 })).to.deep.equal({
 			...resolveLinkDeadlines(3000),
 			dialTimeoutMs: 40_000,
 			transferTimeoutMs: 40_000,
 			transactionTimeoutMs: 160_000,
+			deadConnectionDelayMs: 40_000,
 		});
 	});
 

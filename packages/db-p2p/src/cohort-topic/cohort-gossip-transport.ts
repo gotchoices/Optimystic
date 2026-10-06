@@ -4,6 +4,7 @@ import { peerIdFromString } from "@libp2p/peer-id";
 import { peerIdToBytes } from "./peer-codec.js";
 import { sendOneWay } from "./stream-util.js";
 import { PROTOCOL_COHORT_GOSSIP } from "./protocols.js";
+import type { StreamOpenDeadlines } from "../rpc-deadline.js";
 
 /** Resolves the cohort owning a coord to its libp2p peer-id strings (FRET two-sided assembly). */
 export interface CohortPeerResolver {
@@ -17,6 +18,8 @@ export interface FretCohortGossipTransportOptions {
 	readonly wants?: number;
 	/** This node's peer-id string — excluded from its own broadcasts. */
 	readonly selfPeerId: string;
+	/** The stream-open delays for each member's dial (`sendOneWay` in `stream-util.ts`); the node's where the host has them. */
+	readonly streamOpen?: StreamOpenDeadlines;
 }
 
 /**
@@ -31,11 +34,13 @@ export class FretCohortGossipTransport implements ICohortGossipTransport {
 	private readonly gossipProtocol: string;
 	private readonly wants: number;
 	private readonly selfPeerId: string;
+	private readonly streamOpen: StreamOpenDeadlines | undefined;
 
 	constructor(private readonly node: Libp2p, private readonly resolver: CohortPeerResolver, options: FretCohortGossipTransportOptions) {
 		this.gossipProtocol = options.gossipProtocol ?? PROTOCOL_COHORT_GOSSIP;
 		this.wants = options.wants ?? 16;
 		this.selfPeerId = options.selfPeerId;
+		this.streamOpen = options.streamOpen;
 	}
 
 	broadcast(coord: RingCoord, msg: Uint8Array): void {
@@ -53,7 +58,7 @@ export class FretCohortGossipTransport implements ICohortGossipTransport {
 			if (peerStr === this.selfPeerId) {
 				continue;
 			}
-			void sendOneWay(this.node, peerIdFromString(peerStr), protocol, msg).catch(() => {
+			void sendOneWay(this.node, peerIdFromString(peerStr), protocol, msg, this.streamOpen).catch(() => {
 				// Best-effort: a single unreachable member is recovered by the next round.
 			});
 		}

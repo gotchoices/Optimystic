@@ -8,6 +8,7 @@ import { createLogger, verbose } from './logger.js'
 import { classifySelfDialability, mergePeerAddresses, publishableConnectionAddr, unionPublishableAddrs, type AddressLog } from './peer-address-book.js'
 import type { IPeerReputation } from './reputation/types.js'
 import { openProtocolStream } from './network/open-protocol-stream.js'
+import { UNDECLARED_STREAM_OPEN_DEADLINES, type StreamOpenDeadlines } from './rpc-deadline.js'
 import type { BootstrapContact } from './network/bootstrap-contact.js'
 
 interface WithFretService { services?: { fret?: FretService } }
@@ -279,9 +280,10 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	private bootstrapWaitClosed?: 'deadline' | 'nothing-arriving';
 	private readonly persistence?: NetworkStatePersistence;
 
-	// NOTE: seven positional parameters, and the list stays that way for now — converting to an
-	// options bag would touch ~50 construction sites in `test/libp2p-key-network.spec.ts` alone.
-	// Revisit if an eighth parameter is ever needed, or if that spec is being rewritten anyway.
+	// NOTE: eight positional parameters. The options-bag conversion was weighed again when the
+	// eighth (`streamOpen`) was added and deferred again: it would touch ~98 construction sites in
+	// `test/libp2p-key-network.spec.ts` alone, while an optional trailing parameter with a default
+	// touches none. Take the conversion when that spec is rewritten, or before a ninth parameter.
 	constructor(
 		private readonly libp2p: Libp2p,
 		/**
@@ -313,11 +315,19 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		 * caller is affected. Make it required (or take the whole list as an options bag) the
 		 * moment a THIRD production construction site appears, or when that spec is rewritten.
 		 */
-		private readonly protocolPrefix?: string
+		private readonly protocolPrefix?: string,
+		/**
+		 * The hedge and dead-connection delays {@link connect} opens streams under — the node's
+		 * `LinkDeadlines` (`createLibp2pNodeBase` passes them, and so does the foreign-node fallback in
+		 * the Quereus collection-factory when the node carries them). A caller built without a node
+		 * gets the undeclared defaults, which is what every deadline falls back to.
+		 */
+		private readonly streamOpen: StreamOpenDeadlines = UNDECLARED_STREAM_OPEN_DEADLINES
 	) {
 		// Built here rather than as a field initializer: field initializers run before the
 		// constructor body, where `this.libp2p` (a parameter property) is not yet assigned.
 		this.log = createLogger('libp2p-key-network', this.libp2p.peerId.toString())
+		this.streamOpenLog = createLogger('open-protocol-stream', this.libp2p.peerId.toString())
 		// NOTE: no production construction site in this repo passes a SelfCoordinationConfig —
 		// both leave it `undefined` (libp2p-node-base.ts, and the foreign-node fallback in
 		// quereus-plugin-optimystic's collection-factory.ts), so these defaults are always what
@@ -363,6 +373,8 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	private readonly coordinatorCache = new Map<string, { id: PeerId, expires: number }>()
 	private static readonly MAX_CACHE_ENTRIES = 1000
 	private readonly log: ReturnType<typeof createLogger>
+	/** The `open-protocol-stream` logger {@link connect} hands `openProtocolStream`, suffixed with this node's peer id. */
+	private readonly streamOpenLog: ReturnType<typeof createLogger>
 	/**
 	 * This instance's logger, in the shape `peer-address-book.ts` accepts. Declared once so the
 	 * five address predicates that take a sink all report under the same peer-id-suffixed
@@ -751,12 +763,16 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	}
 
 	/**
-	 * Open a stream to `peerId` on `protocol` — reusing a live connection when we hold one, and
-	 * otherwise dialing.
+	 * Open a stream to `peerId` on `protocol` — on a live connection when we hold one that answers,
+	 * and otherwise dialing.
 	 *
-	 * Connection selection (prefer a direct connection over a resettable circuit-relay one, skip
-	 * entries libp2p has not yet evicted, opt in to limited connections) lives in
-	 * {@link openProtocolStream}, the single place in this package that opens a protocol stream.
+	 * Connection selection and fallback live in {@link openProtocolStream}, the single place in this
+	 * package that opens a protocol stream: a direct connection ahead of a resettable circuit-relay
+	 * one, entries libp2p has not yet evicted skipped, limited connections opted in to; an open that
+	 * stays pending past the hedge delay is hedged with the next connection and then a fresh dial,
+	 * the first stream to open wins, and a connection whose open stays pending for the whole
+	 * dead-connection delay is aborted as dead (`open-stream:connection-dead`) so the next request
+	 * does not pick it. Both delays are this node's `LinkDeadlines`, passed at construction.
 	 *
 	 * `negotiateFully: false` is meant to skip waiting for the remote's protocol acknowledgement, and
 	 * is safe here because this is request/response and the caller always reads a reply, so an
@@ -766,23 +782,28 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * than that round trip fails every request (`test/stream-open-costs-a-round-trip.spec.ts` pins
 	 * this, and fails if libp2p honours the option again). It is passed anyway, since it costs nothing
 	 * and takes effect if it is ever honoured. The caller's `AbortSignal` is forwarded so a per-peer
-	 * dial deadline (enforced upstream by `ProtocolClient.processMessage`) can actually cancel a stuck
-	 * dial or negotiation — without it, libp2p falls back to its built-in connection-manager
-	 * `dialTimeout` and the caller's tighter deadline is decorative.
+	 * dial deadline (enforced upstream by `ProtocolClient.processMessage`) rejects the open with its
+	 * own reason — `DialTimeoutError` when every path is slow — and cancels a fresh dial in flight.
+	 * It does not end an open on an existing connection: that runs on to the dead-connection delay,
+	 * since the caller's deadline is no evidence that the connection is dead.
 	 *
 	 * The cold path pays one `peerStore.get` before dialing, to separate two failures libp2p
 	 * reports identically: "nobody ever taught us an address" and "every address we hold routes
 	 * back through us" (see {@link SelfRelayOnlyAddressesError}). Only the second is diagnosed
 	 * here; the first still dials, so an unknown peer produces libp2p's own `NoValidAddressesError`
-	 * exactly as before. It rides `beforeDial`, which never runs on the reuse path — the warm path
+	 * exactly as before. It rides `beforeDial`, which never runs on a reuse path — the warm path
 	 * is deliberately kept clear of that read, since a live connection is the case this method
-	 * exists to make cheap.
+	 * exists to make cheap. A refusal there fails only the dial path; the open as a whole fails with
+	 * it only when no connection path opened either, and then with the preferred connection's error
+	 * when there was one.
 	 */
 	async connect(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<Stream> {
 		return await openProtocolStream(this.libp2p, peerId, protocol, {
 			signal: options?.signal,
 			negotiateFully: false,
-			beforeDial: () => this.assertNotSelfRelayOnly(peerId, protocol, options)
+			beforeDial: () => this.assertNotSelfRelayOnly(peerId, protocol, options),
+			deadlines: this.streamOpen,
+			log: this.streamOpenLog
 		})
 	}
 

@@ -28,6 +28,7 @@ import { readFrame, sendOneWay, DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic
 import { PROTOCOL_REACTIVITY_NOTIFY } from "./protocols.js";
 import { registerProtocolHandler } from "../network/register-protocol-handler.js";
 import { createLogger } from "../logger.js";
+import type { StreamOpenDeadlines } from "../rpc-deadline.js";
 
 const log = createLogger("reactivity-notify");
 
@@ -53,6 +54,8 @@ export interface ReactivityNotifyTransportOptions {
 	readonly maxBytes?: number;
 	/** This node's peer-id string; when set, {@link Libp2pReactivityNotifyTransport.send} never dials self. */
 	readonly selfPeerId?: string;
+	/** The stream-open delays a {@link Libp2pReactivityNotifyTransport.send} dials under; the node's `LinkDeadlines` where the host has them. */
+	readonly streamOpen?: StreamOpenDeadlines;
 }
 
 /**
@@ -66,11 +69,13 @@ export class Libp2pReactivityNotifyTransport implements ReactivityNotifyTranspor
 	private readonly notifyProtocol: string;
 	private readonly maxBytes: number;
 	private readonly selfPeerId?: string;
+	private readonly streamOpen?: StreamOpenDeadlines;
 
 	constructor(private readonly node: Libp2p, options: ReactivityNotifyTransportOptions = {}) {
 		this.notifyProtocol = options.notifyProtocol ?? PROTOCOL_REACTIVITY_NOTIFY;
 		this.maxBytes = options.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
 		this.selfPeerId = options.selfPeerId;
+		this.streamOpen = options.streamOpen;
 	}
 
 	send(target: string, n: NotificationV1): Promise<void> {
@@ -80,7 +85,7 @@ export class Libp2pReactivityNotifyTransport implements ReactivityNotifyTranspor
 		}
 		try {
 			const frame = encodeNotificationV1(n);
-			return sendOneWay(this.node, peerIdFromString(target), this.notifyProtocol, frame).catch((err: unknown) => {
+			return sendOneWay(this.node, peerIdFromString(target), this.notifyProtocol, frame, this.streamOpen).catch((err: unknown) => {
 				// Best-effort, failure-isolated: a dead/unreachable target must not break the fan-out or a commit.
 				log("send to %s failed (swallowed): %o", target, err);
 			});
