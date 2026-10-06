@@ -336,6 +336,14 @@ describe('matchmaking / seeker walk client', () => {
 			expect(h.sleeps).to.deep.equal([]);
 		});
 
+		it('patience gone on arrival: the immediate query is the final poll — no second query at the same deadline', async () => {
+			const h = new Harness({ 0: { probe: accepted(hot), providers: three } }, 10_000, []);
+			const result = await client(h, { wantCount: 8, dMax: 0, patienceMs: 10_000 }).run();
+			expect(result.metWantCount).to.equal(false);
+			expect(h.calls).to.deep.equal(['register:0', 'query:0']);
+			expect(h.waits).to.deep.equal([]);
+		});
+
 		it('missed push, final poll recovers: a provider only the final query returns is in the result', async () => {
 			const late = entry('late');
 			const h = new Harness({ 0: { probe: accepted(hot), providers: (n) => (n < 2 ? three : [...three, late]) } }, 0, []);

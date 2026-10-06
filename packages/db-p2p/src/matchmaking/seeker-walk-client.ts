@@ -301,6 +301,12 @@ export class SeekerWalkClient {
 	}
 
 	/** Fold traffic heard at the current tier into the hotness signal and the mid-tier promotion check. */
+	// NOTE: assumes traffic heard at tier d is tier d's. Two ways it is not, each costing at most one
+	// spurious same-tier re-register per tier per walk: (1) the libp2p transport and the mesh harness
+	// answer every tier's query from the tier-0 cohort (single-tier-0 milestone), so once a promoted tree is
+	// served, a leaf tier's watch sees tier 0's child cohorts — route queries to the walk tier when
+	// multi-tier serving lands; (2) after a descend, pushes queued by the promoted tier it left carry that tier's
+	// child cohorts into the leaf tier's watch — if that shows up, scope pushes to the tier they came from.
 	private noteTraffic(traffic: TopicTrafficV1): void {
 		this.maxChildCohortCount = Math.max(this.maxChildCohortCount, traffic.childCohortCount);
 		if (this.promotionWatched && traffic.childCohortCount > 0) {
@@ -402,6 +408,10 @@ export class SeekerWalkClient {
 	 * boundary). Like the poll path's last poll, it overruns patience by one RPC.
 	 */
 	private async pushHangOut(d: number, pushes: SeekerPushChannel): Promise<void> {
+		if (this.remaining() <= 0) {
+			// The tier's immediate query, just issued, already ran at the deadline: it is the final poll.
+			return;
+		}
 		let lastPoll = this.clock();
 		while (this.remaining() > 0 && this.tierExit() === undefined) {
 			const nextSafetyPoll = lastPoll + this.config.pushSafetyPollMs;
