@@ -140,6 +140,9 @@ export class ArrivalPushDriver {
 		if (arrived?.role !== "provider") {
 			return;
 		}
+		// NOTE: bindings are scoped per engine, so while a moved root leaves two of this node's engines holding one
+		// seeker, an arrival reaching both pushes it twice (the seeker dedups by participantId). If that window ever
+		// shows up as duplicate-push load, key bindings by (topicId, seeker, correlationId) alone.
 		const scopeKey = `${bytesToB64url(engine.servedCoord)}|${bytesToB64url(rec.topicId)}`;
 		const seekers = this.pushOptedSeekers(engine, rec.topicId, scopeKey);
 		this.dropUnheldBindings(scopeKey, seekers);
@@ -174,7 +177,12 @@ export class ArrivalPushDriver {
 		return decoded;
 	}
 
-	/** The push-opted seekers `engine` holds for `topicId`. */
+	/**
+	 * The push-opted seekers `engine` holds for `topicId`.
+	 * NOTE: lists the whole topic per provider arrival (the cost a query pays per query; decoding is cached).
+	 * Bounded by the `cap_promote` participant ceiling; if arrival bursts ever show this in profiles, keep a
+	 * per-topic push-opted seeker index updated from the same record-added and eviction signals.
+	 */
 	private pushOptedSeekers(engine: ArrivalPushEngine, topicId: Uint8Array, scopeKey: string): PushOptedSeeker[] {
 		const seekers: PushOptedSeeker[] = [];
 		for (const rec of engine.records(topicId)) {

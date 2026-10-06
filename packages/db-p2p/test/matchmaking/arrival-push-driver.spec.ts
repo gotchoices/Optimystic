@@ -85,7 +85,13 @@ interface Member {
 	readonly added: RegistrationRecord[];
 }
 
-function cohortMember(self: string, members: readonly string[], sent: SentPush[], ack: (push: ArrivalPushV1) => ArrivalPushResult = () => 'ok'): Member {
+function cohortMember(
+	self: string,
+	members: readonly string[],
+	sent: SentPush[],
+	ack: (push: ArrivalPushV1) => ArrivalPushResult = () => 'ok',
+	replies: (push: ArrivalPushV1) => boolean = () => true,
+): Member {
 	const timers = new ManualTimers();
 	const added: RegistrationRecord[] = [];
 	const driver = new ArrivalPushDriver({
@@ -95,7 +101,7 @@ function cohortMember(self: string, members: readonly string[], sent: SentPush[]
 		send: async (contactHint, frame) => {
 			const push = decodeArrivalPushV1(frame);
 			sent.push({ from: self, contactHint, push });
-			return encodeArrivalPushAckV1({ v: 1, result: ack(push) });
+			return replies(push) ? encodeArrivalPushAckV1({ v: 1, result: ack(push) }) : undefined;
 		},
 		setTimer: timers.setTimer,
 	});
@@ -179,6 +185,18 @@ describe('matchmaking / arrival push driver', () => {
 			const primary = slots.assignSlots(idBytes(contactHint), cohortEpoch, members.map(idBytes)).primary;
 			expect(from).to.equal(idString(primary));
 		}
+	});
+
+	it('a lost push does not count toward the seeker\'s need: the next arrival is pushed', async () => {
+		const sent: SentPush[] = [];
+		const member = cohortMember('member-a', ['member-a'], sent, () => 'ok', (push) => push.providers[0]!.participantId !== 'provider-1');
+		member.store.put(await seekerRecord('seeker-1', 100, 1));
+		member.store.put(await providerRecord('provider-1', 200));
+		await settle();
+		member.store.put(await providerRecord('provider-2', 300));
+		await settle();
+
+		expect(sent.map((s) => s.push.providers.map((p) => p.participantId))).to.deep.equal([['provider-1'], ['provider-2']]);
 	});
 
 	it('stops pushing a registration the seeker disowns, and pushes its re-registration', async () => {
