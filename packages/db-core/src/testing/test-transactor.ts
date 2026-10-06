@@ -73,22 +73,21 @@ export class TestTransactor implements ITransactor {
 				// revision-pinned read of a block committed further since the pin makes them differ,
 				// and there the pinned value is what the reader observed (see the field's doc).
 				let materializedRev: number | undefined;
-				if (blockGets.context?.actionId !== undefined) {
-					// If requesting a specific action, apply pending transform if it exists
-					const pendingTransform = blockState.pendingActions.get(blockGets.context.actionId);
-					if (pendingTransform) {
-						// Read latest committed block as base for pending transform
-						const baseBlock = blockState.materializedBlocks.get(blockState.latestRev);
-						block = applyTransformSafe(baseBlock, pendingTransform);
-						// A pending carries no revision of its own — report the committed base it was
-						// applied over. Absent when there was no base (a pending-only insert).
-						if (baseBlock) materializedRev = blockState.latestRev;
-					} else {
-						// Action not pending, maybe committed? Or maybe invalid actionId for context.
-						// For simplicity, return undefined block if specific pending action not found.
-						// A more complex impl might check committedActions history.
-						block = undefined;
-					}
+				// A named pending is overlaid only where this block holds it; every other block gets the
+				// plain answer for the same context (mirrors StorageRepo.get).
+				const namedPending = blockGets.context?.actionId !== undefined
+					? blockState.pendingActions.get(blockGets.context.actionId) : undefined;
+				if (namedPending) {
+					// Overlay over the committed base at the context's pin, as StorageRepo does.
+					const base = blockGets.context?.rev !== undefined
+						? latestMaterializedAt(blockState, blockGets.context.rev)
+						: (blockState.materializedBlocks.has(blockState.latestRev)
+							? { block: blockState.materializedBlocks.get(blockState.latestRev)!, rev: blockState.latestRev }
+							: undefined);
+					block = applyTransformSafe(base?.block, namedPending);
+					// A pending carries no revision of its own — report the committed base it was
+					// applied over. Absent when there was no base (a pending-only insert).
+					materializedRev = base?.rev;
 				} else if (blockGets.context?.committed) {
 					// Check context.committed for matching pending actions — mirrors coordinator
 					// behavior: context.committed proves the action succeeded, so pending blocks

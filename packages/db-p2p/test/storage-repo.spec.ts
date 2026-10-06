@@ -839,27 +839,34 @@ describe('StorageRepo', () => {
 			expect(entry.materialized?.rev, 'the base it was applied over is still reported').to.equal(1);
 		});
 
-		it('a context naming a pending this repo NEVER had still throws', async () => {
-			// The genuine caller-contract violation the flagged answers above must not swallow: a
-			// healthy committed block, no refusal, and an actionId this repo has no record of.
-			const blockId = 'healthy-block' as BlockId;
+		it('a context naming a pending action answers each block on its own: overlay where held, plain read elsewhere', async () => {
+			// Y was never touched by p1; X's record of p1 is promoted by this very read, because the
+			// context names p1 both as committed and as the overlay. Neither holds the record when the
+			// overlay is decided, so both get the plain answer — and the batch does not fail.
+			const x = 'overlay-x' as BlockId;
+			const y = 'overlay-y' as BlockId;
 			await repo.pend({
 				actionId: 'a1' as ActionId,
-				transforms: makeInsertTransforms(blockId, makeBlock('healthy-block', { items: ['v1'] })),
+				transforms: makeInsertTransforms(y, makeBlock('overlay-y', { items: ['v1'] })),
 				policy: 'c'
 			});
-			expect((await repo.commit({ actionId: 'a1' as ActionId, blockIds: [blockId], tailId: blockId, rev: 1 })).success).to.equal(true);
+			expect((await repo.commit({ actionId: 'a1' as ActionId, blockIds: [y], tailId: y, rev: 1 })).success).to.equal(true);
+			await repo.pend({
+				actionId: 'p1' as ActionId,
+				transforms: makeInsertTransforms(x, makeBlock('overlay-x', { items: ['fresh'] })),
+				policy: 'c'
+			});
 
-			let error: unknown;
-			try {
-				await repo.get({
-					blockIds: [blockId],
-					context: { actionId: 'never-pended' as ActionId, rev: 1, committed: [] }
-				});
-			} catch (err) {
-				error = err;
-			}
-			expect((error as Error)?.message).to.contain('Pending action never-pended not found');
+			const result = await repo.get({
+				blockIds: [x, y],
+				context: { actionId: 'p1' as ActionId, rev: 1, committed: [{ actionId: 'p1' as ActionId, rev: 1 }] }
+			});
+
+			expect((result[x]!.block as unknown as { items: string[] }).items).to.deep.equal(['fresh']);
+			expect(result[x]!.materialized).to.deep.equal({ actionId: 'p1', rev: 1 });
+			expect(result[x]!.state.pendings, 'promoted, so no longer held').to.not.include('p1');
+			expect((result[y]!.block as unknown as { items: string[] }).items).to.deep.equal(['v1']);
+			expect(result[y]!.materialized?.rev).to.equal(1);
 		});
 
 		it('a mixed batch serves a pending-only insert alongside a wedged block', async () => {

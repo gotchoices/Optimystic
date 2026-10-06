@@ -1902,6 +1902,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   with a context is served from its pending overlay, and only an overlay that produces no block —
   a pending *update* with nothing to apply itself to — is flagged. A pending *delete* over a real
   committed base is likewise unflagged: an intended tombstone is an authoritative absent.
+  The overlay is per block: a read naming a pending action (`ActionContext.actionId`) gets that
+  action laid over each block where the node holds its pending record, and the plain answer for the
+  same context on every other block — never a failure of the whole batch.
   `CoordinatorRepo.get` flags a locally-missing block whose cohort consult could not rule it out,
   and the reason **names what the consult established** rather than one catch-all:
 

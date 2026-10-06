@@ -450,38 +450,33 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				return [blockId, { state: {}, unavailable: 'unmaterializable' } as GetBlockResult];
 			}
 
-			// Include pending action if requested, applying the pending transform over whatever
-			// committed base getBlock() resolved (possibly none — a pending-only insert has no
-			// committed revision under it and getBlock reports that as an absent base, not a fault).
-			if (context?.actionId !== undefined) {
-				const pendingTransform = await blockStorage.getPendingTransaction(context.actionId);
-				if (!pendingTransform) {
-					if (unavailable !== undefined) {
-						// The promotion refusal above deleted this very pending record
-						// (`refuseMissingBase` drops the pending it cannot promote). This node DID hold
-						// the record and dropped it, so the honest answer is an availability one — not
-						// a caller-contract violation, and never a throw that would fail the whole batch.
-						return [blockId, { state: {}, unavailable } as GetBlockResult];
-					}
-					// Caller-contract violation (the caller asserted a pending this repo never had, or
-					// cancelled) — an error, not an availability question. Deliberately NOT `unavailable`.
-					//
-					// It is NOT the only way to reach here. A context that both PROVES its own action
-					// (`committed` names it) and names it as the pending overlay (`actionId`) is
-					// self-contradictory, and the two halves of that contradiction land differently: if
-					// the read-driven promotion above REFUSED, the arm above answers gracefully; if it
-					// SUCCEEDED, `promotePendingTransaction` moved the record and we throw here — failing
-					// the whole batch for a request the refusal path tolerates. No production code sets
-					// `ActionContext.actionId` at all today, so neither is reachable except from tests or
-					// a peer that crafts the field on the wire. See
-					// tickets/blocked/repo-pending-overlay-has-no-producer.
-					throw new Error(`Pending action ${context.actionId} not found`);
-				}
-				// A record the promotion above DECLINED (its base not reached here) is still present, so
-				// it is overlaid on whatever committed content this node holds — content older than the
-				// base its operations were computed against. Tolerated on this branch alone: the caller
-				// asserted its own pending, no production code sets `actionId` (the blocked ticket
-				// above), and the no-base case is still flagged by the clauses below.
+			// The named pending action (`context.actionId`) is overlaid on this block only where this
+			// node holds a pending record of it for the block. Every other block — never touched by
+			// the action, already promoted (possibly by this very read, when `committed` also names
+			// it), cancelled or swept — falls through to the plain answer for the same context. A
+			// caller tells the two apart by `state.pendings`: the overlay answer names the action, the
+			// plain one never does, since the record is not held. A reader that wants its own
+			// unfinished change reads more blocks than the change wrote (header, B-tree path), so a
+			// per-batch rule here would fail the whole read on its first untouched block. No
+			// production code sets `actionId` yet — see tickets/blocked/repo-pending-overlay-has-no-producer.
+			//
+			// NOTE: accepted tradeoff — any peer past the inbound-stream gate may name ANY pending
+			// action and see its uncommitted transform here; there is no per-asker check. Nothing on
+			// the repo protocol binds an action id to its author (a single-collection pend is
+			// unsigned), the ids are already listed in every plain read's `state.pendings`, `pend`
+			// under the 'r' policy already returns rival pending transforms, and no read anywhere is
+			// confidential per reader (authorization is node-level, `authorizeInboundStream`). Revisit
+			// if per-reader read authorization or signed pends binding an action id to its author land.
+			const pendingTransform = context?.actionId !== undefined
+				? await blockStorage.getPendingTransaction(context.actionId)
+				: undefined;
+			if (context?.actionId !== undefined && pendingTransform) {
+				// The overlay is applied over whatever committed base getBlock() resolved at the pin —
+				// possibly none: a pending-only insert has no committed revision under it, which
+				// getBlock reports as an absent base, not a fault. A record the promotion above
+				// DECLINED (its base not reached here) is still held, so it is overlaid on content
+				// older than the base its operations were computed against; the no-base case of that
+				// is flagged by the clauses below. Read-only and unlatched, like the plain read.
 				const block = applyTransform(blockRev?.block, pendingTransform);
 				return [blockId, {
 					block,

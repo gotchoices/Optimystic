@@ -26,7 +26,11 @@ export type ActionContext = {
 	committed: ActionRev[];
 	/** The latest known revision number */
 	rev: number;
-	/** Optional uncommitted pending action ID */
+	/** Optional uncommitted pending action to read through. A repo overlays this action's pending
+	 *  transform on each block where it holds a pending record of it, and answers every other block
+	 *  exactly as a plain read with the same context would; the overlay answer's `state.pendings`
+	 *  names the action, the plain one's does not. No production code sets it today — see the
+	 *  blocked ticket `repo-pending-overlay-has-no-producer`. */
 	actionId?: ActionId;
 };
 
