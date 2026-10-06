@@ -93,6 +93,10 @@ export function createArrivalPushSend(deps: ArrivalPushSendDeps): ArrivalPushDri
 		if (target.peerId.toString() === selfPeerId) {
 			return receiver.receive(frame, selfPeerId);
 		}
+		// NOTE: the dialed peer is whoever the hint names, which nothing checks against the registration's
+		// participant, so a seeker can point a member's pushes at a third party (one dial per selected arrival,
+		// bounded by provider arrivals × capacityBudget). If that shows up as abuse, require the hint's peer to
+		// equal the participant that signed the registration.
 		if (target.addr !== undefined) {
 			mergePeerAddresses(node, target.peerId, [target.addr], log);
 		}

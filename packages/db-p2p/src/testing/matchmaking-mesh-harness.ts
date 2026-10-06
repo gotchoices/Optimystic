@@ -183,6 +183,8 @@ function virtualClock(): { clock: () => number; sleep: (ms: number) => Promise<v
 }
 
 /** Real time {@link VirtualTime.advance} gives the work a fired timer starts (a push's sign → deliver → ack, a walk's next query). */
+// NOTE: work that needs longer than this before arming its next virtual timer is skipped past within one
+// `advance` call; if a push spec ever flakes on a slow machine, make `advance` wait for quiescence instead.
 const SETTLE_MS = 10;
 
 /** A one-shot timer on {@link VirtualTime}. */

@@ -580,7 +580,11 @@ A hanging-out seeker that set `pushOnArrival` does not poll at `requery_interval
 >   the mid-tier promotion re-register (§Hang-out vs. continue); the hang-out-vs-escalate decision is made once
 >   per `Accepted`, on both paths.
 > - **Real renew and withdraw on both paths**, so a hanging-out seeker's record outlives its 10 s TTL and
->   leaves the cohort when the walk moves on (§Hang-out vs. continue).
+>   leaves the cohort when the walk moves on (§Hang-out vs. continue). A renew whose slot primary is the
+>   seeker's own node is served in process only when the transport is given `selfServe.renew` (bound to the
+>   host's `resolveRenew`); without it that renew is logged and skipped, the record lapses after one TTL, and
+>   the walk falls back to its safety poll. The node does not yet hand an application a ready self-serve
+>   binding (backlog `feat-node-offers-matchmaking-self-serve`).
 > - **A seeker reachable only through a relay advertises its circuit address**, ending in `/p2p/<its id>`, as
 >   its `contactHint` (§Edge cases & interactions below).
 >
