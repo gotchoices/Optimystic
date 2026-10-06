@@ -211,7 +211,8 @@ describe('cohort-topic / bootstrap-evidence verifiers (db-p2p)', () => {
 	describe('createBootstrapEvidenceBuilder', () => {
 		it('mints a PoW (low bits) that the matching verifier accepts for the same register', async () => {
 			const { bytes: participant } = await makeKey();
-			const bits = 0; // every nonce solves → deterministic, fast
+			// Not 0: at 0 any nonce passes, so a nonce copied from the wrong bytes of the reused preimage would too.
+			const bits = 12;
 			const build = createBootstrapEvidenceBuilder({ hash, bits });
 			const reg = makeReg(participant, TOPIC, { tier: 2 });
 			const raw = await build(boundOf(reg));
@@ -246,6 +247,20 @@ describe('cohort-topic / bootstrap-evidence verifiers (db-p2p)', () => {
 			// 256-bit difficulty over a 32-byte digest is effectively unsatisfiable; a tiny cap returns undefined fast.
 			const build = createBootstrapEvidenceBuilder({ hash, bits: 256, maxIterations: 64 });
 			expect(await build(boundOf(makeReg(participant, TOPIC, { tier: 2 })))).to.equal(undefined);
+		});
+
+		it('lets timers run during the search and gives up when its time budget is spent', async () => {
+			const { bytes: participant } = await makeKey();
+			// Unsolvable, with an iteration cap that would take seconds, so only the budget can end it.
+			const build = createBootstrapEvidenceBuilder({ hash, bits: 256, maxIterations: 1 << 30, timeBudgetMs: 300 });
+			let ticks = 0;
+			const interval = setInterval(() => { ticks++; }, 10);
+			try {
+				expect(await build(boundOf(makeReg(participant, TOPIC, { tier: 2 }))), 'a spent budget attaches nothing').to.equal(undefined);
+			} finally {
+				clearInterval(interval);
+			}
+			expect(ticks, 'the interval fired while the search ran').to.be.at.least(3);
 		});
 	});
 });

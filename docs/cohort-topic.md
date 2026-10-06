@@ -1268,9 +1268,16 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 > - **Proof-of-work (real, T2/T3).** `verifyPoW` hashes `RingHash.H(powPreimage(reg, nonce))` and checks
 >   it against `meetsDifficulty(·, powDifficultyBits)` — self-contained, one hash, bound to
 >   `(topicId, tier, participantCoord, timestamp)` so a PoW minted for one topic/peer/time cannot
->   bootstrap another. The participant builder mints it (nonce search ≈ `2^bits` hashes; capped so the
->   register path never hangs). Whenever the gate is *configured*, this real PoW path runs (no longer a
->   fail-closed deny).
+>   bootstrap another. The participant builder mints it: a nonce search of geometrically distributed
+>   length around `2^bits` tries, about 1.2 µs of CPU each on a desktop under Node 24, so a default 20-bit
+>   mint averages about 1.2 s there plus the yields below, and runs far slower on Hermes (React Native),
+>   where the hash is un-JITted JavaScript. The search yields to the event loop with a `setTimeout(0)`
+>   every 50 ms so timers and sockets keep running, and gives up — attaching no evidence, which a
+>   configured cohort refuses — after half the replay window (30 s by default), because the register's
+>   `timestamp` is inside the hashed preimage and a register stamped longer ago than the window is refused
+>   as stale whatever it carries (`createBootstrapEvidenceBuilder` in
+>   `packages/db-p2p/src/cohort-topic/bootstrap-evidence-builder.ts`). Whenever the gate is *configured*,
+>   this real PoW path runs (no longer a fail-closed deny).
 > - **Reputation endorsement (real verifier, T2/T3).** `verifyReputation` checks a *referee* peer-key
 >   signature over the bound image **and** that the referee is sufficiently reputable in the node's local
 >   `PeerReputationService` view (not banned **and** `getScore < deprioritize`, stronger than mere

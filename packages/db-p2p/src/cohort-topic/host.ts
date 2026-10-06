@@ -100,6 +100,7 @@ import {
 	createRegisterRateLimiter,
 	DEFAULT_RATE_WINDOW_MS,
 	createCorrelationReplayGuard,
+	DEFAULT_REPLAY_MAX_AGE_MS,
 	createTopicBudget,
 	createBootstrapEvidence,
 	LruMap,
@@ -191,7 +192,7 @@ import { registerProtocolHandler } from "../network/register-protocol-handler.js
 import { signPeer, verifyPeerSig } from "./peer-sig.js";
 import { createPoWVerifier, createReputationVerifier, type BootstrapReputationView } from "./bootstrap-evidence-verifiers.js";
 import { createParentReferenceVerifier, createDefaultParentTopicView, type BootstrapParentTopicView } from "./bootstrap-parent-reference.js";
-import { createBootstrapEvidenceBuilder } from "./bootstrap-evidence-builder.js";
+import { createBootstrapEvidenceBuilder, powTimeBudgetFor } from "./bootstrap-evidence-builder.js";
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS, cohortTopicProtocolList, type CohortTopicProtocols } from "./protocols.js";
 import { readFrame, requestResponse, requireReply, DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
 import { createLogger } from "../logger.js";
@@ -1410,9 +1411,12 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// carries no evidence here (the builder supports an `endorse` self-vouch seam — see
 	// `bootstrap-evidence-builder.ts` — but origination at those tiers is the committed-parent-reference
 	// follow-on `cohort-topic-bootstrap-parent-reference`, so it is intentionally left unwired for now).
+	// The mint gives up inside half of this node's own replay window — the best guess at the serving group's,
+	// which refuses a register stamped longer ago than that, PoW or not.
 	const buildBootstrapEvidence = createBootstrapEvidenceBuilder({
 		hash,
 		bits: options.antiDos?.powDifficultyBits,
+		timeBudgetMs: powTimeBudgetFor(options.antiDos?.replayGuard?.maxAgeMs ?? DEFAULT_REPLAY_MAX_AGE_MS),
 	});
 
 	const service = createCohortTopicService({
