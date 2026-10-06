@@ -45,3 +45,7 @@ Any sereus build that picks up this Optimystic build cannot start a second machi
 ## Reversibility
 
 Complete on both sides. No stored data or wire format changed; the rule is three decisions made at read time, and the sereus change is where a list of addresses is passed.
+
+## Resolution (2026-10-05)
+
+Maintainer chose to release the rule now (Option 1). Nothing changes here; sereus builds an isolated-bring-up node with an empty `bootstrapNodes` and dials its peers after bring-up before taking this release. Stated as a breaking change in `.release-notes.pending.md`.
