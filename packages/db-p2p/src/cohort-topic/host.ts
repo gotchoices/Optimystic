@@ -80,6 +80,7 @@ import { hashPeerId, sendFramed } from "p2p-fret";
 import {
 	RingHash,
 	createRegistrationStore,
+	observeRecordAdditions,
 	createSlotAssigner,
 	createCohortGossipBus,
 	createWillingnessCheck,
@@ -812,9 +813,21 @@ export interface CohortTopicHost {
 	 * read it back via `current(coord)` to observe that a `/membership` refetch replaced a stale cached view.
 	 */
 	readonly membershipSource: { cache(coord: RingCoord, encoded: Uint8Array): void; current(coord: RingCoord): Promise<Uint8Array | undefined> };
+	/**
+	 * Subscribe to every registration record that becomes present on one of this node's coord engines: by
+	 * local admission, a gossip merge, or a rotation-handoff pull — never by a renewal or re-merge of a record
+	 * the engine already holds. Fires synchronously inside the store write, after it; a throwing listener is
+	 * logged and does not reach the write. A subscription rather than a constructor option, so an application
+	 * layered above the substrate (matchmaking's arrival push, `docs/matchmaking.md` §Arrival push on provider
+	 * arrival) can attach after the host is built. Returns an idempotent unsubscribe; `stop()` drops them all.
+	 */
+	onRecordAdded(listener: CoordRecordAddedListener): () => void;
 	/** Unregister the four protocols and tear down every coord engine. */
 	stop(): Promise<void>;
 }
+
+/** A {@link CohortTopicHost.onRecordAdded} subscriber: the engine whose store gained `rec`, and the record. */
+export type CoordRecordAddedListener = (engine: CoordEngine, rec: RegistrationRecord) => void;
 
 /** Node-wide collaborators injected into every {@link CoordEngine} (shared singletons). */
 interface CoordEngineContext {
@@ -917,6 +930,8 @@ interface CoordEngineContext {
 	 * host (key-less nodes also adopt verified inbound notices); optional only for unit composition.
 	 */
 	readonly adoptedTransition?: (coord: RingCoord, tier: number, topicId: Uint8Array) => AdoptedTransition | undefined;
+	/** Fan a record that became present in an engine's store out to the host's {@link CohortTopicHost.onRecordAdded} subscribers. */
+	readonly recordAdded: CoordRecordAddedListener;
 }
 
 /**
@@ -1149,6 +1164,29 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		options.antiDos?.parentTopicView !== undefined || options.committedParentTopicReader !== undefined;
 	const bootstrapEvidence = createBootstrapEvidencePolicy(options.antiDos, hash, log, parentTopicView, hasCommittedParentBacking);
 
+	// --- record-added subscribers (`onRecordAdded`) ---
+	const recordAddedListeners = new Set<CoordRecordAddedListener>();
+	const notifyRecordAdded = (engine: CoordEngine, rec: RegistrationRecord): void => {
+		for (const listener of recordAddedListeners) {
+			try {
+				listener(engine, rec);
+			} catch (err) {
+				log("cohort-topic: record-added listener threw at %s: %o", bytesToB64url(engine.servedCoord), err);
+			}
+		}
+	};
+	const onRecordAdded = (listener: CoordRecordAddedListener): (() => void) => {
+		recordAddedListeners.add(listener);
+		let unsubscribed = false;
+		return (): void => {
+			if (unsubscribed) {
+				return;
+			}
+			unsubscribed = true;
+			recordAddedListeners.delete(listener);
+		};
+	};
+
 	const ctx: CoordEngineContext = {
 		hash,
 		addressing,
@@ -1213,6 +1251,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		// adopt verified inbound notices, so their recreated engines need the seed just the same.
 		adoptedTransition: (coord: RingCoord, tier: number, topicId: Uint8Array): AdoptedTransition | undefined =>
 			promoteGate.transitions.get(transitionKey(bytesToB64url(coord), tier, bytesToB64url(topicId))),
+		recordAdded: notifyRecordAdded,
 	};
 	const registry = createCoordRegistry(ctx, options.antiDos?.coordEnginesMax);
 
@@ -1663,9 +1702,11 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		gossipTransport,
 		promoteGate,
 		membershipSource,
+		onRecordAdded,
 		stop: async (): Promise<void> => {
 			stopped = true;
 			clearInterval(timer);
+			recordAddedListeners.clear();
 			registry.close();
 			participantGossipBus.close();
 			await node.unhandle(cohortTopicProtocolList(protocols));
@@ -2413,7 +2454,10 @@ function requireRootGroup(ctx: CoordEngineContext, servedCoord: RingCoord): Root
  * (per-cohort child registry, gossip-replicated), `0` until this cohort parents a child.
  */
 function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, treeTier: number, participantCoord: Uint8Array, placement: EnginePlacement): CoordEngine {
-	const store = createRegistrationStore();
+	// Every path a record reaches this engine by (admission, gossip merge, handoff pull) writes through this
+	// store, so the absent→present observer is where `onRecordAdded` is fed. `coordEngine` is the object this
+	// function returns; no record is written before it exists.
+	const store = observeRecordAdditions(createRegistrationStore(), (rec: RegistrationRecord): void => ctx.recordAdded(coordEngine, rec));
 	// --- placement (§Root placement at a routing key) ---
 	// A root-placed engine's cohort is the root group at `servedCoord`, read from the snapshot the dispatch path
 	// filled before creating it and refreshed on every gossip round; its threshold is the ratio rule. The root
@@ -3021,7 +3065,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		promotion: promotion.hasAdoptedState(),
 	});
 
-	return {
+	const coordEngine: CoordEngine = {
 		servedCoord,
 		treeTier,
 		rootPlaced,
@@ -3094,6 +3138,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 			bus.close();
 		},
 	};
+	return coordEngine;
 }
 
 /**

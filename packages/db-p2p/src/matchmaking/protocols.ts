@@ -3,11 +3,13 @@
  *
  * Matchmaking is an application layered **above** the cohort-topic substrate, so it owns its own protocol
  * family rather than riding the cohort-topic protocols (which carry only substrate concerns — register,
- * gossip, promote, membership, sign). Exactly one protocol lives here today:
+ * gossip, promote, membership, sign). Two protocols live here:
  *
- * - `query` — `QueryV1` → `QueryReplyV1`, the seeker's request-reply RPC against a cohort for the
- *             providers/seekers it locally holds (the serve side is `query-transport.ts`; the seeker
- *             walk client is the follow-on `matchmaking-query-rpc-seeker-walk`).
+ * - `query`       — `QueryV1` → `QueryReplyV1`, the seeker's request-reply RPC against a cohort for the
+ *                   providers/seekers it locally holds (the serve side is `query-transport.ts`).
+ * - `arrivalPush` — `ArrivalPushV1` → `ArrivalPushAckV1`, the seeker's slot-primary cohort member telling a
+ *                   push-opted seeker that fresh matchable providers arrived (`docs/matchmaking.md` §Arrival
+ *                   push on provider arrival; the sending side is `arrival-push-driver.ts`).
  *
  * The default (network-agnostic) ID omits the network segment; {@link makeMatchmakingProtocols} mirrors
  * FRET's `makeProtocols(networkName)` so a named network namespaces its matchmaking protocols the same way
@@ -22,14 +24,19 @@ export const MATCHMAKING_BASE = "/optimystic/matchmaking/1.0.0" as const;
 /** `QueryV1` / `QueryReplyV1` — a seeker's query for a cohort's locally-held provider/seeker registrations. */
 export const PROTOCOL_MATCHMAKING_QUERY = `${MATCHMAKING_BASE}/query` as const;
 
+/** `ArrivalPushV1` / `ArrivalPushAckV1` — a cohort member's push of fresh matchable providers to a waiting seeker. */
+export const PROTOCOL_MATCHMAKING_ARRIVAL_PUSH = `${MATCHMAKING_BASE}/arrival-push` as const;
+
 /** The matchmaking protocol IDs in registration order. */
 export interface MatchmakingProtocols {
 	readonly query: string;
+	readonly arrivalPush: string;
 }
 
 /** Default (network-agnostic) protocol IDs, matching `docs/matchmaking.md`. */
 export const DEFAULT_MATCHMAKING_PROTOCOLS: MatchmakingProtocols = {
 	query: PROTOCOL_MATCHMAKING_QUERY,
+	arrivalPush: PROTOCOL_MATCHMAKING_ARRIVAL_PUSH,
 };
 
 /**
@@ -42,10 +49,11 @@ export function makeMatchmakingProtocols(networkName = "default"): MatchmakingPr
 	const base = `/optimystic/${networkName}/matchmaking/1.0.0`;
 	return {
 		query: `${base}/query`,
+		arrivalPush: `${base}/arrival-push`,
 	};
 }
 
 /** All matchmaking protocol IDs as an array (for `node.handle` / `unhandle` over the set). */
 export function matchmakingProtocolList(p: MatchmakingProtocols): string[] {
-	return [p.query];
+	return [p.query, p.arrivalPush];
 }

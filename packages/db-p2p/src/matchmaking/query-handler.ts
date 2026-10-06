@@ -18,7 +18,6 @@
 
 import {
 	bytesToB64url,
-	decodeMatchAppPayload,
 	evaluateQuery,
 	queryReplySigningPayload,
 	type LocalProviderRegistration,
@@ -28,7 +27,7 @@ import {
 	type RegistrationRecord,
 	type TopicTrafficV1,
 } from "@optimystic/db-core";
-import { bytesToPeerIdString } from "../cohort-topic/peer-codec.js";
+import { decodeLocalRegistration } from "./local-registration.js";
 
 /** Everything the {@link handleMatchmakingQuery} needs from the cohort substrate, all injected. */
 export interface CohortQueryContext {
@@ -50,23 +49,11 @@ export async function handleMatchmakingQuery(query: QueryV1, ctx: CohortQueryCon
 	const seekers: LocalSeekerRegistration[] = [];
 
 	for (const rec of ctx.records) {
-		if (rec.appState === undefined) {
-			continue;
-		}
-		const participantId = bytesToPeerIdString(rec.participantId);
-		let payload;
-		try {
-			payload = decodeMatchAppPayload(rec.appState);
-		} catch (err) {
-			// A record whose appState isn't a matchmaking payload (or is malformed) is not ours to serve;
-			// skip it rather than fail the whole reply. Logged so it is never silently swallowed.
-			ctx.log?.("matchmaking query handler: skipping undecodable record for %s: %o", participantId, err);
-			continue;
-		}
-		if (payload.kind === "match-provider") {
-			providers.push({ participantId, attachedAt: rec.attachedAt, payload });
-		} else {
-			seekers.push({ participantId, attachedAt: rec.attachedAt, payload });
+		const decoded = decodeLocalRegistration(rec, ctx.log);
+		if (decoded?.role === "provider") {
+			providers.push(decoded.registration);
+		} else if (decoded?.role === "seeker") {
+			seekers.push(decoded.registration);
 		}
 	}
 
