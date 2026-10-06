@@ -15,8 +15,8 @@
  * - **Tier ≥ maxNoPowTier+1 (T2/T3):** mint a proof-of-work — search nonces until
  *   `meetsDifficulty(hash.H(powPreimage(reg, nonce)), bits)`. The search takes a geometrically
  *   distributed number of tries around `2^bits` (default 20 ≈ 1 M). One try costs about 1.2 µs on a
- *   desktop under Node 24 (one SHA-256 of a ~180-byte preimage), so a default mint averages about 1.2 s
- *   there and a slow one takes several times that; on Hermes (React Native), which runs the hash as
+ *   desktop under Node 24 (one SHA-256 of a ~180-byte preimage), so a default mint averages about 1.2 s of
+ *   hashing there and a slow one takes several times that; on Hermes (React Native), which runs the hash as
  *   un-JITted JavaScript, it is far slower. So the search **yields** to the event loop every
  *   {@link POW_SLICE_MS}, letting timers and sockets run, and **gives up** — returning `undefined`, as
  *   the iteration cap ({@link DEFAULT_POW_MAX_ITERATIONS}) also does — once it has run for
@@ -106,8 +106,6 @@ export interface BootstrapEvidenceBuilderDeps {
 	 * serving group's replay window ({@link powTimeBudgetFor}). Default {@link DEFAULT_POW_TIME_BUDGET_MS}.
 	 */
 	readonly timeBudgetMs?: number;
-	/** Clock for the search's slices and budget. Default `Date.now`. */
-	readonly now?: () => number;
 	/**
 	 * Optional self-vouch endorsement capability for a key-ful node: signs the bound image with the node's
 	 * peer key and returns the referee (= self) + signature. Supplied → T0/T1 mints a reputation
@@ -132,7 +130,6 @@ export function createBootstrapEvidenceBuilder(
 		bits: deps.bits ?? DEFAULT_POW_DIFFICULTY_BITS,
 		maxTries: Math.min(deps.maxIterations ?? DEFAULT_POW_MAX_ITERATIONS, MAX_COUNTER_TRIES),
 		timeBudgetMs: deps.timeBudgetMs ?? DEFAULT_POW_TIME_BUDGET_MS,
-		now: deps.now ?? Date.now,
 	};
 
 	return async (params: BootstrapEvidenceBuildParams): Promise<Uint8Array | undefined> => {
@@ -165,7 +162,6 @@ interface PowSearchLimits {
 	/** Already clamped to what the counter can name. */
 	readonly maxTries: number;
 	readonly timeBudgetMs: number;
-	readonly now: () => number;
 }
 
 /**
@@ -210,25 +206,32 @@ class PowCandidate {
 /**
  * Search counters in strides of {@link POW_CLOCK_STRIDE}, reading the clock between strides to yield
  * once a slice has run for {@link POW_SLICE_MS} and to give up once the time budget is spent.
+ *
+ * NOTE: concurrent mints interleave and share the CPU while each budget runs on the wall clock, so N
+ * cold starts at once each get about 1/N of it and can all give up where run one after another the
+ * first few would finish; if a slow device ever cold-starts many topics together, queue mints per
+ * builder (a queued mint's budget already counts its wait, which is right: its timestamp ages too).
+ * NOTE: nothing cancels a mint — a node stopped mid-search keeps searching, yielding, until it solves
+ * or the budget ends; if shutdown latency matters, thread an `AbortSignal` from the service's register builder.
  */
 async function searchPowNonce(candidate: PowCandidate, limits: PowSearchLimits): Promise<Uint8Array | undefined> {
-	const startedAt = limits.now();
+	const startedAt = Date.now();
 	let sliceStartedAt = startedAt;
 	for (let from = 0; from < limits.maxTries; from += POW_CLOCK_STRIDE) {
 		const to = Math.min(from + POW_CLOCK_STRIDE, limits.maxTries);
 		if (candidate.solveWithin(from, to, limits.bits)) {
 			return candidate.nonce();
 		}
-		const now = limits.now();
+		const now = Date.now();
 		if (now - startedAt >= limits.timeBudgetMs) {
 			return giveUp("time budget spent", now - startedAt, to, limits);
 		}
 		if (now - sliceStartedAt >= POW_SLICE_MS) {
 			await yieldToEventLoop();
-			sliceStartedAt = limits.now();
+			sliceStartedAt = Date.now();
 		}
 	}
-	return giveUp("iteration cap reached", limits.now() - startedAt, limits.maxTries, limits);
+	return giveUp("iteration cap reached", Date.now() - startedAt, limits.maxTries, limits);
 }
 
 /** One line per abandoned mint: on a slow device it is what explains a cold start that keeps being refused. */
