@@ -56,7 +56,7 @@ import { sendOneWay, requestResponse, DEFAULT_STREAM_MAX_BYTES } from '../src/co
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from '../src/cohort-topic/protocols.js';
 import { DEFAULT_MATCHMAKING_PROTOCOLS } from '../src/matchmaking/protocols.js';
 import { createLibp2pMatchmakingTransport } from '../src/matchmaking/query-transport.js';
-import { SeekerWalkClient, type SeekerWalkResult } from '../src/matchmaking/seeker-walk-client.js';
+import { SeekerWalkClient, type SeekerWalkResult, type SeekerWalkTransport } from '../src/matchmaking/seeker-walk-client.js';
 import { waitFor, waitForValue } from '@optimystic/db-core/test';
 import { signedWillingness, type Member } from '../src/testing/cohort-topic-mesh-harness.js';
 import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
@@ -68,7 +68,7 @@ import {
 	createLibp2pRecoverDialer,
 	createRecoverRequestSigners,
 } from '../src/reactivity/recover-transport.js';
-import type { CohortTopicHost, CoordEngine } from '../src/cohort-topic/host.js';
+import { resolveRenew, type CohortTopicHost, type CoordEngine } from '../src/cohort-topic/host.js';
 
 /**
  * **Substrate real-libp2p e2e tier** — the high-fidelity, small-N counterpart to the three mock-tier
@@ -1042,6 +1042,96 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			verifyProviderEntry(matchTopic, forgedEntry, (id, payload, sig) => verifyPeerSig(id, payload, sig)),
 			'verifyProviderEntry rejects the forged entry seeker-side',
 		).to.equal(false);
+	});
+
+	// --- 5d. Matchmaking: a provider arriving mid-hang-out is pushed to a remote seeker over a real socket ---
+	// The node wiring is live: every cohortTopic-enabled node runs the arrival-push driver off its host's
+	// onRecordAdded and serves `/optimystic/matchmaking/1.0.0/arrival-push` into `node.matchmakingArrivalPush`. A
+	// remote seeker built with that receiver walks on the push path; a provider registers once the walk hangs out;
+	// the seeker's slot primary pushes it (dialing the seeker by the peer id it advertised, or in process when the
+	// slot primary is the seeker's own node), and the walk returns before its first safety poll.
+	it('a provider registering while a push-opted seeker hangs out is pushed to it, and the walk returns before its first safety poll', async () => {
+		const matchTopic = Uint8Array.from({ length: 32 }, (_v, i) => (i * 11 + 29) & 0xff);
+		const matchCoord = addressing.coord0(matchTopic);
+		engines(matchCoord);
+		const matchPrimary = primaryFor(matchCoord);
+		const matchPrimaryEngine = engineOf(matchPrimary, matchCoord);
+		expect(await quorumOn(matchPrimaryEngine, matchCoord), 'willingness converged for the push topic').to.equal(true);
+
+		// A remote seeker (not the routed primary, so its register and query dial). Every node is in every cohort here,
+		// so a seeker can be its own slot primary, which gets its push in process; prefer one whose slot primary is
+		// another node, so the push crosses a real socket. Renew and withdraw stay bound in process for the fallback.
+		const { members: cohortMembers, cohortEpoch } = matchPrimaryEngine.cohort();
+		const candidates = nodes.filter((n) => n.idStr !== matchPrimary.idStr);
+		const seeker = candidates.find((n) => bytesToPeerIdString(slotPrimary(n.member.bytes, cohortEpoch, cohortMembers)) !== n.idStr) ?? candidates[0]!;
+		const arrivalPush = seeker.node.matchmakingArrivalPush;
+		expect(arrivalPush, 'a cohortTopic-enabled node exposes its arrival-push receiver').to.not.equal(undefined);
+		const transport = createLibp2pMatchmakingTransport({
+			node: seeker.node,
+			fret: seeker.fret as unknown as FretService,
+			selfPeerId: seeker.idStr,
+			key: seeker.key,
+			wantK: WANT_K,
+			arrivalPush,
+			selfServe: { renew: async (r: RenewV1) => resolveRenew(seeker.host.registry, r, Date.now()) },
+		});
+
+		// Count the walk's queries and see when it waits on pushes.
+		const inner = transport.walkTransport(matchTopic);
+		expect(inner.pushes, 'the walk registered for arrival pushes').to.not.equal(undefined);
+		const innerPushes = inner.pushes!;
+		let queries = 0;
+		let waitingOnPushes = false;
+		const observed: SeekerWalkTransport = {
+			...inner,
+			query: (treeTier: number) => {
+				queries++;
+				return inner.query(treeTier);
+			},
+			pushes: {
+				take: () => innerPushes.take(),
+				wait: async (ms: number) => {
+					waitingOnPushes = true;
+					try {
+						await innerPushes.wait(ms);
+					} finally {
+						waitingOnPushes = false;
+					}
+				},
+			},
+		};
+		// Patience outlasts one 10 s seeker TTL, so the record must be kept alive by real renews if the run is slow.
+		let outcome: { readonly result: SeekerWalkResult } | { readonly error: unknown } | undefined;
+		void new SeekerWalkClient({ transport: observed, topicId: matchTopic, wantCount: 1, dMax: 0, patienceMs: 30_000, verifyEntry: transport.verifyEntry })
+			.run()
+			.then((result) => { outcome = { result }; }, (error: unknown) => { outcome = { error }; });
+		await waitFor(() => waitingOnPushes || outcome !== undefined, { timeoutMs: 20_000, intervalMs: 50, description: 'the seeker walk is hanging out on the push path' });
+		expect(outcome, 'the walk is still waiting: the provider has not arrived yet').to.equal(undefined);
+		expect(queries, 'only the immediate query has run').to.equal(1);
+
+		// Every member needs the seeker's record, since whichever of them is its slot primary does the pushing.
+		const holdsSeeker = (n: RealNode): boolean => engineOf(n, matchCoord).records(matchTopic).some((r) => bytesEqual(r.participantId, seeker.member.bytes));
+		await matchPrimaryEngine.gossipRound(Date.now());
+		await waitFor(() => nodes.every(holdsSeeker), { timeoutMs: 20_000, intervalMs: 100, description: 'the seeker record replicated to every member over real /cohort-gossip' });
+
+		const providerKey = await generateKeyPair('Ed25519');
+		const provider = await memberOf(providerKey, peerIdFromPrivateKey(providerKey));
+		const capabilities = ['transcode'];
+		const providerSig = bytesToB64url(await signPeer(provider.key, providerSigningPayload(matchTopic, capabilities, 1)));
+		const providerPayload = encodeProviderAppPayload({ kind: 'match-provider', capabilities, capacityBudget: 1, contactHint: provider.idStr, signature: providerSig });
+		const now = Date.now();
+		const providerReg = await signedRegister(provider, matchTopic, now, 'mm-push-provider', { tier: 2, selfVouch: true, appPayload: providerPayload });
+		expect((await matchPrimaryEngine.engine.handleRegister(providerReg, { followOn: false, treeTier: 0 }, now)).result, 'the provider was admitted mid-hang-out').to.equal('accepted');
+		await matchPrimaryEngine.gossipRound(Date.now());
+
+		await waitFor(() => outcome !== undefined, { timeoutMs: 20_000, intervalMs: 50, description: 'the push reached the seeker and its walk returned' });
+		if (outcome !== undefined && 'error' in outcome) {
+			throw outcome.error;
+		}
+		const result = outcome!.result;
+		expect(result.metWantCount, 'the pushed provider met the seeker\'s wantCount').to.equal(true);
+		expect(result.providers.map((p) => p.participantId), 'the walk returned the provider that arrived').to.include(provider.idStr);
+		expect(queries, 'no safety or final poll ran: the provider came by push').to.equal(1);
 	});
 
 	// --- 6. Cluster-formation / same-FRET-ring consistency ---

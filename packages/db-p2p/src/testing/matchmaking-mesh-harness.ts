@@ -27,9 +27,18 @@
  * suffices" (an `Accepted` above the root) is gated on that follow-on and is tagged-unimplemented in the
  * mesh suites, not faked here.
  *
- * **Virtual time.** Like the cohort harness this is not a wall-clock simulator: each {@link seek} runs on
- * an injected virtual clock (sleep advances `now`), so a 10 s hang-out resolves instantly and
- * deterministically. Cohort TTL sweeps are driven explicitly via {@link sweepTopic}.
+ * **Arrival push.** Every member runs the real cohort-side {@link ArrivalPushDriver}, subscribed to its real
+ * host's `onRecordAdded`, and the real seeker-side {@link ArrivalPushReceiver}. A driver's delivery is
+ * in-process: the seeker's contact hint is resolved with the production {@link contactHintTarget} and the frame
+ * handed to that member's receiver, so no mock libp2p protocol is involved (the same way {@link query} is
+ * served in process). Every resolved delivery is recorded in {@link MatchmakingMesh.pushSends}.
+ *
+ * **Virtual time.** Like the cohort harness this is not a wall-clock simulator. Each {@link seek} runs on its
+ * own virtual clock whose sleep advances `now` at once, so a 10 s hang-out resolves instantly and
+ * deterministically. A walk that has to interleave with arrivals — every push-path walk, and a poll-path walk
+ * compared against one — runs instead on the mesh's shared virtual time ({@link MatchmakingMesh.startSeek}),
+ * which also drives the drivers' coalescing timers and the receivers' push waits; nothing on it moves until
+ * the test calls {@link MatchmakingMesh.advance}. Cohort TTL sweeps are driven explicitly via {@link sweepTopic}.
  */
 
 import { Tier, providerTtlForProfile } from '@optimystic/db-core';
@@ -56,15 +65,19 @@ import {
 } from '@optimystic/db-core';
 import type { CohortTopicHost, CoordEngine } from '../cohort-topic/host.js';
 import { signPeer, verifyPeerSig } from '../cohort-topic/peer-sig.js';
+import { ArrivalPushDriver } from '../matchmaking/arrival-push-driver.js';
+import { ArrivalPushReceiver } from '../matchmaking/arrival-push-receiver.js';
+import { contactHintTarget } from '../matchmaking/arrival-push-send.js';
 import { MatchmakingProviderManager } from '../matchmaking/provider-manager.js';
 import { handleMatchmakingQuery } from '../matchmaking/query-handler.js';
-import { SeekerWalkClient, type SeekerProbeReply, type SeekerWalkTransport } from '../matchmaking/seeker-walk-client.js';
+import { SeekerWalkClient, type SeekerProbeReply, type SeekerPushChannel, type SeekerWalkTransport } from '../matchmaking/seeker-walk-client.js';
 import {
 	addressing,
 	buildMesh,
 	delay,
 	makeMembers,
 	setupTopic,
+	slots,
 	type CohortMesh,
 	type Member,
 	type MeshOptions,
@@ -102,8 +115,10 @@ export interface MatchResult {
 	readonly maxChildCohortCount: number;
 	/** Distinct tree tiers the walk register-probed (the walk depth). */
 	readonly tiersVisited: number;
-	/** Total virtual time the seeker spent hanging out (sum of poll sleeps). */
+	/** Total virtual time the seeker spent hanging out (sum of poll sleeps; elapsed virtual time for {@link MatchmakingMesh.startSeek}). */
 	readonly hungOutMs: number;
+	/** `QueryV1`s the walk issued, the immediate one at each accepting tier included. */
+	readonly queries: number;
 }
 
 /** Per-seek tuning (start tier, patience, filter, push opt). */
@@ -116,6 +131,26 @@ export interface SeekOptions {
 	readonly filter?: CapabilityFilter;
 	/** Hang-out requery cadence (ms); forwarded to the walk config. */
 	readonly requeryIntervalMs?: number;
+}
+
+/** Per-seek tuning for a walk on the mesh's shared virtual time ({@link MatchmakingMesh.startSeek}). */
+export interface LiveSeekOptions extends SeekOptions {
+	/** Register the walk for arrival pushes on its member's receiver (the push path). Default: the poll path. */
+	readonly pushOnArrival?: boolean;
+}
+
+/** A walk running on the mesh's shared virtual time. */
+export interface SeekHandle {
+	/** The walk's outcome, once it ends. */
+	readonly done: Promise<MatchResult>;
+	/** Whether the walk is parked on virtual time — a hang-out sleep or a push wait — so it moves only on {@link MatchmakingMesh.advance} or a push. */
+	parked(): boolean;
+}
+
+/** One arrival push a member's driver delivered in process: the pushing member and the seeker it reached (peer-id strings). */
+export interface PushSend {
+	readonly from: string;
+	readonly to: string;
 }
 
 /** Construction inputs for a {@link MatchmakingMesh}. */
@@ -147,6 +182,81 @@ function virtualClock(): { clock: () => number; sleep: (ms: number) => Promise<v
 	};
 }
 
+/** Real time {@link VirtualTime.advance} gives the work a fired timer starts (a push's sign → deliver → ack, a walk's next query). */
+const SETTLE_MS = 10;
+
+/** A one-shot timer on {@link VirtualTime}. */
+interface VirtualTimer {
+	readonly id: number;
+	readonly due: number;
+	readonly fn: () => void;
+}
+
+/** The mesh's shared virtual time: one-shot timers that fire only when {@link advance} reaches them, in due order. */
+class VirtualTime {
+	private current = 0;
+	private nextId = 0;
+	private readonly timers = new Map<number, VirtualTimer>();
+
+	readonly now = (): number => this.current;
+
+	readonly setTimer = (fn: () => void, ms: number): (() => void) => {
+		const id = this.nextId++;
+		this.timers.set(id, { id, due: this.current + Math.max(0, ms), fn });
+		return (): void => {
+			this.timers.delete(id);
+		};
+	};
+
+	readonly sleep = (ms: number): Promise<void> => new Promise((resolve) => {
+		this.setTimer(resolve, ms);
+	});
+
+	/** Move time forward `ms`, firing each timer that falls due — including ones a fired timer arms — and letting its work settle. */
+	async advance(ms: number): Promise<void> {
+		const target = this.current + ms;
+		for (let next = this.nextDue(target); next !== undefined; next = this.nextDue(target)) {
+			this.timers.delete(next.id);
+			this.current = next.due;
+			next.fn();
+			await delay(SETTLE_MS);
+		}
+		this.current = target;
+	}
+
+	/** The earliest timer due at or before `limit`; ties go to the one armed first (map order is arming order). */
+	private nextDue(limit: number): VirtualTimer | undefined {
+		let earliest: VirtualTimer | undefined;
+		for (const timer of this.timers.values()) {
+			if (timer.due <= limit && (earliest === undefined || timer.due < earliest.due)) {
+				earliest = timer;
+			}
+		}
+		return earliest;
+	}
+}
+
+/** One member's arrival-push pair: its receiver, and its driver with the host subscription that feeds it. */
+interface PushPeer {
+	readonly receiver: ArrivalPushReceiver;
+	readonly driver: ArrivalPushDriver;
+	readonly unsubscribe: () => void;
+}
+
+/** A walk's clock, sleep and hang-out measure, and — on the push path — how its push channel is wrapped. */
+interface WalkTiming {
+	readonly clock: () => number;
+	readonly sleep: (ms: number) => Promise<void>;
+	readonly hungOutMs: () => number;
+	readonly pushes?: (channel: SeekerPushChannel) => SeekerPushChannel;
+}
+
+/** What a walk transport records as the walk runs. */
+interface WalkTrace {
+	readonly tiersVisited: Set<number>;
+	queries: number;
+}
+
 /**
  * The matchmaking integration mesh. Build with {@link buildMatchmakingMesh}; drive providers/seekers with
  * {@link provide} / {@link seek} / {@link query}; model the hang-out regime with {@link setTraffic}.
@@ -156,13 +266,56 @@ export class MatchmakingMesh {
 	private readonly traffic = new Map<string, TopicTrafficV1>();
 	/** Monotonic correlation-id counter so each routed register/probe is replay-distinct. */
 	private corr = 0;
+	/** The shared virtual time {@link startSeek} walks and the arrival-push timers run on. */
+	private readonly time = new VirtualTime();
+	/** Each member's arrival-push pair, by member index. */
+	private readonly pushPeers: PushPeer[];
+	/** Every arrival push a member's driver delivered, in delivery order. */
+	readonly pushSends: PushSend[] = [];
 
 	private constructor(
 		readonly mesh: CohortMesh,
 		readonly members: Member[],
 		private readonly sizeEstimate: number,
 		private readonly profiles: readonly ('edge' | 'core')[],
-	) {}
+	) {
+		this.pushPeers = mesh.nodes.map((node) => this.attachArrivalPush(node.member, node.host));
+	}
+
+	/** Give `member` a receiver and a driver subscribed to its host, both on the shared virtual time. */
+	private attachArrivalPush(member: Member, host: CohortTopicHost): PushPeer {
+		const driver = new ArrivalPushDriver({
+			selfPeerId: member.idStr,
+			slots,
+			sign: async (payload: Uint8Array): Promise<string> => bytesToB64url(await signPeer(member.key, payload)),
+			send: (contactHint: string, frame: Uint8Array): Promise<Uint8Array | undefined> => this.deliverPush(member, contactHint, frame),
+			setTimer: this.time.setTimer,
+		});
+		return {
+			receiver: new ArrivalPushReceiver({ setTimer: this.time.setTimer }),
+			driver,
+			unsubscribe: host.onRecordAdded(driver.onRecordAdded),
+		};
+	}
+
+	/** The in-process push delivery: the member the hint names takes the frame on its receiver, as sent by `from`. */
+	private async deliverPush(from: Member, contactHint: string, frame: Uint8Array): Promise<Uint8Array | undefined> {
+		const target = contactHintTarget(contactHint);
+		const index = target === undefined ? -1 : this.members.findIndex((m) => m.idStr === target.peerId.toString());
+		if (index < 0) {
+			return undefined;
+		}
+		this.pushSends.push({ from: from.idStr, to: this.members[index]!.idStr });
+		return this.pushPeers[index]!.receiver.receive(frame, from.idStr);
+	}
+
+	/**
+	 * Move the shared virtual time forward `ms`: due coalescing timers flush their pushes, and {@link startSeek}
+	 * walks wake from their sleeps and push waits.
+	 */
+	advance(ms: number): Promise<void> {
+		return this.time.advance(ms);
+	}
 
 	/** Stand up an N-node matchmaking mesh and start every host. */
 	static async build(opts: MatchmakingMeshOptions = {}): Promise<MatchmakingMesh> {
@@ -383,18 +536,26 @@ export class MatchmakingMesh {
 		return out as SeekerProbeReply;
 	}
 
-	/** The walk transport: real per-tier register probes + real cohort queries over the mesh. */
-	private buildWalkTransport(topicId: Uint8Array, seeker: Member, wantCount: number, filter: CapabilityFilter | undefined, tiersVisited: Set<number>): SeekerWalkTransport {
+	/**
+	 * The walk transport: real per-tier register probes + real cohort queries over the mesh. With
+	 * `timing.pushes`, the seeker registers with `pushOnArrival` and the walk listens on its member's receiver.
+	 */
+	private buildWalkTransport(topicId: Uint8Array, seekerIndex: number, wantCount: number, filter: CapabilityFilter | undefined, trace: WalkTrace, timing: WalkTiming): SeekerWalkTransport {
+		const seeker = this.members[seekerIndex]!;
 		const seekerState = new MatchmakingSeeker({
 			topicId,
 			wantCount,
 			contactHint: `/ip4/127.0.0.1/tcp/4002/p2p/${seeker.idStr}`,
 			sign: async (payload: Uint8Array): Promise<string> => bytesToB64url(await signPeer(seeker.key, payload)),
 			...(filter !== undefined ? { filter } : {}),
+			...(timing.pushes !== undefined ? { pushOnArrival: true } : {}),
 		});
+		const subscription = timing.pushes === undefined
+			? undefined
+			: this.pushPeers[seekerIndex]!.receiver.subscribe(topicId, bytesToB64url(seekerState.correlationId));
 		return {
 			register: async (treeTier: number): Promise<SeekerProbeReply> => {
-				tiersVisited.add(treeTier);
+				trace.tiersVisited.add(treeTier);
 				const coord = treeTier === 0 ? addressing.coord0(topicId) : addressing.coord(treeTier, seeker.bytes, topicId);
 				const target = this.mesh.nodeNearest(coord);
 				const engine = target.host.registry.forCoord(coord, treeTier as Tier, seeker.bytes);
@@ -404,7 +565,10 @@ export class MatchmakingMesh {
 				const reply = await engine.engine.handleRegister(reg, { followOn: false, treeTier, ...(parentCoord !== undefined ? { parentCoord } : {}) }, now);
 				return this.toProbeReply(topicId, reply);
 			},
-			query: async (_treeTier: number): Promise<QueryReplyV1> => this.queryCohort(topicId, seeker, filter),
+			query: async (_treeTier: number): Promise<QueryReplyV1> => {
+				trace.queries++;
+				return this.queryCohort(topicId, seeker, filter);
+			},
 			renew: async (): Promise<void> => {
 				// The hang-out keep-alive: a real seeker would renew its registration; the record already
 				// lives in the cohort store for the seek's virtual duration, so this is a no-op touch.
@@ -412,6 +576,10 @@ export class MatchmakingMesh {
 			withdraw: async (): Promise<void> => {
 				// Polite escalation withdrawal (`RenewV1` TTL = 0) is an optimization; the brief seeker record
 				// ages out by TTL. Single-tier-0 walks reach the root and never escalate past it.
+			},
+			...(subscription !== undefined && timing.pushes !== undefined ? { pushes: timing.pushes(subscription.channel) } : {}),
+			close: async (): Promise<void> => {
+				subscription?.unsubscribe();
 			},
 		};
 	}
@@ -425,21 +593,51 @@ export class MatchmakingMesh {
 	 * register from the same node collide on `(topicId, participantId)` in the cohort store.
 	 */
 	async seek(seekerIndex: number, kind: MatchTopicKind, label: string, wantCount: number, opts: SeekOptions = {}): Promise<MatchResult> {
-		const seeker = this.members[seekerIndex]!;
-		const topicId = this.topicId(kind, label);
-		const dMax = opts.dMax ?? this.dMax;
-		const patienceMs = opts.patienceMs ?? 10_000;
 		const vt = virtualClock();
-		const tiersVisited = new Set<number>();
+		return this.runWalk(seekerIndex, kind, label, wantCount, opts, { clock: vt.clock, sleep: vt.sleep, hungOutMs: vt.slept });
+	}
+
+	/**
+	 * Start the real seeker walk on the mesh's shared virtual time and return at once. The walk registers and
+	 * runs its immediate query, then parks on a hang-out sleep or — with `pushOnArrival` — on its member's push
+	 * receiver, and moves on only when the test calls {@link advance} or a member's driver pushes to it. The seek
+	 * to use whenever arrivals must land while the walk hangs out; the same seeker-index rule as {@link seek}.
+	 */
+	startSeek(seekerIndex: number, kind: MatchTopicKind, label: string, wantCount: number, opts: LiveSeekOptions = {}): SeekHandle {
+		let parked = 0;
+		const whileParked = async (wait: Promise<void>): Promise<void> => {
+			parked++;
+			try {
+				await wait;
+			} finally {
+				parked--;
+			}
+		};
+		const startedAt = this.time.now();
+		const timing: WalkTiming = {
+			clock: this.time.now,
+			sleep: (ms: number): Promise<void> => whileParked(this.time.sleep(ms)),
+			hungOutMs: (): number => this.time.now() - startedAt,
+			...(opts.pushOnArrival === true
+				? { pushes: (channel: SeekerPushChannel): SeekerPushChannel => ({ take: () => channel.take(), wait: (ms: number) => whileParked(channel.wait(ms)) }) }
+				: {}),
+		};
+		return { done: this.runWalk(seekerIndex, kind, label, wantCount, opts, timing), parked: (): boolean => parked > 0 };
+	}
+
+	/** Run one seeker walk under `timing`. */
+	private async runWalk(seekerIndex: number, kind: MatchTopicKind, label: string, wantCount: number, opts: SeekOptions, timing: WalkTiming): Promise<MatchResult> {
+		const topicId = this.topicId(kind, label);
+		const trace: WalkTrace = { tiersVisited: new Set<number>(), queries: 0 };
 		const client = new SeekerWalkClient({
-			transport: this.buildWalkTransport(topicId, seeker, wantCount, opts.filter, tiersVisited),
+			transport: this.buildWalkTransport(topicId, seekerIndex, wantCount, opts.filter, trace, timing),
 			topicId,
 			wantCount,
-			dMax,
-			patienceMs,
+			dMax: opts.dMax ?? this.dMax,
+			patienceMs: opts.patienceMs ?? 10_000,
 			verifyEntry: this.verifyEntry,
-			clock: vt.clock,
-			sleep: vt.sleep,
+			clock: timing.clock,
+			sleep: timing.sleep,
 			...(opts.filter !== undefined ? { filter: opts.filter } : {}),
 			...(opts.requeryIntervalMs !== undefined ? { config: { ...DEFAULT_HANG_OUT_CONFIG, requeryIntervalMs: opts.requeryIntervalMs } } : {}),
 		});
@@ -450,8 +648,9 @@ export class MatchmakingMesh {
 			terminalTier: result.terminalTier,
 			hops: result.hops,
 			maxChildCohortCount: result.maxChildCohortCount,
-			tiersVisited: tiersVisited.size,
-			hungOutMs: vt.slept(),
+			tiersVisited: trace.tiersVisited.size,
+			hungOutMs: timing.hungOutMs(),
+			queries: trace.queries,
 		};
 	}
 
@@ -466,6 +665,10 @@ export class MatchmakingMesh {
 	}
 
 	async stop(): Promise<void> {
+		for (const peer of this.pushPeers) {
+			peer.unsubscribe();
+			peer.driver.stop();
+		}
 		await this.mesh.stop();
 	}
 }

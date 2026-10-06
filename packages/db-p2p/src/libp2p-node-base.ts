@@ -79,6 +79,9 @@ import { ReactivityCollectionWatch } from './reactivity/collection-watch.js';
 import { peerIdToBytes } from './cohort-topic/peer-codec.js';
 import { DEFAULT_REACTIVITY_PROTOCOLS, reactivityProtocolList } from './reactivity/protocols.js';
 import { registerMatchmakingQueryHandler } from './matchmaking/query-transport.js';
+import { ArrivalPushDriver } from './matchmaking/arrival-push-driver.js';
+import { ArrivalPushReceiver, registerArrivalPushHandler } from './matchmaking/arrival-push-receiver.js';
+import { createArrivalPushSend } from './matchmaking/arrival-push-send.js';
 import { DEFAULT_MATCHMAKING_PROTOCOLS, matchmakingProtocolList } from './matchmaking/protocols.js';
 import { signPeer } from './cohort-topic/peer-sig.js';
 import {
@@ -89,6 +92,7 @@ import {
 	reactivityRootCoord,
 	createTierAddressing,
 	createRingHash,
+	createSlotAssigner,
 	Tier,
 	b64urlToBytes,
 	bytesToB64url,
@@ -2031,6 +2035,8 @@ export async function createLibp2pNodeBase(
 			let pushStateGossip: ReactivityPushStateGossipDriver | undefined;
 			let reactivityRotation: RotationReRegistrationScheduler | undefined;
 			let reactivityWatch: ReactivityCollectionWatch | undefined;
+			let arrivalPushDriver: ArrivalPushDriver | undefined;
+			let unsubscribeArrivalPush: (() => void) | undefined;
 			{
 				const previousStop = node.stop.bind(node);
 				node.stop = async (): Promise<void> => {
@@ -2042,6 +2048,9 @@ export async function createLibp2pNodeBase(
 						pushStateGossip?.stop();
 						offInboundNotify?.();
 						await node.unhandle(reactivityProtocolList(reactivityProtocols));
+						// No new pushes once the host stops reporting arrivals; the driver's coalescing timers go with it.
+						unsubscribeArrivalPush?.();
+						arrivalPushDriver?.stop();
 						await node.unhandle(matchmakingProtocolList(matchmakingProtocols));
 						unsubscribeCohortBridge?.();
 						await host.stop();
@@ -2110,8 +2119,8 @@ export async function createLibp2pNodeBase(
 			});
 
 			// Inbound notify frames → forwarder host (subscriber role delivers in-process; forwarder role fans out).
-			// NOTE: the four `register*Handler` helpers below (notify / pushStateGossip / recover /
-			// matchmaking query) all call `registerProtocolHandler(...)` fire-and-forget (`void`), so a rejected
+			// NOTE: the five `register*Handler` helpers below (notify / pushStateGossip / recover /
+			// matchmaking query / arrival push) all call `registerProtocolHandler(...)` fire-and-forget (`void`), so a rejected
 			// registration escapes the post-start rollback `catch` as an UNHANDLED rejection instead of
 			// failing node creation. Harmless today — every protocol id here is a fixed constant registered
 			// exactly once, so the only realistic rejection is a duplicate, and that needs a caller to pass
@@ -2281,25 +2290,44 @@ export async function createLibp2pNodeBase(
 			const watchAttachment: Pick<OptimysticNodeAttachments, 'reactivityWatch'> = { reactivityWatch };
 			Object.assign(node, watchAttachment);
 
+			// Single-member signatures over the node peer key: the matchmaking query reply and the arrival push.
+			const signWithNodeKey = async (payload: Uint8Array): Promise<string> => bytesToB64url(await signPeer(nodePrivateKey, payload));
+
 			// --- Matchmaking QueryV1 RPC — cohort serve side (docs/matchmaking.md §Seeker query) ---
 			// The server half of the seeker query transport: a remote seeker dials `/optimystic/matchmaking/1.0.0/query`
 			// and this node answers with its cohort's locally-held provider/seeker registrations, signed by the node
 			// peer key. Matchmaking is layered ABOVE the cohort-topic substrate, so it owns its own protocol family
 			// and is wired here (the composition root) over the host's PUBLIC surface only — mirroring the reactivity
-			// registration above; nothing reaches into host.ts internals. The OUTBOUND seeker walk client is the
-			// prereq follow-on `matchmaking-query-rpc-seeker-walk`; only the serve side is live here.
+			// registration above; nothing reaches into host.ts internals. The seeker half is
+			// `createLibp2pMatchmakingSeekerSession`, which an application builds over this node.
 			registerMatchmakingQueryHandler(node, matchmakingProtocols.query, {
 				registry: host.registry,
 				// db-core default tier addressing: createTierAddressing(createRingHash()) is byte-identical to the
 				// host's internal addressing for the tier-0 coord (peer- and fanout-independent), and the handler
 				// only ever derives coord_0(topicId) — matchmaking topics are not root-placed.
 				addressing: createTierAddressing(createRingHash()),
-				// Single-member reply signature over the node peer key (same pattern reactivity uses for its signers).
-				sign: async (payload: Uint8Array): Promise<string> => bytesToB64url(await signPeer(nodePrivateKey, payload)),
+				sign: signWithNodeKey,
 				// Anti-DoS rate-limit seam (backlog matchmaking-query-rate-limit) intentionally left unwired here:
 				// default-allow. When that ticket lands it passes a `gate: (from, topicId) => boolean` that limits on
 				// the connection's verified `from` peer (NOT the self-asserted query.requesterId).
 			});
+
+			// --- Matchmaking arrival push (docs/matchmaking.md §Arrival push on provider arrival) ---
+			// Seeker side: one receiver holds the walks on this node that wait on pushes. An application passes it to
+			// `createLibp2pMatchmakingSeekerSession` as `arrivalPush`, so its walks opt in.
+			const arrivalPushReceiver = new ArrivalPushReceiver();
+			registerArrivalPushHandler(node, matchmakingProtocols.arrivalPush, arrivalPushReceiver);
+			const arrivalPushAttachment: Pick<OptimysticNodeAttachments, 'matchmakingArrivalPush'> = { matchmakingArrivalPush: arrivalPushReceiver };
+			Object.assign(node, arrivalPushAttachment);
+			// Cohort side: every provider record that becomes present on one of this node's engines is pushed to the
+			// selected seekers whose slot primary is this node, under the slot rule registration renewal uses.
+			arrivalPushDriver = new ArrivalPushDriver({
+				selfPeerId,
+				slots: createSlotAssigner(createRingHash()),
+				sign: signWithNodeKey,
+				send: createArrivalPushSend({ node, receiver: arrivalPushReceiver, protocol: matchmakingProtocols.arrivalPush, streamOpen: linkDeadlines }),
+			});
+			unsubscribeArrivalPush = host.onRecordAdded(arrivalPushDriver.onRecordAdded);
 		}
 
 		return node as unknown as OptimysticNode;

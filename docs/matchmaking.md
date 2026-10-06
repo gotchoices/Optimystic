@@ -22,7 +22,7 @@ Both roles use the same cohort-topic registration mechanism with stable topic an
 
 This replaces the earlier Kademlia `provide`/`findProviders` framing. The cohort-topic layer gives matchmaking what the original provide-based approach could not: tree growth that automatically adapts to hot tasks (without flooding), cohort-stable forwarder identity (instead of fragile per-key replication), and shared infrastructure with reactivity and future directory consumers.
 
-> **Implemented** (mock-tier e2e: `db-p2p` `matchmaking/mesh-{lifecycle,walk,sweep}.spec.ts` over
+> **Implemented** (mock-tier e2e: `db-p2p` `matchmaking/mesh-{lifecycle,walk,sweep,push}.spec.ts` over
 > `matchmaking-mesh-harness.ts` — see §Test expectations "Mock-tier e2e"; the per-feature callouts below
 > still read "mock-tier e2e pending" for the narrower slice each describes). The cohesive public module is
 > `packages/db-p2p/src/matchmaking/module.ts`: `MatchmakingProviderSession`
@@ -420,8 +420,24 @@ Contrast: the seeker's prefix lands it in a thinner shard with `directParticipan
 > across hops via a single wall-clock deadline) is
 > `packages/db-p2p/src/matchmaking/seeker-walk-client.ts` (`SeekerWalkClient`). The client also runs
 > the arrival-push hang-out loop when the walk transport supplies a push channel
-> (`SeekerWalkTransport.pushes`); no production transport supplies one until
-> `matchmaking-arrival-push-seeker-transport` lands. Future refinements tracked as backlog tickets:
+> (`SeekerWalkTransport.pushes`); the libp2p transport (`createLibp2pMatchmakingTransport`) supplies one
+> when it is built with the node's arrival-push receiver (see the §Arrival push callout). On both paths
+> that transport keeps the seeker registration alive with signed renews to its slot primary while the walk
+> hangs out, and withdraws it when the walk leaves a tier (`SeekerKeepAlive` in
+> `packages/db-p2p/src/matchmaking/seeker-keep-alive.ts`).
+>
+> Decisions made in the walk beyond the rule above:
+>
+> - **A promotion seen mid-tier re-registers at the same tier.** When any query reply or push at tier `d`
+>   reports `childCohortCount > 0` although the tier's `Accepted` reported none, the walk registers at `d`
+>   again, with no withdraw, and follows the `promoted` reply it gets. At most once per tier per walk. The
+>   check reads **every** query reply at the tier, the immediate one included, not only hang-out polls.
+> - **Every reply feeds the hotness signal.** `SeekerWalkResult.maxChildCohortCount` takes the maximum over
+>   `Accepted` replies, query replies and pushes alike.
+> - **A tier entered with no patience left issues no final poll** on the push path: its immediate query
+>   already ran at the deadline. The poll path behaves the same way.
+>
+> Future refinements tracked as backlog tickets:
 > `matchmaking-per-tier-patience-splitting` (strategies beyond the fixed
 > `patience_per_tier_fraction = 1.0` implemented here) and `matchmaking-contention-from-seeker-pool`
 > (exact `Σ wantCount` contention instead of the `meanWantCount × queriesPerMin` approximation
@@ -444,7 +460,7 @@ The §Decision rule above is the common path. A few specific situations need exp
 
 ### Test expectations
 
-The wire codecs, the stable topic anchor, both registration roles (provider attach/renew/self-throttle; seeker short-TTL registration), the query/filter evaluation, and the seeker hang-out engine are now implemented (see the callouts in §Anchor, §Provider registration, §Seeker query, §Capability filter, §Hang-out vs. continue, and §Wire formats). Each hang-out bullet below has a corresponding passing unit test — `seeker-walk.spec.ts` (db-core) for the decision arithmetic, `seeker-walk-client.spec.ts` (db-p2p) for the walk behavior. The arrival-push bullets remain doc-as-spec until `matchmaking-cohort-push-on-arrival` lands.
+The wire codecs, the stable topic anchor, both registration roles (provider attach/renew/self-throttle; seeker short-TTL registration), the query/filter evaluation, and the seeker hang-out engine are now implemented (see the callouts in §Anchor, §Provider registration, §Seeker query, §Capability filter, §Hang-out vs. continue, and §Wire formats). Each hang-out bullet below has a corresponding passing unit test — `seeker-walk.spec.ts` (db-core) for the decision arithmetic, `seeker-walk-client.spec.ts` (db-p2p) for the walk behavior. Each arrival-push bullet is pinned as well; the mapping follows that list.
 
 > **Mock-tier e2e (implemented).** The mock-transport integration tier
 > (`packages/db-p2p/src/testing/matchmaking-mesh-harness.ts`, layered on the cohort-topic mesh harness)
@@ -488,10 +504,31 @@ Arrival-push behavior (see [§Arrival push on provider arrival](#arrival-push-on
 - *Filter miss excluded.* A fresh provider failing a seeker's `filter` (including `minBudget`) does not push to that seeker and does not count toward fan-out.
 - *Missed push, final poll recovers.* With pushes suppressed (simulated drop), the hanging-out seeker still returns the provider via the mandatory final `QueryV1` before `patienceMs` drains.
 - *Push/poll overlap deduped.* A provider delivered by both an `ArrivalPushV1` and a subsequent safety poll is dialed once and counts once toward `wantCount`.
-- *Sparse safety-poll cadence.* A push-aware seeker that gets no pushes issues ≈ `patienceMs / push_safety_poll_ms` queries (≈ 2 at defaults), not `patienceMs / requery_interval_ms` (≈ 10).
-- *Promotion observed via folded topicTraffic.* After the cohort promotes, the seeker's next push (or safety poll) reports `childCohortCount > 0` and the seeker enters the descend branch.
+- *Sparse safety-poll cadence.* A push-aware seeker that gets no pushes issues `⌈patienceMs / push_safety_poll_ms⌉` queries while it hangs out — 2 at defaults: the 5 s safety poll, then the final poll at the deadline, which takes the place of the safety poll due then — and 3 counting the tier's immediate query; not one per `requery_interval_ms` (≈ 10).
+- *Promotion observed via folded topicTraffic.* After the cohort promotes, the seeker's next push (or safety poll) reports `childCohortCount > 0`; the seeker re-registers at the same tier and follows the `promoted` reply down.
 - *Push forgery rejected.* An `ArrivalPushV1` whose entries carry an invalid `registrationSig` is discarded; the seeker does not dial the forged provider.
 - *Stale push acked `unknown_seeker`.* A push to a seeker that has re-registered (new `correlationId` / epoch) returns `ArrivalPushAckV1{ unknown_seeker }` and the primary drops the binding.
+
+> **Where each arrival-push bullet is pinned.**
+>
+> - *Fresh arrival pushes to longest waiters*, *Poll-path seekers are not push targets*, *`capacityBudget = 0`
+>   does not push*, *Filter miss excluded* → `arrival-push.spec.ts` (db-core, the pure selection, which also
+>   pins the `attachedAt` rule). The first is also run end to end: over a real cohort by `mesh-push.spec.ts`
+>   "fresh arrival pushes to the waiting seeker …" (one push, from one member, within one coalescing window,
+>   no query past the immediate one, while a poll-path seeker in the same cohort is not pushed and finds the
+>   provider at its next poll), and over real sockets by `substrate-real-libp2p.integration.spec.ts` "a
+>   provider registering while a push-opted seeker hangs out …".
+> - *Renewal does not push*, *Coalescing* → `arrival-push-driver.spec.ts` (db-p2p).
+> - *Missed push, final poll recovers*, *Push/poll overlap deduped*, *Sparse safety-poll cadence*, *Promotion
+>   observed via folded topicTraffic*, *Push forgery rejected* → `seeker-walk-client.spec.ts` (db-p2p, its
+>   arrival-push group, over a scripted transport).
+> - *Stale push acked `unknown_seeker`* → `arrival-push-receiver.spec.ts` (the seeker answers `unknown_seeker`
+>   for a binding no walk listens on) and `arrival-push-driver.spec.ts` "stops pushing a registration the
+>   seeker disowns …" (the member drops the binding and pushes the re-registration).
+> - Beyond the list: only a seeker's slot primary pushes to it (`arrival-push-driver.spec.ts`, and across a
+>   real cohort `mesh-push.spec.ts` "each selected seeker is pushed by exactly one cohort member …"); a lost
+>   push does not count toward the seeker's need (`arrival-push-driver.spec.ts`); a push whose signature does
+>   not verify against its sender gets no reply (`arrival-push-receiver.spec.ts`).
 
 ### Replacing the poll with a push
 
@@ -502,6 +539,52 @@ A seeker that opts in (`pushOnArrival`) replaces the polling `requery_interval_m
 ## Arrival push on provider arrival
 
 A hanging-out seeker that set `pushOnArrival` does not poll at `requery_interval_ms`. Instead its assigned cohort primary **pushes** a notification when a fresh matchable provider lands at the cohort. The push is a **pure optimization over the polling baseline**: correctness never depends on it (see [§Arrival push missed or primary fails mid-coalesce](#arrival-push-missed-or-primary-fails-mid-coalesce)). A seeker that opts out, predates push support, or loses every push degrades silently to a sparse safety poll — never worse than the legacy poll path.
+
+> **Implemented**, live on every node built with `cohortTopic.enabled`. The pieces:
+>
+> - **Selection** — `selectArrivalPushTargets` in `packages/db-core/src/matchmaking/arrival-push.ts`, pure:
+>   which seekers a fresh provider is pushed to (§Fairness below).
+> - **The arrival signal** — `CohortTopicHost.onRecordAdded` in `packages/db-p2p/src/cohort-topic/host.ts`
+>   reports each registration record that becomes present on one of the node's coord engines (by admission,
+>   gossip merge or handoff pull; never by a renewal), fed by `observeRecordAdditions` in
+>   `packages/db-core/src/cohort-topic/registration/store.ts`.
+> - **The sender** — `ArrivalPushDriver` in `packages/db-p2p/src/matchmaking/arrival-push-driver.ts`
+>   subscribes to that signal, runs the selection, keeps the seekers whose slot primary is this node,
+>   coalesces per seeker registration, signs with the node key and sends. Its state is soft and local.
+> - **Delivery** — `createArrivalPushSend` in `packages/db-p2p/src/matchmaking/arrival-push-send.ts` reads
+>   the contact hint (`contactHintTarget`: a bare peer id, or a multiaddr ending in `/p2p/<id>`), delivers in
+>   process when the seeker is on this node, and otherwise merges a multiaddr hint into the peerStore through
+>   the one address-book writer (`mergePeerAddresses` in `packages/db-p2p/src/peer-address-book.ts`) and
+>   dials the arrival-push protocol.
+> - **The seeker's end** — `ArrivalPushReceiver` in `packages/db-p2p/src/matchmaking/arrival-push-receiver.ts`
+>   checks each push's signature against the peer that sent it, queues it for the walk bound to its
+>   `correlationId` and acks; `registerArrivalPushHandler` serves the protocol. The walk loop is
+>   `SeekerWalkClient` (§Hang-out vs. continue).
+> - **Node wiring** — `createLibp2pNodeBase` in `packages/db-p2p/src/libp2p-node-base.ts` builds one receiver
+>   and one driver per node and exposes the receiver as `node.matchmakingArrivalPush`
+>   (`OptimysticNodeAttachments` in `packages/db-p2p/src/optimystic-node.ts`). Passing it to
+>   `createLibp2pMatchmakingSeekerSession` as `arrivalPush` puts that session's walks on the push path. A node
+>   without `cohortTopic.enabled` has neither, and a seeker session there polls.
+>
+> Decisions made while building it:
+>
+> - **Every member ranks, only the slot primary sends.** Each member runs the same selection over the same
+>   replicated records and delivers only to the selected seekers whose slot primary it is. The ranking cannot
+>   see which seekers are already satisfied, so an arrival's fan-out can be under-filled; accepted (§Fairness).
+> - **A provider is not pushed to a seeker that attached after it** (§Fairness).
+> - **The final poll at the patience deadline** runs on every push-path hang-out that has not met
+>   `wantCount`, even with a push in flight.
+> - **Pushes do not refine `filterAcceptRatio`.** A push is already filtered cohort-side, so counting it as a
+>   query yield would bias the ratio upward; only query replies refine it.
+> - **A push re-runs only the promotion check.** Its providers are admitted and its `topicTraffic` can set off
+>   the mid-tier promotion re-register (§Hang-out vs. continue); the hang-out-vs-escalate decision is made once
+>   per `Accepted`, on both paths.
+> - **Real renew and withdraw on both paths**, so a hanging-out seeker's record outlives its 10 s TTL and
+>   leaves the cohort when the walk moves on (§Hang-out vs. continue).
+> - **A seeker reachable only through a relay advertises its circuit address**, ending in `/p2p/<its id>`, as
+>   its `contactHint` (§Edge cases & interactions below).
+>
+> Spec: the arrival-push mapping under §Test expectations.
 
 ### Push channel
 
@@ -539,7 +622,7 @@ The coalescing buffer is **soft, transient, non-gossiped** state held only on th
 
 ### Folded `topicTraffic`
 
-Each `ArrivalPushV1` carries a current `topicTraffic` snapshot alongside the provider batch. This lets a hanging-out seeker re-run its hang-out-vs-continue math — and observe `childCohortCount > 0` (promotion → descend) — on every push without a separate poll, preserving the structural-change handling the poll loop got for free.
+Each `ArrivalPushV1` carries a current `topicTraffic` snapshot alongside the provider batch. This lets a hanging-out seeker observe `childCohortCount > 0` (promotion → descend) on every push without a separate poll, preserving the structural-change handling the poll loop got for free. That promotion check is the only decision a push re-runs: hang-out-vs-continue is decided once per `Accepted`, as on the poll path. The snapshot also feeds the walk's hotness signal (`SeekerWalkResult.maxChildCohortCount`).
 
 ### Failure mode — optimization-only
 
@@ -560,10 +643,12 @@ Because the same fresh provider can surface in both a push and a later safety/fi
 - **Burst exceeding remaining need.** Several providers arriving within one coalesce window are carried in one batched push; the seeker dials up to its outstanding `wantCount`.
 - **Primary failover during the coalesce window.** The unflushed batch is lost (transient, non-gossiped); the safety/final poll recovers it. No replay buffer.
 - **`cohortEpoch` change / primary handoff.** The seeker's primary may move ([cohort-topic.md §Membership rotation and primary handoff](cohort-topic.md#membership-rotation-and-primary-handoff)). The old primary stops pushing; the new primary begins pushing future arrivals; the seeker rebinds on its next renewal. In-flight arrivals during the gap are covered by the safety poll. A push whose echoed `correlationId` no longer matches the seeker's current registration (the seeker re-registered) is acked `ArrivalPushAckV1{ unknown_seeker }`, and the primary drops the binding.
-- **Promotion while hanging out.** After the cohort promotes, fresh providers are redirected to tier `d+1` and stop landing here, so pushes cease. The seeker observes `childCohortCount > 0` via the folded `topicTraffic` on its last push (or via a safety poll) and re-runs the descend decision per [§Decision rule](#decision-rule). This is pre-existing polling behavior, not push-specific — the folded `topicTraffic` simply keeps the seeker informed without extra RPCs.
+- **Promotion while hanging out.** After the cohort promotes, fresh providers are redirected to tier `d+1` and stop landing here, so pushes cease. The seeker observes `childCohortCount > 0` via the folded `topicTraffic` on its last push (or via a safety poll), registers at the same tier again, and follows the cohort's `promoted` reply down (§Hang-out vs. continue). This is pre-existing polling behavior, not push-specific — the folded `topicTraffic` simply keeps the seeker informed without extra RPCs.
 - **`arrivalsPerMin = 0` right after epoch rotation.** Counters reset on rotation, but pushes are driven by record-set deltas, not the counter, so push delivery is unaffected by the stale-zero window. The existing edge-case rule (do not withdraw on a single zero reading) is unchanged.
 - **Final-poll boundary.** A provider that arrives in the last `push_coalesce_ms` before `patienceMs` expiry may not be pushed in time; the mandatory final `QueryV1` guarantees it is still seen. The final poll fires even when a push is in flight.
 - **Contention-signal interaction (beneficial).** Pushes are not `QueryV1`s, so they do not inflate `queriesPerMin`. As seekers adopt `pushOnArrival`, `queriesPerMin` falls, which lowers `contentionFactor` ([§Decision rule](#decision-rule)) for everyone — the hang-out threshold relaxes as polling load disappears. No code beyond not counting pushes as queries.
+- **Seeker reachable only through a relay.** A member dials the seeker's `contactHint`. A multiaddr hint is merged into the member's address book before the dial (the trust boundary third-party cluster-record addresses already sit on: a merged address only allows a dial attempt, authenticated by peer id at the handshake; see [internals.md §Third-Party Address Learning](internals.md#third-party-address-learning)). A relay-only seeker must therefore advertise its circuit address, `…/p2p/<relay>/p2p-circuit/p2p/<seeker>`; one that advertises a bare peer id is unreachable from any member holding no address for it, its pushes fail, and it falls back to the safety poll. A hint that is neither a peer id nor a multiaddr ending in `/p2p/<id>` (a circuit address naming only the relay included) is logged and its push dropped.
+- **Seeker is its own slot primary.** Possible wherever the seeker's node is in the cohort. The push is delivered in process, with no dial.
 - **Adversarial primary.** The push carries a single-member (primary) signature, not a threshold signature — the same posture as `QueryReplyV1`. A malicious primary can withhold pushes (the seeker degrades to safety poll — no worse than baseline) or push junk providers (the seeker re-validates each `ProviderEntryV1.registrationSig` and discards forgeries). Bounded; see [§Arrival push missed or primary fails mid-coalesce](#arrival-push-missed-or-primary-fails-mid-coalesce).
 
 ---
@@ -648,11 +733,16 @@ Matchmaking reuses `RegisterV1`, `RenewV1`, etc., from cohort-topic. The applica
 > `bytesToB64url` / `b64urlToBytes` helpers, per-message structural validation on decode, and stable
 > byte fidelity (encode→decode→encode). The provider/seeker app payloads are serialized to opaque
 > UTF-8 JSON bytes for the cohort-topic `RegisterV1.appPayload` slot (base64url-wrapped by the
-> substrate); the query-protocol messages ride the same length-prefixed framing as cohort-topic
-> messages. Validation enforced on decode: `kind` exactly matches the discriminant; `limit <=
-> query_limit_max` (256); `capacityBudget >= 0`; `wantCount >= 1`; malformed/oversized payloads
-> rejected with `CohortWireError`. The `QueryReplyV1` *producer* is now implemented
-> (`packages/db-p2p/src/matchmaking/query-handler.ts`, signed via `queryReplySigningPayload`); the
+> substrate); the query and arrival-push messages ride the same length-prefixed framing as cohort-topic
+> messages, over the two matchmaking protocols (`/optimystic/matchmaking/1.0.0/query` and
+> `/optimystic/matchmaking/1.0.0/arrival-push`, `MatchmakingProtocols` in
+> `packages/db-p2p/src/matchmaking/protocols.ts`). Validation enforced on decode: `kind` exactly matches
+> the discriminant; `limit <= query_limit_max` (256); `capacityBudget >= 0`; `wantCount >= 1`; a seeker
+> payload with `pushOnArrival` carries a `correlationId`; malformed/oversized payloads rejected with
+> `CohortWireError`. The `QueryReplyV1` *producer* is now implemented
+> (`packages/db-p2p/src/matchmaking/query-handler.ts`, signed via `queryReplySigningPayload`), and so is
+> the `ArrivalPushV1` producer (`ArrivalPushDriver` in
+> `packages/db-p2p/src/matchmaking/arrival-push-driver.ts`, signed via `arrivalPushSigningPayload`); the
 > `AggregateCountV1` producer lands with the multi-cohort sweep. Spec: `wire.spec.ts`,
 > `entry-verify.spec.ts`.
 
@@ -689,6 +779,8 @@ interface CapabilityFilter {
   minBudget?:  number
 }
 ```
+
+`correlationId` is the seeker registration's push binding: a member pushes under it, echoes it in each `ArrivalPushV1`, and the seeker's receiver routes the push to the walk listening for it. It is required when `pushOnArrival` is true, and a payload that sets `pushOnArrival` without it is rejected on decode. It travels inside the payload, which the cohort keeps as the registration record's `appState` and gossips with the record, so every member reads the same binding. It is outside the matchmaking signed image and authenticated by the `RegisterV1` signature instead (the signing-scope note below). One walk carries one `correlationId` at every tier it registers at, so a member's binding follows the seeker from tier to tier; a new walk has a new one, which is what lets a member tell a re-registration from the registration it was pushing to.
 
 ### Query
 
@@ -770,9 +862,9 @@ interface ArrivalPushV1 {
                                    //   seeker that has since re-registered under a new
                                    //   correlationId acks unknown_seeker (see §Edge cases)
   providers:    ProviderEntryV1[]   // fresh, filter-matched, coalesced batch; 1..query_limit_max
-  topicTraffic: TopicTrafficV1      // current snapshot — lets the seeker re-run its
-                                    //   hang-out math and observe childCohortCount>0
-                                    //   (promotion → descend) without a separate poll
+  topicTraffic: TopicTrafficV1      // current snapshot — lets the seeker observe
+                                    //   childCohortCount>0 (promotion → descend)
+                                    //   without a separate poll
   signature:    string             // cohort primary's single-member sig — advisory,
                                    //   same trust model as QueryReplyV1; the seeker
                                    //   re-validates each ProviderEntryV1.registrationSig
@@ -785,7 +877,7 @@ interface ArrivalPushAckV1 {
 }
 ```
 
-Folding `topicTraffic` into the push means a hanging-out seeker re-evaluates hang-out-vs-continue (and sees promotion via `childCohortCount`) on every push, so the structural-change handling the poll loop got for free is preserved. See [§Arrival push on provider arrival](#arrival-push-on-provider-arrival) for fairness, coalescing, and failure semantics.
+Folding `topicTraffic` into the push means a hanging-out seeker sees promotion via `childCohortCount` on every push, so the structural-change handling the poll loop got for free is preserved. It is the only decision a push re-runs (see [§Folded `topicTraffic`](#folded-topictraffic)). See [§Arrival push on provider arrival](#arrival-push-on-provider-arrival) for fairness, coalescing, and failure semantics.
 
 Codecs and validation are `ArrivalPushV1` and `ArrivalPushAckV1` in `packages/db-core/src/matchmaking/wire.ts`. The push's signed image (`arrivalPushSigningPayload`) mirrors the query reply's: an explicitly ordered array of `v`, `topicId`, `cohortEpoch`, `correlationId`, the traffic fields, and the providers' participant ids in order — the per-entry signatures stay outside it, since the seeker re-validates each entry on its own.
 
@@ -850,7 +942,7 @@ Returned only by promoted cohorts; cold cohorts that fall through to `NoState` d
 > ~3 on the push path). No matchmaking default changes for downstream tickets. (Evidence:
 > `matchmaking.ts`, `sweep.ts` `contention_factor_cap` rows, `seeker-walk.ts`.)
 
-All of these rows except `push_coalesce_ms` are consumed only by the seeker — they tune the hang-out decision and the seeker's poll/push-fallback cadence (see [§Hang-out vs. continue](#hang-out-vs-continue) and [§Arrival push on provider arrival](#arrival-push-on-provider-arrival)). The cohort-topic layer is unaware of them, so they're application-level rather than protocol-level: changing them on a seeker has no wire impact. `push_coalesce_ms` is the one cohort-side knob — it tunes the batching window on the seeker's matchmaking-app primary, not the cohort-topic substrate, so it likewise carries no cohort-topic protocol impact. No corresponding per-peer rate limit yet exists for `QueryV1` (only `RegisterV1` is rate-limited via `register_rate_per_peer = 4 / min`). On the **non-push** path, at the default `requery_interval_ms = 1000` and `patience_default_ms = 10000` a hanging-out seeker issues at most ~10 queries per match. On the **push** path it issues at most `patienceMs / push_safety_poll_ms + 1` queries (≈ 3 at defaults — the sparse safety polls plus the mandatory final poll), and zero in the common case where the first push already satisfies `wantCount`. Either way it stays within current cohort budgets. Adding a `QueryV1` rate ceiling is out of scope here; see the matchmaking backlog.
+All of these rows except `push_coalesce_ms` are consumed only by the seeker — they tune the hang-out decision and the seeker's poll/push-fallback cadence (see [§Hang-out vs. continue](#hang-out-vs-continue) and [§Arrival push on provider arrival](#arrival-push-on-provider-arrival)). The cohort-topic layer is unaware of them, so they're application-level rather than protocol-level: changing them on a seeker has no wire impact. `push_coalesce_ms` is the one cohort-side knob — it tunes the batching window on the seeker's matchmaking-app primary, not the cohort-topic substrate, so it likewise carries no cohort-topic protocol impact. No corresponding per-peer rate limit yet exists for `QueryV1` (only `RegisterV1` is rate-limited via `register_rate_per_peer = 4 / min`). On the **non-push** path, at the default `requery_interval_ms = 1000` and `patience_default_ms = 10000` a hanging-out seeker issues at most ~10 queries per match. On the **push** path it issues at most `⌈patienceMs / push_safety_poll_ms⌉` queries while hanging out — 2 at defaults: the 5 s safety poll, then the mandatory final poll at the deadline, which takes the place of the safety poll due then — so 3 counting the tier's immediate query, and none after the immediate query in the common case where the first push already satisfies `wantCount`. Either way it stays within current cohort budgets. Adding a `QueryV1` rate ceiling is out of scope here; see the matchmaking backlog.
 
 The cohort-topic tier for matchmaking is **T2 (functional)**; matchmaking registrations are declined freely by cohorts under T0/T1 load. The seeker's only recourse is to wait — the cohort-topic anti-flood properties prevent the seeker from making things worse by retrying aggressively.
 
@@ -925,8 +1017,8 @@ Throughout, the root cohort's load is bounded: registration storms get `Promoted
 
 ### Real-libp2p e2e coverage
 
-> **Provider registration, the seeker query RPC serve side, AND the outbound seeker hang-out walk all
-> confirmed over real sockets; only the multi-cohort sweep remains deferred.**
+> **Provider registration, the seeker query RPC serve side, the outbound seeker hang-out walk AND arrival
+> push all confirmed over real sockets; only the multi-cohort sweep remains deferred.**
 > [`packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts`](../packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts)
 > (env-gated) stands up 3–16 production `cohortTopic`-enabled libp2p nodes over real TCP. The **provider
 > side** is confirmed real: a provider registration at the matchmaking application tier (T2) is admitted by a
@@ -950,6 +1042,15 @@ Throughout, the root cohort's load is bounded: registration storms get `Promoted
 > though the cohort served it in the raw reply — the advisory-trust contract end-to-end over real sockets.
 > Convergence is asserted (not an exact hop count); the small-N FRET `d_max` estimate is shallow, so the walk
 > registers + queries at the root (the single-tier-0 milestone).
+>
+> **Arrival push** runs over the production node wiring (§Arrival push on provider arrival): test 5d has a
+> **remote** seeker build the transport with its node's `matchmakingArrivalPush` receiver, so its walk waits on
+> pushes, and registers a provider at the cohort only once that walk is hanging out. The seeker's slot primary
+> — chosen to be another node whenever one qualifies, so the push crosses a real socket — pushes the provider
+> over `/optimystic/matchmaking/1.0.0/arrival-push`, dialing the peer id the seeker advertised as its contact
+> hint, and the walk returns it having issued no query after its immediate one (no safety poll, no final
+> poll). Patience is 30 s, past one 10 s seeker TTL, so a slow run depends on the real renews; the renew a
+> seeker addresses to its own node is served in process through `selfServe.renew`.
 >
 > **What is NOT yet real:** the **multi-cohort sweep** ports (`sweepPorts`) stay unbound — they need the
 > promoted-tree `AggregateCountV1` RPC across serving tier-`d ≥ 1` shards (gated on the cohort-topic promotion

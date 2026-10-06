@@ -29,7 +29,7 @@ import {
 import { verifyPeerSig } from "../cohort-topic/peer-sig.js";
 import { handleRequestResponse, DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic/stream-util.js";
 import { createLogger } from "../logger.js";
-import { unrefTimer } from "../unref-timer.js";
+import { armUnrefTimer } from "../unref-timer.js";
 import type { SeekerPushChannel } from "./seeker-walk-client.js";
 
 const defaultLog = createLogger("matchmaking:arrival-push-receiver");
@@ -50,6 +50,8 @@ export interface ArrivalPushReceiverOptions {
 	readonly queueCap?: number;
 	/** Logger for dropped frames and overflowing queues; default the `matchmaking:arrival-push-receiver` namespace. */
 	readonly log?: Log;
+	/** Arm a walk's one-shot wait timer, returning its cancel; default `setTimeout`, unref'd so it never holds a process open. */
+	readonly setTimer?: (fn: () => void, ms: number) => () => void;
 }
 
 /** One walk's listening registration. */
@@ -65,12 +67,14 @@ export class ArrivalPushReceiver {
 	private readonly maxBytes: number;
 	private readonly queueCap: number;
 	private readonly log: Log;
+	private readonly setTimer: (fn: () => void, ms: number) => () => void;
 	private readonly listening = new Map<string, PushQueue>();
 
 	constructor(options: ArrivalPushReceiverOptions = {}) {
 		this.maxBytes = options.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
 		this.queueCap = options.queueCap ?? DEFAULT_ARRIVAL_PUSH_QUEUE_CAP;
 		this.log = options.log ?? defaultLog;
+		this.setTimer = options.setTimer ?? armUnrefTimer;
 		if (!Number.isInteger(this.queueCap) || this.queueCap < 1) {
 			throw new RangeError(`arrival push receiver: queueCap must be an integer >= 1, got ${this.queueCap}`);
 		}
@@ -81,7 +85,7 @@ export class ArrivalPushReceiver {
 		if (this.listening.has(correlationId)) {
 			throw new Error(`arrival push receiver: binding ${correlationId} is already subscribed`);
 		}
-		const queue = new PushQueue(bytesToB64url(topicId), correlationId, this.queueCap, this.log);
+		const queue = new PushQueue(bytesToB64url(topicId), correlationId, this.queueCap, this.log, this.setTimer);
 		this.listening.set(correlationId, queue);
 		return {
 			channel: queue,
@@ -155,6 +159,7 @@ class PushQueue implements SeekerPushChannel {
 		private readonly correlationId: string,
 		private readonly cap: number,
 		private readonly log: Log,
+		private readonly setTimer: (fn: () => void, ms: number) => () => void,
 	) {}
 
 	take(): ArrivalPushV1[] {
@@ -170,16 +175,16 @@ class PushQueue implements SeekerPushChannel {
 		// The walk never waits twice at once; if a caller does, the older waiter is released rather than stranded.
 		this.release();
 		return new Promise<void>((resolve) => {
-			let timer: ReturnType<typeof setTimeout> | undefined;
+			let cancelTimer: (() => void) | undefined;
 			const done = (): void => {
-				clearTimeout(timer);
+				cancelTimer?.();
 				if (this.wake === done) {
 					this.wake = undefined;
 				}
 				resolve();
 			};
 			this.wake = done;
-			timer = unrefTimer(setTimeout(done, ms));
+			cancelTimer = this.setTimer(done, ms);
 		});
 	}
 

@@ -7,3 +7,9 @@ export function unrefTimer<T>(handle: T): T {
 	(handle as { unref?: () => void }).unref?.();
 	return handle;
 }
+
+/** Arm a one-shot timer that never holds a process open; returns its cancel. The default behind the injectable `setTimer` seams. */
+export function armUnrefTimer(fn: () => void, ms: number): () => void {
+	const handle = unrefTimer(setTimeout(fn, ms));
+	return (): void => clearTimeout(handle);
+}

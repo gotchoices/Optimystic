@@ -4,6 +4,7 @@ import type { DisputeService } from './dispute/dispute-service.js';
 import type { Libp2pKeyPeerNetwork } from './libp2p-key-network.js';
 import type { ReactivityCollectionWatch } from './reactivity/collection-watch.js';
 import type { PeerReputationService } from './reputation/peer-reputation.js';
+import type { ArrivalPushReceiver } from './matchmaking/arrival-push-receiver.js';
 import type { LinkDeadlines } from './rpc-deadline.js';
 import type { StorageRepo } from './storage/storage-repo.js';
 
@@ -17,6 +18,7 @@ import type { StorageRepo } from './storage/storage-repo.js';
  * are node-internal wiring, not a host-facing surface, and typing them is a separate job.
  * `reactivityWatch` is the exception among the reactivity pieces because it IS the surface a
  * host uses; the registry, recover transport and rotation scheduler behind it stay internal.
+ * `matchmakingArrivalPush` is the matchmaking counterpart: the one piece a host passes on.
  */
 export interface OptimysticNodeAttachments {
 	/**
@@ -49,6 +51,12 @@ export interface OptimysticNodeAttachments {
 	 * reports commits this node itself stores.
 	 */
 	reactivityWatch?: ReactivityCollectionWatch;
+	/**
+	 * The node's matchmaking arrival-push receiver: pass it to `createLibp2pMatchmakingSeekerSession` as
+	 * `arrivalPush` and that session's walks wait on pushes rather than polling. Present exactly when the node
+	 * was built with `cohortTopic.enabled`; without it a seeker session takes the poll path.
+	 */
+	matchmakingArrivalPush?: ArrivalPushReceiver;
 }
 
 export type OptimysticNode = Libp2p & OptimysticNodeAttachments;

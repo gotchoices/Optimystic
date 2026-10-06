@@ -42,7 +42,7 @@ import {
 import type { CoordEngine } from "../cohort-topic/host.js";
 import { peerIdToBytes } from "../cohort-topic/peer-codec.js";
 import { createLogger } from "../logger.js";
-import { unrefTimer } from "../unref-timer.js";
+import { armUnrefTimer } from "../unref-timer.js";
 import { decodeLocalRegistration, type LocalMatchRegistration } from "./local-registration.js";
 
 const defaultLog = createLogger("matchmaking:arrival-push");
@@ -123,7 +123,7 @@ export class ArrivalPushDriver {
 	constructor(private readonly deps: ArrivalPushDriverDeps) {
 		this.selfBytes = peerIdToBytes(deps.selfPeerId);
 		this.coalesceMs = (deps.config ?? DEFAULT_ARRIVAL_PUSH_CONFIG).coalesceMs;
-		this.setTimer = deps.setTimer ?? setUnrefTimer;
+		this.setTimer = deps.setTimer ?? armUnrefTimer;
 		this.log = deps.log ?? defaultLog;
 		this.bindings = new BindingTable(deps.maxBindings ?? DEFAULT_ARRIVAL_PUSH_MAX_BINDINGS);
 	}
@@ -333,11 +333,6 @@ function pushCorrelationId(seeker: LocalSeekerRegistration): string | undefined 
 function stopTimer(binding: Binding): void {
 	binding.cancelTimer?.();
 	binding.cancelTimer = undefined;
-}
-
-function setUnrefTimer(fn: () => void, ms: number): () => void {
-	const handle = unrefTimer(setTimeout(fn, ms));
-	return (): void => clearTimeout(handle);
 }
 
 /**
