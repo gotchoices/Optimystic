@@ -127,7 +127,7 @@ its own sub-namespace so a single concern can be traced in isolation:
 
 ### db-p2p sub-namespaces
 
-`db-p2p` emits 52 sub-namespaces under `optimystic:db-p2p:`. They are grouped below by subsystem;
+`db-p2p` emits 53 sub-namespaces under `optimystic:db-p2p:`. They are grouped below by subsystem;
 `DEBUG='optimystic:db-p2p:*'` turns on all of them at once. Rows marked *(peer-id suffixed)* append
 the owning node's peer id — see *Telling nodes apart in one process* below.
 
@@ -176,9 +176,10 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 | `network:get-manager` | Failures injecting the real libp2p node into the network manager after construction        |
 | `peer-address-book`   | Peer multiaddrs learned, capped or rejected: `merge`, `capped`, `record-capped`, `peerstore-miss`, plus `WARN:` lines for multiaddrs that address nothing or fail to parse, records carrying an unparseable peer id, and failed peerstore merges *(peer-id suffixed)* |
 | `peer-reputation`     | Reputation scoring: per-peer reports with reason, weight, resulting score and context, resets, `refused self-report` when a report named the node's own identifier — carrying that identifier, the reason, the caller's context and a running count, which is the only place a local fault the node refuses to score against itself is countable — and `refused new record` when the table stood at its `maxPeers` cap with every record banned, so a newly-reported identifier went unrecorded, carrying that identifier, the cap and its own running count |
-| `matchmaking-query`   | Matchmaking query transport: dropped and rate-limited inbound queries, dial/decode failures against a primary |
+| `matchmaking-query`   | Matchmaking query transport: dropped and rate-limited inbound queries, dial/decode failures against a primary, and the walking seeker's registration keep-alive — renew and withdraw failures, a slot primary that does not hold the registration yet (`does not hold the registration yet`, expected while admission gossip is in flight), an unusable `primary_moved`, and a self-primary renew skipped for want of `selfServe.renew` |
 | `matchmaking:seeker-walk` | The seeker's walk: an arrival push dropped because it named another topic than the walk's, and on `:error` a failure releasing the walk's transport when the walk ended |
 | `matchmaking:arrival-push` | The cohort side of matchmaking arrival push: a push dropped with no retry (`sign or send failed`, `no reply`, `undecodable ack`) with its contact hint and provider count, and records in a matchmaking topic skipped because their payload did not decode |
+| `matchmaking:arrival-push-receiver` | The seeker side of matchmaking arrival push: an inbound push dropped with no reply (malformed, or its signature does not verify against the sending peer), and a walk's push queue over its cap dropping the oldest push |
 | `sync-service`        | Sync protocol service start/stop, request-handling errors, and archive-build failures per block |
 
 #### Node startup wiring

@@ -48,7 +48,7 @@ import {
 } from "@optimystic/db-core";
 import { MatchmakingProviderManager } from "./provider-manager.js";
 import { MatchmakingSeekerManager } from "./seeker-manager.js";
-import { SeekerWalkClient, type SeekerWalkTransport } from "./seeker-walk-client.js";
+import { SeekerWalkClient, type SeekerWalkTransport, type SeekerWalkTransportOptions } from "./seeker-walk-client.js";
 
 /** A matchmaking topic reference: `(kind, label)` resolved to `topicId = H(kind ‖ label ‖ "match")`. */
 export interface MatchTopicRef {
@@ -169,6 +169,8 @@ export interface SeekerWalkRequest {
 	readonly filter?: CapabilityFilter;
 	/** Force the multi-cohort sweep even when the single-cohort walk would suffice (representativeness). */
 	readonly preferSweep?: boolean;
+	/** Wait on arrival pushes instead of polling; overrides the walk transport's default. */
+	readonly pushOnArrival?: boolean;
 }
 
 /** The injected substrate-I/O seam a seeker session drives. The FRET host binds these to libp2p RPCs. */
@@ -182,7 +184,7 @@ export interface MatchmakingSeekerSessionDeps {
 	/** Topic anchor; defaults to db-core's ring-hash anchor. */
 	readonly anchor?: MatchTopicAnchor;
 	/** Build the seeker walk transport (register/query/renew/withdraw at a tier) for a topic. */
-	readonly walkTransport: (topicId: Uint8Array) => SeekerWalkTransport;
+	readonly walkTransport: (topicId: Uint8Array, options?: SeekerWalkTransportOptions) => SeekerWalkTransport;
 	/** Issue a one-shot `QueryV1` (resolves the cohort from `q.topicId`). */
 	readonly queryCohort: (q: QueryV1) => Promise<QueryReplyV1>;
 	/** Estimate `d_max` for a topic (the size-estimator seam). */
@@ -259,7 +261,7 @@ export class MatchmakingSeekerSession {
 		const topicId = this.topicIdFor(topic);
 		const dMax = await this.deps.estimateDMax(topicId);
 		const client = new SeekerWalkClient({
-			transport: this.deps.walkTransport(topicId),
+			transport: this.deps.walkTransport(topicId, want.pushOnArrival !== undefined ? { pushOnArrival: want.pushOnArrival } : undefined),
 			topicId,
 			wantCount: want.wantCount,
 			dMax,

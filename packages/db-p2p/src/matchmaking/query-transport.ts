@@ -16,7 +16,9 @@
  * matchmaking `/query` directly (the production analogue of the in-process mock harness
  * `buildWalkTransport` + `queryCohort`), maps a no-reply / dial failure to a benign empty advisory reply,
  * and re-validates every forwarded entry's `registrationSig` itself ({@link verifyEntry}) — the cohort
- * vouches only for "what I held", never provider authenticity.
+ * vouches only for "what I held", never provider authenticity. Each walk keeps its seeker registration alive
+ * while it hangs out and withdraws it when it leaves a tier ({@link SeekerKeepAlive}, signed `RenewV1`s to the
+ * slot primary), on both paths; a push-opted walk also listens on the node's {@link ArrivalPushReceiver}.
  *
  * **Layering.** Matchmaking sits *above* the cohort-topic substrate (it depends on
  * `decodeMatchAppPayload`), so it owns its own protocol family ({@link MatchmakingProtocols}) and is wired
@@ -50,6 +52,7 @@ import {
 	decodeCohortMessage,
 	decodeQueryReplyV1,
 	decodeQueryV1,
+	decodeRenewReplyV1,
 	encodeCohortMessage,
 	encodeQueryReplyV1,
 	encodeQueryV1,
@@ -72,6 +75,8 @@ import {
 	type QueryV1,
 	type RegisterReplyV1,
 	type RegisterV1,
+	type RenewReplyV1,
+	type RenewV1,
 	type TierAddressing,
 } from "@optimystic/db-core";
 import type { CoordRegistry } from "../cohort-topic/host.js";
@@ -83,7 +88,9 @@ import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from "../cohort-topic/protocols.js";
 import { handleMatchmakingQuery } from "./query-handler.js";
 import { PROTOCOL_MATCHMAKING_QUERY, DEFAULT_MATCHMAKING_PROTOCOLS } from "./protocols.js";
 import { MatchmakingSeekerSession, type MatchmakingSeekerSessionDeps } from "./module.js";
-import type { SeekerWalkTransport, SeekerProbeReply } from "./seeker-walk-client.js";
+import type { SeekerWalkTransport, SeekerWalkTransportOptions, SeekerProbeReply } from "./seeker-walk-client.js";
+import type { ArrivalPushReceiver } from "./arrival-push-receiver.js";
+import { SeekerKeepAlive } from "./seeker-keep-alive.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("matchmaking-query");
@@ -202,7 +209,8 @@ export function registerMatchmakingQueryHandler(
 /**
  * A self-routed-primary local-serve hook. `fret.assembleCohort(coord, k)[0]` may resolve to the seeker
  * itself; libp2p cannot dial self, so when the routed primary is `selfPeerId` the transport routes the
- * register/query here instead. Absent ⇒ a self-primary register/query throws a clear error (the gap is
+ * register/query here instead, and likewise a renew or withdraw whose slot primary is this node. Absent ⇒ a
+ * self-primary register/query throws a clear error (the gap is
  * loud, not a silent hang). The gated e2e seeker is deliberately a remote node, so its happy path never
  * self-dials; the production factory must still not hang on a self-primary.
  */
@@ -211,6 +219,12 @@ export interface MatchmakingSelfServe {
 	register?(reg: RegisterV1): Promise<RegisterReplyV1>;
 	/** Serve a query whose FRET-routed primary is this node; `undefined` ⇒ treated as an empty reply. */
 	query?(q: QueryV1): Promise<QueryReplyV1 | undefined>;
+	/**
+	 * Serve a renew or withdraw whose slot primary is this node (bind to the host's `resolveRenew`). Unlike
+	 * the two above, absent ⇒ logged and skipped rather than thrown: a missing keep-alive costs only the
+	 * push optimisation.
+	 */
+	renew?(r: RenewV1): Promise<RenewReplyV1>;
 }
 
 /** Construction inputs for {@link createLibp2pMatchmakingTransport}. */
@@ -247,12 +261,22 @@ export interface Libp2pMatchmakingTransportDeps {
 	readonly filter?: CapabilityFilter;
 	/** Local-serve hook for a self-routed primary; absent ⇒ a self-primary register/query throws (loud, not silent). */
 	readonly selfServe?: MatchmakingSelfServe;
+	/** The node's arrival-push receiver (`node.matchmakingArrivalPush`); a push-opted walk listens on it. */
+	readonly arrivalPush?: ArrivalPushReceiver;
+	/**
+	 * Whether walks opt into arrival pushes unless the walk says otherwise; default `arrivalPush !== undefined`.
+	 * `true` with no {@link arrivalPush} throws at construction: such a walk would ask for pushes it cannot receive.
+	 */
+	readonly pushOnArrival?: boolean;
 }
 
 /** The seeker-side seams a {@link MatchmakingSeekerSession} / the seeker walk client consume over a live node. */
 export interface Libp2pMatchmakingTransport {
-	/** Build the walk transport (register/query/renew/withdraw at a tree tier) for a topic. */
-	walkTransport(topicId: Uint8Array): SeekerWalkTransport;
+	/**
+	 * Build the walk transport (register/query/renew/withdraw at a tree tier) for one walk of a topic; the walk
+	 * must `close()` it. `options.pushOnArrival` overrides the transport default, and `true` with no receiver throws.
+	 */
+	walkTransport(topicId: Uint8Array, options?: SeekerWalkTransportOptions): SeekerWalkTransport;
 	/** Issue a one-shot `QueryV1` (resolves the cohort from `q.topicId`'s tier-0 coord). */
 	queryCohort(q: QueryV1): Promise<QueryReplyV1>;
 	/** Estimate `d_max` for a topic (FRET size estimate → the db-core `d_max` computer). */
@@ -407,14 +431,51 @@ export function createLibp2pMatchmakingTransport(deps: Libp2pMatchmakingTranspor
 		return out;
 	};
 
-	const walkTransport = (topicId: Uint8Array): SeekerWalkTransport => {
+	/** Deliver a renew or withdraw to the slot primary: in process when that is this node, else over `/register`. */
+	const sendRenew = async (primary: string, renew: RenewV1): Promise<RenewReplyV1 | undefined> => {
+		const what = renew.withdraw === true ? "matchmaking withdraw" : "matchmaking renew";
+		if (primary === selfPeerId) {
+			if (selfServe?.renew === undefined) {
+				log("%s: the slot primary is this node and no selfServe.renew is bound; skipped", what);
+				return undefined;
+			}
+			return selfServe.renew(renew);
+		}
+		try {
+			const frame = await requestResponse(node, peerIdFromString(primary), registerProtocol, encodeCohortMessage(renew, maxBytes), maxBytes);
+			return decodeRenewReplyV1(requireReply(frame, what), maxBytes);
+		} catch (err) {
+			log("%s: dial/decode failed for slot primary %s: %o", what, primary, err);
+			return undefined;
+		}
+	};
+
+	/** The receiver a walk listens on, or `undefined` for a poll-path walk; asking for pushes with no receiver throws. */
+	const pushReceiverFor = (pushOnArrival: boolean): ArrivalPushReceiver | undefined => {
+		if (pushOnArrival && deps.arrivalPush === undefined) {
+			throw new Error("matchmaking transport: pushOnArrival needs deps.arrivalPush (the node's arrival-push receiver)");
+		}
+		return pushOnArrival ? deps.arrivalPush : undefined;
+	};
+	const pushByDefault = deps.pushOnArrival ?? deps.arrivalPush !== undefined;
+	// A transport whose walks ask for pushes by default is misconfigured without a receiver: fail at construction, not on the first walk.
+	pushReceiverFor(pushByDefault);
+
+	const walkTransport = (topicId: Uint8Array, options?: SeekerWalkTransportOptions): SeekerWalkTransport => {
+		const receiver = pushReceiverFor(options?.pushOnArrival ?? pushByDefault);
+		// One correlation id per walk, carried by every tier's register: a member's push binding follows the
+		// seeker from tier to tier, and the tier left behind drops its binding once the walk withdraws there.
 		const seekerState = new MatchmakingSeeker({
 			topicId,
 			wantCount: seekerWantCount,
 			contactHint,
 			sign: signImage,
 			...(filter !== undefined ? { filter } : {}),
+			...(receiver !== undefined ? { pushOnArrival: true } : {}),
 		});
+		const keepAlive = new SeekerKeepAlive({ topicId, participantId: seekerBytes, ttlMs: seekerTtlMs, sign: signImage, send: sendRenew, log });
+		const subscription = receiver?.subscribe(topicId, bytesToB64url(seekerState.correlationId));
+		let closed = false;
 		return {
 			register: async (treeTier: number): Promise<SeekerProbeReply> => {
 				const coord = addressing.coord(treeTier, seekerBytes, topicId);
@@ -424,18 +485,29 @@ export function createLibp2pMatchmakingTransport(deps: Libp2pMatchmakingTranspor
 					return { result: "no_state" };
 				}
 				const reg = await buildSeekerRegister(topicId, treeTier, await seekerState.appPayloadBytes());
-				return toProbeReply(await dialRegister(primary, reg));
+				const reply = await dialRegister(primary, reg);
+				if (reply.result === "accepted") {
+					keepAlive.accepted(treeTier, reg.correlationId, reply.primary, primary);
+				}
+				return toProbeReply(reply);
 			},
 			// The serve handler resolves the tier-0 engine only (single-tier-0 milestone), so the query always
 			// targets the topic's tier-0 cohort regardless of the walk tier — matching the mock harness + one-shot.
 			query: async (_treeTier: number): Promise<QueryReplyV1> => dialQuery(buildQuery(topicId)),
-			// Hang-out keep-alive: the seeker's own query does not depend on its seeker record, and the brief
-			// record lives in the cohort store for the walk's duration, so a re-touch is unnecessary for the
-			// single-tier-0 milestone (mirrors the mock harness). A real renew would re-send a `RenewV1` ping.
-			renew: async (): Promise<void> => { /* no-op (documented) */ },
-			// Single-tier-0 walks reach the root and never escalate past it, so withdraw is effectively unreached;
-			// the brief seeker record otherwise ages out by TTL (mirrors the mock harness).
-			withdraw: async (): Promise<void> => { /* no-op (documented) */ },
+			renew: (): Promise<void> => keepAlive.renew(),
+			withdraw: (): Promise<void> => keepAlive.withdraw(),
+			...(subscription !== undefined ? { pushes: subscription.channel } : {}),
+			close: async (): Promise<void> => {
+				if (closed) {
+					return;
+				}
+				closed = true;
+				try {
+					await keepAlive.withdraw();
+				} finally {
+					subscription?.unsubscribe();
+				}
+			},
 		};
 	};
 
@@ -478,7 +550,7 @@ export function createLibp2pMatchmakingSeekerSession(deps: Libp2pMatchmakingSeek
 		service: deps.service,
 		sign,
 		verifyEntry: transport.verifyEntry,
-		walkTransport: (topicId) => transport.walkTransport(topicId),
+		walkTransport: (topicId, options) => transport.walkTransport(topicId, options),
 		queryCohort: (q) => transport.queryCohort(q),
 		estimateDMax: (topicId) => transport.estimateDMax(topicId),
 		...(deps.anchor !== undefined ? { anchor: deps.anchor } : {}),

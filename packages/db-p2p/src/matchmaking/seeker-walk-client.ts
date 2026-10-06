@@ -93,6 +93,12 @@ export interface SeekerWalkTransport {
 	close?(): Promise<void>;
 }
 
+/** Per-walk options a walk-transport factory accepts. */
+export interface SeekerWalkTransportOptions {
+	/** Register this walk for arrival pushes; overrides the transport's default. */
+	readonly pushOnArrival?: boolean;
+}
+
 /** Arrival pushes delivered to one walk. */
 export interface SeekerPushChannel {
 	/** Remove and return every push received since the last call (decoded and sender-verified, entries not yet re-validated). */
