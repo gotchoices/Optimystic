@@ -418,8 +418,10 @@ Contrast: the seeker's prefix lands it in a thinner shard with `directParticipan
 > orchestration (register from `d_max`, immediate `QueryV1`, renew + requery at `requery_interval_ms`
 > on hang-out, withdraw + re-register on escalate, terminal hang-out at `d = 0`, patience draining
 > across hops via a single wall-clock deadline) is
-> `packages/db-p2p/src/matchmaking/seeker-walk-client.ts` (`SeekerWalkClient`, **poll path only** —
-> the arrival-push path is a separate slice). Future refinements tracked as backlog tickets:
+> `packages/db-p2p/src/matchmaking/seeker-walk-client.ts` (`SeekerWalkClient`). The client also runs
+> the arrival-push hang-out loop when the walk transport supplies a push channel
+> (`SeekerWalkTransport.pushes`); no production transport supplies one until
+> `matchmaking-arrival-push-seeker-transport` lands. Future refinements tracked as backlog tickets:
 > `matchmaking-per-tier-patience-splitting` (strategies beyond the fixed
 > `patience_per_tier_fraction = 1.0` implemented here) and `matchmaking-contention-from-seeker-pool`
 > (exact `Σ wantCount` contention instead of the `meanWantCount × queriesPerMin` approximation

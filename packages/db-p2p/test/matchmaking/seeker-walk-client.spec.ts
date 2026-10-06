@@ -7,6 +7,7 @@ import {
 	providerSigningPayload,
 	type CapabilityFilter,
 	type EntrySigVerifier,
+	type ArrivalPushV1,
 	type ProviderEntryV1,
 	type QueryReplyV1,
 	type TopicTrafficV1,
@@ -14,6 +15,7 @@ import {
 import {
 	SeekerWalkClient,
 	type SeekerProbeReply,
+	type SeekerPushChannel,
 	type SeekerWalkClientDeps,
 	type SeekerWalkTransport,
 } from '../../src/matchmaking/seeker-walk-client.js';
@@ -46,19 +48,37 @@ const accepted = (topicTraffic?: TopicTrafficV1): SeekerProbeReply =>
 	topicTraffic === undefined ? { result: 'accepted' } : { result: 'accepted', topicTraffic };
 
 interface TierBehavior {
-	probe: SeekerProbeReply;
+	/** The register reply at this tier; a function receives the per-tier register ordinal. */
+	probe: SeekerProbeReply | ((nthRegister: number) => SeekerProbeReply);
 	/** Providers returned per `QueryV1` at this tier; a function receives the per-tier query ordinal. */
 	providers?: ProviderEntryV1[] | ((nthQuery: number) => ProviderEntryV1[]);
 }
 
-/** Fake substrate: scripted per-tier probe/query replies, virtual clock, recorded call sequence. */
+/** An arrival push the scripted channel delivers once the virtual clock reaches `at`. */
+interface ScheduledPush {
+	at: number;
+	push: ArrivalPushV1;
+}
+
+/**
+ * Fake substrate: scripted per-tier probe/query replies, virtual clock, recorded call sequence. Given a
+ * push schedule (even an empty one) the transport carries a push channel, which puts the walk on the
+ * push path.
+ */
 class Harness {
 	now = 0;
 	readonly calls: string[] = [];
 	readonly sleeps: number[] = [];
+	readonly waits: number[] = [];
+	readonly transport: SeekerWalkTransport;
 	private readonly queryCounts = new Map<number, number>();
+	private readonly registerCounts = new Map<number, number>();
+	private pending: ScheduledPush[];
 
-	constructor(private readonly tiers: Record<number, TierBehavior>, private readonly hopCostMs = 0) {}
+	constructor(private readonly tiers: Record<number, TierBehavior>, private readonly hopCostMs = 0, pushes?: ScheduledPush[]) {
+		this.pending = [...(pushes ?? [])].sort((a, b) => a.at - b.at);
+		this.transport = pushes === undefined ? this.baseTransport : { ...this.baseTransport, pushes: this.channel };
+	}
 
 	readonly clock = (): number => this.now;
 	readonly sleep = async (ms: number): Promise<void> => {
@@ -66,11 +86,28 @@ class Harness {
 		this.now += ms;
 	};
 
-	readonly transport: SeekerWalkTransport = {
+	/** `wait` advances the clock to the next scheduled push or the timeout, whichever comes first. */
+	private readonly channel: SeekerPushChannel = {
+		take: (): ArrivalPushV1[] => {
+			const due = this.pending.filter((p) => p.at <= this.now);
+			this.pending = this.pending.filter((p) => p.at > this.now);
+			return due.map((p) => p.push);
+		},
+		wait: async (ms: number): Promise<void> => {
+			this.waits.push(ms);
+			const next = this.pending[0]?.at;
+			this.now = next !== undefined && next <= this.now + ms ? Math.max(this.now, next) : this.now + Math.max(0, ms);
+		},
+	};
+
+	private readonly baseTransport: SeekerWalkTransport = {
 		register: async (d: number): Promise<SeekerProbeReply> => {
 			this.calls.push(`register:${d}`);
 			this.now += this.hopCostMs;
-			return this.tiers[d]?.probe ?? { result: 'no_state' };
+			const n = this.registerCounts.get(d) ?? 0;
+			this.registerCounts.set(d, n + 1);
+			const probe = this.tiers[d]?.probe;
+			return (typeof probe === 'function' ? probe(n) : probe) ?? { result: 'no_state' };
 		},
 		query: async (d: number): Promise<QueryReplyV1> => {
 			this.calls.push(`query:${d}`);
@@ -87,6 +124,10 @@ class Harness {
 			this.calls.push('withdraw');
 		},
 	};
+}
+
+function push(providers: ProviderEntryV1[], topicTraffic: TopicTrafficV1 = hot): ArrivalPushV1 {
+	return { v: 1, topicId: bytesToB64url(topicId), cohortEpoch: 'AA', correlationId: 'AA', providers, topicTraffic, signature: 'AA' };
 }
 
 function client(h: Harness, opts: Partial<SeekerWalkClientDeps> & Pick<SeekerWalkClientDeps, 'wantCount' | 'dMax' | 'patienceMs'>): SeekerWalkClient {
@@ -280,5 +321,69 @@ describe('matchmaking / seeker walk client', () => {
 		}).run();
 		expect(result.metWantCount).to.equal(false);
 		expect(h.sleeps).to.deep.equal([500, 500]);
+	});
+
+	describe('push path (doc §Arrival push on provider arrival)', () => {
+		const three = eight.slice(0, 3);
+
+		it('sparse safety-poll cadence: no pushes ⇒ one safety poll per pushSafetyPollMs plus the final poll, not a poll per second', async () => {
+			const h = new Harness({ 0: { probe: accepted(hot), providers: three } }, 0, []);
+			const result = await client(h, { wantCount: 8, dMax: 0, patienceMs: 10_000 }).run();
+			expect(result.metWantCount).to.equal(false);
+			// Immediate query, the 5 s safety poll, then the final poll at the 10 s deadline (the poll path issues 11).
+			expect(h.calls).to.deep.equal(['register:0', 'query:0', 'renew', 'query:0', 'renew', 'query:0']);
+			expect(h.waits).to.deep.equal([5_000, 5_000]);
+			expect(h.sleeps).to.deep.equal([]);
+		});
+
+		it('missed push, final poll recovers: a provider only the final query returns is in the result', async () => {
+			const late = entry('late');
+			const h = new Harness({ 0: { probe: accepted(hot), providers: (n) => (n < 2 ? three : [...three, late]) } }, 0, []);
+			const result = await client(h, { wantCount: 4, dMax: 0, patienceMs: 10_000 }).run();
+			expect(result.metWantCount).to.equal(true);
+			expect(result.providers.map((p) => p.participantId)).to.include('late');
+			expect(h.now).to.equal(10_000);
+		});
+
+		it('push/poll overlap deduped: a provider pushed and then polled counts once toward wantCount', async () => {
+			const [a, b] = [entry('A'), entry('B')];
+			const h = new Harness({ 1: { probe: accepted(hot), providers: (n) => (n === 0 ? [a!] : [b!]) } }, 0, [{ at: 1_000, push: push([b!]) }]);
+			const result = await client(h, { wantCount: 3, dMax: 1, patienceMs: 10_000 }).run();
+			expect(result.metWantCount).to.equal(false);
+			expect(result.providers.map((p) => p.participantId)).to.deep.equal(['A', 'B']);
+		});
+
+		it('push forgery rejected: a pushed entry whose registrationSig fails re-validation is not returned', async () => {
+			const forged = { ...entry('evil'), capacityBudget: 99 }; // tampered after signing
+			const h = new Harness({ 1: { probe: accepted(hot), providers: [entry('A')] } }, 0, [{ at: 1_000, push: push([forged, entry('B')]) }]);
+			const result = await client(h, { wantCount: 2, dMax: 1, patienceMs: 10_000 }).run();
+			expect(result.metWantCount).to.equal(true);
+			expect(result.providers.map((p) => p.participantId)).to.deep.equal(['A', 'B']);
+		});
+
+		it('promotion observed via a push: re-registers at the same tier (no withdraw) and follows the promoted reply', async () => {
+			const promotedTraffic: TopicTrafficV1 = { ...hot, childCohortCount: 2 };
+			const h = new Harness(
+				{
+					1: { probe: (n) => (n === 0 ? accepted(hot) : { result: 'promoted', targetTier: 2 }), providers: [entry('A')] },
+					2: { probe: accepted(hot), providers: eight },
+				},
+				0,
+				[{ at: 1_000, push: push([entry('B')], promotedTraffic) }],
+			);
+			const result = await client(h, { wantCount: 8, dMax: 1, patienceMs: 10_000 }).run();
+			expect(result.metWantCount).to.equal(true);
+			expect(result.terminalTier).to.equal(2);
+			expect(result.maxChildCohortCount).to.equal(2);
+			expect(h.calls).to.deep.equal(['register:1', 'query:1', 'register:1', 'register:2', 'query:2']);
+		});
+
+		it('a push that meets wantCount ends the walk before the first safety poll: no query after the immediate one', async () => {
+			const h = new Harness({ 1: { probe: accepted(hot), providers: eight.slice(0, 6) } }, 0, [{ at: 2_000, push: push(eight.slice(6)) }]);
+			const result = await client(h, { wantCount: 8, dMax: 1, patienceMs: 10_000 }).run();
+			expect(result.metWantCount).to.equal(true);
+			expect(h.calls).to.deep.equal(['register:1', 'query:1']);
+			expect(h.now).to.equal(2_000);
+		});
 	});
 });

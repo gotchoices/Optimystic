@@ -13,9 +13,23 @@
  * the same `patienceMs` — escalation makes the next tier's hang-out progressively less attractive, which
  * is correct since the root is terminal.
  *
+ * **Two hang-out paths.** Without a push channel on the transport, a hanging-out seeker renews and
+ * re-queries every `requery_interval_ms` (the poll path). With one ({@link SeekerWalkTransport.pushes},
+ * present when the transport registered the seeker with `pushOnArrival`) it waits on arrival pushes,
+ * re-queries only every `push_safety_poll_ms`, and issues one final `QueryV1` when patience runs out, so a
+ * lost push never leaves it worse off than the poll path (`docs/matchmaking.md` §Failure mode —
+ * optimization-only). Pushed entries and query replies are admitted by one rule — filter, re-validate
+ * `registrationSig`, dedupe by `participantId` — but only query replies refine `filterAcceptRatio`: a push
+ * is already filtered cohort-side, so counting it would bias the ratio upward.
+ *
+ * **Promotion seen mid-tier (both paths).** A query reply or push reporting `childCohortCount > 0` at a
+ * tier whose `Accepted` reported none means the cohort promoted while the seeker was there. The client
+ * then registers at the same tier again, without withdrawing, so the cohort's `promoted` reply sends the
+ * walk down a tier — at most once per tier per walk. That is the only decision a push re-runs; the
+ * hang-out-vs-escalate decision is made once per `Accepted`, as on the poll path.
+ *
  * The transport, clock, sleep, and per-entry verifier are all injected, so the walk unit-tests without a
- * live libp2p stack (mock-tier e2e is a documented follow-on). This client implements the **poll path**
- * only; the arrival-push path (`pushOnArrival`) is a separate slice.
+ * live libp2p stack.
  *
  * Edge cases encoded here (`docs/matchmaking.md` §Edge cases — the rest live in {@link decide}):
  * - **`topicTraffic` absent (case 1):** the cohort is treated as zero-rate; the seeker issues one query
@@ -34,6 +48,7 @@ import {
 	newFilterAcceptRatioState,
 	observeYield,
 	verifyProviderEntry,
+	bytesToB64url,
 	DEFAULT_HANG_OUT_CONFIG,
 	DEFAULT_MEAN_WANT_COUNT,
 	FILTER_ACCEPT_RATIO_INITIAL,
@@ -43,7 +58,12 @@ import {
 	type HangOutConfig,
 	type ProviderEntryV1,
 	type QueryReplyV1,
+	type TopicTrafficV1,
+	type ArrivalPushV1,
 } from "@optimystic/db-core";
+import { createLogger } from "../logger.js";
+
+const log = createLogger("matchmaking:seeker-walk");
 
 /** A seeker register/probe reply at a tree tier (the matchmaking-relevant subset of `RegisterReplyV1`). */
 export interface SeekerProbeReply {
@@ -64,6 +84,21 @@ export interface SeekerWalkTransport {
 	renew(): Promise<void>;
 	/** Withdraw the seeker registration before escalating (polite `RenewV1` TTL = 0; optional). */
 	withdraw(): Promise<void>;
+	/**
+	 * Present iff this walk's registration opted into arrival pushes (`pushOnArrival`) and the transport
+	 * can receive them; its presence alone puts the walk on the push path.
+	 */
+	readonly pushes?: SeekerPushChannel;
+	/** Release transport resources when the walk ends (e.g. withdraw and stop receiving pushes). Optional. */
+	close?(): Promise<void>;
+}
+
+/** Arrival pushes delivered to one walk. */
+export interface SeekerPushChannel {
+	/** Remove and return every push received since the last call (decoded and sender-verified, entries not yet re-validated). */
+	take(): ArrivalPushV1[];
+	/** Resolve after `ms` (at once when `ms <= 0`), or earlier as soon as a push is waiting. Never rejects. */
+	wait(ms: number): Promise<void>;
 }
 
 /** Construction inputs for {@link SeekerWalkClient}. */
@@ -104,16 +139,16 @@ export interface SeekerWalkResult {
 	/** Total register hops issued (probes + escalations + descends). */
 	readonly hops: number;
 	/**
-	 * Max `topicTraffic.childCohortCount` observed across every `Accepted` reply this walk saw. `> 0`
-	 * means the topic has promoted (it is hot), so the single-cohort sample is unrepresentative — the
-	 * public seeker session / voting `QuorumDiscovery` binding uses this to decide whether to escalate to
-	 * the multi-cohort sweep (`docs/matchmaking.md` §Multi-cohort sweep).
+	 * Max `topicTraffic.childCohortCount` observed across every `Accepted` reply, query reply and push this
+	 * walk saw. `> 0` means the topic has promoted (it is hot), so the single-cohort sample is
+	 * unrepresentative — the public seeker session / voting `QuorumDiscovery` binding uses this to decide
+	 * whether to escalate to the multi-cohort sweep (`docs/matchmaking.md` §Multi-cohort sweep).
 	 */
 	readonly maxChildCohortCount: number;
 }
 
-/** Outcome of evaluating one `Accepted` tier. */
-type AcceptedOutcome = "done" | "escalate" | "terminal";
+/** Outcome of evaluating one `Accepted` tier; `reregister` = promotion seen mid-tier (see the module header). */
+type AcceptedOutcome = "done" | "escalate" | "terminal" | "reregister";
 
 /** Drives the seeker hang-out-vs-continue walk for one matchmaking topic. See the module header. */
 export class SeekerWalkClient {
@@ -130,17 +165,27 @@ export class SeekerWalkClient {
 	private readonly clock: () => number;
 	private readonly sleep: (ms: number) => Promise<void>;
 
-	/** Matched providers, deduped by `participantId` (a provider seen via two queries counts once). */
+	/** {@link topicId} as pushes spell it, to drop a push for another topic. */
+	private readonly topicIdB64: string;
+
+	/** Matched providers, deduped by `participantId` (a provider seen via two queries, or a push and a query, counts once). */
 	private readonly matched = new Map<string, ProviderEntryV1>();
 	private ratioState: FilterAcceptRatioState = newFilterAcceptRatioState();
 	private deadline = 0;
 	private hops = 0;
-	/** Max `childCohortCount` seen across `Accepted` replies — the hot-topic / sweep-escalation signal. */
+	/** Max `childCohortCount` seen across everything the walk heard — the hot-topic / sweep-escalation signal. */
 	private maxChildCohortCount = 0;
+	/** Tiers this walk already re-registered at on a promotion; once each, so a cohort that keeps answering `accepted` cannot loop the walk. */
+	private readonly reregisteredTiers = new Set<number>();
+	/** A promotion at the current tier would be news: its `Accepted` reported no child cohorts and the walk has not re-registered here. */
+	private promotionWatched = false;
+	/** A query reply or push at the current tier reported child cohorts its `Accepted` did not. */
+	private promotionObserved = false;
 
 	constructor(deps: SeekerWalkClientDeps) {
 		this.transport = deps.transport;
 		this.topicId = deps.topicId;
+		this.topicIdB64 = bytesToB64url(deps.topicId);
 		this.wantCount = deps.wantCount;
 		this.dMax = deps.dMax;
 		this.patienceMs = deps.patienceMs;
@@ -155,6 +200,14 @@ export class SeekerWalkClient {
 
 	/** Run the walk from `d_max` toward the root; resolves the matched providers + termination info. */
 	async run(): Promise<SeekerWalkResult> {
+		try {
+			return await this.walk();
+		} finally {
+			await this.closeTransport();
+		}
+	}
+
+	private async walk(): Promise<SeekerWalkResult> {
 		this.deadline = this.clock() + this.patienceMs;
 		let d = this.dMax;
 
@@ -187,6 +240,11 @@ export class SeekerWalkClient {
 					if (outcome === "done" || outcome === "terminal") {
 						return this.finish(d);
 					}
+					if (outcome === "reregister") {
+						// No withdraw: the cohort answers this same-tier register with `promoted`, and the case above descends.
+						this.reregisteredTiers.add(d);
+						continue;
+					}
 					await this.transport.withdraw();
 					d -= 1;
 					continue;
@@ -195,44 +253,92 @@ export class SeekerWalkClient {
 		}
 	}
 
+	/** End-of-walk release. A failure is logged, never thrown, so it cannot replace the walk's own result or error. */
+	private async closeTransport(): Promise<void> {
+		try {
+			await this.transport.close?.();
+		} catch (err) {
+			log.error("seeker walk transport close failed: %o", err);
+		}
+	}
+
 	/** Remaining patience (ms); the wall-clock deadline drains uniformly across hops + hang-out. */
 	private remaining(): number {
 		return Math.max(0, this.deadline - this.clock());
 	}
 
-	/** Filter, re-validate (`registrationSig`), and dedupe a query reply's providers into {@link matched}. */
+	/** Admit a query reply: its providers, its traffic, and its yield (which refines `filterAcceptRatio`). */
 	private collect(reply: QueryReplyV1): void {
 		const returned = reply.providers ?? [];
-		let matchedThisQuery = 0;
-		for (const entry of returned) {
-			if (!matchesFilter(entry, this.filter)) {
+		this.ratioState = observeYield(this.ratioState, this.admit(returned), returned.length);
+		this.noteTraffic(reply.topicTraffic);
+	}
+
+	/**
+	 * Admit an arrival push: its providers and its traffic, not a yield (see the module header). The
+	 * pushing member's signature is the transport's to check, since only it knows the sender.
+	 */
+	private absorbPush(push: ArrivalPushV1): void {
+		if (push.topicId !== this.topicIdB64) {
+			log("arrival push for topic %s dropped: this walk is on %s", push.topicId, this.topicIdB64);
+			return;
+		}
+		this.admit(push.providers);
+		this.noteTraffic(push.topicTraffic);
+	}
+
+	/** Filter, re-validate (`registrationSig`), and dedupe entries into {@link matched}; returns how many passed. */
+	private admit(entries: readonly ProviderEntryV1[]): number {
+		let passed = 0;
+		for (const entry of entries) {
+			if (!matchesFilter(entry, this.filter) || !verifyProviderEntry(this.topicId, entry, this.verifyEntry)) {
 				continue;
 			}
-			if (!verifyProviderEntry(this.topicId, entry, this.verifyEntry)) {
-				continue;
-			}
-			matchedThisQuery++;
+			passed++;
 			this.matched.set(entry.participantId, entry);
 		}
-		this.ratioState = observeYield(this.ratioState, matchedThisQuery, returned.length);
+		return passed;
+	}
+
+	/** Fold traffic heard at the current tier into the hotness signal and the mid-tier promotion check. */
+	private noteTraffic(traffic: TopicTrafficV1): void {
+		this.maxChildCohortCount = Math.max(this.maxChildCohortCount, traffic.childCohortCount);
+		if (this.promotionWatched && traffic.childCohortCount > 0) {
+			this.promotionObserved = true;
+		}
+	}
+
+	/** Start tier `d` on its `Accepted` traffic: fold the hotness signal and arm the promotion check. */
+	private enterTier(d: number, traffic: TopicTrafficV1 | undefined): void {
+		const childCohorts = traffic?.childCohortCount ?? 0;
+		this.maxChildCohortCount = Math.max(this.maxChildCohortCount, childCohorts);
+		this.promotionWatched = childCohorts === 0 && !this.reregisteredTiers.has(d);
+		this.promotionObserved = false;
+	}
+
+	/** `done` once `wantCount` is met, `reregister` once a promotion was seen at this tier, otherwise `undefined`. */
+	private tierExit(): "done" | "reregister" | undefined {
+		if (this.matched.size >= this.wantCount) {
+			return "done";
+		}
+		return this.promotionObserved ? "reregister" : undefined;
 	}
 
 	/** Evaluate one `Accepted` tier: immediate query, then {@link decide} → done / hangOut / escalate. */
-	private async handleAccepted(d: number, traffic: SeekerProbeReply["topicTraffic"]): Promise<AcceptedOutcome> {
+	private async handleAccepted(d: number, traffic: TopicTrafficV1 | undefined): Promise<AcceptedOutcome> {
 		// Record the hottest tier seen as soon as this Accepted reply's traffic is available — *before* the
 		// immediate-match/done short-circuit below, so the single-cohort-vs-sweep decision (public session /
 		// voting QuorumDiscovery binding) still sees a hot topic even when one cohort's query already met
 		// wantCount. Folding it only on the `decide` path would drop the signal for a small quorum that a
 		// single hot cohort satisfies, leaving the assembler with a prefix-biased sample it should sweep.
-		if (traffic !== undefined) {
-			this.maxChildCohortCount = Math.max(this.maxChildCohortCount, traffic.childCohortCount);
-		}
+		this.enterTier(d, traffic);
 
 		// Immediate-match check runs in every case — also satisfies edge case 2 (a stale arrivalsPerMin=0
 		// cohort that actually holds enough providers resolves here rather than escalating spuriously).
 		this.collect(await this.transport.query(d));
-		if (this.matched.size >= this.wantCount) {
-			return "done";
+		const exit = this.tierExit();
+		if (exit !== undefined) {
+			return exit;
 		}
 
 		// Edge case 1: a reply without topicTraffic is treated as zero-rate — walk one tier toward the
@@ -258,25 +364,62 @@ export class SeekerWalkClient {
 
 		if (decision.action === "hangOut") {
 			await this.hangOut(d, decision.requeryIntervalMs);
-			if (this.matched.size >= this.wantCount) {
-				return "done";
-			}
-			return d <= 0 ? "terminal" : "escalate";
+			return this.tierExit() ?? (d <= 0 ? "terminal" : "escalate");
 		}
 
 		// escalate — but at the root there is nowhere to walk: hang out the remaining patience, then end.
 		if (d <= 0) {
 			await this.hangOut(d, this.config.requeryIntervalMs);
-			return "terminal";
+			return this.tierExit() ?? "terminal";
 		}
 		return "escalate";
 	}
 
-	/** Keep the registration alive and re-query on the poll cadence until `wantCount` met or patience drains. */
+	/** Keep the registration alive at tier `d` until {@link tierExit} or patience drains, on whichever path the transport offers. */
 	private async hangOut(d: number, requeryIntervalMs: number): Promise<void> {
-		while (this.remaining() > 0 && this.matched.size < this.wantCount) {
+		const pushes = this.transport.pushes;
+		if (pushes === undefined) {
+			await this.pollHangOut(d, requeryIntervalMs);
+		} else {
+			await this.pushHangOut(d, pushes);
+		}
+	}
+
+	/** Poll path: renew and re-query on the `requeryIntervalMs` cadence. */
+	private async pollHangOut(d: number, requeryIntervalMs: number): Promise<void> {
+		while (this.remaining() > 0 && this.tierExit() === undefined) {
 			await this.sleep(Math.min(requeryIntervalMs, this.remaining()));
 			await this.transport.renew();
+			this.collect(await this.transport.query(d));
+		}
+	}
+
+	/**
+	 * Push path: wait on pushes, renewing on every wake (the transport throttles renewal to the TTL
+	 * cadence), with a safety `QueryV1` every `pushSafetyPollMs` and one final query once patience runs
+	 * out — issued even when a push is in flight, since a provider arriving inside the last coalesce
+	 * window may never be pushed in time (`docs/matchmaking.md` §Edge cases & interactions, final-poll
+	 * boundary). Like the poll path's last poll, it overruns patience by one RPC.
+	 */
+	private async pushHangOut(d: number, pushes: SeekerPushChannel): Promise<void> {
+		let lastPoll = this.clock();
+		while (this.remaining() > 0 && this.tierExit() === undefined) {
+			const nextSafetyPoll = lastPoll + this.config.pushSafetyPollMs;
+			await pushes.wait(Math.min(nextSafetyPoll, this.deadline) - this.clock());
+			for (const push of pushes.take()) {
+				this.absorbPush(push);
+			}
+			if (this.tierExit() !== undefined) {
+				return;
+			}
+			await this.transport.renew();
+			// A wake at the deadline leaves the due poll to the final one below rather than querying twice.
+			if (this.clock() >= nextSafetyPoll && this.remaining() > 0) {
+				this.collect(await this.transport.query(d));
+				lastPoll = this.clock();
+			}
+		}
+		if (this.tierExit() === undefined) {
 			this.collect(await this.transport.query(d));
 		}
 	}
