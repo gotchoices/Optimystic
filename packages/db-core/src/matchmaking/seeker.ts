@@ -16,6 +16,7 @@
 
 import { randomBytes } from "@noble/hashes/utils.js";
 import { bytesToB64url } from "../cohort-topic/wire/codec.js";
+import { CORRELATION_BYTES } from "../cohort-topic/wire/primitives.js";
 import { seekerSigningPayload, type CapabilityFilter, type SeekerAppPayloadV1, encodeSeekerAppPayload } from "./wire.js";
 
 /** Construction inputs for a {@link MatchmakingSeeker}. */
@@ -62,7 +63,7 @@ export class MatchmakingSeeker {
 		this.pushOnArrival = options.pushOnArrival;
 		this.sign = options.sign;
 		const rand = options.randomBytes ?? randomBytes;
-		this.correlationId = options.correlationId ?? rand(16);
+		this.correlationId = options.correlationId ?? rand(CORRELATION_BYTES);
 	}
 
 	/** Build the signed {@link SeekerAppPayloadV1} for this seeker's registration. */

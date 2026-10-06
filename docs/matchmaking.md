@@ -161,6 +161,7 @@ SeekerAppPayloadV1 {
   filter:         CapabilityFilter?   // optional, see below
   contactHint:    string              // for collective-assembly use
   pushOnArrival?: boolean             // opt into arrival pushes; default false (poll path)
+  correlationId?: string              // 16 bytes; the arrival-push binding, required when pushOnArrival
   signature:      string
 }
 ```
@@ -522,7 +523,7 @@ On a fresh matchable arrival, the primary notifies the **`min(provider.capacityB
 
 A fresh arrival with `capacityBudget == 0` is skipped entirely — a "listed but full" provider ([§Provider self-throttling](#provider-self-throttling)) is not a new matchable slot.
 
-**Who computes the set, and who sends.** The set is a pure function of the cohort's gossip-replicated records (`selectArrivalPushTargets` in `packages/db-core/src/matchmaking/arrival-push.ts`), so every member computes the same one: push-opted seekers that carry a `correlationId`, match the provider's filter, and attached no later than the provider; sorted by `attachedAt`, ties by `participantId`; the first `capacityBudget` of them. Each member then delivers only to the selected seekers whose slot primary it is, so the cohort as a whole notifies `capacityBudget` seekers, not `capacityBudget` per member. A seeker's push binding — its `contactHint`, filter, `wantCount`, `correlationId` and `attachedAt` — travels in its signed registration payload and so in the replicated record; only the per-seeker "already pushed" set and the coalescing batch are local to the pushing member, which is why a failover needs no new replication.
+**Who computes the set, and who sends.** The set is a pure function of the cohort's gossip-replicated records (`selectArrivalPushTargets` in `packages/db-core/src/matchmaking/arrival-push.ts`), so every member computes the same one: push-opted seekers that carry a `correlationId`, match the provider's filter, and attached no later than the provider; sorted by `attachedAt`, ties by `participantId`; the first `capacityBudget` of them. Each member then delivers only to the selected seekers whose slot primary it is, so the cohort as a whole notifies `capacityBudget` seekers, not `capacityBudget` per member. A seeker's push binding travels in the replicated record: `contactHint`, filter, `wantCount` and `correlationId` in its registration payload, `attachedAt` as the cohort stamped it on first attach; only the per-seeker "already pushed" set and the coalescing batch are local to the pushing member, which is why a failover needs no new replication.
 
 **A provider is not pushed to a seeker that attached after it.** That provider was already answerable by the seeker's own first `QueryV1`. Without the rule, a member that receives the whole record set at once — a new member catching up by gossip, or one pulling records in a rotation handoff — would see every existing provider as an arrival and push it to every seeker. A provider the rule misses is still found by the seeker's safety poll.
 

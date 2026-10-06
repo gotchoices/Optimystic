@@ -30,7 +30,7 @@ export type ArrivalPushCandidate = LocalSeekerRegistration;
  *
  * NOTE: accepted tradeoff — the ranking reads only replicated state, so a seeker already satisfied,
  * finished, or answering `unknown_seeker` to its own primary keeps holding a fan-out slot until its
- * record leaves the cohort (withdraw on finish, or its 10 s TTL), under-filling that arrival's fan-out;
+ * record leaves the cohort (withdraw on finish, or its `seeker_ttl` expiry), under-filling that arrival's fan-out;
  * members whose gossip views differ can also over- or under-fill by a few. Excluding them would mean
  * gossiping per-seeker push state; the seeker's safety poll covers what is missed. Revisit if push
  * under-fill shows up as seekers routinely falling back to the safety poll on a busy topic.
