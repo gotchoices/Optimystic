@@ -5,7 +5,7 @@ files:
   - packages/db-core/src/transaction/transaction.ts (priority field from implement-occ-priority-aging)
   - docs/correctness.md (Theorem 9; Theorem 7 termination)
 difficulty: hard
-tradeoffs: It hands a peer a lever that actively makes other peers reject work, so a dishonest claimant could deny service on a hot block — the question of whether priority can be verified may sink it, and the starvation it fixes has not been observed in practice.
+tradeoffs: It hands a peer a lever that actively makes other peers reject work, so a dishonest claimant could deny service on a hot block — the question of whether priority can be verified may sink it,. The starvation it fixes has now been observed in the field (GitHub #18, below).
 ----
 
 ## Why this exists
@@ -62,3 +62,38 @@ and a Byzantine claimant cannot weaponize reservations to deny service.
 
 This is a design-first item — it needs a `plan/` pass to settle the Byzantine-verifiability and
 throughput-bound questions before any implement ticket.
+
+## Observed in the field — GitHub issue #18 (2026-09-24)
+
+The reporter (kjeib, sereus/VoteTorrent) reproduced sequential starvation on the published 1.5.0
+stack. Two relay-only Node processes write one collection, the fast one every 200 ms and the slow one
+every 1000 ms. The slow writer has its event loop taken away for 60% of every 50 ms window, which
+models what Hermes does to a phone:
+
+```js
+const DUTY = 0.6, PERIOD = 50;
+setInterval(() => { const end = Date.now() + PERIOD * DUTY; while (Date.now() < end); }, PERIOD);
+```
+
+- The slow writer rebases correctly every time: its requested revision climbs steadily (388, 504,
+  619 … 1910). It re-reads, submits, and loses, repeatedly. No pending state is stuck.
+- About 95% of its failures are `stale revision` (`latest.rev >= pendRequest.rev`), not
+  `rival action`. A fix aimed only at the rival-reservation path will not move these numbers.
+- Longest unbroken outage per 600 s run: 455 s and 376 s on 1.4.0, 323 s and 356 s on 1.5.0. The
+  racing-write tie-break in 1.5.0 raised the slow party's successful writes but did not shorten the
+  outages.
+- On an Android emulator against a Node host over a circuit relay, one typed message collided with
+  the host's 45 s periodic writer, and the host then failed every write for over 1097 s. Reads stayed
+  healthy.
+- The app reported nothing. The composer cleared and the message looked sent. Check whether that is
+  the host app dropping `SyncRetryExhaustedError` or something in our write path.
+
+So the precondition this ticket was deferred on (unobserved starvation) no longer holds, and the
+reported workload is ordinary chat traffic on a phone. Re-measure on the current release before
+designing: several later changes touch this path (stall detection that ends a hopeless retry early,
+the floored log-tail read after a refused write, the expiry vote).
+
+The plan stage should also weigh lighter remedies than a cluster-side reservation before taking on
+the verifiability problem above. Candidates: client-side backoff that favours the writer who has
+lost the most, a writer that re-reads only the log tail on a stale refusal, and making each attempt
+cheaper so a slow writer's read-to-pend window shrinks.
