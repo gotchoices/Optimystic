@@ -19,9 +19,9 @@ export interface SyncOptions {
 	 * of the attempt count — a progress-agnostic ceiling. Unset means no deadline. */
 	deadlineMs?: number;
 	/** Base backoff delay in ms applied before the first retry; subsequent retries grow the delay
-	 * exponentially up to {@link maxBackoffMs}. Default 100. Not applied once the write has lost
-	 * `SlotHoldAfterLosses` consecutive attempts and the latest was refused with a confirmed
-	 * committed revision (`StaleFailure.staleAt`): a member then holds the next slot for this write,
+	 * exponentially up to {@link maxBackoffMs}. Default 100. Not applied once `SlotHoldAfterLosses` of the
+	 * write's refused attempts carried a confirmed committed revision (`StaleFailure.staleAt`) and the
+	 * latest refusal is one of them: a member then holds the next slot for this write,
 	 * and the retry follows at once rather than spending the hold asleep. */
 	baseBackoffMs?: number;
 	/** Upper bound on any single backoff sleep, in ms. Default 5000. Like {@link baseBackoffMs}, not

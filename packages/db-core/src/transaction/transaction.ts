@@ -168,9 +168,10 @@ export function clampPriority(priority: number | undefined): number {
  * so `resolveRace` never meets them (docs/correctness.md Theorem 9, "Bound").
  *
  * The count is the member's own and never the self-asserted priority: a member grants only on
- * refusals it issued, so no claimant can talk it into a hold with a number. The writer side reads the
- * same constant to stop backing off on exactly the loss after which a member holds for it, so the two
- * sides agree by construction with nothing on the wire.
+ * refusals it issued, so no claimant can talk it into a hold with a number. The writer side counts the
+ * refusals that confirmed a committed revision against the same constant to stop backing off on the
+ * loss after which a member holds for it (`retryBackoffMs` in `collection/collection.ts`), so the two
+ * sides agree with nothing on the wire — wherever the refused pends reached the member.
  *
  * Three: the plan-stage measurement (ticket `slot-hold-for-an-aged-writer`) showed an honest slow
  * writer behind a quick stream losing nine of ten attempts, so two losses are an ordinary lost race

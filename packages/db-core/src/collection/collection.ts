@@ -122,19 +122,23 @@ const DefaultMaxStalledAttempts = 2;
  * The sleep before the refresh that follows a write's `failures`-th consecutive loss.
  *
  * The jittered backoff exists to separate a herd of writers that lost the SAME race, so they do not
- * re-collide on the next tick. A writer that keeps losing to rivals each of which had already
- * committed (`lostToCommittedRival`: the refusal carried a confirmed `staleAt`) is not in a herd, and
- * from its `SlotHoldAfterLosses`-th such loss on, the members that refused it hold the next slot for
- * it — so sleeping only spends that hold. The two sides count the same constant, so the writer stops
- * sleeping on exactly the loss after which a member holds, with nothing said over the wire.
+ * re-collide on the next tick. A loss to a rival that had already committed (the refusal carried a
+ * confirmed `staleAt`) is not a herd, and once this write has taken `SlotHoldAfterLosses` such losses
+ * (`confirmedLosses`, counted over the whole write as a member counts its stale refusals of one
+ * action) the members that refused it hold the next slot for it — so sleeping only spends that hold.
+ * Both sides count the same refusals against the same constant, so the writer stops sleeping on the
+ * loss after which a member holds, with nothing said over the wire. A loss the latest refusal did not
+ * confirm (`latestConfirmed` false — a race against something still in flight) keeps the jitter.
  *
- * NOTE: against members that do not hold (an earlier release, or `slotHoldWindowMs: 0`) this retries
- * without sleeping and so spends the same attempt budget sooner, at about twice one writer's pend
- * rate (measured in the plan stage of `slot-hold-for-an-aged-writer`). Accepted: the backoff bought
- * that writer nothing either, it only delayed the same give-up.
+ * NOTE: against members that do not hold (an earlier release, `slotHoldWindowMs: 0`, or a member the
+ * refused pends did not reach) this retries without sleeping and so spends the same attempt budget
+ * sooner, at about twice one writer's pend rate (measured in the plan stage of
+ * `slot-hold-for-an-aged-writer`). Accepted: the backoff bought that writer nothing either, it only
+ * delayed the same give-up.
  */
-function retryBackoffMs(failures: number, lostToCommittedRival: boolean, config: JitteredBackoffConfig, rand?: RandFn): number {
-	if (lostToCommittedRival && failures >= SlotHoldAfterLosses) {
+function retryBackoffMs(failures: number, confirmedLosses: number, latestConfirmed: boolean,
+	config: JitteredBackoffConfig, rand?: RandFn): number {
+	if (latestConfirmed && confirmedLosses >= SlotHoldAfterLosses) {
 		return 0;
 	}
 	return jitteredBackoffMs(failures - 1, config, rand);
@@ -1793,6 +1797,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// responder to have re-confirmed the number this round, not merely an older observation
 		// left standing in `lastStaleAt`.
 		let lastFailureConfirmedStaleAt = false;
+		// Refused attempts of this write that carried their own staleAt. Never reset: a member counts
+		// its stale refusals per action for the action's whole life, and this is the writer's view of
+		// that count (see retryBackoffMs).
+		let confirmedLosses = 0;
 		// Consecutive refreshes that moved `getNextRev()` nowhere at all while a confirmed revision
 		// stood at or above it.
 		let consecutiveStalls = 0;
@@ -1944,6 +1952,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 				// producers and the transactor's aggregation already use.
 				lastStaleAt = highestStaleAt([lastStaleAt, attempt.staleAt]);
 				lastFailureConfirmedStaleAt = attempt.staleAt !== undefined;
+				if (lastFailureConfirmedStaleAt) confirmedLosses++;
 				// Give up once the consecutive no-progress budget is exhausted, so a transactor that
 				// persistently rejects the sync can no longer hold the collection latch forever.
 				// NOTE: this also bounds the legitimate `pending`-wait case (retrying the same action
@@ -1982,7 +1991,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 				// Whether the failure just handled was a loss to a rival already durably committed. Only
 				// the attempt's own refusal can say so; a refresh refused for a cause that can clear
 				// (below) is a race against something still in flight, and clears it.
-				let lostToCommittedRival = lastFailureConfirmedStaleAt;
+				let latestConfirmed = lastFailureConfirmedStaleAt;
 				for (;;) {
 					// Back off before every retry (any stale failure — reason/missing/pending), growing
 					// exponentially from the base delay up to the cap, with proportional random jitter so a
@@ -1994,7 +2003,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 					// retried with zero delay); that is what stops the persistent-`reason` hot spin. If a
 					// high-contention workload ever shows this base delay as recovery latency, lower
 					// baseBackoffMs for that caller rather than reintroducing the zero-delay retry.
-					const delay = retryBackoffMs(consecutiveFailures, lostToCommittedRival,
+					const delay = retryBackoffMs(consecutiveFailures, confirmedLosses, latestConfirmed,
 						{ baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
 					await abortableDelay(delay, signal);
 					try {
@@ -2034,7 +2043,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 						// is what escapes: the log holds an entry for a write that was not saved.
 						consecutiveFailures++;
 						lastReason = err.detail;
-						lostToCommittedRival = false;
+						latestConfirmed = false;
 						if (consecutiveFailures >= maxAttempts
 							|| (deadlineMs !== undefined && Date.now() - startedAt >= deadlineMs)) {
 							throw err;

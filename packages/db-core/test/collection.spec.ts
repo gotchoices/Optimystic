@@ -1184,20 +1184,34 @@ describe('Collection', () => {
         expect(err.lastReason).to.equal('low')
       })
 
-      // The jittered backoff separates a herd that lost the same race. A writer losing to rivals that
-      // had each already committed is not in a herd, and from its SlotHoldAfterLosses-th such loss a
+      // The jittered backoff separates a herd that lost the same race. A loss to a rival that had
+      // already committed is not a herd, and once a write has taken SlotHoldAfterLosses of them a
       // member holds the next slot for it, so the retry follows at once. `rand` is consulted once per
       // jittered sleep and never for a zero one, so the failures it was called after are the ones
       // that slept.
       describe('backoff once a member holds the slot', () => {
-        const sleptAfter = async (failure: StaleFailure) => {
-          const transactorUnderTest = new StaleAtCommitTransactor(new TestTransactor(), failure)
+        const taken: StaleFailure = { success: false, conflict: true, reason: 'taken', staleAt: { blockId: 'hot-block', rev: 42 } }
+        const held: StaleFailure = { success: false, conflict: true, reason: 'held by a pending rival' }
+        const attempts = SlotHoldAfterLosses + 3
+        /** 1..n inclusive. */
+        const through = (n: number) => Array.from({ length: n }, (_, i) => i + 1)
+
+        class SequencedRefusals extends StaleAtCommitTransactor {
+          constructor(private readonly refusals: StaleFailure[]) { super(new TestTransactor(), taken) }
+          override async commit(request: CommitRequest): Promise<CommitResult> {
+            await super.commit(request)
+            return this.refusals[Math.min(this.commitAttempts, this.refusals.length) - 1]!
+          }
+        }
+
+        const sleptAfter = async (refusals: StaleFailure[]) => {
+          const transactorUnderTest = new SequencedRefusals(refusals)
           const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
           await collection.act({ type: 'set', data: { value: 'never-commits', timestamp: 1 } })
           const slept: number[] = []
           const syncPromise = collection.sync({
-            maxAttempts: 6,
-            maxStalledAttempts: 6,
+            maxAttempts: attempts,
+            maxStalledAttempts: attempts,
             baseBackoffMs: 1,
             maxBackoffMs: 5,
             rand: () => { slept.push(transactorUnderTest.commitAttempts); return 0 },
@@ -1207,14 +1221,20 @@ describe('Collection', () => {
         }
 
         it('stops sleeping after SlotHoldAfterLosses losses to a committed revision', async () => {
-          const slept = await sleptAfter({ success: false, conflict: true, reason: 'taken', staleAt: { blockId: 'hot-block', rev: 42 } })
-          expect(SlotHoldAfterLosses).to.equal(3)
-          expect(slept).to.deep.equal([1, 2])
+          expect(await sleptAfter([taken])).to.deep.equal(through(SlotHoldAfterLosses - 1))
         })
 
-        it('keeps sleeping when the refusal confirms no committed revision', async () => {
-          const slept = await sleptAfter({ success: false, conflict: true, reason: 'held by a pending rival' })
-          expect(slept).to.deep.equal([1, 2, 3, 4, 5])
+        it('counts only the losses a refusal confirmed, as a member counts its stale refusals', async () => {
+          // Two races against pending rivals first: the write has failed often enough, but a member
+          // has refused it as stale only once by the third failure, and holds nothing yet.
+          const slept = await sleptAfter([held, held, taken])
+          expect(slept).to.deep.equal(through(SlotHoldAfterLosses + 1))
+        })
+
+        it('sleeps again on a loss the refusal did not confirm, even past the count', async () => {
+          const refusals = [...Array<StaleFailure>(SlotHoldAfterLosses).fill(taken), held, taken]
+          const slept = await sleptAfter(refusals)
+          expect(slept).to.deep.equal([...through(SlotHoldAfterLosses - 1), SlotHoldAfterLosses + 1])
         })
       })
 

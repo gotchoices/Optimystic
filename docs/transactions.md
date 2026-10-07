@@ -160,7 +160,7 @@ This document describes the architecture for multi-collection transactions in Op
 >   default policy as `Collection.sync` — see
 >   [`utility/backoff.ts`](../packages/db-core/src/utility/backoff.ts) — save one
 >   difference: `Collection.sync` stops sleeping once a write has lost
->   `SlotHoldAfterLosses` consecutive attempts to confirmed committed revisions,
+>   `SlotHoldAfterLosses` attempts to confirmed committed revisions, the latest included,
 >   because cohort members then hold the next slot for it (`retryBackoffMs` in
 >   `packages/db-core/src/collection/collection.ts`); the coordinator loop cannot
 >   see the confirmed revision yet and keeps backing off). Only once
