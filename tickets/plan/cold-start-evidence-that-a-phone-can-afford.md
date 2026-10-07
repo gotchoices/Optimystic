@@ -4,7 +4,7 @@ files: packages/db-p2p/src/cohort-topic/bootstrap-evidence-builder.ts, packages/
 repro: static
 ----
 
-**Blocked: the specification contradicts the code.** Unblocked by a human choosing option A, B or C below (or editing one).
+**Decided (maintainer, 2026-10-07): option A.** Honest nodes sign their own endorsement; proof of work stays only as the fallback for participants with no key. Plan the change on that basis.
 
 GitHub: [#31](https://github.com/gotchoices/Optimystic/issues/31). The thread-blocking half of that issue is fixed independently by `implement/pow-mint-yields-the-thread-and-stops-before-its-timestamp-goes-stale`, which is correct under every option here.
 

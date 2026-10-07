@@ -6,7 +6,7 @@ files: packages/db-core/src/collection/action.ts, packages/db-core/src/transacto
 
 # Should anything set the pending-overlay field, given that it cannot short-circuit a failure?
 
-**Category: the decision's stated premise does not hold up against the code. To unblock it, the maintainer picks one of the options below. Accepting the recommended default is enough.**
+**Decided (maintainer, 2026-10-07): the recommended default.** Keep the field with no producer, reserve it for long-lived pend, and turn the `TODO` into a `NOTE:`. No early-abort check is wanted.
 
 The storage-side fix this work required ships regardless: a read naming a pending change now answers per block and never fails the batch (`implement/pending-overlay-read-answers-every-block`). This ticket covers only the producer question.
 
