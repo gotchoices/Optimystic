@@ -70,3 +70,10 @@ live-wiring ticket should depend on this one (and on the trust-anchor / recomput
   the cluster path (`applyConsensusInvalidation` passes the recompute) — but the live-wiring work must
   preserve that invariant: a cascade root must always pass through the recompute-capable gate before
   its children reuse the proof.
+
+## Also gates dispute rulings (added 2026-10-06)
+
+Under block-then-escalate (`docs/right-is-right.md` §The ruling) the same certificate — generalized into a *ruling* by `dispute-ruling-certificate` — also resumes a blocked commit and ejects peers. A forged `approvers-win` ruling would commit an invalid transaction over honest dissent; a forged ruling of either kind would eject honest peers. So the hard gate this ticket requires applies to every ruling verification, not only the invalidation apply path, and `feat-dispute-subsystem-live-activation` (which switches disputes on by default) depends on it.
+
+Note for whoever promotes this: its `prereq:` slug `cohort-topic-membership-cert-trust-anchoring` matches no ticket on the board and none in `tickets/.pruned-tickets.jsonl` as of 2026-10-06. The nearest open ticket is `feat-cluster-membership-threshold-cert-anchoring` (backlog); the reactivity side's anchoring landed separately (`CommitLogTrustAnchor`, `docs/internals.md`). Re-point the prereq when this is triaged.
+

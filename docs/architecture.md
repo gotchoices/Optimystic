@@ -196,7 +196,7 @@ Two complementary mechanisms keep the network honest.
 
 ### Right-is-Right — cascading validity disputes
 
-When cluster peers disagree on transaction *validity* (not merely staleness), the transaction is blocked and disagreeing members deterministically elect a **dissent coordinator** (nearest dissenter to the block ID in FRET distance). The dissent coordinator enlists the next ring of peers to re-execute and vote. If the expanded audience also splits, escalation continues; the audience grows geometrically until consensus emerges, and the losing side is ejected. Honest disagreements resolve in one round; coordinated attacks pay a rising cost curve. Full design, scenarios, and current-vs-target state: [right-is-right.md](right-is-right.md).
+When cluster peers disagree on transaction *validity* (not merely staleness), the transaction is blocked and disagreeing members deterministically elect a **dissent coordinator** (nearest dissenter to the block ID in FRET distance). The dissent coordinator draws arbitrators from across the whole keyspace to re-execute and vote. If they also split, the next round draws twice as many, up to a fixed number of rounds; the losing side is ejected, and a dispute still split at the cap fails closed. Dissent the commit quorum never saw is challenged after commit and, if upheld, reversed durably. Honest disagreements resolve in one round; coordinated attacks pay a rising cost curve. Full design, scenarios, and current-vs-target state: [right-is-right.md](right-is-right.md).
 
 ### Reputation & equivocation
 

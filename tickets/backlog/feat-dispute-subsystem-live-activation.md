@@ -1,5 +1,5 @@
 description: Turn the built-but-switched-off dispute/arbitration feature on for real running nodes so a node can actually raise and answer a dispute — but only after the network can independently re-derive who the legitimate referees are, otherwise a node making fake identities could forge a passing outcome.
-prereq: invalidation-live-wiring-requires-arbitrator-set-anchoring
+prereq: invalidation-live-wiring-requires-arbitrator-set-anchoring, dispute-commit-path-block, dispute-writer-sees-disputed-pend, dispute-post-commit-challenge, dispute-ejection-propagation
 files:
   - packages/db-p2p/src/libp2p-node-base.ts (services map ~643 dormancy note; DisputeService construction ~1217-1282)
   - packages/db-p2p/src/inbound-authorization.ts (authorizeInboundStream — must cover the dispute stream when it is registered)
@@ -57,7 +57,7 @@ invocation, callback wiring) rather than one oversized change.
   earlier, or register via the registrar post-construction the way other post-start
   wiring is done). **See "Who may make this node vote?" below — the authorization
   decision must be settled before the handler is registered, not after.**
-- **Invoke `initiateDispute` from the coordinator.** From the disputed-record
+- **~~Invoke `initiateDispute` from the coordinator.~~ Superseded** — see *Block-then-escalate* below: with disputes on, a split pend never commits before a ruling (`dispute-commit-path-block`), and the post-commit trigger is member-side (`dispute-post-commit-challenge`). The original text is kept for the record: From the disputed-record
   path (`cluster-coordinator.ts:319-339`), after `record.disputed = true` and
   `disputeEvidence` are set, call `DisputeService.initiateDispute(record,
   evidence)`. Decide the coordinator→DisputeService handle (injection vs. the
@@ -160,3 +160,14 @@ Expected behaviour, whichever way it goes:
 - Documented dormancy this activates: `annotate-dispute-subsystem-dormancy`
 - Round progression (out of scope here): `design-dispute-synchronous-escalation`
 - Membership epoch (out of scope here): `design-cluster-membership-agreement`
+
+## Block-then-escalate (added by the `dispute-synchronous-escalation` plan, 2026-10-06)
+
+The design of record is now synchronous block-then-escalate (`docs/right-is-right.md` §Design of Record: Block-then-Escalate). Its mechanism is built behind `disputeEnabled` by the implement tickets this one now names as prereqs; this ticket is where it goes live, so its scope grows by:
+
+- **Default on.** Flip `DEFAULT_DISPUTE_CONFIG.disputeEnabled` to `true` once the anchoring gate hard-gates ruling verification (a ruling is the certificate that resumes a blocked commit and ejects peers, so a forged one is as dangerous as a forged invalidation). The flag is network policy — say so wherever `superMajorityThreshold`'s uniformity is documented.
+- **Pass the dispute port** to `ClusterCoordinator` and `ClusterMember` at the composition root (built by `dispute-commit-path-block`, supplied only when the service exists), and the engine-health hook from `dispute-validity-reject-marker`.
+- **End-to-end mesh test** (env-gated like the other mesh specs if it is slow): right-is-right Scenario 2 (minority rejects a valid transaction → commits after one round, minority ejected) and Scenario 8 (majority approves an invalid transaction → never commits, approvers ejected), with an injected validator that disagrees on purpose.
+- **Status reconciliation.** Rewrite the status notes on `docs/correctness.md` Theorems 1 (Case 3), 7, 8, 10 and §1.5, the implementation-status notice at the top of that file, `docs/right-is-right.md` §Current Implementation, and `docs/architecture.md` §Status & Evolution to describe what then ships.
+- **Validator reality check.** The mechanism is inert while no deployment supplies a transaction validator (`feat-no-deployment-validates-transactions-at-pend`): no validator, no validity rejections, no disputes. Turning disputes on does not need it, but the end-to-end claim in the docs must say which deployments actually validate.
+

@@ -69,8 +69,8 @@ The client's public key and signature on the transaction serve two purposes:
 1. **Cluster validates** — coordinator sends transaction to K cluster peers. If unanimous → done.
 2. **Split detected** — disagreeing members elect a dissent coordinator (D) deterministically. D enlists K arbitrators by **verifiable dispersed sampling** — the peers nearest K pseudo-random ring coordinates (`hash(blockId ‖ round ‖ epoch ‖ i)`), spread across the whole keyspace rather than drawn from the original cluster's neighborhood — for re-execution.
 3. **Enlistees validate** — if enlistees are unanimous, the dispute is resolved. The losing side (whichever team the enlistees disagree with) is ejected.
-4. **Enlistees also split** — if the expanded audience also disagrees, the disagreeing subset escalates further by drawing another dispersed sample from the whole population (excluding those already drawn). The audience grows geometrically.
-5. **Convergence** — escalation continues until one side achieves consensus at a given level. In the worst case (near-global disagreement), this degenerates to whole-network consensus — the blockchain extreme. But for honest disagreements, resolution typically happens at step 2 or 3.
+4. **Enlistees also split** — if the expanded audience also disagrees, the dispute's driver escalates by drawing another dispersed sample, twice the size, from the whole population (excluding everyone already drawn). The audience grows geometrically.
+5. **Convergence** — escalation continues until one side wins a round, up to a fixed number of rounds. A dispute that is still split when the rounds run out ends **unresolved**, and an unresolved dispute fails closed: the transaction does not commit and nobody is ejected. For honest disagreements, resolution typically happens at step 2 or 3. The rules — round size, the per-round threshold, termination — are in [Design of Record: Block-then-Escalate](#design-of-record-block-then-escalate).
 
 ### Resolution & Ejection
 
@@ -125,13 +125,96 @@ The actors — client (C), coordinator (O), members (M), enlistees (E) — can e
 
 `C:good, O:unresponsive` — C has a timeout. After expiration, C contacts cluster members directly (C's signature lets members verify authenticity). Members report status. C identifies a functioning coordinator or the dissent coordinator and re-engages. O gets flagged for non-responsiveness.
 
-## Open Design Questions
+## Design of Record: Block-then-Escalate
 
-- **Escalation fan-out**: when D enlists enlistees, how many? Same as original cluster size? Double? Larger fan-out converges faster but costs more per round.
-- **Escalation termination threshold**: at each level, must enlistees be unanimous to resolve, or does a super-majority suffice? Requiring unanimity is cleaner conceptually (unanimity is always the rule, audience just grows) but a single buggy enlistee could force unnecessary escalation.
-- **Ejection durability**: how are ejection rulings stored and propagated? They likely need to be signed, durable artifacts that new peers in the ring segment can discover — otherwise ejected peers could rejoin immediately.
-- **Rejoin policy**: after ejection (e.g., a node fixes its buggy software), what's the path back? Time-based decay? Original ruling re-validation ("evidence" ruling is kept with evictions?)?
-- **Reputation-locality and gossip propagation**: how ejection rulings and reputation penalties propagate across the network (coordinator selection and cluster expansion down-ranking blacklisted peers) is tracked in [backlog: gossip-reputation-blacklisting](../tickets/backlog/speculative/7.5-gossip-reputation-blacklisting.md).
+This section is the design the implementation is built and checked against (decided 2026-10; the maintainer chose synchronous blocking over making optimistic commit plus reversal the design of record). It answers what the sections above leave open: which rejections are disputes, how the commit path waits, how escalation widens and ends, what a ruling is, how ejection is stored, and how all of this coexists with the post-commit dispute and durable reversal that already exist. [correctness.md Theorems 7, 8 and 10](correctness.md#theorem-8-dispute-convergence) state the guarantees it is held to.
+
+### What blocks and what reverses
+
+Two triggers, one dispute machinery:
+
+- **Dissent the commit quorum can see blocks.** A cohort member's validity rejection that is present in the promise record the coordinator merged stops that record from reaching its commit round until a **ruling** exists. Nothing is applied meanwhile: the pend is the first consensus operation of a write, and the validity check is on its promise round, so no pending record exists on any member while the dispute runs.
+- **Dissent the commit quorum never saw reverses.** A rejection that arrived after the promise round closed, one a coordinator left out of the record, or invalidity a member finds later cannot block anything — the commit quorum signed without it. The rejecting member challenges the committed transaction instead, through the same escalation; a ruling for the rejecting side originates the [durable invalidation](#durable-invalidation-reversing-a-proven-invalid-commit) below.
+
+A dispute is about one record: its id is derived from the record's message hash, so every party computes the same id and an arbitrator asked twice answers once, and a record that already has a ruling is never challenged again after commit. A writer whose transaction was refused as disputed is told when the dispute will have ended, and its re-drive waits until then, so the re-drive meets the cohort the ruling left behind instead of opening a second dispute against the same dissenters.
+
+### Which rejections are disputes
+
+A dispute is expensive and ends in ejection, so only a judgement a third party can check by re-executing the transaction may start one. `TransactionValidator` (`packages/db-core/src/transaction/validator.ts`) and the member's own checks refuse for many reasons; they fall into four classes:
+
+| Refusal | Class | Starts a dispute? |
+|---|---|---|
+| Re-execution failed; operations-hash mismatch; tampered stamp; client-signature failure | **validity** — the transaction is wrong | yes |
+| Stale read, stale revision, lost race (`conflict`), reserved block (`held`) | **transient** — retry can win | no |
+| Expired by the member's clock (`expiredAt`) | **clock** | no |
+| Unknown engine, schema mismatch, unsupported operations-hash format, nothing to re-execute, checker fault, membership-admission refusal, base or content-digest disagreement | **incapacity or structure** — this member cannot judge, or the record is malformed | no |
+
+A validity refusal is signed as a `reject` vote carrying a structured **validity marker** (the operations hash the member computed, absent when re-execution failed), folded into the signed vote payload the way `expiredAt` is (`clusterVoteSigningPayload` in `packages/db-core/src/cluster/structs.ts`). A coordinator therefore cannot turn a stale reject into a dispute, nor strip the marker without dropping the whole vote. Every other refusal keeps the counting it has today. Capability refusals are deliberately not disputes: a member running an older engine during a rolling upgrade cannot judge the transaction, and ejecting it for that would turn every upgrade into mass ejection.
+
+### The block, on the coordinator
+
+`executeTransaction` in `packages/db-p2p/src/repo/cluster-coordinator.ts` already waits for every member's promise vote (or its failure) before deciding. With disputes enabled it decides one more case:
+
+1. **Split.** The merged promises hold at least one approval (the coordinator's own pre-vote counts — sending the record endorsed it) and at least one marked validity rejection. A record every member rejects on validity is not a split; it fails at once, as today ([Scenario 4](#4-bad-coordinator-good-members)).
+2. **Notice.** The coordinator sends the merged record to every cohort member. The signed votes in it prove the split, so a member need not trust the coordinator to act on it — the same proof-carrying rule `broadcastAbandonment` follows.
+3. **Drivers.** Two parties drive the escalation, one for each side: the coordinator, and the **dissent coordinator** — the marked rejecter whose ring coordinate is nearest the coordinating block's, which every party computes from the record alone. Each side therefore gets a ruling without depending on the other: a hostile rejecter cannot stall a valid transaction by never driving, and a hostile coordinator cannot escape ejection by never driving. Two drivers cannot reach opposite rulings in one round (see *A round decides* below), the dispute id and the arbitrator draw are deterministic, and an arbitrator answers a dispute once, so the second driver costs the arbitrators one extra challenge message each and nothing else.
+4. **Wait.** The coordinator waits for the ruling until the record's **commit cutoff**: its expiration less the time a commit round needs. The writer's pend request waits with it — the request deadline and the record's expiration are the same number (`pendThroughCluster` in `packages/db-p2p/src/repo/coordinator-repo.ts` builds the message's `expiration` from the request's), so the coordinator always answers inside the writer's deadline.
+5. **Outcome.**
+
+| Ruling at the cutoff | Approvals on the record | Coordinator does | Writer sees |
+|---|---|---|---|
+| approvers win | ≥ super-majority | attaches the ruling to the record and runs the commit round | success, later than usual |
+| approvers win | below super-majority | abandons the record, proof-carrying (the ruling) | retryable *dispute settled*; the re-drive runs on the cohort without the ejected losers |
+| rejecters win | any | abandons the record, proof-carrying | non-retryable *ruled invalid* |
+| none yet, or unresolved | any | lets the record expire | retryable *disputed*, naming the dispute and when it will have ended; the re-drive waits until then |
+
+The second row exists because a record whose winning side is a minority of its cohort cannot gather a commit majority on that cohort: the losers will not sign. The transaction commits through its re-drive instead, one pend round later.
+
+### The block, on the members
+
+- **No commit signature over unresolved dissent.** `getTransactionPhase` in `packages/db-p2p/src/cluster/cluster-repo.ts` signs a commit only on a super-majority of approvals. With disputes enabled it also requires that the record carry no marked validity rejection, unless it carries a verified approvers-win ruling for that record. This is what stops a coordinator that saw the dissent from committing anyway; the dissenter's own vote is in the record, signed, and the coordinator cannot remove it without removing the vote entirely.
+- **A rejecters-win ruling is a rejection.** A record carrying one is treated as rejected and leaves the member's reservation table at once, like the existing proof-carrying abandonment.
+- **Reservations while blocked.** Approving members keep the record in their reservation table for as long as it is blocked, so a rival writer's pend is answered `conflict` (a lost race, retryable) — the block holds the blocks it names. Rejecting members hold nothing. Both are bounded by the record's expiration, as any record is.
+
+### Escalation
+
+- **Round size.** Round *r* (from 0) draws *K*·2^*r* arbitrators with `sampleArbitrators` (`packages/db-p2p/src/dispute/arbitrator-selection.ts`), where *K* is the cohort size, excluding the cohort and every arbitrator drawn in an earlier round. Doubling is what makes the audience grow geometrically: rounds 0 through *r* together consult *K*·(2^(*r*+1) − 1) arbitrators.
+- **The vote.** Each arbitrator re-executes the transaction against the state it read, fetched through the ordinary read path pinned at the record's revision, and signs one of: agree with the approvers, agree with the rejecters, or inconclusive (it could not judge). The signed payload is bound to the dispute's target and to its round's arbitrator set (the v3 payload below). An arbitrator asked twice about one dispute returns the vote it already signed.
+- **A round decides** when one side holds signed votes from at least ⌈2/3⌉ of the arbitrators **drawn** for that round — not of those who answered. Anything else — silence, inconclusive votes, a closer split — sends the dispute to the next round. Counting against the drawn set is what makes a ruling independent of its driver: a driver that drops votes can only push the dispute to the next round, never turn a split round into a ruling for its side, and two thirds of one set cannot be held by both sides, so two drivers cannot reach opposite rulings in the same round. The cost is that unreachable and inconclusive arbitrators count against resolution. Two thirds rather than unanimity: one buggy or hostile arbitrator per round would otherwise force every dispute to widen. Two thirds rather than a simple majority: rounds are small samples, and a simple-majority round of ten arbitrators drawn from a network that is 40% hostile is won by the hostile side about one time in six; at two thirds that falls off exponentially with the round's size.
+- **Each round has a deadline** (`disputeRoundTimeoutMs`); votes that miss it are not counted.
+- **Termination.** The dispute ends at the first deciding round, or **unresolved** when any of these is reached first: `maxEscalationRounds` rounds (default 4, so at most 15·*K* arbitrators in all), a round whose draw returns fewer peers than asked for and still does not decide (the eligible population is exhausted), or the dispute's own deadline (`disputeDeadlineMs`). Unresolved fails closed: the transaction does not commit, nobody is ejected, and the node logs it as a health signal. Bounding the rounds rather than degenerating to a whole-network vote is deliberate: a round of thousands of dials is not something this protocol can run within any deadline a writer would wait for, and failing closed keeps the safety property while giving up liveness only in a network already split near the middle.
+- **The dispute outlives its transaction.** The transaction stops waiting at its commit cutoff; the dispute runs to its own deadline regardless, because its ruling still decides who is ejected.
+
+### The ruling
+
+A **ruling** is the one certificate every outcome rests on: commit resumption, rejection, ejection, and the durable invalidation of a transaction challenged after commit. It generalizes the existing `DisputeResolutionProof`:
+
+- **Outcome, side-neutral:** approvers win or rejecters win. "Challenger" and "majority" stop being the vocabulary, because in [Scenario 3](#3-bad-majority-in-cluster) the rejecting side is the cohort's majority.
+- **Contents:** the target (record message hash, action id, block ids), the agreed-membership epoch, the deciding round's number, its arbitrator set with the driver's signature over it, and the winning side's votes. Earlier rounds are not carried: a driver can always fake a split by dropping votes, so evidence of one proves nothing, and what bounds a driver hunting for a favourable draw is the round cap — at most `maxEscalationRounds` draws, each needing two thirds of its arbitrators on one side.
+- **Two rulings for one dispute** can exist only at different rounds (one driver missed votes the other had). A node holding both honors the one from the earlier round.
+- **Verification** keeps every binding the invalidation certificate has today (target-bound and set-bound v3 votes, one vote per arbitrator, an equivocating arbitrator dropped from both sides) and adds the round checks: the round number is below the cap, the set is that round's draw, and the winning side's distinct, valid votes reach two thirds of the set's size. Whether a round's arbitrator set is the legitimate draw is the layer-2 recompute or layer-3 trust anchor described under [Durable Invalidation](#durable-invalidation-reversing-a-proven-invalid-commit): a ruling a node can neither recompute nor anchor is not honored, because a peer minting keys could otherwise self-sign a hostile arbitrator set and use the ruling to commit an invalid transaction or eject honest peers. That gate is why disputes stay off by default until anchoring lands (see *Default posture* below).
+
+### Ejection and rejoin
+
+- **Who is ejected:** every participant whose signed vote opposed the ruling — cohort members, the coordinator (whose record endorsed the transaction), and arbitrators of every round. An inconclusive vote is not penalized. The existing reputation penalties (`FalseApproval`, `DisputeLost`) are applied as well.
+- **Stored durably.** A node that verifies a ruling records an ejection per loser in its local state: the peer, the ruling's digest, and the term. It survives restart; the ruling itself is kept so the node can prove the ejection to others.
+- **Honored** in cohort assembly and coordinator selection: an ejected peer is left out of every block's cohort for its term, its votes count for nothing, and the [cohort-growth push](internals.md#rebalancemonitor) copies blocks to whoever takes its place. Ejection is per identity and network-wide (every node that holds the ruling), not per ring segment: an engine that judges a transaction wrongly judges it wrongly everywhere.
+- **Propagation:** pushed with the ruling to the cohort, every arbitrator and the coordinator — the nodes whose views of that ring segment matter first — and pulled on disagreement: a member that refuses a record because its cohort includes a peer the member holds an ejection for names the ruling's digest in its refusal, and the other side fetches the ruling from it, verifies it, and records the ejection.
+- **Rejoin is by term.** The first term is 24 hours; a peer ejected again within seven days of its previous term ending gets twice its previous term, up to 30 days. When a term ends the peer is admitted again, its reputation penalty still decaying. There is no path that re-examines the old ruling: a fixed engine shows itself by winning later disputes. Tradeoff: identities are cheap to mint, so a permanent ban buys little against a deliberate attacker while costing an honest operator who shipped a bug; terms aim at the operator. The term lengths are configuration, not protocol.
+
+How ejections and reputation spread beyond the nodes a ruling reaches is still open, tracked in [backlog: gossip-reputation-blacklisting](../tickets/backlog/speculative/7.5-gossip-reputation-blacklisting.md).
+
+### Cost, latency, and what the guarantee is
+
+- **No split, no cost.** A transaction no member rejects on validity pays nothing new beyond each member checking the record for a marker.
+- **A one-round dispute** adds, counted from the message flow (not measured): the notice (one round trip), the challenge and its votes (one round trip, plus dialing arbitrators the driver is not connected to, plus re-execution), and the ruling's delivery to the coordinator (one round trip) — then the commit round as usual. Each further round adds one challenge-and-vote exchange with twice the arbitrators. Everything the writer waits for ends at its record's expiration (30 s for the default request deadline), so a write is still answered within its deadline.
+- **Pre-commit guarantee.** An invalid transaction that any cohort member rejects on validity does not commit before a ruling **if that rejection is in the record the coordinator merged**. It can commit first only when at least ⌈`superMajorityThreshold`·*K*⌉ cohort members approve it *and* the dissent is missing from the record (the coordinator left it out, or it arrived after the promise round); the dissenter's post-commit challenge then reverses it.
+- **Ruling safety and liveness are different bounds.** A side wins a round only with two thirds of a uniformly drawn sample, so with fewer than half the network hostile the chance a hostile side wins a round falls exponentially with round size — rulings are safe under *f* < *N*/2. But an honest side needs two thirds too, so disputes reliably *resolve* only while the hostile fraction is comfortably below a third; between a third and a half, rounds tend to split and disputes end unresolved, which fails closed.
+- **Griefing.** A member that rejects valid transactions costs each one a dispute's latency until its first ruling ejects it — one ruling per identity.
+
+### Default posture
+
+`disputeEnabled` (`packages/db-p2p/src/dispute/types.ts`) stays `false` until two things land: ruling verification hard-gated on arbitrator-set anchoring (backlog `invalidation-live-wiring-requires-arbitrator-set-anchoring`), and live activation of the dispute protocol on a node (backlog `feat-dispute-subsystem-live-activation`). It then defaults to `true`. It is network policy, like `superMajorityThreshold`: members and coordinators that disagree on it disagree on when a commit may be signed, so a network sets it the same everywhere. Note that the mechanism is inert even when on until deployments supply a transaction validator (backlog `feat-no-deployment-validates-transactions-at-pend`): with no validator, no member ever casts a validity rejection.
 
 ## Current Implementation
 
@@ -158,13 +241,13 @@ record.disputeEvidence = {
 };
 ```
 
-**Target change**: instead of threshold-based override, any validity disagreement blocks the transaction and triggers the dispute/escalation path.
+**Target change**: instead of threshold-based override, any validity disagreement blocks the transaction and triggers the dispute/escalation path — see [Design of Record: Block-then-Escalate](#design-of-record-block-then-escalate).
 
 ### Current Behavior: Async Dispute
 
 Currently, disputes run asynchronously — the transaction commits first, then the minority can challenge. Arbitrators are selected by ring distance (FRET) beyond the original cluster, re-execute the transaction, and vote. A 2/3 super-majority of decisive votes determines the outcome. **However, this async path is also not wired in production today: `initiateDispute` in `packages/db-p2p/src/dispute/dispute-service.ts` has no production caller, and the dispute service is off by default (`disputeEnabled`, `packages/db-p2p/src/dispute/types.ts`). The `disputed` flag and `disputeEvidence` fields on `ClusterRecord` are set on super-majority commit despite minority rejection (`ClusterCoordinator.executeTransaction`'s dispute-marking branch, `packages/db-p2p/src/repo/cluster-coordinator.ts`), but no arbitration round runs end-to-end in the field.**
 
-**Target change**: disputes will be synchronous (block the transaction) with cascading escalation.
+**Target change**: disputes will be synchronous (block the transaction) with cascading escalation, and the post-commit challenge remains for dissent the commit quorum never saw — see [What blocks and what reverses](#what-blocks-and-what-reverses).
 
 ### Durable Invalidation (Reversing a Proven-Invalid Commit)
 
@@ -226,7 +309,7 @@ A client that received `committed` for `T_inv` must be able to learn it was late
 
 ### Dissent Coordinator
 
-**Target addition**: deterministic selection of a dissent coordinator from the disagreeing members, based on FRET distance to the block ID.
+**Target addition**: deterministic selection of a dissent coordinator from the disagreeing members, based on ring distance to the coordinating block — see [The block, on the coordinator](#the-block-on-the-coordinator).
 
 ### Client Signatures
 
@@ -234,7 +317,7 @@ A client that received `committed` for `T_inv` must be able to learn it was late
 
 ### Engine Health Monitor
 
-Each node tracks its dispute losses within a rolling time window. If losses exceed a threshold (default: 3 in 10 minutes), the node flags itself as unhealthy and stops initiating disputes. Auto-recovers when losses decay below threshold. This mechanism remains relevant in the target design — a node that keeps losing disputes should stop escalating.
+Each node tracks its dispute losses within a rolling time window. If losses exceed a threshold (default: 3 in 10 minutes), the node flags itself as unhealthy and stops initiating disputes. Auto-recovers when losses decay below threshold. This mechanism remains relevant in the target design — a node that keeps losing disputes should stop escalating. Under block-then-escalate it also stops *blocking*: while flagged, the node signs its validity refusals without the validity marker, so they count as ordinary rejections and cannot hold another writer's transaction.
 
 ### Reputation & Penalties
 
