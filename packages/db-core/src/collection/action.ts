@@ -29,8 +29,18 @@ export type ActionContext = {
 	/** Optional uncommitted pending action to read through. A repo overlays this action's pending
 	 *  transform on each block where it holds a pending record of it, and answers every other block
 	 *  exactly as a plain read with the same context would; the overlay answer's `state.pendings`
-	 *  names the action, the plain one's does not. No production code sets it today — see the
-	 *  blocked ticket `repo-pending-overlay-has-no-producer`. */
+	 *  names the action, the plain one's does not.
+	 *
+	 *  No production code sets it. It is reserved for tentative reads in long-lived pend (backlog
+	 *  `feat-long-lived-pend-completes-as-members-appear`), where a read that observes a
+	 *  pended-but-uncommitted revision makes the reading transaction tentative too. It is
+	 *  deliberately not used for early abort: the only certain abort signal — a latest revision at
+	 *  or past the pended one under another action — is already on a plain read's `state.latest`.
+	 *  Whoever sets it must keep the overlay answer out of every cache as committed content: mark it
+	 *  `mayRetain: false` through `TransactorSource.describeServed`, and record no read dependency
+	 *  for it. The content is no committed revision, and the answer's `materialized` revision names
+	 *  the base under the overlay, not the content (see "Staged Edits Keep Their Base" in
+	 *  `docs/internals.md`). */
 	actionId?: ActionId;
 };
 

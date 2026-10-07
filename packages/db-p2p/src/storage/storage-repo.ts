@@ -458,7 +458,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			// plain one never does, since the record is not held. A reader that wants its own
 			// unfinished change reads more blocks than the change wrote (header, B-tree path), so a
 			// per-batch rule here would fail the whole read on its first untouched block. No
-			// production code sets `actionId` yet — see tickets/blocked/repo-pending-overlay-has-no-producer.
+			// production code sets `actionId`; it is reserved for tentative reads — see the doc comment
+			// on `ActionContext.actionId`.
 			//
 			// NOTE: accepted tradeoff — any peer past the inbound-stream gate may name ANY pending
 			// action and see its uncommitted transform here; there is no per-asker check. Nothing on

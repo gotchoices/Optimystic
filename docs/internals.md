@@ -1922,7 +1922,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   committed base is likewise unflagged: an intended tombstone is an authoritative absent.
   The overlay is per block: a read naming a pending action (`ActionContext.actionId`) gets that
   action laid over each block where the node holds its pending record, and the plain answer for the
-  same context on every other block — never a failure of the whole batch.
+  same context on every other block — never a failure of the whole batch. Nothing in production
+  names a pending action today: the field is reserved for tentative reads in long-lived pend, and
+  an overlay answer must never be kept by a read cache as committed content.
   `CoordinatorRepo.get` flags a locally-missing block whose cohort consult could not rule it out,
   and the reason **names what the consult established** rather than one catch-all:
 

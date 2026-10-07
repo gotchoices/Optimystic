@@ -134,8 +134,12 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 				this.readRevisions.set(id, rev);
 				this.served.set(block, { rev, mayRetain: this.mayRetain(id, rev) });
 			}
-			// TODO: if the state reports that there is a pending action, record this so that we are sure to update before syncing
-			//state.pendings
+			// NOTE: rival pendings in `state.pendings` are deliberately not remembered for a refresh
+			// before the next pend. It would save one doomed pend round only when the rival commits in
+			// between; the hint goes stale on a cache hit (which never re-reads), stuck records would
+			// trigger refreshes for nothing (backlog `debt-unpromotable-pending-records-need-a-sweep`),
+			// and while the rival is still pending a refresh changes nothing and the pend is refused
+			// `held` anyway. Revisit if lost pend rounds after a rival commit show up in measurements.
 			return block as TBlock;
 		}
 	}
