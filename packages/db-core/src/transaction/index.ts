@@ -24,7 +24,8 @@ export {
 	clientSignaturePayload,
 	CLIENT_SIG_VERSION,
 	MaxPriority,
-	clampPriority
+	clampPriority,
+	SlotHoldAfterLosses
 } from './transaction.js';
 
 export {

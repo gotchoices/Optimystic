@@ -369,6 +369,19 @@ export interface ClusterConsensusConfig {
 	 */
 	cohortQueryTimeoutMs?: number;
 	/**
+	 * How long a member holds the next slot of a block for a writer it has itself refused as stale
+	 * `SlotHoldAfterLosses` times, in milliseconds, before the hold expires unconsumed (default
+	 * 3000; see `resolveSlotHoldWindowMs` in db-p2p's `cluster/cluster-policy.ts`). `0` disables the
+	 * mechanism on that member — no loss is counted, no hold granted, no pend checked against one.
+	 *
+	 * While a hold stands the block admits no other writer's pend, so the window is also the worst
+	 * case a holder that never returns can idle the block per grant; an honest holder consumes it in
+	 * its own read-to-pend time, well under the default. Size it above the slowest honest writer's
+	 * refresh-plus-pend round trip (several sequential reads on the link it uses), and no larger.
+	 * A value that is not a finite number at or above zero throws at node construction.
+	 */
+	slotHoldWindowMs?: number;
+	/**
 	 * When FRET has no confident network-size estimate, allow an undersized cluster
 	 * (peerCount < minAbsoluteClusterSize) to proceed anyway. Default false: with no
 	 * confident estimate an undersized cluster is REJECTED. Turn on only for

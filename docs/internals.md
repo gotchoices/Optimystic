@@ -1478,6 +1478,24 @@ saveMaterializedBlock(block): store(structuredClone(block));
   these are the two returned refusals that are not confirmed revision losses; they are separate vote
   kinds because each can name only what its own source holds (see
   [correctness.md §Theorem 1](correctness.md#theorem-1-consensus-safety-no-conflicting-commits)).
+- **A `held` vote can also come from a slot hold, which is not a storage record and is never stuck.**
+  A member that has refused one action's pend as stale `SlotHoldAfterLosses` times
+  (`packages/db-core/src/transaction/transaction.ts`, default three) holds the next slot of every
+  block that pend named for the action, in memory, for `slotHoldWindowMs` (`ClusterConsensusConfig`;
+  default 3 s, `0` disables), and answers every other action's pend of the block with the same `held`
+  vote until the action's own pend consumes the hold or the window lapses (`noteStaleLoss` and
+  `judgeSlotHolds` in `packages/db-p2p/src/cluster/cluster-repo.ts`). It closes the sequential
+  starvation the aged priority cannot reach — rivals that commit and leave before the slow writer's
+  pend arrives never meet it in `resolveRace` — see
+  [correctness.md Theorem 9](correctness.md#theorem-9-progress-under-contention). A member counts
+  every refused pend of the action whose promise round reached it, voting or not: a record that
+  arrives already refused by the coordinating member is judged against this member's own storage
+  under the same rule and counted without a vote (`noteStaleLossUnvoted`), so the count does not
+  depend on which node coordinated each attempt. Two things a hold refusal never does: it never feeds
+  `nameStuckReservation` on the member, and on the coordinator the enrichment read behind the answer
+  finds no pending record for the holder, so `CoordinatorRepo.noteStuckReservation` is not fed either
+  — a hold lapses on its own clock and cannot be stuck. The bounds, and the per-block cooldown
+  tripwire, are the `NOTE:` at the member's `slotHolds` map.
 - **Pend retryability is an explicit field, not a payload shape.** `StaleFailure.conflict` says
   outright "this was a lost race, a re-read can win"; `isConflictFailure`
   ([`network/stale-failure.ts`](../packages/db-core/src/network/stale-failure.ts)) is the single

@@ -173,6 +173,15 @@ export interface ClusterPolicyOptions {
 		 * fields do.
 		 */
 		cohortQueryTimeoutMs?: number;
+		/**
+		 * How long a member holds the next slot of a block for a writer it has itself refused as stale
+		 * `SlotHoldAfterLosses` times, in milliseconds (default {@link DEFAULT_SLOT_HOLD_WINDOW_MS} =
+		 * 3000); `0` disables the hold on this node. See
+		 * {@link ClusterConsensusConfig.slotHoldWindowMs} for what the window bounds and how to size
+		 * it, and {@link resolveSlotHoldWindowMs} for why a degenerate value throws rather than
+		 * falling through.
+		 */
+		slotHoldWindowMs?: number;
 	};
 }
 
@@ -206,6 +215,12 @@ export type ResolvedClusterPolicy = ClusterConsensusConfig & {
 	 * number without a coupling assertion.
 	 */
 	reconcilePassTimeoutMs: number;
+	/**
+	 * How long a member's slot hold for an aged writer stands before it expires unconsumed, in
+	 * milliseconds; `0` is "disabled". Concrete here the way {@link cohortQueryTimeoutMs} is, so the
+	 * resolution is directly assertable — see {@link resolveSlotHoldWindowMs}.
+	 */
+	slotHoldWindowMs: number;
 };
 
 /**
@@ -329,6 +344,41 @@ export function resolveCohortQueryTimeoutMs(declared: number | undefined): numbe
  */
 export function reconcilePassTimeoutMs(cohortQueryTimeoutMs: number): number {
 	return Math.max(RECONCILE_TIMEOUT_MS, 5 * cohortQueryTimeoutMs);
+}
+
+/**
+ * Default `clusterPolicy.slotHoldWindowMs`, in milliseconds: how long a member holds the next slot of
+ * a block for a writer it has refused as stale `SlotHoldAfterLosses` times.
+ *
+ * 3000 is a few of the slowest honest writer's read-to-pend windows: measured at 0.6 to 0.8 s for a
+ * writer whose every repo call takes 120 ms over the in-process mesh (ticket
+ * `slot-hold-for-an-aged-writer`), and that writer's own backoff before the attempt that consumes
+ * the hold adds under half a second at the default schedule. It is also the worst case a holder that
+ * never comes back can idle a block per grant, which is why it is not larger.
+ */
+export const DEFAULT_SLOT_HOLD_WINDOW_MS = 3000;
+
+/**
+ * The slot-hold window, in milliseconds: the declared `clusterPolicy.slotHoldWindowMs`, else
+ * {@link DEFAULT_SLOT_HOLD_WINDOW_MS}. `0` is a legal declaration and means the member never counts,
+ * grants or checks a hold.
+ *
+ * Exported for the same reason as {@link resolveCohortQueryTimeoutMs}: `ClusterMember` applies it to
+ * the config it is handed, so a member built by hand and one built through {@link resolveClusterPolicy}
+ * land on the same window.
+ *
+ * NOTE: a value that is not a finite number at or above zero THROWS, as the cohort deadline does and
+ * for the same reason — there is no safe direction to fall toward. Falling through to the default
+ * would keep the hold on for an operator who typed `NaN` meaning to turn it off, and clamping a
+ * negative to zero would turn it off for one who mistyped a duration. No ceiling: the window is only
+ * ever compared against a clock reading, never handed to a timer, so it cannot overflow anything.
+ */
+export function resolveSlotHoldWindowMs(declared: number | undefined): number {
+	if (declared === undefined) return DEFAULT_SLOT_HOLD_WINDOW_MS;
+	if (!Number.isFinite(declared) || declared < 0) {
+		throw new Error(`clusterPolicy.slotHoldWindowMs must be a finite number of milliseconds at or above 0 (0 disables); got ${String(declared)}`);
+	}
+	return declared;
 }
 
 /**
@@ -567,6 +617,9 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 		// sets both, so the latest-revision query, the archive fetch and the pass that runs them
 		// cannot be raised independently of one another.
 		cohortQueryTimeoutMs,
-		reconcilePassTimeoutMs: reconcilePassTimeoutMs(cohortQueryTimeoutMs)
+		reconcilePassTimeoutMs: reconcilePassTimeoutMs(cohortQueryTimeoutMs),
+		// The member re-applies the same resolver to whatever config it is handed, so a hand-wired
+		// member and a node agree on the window as they do on the cohort deadline.
+		slotHoldWindowMs: resolveSlotHoldWindowMs(options.clusterPolicy?.slotHoldWindowMs)
 	};
 }

@@ -2370,11 +2370,13 @@ export class CoordinatorRepo implements IRepo {
 			// jittered backoff plus the aged retry priority carried on the re-pend
 			// (`clampPriority(consecutiveFailures)` in `Collection.syncInternal`), which out-ranks
 			// fresh priority-0 rivals at EQUAL approval counts — priority sits below the approval
-			// count in `resolveRace`, so it does not displace a more-progressed rival. If a
-			// high-contention workload ever shows syncs exhausting `maxAttempts` on repeated
-			// all-lose rounds, the fix is reserve/defer at pend time (backlog
-			// `feat-occ-priority-reservation`, which `resolveRace`'s own residual-fairness NOTE
-			// already points at) rather than raising maxAttempts.
+			// count in `resolveRace`, so it does not displace a more-progressed rival. A writer that
+			// keeps losing to rivals that COMMITTED ahead of it (stale refusals, not all-lose rounds)
+			// is held a slot by each member after `SlotHoldAfterLosses` such refusals
+			// (`ClusterMember.noteStaleLoss` in `cluster/cluster-repo.ts`). If a high-contention
+			// workload ever shows syncs exhausting `maxAttempts` on repeated all-lose rounds — rounds
+			// no member refuses as stale, so the hold never arms — the fix is to count those
+			// refusals there too, rather than raising maxAttempts.
 			if (error instanceof ConflictRaceLostError) {
 				return { success: false, conflict: true, reason: error.message };
 			}

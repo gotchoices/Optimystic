@@ -957,6 +957,7 @@ interface ClusterConsensusConfig {
   assumedClusterSize?: number;        // Smallest cohort the operator asserts exists (admission gate; default 2 via libp2p-node-base)
   membershipAdmissionFraction?: number; // Default 0.75 — fraction of the size reference a declared set must meet
   cohortQueryTimeoutMs?: number;      // Default 1000ms, or max(1000, 3 × linkRoundTripMs) when the node declares one — one cohort peer's budget for one read-path request
+  slotHoldWindowMs?: number;          // Default 3000ms; 0 disables — how long a member holds a block's next slot for a writer it has refused as stale SlotHoldAfterLosses (3) times
 }
 ```
 
@@ -1153,6 +1154,27 @@ member, the coordinator and `reconcilePassTimeoutMs` all read one number, and a 
 and the one a member re-sends an expired transaction's reject with — carries the derived dial and reply
 deadlines (or `NodeOptions.rpcDeadlines`, when set), so a consensus round on a 3 s link is no longer
 failed at the 3 s dial before the peer can answer.
+
+**`slotHoldWindowMs` — how long a member holds a slot for a writer that keeps losing.** A writer
+whose read-to-pend window is longer than a quicker rival's commit interval — a phone over a relay
+behind a desktop appending in a loop — is refused as stale on nearly every attempt, because each
+quick write lands and leaves before the slow one's pend arrives, and the retry budget runs out
+(GitHub #18). Once a member has refused one action's pend as stale `SlotHoldAfterLosses` times
+(three; `packages/db-core/src/transaction/transaction.ts`) it holds the next slot of every block that
+pend named for the action and answers every other writer's pend of the block `held` — the same
+retryable refusal a storage reservation produces — until the slow writer's own next pend consumes
+the hold, or this many milliseconds pass (`noteStaleLoss` and `judgeSlotHolds` in
+`packages/db-p2p/src/cluster/cluster-repo.ts`; the guarantee and its residual are in
+[docs/correctness.md Theorem 9](../../../docs/correctness.md#theorem-9-progress-under-contention)).
+Default 3000 ms, resolved by `resolveSlotHoldWindowMs` in `packages/db-p2p/src/cluster/cluster-policy.ts`.
+Size it above the slowest honest writer's refresh-plus-pend round trip on the link it uses, and no
+larger: while a hold stands the block admits no other writer, so the window is also the worst case a
+holder that never returns can idle the block per grant (an honest holder consumes it in under a
+second at the measured delay). `0` turns the mechanism off on that node — no loss is counted, no hold
+granted, no pend checked against one — and a cohort mixing nodes with it on and off still works,
+since one `held` vote is enough on a two- or three-member cohort. Like the cohort deadline, a value
+that is not a finite number at or above zero throws at node construction rather than falling through
+to the default. Read once at construction, like everything else in this block.
 
 **Changing a size after the node is running.** Both yardsticks are resolved **once**, by
 `resolveClusterPolicy` at node construction, and every consumer — the cluster member, the coordinator,

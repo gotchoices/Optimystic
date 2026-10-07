@@ -1,7 +1,7 @@
 import type { IRepo, ClusterRecord, ClusterPeers, Signature, ClusterVote, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, PendRequest, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest, MemberApplyOutcome } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
-import { blockIdsForTransforms, transformForBlockId, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability, formatInstant } from "@optimystic/db-core";
+import { blockIdsForTransforms, transformForBlockId, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability, formatInstant, LruMap, SlotHoldAfterLosses } from "@optimystic/db-core";
 import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest, clusterVoteSigningPayload, clusterVoteVerificationPayload } from "@optimystic/db-core";
 import { verifyInvalidationCertificate, type ArbitratorSetRecompute } from "../dispute/invalidation.js";
 import { buildCommitCert, invalidationActionId } from "./commit-cert.js";
@@ -24,7 +24,7 @@ import { checkPendValidation, TRANSACTION_EXPIRED } from "../pend-validation.js"
 import { getAffectedBlockIds } from "./record-operations.js";
 import { operationsConflict, resolveRace } from "./race-resolution.js";
 import { buildBlockCommitProof, mintSoloCommitProof, type BlockCommitProof } from "./commit-proof.js";
-import { reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs } from "./cluster-policy.js";
+import { reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs, resolveSlotHoldWindowMs } from "./cluster-policy.js";
 import type { BlockHolders } from "./rebalance-monitor.js";
 import { unrefTimer } from "../unref-timer.js";
 
@@ -107,6 +107,16 @@ type PromiseVerdict =
 /** A refusal that judges the record invalid — the permanent kind, and every kind but the pending-conflict one. */
 function invalidVerdict(reason?: string): PromiseVerdict {
 	return { valid: false, kind: 'invalid', reason };
+}
+
+/**
+ * One slot hold: the aged action a block's next slot is held for, and the member-clock instant the
+ * hold lapses at if that action's own pend has not consumed it by then. Granted by
+ * {@link ClusterMember.noteStaleLoss}, judged by {@link ClusterMember.judgeSlotHolds}.
+ */
+interface SlotHold {
+	actionId: ActionId;
+	untilMs: number;
 }
 
 /** The two instants an expiry judgement compares, both unix ms. */
@@ -343,11 +353,12 @@ interface ClusterMemberComponents {
 	createClusterClient?: (peerId: PeerId) => ICluster;
 	/**
 	 * Wall clock in unix milliseconds; defaults to `Date.now`. Injectable so a test can age a held
-	 * reservation past {@link CONFLICT_STALE_THRESHOLD_MS} without sleeping. It governs BOTH sides of
-	 * the reservation's `lastUpdate` — the stamp and the comparison — so the two can never end up on
-	 * different time bases.
+	 * reservation past {@link CONFLICT_STALE_THRESHOLD_MS}, or a slot hold past its window, without
+	 * sleeping. It governs BOTH sides of the reservation's `lastUpdate` — the stamp and the comparison
+	 * — and both sides of a slot hold's `untilMs`, so neither pair can end up on different time bases.
 	 *
-	 * NOTE: partial injection, by design. This clock reaches ONLY `lastUpdate`; `message.expiration`,
+	 * NOTE: partial injection, by design. This clock reaches ONLY `lastUpdate` and the slot holds
+	 * (`noteStaleLoss`, `judgeSlotHolds`); `message.expiration`,
 	 * the promise/resolution timeouts, the periodic expiry sweep and the executed-transaction TTL all
 	 * still read the real `Date.now`. So an injected clock must share an epoch with real time (seed it
 	 * from `Date.now()`, then advance) — one starting near zero makes every record look long expired
@@ -454,6 +465,47 @@ export class ClusterMember implements ICluster {
 	 * lives. Forgotten for a block the moment a vote finds it no longer reserved.
 	 */
 	private readonly stuckReservations = new StuckReservationTracker(1000);
+	/**
+	 * Per action id, how many pends this member has ITSELF refused as stale for it — the count
+	 * {@link SlotHoldAfterLosses} is measured against in {@link noteStaleLoss}. An action id is one
+	 * sync cycle, so the count only rises and never needs resetting; the bound forgets the oldest. In
+	 * memory only: a restart forgets it, and an aged writer loses up to `SlotHoldAfterLosses` more
+	 * times before this member holds for it again (accepted — the writer's retry budget covers it).
+	 */
+	private readonly staleLosses = new LruMap<ActionId, number>(1000);
+	/**
+	 * The pend records (by message hash) already counted into {@link staleLosses}, so one record is
+	 * one loss however many times it is delivered: the abandonment broadcast re-sends a refused
+	 * record to every member, and a member that cast no vote on it ({@link noteStaleLossUnvoted})
+	 * would otherwise count it on each delivery.
+	 */
+	private readonly countedStaleLosses = new LruMap<string, true>(1000);
+	/**
+	 * Per block, the one slot hold standing on it ({@link SlotHold}): granted by {@link noteStaleLoss}
+	 * once an action has lost `SlotHoldAfterLosses` times here, consumed by that action's own next
+	 * pend, and until then answering every other action's pend of the block `held`
+	 * ({@link judgeSlotHolds}). In memory only, like {@link staleLosses}, and never a storage record,
+	 * so it is never a stuck reservation and never feeds {@link nameStuckReservation}.
+	 *
+	 * NOTE: two bounds on what a hold costs the block. The honest cost is the holder's own read-to-pend
+	 * window per `SlotHoldAfterLosses` of its losses — 0.6 to 0.8 s per three losses for a writer
+	 * whose every call takes 120 ms, measured on the in-process mesh (ticket
+	 * `slot-hold-for-an-aged-writer`) — so a quick rival loses under a second of commit time per three
+	 * losses of a slow one. The worst case is a holder that never returns: `slotHoldWindowMs` idle per
+	 * grant, and a grant needs that many refusals of ONE action first. The one honest-looking abuse —
+	 * a claimant that earns a hold, lets it lapse and earns another — costs the claimant a refused
+	 * round trip per window and shows as repeated `cluster-member:slot-hold-expired-unconsumed` lines
+	 * for one block; if that ever shows up, add a per-block cooldown between grants here.
+	 *
+	 * A hold stands on the blocks the aged pend NAMED. Its next attempt may name others (the log tail
+	 * rolled over, or the replay re-staged a different leaf): the old holds then lapse unconsumed, a
+	 * fresh rival slips in once on the new blocks, and the stale refusal regrants there — one more
+	 * loss, the same bound as a rival already past its promise round at the grant.
+	 */
+	private readonly slotHolds = new LruMap<BlockId, SlotHold>(1000);
+	/** How long a slot hold stands, resolved from `consensusConfig.slotHoldWindowMs`; `0` disables
+	 *  the count, the grant and the check — see {@link resolveSlotHoldWindowMs}. */
+	private readonly slotHoldWindowMs: number;
 	// Queue of transactions to clean up
 	private cleanupQueue: string[] = [];
 	// Serialize concurrent updates for the same transaction
@@ -546,6 +598,9 @@ export class ClusterMember implements ICluster {
 		// needs no `assertSuperMajorityCoupling`-style check against the coordinator's copy — see the
 		// field's doc for what would re-open the drift.
 		this.reconcileTimeoutMs = reconcilePassTimeoutMs(resolveCohortQueryTimeoutMs(consensusConfig?.cohortQueryTimeoutMs));
+		// Same resolver `resolveClusterPolicy` applies, so a member built by hand and one built by a
+		// node agree on the window (and on `0` meaning off).
+		this.slotHoldWindowMs = resolveSlotHoldWindowMs(consensusConfig?.slotHoldWindowMs);
 		// State the resolved gate parameters once, so an operator diagnosing a membership rejection can see
 		// what this node actually resolved. A fact, not a warning: `assumedClusterSize < clusterSize` is the
 		// normal default state, so warning on it would fire for every node and be ignored.
@@ -811,6 +866,13 @@ export class ClusterMember implements ICluster {
 					log('cluster-member:action-rejected', {
 						messageHash: record.messageHash
 					});
+					// A pend record that arrived already refused — on a cohort of two or three the
+					// coordinating member's stale reject is terminal before anyone else votes — still
+					// counts as a loss HERE when this member's own storage would have refused it too, so
+					// the slot hold does not depend on which member coordinated each attempt.
+					if (!currentRecord.promises[ourId]) {
+						await this.noteStaleLossUnvoted(currentRecord);
+					}
 					await this.handleRejection(currentRecord);
 					shouldPersist = false;
 					break phaseLoop;
@@ -1739,6 +1801,11 @@ export class ClusterMember implements ICluster {
 								requestedRev: pendRequest.rev,
 								latestRev: latest.rev
 							});
+							// Counted BEFORE the refusal is returned, and only here — a stale loss is the one
+							// refusal that says a quicker rival committed and left — so an action this member
+							// keeps refusing earns the next slot of these blocks (see {@link noteStaleLoss}).
+							// The verdict is unchanged.
+							this.noteStaleLoss(record, pendRequest, blockIds);
 							// Deliberately prose-only: this reason is fed to computeSigningPayload, signed,
 							// and carried as Signature.rejectReason, so adding a structured revision here
 							// would change the signed byte layout and the Signature type — every peer would
@@ -1749,6 +1816,15 @@ export class ClusterMember implements ICluster {
 							return invalidVerdict(`stale revision: block ${blockId} at rev ${latest.rev}, requested rev ${pendRequest.rev}`);
 						}
 					}
+				}
+
+				// A pend that is not stale is judged against the slot holds standing on its blocks before
+				// the storage reservations below: a hold for another action is the same transient `held`
+				// answer a reservation gives, granted one step earlier, and the pend's own hold is
+				// consumed here (see {@link judgeSlotHolds}).
+				const slotHold = this.judgeSlotHolds(record, pendRequest, blockIds);
+				if (slotHold !== undefined) {
+					return slotHold;
 				}
 
 				// Refuse a pend whose blocks are RESERVED by a DIFFERENT unresolved pending action. This
@@ -1928,6 +2004,142 @@ export class ClusterMember implements ICluster {
 		for (const episode of named) {
 			log('cluster-member:stuck-reservation', { peerId: this.peerId.toString(), ...episode });
 		}
+	}
+
+	/**
+	 * Count a stale refusal this member just cast against `pendRequest`'s action and, once the action
+	 * has lost {@link SlotHoldAfterLosses} times HERE, hold the next slot of every block the pend
+	 * names for it ({@link slotHolds}). The refusal the caller returns is unchanged, and a hold only
+	 * ever turns a later approval into a `held` answer ({@link judgeSlotHolds}), never the reverse, so
+	 * the consensus and partition safety arguments (docs/correctness.md Theorems 1 and 2) are untouched.
+	 *
+	 * Why the member and not the coordinator: a pend's promise round reaches every member of the
+	 * cohort on every attempt, while the coordinator is picked per BLOCK (the nearest node to the
+	 * block's key), so a writer whose log tail rolls over mid-cycle is judged by a different
+	 * coordinator for its next attempts; the member is the one place every refusal of an action is
+	 * seen. That is also why a record this member casts no vote on is counted too
+	 * ({@link noteStaleLossUnvoted}): on a cohort of two or three the coordinating member's reject is
+	 * terminal before anyone else votes, and counting only one's own votes split the count across
+	 * coordinators (measured: a roll-over mid-cycle left no member at the threshold, and the writer
+	 * went to five pends with no hold). Why its own count and never the record's self-asserted
+	 * `priority`: a member counts only refusals its own storage justifies, so no claimant can talk it
+	 * into a hold with a number.
+	 *
+	 * A block another action already holds keeps that hold: two aged writers take turns, the second
+	 * refused by the first's hold like any rival and granted its own on the stale refusal that follows
+	 * the first's commit. A hold already this action's is renewed, since the loss that renews it says
+	 * a rival got in ahead of the hold (one past its promise round when the hold was granted).
+	 */
+	private noteStaleLoss(record: ClusterRecord, pendRequest: PendRequest, blockIds: BlockId[]): void {
+		if (this.slotHoldWindowMs === 0) return;
+		// One record is one loss, however many times it is delivered (see {@link countedStaleLosses}).
+		if (this.countedStaleLosses.has(record.messageHash)) return;
+		this.countedStaleLosses.set(record.messageHash, true);
+		const losses = (this.staleLosses.get(pendRequest.actionId) ?? 0) + 1;
+		this.staleLosses.set(pendRequest.actionId, losses);
+		if (losses < SlotHoldAfterLosses) return;
+		const now = this.now();
+		for (const blockId of blockIds) {
+			const standing = this.standingSlotHold(blockId, now);
+			if (standing !== undefined && standing.actionId !== pendRequest.actionId) continue;
+			this.slotHolds.set(blockId, { actionId: pendRequest.actionId, untilMs: now + this.slotHoldWindowMs });
+			log('cluster-member:slot-hold-granted', {
+				messageHash: record.messageHash,
+				blockId,
+				actionId: pendRequest.actionId,
+				losses,
+				windowMs: this.slotHoldWindowMs
+			});
+		}
+	}
+
+	/**
+	 * Count a stale loss for a pend record this member casts NO vote on because it arrived already
+	 * refused (terminal on arrival, see the `Rejected` arm of the phase loop). The record is judged
+	 * exactly as the vote would have judged it — the membership admission gate, then the stale rule
+	 * with its own-revision carve-out, against this member's OWN storage — and only counted; nothing
+	 * is signed or answered, and an arriving reject is never taken on trust. A block this member
+	 * cannot read, or holds behind the requested revision, counts nothing: this member would not
+	 * have refused it as stale, and a member behind the cohort is the residual docs/correctness.md
+	 * Theorem 9 states.
+	 */
+	private async noteStaleLossUnvoted(record: ClusterRecord): Promise<void> {
+		if (this.slotHoldWindowMs === 0 || this.countedStaleLosses.has(record.messageHash)) return;
+		const pendRequests = record.message.operations.flatMap(operation => 'pend' in operation && operation.pend.rev !== undefined ? [operation.pend] : []);
+		if (pendRequests.length === 0) return;
+		const admission = await this.admitMembership(record);
+		if (!admission.admit) return;
+		for (const pendRequest of pendRequests) {
+			const blockIds = blockIdsForTransforms(pendRequest.transforms);
+			const blockResults = await this.storageRepo.get({ blockIds });
+			const stale = blockIds.some(blockId => {
+				const latest = blockResults[blockId]?.state?.latest;
+				return latest !== undefined && latest.rev >= pendRequest.rev! && !isOwnRevision(latest, pendRequest.rev!, pendRequest.actionId);
+			});
+			if (stale) {
+				log('cluster-member:slot-hold-loss-unvoted', { messageHash: record.messageHash, actionId: pendRequest.actionId, requestedRev: pendRequest.rev });
+				this.noteStaleLoss(record, pendRequest, blockIds);
+			}
+		}
+	}
+
+	/**
+	 * Judge a pend that passed the stale check against the slot holds standing on the blocks it
+	 * names. A hold for ANOTHER action answers the `held` kind naming the holder — the same transient
+	 * refusal a storage reservation produces, which the coordinator returns as a retryable conflict
+	 * and the writer retries without anything new on the wire — and the pend's OWN holds are consumed.
+	 * Two passes, so a pend refused on one block keeps its hold on another for its next attempt; a
+	 * pend refused on no block consumes every hold of its own, whatever the checks after this one
+	 * decide, since the holder has had the clear chance the hold exists to give.
+	 *
+	 * Deliberately never feeds {@link nameStuckReservation}: a hold is not a storage record, lapses on
+	 * its own clock, and cannot be stuck. On the coordinating node the enrichment read behind its
+	 * `held` answer finds no pending record for the holder either, so that side's counter is not fed.
+	 */
+	private judgeSlotHolds(record: ClusterRecord, pendRequest: PendRequest, blockIds: BlockId[]): PromiseVerdict | undefined {
+		if (this.slotHoldWindowMs === 0) return undefined;
+		const now = this.now();
+		const own: BlockId[] = [];
+		for (const blockId of blockIds) {
+			const hold = this.standingSlotHold(blockId, now);
+			if (hold === undefined) continue;
+			if (hold.actionId === pendRequest.actionId) {
+				own.push(blockId);
+				continue;
+			}
+			log('cluster-member:slot-hold-refused', {
+				messageHash: record.messageHash,
+				blockId,
+				actionId: pendRequest.actionId,
+				heldFor: hold.actionId,
+				remainingMs: hold.untilMs - now
+			});
+			return {
+				valid: false,
+				kind: 'held',
+				heldBy: hold.actionId,
+				reason: `slot held for aged action ${hold.actionId}: block ${blockId}`
+			};
+		}
+		for (const blockId of own) {
+			this.slotHolds.delete(blockId);
+			log('cluster-member:slot-hold-consumed', { messageHash: record.messageHash, blockId, actionId: pendRequest.actionId });
+		}
+		return undefined;
+	}
+
+	/**
+	 * The hold standing on `blockId` at `now`, or `undefined`. A lapsed hold is dropped on the way
+	 * through and logged: each such line is one count toward the per-block cooldown tripwire recorded
+	 * at {@link slotHolds}.
+	 */
+	private standingSlotHold(blockId: BlockId, now: number): SlotHold | undefined {
+		const hold = this.slotHolds.peek(blockId);
+		if (hold === undefined) return undefined;
+		if (hold.untilMs > now) return hold;
+		this.slotHolds.delete(blockId);
+		log('cluster-member:slot-hold-expired-unconsumed', { blockId, actionId: hold.actionId, lapsedForMs: now - hold.untilMs });
+		return undefined;
 	}
 
 	/**

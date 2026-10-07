@@ -52,22 +52,28 @@ export function approvalCount(record: ClusterRecord): number {
  * concurrent-starvation case aging targets (two fresh rivals, 0 promises each, otherwise coin-flipping
  * on the hash). Priority still breaks those ties deterministically, so aging still solves the stated
  * fairness problem in its common case. It only orders two *concurrently-pending* conflicts; it does NOT
- * defer a fresh pend for an absent aged transaction (that residual — sequential sub-window starvation —
- * is the deferred feat-occ-priority-reservation).
+ * defer a fresh pend for an absent aged transaction. That residual — sequential sub-window starvation,
+ * a stream of quick writers that each commit and leave before the slow one's pend arrives — is closed
+ * one step earlier, at the promise vote: a member that has itself refused one action as stale
+ * `SlotHoldAfterLosses` times holds the next slot of its blocks for it (`ClusterMember.noteStaleLoss`
+ * and `judgeSlotHolds` in `cluster-repo.ts`), answering a fresh rival `held` until the aged action's
+ * own pend consumes the hold or the window lapses.
  *
  * NOTE: residual-fairness tripwire. Under approvals-first an aged transaction can still lose to a fresh
  * rival that has *legitimately* gathered even one more approval — that is not the pure-coin-flip
  * starvation aging targets (equal counts, priority wins), it is the monotonicity behaviour we WANT (a
  * more-progressed rival is never displaced). If deeper fairness against a genuinely-more-progressed
- * rival is ever needed, it belongs to feat-occ-priority-reservation (reserve/defer at pend time), NOT
- * to this race tie-break.
+ * rival is ever needed, it belongs beside the slot hold in `ClusterMember.validatePendOperations`
+ * (reserve/defer at pend time), NOT to this race tie-break.
  *
  * NOTE: Byzantine self-assert is a fairness DoS, not a safety hole. A coordinator can stamp
  * priority == MaxPriority on every transaction; recordPriority clamps to the cap so it cannot
  * exceed it, and priority never influences validity/operationsHash/stale-read checks — and now sits
  * below the approval count, so it can only break equal-count ties it might have ~50% won anyway,
  * degrading to at-worst-status-quo fairness (the same graceful-degradation class as spam under
- * honest-majority). Binding priority to provable age is out of scope (feat-occ-priority-reservation).
+ * honest-majority). Priority is never bound to provable age: the slot hold above deliberately reads
+ * the member's OWN refusal count and not this field, so the one lever a self-asserted number has is
+ * this tie-break.
  *
  * NOTE: keep priority a self-contained additive message field + this one comparison key so it
  * composes with — does not block — a future HLC/crdt-sync redesign of this same path

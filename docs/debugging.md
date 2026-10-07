@@ -139,7 +139,7 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 | Sub-namespace         | What it covers                                                                            |
 |-----------------------|-------------------------------------------------------------------------------------------|
 | `cluster`             | `ClusterCoordinator`'s `cluster-tx:*` trace: cluster membership, promise/commit rounds, majority reached, merge inputs/results, conflict race lost, abandon broadcasts |
-| `cluster-member`      | `ClusterMember`'s `cluster-member:*` trace: promise/commit/consensus handling, admission config and rejects, superseded conflicts, staleness reads, reconcile attempts |
+| `cluster-member`      | `ClusterMember`'s `cluster-member:*` trace: promise/commit/consensus handling, admission config and rejects, superseded conflicts, staleness reads, reconcile attempts, and the slot hold for a writer that keeps losing (`slot-hold-granted`, `slot-hold-refused`, `slot-hold-consumed`, `slot-hold-expired-unconsumed`, `slot-hold-loss-unvoted` — a lapsed hold that keeps recurring for one block is the tripwire for a per-block cooldown) |
 | `cluster-client`      | Record-level address learning on the client side of a cluster call — `peer-address-book:record-capped` and unparseable-peer-id warnings from records this node fetched |
 | `cluster-service`     | Errors raised while handling an inbound cluster protocol message (decode/dispatch). Default name only — `ClusterService`'s `logPrefix` init option can rename it |
 | `cluster-policy`      | The `repair-fault-tolerance` decision: the fault-tolerance/repair-cost trade the sizing policy computes |

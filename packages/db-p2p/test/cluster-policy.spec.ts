@@ -16,7 +16,7 @@
 
 import { expect } from 'chai';
 import { DEFAULT_SUPER_MAJORITY_THRESHOLD } from '@optimystic/db-core';
-import { MAX_COHORT_QUERY_TIMEOUT_MS, minAbsoluteClusterSize, reconcilePassTimeoutMs, resolveClusterPolicy, resolveCohortQueryTimeoutMs, resolveRepairCorroborationClusterSize } from '../src/cluster/cluster-policy.js';
+import { DEFAULT_SLOT_HOLD_WINDOW_MS, MAX_COHORT_QUERY_TIMEOUT_MS, minAbsoluteClusterSize, reconcilePassTimeoutMs, resolveClusterPolicy, resolveCohortQueryTimeoutMs, resolveRepairCorroborationClusterSize } from '../src/cluster/cluster-policy.js';
 import { captureLog, hasTag } from './support/capture-log.js';
 
 describe('resolveClusterPolicy', () => {
@@ -126,6 +126,21 @@ describe('resolveClusterPolicy', () => {
 					.to.equal(policy.reconcilePassTimeoutMs);
 			}
 		});
+	});
+
+	describe('the slot-hold window', () => {
+		it('defaults to 3000 ms and passes 0 through as "disabled"', () => {
+			expect(resolveClusterPolicy({}).slotHoldWindowMs).to.equal(DEFAULT_SLOT_HOLD_WINDOW_MS);
+			expect(resolveClusterPolicy({ clusterPolicy: { slotHoldWindowMs: 0 } }).slotHoldWindowMs).to.equal(0);
+		});
+
+		for (const [label, value] of [['negative', -1], ['NaN', Number.NaN], ['Infinity', Number.POSITIVE_INFINITY]] as [string, number][]) {
+			it(`throws on a ${label} slotHoldWindowMs rather than falling back to the default`, () => {
+				// Same reasoning as the cohort deadline: no safe direction to fall toward — the default
+				// would keep the hold on for an operator who meant to turn it off.
+				expect(() => resolveClusterPolicy({ clusterPolicy: { slotHoldWindowMs: value } })).to.throw(/slotHoldWindowMs/);
+			});
+		}
 	});
 
 	describe('one operator field, two yardsticks', () => {

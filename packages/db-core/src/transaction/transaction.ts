@@ -152,6 +152,33 @@ export function clampPriority(priority: number | undefined): number {
 	return Math.floor(priority);
 }
 
+/**
+ * How many times a storage member must ITSELF have refused one action's pend as stale — a rival's
+ * revision already committed under the requested one — before it holds the next slot of that pend's
+ * blocks for the action. Counted per action id, which is one sync cycle (`Collection.syncInternal`
+ * mints the id once and every attempt of that cycle reuses it), so the count is "losses in a row of
+ * one write" and never needs resetting.
+ *
+ * What the member holds, and how it answers a rival while it holds, is in db-p2p's
+ * `ClusterMember.validatePendOperations` (`cluster/cluster-repo.ts`): the hold answers the next
+ * other-action pend of each block with the same `held` vote a storage reservation produces, once,
+ * for a bounded window, and is consumed by the aged action's own next pend. It closes the
+ * sequential starvation the aged {@link Transaction.priority} cannot reach — a stream of quick
+ * writers that each commit and leave before the slow one's attempt arrives never co-pend with it,
+ * so `resolveRace` never meets them (docs/correctness.md Theorem 9, "Bound").
+ *
+ * The count is the member's own and never the self-asserted priority: a member grants only on
+ * refusals it issued, so no claimant can talk it into a hold with a number. The writer side reads the
+ * same constant to stop backing off on exactly the loss after which a member holds for it, so the two
+ * sides agree by construction with nothing on the wire.
+ *
+ * Three: the plan-stage measurement (ticket `slot-hold-for-an-aged-writer`) showed an honest slow
+ * writer behind a quick stream losing nine of ten attempts, so two losses are an ordinary lost race
+ * and three are the stream. Lower, and a single lost race would hold a block against every other
+ * writer; higher, and the slow writer pays more refused round trips before it is helped.
+ */
+export const SlotHoldAfterLosses = 3;
+
 /** Check whether a transaction stamp has expired. */
 export function isTransactionExpired(stamp: TransactionStamp): boolean {
 	return Date.now() > stamp.expiration;
