@@ -5,7 +5,7 @@ import { Collection, SyncRetryExhaustedError, SyncRevisionStalledError, type Col
 import { TestTransactor, FlakyCommitTransactor } from '../src/testing/test-transactor.js'
 import { waitFor } from '../src/testing/async-wait.js'
 import type { Action, ActionHandler, BlockId, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult, StaleFailure } from '../src/index.js'
-import { BlockUnavailableError, BlockPossiblyStaleError } from '../src/index.js'
+import { BlockUnavailableError, BlockPossiblyStaleError, SlotHoldAfterLosses } from '../src/index.js'
 import debug from 'debug'
 import { captureCollectionLog } from './capture-log.js'
 
@@ -1182,6 +1182,40 @@ describe('Collection', () => {
 
         expect(err.staleAt).to.deep.equal({ blockId: 'high-block', rev: 9 })
         expect(err.lastReason).to.equal('low')
+      })
+
+      // The jittered backoff separates a herd that lost the same race. A writer losing to rivals that
+      // had each already committed is not in a herd, and from its SlotHoldAfterLosses-th such loss a
+      // member holds the next slot for it, so the retry follows at once. `rand` is consulted once per
+      // jittered sleep and never for a zero one, so the failures it was called after are the ones
+      // that slept.
+      describe('backoff once a member holds the slot', () => {
+        const sleptAfter = async (failure: StaleFailure) => {
+          const transactorUnderTest = new StaleAtCommitTransactor(new TestTransactor(), failure)
+          const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
+          await collection.act({ type: 'set', data: { value: 'never-commits', timestamp: 1 } })
+          const slept: number[] = []
+          const syncPromise = collection.sync({
+            maxAttempts: 6,
+            maxStalledAttempts: 6,
+            baseBackoffMs: 1,
+            maxBackoffMs: 5,
+            rand: () => { slept.push(transactorUnderTest.commitAttempts); return 0 },
+          })
+          await syncPromise.catch(() => { /* only the sleeps are asserted */ })
+          return slept
+        }
+
+        it('stops sleeping after SlotHoldAfterLosses losses to a committed revision', async () => {
+          const slept = await sleptAfter({ success: false, conflict: true, reason: 'taken', staleAt: { blockId: 'hot-block', rev: 42 } })
+          expect(SlotHoldAfterLosses).to.equal(3)
+          expect(slept).to.deep.equal([1, 2])
+        })
+
+        it('keeps sleeping when the refusal confirms no committed revision', async () => {
+          const slept = await sleptAfter({ success: false, conflict: true, reason: 'held by a pending rival' })
+          expect(slept).to.deep.equal([1, 2, 3, 4, 5])
+        })
       })
 
       it('produces today\'s message verbatim when no responder reported a revision', async () => {

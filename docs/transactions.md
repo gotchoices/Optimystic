@@ -158,7 +158,12 @@ This document describes the architecture for multi-collection transactions in Op
 >   **automatically** by `coordinator.commit()`: a bounded, jittered backoff retry
 >   that re-reads each collection to fresh revisions between attempts (the same
 >   default policy as `Collection.sync` — see
->   [`utility/backoff.ts`](../packages/db-core/src/utility/backoff.ts)). Only once
+>   [`utility/backoff.ts`](../packages/db-core/src/utility/backoff.ts) — save one
+>   difference: `Collection.sync` stops sleeping once a write has lost
+>   `SlotHoldAfterLosses` consecutive attempts to confirmed committed revisions,
+>   because cohort members then hold the next slot for it (`retryBackoffMs` in
+>   `packages/db-core/src/collection/collection.ts`); the coordinator loop cannot
+>   see the confirmed revision yet and keeps backing off). Only once
 >   the retry budget (`maxAttempts` / optional `deadlineMs`, tunable via the
 >   `SyncOptions` passed to `commit`/`session.commit`) is exhausted does it throw a
 >   [`CoordinatorStaleLossError`](../packages/db-core/src/transaction/errors.ts),

@@ -20,12 +20,13 @@ import { CollectionHeaderVanishedError, SyncRetryExhaustedError, SyncRevisionSta
 import type { ActionContext } from "./action.js";
 import { actionIdAt } from "./action.js";
 import type { ReadDependency } from "../transaction/transaction.js";
-import { clampPriority } from "../transaction/transaction.js";
+import { clampPriority, SlotHoldAfterLosses } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import { Latches } from "../utility/latches.js";
 import { jitteredBackoffMs, abortableDelay, makeAbortError } from "../utility/backoff.js";
+import type { JitteredBackoffConfig, RandFn } from "../utility/backoff.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('collection');
@@ -116,6 +117,28 @@ const DefaultMaxBackoffMs = 5000;
  * refresh made NO progress at all, so a client merely catching up is already excluded; if a
  * spurious `SyncRevisionStalledError` ever shows up under real contention anyway, raise this. */
 const DefaultMaxStalledAttempts = 2;
+
+/**
+ * The sleep before the refresh that follows a write's `failures`-th consecutive loss.
+ *
+ * The jittered backoff exists to separate a herd of writers that lost the SAME race, so they do not
+ * re-collide on the next tick. A writer that keeps losing to rivals each of which had already
+ * committed (`lostToCommittedRival`: the refusal carried a confirmed `staleAt`) is not in a herd, and
+ * from its `SlotHoldAfterLosses`-th such loss on, the members that refused it hold the next slot for
+ * it — so sleeping only spends that hold. The two sides count the same constant, so the writer stops
+ * sleeping on exactly the loss after which a member holds, with nothing said over the wire.
+ *
+ * NOTE: against members that do not hold (an earlier release, or `slotHoldWindowMs: 0`) this retries
+ * without sleeping and so spends the same attempt budget sooner, at about twice one writer's pend
+ * rate (measured in the plan stage of `slot-hold-for-an-aged-writer`). Accepted: the backoff bought
+ * that writer nothing either, it only delayed the same give-up.
+ */
+function retryBackoffMs(failures: number, lostToCommittedRival: boolean, config: JitteredBackoffConfig, rand?: RandFn): number {
+	if (lostToCommittedRival && failures >= SlotHoldAfterLosses) {
+		return 0;
+	}
+	return jitteredBackoffMs(failures - 1, config, rand);
+}
 
 export type CollectionInitOptions<TAction> = {
 	modules: Record<ActionType, ActionHandler<TAction>>;
@@ -1956,17 +1979,23 @@ export class Collection<TAction> implements ICollection<TAction> {
 				// is byte-identical — see logAppendBlockIds — so what is at stake is the second entry,
 				// not two versions of one tail block.) Each round is a failure against the same
 				// no-progress budget as a refused attempt.
+				// Whether the failure just handled was a loss to a rival already durably committed. Only
+				// the attempt's own refusal can say so; a refresh refused for a cause that can clear
+				// (below) is a race against something still in flight, and clears it.
+				let lostToCommittedRival = lastFailureConfirmedStaleAt;
 				for (;;) {
 					// Back off before every retry (any stale failure — reason/missing/pending), growing
 					// exponentially from the base delay up to the cap, with proportional random jitter so a
 					// herd of clients that lost the same race does not re-collide on the next tick (see
-					// utility/backoff.ts). The abortable sleep lets an aborted sync reject promptly instead
-					// of finishing the sleep.
+					// utility/backoff.ts) — except once this write has lost to committed rivals often enough
+					// that a member holds the next slot for it (see retryBackoffMs). The abortable sleep lets
+					// an aborted sync reject promptly instead of finishing the sleep.
 					// NOTE: the `missing`/`reason` conflict paths now pay this backoff too (they previously
 					// retried with zero delay); that is what stops the persistent-`reason` hot spin. If a
 					// high-contention workload ever shows this base delay as recovery latency, lower
 					// baseBackoffMs for that caller rather than reintroducing the zero-delay retry.
-					const delay = jitteredBackoffMs(consecutiveFailures - 1, { baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
+					const delay = retryBackoffMs(consecutiveFailures, lostToCommittedRival,
+						{ baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
 					await abortableDelay(delay, signal);
 					try {
 						// Fetch latest state - updateInternal() will call replayActions() if there are conflicts.
@@ -2005,6 +2034,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 						// is what escapes: the log holds an entry for a write that was not saved.
 						consecutiveFailures++;
 						lastReason = err.detail;
+						lostToCommittedRival = false;
 						if (consecutiveFailures >= maxAttempts
 							|| (deadlineMs !== undefined && Date.now() - startedAt >= deadlineMs)) {
 							throw err;
