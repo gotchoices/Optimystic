@@ -39,7 +39,7 @@ endorse: nodeKey === undefined ? undefined : async (boundImage: Uint8Array): Pro
 }),
 ```
 
-`selfMemberBytes` is `peerIdToBytes(node.peerId)` — the same participant identity the register's own signature uses (`createParticipantSigner` signs with the same key), and the referee encoding `createReputationVerifier` decodes with `bytesToPeerIdString`. `signPeer` and `nodeKey` (`const nodeKey = options.privateKey`) already exist in that function; reuse them. `bootstrapBoundImage` is domain-tagged `"BootstrapEvidenceV1"`, distinct from `registerSigningPayload`, so one key signing both is safe.
+`selfMemberBytes` is `peerIdToBytes(node.peerId)` — the same participant identity the register's own signature uses (`createParticipantSigner` signs with the same key), and the referee encoding `createReputationVerifier` decodes with `bytesToPeerIdString`. `signPeer` and `nodeKey` (`const nodeKey = options.privateKey`) already exist in that function; reuse them. Import the `ReputationEvidenceV1` type from `@optimystic/db-core` (host.ts does not import it yet). `bootstrapBoundImage` is domain-tagged `"BootstrapEvidenceV1"`, distinct from `registerSigningPayload`, so one key signing both is safe.
 
 Rewrite the comment above the builder (it currently says T0/T1 endorsement is "intentionally left unwired") and the host module header's anti-DoS paragraph (the "participant-side PoW minter" sentence) to match: a key-ful host self-endorses at T2/T3; a keyless host mints proof of work.
 
