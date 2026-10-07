@@ -20,8 +20,10 @@
  * the next slot of the log tail for it, the fast writer is answered `held` until the slow one lands,
  * and the slow writer lands on its next attempt: every slow write commits, within
  * `SlotHoldAfterLosses + 2` pends (one more than the threshold, plus one for a rival already past its
- * promise round when the hold was granted). The fast writer's commit count is asserted too, so the
- * hold's honest cost — the holder's own read-to-pend window per episode — is a measured number.
+ * promise round when the hold was granted). The fast writer's commit count is asserted too, against
+ * the pace it set alone on the same machine moments earlier, so the hold's honest cost — the holder's
+ * own read-to-pend window per episode — is a measured share rather than a constant that is only right
+ * on the machine it was measured on.
  */
 
 import { expect } from 'chai';
@@ -36,6 +38,13 @@ const SLOW_CALL_MS = 120;
 /** The fast writer's pause between appends, and the slow writer's. */
 const FAST_PAUSE_MS = 200;
 const SLOW_PAUSE_MS = 1000;
+/** How long the fast writer runs ALONE first, to measure this machine's uncontended pace. */
+const PACE_MS = 5000;
+/** The share of its uncontended pace the fast writer must keep under contention. Measured at about
+ *  three quarters (66 to 73 commits in 20 s against 68 in 15 s alone); half separates the hold's honest
+ *  cost from a hold that idles the tail — a holder that never consumed would cost the whole window per
+ *  grant, which at this shape is most of the run — with room for a slower machine. */
+const KEPT_PACE = 0.5;
 const GRANTED = 'cluster-member:slot-hold-granted';
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
@@ -61,6 +70,9 @@ const delayedBy = (ms: number, pends: Map<string, number>) => (inner: IRepo): IR
 interface SlowWrite { elapsedMs: number; error?: unknown }
 
 interface Run {
+	/** The fast writer's commits in `PACE_MS` alone, before the slow writer started. */
+	fastCommitsAlone: number;
+	/** The fast writer's commits under contention, over the run's `durationMs`. */
 	fastCommits: number;
 	slowWrites: SlowWrite[];
 	/** Pends per slow action id. */
@@ -86,17 +98,25 @@ const runContention = async (durationMs: number, slotHoldWindowMs?: number): Pro
 	await fastDiary.append({ who: 'seed', n: 0 });
 	const slowDiary = await Diary.createOrOpen<Entry>(slow, diaryId);
 
+	/** The fast writer appending on its own cadence until `deadline`; resolves to its commit count. */
+	const fastUntil = async (deadline: number): Promise<number> => {
+		let commits = 0;
+		for (let n = 1; Date.now() < deadline; n++) {
+			await fastDiary.append({ who: 'fast', n });
+			commits++;
+			await sleep(FAST_PAUSE_MS);
+		}
+		return commits;
+	};
+	// The fast writer alone first: its pace on THIS machine is what the contended count is judged
+	// against, since a constant floor is right only for the machine it was measured on.
+	const fastCommitsAlone = await fastUntil(Date.now() + PACE_MS);
+
 	let fastCommits = 0;
 	const slowWrites: SlowWrite[] = [];
 	const captured = await captureLog('cluster-member', async () => {
 		const deadline = Date.now() + durationMs;
-		const fastLoop = (async (): Promise<void> => {
-			for (let n = 1; Date.now() < deadline; n++) {
-				await fastDiary.append({ who: 'fast', n });
-				fastCommits++;
-				await sleep(FAST_PAUSE_MS);
-			}
-		})();
+		const fastLoop = fastUntil(deadline).then(commits => { fastCommits = commits; });
 		const slowLoop = (async (): Promise<void> => {
 			for (let n = 1; Date.now() < deadline; n++) {
 				const startedAt = Date.now();
@@ -111,15 +131,19 @@ const runContention = async (durationMs: number, slotHoldWindowMs?: number): Pro
 		})();
 		await Promise.all([fastLoop, slowLoop]);
 	});
-	return { fastCommits, slowWrites, pends, captured };
+	return { fastCommitsAlone, fastCommits, slowWrites, pends, captured };
 };
+
+/** The fewest contended fast commits that keep {@link KEPT_PACE} of the pace measured alone. */
+const keptPaceFloor = (run: Run, durationMs: number): number =>
+	Math.floor(run.fastCommitsAlone * (durationMs / PACE_MS) * KEPT_PACE);
 
 const describeRun = (run: Run): string => {
 	const failed = run.slowWrites.filter(w => w.error !== undefined).length;
 	const longest = Math.max(0, ...run.slowWrites.map(w => w.elapsedMs));
 	const mostPends = Math.max(0, ...run.pends.values());
 	const holds = run.captured.filter(args => typeof args[0] === 'string' && args[0].includes(GRANTED)).length;
-	return `fast commits ${run.fastCommits}, slow writes ${run.slowWrites.length} (${failed} failed, longest ${longest} ms, most pends for one write ${mostPends}), holds granted ${holds}`;
+	return `fast commits ${run.fastCommits} (${run.fastCommitsAlone} alone in ${PACE_MS} ms), slow writes ${run.slowWrites.length} (${failed} failed, longest ${longest} ms, most pends for one write ${mostPends}), holds granted ${holds}`;
 };
 
 describe('An aged writer behind a stream of quicker ones is held a slot', function () {
@@ -135,8 +159,8 @@ describe('An aged writer behind a stream of quicker ones is held a slot', functi
 			expect(count, `write ${actionId} pended ${count} times (${summary})`).to.be.at.most(SlotHoldAfterLosses + 2);
 		}
 		// The honest cost: each hold idles the tail for the slow writer's own read-to-pend window.
-		// 50 in 20 s is under three quarters of the uncontended pace this machine measured (68 in 15 s).
-		expect(run.fastCommits, `the fast writer must keep most of its throughput (${summary})`).to.be.at.least(50);
+		expect(run.fastCommits, `the fast writer must keep ${KEPT_PACE} of its uncontended pace (${summary})`)
+			.to.be.at.least(keptPaceFloor(run, 20_000));
 		// Without this a lucky phase alignment would pass the assertions above with no hold at all.
 		expect(run.captured.filter(args => typeof args[0] === 'string' && args[0].includes(GRANTED)).length,
 			`at least one hold must have been granted (${summary})`).to.be.at.least(1);

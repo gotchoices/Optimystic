@@ -130,6 +130,20 @@ interface Expiry {
  * `undefined`. A record with no expiration never expires. An expiration exactly equal to the clock
  * reading counts as passed.
  */
+/**
+ * The committed revision that makes `pendRequest` stale on a member holding `latest` for one of its
+ * blocks, or `undefined` when the pend is not refused as stale there: a pend naming no revision is
+ * never stale, and the member's own revision for this action is excluded so a redelivered pend for
+ * the same action stays approvable — the same rule storage applies (see {@link isOwnRevision}). The
+ * one stale rule, shared by the vote ({@link ClusterMember.validatePendOperations}) and by the count
+ * a member keeps for a record it casts no vote on ({@link ClusterMember.noteStaleLossUnvoted}), so
+ * the two cannot drift on what a loss is.
+ */
+function staleRevisionAgainst(latest: ActionRev | undefined, pendRequest: PendRequest): ActionRev | undefined {
+	if (latest === undefined || pendRequest.rev === undefined || latest.rev < pendRequest.rev) return undefined;
+	return isOwnRevision(latest, pendRequest.rev, pendRequest.actionId) ? undefined : latest;
+}
+
 function expiryOf(record: ClusterRecord): Expiry | undefined {
 	const expiration = record.message.expiration;
 	const memberClock = Date.now();
@@ -1787,14 +1801,8 @@ export class ClusterMember implements ICluster {
 							});
 							return invalidVerdict(`block ${blockId} unavailable (${blockResult.unavailable}): cannot verify revision`);
 						}
-						const latest = blockResult?.state?.latest;
-						if (latest !== undefined && latest.rev >= pendRequest.rev) {
-							// Self is excluded so a redelivered pend for this same action stays
-							// approvable — the same exclusion the pending-rival check below documents,
-							// and the same rule storage applies (see {@link isOwnRevision}).
-							if (isOwnRevision(latest, pendRequest.rev, pendRequest.actionId)) {
-								continue;
-							}
+						const latest = staleRevisionAgainst(blockResult?.state?.latest, pendRequest);
+						if (latest !== undefined) {
 							log('cluster-member:validation-stale-revision', {
 								messageHash: record.messageHash,
 								blockId,
@@ -2061,21 +2069,20 @@ export class ClusterMember implements ICluster {
 	 * is signed or answered, and an arriving reject is never taken on trust. A block this member
 	 * cannot read, or holds behind the requested revision, counts nothing: this member would not
 	 * have refused it as stale, and a member behind the cohort is the residual docs/correctness.md
-	 * Theorem 9 states.
+	 * Theorem 9 states. An expired record counts nothing either, as the vote answers expiry ahead of
+	 * everything else ({@link evaluatePromise}): its writer stops on `TransactionExpiredError` rather
+	 * than retrying, so a hold for it could only idle the blocks for the whole window.
 	 */
 	private async noteStaleLossUnvoted(record: ClusterRecord): Promise<void> {
-		if (this.slotHoldWindowMs === 0 || this.countedStaleLosses.has(record.messageHash)) return;
-		const pendRequests = record.message.operations.flatMap(operation => 'pend' in operation && operation.pend.rev !== undefined ? [operation.pend] : []);
+		if (this.slotHoldWindowMs === 0 || this.countedStaleLosses.has(record.messageHash) || expiryOf(record)) return;
+		const pendRequests = record.message.operations.flatMap(operation => 'pend' in operation ? [operation.pend] : []);
 		if (pendRequests.length === 0) return;
 		const admission = await this.admitMembership(record);
 		if (!admission.admit) return;
 		for (const pendRequest of pendRequests) {
 			const blockIds = blockIdsForTransforms(pendRequest.transforms);
 			const blockResults = await this.storageRepo.get({ blockIds });
-			const stale = blockIds.some(blockId => {
-				const latest = blockResults[blockId]?.state?.latest;
-				return latest !== undefined && latest.rev >= pendRequest.rev! && !isOwnRevision(latest, pendRequest.rev!, pendRequest.actionId);
-			});
+			const stale = blockIds.some(blockId => staleRevisionAgainst(blockResults[blockId]?.state?.latest, pendRequest) !== undefined);
 			if (stale) {
 				log('cluster-member:slot-hold-loss-unvoted', { messageHash: record.messageHash, actionId: pendRequest.actionId, requestedRev: pendRequest.rev });
 				this.noteStaleLoss(record, pendRequest, blockIds);
