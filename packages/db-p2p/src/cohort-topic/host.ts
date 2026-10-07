@@ -1452,10 +1452,12 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// carries nothing: the policy accepts only a parent reference there. The endorsement's image is
 	// domain-tagged apart from the register's signing payload, so one key signing both is safe. A mint gives
 	// up inside half of this node's own replay window — the best guess at the serving group's, which refuses a
-	// register stamped longer ago than that, PoW or not.
+	// register stamped longer ago than that, PoW or not. The tier split is likewise this node's own policy's,
+	// so a node configured with a different `maxNoPowTier` offers evidence at the tiers it demands it.
 	const buildBootstrapEvidence = createBootstrapEvidenceBuilder({
 		hash,
 		bits: options.antiDos?.powDifficultyBits,
+		maxNoPowTier: options.antiDos?.bootstrapEvidence?.config?.maxNoPowTier,
 		timeBudgetMs: powTimeBudgetFor(options.antiDos?.replayGuard?.maxAgeMs ?? DEFAULT_REPLAY_MAX_AGE_MS),
 		endorse: nodeKey === undefined ? undefined : async (boundImage: Uint8Array): Promise<ReputationEvidenceV1> => ({
 			referee: bytesToB64url(selfMemberBytes),

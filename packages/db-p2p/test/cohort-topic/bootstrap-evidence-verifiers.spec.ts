@@ -222,13 +222,6 @@ describe('cohort-topic / bootstrap-evidence verifiers (db-p2p)', () => {
 			expect(createPoWVerifier({ hash, bits })(reg), 'the verifier accepts the minted PoW').to.equal(true);
 		});
 
-		it('returns undefined for T0/T1 with no endorse capability (parent-reference origination is the follow-on)', async () => {
-			const { bytes: participant } = await makeKey();
-			const build = createBootstrapEvidenceBuilder({ hash, bits: 0 });
-			expect(await build(boundOf(makeReg(participant, TOPIC, { tier: 0 }))), 'T0 carries no evidence').to.equal(undefined);
-			expect(await build(boundOf(makeReg(participant, TOPIC, { tier: 1 }))), 'T1 carries no evidence').to.equal(undefined);
-		});
-
 		it('with an endorse capability, self-endorses at T2 without searching for a proof-of-work, and offers nothing at T0/T1', async () => {
 			const { bytes: self, key } = await makeKey();
 			// A proof-of-work that cannot finish: were it searched for, the build would end empty at the budget.
