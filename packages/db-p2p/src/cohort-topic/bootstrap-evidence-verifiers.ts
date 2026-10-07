@@ -109,6 +109,15 @@ export interface ReputationVerifierDeps {
  * The `referee` MAY equal the participant (a reputable participant self-vouches with its own peer key).
  * An unknown referee scores `0` (a clean, unseen peer) and so is sufficient; a referee exactly *at* the
  * threshold is not (strict `<`). Bad sig / banned / over-threshold / malformed → `false` (fails closed).
+ *
+ * NOTE: accepted tradeoff — a self-vouch from a never-seen key is free, so this path does not make a cold
+ * start cost anything; what bounds cold starts is listed in docs/cohort-topic.md §Anti-DoS, and every
+ * participant with a key takes this path (`createBootstrapEvidenceBuilder`). Revisit if fresh-key cold-start
+ * churn shows up as real abuse (topic-budget eviction of live topics, or the coordinate-engine cap refusing
+ * coords): require recorded positive history for a referee — which needs the reputation service to define a
+ * "trusted" level it does not have today — and make proof-of-work a real cost for new identities, with a
+ * lower network-wide difficulty and/or native mining on React Native so phones can still pay it. That changes
+ * what serving groups accept, so it needs a rollout note.
  */
 export function createReputationVerifier(deps: ReputationVerifierDeps): (reg: RegisterV1) => boolean {
 	const threshold = deps.deprioritizeThreshold ?? DEFAULT_DEPRIORITIZE_THRESHOLD;

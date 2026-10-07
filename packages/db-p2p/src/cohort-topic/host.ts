@@ -36,8 +36,9 @@
  * independent of another. The
  * node-level {@link BootstrapEvidence} policy (one tier→verifier policy, no per-coord state) is built once
  * and shared. db-core embeds no PoW / reputation scheme, so the host supplies the real verifiers
- * ({@link createPoWVerifier} / {@link createReputationVerifier}) and the participant-side PoW minter
- * ({@link createBootstrapEvidenceBuilder}): once configured, a node gates cold-root `bootstrap: true` at
+ * ({@link createPoWVerifier} / {@link createReputationVerifier}) and the participant-side evidence builder
+ * ({@link createBootstrapEvidenceBuilder}), which self-endorses a T2/T3 cold start with the node's peer key
+ * and mints a proof-of-work only on a key-less host: once configured, a node gates cold-root `bootstrap: true` at
  * T2/T3 (PoW, or a referee reputation endorsement when offered, or a signed parent reference) and at T0/T1
  * once a committed-existence backing is wired (a signed parent reference); a configured node with no such
  * backing keeps T0/T1 permissive-but-logged so cold-root origination is not blocked
@@ -164,6 +165,7 @@ import {
 	type RegistrationRecord,
 	type RenewReplyV1,
 	type RenewV1,
+	type ReputationEvidenceV1,
 	type RingCoord,
 	type RootPlacement,
 	type RotationAttestation,
@@ -1444,18 +1446,21 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		trustRoots: options.genesisTrustRoots ?? [],
 	});
 	// --- participant-side cold-start evidence builder (gap 6) ---
-	// Mints the evidence the participant attaches on a cold-root `bootstrap: true` re-issue. PoW (T2/T3) is
-	// keyless, so even a key-less host can bootstrap those tiers; the proof is bound to the register's own
-	// (topicId, tier, participantCoord, timestamp) tuple so a verifier reconstructs the same image. T0/T1
-	// carries no evidence here (the builder supports an `endorse` self-vouch seam — see
-	// `bootstrap-evidence-builder.ts` — but origination at those tiers is the committed-parent-reference
-	// follow-on `cohort-topic-bootstrap-parent-reference`, so it is intentionally left unwired for now).
-	// The mint gives up inside half of this node's own replay window — the best guess at the serving group's,
-	// which refuses a register stamped longer ago than that, PoW or not.
+	// Mints the evidence the participant attaches to a cold-start register (`bootstrap` or `followOn`). A host
+	// with a peer key self-endorses at T2/T3 — one signature, as the same identity the register itself is
+	// signed by, so a phone pays what a desktop does; a key-less host mints a proof-of-work instead. T0/T1
+	// carries nothing: the policy accepts only a parent reference there. The endorsement's image is
+	// domain-tagged apart from the register's signing payload, so one key signing both is safe. A mint gives
+	// up inside half of this node's own replay window — the best guess at the serving group's, which refuses a
+	// register stamped longer ago than that, PoW or not.
 	const buildBootstrapEvidence = createBootstrapEvidenceBuilder({
 		hash,
 		bits: options.antiDos?.powDifficultyBits,
 		timeBudgetMs: powTimeBudgetFor(options.antiDos?.replayGuard?.maxAgeMs ?? DEFAULT_REPLAY_MAX_AGE_MS),
+		endorse: nodeKey === undefined ? undefined : async (boundImage: Uint8Array): Promise<ReputationEvidenceV1> => ({
+			referee: bytesToB64url(selfMemberBytes),
+			sig: bytesToB64url(await signPeer(nodeKey, boundImage)),
+		}),
 	});
 
 	const service = createCohortTopicService({

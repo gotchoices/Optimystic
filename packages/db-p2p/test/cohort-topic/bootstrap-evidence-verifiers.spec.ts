@@ -9,6 +9,7 @@ import {
 	meetsDifficulty,
 	bootstrapBoundImage,
 	serializeBootstrapEvidenceEnvelope,
+	parseBootstrapEvidenceEnvelope,
 	type RegisterV1,
 	type BootstrapBoundFields,
 } from '@optimystic/db-core';
@@ -228,18 +229,25 @@ describe('cohort-topic / bootstrap-evidence verifiers (db-p2p)', () => {
 			expect(await build(boundOf(makeReg(participant, TOPIC, { tier: 1 }))), 'T1 carries no evidence').to.equal(undefined);
 		});
 
-		it('mints a self-vouch reputation endorsement for T0/T1 when an endorse capability is supplied', async () => {
+		it('with an endorse capability, self-endorses at T2 without searching for a proof-of-work, and offers nothing at T0/T1', async () => {
 			const { bytes: self, key } = await makeKey();
+			// A proof-of-work that cannot finish: were it searched for, the build would end empty at the budget.
 			const build = createBootstrapEvidenceBuilder({
 				hash,
-				bits: 0,
+				bits: 256,
+				maxIterations: 1 << 30,
+				timeBudgetMs: 500,
 				endorse: async (image) => ({ referee: bytesToB64url(self), sig: bytesToB64url(signPeerSig(key, image)) }),
 			});
-			const reg = makeReg(self, TOPIC, { tier: 0 });
+			const reg = makeReg(self, TOPIC, { tier: 2 });
 			const raw = await build(boundOf(reg));
-			expect(raw, 'a key-ful node self-vouches at T0').to.not.equal(undefined);
+			expect(raw, 'a key-ful node self-endorses at T2').to.not.equal(undefined);
 			reg.bootstrapEvidence = bytesToB64url(raw!);
-			expect(createReputationVerifier({ reputation: repView() })(reg), 'the referee verifier accepts the self-vouch').to.equal(true);
+			expect(parseBootstrapEvidenceEnvelope(reg)?.pow, 'no proof-of-work rides along').to.equal(undefined);
+			expect(createReputationVerifier({ reputation: repView() })(reg), 'the referee verifier accepts the self-endorsement').to.equal(true);
+
+			expect(await build(boundOf(makeReg(self, TOPIC, { tier: 0 }))), 'T0 carries no evidence').to.equal(undefined);
+			expect(await build(boundOf(makeReg(self, TOPIC, { tier: 1 }))), 'T1 carries no evidence').to.equal(undefined);
 		});
 
 		it('returns undefined when the difficulty cannot be solved within the iteration cap', async () => {

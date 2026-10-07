@@ -2,18 +2,21 @@
  * Cohort-topic substrate — participant-side bootstrap-evidence builder (db-p2p side of the `buildBootstrapEvidence` seam).
  *
  * Implements the db-core `CohortTopicServiceDeps.buildBootstrapEvidence` seam for the node's participant
- * role: on a cold-start `bootstrap: true` re-issue the service calls this with the register's own
- * canonical `(topicId, tier, participantCoord, timestamp)` tuple (base64url wire strings) and attaches the
- * returned bytes — **before** signing — into `RegisterV1.bootstrapEvidence`.
+ * role: on a cold-start re-issue — `bootstrap: true` at a root, `followOn: true` at a deeper tier — the
+ * service calls this with the register's own canonical `(topicId, tier, participantCoord, timestamp)` tuple
+ * (base64url wire strings) and attaches the returned bytes — **before** signing — into
+ * `RegisterV1.bootstrapEvidence`.
  *
- * - **Tier ≤ maxNoPowTier (T0/T1):** proof-of-work is not the expected evidence. With an `endorse`
- *   capability (a key-ful node) we mint a *self-vouch reputation endorsement* over the bound image so a
- *   configured cohort's referee verifier admits it; without one we return `undefined` (parent-reference
- *   origination is the follow-on `cohort-topic-bootstrap-parent-reference`). A T0/T1 bootstrap with no
- *   evidence is denied by a configured cohort until that lands — but the single-tier-0 milestone's
- *   cohort-side tests construct evidence directly, so this does not block them.
- * - **Tier ≥ maxNoPowTier+1 (T2/T3):** mint a proof-of-work — search nonces until
- *   `meetsDifficulty(hash.H(powPreimage(reg, nonce)), bits)`. The search takes a geometrically
+ * - **Tier ≤ maxNoPowTier (T0/T1):** no evidence. The serving group's policy accepts only a signed parent
+ *   reference there, which this builder does not mint (a brand-new root has no parent to reference; the
+ *   richer committed-parent check is the follow-on `cohort-topic-parent-ref-tx-log-content`). Anything
+ *   else offered at these tiers would be bytes no verifier reads.
+ * - **Tier ≥ maxNoPowTier+1 (T2/T3), with `endorse` (a node with a peer key):** a *self-endorsement* — the
+ *   node signs the bound image with its own key and names itself the referee. One signature, which the
+ *   serving group's reputation verifier admits for any key it has not banned or deprioritized. This is the
+ *   evidence a key-ful node offers; it costs a phone what it costs a desktop.
+ * - **Tier ≥ maxNoPowTier+1 (T2/T3), without `endorse` (a participant with no key):** mint a proof-of-work —
+ *   search nonces until `meetsDifficulty(hash.H(powPreimage(reg, nonce)), bits)`. The search takes a geometrically
  *   distributed number of tries around `2^bits` (default 20 ≈ 1 M). One try costs about 1.2 µs on a
  *   desktop under Node 24 (one SHA-256 of a ~180-byte preimage), so a default mint averages about 1.2 s of
  *   hashing there and a slow one takes several times that; on Hermes (React Native), which runs the hash as
@@ -94,7 +97,7 @@ export interface BootstrapEvidenceBuilderDeps {
 	readonly hash: IRingHash;
 	/** Difficulty bits to mint at. Default {@link DEFAULT_POW_DIFFICULTY_BITS}. `0` solves on the first nonce (test). */
 	readonly bits?: number;
-	/** Highest tier exempt from PoW (T0/T1 → 1). Default {@link DEFAULT_MAX_NO_POW_TIER}. */
+	/** Highest tier the builder offers no evidence at — the policy's PoW-exempt tiers (T0/T1 → 1). Default {@link DEFAULT_MAX_NO_POW_TIER}. */
 	readonly maxNoPowTier?: number;
 	/** Nonce-search cap. Default {@link DEFAULT_POW_MAX_ITERATIONS}. */
 	readonly maxIterations?: number;
@@ -107,10 +110,10 @@ export interface BootstrapEvidenceBuilderDeps {
 	 */
 	readonly timeBudgetMs?: number;
 	/**
-	 * Optional self-vouch endorsement capability for a key-ful node: signs the bound image with the node's
-	 * peer key and returns the referee (= self) + signature. Supplied → T0/T1 mints a reputation
-	 * endorsement (the interim T0/T1 path until parent-reference origination lands); absent → T0/T1 carries
-	 * no evidence.
+	 * Self-endorsement capability for a node with a peer key: signs the bound image with that key and returns
+	 * the referee (= self) and the signature. Supplied → the endorsement is the evidence at every tier whose
+	 * policy accepts one (T2/T3), and no proof-of-work is searched for. Absent → T2/T3 pays a proof-of-work,
+	 * the evidence a participant with no key can offer.
 	 */
 	readonly endorse?: (boundImage: Uint8Array) => Promise<ReputationEvidenceV1>;
 }
@@ -118,9 +121,9 @@ export interface BootstrapEvidenceBuilderDeps {
 /**
  * Build the {@link import("@optimystic/db-core").CohortTopicServiceDeps.buildBootstrapEvidence} seam:
  * a `(params) => Promise<Uint8Array | undefined>` that mints the cold-start evidence for the node's own
- * register. PoW for T2/T3; a self-vouch reputation endorsement (when `endorse` is supplied) or nothing
- * for T0/T1. A PoW search yields to the event loop every {@link POW_SLICE_MS} and ends at the iteration
- * cap or the time budget, whichever comes first.
+ * register. Nothing at T0/T1; at T2/T3 a self-endorsement when `endorse` is supplied, else a proof-of-work.
+ * A PoW search yields to the event loop every {@link POW_SLICE_MS} and ends at the iteration cap or the
+ * time budget, whichever comes first.
  */
 export function createBootstrapEvidenceBuilder(
 	deps: BootstrapEvidenceBuilderDeps,
@@ -141,16 +144,22 @@ export function createBootstrapEvidenceBuilder(
 		};
 
 		if (params.tier <= maxNoPowTier) {
-			// T0/T1: PoW is not the expected evidence. A key-ful node self-vouches; otherwise no evidence
-			// (the parent-reference path is the follow-on ticket — documented deferral).
-			if (deps.endorse === undefined) {
-				return undefined;
-			}
+			return undefined;
+		}
+
+		if (deps.endorse !== undefined) {
+			// NOTE: a serving group whose reputation view has this key banned, or at/above its deprioritize
+			// threshold, refuses the endorsement, and there is no proof-of-work fallback — the register reply is
+			// a generic `unwilling_cohort`, so this participant cannot tell an evidence refusal from any other.
+			// That is the reputation subsystem doing its job for a misbehaving key; if honest-but-penalized keys
+			// (a flaky phone accumulating timeouts) are seen to lose their watches in practice, carry a
+			// proof-of-work alongside the endorsement once a key is known to be refused, or have the register
+			// reply name an evidence refusal so the participant can retry with one.
 			const reputation = await deps.endorse(bootstrapBoundImage(bound));
 			return rawEnvelopeBytes({ v: 1, reputation });
 		}
 
-		// T2/T3: mint a proof-of-work. Without one a configured cohort denies the register.
+		// No key: mint a proof-of-work. Without one a configured cohort denies the register.
 		const nonce = await searchPowNonce(new PowCandidate(deps.hash, bound), limits);
 		return nonce === undefined ? undefined : rawEnvelopeBytes({ v: 1, pow: { nonce: bytesToB64url(nonce) } });
 	};
