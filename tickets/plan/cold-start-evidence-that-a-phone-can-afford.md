@@ -3,6 +3,13 @@ architecture: docs/cohort-topic.md#anti-dos
 files: packages/db-p2p/src/cohort-topic/bootstrap-evidence-builder.ts, packages/db-p2p/src/cohort-topic/bootstrap-evidence-verifiers.ts, packages/db-core/src/cohort-topic/antidos/bootstrap-evidence.ts, packages/db-core/src/cohort-topic/antidos/bootstrap-evidence-envelope.ts, packages/db-p2p/src/cohort-topic/host.ts, packages/db-p2p/src/libp2p-node-base.ts, docs/cohort-topic.md, docs/reactivity.md
 repro: static
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-10-07T06:08:51.030Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\cold-start-evidence-that-a-phone-can-afford.plan.2026-10-07T06-08-51-028Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 
 **Decided (maintainer, 2026-10-07): option A.** Honest nodes sign their own endorsement; proof of work stays only as the fallback for participants with no key. Plan the change on that basis.
 
