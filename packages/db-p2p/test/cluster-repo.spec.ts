@@ -2,6 +2,11 @@ import { expect } from 'chai';
 import { ClusterMember, clusterMember, CONFLICT_STALE_THRESHOLD_MS } from '../src/cluster/cluster-repo.js';
 import { resolveRace } from '../src/cluster/race-resolution.js';
 import { MemoryTransactionStateStore } from '../src/cluster/memory-transaction-state-store.js';
+import { StorageRepo } from '../src/storage/storage-repo.js';
+import { BlockStorage } from '../src/storage/block-storage.js';
+import { MemoryRawStorage } from '../src/storage/memory-storage.js';
+import { withBlockWriteLatch } from '../src/storage/block-latch.js';
+import { captureLog, hasTag } from './support/capture-log.js';
 import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, Transforms, IBlock, BlockId, BlockHeader, ClusterConsensusConfig } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { MaxPriority, localDurability, clusterVoteVerificationPayload } from '@optimystic/db-core';
@@ -275,12 +280,64 @@ describe('ClusterMember', () => {
 			// Should still have a promise
 			expect(result.promises[ourId]).to.not.equal(undefined);
 		});
+	});
 
-		// Ticket repo-reports-unavailable-vs-absent: StorageRepo now reports a block it cannot
-		// materialize as a flagged entry instead of throwing out of the read. The stale-revision
-		// gate must not read that empty `state` as "no revision here, looks fresh" — a member
-		// that cannot check votes reject, not approve.
-		it('rejects a pend whose block read came back unavailable', async () => {
+	// Ticket catching-up-member-vetoes-pends-it-cannot-verify: the pend vote's two storage checks ask
+	// revision and reservation questions, and read block METADATA to answer them. Through a block read,
+	// a member still catching up — holding a `latest` it cannot yet materialize — vetoed every pend on
+	// the block, and a block with no committed revision hid the records reserving it.
+	describe('update - the pend vote reads metadata, not blocks', () => {
+		const BLOCK = 'catching-up-block';
+
+		const pendAt = (actionId: string, rev: number, transform: 'insert' | 'update'): PendRequest => ({
+			actionId,
+			rev,
+			policy: 'c',
+			transforms: transform === 'insert'
+				? { inserts: { [BLOCK]: makeBlock(BLOCK) }, updates: {}, deletes: [] }
+				: { inserts: {}, updates: { [BLOCK]: [['entries', 0, 0, ['x']]] }, deletes: [] }
+		});
+
+		/** A fresh member over `repo` votes on `pend` in a two-member cohort; its promise vote. */
+		const voteOver = async (repo: IRepo, pend: PendRequest): Promise<Signature | undefined> => {
+			const member = clusterMember({ storageRepo: repo, peerNetwork: mockNetwork, peerId: selfKeyPair.peerId, privateKey: selfKeyPair.privateKey });
+			try {
+				const peers = makeClusterPeers([selfKeyPair, await makeKeyPair()]);
+				const result = await member.update(await createClusterRecord(peers, [{ pend }]));
+				return result.promises[selfKeyPair.peerId.toString()];
+			} finally {
+				member.dispose();
+			}
+		};
+
+		const storageRepoOver = (raw: MemoryRawStorage): StorageRepo => new StorageRepo(id => new BlockStorage(id, raw));
+
+		it('judges a held revision that will not materialize: approves a pend past it, rejects one at it', async () => {
+			const raw = new MemoryRawStorage();
+			const repo = storageRepoOver(raw);
+			// A forward tombstone with nothing below it: `latest` is on file, no revision materializes.
+			await withBlockWriteLatch(BLOCK, latch => new BlockStorage(BLOCK, raw).saveDeletion({ rev: 5, actionId: 'a5' }, latch));
+			expect((await repo.get({ blockIds: [BLOCK] }))[BLOCK], 'precondition: a block read cannot answer')
+				.to.have.property('unavailable', 'unmaterializable');
+
+			expect((await voteOver(repo, pendAt('a-next', 6, 'update')))?.type, 'a catching-up member must not veto').to.equal('approve');
+			const stale = await voteOver(repo, pendAt('a-late', 5, 'update'));
+			expect(stale?.type, 'the revision is known, so it is still judged').to.equal('reject');
+			expect(stale).to.have.property('rejectReason', `stale revision: block ${BLOCK} at rev 5, requested rev 5`);
+		});
+
+		it('holds a pend behind a rival record on a block with no committed revision', async () => {
+			const repo = storageRepoOver(new MemoryRawStorage());
+			expect((await repo.pend(pendAt('a-rival', 1, 'insert'))).success).to.equal(true);
+			expect((await repo.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.pendings, 'precondition: a block read lists no rival')
+				.to.equal(undefined);
+
+			const vote = await voteOver(repo, pendAt('a-ours', 1, 'insert'));
+			expect(vote?.type).to.equal('held');
+			expect(vote).to.have.property('heldBy', 'a-rival');
+		});
+
+		it('does not veto when a get-only repo answers the block unavailable', async () => {
 			class UnavailableRepo extends MockRepo {
 				override async get(blockGets: BlockGets): Promise<GetBlockResults> {
 					await super.get(blockGets);
@@ -289,32 +346,10 @@ describe('ClusterMember', () => {
 					);
 				}
 			}
-			const unavailableRepo = new UnavailableRepo();
-			const member = clusterMember({
-				storageRepo: unavailableRepo,
-				peerNetwork: mockNetwork,
-				peerId: selfKeyPair.peerId,
-				privateKey: selfKeyPair.privateKey
+			const captured = await captureLog('cluster-member', async () => {
+				expect((await voteOver(new UnavailableRepo(), pendAt('action-1', 5, 'insert')))?.type).to.equal('approve');
 			});
-			try {
-				const otherKeyPair = await makeKeyPair();
-				const ourId = selfKeyPair.peerId.toString();
-				const peers = makeClusterPeers([selfKeyPair, otherKeyPair]);
-
-				// `rev` is what turns on the stale-revision gate; without it the check is skipped.
-				const transforms: Transforms = { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] };
-				const record = await createClusterRecord(
-					peers,
-					[{ pend: { actionId: 'action-1', transforms, policy: 'c', rev: 5 } }]
-				);
-
-				const result = await member.update(record);
-
-				expect(result.promises[ourId]).to.not.equal(undefined);
-				expect(result.promises[ourId]!.type, 'an unverifiable revision must not be approved').to.equal('reject');
-			} finally {
-				member.dispose();
-			}
+			expect(hasTag(captured, 'cluster-member:validation-block-unavailable'), 'the no-answer stays countable').to.equal(true);
 		});
 	});
 

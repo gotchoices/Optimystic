@@ -2078,9 +2078,19 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `answeredBlock` check `TransactorSource.tryGet` does, and so throws rather than opening with no
   `ActionContext`;
   `NetworkTransactor.getStatus` throws rather than reporting the action `aborted`;
-  `ClusterMember`'s promise-phase stale-revision gate votes *reject* rather than approving a pend
-  whose revision it could not check; `SpreadOnChurnMonitor` keeps the block tracked rather than
-  self-pruning it from the replication set.
+  `SpreadOnChurnMonitor` keeps the block tracked rather than self-pruning it from the replication
+  set. `ClusterMember`'s promise vote (`validatePendOperations`) does not read a `GetBlockResult` at
+  all: its two questions — the committed revision, for the stale-revision check, and the pending
+  records with their slots, for the reservation check — are metadata, so it asks storage for exactly
+  that (`StorageRepo.heldRevisions` and `StorageRepo.listPendingClaims`, the same reads
+  `StorageRepo.pend` makes at apply). A member still catching up, holding a `latest` it cannot yet
+  materialize, therefore still judges the revision it holds, and a block with no committed revision
+  still shows the records reserving it. A member that cannot establish a block's revision at all
+  approves rather than vetoing — the answer a member holding nothing for the block already gives —
+  and logs `cluster-member:validation-block-unavailable`; the approved pend's own commit brings it
+  current through the fork guard and behind-reconcile (see *A behind member actively reconciles*
+  above). Only its fallback for a repo without those reads (a test double) reads `get`, where a
+  flagged entry is likewise "no answer".
 - **A present answer separately says whether it is confirmed CURRENT — `unavailable` is about
   existence, `unconfirmedAheadRev` is about currency.** `GetBlockResult` carries a second optional
   doubt marker ([`network/struct.ts`](../packages/db-core/src/network/struct.ts)):

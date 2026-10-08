@@ -165,7 +165,8 @@ export interface IRevisionActionReader {
  * base?" — the questions the promise-round votes need. The rival check
  * (`ClusterMember.validatePendOperations`) lists every record's claim, because a record the incoming
  * writer has built on is not a reservation against it (`isReservationAgainst`), and
- * `GetBlockResult.state.pendings` carries only action ids; the commit vote
+ * `GetBlockResult.state.pendings` carries only action ids — and only beside a block `get`
+ * materialized, so it misses every record on a block with no committed revision; the commit vote
  * (`ClusterMember.validateCommitBaseDeclarations`) reads one record's claim, to compare the base its
  * pend carried with the one the commit declares. Named for the same reason as
  * {@link IRevisionActionReader}: a repo that lacks `listPendingClaims` degrades the pend vote to
@@ -181,9 +182,11 @@ export interface IPendingClaimReader {
 
 /**
  * The capability that answers "which committed revision of each of these blocks does this node hold?"
- * without doing anything else — the statement a reader attaches to a read it sends to another machine
- * (`BlockGets.askerHolds`, via `stateHoldingsOnReads`). It runs before the request goes out, so it must
- * cost no network time and change nothing: see {@link StorageRepo.heldRevisions}.
+ * without doing anything else. Two consumers: the statement a reader attaches to a read it sends to
+ * another machine (`BlockGets.askerHolds`, via `stateHoldingsOnReads`), which runs before the request
+ * goes out and so must cost no network time and change nothing; and the promise vote's stale-revision
+ * check (`ClusterMember.validatePendOperations`), which needs the revision a member holds even when
+ * that revision will not materialize. See {@link StorageRepo.heldRevisions}.
  */
 export interface IHeldRevisionReader {
 	/**
@@ -444,7 +447,9 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				// block as missing and consult the cohort — exactly the repair this block needs. If a
 				// consumer ever needs the revision behind an unavailable answer (e.g. to ask the cohort
 				// for a specific rev instead of the whole block), carry `latest` here and widen the
-				// coordinator's consult trigger to `isMissing || unavailable` so repair still fires.
+				// coordinator's consult trigger to `isMissing || unavailable` so repair still fires. A
+				// consumer that needs ONLY the revision reads `heldRevisions` instead, as the promise
+				// vote does (`ClusterMember.validatePendOperations`).
 				log('get:unmaterializable blockId=%s error=%s', blockId,
 					err instanceof Error ? err.message : String(err));
 				return [blockId, { state: {}, unavailable: 'unmaterializable' } as GetBlockResult];

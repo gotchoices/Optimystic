@@ -1,4 +1,4 @@
-import type { IRepo, ClusterRecord, ClusterPeers, Signature, ClusterVote, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, PendRequest, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest, MemberApplyOutcome } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, ClusterPeers, Signature, ClusterVote, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, PendRequest, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest, MemberApplyOutcome, GetBlockResults } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms, transformForBlockId, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability, formatInstant, LruMap, SlotHoldAfterLosses } from "@optimystic/db-core";
@@ -17,7 +17,7 @@ import type { FretService } from "p2p-fret";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
-import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister, type IRevisionActionReader, type IPendingClaimReader } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister, type IRevisionActionReader, type IPendingClaimReader, type IHeldRevisionReader } from "../storage/storage-repo.js";
 import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
 import { StuckReservationTracker } from "../repo/stuck-reservation.js";
 import { checkPendValidation, TRANSACTION_EXPIRED } from "../pend-validation.js";
@@ -1772,6 +1772,13 @@ export class ClusterMember implements ICluster {
 	 * committed at that slot on the rest of the cohort (this member missed the commit) or lost the
 	 * slot, and in both cases the record would otherwise refuse every later write to the block, from
 	 * every writer, for as long as this member lives.
+	 *
+	 * Both storage checks read block METADATA — the committed `latest` through
+	 * {@link IHeldRevisionReader}, the pending records through {@link IPendingClaimReader} — never the
+	 * block itself, as `StorageRepo.pend` does at apply. Asked through a block read, a member whose held
+	 * `latest` would not materialize (one still catching up) answered the revision question with a
+	 * content failure and vetoed, while the same member holding no metadata for the block approved; and
+	 * a block with no committed revision listed none of the records reserving it.
 	 */
 	private async validatePendOperations(record: ClusterRecord): Promise<PromiseVerdict> {
 		// Find pend operations in the message
@@ -1779,51 +1786,11 @@ export class ClusterMember implements ICluster {
 			if ('pend' in operation) {
 				const pendRequest = operation.pend;
 				const blockIds = blockIdsForTransforms(pendRequest.transforms);
-				// One state read serves both checks below: `latest` for staleness, `pendings` for the
-				// unresolved-rival check.
-				const blockResults = await this.storageRepo.get({ blockIds });
+				const viaGet = this.onceGet(blockIds);
 
-				// Check for stale revisions before allowing consensus
-				if (pendRequest.rev !== undefined) {
-					for (const blockId of blockIds) {
-						const blockResult = blockResults[blockId];
-						if (blockResult?.unavailable !== undefined) {
-							// This member cannot establish the block's revision, so it cannot judge
-							// staleness. Vote reject rather than approve on an answer it knows is a
-							// guess — approving would let a stale pend reach consensus on the strength
-							// of a member that could not check it. (Before StorageRepo caught
-							// materialization faults per block, this read threw out of the promise
-							// handler; rejecting keeps the fail-closed posture with a signed reason.)
-							log('cluster-member:validation-block-unavailable', {
-								messageHash: record.messageHash,
-								blockId,
-								reason: blockResult.unavailable
-							});
-							return invalidVerdict(`block ${blockId} unavailable (${blockResult.unavailable}): cannot verify revision`);
-						}
-						const latest = staleRevisionAgainst(blockResult?.state?.latest, pendRequest);
-						if (latest !== undefined) {
-							log('cluster-member:validation-stale-revision', {
-								messageHash: record.messageHash,
-								blockId,
-								requestedRev: pendRequest.rev,
-								latestRev: latest.rev
-							});
-							// Counted BEFORE the refusal is returned, and only here — a stale loss is the one
-							// refusal that says a quicker rival committed and left — so an action this member
-							// keeps refusing earns the next slot of these blocks (see {@link noteStaleLoss}).
-							// The verdict is unchanged.
-							this.noteStaleLoss(record, pendRequest, blockIds);
-							// Deliberately prose-only: this reason is fed to computeSigningPayload, signed,
-							// and carried as Signature.rejectReason, so adding a structured revision here
-							// would change the signed byte layout and the Signature type — every peer would
-							// have to agree on the new format or verification breaks across versions. This
-							// is NOT a StaleFailure producer, so StaleFailure.staleAt does not apply; the
-							// coordinator's own local re-read (CoordinatorRepo.classifyStaleRejection)
-							// supplies that number when it can confirm the revision itself.
-							return invalidVerdict(`stale revision: block ${blockId} at rev ${latest.rev}, requested rev ${pendRequest.rev}`);
-						}
-					}
+				const stale = await this.judgeStaleRevisions(record, pendRequest, blockIds, viaGet);
+				if (stale !== undefined) {
+					return stale;
 				}
 
 				// A pend that is not stale is judged against the slot holds standing on its blocks before
@@ -1849,15 +1816,15 @@ export class ClusterMember implements ICluster {
 				// (getExecutedPendResult) for the coordinating node's own member, and returned to the
 				// coordinator on the response record (ClusterRecord.applyOutcomes) by every other
 				// member. Self is excluded so a redelivered pend
-				// for this same action stays approvable. An unavailable block carries no `pendings` and
-				// abstains (the rev branch above already fail-closes when a revision claim is at stake).
+				// for this same action stays approvable.
 				//
 				// This is the ONE refusal in this method that is not a validity judgement: a RESERVING
 				// rival's record is removed the moment it commits or cancels, so the very same pend
 				// succeeds on retry. It therefore returns the `held` kind, which becomes a `held` vote
 				// the coordinator counts toward neither approvals nor rejections. `heldBy` carries the
 				// first rival as signed structured data; the prose reason names the same one, and stays
-				// prose because it is fed to computeSigningPayload exactly like the reasons above.
+				// prose because it is fed to computeSigningPayload exactly like the stale-revision reason
+				// ({@link judgeStaleRevisions}).
 				//
 				// Which rivals reserve is decided by the slot each record claims against what the
 				// incoming writer built on, not by the record's presence (`reservingRivals`): a record
@@ -1875,8 +1842,8 @@ export class ClusterMember implements ICluster {
 				// read the block without the record's change — served by a member that never held the
 				// rival's pend — and admitting it would lose the change. See `isReservationAgainst`.
 				for (const blockId of blockIds) {
-					const rivalIds = (blockResults[blockId]?.state?.pendings ?? []).filter(actionId => actionId !== pendRequest.actionId);
-					const rivals = rivalIds.length === 0 ? [] : await this.reservingRivals(record, blockId, rivalIds, pendRequest);
+					const claims = await this.rivalClaimsOn(record, blockId, pendRequest.actionId, viaGet);
+					const rivals = claims.length === 0 ? [] : this.reservingRivals(record, blockId, claims, pendRequest);
 					if (rivals.length === 0) {
 						// Not reserved (any more): whatever episode this member was counting on the block
 						// has ended, so a later wedge gets its own count.
@@ -1904,7 +1871,7 @@ export class ClusterMember implements ICluster {
 				// policy and the throwing-validator catch live in the shared `checkPendValidation`,
 				// which the storage tier runs too, so a member cannot vote approve on a shape its own
 				// storage would refuse at apply. Its reasons are fed to computeSigningPayload and
-				// carried as Signature.rejectReason, exactly like the stale-revision reason above, so
+				// carried as Signature.rejectReason, exactly like the stale-revision reason, so
 				// a fail-closed refusal here is signed evidence rather than a lost vote.
 				const validator = this.validator;
 				const validation = await checkPendValidation(
@@ -1933,35 +1900,120 @@ export class ClusterMember implements ICluster {
 	}
 
 	/**
-	 * Of the rival pending records `get` listed on `blockId`, the ones that RESERVE the block against
+	 * The stale-revision refusal of `pendRequest`, or `undefined` when no block makes it stale here. A
+	 * block whose revision this member cannot establish is NOT a refusal: the member has no answer for
+	 * it, which is the position a member holding no metadata for the block is already in, and the design
+	 * gives both one answer — approve, and let the approved pend's own commit bring this member current
+	 * (the fork guard in `StorageRepo.internalCommit` refuses and the behind-reconcile lands the block).
+	 * A stale write still cannot pass on such a member alone: every caught-up member judges it, storage
+	 * refuses an update-only commit over a base it does not hold, and `CoordinatorRepo.commit`
+	 * acknowledges nothing a majority does not hold.
+	 */
+	private async judgeStaleRevisions(record: ClusterRecord, pendRequest: PendRequest, blockIds: BlockId[], viaGet: () => Promise<GetBlockResults>): Promise<PromiseVerdict | undefined> {
+		if (pendRequest.rev === undefined) {
+			return undefined;
+		}
+		const held = await this.heldLatestOf(blockIds, viaGet);
+		for (const blockId of blockIds) {
+			const heldLatest = held[blockId];
+			if (heldLatest === undefined) {
+				log('cluster-member:validation-block-unavailable', {
+					messageHash: record.messageHash,
+					blockId,
+					actionId: pendRequest.actionId,
+					requestedRev: pendRequest.rev
+				});
+				continue;
+			}
+			const latest = staleRevisionAgainst(heldLatest ?? undefined, pendRequest);
+			if (latest === undefined) {
+				continue;
+			}
+			log('cluster-member:validation-stale-revision', {
+				messageHash: record.messageHash,
+				blockId,
+				requestedRev: pendRequest.rev,
+				latestRev: latest.rev
+			});
+			// Counted BEFORE the refusal is returned, and only here — a stale loss is the one
+			// refusal that says a quicker rival committed and left — so an action this member
+			// keeps refusing earns the next slot of these blocks (see {@link noteStaleLoss}).
+			// The verdict is unchanged.
+			this.noteStaleLoss(record, pendRequest, blockIds);
+			// Deliberately prose-only: this reason is fed to computeSigningPayload, signed,
+			// and carried as Signature.rejectReason, so adding a structured revision here
+			// would change the signed byte layout and the Signature type — every peer would
+			// have to agree on the new format or verification breaks across versions. This
+			// is NOT a StaleFailure producer, so StaleFailure.staleAt does not apply; the
+			// coordinator's own local re-read (CoordinatorRepo.classifyStaleRejection)
+			// supplies that number when it can confirm the revision itself.
+			return invalidVerdict(`stale revision: block ${blockId} at rev ${latest.rev}, requested rev ${pendRequest.rev}`);
+		}
+		return undefined;
+	}
+
+	/** `get` of `blockIds`, read at most once however many of one vote's fallbacks ask for it. */
+	private onceGet(blockIds: BlockId[]): () => Promise<GetBlockResults> {
+		let results: Promise<GetBlockResults> | undefined;
+		return () => results ??= this.storageRepo.get({ blockIds });
+	}
+
+	/**
+	 * The committed latest this member holds for each of `blockIds` — `null` for a block with no
+	 * committed revision, and no entry for a block whose revision it cannot establish — read through
+	 * {@link IHeldRevisionReader}, which never materializes, so a held `latest` that will not
+	 * materialize is still known. A repo without the capability (a test double) falls back to `get`,
+	 * where an `unavailable` entry is likewise no answer.
+	 */
+	private async heldLatestOf(blockIds: BlockId[], viaGet: () => Promise<GetBlockResults>): Promise<Record<BlockId, ActionRev | null>> {
+		const reader = this.storageRepo as IRepo & Partial<IHeldRevisionReader>;
+		if (typeof reader.heldRevisions === 'function') {
+			return await reader.heldRevisions(blockIds);
+		}
+		const results = await viaGet();
+		const held: Record<BlockId, ActionRev | null> = {};
+		for (const blockId of blockIds) {
+			const result = results[blockId];
+			if (result?.unavailable === undefined) {
+				held[blockId] = result?.state?.latest ?? null;
+			}
+		}
+		return held;
+	}
+
+	/**
+	 * The pending records on `blockId` other than `actionId`'s own, each with the slot it claims, read
+	 * through {@link IPendingClaimReader}: metadata, so a record on a block with no committed revision,
+	 * or on one whose committed revision will not materialize, is listed like any other (`get` lists
+	 * `state.pendings` only beside a block it materialized). A repo without the capability (a plain
+	 * `IRepo` mock), or a claims read that fails, falls back to `get`'s `state.pendings`, each as a
+	 * claim of unknown slot — which {@link isReservationAgainst} counts as reserving, the refusal this
+	 * member cast before claims were recorded, never a silent admission.
+	 */
+	private async rivalClaimsOn(record: ClusterRecord, blockId: BlockId, actionId: ActionId, viaGet: () => Promise<GetBlockResults>): Promise<PendingClaim[]> {
+		const reader = this.storageRepo as IRepo & Partial<IPendingClaimReader>;
+		if (typeof reader.listPendingClaims === 'function') {
+			try {
+				return (await reader.listPendingClaims(blockId)).filter(claim => claim.actionId !== actionId);
+			} catch (err) {
+				log('cluster-member:pending-claims-read-error', { messageHash: record.messageHash, blockId, error: (err as Error).message });
+			}
+		}
+		const pendings = (await viaGet())[blockId]?.state?.pendings ?? [];
+		return pendings.filter(pending => pending !== actionId).map(pending => ({ actionId: pending }));
+	}
+
+	/**
+	 * Of the rival `claims` on `blockId`, the action ids of those that RESERVE the block against
 	 * `pendRequest` — see `isReservationAgainst` for the rule, fed the pend's revision and the base it
 	 * declares for this block (`reservationRequestFor`, the same reading storage applies at apply).
-	 * Asks storage's {@link IPendingClaimReader} for the slot each record claims; a repo without that
-	 * capability (a plain `IRepo` mock) or a read that fails degrades to "every rival reserves", which
-	 * is the refusal this member cast before claims were recorded — never to silently admitting one. A
-	 * rival that `get` listed but that is gone by the time the claims are read has resolved in
-	 * between, and is not a rival any more.
 	 */
-	private async reservingRivals(record: ClusterRecord, blockId: BlockId, rivalIds: ActionId[], pendRequest: PendRequest): Promise<ActionId[]> {
-		const reader = this.storageRepo as IRepo & Partial<IPendingClaimReader>;
-		if (typeof reader.listPendingClaims !== 'function') {
-			return rivalIds;
-		}
-		let claims: PendingClaim[];
-		try {
-			claims = await reader.listPendingClaims(blockId);
-		} catch (err) {
-			log('cluster-member:pending-claims-read-error', { messageHash: record.messageHash, blockId, error: (err as Error).message });
-			return rivalIds;
-		}
+	private reservingRivals(record: ClusterRecord, blockId: BlockId, claims: PendingClaim[], pendRequest: PendRequest): ActionId[] {
 		const reservation = this.reservationRequestOf(record, pendRequest, blockId);
-		const claimOf = new Map(claims.map(claim => [claim.actionId, claim]));
 		const reserving: ActionId[] = [];
-		for (const actionId of rivalIds) {
-			const claim = claimOf.get(actionId);
-			if (claim === undefined) continue;
+		for (const claim of claims) {
 			if (isReservationAgainst(claim, reservation)) {
-				reserving.push(actionId);
+				reserving.push(claim.actionId);
 			} else {
 				log('cluster-member:validation-pending-superseded', {
 					messageHash: record.messageHash,
@@ -1969,7 +2021,7 @@ export class ClusterMember implements ICluster {
 					actionId: pendRequest.actionId,
 					requestedRev: pendRequest.rev,
 					baseRev: reservation.baseRev,
-					rival: actionId,
+					rival: claim.actionId,
 					claimedRev: claim.rev
 				});
 			}
@@ -2081,8 +2133,8 @@ export class ClusterMember implements ICluster {
 		if (!admission.admit) return;
 		for (const pendRequest of pendRequests) {
 			const blockIds = blockIdsForTransforms(pendRequest.transforms);
-			const blockResults = await this.storageRepo.get({ blockIds });
-			const stale = blockIds.some(blockId => staleRevisionAgainst(blockResults[blockId]?.state?.latest, pendRequest) !== undefined);
+			const held = await this.heldLatestOf(blockIds, this.onceGet(blockIds));
+			const stale = blockIds.some(blockId => staleRevisionAgainst(held[blockId] ?? undefined, pendRequest) !== undefined);
 			if (stale) {
 				log('cluster-member:slot-hold-loss-unvoted', { messageHash: record.messageHash, actionId: pendRequest.actionId, requestedRev: pendRequest.rev });
 				this.noteStaleLoss(record, pendRequest, blockIds);
@@ -2208,7 +2260,7 @@ export class ClusterMember implements ICluster {
 			const commit = operation.commit;
 			let blockResults: Awaited<ReturnType<IRepo['get']>>;
 			try {
-				// The member's raw storage repo (no cluster recursion) — the same seam
+				// The member's raw storage repo (no cluster recursion) — the same repo
 				// validatePendOperations reads on every pend vote.
 				blockResults = await this.storageRepo.get({ blockIds: commit.blockIds });
 			} catch (err) {
