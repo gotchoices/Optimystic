@@ -156,3 +156,5 @@
 {"slug":"sync-fail-fast-on-a-stalled-revision-view","file":"2-sync-fail-fast-on-a-stalled-revision-view.md","completedAt":"2026-09-06","commit":"09ed71bb980402804af65cccf2c5d98165dc9260","prunedAt":"2026-10-06T20:08:21.185Z"}
 {"slug":"currency-doubt-cleared-by-a-partial-answer","file":"3-currency-doubt-cleared-by-a-partial-answer.md","completedAt":"2026-09-06","commit":"ae4ce8264ffc9f18ccd0289409b621e4dadef0b2","prunedAt":"2026-10-06T20:08:21.185Z"}
 {"slug":"a-reader-cannot-tell-its-view-stopped-advancing","file":"a-reader-cannot-tell-its-view-stopped-advancing.md","completedAt":"2026-09-06","commit":"e66597f4a97b77c528af2f8a0ed06fcd86922627","prunedAt":"2026-10-06T20:08:21.185Z"}
+{"slug":"feat-declare-repair-yardstick-alone-apply-by-rebuild","file":"1-feat-declare-repair-yardstick-alone-apply-by-rebuild.md","completedAt":"2026-09-07","commit":"d7cd3e010d59321068a5f9fe65e29eb8f722aadf","prunedAt":"2026-10-08T05:21:02.986Z"}
+{"slug":"small-cohort-arming-rule","file":"1-small-cohort-arming-rule.md","completedAt":"2026-09-07","commit":"1d8fdd754a53796e958a517ce32f1ceb94fa3e6f","prunedAt":"2026-10-08T05:21:02.986Z"}
