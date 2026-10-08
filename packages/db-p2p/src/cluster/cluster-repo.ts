@@ -2262,6 +2262,10 @@ export class ClusterMember implements ICluster {
 			try {
 				// The member's raw storage repo (no cluster recursion) — the same repo
 				// validatePendOperations reads on every pend vote.
+				// NOTE: unlike the pend vote, this reads `get`, so a member whose `latest` will not
+				// materialize (or is a tombstone) sees no `latest` and abstains where it could judge.
+				// Abstaining is the safe direction; if stale commits are ever seen passing a cohort of
+				// catching-up members, read `heldLatestOf` here instead.
 				blockResults = await this.storageRepo.get({ blockIds: commit.blockIds });
 			} catch (err) {
 				log('cluster-member:commit-staleness-read-error', {
