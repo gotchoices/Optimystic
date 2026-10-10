@@ -148,7 +148,7 @@ SELECT cid_decode(Cid) ->> 'codec' AS codec FROM T;
 - **`cid_decode(cid) → JSON`** — parse a CID back to `{ version, codec, hashCode,
   digest }` (digest as base64url). Throws cleanly on malformed input.
 
-Selectable values: `codec` ∈ `raw`, `dag-cbor`; `hash` ∈ `sha2-256`, `sha2-512`,
+Selectable values: `codec` ∈ `raw`, `dag-cbor`, `dag-json`; `hash` ∈ `sha2-256`, `sha2-512`,
 `blake3`; `base` ∈ `base32` (default), `base58btc`, `base64url`, `base16`.
 
 **Why `base32` by default?** A CID's whole purpose is to match what an external

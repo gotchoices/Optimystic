@@ -33,7 +33,7 @@ import type { MultibaseEncoder, MultibaseDecoder } from 'multiformats/bases/inte
 import { resolveHasher, type HashAlgorithm } from './crypto.js';
 
 /** Content-type multicodec selectable for the CID. Extensible. */
-export type Multicodec = 'raw' | 'dag-cbor';
+export type Multicodec = 'raw' | 'dag-cbor' | 'dag-json';
 /** Hash-algorithm multihash code selectable for the CID. */
 export type MultihashCode = 'sha2-256' | 'sha2-512' | 'blake3';
 /** Multibase the CID string is rendered in. */
@@ -57,6 +57,9 @@ export interface CidParts {
 const MULTICODEC_CODES: Record<Multicodec, number> = {
 	'raw': 0x55,
 	'dag-cbor': 0x71,
+	// Canonical DAG-JSON documents, e.g. Stroc's: a schema can then check a stored document
+	// against the CID it is filed under (`Cid = cid(Bytes, 'dag-json')`).
+	'dag-json': 0x0129,
 };
 
 /** Hash name → multihash code. */
