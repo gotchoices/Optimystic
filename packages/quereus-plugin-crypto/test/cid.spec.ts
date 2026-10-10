@@ -50,6 +50,13 @@ describe('CID Functions', () => {
 			expect(cidDecode(cbor).codec).to.equal('dag-cbor');
 		});
 
+		it('frames canonical DAG-JSON bytes as the CID a DAG-JSON store computes', () => {
+			// CID.create(1, 0x0129, sha256('{"hello":"world"}')) from multiformats.
+			const c = cid(utf8('{"hello":"world"}'), 'dag-json');
+			expect(c).to.equal('baguqeerasords4njcts6vs7qvdjfcvgnume4hqohf65zsfguprqphs3icwea');
+			expect(cidDecode(c).codec).to.equal('dag-json');
+		});
+
 		it('supports each multihash code with the right digest length', () => {
 			expect(cidDecode(cid(utf8('x'), 'raw', 'sha2-256')).digest).to.have.length(32);
 			expect(cidDecode(cid(utf8('x'), 'raw', 'sha2-512')).digest).to.have.length(64);
