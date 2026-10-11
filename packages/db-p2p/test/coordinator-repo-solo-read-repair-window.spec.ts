@@ -299,6 +299,10 @@ describe('CoordinatorRepo solo-cohort read-repair window', () => {
 		);
 		let clock = BASE_TIME;
 		repo.now = () => clock;
+		// Built inline rather than through `makeSoloRepo`, so the seam is set here for the same reason:
+		// the spec counts one trigger per read, and a read that lands while the previous read's consult
+		// is still running behind it starts none and logs none.
+		repo.awaitWindowConsults = true;
 
 		const captured = await captureCoordinatorLog(async () => {
 			for (let i = 0; i < 9; i++) {

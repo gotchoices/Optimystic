@@ -941,30 +941,21 @@ export class CoordinatorRepo implements IRepo {
 		// `shouldReadRepair` says true on every read under `'paranoid'`, so the mode is tested here
 		// rather than inferred from `windowDemands`.
 		const background = isStale && !floorDemands && this.readRepairMode === 'lazy' && !this.awaitWindowConsults;
-		if (isStale) {
-			// `reason` is 'floor' whenever the floor demanded the consult, even when the window
-			// would have consulted anyway: an operator reading `ageMs` at or below the window needs
-			// to know the asker asked for it (see docs/debugging.md).
-			this.log('cluster-tx:read-repair-triggered', {
-				blockId,
-				mode: this.readRepairMode,
-				ageMs: this.ageMs(blockId),
-				localRev,
-				reason: floorDemands ? 'floor' : 'window',
-				background,
-				...(floor === undefined ? {} : { floor })
-			});
-		}
-
 		const asker = askerStatementFor(blockGets, blockId, options?.asker, localEntry?.state?.latest);
 		if (background) {
-			this.startHeldBlockConsult(blockId, blockGets.context, localRev, asker);
+			// The trigger line is logged only when a consult actually starts: a read that lands while the
+			// block's pass is still running, or past the cap, consulted nobody, and the line's one-per-consult
+			// reading (docs/debugging.md) is what the issue #8 count relied on.
+			if (this.startHeldBlockConsult(blockId, blockGets.context, localRev, floor, asker)) {
+				this.logRepairTriggered(blockId, localRev, 'window', true, floor);
+			}
 			// Served from the local copy, stamped from the unsettled-claim memo as it stands: what moves
 			// off the read is the consult's EFFORT, not its honesty — the same split the window already
 			// makes for the reads inside it.
 			this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
 			return;
 		}
+		if (isStale) this.logRepairTriggered(blockId, localRev, floorDemands ? 'floor' : 'window', false, floor);
 
 		const passSeq = this.nextPassSeq();
 		try {
@@ -1167,6 +1158,11 @@ export class CoordinatorRepo implements IRepo {
 			// not about any revision — it is about how many machines this deployment can field, or how
 			// many of them hold the block — so it outlives the claim that first exposed it and is
 			// dropped only when the block converges (see {@link flagUnconfirmedCurrency}).
+			// NOTE: retiring clears `writtenBy` with the claim, so a pass that started BEFORE this one and
+			// ends after it with an unsettled claim re-records it, and the doubt stands until the next
+			// consult that reaches the claimants (one window later at most). That is the flagging
+			// direction, accepted; if it ever shows as `unconfirmedAheadRev` returning right after a
+			// refutation, keep the retiring pass's sequence on the entry and gate the re-record on it.
 			if (prior?.deadlocksReported) this.unsettledAheadClaims.set(blockId, { deadlocksReported: prior.deadlocksReported });
 			else this.unsettledAheadClaims.delete(blockId);
 			return;
@@ -1394,37 +1390,57 @@ export class CoordinatorRepo implements IRepo {
 	 * At most one pass per block: the block stays unstamped until the pass ends, so every read of it
 	 * meanwhile lands here, is served, and starts nothing. At most {@link MAX_HELD_BLOCK_CONSULTS}
 	 * passes in all: past that the read is served, nothing starts, and the block stays unstamped so a
-	 * later read starts it.
+	 * later read starts it. Returns whether a pass started, so the caller logs a trigger only for one.
 	 *
-	 * `asker` is captured from the triggering read, and `localRev` is what that read served, which is
-	 * the baseline the pass measures its outcome against.
+	 * `asker` and `floor` are captured from the triggering read — the floor only so the stamp records
+	 * the floor consulted under, as the blocking path's would ({@link FreshnessStamp}); the window asked
+	 * for this consult, not the floor — and `localRev` is what that read served, which is the baseline
+	 * the pass measures its outcome against.
 	 */
-	private startHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, localRev: number | undefined, asker: AskerStatement | undefined): void {
-		if (this.heldBlockConsults.has(blockId)) return;
+	private startHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, localRev: number | undefined, floor: number | undefined, asker: AskerStatement | undefined): boolean {
+		if (this.heldBlockConsults.has(blockId)) return false;
 		if (this.heldBlockConsults.size >= MAX_HELD_BLOCK_CONSULTS) {
 			this.log('cluster-tx:read-repair-deferred', { blockId, inFlight: this.heldBlockConsults.size });
-			return;
+			return false;
 		}
 		const passSeq = this.nextPassSeq();
-		const pass = this.runHeldBlockConsult(blockId, context, localRev, asker, passSeq)
+		const pass = this.runHeldBlockConsult(blockId, context, localRev, floor, asker, passSeq)
 			.finally(() => this.heldBlockConsults.delete(blockId));
 		this.heldBlockConsults.set(blockId, pass);
+		return true;
 	}
 
 	/**
 	 * The background pass itself: the same consult, memo update and outcome line as the blocking path
-	 * in {@link readRepairBlock}, minus the floor (the window asked for this consult, not the asker)
-	 * and minus the absence verdict (the block is held). Never rejects: an error is logged and the memo
-	 * stands, since a thrown consult refutes nothing — as on the blocking path.
+	 * in {@link readRepairBlock}, minus the absence verdict (the block is held). Never rejects: an error
+	 * is logged and the memo stands, since a thrown consult refutes nothing — as on the blocking path.
 	 */
-	private async runHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, localRev: number | undefined, asker: AskerStatement | undefined, passSeq: number): Promise<void> {
+	private async runHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, localRev: number | undefined, floor: number | undefined, asker: AskerStatement | undefined, passSeq: number): Promise<void> {
 		try {
-			const { currency } = await this.fetchBlockFromCluster(blockId, context, localRev, undefined, asker);
+			const { currency } = await this.fetchBlockFromCluster(blockId, context, localRev, floor, asker);
 			this.recordAheadClaim(blockId, currency, passSeq);
-			this.logRepairOutcome(blockId, localRev, await this.readLocalRev(blockId));
+			this.logRepairOutcome(blockId, localRev, await this.readLocalRev(blockId, context));
 		} catch (err) {
 			this.log('cluster-fetch:error', { blockId, background: true, error: (err as Error).message });
 		}
+	}
+
+	/**
+	 * The `cluster-tx:read-repair-triggered` line: a consult for a held block is starting. `reason` is
+	 * 'floor' whenever the floor demanded the consult, even when the window would have consulted anyway:
+	 * an operator reading `ageMs` at or below the window needs to know the asker asked for it (see
+	 * docs/debugging.md). `background` says whether the read waited for the consult.
+	 */
+	private logRepairTriggered(blockId: BlockId, localRev: number | undefined, reason: 'window' | 'floor', background: boolean, floor: number | undefined): void {
+		this.log('cluster-tx:read-repair-triggered', {
+			blockId,
+			mode: this.readRepairMode,
+			ageMs: this.ageMs(blockId),
+			localRev,
+			reason,
+			background,
+			...(floor === undefined ? {} : { floor })
+		});
 	}
 
 	/** Report what a held block's consult did to the local copy: `applied` when it advanced, else `noop`. */

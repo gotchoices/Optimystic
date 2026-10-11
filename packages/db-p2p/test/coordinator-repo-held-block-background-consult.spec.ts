@@ -93,14 +93,16 @@ describe('CoordinatorRepo held-block background consult', () => {
 			if (peerId.equals(localPeer)) return selfFrom(storageRepo, blockId)();
 			return new Promise(() => { /* never answers */ });
 		};
-		const repo = buildRepo(localPeer, makeClusterPeers([localPeer, silentPeer]), storageRepo, callback, { clusterSize: 2, cohortQueryTimeoutMs: 500 });
+		// The budget is the discriminator: a read that waited on the silent peer takes at least this long,
+		// one that did not takes milliseconds. The margin is wide so a slow machine cannot blur the two.
+		const repo = buildRepo(localPeer, makeClusterPeers([localPeer, silentPeer]), storageRepo, callback, { clusterSize: 2, cohortQueryTimeoutMs: 2_000 });
 
 		const started = Date.now();
 		const first = await repo.get({ blockIds: [blockId] });
 		const second = await repo.get({ blockIds: [blockId] });
 		const elapsedMs = Date.now() - started;
 
-		expect(elapsedMs, 'neither read waited on the silent peer\'s budget').to.be.below(400);
+		expect(elapsedMs, 'neither read waited on the silent peer\'s budget').to.be.below(1_000);
 		for (const result of [first, second]) {
 			expect(result[blockId]?.state?.latest?.rev).to.equal(1);
 			expect(result[blockId]?.unavailable).to.equal(undefined);

@@ -958,6 +958,8 @@ interface ClusterConsensusConfig {
   membershipAdmissionFraction?: number; // Default 0.75 — fraction of the size reference a declared set must meet
   cohortQueryTimeoutMs?: number;      // Default 1000ms, or max(1000, 3 × linkRoundTripMs) when the node declares one — one cohort peer's budget for one read-path request
   slotHoldWindowMs?: number;          // Default 3000ms; 0 disables — how long a member holds a block's next slot for a writer it has refused as stale SlotHoldAfterLosses (3) times
+  readRepairMode?: 'off' | 'lazy' | 'paranoid'; // Default 'lazy' — whether a read of a block this node holds re-verifies it against the cohort behind the read (lazy), on every read and waiting (paranoid), or never (off)
+  readRepairWindowMs?: number;        // Default 10000ms — how long a held block is served without starting a cohort consult (lazy only); must be a finite number above 0
 }
 ```
 
