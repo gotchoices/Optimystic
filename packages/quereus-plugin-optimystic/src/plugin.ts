@@ -23,6 +23,8 @@ const log = createLogger('plugin');
 // tsup.config.ts, so this package never bundles its own copy of them.
 export { PartialCommitError, ConcurrentModificationError } from './optimystic-adapter/txn-bridge.js';
 export { CoordinatorPartialCommitError, SyncRetryExhaustedError, TornActionError } from '@optimystic/db-core';
+// The predicate an `onCommitDurability` listener tests "saved" with, so a host needs no db-core import for it.
+export { isFullyDurable } from '@optimystic/db-core';
 export type { SqlCommitDurability, SqlCommitDurabilityListener } from './optimystic-adapter/commit-durability.js';
 
 /**

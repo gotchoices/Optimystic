@@ -1935,7 +1935,17 @@ export class OptimysticVirtualTable extends VirtualTable {
    * commit's durability report groups the tree's collection under.
    */
   private registerTree(tree: Tree<any, any>): void {
-    this.txnBridge.registerCollection(tree.getCollection(), `${this.schemaName}.${this.tableName}`);
+    this.txnBridge.registerCollection(tree.getCollection(), this.qualifiedName);
+  }
+
+  /** Stop the bridge naming this table in commit reports; on DROP and on a refused CREATE. */
+  forgetInCommitReports(): void {
+    this.txnBridge.forgetTable(this.qualifiedName);
+  }
+
+  /** The `schema.table` key a commit's durability report groups this table's collections under. */
+  private get qualifiedName(): string {
+    return `${this.schemaName}.${this.tableName}`;
   }
 
   /**
@@ -4302,6 +4312,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       // instance stayed cached. Nothing was registered with Quereus yet.
       this.tables.delete(tableKey);
       table.teardownChangeSubscription();
+      table.forgetInCommitReports();
       throw error;
     }
 
@@ -5061,6 +5072,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       // Release the collection-change → watch bridge before forgetting the table
       // so the storage listener doesn't leak past the table's lifetime.
       table.teardownChangeSubscription();
+      table.forgetInCommitReports();
       try {
         await this.underBatchCheckpoint(table, 'dropped', tableKey, () => table.deleteOwnSchema());
       } catch (error) {

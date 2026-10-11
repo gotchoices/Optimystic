@@ -571,6 +571,20 @@ export class TransactionBridge {
   }
 
   /**
+   * Stop naming `table` (`schema.table`) in commit reports — for a table that was dropped, or
+   * whose CREATE was refused. Its collections stay registered (a DROP has never unregistered
+   * them), so without this a later table declared over the same URI would report its writes
+   * under the dropped table's name as well as its own.
+   */
+  forgetTable(table: string): void {
+    for (const [id, tables] of this.collectionTables) {
+      if (tables.delete(table) && tables.size === 0) {
+        this.collectionTables.delete(id);
+      }
+    }
+  }
+
+  /**
    * Subscribe to the durability of every SQL commit that wrote something: after the commit
    * succeeds and the bridge has torn its transaction down, and before `commitTransaction`
    * returns, each listener is called once, synchronously, in registration order, with a frozen

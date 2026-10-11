@@ -136,6 +136,24 @@ describe('A SQL commit reports its durability', function () {
 		}
 	});
 
+	it('a table declared over a dropped table\'s URI reports under its own name only', async () => {
+		const { db, plugin } = createDb();
+		try {
+			await db.exec(`create table Before (id integer primary key, name text) using optimystic('tree://sqldur/reused')`);
+			await db.exec(`insert into Before (id, name) values (1, 'a')`);
+			await db.exec('drop table Before');
+			await db.exec(`create table After (id integer primary key, name text) using optimystic('tree://sqldur/reused')`);
+			const reports = collectReports(plugin);
+
+			await db.exec(`insert into After (id, name) values (2, 'b')`);
+
+			expect(reports).to.have.length(1);
+			expect([...reports[0]!.tables.keys()]).to.deep.equal(['main.After']);
+		} finally {
+			db.close();
+		}
+	});
+
 	it('a listener that throws neither fails the commit nor stops the next listener', async () => {
 		const { db, plugin } = createDb();
 		try {

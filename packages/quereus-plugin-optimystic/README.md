@@ -134,7 +134,7 @@ A commit can succeed while only this machine holds what it wrote. To tell the ap
 - `tables` — the same folded per table, keyed `schema.table`.
 
 ```typescript
-import { isFullyDurable } from '@optimystic/db-core';
+import { isFullyDurable } from '@optimystic/quereus-plugin-optimystic';
 
 const unsubscribe = plugin.onCommitDurability(({ transactionId, durability }) => {
   const saved = durability.overall !== undefined && isFullyDurable(durability.overall);
@@ -144,7 +144,7 @@ const unsubscribe = plugin.onCommitDurability(({ transactionId, durability }) =>
 
 An absent `overall` means a collection is saved but nobody could say who holds it; show that commit as pending.
 
-The listener is called synchronously before the commit returns. Quereus runs one writer at a time behind its exec lock, so every report delivered while `await db.exec(...)` is running belongs to that call, which is how a wrapper can hand the answer back from its own `exec`. A transaction that wrote nothing (a read, or a statement that matched no rows) calls no one. A failed commit is reported through its error instead: `CoordinatorPartialCommitError.durability` and `PartialCommitError.durability` describe the half that landed. A listener that throws is logged and the other listeners still run; the commit still succeeds. The returned function unsubscribes and is safe to call twice.
+The listener is called synchronously before the commit returns. Quereus runs one writer at a time behind its exec lock, so every report delivered while `await db.exec(...)` is running belongs to that call, which is how a wrapper can hand the answer back from its own `exec`. A transaction that wrote nothing (a read, or a statement that matched no rows) calls no one. A failed commit is reported through its error instead: `CoordinatorPartialCommitError.durability` and `PartialCommitError.durability` describe the half that landed. A listener that throws is logged and the other listeners still run; the commit still succeeds. The returned function unsubscribes and is safe to call twice. A dropped table stops being named in `tables`, so a table later declared over the same URI reports its writes under its own name only.
 
 ## Reactive Watching
 
@@ -429,6 +429,8 @@ failures by — `CoordinatorPartialCommitError` (a coordinated commit that lande
 not others), `SyncRetryExhaustedError`, and `TornActionError` — so a host needs no direct
 `@optimystic/db-core` import to catch them. See [docs/transactions.md](../../docs/transactions.md)
 for the partial-commit pair and [docs/internals.md](../../docs/internals.md) for the other two.
+They re-export `isFullyDurable` too, the predicate a
+[commit-durability listener](#a-commits-durability--pluginoncommitdurabilitylistener) tests with.
 
 When two writers race and the loser's commit is refused, the failure is a typed engine error, the
 same as its sequential counterpart. A concurrent duplicate key (or unique value) is the engine's own
