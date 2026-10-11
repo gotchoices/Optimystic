@@ -877,6 +877,7 @@ The line fires when a read of a block this node **holds** decides to consult the
 - `localRev` — the revision this node holds. Always present, because the line only fires for a held block.
 - `reason` — what asked for the consult: `window` (the lazy window's time test or sample, or `paranoid` mode) or `floor` (the read carried a floor above `localRev` that this node had not yet consulted under). Reported as `floor` whenever the floor asked, even when the window or `paranoid` mode would have consulted anyway.
 - `floor` — the asker's floor for the block, when the read carried one; absent otherwise. Present on every `reason: 'floor'` line, and on a `reason: 'window'` line whenever the read carried one that did not ask — either `localRev` already meets it, or this node consulted under it earlier in the window.
+- `background` — `true` when the read was answered from the held copy and the consult runs behind it (`startHeldBlockConsult` in `packages/db-p2p/src/repo/coordinator-repo.ts`): a `reason: 'window'` consult in `lazy` mode. `false` when the read waited for the consult: a `reason: 'floor'` consult, or any consult in `paranoid` mode. A read's latency can only be explained by a `background: false` line.
 
 | `mode` | `ageMs` | What it means |
 |---|---|---|
@@ -995,6 +996,14 @@ Logged under `coordinator-repo` when a consult weighs what the peer that sent th
 - `standsIn: true` — the statement answered for that peer and it was not asked. Its own log shows no inbound sync request for the block, and it is counted in `cluster-fetch:no-quorum`'s `holders` or `absent` exactly as if it had answered.
 - `standsIn: false` — the peer was asked as usual: its statement was ahead of this node's copy, named a different action at the same revision, or this node holds no copy.
 - No line at all, on a read from another cohort member — the read carried no statement for the block (a reader on an older build, or one whose local metadata for the block could not be read), or no consult ran for it.
+
+### `cluster-tx:read-repair-deferred` — a held block's consult did not start
+
+Logged under `coordinator-repo` when a read of a block this node holds found the window expired but the node already had `MAX_HELD_BLOCK_CONSULTS` (16; `packages/db-p2p/src/repo/coordinator-repo.ts`) held-block consults running behind earlier reads. The read was served from the local copy as usual; no consult started for it, and the block stays unstamped, so a later read of it starts one. Fields: `blockId`, and `inFlight`, the number of consults running at that moment. A burst of these during a table scan right after a restart is expected (one read per block, each wanting a consult, and the sync protocol allows a bounded number of streams per connection). Lines that show steadily under normal load mean the cap is too low for this node's read pattern; the `NOTE:` at the constant says what to do.
+
+### `cluster-fetch:stale-pass-ignored` — an older consult tried to retire a newer doubt
+
+Logged under `coordinator-repo` when a repair pass ended with "nothing ahead", or with a lower claim, for a block whose unsettled-claim memo was written by a pass that STARTED after it (`recordAheadClaim` in `packages/db-p2p/src/repo/coordinator-repo.ts`). The older pass's answers predate the claim, so the memo stands and reads of the block stay marked `unconfirmedAheadRev` until a consult that started after the claim retires it. Fields: `blockId`, `rev` (the standing claim), `passSeq` (the ignored pass) and `recordedBy` (the pass that wrote the memo). The ordinary producer is a held block's background consult (`background: true` on its `cluster-tx:read-repair-triggered` line) running a whole per-peer budget while a floored read's blocking consult for the same block starts and finishes inside it. Informational: the next consult that reaches the claimants settles the claim either way.
 
 ### `cluster-tx:complete` — is a commit retry still running?
 

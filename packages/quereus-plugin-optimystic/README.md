@@ -111,7 +111,7 @@ The `TransactionBridge` supports two modes:
 1. **Legacy mode** (default): Direct collection sync on commit
 2. **Transaction mode**: Uses `TransactionSession` for distributed consensus when configured with a coordinator and engine via `configureTransactionMode()`
 
-> **Read consistency note.** In the default `lazy` read-repair mode, a read served from a locally-cached block may return data up to one commit stale (bounded by `readRepairWindowMs`, default 10 s). Reads used as transaction read-dependencies are protected — validators catch stale data at commit time. Bare reads (outside a transaction) carry no such check. Use `readRepairMode: 'paranoid'` to force per-read verification. See [docs/transactions.md — Read Consistency and Staleness](../../docs/transactions.md#read-consistency-and-staleness) for the full discussion and configuration knobs.
+> **Read consistency note.** In the default `lazy` read-repair mode, a read served from a locally-cached block may return data up to one commit stale (bounded by `readRepairWindowMs`, default 10 s, plus the cohort consult the expiring read starts behind it — a read never waits on that consult). Reads used as transaction read-dependencies are protected — validators catch stale data at commit time. Bare reads (outside a transaction) carry no such check. Use `readRepairMode: 'paranoid'` to force per-read verification. See [docs/transactions.md — Read Consistency and Staleness](../../docs/transactions.md#read-consistency-and-staleness) for the full discussion and configuration knobs.
 
 ### StampId() Function
 

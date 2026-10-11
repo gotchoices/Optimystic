@@ -39,6 +39,20 @@ function isAdvanceOver(rev: number | undefined, baselineRev: number | undefined)
 }
 
 /**
+ * How many held-block consults may run behind reads at once
+ * ({@link CoordinatorRepo.startHeldBlockConsult}). A table scan after a restart reads every block
+ * once, and each consult opens one stream per cohort peer on the sync protocol, so unbounded, a cold
+ * scan would open one stream per block per peer at once. The sync protocol is registered under
+ * libp2p's defaults (`registerProtocolHandler`: 32 inbound streams per connection on the answering
+ * peer, 64 outbound here), so 16 leaves the answering peer half its inbound allowance for its other
+ * readers and for the archive fetches that acquisition runs over the same protocol.
+ *
+ * NOTE: a conservative bound, not a measured one. If `cluster-tx:read-repair-deferred` lines show
+ * steadily under normal load, raise it or queue the deferred blocks instead of dropping them.
+ */
+const MAX_HELD_BLOCK_CONSULTS = 16;
+
+/**
  * Reject if `promise` has not settled within `ms`. The timer is cleared on either outcome, so no
  * handle outlives the race (hence no `unref`, which does not exist off Node).
  */
@@ -172,6 +186,16 @@ interface AheadClaimState {
 	 * it — the pair is one fact. `deadlocksReported` keeps its own independent lifetime.
 	 */
 	claimants?: readonly string[];
+	/**
+	 * The sequence number ({@link CoordinatorRepo.nextPassSeq}) of the latest-STARTED pass that wrote
+	 * {@link rev} and {@link claimants}. Passes end out of order — a held block's background consult
+	 * can run a whole per-peer budget while a floored blocking consult for the same block starts after
+	 * it and finishes first — and a pass's answers are no newer than its start, so a pass that started
+	 * before the one that wrote the memo may not WEAKEN it: its "nothing ahead" predates the claim it
+	 * would retire ({@link CoordinatorRepo.recordAheadClaim}). Raising is never gated — a higher claim
+	 * errs toward flagging, the safe direction. Written and cleared with `rev`.
+	 */
+	writtenBy?: number;
 	/**
 	 * Which `cluster-fetch:repair-deadlock` reasons have already been said for this block (see
 	 * {@link CoordinatorRepo.reportRepairDeadlock}). Neither reason is about any one revision — one is
@@ -614,6 +638,25 @@ export class CoordinatorRepo implements IRepo {
 	now: () => number = () => Date.now();
 	/** Test seam: overridable RNG (0..1) for sample-rate gating. */
 	rand: () => number = () => Math.random();
+	/**
+	 * Test seam: when true, a held block's window-demanded consult takes the blocking path, so a spec
+	 * about what a consult CONCLUDES (the doubt memo, arming, flags, repair outcomes, callback counts)
+	 * can read once and assert. Never set in production wiring, and not in a spec about read latency.
+	 */
+	awaitWindowConsults = false;
+	/**
+	 * Per block, the consult running behind a read that was served from the local copy (see
+	 * {@link startHeldBlockConsult}): at most one per block, at most {@link MAX_HELD_BLOCK_CONSULTS} in
+	 * all. An entry removes itself when its pass ends, and the pass never rejects.
+	 *
+	 * NOTE: `CoordinatorRepo` has no stop. A pass in flight when the node stops runs until its
+	 * deadlines expire (per peer `cohortQueryTimeoutMs`; acquisition `reconcilePassTimeoutMs`), fails
+	 * against the closed node and is logged `cluster-fetch:error`. If that ever delays process exit or
+	 * test teardown measurably, give this class a stop that aborts the in-flight passes.
+	 */
+	private readonly heldBlockConsults = new Map<BlockId, Promise<void>>();
+	/** Last sequence number handed out by {@link nextPassSeq}. */
+	private passSeq = 0;
 
 	constructor(
 		readonly keyNetwork: IKeyNetwork,
@@ -858,6 +901,15 @@ export class CoordinatorRepo implements IRepo {
 	 * `blockId` (freshness stamp, unsettled-claim memo), and acquisition latches the one block, which is
 	 * what lets `get` run one of these per block concurrently.
 	 *
+	 * A held block whose consult only the WINDOW asked for does not wait on it in `'lazy'` mode: the
+	 * read is answered from the local copy at once and the consult runs behind it
+	 * ({@link startHeldBlockConsult}), so a cohort peer that is connected but not answering, or whose
+	 * dial hangs, costs the read nothing (GitHub #25, #34). Three consults still block: a MISSING
+	 * block, whose absence verdict depends on what the cohort says; a held block whose read carries a
+	 * FLOOR above it ({@link floorDemandsConsult}), because the asker has proof the local copy is too
+	 * old and the consult is what lets this node answer at the floor's revision; and every consult
+	 * under `'paranoid'`, which is documented as verifying on every read.
+	 *
 	 * A consult that throws is caught here and flags only this block, so one block's failed consult
 	 * cannot fail the rest of the read.
 	 */
@@ -886,6 +938,9 @@ export class CoordinatorRepo implements IRepo {
 			return;
 		}
 
+		// `shouldReadRepair` says true on every read under `'paranoid'`, so the mode is tested here
+		// rather than inferred from `windowDemands`.
+		const background = isStale && !floorDemands && this.readRepairMode === 'lazy' && !this.awaitWindowConsults;
 		if (isStale) {
 			// `reason` is 'floor' whenever the floor demanded the consult, even when the window
 			// would have consulted anyway: an operator reading `ageMs` at or below the window needs
@@ -896,12 +951,23 @@ export class CoordinatorRepo implements IRepo {
 				ageMs: this.ageMs(blockId),
 				localRev,
 				reason: floorDemands ? 'floor' : 'window',
+				background,
 				...(floor === undefined ? {} : { floor })
 			});
 		}
 
+		const asker = askerStatementFor(blockGets, blockId, options?.asker, localEntry?.state?.latest);
+		if (background) {
+			this.startHeldBlockConsult(blockId, blockGets.context, localRev, asker);
+			// Served from the local copy, stamped from the unsettled-claim memo as it stands: what moves
+			// off the read is the consult's EFFORT, not its honesty — the same split the window already
+			// makes for the reads inside it.
+			this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
+			return;
+		}
+
+		const passSeq = this.nextPassSeq();
 		try {
-			const asker = askerStatementFor(blockGets, blockId, options?.asker, localEntry?.state?.latest);
 			const { absence, currency } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev, floor, asker);
 			// `lineageOf` rides along: the refreshed entry REPLACES the local one below, and an
 			// entry that lost its lineage answer would read to the asker as "could not say".
@@ -913,13 +979,7 @@ export class CoordinatorRepo implements IRepo {
 			if (refreshed[blockId]) {
 				results[blockId] = refreshed[blockId];
 			}
-			if (isStale) {
-				if (typeof newRev === 'number' && typeof localRev === 'number' && newRev > localRev) {
-					this.log('cluster-tx:read-repair-applied', { blockId, oldRev: localRev, newRev });
-				} else {
-					this.log('cluster-tx:read-repair-noop', { blockId });
-				}
-			}
+			if (isStale) this.logRepairOutcome(blockId, localRev, newRev);
 			// A still-missing block the consult could not rule out must not pose as an
 			// authoritative absent; the reason names what the consult established.
 			const unavailable = isMissing ? await this.absenceFlagFor(absence, floor) : undefined;
@@ -937,11 +997,11 @@ export class CoordinatorRepo implements IRepo {
 			// claim already reads as either authoritative (cohort answered, nothing
 			// corroborated) or flagged.
 			if (!isMissing) {
-				this.recordAheadClaim(blockId, currency);
+				this.recordAheadClaim(blockId, currency, passSeq);
 				this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
 			}
 		} catch (err) {
-			this.log('cluster-fetch:error', { blockId, error: (err as Error).message });
+			this.log('cluster-fetch:error', { blockId, background: false, error: (err as Error).message });
 			// The consult that was supposed to make this answer trustworthy did not run.
 			// NOTE: a consult that THROWS (e.g. `findCluster` itself rejected) is reported
 			// 'peers-unreachable' even on an isolated node: a failed cohort lookup is a
@@ -1056,8 +1116,16 @@ export class CoordinatorRepo implements IRepo {
 	 * difference instead, so a new exit cannot mean the wrong one by omission — and `nothing-ahead`
 	 * now carries the evidence rather than a pre-baked refutation for the same reason, so a caller
 	 * cannot assert a refutation it did not observe.
+	 *
+	 * Evidence also has an AGE. `passSeq` is the sequence number the pass took when it started
+	 * ({@link nextPassSeq}), and a pass may not weaken a memo written by a pass that started after
+	 * it: its answers predate the ones the memo rests on, so they are no refutation of it (see
+	 * {@link AheadClaimState.writtenBy}). Two concurrent `get`s could always race this way; a
+	 * background consult that runs a whole per-peer budget beside a floored blocking one makes it
+	 * likely. Only the stamps are ungated: an older pass stamping "checked" after a newer one is
+	 * harmless, and its clearing a newer pass's recorded floor costs at most one extra floored consult.
 	 */
-	private recordAheadClaim(blockId: BlockId, currency: CurrencyVerdict): void {
+	private recordAheadClaim(blockId: BlockId, currency: CurrencyVerdict, passSeq: number): void {
 		if (currency.kind === 'no-evidence') return;
 		const prior = this.unsettledAheadClaims.get(blockId);
 		const priorRev = prior?.rev;
@@ -1071,6 +1139,10 @@ export class CoordinatorRepo implements IRepo {
 		const weakensPrior = priorRev !== undefined
 			&& (currency.kind === 'nothing-ahead' || currency.rev < priorRev);
 		if (weakensPrior) {
+			if (prior?.writtenBy !== undefined && prior.writtenBy > passSeq) {
+				this.log('cluster-fetch:stale-pass-ignored', { blockId, rev: priorRev, passSeq, recordedBy: prior.writtenBy });
+				return;	// the memo stands: this pass's answers are older than the claim it would weaken
+			}
 			const silentClaimants = (prior?.claimants ?? []).filter(id => currency.silent.includes(id));
 			if (silentClaimants.length > 0) {
 				// The operator's only signal that a block's doubt CANNOT settle from this node's
@@ -1116,6 +1188,9 @@ export class CoordinatorRepo implements IRepo {
 		this.unsettledAheadClaims.set(blockId, {
 			rev: currency.rev,
 			claimants,
+			// The newest pass whose evidence this memo now rests on — an older pass that joined a
+			// same-revision claim does not make the memo older.
+			writtenBy: Math.max(prior?.writtenBy ?? 0, passSeq),
 			...(prior?.deadlocksReported ? { deadlocksReported: prior.deadlocksReported } : {})
 		});
 	}
@@ -1286,6 +1361,79 @@ export class CoordinatorRepo implements IRepo {
 	 */
 	setLastSeenForTest(blockId: BlockId, ts: number): void {
 		this.lastSeenCommitMs.set(blockId, { at: ts });
+	}
+
+	/**
+	 * Test seam: resolve once no held-block consult is in flight ({@link heldBlockConsults}). Loops,
+	 * because a pass that ends without arming the window (a transient decline) leaves the block open
+	 * to a read made meanwhile starting the next one.
+	 */
+	async settleHeldBlockConsults(): Promise<void> {
+		while (this.heldBlockConsults.size > 0) {
+			await Promise.all([...this.heldBlockConsults.values()]);
+		}
+	}
+
+	/**
+	 * The sequence number for a repair pass that is starting now. Every pass takes one before its
+	 * consult goes out, blocking or background, and hands it to {@link recordAheadClaim}, which uses
+	 * it to refuse an older pass's weakening of a memo a newer pass wrote.
+	 */
+	private nextPassSeq(): number {
+		return ++this.passSeq;
+	}
+
+	/**
+	 * Run the consult for a held block behind the read that asked for it, so the read is answered from
+	 * the local copy without waiting on a cohort peer that is connected but silent, or whose dial
+	 * hangs. What the pass learns — a repair (promotion or acquisition), the window's stamp, the
+	 * unsettled-claim memo behind `unconfirmedAheadRev`, the `cohort-too-small` arming, a deadlock
+	 * report — applies to the reads after it; a repair that lands content also emits the collection's
+	 * change event (`StorageRepo.saveReplicatedBlock`, `emitPromotions`), which wakes a watcher.
+	 *
+	 * At most one pass per block: the block stays unstamped until the pass ends, so every read of it
+	 * meanwhile lands here, is served, and starts nothing. At most {@link MAX_HELD_BLOCK_CONSULTS}
+	 * passes in all: past that the read is served, nothing starts, and the block stays unstamped so a
+	 * later read starts it.
+	 *
+	 * `asker` is captured from the triggering read, and `localRev` is what that read served, which is
+	 * the baseline the pass measures its outcome against.
+	 */
+	private startHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, localRev: number | undefined, asker: AskerStatement | undefined): void {
+		if (this.heldBlockConsults.has(blockId)) return;
+		if (this.heldBlockConsults.size >= MAX_HELD_BLOCK_CONSULTS) {
+			this.log('cluster-tx:read-repair-deferred', { blockId, inFlight: this.heldBlockConsults.size });
+			return;
+		}
+		const passSeq = this.nextPassSeq();
+		const pass = this.runHeldBlockConsult(blockId, context, localRev, asker, passSeq)
+			.finally(() => this.heldBlockConsults.delete(blockId));
+		this.heldBlockConsults.set(blockId, pass);
+	}
+
+	/**
+	 * The background pass itself: the same consult, memo update and outcome line as the blocking path
+	 * in {@link readRepairBlock}, minus the floor (the window asked for this consult, not the asker)
+	 * and minus the absence verdict (the block is held). Never rejects: an error is logged and the memo
+	 * stands, since a thrown consult refutes nothing — as on the blocking path.
+	 */
+	private async runHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, localRev: number | undefined, asker: AskerStatement | undefined, passSeq: number): Promise<void> {
+		try {
+			const { currency } = await this.fetchBlockFromCluster(blockId, context, localRev, undefined, asker);
+			this.recordAheadClaim(blockId, currency, passSeq);
+			this.logRepairOutcome(blockId, localRev, await this.readLocalRev(blockId));
+		} catch (err) {
+			this.log('cluster-fetch:error', { blockId, background: true, error: (err as Error).message });
+		}
+	}
+
+	/** Report what a held block's consult did to the local copy: `applied` when it advanced, else `noop`. */
+	private logRepairOutcome(blockId: BlockId, oldRev: number | undefined, newRev: number | undefined): void {
+		if (typeof newRev === 'number' && typeof oldRev === 'number' && newRev > oldRev) {
+			this.log('cluster-tx:read-repair-applied', { blockId, oldRev, newRev });
+		} else {
+			this.log('cluster-tx:read-repair-noop', { blockId });
+		}
 	}
 
 	/**

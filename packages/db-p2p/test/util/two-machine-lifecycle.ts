@@ -15,7 +15,7 @@ import { expect } from 'chai';
 import type { PrivateKey } from '@libp2p/interface';
 import type { BlockId, WriteDurability } from '@optimystic/db-core';
 import { NetworkTransactor, Tree, mergeDurability, routingKeyForBlock } from '@optimystic/db-core';
-import { waitFor } from '@optimystic/db-core/test';
+import { delay, waitFor } from '@optimystic/db-core/test';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { createLibp2pNode, type NodeOptions } from '../../src/libp2p-node.js';
 import type { OptimysticNode } from '../../src/optimystic-node.js';
@@ -144,12 +144,37 @@ export async function readRows(machine: Machine, treeId: string, keys: number[])
 	return seen;
 }
 
+/** The rows of `expected` that `seen` does not hold at the expected value, as the assertion reports them. */
+const unreadRows = (expected: Row[], seen: Map<number, Row | undefined>): { key: number, expected: string, read: string | null }[] =>
+	expected.filter(row => seen.get(row.key)?.value !== row.value)
+		.map(row => ({ key: row.key, expected: row.value, read: seen.get(row.key)?.value ?? null }));
+
+/** Every row reads back NOW — the call for rows that must already be on the machine, such as a read with
+ *  the partner stopped. */
 export async function expectReadable(machine: Machine, treeId: string, rows: Iterable<Row>, label: string): Promise<void> {
 	const expected = [...rows];
 	const seen = await readRows(machine, treeId, expected.map(keyOf));
-	const wrong = expected.filter(row => seen.get(row.key)?.value !== row.value);
-	expect(wrong.map(row => ({ key: row.key, expected: row.value, read: seen.get(row.key)?.value ?? null })),
-		`${label}: rows ${machine.name} could not read back`).to.deep.equal([]);
+	expect(unreadRows(expected, seen), `${label}: rows ${machine.name} could not read back`).to.deep.equal([]);
+}
+
+/**
+ * Every row reads back within `timeoutMs` — the call for the read a machine makes right after returning
+ * to its partner. The first read of each block it holds is answered from the copy it held before, while
+ * the cohort consult runs behind the read, so a row its partner wrote while it was away lands on the
+ * read after that consult, or when the partner's push arrives, whichever is first
+ * (docs/transactions.md § Lazy read-repair window). Polled by hand rather than through `waitFor` so the
+ * assertion can name the rows still unread when the deadline passes.
+ */
+export async function expectReadableEventually(machine: Machine, treeId: string, rows: Iterable<Row>, label: string, timeoutMs = 30_000): Promise<void> {
+	const expected = [...rows];
+	const keys = expected.map(keyOf);
+	const deadline = Date.now() + timeoutMs;
+	let unread = unreadRows(expected, await readRows(machine, treeId, keys));
+	while (unread.length > 0 && Date.now() < deadline) {
+		await delay(250);
+		unread = unreadRows(expected, await readRows(machine, treeId, keys));
+	}
+	expect(unread, `${label}: rows ${machine.name} could not read back within ${timeoutMs} ms`).to.deep.equal([]);
 }
 
 /** What became of a write attempted while the writer's partner was away. */

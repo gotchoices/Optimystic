@@ -182,6 +182,22 @@ export interface ClusterPolicyOptions {
 		 * falling through.
 		 */
 		slotHoldWindowMs?: number;
+		/**
+		 * How a block this node HOLDS is re-verified against its cohort on a read (default `'lazy'`):
+		 * `'lazy'` serves the held copy at once and consults the cohort behind the read once per
+		 * {@link readRepairWindowMs}; `'paranoid'` consults on every read and the read waits for the
+		 * consult; `'off'` never consults for a held block. A block this node does not hold consults on
+		 * every read in all three. See {@link ClusterConsensusConfig.readRepairMode} and
+		 * docs/transactions.md § Lazy read-repair window.
+		 */
+		readRepairMode?: ClusterConsensusConfig['readRepairMode'];
+		/**
+		 * How long, in milliseconds, a held block is served without a cohort consult after one
+		 * settled it (default 10 000; `'lazy'` mode only). Undefined leaves the coordinator's default
+		 * in force. A value that is not a finite number above zero, or is above the largest `setTimeout`
+		 * delay, throws at node construction — see {@link resolveReadRepairWindowMs}.
+		 */
+		readRepairWindowMs?: number;
 	};
 }
 
@@ -377,6 +393,34 @@ export function resolveSlotHoldWindowMs(declared: number | undefined): number {
 	if (declared === undefined) return DEFAULT_SLOT_HOLD_WINDOW_MS;
 	if (!Number.isFinite(declared) || declared < 0) {
 		throw new Error(`clusterPolicy.slotHoldWindowMs must be a finite number of milliseconds at or above 0 (0 disables); got ${String(declared)}`);
+	}
+	return declared;
+}
+
+/**
+ * The largest window `clusterPolicy.readRepairWindowMs` accepts: the largest delay `setTimeout`
+ * takes. The window is compared against a clock reading rather than handed to a timer, so nothing
+ * overflows above it; the ceiling catches the unit mix-up a timer would have caught, since a window
+ * of weeks in `'lazy'` mode silently stops re-verifying every held block.
+ */
+export const MAX_READ_REPAIR_WINDOW_MS = 2 ** 31 - 1;
+
+/**
+ * The lazy read-repair window, in milliseconds: the declared `clusterPolicy.readRepairWindowMs`, or
+ * `undefined` when none was declared, which leaves `CoordinatorRepo`'s own default (10 000) in force.
+ *
+ * A declared value that is not a finite number above zero, or is above
+ * {@link MAX_READ_REPAIR_WINDOW_MS}, THROWS rather than falling through, for the reason
+ * {@link resolveCohortQueryTimeoutMs} gives: there is no safe direction to fall toward. Falling
+ * through would keep the 10 s default on the deployment that typed the field precisely in order to
+ * change it. A positive finite fractional value is accepted; this is a duration, not a count.
+ */
+export function resolveReadRepairWindowMs(declared: number | undefined): number | undefined {
+	if (declared === undefined) return undefined;
+	if (!Number.isFinite(declared) || declared <= 0 || declared > MAX_READ_REPAIR_WINDOW_MS) {
+		throw new Error(
+			`clusterPolicy.readRepairWindowMs must be a finite number of milliseconds above 0 and no greater than ${MAX_READ_REPAIR_WINDOW_MS}; got ${String(declared)}`
+		);
 	}
 	return declared;
 }
@@ -620,6 +664,11 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 		reconcilePassTimeoutMs: reconcilePassTimeoutMs(cohortQueryTimeoutMs),
 		// The member re-applies the same resolver to whatever config it is handed, so a hand-wired
 		// member and a node agree on the window as they do on the cohort deadline.
-		slotHoldWindowMs: resolveSlotHoldWindowMs(options.clusterPolicy?.slotHoldWindowMs)
+		slotHoldWindowMs: resolveSlotHoldWindowMs(options.clusterPolicy?.slotHoldWindowMs),
+		// Read-repair knobs, passed through to `CoordinatorRepo` (which defaults an absent mode to
+		// `'lazy'` and an absent window to 10 000). The mode is a closed union and needs no validation;
+		// the window throws on a degenerate declaration, as the cohort deadline does.
+		readRepairMode: options.clusterPolicy?.readRepairMode,
+		readRepairWindowMs: resolveReadRepairWindowMs(options.clusterPolicy?.readRepairWindowMs)
 	};
 }

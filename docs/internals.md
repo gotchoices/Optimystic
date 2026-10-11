@@ -57,7 +57,8 @@ proximity ranking, whenever the node is one of the block's responsible peers and
 self-coordination guard allows it (`selfReadVerdict` in
 `packages/db-p2p/src/libp2p-key-network.ts`). So on a machine in the block's cohort an idle
 poll costs no network request inside the lazy read-repair window, plus one cohort consult per
-block per window. That adds no staleness: a remote coordinator answers from its own copy
+block per window — which runs behind the read that starts it, not on it, so the poll's latency
+is a local read whatever the cohort is doing. That adds no staleness: a remote coordinator answers from its own copy
 under the same window, so answering locally changes which cohort member answers, not what the
 answer guarantees — the bound is the one stated in
 [transactions.md § Lazy read-repair window](transactions.md#lazy-read-repair-window). Floors,

@@ -136,6 +136,9 @@ describe('CoordinatorRepo solo-cohort read-repair window', () => {
 			undefined,
 			clusterLatestCallback
 		);
+		// The specs count triggers and consults per window for a HELD block; in production the window's
+		// consult runs behind the read, so it waits here.
+		repo.awaitWindowConsults = true;
 		// Deterministic clock. The block is never marked seen up front — this node has not
 		// committed it, which is exactly the field case (control-network blocks this node reads
 		// but never writes).

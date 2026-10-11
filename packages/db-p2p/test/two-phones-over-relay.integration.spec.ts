@@ -8,7 +8,7 @@ import type { OptimysticNode } from '../src/optimystic-node.js';
 import { spawnRestartablePlainRelay, waitForCircuitListen, type RestartablePlainRelay } from './util/relay-topology.js';
 import { waitForPeerStoreProtocols } from './util/peer-store-wait.js';
 import {
-	attemptWrite, committedBlocks, createMachine, describeWriteAttempt, expectReadable, rowsFor, running,
+	attemptWrite, committedBlocks, createMachine, describeWriteAttempt, expectReadable, expectReadableEventually, rowsFor, running,
 	sequentialPhases, startMachine, stopMachine, waitForPair, waitUntilHeldLocally, writeRows,
 	type Machine, type Row
 } from './util/two-machine-lifecycle.js';
@@ -225,7 +225,11 @@ describe('Two phones over a relay (transact → replicate → one drops → both
 		expectOnlyRelayed(a, b, 'after B returned');
 
 		await expectReadable(a, TREE_ID, acknowledged.values(), 'A after B returned');
-		await expectReadable(b, TREE_ID, acknowledged.values(), 'B after its restart');
+		// B's first read of each block it holds is answered from its pre-restart copy while the cohort consult
+		// runs behind the read, so the row A wrote while B was away arrives one read later — or with A's push,
+		// whichever is first. The direct-TCP spec waits for that push before reading; this phase deliberately
+		// does not (B returned knowing only the relay), so it waits on the read-back instead.
+		await expectReadableEventually(b, TREE_ID, acknowledged.values(), 'B after its restart');
 
 		// Observed, not asserted, for the same reason as the direct-TCP spec's "one away" phase: whether a lone
 		// survivor of a two-machine group should accept writes is under design

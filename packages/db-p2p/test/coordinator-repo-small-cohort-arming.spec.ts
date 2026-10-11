@@ -152,6 +152,9 @@ describe('CoordinatorRepo small-cohort arming rule', () => {
 			undefined,
 			clusterLatestCallback
 		);
+		// Every spec here asserts what a held block's consult concluded (arming, consult counts, the
+		// doubt memo); in production that consult runs behind the read, so it waits here.
+		repo.awaitWindowConsults = true;
 		let clock = BASE_TIME;
 		repo.now = () => clock;
 		return { repo, callbackInvocations, partnerPeers, setClock: (t: number) => { clock = t; } };
