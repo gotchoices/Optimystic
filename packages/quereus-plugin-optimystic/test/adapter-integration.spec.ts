@@ -410,7 +410,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			const { plugin } = createTestEnv();
 			const bridge = plugin.txnBridge;
 
-			const base = { sync: async () => {}, snapshot: () => ({}), restore: () => {} };
+			const base = { sync: async () => undefined, snapshot: () => ({}), restore: () => {} };
 			const invented = { ...base, describe: () => 'double/invented', committedRevision: () => undefined };
 			const numbered = { ...base, describe: () => 'double/numbered', committedRevision: () => 7 };
 			const unaskable = { ...base, describe: () => 'double/unaskable' };
@@ -448,7 +448,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			const { plugin } = createTestEnv();
 			const bridge = plugin.txnBridge;
 
-			const base = { sync: async () => {}, snapshot: () => ({}), restore: () => {} };
+			const base = { sync: async () => undefined, snapshot: () => ({}), restore: () => {} };
 			// Revision present, no action recorded at it: the shape a real Collection produces
 			// when the log gave its current revision slot to a checkpoint or invalidation entry.
 			const aged = {
@@ -496,7 +496,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			const { plugin } = createTestEnv();
 			const bridge = plugin.txnBridge;
 
-			const base = { sync: async () => {}, snapshot: () => ({}), restore: () => {} };
+			const base = { sync: async () => undefined, snapshot: () => ({}), restore: () => {} };
 			// A realistic session-mode action id (colon-bearing) under a colon-bearing id.
 			const stamped = {
 				...base, describe: () => 'tree://double/stamped',
@@ -543,7 +543,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			const bridge = plugin.txnBridge;
 
 			await bridge.beginTransaction(defaultOptions);
-			bridge.markDirty({ sync: async () => {}, snapshot: () => ({}), restore: () => {}, describe: () => 'double/tagged' });
+			bridge.markDirty({ sync: async () => undefined, snapshot: () => ({}), restore: () => {}, describe: () => 'double/tagged' });
 
 			const lines = await captureTrace(async () => {
 				await bridge.commitTransaction();

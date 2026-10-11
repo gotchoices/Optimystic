@@ -9,6 +9,7 @@ import type { Database, SqlValue, FunctionFlags } from '@quereus/quereus';
 import { TEXT_TYPE } from '@quereus/quereus';
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
+import type { SqlCommitDurabilityListener } from './optimystic-adapter/commit-durability.js';
 import { OptimysticModule } from './optimystic-module.js';
 import { createStampIdFunction } from './functions/transaction-id.js';
 import { createLogger } from './logger.js';
@@ -22,6 +23,7 @@ const log = createLogger('plugin');
 // tsup.config.ts, so this package never bundles its own copy of them.
 export { PartialCommitError, ConcurrentModificationError } from './optimystic-adapter/txn-bridge.js';
 export { CoordinatorPartialCommitError, SyncRetryExhaustedError, TornActionError } from '@optimystic/db-core';
+export type { SqlCommitDurability, SqlCommitDurabilityListener } from './optimystic-adapter/commit-durability.js';
 
 /**
  * Plugin registration function
@@ -96,6 +98,18 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		 */
 		verifyIndexes: (db: Database, table: string, schema?: string) =>
 			optimysticModule.verifyIndexes(db, table, schema),
+		/**
+		 * Be told, after every SQL commit that wrote something, who holds what it wrote: per
+		 * collection, per table (`schema.table`) and overall, with the transaction's `StampId()`.
+		 * The commit is "saved" when `overall !== undefined && isFullyDurable(overall)`; anything
+		 * else is pending. Called synchronously before the commit returns, so every report a
+		 * listener receives while a host's `await db.exec(...)` is running belongs to that exec
+		 * (Quereus runs one writer at a time). A commit that wrote nothing calls nobody; a failed
+		 * commit reports through its error's `durability` instead. Returns an idempotent
+		 * unsubscribe. See `TransactionBridge.onCommitDurability`.
+		 */
+		onCommitDurability: (listener: SqlCommitDurabilityListener) =>
+			txnBridge.onCommitDurability(listener),
 		/**
 		 * Release what the plugin holds outside the `Database` — today its LEASES on the
 		 * raw-storage read caches behind `local` transactors over host-supplied storage (see

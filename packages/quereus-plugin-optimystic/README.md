@@ -125,6 +125,27 @@ COMMIT;
 
 Format: 16 bytes SHA-256(peer ID) + 16 random bytes, base64url encoded. Stable within a transaction, unique across transactions and peers.
 
+### A commit's durability — `plugin.onCommitDurability(listener)`
+
+A commit can succeed while only this machine holds what it wrote. To tell the application which, register a listener on the object `register` returns. After every commit that wrote something, it is called once with an `SqlCommitDurability`:
+
+- `transactionId` — what `StampId()` returned inside the transaction, so a host that tagged rows with it can find them.
+- `durability` — who holds each collection the commit wrote (a table's main tree and each of its index trees), and `overall`, the weakest of them.
+- `tables` — the same folded per table, keyed `schema.table`.
+
+```typescript
+import { isFullyDurable } from '@optimystic/db-core';
+
+const unsubscribe = plugin.onCommitDurability(({ transactionId, durability }) => {
+  const saved = durability.overall !== undefined && isFullyDurable(durability.overall);
+  markMessage(transactionId, saved ? 'delivered' : 'pending');
+});
+```
+
+An absent `overall` means a collection is saved but nobody could say who holds it; show that commit as pending.
+
+The listener is called synchronously before the commit returns. Quereus runs one writer at a time behind its exec lock, so every report delivered while `await db.exec(...)` is running belongs to that call, which is how a wrapper can hand the answer back from its own `exec`. A transaction that wrote nothing (a read, or a statement that matched no rows) calls no one. A failed commit is reported through its error instead: `CoordinatorPartialCommitError.durability` and `PartialCommitError.durability` describe the half that landed. A listener that throws is logged and the other listeners still run; the commit still succeeds. The returned function unsubscribes and is safe to call twice.
+
 ## Reactive Watching
 
 Tables backed by Optimystic drive Quereus's reactive watch API. When a commit
@@ -400,6 +421,8 @@ object, so `instanceof` matches whichever one you import from:
 ```typescript
 import { PartialCommitError } from '@optimystic/quereus-plugin-optimystic/plugin';
 ```
+
+Its `durability` says who holds the trees it persisted, in the same shape a successful commit's report and `CoordinatorPartialCommitError.durability` use (see [A commit's durability](#a-commits-durability--pluginoncommitdurabilitylistener)).
 
 Both entries also re-export the `@optimystic/db-core` errors a caller classifies commit and write
 failures by — `CoordinatorPartialCommitError` (a coordinated commit that landed on some trees but
