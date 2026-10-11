@@ -53,6 +53,8 @@ export function createNetworkMembershipGate(
 	log: NetworkMembershipLog
 ): NetworkMembershipGate | undefined {
 	if (predicate === undefined) return undefined;
+	// NOTE: a faulty predicate logs once per classification — several times per peer per lookup —
+	// unthrottled. Debug-namespace only; if it floods an operator's log, log once per peer per fault kind.
 	return (peerId: string): boolean => {
 		if (peerId === selfPeerId) return true;
 		let verdict: unknown;

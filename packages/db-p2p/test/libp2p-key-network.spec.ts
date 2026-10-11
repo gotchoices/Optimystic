@@ -1314,6 +1314,13 @@ describe('Libp2pKeyPeerNetwork', () => {
 			admitted = false;
 			world.answer = 'foreign';
 			expect(await network.awaitingBootstrapContact(), 'refused identify: not on this network, so heard from').to.equal(false);
+
+			// The remembered verdict is never refreshed for a refused peer, so it must not outrank identify's list.
+			const restored = await joiner({ restoredAsServing: true, isNetworkMember: () => false });
+			expect(await restored.network.awaitingBootstrapContact(), 'restored as serving, refused, not yet identified').to.equal(true);
+			restored.world.answer = 'identified';
+			restored.world.protocols = ['/other-network/cluster/1.0.0'];
+			expect(await restored.network.awaitingBootstrapContact(), 'identified as not serving: heard from').to.equal(false);
 		});
 	});
 

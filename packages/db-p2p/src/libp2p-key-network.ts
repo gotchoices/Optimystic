@@ -1109,7 +1109,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				// FRET's own ring membership has already applied a stricter cut upstream —
 				// `assembleCohort` returns confirmed live ring members only — so a
 				// configured-but-never-reached bootstrap peer is absent from the band entirely,
-				// and only the dial-in-flight signal below can keep the window for it.
+				// and only the dial-in-flight signal below can keep the window for it. The membership
+				// PREDICATE is applied (inside `isSelectable`): its refusal is a settled answer, not a
+				// classification still pending, so a refused peer is nothing to wait for.
 				const knowable = band.filter(id => this.isSelectable(id, excludedSet));
 				if (!this.retryCouldImprove(knowable)) {
 					this.log('findCoordinator:retry-futile key=%s neighbors=%d dialsInFlight=%d mode=%s hwm=%d',
@@ -1564,8 +1566,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * of this network shows a partial list that reads as foreign.
 	 *
 	 * One exception, when the membership predicate is configured: a peer whose settled answer says
-	 * it serves this network — identify's protocol list (`protocols`, read only for this case), or
-	 * the remembered verdict — but which the predicate refuses is NOT yet heard from. A joining
+	 * it serves this network — identify's protocol list (`protocols`, read only for this case) when
+	 * identify answered, else the remembered verdict — but which the predicate refuses is NOT yet
+	 * heard from. A joining
 	 * node whose predicate has not yet learned its inviter would otherwise see a self-only cohort,
 	 * rule the shared catalog absent and found a second one (GitHub issue #27's failure through a
 	 * new door). A refused peer that does not serve this network — a relay, or one that refused
@@ -1577,13 +1580,22 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * lacks, since every such absence is flagged `'cohort-unreachable'`. The remedy is to take that
 	 * peer out of the bootstrap configuration, or admit it; ruling absence on a view the predicate
 	 * emptied is the failure this rule exists to prevent.
+	 *
+	 * NOTE: the list read here is the peerStore's, which a refused bootstrap peer can also fill by
+	 * opening a stream on this network's `cluster` protocol, holding this node in the state above
+	 * for as long as it does so. Only configured bootstrap peers are read, so that takes a hostile
+	 * peer the operator chose to join through; if one is ever seen doing it, judge on identify's
+	 * own list (captured in `identifyOnConnectionOpen`) rather than the peerStore's.
 	 */
 	private heardFromBootstrapPeer(idStr: string, protocols: readonly string[] | undefined): boolean {
 		const answer = this.bootstrap?.contact.answerOf(idStr)
+		if (answer === 'foreign') return true
 		if (answer === undefined && !this.rememberedServing.has(idStr)) return false
-		if (answer === 'foreign' || !this.refusedMembership(idStr)) return true
-		if (this.rememberedServing.has(idStr)) return false
-		return protocols !== undefined && !this.servesThisNetwork(protocols)
+		if (!this.refusedMembership(idStr)) return true
+		// Refused. Identify's list, when there is one, outranks the remembered verdict: `membershipOf`
+		// never refreshes that memory for a refused peer, so it may describe what the peer used to be.
+		if (answer === 'identified') return protocols !== undefined && !this.servesThisNetwork(protocols)
+		return false
 	}
 
 	private async unheardBootstrapPeers(): Promise<string[]> {
