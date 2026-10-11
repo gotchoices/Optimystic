@@ -4,7 +4,7 @@ import { routingKeyForBlock } from '@optimystic/db-core';
 import type { PartitionDetector } from '../cluster/partition-detector.js';
 import type { PushBlockOutcome } from '../cluster/block-transfer-service.js';
 import { buildBlockTransferProtocol } from '../cluster/block-transfer-service.js';
-import type { IUnderReplicationLedger, UnderReplicatedEntry } from './i-under-replication-ledger.js';
+import type { IUnderReplicationLedger, SatisfyOutcome, UnderReplicatedEntry } from './i-under-replication-ledger.js';
 import { admittedBy, type NetworkMembershipGate } from '../network-membership-gate.js';
 import { createLogger } from '../logger.js';
 import { unrefTimer } from '../unref-timer.js';
@@ -416,12 +416,19 @@ export class UnderReplicationDrain implements Startable {
 		}
 
 		if (outcome.confirmed.length > 0) {
-			const cleared = await this.recordConfirmed(entry, owed, outcome.confirmed, heldRev);
-			if (cleared) {
+			const status = await this.recordConfirmed(entry, owed, outcome.confirmed, heldRev);
+			if (status === 'cleared') {
 				counts.cleared++;
 				this.forgetBlock(entry.blockId);
 				// After the deletion, never before: a listener that re-reads the ledger sees it gone.
 				this.deps.emit({ blockIds: [entry.blockId], rev: entry.rev, actionId: entry.actionId, collectionId: outcome.collectionId });
+				return;
+			}
+			if (status === 'absent') {
+				// Removed while the copy was in flight — by a `full` commit, whose coordinator fired the
+				// event when it removed the entry (firing here too would announce the block twice), or by
+				// the ledger's size cap, which owes no event: the block was never confirmed held.
+				this.forgetBlock(entry.blockId);
 				return;
 			}
 		}
@@ -438,24 +445,25 @@ export class UnderReplicationDrain implements Startable {
 	 * is left alone (`name` touches only its own revision; `satisfy` keeps a higher one), and neither
 	 * recreates an entry a concurrent `settle` removed mid-push.
 	 *
-	 * NOTE: an entry settled mid-push by a `full` commit at a newer revision is gone by the time
-	 * `satisfy` runs, which reports that as "gone", so the event fires here too. It is true — the block
-	 * IS fully replicated — but under the older `rev`/`actionId`, and a listener may also have heard
-	 * `full` on that commit's own result. If a host ever needs the two told apart, have `satisfy`
-	 * distinguish "deleted now" from "absent".
+	 * An entry settled mid-push by a `full` commit is gone by the time `satisfy` runs, which reports it
+	 * `absent` rather than `cleared`: the commit that settled it announced it, so this drain does not.
 	 *
-	 * @returns whether the entry is gone — its last missing member confirmed.
+	 * @returns `cleared` when this call removed the entry (its last missing member confirmed), `absent`
+	 * when it was already gone, `owed` when it still stands.
 	 */
-	private async recordConfirmed(entry: UnderReplicatedEntry, owed: Owed & { kind: 'peers' }, confirmed: string[], heldRev: number): Promise<boolean> {
+	private async recordConfirmed(
+		entry: UnderReplicatedEntry, owed: Owed & { kind: 'peers' }, confirmed: string[], heldRev: number
+	): Promise<SatisfyOutcome['status']> {
 		if (!owed.named) {
 			await this.deps.ledger.name(entry.blockId, entry.rev, owed.peerIds);
 		}
-		const remaining = await this.deps.ledger.satisfy(entry.blockId, confirmed, heldRev);
-		if (remaining === undefined) {
+		const outcome = await this.deps.ledger.satisfy(entry.blockId, confirmed, heldRev);
+		if (outcome.status === 'cleared') {
 			log('entry:cleared block=%s rev=%d action=%s', entry.blockId, entry.rev, entry.actionId);
-			return true;
+		} else if (outcome.status === 'absent') {
+			log('entry:settled-elsewhere block=%s rev=%d action=%s', entry.blockId, entry.rev, entry.actionId);
 		}
-		return false;
+		return outcome.status;
 	}
 
 	/** Log each refusal so "cannot place" reads differently from "cannot reach", and count the round. */

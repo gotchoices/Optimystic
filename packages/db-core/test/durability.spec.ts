@@ -76,6 +76,11 @@ describe('mergeDurability', () => {
 		const differing = mergeDurability([cohort, { ...cohort, quorum: 'majority', confirmed: 2, unconfirmed: ['full-peer-2'] }]);
 		expect(differing.quorum).to.equal('majority');
 		expect(differing.otherCohorts).to.deep.equal([cohort]);
+		// The same shortfall recorded by two coordinators is two facts: a host waiting on the
+		// full-replication event must see that one of them is another node's to announce.
+		const owed = { ...report('majority', 3), unconfirmed: ['majority-peer-2'] };
+		const twoRecorders = mergeDurability([{ ...owed, recordedBy: 'node-a' }, { ...owed, recordedBy: 'node-b' }]);
+		expect([twoRecorders.recordedBy, ...(twoRecorders.otherCohorts ?? []).map(r => r.recordedBy)]).to.deep.equal(['node-a', 'node-b']);
 	});
 
 	it('an unrouted batch beside a full one reports unrouted — the weakest is the binding constraint', () => {

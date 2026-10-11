@@ -1480,10 +1480,13 @@ export async function createLibp2pNodeBase(
 			// holds; this is what moves the bytes. Only reached once a corroborated revision exists, so a
 			// genuinely absent block still costs no archive fetch.
 			acquireBlockFromCohort: reconcileBlock,
-			// Records who is still missing each block of a commit acknowledged below `full`. Nothing
-			// drains it yet: sending those copies is `under-replication-drain-and-full-replication-event`.
+			// Records who is still missing each block of a commit acknowledged below `full`; the
+			// under-replication drain below sends those copies.
 			underReplicationLedger,
-			onBlockHolders
+			onBlockHolders,
+			// A `full` commit that settles a ledger entry announces it through the same callable the
+			// drain emits through, so a host hears one event per entry whichever of the two removed it.
+			onBlockDurabilityReached: (event) => storageRepo.emitBlockDurabilityReached(event)
 		});
 
 		// Fail-fast coupling: the cluster member (what accepts a super-majority as sufficient) and the

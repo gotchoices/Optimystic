@@ -130,13 +130,15 @@ function stripMergedFields(d: WriteDurability): WriteDurability {
 /**
  * First occurrence of each structurally identical per-cohort report, input order kept. Peer lists
  * compare as SETS: `findCluster` orders a cohort by routing distance to the block's key, so one
- * cohort answering for two blocks lists the same members in two orders.
+ * cohort answering for two blocks lists the same members in two orders. `recordedBy` is part of the
+ * identity: two otherwise identical answers whose shortfalls two different ledgers recorded are two
+ * facts, and a consumer waiting on full-replication events needs to see both.
  */
 function distinctReports(reports: readonly WriteDurability[]): WriteDurability[] {
 	const seen = new Set<string>();
 	const sorted = (ids: readonly string[] | undefined): string[] | null => ids === undefined ? null : [...ids].sort();
 	return reports.filter(r => {
-		const key = JSON.stringify([r.quorum, r.confirmed, r.cohort, sorted(r.unconfirmed), sorted(r.cohortPeerIds)]);
+		const key = JSON.stringify([r.quorum, r.confirmed, r.cohort, sorted(r.unconfirmed), sorted(r.cohortPeerIds), r.recordedBy ?? null]);
 		if (seen.has(key)) return false;
 		seen.add(key);
 		return true;

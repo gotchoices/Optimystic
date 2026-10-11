@@ -134,6 +134,13 @@ export type WriteDurability = {
 	/** The cohort the write ran on, by peer-id string. Absent where the answering layer has no
 	 *  cohort view at all (a bare `StorageRepo` verdict). */
 	readonly cohortPeerIds?: readonly string[];
+	/** Peer-id string of the node whose under-replication ledger recorded this write's missing
+	 *  copies — the one node that will fire `BlockDurabilityReachedEvent` for these blocks when they
+	 *  reach full replication. Set only below `full`, and only when every non-torn block's shortfall
+	 *  was recorded. Absent: no node is tracking the shortfall (nothing to push from the coordinator,
+	 *  a ledger fault, no ledger, a producer that predates the field), so no full-replication event
+	 *  should be expected. Per cohort answer: each `otherCohorts` entry carries its own. */
+	readonly recordedBy?: string;
 	/** Present only on an action-level result assembled from MORE THAN ONE distinct coordinator
 	 *  answer: the other answers. Identical answers are collapsed (`mergeDurability`), so a healthy
 	 *  single-cohort commit has none; one cohort answering differently for two batches appears

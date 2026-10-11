@@ -1,6 +1,6 @@
 import type { BlockId } from "@optimystic/db-core";
 import type { IKVStore } from "../storage/i-kv-store.js";
-import type { IUnderReplicationLedger, ShortfallQuorum, UnderReplicatedEntry } from "./i-under-replication-ledger.js";
+import type { IUnderReplicationLedger, SatisfyOutcome, ShortfallQuorum, UnderReplicatedEntry } from "./i-under-replication-ledger.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('under-replication-ledger');
@@ -75,20 +75,21 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 		await this.evictBeyondCap();
 	}
 
-	async settle(blockId: BlockId, rev: number): Promise<void> {
-		await this.serialized(blockId, async () => {
+	async settle(blockId: BlockId, rev: number): Promise<UnderReplicatedEntry | undefined> {
+		return this.serialized(blockId, async () => {
 			// Every fully replicated commit settles each of its blocks, and almost none has an entry:
 			// answer those from the index instead of a store read. An entry missing from the index is
 			// one `read` would report absent anyway (malformed), so nothing is skipped that could be settled.
 			const index = await this.index();
-			if (!index.has(blockId)) return;
+			if (!index.has(blockId)) return undefined;
 			const existing = await this.read(blockId);
-			if (existing === undefined) return;
+			if (existing === undefined) return undefined;
 			if (existing.rev > rev) {
 				log('settle:keep-higher-rev %o', { blockId, rev, recordedRev: existing.rev });
-				return;
+				return undefined;
 			}
 			await this.remove(blockId);
+			return existing;
 		});
 	}
 
@@ -126,26 +127,26 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 		return entries.sort((a, b) => a.recordedAt - b.recordedAt);
 	}
 
-	async satisfy(blockId: BlockId, peerIds: readonly string[], heldRev?: number): Promise<UnderReplicatedEntry | undefined> {
-		return this.serialized(blockId, async () => {
+	async satisfy(blockId: BlockId, peerIds: readonly string[], heldRev?: number): Promise<SatisfyOutcome> {
+		return this.serialized(blockId, async (): Promise<SatisfyOutcome> => {
 			const existing = await this.read(blockId);
-			if (existing === undefined) return undefined;
+			if (existing === undefined) return { status: 'absent' };
 			if (heldRev !== undefined && existing.rev > heldRev) {
 				log('satisfy:keep-higher-rev %o', { blockId, heldRev, recordedRev: existing.rev });
-				return existing;
+				return { status: 'owed', entry: existing };
 			}
 			// Unknown is not empty: see `IUnderReplicationLedger.satisfy`.
-			if (existing.missingPeerIds.length === 0) return existing;
+			if (existing.missingPeerIds.length === 0) return { status: 'owed', entry: existing };
 			const confirmed = new Set(peerIds);
 			const remaining = existing.missingPeerIds.filter(peerId => !confirmed.has(peerId));
 			if (remaining.length === 0) {
 				await this.remove(blockId);
-				return undefined;
+				return { status: 'cleared' };
 			}
-			if (remaining.length === existing.missingPeerIds.length) return existing;
+			if (remaining.length === existing.missingPeerIds.length) return { status: 'owed', entry: existing };
 			const updated: UnderReplicatedEntry = { ...existing, missingPeerIds: remaining };
 			await this.kv.set(keyFor(blockId), JSON.stringify(updated));
-			return updated;
+			return { status: 'owed', entry: updated };
 		});
 	}
 
@@ -193,6 +194,12 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 	 *
 	 * An eviction failure is logged and ends the pass rather than failing the recording that
 	 * triggered it: that entry is already written, and the next recording tries again.
+	 *
+	 * NOTE: an evicted entry's write was answered naming this node as `recordedBy`, and its
+	 * full-replication event will now never fire, so a host following that write waits on it until
+	 * its own bookkeeping gives up. Negligible at the default cap; if a deployment ever sits at the
+	 * cap, have eviction announce what it dropped (a distinct "no longer tracked" signal, not the
+	 * full-replication event, which would be false).
 	 */
 	private async evictBeyondCap(): Promise<void> {
 		const index = await this.index();

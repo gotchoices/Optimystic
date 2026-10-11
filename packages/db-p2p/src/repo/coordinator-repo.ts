@@ -17,6 +17,7 @@ import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-
 import type { ReconcileBlockCallback, BlockHoldersSink } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
 import type { IUnderReplicationLedger } from "./i-under-replication-ledger.js";
+import type { BlockDurabilitySink } from "./under-replication-drain.js";
 import { RESPONSIBILITY_TTL_MS, ResponsibilityRefusalError } from "./responsibility.js";
 import { StuckReservationTracker } from "./stuck-reservation.js";
 import { askerStatementFor, type AskerStatement } from "./stated-holdings.js";
@@ -472,6 +473,12 @@ interface CoordinatorRepoComponents {
 	 * {@link CoordinatorRepo.reportBlockHolders}. Absent → commit behaves exactly as without it.
 	 */
 	onBlockHolders?: BlockHoldersSink;
+	/**
+	 * Optional: where a `full` commit announces a ledger entry it settled — the second producer of
+	 * the full-replication event, beside the drain emptying an entry. The node wires the same
+	 * callable it hands the drain. Absent → a settled entry is removed silently, as before.
+	 */
+	onBlockDurabilityReached?: BlockDurabilitySink;
 }
 
 /**
@@ -508,7 +515,8 @@ export function coordinatorRepo(
 		components.acquireBlockFromCohort,
 		components.proofAnchoring,
 		components.underReplicationLedger,
-		components.onBlockHolders
+		components.onBlockHolders,
+		components.onBlockDurabilityReached
 	);
 }
 
@@ -672,7 +680,8 @@ export class CoordinatorRepo implements IRepo {
 		private readonly acquireBlockFromCohort?: AcquireBlockCallback,
 		private readonly proofAnchoring?: ProofAnchoring,
 		private readonly underReplicationLedger?: IUnderReplicationLedger,
-		private readonly onBlockHolders?: BlockHoldersSink
+		private readonly onBlockHolders?: BlockHoldersSink,
+		private readonly onBlockDurabilityReached?: BlockDurabilitySink
 	) {
 		this.localPeerId = localPeerId;
 		this.log = createLogger('coordinator-repo', localPeerId?.toString());
@@ -3245,9 +3254,10 @@ export class CoordinatorRepo implements IRepo {
 
 	/**
 	 * The one way a success leaves {@link commit}: record the replication shortfall the answer
-	 * describes, then return the answer unchanged. Every success exit — solo, local-executed, local
-	 * fallback, tolerated divergence — runs after the durability gate admitted it, so a refused
-	 * commit never reaches the ledger.
+	 * describes, then return the answer — naming this node as `recordedBy` when its ledger now owes
+	 * every block's missing copies, so the writer knows which node will announce full replication.
+	 * Every success exit — solo, local-executed, local fallback, tolerated divergence — runs after the
+	 * durability gate admitted it, so a refused commit never reaches the ledger.
 	 *
 	 * `localHolds` is whether this node's own storage durably holds every block of the commit, which
 	 * is what makes it a source for the missing copies — not whether the class counted it. `record`
@@ -3256,8 +3266,10 @@ export class CoordinatorRepo implements IRepo {
 	 */
 	private async acknowledgeCommit(request: CommitRequest, answer: CommitSuccess, localHolds: boolean, record?: ClusterRecord): Promise<CommitSuccess> {
 		if (localHolds && record !== undefined) this.reportBlockHolders(request, answer.durability, record);
-		await this.noteReplicationShortfall(request, answer.durability, localHolds);
-		return answer;
+		const recorded = await this.noteReplicationShortfall(request, answer.durability, localHolds);
+		const self = this.localPeerId?.toString();
+		if (!recorded || self === undefined) return answer;
+		return { ...answer, durability: { ...answer.durability, recordedBy: self } };
 	}
 
 	/**
@@ -3289,7 +3301,9 @@ export class CoordinatorRepo implements IRepo {
 	 * cohort's answer is gone the moment the writer is answered, and the in-memory commit retry does
 	 * not survive a restart. One entry per block, all sharing this commit's one cohort answer
 	 * (consensus ran on `blockIds[0]`'s cohort for the whole request):
-	 * - `full` settles any older entry for the block, whether or not this node holds it;
+	 * - `full` settles any older entry for the block, whether or not this node holds it, and announces
+	 *   each entry it removed as a full-replication event — the copies it was waiting on are now on
+	 *   every member, at this commit's revision;
 	 * - `majority` records the unconfirmed members by name;
 	 * - `local` records the members it names unconfirmed — the ones this node knows of and wrote
 	 *   without — or an EMPTY missing set, meaning "unknown", when it named none;
@@ -3307,10 +3321,15 @@ export class CoordinatorRepo implements IRepo {
 	 * the ledger's in-memory index and touches the store only when an entry exists). If it shows in
 	 * commit latency, coalesce the writes rather than answering first: an entry written after the
 	 * answer can be lost to a crash in between, which is the one case the ledger exists for.
+	 *
+	 * @returns whether this node's ledger now tracks EVERY non-torn block's shortfall — the condition
+	 * for naming it `recordedBy`. False for a `full` answer, for a node holding nothing, with no
+	 * ledger, and when any one block's recording failed: a writer told to wait on this node must
+	 * never wait on an event its ledger cannot produce.
 	 */
-	private async noteReplicationShortfall(request: CommitRequest, durability: WriteDurability, localHolds: boolean): Promise<void> {
+	private async noteReplicationShortfall(request: CommitRequest, durability: WriteDurability, localHolds: boolean): Promise<boolean> {
 		const ledger = this.underReplicationLedger;
-		if (ledger === undefined) return;
+		if (ledger === undefined) return false;
 		// Blocks a torn commit abandoned were cancelled and hold nothing at this revision: there is no
 		// copy to push, and an entry would have a drain repeatedly read a block that is not there.
 		// No answer built in this class names `torn` today — the writer's transactor derives it after
@@ -3329,16 +3348,19 @@ export class CoordinatorRepo implements IRepo {
 				error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)
 			});
 		});
+		return blockIds.length > 0 && outcomes.every(outcome => outcome.status === 'fulfilled' && outcome.value);
 	}
 
+	/** @returns whether an entry was recorded for the block — never for a settle or a skip. */
 	private async noteBlockShortfall(
 		ledger: IUnderReplicationLedger, request: CommitRequest, blockId: BlockId, durability: WriteDurability, localHolds: boolean
-	): Promise<void> {
+	): Promise<boolean> {
 		if (durability.quorum === 'full') {
-			await ledger.settle(blockId, request.rev);
-			return;
+			const settled = await ledger.settle(blockId, request.rev);
+			if (settled !== undefined) this.announceFullReplication(request, blockId);
+			return false;
 		}
-		if (!localHolds) return;
+		if (!localHolds) return false;
 		// NOTE: accepted tradeoff — a `local` entry naming a member that never comes back stays until
 		// the ledger's size cap evicts it, as an unnamed entry on a node whose cohort stays self-only
 		// already did, so naming adds no cost. Revisit if a deployment reports ledger growth from a
@@ -3354,6 +3376,24 @@ export class CoordinatorRepo implements IRepo {
 			recordedAt: this.now(),
 			attempts: 0
 		});
+		return true;
+	}
+
+	/**
+	 * Fire the full-replication event for a ledger entry a `full` commit just settled — after the
+	 * removal, never before, the order the drain keeps. The entry is gone, so nothing else will ever
+	 * announce it, and a host waiting on an earlier write to this block would otherwise wait forever.
+	 * `rev` is this commit's revision, which every cohort member now holds and which supersedes the
+	 * entry's. No `collectionId`: the coordinator does not read the block, and the field is
+	 * best-effort. A sink that throws is logged, never fails the commit.
+	 */
+	private announceFullReplication(request: CommitRequest, blockId: BlockId): void {
+		if (!this.onBlockDurabilityReached) return;
+		try {
+			this.onBlockDurabilityReached({ blockIds: [blockId], rev: request.rev, actionId: request.actionId });
+		} catch (err) {
+			this.log('coordinator-repo:block-durability-sink-error', { actionId: request.actionId, blockId, error: (err as Error).message });
+		}
 	}
 
 	/**

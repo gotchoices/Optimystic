@@ -445,20 +445,23 @@ describe('UnderReplicationDrain', () => {
 			expect(events).to.deep.equal([]);
 		});
 
-		it('an unnamed entry settled by a full commit mid-push is not resurrected under the resolved names', async () => {
+		it('an unnamed entry settled by a full commit mid-push is not resurrected, and is left to the settling commit to announce', async () => {
 			const drain = await startDrain();
 			await ledger.record(entryFor(BLOCK_A, { rev: 5, quorum: 'local' }));
 			keyNetwork.setCohort(BLOCK_A, [self.toString(), peerX.toString(), peerY.toString()]);
 			libp2p.connect(peerX, { emit: false }); // peerY stays away, so naming would leave it owed
-			pusher.beforeAnswer = async () => { await ledger.settle(BLOCK_A, 6); };
+			let settled: UnderReplicatedEntry | undefined;
+			pusher.beforeAnswer = async () => { settled = await ledger.settle(BLOCK_A, 6); };
 			pusher.latestRev = 5;
 
-			await drain.checkNow();
+			const pass = await drain.checkNow();
 
 			expect(await ledger.get(BLOCK_A), 'the settled entry stays gone').to.equal(undefined);
-			// The block IS fully replicated (the rev-6 commit was full), so the event still fires — see
-			// the NOTE on `recordConfirmed` for why it carries the older revision.
-			expect(events.map(e => e.blockIds)).to.deep.equal([[BLOCK_A]]);
+			// The settling commit removed the entry, so it owes the one event (`CoordinatorRepo`
+			// announces what `settle` returns); the drain firing as well would announce the block twice.
+			expect(settled?.rev, 'the settle is the remover').to.equal(5);
+			expect(pass).to.include({ pushed: 1, cleared: 0 });
+			expect(events).to.deep.equal([]);
 		});
 
 		it('a copy of a NEWER revision than the entry records satisfies it', async () => {
