@@ -37,7 +37,7 @@ export { ReadDependencyCollector } from './read-dependency-collector.js';
 export { TransactionCoordinator } from './coordinator.js';
 export type { CoordinatorOptions, PendValidationMode } from './coordinator.js';
 export { CoordinatorConcurrentStampError, CoordinatorPartialCommitError, CoordinatorStaleLossError } from './errors.js';
-export { transactionDurability, recordCollectionDurability } from './durability.js';
+export { transactionDurability } from './durability.js';
 export type { TransactionDurability } from './durability.js';
 export { TransactionSession } from './session.js';
 export { TransactionValidator } from './validator.js';
