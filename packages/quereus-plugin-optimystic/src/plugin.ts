@@ -9,7 +9,7 @@ import type { Database, SqlValue, FunctionFlags } from '@quereus/quereus';
 import { TEXT_TYPE } from '@quereus/quereus';
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
-import type { SqlCommitDurabilityListener } from './optimystic-adapter/commit-durability.js';
+import type { CommitFullyHeldListener, SqlCommitDurabilityListener } from './optimystic-adapter/commit-durability.js';
 import { OptimysticModule } from './optimystic-module.js';
 import { createStampIdFunction } from './functions/transaction-id.js';
 import { createLogger } from './logger.js';
@@ -25,7 +25,9 @@ export { PartialCommitError, ConcurrentModificationError } from './optimystic-ad
 export { CoordinatorPartialCommitError, SyncRetryExhaustedError, TornActionError } from '@optimystic/db-core';
 // The predicate an `onCommitDurability` listener tests "saved" with, so a host needs no db-core import for it.
 export { isFullyDurable } from '@optimystic/db-core';
-export type { SqlCommitDurability, SqlCommitDurabilityListener } from './optimystic-adapter/commit-durability.js';
+export type {
+	SqlCommitDurability, SqlCommitDurabilityListener, CommitFullyHeld, CommitFullyHeldListener,
+} from './optimystic-adapter/commit-durability.js';
 
 /**
  * Plugin registration function
@@ -113,10 +115,22 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		onCommitDurability: (listener: SqlCommitDurabilityListener) =>
 			txnBridge.onCommitDurability(listener),
 		/**
-		 * Release what the plugin holds outside the `Database` — today its LEASES on the
-		 * raw-storage read caches behind `local` transactors over host-supplied storage (see
-		 * `CollectionFactory.dispose`). Call after `db.close()`. Quereus has no close hook
-		 * that reaches the plugin, so this is explicit.
+		 * Be told when a commit that was saved below full replication — its report said `followed`
+		 * and was not yet fully held — becomes held by every member of its cohort. Called once per
+		 * such commit with its `transactionId`. A commit already fully held when reported is "saved
+		 * now" and is not reported again; a pending commit reported with `followed: false` will never
+		 * be reported here (only commits whose missing copies this node itself owes can be followed).
+		 * Followed commits live in memory, so a restart or `dispose()` forgets them. Same listener
+		 * discipline as `onCommitDurability`. See `TransactionBridge.onCommitFullyHeld`.
+		 */
+		onCommitFullyHeld: (listener: CommitFullyHeldListener) =>
+			txnBridge.onCommitFullyHeld(listener),
+		/**
+		 * Release what the plugin holds outside the `Database` — its subscriptions to the node's
+		 * full-replication events (forgetting every commit still followed, see
+		 * `TransactionBridge.dispose`), and its LEASES on the raw-storage read caches behind
+		 * `local` transactors over host-supplied storage (see `CollectionFactory.dispose`). Call
+		 * after `db.close()`. Quereus has no close hook that reaches the plugin, so this is explicit.
 		 *
 		 * A cache is shared by every consumer of one backing store and is cleared only when the
 		 * LAST lease on it releases, so skipping this is not a correctness problem — but it keeps
@@ -125,7 +139,10 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		 * back between two `Database`s must dispose in between. See `withReadCache` in
 		 * `@optimystic/db-p2p`.
 		 */
-		dispose: () => collectionFactory.dispose(),
+		dispose: async () => {
+			txnBridge.dispose();
+			await collectionFactory.dispose();
+		},
 	};
 }
 

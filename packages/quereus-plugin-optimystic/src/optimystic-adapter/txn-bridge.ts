@@ -1,5 +1,6 @@
 import type {
-  ITransactionEngine, ITransactor, Collection, CollectionId, Transaction, TransactionDurability, WriteDurability,
+  ITransactionEngine, ITransactor, Collection, CollectionId, IBlockDurabilityNotifier, Transaction, TransactionDurability,
+  WriteDurability,
 } from '@optimystic/db-core';
 import {
   TransactionCoordinator, TransactionSession, CoordinatorPartialCommitError, TreeEntryChangedError, TreeGuardRefusedError,
@@ -8,7 +9,8 @@ import {
 import { ConstraintError, QuereusError, StatusCode } from '@quereus/quereus';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
-import { sqlCommitDurability, type SqlCommitDurabilityListener } from './commit-durability.js';
+import { sqlCommitDurability, type CommitFullyHeldListener, type SqlCommitDurabilityListener } from './commit-durability.js';
+import { DurabilityFollower } from './durability-follower.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
 import { createLogger, revisionToken } from '../logger.js';
 
@@ -101,6 +103,32 @@ const treeLabel = (tree: DirtyTree, index: number): string => tree.describe?.() 
  * was gathered — nothing was written, or no tree that wrote could say (a test double). */
 const writtenDurability = (written: ReadonlyMap<CollectionId, WriteDurability | undefined>): TransactionDurability | undefined =>
   written.size === 0 ? undefined : transactionDurability(written);
+
+/** Add `listener` to `listeners`, returning an idempotent unsubscribe. */
+function addListener<L>(listeners: Set<L>, listener: L): () => void {
+  listeners.add(listener);
+  let unsubscribed = false;
+  return () => {
+    if (unsubscribed) return;
+    unsubscribed = true;
+    listeners.delete(listener);
+  };
+}
+
+/**
+ * Call every listener with `event`, in registration order. Over a snapshot, so a listener that
+ * (un)subscribes while being called changes the next delivery, not this one; a listener that throws
+ * is logged and the next still runs.
+ */
+function notifyListeners<E>(listeners: ReadonlySet<(event: E) => void>, event: E, what: string, transactionId: string): void {
+  for (const listener of [...listeners]) {
+    try {
+      listener(event);
+    } catch (error) {
+      log('commit:%s-listener-threw transaction=%s: %o', what, transactionId, error);
+    }
+  }
+}
 
 /**
  * The committed revision to print for a dirty tree in the `commit:collections` trace.
@@ -376,6 +404,18 @@ export class TransactionBridge {
    * commit that wrote something.
    */
   private durabilityListeners = new Set<SqlCommitDurabilityListener>();
+  /** Listeners registered with {@link onCommitFullyHeld}. */
+  private fullyHeldListeners = new Set<CommitFullyHeldListener>();
+  /** Follows each reported commit saved below full replication until its whole cohort holds it. */
+  private durabilityFollower = new DurabilityFollower({
+    onFullyHeld: transactionId => this.reportFullyHeld(transactionId),
+  });
+  /**
+   * The full-replication event source of the node this bridge writes through, resolved at
+   * {@link beginTransaction} beside {@link peerId}; `undefined` for a transactor that keeps no
+   * under-replication ledger.
+   */
+  private durabilityNotifier: IBlockDurabilityNotifier | undefined;
   /**
    * Per-collection SQL rendering of a concurrency-refused duplicate: the
    * `UNIQUE constraint failed: <table>.<col>[, …]` message the vtab registers for its
@@ -599,13 +639,33 @@ export class TransactionBridge {
    * Returns an idempotent unsubscribe.
    */
   onCommitDurability(listener: SqlCommitDurabilityListener): () => void {
-    this.durabilityListeners.add(listener);
-    let unsubscribed = false;
-    return () => {
-      if (unsubscribed) return;
-      unsubscribed = true;
-      this.durabilityListeners.delete(listener);
-    };
+    return addListener(this.durabilityListeners, listener);
+  }
+
+  /**
+   * Subscribe to the moment a followed commit becomes fully held: one whose
+   * {@link SqlCommitDurability} said `followed` while it was held below full replication. Each
+   * listener is called once per such commit, synchronously, in registration order, with its
+   * `transactionId` — from the event that covered the last of its blocks, or from a later commit
+   * through this bridge that wrote those blocks at full replication. A commit already fully held
+   * when reported is never reported here. Same listener discipline as {@link onCommitDurability}.
+   *
+   * Followed commits live in memory: a restart, {@link dispose}, or the follower's cap on pending
+   * commits forgets them, and they are then never reported.
+   *
+   * Returns an idempotent unsubscribe.
+   */
+  onCommitFullyHeld(listener: CommitFullyHeldListener): () => void {
+    return addListener(this.fullyHeldListeners, listener);
+  }
+
+  /**
+   * Stop following commits: release the full-replication subscriptions and forget every pending
+   * commit, so no {@link onCommitFullyHeld} listener is called again for one. Commits made after
+   * this are followed afresh.
+   */
+  dispose(): void {
+    this.durabilityFollower.dispose();
   }
 
   /**
@@ -735,6 +795,11 @@ export class TransactionBridge {
     const transactor = await this.collectionFactory.getOrCreateTransactor(options);
     const peerId = this.collectionFactory.getPeerId(options);
     this.peerId = peerId;
+    this.durabilityNotifier = this.collectionFactory.getBlockDurabilityNotifier(options);
+    // Before the commit is sent: an event for its blocks can fire before its answer reaches us.
+    if (this.durabilityNotifier !== undefined) {
+      this.durabilityFollower.watch(this.durabilityNotifier);
+    }
 
     // Clear any previously accumulated statements + staged-tree tracking
     this.accumulatedStatements = [];
@@ -909,24 +974,35 @@ export class TransactionBridge {
   }
 
   /**
-   * Deliver one commit's durability to every {@link onCommitDurability} listener. A commit
-   * that wrote nothing (`undefined`) reaches nobody, and with no listeners the report is never
-   * built. Each listener runs isolated: a throw is logged and the next still runs.
+   * Deliver one commit's durability to every {@link onCommitDurability} listener, following it
+   * first so the report can say whether {@link onCommitFullyHeld} will fire for it. A commit that
+   * wrote nothing (`undefined`) reaches nobody, and with no listener of either kind it is neither
+   * followed nor reported. Each listener runs isolated: a throw is logged and the next still runs.
+   *
+   * Whatever the listeners, the collections the commit wrote at full replication then cover any
+   * earlier followed commit waiting on those blocks.
    */
   private reportCommitDurability(transactionId: string, durability: TransactionDurability | undefined): void {
-    if (durability === undefined || this.durabilityListeners.size === 0) {
+    if (durability === undefined) {
       return;
     }
-    const report = sqlCommitDurability(transactionId, durability, id => this.collectionTables.get(id));
-    // A snapshot, so a listener that (un)subscribes while being called changes the next
-    // commit's delivery, not this one's.
-    for (const listener of [...this.durabilityListeners]) {
-      try {
-        listener(report);
-      } catch (error) {
-        log('commit:durability-listener-threw transaction=%s: %o', transactionId, error);
+    if (this.durabilityListeners.size > 0 || this.fullyHeldListeners.size > 0) {
+      const verdict = this.durabilityFollower.follow(
+        transactionId, durability, { selfPeerId: this.peerId, notifier: this.durabilityNotifier });
+      const report = sqlCommitDurability(transactionId, durability, id => this.collectionTables.get(id), verdict !== 'unfollowed');
+      notifyListeners(this.durabilityListeners, report, 'durability', transactionId);
+      // Every block's event came before the commit's answer did: fully held already, but reported
+      // so only after the commit itself has been.
+      if (verdict === 'covered') {
+        this.reportFullyHeld(transactionId);
       }
     }
+    this.durabilityFollower.coverHeld(durability, this.durabilityNotifier);
+  }
+
+  /** Tell every {@link onCommitFullyHeld} listener that a followed commit is fully held. */
+  private reportFullyHeld(transactionId: string): void {
+    notifyListeners(this.fullyHeldListeners, Object.freeze({ transactionId }), 'fully-held', transactionId);
   }
 
   /**
