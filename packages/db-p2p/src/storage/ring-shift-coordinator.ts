@@ -5,6 +5,7 @@ import type { PartitionDetector } from '../cluster/partition-detector.js';
 import type { ArachnodeFretAdapter, ArachnodeInfo } from './arachnode-fret-adapter.js';
 import type { RingSelector } from './ring-selector.js';
 import { partitionCovers, qualifiesForFloor } from './arachnode-partition.js';
+import type { NetworkMembershipGate } from '../network-membership-gate.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('ring-shift');
@@ -40,6 +41,12 @@ export interface RingShiftDeps {
 	 * range before this fires.
 	 */
 	onRelease: (blockIds: string[]) => void;
+	/**
+	 * The node's network-membership gate (`createNetworkMembershipGate`). A candidate holder the gate
+	 * refuses is neither pushed a shed block nor counted toward the floor — counting one would release
+	 * a block that only an outsider holds. Absent → no check.
+	 */
+	membership?: NetworkMembershipGate;
 }
 
 export interface RingShiftConfig {
@@ -214,7 +221,9 @@ export class RingShiftCoordinator {
 	 * For each shed block, the qualifying post-move holders to confirm against: the FRET cohort around
 	 * the block minus self and minus any peer that does not still cover the block under its OWN
 	 * advertised (target) partition — which excludes same-range movers ({@link qualifiesForFloor}). A
-	 * candidate with no advertised Arachnode info is excluded (its coverage cannot be verified).
+	 * candidate with no advertised Arachnode info is excluded (its coverage cannot be verified), and so
+	 * is one the membership gate refuses: Arachnode info is something any ring member can advertise.
+	 * Refused peers in the band can leave the floor unmet, which rolls the shift back — the safe side.
 	 */
 	private async buildOwnersMap(shed: string[], floor: number): Promise<Map<string, string[]>> {
 		const owners = new Map<string, string[]>();
@@ -224,6 +233,7 @@ export class RingShiftCoordinator {
 			const cohort = this.deps.fret.assembleCohort(coord, want);
 			const qualifying = cohort.filter(peerId => {
 				if (peerId === this.deps.selfPeerId) return false;
+				if (this.deps.membership !== undefined && !this.deps.membership(peerId)) return false;
 				const info = this.deps.fretAdapter.getArachnodeInfo(peerId);
 				return info !== undefined && qualifiesForFloor(info, coord);
 			});

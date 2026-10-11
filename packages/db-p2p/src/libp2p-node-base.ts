@@ -1207,7 +1207,9 @@ export async function createLibp2pNodeBase(
 		// never selected and can't drag this network's super-majority below quorum.
 		const protocolPrefix = `/optimystic/${options.networkName}`;
 		// Built once, here, and handed to every peer-selection path that must obey it (`undefined`
-		// without a predicate, which every consumer skips).
+		// without a predicate, which every consumer skips): the key network, and the four senders that
+		// take peers from FRET directly — spread-on-churn, the ring-shift confirm, restoration and the
+		// under-replication drain.
 		const membership = createNetworkMembershipGate(options.isNetworkMember, node.peerId.toString(),
 			createLogger('network-membership', node.peerId.toString()));
 		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, bootstrap, options.persistence, reputation, protocolPrefix, linkDeadlines, membership);
@@ -1529,6 +1531,7 @@ export async function createLibp2pNodeBase(
 						pushResponseTimeoutMs: linkDeadlines.responseTimeoutMs,
 						...options.spreadOnChurn
 					},
+					membership,
 				);
 				await spreadMonitor.start();
 				ensureOwnedBlockFeed();
@@ -1578,6 +1581,7 @@ export async function createLibp2pNodeBase(
 				keyNetwork,
 				partitionDetector,
 				protocolPrefix,
+				membership,
 				pushBlock: (blockId, peerIds) => pushBlockToPeers(storageRepo, keyNetwork, blockId, peerIds, {
 					reason: 'replication',
 					protocolPrefix,
@@ -1663,7 +1667,8 @@ export async function createLibp2pNodeBase(
 					keyNetwork,
 					`/optimystic/${options.networkName}`,
 					node.peerId.toString(),
-					linkDeadlines
+					linkDeadlines,
+					membership
 				);
 
 				// Update restore callback to use new coordinator
@@ -1788,6 +1793,7 @@ export async function createLibp2pNodeBase(
 							confirmer: coordinator,
 							ownedBlocks,
 							selfPeerId: peerId,
+							membership,
 							getFloor: () => rebalanceMonitor.getCohortSize(),
 							onRelease: (blockIds) => {
 								for (const blockId of blockIds) {

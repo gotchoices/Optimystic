@@ -7,6 +7,7 @@ import { SyncClient } from '../sync/client.js';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import type { ArachnodeFretAdapter } from './arachnode-fret-adapter.js';
 import { partitionCovers } from './arachnode-partition.js';
+import type { NetworkMembershipGate } from '../network-membership-gate.js';
 import { createLogger } from '../logger.js';
 import type { RpcDeadlineDefaults } from '../rpc-deadline.js';
 
@@ -34,7 +35,13 @@ export class RestorationCoordinator {
 		/** Optional self peer id — used to skip dialing self on solo/bootstrap nodes. */
 		private readonly selfPeerId?: string,
 		/** The fallback deadlines of every `SyncClient` it builds — the node's resolved `LinkDeadlines`. */
-		private readonly rpcDeadlines?: RpcDeadlineDefaults
+		private readonly rpcDeadlines?: RpcDeadlineDefaults,
+		/**
+		 * The node's network-membership gate (`createNetworkMembershipGate`). Every candidate here comes
+		 * from FRET, whose ring a stranger can join, and a restored archive is vetted but not verified
+		 * (`BlockStorage.restoreRevision`), so a peer the gate refuses is never asked. Absent → no check.
+		 */
+		private readonly membership?: NetworkMembershipGate
 	) {}
 
 	private readonly log = createLogger('storage:restoration')
@@ -82,7 +89,7 @@ export class RestorationCoordinator {
 			const storagePeers = this.fretAdapter.findPeersAtRing(ringDepth);
 
 			// Filter to peers responsible for this block's partition (skip self — cannot dial self).
-			const responsiblePeers = this.filterByPartition(storagePeers, blockCoord, ringDepth)
+			const responsiblePeers = this.membersOnly(this.filterByPartition(storagePeers, blockCoord, ringDepth))
 				.filter(p => !this.selfPeerId || p !== this.selfPeerId);
 
 			for (const peerIdStr of responsiblePeers) {
@@ -116,7 +123,13 @@ export class RestorationCoordinator {
 	 * @param blockCoord the block id already hashed into the shared coordinate space.
 	 */
 	private getMyRingPeers(blockCoord: RingCoord): string[] {
-		return this.fretAdapter.getFret().assembleCohort(blockCoord, 10);
+		return this.membersOnly(this.fretAdapter.getFret().assembleCohort(blockCoord, 10));
+	}
+
+	/** Drop the FRET-derived candidates the membership gate refuses. */
+	private membersOnly(peers: string[]): string[] {
+		const membership = this.membership;
+		return membership === undefined ? peers : peers.filter(peerId => membership(peerId));
 	}
 
 	/**

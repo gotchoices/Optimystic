@@ -5,6 +5,7 @@ import { hashKey } from 'p2p-fret'
 import type { FretService } from 'p2p-fret'
 import type { PartitionDetector } from './partition-detector.js'
 import type { ProofRetainingRepo } from '../storage/block-archive.js'
+import type { NetworkMembershipGate } from '../network-membership-gate.js'
 import { pushBlockToPeers } from './block-transfer-service.js'
 import { createLogger } from '../logger.js'
 import { DEFAULT_DIAL_TIMEOUT_MS, DEFAULT_RESPONSE_TIMEOUT_MS } from '../rpc-deadline.js'
@@ -63,6 +64,12 @@ export interface SpreadOnChurnDeps {
 	 * construction (unit tests) — a fresh private `Set` preserves all existing behavior.
 	 */
 	trackedBlocks?: Set<string>
+	/**
+	 * The node's network-membership gate (`createNetworkMembershipGate`). Expansion targets come
+	 * straight from FRET, whose ring membership a stranger can join, so a target the gate refuses is
+	 * dropped before any push. Absent → no check.
+	 */
+	membership?: NetworkMembershipGate
 }
 
 export interface SpreadEvent {
@@ -223,7 +230,7 @@ export class SpreadOnChurnMonitor implements Startable {
 			const expanded = this.deps.fret.expandCohort(
 				cohort, coord, this.config.expansionStep
 			)
-			const targets = expanded.filter(id => !cohortSet.has(id) && id !== selfId)
+			const targets = expanded.filter(id => !cohortSet.has(id) && id !== selfId && this.isMember(id))
 			if (targets.length === 0) continue
 
 			// The shared read-certify-push loop, to every target. Both per-target deadlines are set:
@@ -288,6 +295,10 @@ export class SpreadOnChurnMonitor implements Startable {
 
 		this.emitEvent(event)
 		return event
+	}
+
+	private isMember(peerId: string): boolean {
+		return this.deps.membership === undefined || this.deps.membership(peerId)
 	}
 
 	private computeEffectiveD(): number {

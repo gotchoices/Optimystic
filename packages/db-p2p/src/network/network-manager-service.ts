@@ -106,7 +106,8 @@ export class NetworkManagerService implements Startable {
 	 * Initialize the spread-on-churn monitor. Call after libp2p, FRET are available.
 	 * Caller provides repo and peerNetwork (not held by NetworkManagerService directly),
 	 * plus the node's protocolPrefix (/optimystic/<networkName>) so churn pushes dial the
-	 * same block-transfer protocol the node registers its handler under.
+	 * same block-transfer protocol the node registers its handler under, and its network-membership
+	 * gate (`undefined` without an `isNetworkMember` predicate).
 	 */
 	initSpreadOnChurnMonitor(
 		partitionDetector: PartitionDetector,
@@ -115,7 +116,8 @@ export class NetworkManagerService implements Startable {
 		clusterSize: number,
 		protocolPrefix: string,
 		trackedBlocks: Set<string>,
-		config?: Partial<SpreadOnChurnConfig>
+		config?: Partial<SpreadOnChurnConfig>,
+		membership?: SpreadOnChurnDeps['membership']
 	): SpreadOnChurnMonitor {
 		const libp2p = this.getLibp2p()
 		const fret = this.getFret()
@@ -129,7 +131,7 @@ export class NetworkManagerService implements Startable {
 		// trackedBlocks is the shared owned-block set: the node passes the SAME Set instance into
 		// both monitor inits so spread and rebalance act on one source of truth and never drift.
 		this.spreadOnChurnMonitor = new SpreadOnChurnMonitor(
-			{ libp2p, fret, partitionDetector, repo, peerNetwork, clusterSize, protocolPrefix, trackedBlocks },
+			{ libp2p, fret, partitionDetector, repo, peerNetwork, clusterSize, protocolPrefix, trackedBlocks, membership },
 			config
 		)
 		return this.spreadOnChurnMonitor

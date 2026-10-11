@@ -451,6 +451,25 @@ describe('SpreadOnChurnMonitor', () => {
 			expect(event!.spread[0]!.targets).to.deep.equal([peer3Str]);
 		});
 
+		it('never pushes to an expansion target the membership gate refuses', async () => {
+			const selfStr = selfId.toString();
+			const peer4Str = peerId4.toString();
+			const peer5Str = peerId5.toString();
+
+			mockFret.setNeighborDistance(0);
+			mockFret.setCohort('*', [selfStr, peerId2.toString()]);
+			mockFret.setExpandResult('*', [selfStr, peerId2.toString(), peer4Str, peer5Str]);
+
+			const monitor = makeMonitor({ membership: peerId => peerId !== peer5Str });
+			monitor.trackBlock('block-1');
+
+			const event = await monitor.checkNow();
+			expect(event).to.not.be.null;
+			expect(event!.spread[0]!.targets).to.deep.equal([peer4Str]);
+			expect(event!.spread[0]!.succeeded).to.deep.equal([peer4Str]);
+			expect(pushCalls.map(call => call.peerId)).to.deep.equal([peer4Str]);
+		});
+
 		it('records failed pushes in the spread result', async () => {
 			const selfStr = selfId.toString();
 			const peer4Str = peerId4.toString();

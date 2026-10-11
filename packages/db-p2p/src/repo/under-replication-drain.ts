@@ -5,6 +5,7 @@ import type { PartitionDetector } from '../cluster/partition-detector.js';
 import type { PushBlockOutcome } from '../cluster/block-transfer-service.js';
 import { buildBlockTransferProtocol } from '../cluster/block-transfer-service.js';
 import type { IUnderReplicationLedger, UnderReplicatedEntry } from './i-under-replication-ledger.js';
+import type { NetworkMembershipGate } from '../network-membership-gate.js';
 import { createLogger } from '../logger.js';
 import { unrefTimer } from '../unref-timer.js';
 
@@ -78,6 +79,9 @@ export interface UnderReplicationDrainDeps {
 	/** The `/optimystic/<networkName>` prefix; a connected peer counts as pushable only once identify
 	 *  reports it serving this network's block-transfer protocol. Default: none (any connected peer). */
 	protocolPrefix?: string;
+	/** The node's network-membership gate (`createNetworkMembershipGate`): a connected peer it refuses
+	 *  is never pushable, whatever its protocol list says. Absent → no check. */
+	membership?: NetworkMembershipGate;
 }
 
 /** What woke a pass. */
@@ -518,16 +522,24 @@ export class UnderReplicationDrain implements Startable {
 	 * Connected peers identified as serving this network's block-transfer protocol — the only peers a
 	 * push can land on. Identify fills the peer store's protocol list, so a peer that just connected
 	 * is not yet pushable; the `peer:identify` trigger brings it in. With no prefix configured every
-	 * connected peer counts.
+	 * connected peer counts. A peer the membership gate refuses never counts: that protocol list is
+	 * one any connected peer can write.
+	 *
+	 * NOTE: an entry NAMING a peer the gate has since refused waits for it, so that block's
+	 * full-replication event does not fire while the peer stays refused — the drain has no notion of a
+	 * named member leaving the cohort, refused or otherwise. If a removed member's entries are seen
+	 * never clearing, drop refused peers from the named set (and settle an entry left empty by that).
 	 */
 	private async pushablePeers(): Promise<Set<string>> {
 		const seen = new Set<string>();
 		const pushable = new Set<string>();
+		const membership = this.deps.membership;
 		for (const connection of this.deps.libp2p.getConnections()) {
 			const peerId = connection.remotePeer;
 			const peerIdStr = peerId.toString();
 			if (seen.has(peerIdStr)) continue;
 			seen.add(peerIdStr);
+			if (membership !== undefined && !membership(peerIdStr)) continue;
 			if (this.deps.protocolPrefix === undefined || await this.servesBlockTransfer(peerId)) {
 				pushable.add(peerIdStr);
 			}
