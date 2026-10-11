@@ -130,6 +130,11 @@ describe('write durability reaches the writer', () => {
 
 			expect(answered(durability), 'sync answers with who holds the write').to.deep.equal(MAJORITY)
 			expect(isFullyDurable(durability!), 'a majority write is not fully durable').to.equal(false)
+			// What a host matches full-replication events against: every block the commit wrote — the
+			// header (id = collection id), the log block and the inserted block — at its revision.
+			expect(Object.values(durability!.blockRevs ?? {}), 'names the blocks it committed, at the commit revision')
+				.to.have.lengthOf(3).and.to.satisfy((revs: number[]) => revs.every(rev => rev === 1))
+			expect(durability!.blockRevs).to.have.property('majority-coll', 1)
 		})
 
 		it('reports undefined when nothing is staged — no write happened, so there is no class to report', async () => {

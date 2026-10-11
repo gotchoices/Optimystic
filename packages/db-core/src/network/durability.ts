@@ -149,11 +149,13 @@ function unionTorn(reports: readonly WriteDurability[]): BlockId[] {
 
 /** Every block any report names, at the highest revision any of them names it at. */
 function highestBlockRevs(reports: readonly Pick<WriteDurability, 'blockRevs'>[]): Record<BlockId, number> {
-	const highest: Record<BlockId, number> = {};
+	// A Map, not assignment into `{}`: a header block's id is its collection id, which a caller
+	// names, and `__proto__` assigned into a plain object sets its prototype instead of a key.
+	const highest = new Map<BlockId, number>();
 	for (const [blockId, rev] of reports.flatMap(r => Object.entries(r.blockRevs ?? {}))) {
-		highest[blockId] = Math.max(highest[blockId] ?? rev, rev);
+		highest.set(blockId, Math.max(highest.get(blockId) ?? rev, rev));
 	}
-	return highest;
+	return Object.fromEntries(highest);
 }
 
 function withoutBlocks(blockRevs: Readonly<Record<BlockId, number>>, excluded: readonly BlockId[]): Record<BlockId, number> {
