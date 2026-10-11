@@ -166,3 +166,5 @@
 {"slug":"a-commit-over-a-gapped-base-forks-the-block","file":"a-commit-over-a-gapped-base-forks-the-block.md","completedAt":"2026-09-09","commit":"da57d4e90e99dbc2e864b72b14d12e2f075e3501","prunedAt":"2026-10-11T06:13:02.384Z"}
 {"slug":"insert-or-replace-on-pk-resolves-secondary-unique","file":"insert-or-replace-on-pk-resolves-secondary-unique.md","completedAt":"2026-09-10","commit":"e7412d84ed8b149091b0c45325b860d152dd4253","prunedAt":"2026-10-11T06:13:02.384Z"}
 {"slug":"st-commit-contiguity-guard-premise","file":"st-commit-contiguity-guard-premise.md","completedAt":"2026-09-09","commit":"da57d4e90e99dbc2e864b72b14d12e2f075e3501","prunedAt":"2026-10-11T06:13:02.384Z"}
+{"slug":"a-block-we-do-not-hold-is-consulted-on-every-read","file":"a-block-we-do-not-hold-is-consulted-on-every-read.md","completedAt":"2026-09-11","commit":"b5a3cd381fc414f2b3f05de0f8738a96305b3265","prunedAt":"2026-10-11T07:55:33.174Z"}
+{"slug":"create-index-on-untouched-hydrated-table","file":"create-index-on-untouched-hydrated-table.md","completedAt":"2026-09-11","commit":"8093157364f182cd1b0068e587f9e175f7463546","prunedAt":"2026-10-11T07:55:33.174Z"}
