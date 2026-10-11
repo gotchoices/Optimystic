@@ -372,6 +372,23 @@ const node = await createLibp2pNode({
 Omitting it is the default and leaves behavior unchanged. See
 [internals](../../docs/internals.md) § Inbound Stream Authorization for the full contract.
 
+**Network membership (optional).** Authorization decides who may send to this node, not who this
+node sends to: a peer counts as a member of the network, and so as a candidate cohort member or
+coordinator, when its advertised protocol list names this network's protocols, and any connected
+peer can fill that list. A private database therefore also supplies `isNetworkMember`, a
+synchronous, fail-closed predicate (this node is always a member):
+
+```typescript
+const node = await createLibp2pNode({
+  networkName: 'my-net',
+  bootstrapNodes: [],
+  authorizeInboundStream: (remotePeerId) => memberSet.has(remotePeerId),
+  isNetworkMember: (peerId) => memberSet.has(peerId)
+});
+```
+
+See [internals § Network Membership Predicate](../../docs/internals.md#network-membership-predicate).
+
 **Announcing a different address than you bind (optional).** A node behind a NAT, port forward,
 reverse proxy or DNS front binds one address but is reachable at another. `announceAddrs` advertises
 the reachable address *instead of* whatever the transports report; `appendAnnounceAddrs` advertises

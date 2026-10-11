@@ -137,6 +137,12 @@ export class RepoClient extends ProtocolClient implements IRepo {
 			if (next.id === currentIdStr) {
 				throw new Error('Redirect loop detected in RepoClient (same peer)')
 			}
+			// NOTE: the redirect target is followed without consulting the network membership
+			// predicate (`NodeOptions.isNetworkMember`), here and in `ClusterClient`. The redirect
+			// comes from a cohort member that applies its own predicate, so it reaches a refused
+			// peer only through a member configured without one; the cached hint it records is
+			// re-checked on its next use (`Libp2pKeyPeerNetwork.getCachedCoordinator`). If members
+			// with differing predicates ever share a network, gate the target here.
 			// Learn the redirect target's addresses BEFORE dialing it: the redirect is the only
 			// notice we get that this peer matters, and if it is relay-only we have no address
 			// for it at all. Merging after the dial would help only some later hop.

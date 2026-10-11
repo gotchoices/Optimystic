@@ -21,6 +21,7 @@ import {
 	type SelfCoordinationConfig
 } from '../src/libp2p-key-network.js';
 import type { IPeerReputation } from '../src/reputation/types.js';
+import { createNetworkMembershipGate, type IsNetworkMember } from '../src/network-membership-gate.js';
 import { captureLog, formatCaptured, hasTag } from './support/capture-log.js';
 
 const makePeerId = async (): Promise<PeerId> => {
@@ -1154,7 +1155,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 		 * whether the peer is connected, what its peerStore protocol list says, and whether FRET
 		 * holds it in the ring. `settle()` is one of those flights settling.
 		 */
-		async function joiner(options?: { contactTimeoutMs?: number; restoredAsServing?: boolean }) {
+		async function joiner(options?: { contactTimeoutMs?: number; restoredAsServing?: boolean; isNetworkMember?: IsNetworkMember }) {
 			const partner = await makePeerId();
 			const world = {
 				inFlight: 1,
@@ -1211,7 +1212,8 @@ describe('Libp2pKeyPeerNetwork', () => {
 					servingPeers: [partner.toString()]
 				})
 				: undefined;
-			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, bootstrap, persistence, undefined, PREFIX);
+			const membership = createNetworkMembershipGate(options?.isNetworkMember, selfPeerId.toString(), () => {});
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, bootstrap, persistence, undefined, PREFIX, undefined, membership);
 			await network.initFromPersistedState();
 			const cohort = async (): Promise<string[]> => Object.keys(await network.findCluster(KEY));
 			return { network, partner, world, settle, cohort, assemblies: () => assemblies };
@@ -1294,6 +1296,24 @@ describe('Libp2pKeyPeerNetwork', () => {
 		it('does not await a peer whose serving verdict was restored from persisted state', async () => {
 			const { network } = await joiner({ restoredAsServing: true });
 			expect(await network.awaitingBootstrapContact()).to.equal(false);
+		});
+
+		it('awaits a bootstrap peer the membership predicate refuses while it serves this network, but not one that refused identify', async () => {
+			// A joiner whose predicate has not learned its inviter yet must not rule a block absent on
+			// the self-only view the refusal leaves it, or it founds a second copy (GitHub issue #27).
+			let admitted = false;
+			const { network, world } = await joiner({ isNetworkMember: () => admitted });
+			world.connected = true;
+			world.inFlight = 0;
+			world.answer = 'identified';
+			world.protocols = SERVES;
+			expect(await network.awaitingBootstrapContact(), 'serves, refused: not yet heard from').to.equal(true);
+			admitted = true;
+			expect(await network.awaitingBootstrapContact(), 'admitted: heard from').to.equal(false);
+
+			admitted = false;
+			world.answer = 'foreign';
+			expect(await network.awaitingBootstrapContact(), 'refused identify: not on this network, so heard from').to.equal(false);
 		});
 	});
 
@@ -2267,6 +2287,48 @@ describe('Libp2pKeyPeerNetwork', () => {
 			await after.initFromPersistedState();
 			expect(Object.keys(await after.findCluster(KEY)), 'the restarted node assembles the cohort it had before')
 				.to.deep.equal([remote.toString(), selfPeerId.toString()]);
+		});
+
+		it('a peer refused by the membership predicate is never a cohort member or coordinator', async () => {
+			// O has opened a stream on this network's cluster protocol, which libp2p records in O's
+			// peerStore protocol list, and sits nearest the key in FRET's band.
+			const outsider = await makePeerId();
+			const member = await makePeerId();
+			const O = outsider.toString();
+			const KEY = routingKeyForBlock('control-block');
+			const fret = baseFret({ assembleCohort: () => [O, member.toString(), selfPeerId.toString()], importTable: async () => {} });
+			const peerStore = (outsiderProtocols: string[]): any => peerStoreOf({
+				[O]: { protocols: outsiderProtocols },
+				[member.toString()]: { protocols: servesProto(PREFIX) }
+			});
+			const connections = [outboundConnTo(outsider), outboundConnTo(member)];
+			const build = (isNetworkMember: IsNetworkMember | undefined, options?: { outsiderProtocols?: string[]; persistence?: NetworkStatePersistence }): Libp2pKeyPeerNetwork =>
+				new Libp2pKeyPeerNetwork(
+					createMockLibp2p(selfPeerId, { connections, fret, peerStore: peerStore(options?.outsiderProtocols ?? [`${PREFIX}/cluster/1.0.0`]) }),
+					2, undefined, undefined, options?.persistence, undefined, PREFIX, undefined,
+					createNetworkMembershipGate(isNetworkMember, selfPeerId.toString(), () => {}));
+
+			expect(Object.keys(await build(undefined).findCluster(KEY)), 'without a predicate the forged list admits O').to.include(O);
+
+			let refuseOutsider = false;
+			const network = build(id => !(refuseOutsider && id === O));
+			expect((await network.findCoordinator(KEY)).toString(), 'admitted, O is the nearest pick and is cached').to.equal(O);
+			refuseOutsider = true;
+			expect((await network.findCoordinator(KEY)).toString(), 'the cached pick is re-checked').to.equal(member.toString());
+			expect(Object.keys(await network.findCluster(KEY))).to.deep.equal([member.toString(), selfPeerId.toString()]);
+
+			const restored = build(id => id !== O, {
+				outsiderProtocols: [],
+				persistence: new MemoryPersistence({
+					version: PERSISTED_STATE_VERSION, networkHighWaterMark: 1, lastConnectedTimestamp: Date.now(),
+					consecutiveIsolatedSessions: 0, servingPeers: [O]
+				})
+			});
+			await restored.initFromPersistedState();
+			expect(Object.keys(await restored.findCluster(KEY)), 'a remembered serving verdict does not outrank a refusal').to.not.include(O);
+
+			const throwing = build(id => { if (id === O) throw new Error('membership store unavailable'); return true; });
+			expect(Object.keys(await throwing.findCluster(KEY)), 'a throwing predicate refuses').to.deep.equal([member.toString(), selfPeerId.toString()]);
 		});
 
 		it('with protocolPrefix ABSENT, findCluster retains a cross-network member (filter disabled — regression guard)', async () => {

@@ -110,6 +110,7 @@ import { createLogger } from './logger.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
 import type { IPeerReputation } from './reputation/types.js';
 import type { AuthorizeInboundStream, InboundStreamAuthorizationInit } from './inbound-authorization.js';
+import { createNetworkMembershipGate, type IsNetworkMember } from './network-membership-gate.js';
 import { DisputeService } from './dispute/dispute-service.js';
 import { DisputeClient } from './dispute/client.js';
 import { sampleArbitrators } from './dispute/arbitrator-selection.js';
@@ -452,6 +453,29 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * `DEFAULT_INBOUND_AUTHORIZATION_TIMEOUT_MS` (5s). Ignored when no predicate is supplied.
 	 */
 	authorizeInboundStreamTimeoutMs?: number;
+
+	/**
+	 * Optional predicate answering "is this peer a member of this node's network?", consulted
+	 * wherever this node chooses peers to hold or coordinate its writes. Without it, a peer counts
+	 * as serving this network when its peerStore protocol list names this network's `cluster` or
+	 * `repo` protocol — a list any connected peer can fill, by opening a stream on one of them
+	 * (even a stream {@link NodeOptions.authorizeInboundStream} then refuses) or by advertising
+	 * them. Supplied, a remote peer it refuses is never a cohort member and never a coordinator,
+	 * whatever its protocol list says.
+	 *
+	 * A separate option from {@link NodeOptions.authorizeInboundStream}, which answers who may SEND
+	 * to this node; this one answers who this node sends TO. An embedder whose database is private
+	 * needs both: with only the authorization predicate, any peer that opens a stream can still be
+	 * chosen as a cohort member and sent every write to the blocks it lands near.
+	 *
+	 * Synchronous — it runs inside every cohort assembly's per-peer loop, so keep it an in-memory
+	 * lookup. Fail closed: only a literal `true` admits; a throw or a non-boolean refuses, logged.
+	 * This node is always a member, so the predicate may list remote members only. `peerId` is
+	 * `PeerId.toString()` (base58btc). Read live on every lookup, so admitting or removing a member
+	 * takes effect on the next one. Absent → no check at all. See {@link IsNetworkMember} and
+	 * `docs/internals.md` § Network Membership Predicate.
+	 */
+	isNetworkMember?: IsNetworkMember;
 
 	/**
 	 * Optional libp2p connection gater. The libp2p browser default denies
@@ -1182,7 +1206,11 @@ export async function createLibp2pNodeBase(
 		// bootstraps registers a different (network-namespaced) identify protocol, so it is
 		// never selected and can't drag this network's super-majority below quorum.
 		const protocolPrefix = `/optimystic/${options.networkName}`;
-		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, bootstrap, options.persistence, reputation, protocolPrefix, linkDeadlines);
+		// Built once, here, and handed to every peer-selection path that must obey it (`undefined`
+		// without a predicate, which every consumer skips).
+		const membership = createNetworkMembershipGate(options.isNetworkMember, node.peerId.toString(),
+			createLogger('network-membership', node.peerId.toString()));
+		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, bootstrap, options.persistence, reputation, protocolPrefix, linkDeadlines, membership);
 		await keyNetwork.initFromPersistedState();
 		const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
 

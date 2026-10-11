@@ -2536,7 +2536,52 @@ Semantics:
 - **Self-dials never reach the gate.**  libp2p refuses to dial self at three layers (connection manager, dial queue, upgrader), and every internal caller short-circuits self before dialling anyway (`ClusterCoordinator.updateMember`, `clusterLatestCallback`, `fetchArchiveFromPeer`, `RestorationCoordinator`, `SpreadOnChurnMonitor`).  An embedder predicate that only knows about remote members will therefore never deny its own node.
 - **Cost**: the predicate sits in the hot path of every inbound stream.  Keep it to an in-memory lookup; memoize anything that would otherwise hit storage or the network per stream.
 
-**Scope**: the four database protocols only.  The `dispute` protocol (`packages/db-p2p/src/dispute/service.ts`, which asks this node to vote on a challenge) and the reactivity, matchmaking, cohort-topic and libp2p built-in (`identify`/`ping`/`dcutr`/…) protocols the same node registers are *not* gated by this option.  To refuse a peer across *every* protocol at once, including `identify`, use the connection-level `connectionGater` option instead (`NodeOptions.connectionGater` → libp2p's `denyInboundConnection`); the two are complementary — the gater decides whether to talk to a peer at all, this hook decides whether an already-connected peer may touch the database.
+**Scope**: the four database protocols only.  The `dispute` protocol (`packages/db-p2p/src/dispute/service.ts`, which asks this node to vote on a challenge) and the reactivity, matchmaking, cohort-topic and libp2p built-in (`identify`/`ping`/`dcutr`/…) protocols the same node registers are *not* gated by this option.  To refuse a peer across *every* protocol at once, including `identify`, use the connection-level `connectionGater` option instead (`NodeOptions.connectionGater` → libp2p's `denyInboundConnection`); the two are complementary — the gater decides whether to talk to a peer at all, this hook decides whether an already-connected peer may touch the database.  Neither decides which peers this node *sends* its writes to; that is the [Network Membership Predicate](#network-membership-predicate) below, and a private database needs it too.
+
+### Network Membership Predicate
+
+A node chooses the peers that hold and coordinate a block from FRET's ring, then keeps only the ones it classifies as serving its own network: `membershipOf` in `packages/db-p2p/src/libp2p-key-network.ts` reads each peer's libp2p peerStore protocol list and counts a peer that lists `<prefix>/cluster/1.0.0` or `<prefix>/repo/1.0.0`. Any connected peer can put those protocols into that list, in two ways, and `authorizeInboundStream` stops neither:
+
+- **By opening a stream on one.** libp2p's `onIncomingStream` (libp2p 3.3.11, `libp2p/dist/src/connection.js`) merges the negotiated protocol into the remote peer's peerStore record *before* it looks up the handler, so a stream the authorization gate then resets has already written it.
+- **By advertising them.** The peer registers this network's protocol ids on its own node, and identify announces them.
+
+A stranger classified that way is a cohort member like any other. An embedding application measured it: after an outsider opened one refused stream on each members-only protocol of a member, that member's `findCluster` for a control block named the outsider first, and every later write to the block sent the outsider the block's contents (a pend carries the transforms) and counted it toward the cohort.
+
+`NodeOptions.isNetworkMember` (typed `IsNetworkMember` in `packages/db-p2p/src/network-membership-gate.ts`) lets the embedder overrule the protocol list:
+
+```ts
+const node = await createLibp2pNode({
+  /* … */
+  authorizeInboundStream: (remotePeerId) => memberSet.has(remotePeerId),
+  isNetworkMember: (peerId) => memberSet.has(peerId)
+});
+```
+
+Contract:
+
+- **Absent predicate → today's behavior exactly.** `createNetworkMembershipGate` returns `undefined` and no check runs anywhere.
+- **Synchronous.** It runs inside the per-peer loop of every cohort assembly, so keep it an in-memory lookup. This is one reason it is a separate option rather than derived from `authorizeInboundStream`, which is asynchronous, under a timeout, and asked once per inbound stream. The other is that the two answer different questions: authorization decides who may *send to* this node, membership decides who this node *sends to*.
+- **Fail closed.** Only a literal `true` admits. A throw, or any value other than a boolean (a promise included), refuses and is logged with the peer id under the `network-membership` namespace; nothing is thrown into a lookup.
+- **Self is always a member**, so the predicate may list remote members only — the same contract `authorizeInboundStream` has.
+- **Peer id encoding**: `PeerId.toString()`, the base58btc `12D3KooW…` form.
+- **Read live.** No verdict the predicate gave is kept: a peer the application admits counts on the next lookup, and one it removes drops out of the next lookup. There is no reclassify call to make.
+- **Requires network scoping.** `Libp2pKeyPeerNetwork` refuses a gate without a `protocolPrefix`, since the unscoped path classifies nobody; every node `createLibp2pNode` builds has one.
+
+What it gates. `membershipOf` is the one place every cohort and coordinator choice classifies remote peers — `findCluster`, every `findCoordinator` tier, `servingCohortAt` (where a reactivity topic's root group is placed) and `absentCohortMembers` — and a remote peer the gate refuses reads `foreign` there, ahead of both the protocol list and the remembered serving verdict. So a forged list is never added to that memory, and never persisted from it. Around that one place:
+
+- `isSelectable` refuses the peer as well, so it is neither a connected-fallback pick nor a reason for `findCoordinator` to keep its retry window open.
+- The coordinator cache — the one verdict the key network does remember, for 30 minutes by default — is re-checked on every hit: a pick the gate now refuses is evicted (`findCoordinator:cache-refused`) and the lookup runs the tiers (`getCachedCoordinator`).
+- `CoordinatorRepo`'s 60-second responsibility cache needs nothing: it remembers only whether *this* node is responsible for a block, and the replica set a transaction goes to is a fresh `findCluster` made when the transaction runs, so a removed peer receives nothing after the predicate changes.
+- **A bootstrap peer the gate refuses while it serves this network is not yet heard from** (`heardFromBootstrapPeer`). Otherwise a joining node whose predicate has not yet learned its inviter would see a self-only cohort, rule the shared catalog absent and found a second one — GitHub issue #27's failure through a new door. So `awaitingBootstrapContact` stays true, an absence is flagged `'cohort-unreachable'`, and an open fails, retryably, until the predicate admits the peer. A refused bootstrap peer that does not serve this network — a relay, or a peer that refused identify — is heard from as before, so a node behind infrastructure bootstrap peers is unaffected. The cost, that a node configured with a bootstrap peer its predicate permanently refuses cannot create collections, is the `NOTE:` there.
+- The `cohort:membership` log line counts refused peers as `refused=`, apart from `foreign`, so an operator can tell "another network" from "the predicate said no".
+
+What it does not gate:
+
+- **FRET's own ring membership and routing.** A refused peer is still a ring member: it still routes, it still takes one of the over-fetch slots a cohort is cut from (the `NOTE:` at `membershipOverfetch`), and it can still be a member of a cohort-topic tier below a reactivity topic's root, which FRET assembles directly. Backlog `feat-fret-honours-the-network-membership-predicate`.
+- **The background replication paths that take peers from FRET directly** — spread-on-churn, the ring-shift confirm, restoration, and the under-replication drain's pushable set. Ticket `network-membership-predicate-gates-block-pushes` gates them with the same gate instance, which `createLibp2pNodeBase` builds once beside the key network.
+- **Redirect targets**, which `RepoClient` and `ClusterClient` follow without asking the gate. A redirect comes from a cohort member applying its own predicate, so this matters only where members are configured differently; a coordinator hint the redirect records is re-checked on its next use (the `NOTE:` at the redirect branch in `packages/db-p2p/src/repo/client.ts`).
+
+**An embedder that supplies only `authorizeInboundStream` is still exposed.** Any peer that can open a stream to this node — refused or not — can be chosen as a cohort member and sent every write to the blocks near it on the ring. The two options are complementary: authorization keeps strangers from reading or writing through this node, membership keeps this node from handing them its writes.
 
 ### Equivocation Detection
 
