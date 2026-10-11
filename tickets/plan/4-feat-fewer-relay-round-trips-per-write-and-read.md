@@ -34,3 +34,12 @@ So the reporter's 4 requests is already the floor for this shape after those cha
 3. **Reads.** Skip or batch the per-block `sync` consult when the reader already holds the latest revision (see the lazy read-repair window and `selfReadVerdict` in docs/internals.md; GitHub #25 covers the slow-peer side). Each block's consult opens its own stream to each peer today; docs/transactions.md notes per-peer batching is not done.
 
 Planning should split these into separate tickets; (1) may need an upstream libp2p change.
+
+## Re-measured on 1.12.1 (reporter, 2026-10-09; issue #29 comments)
+
+- **Node:** a one-row insert on a two-member strand is still 4 `/cluster` requests, each on a fresh stream: pend ~290 ms (2 requests), commit ~300 ms (2, `path=one-round`). The 6 → 4 gain applied only to writes touching more than one block.
+- **Devices (Galaxy S7 ↔ emulator):** commit median 7.1–9.3 s. One 9.0 s send: app read 0.7 s (2 `sync` latest checks, see plan ticket `feat-a-read-does-not-wait-on-a-connected-but-silent-member`), local reads 1.5 s, pend 3.6 s, commit 3.0 s. `dial:ok` on an already-open connection took 146–767 ms, about half of every request.
+- The reporter confirmed the stream open is a full round trip because `@libp2p/multistream-select` 7.0.28's `select()` awaits the echo before returning (`negotiateFully: false` is ignored, as `stream-open-costs-a-round-trip.spec.ts` already pins). **Stream reuse (question 1) is the largest single saving: 8 relay round trips → 4 per write, without touching consensus.** Plan it first, as its own ticket.
+- Idle background traffic (~75 streams/min per phone through the relay: FRET ping/neighbors, and `sync` reads) keeps the S7's JS loop 15–19% blocked idle, 39% during a send. The FRET part is gotchoices/Fret#2 (outside this repo); the `sync` part shrinks with the read ticket above.
+
+Sereus ranks this fifth.
