@@ -124,11 +124,13 @@ This document describes the architecture for multi-collection transactions in Op
 > the retry budget runs out, an abort, an expiry, a hard error — is thrown as a
 > `CoordinatorPartialCommitError` that names the saved collections as committed and
 > carries the original error as its `reason`. A commit in which nothing was saved
-> fails with exactly the error it failed with.
+> fails with exactly the error it failed with. The error's `durability` says how
+> well the committed half landed — who holds each committed collection, in the
+> `TransactionDurability` shape a successful commit returns.
 > `coordinator.execute()` gives a partial landing the same local disposition on
 > its (non-retryable) path: it reports the partition as
-> `committedCollections`/`failedCollections` on the `ExecutionResult` instead of
-> throwing, gives the committed half the success-path fold, and restores the
+> `committedCollections`/`failedCollections`, with the committed half's
+> `durability`, on the `ExecutionResult` instead of throwing, gives the committed half the success-path fold, and restores the
 > failed half to the state it was in *before `execute()` staged anything*. It also
 > drops the transaction's rollback tracking, so `rollback(stampId)` after a
 > partial landing from `execute()` is a **no-op** rather than a corrupting rewind

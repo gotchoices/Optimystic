@@ -28,9 +28,8 @@ export interface DirtyTree {
    * Flush this tree's staged changes. Declared as `Promise<unknown>` because a real `Tree.sync`
    * resolves to the write's `WriteDurability` (ticket write-durability-reaches-the-writer) while a
    * test double resolves to nothing, and this bridge consumes NEITHER — it only needs the flush to
-   * have happened. Anything here that wants to report how durable a commit was has to go through
-   * the multi-collection gap tracked in
-   * `tickets/backlog/feat-multi-collection-commit-reports-durability.md`, not by reading this back.
+   * have happened. Reporting how durable a SQL commit was belongs to
+   * `tickets/backlog/feat-a-sql-commit-reports-durability.md`, not to reading this back.
    */
   sync(): Promise<unknown>;
   snapshot(): unknown;

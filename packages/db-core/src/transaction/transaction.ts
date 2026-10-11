@@ -2,6 +2,7 @@ import { randomBytes } from "@noble/hashes/utils.js";
 import { toString as uint8ArrayToString } from "uint8arrays/to-string";
 import type { BlockId } from "../blocks/index.js";
 import type { CollectionId } from "../collection/index.js";
+import type { TransactionDurability } from "./durability.js";
 import { hashString } from "../utility/hash-string.js";
 
 /**
@@ -386,6 +387,14 @@ export type ExecutionResult = {
 	committedCollections?: CollectionId[];
 	/** On a partial multi-collection commit failure, the collections that failed to commit. */
 	failedCollections?: CollectionId[];
+	/**
+	 * Who holds what this commit wrote, present whenever something was written: on success, every
+	 * collection the commit wrote; on a partial failure, exactly {@link committedCollections}. Absent
+	 * when nothing was written — a failure where nothing landed, or a success with nothing staged.
+	 * Test it through `isFullyDurable(durability.overall)`; an absent `overall` means a collection is
+	 * saved but who holds it is unknown, so show the change as pending.
+	 */
+	durability?: TransactionDurability;
 };
 
 /**

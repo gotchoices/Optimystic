@@ -169,7 +169,17 @@ if (durability && !isFullyDurable(durability)) {
 
 Always test it with `isFullyDurable` (`packages/db-core/src/network/durability.ts`) rather than comparing `quorum` yourself: an action whose cohort reported `full` can still have abandoned blocks (listed in `WriteDurability.torn`), and only `isFullyDurable` accounts for both. A result of `undefined` means nothing was written — there was nothing staged, so there is no durability to report, and it is never a failure. `Tree.replace`, `Tree.sync` and `Diary.append` forward the same value without interpreting it.
 
-A commit spanning several collections (`TransactionSession`, below) reports no durability yet — merging a class across collections that may individually have committed or been dropped is a separate design problem.
+A commit spanning several collections (`TransactionSession`, below) reports the same thing per collection, plus one `overall` class that is the weakest of them:
+
+```typescript
+const result = await session.commit();
+const overall = result.durability?.overall;
+if (result.durability && (overall === undefined || !isFullyDurable(overall))) {
+  // Saved, but not yet by every machine — show the change as pending.
+}
+```
+
+`result.durability.collections` names each collection the commit wrote, with its own class. An absent `overall` on a present `durability` means the commit is saved but who holds some collection is unknown, so show it as pending; an absent `durability` means nothing was written.
 
 The full sync lifecycle — block mirroring, when to sync, replay on rejection — is documented in [transactions.md](transactions.md#client-synchronization).
 

@@ -1,4 +1,4 @@
-import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, CommitRequest, ActionId } from "../index.js";
+import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, CommitRequest, ActionId, WriteDurability } from "../index.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
 import { isConflictFailure, isExpiryFailure } from "../network/stale-failure.js";
@@ -12,6 +12,7 @@ import { blockIdsForTransforms, copyTransforms } from "../transform/helpers.js";
 import { computeBlockContentDigests, blockDigestsField, baseRevsField } from "../transform/digest.js";
 import { collectOperations, hashOperations } from "./operations-hash.js";
 import { CoordinatorConcurrentStampError, CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./errors.js";
+import { recordCollectionDurability, transactionDurability, type TransactionDurability } from "./durability.js";
 import { jitteredBackoffMs, abortableDelay, makeAbortError } from "../utility/backoff.js";
 import { createLogger } from "../logger.js";
 
@@ -71,10 +72,42 @@ type CommitCycle = {
 	 * still be finished (the partial-retry branch of {@link commitOnceLatched}). Once non-empty,
 	 * the commit can no longer fail cleanly: every later failure is reported through
 	 * {@link reportSaved} as a partial landing naming these as committed. A successful attempt
-	 * ends the commit and records nothing here; a partial landing on a hard failure reports its
-	 * own committed set at once. */
-	saved: Set<CollectionId>;
+	 * ends the commit and records nothing here (it returns what it committed instead); a partial
+	 * landing on a hard failure reports its own committed set at once. Each saved participant
+	 * carries who holds it, `undefined` where the refresh that saved it could not say (see
+	 * {@link TransactionDurability}). */
+	saved: Map<CollectionId, WriteDurability | undefined>;
 };
+
+/** How one collection's commit ended ({@link TransactionCoordinator.commitCollection}). */
+type CollectionCommitOutcome =
+	| { collectionId: CollectionId; committed: true; durability: WriteDurability }
+	| { collectionId: CollectionId; committed: false; error: string; stale?: boolean; expired?: TransactionExpiredError };
+
+/** How one attempt's distributed phases ended ({@link TransactionCoordinator.coordinateTransaction}).
+ * `committedCollections` carries who holds each collection that durably committed — every
+ * participant on success, a subset (possibly empty) on failure. */
+type CoordinationResult =
+	| { success: true; committedCollections: ReadonlyMap<CollectionId, WriteDurability> }
+	| {
+		success: false;
+		error?: string;
+		committedCollections?: ReadonlyMap<CollectionId, WriteDurability>;
+		failedCollections?: ReadonlySet<CollectionId>;
+		/** True when the failure was a clean optimistic-concurrency conflict (stale loss / pending
+		 * contention) with nothing durable — i.e. safe to re-drive after a re-read. */
+		staleLoss?: boolean;
+		/** Present when a pend or a commit was refused because the transaction had expired by the
+		 * cohort's clocks: the error the commit surfaces, never a stale loss. */
+		expired?: TransactionExpiredError;
+	};
+
+/** What a successful commit wrote: `written` folded into one report, or `undefined` when it holds
+ * nothing (nothing was staged, so there was no pend and no commit — the same hole
+ * `Collection.sync` has). */
+function writtenDurability(written: ReadonlyMap<CollectionId, WriteDurability | undefined>): TransactionDurability | undefined {
+	return written.size === 0 ? undefined : transactionDurability(written);
+}
 
 /**
  * What a pend this coordinator sends carries for the receiving cluster members to re-check.
@@ -321,18 +354,17 @@ export class TransactionCoordinator {
 	 *
 	 * Defaults are safe out of the box: a caller that passes no options gets bounded, jittered retry.
 	 *
-	 * NOTE: this returns nothing, so a multi-collection commit reports NO durability — unlike
-	 * `Collection.sync`, which now answers with the {@link WriteDurability} of what it committed. The
-	 * gap is deliberate and tracked in `tickets/backlog/feat-multi-collection-commit-reports-durability.md`:
-	 * folding a class across collections that may individually have committed or been dropped (see
-	 * {@link CoordinatorPartialCommitError}) is its own design problem, not a pass-through. Until that
-	 * lands, a caller that needs to know whether a write is fully held has to use the single-collection
-	 * path; do not infer one here from a plain successful return.
-	 *
 	 * @param transaction - The transaction to commit
 	 * @param options - Retry knobs; shares the {@link SyncOptions} vocabulary with `Collection.sync`.
+	 * @returns who holds what the commit wrote — per collection, across every attempt (a participant
+	 * the refresh between attempts saved included), with `overall` the weakest of them. Test it
+	 * through `isFullyDurable(overall)`; an absent `overall` means some collection is saved but who
+	 * holds it is unknown. `undefined` means NOTHING was written — nothing was staged, or a retry's
+	 * replay dropped every staged action — exactly as `Collection.sync` reports an empty sync. Every
+	 * other successful return carries a report; a failure after something was written carries the
+	 * committed half's on {@link CoordinatorPartialCommitError.durability}.
 	 */
-	async commit(transaction: Transaction, options?: SyncOptions): Promise<void> {
+	async commit(transaction: Transaction, options?: SyncOptions): Promise<TransactionDurability | undefined> {
 		// At most one open stamp (see the invariant on stampData). Checked once, BEFORE the retry
 		// loop — this is a hard failure, never retryable: the open stamp must be committed or
 		// rolled back first. This guard is what catches a caller that staged directly (Tree.stage /
@@ -346,10 +378,10 @@ export class TransactionCoordinator {
 		const cycle: CommitCycle = {
 			inFlightDisposers: [],
 			participants: new Set(),
-			saved: new Set(),
+			saved: new Map(),
 		};
 		try {
-			await this.commitAttempts(transaction, cycle, options);
+			return await this.commitAttempts(transaction, cycle, options);
 		} catch (err) {
 			// The ONE place a failure leaves this commit, so no exit — present or future — can skip
 			// reporting a participant that is already saved.
@@ -365,8 +397,10 @@ export class TransactionCoordinator {
 	}
 
 	/** The retry loop behind {@link commit}: every attempt, and the refresh between them. Records
-	 * what it learns in `cycle`; {@link commit} owns turning a failure into the right report. */
-	private async commitAttempts(transaction: Transaction, cycle: CommitCycle, options?: SyncOptions): Promise<void> {
+	 * what it learns in `cycle`; {@link commit} owns turning a failure into the right report. On
+	 * success, reports every participant the cycle saved together with what the final attempt
+	 * committed (see {@link commit}'s return). */
+	private async commitAttempts(transaction: Transaction, cycle: CommitCycle, options?: SyncOptions): Promise<TransactionDurability | undefined> {
 		const maxAttempts = options?.maxAttempts ?? DefaultMaxAttempts;
 		const baseBackoffMs = options?.baseBackoffMs ?? DefaultBaseBackoffMs;
 		const maxBackoffMs = options?.maxBackoffMs ?? DefaultMaxBackoffMs;
@@ -400,8 +434,14 @@ export class TransactionCoordinator {
 			}
 
 			try {
-				await this.commitOnce(transaction, cycle);
-				return;
+				const committed = await this.commitOnce(transaction, cycle);
+				// Merged, not overwritten, should one participant be both saved and committed (see the
+				// NOTE in reportSaved).
+				const written = new Map(cycle.saved);
+				for (const [collectionId, durability] of committed) {
+					recordCollectionDurability(written, collectionId, durability);
+				}
+				return writtenDurability(written);
 			} catch (err) {
 				// Only a CLEAN stale loss is retryable. A partial landing, an expired transaction, an
 				// unavailable transactor, etc. all propagate unchanged.
@@ -455,7 +495,7 @@ export class TransactionCoordinator {
 					// can be saved and still hold actions staged after the attempt began, and those
 					// the next attempt must commit.
 					this.stampData.delete(transaction.stamp.id);
-					return;
+					return transactionDurability(cycle.saved);
 				}
 			}
 		}
@@ -463,7 +503,8 @@ export class TransactionCoordinator {
 
 	/**
 	 * Refresh every registered collection between attempts, recording in `cycle.saved` each one
-	 * whose refresh finished this transaction's own log entry (see {@link Collection.refreshInFlight}).
+	 * whose refresh finished this transaction's own log entry (see {@link Collection.refreshInFlight}),
+	 * with who holds it — `undefined` when the refresh could not say, which still records it as saved.
 	 *
 	 * Visits EVERY collection even after one throws. Stopping at the first throw would leave a
 	 * participant later in the map unfinished whenever an earlier one is torn — its log tail stored
@@ -502,7 +543,7 @@ export class TransactionCoordinator {
 			// Read after the try, not only on success: a refresh can throw AFTER it finished the
 			// entry, and that participant is saved either way.
 			if (report.ownEntryFinished !== undefined) {
-				cycle.saved.add(collectionId);
+				recordCollectionDurability(cycle.saved, collectionId, report.ownEntryFinished.durability);
 			}
 		}
 		if (terminal !== undefined) {
@@ -540,6 +581,7 @@ export class TransactionCoordinator {
 	 *
 	 * - `committedCollections`: every refresh-saved participant, plus the committed set of `err`
 	 *   when it is itself a partial landing (merged, never wrapped twice — its `reason` is kept);
+	 *   `durability` carries who holds each of them, merged the same way;
 	 * - `failedCollections`: every other participant of any attempt. Empty when a failure came after
 	 *   every participant was saved (a refresh that finished its entry and then threw, say);
 	 * - `reason`: the original error.
@@ -553,10 +595,12 @@ export class TransactionCoordinator {
 		if (cycle.saved.size === 0) {
 			return err;
 		}
-		const committed = new Set(cycle.saved);
+		const committed = new Map(cycle.saved);
 		let reason = err;
 		if (err instanceof CoordinatorPartialCommitError) {
-			for (const id of err.committedCollections) committed.add(id);
+			for (const [id, durability] of err.durability.collections) {
+				recordCollectionDurability(committed, id, durability);
+			}
 			reason = err.reason;
 		}
 		// NOTE: a participant is in exactly one list, so one saved by a refresh that ALSO held actions
@@ -565,9 +609,9 @@ export class TransactionCoordinator {
 		// races a commit, report such a participant in both lists.
 		const failed = [...cycle.participants].filter(id => !committed.has(id));
 		log('commit:partial-after-refresh tx=%s committed=%o failed=%o reason=%s', transaction.id,
-			[...committed], failed, reason instanceof Error ? reason.name : String(reason));
+			[...committed.keys()], failed, reason instanceof Error ? reason.name : String(reason));
 		this.stampData.delete(transaction.stamp.id);
-		return new CoordinatorPartialCommitError([...committed], failed, reason);
+		return new CoordinatorPartialCommitError(committed, failed, reason);
 	}
 
 	/**
@@ -594,8 +638,10 @@ export class TransactionCoordinator {
 	 * `cycle.inFlightDisposers`. REQUIRED, so a future caller cannot silently reintroduce the
 	 * unmarked refresh the disposers exist to prevent, nor lose track of who took part. The caller
 	 * owns clearing the marks, because they have to survive past this attempt.
+	 * @returns every collection this attempt committed, with who holds it — empty when nothing was
+	 * staged, so the attempt wrote nothing.
 	 */
-	private async commitOnce(transaction: Transaction, cycle: CommitCycle): Promise<void> {
+	private async commitOnce(transaction: Transaction, cycle: CommitCycle): Promise<ReadonlyMap<CollectionId, WriteDurability>> {
 		if (isTransactionExpired(transaction.stamp)) {
 			throw new Error(`Transaction expired at ${transaction.stamp.expiration}`);
 		}
@@ -608,7 +654,7 @@ export class TransactionCoordinator {
 			// or a read-only transaction that opened one (the empty pre-stage barrier) wedges every
 			// later stamp on this coordinator.
 			this.stampData.delete(transaction.stamp.id);
-			return;
+			return new Map();
 		}
 		for (const { collectionId } of collectionData) {
 			cycle.participants.add(collectionId);
@@ -651,7 +697,7 @@ export class TransactionCoordinator {
 				// non-participant is left unmarked and its refresh behaves exactly as a reader's.
 				cycle.inFlightDisposers.push(collection.beginInFlightAction(transaction.id));
 			}
-			await this.commitOnceLatched(transaction, collectionData, cycle);
+			return await this.commitOnceLatched(transaction, collectionData, cycle);
 		} finally {
 			for (const release of latchReleases.reverse()) {
 				release();
@@ -667,14 +713,16 @@ export class TransactionCoordinator {
 	 * is latch-free by contract.
 	 *
 	 * `cycle` is written only on a partial landing that is retried forward: the participants this
-	 * attempt committed go into `cycle.saved`, so the retry loop reports every later failure as the
-	 * partial landing it is (see {@link reportSaved}).
+	 * attempt committed go into `cycle.saved`, with who holds each, so the retry loop reports every
+	 * later failure as the partial landing it is (see {@link reportSaved}).
+	 *
+	 * @returns on success, every participant with who holds it (see {@link commitOnce}).
 	 */
 	private async commitOnceLatched(
 		transaction: Transaction,
 		collectionData: { collectionId: CollectionId; collection: Collection<any> }[],
 		cycle: CommitCycle
-	): Promise<void> {
+	): Promise<ReadonlyMap<CollectionId, WriteDurability>> {
 		// Append each collection's staged actions to its log, then collect the
 		// resulting transforms + critical (log-tail) block for consensus.
 		//
@@ -717,14 +765,7 @@ export class TransactionCoordinator {
 			preCommitSnapshots.set(collectionId, collection.snapshotPending());
 		}
 
-		let coordResult: {
-			success: boolean;
-			error?: string;
-			committedCollections?: Set<CollectionId>;
-			failedCollections?: Set<CollectionId>;
-			staleLoss?: boolean;
-			expired?: TransactionExpiredError;
-		};
+		let coordResult: CoordinationResult;
 		try {
 			for (const { collectionId, collection } of collectionData) {
 				const applyResult = await this.applyActionsToCollection(
@@ -764,7 +805,7 @@ export class TransactionCoordinator {
 		}
 
 		if (!coordResult.success) {
-			const committed = coordResult.committedCollections ?? new Set<CollectionId>();
+			const committed = coordResult.committedCollections ?? new Map<CollectionId, WriteDurability>();
 			// Keep exactly what each participant that did NOT commit sent, BEFORE the restores below
 			// swap its tracker out. A refused commit is not proof nothing landed: a participant's log
 			// tail is committed first and can be stored while the answer is still a failure, and
@@ -831,8 +872,10 @@ export class TransactionCoordinator {
 					// ABOVE the held revision. Collection.consumeOwnEntry is therefore unreachable for
 					// a sibling committed here, and no attempt was retained for it (the loop above
 					// skips committed participants) — the refresh is a reader's, at a cost of one walk.
-					for (const collectionId of committed) cycle.saved.add(collectionId);
-					log('commit:partial-retry tx=%s committed=%o failed=%o reason=%s', transaction.id, [...committed], failed, coordResult.error);
+					for (const [collectionId, durability] of committed) {
+						recordCollectionDurability(cycle.saved, collectionId, durability);
+					}
+					log('commit:partial-retry tx=%s committed=%o failed=%o reason=%s', transaction.id, [...committed.keys()], failed, coordResult.error);
 					throw new CoordinatorStaleLossError(failed, coordResult.error);
 				}
 				// Half-landed on a HARD failure (the transport budget spent on a thrown fault, a
@@ -840,7 +883,7 @@ export class TransactionCoordinator {
 				// stamp tracking (the success path does the same at the end) and surface the
 				// structured signal for reconciliation at once.
 				this.stampData.delete(transaction.stamp.id);
-				throw new CoordinatorPartialCommitError([...committed], failed, coordResult.expired ?? coordResult.error);
+				throw new CoordinatorPartialCommitError(committed, failed, coordResult.expired ?? coordResult.error);
 			}
 
 			// EMPTY committed set: PEND failed, or the whole commit failed cleanly with
@@ -884,6 +927,7 @@ export class TransactionCoordinator {
 		// precisely because the coordinator enforces at most ONE open stamp (the invariant on
 		// stampData): no sibling stamp's snapshot exists to go stale against this commit.
 		this.stampData.delete(transaction.stamp.id);
+		return coordResult.committedCollections;
 	}
 
 	/**
@@ -1224,7 +1268,7 @@ export class TransactionCoordinator {
 				// (docs/transactions.md). If a host ever commits multi-collection transactions
 				// through execute(), route its coordination through commit()'s retry rather than
 				// duplicating that recovery here.
-				const committed = coordResult.committedCollections ?? new Set<CollectionId>();
+				const committed = coordResult.committedCollections ?? new Map<CollectionId, WriteDurability>();
 				if (committed.size > 0) {
 					for (const collectionId of batches.keys()) {
 						const collection = this.collections.get(collectionId);
@@ -1256,7 +1300,9 @@ export class TransactionCoordinator {
 				return {
 					success: false,
 					error: coordResult.error,
-					committedCollections: committed.size > 0 ? [...committed] : undefined,
+					...(committed.size > 0
+						? { committedCollections: [...committed.keys()], durability: transactionDurability(committed) }
+						: {}),
 					failedCollections: coordResult.failedCollections ? [...coordResult.failedCollections] : undefined,
 				};
 			}
@@ -1282,6 +1328,7 @@ export class TransactionCoordinator {
 
 			// Clean up stamp tracking data
 			this.stampData.delete(transaction.stamp.id);
+			const durability = writtenDurability(coordResult.committedCollections);
 
 			// 6. Return results from actions.
 			// `actions` is the engine's ORIGINAL batch list, un-coalesced — the field is documented
@@ -1293,7 +1340,8 @@ export class TransactionCoordinator {
 			return {
 				success: true,
 				actions: result.actions,
-				results: actionResults
+				results: actionResults,
+				...(durability === undefined ? {} : { durability })
 			};
 		} finally {
 			for (const release of latchReleases.reverse()) {
@@ -1418,18 +1466,7 @@ export class TransactionCoordinator {
 		collectionTransforms: Map<CollectionId, Transforms>,
 		criticalBlocks: Map<CollectionId, BlockId>,
 		pendedRevs: ReadonlyMap<CollectionId, number>
-	): Promise<{
-		success: boolean;
-		error?: string;
-		committedCollections?: Set<CollectionId>;
-		failedCollections?: Set<CollectionId>;
-		/** True when the failure was a clean optimistic-concurrency conflict (stale loss / pending
-		 * contention) with nothing durable — i.e. safe to re-drive after a re-read. */
-		staleLoss?: boolean;
-		/** Present when a pend or a commit was refused because the transaction had expired by the
-		 * cohort's clocks: the error the commit surfaces, never a stale loss. */
-		expired?: TransactionExpiredError;
-	}> {
+	): Promise<CoordinationResult> {
 		const trxId = transaction.id;
 		const t0 = Date.now();
 
@@ -1459,7 +1496,7 @@ export class TransactionCoordinator {
 		const commitResult = await this.commitPhase(
 			transaction.id as ActionId,
 			criticalBlockIds,
-			pendResult.pendedBlockIds!,
+			pendResult.pendedBlockIds,
 			pendedRevs
 		);
 		const commitMs = Date.now() - tCommit;
@@ -1467,7 +1504,7 @@ export class TransactionCoordinator {
 			// Targeted cancel: only cancel collections that are still pending (not already committed)
 			await this.cancelPhase(
 				transaction.id as ActionId,
-				pendResult.pendedBlockIds!,
+				pendResult.pendedBlockIds,
 				commitResult.committedCollections
 			);
 			log('trx:phases trxId=%s gather=%dms pend=%dms commit=%dms (failed) total=%dms', trxId, gatherMs, pendMs, commitMs, Date.now() - t0);
@@ -1488,7 +1525,7 @@ export class TransactionCoordinator {
 		// (as per user's note: "managed by each cluster, the client doesn't have to worry about them")
 
 		log('trx:phases trxId=%s gather=%dms pend=%dms commit=%dms total=%dms', trxId, gatherMs, pendMs, commitMs, Date.now() - t0);
-		return { success: true };
+		return { success: true, committedCollections: commitResult.committedCollections };
 	}
 
 	/**
@@ -1553,7 +1590,10 @@ export class TransactionCoordinator {
 		collectionTransforms: ReadonlyMap<CollectionId, Transforms>,
 		pendedRevs: ReadonlyMap<CollectionId, number>,
 		superclusterNominees: ReadonlySet<PeerId> | null
-	): Promise<{ success: boolean; error?: string; pendedBlockIds?: Map<CollectionId, BlockId[]>; staleLoss?: boolean; expired?: TransactionExpiredError }> {
+	): Promise<
+		| { success: true; pendedBlockIds: Map<CollectionId, BlockId[]> }
+		| { success: false; error: string; staleLoss?: boolean; expired?: TransactionExpiredError }
+	> {
 		if (collectionTransforms.size === 0) {
 			return { success: false, error: 'No transforms to pend' };
 		}
@@ -1688,7 +1728,8 @@ export class TransactionCoordinator {
 	): Promise<{
 		success: boolean;
 		error?: string;
-		committedCollections: Set<CollectionId>;
+		/** Who holds each collection that committed. */
+		committedCollections: Map<CollectionId, WriteDurability>;
 		failedCollections: Set<CollectionId>;
 		staleLoss?: boolean;
 		expired?: TransactionExpiredError;
@@ -1701,7 +1742,7 @@ export class TransactionCoordinator {
 			)
 		);
 
-		const committedCollections = new Set<CollectionId>();
+		const committedCollections = new Map<CollectionId, WriteDurability>();
 		const failedCollections = new Set<CollectionId>();
 		const errors: string[] = [];
 		// Classify failures: a returned stale loss (someone committed a newer rev) is retryable after
@@ -1713,14 +1754,14 @@ export class TransactionCoordinator {
 		let expired: TransactionExpiredError | undefined;
 		for (const outcome of outcomes) {
 			if (outcome.status === 'fulfilled') {
-				const { collectionId, committed, error, stale } = outcome.value;
-				if (committed) {
-					committedCollections.add(collectionId);
+				const result = outcome.value;
+				if (result.committed) {
+					committedCollections.set(result.collectionId, result.durability);
 				} else {
-					failedCollections.add(collectionId);
-					if (error) errors.push(error);
-					if (stale) anyStale = true; else anyHard = true;
-					expired ??= outcome.value.expired;
+					failedCollections.add(result.collectionId);
+					errors.push(result.error);
+					if (result.stale) anyStale = true; else anyHard = true;
+					expired ??= result.expired;
 				}
 			} else {
 				// commitCollection resolves rather than rejects, but treat any unexpected
@@ -1747,7 +1788,8 @@ export class TransactionCoordinator {
 	/**
 	 * Commit a single collection's pended blocks, retrying transient failures up to three
 	 * times (forward recovery). Always resolves — success is carried in the returned
-	 * `committed` flag — so the fan-out in {@link commitPhase} can aggregate every result.
+	 * `committed` flag, with the commit's `durability` beside it — so the fan-out in
+	 * {@link commitPhase} can aggregate every result.
 	 */
 	private async commitCollection(
 		actionId: ActionId,
@@ -1758,7 +1800,7 @@ export class TransactionCoordinator {
 		 * family as pendCollection's: recomputing `getNextRev()` here, after the pend round
 		 * trips, could stamp the CommitRequest with a different number than the pend named. */
 		rev: number
-	): Promise<{ collectionId: CollectionId; committed: boolean; error?: string; stale?: boolean; expired?: TransactionExpiredError }> {
+	): Promise<CollectionCommitOutcome> {
 		const collection = this.collections.get(collectionId);
 		if (!collection) {
 			return { collectionId, committed: false, error: `Collection not found: ${collectionId}` };
@@ -1800,7 +1842,7 @@ export class TransactionCoordinator {
 			try {
 				const commitResult = await this.transactor.commit(commitRequest);
 				if (commitResult.success) {
-					return { collectionId, committed: true };
+					return { collectionId, committed: true, durability: commitResult.durability };
 				}
 				if (isExpiryFailure(commitResult)) {
 					// Not a stale loss: a re-drive's expiration comes from the same clock.
@@ -1846,7 +1888,7 @@ export class TransactionCoordinator {
 	private async cancelPhase(
 		actionId: ActionId,
 		pendedBlockIds: Map<CollectionId, BlockId[]>,
-		excludeCollections?: Set<CollectionId>
+		excludeCollections?: ReadonlyMap<CollectionId, unknown>
 	): Promise<void> {
 		// Fan out the per-collection cancels concurrently. Each is best-effort: a cancel
 		// fault is logged and swallowed so it cannot mask the pend/commit failure that
