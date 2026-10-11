@@ -18,6 +18,12 @@
  *   the dead one so the next request does not choose it. `b` does not listen, so no fresh dial from
  *   `a` can succeed in either shape: the spec passes only if the open falls back to the second
  *   existing connection.
+ *
+ * A third shape covers a stream negotiated BEFORE the connection under it went half-open — a
+ * `PreparedStreams` pool held it there for the next request. A request that takes it cannot hedge,
+ * so it waits until the replacement open `connect` starts beside it condemns the dead connection,
+ * which resets the request's stream; `ProtocolClient.processMessage` then re-sends once, on the
+ * stream the replacement opened over the live connection.
  */
 import { expect } from 'chai';
 import { createLibp2p, type Libp2p } from 'libp2p';
@@ -27,11 +33,15 @@ import { yamux } from '@chainsafe/libp2p-yamux';
 import type { Connection, Stream } from '@libp2p/interface';
 import { Libp2pKeyPeerNetwork } from '../src/libp2p-key-network.js';
 import { registerProtocolHandler } from '../src/network/register-protocol-handler.js';
+import { PreparedStreams } from '../src/network/prepared-streams.js';
+import { ProtocolClient } from '../src/protocol-client.js';
+import type { StreamOpenDeadlines } from '../src/rpc-deadline.js';
 
 const ECHO = '/optimystic-test/half-open-echo/1.0.0';
 const REQUEST_MS = 3000;
 const HEDGE_MS = 250;
 const DEAD_CONNECTION_MS = 1000;
+const STREAM_OPEN: StreamOpenDeadlines = { hedgeDelayMs: HEDGE_MS, deadConnectionDelayMs: DEAD_CONNECTION_MS };
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
@@ -70,8 +80,15 @@ async function request(open: (signal: AbortSignal) => Promise<Stream>): Promise<
 }
 
 /** `a`'s key network, with short stream-open delays so the condemnation is observable inside the spec. */
-function keyNetworkOf(a: Libp2p): Libp2pKeyPeerNetwork {
-	return new Libp2pKeyPeerNetwork(a, 1, undefined, undefined, undefined, undefined, undefined, { hedgeDelayMs: HEDGE_MS, deadConnectionDelayMs: DEAD_CONNECTION_MS });
+function keyNetworkOf(a: Libp2p, preparedStreams?: PreparedStreams): Libp2pKeyPeerNetwork {
+	return new Libp2pKeyPeerNetwork(a, 1, undefined, undefined, undefined, undefined, undefined, STREAM_OPEN, undefined, preparedStreams);
+}
+
+/** A request/response over the echo protocol: the echo hands the length-prefixed request back as the reply. */
+class EchoClient extends ProtocolClient {
+	async echo(): Promise<unknown> {
+		return await this.processMessage<unknown>({ ping: 1 }, ECHO, { responseTimeoutMs: REQUEST_MS });
+	}
 }
 
 describe('a half-open connection does not strand a connected peer', function () {
@@ -162,6 +179,46 @@ describe('a half-open connection does not strand a connected peer', function () 
 			const started = Date.now();
 			expect(await request(signal => keyNetwork.connect(b.peerId, ECHO, { signal }))).to.equal('echoed');
 			expect(Date.now() - started).to.be.below(HEDGE_MS);
+		});
+	});
+
+	describe('when a prepared stream is held on a connection that then goes half-open', () => {
+		let a: Libp2p;
+		let b: Libp2p;
+		let newer: Connection;
+		let pool: PreparedStreams | undefined;
+
+		before(async () => {
+			a = await spawnNode(true);
+			b = await spawnNode(false);
+
+			await b.dial(a.getMultiaddrs()[0]!);
+			await sleep(500);
+			newer = await b.dial(a.getMultiaddrs()[0]!, { force: true });
+			await sleep(500);
+		});
+
+		after(async () => {
+			pool?.close();
+			await b?.stop();
+			await a?.stop();
+		});
+
+		it('a request that takes the stream still gets its reply, through the re-send', async () => {
+			pool = new PreparedStreams(a, { protocols: [ECHO], deadlines: STREAM_OPEN });
+			const client = new EchoClient(b.peerId, keyNetworkOf(a, pool));
+
+			// Opens fresh on the newer connection, and leaves a stream prepared beside it there.
+			expect(await client.echo()).to.deep.equal({ ping: 1 });
+			await sleep(200);
+			abortOnOwnSide(newer);
+			await sleep(500);
+
+			const started = Date.now();
+			expect(await client.echo()).to.deep.equal({ ping: 1 });
+			const elapsed = Date.now() - started;
+			expect(elapsed, 'the request went out on the prepared stream and waited out the dead connection').to.be.at.least(DEAD_CONNECTION_MS - 5);
+			expect(elapsed, 'answered within the dead-connection delay plus one request').to.be.below(DEAD_CONNECTION_MS + HEDGE_MS);
 		});
 	});
 });

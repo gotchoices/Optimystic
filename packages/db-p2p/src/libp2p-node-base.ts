@@ -43,12 +43,14 @@ import { BootstrapContactTracker, planBootstrapTargets } from './network/bootstr
 import { identifyOnConnectionOpen, type IdentifyOnOpenHost } from './network/identify-on-open.js';
 import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
 import { BlockTransferCoordinator } from './cluster/block-transfer.js';
-import { pushBlockToPeers } from './cluster/block-transfer-service.js';
+import { buildBlockTransferProtocol, pushBlockToPeers } from './cluster/block-transfer-service.js';
+import { PreparedStreams } from './network/prepared-streams.js';
 import { UnderReplicationDrain, type UnderReplicationDrainConfig } from './repo/under-replication-drain.js';
 import type { RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
+import { buildSyncProtocol } from './sync/protocol.js';
 import { resolveBootstrapContactTimeoutMs, resolveLinkDeadlines, withinRequestBudget, type LinkDeadlines, type RpcDeadlineDefaults } from './rpc-deadline.js';
 import type { ClusterLatestCallback } from './repo/coordinator-repo.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
@@ -730,6 +732,20 @@ function resolveCurrentServedRoot(forwarderHost: ReactivityForwarderHost, collec
 	return ps === undefined ? undefined : b64urlToBytes(ps.tailIdAtJoin);
 }
 
+/**
+ * The protocols a node's own clients send requests on that get a prepared stream: repo, cluster, sync
+ * and block-transfer, under the same ids the four services register. Dispute is left out — rare, and
+ * off by default, so a prepared stream for it would almost always expire unused.
+ */
+function preparedStreamProtocols(protocolPrefix: string): string[] {
+	return [
+		`${protocolPrefix}/repo/1.0.0`,
+		`${protocolPrefix}/cluster/1.0.0`,
+		buildSyncProtocol(protocolPrefix),
+		buildBlockTransferProtocol(protocolPrefix)
+	];
+}
+
 export async function createLibp2pNodeBase(
 	options: NodeOptions,
 	defaults: {
@@ -1212,7 +1228,26 @@ export async function createLibp2pNodeBase(
 		// under-replication drain.
 		const membership = createNetworkMembershipGate(options.isNetworkMember, node.peerId.toString(),
 			createLogger('network-membership', node.peerId.toString()));
-		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, bootstrap, options.persistence, reputation, protocolPrefix, linkDeadlines, membership);
+		// Streams negotiated ahead of the request that takes them, so a request to a peer this node is
+		// already talking to skips the protocol negotiation's round trip (`network/prepared-streams.ts`).
+		// Its stop wrapper is installed at once, so a startup rollback closes it too; it reports its
+		// background opens under the same peer-suffixed `open-protocol-stream` namespace the key network does.
+		const preparedStreams = new PreparedStreams(node, {
+			protocols: preparedStreamProtocols(protocolPrefix),
+			deadlines: linkDeadlines,
+			streamOpenLog: createLogger('open-protocol-stream', node.peerId.toString())
+		});
+		{
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				try {
+					preparedStreams.close();
+				} finally {
+					await previousStop();
+				}
+			};
+		}
+		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, bootstrap, options.persistence, reputation, protocolPrefix, linkDeadlines, membership, preparedStreams);
 		await keyNetwork.initFromPersistedState();
 		const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
 

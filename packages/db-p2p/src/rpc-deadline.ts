@@ -344,7 +344,8 @@ export class RequestBudgetExceededError extends Error {
  * For a caller that owns a per-peer budget of its own. The client defaults cannot simply be left
  * underneath it: opening a stream costs one link round trip even on a connection that is already
  * open (`test/stream-open-costs-a-round-trip.spec.ts`), so on a link whose round trip reaches
- * {@link DEFAULT_DIAL_TIMEOUT_MS} the default dial deadline fails every request, and a larger
+ * {@link DEFAULT_DIAL_TIMEOUT_MS} the default dial deadline fails every request that has to negotiate
+ * its stream (the first to a peer after a quiet spell; later ones take a prepared stream), and a larger
  * budget above it never takes effect. So `request` receives explicit `0`s for both phase deadlines
  * ("no cap", see {@link withRpcDeadlineDefaults}) and a signal that aborts with a
  * {@link RequestBudgetExceededError} once the budget runs out. `ProtocolClient.processMessage`

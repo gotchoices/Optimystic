@@ -365,10 +365,12 @@ export interface ClusterConsensusConfig {
 	 * client's own dial and response defaults do not apply underneath it.
 	 *
 	 * Raise it for a deployment whose links are slower than a LAN: two phones reaching each other
-	 * only through a public circuit relay have a round trip near 1.8s, and every fresh stream (dial
-	 * or reuse, protocol select, send, receive) must fit inside this budget or the peer counts as
-	 * silent. The protocol select costs a round trip even on an open connection, so a request over a
-	 * reused connection costs two. In a two-member cohort one late answer is the whole quorum, so the
+	 * only through a public circuit relay have a round trip near 1.8s, and a request that opens its
+	 * stream (dial or reuse, protocol select, send, receive) must fit inside this budget or the peer
+	 * counts as silent. The protocol select costs a round trip even on an open connection, so such a
+	 * request over a reused connection costs two. db-p2p negotiates the next stream to a peer it is
+	 * talking to in advance, so a later request in a busy spell costs one, but the first after a quiet
+	 * spell still costs two. In a two-member cohort one late answer is the whole quorum, so the
 	 * consult declines every time and a rejoining node never catches up.
 	 *
 	 * Fractional values are accepted — this is a duration, not a count of peers. A value that is not

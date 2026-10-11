@@ -1115,11 +1115,13 @@ callers of that bound derive it the same way from the same input: the read path'
 pair exactly, and a deployment that raises the per-peer budget widens the pass that spends it instead
 of having a slow pass cut short under it.
 
-Raise it when the link is slower than a LAN. Every one of these requests is a fresh stream — dial or
-reuse the connection, select the sync protocol, send, receive — and selecting the protocol costs a
-round trip of its own even on an open connection (`packages/db-p2p/test/stream-open-costs-a-round-trip.spec.ts`),
-so a request over a reused connection costs two round trips. Size the field to comfortably exceed two
-of the link's real round trips. A relayed link whose round trip is near 1.8 s cannot finish one inside
+Raise it when the link is slower than a LAN. A request that has to open its stream does it all inside
+the budget — dial or reuse the connection, select the sync protocol, send, receive — and selecting the
+protocol costs a round trip of its own even on an open connection (`packages/db-p2p/test/stream-open-costs-a-round-trip.spec.ts`),
+so such a request over a reused connection costs two round trips. A later request in a busy spell takes
+a stream negotiated ahead of it (`PreparedStreams` in `packages/db-p2p/src/network/prepared-streams.ts`)
+and costs one; the first after a quiet spell, and each concurrent one beyond the first, still costs two.
+Size the field to comfortably exceed two of the link's real round trips. A relayed link whose round trip is near 1.8 s cannot finish one inside
 a second: every honest answer arrives late and counts as silence.
 In a two-member cohort one late answer is the whole quorum, so the consult declines on every read and
 a machine that re-attaches after being away never catches up. The symptom in the logs is steady
