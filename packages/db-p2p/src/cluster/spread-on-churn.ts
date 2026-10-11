@@ -5,7 +5,7 @@ import { hashKey } from 'p2p-fret'
 import type { FretService } from 'p2p-fret'
 import type { PartitionDetector } from './partition-detector.js'
 import type { ProofRetainingRepo } from '../storage/block-archive.js'
-import type { NetworkMembershipGate } from '../network-membership-gate.js'
+import { admittedBy, type NetworkMembershipGate } from '../network-membership-gate.js'
 import { pushBlockToPeers } from './block-transfer-service.js'
 import { createLogger } from '../logger.js'
 import { DEFAULT_DIAL_TIMEOUT_MS, DEFAULT_RESPONSE_TIMEOUT_MS } from '../rpc-deadline.js'
@@ -230,7 +230,7 @@ export class SpreadOnChurnMonitor implements Startable {
 			const expanded = this.deps.fret.expandCohort(
 				cohort, coord, this.config.expansionStep
 			)
-			const targets = expanded.filter(id => !cohortSet.has(id) && id !== selfId && this.isMember(id))
+			const targets = expanded.filter(id => !cohortSet.has(id) && id !== selfId && admittedBy(this.deps.membership, id))
 			if (targets.length === 0) continue
 
 			// The shared read-certify-push loop, to every target. Both per-target deadlines are set:
@@ -295,10 +295,6 @@ export class SpreadOnChurnMonitor implements Startable {
 
 		this.emitEvent(event)
 		return event
-	}
-
-	private isMember(peerId: string): boolean {
-		return this.deps.membership === undefined || this.deps.membership(peerId)
 	}
 
 	private computeEffectiveD(): number {

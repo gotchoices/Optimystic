@@ -5,7 +5,7 @@ import type { PartitionDetector } from '../cluster/partition-detector.js';
 import type { PushBlockOutcome } from '../cluster/block-transfer-service.js';
 import { buildBlockTransferProtocol } from '../cluster/block-transfer-service.js';
 import type { IUnderReplicationLedger, UnderReplicatedEntry } from './i-under-replication-ledger.js';
-import type { NetworkMembershipGate } from '../network-membership-gate.js';
+import { admittedBy, type NetworkMembershipGate } from '../network-membership-gate.js';
 import { createLogger } from '../logger.js';
 import { unrefTimer } from '../unref-timer.js';
 
@@ -533,13 +533,12 @@ export class UnderReplicationDrain implements Startable {
 	private async pushablePeers(): Promise<Set<string>> {
 		const seen = new Set<string>();
 		const pushable = new Set<string>();
-		const membership = this.deps.membership;
 		for (const connection of this.deps.libp2p.getConnections()) {
 			const peerId = connection.remotePeer;
 			const peerIdStr = peerId.toString();
 			if (seen.has(peerIdStr)) continue;
 			seen.add(peerIdStr);
-			if (membership !== undefined && !membership(peerIdStr)) continue;
+			if (!admittedBy(this.deps.membership, peerIdStr)) continue;
 			if (this.deps.protocolPrefix === undefined || await this.servesBlockTransfer(peerId)) {
 				pushable.add(peerIdStr);
 			}

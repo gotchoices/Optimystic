@@ -40,6 +40,14 @@ export type IsNetworkMember = (peerId: string) => boolean;
  */
 export type NetworkMembershipGate = (peerId: string) => boolean;
 
+/**
+ * Does `gate` admit `peerId`? An absent gate (no predicate configured) admits everyone, which is the
+ * one rule every consumer of an optional gate applies.
+ */
+export function admittedBy(gate: NetworkMembershipGate | undefined, peerId: string): boolean {
+	return gate === undefined || gate(peerId);
+}
+
 /** Log sink shape shared by the component loggers and the `debug` loggers this package uses. */
 export type NetworkMembershipLog = (message: string, ...args: unknown[]) => void;
 

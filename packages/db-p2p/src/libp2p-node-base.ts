@@ -1934,6 +1934,9 @@ export async function createLibp2pNodeBase(
 					// (hash(blockId ‖ round ‖ epoch ‖ i)) rather than the block's XOR neighborhood, so an attacker
 					// who owns the block's locale does not thereby own the arbitrators. `assembleCohort` already
 					// filters to known members; excluding the original cluster + self keeps arbitrators independent.
+					// NOTE: not filtered by `membership` — a node-local predicate would make the draw differ between
+					// nodes — so a refused peer can be drawn and sent the disputed record. Settled before the dispute
+					// subsystem goes live (`feat-dispute-subsystem-live-activation`, "Who may arbitrate?").
 					const excludeSet = new Set(excludePeers);
 					// NOTE: adding the local node's own id to `exclude` makes the draw node-relative. Cross-node
 					// determinism (the verifiable-recompute property) holds today only because the dissent

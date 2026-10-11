@@ -10,7 +10,7 @@ import type { IPeerReputation } from './reputation/types.js'
 import { openProtocolStream } from './network/open-protocol-stream.js'
 import { UNDECLARED_STREAM_OPEN_DEADLINES, type StreamOpenDeadlines } from './rpc-deadline.js'
 import type { BootstrapContact } from './network/bootstrap-contact.js'
-import type { NetworkMembershipGate } from './network-membership-gate.js'
+import { admittedBy, type NetworkMembershipGate } from './network-membership-gate.js'
 
 interface WithFretService { services?: { fret?: FretService } }
 
@@ -608,7 +608,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * predicate's answer.
 	 */
 	private refusedMembership(id: string): boolean {
-		return this.membership !== undefined && !this.membership(id);
+		return !admittedBy(this.membership, id);
 	}
 
 	private persistState(): void {

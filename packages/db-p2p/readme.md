@@ -374,7 +374,7 @@ Omitting it is the default and leaves behavior unchanged. See
 
 **Network membership (optional).** Authorization decides who may send to this node, not who this
 node sends to: a peer counts as a member of the network, and so as a candidate cohort member or
-coordinator, when its advertised protocol list names this network's protocols, and any connected
+coordinator, or a target of background replication, when its advertised protocol list names this network's protocols, and any connected
 peer can fill that list. A private database therefore also supplies `isNetworkMember`, a
 synchronous, fail-closed predicate (this node is always a member):
 

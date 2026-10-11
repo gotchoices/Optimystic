@@ -7,7 +7,7 @@ import { SyncClient } from '../sync/client.js';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import type { ArachnodeFretAdapter } from './arachnode-fret-adapter.js';
 import { partitionCovers } from './arachnode-partition.js';
-import type { NetworkMembershipGate } from '../network-membership-gate.js';
+import { admittedBy, type NetworkMembershipGate } from '../network-membership-gate.js';
 import { createLogger } from '../logger.js';
 import type { RpcDeadlineDefaults } from '../rpc-deadline.js';
 
@@ -60,7 +60,8 @@ export class RestorationCoordinator {
 		const blockCoord = await hashKey(routingKeyForBlock(blockId));
 
 		// 1. Try my transaction ring peers first
-		const myPeers = this.getMyRingPeers(blockCoord);
+		const ringPeers = this.getMyRingPeers(blockCoord);
+		const myPeers = this.membersOnly(ringPeers);
 		const myRingDepth = this.getMyRingDepth();
 
 		// Avoid dialing self: on a solo/bootstrap node with no listenAddrs, dialing self
@@ -70,7 +71,8 @@ export class RestorationCoordinator {
 			? myPeers.filter(p => p !== this.selfPeerId)
 			: myPeers;
 		if (nonSelfMyPeers.length === 0 && myRingDepth <= 0) {
-			this.log('restore:solo-node-skip blockId=%s', blockId);
+			// `refused` > 0 means peers exist but the membership gate turned every one down — not a solo node.
+			this.log('restore:solo-node-skip blockId=%s refused=%d', blockId, ringPeers.length - myPeers.length);
 			return undefined;
 		}
 
@@ -123,13 +125,12 @@ export class RestorationCoordinator {
 	 * @param blockCoord the block id already hashed into the shared coordinate space.
 	 */
 	private getMyRingPeers(blockCoord: RingCoord): string[] {
-		return this.membersOnly(this.fretAdapter.getFret().assembleCohort(blockCoord, 10));
+		return this.fretAdapter.getFret().assembleCohort(blockCoord, 10);
 	}
 
 	/** Drop the FRET-derived candidates the membership gate refuses. */
 	private membersOnly(peers: string[]): string[] {
-		const membership = this.membership;
-		return membership === undefined ? peers : peers.filter(peerId => membership(peerId));
+		return peers.filter(peerId => admittedBy(this.membership, peerId));
 	}
 
 	/**

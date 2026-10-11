@@ -8,6 +8,7 @@ import { RingSelector } from '../src/storage/ring-selector.js';
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { extractPrefix, isServingHolder, qualifiesForFloor, partitionCovers } from '../src/storage/arachnode-partition.js';
 import type { ArachnodeFretAdapter, ArachnodeInfo } from '../src/storage/arachnode-fret-adapter.js';
+import type { NetworkMembershipGate } from '../src/network-membership-gate.js';
 
 /**
  * The **advertise → confirm-replication → release** ring-shift handoff
@@ -135,7 +136,7 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 		released = [];
 	});
 
-	function makeCoordinator(ownedBlocks: Set<string>): RingShiftCoordinator {
+	function makeCoordinator(ownedBlocks: Set<string>, membership?: NetworkMembershipGate): RingShiftCoordinator {
 		return new RingShiftCoordinator({
 			fretAdapter: adapter as unknown as ArachnodeFretAdapter,
 			ringSelector,
@@ -145,7 +146,8 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 			ownedBlocks,
 			selfPeerId: selfId,
 			getFloor: () => FLOOR,
-			onRelease: (ids) => released.push(...ids)
+			onRelease: (ids) => released.push(...ids),
+			membership
 		});
 	}
 
@@ -229,6 +231,22 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 			// The one owner passed to the confirmer was peerC only (peerB excluded as a same-range mover).
 			const ownersForShed = confirmer.calls[0]?.owners.get(shedBlock) ?? [];
 			expect(ownersForShed, 'same-range mover peerB excluded; only stable peerC qualifies').to.deep.equal([peerC]);
+		});
+	});
+
+	describe('network membership', () => {
+		it('a holder the membership gate refuses is not counted toward the floor: rollback, range retained', async () => {
+			adapter.setSelf(active(0, undefined));
+			adapter.setPeer(peerA, active(1, { prefixBits: 1, prefixValue: shedBit0 }));
+			adapter.setPeer(peerB, active(1, { prefixBits: 1, prefixValue: shedBit0 }));
+			fret.setCohort([selfId, peerA, peerB]);
+
+			const outcome = await makeCoordinator(new Set([shedBlock]), peerId => peerId !== peerB)
+				.executeShift({ direction: 'out', newRingDepth: 1 });
+
+			expect(outcome.status, 'one admitted holder < floor 2').to.equal('rolled-back');
+			expect(released).to.deep.equal([]);
+			expect(confirmer.calls[0]?.owners.get(shedBlock), 'refused peerB is never a push target').to.deep.equal([peerA]);
 		});
 	});
 

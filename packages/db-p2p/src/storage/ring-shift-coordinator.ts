@@ -5,7 +5,7 @@ import type { PartitionDetector } from '../cluster/partition-detector.js';
 import type { ArachnodeFretAdapter, ArachnodeInfo } from './arachnode-fret-adapter.js';
 import type { RingSelector } from './ring-selector.js';
 import { partitionCovers, qualifiesForFloor } from './arachnode-partition.js';
-import type { NetworkMembershipGate } from '../network-membership-gate.js';
+import { admittedBy, type NetworkMembershipGate } from '../network-membership-gate.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('ring-shift');
@@ -233,7 +233,7 @@ export class RingShiftCoordinator {
 			const cohort = this.deps.fret.assembleCohort(coord, want);
 			const qualifying = cohort.filter(peerId => {
 				if (peerId === this.deps.selfPeerId) return false;
-				if (this.deps.membership !== undefined && !this.deps.membership(peerId)) return false;
+				if (!admittedBy(this.deps.membership, peerId)) return false;
 				const info = this.deps.fretAdapter.getArachnodeInfo(peerId);
 				return info !== undefined && qualifiesForFloor(info, coord);
 			});

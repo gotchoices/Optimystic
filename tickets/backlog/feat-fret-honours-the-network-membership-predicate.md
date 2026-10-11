@@ -7,7 +7,7 @@ files:
   - ../Fret/docs/fret.md (the planned `AdmissionPolicy` hook under admission control; *Network-scoped admission*)
   - packages/db-p2p/src/libp2p-node-base.ts (where FRET is constructed; would pass the gate)
   - packages/db-p2p/src/cohort-topic/host.ts (non-root tiers use `fret.assembleCohort`)
-tradeoffs: Needs a release of a separate library and an API shape that library's own planned admission design should own; with this repo's two membership tickets landed no database contents reach a refused peer, so what remains is routing and reactivity-metadata hardening that a maintainer may reasonably defer until a deployment shows strangers in its ring.
+tradeoffs: Needs a release of a separate library and an API shape that library's own planned admission design should own; with this repo's two membership tickets landed no database contents reach a refused peer outside the off-by-default dispute path, so what remains is routing and reactivity-metadata hardening that a maintainer may reasonably defer until a deployment shows strangers in its ring.
 ----
 
 # FRET honours the network membership predicate
@@ -20,6 +20,7 @@ What a refused-but-ring-member peer can still do once both db-p2p tickets land:
 
 - be a FRET routing hop (`RouteAndMaybeAct`) and drop or misroute cohort-topic traffic;
 - be in a non-root cohort-topic cohort (`fret.assembleCohort` in `packages/db-p2p/src/cohort-topic/host.ts`), holding subscriber registrations and seeing reactivity notifications (collection id, revision, commit certificate — metadata, not block contents) and matchmaking registrations;
+- be drawn as a dispute arbitrator (the `selectArbitrators` hook uses `fret.assembleCohort`) on a node with `dispute.disputeEnabled`, and so be sent the disputed record, transforms included — the one way block contents still reach a refused peer; `feat-dispute-subsystem-live-activation` ("Who may arbitrate?") recommends this ticket as its fix;
 - occupy the key network's over-fetch band, which can shrink a cohort when refused peers outnumber the band's headroom near a key (the `NOTE:` at `membershipOverfetch`);
 - stay a live ring member after it disconnects with no address (sereus's `fret-evicts-an-address-less-peer-that-disconnects`; FRET 1.0.2 may already change this).
 
