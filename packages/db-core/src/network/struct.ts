@@ -97,12 +97,15 @@ export type DurabilityQuorum =
 	 *  (`withTornBlocks` clamps `full` down to this; `torn` then names the blocks, and `unconfirmed`
 	 *  may be empty). */
 	| 'majority'
-	/** The cohort resolved, and it is this node alone. Nobody else holds the revision yet. */
+	/** The cohort resolved, and it is this node alone. Nobody else holds the revision yet. When this
+	 *  node knows of other members of the cohort that it could not reach (`IKeyNetwork.absentCohortMembers`),
+	 *  they are named in `unconfirmed` and counted in `cohort`: the write is owed to them. With none
+	 *  named, it is a correct, complete one-machine write. */
 	| 'local'
 	/** The cohort did NOT resolve: the lookup threw, or named nobody, or named a single peer that
 	 *  is not this node. The write is on this node's storage and the network was never consulted.
-	 *  Deliberately NOT `local`: a genuine cohort of one is a correct, complete write, whereas this
-	 *  is a write whose correct destination is unknown. */
+	 *  Deliberately NOT `local`: a write that lands where its cohort resolved to is in the right
+	 *  place, whereas this is a write whose correct destination is unknown. */
 	| 'unrouted';
 
 /** What the answering layer knows about who holds a successful write. Each layer refines it:
@@ -120,11 +123,13 @@ export type WriteDurability = {
 	 *  it means "accepted the pending record". The two are NOT comparable — a pend confers no
 	 *  storage durability (see the note in `CoordinatorRepo.pendThroughCluster`). */
 	readonly confirmed: number;
-	/** Size of the cohort the write ran on. Zero exactly when `quorum` is 'unrouted'. */
+	/** Size of the cohort the write ran on. Zero exactly when `quorum` is 'unrouted'. For `local`
+	 *  it is one plus the known members the write ran without, so `local` does not imply 1. */
 	readonly cohort: number;
 	/** Cohort members that did not confirm, by peer-id string. Empty when `quorum` is 'full'.
 	 *  ABSENT (not empty) when the answering layer could not name the cohort — an empty array
-	 *  here means "named the cohort, nobody is missing". */
+	 *  here means "named the cohort, nobody is missing". On a `local` write these are the members
+	 *  this node knows of but could not reach when it wrote alone. */
 	readonly unconfirmed?: readonly string[];
 	/** The cohort the write ran on, by peer-id string. Absent where the answering layer has no
 	 *  cohort view at all (a bare `StorageRepo` verdict). */

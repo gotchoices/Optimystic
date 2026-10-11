@@ -70,6 +70,8 @@ interface SeamOptions {
 	consensus?: Partial<Awaited<ReturnType<ICoordinatorClusterSeam['executeClusterTransaction']>>>;
 	/** Handed to the repo through its components object, as the node wiring does. */
 	ledger?: IUnderReplicationLedger;
+	/** What the key network says belongs in the cohort but is missing from it; absent → it cannot say. */
+	absentMembers?: readonly string[];
 }
 
 /**
@@ -91,7 +93,8 @@ const makeRepo = (storage: IRepo, self: PeerId | undefined, seam: SeamOptions): 
 		async findCoordinator(_key: Uint8Array, _o?: Partial<FindCoordinatorOptions>): Promise<PeerId> { throw new Error('not implemented'); },
 		async findCluster(_key: Uint8Array): Promise<ClusterPeers> {
 			return Object.fromEntries(responsibilityView.map(id => [id, { multiaddrs: [], publicKey: '' }]));
-		}
+		},
+		...(seam.absentMembers === undefined ? {} : { absentCohortMembers: async () => [...seam.absentMembers!] })
 	};
 	const repo = coordinatorRepo(keyNetwork, (_p: PeerId) => ({} as unknown as ClusterClient), { clusterSize: 3 })({
 		storageRepo: storage,
@@ -395,6 +398,18 @@ describe('CoordinatorRepo — an acknowledged commit below full replication reco
 		const unrouted = withClock(makeRepo(storageRepo(), self, { cohort: { resolved: false, reason: 'findCluster threw' }, ledger: unroutedLedger }));
 		successOf(await unrouted.commit(COMMIT));
 		expect(await unroutedLedger.get(BLOCK)).to.deep.equal(expected(BLOCK, { quorum: 'unrouted' }));
+	});
+
+	it('a solo commit that knows of a member it could not reach names it as owed, in the answer and in the ledger', async () => {
+		// The lone survivor of a two-machine group: its partner is remembered as serving but has left
+		// the ring, so the cohort resolved to this node alone.
+		const partner = others[0]!;
+		const repo = withClock(makeRepo(storageRepo(), self, { cohort: { resolved: true, peerIds: [selfId] }, ledger, absentMembers: [partner] }));
+
+		const result = successOf(await repo.commit(COMMIT));
+
+		expect(result.durability).to.deep.equal({ quorum: 'local', confirmed: 1, cohort: 2, unconfirmed: [partner], cohortPeerIds: [selfId, partner] });
+		expect(await ledger.get(BLOCK)).to.deep.equal(expected(BLOCK, { quorum: 'local', missingPeerIds: [partner] }));
 	});
 
 	it('a full commit records nothing and settles an older entry for the same blocks', async () => {

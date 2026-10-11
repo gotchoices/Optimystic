@@ -2220,7 +2220,7 @@ export class CoordinatorRepo implements IRepo {
 
 		const cohort = await this.coordinator.resolveCohort(coordinatingBlockIds[0]!);
 		if (!cohort.resolved || cohort.peerIds.length <= 1) {
-			return await this.pendSolo(request, cohort, options);
+			return await this.pendSolo(request, coordinatingBlockIds[0]!, cohort, options);
 		}
 
 		const message: RepoMessage = {
@@ -2394,16 +2394,19 @@ export class CoordinatorRepo implements IRepo {
 	 * pend goes straight to local storage exactly as before. What changes is the answer's class —
 	 * see {@link soloCohortDurability} for the four-way split. A refusal is returned untouched.
 	 */
-	private async pendSolo(request: PendRequest, cohort: CohortResolution, options?: MessageOptions): Promise<PendResult> {
+	private async pendSolo(request: PendRequest, blockId: BlockId, cohort: CohortResolution, options?: MessageOptions): Promise<PendResult> {
 		const result = await this.storageRepo.pend(request, options);
-		return result.success ? { ...result, durability: this.soloCohortDurability(cohort) } : result;
+		return result.success ? { ...result, durability: await this.soloCohortDurability(cohort, blockId) } : result;
 	}
 
 	/**
 	 * The class of a write that took the solo short-circuit, from the cohort resolution that put it
-	 * there. Policy-free: the write already happened, this only says what it was.
+	 * there, for the block whose cohort that was. Policy-free: the write already happened, this only
+	 * says what it was.
 	 *  - not resolved (the lookup threw, or named nobody) → `unrouted`;
-	 *  - resolved to exactly this node → `local`, a correct and complete one-machine write;
+	 *  - resolved to exactly this node → `local`, naming as unconfirmed every member the key network
+	 *    knows belongs in this cohort but could not place in it ({@link absentCohortMembers}) — the
+	 *    write is owed to them. With none, a correct and complete one-machine write;
 	 *  - resolved to exactly one peer that is NOT this node → `unrouted` — this node wrote somewhere
 	 *    the cohort does not look, which is a write whose destination is wrong, not a solo write.
 	 * With no local peer id (direct constructors, single-node and test wiring) a resolved cohort of
@@ -2416,11 +2419,29 @@ export class CoordinatorRepo implements IRepo {
 	 * staleness window, or when a second lookup fails moments after the first succeeded — and then it
 	 * still reports honestly rather than posing as `local`.
 	 */
-	private soloCohortDurability(cohort: CohortResolution): WriteDurability {
+	private async soloCohortDurability(cohort: CohortResolution, blockId: BlockId): Promise<WriteDurability> {
 		if (!cohort.resolved) return unroutedDurability();
 		const sole = cohort.peerIds[0]!;
 		if (this.localPeerId !== undefined && sole !== this.localPeerId.toString()) return unroutedDurability();
-		return localDurability(sole);
+		const absent = (await this.absentCohortMembers(blockId)).filter(peerId => peerId !== sole);
+		return localDurability(sole, absent);
+	}
+
+	/**
+	 * The members the key network knows belong in `blockId`'s cohort but are missing from the cohort it
+	 * assembles now (`IKeyNetwork.absentCohortMembers`). Asked only by the solo short-circuit, once its
+	 * cohort resolved to this node, so no write that ran on a real cohort pays for the lookup. A failure
+	 * names nobody: the write already happened, and an answer that cannot name its absent members is
+	 * the answer this node gave before it could.
+	 */
+	private async absentCohortMembers(blockId: BlockId): Promise<string[]> {
+		if (this.keyNetwork.absentCohortMembers === undefined) return [];
+		try {
+			return await this.keyNetwork.absentCohortMembers(routingKeyForBlock(blockId));
+		} catch (err) {
+			this.log('coordinator-repo:absent-members-failed', { blockId, error: (err as Error).message });
+			return [];
+		}
 	}
 
 	/**
@@ -3106,7 +3127,9 @@ export class CoordinatorRepo implements IRepo {
 	 * (consensus ran on `blockIds[0]`'s cohort for the whole request):
 	 * - `full` settles any older entry for the block, whether or not this node holds it;
 	 * - `majority` records the unconfirmed members by name;
-	 * - `local` and `unrouted` record an EMPTY missing set, meaning "unknown" — nobody could be named.
+	 * - `local` records the members it names unconfirmed — the ones this node knows of and wrote
+	 *   without — or an EMPTY missing set, meaning "unknown", when it named none;
+	 * - `unrouted` records an EMPTY missing set — no cohort was named.
 	 * A shortfall is recorded only when `localHolds`: a node holding nothing has nothing to push, and
 	 * the remote majority that admitted the commit already holds it.
 	 *
@@ -3152,12 +3175,18 @@ export class CoordinatorRepo implements IRepo {
 			return;
 		}
 		if (!localHolds) return;
+		// NOTE: accepted tradeoff — a `local` entry naming a member that never comes back stays until
+		// the ledger's size cap evicts it, as an unnamed entry on a node whose cohort stays self-only
+		// already did, so naming adds no cost. Revisit if a deployment reports ledger growth from a
+		// permanently departed partner: the remedy is a declared member list (backlog
+		// `feat-declared-membership-feeds-cohort-assembly`) or a "forget peer" operation, the remedy
+		// the accepted-tradeoff note at `membershipOf` in `libp2p-key-network.ts` names.
 		await ledger.record({
 			blockId,
 			rev: request.rev,
 			actionId: request.actionId,
 			quorum: durability.quorum,
-			missingPeerIds: durability.quorum === 'majority' ? durability.unconfirmed ?? [] : [],
+			missingPeerIds: durability.quorum === 'unrouted' ? [] : durability.unconfirmed ?? [],
 			recordedAt: this.now(),
 			attempts: 0
 		});
@@ -3191,17 +3220,27 @@ export class CoordinatorRepo implements IRepo {
 	 * tells a real cohort of one — cohortSize 1, soleIsSelf true — from a routing failure) now also
 	 * carries the `quorum` the writer is told, and both come from {@link soloCohortDurability}, so the
 	 * log and the answer cannot disagree.
+	 *
+	 * Two more fields tell apart the three ways a node that is part of a group comes to write alone:
+	 * `knownAbsent` counts the members it knows of and could not reach (named in `absentPeers`), and
+	 * `awaitingBootstrap` says it is still waiting to hear from a peer it was configured to join
+	 * through. With neither, the node is genuinely alone or has never identified another member of
+	 * its group.
 	 */
 	private async commitSolo(request: CommitRequest, blockIds: BlockId[], cohort: CohortResolution, options?: MessageOptions): Promise<CommitResult> {
 		const cohortPeerIds = cohort.resolved ? cohort.peerIds : [];
 		const peerCount = cohortPeerIds.length;
-		const soloDurability = this.soloCohortDurability(cohort);
+		const soloDurability = await this.soloCohortDurability(cohort, blockIds[0]!);
+		const absent = soloDurability.unconfirmed ?? [];
 		this.log('commit:solo-cohort', {
 			blockId: blockIds[0],
 			cohortSize: peerCount,
 			soleIsSelf: peerCount === 1 && this.localPeerId !== undefined
 				&& cohortPeerIds[0] === this.localPeerId.toString(),
 			quorum: soloDurability.quorum,
+			knownAbsent: absent.length,
+			...(absent.length === 0 ? {} : { absentPeers: absent.map(peerId => peerId.substring(0, 12)) }),
+			awaitingBootstrap: await this.keyNetwork.awaitingBootstrapContact?.() ?? false,
 			...(cohort.resolved ? {} : { reason: cohort.reason })
 		});
 		// Same message shape the multi-peer path produces — executeClusterTransaction stamps

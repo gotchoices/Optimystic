@@ -124,18 +124,19 @@ const zeroCounts = (trigger: DrainTrigger): DrainPassResult => ({
  * finally has all of them.
  *
  * `CoordinatorRepo.commit` writes an entry per block it acknowledged below full replication, naming
- * the cohort members that had not confirmed it (or an EMPTY set when no cohort could be named — a
- * `local` or `unrouted` write). This service is the other half: on start, whenever a peer connects or
- * is identified, and on a re-check timer while anything is outstanding, it walks the ledger and pushes
- * each block to the owed peers that are reachable right now. A peer that confirms is removed from the
- * entry; when the entry empties it is deleted and ONE {@link BlockDurabilityReachedEvent} fires through
- * the sink — after the deletion, never before.
+ * the cohort members that had not confirmed it (or an EMPTY set when no cohort could be named — an
+ * `unrouted` write, or a `local` one that knew of no other member). This service is the other half:
+ * on start, whenever a peer connects or is identified, and on a re-check timer while anything is
+ * outstanding, it walks the ledger and pushes each block to the owed peers that are reachable right
+ * now. A peer that confirms is removed from the entry; when the entry empties it is deleted and ONE
+ * {@link BlockDurabilityReachedEvent} fires through the sink — after the deletion, never before.
  *
  * What it deliberately does not do:
  * - **Dial the world.** A copy goes only to a peer that is connected and identified as serving this
  *   network. An entry whose owed peers are all away simply waits; the next arrival wakes the drain.
  * - **Re-resolve a NAMED peer.** A `majority` entry names members that were in the cohort when the
- *   write was acknowledged; a copy there is never harmful even if the cohort has since moved on.
+ *   write was acknowledged, and a `local` entry the members the node knew belonged in it; a copy there
+ *   is never harmful even if the cohort has since moved on.
  * - **Count an attempt against a node that is alone.** An entry with no named members whose cohort
  *   still resolves to this node alone is left exactly as it is: nobody is owed anything yet.
  * - **Delete an entry to tidy up.** Only a confirmed copy (or the block leaving local storage) removes

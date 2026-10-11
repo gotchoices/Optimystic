@@ -728,7 +728,12 @@ cohort of one (1 / true) from a routing failure (0, or a sole peer that is not t
 `quorum` — the durability class the writer was told (`local` for the former, `unrouted` for the
 latter; see `WriteDurability` in `packages/db-core/src/network/struct.ts`), plus `reason` when the
 cohort did not resolve. The log and the returned answer come from the same classification
-(`soloCohortDurability` in `packages/db-p2p/src/repo/coordinator-repo.ts`), so they cannot disagree. A node briefly
+(`soloCohortDurability` in `packages/db-p2p/src/repo/coordinator-repo.ts`), so they cannot disagree.
+Two more fields say why a node that belongs to a group wrote alone: `knownAbsent` counts the members
+it knows of and could not reach (with their short ids in `absentPeers`), whom the `local` answer names
+as `unconfirmed`, and `awaitingBootstrap` says it is still waiting to hear from a peer it was
+configured to join through. With neither, the node is genuinely alone or has never identified
+another member of its group. A node briefly
 alone can still mint a proof for a revision the rest of its cohort never saw, so the repair
 selectors weigh a proof by **how many distinct peers signed it**: a one-signer proof — which is
 exactly what this branch mints — no longer out-ranks a corroborated claim at equal revision. Two or
@@ -2009,7 +2014,14 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `absenceFlagFor`: a node configured with a bootstrap peer that is permanently gone, and holding
   no persisted network state, can neither create a collection nor read a block it lacks until that
   peer is heard from or taken out of its configuration. Out of scope here: a write to a collection
-  the node already holds, made before contact, still commits alone.
+  the node already holds, made before contact, still commits alone, at `local`. What it now does is
+  say who it is owed to: every serving member the node knows of that belongs in the block's cohort
+  but is missing from it (`absentCohortMembers` in `packages/db-p2p/src/libp2p-key-network.ts`) is
+  named in the answer's `unconfirmed` and in the under-replication ledger, so the copy is pushed to
+  that member as soon as it is connected (see
+  [packages/db-p2p/docs/repo.md §The durability gate and the under-replication ledger](../packages/db-p2p/docs/repo.md#the-durability-gate-and-the-under-replication-ledger)).
+  Whether such a write should be admitted at all belongs to the partition-healing design (backlog
+  `6.5-partition-healing`).
 
   "Remembers" has to cover which of those peers serve this network, not only that they exist. The
   cohort admits only peers positively classified as serving, and the classification reads each

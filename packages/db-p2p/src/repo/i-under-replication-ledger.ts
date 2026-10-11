@@ -18,9 +18,10 @@ export type UnderReplicatedEntry = {
 	/** The class the commit was acknowledged at — `local`, `unrouted`, or `majority`. */
 	readonly quorum: ShortfallQuorum;
 	/** Cohort members that had not confirmed holding `rev`, by peer-id string.
-	 *  EMPTY when the cohort could not be named (`local`, `unrouted`): there was nobody to name,
-	 *  and the drain must re-resolve the cohort at drain time instead. An empty array therefore
-	 *  means "unknown", not "nobody". */
+	 *  EMPTY when the cohort could not be named (`unrouted`, or a `local` write that knew of no
+	 *  other member): there was nobody to name, and the drain must re-resolve the cohort at drain
+	 *  time instead. An empty array therefore means "unknown", not "nobody". A `local` entry names
+	 *  the members the node knew of and wrote without. */
 	readonly missingPeerIds: readonly string[];
 	/** When this shortfall was first recorded, in milliseconds since the epoch. */
 	readonly recordedAt: number;
@@ -64,7 +65,7 @@ export interface IUnderReplicationLedger {
 	 * Remove `peerIds` from an entry's missing set, deleting the entry when it empties. Returns the
 	 * remaining entry, or `undefined` when it was deleted or never existed.
 	 *
-	 * An entry whose missing set is UNKNOWN (empty — recorded `local` or `unrouted`) is returned
+	 * An entry whose missing set is UNKNOWN (empty — recorded `unrouted`, or `local` naming nobody) is returned
 	 * unchanged: removing named peers from an unknown set cannot prove it empty. `name` its missing
 	 * set first, or `delete` it once the whole re-resolved cohort has confirmed.
 	 *

@@ -3,7 +3,7 @@ import { toString as u8ToString } from 'uint8arrays'
 import type { ClusterPeers, CoordinatorIntent, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork, RoutingKey } from "@optimystic/db-core";
 import { peerIdFromString } from '@libp2p/peer-id'
 import type { FretService, SerializedTable } from 'p2p-fret'
-import { hashKey } from 'p2p-fret'
+import { hashKey, hashPeerId, lexLess, minDistance } from 'p2p-fret'
 import { createLogger, verbose } from './logger.js'
 import { classifySelfDialability, mergePeerAddresses, publishableConnectionAddr, unionPublishableAddrs, type AddressLog } from './peer-address-book.js'
 import type { IPeerReputation } from './reputation/types.js'
@@ -1642,6 +1642,55 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	async servingCohortAt(coord: Uint8Array): Promise<string[]> {
 		const assembled = await this.assembleServingCohortAt(coord, u8ToString(coord, 'base64url').substring(0, 12))
 		return assembled.cohort
+	}
+
+	/**
+	 * The peers this node has seen serving this network that belong in `key`'s cohort but are missing
+	 * from the one {@link assembleServingCohort} assembles now — a partner that went offline, or a
+	 * relay-only peer FRET dropped from the ring once it disconnected. A write this node makes without
+	 * them is owed to them, which `CoordinatorRepo`'s solo short-circuit reports and records.
+	 *
+	 * Candidates are the peers whose membership verdict is `serves` ({@link membershipOf}, so they
+	 * come from {@link rememberedServing}, the one memory of positive verdicts) and that FRET does not
+	 * hold live near the key: anything in the assembly's band was placed or left out by FRET itself,
+	 * which is the authority on live members. Never self, an `unknown` or `foreign` peer, or a
+	 * bootstrap peer that is merely configured. The expected cohort is the nearest `clusterSize` of the
+	 * assembled cohort and the candidates together; the candidates in it are returned, nearest first.
+	 * A node that has never seen another serving peer answers `[]`, so a genuine one-machine
+	 * deployment is unchanged.
+	 *
+	 * NOTE: the expected cohort is ranked by two-sided ring distance, which approximates FRET's
+	 * alternating successor/predecessor walk rather than reproducing it. That decides only who is
+	 * pushed a copy, and a copy to a peer just outside the true cohort is harmless, so the difference
+	 * needs no closing. Whenever the assembled cohort and the candidates together number at most
+	 * `clusterSize` — every group up to the cluster size, two-machine groups included — every
+	 * candidate is in it whatever the ranking.
+	 */
+	async absentCohortMembers(key: RoutingKey): Promise<string[]> {
+		const coord = await hashKey(key)
+		const { cohort, band } = await this.assembleServingCohortAt(coord, this.toCacheKey(key).substring(0, 12))
+		const candidates = await this.servingPeersOutside(band)
+		if (candidates.length === 0) return []
+		const expected = await this.nearestTo(coord, [...cohort, ...candidates], this.clusterSize)
+		const absent = new Set(candidates)
+		return expected.filter(id => absent.has(id))
+	}
+
+	/** Remote peers outside `band` whose membership verdict, read from their peerStore protocols now, is `serves`. */
+	private async servingPeersOutside(band: readonly string[]): Promise<string[]> {
+		const excluded = new Set([...band, this.libp2p.peerId.toString()])
+		const remembered = [...this.rememberedServing].filter(id => !excluded.has(id))
+		if (remembered.length === 0) return []
+		const protocols = await this.getPeerStoreProtocolsByPeer(remembered)
+		return remembered.filter(id => this.membershipOf(id, protocols[id]) === 'serves')
+	}
+
+	/** The `count` of `ids` nearest `coord` by two-sided ring distance, nearest first. */
+	private async nearestTo(coord: Uint8Array, ids: readonly string[], count: number): Promise<string[]> {
+		const placed = await Promise.all(ids.map(async id =>
+			({ id, distance: minDistance(coord, await hashPeerId(peerIdFromString(id))) })))
+		placed.sort((a, b) => lexLess(a.distance, b.distance) ? -1 : lexLess(b.distance, a.distance) ? 1 : 0)
+		return placed.slice(0, count).map(p => p.id)
 	}
 
 	/**

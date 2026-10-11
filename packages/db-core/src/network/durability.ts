@@ -72,13 +72,20 @@ export function withTornBlocks(d: WriteDurability, torn: readonly BlockId[]): Wr
 	};
 }
 
-/** The single-node answer: this node holds it and knows nothing about a cohort beyond itself. */
-export function localDurability(selfPeerId?: string): WriteDurability {
+/**
+ * The single-node answer: this node holds it and nobody else does yet. `absent` names the cohort
+ * members this node knows of that the write ran without — they are part of the cohort the write is
+ * owed to, so they count in `cohort` and are listed in `unconfirmed`. With none, it is a one-machine
+ * write that is complete. `absent` needs `selfPeerId`: without it the answer cannot name the cohort.
+ */
+export function localDurability(selfPeerId?: string, absent: readonly string[] = []): WriteDurability {
+	if (selfPeerId === undefined) return { quorum: 'local', confirmed: 1, cohort: 1 };
 	return {
 		quorum: 'local',
 		confirmed: 1,
-		cohort: 1,
-		...(selfPeerId === undefined ? {} : { unconfirmed: [], cohortPeerIds: [selfPeerId] })
+		cohort: 1 + absent.length,
+		unconfirmed: [...absent],
+		cohortPeerIds: [selfPeerId, ...absent]
 	};
 }
 

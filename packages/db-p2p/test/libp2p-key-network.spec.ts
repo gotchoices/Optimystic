@@ -5,6 +5,7 @@ import { generateKeyPair } from '@libp2p/crypto/keys';
 import { multiaddr } from '@multiformats/multiaddr';
 import type { PeerId, Libp2p, Connection, PendingDial } from '@libp2p/interface';
 import type { SerializedTable } from 'p2p-fret';
+import { hashKey, hashPeerId, lexLess, minDistance } from 'p2p-fret';
 import { waitFor } from '@optimystic/db-core/test';
 import {
 	Libp2pKeyPeerNetwork,
@@ -2532,6 +2533,47 @@ describe('Libp2pKeyPeerNetwork', () => {
 				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, undefined, undefined, undefined, PREFIX);
 				await expectCode(() => network.findCoordinator(KEY, { excludedPeers: [selfPeerId] }), FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_EXHAUSTED, 'self excluded');
 			});
+		});
+	});
+
+	describe('absentCohortMembers()', () => {
+		const PREFIX = '/optimystic/netA';
+		const servesProto = [`${PREFIX}/cluster/1.0.0`, `${PREFIX}/repo/1.0.0`];
+		const KEY = routingKeyForBlock('absent-members-key');
+
+		it('names a remembered serving peer that ranks inside the expected cohort, and not one that ranks outside it', async () => {
+			// Four fresh peers in ring-distance order from the key: the nearest and the farthest are
+			// remembered as serving but gone from the ring; the middle two are the live cohort.
+			const coord = await hashKey(KEY);
+			const placed = await Promise.all((await Promise.all([makePeerId(), makePeerId(), makePeerId(), makePeerId()]))
+				.map(async peer => ({ peer: peer.toString(), distance: minDistance(coord, await hashPeerId(peer)) })));
+			placed.sort((a, b) => lexLess(a.distance, b.distance) ? -1 : lexLess(b.distance, a.distance) ? 1 : 0);
+			const [near, live1, live2, far] = placed.map(p => p.peer) as [string, string, string, string];
+			const fret = {
+				assembleCohort: () => [live1, live2],
+				getNetworkSizeEstimate: () => ({ size_estimate: 4, confidence: 0.5 }),
+				detectPartition: () => false,
+				exportTable: () => undefined
+			};
+			const peerStore = {
+				all: async () => [],
+				get: async (pid: { toString(): string }) => ({
+					protocols: [live1, live2].includes(pid.toString()) ? servesProto : [],
+					addresses: []
+				})
+			};
+			const persistence = new MemoryPersistence({
+				version: PERSISTED_STATE_VERSION,
+				networkHighWaterMark: 4,
+				lastConnectedTimestamp: Date.now(),
+				consecutiveIsolatedSessions: 0,
+				servingPeers: [near, far]
+			});
+			const network = new Libp2pKeyPeerNetwork(createMockLibp2p(selfPeerId, { fret, peerStore }), 2, undefined, undefined, persistence, undefined, PREFIX);
+			await network.initFromPersistedState();
+
+			expect(Object.keys(await network.findCluster(KEY)), 'the live cohort').to.have.members([live1, live2]);
+			expect(await network.absentCohortMembers(KEY)).to.deep.equal([near]);
 		});
 	});
 
