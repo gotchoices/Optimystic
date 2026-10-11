@@ -12,7 +12,7 @@ import { copyTransforms, isTransformsEmpty } from "../transform/helpers.js";
 import { TransactorSource, answeredBlock, servedRevision } from "../transactor/transactor-source.js";
 import { BlockFloors } from "../transactor/block-floors.js";
 import type { WriteDurability } from "../network/struct.js";
-import { mergeDurability } from "../network/durability.js";
+import { mergeDurability, withBlockRevs } from "../network/durability.js";
 import { highestStaleAt, isExpiryFailure } from "../network/stale-failure.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
 import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions, TornActionReason } from "./index.js";
@@ -827,10 +827,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 		const discharged = await this.dischargeOwnPendings(entry);
 		const lineage = rev === undefined ? undefined : await this.lineageOfOwnEntry(entry, rev);
 		const unsaved = entry.blockIds.filter((blockId, i) => blockId !== tailId && lineage?.blocks[i] !== 'contains');
-		if (lineage !== undefined && unsaved.length === 0) {
+		if (lineage !== undefined && rev !== undefined && unsaved.length === 0) {
 			log('collection:own-entry-superseded-but-saved id=%s tag=%s action=%s rev=%d blocks=%d',
 				this.id, this.instanceTag, entry.actionId, rev, entry.blockIds.length);
-			return lineage.durability;
+			// The write's own revision: what superseded it built on it at a later one, and an event
+			// covering that later revision covers this one too.
+			return lineage.durability === undefined ? undefined : withBlockRevs(lineage.durability, entry.blockIds, rev);
 		}
 		const cannotLand = lineage !== undefined && unsaved.every(blockId => {
 			const answer = lineage.blocks[entry.blockIds.indexOf(blockId)];

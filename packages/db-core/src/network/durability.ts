@@ -25,7 +25,8 @@ export function durabilityRank(q: DurabilityQuorum): number {
  * Merge per-cohort reports into one action-level report: the weakest becomes the scalar answer and
  * the rest become `otherCohorts`, so a consumer that reads only the scalar fields is reading the
  * binding constraint. `torn` is the union across the inputs — an abandoned block is abandoned
- * whichever cohort it ran on. Reports that already carry `otherCohorts` are flattened first, so
+ * whichever cohort it ran on — and `blockRevs` the union at the higher revision per block, less
+ * every torn block. Reports that already carry `otherCohorts` are flattened first, so
  * merging a merge is the same as merging its inputs. Identical reports collapse to one: a commit
  * sends the tail and the sweep as separate batches, so ONE cohort routinely answers twice for one
  * action, and without this a healthy single-cohort commit would list its own cohort under
@@ -46,29 +47,45 @@ export function mergeDurability(reports: readonly WriteDurability[]): WriteDurab
 	const ranked = [...flat].sort((a, b) => durabilityRank(a.quorum) - durabilityRank(b.quorum));
 	const weakest = ranked[0]!;
 	const others = ranked.slice(1);
-	// Over the ORIGINAL reports: flattening strips `torn` (it is action-level), so the union must
-	// be taken before that or a torn input merges to an untorn answer.
+	// Over the ORIGINAL reports: flattening strips `torn` and `blockRevs` (they are action-level),
+	// so both are taken before that or a torn input merges to an untorn answer.
 	const torn = unionTorn(reports);
+	const blockRevs = withoutBlocks(highestBlockRevs(reports), torn);
 	return {
 		...stripMergedFields(weakest),
 		...(others.length === 0 ? {} : { otherCohorts: others.map(stripMergedFields) }),
-		...(torn.length === 0 ? {} : { torn })
+		...(torn.length === 0 ? {} : { torn }),
+		...blockRevsField(blockRevs)
 	};
+}
+
+/**
+ * Name the blocks a write committed, at the revision it committed them at — set where the commit is
+ * confirmed, by the db-core layer that issued it. A block already named keeps the higher revision,
+ * and a block in `d.torn` is left out: it holds nothing.
+ */
+export function withBlockRevs(d: WriteDurability, blockIds: readonly BlockId[], rev: number): WriteDurability {
+	const committed = Object.fromEntries(blockIds.map(blockId => [blockId, rev]));
+	const blockRevs = withoutBlocks(highestBlockRevs([d, { blockRevs: committed }]), d.torn ?? []);
+	return { ...d, ...blockRevsField(blockRevs) };
 }
 
 /**
  * Clamp an action-level report below `full` when the action abandoned blocks. A cohort can hold
  * every block it was asked to commit and the action still be incomplete — the blocks the sweep
  * never reached are on nobody. Never raises the class; a report already below `full` keeps it.
- * Idempotent, and a no-op for an empty `torn`.
+ * A torn block leaves `blockRevs`, since it was not committed. Idempotent, and a no-op for an
+ * empty `torn`.
  */
 export function withTornBlocks(d: WriteDurability, torn: readonly BlockId[]): WriteDurability {
 	if (torn.length === 0) return d;
 	const allTorn = Array.from(new Set([...(d.torn ?? []), ...torn]));
+	const { blockRevs: _blockRevs, ...rest } = d;
 	return {
-		...d,
+		...rest,
 		quorum: d.quorum === 'full' ? 'majority' : d.quorum,
-		torn: allTorn
+		torn: allTorn,
+		...blockRevsField(withoutBlocks(d.blockRevs ?? {}, allTorn))
 	};
 }
 
@@ -103,9 +120,10 @@ function flattenDurability(d: WriteDurability): WriteDurability[] {
 	return [stripMergedFields(d), ...(d.otherCohorts ?? [])];
 }
 
-/** The per-cohort fields only — `otherCohorts` and `torn` are action-level and re-derived by the merge. */
+/** The per-cohort fields only — `otherCohorts`, `torn` and `blockRevs` are action-level and
+ *  re-derived by the merge. */
 function stripMergedFields(d: WriteDurability): WriteDurability {
-	const { otherCohorts: _otherCohorts, torn: _torn, ...cohortReport } = d;
+	const { otherCohorts: _otherCohorts, torn: _torn, blockRevs: _blockRevs, ...cohortReport } = d;
 	return cohortReport;
 }
 
@@ -127,4 +145,23 @@ function distinctReports(reports: readonly WriteDurability[]): WriteDurability[]
 
 function unionTorn(reports: readonly WriteDurability[]): BlockId[] {
 	return Array.from(new Set(reports.flatMap(r => r.torn ?? [])));
+}
+
+/** Every block any report names, at the highest revision any of them names it at. */
+function highestBlockRevs(reports: readonly Pick<WriteDurability, 'blockRevs'>[]): Record<BlockId, number> {
+	const highest: Record<BlockId, number> = {};
+	for (const [blockId, rev] of reports.flatMap(r => Object.entries(r.blockRevs ?? {}))) {
+		highest[blockId] = Math.max(highest[blockId] ?? rev, rev);
+	}
+	return highest;
+}
+
+function withoutBlocks(blockRevs: Readonly<Record<BlockId, number>>, excluded: readonly BlockId[]): Record<BlockId, number> {
+	const drop = new Set(excluded);
+	return Object.fromEntries(Object.entries(blockRevs).filter(([blockId]) => !drop.has(blockId)));
+}
+
+/** The field, or nothing: an empty map is left off, as an empty `torn` is. */
+function blockRevsField(blockRevs: Readonly<Record<BlockId, number>>): Pick<WriteDurability, 'blockRevs'> {
+	return Object.keys(blockRevs).length === 0 ? {} : { blockRevs };
 }

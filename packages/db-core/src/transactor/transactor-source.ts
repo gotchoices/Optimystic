@@ -2,6 +2,7 @@ import { randomBytes } from '@noble/hashes/utils.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import type { IBlock, BlockId, BlockHeader, ITransactor, ActionId, CommitResult, ActionContext, BlockType, BlockSource, ReadPurpose, Transforms, BlockContentDigests, BlockBaseRevs, GetBlockResult } from "../index.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
+import { withBlockRevs } from "../network/durability.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 import { blockDigestsField, baseRevsField } from "../transform/digest.js";
@@ -228,10 +229,11 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	 * committed revision each update-only block's operations were computed against, from the same tracker
 	 * (`Tracker.stagedBaseRevs`). Omitted from the pend request when empty, for the same preimage reason.
 	 * @returns The transactor's own verdict, unflattened: a {@link CommitSuccess} carrying the
-	 * {@link WriteDurability} of the committed revision, or a {@link StaleFailure} if the pend or the commit
-	 * was refused. Success is deliberately NOT collapsed to `undefined` — the durability is the only thing
-	 * that tells a write every machine holds from one only this machine holds, and a caller that wants the
-	 * old boolean reads `result.success`. Test "is this completely saved" through `isFullyDurable`, never
+	 * {@link WriteDurability} of the committed revision — naming every block it committed at `rev`
+	 * (`blockRevs`) — or a {@link StaleFailure} if the pend or the commit was refused. Success is
+	 * deliberately NOT collapsed to `undefined` — the durability is the only thing that tells a write every
+	 * machine holds from one only this machine holds, and a caller that wants the old boolean reads
+	 * `result.success`. Test "is this completely saved" through `isFullyDurable`, never
 	 * by comparing `quorum` (see {@link WriteDurability}).
 	 */
 	async transact(transform: Transforms, actionId: ActionId, rev: number, headerId: BlockId, tailId: BlockId, priority = 0, blockDigests?: BlockContentDigests, baseRevs?: BlockBaseRevs): Promise<CommitResult> {
@@ -259,8 +261,9 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 				// rebase — letting the cancel's own failure throw over it would turn a routine,
 				// recoverable race into a hard failure. So the cancel fault is logged, not raised.
 				await this.dischargePend(actionId, pendResult.blockIds);
+				return commitResult;
 			}
-			return commitResult;
+			return { ...commitResult, durability: withBlockRevs(commitResult.durability, pendResult.blockIds, rev) };
 		} catch (e) {
 			// `e` is the real cause — a transport fault, the thing the caller needs to see. A cancel
 			// that also fails must not silently take its place, but it must not be lost either: the

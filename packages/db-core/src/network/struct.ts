@@ -145,6 +145,14 @@ export type WriteDurability = {
 	 *  These blocks NEVER heal by replication: their transform is gone, and only the writer
 	 *  re-driving the action puts them back. */
 	readonly torn?: readonly BlockId[];
+	/** Action-level: every block this write committed, with the revision it committed at — what a
+	 *  host holds to match full-replication events (`BlockDurabilityReachedEvent`, keyed by block and
+	 *  revision) back to this write. Set by the db-core layer that issued the commit
+	 *  (`withBlockRevs`), never by a coordinator and never on the wire. Excludes `torn` blocks: they
+	 *  hold nothing. Merging two reports keeps, per block, the HIGHER revision — a block written at r
+	 *  and again at r+1 by one write is covered by an event at r+1 or later. A `Record` rather than a
+	 *  `Map` so the type stays plain JSON. */
+	readonly blockRevs?: Readonly<Record<BlockId, number>>;
 };
 
 export type PendSuccess = {

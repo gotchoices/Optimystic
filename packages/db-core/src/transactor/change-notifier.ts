@@ -90,9 +90,11 @@ export function isBlockChangeNotifier(x: unknown): x is IBlockChangeNotifier {
  * revision: a block written again by a LATER action replaces the earlier entry, so the earlier
  * action's shortfall is cleared by the later action's copies and reported under the later
  * action's `actionId` — the earlier action never fires an event of its own. A host that keys its
- * pending state by action alone therefore waits forever for a superseded write. Hold the block ids
- * the write's result names (`PendSuccess.blockIds`) and clear each as an event covers it; `rev`
- * and `actionId` say which write's copies did the covering.
+ * pending state by action alone therefore waits forever for a superseded write. Hold the blocks the
+ * write's durability names (`WriteDurability.blockRevs`, each with the revision it committed at) and
+ * clear a block when an event names it at that revision or a later one; `rev` and `actionId` say
+ * which write's copies did the covering. An event can arrive before the write's answer has reached
+ * the host, so a host that registers on the answer must also remember events it has already seen.
  */
 export type BlockDurabilityReachedEvent = {
 	/** Blocks that reached full replication in this round. Today's producer reports one block per

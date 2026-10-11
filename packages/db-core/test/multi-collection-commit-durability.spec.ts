@@ -99,6 +99,18 @@ class PerCollectionDurabilityTransactor extends DelegatingTransactor {
 	}
 }
 
+/** The answer minus `blockRevs`, which the coordinator adds per collection (the blocks it
+ *  committed, under random ids): these tests compare the class the transactor answered with. */
+function answered(d: WriteDurability | undefined): WriteDurability | undefined {
+	if (d === undefined) return undefined;
+	const { blockRevs: _blockRevs, ...rest } = d;
+	return rest;
+}
+
+function answeredPerCollection(collections: ReadonlyMap<CollectionId, WriteDurability | undefined>): Map<CollectionId, WriteDurability | undefined> {
+	return new Map([...collections].map(([id, d]) => [id, answered(d)]));
+}
+
 /** Stage one `set` action per entry and return the transaction that will commit them. With no
  *  entries this is the read-only stamp: the empty pre-stage barrier opens it, nothing is staged. */
 async function stage(
@@ -138,7 +150,7 @@ describe('multi-collection commit reports durability', () => {
 		expect(result.success).to.equal(true);
 		expect(result.durability, 'a commit that wrote something reports it').to.not.equal(undefined);
 		const durability = result.durability!;
-		expect(durability.collections).to.deep.equal(new Map([[idA, FULL], [idB, MAJORITY]]));
+		expect(answeredPerCollection(durability.collections)).to.deep.equal(new Map([[idA, FULL], [idB, MAJORITY]]));
 		expect(durability.overall?.quorum, 'overall is the weaker class').to.equal('majority');
 		expect(isFullyDurable(durability.overall!), 'one collection held by a majority is not fully held').to.equal(false);
 	});
@@ -180,9 +192,9 @@ describe('multi-collection commit reports durability', () => {
 		const partial = thrown as CoordinatorPartialCommitError;
 		expect(partial.committedCollections).to.deep.equal([idA]);
 		expect(partial.failedCollections).to.deep.equal([idB]);
-		expect(partial.durability.collections, 'names exactly the committed collection, with its class')
+		expect(answeredPerCollection(partial.durability.collections), 'names exactly the committed collection, with its class')
 			.to.deep.equal(new Map([[idA, MAJORITY]]));
-		expect(partial.durability.overall).to.deep.equal(MAJORITY);
+		expect(answered(partial.durability.overall)).to.deep.equal(MAJORITY);
 	});
 
 	it('never folds an unknown class into an overall answer', () => {

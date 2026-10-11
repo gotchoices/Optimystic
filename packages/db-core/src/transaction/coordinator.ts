@@ -2,6 +2,7 @@ import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, Commi
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
 import { isConflictFailure, isExpiryFailure } from "../network/stale-failure.js";
+import { withBlockRevs } from "../network/durability.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
 import type { Collection, CollectionSnapshot, RefreshReport } from "../collection/collection.js";
 import type { SyncOptions } from "../collection/index.js";
@@ -1842,7 +1843,7 @@ export class TransactionCoordinator {
 			try {
 				const commitResult = await this.transactor.commit(commitRequest);
 				if (commitResult.success) {
-					return { collectionId, committed: true, durability: commitResult.durability };
+					return { collectionId, committed: true, durability: withBlockRevs(commitResult.durability, blockIds, rev) };
 				}
 				if (isExpiryFailure(commitResult)) {
 					// Not a stale loss: a re-drive's expiration comes from the same clock.
