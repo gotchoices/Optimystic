@@ -1676,7 +1676,14 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return expected.filter(id => absent.has(id))
 	}
 
-	/** Remote peers outside `band` whose membership verdict, read from their peerStore protocols now, is `serves`. */
+	/**
+	 * Remote peers outside `band` whose membership verdict, read from their peerStore protocols now, is `serves`.
+	 *
+	 * NOTE: one peerStore read here, and one ring hash in {@link nearestTo}, per remembered serving peer
+	 * outside the band, on every solo write — a node cut off from a wide network it once saw pays that
+	 * for every peer it ever saw serving. If it shows in a profile, memoize each peer's ring position
+	 * (it never changes) and pre-select by distance before reading the peerStore.
+	 */
 	private async servingPeersOutside(band: readonly string[]): Promise<string[]> {
 		const excluded = new Set([...band, this.libp2p.peerId.toString()])
 		const remembered = [...this.rememberedServing].filter(id => !excluded.has(id))
