@@ -53,7 +53,8 @@ export const DEFAULT_UNDER_REPLICATION_DRAIN_CONFIG: UnderReplicationDrainConfig
 /**
  * The one method the drain may call on the node's storage repo: emit a full-replication event.
  * Handed in as a function, exactly as the cluster side receives a `CommitCertificateSink`, so the
- * drain has no way to reach anything else on the repo.
+ * drain has no way to reach anything else on the repo. `CoordinatorRepo` is handed the same
+ * callable, for the entries a `full` commit settles — the event's other producer.
  */
 export type BlockDurabilitySink = (event: BlockDurabilityReachedEvent) => void;
 
