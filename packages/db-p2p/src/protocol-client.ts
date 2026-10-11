@@ -100,7 +100,8 @@ export class ProtocolClient {
 	 * A stream the key network's `PreparedStreams` pool handed out was negotiated up to its idle time
 	 * before this request, and the connection under it can have died in between without either side
 	 * noticing. When such a stream fails before any reply byte arrives — for any reason other than this
-	 * request's own response deadline or the caller's abort — the request is sent once more, on a stream
+	 * request's own response deadline, the caller's abort, or a reset from the remote (see
+	 * {@link mayResend}) — the request is sent once more, on a stream
 	 * from a new `connect`, under the same caller signal and inside what is left of the same response
 	 * deadline. That can deliver a request twice if the remote did receive it before failing; every
 	 * protocol the pool serves already tolerates re-delivery, since the batch retries in
@@ -131,10 +132,15 @@ export class ProtocolClient {
 	/**
 	 * A request on a prepared stream that failed before its reply began is sent once more — but never
 	 * when the failure is this request's own response deadline or the caller's abort, which a re-send
-	 * would only repeat.
+	 * would only repeat, nor when the remote reset the stream. Every service this pool serves resets
+	 * its stream when handling the request throws, so a reset says the request reached a live handler
+	 * and failed there: re-sending would run it a second time to the same end. The failure a re-send
+	 * exists for — a connection that died under the held stream — never arrives as a remote reset,
+	 * since nothing comes back over a dead connection; it ends the stream from this side.
 	 */
 	private mayResend(stream: Libp2pStream, progress: ExchangeProgress, err: unknown, options?: ProcessMessageOptions): boolean {
 		if (!isPreparedStream(stream) || progress.replyStarted) return false;
+		if (stream.status === 'reset') return false;
 		if (err instanceof ResponseTimeoutError) return false;
 		return options?.signal?.aborted !== true;
 	}

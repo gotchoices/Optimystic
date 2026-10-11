@@ -40,10 +40,11 @@
  * connection may have died in between without either side noticing (the half-open connection of
  * GitHub #32). A request on it cannot hedge to another connection the way a fresh open does, since
  * that would send the request twice on purpose; instead `processMessage` re-sends once when a stream
- * this pool handed out ({@link isPreparedStream}) fails before any reply byte arrives. What ends the
+ * this pool handed out ({@link isPreparedStream}) fails before any reply byte arrives — unless the
+ * remote reset it, which means the request reached a live handler and failed there. What ends the
  * wait on a dead connection is the replacement open `connect` starts beside the request: it picks
  * the same connection first, stays pending there, and condemns it after the dead-connection delay,
- * which resets the request's stream.
+ * which aborts the request's stream from this side.
  *
  * Imports here are type-only or pure, like `open-protocol-stream.ts`: this module is reachable from
  * the react-native entry (`src/rn.ts`) through `libp2p-key-network.ts`.

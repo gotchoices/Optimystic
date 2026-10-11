@@ -23,7 +23,9 @@
  * `PreparedStreams` pool held it there for the next request. A request that takes it cannot hedge,
  * so it waits until the replacement open `connect` starts beside it condemns the dead connection,
  * which resets the request's stream; `ProtocolClient.processMessage` then re-sends once, on the
- * stream the replacement opened over the live connection.
+ * stream the replacement opened over the live connection. A fourth shape is the contrast: a request
+ * the remote received and reset — what every database service does when handling it throws — is
+ * not re-sent, since the remote would only run it again.
  */
 import { expect } from 'chai';
 import { createLibp2p, type Libp2p } from 'libp2p';
@@ -38,6 +40,7 @@ import { ProtocolClient } from '../src/protocol-client.js';
 import type { StreamOpenDeadlines } from '../src/rpc-deadline.js';
 
 const ECHO = '/optimystic-test/half-open-echo/1.0.0';
+const RESET = '/optimystic-test/half-open-reset/1.0.0';
 const REQUEST_MS = 3000;
 const HEDGE_MS = 250;
 const DEAD_CONNECTION_MS = 1000;
@@ -89,6 +92,19 @@ class EchoClient extends ProtocolClient {
 	async echo(): Promise<unknown> {
 		return await this.processMessage<unknown>({ ping: 1 }, ECHO, { responseTimeoutMs: REQUEST_MS });
 	}
+}
+
+/** A request on a protocol whose handler resets the stream on every request, as a throwing service does. */
+class ResetClient extends ProtocolClient {
+	async request(): Promise<unknown> {
+		return await this.processMessage<unknown>({ ping: 1 }, RESET, { responseTimeoutMs: REQUEST_MS });
+	}
+}
+
+async function expectRejection(promise: Promise<unknown>): Promise<void> {
+	let rejected = false;
+	try { await promise; } catch { rejected = true; }
+	expect(rejected, 'the remote reset the request').to.equal(true);
 }
 
 describe('a half-open connection does not strand a connected peer', function () {
@@ -221,4 +237,45 @@ describe('a half-open connection does not strand a connected peer', function () 
 			expect(elapsed, 'answered within the dead-connection delay plus one request').to.be.below(DEAD_CONNECTION_MS + HEDGE_MS);
 		});
 	});
+
+	describe('when the remote resets a request it received on a prepared stream', () => {
+		let a: Libp2p;
+		let b: Libp2p;
+		let pool: PreparedStreams | undefined;
+		let received = 0;
+
+		before(async () => {
+			a = await spawnNode(true);
+			b = await spawnNode(false);
+			// What every database service does when handling a request throws: reset the stream.
+			await registerProtocolHandler(b, RESET, (stream: Stream) => {
+				stream.addEventListener('message', () => {
+					received++;
+					stream.abort(new Error('handler threw (simulated)'));
+				});
+			});
+			await b.dial(a.getMultiaddrs()[0]!);
+			await sleep(500);
+		});
+
+		after(async () => {
+			pool?.close();
+			await b?.stop();
+			await a?.stop();
+		});
+
+		it('is not sent a second time', async () => {
+			pool = new PreparedStreams(a, { protocols: [RESET], deadlines: STREAM_OPEN });
+			const client = new ResetClient(b.peerId, keyNetworkOf(a, pool));
+
+			await expectRejection(client.request());
+			await sleep(200);
+			const held = a.getConnections(b.peerId).flatMap(c => c.streams).filter(s => s.protocol === RESET && s.status === 'open');
+			expect(held, 'the first request left a stream prepared').to.have.length(1);
+
+			await expectRejection(client.request());
+			expect(received, 'one delivery per request').to.equal(2);
+		});
+	});
 });
+
